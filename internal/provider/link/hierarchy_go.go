@@ -21,6 +21,10 @@ const (
 	// goMethodRecord is a method the type itself declares: its name in Aux,
 	// its signature in Sig, its flags in Flags.
 	goMethodRecord
+	// goFieldRecord is a field the type itself declares, its name in Aux:
+	// a named field, or an embedded field, named by its type's unqualified
+	// name ("Struct types").
+	goFieldRecord
 	// goEmbedRecord is a type the type embeds, in Ref.
 	goEmbedRecord
 )
@@ -31,13 +35,16 @@ func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name strin
 	return methodSets.Add(entry{Key: refKey(typ), Tag: goMethodRecord, Ref: e.Ref, Aux: name, Sig: e.Sig, Flags: e.Flags})
 }
 
-// goEmbeddings records each type declaration of a Go table and what each
-// embeds. An embedded field or an embedded interface promotes the embedded
-// type's methods into the embedding type's method set (The Go Programming
-// Language Specification, "Struct types", "Interface types"): it is walked
-// upward from the embedding type, as a supertype, and never makes the
-// embedding type a subtype a call on the embedded one dispatches into.
-func (h *hierarchy) goEmbeddings(ctx context.Context, links, methodSets *pagination.ExternalSort[entry], fc fileCtx, t *Table) error {
+// goEmbeddings records each type declaration of a Go table, the fields
+// each declares and what each embeds. An embedded field or an embedded
+// interface promotes the embedded type's methods into the embedding type's
+// method set (The Go Programming Language Specification, "Struct types",
+// "Interface types"), which satisfy lists in full under the embedding type.
+// It is no subtype relation in either direction: a call on the embedded type
+// never dispatches into the embedding type, and a call on the embedding type
+// reaches only what its method set holds, never a promoted method a
+// shallower name hides.
+func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.ExternalSort[entry], fc fileCtx, t *Table) error {
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		if !isType(d.Kind) {
@@ -51,13 +58,24 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, links, methodSets *paginat
 			return err
 		}
 	}
+	for i := range t.Decls {
+		d := &t.Decls[i]
+		if d.Kind != model.NodeField || d.Parent < 0 || !isType(t.Decls[d.Parent].Kind) {
+			continue
+		}
+		f := entry{Key: refKey(Ref{File: fc.file, Index: d.Parent}), Tag: goFieldRecord, Aux: d.Name}
+		if err := methodSets.Add(f); err != nil {
+			return err
+		}
+	}
 	for _, st := range t.Supertypes {
 		err := h.typesIn(ctx, fc, st.Type, func(sub entry) error {
 			return h.typesIn(ctx, fc, st.Super, func(super entry) error {
 				if sub.Ref == super.Ref {
 					return nil
 				}
-				if err := links.Add(entry{Key: keySuper + refKey(sub.Ref), Ref: super.Ref}); err != nil {
+				field := entry{Key: refKey(sub.Ref), Tag: goFieldRecord, Aux: lastComponent(typeName(st.Super), ".")}
+				if err := methodSets.Add(field); err != nil {
 					return err
 				}
 				return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: super.Ref})
@@ -156,10 +174,10 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 
 // goMethodSet yields the method set of the Go type typ ("Method sets",
 // "Selectors"): every method typ declares, then, depth by depth through its
-// embedded types, each method of a name no shallower depth has. At one
-// depth a name a struct reaches along two or more embedding paths is an
-// ambiguous selector and in no method set, and hides the name at every
-// deeper depth; an interface's method set is the union of its embedded
+// embedded types, each method of a name no shallower depth declares as a
+// method or a field. At one depth a name a struct reaches along two or more
+// embedding paths, or as a field, is in no method set, and hides the name at
+// every deeper depth; an interface's method set is the union of its embedded
 // interfaces' and admits a name from several of them. An interface embeds
 // only interfaces. Only typ's own walk is held.
 func goMethodSet(ix *index, typ Ref, iface bool, yield func(name string, m entry, promoted bool) error) error {
@@ -172,6 +190,8 @@ func goMethodSet(ix *index, typ Ref, iface bool, yield func(name string, m entry
 		case goMethodRecord:
 			have[e.Aux] = true
 			return yield(e.Aux, e, false)
+		case goFieldRecord:
+			have[e.Aux] = true
 		case goEmbedRecord:
 			level[e.Ref] = min(level[e.Ref]+1, 2)
 		}
@@ -198,13 +218,15 @@ func goMethodSet(ix *index, typ Ref, iface bool, yield func(name string, m entry
 				case e.Tag == goTypeRecord:
 					skip = iface && e.Flags&flagAbstract == 0
 				case skip:
-				case e.Tag == goMethodRecord:
+				case e.Tag == goMethodRecord || e.Tag == goFieldRecord:
 					r := byName[e.Aux]
 					if r == nil {
 						r = &reach{}
 						byName[e.Aux] = r
 					}
-					r.methods = append(r.methods, e)
+					if e.Tag == goMethodRecord {
+						r.methods = append(r.methods, e)
+					}
 					r.paths = min(r.paths+paths, 2)
 				case e.Tag == goEmbedRecord && !visited[e.Ref]:
 					next[e.Ref] = min(next[e.Ref]+paths, 2)
@@ -220,7 +242,7 @@ func goMethodSet(ix *index, typ Ref, iface bool, yield func(name string, m entry
 				continue
 			}
 			have[name] = true
-			if !iface && r.paths > 1 {
+			if !iface && r.paths > 1 || len(r.methods) == 0 {
 				continue
 			}
 			for _, m := range r.methods {

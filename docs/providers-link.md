@@ -182,9 +182,9 @@ The members' language family picks the resolver:
   a package of the unit only through the module path of the `go.mod` at the unit's root: the module path is the
   root, a path under it the directory it continues with, any other path the root's `vendor` copy; a unit with no
   `go.mod` binds no import path (`hierarchy.goPackages`, `internal/provider/link/hierarchy_go.go`). A Go type's method
-  set is its own methods and, depth by depth, those its embedded fields and embedded interfaces promote; a name two
-  embedding paths reach at one depth of a struct is ambiguous and promotes nothing. Embedding is promotion, never
-  subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
+  set is its own methods and, depth by depth, those its embedded fields and embedded interfaces promote. A name a
+  shallower depth declares, as a method or as a named or embedded field, is not promoted; a name a struct reaches at
+  one depth along two embedding paths, or as a field, promotes nothing. Embedding is promotion, never subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
   under the embedding type, and implicit interface satisfaction compares whole method sets (`hierarchy.satisfy`). An
   indirect site joins every function taken as a value whose declared signature equals the site's
   (`wire.Export.Signature`, `wire/link.go:42-49`); a Go method expression `T.M` taken as a value has the method's

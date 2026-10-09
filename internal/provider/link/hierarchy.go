@@ -525,7 +525,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 	}
 	if fc.family == "go" {
-		return h.goEmbeddings(ctx, links, methodSets, fc, t)
+		return h.goEmbeddings(ctx, methodSets, fc, t)
 	}
 	for i, st := range t.Supertypes {
 		err := h.typesIn(ctx, fc, st.Type, func(sub entry) error {
