@@ -80,8 +80,10 @@ type Site struct {
 	Name  Span
 	Shape Shape
 	// Qualifier is the type, package, namespace or module a ShapeStatic site
-	// names, as written (`T` in `T::f()`, `pkg` in `pkg.F()`), and empty for
-	// every other shape.
+	// names, as written (`T` in `T::f()`, `pkg` in `pkg.F()`); for a
+	// ShapeConstructor site, the type it creates when the callee token alone
+	// does not name it (`a.b.T` in `new a.b.T()`, the class a `this(...)` or
+	// `super(...)` invocation constructs); empty for every other shape.
 	Qualifier string
 	// Receiver is the receiver's type for a ShapeMember site, and the called
 	// value's type for a ShapeIndirect site when it is recovered.
