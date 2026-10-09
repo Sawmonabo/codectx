@@ -2,6 +2,7 @@ package link
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -10,11 +11,13 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
@@ -50,6 +53,9 @@ const (
 	// keyGoDir + directory: a Go package declared in that directory, its
 	// name in Aux, which an import path ending in the directory reaches.
 	keyGoDir = "g\x00"
+	// keyPath + a suffix of a member file's path at a component boundary:
+	// that file, which a C or C++ include of the suffix names.
+	keyPath = "x\x00"
 	// keyType + family + scope + name: a type declaration visible under its
 	// simple name in that scope. C and C++ types carry their namespace in
 	// Aux under the empty scope instead.
@@ -139,13 +145,23 @@ type fileCtx struct {
 	// and package, Java's package, Rust's and every other language's file,
 	// and for C and C++ the namespaces the file declares in, "" first.
 	scopes []string
+	// imports are the file's imports, nil for a context read back from the
+	// index (types), where they are not known; closed is shared by every
+	// copy of the context and answers, once asked, whether each of them
+	// names a declaration or file of the unit (closedImports).
+	imports []Import
+	closed  *closedState
 }
+
+// closedState caches a file's closedImports answer.
+type closedState struct{ asked, closed bool }
 
 // contextOf is t's fileCtx: Go's directory and package clause, Java's
 // package clause, the namespaces a C or C++ file declares in and those its
 // using-directives name, and every other language's file.
 func contextOf(file int32, t *Table) fileCtx {
-	fc := fileCtx{file: file, language: t.Language, family: familyOf(t.Language), sep: separatorOf(t.Language), path: t.Path}
+	fc := fileCtx{file: file, language: t.Language, family: familyOf(t.Language), sep: separatorOf(t.Language), path: t.Path,
+		imports: t.Imports, closed: &closedState{}}
 	switch fc.family {
 	case "go":
 		fc.scopes = []string{path.Dir(t.Path) + "\x00" + t.Package}
@@ -309,6 +325,16 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 			return err
 		}
 	}
+	for p := t.Path; ; {
+		if err := s.Add(entry{Key: keyPath + p, Ref: Ref{File: file}}); err != nil {
+			return err
+		}
+		_, rest, ok := strings.Cut(p, "/")
+		if !ok {
+			break
+		}
+		p = rest
+	}
 	if fc.family == "go" {
 		if err := s.Add(entry{Key: keyGoDir + path.Dir(t.Path), Aux: t.Package}); err != nil {
 			return err
@@ -352,7 +378,8 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		}
 		keys = append(keys, prefix+fc.family+"\x00"+scope+"\x00"+d.Name)
 		qualifiedSuffixes(d.Qualified, fc.sep, func(q string) { keys = append(keys, qualifiedPrefix+fc.family+"\x00"+q) })
-		e := entry{Ref: ref, Aux: ns, Sig: d.Signature, Flags: flagsOf(d)}
+		e := declEntry(ref, d)
+		e.Aux = ns
 		for _, k := range keys {
 			e.Key = k
 			if err := s.Add(e); err != nil {
@@ -361,6 +388,29 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		}
 	}
 	return nil
+}
+
+// declEntry is the entry of declaration d at ref, with what a lookup
+// filters and answers on without reading d's table: its signature, its
+// flags, the argument counts a call of it may pass (wire.Export.Params) and
+// the type it returns when the worker named one.
+func declEntry(ref Ref, d *Decl) entry {
+	e := entry{Ref: ref, Sig: d.Signature, Flags: flagsOf(d)}
+	if d.Described && isCallable(d.Kind) {
+		// A variable-arity parameter is counted in Params and may receive
+		// no argument.
+		fixed := d.Params
+		if d.Variadic {
+			fixed -= min(fixed, 1)
+		} else {
+			e.MaxArgs = d.Params + 1
+		}
+		e.MinArgs = fixed - min(d.Optional, fixed)
+	}
+	if d.Returns.Kind == wire.TypeNamed {
+		e.Returns = d.Returns.Name
+	}
+	return e
 }
 
 func flagsOf(d *Decl) byte {
@@ -396,7 +446,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			continue
 		}
 		ref := Ref{File: file, Index: int32(i)}
-		e := entry{Ref: ref, Sig: d.Signature, Flags: flagsOf(d)}
+		e := declEntry(ref, d)
 		add := func(typ Ref) error {
 			e.Key = keyMethod + refKey(typ) + d.Name
 			if err := links.Add(e); err != nil {
@@ -412,7 +462,10 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			}
 			return methodSets.Add(m)
 		}
-		if p := d.Parent; p >= 0 && isType(t.Decls[p].Kind) {
+		// A Java anonymous class body's method is its synthetic type's,
+		// whatever declaration encloses it (an initializer block's is its
+		// class).
+		if p := d.Parent; p >= 0 && isType(t.Decls[p].Kind) && !anonymousReceiver(fc, d) {
 			if err := add(Ref{File: file, Index: p}); err != nil {
 				return err
 			}
@@ -478,9 +531,15 @@ func (h *hierarchy) types(ctx context.Context, file int32, name string, yield fu
 // that introduces it (a Java single-type import, a C++ using-declaration, a
 // Rust `use`, an ECMAScript or Python import of the module declaring it),
 // which decides alone when there is one; and through the file's imports of
-// every member of a path. Only a name none of these can supply (the file has
-// no import naming it and no import of every member) falls back to every
-// type of that name in the unit.
+// every member of a path. A name none of these can supply falls back to
+// every type of that name in the unit only in Go, Rust, C and C++, and only
+// when every import of the file names a declaration or file of the unit
+// (closedImports), so that the name cannot come from outside it: in Java
+// such a name is a type of the file's package or of java.lang, and in
+// ECMAScript and Python a global, never a unit type of another module.
+//
+// A Java anonymous class body's name (anonymousType) denotes its synthetic
+// type alone.
 //
 // A qualified name whose first component an import introduces is read with
 // that component replaced by what it denotes: a Go package by its import
@@ -492,6 +551,11 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 	if name == "" {
 		return nil
 	}
+	if fc.family == "java" {
+		if ref, ok := anonymousType(fc.file, name); ok {
+			return yield(entry{Ref: ref})
+		}
+	}
 	if head, rest, ok := strings.Cut(name, fc.sep); ok {
 		return h.qualifiedTypes(fc, name, head, rest, yield)
 	}
@@ -501,14 +565,32 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 		return yield(e)
 	}
 	if fc.family == "c" {
+		// A type of internal linkage (one in an unnamed namespace) that the
+		// file itself declares decides alone: no other file's is named
+		// there ([basic.link]). Another file's is read with the others,
+		// since a header the file includes may declare it.
+		var others []entry
+		own := false
 		err := h.decls.lookup(keyType+fc.family+"\x00\x00"+name, func(e entry) error {
-			if slices.ContainsFunc(fc.scopes, func(from string) bool { return visible(e.Aux, from) }) {
+			if !slices.ContainsFunc(fc.scopes, func(from string) bool { return visible(e.Aux, from) }) {
+				return nil
+			}
+			if e.Flags&flagInternal != 0 && e.Ref.File == fc.file {
+				own = true
 				return hit(e)
 			}
+			others = append(others, e)
 			return nil
 		})
 		if err != nil {
 			return err
+		}
+		if !own {
+			for _, e := range others {
+				if err := hit(e); err != nil {
+					return err
+				}
+			}
 		}
 	} else {
 		for _, s := range fc.scopes {
@@ -536,7 +618,99 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 	if err != nil || found || all {
 		return err
 	}
+	switch fc.family {
+	case "java", "js", "python":
+		return nil
+	}
+	if closed, err := h.closedImports(fc); err != nil || !closed {
+		return err
+	}
 	return h.decls.lookup(keyTypeName+fc.family+"\x00"+name, yield)
+}
+
+// anonymousType is the synthetic type of the Java anonymous class body a
+// name written in file denotes: the Java worker names each anonymous class
+// body (and each enum constant's body) of a file `#k`, k its one-based
+// ordinal in source order, a name no Java identifier can spell (JLS §3.8).
+// Its methods are its own and it is a subtype of the type it instantiates
+// (JLS §15.9.5), so a call on that type dispatches into them and a call on
+// any other subtype does not. It has no declaration: its Ref's Index is
+// -1-k, below the module's -1, and it is only ever a key of the hierarchy.
+func anonymousType(file int32, name string) (Ref, bool) {
+	digits, ok := strings.CutPrefix(name, "#")
+	if !ok {
+		return Ref{}, false
+	}
+	k, err := strconv.ParseInt(digits, 10, 32)
+	if err != nil || k < 1 {
+		return Ref{}, false
+	}
+	return Ref{File: file, Index: int32(-1 - k)}, true
+}
+
+// anonymousReceiver reports a method of a Java anonymous class body: its
+// receiver is the body's synthetic type (anonymousType).
+func anonymousReceiver(fc fileCtx, d *Decl) bool {
+	if fc.family != "java" {
+		return false
+	}
+	_, ok := anonymousType(fc.file, d.Receiver)
+	return ok
+}
+
+// closedImports reports that every import of fc's file names a declaration
+// or a file of the unit: a Go import a package of the unit, a C or C++
+// include a member file (by a suffix of its path), a using-declaration a
+// type or function of the unit, a Rust `use` a type or function of the
+// module its path names. An import of every member of a path never reaches
+// here (typesIn returns before), and a context without its imports (one
+// read back from the index) is not closed. The answer is cached per file.
+func (h *hierarchy) closedImports(fc fileCtx) (bool, error) {
+	if fc.closed == nil {
+		return false, nil
+	}
+	if fc.closed.asked {
+		return fc.closed.closed, nil
+	}
+	closed := true
+	for _, imp := range fc.imports {
+		found := false
+		hit := func(entry) error {
+			found = true
+			return nil
+		}
+		var err error
+		switch fc.family {
+		case "go":
+			err = h.goPackages(imp.Path, func(string) error { return hit(entry{}) })
+		case "c":
+			if imp.Name == "" {
+				err = h.decls.lookup(keyPath+strings.Trim(imp.Path, "<>"), hit)
+				break
+			}
+			if err = h.decls.lookup(keyTypeQualified+fc.family+"\x00"+imp.Path, hit); err == nil && !found {
+				err = h.decls.lookup(keyFuncQualified+fc.family+"\x00"+imp.Path, hit)
+			}
+		case "rust":
+			module, last, ok := cutLast(imp.Path, fc.sep)
+			if !ok {
+				break
+			}
+			module = rustPath(fc.path, module)
+			if err = h.decls.lookup(keyTypeModule+module+"\x00"+last, hit); err == nil && !found {
+				err = h.decls.lookup(keyFuncModule+module+"\x00"+last, hit)
+			}
+		}
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			closed = false
+			break
+		}
+	}
+	fc.closed.asked, fc.closed.closed = true, closed
+	return closed, nil
 }
 
 // qualifiedTypes is typesIn for a qualified name, head its first component
@@ -652,7 +826,10 @@ func (h *hierarchy) methods(typ Ref, method string, yield func(entry) error) err
 
 // preferDefinitions yields what each yields, without its prototypes when
 // it yields any definition. Only the entries of one name in one scope are
-// held.
+// held. A definition takes from each prototype of its signature what C++
+// writes on the declaration alone: `virtual` and `final`, which a definition
+// outside its class cannot repeat, and default arguments, which a call may
+// leave out (the fewest arguments any of them accepts).
 func preferDefinitions(each func(func(entry) error) error, yield func(entry) error) error {
 	var prototypes, definitions []entry
 	err := each(func(e entry) error {
@@ -668,6 +845,16 @@ func preferDefinitions(each func(func(entry) error) error, yield func(entry) err
 	}
 	if len(definitions) == 0 {
 		definitions = prototypes
+	} else {
+		for i := range definitions {
+			d := &definitions[i]
+			for _, p := range prototypes {
+				if p.Sig == d.Sig {
+					d.Flags |= p.Flags & (flagVirtual | flagFinal)
+					d.MinArgs = min(d.MinArgs, p.MinArgs)
+				}
+			}
+		}
 	}
 	for _, e := range definitions {
 		if err := yield(e); err != nil {
@@ -722,10 +909,16 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 // A declaration without a body is yielded only when no declaration with one
 // is reachable, since a call runs a body.
 func (h *hierarchy) dispatch(ctx context.Context, typ Ref, method string, yield func(Ref) error) error {
-	return h.dispatchEntries(ctx, typ, method, func(e entry) error { return yield(e.Ref) })
+	return h.dispatchEntries(ctx, "", typ, method, func(e entry, _ bool) error { return yield(e.Ref) })
 }
 
-func (h *hierarchy) dispatchEntries(ctx context.Context, typ Ref, method string, yield func(entry) error) error {
+// dispatchEntries is dispatch for a call written in a file of family, which
+// reaches the overrides in typ's subtypes only when the nearest declarations
+// can be overridden (overridable); down reports, with each entry, that it
+// did. The family "" overrides by name alone.
+func (h *hierarchy) dispatchEntries(ctx context.Context, family string, typ Ref, method string,
+	yield func(e entry, down bool) error,
+) error {
 	var concrete, abstract []entry
 	collect := func(e entry) error {
 		if e.Flags&flagAbstract != 0 {
@@ -738,9 +931,13 @@ func (h *hierarchy) dispatchEntries(ctx context.Context, typ Ref, method string,
 	if err := h.declared(typ, method, collect); err != nil {
 		return err
 	}
+	down, err := h.overridable(family, typ, method, slices.Concat(concrete, abstract))
+	if err != nil {
+		return err
+	}
 	seen := map[Ref]bool{typ: true}
 	queue := []Ref{typ}
-	for len(queue) > 0 {
+	for down && len(queue) > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -768,11 +965,77 @@ func (h *hierarchy) dispatchEntries(ctx context.Context, typ Ref, method string,
 			continue
 		}
 		yielded[e.Ref] = true
-		if err := yield(e); err != nil {
+		if err := yield(e, down); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// overridable reports that a call of method on typ reaches the overrides
+// in typ's subtypes, given found, the nearest declarations of it typ
+// declares or inherits, by the rule of the call's family:
+//   - Java: one of them is an instance method that is not Final (JLS
+//     §8.4.8): a static method hides and a final or private one, or one of a
+//     final class, has no override;
+//   - C and C++: one of them is not Final, and typ or a supertype declares
+//     the method virtual ([class.virtual]): a member overriding a virtual
+//     one is virtual without saying so, and a non-virtual call runs the
+//     member the static type names;
+//   - Go: one of them is an interface's method; a concrete type's method is
+//     promoted into the types embedding it, never overridden;
+//   - every other family: always.
+//
+// When the unit declares none (typ inherits the method from outside the
+// unit, whose rules are unknown), the call reaches every override.
+func (h *hierarchy) overridable(family string, typ Ref, method string, found []entry) (bool, error) {
+	if len(found) == 0 {
+		return true, nil
+	}
+	switch family {
+	case "java":
+		return slices.ContainsFunc(found, func(e entry) bool { return e.Flags&(flagStatic|flagFinal) == 0 }), nil
+	case "go":
+		return slices.ContainsFunc(found, func(e entry) bool { return e.Flags&flagAbstract != 0 }), nil
+	case "c":
+		if !slices.ContainsFunc(found, func(e entry) bool { return e.Flags&flagFinal == 0 }) {
+			return false, nil
+		}
+		return h.virtual(typ, method)
+	}
+	return true, nil
+}
+
+// virtual reports that typ or one of its supertypes declares method
+// virtual. Every declaration is read, the prototypes a definition replaces
+// included (methods drops them): only the declaration inside the class can
+// say `virtual`, never a definition outside it.
+func (h *hierarchy) virtual(typ Ref, method string) (bool, error) {
+	seen := map[Ref]bool{typ: true}
+	queue := []Ref{typ}
+	for len(queue) > 0 {
+		t := queue[0]
+		queue = queue[1:]
+		found := false
+		err := h.links.lookup(keyMethod+refKey(t)+method, func(e entry) error {
+			found = found || e.Flags&flagVirtual != 0
+			return nil
+		})
+		if err != nil || found {
+			return found, err
+		}
+		err = h.links.lookup(keySuper+refKey(t), func(e entry) error {
+			if !seen[e.Ref] {
+				seen[e.Ref] = true
+				queue = append(queue, e.Ref)
+			}
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 // close releases what the hierarchy spilled.
@@ -793,6 +1056,19 @@ type entry struct {
 	Aux   string
 	Sig   string
 	Flags byte
+	// MinArgs and MaxArgs bound the arguments a call of the declaration may
+	// pass: at least MinArgs and, when MaxArgs is non-zero, fewer than
+	// MaxArgs. The zero values accept any count, as for a declaration the
+	// worker described nothing of (declEntry).
+	MinArgs, MaxArgs uint32
+	// Returns is the type the declaration returns, as its own file writes
+	// it, when the worker named one.
+	Returns string
+}
+
+// fits reports that a call passing n arguments may call e.
+func (e entry) fits(n int) bool {
+	return n >= int(e.MinArgs) && (e.MaxArgs == 0 || n < int(e.MaxArgs))
 }
 
 func compareEntry(a, b entry) int {
@@ -814,11 +1090,20 @@ func compareEntry(a, b entry) int {
 	if c := strings.Compare(a.Sig, b.Sig); c != 0 {
 		return c
 	}
-	return int(a.Flags) - int(b.Flags)
+	if a.Flags != b.Flags {
+		return int(a.Flags) - int(b.Flags)
+	}
+	if a.MinArgs != b.MinArgs {
+		return cmp.Compare(a.MinArgs, b.MinArgs)
+	}
+	if a.MaxArgs != b.MaxArgs {
+		return cmp.Compare(a.MaxArgs, b.MaxArgs)
+	}
+	return strings.Compare(a.Returns, b.Returns)
 }
 
 func encodeEntry(e entry) ([]byte, error) {
-	b := make([]byte, 0, len(e.Key)+len(e.Aux)+len(e.Sig)+3*binary.MaxVarintLen32+10)
+	b := make([]byte, 0, len(e.Key)+len(e.Aux)+len(e.Sig)+len(e.Returns)+6*binary.MaxVarintLen32+10)
 	b = binary.AppendUvarint(b, uint64(len(e.Key)))
 	b = append(b, e.Key...)
 	b = append(b, e.Tag)
@@ -828,7 +1113,11 @@ func encodeEntry(e entry) ([]byte, error) {
 	b = append(b, e.Aux...)
 	b = binary.AppendUvarint(b, uint64(len(e.Sig)))
 	b = append(b, e.Sig...)
-	return append(b, e.Flags), nil
+	b = append(b, e.Flags)
+	b = binary.AppendUvarint(b, uint64(e.MinArgs))
+	b = binary.AppendUvarint(b, uint64(e.MaxArgs))
+	b = binary.AppendUvarint(b, uint64(len(e.Returns)))
+	return append(b, e.Returns...), nil
 }
 
 var errMalformedEntry = errors.New("link: malformed hierarchy entry")
@@ -854,10 +1143,28 @@ func decodeEntry(b []byte) (entry, error) {
 	if e.Aux, ok = str(); !ok {
 		return e, errMalformedEntry
 	}
-	if e.Sig, ok = str(); !ok || len(b) != 1 {
+	if e.Sig, ok = str(); !ok || len(b) < 1 {
 		return e, errMalformedEntry
 	}
 	e.Flags = b[0]
+	b = b[1:]
+	count := func() (uint32, bool) {
+		n, w := binary.Uvarint(b)
+		if w <= 0 || n > 1<<32-1 {
+			return 0, false
+		}
+		b = b[w:]
+		return uint32(n), true
+	}
+	if e.MinArgs, ok = count(); !ok {
+		return e, errMalformedEntry
+	}
+	if e.MaxArgs, ok = count(); !ok {
+		return e, errMalformedEntry
+	}
+	if e.Returns, ok = str(); !ok || len(b) != 0 {
+		return e, errMalformedEntry
+	}
 	return e, nil
 }
 

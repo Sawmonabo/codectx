@@ -2,6 +2,7 @@ package link
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -36,7 +37,7 @@ func resolveStatic(ctx context.Context, u *unit, emit func(Binding) error) error
 	}
 	defer bySignature.Close()
 	err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
-		r := staticFile{h: h, ctx: ctx, file: file, t: t, fc: contextOf(file, t), emit: emit}
+		r := staticFile{h: h, ctx: ctx, file: file, t: t, fc: contextOf(file, t), emit: emit, returns: map[int32][]returned{}}
 		for i := range t.Sites {
 			if err := r.site(int32(i), bySignature); err != nil {
 				return err
@@ -102,22 +103,62 @@ type staticFile struct {
 	t    *Table
 	fc   fileCtx
 	emit func(Binding) error
+	// returns holds, for each site resolved so far, the types its targets
+	// return, which a receiver of kind TypeResult naming it reads. A site
+	// is present while it is being resolved, so a cycle reads nothing.
+	returns map[int32][]returned
 }
 
-// site resolves site i by its shape, and adds an indirect site with a
-// declared function type to bySignature.
+// returned is a type a target returns, as the target's own file writes it.
+type returned struct {
+	file int32
+	name string
+}
+
+// site resolves site i and publishes its bindings; an indirect site with a
+// declared function type also joins bySignature.
 func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) error {
-	s := &r.t.Sites[i]
 	ref := Ref{File: r.file, Index: i}
+	return r.resolve(i, bySignature, func(e entry, detail string) error {
+		return r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail})
+	})
+}
+
+// resolve yields the declarations site i binds by its shape, with each
+// binding's detail, and records the types they return. Only a target a call
+// passing the site's arguments can call is yielded (fits). With
+// bySignature, an indirect site with a declared function type, and a Java
+// call of an abstract method, also join it.
+func (r *staticFile) resolve(i int32, bySignature *pagination.ExternalSort[entry], yield func(entry, string) error) error {
+	s := &r.t.Sites[i]
+	_, known := r.returns[i]
+	if !known {
+		r.returns[i] = nil
+	}
+	var rets []returned
 	bind := func(detail string) func(entry) error {
 		return func(e entry) error {
-			d := detail
-			if d == DetailHierarchy && e.Flags&flagStatic != 0 {
-				d = DetailDirect
+			if !r.fits(s, e) {
+				return nil
 			}
-			return r.emit(Binding{Site: ref, Target: e.Ref, Detail: d})
+			if !known && e.Returns != "" {
+				ret := returned{file: e.Ref.File, name: e.Returns}
+				if !slices.Contains(rets, ret) {
+					rets = append(rets, ret)
+				}
+			}
+			return yield(e, detail)
 		}
 	}
+	err := r.shape(i, s, bySignature, bind)
+	if !known {
+		r.returns[i] = rets
+	}
+	return err
+}
+
+// shape resolves site s, at index i, by its shape.
+func (r *staticFile) shape(i int32, s *Site, bySignature *pagination.ExternalSort[entry], bind func(string) func(entry) error) error {
 	switch s.Shape {
 	case wire.ShapeBare:
 		return r.bare(s.Caller, s.Callee, bind)
@@ -133,7 +174,7 @@ func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) 
 		})
 	case wire.ShapeMember:
 		err := r.member(s.Caller, s.Receiver, s.Callee, bind)
-		if err != nil || r.fc.language != "java" || s.Receiver.Kind != wire.TypeNamed {
+		if err != nil || bySignature == nil || r.fc.language != "java" || s.Receiver.Kind != wire.TypeNamed {
 			return err
 		}
 		// A Java call of an abstract method (a functional interface's, on a
@@ -146,7 +187,7 @@ func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) 
 				if e.Flags&flagAbstract == 0 || e.Sig == "" {
 					return nil
 				}
-				return bySignature.Add(entry{Key: e.Sig, Tag: 1, Ref: ref})
+				return bySignature.Add(entry{Key: e.Sig, Tag: 1, Ref: Ref{File: r.file, Index: i}})
 			})
 		})
 	case wire.ShapeIndirect:
@@ -155,26 +196,82 @@ func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) 
 				return err
 			}
 		}
-		if s.Signature == "" {
+		if s.Signature == "" || bySignature == nil {
 			return nil
 		}
-		return bySignature.Add(entry{Key: s.Signature, Tag: 1, Ref: ref})
+		return bySignature.Add(entry{Key: s.Signature, Tag: 1, Ref: Ref{File: r.file, Index: i}})
 	}
 	return nil
 }
 
+// fits reports that site s passes as many arguments as target e accepts
+// (wire.Export.Params). A Go method expression or a Rust path naming a
+// method (`T.M(t, x)`, `T::m(t, x)`) passes the receiver as its first
+// argument. A site the worker recovered no argument of (no Args) is not
+// filtered, since the table does not tell a call the worker did not
+// describe from one passing none.
+func (r *staticFile) fits(s *Site, e entry) bool {
+	if s.Args == nil {
+		return true
+	}
+	n := len(s.Args)
+	if s.Shape == wire.ShapeStatic && e.Flags&flagStatic == 0 && (r.fc.family == "go" || r.fc.family == "rust") {
+		n--
+	}
+	return e.fits(n)
+}
+
+// dispatch binds the methods a call of method on a receiver of static type
+// typ reaches (dispatchEntries): DetailHierarchy when the call reaches into
+// typ's subtypes, DetailDirect when the language says it cannot.
+func (r *staticFile) dispatch(typ Ref, method string, bind func(string) func(entry) error) error {
+	return r.h.dispatchEntries(r.ctx, r.fc.family, typ, method, func(e entry, down bool) error {
+		if down {
+			return bind(DetailHierarchy)(e)
+		}
+		return bind(DetailDirect)(e)
+	})
+}
+
 // bare resolves a call of a simple name: in Java, and in C++ inside a
-// class, the enclosing class's methods by class-hierarchy analysis (an
-// implicit `this`); otherwise the free functions the language's scope makes
-// visible to the caller.
+// class, by class-hierarchy analysis over the innermost enclosing type that
+// has a method of that name (JLS §15.12.1, [class.member.lookup]), walking
+// out from an inner, local or anonymous class to the classes enclosing it
+// (an implicit `this` of the class that declares or inherits it); otherwise
+// the free functions the language's scope makes visible to the caller. In
+// C++ a member of an enclosing class is called without an object of it, so
+// only its static members are bound there.
 func (r *staticFile) bare(caller int32, callee string, bind func(string) func(entry) error) error {
 	if r.fc.language == "java" || r.fc.language == "cpp" {
-		found := false
-		err := r.enclosingTypes(caller, func(typ Ref) error {
-			return r.h.dispatchEntries(r.ctx, typ, callee, func(e entry) error {
+		found, outer := false, false
+		hit := func(detail string) func(entry) error {
+			return func(e entry) error {
 				found = true
-				return bind(DetailHierarchy)(e)
-			})
+				if outer && r.fc.language == "cpp" && e.Flags&flagStatic == 0 {
+					return nil
+				}
+				return bind(detail)(e)
+			}
+		}
+		err := r.enclosingTypes(caller, func(types []Ref) (bool, error) {
+			for _, typ := range types {
+				// A level counts only when its type has the method as a
+				// member, declared or inherited: one it lacks is not
+				// reached through that type's subtypes.
+				member := false
+				err := r.h.declared(typ, callee, func(entry) error {
+					member = true
+					return nil
+				})
+				if err == nil && member {
+					err = r.dispatch(typ, callee, hit)
+				}
+				if err != nil {
+					return false, err
+				}
+			}
+			outer = true
+			return found, nil
 		})
 		if err != nil || found {
 			return err
@@ -238,7 +335,7 @@ func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) e
 		return yield(e)
 	}
 	if r.fc.language == "rust" && q == "Self" {
-		return r.enclosingTypes(caller, func(typ Ref) error { return r.h.declared(typ, name, yield) })
+		return r.innermostTypes(caller, func(typ Ref) error { return r.h.declared(typ, name, yield) })
 	}
 	if r.fc.family == "go" {
 		if imported, err := r.qualifiedGo(q, name, yield); err != nil || imported {
@@ -259,14 +356,15 @@ func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) e
 }
 
 // member resolves a call of method on a receiver: by class-hierarchy
-// analysis over its declared type, along the enclosing class's supertypes
-// for `super`, or as a qualified call through a module.
+// analysis over its declared type, or over the types the targets of the
+// call it is the result of return; along the enclosing class's supertypes
+// for `super`; or as a qualified call through a module.
 func (r *staticFile) member(caller int32, recv wire.Type, method string, bind func(string) func(entry) error) error {
 	switch recv.Kind {
 	case wire.TypeNamed:
-		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
-			return r.h.dispatchEntries(r.ctx, typ.Ref, method, bind(DetailHierarchy))
-		})
+		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error { return r.dispatch(typ.Ref, method, bind) })
+	case wire.TypeResult:
+		return r.results(int32(recv.Index), func(typ Ref) error { return r.dispatch(typ, method, bind) })
 	case wire.TypeSuper:
 		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
 			return r.h.links.lookup(keySuper+refKey(typ.Ref), func(super entry) error {
@@ -275,6 +373,35 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, bind fu
 		})
 	case wire.TypeModule:
 		return r.qualified(caller, recv.Name, method, bind(DetailDirect))
+	}
+	return nil
+}
+
+// results yields, each once, the types the targets of site j return, each
+// read in the file of the target that returns it: the static type of a
+// call's result (`NewServer().Start()`, a fluent chain, `Config::new().load()`).
+// A site not yet resolved is resolved first, without publishing anything.
+func (r *staticFile) results(j int32, yield func(Ref) error) error {
+	if j < 0 || int(j) >= len(r.t.Sites) {
+		return nil
+	}
+	if _, ok := r.returns[j]; !ok {
+		if err := r.resolve(j, nil, func(entry, string) error { return nil }); err != nil {
+			return err
+		}
+	}
+	seen := map[Ref]bool{}
+	for _, ret := range r.returns[j] {
+		err := r.h.types(r.ctx, ret.file, ret.name, func(typ Ref) error {
+			if seen[typ] {
+				return nil
+			}
+			seen[typ] = true
+			return yield(typ)
+		})
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -295,24 +422,58 @@ func (r *staticFile) function(caller int32, written string, yield func(entry) er
 		return r.free(caller, name, yield)
 	}
 	if q == "this" || q == "self" {
-		return r.enclosingTypes(caller, func(typ Ref) error { return r.h.dispatchEntries(r.ctx, typ, last, yield) })
+		return r.innermostTypes(caller, func(typ Ref) error {
+			return r.h.dispatchEntries(r.ctx, r.fc.family, typ, last, func(e entry, _ bool) error { return yield(e) })
+		})
 	}
 	return r.qualified(caller, q, last, yield)
 }
 
-// enclosingTypes yields the types caller is a member of: the type
-// declaration enclosing it, or the types its receiver names.
-func (r *staticFile) enclosingTypes(caller int32, yield func(Ref) error) error {
-	for i := caller; i >= 0; i = r.t.Decls[i].Parent {
+// enclosingTypes calls level with the types whose bodies enclose code in
+// caller, one enclosing level at a time, innermost first, until level
+// reports it is done: each type declaration enclosing caller, and the types
+// the receiver of an enclosing callable declared outside any type names (a
+// Go, Rust or C++ method defined outside its type) or a method of a Java
+// anonymous class body names (its synthetic type, inside the enclosing
+// class even when an initializer block, which declares nothing, holds it).
+func (r *staticFile) enclosingTypes(caller int32, level func([]Ref) (bool, error)) error {
+	for i := caller; i >= 0 && int(i) < len(r.t.Decls); i = r.t.Decls[i].Parent {
 		d := &r.t.Decls[i]
-		if isType(d.Kind) {
-			return yield(Ref{File: r.file, Index: i})
+		var types []Ref
+		switch {
+		case isType(d.Kind):
+			types = []Ref{{File: r.file, Index: i}}
+		case d.Receiver != "" && (d.Parent < 0 || int(d.Parent) >= len(r.t.Decls) || !isType(r.t.Decls[d.Parent].Kind) ||
+			anonymousReceiver(r.fc, d)):
+			err := r.h.typesIn(r.ctx, r.fc, d.Receiver, func(e entry) error {
+				types = append(types, e.Ref)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
 		}
-		if d.Receiver != "" {
-			return r.h.typesIn(r.ctx, r.fc, d.Receiver, func(e entry) error { return yield(e.Ref) })
+		if len(types) == 0 {
+			continue
+		}
+		if done, err := level(types); err != nil || done {
+			return err
 		}
 	}
 	return nil
+}
+
+// innermostTypes yields the types of the innermost level enclosingTypes
+// finds: those `this`, `self` and `Self` denote.
+func (r *staticFile) innermostTypes(caller int32, yield func(Ref) error) error {
+	return r.enclosingTypes(caller, func(types []Ref) (bool, error) {
+		for _, typ := range types {
+			if err := yield(typ); err != nil {
+				return true, err
+			}
+		}
+		return true, nil
+	})
 }
 
 func cutLast(s, sep string) (before, after string, ok bool) {
