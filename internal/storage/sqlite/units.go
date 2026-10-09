@@ -1639,8 +1639,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if _, err := tx.ExecContext(ctx, `DELETE FROM generation_capabilities WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("generation_capabilities", err)
 		}
-		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, units_running, details_json)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, details_json)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
@@ -1651,7 +1651,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 				return err
 			}
 			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State),
-				c.DiagnosticCode, c.Remediation, c.UnitsRunning, details); err != nil {
+				c.DiagnosticCode, c.Remediation, details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 		}
@@ -1667,12 +1667,6 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		// they were written. remediation is in it because it is a function of
 		// the typed failure, exactly as diagnostic_code and the message inside
 		// details_json are: two identical runs produce the same string.
-		// units_running is deliberately NOT, and must not be added: it records
-		// how many scopes happened to still be in flight at the moment the
-		// generation was published, which is scheduling and not content, so
-		// two rebuilds of one workspace under one configuration can
-		// legitimately differ on it and folding it in would make the digest
-		// nondeterministic (Section 20.2).
 		capsHash := model.NewHasher(domainCapabilities)
 		if err := foldColumn(ctx, tx, capsHash, `SELECT provider_id || char(0) || capability || char(0) || scope_key || char(0) || state || char(0) || diagnostic_code
 			|| char(0) || remediation || char(0) || details_json

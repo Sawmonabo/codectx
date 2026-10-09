@@ -64,24 +64,22 @@ func TestRunFailureOutlivesTheFailedRunAndDiesWithItsGeneration(t *testing.T) {
 	}
 }
 
-// TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning protects the two
-// disclosures a status report owes a process that did not do the indexing.
+// TestASecondProcessReadsWhyAUnitFailed protects the disclosure a status
+// report owes a process that did not do the indexing.
 //
-// Failure mode: the reason a unit failed and the fact that a scope is still
-// being built both lived only in the indexing process -- the reason on a run
-// row no command read, the running set in the coordinator's own deferred
-// queue. A `codectx status` in another terminal, and the index-status tool in
-// a server, therefore reported a capability as merely degraded while the work
-// that completes it was still running, and could not say why any scope had no
-// facts at all. Both must come off the stored generation, and the reason must
-// arrive without the analyzer's standard-error tail, which stays on the run
-// row: this answer is what `status --json` hands any client.
+// Failure mode: the reason a unit failed lived only in the indexing process,
+// on a run row no command read. A `codectx status` in another terminal, and
+// the index-status tool in a server, therefore reported a capability as merely
+// degraded and could not say why any scope had no facts at all. The reason
+// must come off the stored generation, and it must arrive without the
+// analyzer's standard-error tail, which stays on the run row: this answer is
+// what `status --json` hands any client.
 //
 // Mutation proof: in StatusReader.Status, drop the FailedRuns read, and no
 // failed unit is read; drop its withoutRawOutput loop, and the tail is served;
-// in Store.Activate, insert 0 for units_running, and neither running scope is
-// read.
-func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
+// in Store.Activate, insert an empty remediation, and the row's remediation
+// is not read.
+func TestASecondProcessReadsWhyAUnitFailed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	f := newFixture(t, path)
 	// A generation with a sealed unit: the capability below is partial, which
@@ -100,29 +98,14 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 		t.Fatalf("RecordRunFailure: %v", err)
 	}
 	var err error
-	// The interleaving the fold used to lose: one scope failed, another
-	// published, and a third is still building in the background. The failure
-	// row outranks the deferred row, so the running scope is disclosed on the
-	// surviving row or nowhere at all.
-	interleaved := model.CapabilityState{ProviderID: providerID, Capability: "structure",
+	// One scope failed and another published, so the capability is partial
+	// and the row carries the failure's code and remediation.
+	partial := model.CapabilityState{ProviderID: providerID, Capability: "structure",
 		Scope: "workspace", State: model.CapabilityPartial, DiagnosticCode: reason.Code,
-		Remediation: reason.Remediation, UnitsRunning: 1,
-		Details: map[string]string{model.DetailUnitsFailed: "1", model.DetailUnitsPlanned: "3"}}
-	// A second provider with work of its own still in flight. units_running is
-	// an assertion about the whole generation, so a publication that counted
-	// only the scopes of whichever provider it was publishing for would answer
-	// zero here, and the second process would be told this capability is
-	// simply unavailable while its units are being built.
-	//
-	// This builds the rows rather than driving a late seal, which no test in
-	// this package can reach, so it holds the store and the second handle to
-	// the figure and not to the counting; what counts it is internal/index's
-	// holdsFreshUnit, over generation_units.
-	otherProvider := model.CapabilityState{ProviderID: "link", Capability: "calls",
-		Scope: "workspace", State: model.CapabilityUnavailable, DiagnosticCode: model.CodeProviderUnavailable,
-		UnitsRunning: 2}
+		Remediation: reason.Remediation,
+		Details:     map[string]string{model.DetailUnitsFailed: "1", model.DetailUnitsPlanned: "2"}}
 	if _, err = f.s.Activate(f.ctx, gen, 0, model.HealthDegraded,
-		[]model.CapabilityState{interleaved, otherProvider}, "norm-v1"); err != nil {
+		[]model.CapabilityState{partial}, "norm-v1"); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 	if err := f.s.Flush(f.ctx); err != nil {
@@ -159,25 +142,10 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 	if _, ok := got.Details[model.DetailStderrTail]; ok {
 		t.Errorf("the second process read the analyzer's standard-error tail on a failed unit")
 	}
-	running := map[string]int{}
-	var row model.CapabilityState
-	for _, c := range st.Completeness {
-		running[c.ProviderID] = c.UnitsRunning
-		if c.ProviderID == providerID {
-			row = c
-		}
+	if len(st.Completeness) != 1 {
+		t.Fatalf("the second process read %d capability rows, want one: %+v", len(st.Completeness), st.Completeness)
 	}
-	if len(st.Completeness) != 2 {
-		t.Fatalf("the second process read %d capability rows, want two: %+v", len(st.Completeness), st.Completeness)
-	}
-	if running[providerID] != 1 {
-		t.Errorf("the row reports units_running=%d, want 1: the scope still being built was disclosed to nobody",
-			running[providerID])
-	}
-	if running[otherProvider.ProviderID] != 2 {
-		t.Errorf("the other provider reports units_running=%d, want 2: the scopes queued for a provider other "+
-			"than the one being published for were counted by nobody", running[otherProvider.ProviderID])
-	}
+	row := st.Completeness[0]
 	if row.Remediation != reason.Remediation {
 		t.Errorf("the row carries remediation %q, want %q", row.Remediation, reason.Remediation)
 	}
