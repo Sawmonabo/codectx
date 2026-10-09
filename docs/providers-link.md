@@ -76,7 +76,7 @@ name (docs/providers-treesitter.md). What a call can bind to differs by family, 
 
 | Family | Targets | `Receiver` |
 |---|---|---|
-| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods | the enclosing class, interface, record or enum |
+| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#k` for an anonymous class body or an enum constant's body, the k-th in the file in source order, sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
 | Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body) | the impl's self type; the trait for a trait method |
 | C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
@@ -169,9 +169,13 @@ an import, a type or a signature.
 The members' language family picks the resolver:
 - **Java** (`resolveStatic`, `internal/provider/link/resolve_static.go`): class-hierarchy analysis. A static,
   constructor or `super` site binds directly, and a bare call a static import names binds the imported method. A
-  member site binds by its receiver's static type to that type's method and to every override in a subtype
-  (`hierarchy.dispatch`, `internal/provider/link/hierarchy.go:814-821`). A call of an abstract method (a functional
-  interface's) also joins every method reference of that method's signature.
+  bare call binds in the innermost enclosing class that has the method, declared or inherited, walking out from an
+  inner, local or anonymous class (JLS §15.12.1). A member site binds by its receiver's static type to the method
+  that type declares or inherits, and to every override in a subtype only when that method can be overridden: not
+  static and not `Final` (`hierarchy.dispatchEntries`, `hierarchy.overridable`). An anonymous class body is a
+  synthetic subtype of the type it instantiates (`hierarchy.anonymousType`), so a call on that type reaches its
+  methods and a call on another subtype does not. A call of an abstract method (a functional interface's) also
+  joins every method reference of that method's signature.
 - **Go, Rust, C, C++** (`resolveStatic`): direct binding and class-hierarchy analysis over interfaces and traits.
   Bare and static sites bind by the language's scoping: same package, import, `use`, namespace and
   using-directive, and a prototype yields to the definition it announces (`Decl.Prototype`). A Go import path names
@@ -185,11 +189,23 @@ The members' language family picks the resolver:
   indirect site joins every function taken as a value whose declared signature equals the site's
   (`wire.Export.Signature`, `wire/link.go:42-49`); a Go method expression `T.M` taken as a value has the method's
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
-  cross-product, with no reachability fixed point.
+  cross-product, with no reachability fixed point. A C++ call reaches into subtypes only from a member that is not
+  `Final` and that the receiver's type or a supertype declares `virtual` ([class.virtual]). In C++ a bare call inside
+  a class walks out to the enclosing classes' static members.
+
+In every static family a site binds only a target its arguments fit: at least `Params - Optional` (one fewer for
+a `Variadic` one, whose last parameter may take none) and, unless `Variadic`, at most `Params` (`staticFile.fits`).
+A C or C++ definition takes `virtual`, `final` and default arguments from its prototypes of the same signature
+(`preferDefinitions`). A Go method expression or a Rust path naming a method passes
+its receiver as the first argument. A site with no recovered arguments is not filtered. A receiver that is
+another call's result (`TypeResult`) has the types that call's targets return, each read in its target's file
+(`staticFile.results`).
 
 A type name is read in the file's scopes, then through the import that names it (which decides alone), then
-through the file's imports of every member. Only a name that no scope or import of the file can supply falls back
-to every type of that name in the unit (`hierarchy.typesIn`).
+through the file's imports of every member. A name none of them can supply falls back to every type of that name
+in the unit only in Go, Rust, C and C++, and only when every import of the file names a declaration or file of the
+unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where such a name is the package's,
+`java.lang`'s or a global (`hierarchy.typesIn`).
 
 - **JavaScript, TypeScript, TSX** (`resolveECMAScript`, `internal/provider/link/resolve_ecmascript.go`): direct
   binding through imports and scopes. A bare name binds only the declarations its scope sees, those of the innermost
