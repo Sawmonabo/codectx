@@ -340,7 +340,9 @@ fact of the new unit, which is exactly the condition `SealUnit` enforces.
 
 `UnitWriter.PutDeltaState(kind, reader)` stores the artifact the *next*
 refresh needs in order to diff without recomputing this one: the SCIP
-`DocumentManifest`, the dependence `KeySet`. The payload is opaque to storage,
+`DocumentManifest`, the dependence `KeySet`, the link resolution. A
+structural unit also stores its file's link table and the table's member
+digest this way, for the linking unit to read. The payload is opaque to storage,
 read from the file it was produced in and stored as a sequence of 1 MiB parts,
 so an artifact the size of a large unit is never held whole and has no bound.
 It shares the unit's lifetime exactly, so a retired unit takes its manifest
@@ -356,9 +358,17 @@ What a unit *declared* is not delta state and is never stored twice:
 predecessor's declared files against the fresh ones without holding either
 list. It refuses a unit that is not sealed: a building unit's rows are still
 arriving, and a delta diffed against a partial set would name too few replaced
-buckets and carry a stale fact. The dependence applier uses it to compute
-`Replaced.Files`; no manifest of the same rows is stored beside the
+buckets and carry a stale fact. The dependence and link appliers use it to
+compute `Replaced.Files`; no manifest of the same rows is stored beside the
 unit.
+
+Each row also carries `unit_inputs.digest`, the digest of the table another
+unit derived from the file that this unit read in place of its bytes
+(`model.UnitInput.Digest`), and NULL for an input read as bytes. A linking
+unit records each member's link-table digest there, and its applier
+merge-joins those digests against its predecessor's to decide whether it may
+inherit the predecessor's resolution. The digest is not part of the unit's
+identity: `UnitInputHasher` folds each input's file id, content hash and mode.
 
 ## Applier sketch
 

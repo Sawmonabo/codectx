@@ -22,8 +22,8 @@ InvalidationScope package
 Required          false
 ```
 
-`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:38-54`, and the descriptor is
-`Provider.Descriptor` (`provider.go:106-109`). The id is not `dependence`, which is never reused (decision 9). The
+`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:39-55`, and the descriptor is
+`Provider.Descriptor` (`provider.go:115-118`). The id is not `dependence`, which is never reused (decision 9). The
 provider is not required: a failed link degrades `calls` and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 
@@ -35,7 +35,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `calls` | `calls` | caller → ambiguous callee node | `ambiguous` |
 | `calls` | `may_refer_to` | caller → each candidate of an ambiguous site | `ambiguous call target` |
 
-The details are the `Detail*` constants (`provider.go:58-79`). Each one names the technique that bound the site:
+The details are the `Detail*` constants (`provider.go:59-80`). Each one names the technique that bound the site:
 - `direct`: the callee names the declaration by its package, module, import or scope;
 - `hierarchy`: class-hierarchy analysis over the receiver's static type and its subtypes;
 - `address_taken`: an indirect site joined to an address-taken function of the same signature;
@@ -59,7 +59,7 @@ own evidence at the declaration's range. So the edge joins the structural node, 
 
 **Ambiguous sites.** A site bound to two or more declarations publishes into the ambiguous family the structural
 provider already uses. The linker mints a callee node in scope `file:<path>` with native key
-`link:<call-site key>` and metadata `{"resolution":"ambiguous","candidates":n,"callee":"<name>"}`. It publishes a
+`link:<call-site key>`, located in the site's file at the site's range, and metadata `{"resolution":"ambiguous","candidates":n,"callee":"<name>"}`. It publishes a
 `calls` edge to that node and one `may_refer_to` edge per candidate. Nothing is capped: every candidate is published
 and counted in `candidates`. This differs from the structural provider's in-file family, which keeps at most
 `model.MaxAmbiguousCandidates` candidates and counts the rest as dropped.
@@ -89,43 +89,60 @@ A unit is one project of the repository, the scope `dependence.PlanUnits` derive
 (`internal/provider/dependence/units.go:136`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
 `units.go:359`). The planner is reused rather than copied.
 
-The unit's inputs are its member files. Each input records `model.UnitInput.Digest`, the digest of the link table
-the unit read for that file (`internal/model/storage.go:92-103`). The digest is outside the unit's identity:
-`UnitInputHasher` does not read it, because the content hash already decides the table.
+The unit's inputs are its member files. The unit's identity is their content, as for every unit: the facts it
+publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
+is its qualified name, so a unit reused on a match of anything less would serve evidence about bytes that are gone.
+Each input also records `model.UnitInput.Digest`, the member digest of the file's link table (`link.MemberDigest`,
+`internal/provider/link/tables.go:35-46`). The digest is outside the unit's identity: `UnitInputHasher` does not
+read it. It decides what a rebuild costs (the fast path below).
 
 **The link tables.** For each file with a lowering, the worker sends one `KindLink` message (`wire.Link`). The
 structural provider joins it to the declarations and call references it validated, and stores the result as a
-`link.Table` with the file's structural unit, under `link.TableKind` (`provider.go:44-46`). It stores it through
-`provider.StateSink` (`internal/provider/sink.go:240-249`), so the table shares the unit's lifetime. The linker
-reads a table back through `link.Tables` (`internal/provider/link/tables.go:14-50`): the structural unit the
-generation selects for the file's scope, then that unit's state. A file with no lowering, or whose dependence or link
-pass failed, has no table.
+`link.Table` with the file's structural unit, under `link.TableKind`, and the table's member digest beside it, under
+`link.DigestKind` (`storeTable`, `internal/provider/treesitter/link.go:319-340`). It stores both through
+`provider.StateSink` (`internal/provider/sink.go:240-249`), so they share the unit's lifetime. The linker reads a
+table, or its digest alone, back through `link.Tables` (`tables.go:14-97`): the structural unit the generation
+selects for the file's scope, then that unit's state of the kind. A file with no lowering, or whose dependence or
+link pass failed, has neither.
 
 Besides the joined declarations, sites and values, the table carries what the resolvers read a name in
-(`table.go:21-66`, filled by `internal/provider/treesitter/link.go`):
+(`internal/provider/link/table.go`, filled by `internal/provider/treesitter/link.go`):
 - `Package`: the file's package or module clause (`wire.Done.Package`);
-- `Imports`: one `Import{Name, Path}` per name an import introduces, `Path` being what the name denotes as the
-  language writes it. A Rust use tree is split into one path per leaf (`use a::{b, c as d}` gives `b → a::b` and
-  `d → a::c`). An import of every member of a path (a Go dot import, a Java on-demand import, a C++ using-directive,
-  a Rust glob, a Python `from m import *`) is named `ImportAll`. An include or a side-effect import has no name;
+- `Imports`: one `Import{Name, Path, Original}` per name an import introduces, `Path` being what the name denotes as
+  the language writes it and `Original` the name it denotes in that module when the import renames it. A Rust use
+  tree is split into one path per leaf (`use a::{b, c as d}` gives `b → a::b` and `d → a::c`). An import of every
+  member of a path (a Go dot import, a Java on-demand import, a C++ using-directive, a Rust glob, a Python
+  `from m import *`) is named `ImportAll`. An include or a side-effect import has no name;
 - `Decl.Prototype`: a C or C++ function declaration without a body (`wire.Decl.Prototype`);
-- `Decl.Default`: an ECMAScript declaration an `export default` statement declares, decided from the pinned bytes
-  before the declaration (the keywords `export default`, with only whitespace and block comments between).
+- `Reexports`: the names the module exports under a name of its own or from another module (`wire.Reexport`),
+  ECMAScript's `export default` included.
 
-**The digest** (`Table.Digest`, `table.go:160-183`) covers everything resolution reads. That is every name, kind,
-shape, type fact, candidate and index, the package and the imports, and the order of every list. It covers no byte range, position, node identity
-or dropped count. An edit that shifts a range moves no name and no type. So two tables with one digest resolve every
-site to the same declarations, by index; only the ranges and identities the edges are published with differ.
+**The digest.** `Table.Digest` (`table.go:185-218`) covers everything resolution reads. That is every name, kind,
+shape, type fact, candidate and index, the package, the imports and re-exports, and the order of every list. It
+covers no byte range, position or node identity. An edit that shifts a range moves no name and no type. So two tables
+with one digest resolve every site to the same declarations, by index; only the ranges and identities the edges are
+published with differ. The member digest adds the table's `Dropped` count, which decides the unit's coverage.
 
 ## The fast path
 
-The delta build compares each member's fresh digest with its predecessor's, in FileID order, as one merge join
-against the predecessor unit's stored inputs. When membership and every digest are equal, it hands `Link` the
-predecessor's resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`, `provider.go:47-50` and
-`provider.go:82-93`). The linker then resolves nothing. It re-emits the stored bindings with the ranges and
-identities of the fresh tables, because the state names each site and target by position (`Ref`,
-`internal/provider/link/unit.go:43-47`). So an edit inside a function body that changes neither table relinks
-nothing. Any other build resolves in full and stores its state for the next.
+The delta build reads each member's digest, one small read per member and no table decoded, and compares it with
+its predecessor's in FileID order, as one merge join against the predecessor unit's stored inputs
+(`internal/index/delta/link.go`). When membership and every digest are equal, it hands `Link` the predecessor's
+resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`) and the stream of members whose bytes
+changed (`LinkOptions.Edited`, `provider.go:82-102`). The state names each site and target by position (`Ref`,
+`internal/provider/link/unit.go`) and holds the unit's coverage, so the linker resolves nothing. It republishes only
+the facts whose evidence lies in an edited member: the occurrences of its declarations that an edge names, and its
+sites' `calls`, `may_refer_to` and ambiguous callee nodes. Every other fact of the predecessor is carried over
+(`sqlite.CarryOver`) with the edited members named in `Replaced.Files`.
+
+A table is read only when what is republished needs it: an edited member's, and an untouched member's when a
+republished site binds one of its declarations. An untouched member whose path is long enough that an ambiguous
+site's `link:` key could exceed `model.MaxNativeKeyBytes` is also walked, to count `unkeyed_ambiguous_sites`, and
+publishes nothing. So an edit inside a function body resolves nothing and republishes one file's facts.
+
+A predecessor that stored no state, or a state the build cannot read (`link.ValidateState`), resolves in full,
+with `Result.FullReason` `no_previous_state` or `unreadable_previous_state`. Any other build resolves in full,
+publishes every fact, carries nothing, and stores its state for the next.
 
 ## Resolution
 
@@ -179,7 +196,7 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 The `calls` row is published at the unit's scope:
 - `fresh` when every member had a table, no table dropped an entry, and every bound site was published;
-- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:190-211`), when
+- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:208-228`), when
   a member has no table (`members_without_table`), a table's `Dropped` is non-zero (`dropped_table_entries`,
   `table.go:43-47`), or an ambiguous site's `link:` key would exceed `model.MaxNativeKeyBytes` and so has no callee
   node to mint (`unkeyed_ambiguous_sites`). The row also counts the unit's `members`. A dropped entry is a worker
