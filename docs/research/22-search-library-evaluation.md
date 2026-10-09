@@ -31,7 +31,7 @@ ways (`harness/03-query-modes.md`):
 ## 0. Bottom line
 
 1. **The library's index is 44 times faster to build and about half the size.** 9.0 s against 400.7 s, 48.8 s of
-   CPU against 593.7 s, 0.85 GB peak against 2.45 GB, 337–387 MB against about 641 MB live (`runs/01`, `runs/02`).
+   CPU against 593.7 s, 0.85 GB peak against 2.45 GB, 337–387 MB against about 641 MB live (`runs/01-ours-index.md`, `runs/02-library-index.md`).
    Activation, 165.4 s today, disappears: the library merges in the background.
 2. **Our exact rules inside the library are 12 times faster than today; the library's pruned top 200 is about 3 000
    times faster.** 30 queries, warm, first page of 200: 47.4 s today, 4.04 s for `product`, 129 ms for
@@ -53,7 +53,7 @@ ways (`harness/03-query-modes.md`):
 
 ## 1. Question and method
 
-### The export (`runs/00-export.md`, `ours/01`–`04`)
+### The export (`runs/00-export.md`, `ours/01-export-path.md` to `ours/04-export-fidelity-check.md`)
 
 - **Corpus:** kubernetes at `dfd7b93a1783878be367e1fc4a780318330cb3bf` (Sept 26, 2026), 31 407 files.
 - **Producer:** the real `codectx index` at `16dfef6`, with the scip, lsp and dependence providers turned off by a
@@ -65,17 +65,17 @@ ways (`harness/03-query-modes.md`):
 - **Completeness check:** with the 15 459 manifest documents the export leaves out, the total is 562 072, exactly
   the stored count of the Sept 27 full run of the same commit.
 - **Fidelity:** on a public smoke repository (spf13/cobra) the index arm's store equals the real run's in rows,
-  `token_count` sum, distinct keys and summed name and path lengths, at 1 and 16 workers (`ours/04`).
+  `token_count` sum, distinct keys and summed name and path lengths, at 1 and 16 workers (`ours/04-export-fidelity-check.md`).
 - **Token counts:** the library arm recounted every document's tokens and matched our store's `token_count` on every
-  document in every build (`runs/02`).
+  document in every build (`runs/02-library-index.md`).
 
 ### The arms' fidelity
 
 - **Our arm** builds through `BeginUnit`, `PutSearchUnits`, `SealUnit` and `Activate`, with the production sink
   limits and worker count, and writes the rows the store requires before a search document can exist (repository,
   blobs, snapshot, generation, unit inputs, node facts with one evidence row each). Those are timed apart from search
-  work (`ours/02`, `ours/03`). It queries through the real first-page path, including hydration and the cursor sign
-  (`ours/06`). Its departures are listed in `ours/07-departures.md`.
+  work (`ours/02-index-arm.md`, `ours/03-rows-the-store-forces.md`). It queries through the real first-page path, including hydration and the cursor sign
+  (`ours/06-query-arm-and-filters.md`). Its departures are listed in `ours/07-departures.md`.
 - **The library arm** reproduces our tokenizer from tables probed out of the product's own SQLite build: 0 anomalies
   over every codepoint, and text identical over 303 391 tokens except one known mid-character cut at 32 768 bytes
   (`harness/01-tokenizer-probe.md`). Its IDF logarithm is a bit-identical port of Go's `math.Log`; the platform `ln`
@@ -165,7 +165,42 @@ Sum over the band's five queries of each query's warm median, first page of 200,
 | phrases | 2 492 ms | 51.3 ms | 49× | 7.34 ms | 340× | 3.39 ms | 735× |
 | **all 30** | **47.4 s** | **4.04 s** | **11.7×** | **129 ms** | **367×** | **16.0 ms** | **2 962×** |
 
-Per query, `runs/03-search-speed.txt` has every row. The five common terms take 4.15–7.11 s each today and 413–709 ms
+Per query (warm median; "Matches" counts documents, before the fold):
+
+| Query | Matches | Today, cold | Today, warm | `product` | Δ | `library-all` | Δ | `library` | Δ |
+|---|---|---|---|---|---|---|---|---|---|
+| `vendor` | 253 589 | 9.78 s | 5.89 s | 708.6 ms | 8× | 32.5 ms | 181× | 1.24 ms | 4 752× |
+| `func` | 201 750 | 7.99 s | 7.11 s | 525.6 ms | 14× | 26.9 ms | 265× | 1.49 ms | 4 787× |
+| `src` | 169 436 | 5.05 s | 4.86 s | 457.3 ms | 11× | 10.6 ms | 460× | 0.86 ms | 5 641× |
+| `staging` | 167 943 | 5.18 s | 5.34 s | 469.7 ms | 11× | 10.8 ms | 497× | 1.01 ms | 5 271× |
+| `org` | 167 741 | 4.10 s | 4.15 s | 413.0 ms | 10× | 9.37 ms | 443× | 0.99 ms | 4 203× |
+| `output` | 9 987 | 1.03 s | 1.00 s | 90.5 ms | 11× | 1.45 ms | 691× | 0.26 ms | 3 882× |
+| `metrics` | 9 985 | 884.6 ms | 792.0 ms | 91.1 ms | 9× | 1.50 ms | 526× | 0.29 ms | 2 722× |
+| `net` | 10 033 | 1.03 s | 949.1 ms | 95.3 ms | 10× | 1.99 ms | 478× | 0.53 ms | 1 787× |
+| `service` | 9 946 | 1.03 s | 967.9 ms | 89.2 ms | 11× | 1.52 ms | 638× | 0.28 ms | 3 457× |
+| `meta` | 9 930 | 770.7 ms | 735.1 ms | 83.1 ms | 9× | 2.42 ms | 304× | 0.23 ms | 3 224× |
+| `actions` | 1 000 | 475.2 ms | 407.9 ms | 16.4 ms | 25× | 1.38 ms | 295× | 0.13 ms | 3 067× |
+| `progress` | 999 | 495.7 ms | 430.3 ms | 17.8 ms | 24× | 1.01 ms | 425× | 0.24 ms | 1 771× |
+| `tracker` | 997 | 385.3 ms | 309.9 ms | 18.4 ms | 17× | 1.03 ms | 300× | 0.14 ms | 2 198× |
+| `encrypt` | 996 | 334.5 ms | 275.6 ms | 18.2 ms | 15× | 1.18 ms | 233× | 0.14 ms | 1 968× |
+| `indicate` | 996 | 500.7 ms | 443.0 ms | 17.2 ms | 26× | 0.99 ms | 446× | 0.46 ms | 969× |
+| `comparelock` | 2 | 142.4 ms | 80.5 ms | 0.41 ms | 195× | 0.02 ms | 4239× | 0.01 ms | 10 066× |
+| `currentutilizationval` | 4 | 139.3 ms | 87.6 ms | 0.40 ms | 217× | 0.03 ms | 3368× | 0.01 ms | 9 731× |
+| `messageoptionsr` | 2 | 149.7 ms | 79.9 ms | 0.47 ms | 170× | 0.02 ms | 4441× | 0.01 ms | 6 150× |
+| `cachedresource` | 7 | 149.8 ms | 93.2 ms | 0.50 ms | 187× | 0.05 ms | 1863× | 0.01 ms | 6 655× |
+| `defaultstubrefreshtoken` | 6 | 143.4 ms | 77.5 ms | 0.50 ms | 155× | 0.04 ms | 2096× | 0.04 ms | 2 096× |
+| `pod scheduler` | 36 309 | 2.05 s | 1.99 s | 169.8 ms | 12× | 3.58 ms | 556× | 0.85 ms | 2 357× |
+| `resource version` | 48 699 | 2.84 s | 2.74 s | 188.3 ms | 15× | 4.14 ms | 661× | 0.94 ms | 2 923× |
+| `node status` | 31 325 | 2.18 s | 2.09 s | 166.4 ms | 13× | 2.94 ms | 713× | 1.00 ms | 2 087× |
+| `client config` | 65 848 | 2.88 s | 2.88 s | 234.3 ms | 12× | 4.73 ms | 610× | 1.04 ms | 2 773× |
+| `volume mount` | 14 606 | 1.20 s | 1.10 s | 115.1 ms | 10× | 1.89 ms | 583× | 0.44 ms | 2 485× |
+| `"resource version"` | 485 | 961.9 ms | 512.8 ms | 8.88 ms | 58× | 1.83 ms | 280× | 1.38 ms | 371× |
+| `"garbage collector"` | 851 | 221.1 ms | 188.4 ms | 7.18 ms | 26× | 1.08 ms | 174× | 0.22 ms | 856× |
+| `"service account"` | 1 052 | 514.4 ms | 391.0 ms | 15.7 ms | 25× | 1.19 ms | 328× | 0.26 ms | 1 487× |
+| `"node name"` | 935 | 1.68 s | 1.06 s | 14.2 ms | 75× | 2.00 ms | 531× | 1.18 ms | 897× |
+| `"admission controller"` | 309 | 553.1 ms | 339.3 ms | 5.27 ms | 64× | 1.23 ms | 275× | 0.34 ms | 984× |
+
+The five common terms take 4.15–7.11 s each today and 413–709 ms
 under `product`. Cold runs today add 7.4 s over the warm sum (54.8 s), mostly on the common terms.
 
 ### 2.3 Filters, segments, pages and threads (`runs/03-pooled-latency.txt`, `runs/tquery-speed.log`)
@@ -206,7 +241,7 @@ MRR@10 / Success@10, Recall@200 in brackets where it matters. "Δ" is MRR@10 aga
 | `library-all`, code-aware tokenizer | 0.912 / 99.1% | +0.079 | 0.046 / 12.1% | −0.639 | 0.703 / 92.8% (0.661) | +0.324 |
 
 - `product` equals today to the fourth decimal on every set. Its subword Recall@200 differs in the fourth place
-  (0.2139 against 0.2130) because it counts folded results, not documents.
+  (0.2139 against 0.2130), consistent with its counting folded results, not documents.
 - The code-aware tokenizer ends subword's 13 zero-hit queries.
 - The library's per-column scoring wins name and subword. That gain is set against its collapse on doc (§3). The
   code-aware tokenizer gives most of the subword gain without the per-column model; under our scoring it is being
@@ -245,7 +280,7 @@ decides the route (§9). A soft delta through hiding equalled the hard delete on
 
 ## 3. Why today's tier is slow, and why per-column scoring collapses on the doc set
 
-### Today's cost (`runs/01-ours-index.md`, `ours/02`, `ours/06`)
+### Today's cost (`runs/01-ours-index.md`, `ours/02-index-arm.md`, `ours/06-query-arm-and-filters.md`)
 
 - **Two indexes over one text.** Every document is written to a full-text table, which exists only to serve phrases,
   and to packed per-unit posting segments, which serve ranking. The full-text table alone is 157.6 MB live.

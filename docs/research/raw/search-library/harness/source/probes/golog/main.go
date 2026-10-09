@@ -15,7 +15,9 @@ func main() {
 	}
 	s := uint64(88172645463325252)
 	for i := 0; i < 200000; i++ {
-		s ^= s << 13; s ^= s >> 7; s ^= s << 17
+		s ^= s << 13
+		s ^= s >> 7
+		s ^= s << 17
 		xs = append(xs, 1+float64(s%1000000007)/float64(1+s%9973))
 	}
 	for _, x := range xs {

@@ -5,8 +5,8 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"

@@ -32,7 +32,8 @@ Two arms were measured on the same 546 613 search documents:
   subfolder, `indexing/`). `features-matrix/` holds the matrix (00) and its notes, renumbered 10–18. Byte-identical
   copies of 10–18 that sat in `features/` were dropped. Cross-references, two source comments
   (`harness/source/src/library.rs`, `harness/source/src/variants.rs`) and one in `ours/source/internal/tbench/tbench.go`
-  were updated to the new paths.
+  were updated to the new paths. The two Go probes under `harness/source/probes/` were run through `gofmt`; no code
+  changed.
 - **Labels.** The web notes number codectx's product rules as "rule 1" to "rule 11" (listed in `web/00-summary.md`).
   The matrix's search-runtime features are RT1 to RT7.
 - **Split log.** The library arm's query log is published as `runs/tquery-speed.log` (speed, filters, pages, explain,
