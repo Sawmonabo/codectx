@@ -164,6 +164,10 @@ units over one index:
 - It is applied as each segment's alive set, through the library's custom-alive-set reader, or inside the collector.
   Hidden documents are never candidates. They never count in N, in the total token count or in df.
 - A unit's documents are deleted only when collection frees the unit. Deletion is by term on the `unit` field.
+- A delta carries a unit by listing it in the new generation, never by writing its documents again. Only units the
+  delta rebuilds add documents.
+- The index is one directory beside the store's database, owned by the store: it is created, recovered (decision 4)
+  and removed with it.
 
 Measured on the fixture, 18 queries: our scoring with 10% and with 50% of units hidden returned pages identical to an
 index built from only the visible documents, 18 of 18 both times. The library's own scoring did not, because its
@@ -210,6 +214,12 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   library's queries.
 - **Match count.** The count is exact when every match was visited, and otherwise a lower bound marked as one. That is
   how the major engines report it.
+- **Folding.** Documents that share a deduplication key (one symbol's several documents) fold into one result whose
+  score is the group's highest. The heap holds one entry per key and keeps that maximum, so a page is 200 distinct
+  results. Pruning can skip a group member only when it cannot raise its group's score or enter the page, so the
+  folded score is exact. A folded result's occurrence count is exact when no member was skipped, and otherwise a
+  lower bound, like the match count. Exact-tier results come first and a lexical document folds into the exact-tier
+  result with its key.
 - **No spool.** The ranked set is never sorted to disk. ADR-0001 §2.4 is amended to this rule.
 
 The exact tier (path and symbol lookup) is not ranked and keeps returning every match.
