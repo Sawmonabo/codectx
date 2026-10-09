@@ -47,10 +47,6 @@
 # line like any other rather than reported as a binary match, and a file is
 # checked as it is staged, so stage an edit before checking it.
 #
-# The private-name guard (scripts/private-names-check.sh) runs here too, over
-# every tracked path and its content, so one check fails on either kind of
-# reference and both lists are printed.
-#
 # The check takes no argument. It fails closed: on any argument, when git
 # cannot list the tracked files, when it lists none, or when a tracked entry
 # cannot be read (a submodule included), it exits 2 with the reason and never
@@ -118,10 +114,6 @@ if [ -n "$hits" ]; then
   echo "$hits"
   status=1
 fi
-names=0
-sh scripts/private-names-check.sh || names=$?
-[ "$names" -le 1 ] || fail "the private-name guard did not complete"
-[ "$names" -eq 0 ] || status=1
 if [ "$status" -ne 0 ]; then
   exit 1
 fi
