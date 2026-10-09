@@ -7,6 +7,14 @@
 
 (function_definition declarator: (_) @declarator body: (_) @body) @def.function
 (translation_unit (declaration declarator: (_) @declarator) @def.variable)
+; A file-scope declaration may sit under any number of conditional arms; the
+; same patterns match a local inside a function body, which the declarator
+; hook drops (only a declaration at file scope is extracted).
+(preproc_if (declaration declarator: (_) @declarator) @def.variable)
+(preproc_ifdef (declaration declarator: (_) @declarator) @def.variable)
+(preproc_else (declaration declarator: (_) @declarator) @def.variable)
+(preproc_elif (declaration declarator: (_) @declarator) @def.variable)
+(preproc_elifdef (declaration declarator: (_) @declarator) @def.variable)
 (struct_specifier name: (type_identifier) @name body: (_) @body) @def.struct
 (union_specifier name: (type_identifier) @name body: (_) @body) @def.struct
 (enum_specifier name: (type_identifier) @name body: (_) @body) @def.enum
@@ -18,5 +26,9 @@
 
 (call_expression function: (identifier) @call.name) @call
 (call_expression function: (field_expression argument: (_) @call.qualifier field: (field_identifier) @call.name)) @call
+; A call through a function pointer written `(*fp)(x)` or through a table
+; entry `tbl[i](x)`: the callee token is the pointer's or the table's name.
+(call_expression function: (parenthesized_expression (pointer_expression operator: "*" argument: (identifier) @call.name))) @call
+(call_expression function: (subscript_expression argument: (identifier) @call.name)) @call
 
 (type_identifier) @ref.type

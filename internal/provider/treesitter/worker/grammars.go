@@ -400,6 +400,14 @@ var cWrappers = []string{"template_declaration", "declaration_list"}
 
 // cRefine finds the identifier below a declarator chain and decides whether a
 // declaration declares a function (a prototype), a variable or a typedef.
+//
+// A declaration is extracted only at file scope (cLinkSyntax.fileScope): the
+// queries capture one under any preprocessor conditional or C++ template,
+// and such a node inside a function body declares a local, which is no
+// declaration of the file. A declarator declares a function only when a
+// function declarator is the type constructor nearest its name: `int g(int)`
+// and `int *g(int)` are functions, `int (*fp)(int)` and `void (*tbl[4])(int)`
+// are objects of pointer type.
 func cRefine(d *decl, src []byte) {
 	f, k := d.ex.f, d.ex.k
 	if d.declarator == nil {
@@ -407,6 +415,16 @@ func cRefine(d *decl, src []byte) {
 			d.macro = true
 		}
 		return
+	}
+	x := cLinkSyntaxIn(d.ex.l.Name, func(string) *ts.Language { return d.ex.g.tsLanguage() })
+	if d.node.KindId() == x.declaration {
+		p := d.node.Parent()
+		for p != nil && x.in(x.conditional, p.KindId()) {
+			p = p.Parent()
+		}
+		if p == nil || !x.fileScope(p.KindId()) {
+			return
+		}
 	}
 	n := d.declarator
 	isFunc := false
@@ -416,6 +434,9 @@ func cRefine(d *decl, src []byte) {
 			isFunc = true
 			n = n.ChildByFieldId(f.declarator)
 		case k.declaratorChain.has(n):
+			if x.in(x.object, id) {
+				isFunc = false
+			}
 			if c := n.ChildByFieldId(f.declarator); c != nil {
 				n = c
 			} else {
