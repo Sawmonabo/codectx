@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-09-16.
+Accepted, 2026-09-16. Amended 2026-10-08: the hosted dependence engine this record governs was deleted under ADR-0012 phase 6.
 
 ## Context
 

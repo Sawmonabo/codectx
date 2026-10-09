@@ -2,12 +2,13 @@
 
 ## Status
 
-Accepted, 2026-09-16.
+Accepted, 2026-09-16. Superseded 2026-10-08 by [ADR-0012](ADR-0012-native-dependence-engine.md): the hosted
+dependence engine this record governs was deleted under its phase 6.
 
 ## Context
 
 The dependence provider runs an external analysis engine once per unit for the parse and
-once for the export, under a heap ceiling the provider chooses ([providers-dependence](../providers-dependence.md)).
+once for the export, under a heap ceiling the provider chooses.
 Until this decision the ceiling was the unit's estimate -- 512 bytes of heap per byte of JavaScript
 source, from the empirical research -- clamped to the machine's available memory minus two gigabytes.
 The first uncapped index of the 13,222-file reference repository showed what that means on a host

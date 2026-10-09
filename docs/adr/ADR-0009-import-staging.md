@@ -2,13 +2,14 @@
 
 ## Status
 
-Accepted.
+Accepted. Superseded 2026-10-08 by [ADR-0012](ADR-0012-native-dependence-engine.md): the hosted dependence
+engine and the import this record governs were deleted under its phase 6.
 
 ## Context
 
 The dependence provider imports one unit's analysis export -- a directory of
 node and edge CSV files -- by staging it in a private SQLite database and
-deriving the unit's facts by ordered query ([providers-dependence](../providers-dependence.md#the-staging-database)).
+deriving the unit's facts by ordered query.
 Measured with the phase-by-phase harness in `internal/provider/dependence/graphcsv/scale_test.go`,
 the staging wrote 34.5 times the export's bytes for a 9 MB synthetic export
 and 42 times for a 47 MB one, and an uncapped index of the reference
