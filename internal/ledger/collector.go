@@ -345,9 +345,9 @@ func (c *collector) ensureRun(ctx context.Context, tx *sql.Tx, run *Run) error {
 	expires := time.Now().Add(LiveWindow)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(
 		run_id, kind, repository_id, generation_id, started_at, expires_at, finished_at, outcome,
-		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
+		file_count, source_bytes, units_planned, units_succeeded, units_failed,
 		events_dropped, process_peak_rss_bytes)
-		VALUES(?, ?, ?, NULL, ?, ?, NULL, 'running', 0, 0, 0, 0, 0, 0, 0, NULL)`,
+		VALUES(?, ?, ?, NULL, ?, ?, NULL, 'running', 0, 0, 0, 0, 0, 0, NULL)`,
 		run.id, string(run.kind), run.repo, formatTime(run.started), formatTime(expires)); err != nil {
 		return wrap("record the run", err)
 	}
@@ -416,11 +416,11 @@ func (c *collector) updateRuns(ctx context.Context, tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `UPDATE runs SET
 			generation_id = ?, finished_at = ?, outcome = ?,
 			file_count = ?, source_bytes = ?, units_planned = ?, units_succeeded = ?,
-			units_failed = ?, units_subdivided = ?, events_dropped = ?, process_peak_rss_bytes = ?
+			units_failed = ?, events_dropped = ?, process_peak_rss_bytes = ?
 			WHERE run_id = ?`,
 			generation, finished, string(outcome),
 			t.FileCount, t.SourceBytes, t.UnitsPlanned, t.UnitsSucceeded,
-			t.UnitsFailed, t.UnitsSubdivided, run.dropped.Load(), peak, run.id); err != nil {
+			t.UnitsFailed, run.dropped.Load(), peak, run.id); err != nil {
 			return wrap("update the run", err)
 		}
 	}
@@ -497,25 +497,7 @@ func endSpan(ctx context.Context, tx *sql.Tx, e event) (SpanRow, error) {
 	if err != nil {
 		return row, wrap("close a span", err)
 	}
-	return row, raisePeak(ctx, tx, s, m.PeakRSSBytes)
-}
-
-// raisePeak folds a span's measured process-tree peak into its scope's
-// high-water row, in the same transaction as the span's end. Only a
-// measurement above zero is folded: an absent one is no observation, and a
-// zero can never raise the row, so neither writes anything. A span with no
-// scope key describes no scope a planner could ask about: a parser worker's
-// span is one, because a worker is not a scope, and what a worker measures of
-// each file reaches the need model through Run.ObserveNeed instead.
-func raisePeak(ctx context.Context, tx *sql.Tx, s *Span, peak *uint64) error {
-	if peak == nil || *peak == 0 || s.scopeKey == "" {
-		return nil
-	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO scope_peaks(repository_id, scope_key, peak_rss_bytes)
-		VALUES(?, ?, ?) ON CONFLICT(repository_id, scope_key)
-		DO UPDATE SET peak_rss_bytes = max(peak_rss_bytes, excluded.peak_rss_bytes)`,
-		s.run.repo, s.scopeKey, int64(*peak))
-	return wrap("record the scope's peak", err)
+	return row, nil
 }
 
 // foldNeed writes one file's need observation into its class's row, in the

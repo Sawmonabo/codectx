@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -171,8 +170,7 @@ type collector struct {
 	runs   []*Run
 }
 
-// A Run is one recorded run: an index attempt, a deferred publication, or the
-// per-process overlay. It allocates its spans' ordinals and carries the run
+// A Run is one recorded run: an index attempt or the per-process overlay. It allocates its spans' ordinals and carries the run
 // row's own totals, which the collector writes at every flush.
 //
 // A nil *Run is the run of a ledger that records nothing: its methods do
@@ -230,7 +228,6 @@ type Totals struct {
 	UnitsPlanned        int64
 	UnitsSucceeded      int64
 	UnitsFailed         int64
-	UnitsSubdivided     int64
 	ProcessPeakRSSBytes *uint64
 }
 
@@ -343,9 +340,9 @@ func (l *Ledger) NewRun(kind Kind, repositoryID string) (*Run, error) {
 		return nil, nil
 	}
 	switch kind {
-	case KindIndex, KindDeferred, KindOverlay:
+	case KindIndex, KindOverlay:
 	default:
-		return nil, invalid("run kind %q is not one of index, deferred or overlay", string(kind))
+		return nil, invalid("run kind %q is not one of index or overlay", string(kind))
 	}
 	repo, err := model.DecodeID(repositoryID)
 	if err != nil {
@@ -746,12 +743,6 @@ const notLive = `NOT (outcome = 'running' AND expires_at > ?)`
 // and so does every run since the oldest of them, including the failures an
 // operator is investigating.
 //
-// The window is the store's, so it shares the store's consequences. An index
-// run whose generation a deferred publication supersedes on the same ref is
-// deleted once retention sweeps that generation, unless the run behind an
-// older retained ref precedes it: the deferred run is then what built the
-// active store, and it is the run `status --resources` shows.
-//
 // When no run in the file names a retained generation, nothing is deleted.
 // That is the first run of a workspace before the generation it published has
 // been flushed to its row, and a file recreated after the store was built:
@@ -853,74 +844,6 @@ func (c *collector) retainedCutoff(ctx context.Context, repo []byte,
 		}
 		last := page[len(page)-1]
 		afterStart, afterID = last.started, last.runID
-	}
-}
-
-// RetirePeaks deletes this repository's high-water rows whose scope keys are
-// not in keep, which is what bounds that table by what the repository holds
-// instead of by a count: keep is every heavy scope a plan just derived for the
-// repository, in ascending order, so a scope that no longer exists -- a
-// removed project, a renamed root, a subdivision part or any other key a span
-// measured that no plan asks about -- leaves the table at the next plan, and
-// every scope that still exists keeps its measurement however many runs have
-// passed since one last touched it.
-//
-// The caller calls it only with a plan that derived the complete heavy scope
-// set; a plan that did not -- the provider that plans heavy units was not
-// active -- names nothing, and retiring against it would forget every
-// measurement a later plan will need. The table is read in pages of
-// model.MaxRecordsPerResult, one write transaction per page, so no statement
-// carries a repository-sized parameter list and the writer is never held for
-// longer than one page.
-func (l *Ledger) RetirePeaks(ctx context.Context, repositoryID string, keep []string) error {
-	c := l.current()
-	if c == nil {
-		return nil
-	}
-	repo, err := model.DecodeID(repositoryID)
-	if err != nil {
-		return err
-	}
-	after := ""
-	for {
-		var n int
-		err := c.writeTx(ctx, func(tx *sql.Tx) error {
-			rows, err := tx.QueryContext(ctx, `SELECT scope_key FROM scope_peaks
-				WHERE repository_id = ? AND scope_key > ? ORDER BY scope_key LIMIT ?`,
-				repo, after, model.MaxRecordsPerResult)
-			if err != nil {
-				return wrap("read the scope peaks", err)
-			}
-			var gone []string
-			for rows.Next() {
-				var key string
-				if err := rows.Scan(&key); err != nil {
-					rows.Close()
-					return wrap("read the scope peaks", err)
-				}
-				n++
-				after = key
-				if _, found := slices.BinarySearch(keep, key); !found {
-					gone = append(gone, key)
-				}
-			}
-			// Closed before the deletes: the transaction runs one statement
-			// at a time, so the page is read out before a write on its rows.
-			rows.Close()
-			if err := rows.Err(); err != nil {
-				return wrap("read the scope peaks", err)
-			}
-			for _, key := range gone {
-				if _, err := tx.ExecContext(ctx, `DELETE FROM scope_peaks WHERE repository_id = ? AND scope_key = ?`,
-					repo, key); err != nil {
-					return wrap("retire a scope peak", err)
-				}
-			}
-			return nil
-		})
-		if err != nil || n < model.MaxRecordsPerResult {
-			return err
-		}
 	}
 }
 

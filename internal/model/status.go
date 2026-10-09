@@ -865,9 +865,8 @@ type RunRecord struct {
 	// coordinator's first stage, which is earlier than any generation, so it
 	// and not the generation is what names a run.
 	RunID string `json:"run_id"`
-	// Kind is `index`, `deferred` or `overlay`: an ordinary indexing run, a
-	// deferred publication, or the per-process run that carries work with no
-	// generation of its own.
+	// Kind is `index` or `overlay`: an ordinary indexing run, or the
+	// per-process run that carries work with no generation of its own.
 	Kind string `json:"kind"`
 	// RepositoryID is the repository the run indexed, hex-encoded.
 	RepositoryID string `json:"repository_id"`
@@ -881,16 +880,15 @@ type RunRecord struct {
 	// WallMS is the run's elapsed time: its measured wall once FinishedAt is
 	// set, and its elapsed time so far while it is live.
 	WallMS int64 `json:"wall_ms"`
-	// Outcome is one of `running`, `ok`, `failed`, `subdivided`, `reused`,
-	// `skipped` or `interrupted`; `interrupted` is a run whose process ended
-	// without finishing it.
-	Outcome         string `json:"outcome"`
-	FileCount       int64  `json:"file_count"`
-	SourceBytes     int64  `json:"source_bytes"`
-	UnitsPlanned    int64  `json:"units_planned"`
-	UnitsSucceeded  int64  `json:"units_succeeded"`
-	UnitsFailed     int64  `json:"units_failed"`
-	UnitsSubdivided int64  `json:"units_subdivided"`
+	// Outcome is one of `running`, `ok`, `failed`, `reused` or
+	// `interrupted`; `interrupted` is a run whose process ended without
+	// finishing it.
+	Outcome        string `json:"outcome"`
+	FileCount      int64  `json:"file_count"`
+	SourceBytes    int64  `json:"source_bytes"`
+	UnitsPlanned   int64  `json:"units_planned"`
+	UnitsSucceeded int64  `json:"units_succeeded"`
+	UnitsFailed    int64  `json:"units_failed"`
 	// EventsDropped counts the accounting events the bounded bus refused
 	// because the collector was behind. A run never waits on its own
 	// accounting, so the loss is counted rather than prevented: above zero,
@@ -993,7 +991,6 @@ func validateRunLedger(field string, run *RunRecord, stages []StageRecord, omitt
 			{field + ".run.units_planned", run.UnitsPlanned},
 			{field + ".run.units_succeeded", run.UnitsSucceeded},
 			{field + ".run.units_failed", run.UnitsFailed},
-			{field + ".run.units_subdivided", run.UnitsSubdivided},
 			{field + ".run.events_dropped", run.EventsDropped},
 		} {
 			if err := requireNonNegative(c.name, c.value); err != nil {
