@@ -55,8 +55,9 @@ The full record, with every command and raw result line, is
 | A commit per unit | — | 954 s for 47 995 commits (about 20 ms of fsync each) |
 
 Under our exact scoring, the library returned the same folded hits as today on 30 of 30 queries. The first page was
-identical on 22 of 30. The other 8 diverge at position 116 or later, because today's arm records an unfolded,
-document-level page.
+identical on 22 of 30. All 8 differences come from folding, because today's arm records its unfolded, document-level
+page: on 3 rare queries (4 to 7 documents folding to 2 to 5 results) the pages diverge at position 3 or 5, and on the
+other 5 at positions 117 to 172.
 
 | Quality (MRR@10 / Success@10) | name | doc | subword |
 |---|---|---|---|
