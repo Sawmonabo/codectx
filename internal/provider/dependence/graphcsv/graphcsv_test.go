@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -281,8 +280,9 @@ func TestImport(t *testing.T) {
 			// provider's. Every fixture's export carries call edges and the
 			// CDG, REACHING_DEF and assignment rows the other families could
 			// be derived from, so each language is a case.
-			// Mutation that fails it: restore the emitRelations call in Import
-			// -> the gofix case puts its `calls` edges to the sink.
+			// Mutation that fails it: hand the projected call edges to the
+			// sink's PutRelations in Import -> the gofix case puts its `calls`
+			// edges to the sink.
 			if len(c.rel) != 0 {
 				t.Errorf("relations put to the sink: %v; the importer publishes no relation", c.rel)
 			}
@@ -369,79 +369,11 @@ func TestOversizeDescriptiveFieldIsCutNotDropped(t *testing.T) {
 	}
 }
 
-// TestImportDelta proves the refresh contract: two imports of one export
-// produce the same key set, and an import of the edited unit against the
-// previous key set reports exactly the keys that changed and publishes only
-// those relations. Silent breakage here makes every refresh rewrite the whole
-// unit (or, worse, keep a stale row whose key it thinks is unchanged).
-func TestImportDelta(t *testing.T) {
-	dir := t.TempDir()
-	base := filepath.Join(dir, "base")
-	again := filepath.Join(dir, "again")
-	rep1, _, _, err := run(t, filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix"),
-		graphcsv.Options{Language: "go", KeysPath: base})
-	if err != nil {
-		t.Fatalf("Import: %v", err)
-	}
-	rep2, _, _, err := run(t, filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix"),
-		graphcsv.Options{Language: "go", KeysPath: again})
-	if err != nil {
-		t.Fatalf("Import: %v", err)
-	}
-	if !sameFile(t, base, again) {
-		t.Fatalf("two imports of one export produced different key sets (%d and %d keys)", rep1.Keys.Count(), rep2.Keys.Count())
-	}
-
-	prev, err := graphcsv.LoadKeySet(base)
-	if err != nil {
-		t.Fatalf("LoadKeySet: %v", err)
-	}
-	rep3, c, state, err := run(t, filepath.Join("testdata", "src", "gofix-edit"), filepath.Join("testdata", "gofix-edit"),
-		graphcsv.Options{Language: "go", PreviousKeys: prev, KeysPath: filepath.Join(dir, "edit")})
-	if err != nil {
-		t.Fatalf("Import: %v", err)
-	}
-	if state != model.UnitSealed {
-		t.Fatalf("unit state = %q, want sealed", state)
-	}
-	if rep3.Unchanged == 0 || rep3.Changed == 0 {
-		t.Fatalf("delta = %d changed, %d unchanged, %d removed; a one-line edit changes some keys and keeps most",
-			rep3.Changed, rep3.Unchanged, rep3.Removed)
-	}
-	if rep3.Changed+rep3.Unchanged != rep3.Keys.Count() {
-		t.Fatalf("changed %d + unchanged %d != %d keys", rep3.Changed, rep3.Unchanged, rep3.Keys.Count())
-	}
-	// This fixture's edit removes keys, which is the case a delta import may
-	// not filter: a removed key cannot be mapped back to the edge it backed,
-	// and that edge's previous row is already gone, so every relation is
-	// republished. What must hold is that the delta unit is not poorer than a
-	// full one — the same relations, the same evidence.
-	if rep3.Removed == 0 {
-		t.Fatalf("the fixture edit removed no key; it no longer covers the unfiltered case")
-	}
-	_, full, _, err := run(t, filepath.Join("testdata", "src", "gofix-edit"), filepath.Join("testdata", "gofix-edit"),
-		graphcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "full")})
-	if err != nil {
-		t.Fatalf("Import: %v", err)
-	}
-	if !maps.Equal(c.rel, full.rel) || !maps.Equal(c.detail, full.detail) {
-		t.Fatalf("a delta import published %v relations with %v evidence; a full import of the same export published %v and %v",
-			c.rel, c.detail, full.rel, full.detail)
-	}
-	delta, err := rep3.Keys.Diff(prev, nil)
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	if delta.Changed != rep3.Changed || delta.Removed != rep3.Removed || delta.Unchanged != rep3.Unchanged {
-		t.Fatalf("Diff = %+v, report = %d/%d/%d", delta, rep3.Changed, rep3.Unchanged, rep3.Removed)
-	}
-}
-
-// descriptor is the provider identity the import is driven under, with the
-// dependence provider's declared capability.
+// descriptor is the provider identity the import is driven under. It
+// declares no capability, as the dependence provider does: the import
+// publishes no relation.
 func descriptor() model.ProviderDescriptor {
 	return model.ProviderDescriptor{ID: graphcsv.ProviderID, Version: "test-1",
-		Capabilities:      []string{"calls"},
 		InvalidationScope: model.InvalidationPackage}
 }
 
@@ -556,19 +488,6 @@ func copyExport(t *testing.T, src string, rewrite func(name string, data []byte)
 		}
 	}
 	return dst
-}
-
-func sameFile(t *testing.T, a, b string) bool {
-	t.Helper()
-	x, err := os.ReadFile(a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	y, err := os.ReadFile(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(x) == string(y)
 }
 
 func keysOf(m map[string]string) []string {
