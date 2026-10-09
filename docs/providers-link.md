@@ -185,7 +185,9 @@ The members' language family picks the resolver:
   set is its own methods and, depth by depth, those its embedded fields and embedded interfaces promote. A name a
   shallower depth declares, as a method or as a named or embedded field, is not promoted; a name a struct reaches at
   one depth along two embedding paths, or as a field, promotes nothing. Embedding is promotion, never subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
-  under the embedding type, and implicit interface satisfaction compares whole method sets (`hierarchy.satisfy`). An
+  under the embedding type, and implicit interface satisfaction compares whole method sets (`hierarchy.satisfy`). A Go
+  member site on a field (`x.cfg.Load()`) is typed by the declared type of the field that selector denotes on the
+  owner's type, its own or promoted, read in the file that declares it (`fieldGo`). An
   indirect site joins every function taken as a value whose declared signature equals the site's
   (`wire.Export.Signature`, `wire/link.go:42-49`); a Go method expression `T.M` taken as a value has the method's
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
