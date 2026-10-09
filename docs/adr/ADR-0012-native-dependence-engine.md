@@ -43,13 +43,21 @@ dynamic-language one, are not gates of phases 4 and 5. They are measured in the 
 Decisions 1, 2, 4, 5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
 but impact still excludes them (`internal/graph/cost.go:83-89`) and no program-dependence relation set joins them.
 
+**Amended 2026-10-08, phase 6 done.** By the owner's ruling, phase 6 is carried out in the change that records
+this amendment: the hosted engine, its package (the provider, its backend, its importer and its engine driver), its
+import path, its configuration, its tool lock entry and every consumer are deleted. The structural provider publishes
+`control_depends_on`, `data_flows_to`, `reads` and `writes`, and the linking provider publishes `calls`. The project
+planner the linking provider uses lives in `internal/provider/link/projects.go`, and the machine memory reading
+admission uses lives in `internal/admission/machine.go`. The Java runtime stays in the tool lock, because the Java
+precise indexer and the Java language server run on it. The retirement gate is amended in decision 6, and the oracle's
+relocation in decision 7.
+
 ## Context
 
 ### What the product does today
 
 The `dependence` provider runs an external analysis engine, a JVM, once per unit for the parse and once
-for the export, under a heap ceiling the provider chooses ([providers-dependence](../providers-dependence.md),
-[ADR-0010](ADR-0010-engine-memory.md)). It publishes five capabilities — `control_depends_on`,
+for the export, under a heap ceiling the provider chooses ([ADR-0010](ADR-0010-engine-memory.md)). It publishes five capabilities — `control_depends_on`,
 `data_flows_to`, `reads`, `writes` and `calls` — every fact at `static_analysis` precision with exact
 byte ranges. Those facts are what `codectx_callers`, `codectx_callees`, `codectx_dependency_path` and
 `codectx_impact` walk; `codectx_symbol_info` and `codectx_references` report their precision.
@@ -535,11 +543,23 @@ output or the first table.
 | **4 and 5, as amended 2026-10-08 — `calls` for every language at once** | resolved `calls` for all nine advertised languages, published by the package-scoped linking provider of decision 9: class-hierarchy analysis for Java; direct binding, the signature-keyed address-taken × indirect-site cross-product and class-hierarchy analysis for Go, Rust, C and C++; flow-based type inference, field-based resolution and class-hierarchy analysis for the ECMAScript family and Python | **nothing**; the engine's importer publishes no relation | the linker's authored goldens, each derived twice, the second blind, reproduce every case, and the integrated change has had one test pass, one review and one fix round. No engine run gates it: there is no in-repo-resolved band and no pinned-corpus diff. The two call-resolution targets are not gates here; they are measured in the proofs after the engine's deletion. The rows for phases 4 and 5 below are withdrawn |
 | **4 — static call linking, the four frontends with no type recovery** (withdrawn) | resolved `calls` for C/C++, Go, Rust **and Java**, by the package-scoped linker of decision 9 | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora of each class. Rust's gate is its authored goldens. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
 | **5 — type recovery, the two frontends that have it** (withdrawn) | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise |
-| **6 — the retirement gate** | nothing is ported; the engine, its backend package and its import path are deleted | **nothing** | the five conditions below, simultaneously |
+| **6 — the retirement gate**, done 2026-10-08 | nothing is ported; the engine, its package, its import path, its configuration, its tool lock entry and every consumer are deleted | **nothing** | as amended 2026-10-08: conditions 2 and 5 below as checked at the deletion; conditions 3 and 4 measured in the proofs after it; condition 1 withdrawn |
 
 **The retirement gate — all five at once.** **Amended 2026-10-08.** Conditions 1 and 3 are not gates of the
 deletion: condition 1's engine band is withdrawn with the band itself (decision 7), and the targets of condition 3 are
 measured in the proofs after the engine's deletion, against the same denominator and by the same sample method.
+
+**Amended again 2026-10-08, by the owner's ruling: the gate as the deletion uses it.** Phase 6 is done in the change
+that records this amendment. The conditions are checked as follows:
+- **Condition 5** is checked by a final search of the tree for the engine's package names, its tool name, its
+  configuration keys and its capability mapping. The search returns only research documents.
+- **Condition 2** is checked by a test that indexes the multi-language fixture and asserts every capability row at the
+  state it had before the deletion, with no provider id `dependence` present anywhere.
+- **Conditions 3 and 4** (the resolution targets and coexistence) are measured in the proofs after the deletion, which
+  the owner's halt on testing defers.
+- **Condition 1** stays withdrawn.
+
+The conditions below are the gate as accepted.
 
 1. **Parity.** For each of the nine advertised languages and each of the five published families, the native key set
    is within the per-family band measured from two engine runs on that language's pinned units, on every instance of
@@ -582,9 +602,11 @@ full name, its file, the operator it was lowered from, its target name, its orde
 both endpoints' published identities. It streams the key set to a sorted file and diffs two sets in one merge pass. A
 native producer is a **second producer feeding an existing algebra**, not a new framework.
 
-**What relocates.** The key, the key set, its loader, the diff, the key writer and the delta marker move to the
-differential harness when the import package is deleted. This is why the deletion credit in the measurements section is
-not the whole package: **339 of those lines relocate rather than die.**
+**What relocates.** As accepted, the key, the key set, its loader, the diff, the key writer and the delta marker were
+to move to the differential harness when the import package is deleted, so 339 of its lines would relocate rather
+than die. **Amended 2026-10-08:** nothing relocates. The differential harness is deleted, not built: once the engine is
+gone and the band is withdrawn it has no consumer. The key algebra is deleted with the rest of the package, and the
+deletion credit in the measurements section is the whole package.
 
 **The comparison key, normalised.**
 - The owner's full name and the operator are normalised away.
@@ -656,7 +678,7 @@ what it is, and the retirement gate's parity condition is what proves the label 
 **Alternative weighed:** a native backend under the `dependence` id. Its strength is real: none of the nine
 consumers keyed on that id would change. It loses on three counts:
 - the phase-3 gate and retirement condition 2 become unmeasurable;
-- a provider has one invalidation scope, and `dependence` is package-scoped (`Provider.Descriptor` in `internal/provider/dependence/provider.go`);
+- a provider has one invalidation scope, and `dependence` was package-scoped (`Provider.Descriptor` of the `dependence` package, deleted under phase 6);
 - it would parse every file a second time.
 
 **Trade-off accepted:** the nine id-keyed consumers learn a second publisher of those families for the length of the
@@ -707,13 +729,17 @@ Sizing, in Scala lines measured at the pinned tag and Go lines estimated from th
 | Per-language normalise + def/use | — | 370–920 each |
 | Scope/binding resolver where no precise index covers a unit | — | 0, or 400–900 per language |
 | Differential harness + corpora | — | 2,500–4,500 + 400–900 per language |
-| **Credit: the import and staging package deleted** | — | **−4,535** |
+| **Credit: the import and staging package deleted** (as accepted; amended 2026-10-08 below) | — | **−4,535** |
 
 Held out of the sums on purpose: a 633-line closure-and-capture scope manager, because the
 scope/binding resolver row already prices it; and 1,628 lines belonging to three frontends the product
 never invokes. The familiar "5,413" figure for type recovery is the aggregate of two directories, not
-the product's cost. The deletion credit is **4,535**: the package is 4,874 lines of source, less the
-339-line comparator that relocates to the oracle; 99 lines of Go fixture source go with it.
+the product's cost. As accepted, the deletion credit was **4,535**: the package was 4,874 lines of source,
+less the 339-line comparator that was to relocate to the oracle; 99 lines of Go fixture source went with it.
+**Amended 2026-10-08:** nothing relocates and no differential harness is built (decision 7), so the harness row
+above is not spent, and the whole `dependence` package is deleted. Counted at the deletion, the package (the
+provider, its backend, its importer and its engine driver) is **6,964 lines of Go source and 9,370 with its tests**,
+fixtures excluded.
 
 Engine cost on the reference repository (13,222 files, 6,663 parsed, 555,588 call sites; largest unit
 4,984 files / 157.2 MB):
@@ -957,8 +983,6 @@ code.
 - [00-synthesis.md §8](../research/00-synthesis.md) — the standing direction: the hosted engine
   is the MVP backend, the pinned benchmark corpora are the differential oracle for any future native
   engine, and no analysis limit is lowered.
-- [providers-dependence.md](../providers-dependence.md) — what the provider publishes, its failure
-  classes, its staging database, and the fact-key algebra the oracle is built on.
 - [ADR-0001](ADR-0001-scale-posture.md) — unlimited by default, bounded by page: the posture decisions 5
   and 6 sit under.
 - [ADR-0005](ADR-0005-graph-traversal-layout.md) — the published per-generation adjacency and visited

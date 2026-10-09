@@ -183,18 +183,17 @@ still unreferenced on the next one.
 
 ## The two granularities
 
-Two importers produce deltas at two different granularities, and
-`Replaced` expresses both.
+`Replaced` expresses a delta at two granularities: a file and its alias
+scopes, or a single fact named by its producer's keys.
 
 | Producer | Delta unit | What the applier names |
 |---|---|---|
 | `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes) — **shipped**; the applier sketch below is against the code as it stands |
-| `internal/provider/dependence/graphcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — shipped: `emitNodes`/`emitRelations` hand every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key), and `KeySet.Diff` yields the replaced set; the applier that passes it to `CarryOver` is `internal/index/delta` — shipped. |
+| a producer that keys its facts | one fact | `Replaced.Keys` (the changed and removed fact keys): the producer hands every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key). No shipped producer keys its facts. |
 
 `Replaced` names the **complement** — what does *not* survive — rather than the
-survivors. For both importers that is a handful of entries against tens of
-thousands: a one-file edit of this repository replaces 1 of 174 SCIP documents,
-and an unchanged engine export replaces 0 of 77,701 fact keys.
+survivors. For the SCIP importer that is a handful of entries against
+thousands: a one-file edit of this repository replaces 1 of 174 SCIP documents.
 
 All three sets are `iter.Seq` streams, consumed once and never materialized.
 The replaced set is small for the refreshes that motivate a delta, but a branch
@@ -206,8 +205,8 @@ SQLite's own bounded temp table. A stream that fails mid-walk must be reported
 by the applier: it staged fewer entries than the applier named, so the
 applier checks its stream error *before* `CarryOver`'s own return.
 
-A producer's stream may itself read the store — the dependence applier's
-`Files` is a merge join against `Store.UnitInputs` — and `CarryOver` drains all
+A producer's stream may itself read the store — an applier's `Files` may be a
+merge join against `Store.UnitInputs` — and `CarryOver` drains all
 three streams inside its own write transaction on the single writer
 connection. Such a stream therefore takes a reader-pool connection
 (`read_connections`; by default one per unit built at once plus one per
@@ -240,7 +239,7 @@ id-independent keys, supplied through `PutKeyedNodes` / `PutKeyedRelations`
 (`provider.DeltaSink`). Storage never derives or interprets one.
 
 A key is needed because a path bucket cannot express every removal. A
-dependence edge can disappear while every file holding its evidence is
+cross-file edge can disappear while every file holding its evidence is
 unchanged — the edit was in the *callee's* file, the evidence is in the
 caller's — so only the producer can say the fact is gone. It cannot say so by
 fact identity either: a `RelationID` is derived from the resolved endpoints,
@@ -259,7 +258,7 @@ sorted and without duplicates.
 Folding a fact's keys into one was considered and rejected: `Replaced.Keys`
 must name the **previous** unit's keys, and the previous run's grouping of
 occurrence keys per fact is not recoverable from what a producer persists
-(`neo4jcsv.KeySet` is a flat sorted file of bare digests). A folded key would
+(a stored key set is a flat sorted file of bare digests). A folded key would
 also change whenever any occurrence moved, so every such fact would be
 reported replaced and re-added — defeating the delta in exactly the
 cross-file-edge case the key exists for.
@@ -276,8 +275,7 @@ only their bucket can replace them. If the applier names replaced keys and the
 previous unit stored none, `CarryOver` refuses rather than silently carrying
 everything.
 
-A repeated fact identity is ordinary — two workers, two parts of a subdivided
-unit, or the fresh import and the carried predecessor — and its keys
+A repeated fact identity is ordinary — two workers, or the fresh import and the carried predecessor — and its keys
 accumulate: the carried set is the union of the keys the fresh import
 published and the predecessor's keys that this refresh did not replace. In a
 conformant refresh that union is exactly the fresh set, because `Replaced.Keys`
@@ -340,7 +338,7 @@ fact of the new unit, which is exactly the condition `SealUnit` enforces.
 
 `UnitWriter.PutDeltaState(kind, reader)` stores the artifact the *next*
 refresh needs in order to diff without recomputing this one: the SCIP
-`DocumentManifest`, the dependence `KeySet`. The payload is opaque to storage,
+`DocumentManifest`, the structural provider's link tables. The payload is opaque to storage,
 read from the file it was produced in and stored as a sequence of 1 MiB parts,
 so an artifact the size of a large unit is never held whole and has no bound.
 It shares the unit's lifetime exactly, so a retired unit takes its manifest
@@ -356,9 +354,8 @@ What a unit *declared* is not delta state and is never stored twice:
 predecessor's declared files against the fresh ones without holding either
 list. It refuses a unit that is not sealed: a building unit's rows are still
 arriving, and a delta diffed against a partial set would name too few replaced
-buckets and carry a stale fact. The dependence applier uses it to compute
-`Replaced.Files`; no manifest of the same rows is stored beside the
-unit.
+buckets and carry a stale fact. No manifest of the same rows is stored
+beside the unit.
 
 ## Applier sketch
 
@@ -487,7 +484,7 @@ every manifest row and blob it reads through the snapshot view -- run on the
 reader pool against the last commit and never queue behind the writer. The
 ingestion side reads its own writes on the group's connection only where it
 reasons about what this run has stored since the last commit: the capture's
-check for a blob it already recorded, the selected and carried units, delta
+check for a blob it already recorded, the selected units, delta
 state, generation status and provider runs.
 
 The reason is what a commit costs. SQLite writes every page a transaction
@@ -654,8 +651,7 @@ later reading are not freed at all. They are taken from a **scratch pool** under
 the directory they belong to and given back to it: an external sort's runs and
 its merged output, a lexical seal's staging database, the surface a blob is
 streamed into while it is hashed, a shortest-path search's state, an index
-import's symbol spool, a dependence import's staging database, and the
-engine's own temporaries. `Take` hands out an existing file of the asked-for
+import's symbol spool, and the database engine's own temporaries. `Take` hands out an existing file of the asked-for
 purpose, opened for overwrite at offset zero, or creates one; `Release` returns
 it for the next taker. **Nothing truncates a surface to reuse it**: a file
 keeps whatever length its largest tenant gave it, and re-indexing an unchanged
@@ -715,7 +711,7 @@ at the same rate as the reclaimer's own and through the same turn.
 
 | What | How | Why it is not pooled | Purpose |
 | --- | --- | --- | --- |
-| An indexer's index file, a dependence engine's export directory | Removal | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
+| An indexer's index file | Removal | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
 | A materialized source tree | Removal | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
 | A published blob a retention sweep collected, and an orphan the sweep found | Removal | The object is content the store no longer names | — |
 | The trim of a staged blob before it is published | In place | The published object is that file and a reader proves it by its length, so it must be that length before the publication, not after | — |
@@ -726,7 +722,6 @@ at the same rate as the reclaimer's own and through the same turn.
 | A continuation's spool and a retained search directory a lease reclaimed | Removal | State a run left for a caller that never came back | `lease-reclamation` |
 | Sort runs a sort adopted from a continuation | Removal | They are that continuation's files, not the pool's | — |
 | A capture's staging database | Removal | It belongs to exactly one capture | — |
-| A dependence import's key set, emptied before the next is written over it | In place | The file keeps its name across imports | — |
 | A tool payload reset before a download is retried | In place | The staging file is written again from the start | — |
 | The engine's journals and its log, larger than one window | Removal | The engine deletes the log from inside its close, holding the database exclusively for the whole call; emptying it there is a quarter second of held lock per window, which every other process waits out at its next open | — |
 | The engine's journals and its log, one window or smaller | In place | A rename would cost a directory entry and a turn of the pace to give back less than one window | — |
@@ -839,8 +834,7 @@ the ledger, and each run's spans go with it by cascade.
 Two kinds of run no generation will ever claim, so a second sweep reaches
 them, in the collection pass beside the store's own: the `overlay` run a
 process opens for work that belongs to no generation, such as starting a
-language server; and a run that ended without publishing anything, which the
-deferred publication produces on every tick that finds nothing to publish.
+language server; and a run that ended without publishing anything.
 Both sweeps skip any run whose writer is still renewing its deadline, so the
 pass can never delete a run another process is writing or one a status surface
 has just reported live. A process that exits cleanly forgets its own overlay

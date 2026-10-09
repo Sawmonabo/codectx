@@ -61,7 +61,7 @@ before. Concurrency is the machine's: each server is admitted against the one
 machine-derived allocation by the memory its pinned definition reserves, so a
 repository with many projects runs as many servers at once as the machine has
 room for. That allocation is the whole process's, not this package's — the
-analysis engine's heavy units are admitted from the same ledger and in the same
+precise indexers' heavy units are admitted from the same ledger and in the same
 first-in-first-out order, so a server never overtakes a unit that asked first.
 When there is no room, an idle server is stopped to make room and otherwise the
 open waits — another project's server already running is never a refusal.

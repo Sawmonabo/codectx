@@ -68,8 +68,7 @@ The parser smoke checks are also `--deep` only.
   re-verified against its recorded hash. `--deep` widens this.
 - **Bundled grammar availability.**
 - **Managed toolchain status, one check per lock entry** — identified by the
-  entry name the lock records. The dependence backend is reported as
-  `engine <version> <digest>`; no third-party product name is printed.
+  entry name the lock records.
 - **Orphan temporary state** — staging directories, materializations and spools
   that no live owner references.
 - **Session and lease retention** — live and expired sessions, and the retention
@@ -274,7 +273,7 @@ workspace. The two processes are different builds; let the holder finish, or
 stop it, and run the command again from one of them.
 
 The wait belongs to the operation, not to the command: the build a person
-asked for waits, and a watch beat, a background seal and an agent's
+asked for waits, and a watch beat and an agent's
 `codectx_refresh_index` take the workspace only if it is free this moment. A
 beat that queues would stall every notification behind it, and a tool call held
 open for the length of somebody else's index is not an answer; both are
@@ -314,7 +313,7 @@ What an agent sees for it:
 | `fresh` | This generation holds the capability's facts and nothing degraded it. |
 | `partial` | Some scope of this capability published facts into this generation and at least one other did not. The facts that are there are complete for the scopes that sealed. |
 | `failed` | The capability was attempted and no scope of it published facts into this generation. It is never reported `unavailable`: that would leave the generation healthy over a provider that answers nothing. |
-| `unavailable` | It was wanted and nobody attempted it — no unit was planned (the tool is not installed, the platform has no payload), or its units are still deferred to background work. The row says which. |
+| `unavailable` | It was wanted and nobody attempted it — no unit was planned (the tool is not installed, or the platform has no payload). The row says which. |
 
 A provider you turned off in the configuration has **no row here at all**, in
 any state. It was planned for nothing, so there is nothing to report about it
@@ -329,11 +328,11 @@ under `component=index`.
 A `partial` or `failed` row carries the shape of the failure, not just its
 code. **The figures follow one counting rule, applied once where the row is
 built:** a capability's planned total is every scope the plan assigned its
-provider for that generation — the units the run builds, the stale
-predecessors it carries and the sealed units it reuses — and its failed total
+provider for that generation — the units the run builds and the sealed
+units it reuses — and its failed total
 is those of them that did not seal. The row is the only place those two
 numbers are computed. The `planned` figure on an indexing run's run line
-follows the same rule, so a carried scope is counted once there too.
+follows the same rule.
 `codectx status`, the completion block of an indexing
 run and the `codectx_index_status` tool all render that one row and none of
 them recounts, so one generation cannot read differently on two of them. In
@@ -362,22 +361,6 @@ carries the whole row.
   because the details are the provider's own bounded budget and a remediation
   charged to it could be the entry a busy row has to drop. Text output prints
   it on its own line beneath the row.
-- `units_running` — how many scopes of this capability were still being built
-  in the background when the generation was published. Like `remediation` it
-  is a field of the row and not one of the details below, for the same reason.
-  It is counted, once, from the generation's own unit rows: a deferred scope
-  counts as still running until the generation holds the unit the plan derives
-  for it, so the figure is about the whole generation and every provider in
-  it, and never about whichever background batch happened to publish. It is
-  then stored on the row, and that — separately from where it is counted — is
-  what lets a second process, `codectx status` in another terminal, read the
-  same number as the process doing the work. It is stored but
-  deliberately kept out of the capability digest: it records what was in
-  flight at publication, which is scheduling and not content, so two rebuilds
-  of one workspace may legitimately differ on it.
-- `subdivided`, on a dependence capability, names a unit that crashed and was
-  recovered by splitting; `backend_failure` beside it says what the crash was
-  and how it was established to reproduce ([dependence](providers-dependence.md)).
 
 Raw analyzer output is never in a capability row and never in an ordinary log
 line. What an operator can read is, in order of how long it lasts:
@@ -606,7 +589,6 @@ reports `unavailable`. It never reports `0`.
 | Pending watch events | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | A running watch (`codectx watch`, or `codectx index --watch`) publishes a heartbeat row of its own, carrying its process, when it last published itself, its pending-event count and **its own** expiry, refreshed while it runs and withdrawn when it stops. There is one row per watching process, not one per repository, keyed by the watch's own session identity and not by its process id, which the operating system reuses: two watches on one workspace — a terminal's and an editor's server — each keep their own row instead of overwriting each other's. `codectx status` lists every watcher whose row is live, with its process and its last beat, in any process, including one that is watching nothing itself; `status --resources` reports the figure of a watch that is covering the workspace while its row is live. A watch that is still waiting for whichever process holds the workspace has reconciled nothing, so it publishes its presence and no figure at all: the count is `unavailable` and `doctor`'s `watch_heartbeat` check says the watch is running but covering nothing, which is a different answer from a covering watch and from a workspace no watch has ever run in. Once a row expires — the watch was killed, or the machine went down — that watcher drops out of the list and its figure is `unavailable` again rather than the dead writer's last count, which would read as "the watch is caught up"; `doctor`'s `watch_heartbeat` check is what says a watch stopped. An elapsed deadline is the only death signal, the same rule the run ledger judges a run's writer by, and no process id is ever probed; the next beat published for the workspace deletes the rows that have elapsed. A watch running without filesystem notifications has no queue to count and publishes no figure. |
 | Freed, pending-free and scratch bytes | platform-independent | platform-independent | platform-independent | Counted in the process, not read from the host. `freed_bytes` is one byte-exact counter of everything this process has actually given back -- its own removals, the reclaimer's, and the file-system shim's shortening of a file the engine owns -- and `freed_by_purpose` is the labelled part of that same counter, so the two cannot disagree. `pending_free_bytes` is what a removal has renamed aside and the reclaimer has not released yet; it is neither of the other two while it waits. `scratch_bytes` is the disk the pools hold, summed over every pool this process has opened, and it is absent rather than short if a pool cannot be read. Only `scratch_bytes` reads the disk, and only it can be `unavailable`. `stuck_frees` names the queued removals the filesystem refused, with the reason, so `pending_free_bytes` that never falls is never left unexplained; it is one page at the response record bound, and `stuck_frees_omitted` counts the rest. |
 | Query, cache and queue reservations | platform-independent | platform-independent | platform-independent | Derived from the resolved `[resources]` configuration, so they are what was reserved, not what was touched, and no platform differs. |
-| Per-unit analyzer memory (`analyzer_units`) | measured | reservation and caps only | reservation and caps only | One row per heavy analysis unit this process ran: the reservation it was admitted against, the heap caps its two steps ran under, the machine-derived allocation those caps were bounded by, and the peak its process tree reached. The first three are the governor's own arithmetic and are always present. `allocation_bytes` is absent where the host does not publish available memory, and `observed_peak_bytes` is absent wherever the tree sampler is — the same reader as the process-tree peak above. Reading the row's figures together is the point: a peak far under the cap says the unit was serialized behind memory it never used. It is process accounting and not per generation, so it covers what **this** process has run. |
 | Learned per-file need (`need_classes`) | measured | none recorded | none recorded | One row per learned need class of this repository -- language, grammar fingerprint and file-size class -- with the files it learned from, how many overran their reservation, and the largest drift, need minus reservation, below zero when every file fitted. Overruns over observations is the per-class figure the overrun target is stated in. Read from the run ledger's observation store, so it covers every recorded run; one page at the response record bound, and `need_classes_omitted` counts the rest. A platform that reports no resettable per-process peak measures no need, so it learns and lists no class. |
 | Hard OS memory enforcement | partial | none | partial | Enforcement uses cgroup and job controls where they exist. Where they do not, codectx **admits and monitors only**, and says so rather than implying a limit it cannot enforce. |
 

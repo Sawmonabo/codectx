@@ -61,7 +61,7 @@ where none does.
 
 | Hosted on `tools-v1` (no upstream binary exists) | Pinned at the upstream URL |
 |---|---|
-| `gopls` — upstream ships no binaries; cross-built for all six | `node`, `jdk`, `joern`, `jdtls`, `clangd`, `scip-java`, `scip-clang`, `rust-analyzer` |
+| `gopls` — upstream ships no binaries; cross-built for all six | `node`, `jdk`, `jdtls`, `clangd`, `scip-java`, `scip-clang`, `rust-analyzer` |
 | `scip-typescript`, `scip-python`, `typescript-language-server` — npm packages, prebuilt so the user never runs npm | `ty` — a static binary per platform, with a per-asset `.sha256` sidecar |
 | `scip-go` — darwin amd64 and both Windows targets only; cross-built | `scip-go` — linux amd64/arm64 and darwin arm64 |
 
@@ -75,7 +75,7 @@ payload above the 2 GiB release-asset ceiling rather than discovering it
 mid-upload.
 
 Entry paths in the lock are relative to the archive **as upstream ships it** —
-`node-v22.23.2-linux-x64/bin/node`, `joern-cli/joern-parse`,
+`node-v22.23.2-linux-x64/bin/node`,
 `jdk-21.0.12.1+1/Contents/Home/bin/java` on macOS. Nothing is restripped or
 repacked, so what the runtime extractor writes is exactly what upstream
 published.
@@ -112,12 +112,11 @@ and a path, which the lock's own validation enforces. The hosts in use are
 | `ty` | 0.0.81 | server | — | python | all six | upstream; per-asset `.sha256` sidecar |
 | `clangd` | 22.1.6 | server | — | c, cpp | linux amd64, darwin amd64, windows amd64 | upstream; upstream publishes no digest |
 | `jdtls` | 1.61.0 | server | jdk | java | all six | upstream Eclipse tarball, sidecar `.sha256` |
-| `joern` | 4.0.627 | cpg | jdk | all nine | all six | upstream `joern-cli` archives, sidecar `.sha512` |
 
-The engine name in the last row appears here, in the lock and in the license
-inventory only. It never appears in a command, a config key, a provider id, an
-evidence detail or a query result: the provider is `dependence`, so replacing
-the engine is a backend swap rather than a product change.
+The `jdk` runtime is pinned for the two tools that run on it, `scip-java` and
+`jdtls`: the Java precise indexer and the Java language server. Dependence
+facts and `calls` are computed in process by the structural and linking
+providers and need no tool from the lock.
 
 ### Notes on individual pins
 
@@ -188,7 +187,7 @@ codectx tools gc [--json]                              # remove versions the cur
 
 `status` is the cheap report: it checks each entry's publication marker and the
 presence of its executable, and never rehashes, so it stays usable for a store
-holding the 1.8 GB engine. Each entry is reported in one of five states —
+holding the largest payloads. Each entry is reported in one of five states —
 `installed`, `available` (pinned but not fetched yet), `unsupported_platform`
 (the lock carries no payload here, which is honest absence and not a failure),
 `override` (a `[tools.override.<name>]` replaces it) or `corrupt`. `verify`
@@ -208,10 +207,9 @@ logs one record — tool, version, digest, bytes, elapsed — on stderr, and the
 report of what is now installed goes to stdout.
 
 `--for-repo PATH` installs what that repository selects, which on a Go
-repository is four payloads rather than fourteen. The selection is read from the
+repository is two payloads rather than thirteen. The selection is read from the
 mappings that already decide it — the SCIP indexers' trigger manifests, the
-language servers' root markers, the dependence families' project markers, and
-the path-to-language table for the source check below — plus each selected
+language servers' root markers — plus each selected
 entry's `runtime` from the lock, so no second copy of any of them exists
 anywhere in the CLI. The whole repository is read, by filename only and in two
 passes: a traversal under the configuration's own traversal policy, then the
@@ -222,7 +220,7 @@ its tools, because Section 10.2 forces a tracked path past every exclusion: it
 is in the snapshot manifest a capture builds, it roots a project and it plans a
 unit. That is the same force-include a capture applies, from the same index
 listing, and the two passes read the repository without holding any part of it:
-each ends as soon as every marker has been seen and a source found, because at
+each ends as soon as every marker has been seen, because at
 that moment the answer is complete. A workspace carrying a `.git` entry whose
 Git cannot be run is a typed failure rather than the quieter answer that would
 under-select. A repository that selects nothing is an argument error rather than
@@ -234,7 +232,7 @@ binary pins, and bytes no lock entry vouches for are not part of that. It leaves
 superseded **versions** of pinned tools alone; reclaiming those is `gc`'s job,
 because another workspace may still be resolving one.
 
-What the command sees is what the planners see, for all three providers:
+What the command sees is what the planners see:
 
 - **The precise indexers and the language servers are planned per project.**
   Both find their manifests anywhere the traversal admits, so what `--for-repo`
@@ -243,17 +241,6 @@ What the command sees is what the planners see, for all three providers:
   server at `svc/` at index time. A repository whose every project sits in a
   subdirectory — the ordinary monorepo — selected nothing at all while a
   root-only check decided this.
-- **The dependence provider walks for sources.** Its C/C++ family declares no
-  project marker at all — its unit is the repository itself — and its other
-  families' units are found by walking the tree. `--for-repo` therefore selects
-  the graph engine and its JDK on either of two signals anywhere in the
-  repository: a project marker of one of the other families (`go.mod`,
-  `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
-  `jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`,
-  `Cargo.toml`), or a source file of any of the families. The C and C++ family
-  is selected by its sources, which is what the planner gates on; a build
-  declaration with no source of that family anywhere selects nothing, because
-  no unit would analyse it.
 
 The Git ignore predicate an index run installs on top of the traversal policy is
 not built here — it needs a Git process runner this command has none of — so the
@@ -264,8 +251,6 @@ select a payload the repository does not need; it can never miss one.
 $ codectx tools prefetch --for-repo .
 NAME     VERSION      STATE      LANGUAGES
 gopls    0.23.0       installed  go
-jdk      21.0.12.1+1  installed
-joern    4.0.627      installed  c, cpp, go, java, javascript, python, rust, tsx, typescript
 scip-go  0.2.7        installed  go
 ```
 
@@ -375,7 +360,7 @@ them:
 Nothing else needs anything on the host. Java in particular does not: `scip-java`
 is driven from a `--scip-config` project description compiled with the managed
 JDK's own `javac`, so neither Maven nor Gradle is required. Where one of the
-three is absent, that language falls back to the structural and dependence
+three is absent, that language falls back to the structural and linking
 providers and is reported at the precision they give; it is never a failure of
 another language. On the matrix runner the same absence **fails the leg**: a
 language the runner cannot prove is the platform going uncovered, which is
@@ -389,7 +374,7 @@ the lock carries for that platform, re-verifies the store, and then runs
 `.github/tools-matrix --store <the store>`, which indexes a nine-language
 fixture — Go, TypeScript, TSX, JavaScript, Python, Java, C, C++ and Rust, every
 one of them carrying non-ASCII identifiers and literals — with the pinned
-analyzers and parses each language family with the pinned graph engine.
+analyzers.
 
 Every indexer run issues **the product's own argument array**: the smoke builds
 it with `scip.Argv`, the single source of every indexer invocation this product
@@ -425,7 +410,7 @@ is what is checked, not a grep of the source.
 ```bash
 go run ./internal/tools/toollock              # pin upstream, build and publish what we host, write the lock
 go run ./internal/tools/toollock -check       # re-download every URL in the lock and confirm digests
-go run ./internal/tools/toollock -tools joern # limit to one tool
+go run ./internal/tools/toollock -tools gopls # limit to one tool
 go run ./internal/tools/toollock -no-upload   # produce the hosted payloads without publishing
 ```
 

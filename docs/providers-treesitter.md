@@ -133,9 +133,8 @@ symbols without rescanning):
 - `("file:"+path, "module:"+path)` → file module.
 - `("file:"+path, qualified name)` → every declaration.
 - `("file:"+path, "decl:"+name+"@"+path+":"+startLine+"-"+endLine)` → every
-  declaration. This is the one cross-provider declaration key, shared
-  byte-for-byte with the `dependence` provider, whose exported
-  declaration key is exactly this string:
+  declaration. This is the one cross-provider declaration key: a semantic
+  provider that names the same declaration computes exactly this string:
 
   ```
   scope key  file:<path>

@@ -297,9 +297,6 @@ the path search completed` and mints a cursor over the retained search state, so
 the next request carries on settling buckets. A `path` request never fails with
 `CTX_QUERY_DEADLINE`.
 
-A capability that is still building is reported as an unavailable row plus a
-warning, so an incomplete answer never reads as a complete one.
-
 ## What `search` reads for the lexical tier
 
 The lexical tier scores a single-token term from the generation's packed term

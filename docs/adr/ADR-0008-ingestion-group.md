@@ -4,6 +4,8 @@
 identities), ADR-0004 (WAL synchronous mode) · **Inputs:** the measurements below, taken on this
 repository's reference stores on 2026-09-15.
 
+Amended 2026-10-08: the hosted dependence engine this record governs was deleted under ADR-0012 phase 6.
+
 ## Context
 
 An index run of the reference repository (20 038 units, a 3.2 GB store) sent 118 GB to disk in
