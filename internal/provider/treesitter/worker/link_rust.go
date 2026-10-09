@@ -1,13 +1,12 @@
 package worker
 
 import (
-	"slices"
-	"strings"
 	"sync"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
@@ -322,7 +321,8 @@ func (k *rustLinker) member(n Node) bool {
 // an identifier, the declarations the structural queries capture. A self
 // parameter is the receiver, never one of Params, and its presence is what
 // makes the callable not Static; a path call `T::m(x, a)` of such a method
-// passes the receiver x as its first argument.
+// passes the receiver x as its first argument. A foreign function's `...`
+// is one of Params, with Variadic set.
 func (k *rustLinker) export(n Node) {
 	s := k.k
 	name := n.ChildByFieldId(s.fName)
@@ -344,10 +344,7 @@ func (k *rustLinker) export(n Node) {
 			case k.isSelf(p):
 				x.Static = false
 			case p.KindId() == s.variadicParameter:
-				// A C variadic `...` of a foreign function takes any number
-				// of arguments, none included (wire.Export.Params).
 				x.Params++
-				x.Optional++
 				x.Variadic = true
 			case !k.paramType(p).IsNull():
 				x.Params++
@@ -356,8 +353,20 @@ func (k *rustLinker) export(n Node) {
 	}
 	x.Signature = k.signature(ps, ret)
 	if !ret.IsNull() {
-		inner, _ := k.unwrap(ret)
-		if t := k.typeName(inner); t != "" {
+		// A smart pointer stays in the result type as written, since a
+		// method the pointer answers itself is called on the pointer, not
+		// on what it owns; the linker removes it for every other method.
+		inner, ptr := k.unwrap(ret)
+		t := k.typeName(inner)
+		if ptr {
+			outer := ret
+			for outer.KindId() == s.referenceType || outer.KindId() == s.pointerType {
+				outer = outer.ChildByFieldId(s.fType)
+			}
+			b := k.spell(k.buf[:0], outer)
+			k.buf, t = b, string(b)
+		}
+		if t != "" {
 			x.Returns = wire.Type{Kind: wire.TypeNamed, Name: t}
 		}
 	}
@@ -395,12 +404,23 @@ func (k *rustLinker) paramType(p Node) Node {
 }
 
 // signature spells a parameter list ps and result type ret (either null) by
-// the rule of wire.Export.Signature.
+// the rule of wire.Export.Signature. A method's self parameter is spelled
+// first, as the type it declares (selfType): a Rust method is taken as a
+// value only through its path, `Foo::m`, whose function type takes the
+// receiver first (the Rust Reference's "Associated Items"), so its
+// signature joins the indirect sites of type `fn(&Foo, …)`.
 func (k *rustLinker) signature(ps, ret Node) string {
 	b := append(k.buf[:0], '(')
 	first := true
 	if !ps.IsNull() {
 		for p := ps.first(); !p.IsNull(); p = p.next() {
+			if k.isSelf(p) {
+				if !first {
+					b = append(b, ',')
+				}
+				b, first = k.selfType(b, p), false
+				continue
+			}
 			t := k.paramType(p)
 			if p.KindId() == k.k.variadicParameter {
 				if !first {
@@ -459,6 +479,36 @@ func (k *rustLinker) spell(b []byte, t Node) []byte {
 			}
 		}
 	}
+}
+
+// selfType appends the type a method's self parameter declares, `Self`
+// spelled as its owner: `self` and `mut self` are Foo, `&self` &Foo, `&mut
+// self` &mut Foo, `self: Box<Self>` Box<Foo>.
+func (k *rustLinker) selfType(b []byte, p Node) []byte {
+	s := k.k
+	if p.KindId() == s.parameter {
+		return k.spell(b, p.ChildByFieldId(s.fType))
+	}
+	self := k.self()
+	if self == "" {
+		self = "Self"
+	}
+	ref := false
+	for c := p.first(); !c.IsNull(); c = c.next() {
+		switch w := string(textOf(k.src, c)); {
+		case c.IsExtra() || c.KindId() == s.lifetime:
+		case w == "&":
+			ref, b = true, append(b, '&')
+		case w == "mut" && ref:
+			b = append(b, "mut"...)
+		case c.KindId() == s.self:
+			if len(b) > 0 && rsWord(b[len(b)-1]) {
+				b = append(b, ' ')
+			}
+			b = append(b, self...)
+		}
+	}
+	return b
 }
 
 // rsWord reports a byte of an identifier or keyword.
@@ -642,25 +692,8 @@ func (k *rustLinker) declared(t Node) (wire.Type, bool) {
 	return wire.Type{}, ptr
 }
 
-// rsPointers are the standard library's smart pointers. A method call on
-// one reaches, by auto-dereference, the methods of the value it owns (the
-// Rust Reference's "Method-call expressions"), so a receiver declared as
-// one carries the owned value's type: `Box<dyn Handler>` is Handler.
-var rsPointers = []string{"Box", "Rc", "Arc", "Pin"}
-
-// rsPointerMethods are the methods every smart pointer of rsPointers
-// answers itself, through the standard traits it implements (Clone, Deref,
-// DerefMut, AsRef, AsMut, Borrow, BorrowMut, PartialEq, PartialOrd, Ord,
-// Hash, Debug, Display, Pointer, Any) and the blanket conversions
-// (Into, TryInto, ToOwned, ToString). The method-call lookup tries the
-// pointer's own type before it dereferences, so such a call on a pointer
-// is the pointer's method, never the owned value's.
-var rsPointerMethods = []string{"clone", "clone_from", "deref", "deref_mut", "as_ref", "as_mut", "borrow",
-	"borrow_mut", "eq", "ne", "partial_cmp", "lt", "le", "gt", "ge", "cmp", "max", "min", "clamp", "hash", "fmt",
-	"type_id", "into", "try_into", "to_owned", "to_string"}
-
 // unwrap is the type t declares a value of once references, raw pointers
-// and smart pointers (rsPointers) are removed (`&Rc<Foo>` is Foo), and
+// and smart pointers (lang.RustPointer) are removed (`&Rc<Foo>` is Foo), and
 // whether a smart pointer was removed.
 func (k *rustLinker) unwrap(t Node) (Node, bool) {
 	s := k.k
@@ -672,11 +705,7 @@ func (k *rustLinker) unwrap(t Node) (Node, bool) {
 			continue
 		case s.genericType:
 			args := k.kid(t, s.fTypeArguments)
-			name := k.typeName(t.ChildByFieldId(s.fType))
-			if i := strings.LastIndex(name, "::"); i >= 0 {
-				name = name[i+2:]
-			}
-			if !args.IsNull() && args.NamedChildCount() == 1 && slices.Contains(rsPointers, name) {
+			if !args.IsNull() && args.NamedChildCount() == 1 && lang.RustPointer(k.typeName(t.ChildByFieldId(s.fType))) {
 				t, ptr = firstNamed(args), true
 				continue
 			}
@@ -687,7 +716,7 @@ func (k *rustLinker) unwrap(t Node) (Node, bool) {
 }
 
 // pointer reports that the receiver expression n holds a smart pointer
-// (rsPointers) by its declaration: a binding, or a field of a binding or of
+// (lang.RustPointer) by its declaration: a binding, or a field of a binding or of
 // `self`, declared as one.
 func (k *rustLinker) pointer(n Node) bool {
 	s := k.k
@@ -931,7 +960,7 @@ func (k *rustLinker) call(n Node) wire.Type {
 		recv := k.walk(value)
 		if f := k.kid(fn, s.fField); !f.IsNull() && f.KindId() == s.fieldIdentifier {
 			name, site.Shape, site.Receiver = f, wire.ShapeMember, recv
-			if !value.IsNull() && slices.Contains(rsPointerMethods, view(textOf(k.src, f))) && k.pointer(value) {
+			if !value.IsNull() && lang.RustPointerMethod(view(textOf(k.src, f))) && k.pointer(value) {
 				// The smart pointer's own method, which no table declares.
 				site.Receiver = wire.Type{}
 			}

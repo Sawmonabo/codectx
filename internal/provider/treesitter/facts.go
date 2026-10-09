@@ -574,7 +574,7 @@ func (b *builder) imports() error {
 func (b *builder) refs() error {
 	callees := map[string]model.Resolution{}
 	for _, r := range b.ex.refs {
-		if r.Kind != "call" && r.Kind != "type" {
+		if r.Kind != "call" && r.Kind != "type" && r.Kind != "macro" {
 			return outputInvalid("reference kind " + bound(r.Kind, 32) + " is unknown")
 		}
 		if r.Name == "" || len(r.Name) > model.MaxNameBytes || !utf8.ValidString(r.Name) {
@@ -612,9 +612,11 @@ func (b *builder) refs() error {
 			from = b.decls[r.Scope].res.Node.ID
 		}
 		targets := b.targets(r)
-		if r.Kind == "type" {
-			// A type reference to a name this file does not declare is left to a
-			// provider that can see the other file; no placeholder is minted.
+		if r.Kind == "type" || r.Kind == "macro" {
+			// A type or macro reference to a name this file does not declare
+			// is left to a provider that can see the other file; no
+			// placeholder is minted. A macro invocation calls nothing, so it
+			// is a reference to its macro, never a call.
 			for _, t := range targets {
 				b.putRelation(structure, from, model.RelReferences, b.decls[t].res.Node.ID, rng, r.Name, "")
 			}
@@ -751,7 +753,9 @@ func (b *builder) rangeKey(prefix string, start, end uint32) string {
 
 // targets are the declarations in this file a reference can name. A
 // qualified call (receiver.name, Type::name) names methods; a bare call names
-// functions, tests or macros; a type reference names type-like declarations.
+// functions, tests and C's function-like macros, never a Rust macro, whose
+// name is in its own namespace; a Rust macro reference names macros; a type
+// reference names type-like declarations.
 // Definitions are preferred over prototypes when both exist. A qualifier that
 // is an imported name makes the target cross-file, so nothing here.
 // Declarations that are occurrences of one node are one target, so a
@@ -768,11 +772,13 @@ func (b *builder) targets(r wire.Ref) []int {
 		switch r.Kind {
 		case "type":
 			ok = d.kind == model.NodeClass || d.kind == model.NodeStruct || d.kind == model.NodeInterface || d.kind == model.NodeEnum
+		case "macro":
+			ok = d.Macro
 		case "call":
 			if r.Qualified {
 				ok = d.kind == model.NodeMethod
 			} else {
-				ok = d.kind == model.NodeFunction || d.kind == model.NodeTest || d.kind == model.NodeClass || d.kind == model.NodeStruct
+				ok = !(d.Macro && b.lang.Name == "rust") && (d.kind == model.NodeFunction || d.kind == model.NodeTest || d.kind == model.NodeClass || d.kind == model.NodeStruct)
 			}
 		}
 		if !ok {

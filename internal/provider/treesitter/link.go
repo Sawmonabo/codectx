@@ -167,7 +167,7 @@ func (b *builder) linkTable() error {
 		d := &b.decls[i]
 		t.Decls[i] = link.Decl{Endpoint: link.Endpoint{Node: d.res.Node.ID, CanonicalKey: d.res.CanonicalKey, Kind: d.kind,
 			Name: d.Name, Qualified: d.Qualified, Range: *d.rng}, Parent: int32(d.Parent), Exported: d.Exported,
-			Prototype: d.Prototype}
+			Prototype: d.Prototype, Macro: d.Macro}
 	}
 	for _, x := range wl.Exports {
 		i, ok := b.nameAt[x.Name]
@@ -199,7 +199,7 @@ func (b *builder) linkTable() error {
 }
 
 // linkImports is the names the file's import records introduce, each with
-// the path it denotes (link.Import). The worker's record is one statement:
+// the path it denotes and the declaration it is written in (link.Import). The worker's record is one statement:
 // its path as written and the local names it binds. A Rust use tree is
 // split into one path per leaf (lang.RustUse). An import of every member of a path (a Go
 // dot import, a Java on-demand import `a.b.*`, a C++ using-directive, a Rust
@@ -208,13 +208,15 @@ func (b *builder) linkTable() error {
 // ECMAScript side-effect import) has an empty name.
 func (b *builder) linkImports() []link.Import {
 	var out []link.Import
+	byStart := b.declsByStart()
 	for _, imp := range b.ex.imports {
 		text := string(b.src[imp.Start:imp.End])
 		names := imp.Names
+		scope := b.enclosing(byStart, wire.Span{Start: imp.Start, End: imp.End})
 		switch b.lang.Name {
 		case "rust":
 			// A glob's name is lang.RustGlob, which is link.ImportAll.
-			lang.RustUse(imp.Path, func(name, p string) { out = append(out, link.Import{Name: name, Path: p}) })
+			lang.RustUse(imp.Path, func(name, p string) { out = append(out, link.Import{Name: name, Path: p, Scope: scope}) })
 			continue
 		case "go":
 			if len(names) == 1 && names[0] == "." {
@@ -234,10 +236,10 @@ func (b *builder) linkImports() []link.Import {
 			}
 		}
 		if len(names) == 0 {
-			out = append(out, link.Import{Path: imp.Path})
+			out = append(out, link.Import{Path: imp.Path, Scope: scope})
 		}
 		for i, n := range names {
-			li := link.Import{Name: n, Path: imp.Path}
+			li := link.Import{Name: n, Path: imp.Path, Scope: scope}
 			if len(imp.Originals) == len(names) {
 				li.Original = imp.Originals[i]
 			}

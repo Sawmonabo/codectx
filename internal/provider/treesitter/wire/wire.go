@@ -193,7 +193,8 @@ type Import struct {
 
 // Ref is one reference occurrence: a call site or a type reference.
 type Ref struct {
-	// Kind is "call" or "type".
+	// Kind is "call", "type" or "macro" (a Rust macro invocation, which
+	// names a macro and calls nothing).
 	Kind string `json:"kind"`
 	// Start and End bound the whole reference expression: the call
 	// expression for a call, the identifier itself for a type reference.

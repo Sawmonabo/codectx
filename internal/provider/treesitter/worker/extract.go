@@ -154,6 +154,9 @@ func (e *extraction) dispatch(caps map[string][]ts.Node) {
 		case name == "call":
 			e.addRef("call", nodes[0], caps["call.name"], caps["call.qualifier"])
 			return
+		case name == "ref.macro":
+			e.addRef("macro", nodes[0], caps["ref.macro.name"], nil)
+			return
 		case name == "ref.type":
 			for _, n := range nodes {
 				e.addRef("type", n, []ts.Node{n}, nil)
