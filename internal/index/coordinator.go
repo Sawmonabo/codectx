@@ -136,7 +136,7 @@ type Options struct {
 	// Lock is where the cross-process workspace lock comes from. It may be nil
 	// for a report-only coordinator: Status is legal without it, because
 	// Section 12.3 makes the active generation immutable once published and a
-	// report only reads it. Index, Refresh, Watch, Promote and Drain refuse
+	// report only reads it. Index, Refresh, Watch and Drain refuse
 	// with a typed CTX_ARGUMENT_INVALID: they capture, build and publish, and
 	// Section 13.2 gives that to exactly one cross-process owner.
 	//
@@ -216,18 +216,10 @@ type SuppliedIndex struct {
 	ScopeKey   string
 }
 
-// Pending is the typed answer a query gets for a capability whose dependence
-// units have not sealed yet (Section 11.6): how many units it waits on, where
-// the promoted scope now sits in the background queue, and how long one unit
-// is expected to take to build. Estimate is the mean build time of the
-// deferred units this process has completed, measured from each one's
-// admission, so the time a unit spent queued or waiting for admission is not
-// in it. It is zero while no deferred unit of this process has completed: an
-// unmeasured duration is reported as unmeasured, never as an invented number.
+// Pending is the deferred work outstanding (Section 11.6): the units the
+// background queue holds or is building.
 type Pending struct {
-	Units    int
-	Position int
-	Estimate time.Duration
+	Units int
 }
 
 // Coordinator owns one workspace's indexing. Index, Refresh and Status are

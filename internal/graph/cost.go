@@ -87,15 +87,3 @@ func ImpactRelations() []model.RelationKind {
 		model.RelDependsOn, model.RelImports,
 	}
 }
-
-// DependenceOnly lists the relation kinds only the dependence provider can
-// produce. A request touching any of them must report a deferred dependence
-// capability before traversing, because their absence would otherwise look like
-// a genuine absence of edges. `calls` is deliberately not in this list: it also
-// has a non-engine path, so a deferred dependence build does not make a calls
-// answer incomplete.
-func DependenceOnly() []model.RelationKind {
-	return []model.RelationKind{
-		model.RelControlDependsOn, model.RelDataFlowsTo, model.RelReads, model.RelWrites,
-	}
-}

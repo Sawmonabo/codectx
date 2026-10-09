@@ -4,7 +4,10 @@ The bundled structural provider (implementation plan Section 11.3). It parses
 each supported source file with a pinned tree-sitter grammar in an isolated
 worker subprocess and publishes declarations, containing scopes, signatures,
 imports and exports, syntax references and call sites, test declarations and
-attached documentation at precision `syntax`. It is required, file-scoped and
+attached documentation at precision `syntax`. From the same walk it publishes
+the four file-local dependence families, `control_depends_on`,
+`data_flows_to`, `reads` and `writes`, at precision `static_analysis` (see
+Dependence facts); it is their only publisher. It is required, file-scoped and
 depends on the `filesystem` provider by ID.
 
 Packages:
@@ -13,7 +16,8 @@ Packages:
 |---|---|
 | `internal/provider/treesitter` | Parent side: worker pool, fact validation, resolution, emission. Never links a grammar. |
 | `internal/provider/treesitter/worker` | Child side: `Main(ctx, stdin, stdout, stderr) int`. Owns every native object. |
-| `internal/provider/treesitter/wire` | Length-prefixed JSON framing shared by both. |
+| `internal/provider/treesitter/wire` | Length-prefixed framing shared by both: JSON records, and the binary function message (`wire.Function`). |
+| `internal/provider/treesitter/flow` | The flow core the worker runs per callable: CFG, post-dominators, control dependence, SSA def-use. |
 | `internal/provider/treesitter/lang` | Pin table (grammar module, ABI, version), embedded query packs, fingerprint. |
 | `internal/bench` | `TestParserResourcePlateau` (skipped under `-short`). |
 
@@ -22,7 +26,7 @@ Packages:
 ```
 ID                treesitter
 Version           1.<extraction-version>-<fingerprint[:24]>
-Capabilities      structure
+Capabilities      structure, control_depends_on, data_flows_to, reads, writes
 DependsOn         filesystem
 InvalidationScope file
 Required          true
@@ -216,7 +220,9 @@ duplicated (Section 11.2 stores source once, in the filesystem unit).
 ### Capability state per file
 
 The run always reports `succeeded` (so the unit seals and coverage is
-recorded) with one `structure` capability state at the file's scope:
+recorded) with one `structure` capability state at the file's scope, and one
+row for each of the four dependence capabilities beside it, whose states are
+given under Dependence facts, Capabilities. The `structure` row's states:
 
 | State | DiagnosticCode | Meaning |
 |---|---|---|
@@ -252,6 +258,115 @@ Every other path is parsed with `FileVersion.Language` from the snapshot
 manifest when it names a pinned language, and otherwise the extension decides
 (`.go .py .pyi .js .mjs .cjs .jsx .ts .mts .cts .tsx .java .rs .c .cc .cpp .cxx
 .hpp .hh .hxx`).
+
+## Dependence facts
+
+The provider publishes the four file-local dependence families, `control_depends_on`, `data_flows_to`, `reads` and
+`writes`, from the same worker walk that extracts the file (ADR-0012 decisions 1 and 9). This section is the contract
+the worker, the wire and the parent share.
+
+### The worker's walk
+
+For each file the worker extracts the structural facts from the native tree, flattens the tree (`worker.Flatten`),
+closes the native tree, and then visits every callable of the flat array in the lowering's preorder
+(`Lowering.Functions`). For each callable it lowers the function (`Lowering.Lower`), computes post-dominators, control
+dependence and SSA def-use (package `flow`), projects them as below, and sends one `KindFunction` message. A panic in
+one function's lowering or analysis is recovered, and that function's message carries `Failed`, its span and the
+recovered value's text instead of facts. The file's memory is released at the file boundary before `KindDone`.
+
+A failure of the pass outside every function, such as a tree that does not flatten, sends no function message and
+sets `Done.DependenceFailure`. Neither kind of failure touches the file's structural facts.
+
+### Projection
+
+Inside one function, a variable is **named** when the lowering declared it with `flow.Builder.Named`: a parameter or
+a local, identified by its declaring identifier's byte range (`flow.Graph.Declared`). That range lies in the file and
+usually inside the function; a Java compact constructor's parameters are declared in its record's header. A variable the lowering owns
+(`flow.Builder.Var`: a result, an iteration value, a selector) is never published; facts pass through it.
+
+For a node `n`:
+- `W(n)` is the named variables `n` defines or may define;
+- `R(n)` is the named variables `n` uses;
+- `Src(n)` is the named variables whose value reaches `n`: for every def-use pair `(p, n)`, each variable `p` defines
+  or may define that `n` uses (or, for a may-definition at `n`, reads as its prior version) contributes itself when
+  it is named, and `Src(p)` when it is owned. `Src` is the least fixed point of these equations over the function's
+  def-use pairs, so a cycle of owned variables (a result defined and consumed inside a loop) adds nothing twice and
+  ends; it has no depth bound;
+- `A(n)` is `W(n) ∪ Src(n)`.
+
+The function message carries:
+- **control**: for every control-dependence pair (controller `c`, dependent `d`), each `x` in `A(d)` and each `y` in
+  `Src(c)` with `x ≠ y` gives `x control_depends_on y`, evidenced at `d`. A condition built from operators is anchored
+  at every variable it reads;
+- **flows**: for every node `u`, each `y` in `W(u)` and each `x` in `Src(u)` with `x ≠ y` gives `x data_flows_to y`,
+  evidenced at `u`;
+- **reads**: each `v` in `R(n)`, evidenced at `n`;
+- **writes**: each `v` in `W(n)`, evidenced at `n`, marked as a may-definition when it is one.
+
+A repeated fact at one node is sent once. Nothing is capped.
+
+### Published shape
+
+The parent validates every range against the pinned bytes, as it does for every structural record, and publishes:
+
+| fact | from | to | evidence range | evidence detail |
+|---|---|---|---|---|
+| `control_depends_on` | variable of the dependent node | variable the controlling node reads | the dependent node | `cdg` |
+| `data_flows_to` | variable whose value flows | variable the reached node defines | the reached node | `reaching_def` |
+| `reads` | the owning declaration | variable | the reading node | `use` |
+| `writes` | the owning declaration | variable | the defining node | `definition` or `may_definition` |
+
+- **Variable entity.** Each named variable is one node, whichever functions' messages name it. When its declaring
+  identifier is a structural declaration's name token (a module or class assignment, an ECMAScript declarator, a Go
+  `var_spec`, a Python `def` or `class` name declared in its module or class), it is that declaration's node: the
+  wire carries every declaration's name range for this match, and no second node is minted. Otherwise it is a
+  `variable` node. Its name is the declaring identifier's text, its range is that identifier's range, and its
+  qualified name is the owning declaration's qualified name, the language's separator, and the name (the name alone
+  when the owner is the file's module). Its native key, under the file's scope `file:<path>`, is
+  `var:<path>:<first byte>-<last byte>` over the identifier, one-based and inclusive: one identifier is one
+  variable, so no other entity of the file has that key. Its alias is the cross-provider declaration key
+  `decl:<name>@<path>:<first line>-<last line>` over the identifier's lines, so any other producer of the same
+  declaration resolves to the same identity (ADR-0012 decision 4). That key is line based, so it can repeat: a
+  one-line `func f(f int)` gives the function and its parameter one key, and two same-name locals on one line share
+  one. A variable whose declaration key a declaration of the file or another of its variables also carries publishes
+  no alias, which would name two identities, and the omission is counted, so the four rows report partial. A key
+  over the model's native-key bound is omitted, never truncated: an omitted native key drops the variable and its
+  facts, an omitted alias is counted, and both make the rows partial.
+- **Owning declaration.** The owner of a function's `reads` and `writes`, and of its variables, is the innermost
+  structural declaration of the same file whose range contains the callable's range; a callable no declaration
+  contains is owned by the file's module node. A lambda or closure is therefore owned by the declaration that
+  contains it.
+- **Endpoints.** Every endpoint of `control_depends_on` and `data_flows_to` is a variable entity. A call site is not
+  an endpoint: the callee is resolved by the linking provider that publishes `calls`, and a fact that reaches only a
+  call, a return or a field is carried by `reads` alone. Fields, globals and names the lowering resolves to no
+  variable are not tracked (see the shared contract in `internal/provider/treesitter/worker/lower.go`).
+- **Relation evidence.** Each occurrence is one evidence row: the node's range, the owning declaration's qualified
+  name as its native key, and the detail above. The existing per-fact evidence clip applies.
+- **Precision.** Every evidence row of the four families, and of a variable node the pass mints, is
+  `static_analysis` (ADR-0012 decision 8). Every other fact of the provider stays `syntax`, a declaration that is
+  also a variable included.
+
+### Capabilities
+
+The descriptor lists `structure`, `control_depends_on`, `data_flows_to`, `reads` and `writes`. Every parsed file
+reports one row per capability under its own scope:
+- the four rows follow the structure row's state for a file that was not parsed (unavailable) or that has syntax
+  errors (partial, `CTX_COVERAGE_INCOMPLETE`);
+- a failed function makes the four rows `partial` with `CTX_COVERAGE_INCOMPLETE`, and discloses
+  `failed_functions` (the count, a space, and the first failed function's byte range `start-end`) and
+  `failure_cause` (that function's recovered text, bounded to the detail bound);
+- an unresolved jump makes them `partial` and discloses `unresolved_jumps`;
+- a fact a bound kept out (an omitted key, the evidence clip) makes them `partial`, disclosed as the structure row
+  discloses its own;
+- `Done.DependenceFailure` makes them `failed` with `CTX_INTERNAL` and the reason under `failure_cause`.
+
+None of these fails the unit or changes the structure row.
+
+### Reuse
+
+The four families are facts of the structural file unit, so a file whose fingerprint matches its sealed unit reuses
+them with its structural facts, and an edited file recomputes all of them. The extraction version
+(`internal/provider/treesitter/lang/lang.go`) changes with the facts the worker emits.
 
 ## Worker process
 
@@ -391,12 +506,16 @@ worker → parent   Hello{pid, fingerprint, languages}          once, first
 parent → worker   Request{language, path, source_bytes}
 parent → worker   Source<raw bytes>                            exactly source_bytes
 worker → parent   Decl* Import* Ref*                           facts, one record each
+                  Decl{id, parent, kind, name, qualified, start, end, name_start, name_end, sig_end, doc_start, doc_end, ...}
                   Ref{kind, start, end, name_start, name_end, name, scope, qualified?, qualifier?, qualifier_is_import?}
-worker → parent   Done{package, syntax_errors, truncated, rss_bytes}
+worker → parent   Function*                                    KindFunction, one per callable, binary
+worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, memory}
               or  Error{code, message}                         per-file failure; worker stays healthy
 ```
 
-A `Ref` carries two ranges: `start`/`end` bound the whole reference
+A `Decl`'s `name_start`/`name_end` bound its name token inside `start`/`end`;
+a dependence variable declared at that token is the declaration's node
+(Variable entity). A `Ref` carries two ranges: `start`/`end` bound the whole reference
 expression (the call expression for a call), and `name_start`/`name_end`
 bound the callee identifier token alone. The alias is built from the second,
 because that is what a SCIP occurrence covers; the enclosing expression's
@@ -405,6 +524,19 @@ name within `wire.MaxQualifierBytes` and empty when the receiver is a larger
 expression — a chained `a.b(x).c(y).Scan(&v)` has a receiver hundreds of bytes
 long, which is a callee this file cannot name, not a string to truncate.
 `qualifier_is_import` is decided from the receiver's full text either way.
+
+A `Function` message (`KindFunction`, `wire.AppendFunction` and
+`wire.DecodeFunction`) is the one message that is not JSON: big-endian
+integers and length-prefixed lists carrying the callable's span, its named
+variables as declaring-identifier ranges, its evidence node ranges, and its
+control, flow, read and write facts as indices into those two lists, or, for
+a function whose analysis panicked, its span and the recovered text. The
+decoder checks every list length against the bytes that remain before it
+allocates and refuses an index past the list it names
+(`wire.ErrMalformedFunction`). `Done.DependenceFailure` is set when the
+file's dependence pass failed outside every function, so no function message
+was sent; it never touches the file's structural facts. What the parent
+publishes from these is stated under Dependence facts.
 
 Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single
@@ -574,6 +706,15 @@ All MIT:
   bytes publishes identical keys naming identical identities, and the call to
   the builtin `len` publishes both its alias and a callee node with
   `resolution=unresolved`, `candidates=0`.
+- `internal/provider/treesitter/worker` `Test<Language>LoweringGolden`, one
+  per lowering (`lower_c_test.go`, `lower_cpp_test.go`, `lower_go_test.go`,
+  `lower_java_test.go`, `lower_javascript_test.go`, `lower_python_test.go`,
+  `lower_rust_test.go`, `lower_typescript_test.go`): each authored golden
+  table, derived twice from the source text and the language reference, runs
+  on the flat array through the shared harness in `lower_fixture_test.go` and
+  must reproduce every case's control dependence and def-use exactly and emit
+  nothing outside them. They are the gate the four dependence families are
+  published under (ADR-0012, Status).
 - `internal/bench` `TestParserResourcePlateau` (skipped under `-short`): 600
   parses of 64×-repeated fixtures through the real worker path on one
   long-lived worker; worker RSS after warm-up must stay within 8 MiB of its

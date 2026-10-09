@@ -212,10 +212,8 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 
 	// The same capability disclosure every other graph answer carries, from the
 	// same helper, so `refs` reports the generation's capabilities rather than
-	// none. The deferred-dependence flag is discarded deliberately: a reference
-	// operation walks references, calls or implements (referenceWalkFor), none
-	// of which is a dependence-only kind, so there is nothing for it to report.
-	caps, _, err := e.completeness(ctx, walk.kinds)
+	// none.
+	caps, err := e.completeness(ctx)
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}

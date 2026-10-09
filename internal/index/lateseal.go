@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -143,11 +142,6 @@ type lateSealer struct {
 	// unit spans (markAbandoned), and status reads that where this record is
 	// empty. It is bounded and replaced exactly as background is.
 	abandoned map[string]abandonedUnit
-	// estimate is the mean duration of the deferred units this process has
-	// completed, and samples how many it is over. Zero samples means the
-	// estimate is unknown and Pending reports no estimate at all.
-	estimate time.Duration
-	samples  int64
 	// published holds the results of the publications no Drain has delivered
 	// yet. A tick records its publication here and never calls the caller's
 	// callback itself: the tick may be the background loop's goroutine, and
@@ -372,16 +366,6 @@ func (l *lateSealer) pending() (int, queueState) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.queue) + len(l.inflight), l.state
-}
-
-// pendingAt builds the typed answer, attaching the estimate only once this
-// process has actually completed a deferred unit to average.
-func (l *lateSealer) pendingAt(units, position int) Pending {
-	p := Pending{Units: units, Position: position}
-	if l.samples > 0 {
-		p.Estimate = l.estimate
-	}
-	return p
 }
 
 // sealed is one background unit that completed.
@@ -870,29 +854,13 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 		defer grant.release()
 	}
 	// Past the gate: this reservation is part of the sum the next unit is
-	// admitted against, so the tick may offer that one now. The duration the
-	// estimate averages starts here too: what Pending estimates is a unit's
-	// own build, and the wait for admission is the queue's, not the unit's.
+	// admitted against, so the tick may offer that one now.
 	admitted()
-	started := l.c.now()
 	out, err := work.run(ctx, d.unit, spec, span, grant)
 	if err != nil {
 		return "", out, err
 	}
-	l.observe(l.c.now().Sub(started))
 	return spec.ID, out, nil
-}
-
-// observe folds one completed unit's duration into the running mean Pending
-// reports its estimate from.
-func (l *lateSealer) observe(d time.Duration) {
-	if d <= 0 {
-		return
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.samples++
-	l.estimate += (d - l.estimate) / time.Duration(l.samples)
 }
 
 // publish opens the publication generation: every member of the active
@@ -1201,8 +1169,7 @@ func (l *lateSealer) attach(ctx context.Context, g *generation, replacing map[st
 
 // Pending reports the deferred work outstanding right now (Section 11.6):
 // what a caller that is about to close the coordinator would abandon, and what
-// Drain would run. Position is zero because this is an answer about the whole
-// queue rather than about one promoted scope.
+// Drain would run.
 //
 // A batch that has finished building and is publishing counts as one unit:
 // closing the coordinator cancels that publication and its units are collected
@@ -1219,10 +1186,7 @@ func (c *Coordinator) Pending() Pending {
 	if l.publishing {
 		units++
 	}
-	if units == 0 {
-		return Pending{}
-	}
-	return l.pendingAt(units, 0)
+	return Pending{Units: units}
 }
 
 // Drain runs the deferred queue to empty in the caller's own goroutine,
@@ -1297,50 +1261,6 @@ func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult
 			return err
 		}
 	}
-}
-
-// Promote moves one scope's deferred unit to the head of the background queue
-// and answers what the caller is waiting for (Section 11.6). A scope that is
-// not queued answers zero units: it is not pending, and the active generation
-// already holds whatever it has.
-func (c *Coordinator) Promote(ctx context.Context, providerID, scopeKey string) (Pending, error) {
-	_, release, err := c.hold(ctx, HoldNow)
-	if err != nil {
-		return Pending{}, err
-	}
-	defer release()
-	if err := ctx.Err(); err != nil {
-		return Pending{}, model.Canceled(err)
-	}
-	if providerID == "" || scopeKey == "" {
-		return Pending{}, invalid("promotion needs a provider id and a scope key")
-	}
-	l := c.late
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	pending := len(l.queue) + len(l.inflight)
-	// A unit already building cannot be promoted any further, and reporting it
-	// as absent would let the caller read "nothing pending" for the whole time
-	// it runs.
-	if l.inflight[plan.Key(providerID, scopeKey)] {
-		return l.pendingAt(pending, 1), nil
-	}
-	at := -1
-	for i, d := range l.queue {
-		if d.unit.ProviderID == providerID && d.unit.ScopeKey == scopeKey {
-			at = i
-			break
-		}
-	}
-	if at < 0 {
-		return Pending{}, nil
-	}
-	promoted := l.queue[at]
-	copy(l.queue[1:at+1], l.queue[:at])
-	l.queue[0] = promoted
-	// The units in flight hold the positions in front, so a promoted unit is
-	// next after them.
-	return l.pendingAt(pending, len(l.inflight)+1), nil
 }
 
 // ref is the ref of the generation this pass built, which the deferred work

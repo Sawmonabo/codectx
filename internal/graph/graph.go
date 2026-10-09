@@ -34,24 +34,11 @@ type Adjacency interface {
 	// EvidenceFor hydrates the evidence backing a page of relations, in one
 	// round trip, so a returned path is evidence-backed without one query per edge.
 	EvidenceFor(ctx context.Context, relations []model.RelationID, limit int) (map[model.RelationID][]model.EvidenceID, error)
-	// Capabilities reports the pinned generation's capability states, including
-	// the deferred dependence rows an incomplete answer must disclose.
+	// Capabilities reports the pinned generation's capability states, which
+	// every graph answer discloses.
 	Capabilities(ctx context.Context) ([]model.CapabilityState, error)
 	// Binding is the pinned generation the answer is bound to.
 	Binding() model.Binding
-}
-
-// PendingUnits mirrors index.Pending's three fields locally so internal/graph never imports the
-// coordinator package. app adapts index.Pending into it.
-type PendingUnits struct {
-	Units, Position int
-	Estimate        time.Duration
-}
-
-// Promoter raises the priority of a deferred provider build so a query that
-// needs those facts does not wait behind unrelated work.
-type Promoter interface { // nil in report mode; a failed promotion never fails the query
-	Promote(ctx context.Context, providerID, scopeKey string) (PendingUnits, error)
 }
 
 // Gate is the PROCESS-scoped traversal semaphore, sized from the cores. It is owned by the app stack
@@ -72,8 +59,6 @@ type Options struct {
 	// overview, references and path endpoints have moved onto it; then it
 	// becomes the only structural read and Adjacency keeps delivery only.
 	Reader GraphReader
-	// Promoter is nil in report mode, where the coordinator is not writable.
-	Promoter Promoter
 	// Signer is nil when continuations are not offered; a request that asks to
 	// page without one is answered as truncated with no NextCursor.
 	Signer *pagination.Signer
@@ -146,7 +131,6 @@ func (l Limits) ReasonPaths() config.Limit { return config.Limit(l.MaxReasonPath
 type Engine struct {
 	adjacency Adjacency
 	reader    GraphReader
-	promoter  Promoter
 	signer    *pagination.Signer
 	spools    *pagination.Spools
 	leases    *pagination.Leases
@@ -170,8 +154,8 @@ type Engine struct {
 	pairStopAfter int
 }
 
-// New builds an Engine. Adjacency is required; Promoter, Signer, Spools, Leases
-// and Gate are optional as documented on Options, and a nil Now defaults to
+// New builds an Engine. Adjacency is required; Signer, Spools, Leases and
+// Gate are optional as documented on Options, and a nil Now defaults to
 // time.Now.
 //
 // The scale bounds accept 0 = unlimited (the config.Limit convention); only a
@@ -235,7 +219,6 @@ func New(o Options) (*Engine, error) {
 	return &Engine{
 		adjacency: o.Adjacency,
 		reader:    o.Reader,
-		promoter:  o.Promoter,
 		signer:    o.Signer,
 		spools:    o.Spools,
 		leases:    o.Leases,

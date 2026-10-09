@@ -1618,11 +1618,11 @@ func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource) 
 				return err
 			}
 			// The read and write occurrence roles are deliberately not
-			// mapped: `reads` and `writes` are the dependence provider's
-			// facts (Section 11.6), derived from the graph's assignment
-			// operators, and two providers publishing one relation kind from
-			// different precisions is the parallel implementation Section 5.1
-			// forbids. Every non-definition, non-import occurrence is a
+			// mapped: `reads` and `writes` are the structural provider's
+			// facts (docs/providers-treesitter.md, Dependence facts),
+			// derived from each function's def-use analysis, and two
+			// providers publishing one relation kind from different
+			// precisions is the parallel implementation Section 5.1 forbids. Every non-definition, non-import occurrence is a
 			// `references` edge here.
 			kind, detail := model.RelReferences, "reference"
 			if roles&roleImport != 0 {

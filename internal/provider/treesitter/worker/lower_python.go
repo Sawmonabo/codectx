@@ -3,8 +3,6 @@ package worker
 import (
 	"sync"
 
-	ts "github.com/tree-sitter/go-tree-sitter"
-
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 )
 
@@ -384,7 +382,7 @@ var pythonLowering = Lowering{
 // capture does, and `except E as n` with n global keeps its finally and
 // its deleting node, which defines nothing. So reads, seen and the Builder
 // never see -1.
-func lowerPython(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+func lowerPython(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch) {
 	j := &s.py
 	j.start(l, b, fn, src, s)
 	defer j.finish()
@@ -416,9 +414,9 @@ type pyLower struct {
 	b   *flow.Builder
 	src []byte
 	k   *pySyntax
-	cur *ts.TreeCursor
+	cur *Cursor
 	// buf is a stack of child lists; kids pushes one and done pops it.
-	buf []ts.Node
+	buf []Node
 	// binds is the scope chain, innermost binding last; frames marks where
 	// each callable's bindings begin. frames[0] is the callable being
 	// lowered; the frames above it belong to nested callables whose captures
@@ -477,7 +475,7 @@ type pyLower struct {
 
 // start resets j in place to lower fn: every scalar is set anew and every
 // list truncated, keeping its capacity; stmtNo only advances (see seen).
-func (j *pyLower) start(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+func (j *pyLower) start(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch) {
 	clear(j.buf)
 	*j = pyLower{
 		l: l, b: b, src: src, k: pySyntaxOf(), cur: s.cursor(fn), binds: &s.scope,
@@ -511,14 +509,14 @@ type pyFrame struct {
 // kids calls: later pushes never overwrite it. An ERROR node the parser made
 // an extra, which its recovery does when it wraps what it could not parse or
 // a token it skipped, is kept: stmt lowers it (see errorStmt).
-func (j *pyLower) kids(n *ts.Node) (int, []ts.Node) {
+func (j *pyLower) kids(n Node) (int, []Node) {
 	start := len(j.buf)
 	c := j.cur
-	c.Reset(*n)
+	c.Reset(n)
 	if c.GotoFirstChild() {
 		for {
 			if x := c.Node(); x.IsNamed() && (!x.IsExtra() || x.IsError()) {
-				j.buf = append(j.buf, *x)
+				j.buf = append(j.buf, x)
 			}
 			if !c.GotoNextSibling() {
 				break
@@ -535,13 +533,13 @@ func (j *pyLower) done(mark int) {
 	j.buf = j.buf[:mark]
 }
 
-func (j *pyLower) text(n *ts.Node) []byte { return textOf(j.src, n) }
+func (j *pyLower) text(n Node) []byte { return textOf(j.src, n) }
 
 // token is the span of n's first anonymous child of kind id, and whether n
 // has one.
-func (j *pyLower) token(n *ts.Node, id uint16) (flow.Span, bool) {
+func (j *pyLower) token(n Node, id uint16) (flow.Span, bool) {
 	c := j.cur
-	c.Reset(*n)
+	c.Reset(n)
 	if !c.GotoFirstChild() {
 		return flow.Span{}, false
 	}
@@ -558,7 +556,7 @@ func (j *pyLower) token(n *ts.Node, id uint16) (flow.Span, bool) {
 // pushFrame opens the scope of callable fn and binds its locals: the
 // variables of the function being lowered when it is the first frame,
 // shadows (-1) for a nested callable.
-func (j *pyLower) pushFrame(fn *ts.Node) {
+func (j *pyLower) pushFrame(fn Node) {
 	j.frames = append(j.frames, pyFrame{mark: j.binds.mark(), class: fn.KindId() == j.k.classDefinition})
 	j.collect(fn)
 }
@@ -600,7 +598,7 @@ func (j *pyLower) resolve(name []byte, from int) int32 {
 
 // lookup resolves name from the innermost frame: its variable, or -1 when it
 // is local to a nested callable or not a variable of this function.
-func (j *pyLower) lookup(name *ts.Node) int32 { return j.resolve(j.text(name), len(j.frames)-1) }
+func (j *pyLower) lookup(name Node) int32 { return j.resolve(j.text(name), len(j.frames)-1) }
 
 // frameMark is where the innermost frame's bindings begin.
 func (j *pyLower) frameMark() int { return j.frames[len(j.frames)-1].mark }
@@ -612,10 +610,13 @@ func (j *pyLower) bindAs(name []byte, v int32) {
 	}
 }
 
-// site records a binding site of name in the innermost frame: a new local,
-// or, when name is declared global or nonlocal there and resolves to a
-// variable of this function, a write the creating node may-defines.
-func (j *pyLower) site(name *ts.Node) {
+// site records a binding site of name, an identifier, in the innermost
+// frame. A name not yet bound there is a new local: in the callable being
+// lowered a variable declared over name's span, so the first site of a name
+// declares it, and in a nested callable a shadow (-1). A name a nested
+// callable already binds, through a global or nonlocal declaration, to a
+// variable of this function is a write the creating node may-defines.
+func (j *pyLower) site(name Node) {
 	t := j.text(name)
 	if i := j.binds.find(t, j.frameMark()); i >= 0 {
 		if j.shadow > 0 && j.binds.at(i).v >= 0 {
@@ -625,7 +626,7 @@ func (j *pyLower) site(name *ts.Node) {
 	}
 	v := int32(-1)
 	if j.shadow == 0 {
-		v = j.b.Var()
+		v = j.b.Named(spanOf(name))
 	}
 	j.binds.push(t, v)
 }
@@ -633,7 +634,7 @@ func (j *pyLower) site(name *ts.Node) {
 // collect binds callable fn's locals in the innermost frame: first its
 // global and nonlocal names, then its parameters, then every other binding
 // site of its own code.
-func (j *pyLower) collect(fn *ts.Node) {
+func (j *pyLower) collect(fn Node) {
 	k := j.k
 	switch fn.KindId() {
 	case k.module:
@@ -642,12 +643,12 @@ func (j *pyLower) collect(fn *ts.Node) {
 	case k.functionDefinition, k.classDefinition:
 		body := fn.ChildByFieldId(k.fBody)
 		j.declarations(body)
-		if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+		if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 			j.paramSites(ps)
 		}
 		j.scan(body)
 	case k.lambda:
-		if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+		if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 			j.paramSites(ps)
 		}
 		j.scan(fn.ChildByFieldId(k.fBody))
@@ -674,17 +675,17 @@ func (j *pyLower) collect(fn *ts.Node) {
 // callable's own statements declare: a global name to the module's variable
 // when the module is being lowered and the callable is nested in it, a
 // nonlocal name to what it resolves to in the enclosing function scopes.
-func (j *pyLower) declarations(n *ts.Node) {
+func (j *pyLower) declarations(n Node) {
 	k := j.k
 	start, list := j.kids(n)
 	for i := range list {
-		c := &list[i]
+		c := list[i]
 		switch c.KindId() {
 		case k.globalStatement, k.nonlocalStatement:
 			global := c.KindId() == k.globalStatement
 			s2, names := j.kids(c)
 			for x := range names {
-				t := j.text(&names[x])
+				t := j.text(names[x])
 				v := int32(-1)
 				switch {
 				case global && j.module && len(j.frames) > 1:
@@ -708,16 +709,16 @@ func (j *pyLower) declarations(n *ts.Node) {
 // global statement makes its names the module's (§7.12), so a function may
 // assign a module variable the module's own code never binds. n is the
 // module or one of its statements.
-func (j *pyLower) moduleGlobals(n *ts.Node) {
+func (j *pyLower) moduleGlobals(n Node) {
 	k := j.k
 	start, list := j.kids(n)
 	for i := range list {
-		c := &list[i]
+		c := list[i]
 		switch c.KindId() {
 		case k.globalStatement:
 			s2, names := j.kids(c)
 			for x := range names {
-				j.site(&names[x])
+				j.site(names[x])
 			}
 			j.done(s2)
 		case k.functionDefinition, k.classDefinition:
@@ -746,19 +747,19 @@ func (j *pyLower) frameVar(i int, name []byte) int32 {
 }
 
 // paramSites binds every name a parameter list binds.
-func (j *pyLower) paramSites(ps *ts.Node) {
+func (j *pyLower) paramSites(ps Node) {
 	start, list := j.kids(ps)
 	for i := range list {
-		if id := j.paramName(&list[i]); id != nil {
+		if id := j.paramName(list[i]); !id.IsNull() {
 			j.targetSites(id)
 		}
 	}
 	j.done(start)
 }
 
-// paramName is the name or pattern parameter p binds, or nil for a
+// paramName is the name or pattern parameter p binds, or null for a
 // separator.
-func (j *pyLower) paramName(p *ts.Node) *ts.Node {
+func (j *pyLower) paramName(p Node) Node {
 	k := j.k
 	switch p.KindId() {
 	case k.identifier, k.tuplePattern:
@@ -766,23 +767,23 @@ func (j *pyLower) paramName(p *ts.Node) *ts.Node {
 	case k.defaultParameter, k.typedDefaultParameter:
 		return p.ChildByFieldId(k.fName)
 	case k.typedParameter, k.listSplatPattern, k.dictionarySplatPattern:
-		if c := firstNamed(p); c != nil {
+		if c := firstNamed(p); !c.IsNull() {
 			return j.paramName(c)
 		}
 	}
-	return nil
+	return Node{}
 }
 
 // params emits one defining node per bound parameter name, in order.
-func (j *pyLower) params(ps *ts.Node) {
-	if ps == nil {
+func (j *pyLower) params(ps Node) {
+	if ps.IsNull() {
 		return
 	}
 	start, list := j.kids(ps)
 	for i := range list {
-		if id := j.paramName(&list[i]); id != nil {
+		if id := j.paramName(list[i]); !id.IsNull() {
 			j.reset()
-			j.bind(id, nil, 0, 0)
+			j.bind(id, Node{}, 0, 0)
 		}
 	}
 	j.done(start)
@@ -790,8 +791,8 @@ func (j *pyLower) params(ps *ts.Node) {
 
 // defaults calls eval on every parameter default of ps, which is evaluated
 // where the callable is created.
-func (j *pyLower) defaults(ps *ts.Node, lower bool) {
-	if ps == nil {
+func (j *pyLower) defaults(ps Node, lower bool) {
+	if ps.IsNull() {
 		return
 	}
 	k := j.k
@@ -805,9 +806,9 @@ func (j *pyLower) defaults(ps *ts.Node, lower bool) {
 }
 
 // targetSites records the binding sites of an assignment target.
-func (j *pyLower) targetSites(t *ts.Node) {
+func (j *pyLower) targetSites(t Node) {
 	k := j.k
-	if t == nil {
+	if t.IsNull() {
 		return
 	}
 	switch t.KindId() {
@@ -817,7 +818,7 @@ func (j *pyLower) targetSites(t *ts.Node) {
 		k.listSplatPattern, k.listSplat, k.asPatternTarget:
 		start, list := j.kids(t)
 		for i := range list {
-			j.targetSites(&list[i])
+			j.targetSites(list[i])
 		}
 		j.done(start)
 	default:
@@ -828,9 +829,9 @@ func (j *pyLower) targetSites(t *ts.Node) {
 // scan records the binding sites of n, a part of the innermost frame's own
 // code: it does not enter a nested callable beyond the parts evaluated where
 // the callable is created, except to find the `:=` names of a comprehension.
-func (j *pyLower) scan(n *ts.Node) {
+func (j *pyLower) scan(n Node) {
 	k := j.k
-	if n == nil {
+	if n.IsNull() {
 		return
 	}
 	id := n.KindId()
@@ -847,7 +848,7 @@ func (j *pyLower) scan(n *ts.Node) {
 				j.scan(n.ChildByFieldId(k.fSuperclasses))
 				return
 			}
-			if ps := n.ChildByFieldId(k.fParameters); ps != nil {
+			if ps := n.ChildByFieldId(k.fParameters); !ps.IsNull() {
 				start, list := j.kids(ps)
 				for i := range list {
 					if d := list[i].KindId(); d == k.defaultParameter || d == k.typedDefaultParameter {
@@ -860,10 +861,10 @@ func (j *pyLower) scan(n *ts.Node) {
 			start, list := j.kids(n)
 			if j.walrusOnly > 0 {
 				for i := range list {
-					j.scan(&list[i])
+					j.scan(list[i])
 				}
 			} else {
-				j.firstIterable(list, func(r *ts.Node) { j.scan(r) })
+				j.firstIterable(list, func(r Node) { j.scan(r) })
 				j.walrusOnly++
 				j.compParts(list, false)
 				j.walrusOnly--
@@ -904,41 +905,41 @@ func (j *pyLower) scan(n *ts.Node) {
 		start, list := j.kids(n)
 		for i := range list {
 			if list[i].KindId() == k.asPatternTarget {
-				j.targetSites(&list[i])
+				j.targetSites(list[i])
 			} else {
-				j.scan(&list[i])
+				j.scan(list[i])
 			}
 		}
 		j.done(start)
 	case k.deleteStatement:
 		start, list := j.kids(n)
 		for i := range list {
-			j.targetSites(&list[i])
+			j.targetSites(list[i])
 		}
 		j.done(start)
 	case k.importStatement, k.importFromStatement, k.futureImportStatement:
 		start, list := j.kids(n)
 		mod := n.ChildByFieldId(k.fModuleName)
 		for i := range list {
-			if mod != nil && list[i].StartByte() == mod.StartByte() {
+			if !mod.IsNull() && list[i].StartByte() == mod.StartByte() {
 				continue
 			}
-			if nm := j.importName(&list[i]); nm != nil {
+			if nm := j.importName(list[i]); !nm.IsNull() {
 				j.site(nm)
 			}
 		}
 		j.done(start)
 	case k.typeAliasStatement:
-		if nm := j.aliasName(n); nm != nil {
+		if nm := j.aliasName(n); !nm.IsNull() {
 			j.site(nm)
 		}
 	case k.caseClause:
 		start, list := j.kids(n)
 		for i := range list {
 			if list[i].KindId() == k.casePattern {
-				j.pattern(&list[i], patSites, true)
+				j.pattern(list[i], patSites, true)
 			} else {
-				j.scan(&list[i])
+				j.scan(list[i])
 			}
 		}
 		j.done(start)
@@ -947,10 +948,10 @@ func (j *pyLower) scan(n *ts.Node) {
 	}
 }
 
-func (j *pyLower) scanKids(n *ts.Node) {
+func (j *pyLower) scanKids(n Node) {
 	start, list := j.kids(n)
 	for i := range list {
-		j.scan(&list[i])
+		j.scan(list[i])
 	}
 	j.done(start)
 }
@@ -958,17 +959,17 @@ func (j *pyLower) scanKids(n *ts.Node) {
 // firstIterable calls f with each expression of a comprehension's first
 // iterable, which the enclosing callable evaluates; list is the
 // comprehension's children.
-func (j *pyLower) firstIterable(list []ts.Node, f func(*ts.Node)) {
+func (j *pyLower) firstIterable(list []Node, f func(Node)) {
 	k := j.k
 	for i := range list {
 		if list[i].KindId() != k.forInClause {
 			continue
 		}
 		left := list[i].ChildByFieldId(k.fLeft)
-		start, parts := j.kids(&list[i])
+		start, parts := j.kids(list[i])
 		for p := range parts {
 			if parts[p].StartByte() != left.StartByte() {
-				f(&parts[p])
+				f(parts[p])
 			}
 		}
 		j.done(start)
@@ -980,11 +981,11 @@ func (j *pyLower) firstIterable(list []ts.Node, f func(*ts.Node)) {
 // scan) or collects the captures of every part of a comprehension but its
 // first iterable: the element, every clause's target, every later iterable
 // and every condition. list is the comprehension's children.
-func (j *pyLower) compParts(list []ts.Node, scanning bool) {
+func (j *pyLower) compParts(list []Node, scanning bool) {
 	k := j.k
 	firstSeen := false
 	for i := range list {
-		c := &list[i]
+		c := list[i]
 		if c.KindId() != k.forInClause {
 			j.part(c, scanning, false)
 			continue
@@ -996,7 +997,7 @@ func (j *pyLower) compParts(list []ts.Node, scanning bool) {
 			if !isLeft && !firstSeen {
 				continue
 			}
-			j.part(&parts[p], scanning, isLeft)
+			j.part(parts[p], scanning, isLeft)
 		}
 		j.done(start)
 		firstSeen = true
@@ -1006,7 +1007,7 @@ func (j *pyLower) compParts(list []ts.Node, scanning bool) {
 // part scans a comprehension part for binding sites, or collects its
 // captures while the comprehension's frame is open; target marks a for
 // clause's target.
-func (j *pyLower) part(n *ts.Node, scanning, target bool) {
+func (j *pyLower) part(n Node, scanning, target bool) {
 	switch {
 	case scanning || j.walrusOnly > 0:
 		j.scan(n)
@@ -1018,8 +1019,8 @@ func (j *pyLower) part(n *ts.Node, scanning, target bool) {
 }
 
 // importName is the local name one import clause binds: an alias, or the
-// first component of a dotted name; nil for a wildcard.
-func (j *pyLower) importName(n *ts.Node) *ts.Node {
+// first component of a dotted name; null for a wildcard.
+func (j *pyLower) importName(n Node) Node {
 	k := j.k
 	switch n.KindId() {
 	case k.aliasedImport:
@@ -1027,24 +1028,24 @@ func (j *pyLower) importName(n *ts.Node) *ts.Node {
 	case k.dottedName:
 		return firstNamed(n)
 	}
-	return nil
+	return Node{}
 }
 
 // aliasName is the name a type alias statement defines.
-func (j *pyLower) aliasName(n *ts.Node) *ts.Node {
+func (j *pyLower) aliasName(n Node) Node {
 	k := j.k
 	t := firstNamed(n.ChildByFieldId(k.fLeft))
-	if t != nil && t.KindId() == k.genericType {
+	if !t.IsNull() && t.KindId() == k.genericType {
 		t = firstNamed(t)
 	}
-	if t != nil && t.KindId() == k.identifier {
+	if !t.IsNull() && t.KindId() == k.identifier {
 		return t
 	}
-	return nil
+	return Node{}
 }
 
 // ref records a read of name when it resolves to a variable of this function.
-func (j *pyLower) ref(name *ts.Node) { j.read(j.lookup(name)) }
+func (j *pyLower) ref(name Node) { j.read(j.lookup(name)) }
 
 // read records a read of v, unless v is -1.
 func (j *pyLower) read(v int32) {
@@ -1079,7 +1080,7 @@ func (j *pyLower) reset() {
 
 // node creates a node spanning n that Uses reads[from:to], and MayThrow when
 // a throwing construct was evaluated since the previous node.
-func (j *pyLower) node(kind flow.Kind, n *ts.Node, from, to int) int32 {
+func (j *pyLower) node(kind flow.Kind, n Node, from, to int) int32 {
 	return j.nodeAt(kind, spanOf(n), from, to)
 }
 
@@ -1154,7 +1155,7 @@ func (j *pyLower) close(saved int32) int32 {
 // at the nodes that decide it; any other expression is one Stmt node
 // spanning n without its parentheses. The reads those nodes carry are
 // dropped from reads.
-func (j *pyLower) yield(n *ts.Node, dst int32) {
+func (j *pyLower) yield(n Node, dst int32) {
 	k := j.k
 	u := j.l.unparen(n)
 	m := len(j.reads)
@@ -1179,7 +1180,7 @@ func (j *pyLower) yield(n *ts.Node, dst int32) {
 // result lowers n, a construct lowered to nodes of its own, and hands its
 // value to the node consuming it through a result variable the lowering
 // owns: the construct's nodes define it and the consumer reads it.
-func (j *pyLower) result(n *ts.Node) {
+func (j *pyLower) result(n Node) {
 	r := j.b.Var()
 	j.yield(n, r)
 	j.read(r)
@@ -1195,19 +1196,19 @@ func (j *pyLower) merge(base int) {
 }
 
 // block lowers a statement list; Python blocks open no scope.
-func (j *pyLower) block(n *ts.Node) {
-	if n == nil {
+func (j *pyLower) block(n Node) {
+	if n.IsNull() {
 		return
 	}
 	start, list := j.kids(n)
 	for i := range list {
-		j.stmt(&list[i])
+		j.stmt(list[i])
 	}
 	j.done(start)
 }
 
 // stmt lowers one statement.
-func (j *pyLower) stmt(n *ts.Node) {
+func (j *pyLower) stmt(n Node) {
 	k := j.k
 	j.reset()
 	if n.IsError() {
@@ -1218,10 +1219,10 @@ func (j *pyLower) stmt(n *ts.Node) {
 	case k.expressionStatement:
 		start, list := j.kids(n)
 		if len(list) == 1 {
-			j.exprStmt(&list[0])
+			j.exprStmt(list[0])
 		} else {
 			for i := range list {
-				j.value(&list[i])
+				j.value(list[i])
 			}
 			j.node(flow.Stmt, n, 0, len(j.reads))
 		}
@@ -1231,7 +1232,7 @@ func (j *pyLower) stmt(n *ts.Node) {
 		j.imports(n)
 	case k.typeAliasStatement:
 		id := j.node(flow.Stmt, n, 0, 0)
-		if nm := j.aliasName(n); nm != nil {
+		if nm := j.aliasName(n); !nm.IsNull() {
 			j.def(id, j.lookup(nm))
 		}
 	case k.returnStatement:
@@ -1271,7 +1272,7 @@ func (j *pyLower) stmt(n *ts.Node) {
 		start, list := j.kids(n)
 		for i := range list {
 			if list[i].KindId() == k.decorator {
-				j.children(&list[i], true)
+				j.children(list[i], true)
 			}
 		}
 		j.done(start)
@@ -1287,11 +1288,11 @@ func (j *pyLower) stmt(n *ts.Node) {
 // position (see the statement kinds in lowerPython): each named child as a
 // statement, through stmt, then a Stmt node spanning the ERROR node, unless
 // the last node its children made already spans it.
-func (j *pyLower) errorStmt(n *ts.Node) {
+func (j *pyLower) errorStmt(n Node) {
 	last := j.last
 	start, list := j.kids(n)
 	for i := range list {
-		j.stmt(&list[i])
+		j.stmt(list[i])
 	}
 	j.done(start)
 	j.reset()
@@ -1301,7 +1302,7 @@ func (j *pyLower) errorStmt(n *ts.Node) {
 }
 
 // exprStmt lowers an expression evaluated for its effect.
-func (j *pyLower) exprStmt(e *ts.Node) {
+func (j *pyLower) exprStmt(e Node) {
 	k := j.k
 	switch e.KindId() {
 	case k.assignment:
@@ -1314,14 +1315,14 @@ func (j *pyLower) exprStmt(e *ts.Node) {
 }
 
 // imports binds and defines the local names of one import statement.
-func (j *pyLower) imports(n *ts.Node) {
+func (j *pyLower) imports(n Node) {
 	k := j.k
 	j.throws++
 	start, list := j.kids(n)
 	mod := n.ChildByFieldId(k.fModuleName)
 	for i := range list {
-		c := &list[i]
-		if mod != nil && c.StartByte() == mod.StartByte() {
+		c := list[i]
+		if !mod.IsNull() && c.StartByte() == mod.StartByte() {
 			continue
 		}
 		if c.KindId() == k.wildcardImport {
@@ -1336,7 +1337,7 @@ func (j *pyLower) imports(n *ts.Node) {
 			}
 			continue
 		}
-		if nm := j.importName(c); nm != nil {
+		if nm := j.importName(c); !nm.IsNull() {
 			j.def(j.node(flow.Stmt, nm, 0, 0), j.lookup(nm))
 		}
 	}
@@ -1344,12 +1345,12 @@ func (j *pyLower) imports(n *ts.Node) {
 }
 
 // assign lowers `t = e`, `t1 = t2 = e` and `t: T = e`.
-func (j *pyLower) assign(n *ts.Node) {
+func (j *pyLower) assign(n Node) {
 	k := j.k
 	base := len(j.buf)
 	r := n
-	for r != nil && r.KindId() == k.assignment {
-		j.buf = append(j.buf, *r.ChildByFieldId(k.fLeft))
+	for !r.IsNull() && r.KindId() == k.assignment {
+		j.buf = append(j.buf, r.ChildByFieldId(k.fLeft))
 		r = r.ChildByFieldId(k.fRight)
 	}
 	targets := j.buf[base:]
@@ -1357,29 +1358,29 @@ func (j *pyLower) assign(n *ts.Node) {
 	// after the value, in a class body or the module only (§7.2.2).
 	ann := n.ChildByFieldId(k.fType)
 	if !j.eager() {
-		ann = nil
+		ann = Node{}
 	}
-	if r == nil {
+	if r.IsNull() {
 		// `t: T` evaluates a reference target's object and index, but not
 		// the final attribute or item access (§7.2.2), and the annotation,
 		// when it is evaluated; it binds nothing.
 		m := len(j.reads)
-		t := j.l.unparen(&targets[0])
+		t := j.l.unparen(targets[0])
 		ref := t.KindId() == k.attribute || t.KindId() == k.subscript
 		if ref {
 			j.reference(t)
 		}
 		j.annotation(ann, true)
-		if ref || ann != nil {
+		if ref || !ann.IsNull() {
 			j.node(flow.Stmt, n, m, len(j.reads))
 		}
 		j.done(base)
 		return
 	}
-	if len(targets) == 1 && j.single(&targets[0]) {
+	if len(targets) == 1 && j.single(targets[0]) {
 		j.value(r)
 		j.annotation(ann, true)
-		j.bind(&targets[0], n, 0, len(j.reads))
+		j.bind(targets[0], n, 0, len(j.reads))
 		j.done(base)
 		return
 	}
@@ -1391,7 +1392,7 @@ func (j *pyLower) assign(n *ts.Node) {
 	from := len(j.reads)
 	j.read(v)
 	for i := range targets {
-		j.bind(&targets[i], nil, from, from+1)
+		j.bind(targets[i], Node{}, from, from+1)
 	}
 	j.done(base)
 }
@@ -1399,7 +1400,7 @@ func (j *pyLower) assign(n *ts.Node) {
 // single reports whether assignment target t, without its parentheses, is
 // one name, attribute or subscript, bound by one node spanning the
 // statement.
-func (j *pyLower) single(t *ts.Node) bool {
+func (j *pyLower) single(t Node) bool {
 	switch j.l.unparen(t).KindId() {
 	case j.k.identifier, j.k.attribute, j.k.subscript:
 		return true
@@ -1409,7 +1410,7 @@ func (j *pyLower) single(t *ts.Node) bool {
 
 // augment lowers `t op= e`: the target is evaluated, and read, first
 // (§7.2.1).
-func (j *pyLower) augment(n *ts.Node) {
+func (j *pyLower) augment(n Node) {
 	k := j.k
 	left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
 	if left.KindId() == k.identifier {
@@ -1429,7 +1430,7 @@ func (j *pyLower) augment(n *ts.Node) {
 // reference evaluates an attribute's object or a subscript's value and
 // indices and reports whether t is one; any other target is evaluated as a
 // value.
-func (j *pyLower) reference(t *ts.Node) bool {
+func (j *pyLower) reference(t Node) bool {
 	k := j.k
 	switch t.KindId() {
 	case k.attribute:
@@ -1445,9 +1446,9 @@ func (j *pyLower) reference(t *ts.Node) bool {
 
 // mayDefBase may-defines, on node id, the variable at the base of the
 // attribute or subscript target t.
-func (j *pyLower) mayDefBase(id int32, t *ts.Node) {
+func (j *pyLower) mayDefBase(id int32, t Node) {
 	k := j.k
-	for t != nil {
+	for !t.IsNull() {
 		switch t.KindId() {
 		case k.attribute:
 			t = t.ChildByFieldId(k.fObject)
@@ -1471,11 +1472,11 @@ func (j *pyLower) mayDefBase(id int32, t *ts.Node) {
 // order, each using reads[from:to] and the reads of its own evaluation (a
 // reference's object and index), which it drops from reads (see Node
 // granularity). A single identifier, attribute or subscript target's node
-// spans whole when it is not nil.
-func (j *pyLower) bind(t *ts.Node, whole *ts.Node, from, to int) {
+// spans whole when it is not null.
+func (j *pyLower) bind(t Node, whole Node, from, to int) {
 	k := j.k
 	span := t
-	if whole != nil {
+	if !whole.IsNull() {
 		span = whole
 	}
 	switch t.KindId() {
@@ -1495,11 +1496,11 @@ func (j *pyLower) bind(t *ts.Node, whole *ts.Node, from, to int) {
 		j.throws++
 		start, list := j.kids(t)
 		for i := range list {
-			j.bind(&list[i], nil, from, to)
+			j.bind(list[i], Node{}, from, to)
 		}
 		j.done(start)
 	case k.parenthesizedExpression, k.listSplatPattern, k.listSplat:
-		if c := firstNamed(t); c != nil {
+		if c := firstNamed(t); !c.IsNull() {
 			j.bind(c, whole, from, to)
 		}
 	default:
@@ -1514,11 +1515,11 @@ func (j *pyLower) bind(t *ts.Node, whole *ts.Node, from, to int) {
 }
 
 // deleteStmt lowers `del t, …`.
-func (j *pyLower) deleteStmt(n *ts.Node) {
+func (j *pyLower) deleteStmt(n Node) {
 	k := j.k
 	start, list := j.kids(n)
 	if len(list) == 1 && list[0].KindId() == k.expressionList {
-		s2, targets := j.kids(&list[0])
+		s2, targets := j.kids(list[0])
 		j.delete(targets, n)
 		j.done(s2)
 	} else {
@@ -1531,16 +1532,16 @@ func (j *pyLower) deleteStmt(n *ts.Node) {
 // target spans stmt, the statement, when it is the statement's only one, and
 // itself otherwise, parentheses included; the elements of a tuple or list
 // target are targets of their own, each spanning itself.
-func (j *pyLower) delete(targets []ts.Node, stmt *ts.Node) {
+func (j *pyLower) delete(targets []Node, stmt Node) {
 	k := j.k
 	for i := range targets {
-		t := &targets[i]
+		t := targets[i]
 		span := t
-		if len(targets) == 1 && stmt != nil {
+		if len(targets) == 1 && !stmt.IsNull() {
 			span = stmt
 		}
 		u := j.l.unparen(t)
-		if u == nil {
+		if u.IsNull() {
 			continue
 		}
 		j.reset()
@@ -1553,7 +1554,7 @@ func (j *pyLower) delete(targets []ts.Node, stmt *ts.Node) {
 			j.mayDefBase(j.node(flow.Stmt, span, 0, len(j.reads)), u)
 		case k.tuple, k.list:
 			start, list := j.kids(u)
-			j.delete(list, nil)
+			j.delete(list, Node{})
 			j.done(start)
 		default:
 			j.value(u)
@@ -1564,15 +1565,15 @@ func (j *pyLower) delete(targets []ts.Node, stmt *ts.Node) {
 
 // assertStmt lowers `assert c, m`: when c is false, m is evaluated and
 // AssertionError raised.
-func (j *pyLower) assertStmt(n *ts.Node) {
+func (j *pyLower) assertStmt(n Node) {
 	start, list := j.kids(n)
-	cond := j.l.unparen(&list[0])
+	cond := j.l.unparen(list[0])
 	j.value(cond)
 	j.node(flow.Branch, cond, 0, len(j.reads))
 	p := j.b.Push()
 	if len(list) > 1 {
 		j.reset()
-		j.yield(&list[1], -1)
+		j.yield(list[1], -1)
 	}
 	j.b.Throw()
 	j.b.Restore(p)
@@ -1581,14 +1582,14 @@ func (j *pyLower) assertStmt(n *ts.Node) {
 }
 
 // cond lowers a condition as one Branch node spanning it.
-func (j *pyLower) cond(c *ts.Node) {
+func (j *pyLower) cond(c Node) {
 	c = j.l.unparen(c)
 	m := len(j.reads)
 	j.value(c)
 	j.node(flow.Branch, c, m, len(j.reads))
 }
 
-func (j *pyLower) ifStmt(n *ts.Node) {
+func (j *pyLower) ifStmt(n Node) {
 	k := j.k
 	j.cond(n.ChildByFieldId(k.fCondition))
 	p := j.b.Push()
@@ -1598,7 +1599,7 @@ func (j *pyLower) ifStmt(n *ts.Node) {
 	j.b.Restore(p)
 	start, list := j.kids(n)
 	for i := range list {
-		switch alt := &list[i]; alt.KindId() {
+		switch alt := list[i]; alt.KindId() {
 		case k.elifClause:
 			j.reset()
 			j.cond(alt.ChildByFieldId(k.fCondition))
@@ -1618,7 +1619,7 @@ func (j *pyLower) ifStmt(n *ts.Node) {
 // head lowers a while condition as the loop's decision node, or as a Stmt
 // node without an exit edge when it is the literal True. It reports whether
 // the loop exits through it.
-func (j *pyLower) head(cond *ts.Node) bool {
+func (j *pyLower) head(cond Node) bool {
 	j.reset()
 	cond = j.l.unparen(cond)
 	if cond.KindId() == j.k.trueLit {
@@ -1635,7 +1636,7 @@ func (j *pyLower) head(cond *ts.Node) bool {
 // §8.3). The else body runs from the head's false edge, saved in exit, when
 // the loop exits through its head, and is unreachable otherwise; the loop's
 // own breaks leave past it.
-func (j *pyLower) loopEnd(n *ts.Node, f flow.Frame, h int32, exits bool, exit flow.Fringe) {
+func (j *pyLower) loopEnd(n Node, f flow.Frame, h int32, exits bool, exit flow.Fringe) {
 	j.b.ContinueHere(f)
 	j.b.Close(h)
 	if !exits {
@@ -1645,14 +1646,14 @@ func (j *pyLower) loopEnd(n *ts.Node, f flow.Frame, h int32, exits bool, exit fl
 	j.b.CloseFrame(f)
 	breaks := j.b.Push()
 	j.b.Restore(exit)
-	if alt := n.ChildByFieldId(j.k.fAlternative); alt != nil {
+	if alt := n.ChildByFieldId(j.k.fAlternative); !alt.IsNull() {
 		j.block(alt.ChildByFieldId(j.k.fBody))
 	}
 	j.b.Merge(breaks)
 	j.b.Pop(exit)
 }
 
-func (j *pyLower) whileStmt(n *ts.Node) {
+func (j *pyLower) whileStmt(n Node) {
 	k := j.k
 	f := j.b.OpenLoop()
 	saved := j.open()
@@ -1667,7 +1668,7 @@ func (j *pyLower) whileStmt(n *ts.Node) {
 }
 
 // forStmt lowers for and async for.
-func (j *pyLower) forStmt(n *ts.Node) {
+func (j *pyLower) forStmt(n Node) {
 	k := j.k
 	left, right := n.ChildByFieldId(k.fLeft), n.ChildByFieldId(k.fRight)
 	j.value(right)
@@ -1682,19 +1683,19 @@ func (j *pyLower) forStmt(n *ts.Node) {
 	exit := j.b.Push()
 	j.reset()
 	j.read(it)
-	j.bind(left, nil, 0, len(j.reads))
+	j.bind(left, Node{}, 0, len(j.reads))
 	j.block(n.ChildByFieldId(k.fBody))
 	j.loopEnd(n, f, h, true, exit)
 }
 
-func (j *pyLower) tryStmt(n *ts.Node) {
+func (j *pyLower) tryStmt(n Node) {
 	k := j.k
 	start, list := j.kids(n)
-	var firstExcept, elseC, finC *ts.Node
+	var firstExcept, elseC, finC Node
 	for i := range list {
-		switch c := &list[i]; c.KindId() {
+		switch c := list[i]; c.KindId() {
 		case k.exceptClause:
-			if firstExcept == nil {
+			if firstExcept.IsNull() {
 				firstExcept = c
 			}
 		case k.elseClause:
@@ -1704,14 +1705,14 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 		}
 	}
 	var ff, cf flow.Frame
-	if finC != nil {
+	if !finC.IsNull() {
 		ff = j.b.OpenFinally()
 	}
-	if firstExcept != nil {
+	if !firstExcept.IsNull() {
 		cf = j.b.OpenCatch()
 	}
 	j.block(n.ChildByFieldId(k.fBody))
-	if firstExcept != nil {
+	if !firstExcept.IsNull() {
 		tEnd := j.b.Push()
 		j.b.EnterHandler(cf, spanOf(firstExcept.Child(0)))
 		base := len(j.hold)
@@ -1719,7 +1720,7 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 		// first clause decides.
 		if _, star := j.token(firstExcept, k.star); star {
 			for i := range list {
-				if c := &list[i]; c.KindId() == k.exceptClause {
+				if c := list[i]; c.KindId() == k.exceptClause {
 					j.except(c, true)
 				}
 			}
@@ -1732,7 +1733,7 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 		} else {
 			caught := false
 			for i := range list {
-				if c := &list[i]; c.KindId() == k.exceptClause && !caught {
+				if c := list[i]; c.KindId() == k.exceptClause && !caught {
 					caught = j.except(c, false)
 				}
 			}
@@ -1743,18 +1744,18 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 		j.merge(base)
 		hx := j.b.Push()
 		j.b.Restore(tEnd)
-		if elseC != nil {
+		if !elseC.IsNull() {
 			j.block(elseC.ChildByFieldId(k.fBody))
 		}
 		j.b.Merge(hx)
 		j.b.Pop(tEnd)
-	} else if elseC != nil {
+	} else if !elseC.IsNull() {
 		j.block(elseC.ChildByFieldId(k.fBody))
 	}
-	if finC != nil {
+	if !finC.IsNull() {
 		normal := j.b.EnterFinally(ff, spanOf(finC.Child(0)))
 		s2, fl := j.kids(finC)
-		j.block(&fl[len(fl)-1])
+		j.block(fl[len(fl)-1])
 		j.done(s2)
 		j.b.CloseFinally(ff, normal)
 	}
@@ -1773,28 +1774,28 @@ func (j *pyLower) tryStmt(n *ts.Node) {
 // is the node deleting n (§8.4.1: n is deleted however the clause ends), a
 // Stmt node spanning the clause; the finally's Handler spans the `as`
 // keyword.
-func (j *pyLower) except(c *ts.Node, star bool) bool {
+func (j *pyLower) except(c Node, star bool) bool {
 	k := j.k
 	j.reset()
 	// The clause's block is its last child; list stays on the stack until
 	// the clause is lowered.
 	start, list := j.kids(c)
 	defer j.done(start)
-	body := &list[len(list)-1]
+	body := list[len(list)-1]
 	tests := list[:len(list)-1]
 	if len(tests) == 0 {
 		j.block(body)
 		return true
 	}
-	var lo, hi, alias *ts.Node
+	var lo, hi, alias Node
 	var as flow.Span
 	for i := range tests {
-		x := &tests[i]
+		x := tests[i]
 		if x.KindId() == k.asPattern {
 			as, _ = j.token(x, k.asKw)
 			x, alias = j.asParts(x)
 		}
-		if lo == nil {
+		if lo.IsNull() {
 			lo = x
 		}
 		hi = x
@@ -1802,13 +1803,13 @@ func (j *pyLower) except(c *ts.Node, star bool) bool {
 	}
 	j.nodeAt(flow.Branch, flow.Span{Start: uint32(lo.StartByte()), End: uint32(hi.EndByte())}, 0, len(j.reads))
 	miss := j.b.Push()
-	if alias != nil {
+	if !alias.IsNull() {
 		j.reset()
-		j.bind(alias, nil, 0, 0)
+		j.bind(alias, Node{}, 0, 0)
 	}
 	// The name is deleted whether or not it is a variable of this function
 	// (a global is deleted too); def filters an unresolved one.
-	if alias != nil && alias.KindId() == k.identifier {
+	if !alias.IsNull() && alias.KindId() == k.identifier {
 		f := j.b.OpenFinally()
 		j.block(body)
 		normal := j.b.EnterFinally(f, as)
@@ -1831,62 +1832,62 @@ func (j *pyLower) except(c *ts.Node, star bool) bool {
 // asParts splits an as-pattern value `e as t` of a with item or an except
 // clause into e and the target t, which the grammar wraps in an
 // as_pattern_target node holding one expression.
-func (j *pyLower) asParts(v *ts.Node) (e, t *ts.Node) {
+func (j *pyLower) asParts(v Node) (e, t Node) {
 	start, list := j.kids(v)
 	x := list[0]
-	t = firstNamed(&list[1])
+	t = firstNamed(list[1])
 	j.done(start)
-	return &x, t
+	return x, t
 }
 
 // withStmt lowers with and async with (see Node granularity).
-func (j *pyLower) withStmt(n *ts.Node) {
+func (j *pyLower) withStmt(n Node) {
 	k := j.k
 	var kw flow.Span
-	var clause ts.Node
+	var clause Node
 	c := j.cur
-	c.Reset(*n)
+	c.Reset(n)
 	for ok := c.GotoFirstChild(); ok; ok = c.GotoNextSibling() {
 		switch x := c.Node(); {
 		case !x.IsNamed() && x.KindId() == k.withKw:
 			kw = spanOf(x)
 		case x.KindId() == k.withClause:
-			clause = *x
+			clause = x
 		}
 	}
-	start, items := j.kids(&clause)
+	start, items := j.kids(clause)
 	base := len(j.fins)
 	for i := range items {
 		j.reset()
-		mgr, target := j.withParts(&items[i])
+		mgr, target := j.withParts(items[i])
 		j.value(mgr)
 		j.throws++ // __enter__
-		a := j.node(flow.Stmt, &items[i], 0, len(j.reads))
+		a := j.node(flow.Stmt, items[i], 0, len(j.reads))
 		m := j.b.Var()
 		j.b.Def(a, m)
 		j.mgrs = append(j.mgrs, m)
-		var t *ts.Node
-		if target != nil {
+		var t Node
+		if !target.IsNull() {
 			t = j.l.unparen(target)
 		}
-		if t != nil && t.KindId() == k.identifier {
+		if !t.IsNull() && t.KindId() == k.identifier {
 			j.def(a, j.lookup(t))
-			t = nil
+			t = Node{}
 		}
 		// A pattern or reference target is bound from the entered value,
 		// which a defines.
 		ev := int32(-1)
-		if t != nil {
+		if !t.IsNull() {
 			ev = j.b.Var()
 			j.b.Def(a, ev)
 		}
 		j.fins = append(j.fins, j.b.OpenFinally())
-		if t != nil {
+		if !t.IsNull() {
 			// A failing assignment to a pattern or reference target runs
 			// __exit__ (§8.5), so it is bound inside the item's finally.
 			j.reset()
 			j.read(ev)
-			j.bind(t, nil, 0, len(j.reads))
+			j.bind(t, Node{}, 0, len(j.reads))
 		}
 	}
 	j.block(n.ChildByFieldId(k.fBody))
@@ -1909,11 +1910,11 @@ func (j *pyLower) withStmt(n *ts.Node) {
 	j.done(start)
 }
 
-// withParts is a with item's context expression and its `as` target, or nil.
-func (j *pyLower) withParts(item *ts.Node) (mgr, target *ts.Node) {
+// withParts is a with item's context expression and its `as` target, or null.
+func (j *pyLower) withParts(item Node) (mgr, target Node) {
 	v := item.ChildByFieldId(j.k.fValue)
 	if v.KindId() != j.k.asPattern {
-		return v, nil
+		return v, Node{}
 	}
 	return j.asParts(v)
 }
@@ -1929,16 +1930,16 @@ const (
 // pattern walks case pattern p in mode. capture reports that a bare dotted
 // name in p's position is a capture (it is a value everywhere else: a class
 // name, a mapping key).
-func (j *pyLower) pattern(p *ts.Node, mode int, capture bool) {
+func (j *pyLower) pattern(p Node, mode int, capture bool) {
 	k := j.k
 	switch p.KindId() {
 	case k.dottedName:
 		start, parts := j.kids(p)
 		switch {
 		case capture && len(parts) == 1:
-			j.capture(&parts[0], mode)
+			j.capture(parts[0], mode)
 		case mode == patReads:
-			j.ref(&parts[0])
+			j.ref(parts[0])
 			if len(parts) > 1 {
 				j.throws++
 			}
@@ -1948,9 +1949,9 @@ func (j *pyLower) pattern(p *ts.Node, mode int, capture bool) {
 		start, list := j.kids(p)
 		for i := range list {
 			if list[i].KindId() == k.identifier {
-				j.capture(&list[i], mode)
+				j.capture(list[i], mode)
 			} else {
-				j.pattern(&list[i], mode, true)
+				j.pattern(list[i], mode, true)
 			}
 		}
 		j.done(start)
@@ -1960,17 +1961,17 @@ func (j *pyLower) pattern(p *ts.Node, mode int, capture bool) {
 		}
 		start, list := j.kids(p)
 		for i := range list {
-			j.pattern(&list[i], mode, i > 0)
+			j.pattern(list[i], mode, i > 0)
 		}
 		j.done(start)
 	case k.keywordPattern:
 		start, list := j.kids(p)
 		for i := 1; i < len(list); i++ {
-			j.pattern(&list[i], mode, true)
+			j.pattern(list[i], mode, true)
 		}
 		j.done(start)
 	case k.splatPattern:
-		if c := firstNamed(p); c != nil {
+		if c := firstNamed(p); !c.IsNull() {
 			j.capture(c, mode)
 		}
 	case k.dictPattern:
@@ -1980,7 +1981,7 @@ func (j *pyLower) pattern(p *ts.Node, mode int, capture bool) {
 		start, list := j.kids(p)
 		for i := range list {
 			id := list[i].KindId()
-			j.pattern(&list[i], mode, id == k.casePattern || id == k.splatPattern)
+			j.pattern(list[i], mode, id == k.casePattern || id == k.splatPattern)
 		}
 		j.done(start)
 	case k.listPattern, k.tuplePattern:
@@ -1993,10 +1994,10 @@ func (j *pyLower) pattern(p *ts.Node, mode int, capture bool) {
 	}
 }
 
-func (j *pyLower) patternKids(p *ts.Node, mode int) {
+func (j *pyLower) patternKids(p Node, mode int) {
 	start, list := j.kids(p)
 	for i := range list {
-		j.pattern(&list[i], mode, true)
+		j.pattern(list[i], mode, true)
 	}
 	j.done(start)
 }
@@ -2004,7 +2005,7 @@ func (j *pyLower) patternKids(p *ts.Node, mode int) {
 // capture handles one captured name in mode: a binding site, nothing to
 // read, or a defining node using the match subjects' variable, held in
 // reads[0:].
-func (j *pyLower) capture(name *ts.Node, mode int) {
+func (j *pyLower) capture(name Node, mode int) {
 	switch mode {
 	case patSites:
 		j.site(name)
@@ -2014,7 +2015,7 @@ func (j *pyLower) capture(name *ts.Node, mode int) {
 }
 
 // irrefutable reports whether case pattern p always matches (§8.6.3).
-func (j *pyLower) irrefutable(p *ts.Node) bool {
+func (j *pyLower) irrefutable(p Node) bool {
 	k := j.k
 	start, list := j.kids(p)
 	r := false
@@ -2024,40 +2025,40 @@ func (j *pyLower) irrefutable(p *ts.Node) bool {
 		if len(list) == 0 {
 			r = true
 		} else {
-			r = len(list) == 1 && j.irrefutable(&list[0])
+			r = len(list) == 1 && j.irrefutable(list[0])
 		}
 	case k.dottedName:
 		r = len(list) == 1
 	case k.asPattern:
-		r = len(list) > 0 && list[0].KindId() == k.casePattern && j.irrefutable(&list[0])
+		r = len(list) > 0 && list[0].KindId() == k.casePattern && j.irrefutable(list[0])
 	case k.unionPattern:
 		_, r = j.token(p, k.underscore)
 		for i := range list {
-			r = r || j.irrefutable(&list[i])
+			r = r || j.irrefutable(list[i])
 		}
 	case k.tuplePattern:
 		// A parenthesized group `(p)`, not a one-element sequence `(p,)`.
 		_, comma := j.token(p, k.comma)
-		r = len(list) == 1 && !comma && j.irrefutable(&list[0])
+		r = len(list) == 1 && !comma && j.irrefutable(list[0])
 	}
 	j.done(start)
 	return r
 }
 
-func (j *pyLower) matchStmt(n *ts.Node) {
+func (j *pyLower) matchStmt(n Node) {
 	k := j.k
 	body := n.ChildByFieldId(k.fBody)
 	start, list := j.kids(n)
-	var lo, hi *ts.Node
+	var lo, hi Node
 	for i := range list {
 		if list[i].StartByte() == body.StartByte() {
 			continue
 		}
-		if lo == nil {
-			lo = &list[i]
+		if lo.IsNull() {
+			lo = list[i]
 		}
-		hi = &list[i]
-		j.value(&list[i])
+		hi = list[i]
+		j.value(list[i])
 	}
 	// The subjects are evaluated once, at a node defining sv; every case
 	// and capture node Uses sv, never the names the subjects read.
@@ -2072,24 +2073,24 @@ func (j *pyLower) matchStmt(n *ts.Node) {
 	base := len(j.hold)
 	s2, cases := j.kids(body)
 	for c := range cases {
-		cc := &cases[c]
+		cc := cases[c]
 		if cc.KindId() != k.caseClause {
 			continue
 		}
 		s3, parts := j.kids(cc)
 		subj()
-		var plo, phi *ts.Node
+		var plo, phi Node
 		for i := range parts {
 			if parts[i].KindId() == k.casePattern {
-				if plo == nil {
-					plo = &parts[i]
+				if plo.IsNull() {
+					plo = parts[i]
 				}
-				phi = &parts[i]
-				j.pattern(&parts[i], patReads, true)
+				phi = parts[i]
+				j.pattern(parts[i], patReads, true)
 			}
 		}
 		guard := cc.ChildByFieldId(k.fGuard)
-		irref := plo == phi && plo != nil && j.irrefutable(plo)
+		irref := plo == phi && !plo.IsNull() && j.irrefutable(plo)
 		kind := flow.Branch
 		if irref {
 			kind = flow.Stmt
@@ -2102,11 +2103,11 @@ func (j *pyLower) matchStmt(n *ts.Node) {
 		subj()
 		for i := range parts {
 			if parts[i].KindId() == k.casePattern {
-				j.pattern(&parts[i], patDefs, true)
+				j.pattern(parts[i], patDefs, true)
 			}
 		}
 		var gmiss flow.Fringe
-		if guard != nil {
+		if !guard.IsNull() {
 			j.reset()
 			j.cond(firstNamed(guard))
 			gmiss = j.b.Push()
@@ -2117,10 +2118,10 @@ func (j *pyLower) matchStmt(n *ts.Node) {
 		switch {
 		case !irref:
 			j.b.Restore(miss)
-			if guard != nil {
+			if !guard.IsNull() {
 				j.b.Merge(gmiss)
 			}
-		case guard != nil:
+		case !guard.IsNull():
 			j.b.Restore(gmiss)
 		}
 	}
@@ -2130,7 +2131,7 @@ func (j *pyLower) matchStmt(n *ts.Node) {
 }
 
 // comprehension lowers a comprehension's own graph (see Node granularity).
-func (j *pyLower) comprehension(fn *ts.Node) {
+func (j *pyLower) comprehension(fn Node) {
 	k := j.k
 	body := fn.ChildByFieldId(k.fBody)
 	start, list := j.kids(fn)
@@ -2145,7 +2146,7 @@ func (j *pyLower) comprehension(fn *ts.Node) {
 	// The first iterable is the enclosing function's, its iterator passed
 	// in as an implicit argument (§6.2.4): a parameter-like node spanning
 	// it, reading nothing, defines the first clause's iteration variable.
-	first := &clauses[0]
+	first := clauses[0]
 	j.reset()
 	it := j.b.Var()
 	j.b.Def(j.nodeAt(flow.Stmt, j.iterable(first, false), 0, 0), it)
@@ -2155,20 +2156,20 @@ func (j *pyLower) comprehension(fn *ts.Node) {
 
 // iterable is the span of for clause c's iterable, from its first
 // expression to its last; lower evaluates each of them for its value.
-func (j *pyLower) iterable(c *ts.Node, lower bool) flow.Span {
+func (j *pyLower) iterable(c Node, lower bool) flow.Span {
 	left := c.ChildByFieldId(j.k.fLeft)
 	start, parts := j.kids(c)
-	var lo, hi *ts.Node
+	var lo, hi Node
 	for p := range parts {
 		if parts[p].StartByte() == left.StartByte() {
 			continue
 		}
-		if lo == nil {
-			lo = &parts[p]
+		if lo.IsNull() {
+			lo = parts[p]
 		}
-		hi = &parts[p]
+		hi = parts[p]
 		if lower {
-			j.value(&parts[p])
+			j.value(parts[p])
 		}
 	}
 	sp := flow.Span{Start: uint32(lo.StartByte()), End: uint32(hi.EndByte())}
@@ -2178,14 +2179,14 @@ func (j *pyLower) iterable(c *ts.Node, lower bool) flow.Span {
 
 // clauses lowers comprehension clauses cs[i:] around the element body; it
 // is the first clause's iteration variable.
-func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node, it int32) {
+func (j *pyLower) clauses(cs []Node, i int, body Node, it int32) {
 	k := j.k
 	if i == len(cs) {
 		j.reset()
 		j.yield(body, -1)
 		return
 	}
-	c := &cs[i]
+	c := cs[i]
 	if c.KindId() == k.ifClause {
 		j.reset()
 		j.cond(firstNamed(c))
@@ -2211,7 +2212,7 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node, it int32) {
 	j.throws++
 	h := j.node(flow.Branch, c, 0, len(j.reads))
 	exit := j.b.Push()
-	j.bind(left, nil, 0, len(j.reads))
+	j.bind(left, Node{}, 0, len(j.reads))
 	j.clauses(cs, i+1, body, it)
 	j.b.Close(h)
 	j.b.Restore(exit)
@@ -2226,7 +2227,7 @@ func (j *pyLower) clauses(cs []ts.Node, i int, body *ts.Node, it int32) {
 // reads. It defines dst, the created value (a def or class statement's
 // name, or the result variable of a lambda or comprehension), and
 // may-defines every enclosing variable n assigns.
-func (j *pyLower) closure(n, at *ts.Node, from int, dst int32) {
+func (j *pyLower) closure(n, at Node, from int, dst int32) {
 	w := len(j.writes)
 	j.nested(n, true)
 	id := j.node(flow.Stmt, at, from, len(j.reads))
@@ -2239,8 +2240,8 @@ func (j *pyLower) closure(n, at *ts.Node, from int, dst int32) {
 }
 
 // eval lowers x for its value (lower) or collects its captures.
-func (j *pyLower) eval(x *ts.Node, lower bool) {
-	if x == nil {
+func (j *pyLower) eval(x Node, lower bool) {
+	if x.IsNull() {
 		return
 	}
 	if lower {
@@ -2253,27 +2254,27 @@ func (j *pyLower) eval(x *ts.Node, lower bool) {
 // deferred reports whether the module holding fn imports annotations from
 // __future__. A future statement may follow only the docstring (§7.11.1),
 // so only the module's leading statements are read.
-func (j *pyLower) deferred(fn *ts.Node) bool {
+func (j *pyLower) deferred(fn Node) bool {
 	k := j.k
 	m := fn
-	for p := m.Parent(); p != nil; p = p.Parent() {
+	for p := m.Parent(); !p.IsNull(); p = p.Parent() {
 		m = p
 	}
 	// The walk stops at the first statement that is neither, so a module's
 	// size never enters it.
-	for i, c := uint(0), m.NamedChild(0); c != nil; c = c.NextNamedSibling() {
+	for i, c := uint(0), m.NamedChild(0); !c.IsNull(); c = c.NextNamedSibling() {
 		if c.IsExtra() {
 			continue
 		}
 		switch c.KindId() {
 		case k.expressionStatement:
-			if x := firstNamed(c); i != 0 || x == nil || x.KindId() != k.stringLit {
+			if x := firstNamed(c); i != 0 || x.IsNull() || x.KindId() != k.stringLit {
 				return false
 			}
 		case k.futureImportStatement:
 			start, names := j.kids(c)
 			for x := range names {
-				nm := &names[x]
+				nm := names[x]
 				if nm.KindId() == k.aliasedImport {
 					nm = nm.ChildByFieldId(k.fName)
 				}
@@ -2299,9 +2300,9 @@ func (j *pyLower) eager() bool { return !j.lazy && (j.module || j.frames[0].clas
 // signature evaluates the parameter and return annotations of function
 // definition fn, which the enclosing function evaluates where fn is created
 // (§8.7), for their value (lower) or their captures.
-func (j *pyLower) signature(fn *ts.Node, lower bool) {
+func (j *pyLower) signature(fn Node, lower bool) {
 	k := j.k
-	if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+	if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 		start, list := j.kids(ps)
 		for i := range list {
 			if id := list[i].KindId(); id == k.typedParameter || id == k.typedDefaultParameter {
@@ -2318,8 +2319,8 @@ func (j *pyLower) signature(fn *ts.Node, lower bool) {
 // annotation's type forms apart from expressions: `n[a]` is a subscript,
 // `t.n` an attribute whose name is no read, `*n` an unpacking, `a | b` an
 // operator.
-func (j *pyLower) annotation(t *ts.Node, lower bool) {
-	if t == nil || j.lazy {
+func (j *pyLower) annotation(t Node, lower bool) {
+	if t.IsNull() || j.lazy {
 		return
 	}
 	k := j.k
@@ -2327,14 +2328,14 @@ func (j *pyLower) annotation(t *ts.Node, lower bool) {
 	case k.typeKind, k.unionType, k.typeParameter, k.constrainedType:
 		start, list := j.kids(t)
 		for i := range list {
-			j.annotation(&list[i], lower)
+			j.annotation(list[i], lower)
 		}
 		j.done(start)
 	case k.genericType:
 		start, list := j.kids(t)
-		j.eval(&list[0], lower)
+		j.eval(list[0], lower)
 		for i := 1; i < len(list); i++ {
-			j.annotation(&list[i], lower)
+			j.annotation(list[i], lower)
 		}
 		j.done(start)
 		if lower {
@@ -2358,7 +2359,7 @@ func (j *pyLower) annotation(t *ts.Node, lower bool) {
 // nested evaluates the parts of nested callable n evaluated where it is
 // created (lowered when lower, else captured), then collects the captures of
 // its own code in a frame of its own.
-func (j *pyLower) nested(n *ts.Node, lower bool) {
+func (j *pyLower) nested(n Node, lower bool) {
 	k := j.k
 	id := n.KindId()
 	switch id {
@@ -2369,7 +2370,7 @@ func (j *pyLower) nested(n *ts.Node, lower bool) {
 		j.eval(n.ChildByFieldId(k.fSuperclasses), lower)
 	default:
 		start, list := j.kids(n)
-		j.firstIterable(list, func(r *ts.Node) { j.eval(r, lower) })
+		j.firstIterable(list, func(r Node) { j.eval(r, lower) })
 		j.done(start)
 	}
 	// Creating a class or a comprehension may throw; one a nested callable
@@ -2395,9 +2396,9 @@ func (j *pyLower) nested(n *ts.Node, lower bool) {
 // throwing constructs counted, and nodes created for every decision, every
 // conditionally evaluated operand, every definition and every nested
 // callable.
-func (j *pyLower) value(n *ts.Node) {
+func (j *pyLower) value(n Node) {
 	k := j.k
-	if n == nil {
+	if n.IsNull() {
 		return
 	}
 	if j.l.isCallable(n) {
@@ -2437,7 +2438,7 @@ func (j *pyLower) value(n *ts.Node) {
 // operand is a Branch node spanning it that defines dst, the value when it
 // decides, and the right operand, evaluated on its other edge, defines dst
 // again.
-func (j *pyLower) shortCircuit(n *ts.Node, dst int32) {
+func (j *pyLower) shortCircuit(n Node, dst int32) {
 	left := j.l.unparen(n.ChildByFieldId(j.k.fLeft))
 	m := len(j.reads)
 	j.value(left)
@@ -2454,19 +2455,19 @@ func (j *pyLower) shortCircuit(n *ts.Node, dst int32) {
 
 // conditional lowers `a if c else b` (§6.13) into dst: c is a Branch node
 // spanning it, and each arm yields its value into dst.
-func (j *pyLower) conditional(n *ts.Node, dst int32) {
+func (j *pyLower) conditional(n Node, dst int32) {
 	// Children: the value if true, the condition, the value if false.
 	start, list := j.kids(n)
 	m := len(j.reads)
-	j.cond(&list[1])
+	j.cond(list[1])
 	j.reads = j.reads[:m]
 	saved := j.region
 	j.region = m
 	p := j.b.Push()
-	j.yield(&list[0], dst)
+	j.yield(list[0], dst)
 	t := j.b.Push()
 	j.b.Restore(p)
-	j.yield(&list[2], dst)
+	j.yield(list[2], dst)
 	j.region = saved
 	j.b.Merge(t)
 	j.b.Pop(p)
@@ -2476,7 +2477,7 @@ func (j *pyLower) conditional(n *ts.Node, dst int32) {
 // walrus lowers `x := e` (§6.12) into dst: one node spanning it Uses e's
 // reads and defines x, when x is a variable of this function, and dst, each
 // a killing definition (see Uses in Lowering).
-func (j *pyLower) walrus(n *ts.Node, dst int32) {
+func (j *pyLower) walrus(n Node, dst int32) {
 	m := len(j.reads)
 	j.value(n.ChildByFieldId(j.k.fValue))
 	id := j.node(flow.Stmt, n, m, len(j.reads))
@@ -2487,7 +2488,7 @@ func (j *pyLower) walrus(n *ts.Node, dst int32) {
 
 // chained reports whether comparison n is a chain of more than one
 // comparison.
-func (j *pyLower) chained(n *ts.Node) bool {
+func (j *pyLower) chained(n Node) bool {
 	start, ops := j.kids(n)
 	j.done(start)
 	return len(ops) > 2
@@ -2503,15 +2504,15 @@ func (j *pyLower) chained(n *ts.Node) bool {
 // one defines a held variable of its own, and the comparison it ends is a
 // Branch node spanning both operands that Uses the two held variables and
 // defines dst.
-func (j *pyLower) chain(n *ts.Node, dst int32) {
+func (j *pyLower) chain(n Node, dst int32) {
 	start, ops := j.kids(n)
-	span := func(a, b *ts.Node) flow.Span {
+	span := func(a, b Node) flow.Span {
 		return flow.Span{Start: uint32(a.StartByte()), End: uint32(b.EndByte())}
 	}
 	m := len(j.reads)
-	j.value(&ops[0])
-	j.value(&ops[1])
-	id := j.nodeAt(flow.Branch, span(&ops[0], &ops[1]), m, len(j.reads))
+	j.value(ops[0])
+	j.value(ops[1])
+	id := j.nodeAt(flow.Branch, span(ops[0], ops[1]), m, len(j.reads))
 	j.reads = j.reads[:m]
 	j.def(id, dst)
 	held := j.b.Var()
@@ -2522,7 +2523,7 @@ func (j *pyLower) chain(n *ts.Node, dst int32) {
 	saved := j.region
 	j.region = m
 	for i := 2; i < len(ops); i++ {
-		o := j.l.unparen(&ops[i])
+		o := j.l.unparen(ops[i])
 		j.value(o)
 		x := j.node(flow.Stmt, o, m, len(j.reads))
 		j.reads = j.reads[:m]
@@ -2533,7 +2534,7 @@ func (j *pyLower) chain(n *ts.Node, dst int32) {
 		}
 		next := j.b.Var()
 		j.b.Def(x, next)
-		h := j.nodeAt(flow.Branch, span(&ops[i-1], &ops[i]), m, m)
+		h := j.nodeAt(flow.Branch, span(ops[i-1], ops[i]), m, m)
 		j.b.Use(h, held)
 		j.b.Use(h, next)
 		j.def(h, dst)
@@ -2548,13 +2549,13 @@ func (j *pyLower) chain(n *ts.Node, dst int32) {
 
 // children walks n's named children, lowering them (lower) or collecting
 // their captures.
-func (j *pyLower) children(n *ts.Node, lower bool) {
+func (j *pyLower) children(n Node, lower bool) {
 	start, list := j.kids(n)
 	for i := range list {
 		if lower {
-			j.value(&list[i])
+			j.value(list[i])
 		} else {
-			j.cap(&list[i])
+			j.cap(list[i])
 		}
 	}
 	j.done(start)
@@ -2565,9 +2566,9 @@ func (j *pyLower) children(n *ts.Node, lower bool) {
 // `:=`, or a for, with, except or del target binds is written there, not
 // read (its write was recorded when the callable's sites were scanned); an
 // augmented assignment's target is read too.
-func (j *pyLower) cap(n *ts.Node) {
+func (j *pyLower) cap(n Node) {
 	k := j.k
-	if n == nil {
+	if n.IsNull() {
 		return
 	}
 	if j.l.isCallable(n) {
@@ -2596,16 +2597,16 @@ func (j *pyLower) cap(n *ts.Node) {
 		start, list := j.kids(n)
 		for i := range list {
 			if list[i].KindId() == k.asPatternTarget {
-				j.capTarget(&list[i])
+				j.capTarget(list[i])
 			} else {
-				j.cap(&list[i])
+				j.cap(list[i])
 			}
 		}
 		j.done(start)
 	case k.deleteStatement:
 		start, list := j.kids(n)
 		for i := range list {
-			j.capTarget(&list[i])
+			j.capTarget(list[i])
 		}
 		j.done(start)
 	case k.caseClause:
@@ -2616,10 +2617,10 @@ func (j *pyLower) cap(n *ts.Node) {
 		for i := range list {
 			if list[i].KindId() == k.casePattern {
 				t := j.throws
-				j.pattern(&list[i], patReads, true)
+				j.pattern(list[i], patReads, true)
 				j.throws = t
 			} else {
-				j.cap(&list[i])
+				j.cap(list[i])
 			}
 		}
 		j.done(start)
@@ -2633,7 +2634,7 @@ func (j *pyLower) cap(n *ts.Node) {
 	case k.keywordPattern:
 		start, list := j.kids(n)
 		for i := 1; i < len(list); i++ {
-			j.cap(&list[i])
+			j.cap(list[i])
 		}
 		j.done(start)
 	case k.importStatement, k.importFromStatement, k.futureImportStatement, k.globalStatement, k.nonlocalStatement,
@@ -2646,9 +2647,9 @@ func (j *pyLower) cap(n *ts.Node) {
 // capTarget collects the references of a binding target: a name is written
 // and records nothing, an attribute's object and a subscript's value and
 // index are read, and a pattern's elements are targets in turn.
-func (j *pyLower) capTarget(t *ts.Node) {
+func (j *pyLower) capTarget(t Node) {
 	k := j.k
-	if t == nil {
+	if t.IsNull() {
 		return
 	}
 	switch t.KindId() {
@@ -2659,7 +2660,7 @@ func (j *pyLower) capTarget(t *ts.Node) {
 		k.listSplatPattern, k.listSplat, k.asPatternTarget:
 		start, list := j.kids(t)
 		for i := range list {
-			j.capTarget(&list[i])
+			j.capTarget(list[i])
 		}
 		j.done(start)
 	default:

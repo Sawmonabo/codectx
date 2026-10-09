@@ -256,10 +256,14 @@ type Lowering struct {
 	// descend into them, so a callable written there is not a function.
 	ambient []string
 	// lower drives b over fn's parameters and body in source order, keeping
-	// every reusable list in s. It must not descend into a nested callable
-	// (l.isCallable reports one) beyond the expression that creates it.
-	// Begin and Finish are Lower's.
-	lower func(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch)
+	// every reusable list in s. fn is a node of the file's flat array
+	// (Flatten), read with no native call; the native tree is closed before
+	// any function is lowered. It must not descend into a nested callable
+	// (l.isCallable reports one) beyond the expression that creates it. It
+	// declares every parameter and local with b.Named over the declaring
+	// identifier's span, and every variable it owns with b.Var. Begin and
+	// Finish are Lower's.
+	lower func(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch)
 
 	// once resolves callable and paren against the grammar, so every shared
 	// helper compares kind ids rather than kind strings.
@@ -356,32 +360,33 @@ func mustField(tl *ts.Language, language, name string) uint16 {
 
 // isCallable reports whether n begins a function of this language. An error
 // node's id lies outside the grammar's kind count.
-func (l *Lowering) isCallable(n *ts.Node) bool {
+func (l *Lowering) isCallable(n Node) bool {
 	id := n.KindId()
 	return n.IsNamed() && int(id) < len(l.callable) && l.callable[id]
 }
 
 // isAmbient reports whether n is of an ambient kind.
-func (l *Lowering) isAmbient(n *ts.Node) bool {
+func (l *Lowering) isAmbient(n Node) bool {
 	id := n.KindId()
 	return n.IsNamed() && int(id) < len(l.opaque) && l.opaque[id]
 }
 
-// unparen strips parentheses around n.
-func (l *Lowering) unparen(n *ts.Node) *ts.Node {
-	for n != nil && n.KindId() == l.paren {
+// unparen strips parentheses around n; a null n stays null.
+func (l *Lowering) unparen(n Node) Node {
+	for !n.IsNull() && n.KindId() == l.paren {
 		n = firstNamed(n)
 	}
 	return n
 }
 
 // Functions calls visit with every callable under root, root included, in
-// preorder, nested callables included, in one tree-cursor walk. It stops at
-// and returns the first error visit returns. A unit with no code of its own
+// preorder, nested callables included, in one cursor walk of the flat array.
+// It stops at and returns the first error visit returns. A unit with no code
+// of its own
 // (a class body without initializers or static blocks) is still visited and
 // lowers to Entry -> Exit, so a count of callables counts it. The subtree of
 // an ambient kind is not walked.
-func (l *Lowering) Functions(root *ts.Node, visit func(fn *ts.Node) error) error {
+func (l *Lowering) Functions(root Node, visit func(fn Node) error) error {
 	c := root.Walk()
 	defer c.Close()
 	for {
@@ -404,10 +409,10 @@ func (l *Lowering) Functions(root *ts.Node, visit func(fn *ts.Node) error) error
 
 // Lower builds fn's graph in a: Begin over fn's byte range, the language's
 // lowering, Finish. fn must be a node Functions visited, and src the source
-// its tree was parsed from, unchanged while fn is lowered. The graph is valid
-// until the next a.Begin. s is the worker's lowering scratch; one Scratch
-// serves every language and every function a worker lowers.
-func (l *Lowering) Lower(fn *ts.Node, src []byte, a *flow.Arena, s *Scratch) *flow.Graph {
+// its flat array was flattened from, unchanged while fn is lowered. The graph
+// is valid until the next a.Begin. s is the worker's lowering scratch; one
+// Scratch serves every language and every function a worker lowers.
+func (l *Lowering) Lower(fn Node, src []byte, a *flow.Arena, s *Scratch) *flow.Graph {
 	b := a.Begin(spanOf(fn))
 	s.scope.truncate(0)
 	l.lower(l, b, fn, src, s)
@@ -416,11 +421,11 @@ func (l *Lowering) Lower(fn *ts.Node, src []byte, a *flow.Arena, s *Scratch) *fl
 }
 
 // Scratch is one worker's reusable lowering state, the pointer-bearing
-// counterpart of flow.Arena: the tree cursor every lowering walks with, the
+// counterpart of flow.Arena: the flat cursor every lowering walks with, the
 // scope chain every lowering resolves names through, and each language's
-// lowering state, whose lists keep their capacity from one
-// function to the next. The zero value is ready to use; Close releases the
-// cursor. It is not safe for concurrent use: one Scratch per worker, beside
+// lowering state, whose lists keep their capacity from one function to the
+// next. The zero value is ready to use; Close drops all of it at the file
+// boundary. It is not safe for concurrent use: one Scratch per worker, beside
 // its Arena.
 //
 // Each language's state is created on first use and, at the start of every
@@ -432,7 +437,7 @@ func (l *Lowering) Lower(fn *ts.Node, src []byte, a *flow.Arena, s *Scratch) *fl
 type Scratch struct {
 	// cur is the cursor, created by the first Lower and Reset to each
 	// function's node after it.
-	cur *ts.TreeCursor
+	cur *Cursor
 	// scope is the scope chain of the function being lowered, empty between
 	// functions.
 	scope scope
@@ -445,30 +450,28 @@ type Scratch struct {
 }
 
 // cursor is s's tree cursor reset to fn.
-func (s *Scratch) cursor(fn *ts.Node) *ts.TreeCursor {
+func (s *Scratch) cursor(fn Node) *Cursor {
 	if s.cur == nil {
 		s.cur = fn.Walk()
 	} else {
-		s.cur.Reset(*fn)
+		s.cur.Reset(fn)
 	}
 	return s.cur
 }
 
-// Close releases the cursor. s stays usable: the next Lower creates another.
-func (s *Scratch) Close() {
-	if s.cur != nil {
-		s.cur.Close()
-		s.cur = nil
-	}
-}
+// Close drops the cursor, the scope chain and every language's state, at
+// the file boundary: their lists hold handles on the file's flat array and
+// views of its source, and keeping their capacity would keep both alive into
+// the next file. s stays usable: the next Lower starts afresh.
+func (s *Scratch) Close() { *s = Scratch{} }
 
 // spanOf is n's byte range.
-func spanOf(n *ts.Node) flow.Span {
+func spanOf(n Node) flow.Span {
 	return flow.Span{Start: uint32(n.StartByte()), End: uint32(n.EndByte())}
 }
 
 // textOf is n's source text in src, the source its tree was parsed from.
-func textOf(src []byte, n *ts.Node) []byte { return src[n.StartByte():n.EndByte()] }
+func textOf(src []byte, n Node) []byte { return src[n.StartByte():n.EndByte()] }
 
 // view is b as a string without a copy: a label or a scope key names the
 // source bytes themselves. It is sound because the source is not modified
@@ -478,14 +481,14 @@ func textOf(src []byte, n *ts.Node) []byte { return src[n.StartByte():n.EndByte(
 func view(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
 
 // firstNamed is n's first named child that is not an extra (a comment), or
-// nil.
-func firstNamed(n *ts.Node) *ts.Node {
+// null.
+func firstNamed(n Node) Node {
 	for i := range n.NamedChildCount() {
 		if c := n.NamedChild(i); !c.IsExtra() {
 			return c
 		}
 	}
-	return nil
+	return Node{}
 }
 
 // binding is one name in scope: name, a view of the source, resolves to

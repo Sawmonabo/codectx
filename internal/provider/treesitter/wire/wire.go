@@ -1,6 +1,7 @@
 // Package wire is the framed protocol between the tree-sitter provider and
 // its parser worker subprocess. Every message -- a hello, a request, a source
-// file, one fact record, a done or an error -- travels as one or more
+// file, one fact record, one function's dependence facts, a done or an
+// error -- travels as one or more
 // length-prefixed frames of at most ChunkBytes each; a message longer than one
 // frame continues in frames of the same kind, and the reader reassembles it
 // whole. No message has a size limit of its own: a source file is bounded by
@@ -36,12 +37,18 @@ const (
 	// message of exactly Request.SourceBytes bytes.
 	KindRequest Kind = 2
 	KindSource  Kind = 3
-	// Fact messages, one record each, then KindDone or KindError.
+	// Fact messages, one record each, then KindDone or KindError. A
+	// file's answer is every KindDecl, KindImport and KindRef message, then
+	// one KindFunction message per callable in the lowering's preorder, then
+	// KindDone.
 	KindDecl   Kind = 4
 	KindImport Kind = 5
 	KindRef    Kind = 6
 	KindDone   Kind = 7
 	KindError  Kind = 8
+	// KindFunction carries one callable's dependence facts in the binary
+	// encoding of AppendFunction, never JSON.
+	KindFunction Kind = 9
 )
 
 // ChunkBytes is the transport unit, not a limit on anything carried: the
@@ -149,6 +156,11 @@ type Decl struct {
 	Qualified string `json:"qualified"`
 	Start     uint32 `json:"start"`
 	End       uint32 `json:"end"`
+	// NameStart and NameEnd bound the declaration's name token alone, inside
+	// [Start, End). A variable the dependence pass declares at that token is
+	// this declaration, not a second entity.
+	NameStart uint32 `json:"name_start"`
+	NameEnd   uint32 `json:"name_end"`
 	SigEnd    uint32 `json:"sig_end"`
 	DocStart  uint32 `json:"doc_start"`
 	DocEnd    uint32 `json:"doc_end"`
@@ -211,6 +223,12 @@ type Done struct {
 	// Header is a header's grammar choice: the grammar each parse used, which
 	// was kept and why. It is nil for a request that named no fallback.
 	Header *lang.HeaderChoice `json:"header,omitempty"`
+	// DependenceFailure is why the file's dependence pass produced no
+	// function message at all: a failure outside every function's analysis,
+	// such as the tree failing to flatten. It is empty when the pass ran, and
+	// a function whose own analysis failed is disclosed by its message
+	// instead (Function.Failed). It never fails the file's structural facts.
+	DependenceFailure string `json:"dependence_failure,omitempty"`
 	// Memory is the worker's reading of itself at the end of this file.
 	Memory Memory `json:"memory"`
 }

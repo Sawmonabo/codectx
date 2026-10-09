@@ -500,7 +500,7 @@ func (p *pool) leaveStage(ctx context.Context) {
 // total. This is why no file is a span: a worker's files are two atomic adds
 // on a span that already exists, and the total is the sum of its workers.
 func (p *pool) count(ctx context.Context, w *worker, ex *extraction) {
-	records := int64(len(ex.decls) + len(ex.imports) + len(ex.refs))
+	records := int64(len(ex.decls) + len(ex.imports) + len(ex.refs) + len(ex.functions))
 	w.span.AddIn(1)
 	w.span.AddOut(records)
 	run := ledger.RunFromContext(ctx)
@@ -1112,14 +1112,16 @@ func (w *worker) stderrLine() string {
 }
 
 // extraction is one parsed file as the worker reported it: every record it
-// extracted, each reassembled whole from its frames. It is held for this one
-// file and released with it, which is what bounds the parent's heap for a
-// parse (see wire.ChunkBytes).
+// extracted, each reassembled whole from its frames, and one dependence
+// message per callable in the order the worker sent them. It is held for
+// this one file and released with it, which is what bounds the parent's heap
+// for a parse (see wire.ChunkBytes).
 type extraction struct {
-	decls   []wire.Decl
-	imports []wire.Import
-	refs    []wire.Ref
-	done    wire.Done
+	decls     []wire.Decl
+	imports   []wire.Import
+	refs      []wire.Ref
+	functions []wire.Function
+	done      wire.Done
 }
 
 // perFileError is a worker error frame: the file failed, the worker did not.
@@ -1202,6 +1204,14 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 				return nil, err
 			}
 			ex.refs = append(ex.refs, r)
+		case wire.KindFunction:
+			// A message no writer of this protocol produces is a protocol
+			// break like any other undecodable frame: the worker is retired.
+			f, err := wire.DecodeFunction(payload)
+			if err != nil {
+				return nil, err
+			}
+			ex.functions = append(ex.functions, f)
 		case wire.KindDone:
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err

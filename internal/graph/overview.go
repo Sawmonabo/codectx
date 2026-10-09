@@ -148,11 +148,8 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
 	meta.Notices = appendNotice(appendNotice(meta.Notices, depthNotice), limitNotice)
-	// The deferred flag is discarded deliberately: it reports that a
-	// DEPENDENCE-only kind was asked for while its units are still building,
-	// and both kinds this map counts are canonical ones no provider defers. The
-	// capability rows themselves still ride on every answer.
-	caps, _, err := e.completeness(ctx, overviewRelationKinds())
+	// The capability rows ride on every answer.
+	caps, err := e.completeness(ctx)
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}

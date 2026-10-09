@@ -5,7 +5,6 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
-	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -154,22 +153,6 @@ func (a adjacency) Capabilities(ctx context.Context) ([]model.CapabilityState, e
 }
 
 func (a adjacency) Binding() model.Binding { return a.reader.Binding() }
-
-// promoter adapts the index coordinator to the engine's Promoter port, which
-// declares the three pending fields locally so internal/graph never imports the
-// coordinator package. It is installed only in index mode: Coordinator.Promote
-// requires the workspace indexing lock and a report holds none.
-type promoter struct {
-	coord *index.Coordinator
-}
-
-func (p promoter) Promote(ctx context.Context, providerID, scopeKey string) (graph.PendingUnits, error) {
-	pending, err := p.coord.Promote(ctx, providerID, scopeKey)
-	if err != nil {
-		return graph.PendingUnits{}, err
-	}
-	return graph.PendingUnits{Units: pending.Units, Position: pending.Position, Estimate: pending.Estimate}, nil
-}
 
 // graphLimits resolves the traversal budget from the configuration once, so
 // every engine this process builds holds the same bounds and the engine itself

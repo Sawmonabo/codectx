@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"sync"
 
-	ts "github.com/tree-sitter/go-tree-sitter"
-
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 )
 
@@ -52,7 +50,7 @@ type jsGrammar struct {
 }
 
 // lower is the Lowering.lower of the grammar: lowerJavaScript over its table.
-func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch) {
+func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch) {
 	g.once.Do(func() { g.s = resolveJSSyntax(g.language) })
 	lowerJavaScript(l, b, fn, src, s, g.s)
 }
@@ -449,7 +447,7 @@ func (g *jsGrammar) lower(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte,
 //     defines it and may throw; `import x = A.B` is one spanning x that
 //     Uses A and defines x, and may throw when it reads a property.
 //   - `export = e` evaluates e like a default export.
-func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *Scratch, k *jsSyntax) {
+func lowerJavaScript(l *Lowering, b *flow.Builder, fn Node, src []byte, s *Scratch, k *jsSyntax) {
 	// The state is s.js, reset in place: every list keeps its capacity, and
 	// the lists holding nodes or views of the previous function's source are
 	// cleared first, so nothing of it outlives its function. seen is
@@ -467,32 +465,32 @@ func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *S
 		start, list := j.kids(fn)
 		for i := range list {
 			if list[i].KindId() == k.importStatement {
-				j.imports(&list[i])
+				j.imports(list[i])
 			}
 		}
 		j.done(start)
-		j.block(fn)
+		j.block(fn, true)
 	case k.classBody:
 		j.classBody(fn)
 	default:
-		if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+		if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 			start, list := j.kids(ps)
 			for i := range list {
-				j.declarePattern(&list[i], false)
+				j.declarePattern(list[i], false)
 			}
 			for i := range list {
 				j.reset()
-				j.bind(&list[i], 0, 0)
+				j.bind(list[i], 0, 0)
 			}
 			j.done(start)
-		} else if p := fn.ChildByFieldId(k.fParameter); p != nil {
+		} else if p := fn.ChildByFieldId(k.fParameter); !p.IsNull() {
 			v := j.declare(p)
 			j.def(j.node(flow.Stmt, p, 0, 0), v)
 		}
 		body := fn.ChildByFieldId(k.fBody)
 		if body.KindId() == k.statementBlock {
 			j.hoistVars(body)
-			j.block(body)
+			j.block(body, true)
 			return
 		}
 		j.reset()
@@ -502,13 +500,13 @@ func lowerJavaScript(l *Lowering, b *flow.Builder, fn *ts.Node, src []byte, s *S
 
 // classBody lowers a class body's unit: every field initializer and static
 // block, in source order.
-func (j *jsLower) classBody(n *ts.Node) {
+func (j *jsLower) classBody(n Node) {
 	k := j.k
 	start, list := j.kids(n)
 	for i := range list {
-		switch m := &list[i]; m.KindId() {
+		switch m := list[i]; m.KindId() {
 		case k.fieldDefinition, k.publicFieldDefinition:
-			if v := m.ChildByFieldId(k.fValue); v != nil {
+			if v := m.ChildByFieldId(k.fValue); !v.IsNull() {
 				j.reset()
 				j.value(v, false)
 				j.node(flow.Stmt, m, 0, len(j.reads))
@@ -518,7 +516,7 @@ func (j *jsLower) classBody(n *ts.Node) {
 			j.fnMark = mark
 			body := m.ChildByFieldId(k.fBody)
 			j.hoistVars(body)
-			j.block(body)
+			j.block(body, true)
 			j.binds.truncate(mark)
 		}
 	}
@@ -531,9 +529,11 @@ type jsLower struct {
 	b   *flow.Builder
 	src []byte
 	k   *jsSyntax
-	cur *ts.TreeCursor
+	// cur is the Scratch's cursor over the file's flat array, which kids and
+	// hasTok reset to the node they walk.
+	cur *Cursor
 	// buf is a stack of child lists; kids pushes one and done pops it.
-	buf []ts.Node
+	buf []Node
 	// binds is the scope chain, innermost last; fnMark is where the
 	// innermost function scope begins, the target of var hoisting.
 	binds  *scope
@@ -592,14 +592,14 @@ type jsLower struct {
 // node the parser made an extra, which its recovery does when it wraps what
 // it could not parse or a token it skipped, is kept: it is lowered as a kind
 // the lowering does not name is.
-func (j *jsLower) kids(n *ts.Node) (int, []ts.Node) {
+func (j *jsLower) kids(n Node) (int, []Node) {
 	start := len(j.buf)
 	c := j.cur
-	c.Reset(*n)
+	c.Reset(n)
 	if c.GotoFirstChild() {
 		for {
 			if x := c.Node(); x.IsNamed() && (!x.IsExtra() || x.IsError()) {
-				j.buf = append(j.buf, *x)
+				j.buf = append(j.buf, x)
 			}
 			if !c.GotoNextSibling() {
 				break
@@ -611,14 +611,14 @@ func (j *jsLower) kids(n *ts.Node) (int, []ts.Node) {
 
 func (j *jsLower) done(mark int) { j.buf = j.buf[:mark] }
 
-func (j *jsLower) text(n *ts.Node) []byte { return textOf(j.src, n) }
+func (j *jsLower) text(n Node) []byte { return textOf(j.src, n) }
 
-// declare binds name in the innermost scope: a new variable, or -1 inside a
-// nested callable.
-func (j *jsLower) declare(name *ts.Node) int32 {
+// declare binds name, the declaring identifier, in the innermost scope: a
+// new variable named by name's span, or -1 inside a nested callable.
+func (j *jsLower) declare(name Node) int32 {
 	v := int32(-1)
 	if j.shadow == 0 {
-		v = j.b.Var()
+		v = j.b.Named(spanOf(name))
 	}
 	j.binds.push(j.text(name), v)
 	return v
@@ -626,15 +626,15 @@ func (j *jsLower) declare(name *ts.Node) int32 {
 
 // lookup resolves name through the scope chain: its variable, or -1 when it
 // is declared inside a nested callable or not in this function at all.
-func (j *jsLower) lookup(name *ts.Node) int32 { return j.binds.lookup(j.text(name)) }
+func (j *jsLower) lookup(name Node) int32 { return j.binds.lookup(j.text(name)) }
 
 // boundSince reports whether name is bound in binds[from:].
-func (j *jsLower) boundSince(from int, name *ts.Node) bool {
+func (j *jsLower) boundSince(from int, name Node) bool {
 	return j.binds.find(j.text(name), from) >= 0
 }
 
 // ref records a read of name when it resolves to a variable of this function.
-func (j *jsLower) ref(name *ts.Node) { j.read(j.lookup(name)) }
+func (j *jsLower) ref(name Node) { j.read(j.lookup(name)) }
 
 // read records a read of v, unless v is -1.
 func (j *jsLower) read(v int32) {
@@ -698,7 +698,7 @@ func (j *jsLower) give(id int32, m int) {
 // the pending may-definitions made within those reads name, and MayThrow when
 // a throwing construct was evaluated since the previous node: that throw
 // happens before this node's definitions, which is what the Handler sees.
-func (j *jsLower) node(kind flow.Kind, n *ts.Node, from, to int) int32 {
+func (j *jsLower) node(kind flow.Kind, n Node, from, to int) int32 {
 	return j.nodeAt(kind, spanOf(n), from, to)
 }
 
@@ -807,7 +807,7 @@ func (j *jsLower) mark(v int32, at int) {
 // n. It returns the node standing for n and the start of the reads that
 // carry n's value, which that node Uses (a node that stood for n left its
 // result there).
-func (j *jsLower) valueNode(n *ts.Node) (int32, int) {
+func (j *jsLower) valueNode(n Node) (int32, int) {
 	m, last := len(j.reads), j.last
 	j.value(n, false)
 	if j.last != last && j.lastSpan == spanOf(j.strip(n)) && j.thrown == j.throws && !j.pending(m) {
@@ -818,15 +818,15 @@ func (j *jsLower) valueNode(n *ts.Node) (int32, int) {
 
 // strip is n without parentheses and without the TypeScript wrappers that
 // evaluate to their operand.
-func (j *jsLower) strip(n *ts.Node) *ts.Node {
+func (j *jsLower) strip(n Node) Node {
 	k := j.k
-	for n != nil {
+	for !n.IsNull() {
 		switch n.KindId() {
 		case k.parenthesizedExpression:
 			n = firstNamed(n)
 		case k.nonNullExpression, k.asExpression, k.satisfiesExpression, k.typeAssertion, k.instantiationExpression:
 			o := j.operand(n)
-			if o == nil {
+			if o.IsNull() {
 				return n
 			}
 			n = o
@@ -839,17 +839,17 @@ func (j *jsLower) strip(n *ts.Node) *ts.Node {
 
 // operand is the expression a transparent TypeScript wrapper evaluates: its
 // first named child that is not a type argument list or a comment.
-func (j *jsLower) operand(n *ts.Node) *ts.Node {
+func (j *jsLower) operand(n Node) Node {
 	for i := range n.NamedChildCount() {
 		if c := n.NamedChild(i); !c.IsExtra() && c.KindId() != j.k.typeArguments {
 			return c
 		}
 	}
-	return nil
+	return Node{}
 }
 
 // erased reports whether n is syntax the TypeScript compiler erases.
-func (j *jsLower) erased(n *ts.Node) bool {
+func (j *jsLower) erased(n Node) bool {
 	id := n.KindId()
 	if int(id) >= len(j.k.erased) || !n.IsNamed() {
 		return false
@@ -862,12 +862,12 @@ func (j *jsLower) erased(n *ts.Node) bool {
 
 // hasTok reports whether one of n's anonymous children is the token id; an
 // id the grammar lacks (0) is never one.
-func (j *jsLower) hasTok(n *ts.Node, id uint16) bool {
+func (j *jsLower) hasTok(n Node, id uint16) bool {
 	if id == 0 {
 		return false
 	}
 	c := j.cur
-	c.Reset(*n)
+	c.Reset(n)
 	if !c.GotoFirstChild() {
 		return false
 	}
@@ -883,39 +883,39 @@ func (j *jsLower) hasTok(n *ts.Node, id uint16) bool {
 
 // root is the leftmost identifier of a dotted name (a namespace path, an
 // import alias's target), or n itself.
-func (j *jsLower) root(n *ts.Node) *ts.Node {
+func (j *jsLower) root(n Node) Node {
 	k := j.k
-	for n != nil && (n.KindId() == k.nestedIdentifier || n.KindId() == k.memberExpression) {
+	for !n.IsNull() && (n.KindId() == k.nestedIdentifier || n.KindId() == k.memberExpression) {
 		n = n.ChildByFieldId(k.fObject)
 	}
 	return n
 }
 
 // paramPattern is the pattern a TypeScript parameter wrapper binds.
-func (j *jsLower) paramPattern(p *ts.Node) *ts.Node {
-	if pat := p.ChildByFieldId(j.k.fPattern); pat != nil {
+func (j *jsLower) paramPattern(p Node) Node {
+	if pat := p.ChildByFieldId(j.k.fPattern); !pat.IsNull() {
 		return pat
 	}
 	return p.ChildByFieldId(j.k.fName)
 }
 
 // namespaceOf is the namespace n declares, as a declaration or as the
-// expression of an expression statement, or nil.
-func (j *jsLower) namespaceOf(n *ts.Node) *ts.Node {
+// expression of an expression statement, or null.
+func (j *jsLower) namespaceOf(n Node) Node {
 	k := j.k
 	if n.KindId() == k.expressionStatement {
-		if n = firstNamed(n); n == nil {
-			return nil
+		if n = firstNamed(n); n.IsNull() {
+			return Node{}
 		}
 	}
 	if id := n.KindId(); id == k.internalModule || id == k.module {
 		return n
 	}
-	return nil
+	return Node{}
 }
 
 // enum lowers an enum declaration (see TypeScript in lowerJavaScript).
-func (j *jsLower) enum(n *ts.Node) {
+func (j *jsLower) enum(n Node) {
 	k := j.k
 	name := n.ChildByFieldId(k.fName)
 	v := j.lookup(name)
@@ -927,25 +927,25 @@ func (j *jsLower) enum(n *ts.Node) {
 // enumMembers binds every member name of an enum to no variable, then walks
 // the member initializers in order, lowering (lower) or collecting the
 // captures of each.
-func (j *jsLower) enumMembers(n *ts.Node, lower bool) {
+func (j *jsLower) enumMembers(n Node, lower bool) {
 	k := j.k
 	body := n.ChildByFieldId(k.fBody)
-	if body == nil {
+	if body.IsNull() {
 		return
 	}
 	mark := j.binds.mark()
 	start, list := j.kids(body)
 	for i := range list {
-		member := &list[i]
+		member := list[i]
 		if member.KindId() == k.enumAssignment {
 			member = member.ChildByFieldId(k.fName)
 		}
 		j.binds.push(j.text(member), -1)
 	}
 	for i := range list {
-		m := &list[i]
+		m := list[i]
 		val := m.ChildByFieldId(k.fValue)
-		if m.KindId() != k.enumAssignment || val == nil {
+		if m.KindId() != k.enumAssignment || val.IsNull() {
 			continue
 		}
 		if lower {
@@ -962,10 +962,10 @@ func (j *jsLower) enumMembers(n *ts.Node, lower bool) {
 
 // namespace lowers a namespace with a body inline (see TypeScript in
 // lowerJavaScript).
-func (j *jsLower) namespace(n *ts.Node) {
+func (j *jsLower) namespace(n Node) {
 	k := j.k
 	name, body := j.root(n.ChildByFieldId(k.fName)), n.ChildByFieldId(k.fBody)
-	if name == nil || name.KindId() != k.identifier || body == nil {
+	if name.IsNull() || name.KindId() != k.identifier || body.IsNull() {
 		return
 	}
 	v := j.lookup(name)
@@ -974,20 +974,20 @@ func (j *jsLower) namespace(n *ts.Node) {
 	mark, savedFn := j.binds.mark(), j.fnMark
 	j.fnMark = mark
 	j.hoistVars(body)
-	j.block(body)
+	j.block(body, true)
 	j.binds.truncate(mark)
 	j.fnMark = savedFn
 }
 
 // importEquals lowers `import x = require(m)` and `import x = A.B`.
-func (j *jsLower) importEquals(n *ts.Node) {
+func (j *jsLower) importEquals(n Node) {
 	k := j.k
 	start, list := j.kids(n)
 	for i := range list {
-		c := &list[i]
+		c := list[i]
 		switch c.KindId() {
 		case k.importRequireClause:
-			if id := firstNamed(c); id != nil {
+			if id := firstNamed(c); !id.IsNull() {
 				j.throws++
 				j.def(j.node(flow.Stmt, id, 0, 0), j.lookup(id))
 			}
@@ -999,7 +999,7 @@ func (j *jsLower) importEquals(n *ts.Node) {
 				j.throws++
 			}
 			j.ref(j.root(c))
-			j.def(j.node(flow.Stmt, &list[0], 0, len(j.reads)), j.lookup(&list[0]))
+			j.def(j.node(flow.Stmt, list[0], 0, len(j.reads)), j.lookup(list[0]))
 		}
 	}
 	j.done(start)
@@ -1007,13 +1007,13 @@ func (j *jsLower) importEquals(n *ts.Node) {
 
 // hoistEquals binds, like var, the name an import-equals declaration or an
 // import alias declares.
-func (j *jsLower) hoistEquals(n *ts.Node) {
+func (j *jsLower) hoistEquals(n Node) {
 	k := j.k
 	start, list := j.kids(n)
 	for i := range list {
-		switch c := &list[i]; {
+		switch c := list[i]; {
 		case c.KindId() == k.importRequireClause:
-			if id := firstNamed(c); id != nil {
+			if id := firstNamed(c); !id.IsNull() {
 				j.declarePattern(id, true)
 			}
 		case n.KindId() == k.importAlias && i == 0:
@@ -1024,11 +1024,11 @@ func (j *jsLower) hoistEquals(n *ts.Node) {
 }
 
 // decorators reads the decorators among n's children.
-func (j *jsLower) decorators(n *ts.Node) {
+func (j *jsLower) decorators(n Node) {
 	start, list := j.kids(n)
 	for i := range list {
 		if list[i].KindId() == j.k.decorator {
-			j.cap(&list[i])
+			j.cap(list[i])
 		}
 	}
 	j.done(start)
@@ -1036,11 +1036,11 @@ func (j *jsLower) decorators(n *ts.Node) {
 
 // closure creates the node spanning n, a nested callable or class: it Uses
 // n's captures and may-defines every enclosing variable n assigns.
-func (j *jsLower) closure(n *ts.Node) int32 { return j.closureFrom(n, len(j.reads)) }
+func (j *jsLower) closure(n Node) int32 { return j.closureFrom(n, len(j.reads)) }
 
 // closureFrom is closure whose node also Uses reads[m:], read before n (an
 // exported class's decorators).
-func (j *jsLower) closureFrom(n *ts.Node, m int) int32 {
+func (j *jsLower) closureFrom(n Node, m int) int32 {
 	w := len(j.writes)
 	if j.l.isCallable(n) {
 		j.capFunction(n)
@@ -1074,17 +1074,20 @@ func (j *jsLower) close(saved int32) int32 {
 
 // block lowers a statement list in its own lexical scope: its lexical names
 // are bound from the start and its function declarations defined there.
-func (j *jsLower) block(n *ts.Node) {
+// varScope marks the top-level statement list of a var scope (a program, a
+// function body, a class static block, a namespace body), whose `var` names
+// are already hoisted into the bindings before it.
+func (j *jsLower) block(n Node, varScope bool) {
 	mark := j.binds.mark()
 	start, list := j.kids(n)
 	for i := range list {
-		j.predeclare(&list[i], mark)
+		j.predeclare(list[i], mark, varScope)
 	}
 	for i := range list {
-		j.hoistFunction(&list[i])
+		j.hoistFunction(list[i])
 	}
 	for i := range list {
-		j.stmt(&list[i])
+		j.stmt(list[i])
 	}
 	j.done(start)
 	j.binds.truncate(mark)
@@ -1093,8 +1096,12 @@ func (j *jsLower) block(n *ts.Node) {
 // predeclare binds the block-scoped names statement n declares, in the block
 // whose bindings start at mark. An enum or a namespace whose name the block
 // already binds (an enum or namespace before it, or the class or function a
-// namespace merges with) merges into that variable.
-func (j *jsLower) predeclare(n *ts.Node, mark int) {
+// namespace merges with) merges into that variable. In a var scope's
+// top-level list (varScope), a function declaration is var-scoped (ECMA-262
+// FunctionDeclarationInstantiation and VarScopedDeclarations): a name a
+// parameter, a hoisted `var` or an earlier function declaration of that
+// scope already binds is the same binding, not a second variable.
+func (j *jsLower) predeclare(n Node, mark int, varScope bool) {
 	k := j.k
 	switch n.KindId() {
 	case k.lexicalDeclaration, k.usingDeclaration:
@@ -1103,11 +1110,15 @@ func (j *jsLower) predeclare(n *ts.Node, mark int) {
 			j.declarePattern(list[i].ChildByFieldId(k.fName), false)
 		}
 		j.done(start)
-	case k.classDeclaration, k.abstractClassDeclaration, k.functionDeclaration, k.generatorFunctionDeclaration:
+	case k.classDeclaration, k.abstractClassDeclaration:
 		j.declare(n.ChildByFieldId(k.fName))
+	case k.functionDeclaration, k.generatorFunctionDeclaration:
+		if name := n.ChildByFieldId(k.fName); !varScope || !j.boundSince(j.fnMark, name) {
+			j.declare(name)
+		}
 	case k.exportStatement:
-		if d := n.ChildByFieldId(k.fDeclaration); d != nil {
-			j.predeclare(d, mark)
+		if d := n.ChildByFieldId(k.fDeclaration); !d.IsNull() {
+			j.predeclare(d, mark, varScope)
 		}
 	case k.enumDeclaration:
 		if name := n.ChildByFieldId(k.fName); !j.erased(n) && !j.boundSince(mark, name) {
@@ -1119,12 +1130,12 @@ func (j *jsLower) predeclare(n *ts.Node, mark int) {
 		if k.internalModule == 0 {
 			return
 		}
-		if ns := j.namespaceOf(n); ns != nil && ns.ChildByFieldId(k.fBody) != nil {
-			if name := j.root(ns.ChildByFieldId(k.fName)); name != nil && name.KindId() == k.identifier && !j.boundSince(mark, name) {
+		if ns := j.namespaceOf(n); !ns.IsNull() && !ns.ChildByFieldId(k.fBody).IsNull() {
+			if name := j.root(ns.ChildByFieldId(k.fName)); !name.IsNull() && name.KindId() == k.identifier && !j.boundSince(mark, name) {
 				j.declare(name)
 			}
 		} else if n.KindId() == k.expressionStatement {
-			if e := firstNamed(n); e != nil {
+			if e := firstNamed(n); !e.IsNull() {
 				j.declareUsing(e, false)
 			}
 		}
@@ -1137,13 +1148,13 @@ func (j *jsLower) predeclare(n *ts.Node, mark int) {
 // element after it being another declarator of the same declaration. using
 // reports whether an earlier element of the sequence carried `using`; the
 // result is whether e or an element of it did.
-func (j *jsLower) declareUsing(e *ts.Node, using bool) bool {
+func (j *jsLower) declareUsing(e Node, using bool) bool {
 	k := j.k
 	switch e.KindId() {
 	case k.sequenceExpression:
 		start, list := j.kids(e)
 		for i := range list {
-			using = j.declareUsing(&list[i], using)
+			using = j.declareUsing(list[i], using)
 		}
 		j.done(start)
 	case k.assignmentExpression:
@@ -1157,10 +1168,10 @@ func (j *jsLower) declareUsing(e *ts.Node, using bool) bool {
 
 // hoistFunction emits a function declaration's hoisted defining node, spanning
 // its name, at the start of its block.
-func (j *jsLower) hoistFunction(n *ts.Node) {
+func (j *jsLower) hoistFunction(n Node) {
 	k := j.k
 	if n.KindId() == k.exportStatement {
-		if n = n.ChildByFieldId(k.fDeclaration); n == nil {
+		if n = n.ChildByFieldId(k.fDeclaration); n.IsNull() {
 			return
 		}
 	}
@@ -1174,7 +1185,7 @@ func (j *jsLower) hoistFunction(n *ts.Node) {
 
 // declarePattern binds every name a binding pattern declares. With merge (var
 // hoisting) a name already bound in the function scope is the same variable.
-func (j *jsLower) declarePattern(p *ts.Node, merge bool) {
+func (j *jsLower) declarePattern(p Node, merge bool) {
 	k := j.k
 	switch p.KindId() {
 	case k.identifier, k.shorthandPropertyIdentifierPattern:
@@ -1190,7 +1201,7 @@ func (j *jsLower) declarePattern(p *ts.Node, merge bool) {
 	case k.objectPattern, k.arrayPattern, k.restPattern:
 		start, list := j.kids(p)
 		for i := range list {
-			j.declarePattern(&list[i], merge)
+			j.declarePattern(list[i], merge)
 		}
 		j.done(start)
 	}
@@ -1198,7 +1209,7 @@ func (j *jsLower) declarePattern(p *ts.Node, merge bool) {
 
 // hoistVars binds every `var` name under statement n into the function
 // scope, without entering nested callables or classes.
-func (j *jsLower) hoistVars(n *ts.Node) {
+func (j *jsLower) hoistVars(n Node) {
 	k := j.k
 	switch n.KindId() {
 	case k.variableDeclaration:
@@ -1208,7 +1219,7 @@ func (j *jsLower) hoistVars(n *ts.Node) {
 		}
 		j.done(start)
 	case k.forInStatement:
-		if kw := n.ChildByFieldId(k.fKind); kw != nil && kw.KindId() == k.varKw {
+		if kw := n.ChildByFieldId(k.fKind); !kw.IsNull() && kw.KindId() == k.varKw {
 			j.declarePattern(n.ChildByFieldId(k.fLeft), true)
 		}
 		j.hoistVars(n.ChildByFieldId(k.fBody))
@@ -1221,7 +1232,7 @@ func (j *jsLower) hoistVars(n *ts.Node) {
 		k.switchBody, k.switchCase, k.switchDefault, k.exportStatement:
 		start, list := j.kids(n)
 		for i := range list {
-			j.hoistVars(&list[i])
+			j.hoistVars(list[i])
 		}
 		j.done(start)
 	}
@@ -1229,18 +1240,19 @@ func (j *jsLower) hoistVars(n *ts.Node) {
 
 // imports binds and defines the local names of one import statement, walking
 // its clause as the extraction does; a `type` specifier binds nothing.
-func (j *jsLower) imports(n *ts.Node) {
+func (j *jsLower) imports(n Node) {
 	k := j.k
 	if j.erased(n) {
 		return
 	}
 	start, list := j.kids(n)
 	for i := range list {
-		c := &list[i]
+		c := list[i]
 		if c.KindId() != k.importClause {
 			continue
 		}
-		importClauseBindings(j.cur, c, &k.imports, func(local *ts.Node, typeOnly bool) {
+		j.cur.Reset(c)
+		importClauseBindings(j.cur, &k.imports, func(local Node, typeOnly bool) {
 			if !typeOnly {
 				j.importName(local)
 			}
@@ -1249,13 +1261,13 @@ func (j *jsLower) imports(n *ts.Node) {
 	j.done(start)
 }
 
-func (j *jsLower) importName(id *ts.Node) {
+func (j *jsLower) importName(id Node) {
 	v := j.declare(id)
 	j.def(j.node(flow.Stmt, id, 0, 0), v)
 }
 
 // stmt lowers one statement.
-func (j *jsLower) stmt(n *ts.Node) {
+func (j *jsLower) stmt(n Node) {
 	k := j.k
 	labels := j.labels
 	j.labels = nil
@@ -1265,7 +1277,7 @@ func (j *jsLower) stmt(n *ts.Node) {
 	}
 	switch n.KindId() {
 	case k.expressionStatement:
-		if e := firstNamed(n); e != nil {
+		if e := firstNamed(n); !e.IsNull() {
 			j.exprStmt(e)
 		}
 	case k.lexicalDeclaration, k.usingDeclaration:
@@ -1288,7 +1300,7 @@ func (j *jsLower) stmt(n *ts.Node) {
 	case k.classDeclaration, k.abstractClassDeclaration:
 		j.def(j.closure(n), j.lookup(n.ChildByFieldId(k.fName)))
 	case k.statementBlock:
-		j.block(n)
+		j.block(n, false)
 	case k.ifStatement:
 		j.ifStmt(n)
 	case k.forStatement:
@@ -1306,13 +1318,13 @@ func (j *jsLower) stmt(n *ts.Node) {
 	case k.labeledStatement:
 		j.labeled(n, labels)
 	case k.returnStatement:
-		if e := firstNamed(n); e != nil {
+		if e := firstNamed(n); !e.IsNull() {
 			j.value(e, false)
 		}
 		j.node(flow.Jump, n, 0, len(j.reads))
 		j.b.Return()
 	case k.throwStatement:
-		if e := firstNamed(n); e != nil {
+		if e := firstNamed(n); !e.IsNull() {
 			j.value(e, false)
 		}
 		j.node(flow.Jump, n, 0, len(j.reads))
@@ -1330,19 +1342,19 @@ func (j *jsLower) stmt(n *ts.Node) {
 		// An export with neither a declaration nor a value evaluates nothing.
 		d := n.ChildByFieldId(k.fDeclaration)
 		switch {
-		case d != nil && (d.KindId() == k.classDeclaration || d.KindId() == k.abstractClassDeclaration):
+		case !d.IsNull() && (d.KindId() == k.classDeclaration || d.KindId() == k.abstractClassDeclaration):
 			m, dec := len(j.reads), j.decorated
 			j.decorators(n)
 			if j.decorated > dec {
 				j.throws++
 			}
 			j.def(j.closureFrom(d, m), j.lookup(d.ChildByFieldId(k.fName)))
-		case d != nil:
+		case !d.IsNull():
 			j.stmt(d)
-		case n.ChildByFieldId(k.fValue) != nil:
+		case !n.ChildByFieldId(k.fValue).IsNull():
 			j.valueNode(n.ChildByFieldId(k.fValue))
 		case j.hasTok(n, k.eqTok):
-			if e := firstNamed(n); e != nil {
+			if e := firstNamed(n); !e.IsNull() {
 				j.valueNode(e)
 			}
 		}
@@ -1354,30 +1366,30 @@ func (j *jsLower) stmt(n *ts.Node) {
 // sub lowers n, a statement standing alone as the body of an if, else, loop,
 // with or label, in an implicit block of its own: a declaration there binds
 // its names in that block, and a function declaration is hoisted within it.
-func (j *jsLower) sub(n *ts.Node) {
+func (j *jsLower) sub(n Node) {
 	mark := j.binds.mark()
-	j.predeclare(n, mark)
+	j.predeclare(n, mark, false)
 	j.hoistFunction(n)
 	j.stmt(n)
 	j.binds.truncate(mark)
 }
 
 // label is a break or continue statement's label, or "".
-func (j *jsLower) label(n *ts.Node) string {
-	if l := n.ChildByFieldId(j.k.fLabel); l != nil {
+func (j *jsLower) label(n Node) string {
+	if l := n.ChildByFieldId(j.k.fLabel); !l.IsNull() {
 		return view(j.text(l))
 	}
 	return ""
 }
 
 // exprStmt lowers an expression evaluated for its effect.
-func (j *jsLower) exprStmt(e *ts.Node) {
+func (j *jsLower) exprStmt(e Node) {
 	k := j.k
 	if e.KindId() == k.sequenceExpression {
 		start, list := j.kids(e)
 		for i := range list {
 			j.reset()
-			j.exprStmt(&list[i])
+			j.exprStmt(list[i])
 		}
 		j.done(start)
 		return
@@ -1399,16 +1411,16 @@ func (j *jsLower) exprStmt(e *ts.Node) {
 }
 
 // declaration lowers a var, let, const or using declaration.
-func (j *jsLower) declaration(n *ts.Node, isVar bool) {
+func (j *jsLower) declaration(n Node, isVar bool) {
 	k := j.k
 	start, list := j.kids(n)
 	for i := range list {
-		d := &list[i]
+		d := list[i]
 		name, val := d.ChildByFieldId(k.fName), d.ChildByFieldId(k.fValue)
 		m := len(j.reads)
 		switch {
-		case val == nil && isVar:
-		case val == nil:
+		case val.IsNull() && isVar:
+		case val.IsNull():
 			j.def(j.node(flow.Stmt, d, m, m), j.lookup(name))
 		case name.KindId() == k.identifier:
 			j.value(val, false)
@@ -1425,7 +1437,7 @@ func (j *jsLower) declaration(n *ts.Node, isVar bool) {
 	j.done(start)
 }
 
-func (j *jsLower) ifStmt(n *ts.Node) {
+func (j *jsLower) ifStmt(n Node) {
 	k := j.k
 	cond := j.l.unparen(n.ChildByFieldId(k.fCondition))
 	j.value(cond, false)
@@ -1434,8 +1446,8 @@ func (j *jsLower) ifStmt(n *ts.Node) {
 	j.sub(n.ChildByFieldId(k.fConsequence))
 	t := j.b.Push()
 	j.b.Restore(p)
-	if alt := n.ChildByFieldId(k.fAlternative); alt != nil {
-		if s := firstNamed(alt); s != nil {
+	if alt := n.ChildByFieldId(k.fAlternative); !alt.IsNull() {
+		if s := firstNamed(alt); !s.IsNull() {
 			j.sub(s)
 		}
 	}
@@ -1444,12 +1456,12 @@ func (j *jsLower) ifStmt(n *ts.Node) {
 }
 
 // isTrue reports whether a loop condition is the literal true.
-func (j *jsLower) isTrue(cond *ts.Node) bool { return j.l.unparen(cond).KindId() == j.k.trueLit }
+func (j *jsLower) isTrue(cond Node) bool { return j.l.unparen(cond).KindId() == j.k.trueLit }
 
 // head lowers a loop condition as the loop's decision node, or as a Stmt
 // node without an exit edge when it is the literal true. It reports whether
 // the loop exits through it.
-func (j *jsLower) head(cond *ts.Node) bool {
+func (j *jsLower) head(cond Node) bool {
 	j.reset()
 	if j.isTrue(cond) {
 		j.node(flow.Stmt, cond, 0, 0)
@@ -1473,7 +1485,7 @@ func (j *jsLower) loopEnd(f flow.Frame, h int32, exits bool, exit flow.Fringe) {
 	}
 }
 
-func (j *jsLower) whileStmt(n *ts.Node, labels []string) {
+func (j *jsLower) whileStmt(n Node, labels []string) {
 	k := j.k
 	f := j.b.OpenLoop(labels...)
 	saved := j.open()
@@ -1488,7 +1500,7 @@ func (j *jsLower) whileStmt(n *ts.Node, labels []string) {
 	j.loopEnd(f, h, exits, exit)
 }
 
-func (j *jsLower) doStmt(n *ts.Node, labels []string) {
+func (j *jsLower) doStmt(n Node, labels []string) {
 	k := j.k
 	f := j.b.OpenLoop(labels...)
 	saved := j.open()
@@ -1503,12 +1515,12 @@ func (j *jsLower) doStmt(n *ts.Node, labels []string) {
 	j.loopEnd(f, h, exits, exit)
 }
 
-func (j *jsLower) forStmt(n *ts.Node, labels []string) {
+func (j *jsLower) forStmt(n Node, labels []string) {
 	k := j.k
 	mark := j.binds.mark()
 	switch init := n.ChildByFieldId(k.fInitializer); init.KindId() {
 	case k.lexicalDeclaration:
-		j.predeclare(init, mark)
+		j.predeclare(init, mark, false)
 		j.stmt(init)
 	case k.variableDeclaration:
 		j.stmt(init)
@@ -1533,7 +1545,7 @@ func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 	}
 	j.sub(n.ChildByFieldId(k.fBody))
 	j.b.ContinueHere(f)
-	if inc := n.ChildByFieldId(k.fIncrement); inc != nil {
+	if inc := n.ChildByFieldId(k.fIncrement); !inc.IsNull() {
 		j.reset()
 		j.exprStmt(inc)
 	}
@@ -1542,16 +1554,16 @@ func (j *jsLower) forStmt(n *ts.Node, labels []string) {
 }
 
 // forIn lowers for…in, for…of and for await…of.
-func (j *jsLower) forIn(n *ts.Node, labels []string) {
+func (j *jsLower) forIn(n Node, labels []string) {
 	k := j.k
 	mark := j.binds.mark()
 	left := j.strip(n.ChildByFieldId(k.fLeft))
 	kw := n.ChildByFieldId(k.fKind)
-	if kw != nil && kw.KindId() != k.varKw {
+	if !kw.IsNull() && kw.KindId() != k.varKw {
 		j.declarePattern(left, false)
 	}
 	of := n.ChildByFieldId(k.fOperator).KindId() == k.ofKw
-	if v := n.ChildByFieldId(k.fValue); v != nil {
+	if v := n.ChildByFieldId(k.fValue); !v.IsNull() {
 		j.reset()
 		j.value(v, false)
 		d := j.node(flow.Stmt, v, 0, len(j.reads))
@@ -1591,7 +1603,7 @@ func (j *jsLower) forIn(n *ts.Node, labels []string) {
 	j.binds.truncate(mark)
 }
 
-func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
+func (j *jsLower) switchStmt(n Node, labels []string) {
 	k := j.k
 	disc := j.l.unparen(n.ChildByFieldId(k.fValue))
 	j.value(disc, false)
@@ -1603,7 +1615,7 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	mark := j.binds.mark()
 	start, cases := j.kids(n.ChildByFieldId(k.fBody))
 	// A case's statements are its named children after the test value.
-	body := func(c *ts.Node) (int, []ts.Node) {
+	body := func(c Node) (int, []Node) {
 		s, list := j.kids(c)
 		if c.KindId() == k.switchCase && len(list) > 0 {
 			list = list[1:]
@@ -1611,16 +1623,16 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 		return s, list
 	}
 	for c := range cases {
-		s, list := body(&cases[c])
+		s, list := body(cases[c])
 		for i := range list {
-			j.predeclare(&list[i], mark)
+			j.predeclare(list[i], mark, false)
 		}
 		j.done(s)
 	}
 	for c := range cases {
-		s, list := body(&cases[c])
+		s, list := body(cases[c])
 		for i := range list {
-			j.hoistFunction(&list[i])
+			j.hoistFunction(list[i])
 		}
 		j.done(s)
 	}
@@ -1660,9 +1672,9 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 		} else {
 			j.b.Merge(h)
 		}
-		s, list := body(&cases[c])
+		s, list := body(cases[c])
 		for i := range list {
-			j.stmt(&list[i])
+			j.stmt(list[i])
 		}
 		j.done(s)
 	}
@@ -1676,34 +1688,34 @@ func (j *jsLower) switchStmt(n *ts.Node, labels []string) {
 	j.binds.truncate(mark)
 }
 
-func (j *jsLower) tryStmt(n *ts.Node) {
+func (j *jsLower) tryStmt(n Node) {
 	k := j.k
 	handler, fin := n.ChildByFieldId(k.fHandler), n.ChildByFieldId(k.fFinalizer)
 	var ff, cf flow.Frame
-	if fin != nil {
+	if !fin.IsNull() {
 		ff = j.b.OpenFinally()
 	}
-	if handler != nil {
+	if !handler.IsNull() {
 		cf = j.b.OpenCatch()
 	}
-	j.block(n.ChildByFieldId(k.fBody))
-	if handler != nil {
+	j.block(n.ChildByFieldId(k.fBody), false)
+	if !handler.IsNull() {
 		t := j.b.Push()
 		j.b.EnterHandler(cf, spanOf(handler.Child(0)))
 		mark := j.binds.mark()
-		if p := handler.ChildByFieldId(k.fParameter); p != nil {
+		if p := handler.ChildByFieldId(k.fParameter); !p.IsNull() {
 			j.reset()
 			j.declarePattern(p, false)
 			j.bind(p, 0, 0)
 		}
-		j.block(handler.ChildByFieldId(k.fBody))
+		j.block(handler.ChildByFieldId(k.fBody), false)
 		j.binds.truncate(mark)
 		j.b.Merge(t)
 		j.b.Pop(t)
 	}
-	if fin != nil {
+	if !fin.IsNull() {
 		normal := j.b.EnterFinally(ff, spanOf(fin.Child(0)))
-		j.block(fin.ChildByFieldId(k.fBody))
+		j.block(fin.ChildByFieldId(k.fBody), false)
 		j.b.CloseFinally(ff, normal)
 	}
 }
@@ -1711,7 +1723,7 @@ func (j *jsLower) tryStmt(n *ts.Node) {
 // labeled collects a statement's labels: a loop or switch takes them as its
 // frame's names, any other statement is a block frame only a labelled break
 // targets.
-func (j *jsLower) labeled(n *ts.Node, labels []string) {
+func (j *jsLower) labeled(n Node, labels []string) {
 	k := j.k
 	// labels, the labels of the labelled statements this one is the body of,
 	// is the top of lab; this label is pushed after them. The frame a loop,
@@ -1738,7 +1750,7 @@ func (j *jsLower) labeled(n *ts.Node, labels []string) {
 // conditionally evaluated operand, every definition and every nested
 // callable or class. inChain reports that n is the receiver of an enclosing
 // member access or call of the same optional chain.
-func (j *jsLower) value(n *ts.Node, inChain bool) {
+func (j *jsLower) value(n Node, inChain bool) {
 	k := j.k
 	id := n.KindId()
 	if j.l.isCallable(n) {
@@ -1753,7 +1765,7 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 	case k.identifier, k.shorthandPropertyIdentifier:
 		j.ref(n)
 	case k.nonNullExpression, k.asExpression, k.satisfiesExpression, k.typeAssertion, k.instantiationExpression:
-		if o := j.operand(n); o != nil {
+		if o := j.operand(n); !o.IsNull() {
 			j.value(o, inChain)
 		}
 	case k.binaryExpression:
@@ -1834,7 +1846,7 @@ func (j *jsLower) value(n *ts.Node, inChain bool) {
 // deleted is the base variable of the property a unary expression n deletes
 // (o in `delete o.p`, `delete o[k]`, `delete o?.p`), or -1 when n is no
 // delete of a property or its base is no variable.
-func (j *jsLower) deleted(n *ts.Node) int32 {
+func (j *jsLower) deleted(n Node) int32 {
 	k := j.k
 	if n.ChildByFieldId(k.fOperator).KindId() != k.deleteKw {
 		return -1
@@ -1848,13 +1860,13 @@ func (j *jsLower) deleted(n *ts.Node) int32 {
 
 // children walks n's named children, lowering them (lower) or collecting
 // their captures.
-func (j *jsLower) children(n *ts.Node, lower bool) {
+func (j *jsLower) children(n Node, lower bool) {
 	start, list := j.kids(n)
 	for i := range list {
 		if lower {
-			j.value(&list[i], false)
+			j.value(list[i], false)
 		} else {
-			j.cap(&list[i])
+			j.cap(list[i])
 		}
 	}
 	j.done(start)
@@ -1864,7 +1876,7 @@ func (j *jsLower) children(n *ts.Node, lower bool) {
 // optional chain. At the chain's outermost link every `?.` inside it is
 // closed: one node spans the chain on the non-nullish path, joined with the
 // nullish exits.
-func (j *jsLower) chain(n *ts.Node, inChain bool) {
+func (j *jsLower) chain(n Node, inChain bool) {
 	k := j.k
 	base, outer, outerFrom := len(j.opt), j.optR, j.condFrom
 	if !inChain {
@@ -1881,7 +1893,7 @@ func (j *jsLower) chain(n *ts.Node, inChain bool) {
 	// token, not in the optional_chain field.
 	// The Branch before a `?.` yields the chain's value, undefined, on its
 	// nullish exit, and hands the receiver on through the same variable.
-	if n.ChildByFieldId(k.fOptionalChain) != nil || id == k.callExpression && j.hasTok(n, k.optTok) {
+	if !n.ChildByFieldId(k.fOptionalChain).IsNull() || id == k.callExpression && j.hasTok(n, k.optTok) {
 		if j.optR < 0 {
 			j.optR = j.b.Var()
 		}
@@ -1917,7 +1929,7 @@ func (j *jsLower) chain(n *ts.Node, inChain bool) {
 
 // reference evaluates a property reference's object and index and reports
 // whether t is one; any other target is evaluated as a value.
-func (j *jsLower) reference(t *ts.Node) bool {
+func (j *jsLower) reference(t Node) bool {
 	k := j.k
 	switch t.KindId() {
 	case k.memberExpression:
@@ -1935,7 +1947,7 @@ func (j *jsLower) reference(t *ts.Node) bool {
 // target evaluates the reference of a property access that reads or writes
 // before anything else is evaluated (an update, a compound assignment's read,
 // a for…in/for…of or destructuring target): it may throw there.
-func (j *jsLower) target(t *ts.Node) {
+func (j *jsLower) target(t Node) {
 	if j.reference(t) {
 		j.throws++
 	}
@@ -1944,7 +1956,7 @@ func (j *jsLower) target(t *ts.Node) {
 // assign lowers `left = right`, the node spanning n or, for a destructuring,
 // the right side's node and the element nodes, and leaves the value's result
 // variable as its only read past the reads before it.
-func (j *jsLower) assign(n *ts.Node) {
+func (j *jsLower) assign(n Node) {
 	k := j.k
 	left, right := j.strip(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	m := len(j.reads)
@@ -1984,7 +1996,7 @@ func (j *jsLower) assign(n *ts.Node) {
 
 // update lowers `x++`, `--x` and their property forms, one node spanning n
 // that reads and writes the target; its result is left as for assign.
-func (j *jsLower) update(n *ts.Node) {
+func (j *jsLower) update(n Node) {
 	k := j.k
 	arg := j.strip(n.ChildByFieldId(k.fArgument))
 	m := len(j.reads)
@@ -2001,7 +2013,7 @@ func (j *jsLower) update(n *ts.Node) {
 
 // augment lowers a compound or logical assignment; its result is left as
 // for assign.
-func (j *jsLower) augment(n *ts.Node) {
+func (j *jsLower) augment(n Node) {
 	k := j.k
 	left, right := j.strip(n.ChildByFieldId(k.fLeft)), n.ChildByFieldId(k.fRight)
 	op := n.ChildByFieldId(k.fOperator).KindId()
@@ -2071,7 +2083,7 @@ func (j *jsLower) augment(n *ts.Node) {
 // identifier x names and yield its value into an owned result, both killing
 // definitions, which the consumer reads in place of reads[m:]: never x
 // itself, which a later assignment in the same expression may overwrite.
-func (j *jsLower) carry(id int32, m int, x *ts.Node) {
+func (j *jsLower) carry(id int32, m int, x Node) {
 	j.def(id, j.lookup(x))
 	j.give(id, m)
 }
@@ -2080,20 +2092,20 @@ func (j *jsLower) carry(id int32, m int, x *ts.Node) {
 // may-defines the variable at t's base (o in `o.p`, `o[i].q`), as every
 // write through a field, index or pointer target is a may-definition of its
 // base variable (see Lowering).
-func (j *jsLower) mayDefBase(id int32, t *ts.Node) {
+func (j *jsLower) mayDefBase(id int32, t Node) {
 	if v := j.base(t); v >= 0 {
 		j.b.MayDef(id, v)
 	}
 }
 
 // base is the variable at the base of the property target t, or -1.
-func (j *jsLower) base(t *ts.Node) int32 {
+func (j *jsLower) base(t Node) int32 {
 	k := j.k
 	t = j.strip(t)
-	for t != nil && (t.KindId() == k.memberExpression || t.KindId() == k.subscriptExpression) {
+	for !t.IsNull() && (t.KindId() == k.memberExpression || t.KindId() == k.subscriptExpression) {
 		t = j.strip(t.ChildByFieldId(k.fObject))
 	}
-	if t == nil || t.KindId() != k.identifier {
+	if t.IsNull() || t.KindId() != k.identifier {
 		return -1
 	}
 	return j.lookup(t)
@@ -2105,7 +2117,7 @@ func (j *jsLower) base(t *ts.Node) int32 {
 // defining node per bound name, in source order, each using all of
 // reads[from:to] (see Destructuring in lowerJavaScript). An element is read
 // through the transparent wrappers, so `[y!] = a` defines y.
-func (j *jsLower) bind(p *ts.Node, from, to int) {
+func (j *jsLower) bind(p Node, from, to int) {
 	k := j.k
 	p = j.strip(p)
 	switch p.KindId() {
@@ -2121,19 +2133,19 @@ func (j *jsLower) bind(p *ts.Node, from, to int) {
 	case k.assignmentPattern:
 		j.defaulted(p.ChildByFieldId(k.fLeft), p.ChildByFieldId(k.fRight), p, from, to)
 	case k.requiredParameter, k.optionalParameter:
-		if v := p.ChildByFieldId(k.fValue); v != nil {
+		if v := p.ChildByFieldId(k.fValue); !v.IsNull() {
 			j.defaulted(j.paramPattern(p), v, p, from, to)
 		} else {
 			j.bind(j.paramPattern(p), from, to)
 		}
 	case k.restPattern:
-		if c := firstNamed(p); c != nil {
+		if c := firstNamed(p); !c.IsNull() {
 			j.bind(c, from, to)
 		}
 	case k.objectPattern, k.arrayPattern:
 		start, list := j.kids(p)
 		for i := range list {
-			c := &list[i]
+			c := list[i]
 			j.throws++
 			switch c.KindId() {
 			case k.pairPattern:
@@ -2161,7 +2173,7 @@ func (j *jsLower) bind(p *ts.Node, from, to int) {
 
 // defaulted lowers a pattern element with a default: whole decides whether
 // the incoming value is undefined, the default is evaluated only then.
-func (j *jsLower) defaulted(left, dflt, whole *ts.Node, from, to int) {
+func (j *jsLower) defaulted(left, dflt, whole Node, from, to int) {
 	k := j.k
 	left = j.strip(left)
 	named := left.KindId() == k.identifier || left.KindId() == k.shorthandPropertyIdentifierPattern
@@ -2197,7 +2209,7 @@ func (j *jsLower) defaulted(left, dflt, whole *ts.Node, from, to int) {
 // static block references, resolving names through its own parameters and
 // scopes first. A computed method name is evaluated where the method is
 // created.
-func (j *jsLower) capFunction(fn *ts.Node) {
+func (j *jsLower) capFunction(fn Node) {
 	k := j.k
 	id := fn.KindId()
 	if id == k.methodDefinition {
@@ -2206,11 +2218,11 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 		}
 	}
 	// Parameter decorators are evaluated with the class, outside the method.
-	if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+	if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 		start, list := j.kids(ps)
 		for i := range list {
 			if pid := list[i].KindId(); pid == k.requiredParameter || pid == k.optionalParameter {
-				j.decorators(&list[i])
+				j.decorators(list[i])
 			}
 		}
 		j.done(start)
@@ -2223,20 +2235,20 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 	mark, savedFn := j.binds.mark(), j.fnMark
 	j.fnMark = mark
 	if id == k.functionExpression || id == k.generatorFunction {
-		if nm := fn.ChildByFieldId(k.fName); nm != nil {
+		if nm := fn.ChildByFieldId(k.fName); !nm.IsNull() {
 			j.declare(nm)
 		}
 	}
-	if ps := fn.ChildByFieldId(k.fParameters); ps != nil {
+	if ps := fn.ChildByFieldId(k.fParameters); !ps.IsNull() {
 		start, list := j.kids(ps)
 		for i := range list {
-			j.declarePattern(&list[i], false)
+			j.declarePattern(list[i], false)
 		}
 		for i := range list {
-			j.patternExprs(&list[i])
+			j.patternExprs(list[i])
 		}
 		j.done(start)
-	} else if p := fn.ChildByFieldId(k.fParameter); p != nil {
+	} else if p := fn.ChildByFieldId(k.fParameter); !p.IsNull() {
 		j.declare(p)
 	}
 	body := fn.ChildByFieldId(k.fBody)
@@ -2256,12 +2268,12 @@ func (j *jsLower) capFunction(fn *ts.Node) {
 // its `extends` expression, its computed keys, its static field initializers
 // and its static blocks are evaluated, and each may throw; a TypeScript
 // `implements` clause is erased and evaluates nothing.
-func (j *jsLower) capClass(n *ts.Node) {
+func (j *jsLower) capClass(n Node) {
 	k := j.k
 	start, list := j.kids(n)
 	if j.shadow == 0 {
 		for i := range list {
-			switch c := &list[i]; c.KindId() {
+			switch c := list[i]; c.KindId() {
 			case k.classHeritage:
 				if k.extendsClause == 0 || j.childOfKind(c, k.extendsClause) {
 					j.throws++
@@ -2276,16 +2288,16 @@ func (j *jsLower) capClass(n *ts.Node) {
 	dec := j.decorated
 	j.shadow++
 	mark := j.binds.mark()
-	if nm := n.ChildByFieldId(k.fName); nm != nil {
+	if nm := n.ChildByFieldId(k.fName); !nm.IsNull() {
 		j.declare(nm)
 	}
 	for i := range list {
 		switch list[i].KindId() {
 		case k.identifier:
 		case k.classBody:
-			j.children(&list[i], false)
+			j.children(list[i], false)
 		default:
-			j.cap(&list[i])
+			j.cap(list[i])
 		}
 	}
 	j.done(start)
@@ -2297,7 +2309,7 @@ func (j *jsLower) capClass(n *ts.Node) {
 }
 
 // childOfKind reports whether one of n's named children is of kind id.
-func (j *jsLower) childOfKind(n *ts.Node, id uint16) bool {
+func (j *jsLower) childOfKind(n Node, id uint16) bool {
 	start, list := j.kids(n)
 	defer j.done(start)
 	for i := range list {
@@ -2310,23 +2322,23 @@ func (j *jsLower) childOfKind(n *ts.Node, id uint16) bool {
 
 // createThrows reports whether class body n evaluates, where its class is
 // created, a computed key, a static field initializer or a static block.
-func (j *jsLower) createThrows(n *ts.Node) bool {
+func (j *jsLower) createThrows(n Node) bool {
 	k := j.k
 	start, list := j.kids(n)
 	defer j.done(start)
 	for i := range list {
-		switch m := &list[i]; m.KindId() {
+		switch m := list[i]; m.KindId() {
 		case k.classStaticBlock:
 			return true
 		case k.methodDefinition, k.fieldDefinition, k.publicFieldDefinition:
 			name := m.ChildByFieldId(k.fName)
-			if name == nil {
+			if name.IsNull() {
 				name = m.ChildByFieldId(k.fProperty)
 			}
-			if name != nil && name.KindId() == k.computedPropertyName {
+			if !name.IsNull() && name.KindId() == k.computedPropertyName {
 				return true
 			}
-			if m.KindId() != k.methodDefinition && m.ChildByFieldId(k.fValue) != nil && j.hasTok(m, k.staticKw) {
+			if m.KindId() != k.methodDefinition && !m.ChildByFieldId(k.fValue).IsNull() && j.hasTok(m, k.staticKw) {
 				return true
 			}
 		}
@@ -2336,7 +2348,7 @@ func (j *jsLower) createThrows(n *ts.Node) bool {
 
 // patternExprs collects the captures of a binding pattern's defaults and
 // computed keys; its names are bound by declarePattern.
-func (j *jsLower) patternExprs(p *ts.Node) {
+func (j *jsLower) patternExprs(p Node) {
 	k := j.k
 	switch p.KindId() {
 	case k.assignmentPattern, k.objectAssignmentPattern:
@@ -2349,13 +2361,13 @@ func (j *jsLower) patternExprs(p *ts.Node) {
 		j.patternExprs(p.ChildByFieldId(k.fValue))
 	case k.requiredParameter, k.optionalParameter:
 		j.patternExprs(j.paramPattern(p))
-		if v := p.ChildByFieldId(k.fValue); v != nil {
+		if v := p.ChildByFieldId(k.fValue); !v.IsNull() {
 			j.cap(v)
 		}
 	case k.objectPattern, k.arrayPattern, k.restPattern:
 		start, list := j.kids(p)
 		for i := range list {
-			j.patternExprs(&list[i])
+			j.patternExprs(list[i])
 		}
 		j.done(start)
 	}
@@ -2363,7 +2375,7 @@ func (j *jsLower) patternExprs(p *ts.Node) {
 
 // cap collects the references n makes to variables of the function being
 // lowered, honouring every scope n opens.
-func (j *jsLower) cap(n *ts.Node) {
+func (j *jsLower) cap(n Node) {
 	k := j.k
 	id := n.KindId()
 	if j.l.isCallable(n) {
@@ -2382,7 +2394,7 @@ func (j *jsLower) cap(n *ts.Node) {
 	case k.enumDeclaration:
 		j.enumMembers(n, false)
 	case k.internalModule, k.module:
-		if body := n.ChildByFieldId(k.fBody); body != nil {
+		if body := n.ChildByFieldId(k.fBody); !body.IsNull() {
 			mark, savedFn := j.binds.mark(), j.fnMark
 			j.fnMark = mark
 			j.hoistVars(body)
@@ -2392,7 +2404,7 @@ func (j *jsLower) cap(n *ts.Node) {
 		}
 	case k.nonNullExpression, k.asExpression, k.satisfiesExpression, k.typeAssertion, k.instantiationExpression:
 		// The wrapper evaluates its operand; its type is no code.
-		if o := j.operand(n); o != nil {
+		if o := j.operand(n); !o.IsNull() {
 			j.cap(o)
 		}
 	case k.assignmentExpression:
@@ -2402,14 +2414,14 @@ func (j *jsLower) cap(n *ts.Node) {
 		// A compound or logical assignment and an update read the variable
 		// they write.
 		t := n.ChildByFieldId(k.fLeft)
-		if t == nil {
+		if t.IsNull() {
 			t = n.ChildByFieldId(k.fArgument)
 		}
 		j.capTarget(t)
 		if u := j.strip(t); u.KindId() == k.identifier {
 			j.ref(u)
 		}
-		if r := n.ChildByFieldId(k.fRight); r != nil {
+		if r := n.ChildByFieldId(k.fRight); !r.IsNull() {
 			j.cap(r)
 		}
 	case k.fieldDefinition, k.publicFieldDefinition:
@@ -2421,8 +2433,8 @@ func (j *jsLower) cap(n *ts.Node) {
 		start, list := j.kids(n)
 		for i := range list {
 			dec := j.decorated
-			j.cap(&list[i])
-			if v != nil && list[i].StartByte() == v.StartByte() {
+			j.cap(list[i])
+			if !v.IsNull() && list[i].StartByte() == v.StartByte() {
 				j.decorated = dec
 			}
 		}
@@ -2435,10 +2447,10 @@ func (j *jsLower) cap(n *ts.Node) {
 		mark := j.binds.mark()
 		start, list := j.kids(n)
 		for i := range list {
-			j.predeclare(&list[i], mark)
+			j.predeclare(list[i], mark, false)
 		}
 		for i := range list {
-			j.cap(&list[i])
+			j.cap(list[i])
 		}
 		j.done(start)
 		j.binds.truncate(mark)
@@ -2448,9 +2460,9 @@ func (j *jsLower) cap(n *ts.Node) {
 		body := n.ChildByFieldId(k.fBody)
 		start, cases := j.kids(body)
 		for c := range cases {
-			s, list := j.kids(&cases[c])
+			s, list := j.kids(cases[c])
 			for i := range list {
-				j.predeclare(&list[i], mark)
+				j.predeclare(list[i], mark, false)
 			}
 			j.done(s)
 		}
@@ -2460,14 +2472,14 @@ func (j *jsLower) cap(n *ts.Node) {
 	case k.forStatement:
 		mark := j.binds.mark()
 		if init := n.ChildByFieldId(k.fInitializer); init.KindId() == k.lexicalDeclaration {
-			j.predeclare(init, mark)
+			j.predeclare(init, mark, false)
 		}
 		j.children(n, false)
 		j.binds.truncate(mark)
 	case k.forInStatement:
 		mark := j.binds.mark()
 		left := j.strip(n.ChildByFieldId(k.fLeft))
-		if kw := n.ChildByFieldId(k.fKind); kw == nil {
+		if kw := n.ChildByFieldId(k.fKind); kw.IsNull() {
 			j.capTarget(left)
 		} else {
 			if kw.KindId() != k.varKw {
@@ -2475,7 +2487,7 @@ func (j *jsLower) cap(n *ts.Node) {
 			}
 			j.patternExprs(left)
 		}
-		if v := n.ChildByFieldId(k.fValue); v != nil {
+		if v := n.ChildByFieldId(k.fValue); !v.IsNull() {
 			j.cap(v)
 		}
 		j.cap(n.ChildByFieldId(k.fRight))
@@ -2483,7 +2495,7 @@ func (j *jsLower) cap(n *ts.Node) {
 		j.binds.truncate(mark)
 	case k.catchClause:
 		mark := j.binds.mark()
-		if p := n.ChildByFieldId(k.fParameter); p != nil {
+		if p := n.ChildByFieldId(k.fParameter); !p.IsNull() {
 			j.declarePattern(p, false)
 			j.patternExprs(p)
 		}
@@ -2491,7 +2503,7 @@ func (j *jsLower) cap(n *ts.Node) {
 		j.binds.truncate(mark)
 	case k.variableDeclarator:
 		j.patternExprs(n.ChildByFieldId(k.fName))
-		if v := n.ChildByFieldId(k.fValue); v != nil {
+		if v := n.ChildByFieldId(k.fValue); !v.IsNull() {
 			j.cap(v)
 		}
 	case k.unaryExpression:
@@ -2515,7 +2527,7 @@ func (j *jsLower) cap(n *ts.Node) {
 // index of a property target are evaluated, so their references are reads,
 // and a property target writes its base variable (a may-definition, as
 // outside a callable).
-func (j *jsLower) capTarget(t *ts.Node) {
+func (j *jsLower) capTarget(t Node) {
 	k := j.k
 	switch t = j.strip(t); t.KindId() {
 	case k.identifier, k.shorthandPropertyIdentifierPattern:
@@ -2533,7 +2545,7 @@ func (j *jsLower) capTarget(t *ts.Node) {
 	case k.objectPattern, k.arrayPattern, k.restPattern:
 		start, list := j.kids(t)
 		for i := range list {
-			j.capTarget(&list[i])
+			j.capTarget(list[i])
 		}
 		j.done(start)
 	case k.memberExpression, k.subscriptExpression:
@@ -2548,13 +2560,13 @@ func (j *jsLower) capTarget(t *ts.Node) {
 
 // jsxElement walks a JSX tag: its name is a reference unless it is an
 // intrinsic tag (a lowercase or hyphenated name), then its attributes.
-func (j *jsLower) jsxElement(n *ts.Node, lower bool) {
+func (j *jsLower) jsxElement(n Node, lower bool) {
 	k := j.k
 	name := n.ChildByFieldId(k.fName)
 	start, list := j.kids(n)
 	for i := range list {
-		c := &list[i]
-		if name != nil && c.StartByte() == name.StartByte() {
+		c := list[i]
+		if !name.IsNull() && c.StartByte() == name.StartByte() {
 			if c.KindId() == k.identifier {
 				t := j.text(c)
 				if len(t) == 0 || t[0] >= 'a' && t[0] <= 'z' || bytes.IndexByte(t, '-') >= 0 {

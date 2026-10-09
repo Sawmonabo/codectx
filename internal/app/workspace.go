@@ -283,10 +283,7 @@ func (w *Workspace) Config() config.Config { return w.s.cfg }
 // would find the spool it names already released.
 //
 // The engine is built per request, which is why the concurrency gate it is
-// given is the stack's process-scoped one. The coordinator is passed as the
-// promoter only when this workspace holds the indexing lock: Coordinator.Promote
-// requires it, so a report promotes nothing and reports the deferred capability
-// rows instead (Section 11.6).
+// given is the stack's process-scoped one.
 func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.Engine, func() error, error) {
 	return w.query(ctx, gen, false)
 }
@@ -304,20 +301,13 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 // transaction this handle exists to stay off, and handing it a lease store over
 // the reader would fail the page rather than end it.
 func (w *Workspace) query(ctx context.Context, gen model.GenerationID, readOnly bool) (*graph.Engine, func() error, error) {
-	store, leases, mayPromote := w.s.store, w.s.leases, w.s.lock != nil
+	store, leases := w.s.store, w.s.leases
 	if readOnly && w.s.queryStore != w.s.store {
-		// The reader handle, no lease store, and no promoter: promotion builds
-		// a deferred capability, which is a write. A read tool in a serving
-		// process reports the deferred rows exactly as a report does.
-		store, leases, mayPromote = w.s.queryStore, nil, false
+		store, leases = w.s.queryStore, nil
 	}
 	reader, err := store.PinGeneration(ctx, w.s.repo, gen, w.s.cfg.Storage.QueryCursorTTL.Std())
 	if err != nil {
 		return nil, nil, err
-	}
-	var promote graph.Promoter
-	if mayPromote {
-		promote = promoter{coord: w.coord}
 	}
 	// The packed per-generation adjacency is the structure every traversal
 	// reads (ADR-0005); it is opened on the same pinned generation, so the
@@ -330,7 +320,6 @@ func (w *Workspace) query(ctx context.Context, gen model.GenerationID, readOnly 
 	engine, err := graph.New(graph.Options{
 		Adjacency: adjacency{reader: reader},
 		Reader:    packed,
-		Promoter:  promote,
 		Signer:    w.s.signer,
 		Spools:    w.s.spools,
 		Leases:    leases,

@@ -397,14 +397,14 @@ type LSP struct {
 	MaxOverlayBytes Limit `toml:"max_overlay_bytes"`
 }
 
-// Dependence configures the control-dependence, data-dependence and fallback
-// call provider of Section 11.6. Everything here is scheduling and admission
-// policy: which backend produces the facts is a tool-lock entry the product
-// owns and never a configuration value, so no key names one.
+// Dependence configures the fallback call provider of Section 11.6.
+// Everything here is scheduling and admission policy: which backend produces
+// the facts is a tool-lock entry the product owns and never a configuration
+// value, so no key names one.
 type Dependence struct {
 	// Enabled defaults to auto: dependence units run as low-priority
-	// background work once the base generation is active, and a query for a
-	// dependence fact promotes its units and is answered `pending` until they
+	// background work once the base generation is active, and their
+	// capability is unavailable with the reason units_deferred until they
 	// seal. true blocks the index on those units; false disables the provider.
 	Enabled Enablement `toml:"enabled"`
 	// Timeout bounds one whole unit. 0, the default, means no wall-clock

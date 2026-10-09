@@ -14,11 +14,12 @@
 // phase reads -- so its disk traffic is a small constant times the export's
 // bytes (ADR-0009).
 //
-// The import publishes the five capabilities of Section 11.6 —
-// control_depends_on, data_flows_to, reads, writes and calls — plus
-// may_refer_to for a write whose target shape does not resolve. Precision is
-// static_analysis and every evidence range is verified against the pinned
-// snapshot bytes before it is published.
+// The import publishes one capability, calls: the methods of the unit and the
+// call edges between them, plus may_refer_to for a declaration the resolver
+// bound several ways. Control dependence, data flow, reads and writes are the
+// structural provider's, per file. Precision is static_analysis and every
+// evidence range is verified against the pinned snapshot bytes before it is
+// published.
 //
 // Delta. The engine has no incremental mode, so a refreshed unit is a whole
 // re-parse and re-export; the storage update is the delta. Every published
@@ -53,9 +54,8 @@ const ProviderID = "dependence"
 // neutral terms and are the only vocabulary published on an evidence row
 // (Section 11.6).
 const (
-	detailCDG        = "cdg"
-	detailReachDef   = "reaching_def"
-	detailReachDefCB = "reaching_def capture"
+	// detailAssignment is the detail of the may_refer_to edge from a method to
+	// an equally supported alternative identity.
 	detailAssignment = "assignment"
 	detailCall       = "call"
 	// detailCallSpeculated is a call whose callee the export invented: a
@@ -75,11 +75,6 @@ const (
 	// maxUnknownLabels bounds the distinct unknown labels reported by name;
 	// the rest are counted in aggregate.
 	maxUnknownLabels = 32
-	// maxDataFlowDepth bounds the def-use walk between two anchored nodes.
-	maxDataFlowDepth = 8
-	// maxOperandDepth bounds the descent into one assignment's written
-	// operand and into its read operands.
-	maxOperandDepth = 16
 	// pageSize bounds every keyset page read from the scratch.
 	pageSize = 512
 	// maxRangeFileBytes bounds the source held in memory at once: one file's
@@ -193,8 +188,7 @@ type Options struct {
 const (
 	PhaseFilesStaged      = "files staged"
 	PhaseExportStaged     = "export staged"
-	PhaseProjected        = "entities and edges projected"
-	PhaseReadsWrites      = "reads and writes derived"
+	PhaseProjected        = "entities and calls projected"
 	PhaseLocated          = "located"
 	PhaseIdentified       = "identified"
 	PhaseRelationsStaged  = "relations staged"
@@ -261,9 +255,6 @@ type Report struct {
 	// UnlocatedFacts counts published facts whose coordinates did not verify
 	// against the pinned bytes and therefore carry no range.
 	UnlocatedFacts int
-	// UnresolvedWrites counts assignment targets whose shape did not resolve
-	// to a declaration and were published as may_refer_to instead of writes.
-	UnresolvedWrites int
 	// ClippedEvidence counts occurrence rows dropped because the fact already
 	// carries model.MaxEvidencePerFact of them. The fact is still published;
 	// the count is what keeps that truncation from being silent.
@@ -349,14 +340,10 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err := sc.project(ctx); err != nil {
 		return rep, err
 	}
-	opts.phase(PhaseProjected)
-	if err := e.deriveReadsWrites(ctx); err != nil {
-		return rep, err
-	}
 	if err := sc.occurrences(ctx); err != nil {
 		return rep, err
 	}
-	opts.phase(PhaseReadsWrites)
+	opts.phase(PhaseProjected)
 	if err := e.locate(ctx); err != nil {
 		return rep, err
 	}
@@ -397,7 +384,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 
 	rep.Nodes, rep.Relations, rep.Aliases = e.nodes, e.relations, e.aliases
 	rep.ExternalMethods, rep.DroppedMethods = e.external, e.dropped
-	rep.UnlocatedFacts, rep.UnresolvedWrites = e.noRange, e.unresolved
+	rep.UnlocatedFacts = e.noRange
 	rep.ClippedEvidence, rep.UnknownRows, rep.IgnoredFiles = e.clipped, sc.unknownN, sc.ignoredFiles
 	rep.StagedRows, rep.OverStagedRows = sc.rows, sc.overRows
 	rep.DerivedRows = sc.derivedRows

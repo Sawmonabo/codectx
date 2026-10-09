@@ -15,9 +15,9 @@ import (
 // failure class a run belongs to. Silent breakage here is a correctness
 // failure, not a cosmetic one — an out-of-memory run misread as a crash loses
 // the single retry the plan allows, a crash misread as out-of-memory burns a
-// full parse on a retry that cannot succeed, a definition-cap skip misread as
-// a clean run seals a unit as complete when its data dependence is missing
-// whole method bodies, and a zero-exit dead graph misread as success admits an
+// full parse on a retry that cannot succeed, a benign definition-cap warning
+// misread as a failure throws away a unit whose calls are whole, and a
+// zero-exit dead graph misread as success admits an
 // empty analysis as a fresh one.
 //
 // The inputs are the real engine's own bytes, captured from runs of the
@@ -51,8 +51,6 @@ func TestClassify(t *testing.T) {
 		want      dependence.FailureClass
 		pass      string
 		exception string
-		skips     int
-		firstSkip string
 	}{
 		{name: "a clean run is not a failure", want: dependence.FailureNone},
 		{name: "frontend warnings that mean nothing are not a failure",
@@ -60,9 +58,8 @@ func TestClassify(t *testing.T) {
 		{name: "heap exhaustion is memory even though the same stderr also reports a helper exit",
 			stderr: fixture(t, "out-of-memory.stderr"), exit: 1, want: dependence.FailureMemory,
 			exception: "java.lang.OutOfMemoryError"},
-		{name: "a definition-cap skip degrades the unit without failing it",
-			stderr: fixture(t, "definition-cap-skip.stderr"), want: dependence.FailureNone,
-			skips: 3, firstSkip: "<operator>.tupleLiteral"},
+		{name: "a definition-cap skip is not a failure",
+			stderr: fixture(t, "definition-cap-skip.stderr"), want: dependence.FailureNone},
 		{name: "a pass crash names the pass and the exception",
 			stderr: passCrash, exit: 1, want: dependence.FailureEngine,
 			pass: "CfgCreationPass", exception: "java.util.NoSuchElementException"},
@@ -107,12 +104,6 @@ func TestClassify(t *testing.T) {
 			}
 			if got.Exception != c.exception {
 				t.Errorf("exception = %q, want %q", got.Exception, c.exception)
-			}
-			if got.SkippedCount != c.skips {
-				t.Errorf("skipped = %d, want %d", got.SkippedCount, c.skips)
-			}
-			if c.firstSkip != "" && (len(got.SkippedMethods) == 0 || got.SkippedMethods[0] != c.firstSkip) {
-				t.Errorf("skipped methods = %v, want the first to be %q", got.SkippedMethods, c.firstSkip)
 			}
 		})
 	}

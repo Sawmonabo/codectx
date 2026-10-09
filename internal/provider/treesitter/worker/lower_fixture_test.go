@@ -108,16 +108,23 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				if tree == nil {
 					t.Fatal("the parser produced no tree")
 				}
-				defer tree.Close()
-				if got := tree.RootNode().HasError(); got != c.recovered {
-					t.Fatalf("syntax error in the %s tree = %v, want %v: %s", language, got, c.recovered, tree.RootNode().ToSexp())
+				// The production path: the tree is flattened, closed, and every
+				// callable is found and lowered from the flat array alone.
+				sexp := tree.RootNode().ToSexp()
+				flat, err := Flatten(tree, language)
+				tree.Close()
+				if err != nil {
+					t.Fatalf("flatten: %v", err)
+				}
+				if got := flat.Root().HasError(); got != c.recovered {
+					t.Fatalf("syntax error in the %s tree = %v, want %v: %s", language, got, c.recovered, sexp)
 				}
 				if c.unresolved != 0 && !c.illFormed && !c.recovered {
 					t.Errorf("unresolved = %d on a source not marked ill-formed: a jump whose target no frame opens is rejected by every compiler", c.unresolved)
 				}
-				var fn *ts.Node
+				var fn Node
 				i := 0
-				if err := low.Functions(tree.RootNode(), func(n *ts.Node) error {
+				if err := low.Functions(flat.Root(), func(n Node) error {
 					if i == c.fn {
 						fn = n
 					}
@@ -129,7 +136,7 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				if c.callables != 0 && i != c.callables {
 					t.Errorf("callables = %d, want %d\nprotects: %s\nmutation: %s", i, c.callables, c.protects, c.mutation)
 				}
-				if fn == nil {
+				if fn.IsNull() {
 					t.Fatalf("callable %d not found (%d callables)", c.fn, i)
 				}
 				var a flow.Arena
@@ -166,7 +173,7 @@ func runGolden(t *testing.T, language string, cases []goldenCase) {
 				}
 				if mismatch {
 					t.Logf("lowered graph:\n%s\ncd:\n  %s\ndu:\n  %s\ntree: %s",
-						dumpGraph(g, src), strings.Join(cd, "\n  "), strings.Join(du, "\n  "), fn.ToSexp())
+						dumpGraph(g, src), strings.Join(cd, "\n  "), strings.Join(du, "\n  "), sexp)
 				}
 			})
 		}
@@ -249,17 +256,22 @@ func TestMayDefinitionChainIsLinear(t *testing.T) {
 			if tree == nil {
 				t.Fatal("the parser produced no tree")
 			}
-			defer tree.Close()
-			var fn *ts.Node
+			flat, err := Flatten(tree, c.language)
+			tree.Close()
+			if err != nil {
+				t.Fatalf("flatten: %v", err)
+			}
+			declaration := tl.IdForNodeKind("function_declaration", true)
+			var fn Node
 			found := errors.New("found")
-			_ = low.Functions(tree.RootNode(), func(m *ts.Node) error {
-				if m.Kind() == "function_declaration" {
+			_ = low.Functions(flat.Root(), func(m Node) error {
+				if m.KindId() == declaration {
 					fn = m
 					return found
 				}
 				return nil
 			})
-			if fn == nil {
+			if fn.IsNull() {
 				t.Fatal("no function declaration")
 			}
 			var s Scratch
@@ -268,6 +280,92 @@ func TestMayDefinitionChainIsLinear(t *testing.T) {
 			g := low.Lower(fn, src, &a, &s)
 			if got, want := flow.DefUse(g, &a).Len(), 2*n-1; got != want {
 				t.Errorf("def-use pairs = %d, want 2n-1 = %d for n = %d writes through one base", got, want, n)
+			}
+		})
+	}
+}
+
+// TestOneBindingIsOneNamedVariable pins which identifiers a lowering
+// declares with Builder.Named, the spans the parent mints one variable entity
+// from (docs/providers-treesitter.md, Variable entity).
+//
+// Failure modes: a lowering that declares one binding at two identifiers
+// publishes two variable entities for it, so a fact through one is missing
+// from the other; one that declares a selector publishes a variable named
+// `a.b` that names no binding.
+//
+// Mutation: declare every `:=` range target in goLower.rangeLoop, whatever
+// its kind -> the go case declares a.b. Declare a function declaration in
+// jsLower.predeclare whatever its var scope already binds -> each
+// javascript case declares f twice.
+func TestOneBindingIsOneNamedVariable(t *testing.T) {
+	var s Scratch
+	defer s.Close()
+	for _, c := range []struct {
+		name, language, src string
+		fn                  int
+		want                []string
+	}{
+		{"a selector range target declares nothing", "go",
+			"package p\n\nfunc f(s []int) {\n\tfor a.b := range s {\n\t}\n}\n", 0, []string{"s"}},
+		{"a var and a function declaration in a body are one binding", "javascript",
+			"function g() {\n  var f = 1;\n  function f() {}\n}\n", 1, []string{"f"}},
+		{"a var and a function declaration in a program are one binding", "javascript",
+			"var f = 1;\nfunction f() {}\n", 0, []string{"f"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tl, ok := Grammar(c.language)
+			if !ok {
+				t.Fatalf("no grammar for %q", c.language)
+			}
+			low, ok := LoweringFor(c.language)
+			if !ok {
+				t.Fatalf("no lowering for %q", c.language)
+			}
+			src := []byte(c.src)
+			p := ts.NewParser()
+			defer p.Close()
+			if err := p.SetLanguage(tl); err != nil {
+				t.Fatalf("set language: %v", err)
+			}
+			tree := p.Parse(src, nil)
+			if tree == nil {
+				t.Fatal("the parser produced no tree")
+			}
+			flat, err := Flatten(tree, c.language)
+			tree.Close()
+			if err != nil {
+				t.Fatalf("flatten: %v", err)
+			}
+			// A recovered tree would not reach the construct the case pins.
+			if flat.Root().HasError() {
+				t.Fatalf("the %s source did not parse clean", c.language)
+			}
+			var fn Node
+			i := 0
+			if err := low.Functions(flat.Root(), func(n Node) error {
+				if i == c.fn {
+					fn = n
+				}
+				i++
+				return nil
+			}); err != nil {
+				t.Fatalf("functions: %v", err)
+			}
+			if fn.IsNull() {
+				t.Fatalf("callable %d not found (%d callables)", c.fn, i)
+			}
+			var a flow.Arena
+			g := low.Lower(fn, src, &a, &s)
+			var got []string
+			for v := range int32(g.Vars()) {
+				if span, named := g.Declared(v); named {
+					got = append(got, string(src[span.Start:span.End]))
+				}
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, c.want) {
+				t.Fatalf("named variables = %q, want %q", got, c.want)
 			}
 		})
 	}

@@ -19,6 +19,21 @@ review on 2026-09-26 found these gaps:
 
 Each gap is closed before phase 0 is claimed.
 
+**Amended 2026-10-08 (October 8, 2026), by the owner's ruling.** Testing is halted and the replacement is integrated
+now, with no proofs, benchmarks, corpus differentials or engine runs. The gates that need the engine to run are
+withdrawn:
+- decision 6's band conditions for phases 1 to 3;
+- decision 7's band;
+- the seven-corpus substitution differential that was to license the substitution.
+
+The gate actually used is the authored goldens, each table derived twice, blind, from the source text and the
+language reference, plus one test pass, one review and one fix round over the integrated change. The four file-local
+families move to the structural provider for every language at once, so decision 9's graduation set is not built.
+The engine's importer stops publishing those four families for every language in the same change, and the engine
+runs for `calls` only until the linking provider of decision 9 publishes them; it is then deleted. Decisions 1, 2, 4,
+5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
+but impact still excludes them (`internal/graph/cost.go:83-89`) and no program-dependence relation set joins them.
+
 ## Context
 
 ### What the product does today
@@ -450,6 +465,12 @@ minute later, after the product has reported done.
 
 ### 6. Seven phases, each with a residue and a measured end
 
+**Amended 2026-10-08.** The band conditions of phases 1, 2 and 3 below are withdrawn (Status): no engine run gates
+them. Phases 1 to 3 close together, for all nine languages, when the authored golden tables, derived twice, pass
+and the integrated change has had its one test pass, review and fix round. Phase 3's zero-rows condition is met by
+construction: the engine's importer no longer publishes the four families. The text below is the plan as accepted
+on 2026-09-26; the phase table marks what the amendment changes.
+
 Every gate is stated per **repository class**, never per repository. A class is claimed only on at least two instances
 from different language families, and **every** instance must pass, not the average. Two classes cannot be claimed yet,
 because each has one pinned instance:
@@ -491,9 +512,10 @@ output or the first table.
 | phase | what becomes native | what still needs the engine at the end | the measured condition that ends it |
 |---|---|---|---|
 | **0 — shared core and every lowering** | CFG, post-dominators, control dependence, def-use; the lowering of all nine languages with their authored goldens; the one-pass worker walk and the per-file memory of decisions 1, 2 and 5 | all four families for every language (nothing is published yet) | each authored golden table reproduces **100%** of its cases and emits nothing outside them. Equality is right here and only here, because the corpus is authored rather than observed. Mandatory golden cases: the try operator must yield a control dependence, which the engine does not emit. The benchmark shows the need-derived reservation holding its overrun target over the matrix |
-| **1 — Go and Rust publish, the calibration gate** | `control_depends_on` and `data_flows_to` for Go and Rust, published by the structural provider (decision 9) | the same two families for the other seven languages; `reads`/`writes` and `calls` everywhere | per family, the symmetric difference against the engine is **≤ the band measured first from two engine runs on the same units**, per class. Rust's gate is its authored goldens, because the engine has no Rust test corpus and emits no try-operator control dependence. Second required output: **differential-test cost per language**, the number nobody has, from which every later phase is priced |
-| **2 — ECMAScript family, and the shared write algebra** | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate per class (Rust's by its authored goldens, since no engine band exists for it), **and** on every instance of the class the native pass completes with a lower wall *and* a lower tree-summed peak than the engine on the same units, on the same 250 ms sampler |
-| **3 — Python, Java, C/C++ dependence** | all four dependence families for all nine advertised languages | **resolved `calls` only**, where no precise profile applies | the per-family band gate per language and class; Java control and data dependence are diffed against the engine like any other language, and only Java `calls` is authored. **And** a store query over a fresh index returns **zero** dependence-provider rows of the four dependence kinds at the active generation, which is what licenses deleting the import path |
+| **1 to 3, as amended 2026-10-08 — all four families, every language at once** | `control_depends_on`, `data_flows_to`, `reads` and `writes` for all nine advertised languages, published by the structural provider (decision 9) | **`calls` only**; the engine's importer publishes none of the four families | the authored golden tables, each derived twice, reproduce every case, and the integrated change has had one test pass, one review and one fix round. No engine run gates it. The rows for phases 1, 2 and 3 below are withdrawn |
+| **1 — Go and Rust publish, the calibration gate** (withdrawn) | `control_depends_on` and `data_flows_to` for Go and Rust, published by the structural provider (decision 9) | the same two families for the other seven languages; `reads`/`writes` and `calls` everywhere | per family, the symmetric difference against the engine is **≤ the band measured first from two engine runs on the same units**, per class. Rust's gate is its authored goldens, because the engine has no Rust test corpus and emits no try-operator control dependence. Second required output: **differential-test cost per language**, the number nobody has, from which every later phase is priced |
+| **2 — ECMAScript family, and the shared write algebra** (withdrawn) | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate per class (Rust's by its authored goldens, since no engine band exists for it), **and** on every instance of the class the native pass completes with a lower wall *and* a lower tree-summed peak than the engine on the same units, on the same 250 ms sampler |
+| **3 — Python, Java, C/C++ dependence** (withdrawn) | all four dependence families for all nine advertised languages | **resolved `calls` only**, where no precise profile applies | the per-family band gate per language and class; Java control and data dependence are diffed against the engine like any other language, and only Java `calls` is authored. **And** a store query over a fresh index returns **zero** dependence-provider rows of the four dependence kinds at the active generation, which is what licenses deleting the import path |
 | **4 — static call linking, the four frontends with no type recovery** | resolved `calls` for C/C++, Go, Rust **and Java**, by the package-scoped linker of decision 9 | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora of each class. Rust's gate is its authored goldens. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
 | **5 — type recovery, the two frontends that have it** | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise |
 | **6 — the retirement gate** | nothing is ported; the engine, its backend package and its import path are deleted | **nothing** | the five conditions below, simultaneously |
@@ -531,6 +553,10 @@ output or the first table.
    key that nothing reads.
 
 ### 7. The oracle is the existing key algebra, and it measures a band
+
+**Amended 2026-10-08.** The band below is withdrawn as a gate for the four file-local families (Status): it needs
+two engine runs per unit, and no engine run gates their substitution. The authored goldens, derived twice, are that
+gate. What follows records the design of the band as accepted.
 
 The importer already derives an id-independent semantic key per fact. The key covers the label, its owning method's
 full name, its file, the operator it was lowered from, its target name, its ordered byte ranges and, for a relation,
@@ -576,7 +602,7 @@ languages, the engine's own frontends are parsers with no type information behin
 today at `static_analysis`. The native pass performs the same analysis on the same class of input, so it is published
 at **`static_analysis`** too, and a consumer sees no change of label for the four dependence families. The structural
 provider's evidence precision therefore becomes per family. Today it is fixed at `syntax`
-(`internal/provider/treesitter/facts.go:712`).
+(`builder.evidence` in `internal/provider/treesitter/facts.go`).
 
 What differs between producers is endpoint *resolution*, and that is already carried separately:
 - a `calls` edge whose callee comes from a precise index carries the `compiler` origin on that endpoint;
@@ -604,18 +630,19 @@ what it is, and the retirement gate's parity condition is what proves the label 
 - **Per-file reindexing.** The four file-local families reuse structural file units on a fingerprint match.
 - **The `dependence` id is never reused.** That keeps two conditions measurable: phase 3's zero dependence-provider rows
   and retirement condition 2.
-- **Graduation.** During the gates, a per-language graduation set decides which producer publishes. It is one predicate
-  in code, read by both the structural provider and the engine's importer, which drops the four families for a
-  graduated language. The set is deleted at phase 3.
+- **Graduation.** As accepted, a per-language graduation set was to decide which producer publishes during the gates.
+  **Amended 2026-10-08:** it is not built. Every language moves at once, so the engine's importer drops the four
+  families for every language in one change, and the structural provider publishes them for every language.
 
 **Alternative weighed:** a native backend under the `dependence` id. Its strength is real: none of the nine
 consumers keyed on that id would change. It loses on three counts:
 - the phase-3 gate and retirement condition 2 become unmeasurable;
-- a provider has one invalidation scope, and `dependence` is package-scoped (`internal/provider/dependence/provider.go:214`);
+- a provider has one invalidation scope, and `dependence` is package-scoped (`Provider.Descriptor` in `internal/provider/dependence/provider.go`);
 - it would parse every file a second time.
 
 **Trade-off accepted:** the nine id-keyed consumers learn a second publisher of those families for the length of the
-gates.
+gates. **Amended 2026-10-08:** with no graduation set there is never a second publisher; the four families change
+publisher for every language in one change.
 
 ### 10. A header's language is decided by the repository, not by its extension
 

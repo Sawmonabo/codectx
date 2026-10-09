@@ -52,7 +52,8 @@ import (
 // Version 3 is the Section 11.3/11.4 mapping: every reference occurrence
 // publishes a call-site alias, an external entity's evidence carries no
 // location, a read or write occurrence is a `references` edge because
-// `reads`/`writes` are the dependence provider's facts (Section 11.6), and a
+// `reads`/`writes` are the structural provider's facts
+// (docs/providers-treesitter.md, Dependence facts), and a
 // document that does not declare its position encoding is converted in the
 // measured encoding of the tool **build** that wrote the index and only after
 // that encoding is proved against the pinned bytes.

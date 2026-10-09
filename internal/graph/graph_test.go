@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -37,7 +38,7 @@ import (
 //	                DirectionBoth also admits a third route through the package
 //	                containment edges (n-a <-contains pkg-app -imports-> pkg-lib
 //	                -contains-> n-z, cost 14).
-//	dependence-only reads / data_flows_to edges alongside ordinary kinds
+//	dependence reads / data_flows_to edges alongside ordinary kinds
 //	two packages    pkg-app and pkg-lib, so a rollup has a distinct pair
 
 // fixtureID maps a readable fixture name to the 64-lowercase-hex id every
@@ -172,7 +173,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		{"n-a", model.RelCalls, "n-q"},
 		{"n-q", model.RelCalls, "n-z"},
 
-		// dependence-only kinds mixed in with ordinary ones
+		// dependence kinds mixed in with ordinary ones
 		{"n-a", model.RelReads, "n-var"},
 		{"n-b", model.RelWrites, "n-var"},
 		{"n-b", model.RelDataFlowsTo, "n-sink"},
@@ -260,11 +261,10 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
 
 	// The generation's capability report, as PinnedReader.Capabilities returns
-	// it: one ordinary fresh row, and one deferred dependence row. An answer
-	// that traverses a dependence-only kind must disclose the deferred row, and
-	// EVERY answer must carry the report itself -- a graph answer that dropped
-	// it would report "no capabilities" on a generation whose search answers
-	// report them from the same reader.
+	// it: one fresh row and one unavailable row. EVERY answer must carry the
+	// report itself, unchanged -- a graph answer that dropped it would report
+	// "no capabilities" on a generation whose search answers report them from
+	// the same reader.
 	f.caps = []model.CapabilityState{{
 		ProviderID: "canonical",
 		Capability: "relations",
@@ -272,11 +272,10 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		State:      model.CapabilityFresh,
 	}, {
 		ProviderID:     "dependence",
-		Capability:     "data_flows_to",
+		Capability:     "calls",
 		Scope:          "workspace",
 		State:          model.CapabilityUnavailable,
 		DiagnosticCode: model.CodeProviderUnavailable,
-		Details:        map[string]string{"reason": "units_deferred"},
 	}}
 	return f
 }
@@ -717,32 +716,12 @@ func TestGraphScenarios(t *testing.T) {
 				if !seen[fixtureNodeID("n-c")] {
 					t.Error("n-c is missing; it is reachable only through the cycle")
 				}
-				// The default impact allowlist includes reads and writes, so the
-				// deferred dependence row must be disclosed unchanged and the
-				// answer must not claim to be exhaustive.
-				if !res.Meta.Truncated || res.Meta.TruncationReason != reasonDependence {
-					t.Errorf("meta = (%v, %q), want truncated with %q",
-						res.Meta.Truncated, res.Meta.TruncationReason, reasonDependence)
-				}
 				// The answer carries the generation's whole capability report,
-				// with the deferred row disclosed once inside it: dropping the
-				// report leaves the caller unable to tell a complete answer from
-				// a degraded one, and publishing the deferred row a second time
-				// alongside it both misreports and grows a full report past
-				// model.MaxCapabilityStates.
-				if len(res.Meta.Completeness) != len(f.caps) {
-					t.Fatalf("completeness rows = %d, want the generation's %d capability rows",
-						len(res.Meta.Completeness), len(f.caps))
-				}
-				var row model.CapabilityState
-				for _, c := range res.Meta.Completeness {
-					if c.ProviderID == "dependence" {
-						row = c
-					}
-				}
-				if row.State != model.CapabilityUnavailable || row.DiagnosticCode != model.CodeProviderUnavailable ||
-					row.Details["reason"] != "units_deferred" {
-					t.Errorf("deferred row = %+v, want it copied unchanged from the capability report", row)
+				// unchanged: dropping it leaves the caller unable to tell a
+				// complete answer from a degraded one. Mutation: answer
+				// completeness with no rows -> this fails.
+				if !reflect.DeepEqual(res.Meta.Completeness, f.caps) {
+					t.Fatalf("completeness = %+v, want the generation's capability report %+v", res.Meta.Completeness, f.caps)
 				}
 			},
 		},

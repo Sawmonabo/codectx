@@ -2,25 +2,29 @@
 // tree-sitter pass over each supported source file that publishes
 // declarations, containing scopes, signatures, imports and exports, syntax
 // references and call sites, test declarations and attached documentation at
-// precision syntax. Parsing runs in isolated worker subprocesses (package
-// worker) started through the shared process runner; this package is the
-// parent side, which streams pinned bytes to a worker, validates every framed
-// fact it answers with against those bytes, resolves identities through the
-// unit's resolver and emits facts through the sink. It never links the
-// grammars itself and never holds a repository-wide AST or source cache: the
-// unit of work is one file, and its bytes live only for that unit.
+// precision syntax, and, from the same worker walk, the file-local
+// dependence families control_depends_on, data_flows_to, reads and writes
+// between the file's parameters and locals at precision static_analysis
+// (docs/providers-treesitter.md, Dependence facts). Parsing runs in isolated
+// worker subprocesses (package worker) started through the shared process
+// runner; this package is the parent side, which streams pinned bytes to a
+// worker, validates every framed fact it answers with against those bytes,
+// resolves identities through the unit's resolver and emits facts through the
+// sink. It never links the grammars itself and never holds a repository-wide
+// AST or source cache: the unit of work is one file, and its bytes live only
+// for that unit.
 //
 // Memory is taken from each file's observed need (ADR-0012 decision 5): a
 // worker holds its reported base on the process's reservation ledger, and
 // each file reserves its predicted increment before it is dispatched -- the
 // learned p99 of need per source byte for its repository, language, grammar
 // fingerprint and size class, or the structural prior for the first file of
-// that key. The need a worker measures covers the parse and the extraction
-// only, since the dependence lowering does not run in the worker, so the
-// model learns that and nothing more. The overrun target of at most 2% of
-// files per class after the first generation is not claimed: overruns are
-// counted per class and disclosed in Stats, and every file that overruns
-// still runs.
+// that key. The need a worker measures covers the parse, the extraction and
+// the dependence lowering and analysis of every callable, which all run in
+// the worker's one walk over the file, so the model learns all three. The
+// overrun target of at most 2% of files per class after the first generation
+// is not claimed: overruns are counted per class and disclosed in Stats, and
+// every file that overruns still runs.
 package treesitter
 
 import (
@@ -30,6 +34,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -220,7 +225,7 @@ func invalidOption(msg string) *model.Error {
 // (lang.Version), so a grammar or query change invalidates every unit.
 func (p *Provider) Descriptor() model.ProviderDescriptor {
 	return model.ProviderDescriptor{
-		ID: lang.ProviderID, Version: lang.Version(), Capabilities: []string{capabilityName},
+		ID: lang.ProviderID, Version: lang.Version(), Capabilities: slices.Clone(capabilities),
 		DependsOn: []string{"filesystem"}, InvalidationScope: model.InvalidationFile, Required: true,
 	}
 }
@@ -234,7 +239,7 @@ func (p *Provider) Detect(_ context.Context, _ workspace.Root, _ workspace.Polic
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
 		return provider.Detection{Available: false, DiagnosticCode: model.CodeProviderUnavailable}, nil
 	}
-	return provider.Detection{Available: true, Capabilities: []string{capabilityName}}, nil
+	return provider.Detection{Available: true, Capabilities: slices.Clone(capabilities)}, nil
 }
 
 // LanguageOf reports whether the provider parses a manifest row, and the
@@ -367,10 +372,12 @@ func (p *Provider) OpenStage(ctx context.Context) (closeStage func() model.Stage
 
 // IndexUnit indexes the one file the unit's scope key names. The run always
 // reports succeeded when facts were produced or the file was honestly
-// skipped, with the capability state for the file's scope saying fresh,
-// partial (syntax errors, a query that exceeded its match limit, or a bound
-// the builder disclosed) or unavailable (over max_parse_file_bytes, wider than
-// the parser can address, not UTF-8, or not a supported language); an
+// skipped, with one capability row per descriptor capability for the file's
+// scope. The structure row says fresh, partial (syntax errors, a query that
+// exceeded its match limit, or a bound the builder disclosed) or unavailable
+// (over max_parse_file_bytes, wider than the parser can address, not UTF-8,
+// or not a supported language); the four dependence rows are unavailable with
+// it, and otherwise follow builder.capabilities, which never fails the unit; an
 // unhealthy worker is replaced and the parse retried once; anything else fails
 // the unit. A header is parsed with the grammar its snapshot's census chooses
 // and falls back once to the other (grammarOf); its facts are in the grammar
@@ -388,18 +395,21 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	result := model.ProviderResult{RunID: req.Run, State: model.RunSucceeded}
-	state := model.CapabilityState{ProviderID: lang.ProviderID, Capability: capabilityName, Scope: req.Unit.ScopeKey, State: model.CapabilityFresh}
-	finish := func(st model.CapabilityStateValue, code string) (model.ProviderResult, error) {
-		state.State, state.DiagnosticCode = st, code
-		result.Capabilities = []model.CapabilityState{state}
+	// unavailable reports a file that was not parsed: every capability of
+	// its scope is unavailable for the same reason.
+	unavailable := func(code string) (model.ProviderResult, error) {
+		for _, c := range capabilities {
+			result.Capabilities = append(result.Capabilities, model.CapabilityState{ProviderID: lang.ProviderID, Capability: c,
+				Scope: req.Unit.ScopeKey, State: model.CapabilityUnavailable, DiagnosticCode: code})
+		}
 		return result, nil
 	}
 	l, fallback, ok := p.grammarOf(censusOf(req.Content), fv)
 	if !ok {
-		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
+		return unavailable(model.CodeProviderUnavailable)
 	}
 	if p.opts.MaxParseFileBytes.Exceeded(fv.Size) || fv.Size > wire.MaxSourceOffset {
-		return finish(model.CapabilityUnavailable, model.CodeResourceLimit)
+		return unavailable(model.CodeResourceLimit)
 	}
 	src, err := p.read(ctx, req.Content, fv)
 	if err != nil {
@@ -407,7 +417,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	}
 	result.BytesProcessed = uint64(len(src))
 	if !utf8.Valid(src) {
-		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
+		return unavailable(model.CodeProviderUnavailable)
 	}
 	wreq := wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint64(len(src)), Fallback: fallback}
 	ex, err := p.parse(ctx, req.Content, wreq, src)
@@ -427,14 +437,16 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	result.RecordsEmitted = records
+	state := model.CapabilityState{ProviderID: lang.ProviderID, Capability: capabilityName, Scope: req.Unit.ScopeKey, State: model.CapabilityFresh}
 	if h := ex.done.Header; h != nil {
 		state = discloseHeader(state, *h)
 	}
-	state, bounded := b.bounds(state)
+	state, bounded := b.bounds(structure, state)
 	if ex.done.SyntaxErrors || ex.done.Truncated || bounded {
-		return finish(model.CapabilityPartial, model.CodeCoverageIncomplete)
+		state.State, state.DiagnosticCode = model.CapabilityPartial, model.CodeCoverageIncomplete
 	}
-	return finish(model.CapabilityFresh, "")
+	result.Capabilities = b.capabilities(state)
+	return result, nil
 }
 
 // lookup finds the manifest row for one path without walking the manifest.

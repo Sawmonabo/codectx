@@ -21,6 +21,13 @@ External tools (SCIP indexers, the dependence engine, language servers) run thro
 loader: providers are Go packages composed into one `Registry` by
 `internal/app`.
 
+Each relation family has one publisher. The four file-local dependence
+families, `control_depends_on`, `data_flows_to`, `reads` and `writes`, are the
+structural `treesitter` provider's, published per file at `static_analysis`
+from the same worker walk that extracts the file
+(`docs/providers-treesitter.md`, Dependence facts). The `dependence` provider
+publishes `calls` only (`docs/providers-dependence.md`).
+
 ```go
 type Provider interface {
     Descriptor() model.ProviderDescriptor

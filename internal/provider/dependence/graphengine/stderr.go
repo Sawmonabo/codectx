@@ -16,7 +16,9 @@ package graphengine
 //     in an out-of-memory failure too and would otherwise mask it.
 //   - Definition-cap skips: an induced `--max-num-def 1` on a Python fixture
 //     produced paired WARN lines, `<method> has more than <n> definitions`
-//     and `Skipping.`, 13 of each, from `ReachingDefPass`.
+//     and `Skipping.`, 13 of each, from `ReachingDefPass`. That pass feeds no
+//     fact this provider publishes, so the lines are not a failure and are
+//     not counted.
 //   - Pass crash: the pass runner logs `Pass %s failed in %.0f ms` with the
 //     throwable attached, at WARN, and a pass that throws before it is timed
 //     is logged as `Pass %s failed` at ERROR instead. The format string and
@@ -49,8 +51,6 @@ const (
 	markerFailed       = " failed"
 	markerFailedIn     = markerFailed + " in "
 	markerHelperExited = "Process exited with code"
-	markerSkipping     = "Skipping."
-	markerOverDefs     = " has more than "
 )
 
 // maxStderrLines bounds how much of a bounded stderr buffer the classifier
@@ -92,13 +92,6 @@ func classify(res process.Result, private, roots []string) dependence.Outcome {
 			oom = true
 		case strings.Contains(line, markerHelperExited):
 			helperCrash = true
-		case strings.Contains(line, markerSkipping):
-			out.SkippedCount++
-		}
-		if name, ok := skippedMethod(line); ok {
-			if len(out.SkippedMethods) < dependence.MaxReportedSkips {
-				out.SkippedMethods = append(out.SkippedMethods, name)
-			}
 		}
 		if out.Pass == "" {
 			if pass, ok := failedPass(line); ok {
@@ -350,22 +343,6 @@ func failedPass(line string) (string, bool) {
 	}
 	fields := strings.Fields(head)
 	if len(fields) < 2 || fields[len(fields)-2] != markerPassFailed {
-		return "", false
-	}
-	return fields[len(fields)-1], true
-}
-
-// skippedMethod extracts the method the engine declined to analyse for data
-// flow from its `<method> has more than <n> definitions` warning. The name is
-// the last field before the marker, so the log's timestamp, level and logger
-// columns fall away without the classifier having to model the layout.
-func skippedMethod(line string) (string, bool) {
-	i := strings.Index(line, markerOverDefs)
-	if i < 0 || !strings.HasSuffix(strings.TrimSpace(line), "definitions") {
-		return "", false
-	}
-	fields := strings.Fields(line[:i])
-	if len(fields) == 0 {
 		return "", false
 	}
 	return fields[len(fields)-1], true

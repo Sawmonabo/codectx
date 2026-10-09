@@ -172,6 +172,9 @@ type Builder struct {
 	useOff, useVars []int32
 	defOff, defVars []int32
 	mayOff, mayVars []int32
+	// declared holds, per variable, the span of the identifier that declares
+	// it (Named), or the zero Span for a variable the lowering owns (Var).
+	declared []Span
 
 	// vars is the variable count.
 	vars int
@@ -302,6 +305,7 @@ func (b *Builder) reset(a *Arena, fn Span) {
 		defVars:  b.defVars[:0],
 		mayOff:   b.mayOff[:0],
 		mayVars:  b.mayVars[:0],
+		declared: b.declared[:0],
 	}
 	b.add(EntryNode)
 }
@@ -356,11 +360,12 @@ func (b *Builder) scratchSize(count func(n, c int) int) int {
 		count(len(b.defOff), cap(b.defOff))*4 +
 		count(len(b.defVars), cap(b.defVars))*4 +
 		count(len(b.mayOff), cap(b.mayOff))*4 +
-		count(len(b.mayVars), cap(b.mayVars))*4
+		count(len(b.mayVars), cap(b.mayVars))*4 +
+		count(len(b.declared), cap(b.declared))*int(unsafe.Sizeof(Span{}))
 }
 
-// release drops every scratch list's backing array. Arena.Begin calls it,
-// before reset, when the release rule fires.
+// release drops every scratch list's backing array. Arena.Release calls
+// it.
 func (b *Builder) release() {
 	*b = Builder{}
 }
@@ -385,9 +390,30 @@ func (b *Builder) Node(k Kind, s Span) int32 {
 	return n
 }
 
-// Var declares a variable and returns its dense id. Scoping is the
+// Var declares a variable the lowering owns and binds to no name (a result,
+// an iteration value, a selector) and returns its dense id. Scoping is the
 // lowering's: it maps names to ids.
-func (b *Builder) Var() int32 {
+func (b *Builder) Var() int32 { return b.declare(Span{}) }
+
+// Named declares a variable bound to a name in the source, a parameter or a
+// local, whose declaring identifier spans decl, and returns its dense id.
+// The span is the variable's identity outside the function (Graph.Declared):
+// it is the identifier token alone, inside the function's span or, for a
+// Java compact constructor's parameters, in its record's header. An empty
+// span, the zero-width identifier an error-recovered tree supplies for a
+// missing token, declares a variable with no name in the source, which
+// Graph.Declared reports as owned. A variable declared at several sites (a
+// name a preprocessor conditional's arms each declare) takes the span of the
+// site that created it.
+func (b *Builder) Named(decl Span) int32 {
+	if decl.End <= decl.Start {
+		decl = Span{}
+	}
+	return b.declare(decl)
+}
+
+func (b *Builder) declare(decl Span) int32 {
+	b.declared = append(b.declared, decl)
 	b.vars++
 	return int32(b.vars - 1)
 }
@@ -866,6 +892,7 @@ func (b *Builder) Finish() *Graph {
 		succ:       succ,
 		predOff:    predOff,
 		pred:       pred,
+		declared:   b.declared,
 		vars:       b.vars,
 		unresolved: b.unresolved,
 	}
