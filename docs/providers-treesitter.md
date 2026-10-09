@@ -199,7 +199,7 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `calls` | enclosing declaration (or file module) → declaration | a call whose name is declared exactly once in this file, respecting qualification (a `recv.name()` call names methods; a bare call names functions, tests, classes and structs); definitions preferred over prototypes |
 | `calls` | enclosing declaration (or file module) → callee reference | a call this file cannot resolve to exactly one of its declarations: ambiguous, import-qualified (`fmt.Println`, `str.ToUpper`, `path.join`, `std::move`) or not declared here. The callee is a provider-local node carrying `resolution`/`candidates`, never a guess |
 | `may_refer_to` | enclosing declaration → each candidate | a call whose name is declared more than once in this file (overloads, shadowing); bounded by `MaxAmbiguousCandidates`, alongside the `calls` edge to the ambiguous callee reference |
-| `references` | enclosing declaration → type declaration | a type reference to a class/struct/interface/enum declared in this file; a type this file does not declare gets no placeholder |
+| `references` | enclosing declaration → type or macro declaration | a type reference to a class/struct/interface/enum declared in this file, or a Rust macro invocation of a `macro_rules!` declared in it; a name this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
@@ -380,13 +380,16 @@ normalisation rule, so equal strings join an indirect site to an address-taken f
 outside the file.
 
 For Rust (`worker/link_rust.go`), a method's `self` parameter is its receiver, not one of `Params`, and a foreign
-function's `...` counts as one parameter a call may leave out (`Optional`). A value's declared type loses the
-references and the standard smart pointer around it (`&Box<dyn Handler>`, `Rc<T>`, `Arc<T>`, `Pin<P>`), as a method
-call's auto-dereference does, so the receiver names the owned type; an impl's self type and a trait bound keep
-theirs. A call of a method the pointer itself answers through a standard trait (`clone`, `as_ref`, `fmt`, …) on a
-binding or field declared as a pointer carries no receiver type. A macro invocation is not a call site: the query pack
-captures none (`lang/queries/rust.scm`), since a macro's name is in its own namespace and its expansion is never
-parsed.
+function's `...` is one of `Params` with `Variadic` set. A method's `Signature` spells its self parameter first, as
+the type it declares (`&self` of `Foo` is `&Foo`), because a Rust method is a value only through its path, `Foo::m`,
+whose function type takes the receiver first. A binding's or field's declared type loses the references and the
+standard smart pointer around it (`&Box<dyn Handler>`, `Rc<T>`, `Arc<T>`, `Pin<P>`), as a method call's
+auto-dereference does, so the receiver names the owned type; an impl's self type and a trait bound keep theirs, and a
+declared result keeps its pointer (`Rc<Foo>`), which the linker removes for every method but the pointer's own (the
+lists in `lang/rust.go`). A call of a method the pointer itself answers through a standard trait (`clone`, `as_ref`,
+`fmt`, …) on a binding or field declared as a pointer carries no receiver type. A macro invocation is not a call: the
+query pack captures it as a `macro` reference (`lang/queries/rust.scm`), which names only a `macro_rules!` of the file
+and is never a link site, and a bare call never names a Rust macro.
 
 The parent joins the tables to the declarations and call references it validated: every call reference becomes a
 site of the stored `link.Table` (`internal/provider/link/table.go`), with its shape from the joined wire site or,
@@ -692,7 +695,7 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
 | `@bind.names` + `@bind.values` | the name list and the value list of a Go short variable declaration whose values hold a function literal, each captured once per statement under `@def.function`; the worker pairs the i-th name with the i-th value and declares each identifier bound to a function literal, so `x, f := 1, func() {}` declares f alone. The value list must hold a function literal for the pattern to match, so a plain `x := v` is never walked |
 | `@import.clause` | an ECMAScript import clause, captured once per statement; the worker walks its default, namespace and named bindings in source order. No pattern captures each entry of a list and then a later sibling of that list: the matcher would keep one partial match per entry open until the sibling, which is quadratic in the entry count |
-| `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`). A Rust macro invocation is not one |
+| `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`). A Rust macro invocation is not one: it is `@ref.macro` + `@ref.macro.name`, a reference to the macro |
 | `@ref.type` | a type reference |
 | `@package` | the package/module clause |
 | `@export` + `@export.name` | an export wrapper or export list entry |

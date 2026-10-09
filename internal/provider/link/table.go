@@ -69,6 +69,10 @@ type Import struct {
 	// the import renames it (wire.Import.Originals): `a` for `import { a as
 	// b }`, "default" for a default import, "*" for a namespace import.
 	Original string `json:"original,omitempty"`
+	// Scope is the declaration the import is written in, -1 the module: a
+	// Rust `use` inside an inline module or a block is that scope's alone,
+	// and its relative path (`super::*`) starts there.
+	Scope int32 `json:"scope"`
 }
 
 // ImportAll is the Name of an import of every member of its Path: a Go dot
@@ -108,8 +112,12 @@ type Decl struct {
 	Internal  bool   `json:"internal,omitempty"`
 	// Prototype is a C or C++ function declaration without a body: it
 	// announces a definition and yields to one wherever one is declared.
-	Prototype bool      `json:"prototype,omitempty"`
-	Returns   wire.Type `json:"returns"`
+	Prototype bool `json:"prototype,omitempty"`
+	// Macro is a macro definition: a Rust `macro_rules!`, which only a
+	// macro invocation names and no call reaches, or a C or C++
+	// function-like macro, which a call does.
+	Macro   bool      `json:"macro,omitempty"`
+	Returns wire.Type `json:"returns"`
 }
 
 // Visible reports that declaration cand can be named by a bare name in code

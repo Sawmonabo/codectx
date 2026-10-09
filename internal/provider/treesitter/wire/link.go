@@ -49,7 +49,10 @@ type Export struct {
 	// with parameter names, whitespace and comments removed, as
 	// "(" types joined by "," ")" then the results the same way: a Go
 	// `func(a int, b string) error` is "(int,string)(error)". A method's
-	// receiver is not a parameter. It is empty when the language declares no
+	// receiver is not a parameter, except a Rust method's self parameter,
+	// spelled first as the type it declares (`&self` of Foo is "&Foo"):
+	// Rust takes a method as a value only through its path, `Foo::m`, whose
+	// function type takes the receiver first. It is empty when the language declares no
 	// types. Site.Signature is spelled by the same rule, so equal strings are
 	// the address-taken × indirect-site join key (ADR-0012 decision 2).
 	Signature string

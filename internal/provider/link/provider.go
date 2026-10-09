@@ -187,7 +187,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		pu, each, count = members.unit, members.Each, members.Len()
 	}
 	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir, root: pu.Root, content: req.Content,
-		members: each}
+		family: pu.Family, members: each}
 
 	sorted, err := newBindingSort(dir, compareSiteTarget)
 	if err != nil {

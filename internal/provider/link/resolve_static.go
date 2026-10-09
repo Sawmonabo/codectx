@@ -340,7 +340,7 @@ func (r *staticFile) free(caller int32, callee string, yield func(entry) error) 
 	case "go":
 		return r.freeGo(callee, yield)
 	case "rust":
-		return r.freeRust(callee, yield)
+		return r.freeRust(caller, callee, yield)
 	}
 	return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, yield)
 }
@@ -372,7 +372,7 @@ func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) e
 	case "c":
 		return r.qualifiedC(q, name, yield)
 	case "rust":
-		return r.qualifiedRust(q, name, yield)
+		return r.qualifiedRust(caller, q, name, yield)
 	}
 	return nil
 }
@@ -386,7 +386,7 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, bind fu
 	case wire.TypeNamed:
 		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error { return r.dispatch(typ.Ref, method, bind) })
 	case wire.TypeResult:
-		return r.results(int32(recv.Index), func(typ Ref) error { return r.dispatch(typ, method, bind) })
+		return r.results(int32(recv.Index), method, func(typ Ref) error { return r.dispatch(typ, method, bind) })
 	case wire.TypeSuper:
 		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
 			return r.h.links.lookup(keySuper+refKey(typ.Ref), func(super entry) error {
@@ -399,11 +399,14 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, bind fu
 	return nil
 }
 
-// results yields, each once, the types the targets of site j return, each
-// read in the file of the target that returns it: the static type of a
-// call's result (`NewServer().Start()`, a fluent chain, `Config::new().load()`).
-// A site not yet resolved is resolved first, without publishing anything.
-func (r *staticFile) results(j int32, yield func(Ref) error) error {
+// results yields, each once, the types the targets of site j return that a
+// call of method on the result reaches, each read in the file of the target
+// that returns it: the static type of a call's result
+// (`NewServer().Start()`, a fluent chain, `Config::new().load()`). A Rust
+// result held in a smart pointer (`-> Rc<Foo>`) reaches the owned type,
+// except by a method the pointer answers itself (rustReceiver). A site not
+// yet resolved is resolved first, without publishing anything.
+func (r *staticFile) results(j int32, method string, yield func(Ref) error) error {
 	if j < 0 || int(j) >= len(r.t.Sites) {
 		return nil
 	}
@@ -414,7 +417,14 @@ func (r *staticFile) results(j int32, yield func(Ref) error) error {
 	}
 	seen := map[Ref]bool{}
 	for _, ret := range r.returns[j] {
-		err := r.h.types(r.ctx, ret.file, ret.name, func(typ Ref) error {
+		name := ret.name
+		if r.fc.family == "rust" {
+			var ok bool
+			if name, ok = rustReceiver(name, method); !ok {
+				continue
+			}
+		}
+		err := r.h.types(r.ctx, ret.file, name, func(typ Ref) error {
 			if seen[typ] {
 				return nil
 			}

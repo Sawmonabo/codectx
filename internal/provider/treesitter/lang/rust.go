@@ -1,6 +1,66 @@
 package lang
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
+
+// rustPointers are the standard library's smart pointers. A method call on
+// one reaches, by auto-dereference, the methods of the value it owns (the
+// Rust Reference's "Method-call expressions"), so a receiver declared as
+// one carries the owned value's type: `Box<dyn Handler>` is Handler.
+var rustPointers = []string{"Box", "Rc", "Arc", "Pin"}
+
+// rustPointerMethods are the methods every smart pointer of rustPointers
+// answers itself, through the standard traits it implements (Clone, Deref,
+// DerefMut, AsRef, AsMut, Borrow, BorrowMut, PartialEq, PartialOrd, Ord,
+// Hash, Debug, Display, Pointer, Any) and the blanket conversions (Into,
+// TryInto, ToOwned, ToString). The method-call lookup tries the pointer's
+// own type before it dereferences, so such a call on a pointer is the
+// pointer's method, never the owned value's.
+var rustPointerMethods = []string{"clone", "clone_from", "deref", "deref_mut", "as_ref", "as_mut", "borrow",
+	"borrow_mut", "eq", "ne", "partial_cmp", "lt", "le", "gt", "ge", "cmp", "max", "min", "clamp", "hash", "fmt",
+	"type_id", "into", "try_into", "to_owned", "to_string"}
+
+// RustPointer reports that the type path name (`Rc`, `std::rc::Rc`, no
+// generic arguments) is a standard smart pointer.
+func RustPointer(name string) bool {
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		name = name[i+2:]
+	}
+	return slices.Contains(rustPointers, strings.TrimSpace(name))
+}
+
+// RustPointerMethod reports that a call of method on a smart pointer is the
+// pointer's own method (rustPointerMethods).
+func RustPointerMethod(method string) bool { return slices.Contains(rustPointerMethods, method) }
+
+// RustPointee is the type a smart pointer spelled as written owns, with one
+// level removed (`Rc<RefCell<T>>` is `RefCell<T>`, `&Box<dyn H>` is `dyn H`),
+// and true; false when written is not a smart pointer of one type argument.
+func RustPointee(written string) (string, bool) {
+	s := strings.TrimLeft(strings.TrimSpace(written), "&* ")
+	s = strings.TrimSpace(strings.TrimPrefix(s, "mut "))
+	open := strings.IndexByte(s, '<')
+	if open < 0 || !strings.HasSuffix(s, ">") || !RustPointer(s[:open]) {
+		return "", false
+	}
+	inner := s[open+1 : len(s)-1]
+	depth := 0
+	for _, c := range inner {
+		switch c {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			depth--
+		case ',':
+			if depth == 0 {
+				return "", false
+			}
+		}
+	}
+	return strings.TrimSpace(inner), true
+}
 
 // RustGlob is the name RustUse yields for a glob leaf (`a::*`), whose path
 // is the module every member of which it imports.

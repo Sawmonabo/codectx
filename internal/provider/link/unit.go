@@ -27,6 +27,9 @@ type unit struct {
 	// import paths are the project's own).
 	root    string
 	content model.SnapshotView
+	// family is the unit's language family; a Rust unit reads its crates'
+	// names from their Cargo.toml (rustCrates).
+	family dependence.Family
 }
 
 // Files streams the unit's member tables in ascending FileID order, one
