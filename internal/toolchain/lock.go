@@ -43,15 +43,15 @@ var supportedPlatforms = map[string]bool{
 }
 
 // lockKinds are the Section 11.7 tool kinds.
-var lockKinds = map[string]bool{"indexer": true, "server": true, "cpg": true, "runtime": true}
+var lockKinds = map[string]bool{"indexer": true, "server": true, "runtime": true}
 
 // lockRuntimes are the launchers a tool may need. The empty string is a tool
 // that runs as itself.
 var lockRuntimes = map[string]bool{"": true, "node": true, "jdk": true}
 
 // maxPayloadBytes bounds a single lock payload. The largest thing the lock
-// carries is the dependence engine distribution at a few hundred megabytes;
-// four gigabytes is a lock that is wrong. The operative cap on a real fetch is
+// carries is the Java runtime at about two hundred megabytes; four gigabytes is
+// a lock that is wrong. The operative cap on a real fetch is
 // tools.max_fetch_bytes, which defaults well below this; the value here only
 // stops a malformed lock from ever describing an unbounded download.
 const maxPayloadBytes = 4 << 30
@@ -230,7 +230,7 @@ func validEntry(l Lock, name string, e Entry) error {
 		return invalid("tool %q needs an exact version of at most %d bytes", name, maxVersionBytes)
 	}
 	if !lockKinds[e.Kind] {
-		return invalid("tool %q has kind %q, which is not indexer, server, cpg or runtime", name, e.Kind)
+		return invalid("tool %q has kind %q, which is not indexer, server or runtime", name, e.Kind)
 	}
 	if e.License == "" {
 		return invalid("tool %q records no license; every redistributed payload has one", name)
@@ -415,7 +415,6 @@ var toolLanguages = map[string][]string{
 	"ty":                         {"python"},
 	"clangd":                     {"c", "cpp"},
 	"jdtls":                      {"java"},
-	"joern":                      {"c", "cpp", "go", "java", "javascript", "python", "rust", "tsx", "typescript"},
 }
 
 // languagesOf reports the languages a lock entry unlocks, as a fresh slice so
