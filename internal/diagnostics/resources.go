@@ -4,13 +4,11 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
@@ -56,28 +54,6 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 		report.WALBytes = nonNegativeBytes(stats.WALBytes)
 	}
 	report.FreedBytes = nonNegativeBytes(paced.FreedBytes())
-	// What this process handed its heavy analyzers, and what they used. It is
-	// read from the provider's own record rather than from the store because
-	// it is process accounting: a unit's reservation and the peak its tree
-	// reached belong to the run that started it, not to a stored generation.
-	report.AnalyzerUnits = dependence.ObservedUnits()
-	// A unit that peaked above what it was admitted against took memory the
-	// machine had accounted for elsewhere, which is the direction that freezes
-	// a host. The rows above carry both figures; this is the count, so an
-	// overrun reaches an operator reading the block rather than only one
-	// comparing every row by hand. It is the provider's own total, which also
-	// counts the units past the rows' bound. It is absent where this process
-	// ran no heavy unit -- nothing was measured -- and zero where it ran them
-	// and none overran.
-	overran, omitted := dependence.ObservedTotals()
-	if len(report.AnalyzerUnits) > 0 || omitted > 0 {
-		report.AnalyzerOverrunUnits = &overran
-	}
-	if omitted > 0 {
-		report.Warnings = append(report.Warnings, fmt.Sprintf(
-			"%d heavy analyzer unit runs are past the %d rows this block carries; the overrun count includes them",
-			omitted, dependence.MaxObservedUnits))
-	}
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
@@ -259,7 +235,7 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 // reservations fills the figures that are not measured but promised: what this
 // process has set aside for concurrent queries, for the parsed-graph cache and
 // for the indexing queue, and beside them the one allocation every heavy child
-// of this process -- engine runs, external indexers, language servers -- is
+// of this process -- precise-indexer runs and language servers -- is
 // admitted against, with the sum currently reserved against it. Two of the
 // first three are configuration and the third is how many queries this
 // machine's cores run at once, so all three are always available and a zero

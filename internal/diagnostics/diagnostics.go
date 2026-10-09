@@ -85,9 +85,7 @@ type StoreSizer interface {
 }
 
 // ToolchainReporter reports one status per lock entry. The lock entry name is
-// what a check prints for a managed tool; the dependence backend is reported in
-// the `engine <version> <digest>` form the provider already uses, never by the
-// backend's product name.
+// what a check prints for a managed tool.
 type ToolchainReporter interface {
 	Statuses(ctx context.Context) ([]toolchain.Status, error)
 	// Selected names the lock entries the repository at root selects -- the
