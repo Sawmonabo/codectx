@@ -32,8 +32,9 @@ type Link struct {
 	Unions [][]Type
 }
 
-// Export describes one declaration of the file that a call may bind to, with
-// the language's type facts the linker reads. A declaration the worker sends
+// Export describes one declaration of the file that a call may bind to, or a
+// type whose linkage decides which files' names reach it, with the
+// language's type facts the linker reads. A declaration the worker sends
 // no Export for is still a declaration (Decl); it has no type facts.
 type Export struct {
 	// Name is the declaration's name token.
@@ -78,9 +79,10 @@ type Export struct {
 	// `final` or of a `final` class. A call of it never dispatches into a
 	// subtype.
 	Final bool
-	// Internal reports a function with internal linkage: a C or C++ `static`
-	// function at namespace scope, or one declared in a C++ unnamed
-	// namespace. Only its own file can call it by name.
+	// Internal reports a declaration with internal linkage: a C or C++
+	// `static` function at namespace scope, or a function, class, struct,
+	// union or enum declared in a C++ unnamed namespace. Only its own file
+	// names it.
 	Internal bool
 	// Returns is the type the callable returns: its declared result type,
 	// or the type the worker recovered from its return statements inside the
