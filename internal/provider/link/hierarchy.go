@@ -16,6 +16,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/scratch"
@@ -51,8 +52,9 @@ const (
 	// by a NUL) and its scopes (Sig, joined by "\n"), the context a name
 	// written in it is read in.
 	keyFile = "f\x00"
-	// keyImport + refKey(file, 0) + name: the path a name the file's imports
-	// introduce denotes (Aux), ImportAll for an import of every member, and
+	// keyImport + refKey(file, 0) + name: the declaration the import is
+	// written in (Ref.Index, -1 the module), the path a name the file's
+	// imports introduce denotes (Aux), ImportAll for an import of every member, and
 	// the name it denotes in that path's module when the import renames it
 	// (Sig, Import.Original).
 	keyImport = "i\x00"
@@ -97,6 +99,13 @@ const (
 	// keyFuncModule + a Rust module (rustModuleKey) + name: a free function
 	// that module declares, which a `use` or a `module::f` path reaches.
 	keyFuncModule = "um\x00"
+	// keyRustModule + a Rust module (rustModuleKey): a module of the unit, a
+	// file's or an inline or declared `mod` item's, which a path's first
+	// component names before any crate of that name (rustPath).
+	keyRustModule = "rm\x00"
+	// keyRustCrate + a crate's name: the crate (rustFile) of the library a
+	// Cargo.toml of the unit declares under that name, in Aux (rustCrates).
+	keyRustCrate = "rc\x00"
 	// keyFuncInternal + scope + name, and + scope + each qualified suffix of
 	// two or more components: a C or C++ function with internal linkage,
 	// which no other translation unit names. The scope is its file's path,
@@ -170,6 +179,10 @@ type fileCtx struct {
 	// names a declaration or file of the unit (closedImports).
 	imports []Import
 	closed  *closedState
+	// decls are the file's declarations, nil for a context read back from
+	// the index; a Rust path written inside an inline module is read from
+	// that module (rustScope).
+	decls []Decl
 }
 
 // closedState caches a file's closedImports answer.
@@ -180,7 +193,7 @@ type closedState struct{ asked, closed bool }
 // using-directives name, and every other language's file.
 func contextOf(file int32, t *Table) fileCtx {
 	fc := fileCtx{file: file, language: t.Language, family: familyOf(t.Language), sep: separatorOf(t.Language), path: t.Path,
-		imports: t.Imports, closed: &closedState{}}
+		imports: t.Imports, closed: &closedState{}, decls: t.Decls}
 	switch fc.family {
 	case "go":
 		fc.scopes = []string{path.Dir(t.Path) + "\x00" + t.Package}
@@ -300,6 +313,11 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	if err != nil {
 		return nil, err
 	}
+	if u.family == dependence.FamilyRust {
+		if err := rustCrates(ctx, u, decls); err != nil {
+			return nil, err
+		}
+	}
 	if h.decls, err = writeIndex(u.dir, decls); err != nil {
 		return nil, err
 	}
@@ -344,7 +362,7 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		if imp.Name == "" {
 			continue
 		}
-		if err := s.Add(entry{Key: keyImport + fileKey + imp.Name, Aux: imp.Path, Sig: imp.Original}); err != nil {
+		if err := s.Add(entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}); err != nil {
 			return err
 		}
 	}
@@ -361,6 +379,23 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 	if fc.family == "go" {
 		if err := s.Add(entry{Key: keyGoDir + path.Dir(t.Path), Aux: t.Package}); err != nil {
 			return err
+		}
+	}
+	if fc.family == "rust" {
+		// The file's module and every module item it declares.
+		if err := s.Add(entry{Key: keyRustModule + rustModuleKey(rustFile(t.Path))}); err != nil {
+			return err
+		}
+		for i := range t.Decls {
+			d := &t.Decls[i]
+			if d.Kind != model.NodeModule {
+				continue
+			}
+			if m, ok := rustDeclModule(t, d); ok {
+				if err := s.Add(entry{Key: keyRustModule + m + "::" + d.Name}); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	// bases are the module paths an import names this file by, for the
@@ -398,7 +433,7 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 				return err
 			}
 			continue
-		case isCallable(d.Kind) && d.Receiver == "" && (d.Parent < 0 || !isType(t.Decls[d.Parent].Kind)):
+		case isCallable(d.Kind) && d.Receiver == "" && (d.Parent < 0 || !isType(t.Decls[d.Parent].Kind)) && !(d.Macro && fc.family == "rust"):
 			prefix, qualifiedPrefix = keyFunc, keyFuncQualified
 			if fc.family == "rust" {
 				if m, ok := rustDeclModule(t, d); ok {
@@ -672,17 +707,17 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 		return nil
 	}
 	imported := false
-	err := h.imports(fc, name, func(p string) error {
+	err := h.importsAt(fc, name, func(p string, scope int32) error {
 		imported = true
-		return h.importedType(fc, name, p, yield)
+		return h.importedType(fc, name, p, scope, yield)
 	})
 	if err != nil || imported {
 		return err
 	}
 	all := false
-	err = h.imports(fc, ImportAll, func(p string) error {
+	err = h.importsAt(fc, ImportAll, func(p string, scope int32) error {
 		all = true
-		return h.memberType(fc, p, name, hit)
+		return h.memberType(fc, p, scope, name, hit)
 	})
 	if err != nil || found || all {
 		return err
@@ -765,9 +800,8 @@ func (h *hierarchy) closedImports(fc fileCtx) (bool, error) {
 			if !ok {
 				break
 			}
-			module = rustPath(fc.path, module)
-			if err = h.decls.lookup(keyTypeModule+module+"\x00"+last, hit); err == nil && !found {
-				err = h.decls.lookup(keyFuncModule+module+"\x00"+last, hit)
+			if err = h.rustModuleDecls(keyTypeModule, fc, imp.Scope, module, last, hit); err == nil && !found {
+				err = h.rustModuleDecls(keyFuncModule, fc, imp.Scope, module, last, hit)
 			}
 		}
 		if err != nil {
@@ -786,7 +820,7 @@ func (h *hierarchy) closedImports(fc fileCtx) (bool, error) {
 // and rest the others.
 func (h *hierarchy) qualifiedTypes(fc fileCtx, name, head, rest string, yield func(entry) error) error {
 	imported := false
-	err := h.imports(fc, head, func(p string) error {
+	err := h.importsAt(fc, head, func(p string, scope int32) error {
 		imported = true
 		switch fc.family {
 		case "go":
@@ -809,7 +843,7 @@ func (h *hierarchy) qualifiedTypes(fc fileCtx, name, head, rest string, yield fu
 			}
 			return h.moduleType(fc, p, last, yield)
 		}
-		return h.importedType(fc, "", p+fc.sep+rest, yield)
+		return h.importedType(fc, "", p+fc.sep+rest, scope, yield)
 	})
 	if err != nil || imported {
 		return err
@@ -817,7 +851,7 @@ func (h *hierarchy) qualifiedTypes(fc fileCtx, name, head, rest string, yield fu
 	if fc.family == "rust" {
 		module, last, _ := cutLast(name, fc.sep)
 		found := false
-		err := h.decls.lookup(keyTypeModule+rustPath(fc.path, module)+"\x00"+last, func(e entry) error {
+		err := h.rustModuleDecls(keyTypeModule, fc, -1, module, last, func(e entry) error {
 			found = true
 			return yield(e)
 		})
@@ -834,14 +868,14 @@ func (h *hierarchy) qualifiedTypes(fc fileCtx, name, head, rest string, yield fu
 // (Import.Original: `Foo` for `import { Foo as Bar }` and `from m import Foo
 // as Bar`, `default` for a default import), the local name when it does not
 // rename it; a namespace import binds a module, never a type.
-func (h *hierarchy) importedType(fc fileCtx, local, p string, yield func(entry) error) error {
+func (h *hierarchy) importedType(fc fileCtx, local, p string, scope int32, yield func(entry) error) error {
 	switch fc.family {
 	case "rust":
 		module, last, ok := cutLast(p, fc.sep)
 		if !ok {
 			return nil
 		}
-		return h.decls.lookup(keyTypeModule+rustPath(fc.path, module)+"\x00"+last, yield)
+		return h.rustModuleDecls(keyTypeModule, fc, scope, module, last, yield)
 	case "js", "python":
 		original, err := h.importOriginal(fc, local, p)
 		switch {
@@ -860,14 +894,14 @@ func (h *hierarchy) importedType(fc fileCtx, local, p string, yield func(entry) 
 
 // memberType yields the type declarations named name among the members an
 // import of every member of p reaches.
-func (h *hierarchy) memberType(fc fileCtx, p, name string, yield func(entry) error) error {
+func (h *hierarchy) memberType(fc fileCtx, p string, scope int32, name string, yield func(entry) error) error {
 	switch fc.family {
 	case "go":
 		return h.goPackages(p, func(scope string) error {
 			return h.decls.lookup(keyType+fc.family+"\x00"+scope+"\x00"+name, yield)
 		})
 	case "rust":
-		return h.decls.lookup(keyTypeModule+rustPath(fc.path, p)+"\x00"+name, yield)
+		return h.rustModuleDecls(keyTypeModule, fc, scope, p, name, yield)
 	case "js", "python":
 		return h.moduleType(fc, p, name, yield)
 	case "c":
@@ -988,7 +1022,13 @@ func (h *hierarchy) importOriginal(fc fileCtx, local, p string) (string, error) 
 // imports yields the path each import of fc's file binding name denotes,
 // ImportAll naming the imports of every member.
 func (h *hierarchy) imports(fc fileCtx, name string, yield func(string) error) error {
-	return h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+name, func(e entry) error { return yield(e.Aux) })
+	return h.importsAt(fc, name, func(p string, _ int32) error { return yield(p) })
+}
+
+// importsAt is imports with the declaration each import is written in (-1
+// the module, Import.Scope).
+func (h *hierarchy) importsAt(fc fileCtx, name string, yield func(p string, scope int32) error) error {
+	return h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+name, func(e entry) error { return yield(e.Aux, e.Ref.Index) })
 }
 
 // methods yields the methods typ itself declares named method. A C++

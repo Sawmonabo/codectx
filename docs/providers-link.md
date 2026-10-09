@@ -204,11 +204,17 @@ another call's result (`TypeResult`) has the types that call's targets return, e
 A Rust path is read through the module it names in its own crate (`internal/provider/link/resolve_rust.go`). A
 crate is the directory Cargo's layout makes its root: the nearest `src` (`lib.rs` and `main.rs` are the root,
 `a/b.rs` is `a::b`, `a/mod.rs` is `a`), or `src/bin`, `tests`, `examples` or `benches`, each of whose files is a
-crate root. Every function and type is keyed by its module, inline `mod` items included. From a file, `crate` is the
-root, `self` its module, each `super` one module up, and any other first component a module the file's module
-declares, once a `use` binding it has been read. A path that leaves the crate binds nothing, and no Rust
-declaration is reached by a suffix of its qualified name. For example, `use crate::a::util; util::f()` binds
-`src/a/util.rs`'s `f` and never `src/b/util.rs`'s.
+crate root. Every function and type is keyed by its module, inline `mod` items included. A path is read from the
+module it is written in, an inline `mod` included (each `link.Import` carries the declaration it is written in,
+`Import.Scope`): `crate` is the root, `self` the module, each `super` one module up, `::name` a crate, and any other
+first component a module the current one declares, else a crate of the unit by the name its `Cargo.toml` gives its
+library (`[lib] name`, else `[package] name` with `-` as `_`; `rustCrates`), once a `use` binding it has been read. A
+bare name sees the functions and `use`s of its own module and enclosing blocks, never those of an enclosing module,
+so `mod tests { use super::*; }` reads `super` from `tests`. A path that names no module of the unit binds nothing,
+and no Rust declaration is reached by a suffix of its qualified name. For example, `use crate::a::util; util::f()`
+binds `src/a/util.rs`'s `f` and never `src/b/util.rs`'s. A method path taken as a value (`let g: fn(&Foo, i32) =
+Foo::m`) joins on its receiver-first signature. A call's result declared as a smart pointer (`-> Rc<Foo>`) reaches
+`Foo`'s methods, except those the pointer answers itself (`rustReceiver`). A `macro_rules!` is never a call target.
 
 A type name is read in the file's scopes, then through the import that names it (which decides alone), then
 through the file's imports of every member. A name none of them can supply falls back to every type of that name
