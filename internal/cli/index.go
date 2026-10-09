@@ -912,7 +912,6 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		{"awaiting freeing", byteMetric(r.PendingFreeBytes)},
 		{"live subprocesses", countMetric(r.LiveSubprocesses)},
 		{"pending events", countMetric(r.PendingEvents)},
-		{"analyzer units over reservation", countMetric(r.AnalyzerOverrunUnits)},
 		{"units reused", countMetric(r.UnitsReused)},
 		{"units parsed", countMetric(r.UnitsParsed)},
 	} {
@@ -932,23 +931,6 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 	}
 	if r.StuckFreesOmitted > 0 {
 		fmt.Fprintf(tw, "    stuck %d more\t\n", r.StuckFreesOmitted)
-	}
-	// One line per heavy analysis unit: what it was admitted against, the cap
-	// it ran under, and what its process tree actually reached. Reading the
-	// three together is the whole point -- a peak far under the cap says the
-	// unit was serialized behind memory it never used.
-	for _, u := range r.AnalyzerUnits {
-		// The count above is the report's own and covers every unit this
-		// process recorded, including runs the rows had no room for; it is
-		// never re-derived from these rows. This marks which of the rows shown
-		// overran, on the row that carries both figures it compares.
-		overran := ""
-		if u.OverranReservation() {
-			overran = ", OVER RESERVATION"
-		}
-		fmt.Fprintf(tw, "    unit %s\treserved %d bytes, cap %d bytes (export %d bytes), allocation %s, observed peak %s%s\n",
-			u.ScopeKey, u.ReservationBytes, u.HeapCapBytes, u.ExportHeapCapBytes,
-			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes), overran)
 	}
 	// One line per learned need class, keyed as the model is -- the worker's
 	// build included, so two builds' models of one class are two lines and

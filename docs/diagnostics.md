@@ -102,8 +102,7 @@ wall-sorted table while measuring nothing.
 
 ### How each stage ends
 
-`ok`, `failed`, `subdivided`, `reused` and `skipped` are endings the run
-reported. Three are not:
+`ok`, `failed` and `reused` are endings the run reported. Three are not:
 
 - `running` is a span that had not finished when the row was read.
 - `interrupted` is a span that was still open when its run ended -- a
@@ -189,7 +188,7 @@ wall time with each one's share:
 
 ```
 stage       capture 6ms, ok, in 0, out 3
-run         ok in 21ms, 8 planned, 8 succeeded, 0 failed, 0 subdivided
+run         ok in 21ms, 8 planned, 8 succeeded, 0 failed
 stage       capture 6ms, 29% of the run, ok, in 0, out 3
 stage       activation 5ms, 24% of the run, ok, in 0, out 0
 ```

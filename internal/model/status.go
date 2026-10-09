@@ -430,37 +430,8 @@ type ResourceReport struct {
 	// page (PageStuckFrees); StuckFreesOmitted counts the rest.
 	StuckFrees        []StuckFree `json:"stuck_frees,omitempty"`
 	StuckFreesOmitted int64       `json:"stuck_frees_omitted"`
-	// AnalyzerUnits is what each heavy analysis unit this process ran was
-	// given and what it used: the reservation it was admitted against, the
-	// heap caps its two steps ran under, the machine-derived allocation those
-	// caps were bounded by, and the peak resident memory its process tree
-	// reached. It is the only place the three appear together, and the only
-	// way an operator can see that a unit was handed far more than it needed
-	// -- or serialized behind a reservation it never came close to using.
-	//
-	// It is process accounting and not a capability detail on purpose: an
-	// observed peak differs on every run, and a capability row's details fold
-	// into the analysis key, where two identical runs must key identically.
-	AnalyzerUnits []AnalyzerUnit `json:"analyzer_units,omitempty"`
-	// AnalyzerOverrunUnits is how many of those units peaked ABOVE the
-	// reservation they were admitted against. It is the one direction of the
-	// memory accounting that can freeze the host the product is running on --
-	// every reservation in flight is sized so the machine holds them all, and
-	// a unit that exceeds its own takes memory nobody accounted for -- so it
-	// is a count in its own right and not something an operator has to derive
-	// by reading every unit row. The rows name which ones.
-	//
-	// It counts every unit this process ran, including the unit runs past the
-	// bound of the rows (MaxRecordsPerResult), whose overruns are counted as
-	// they end even though no row names them; so it can exceed the overruns
-	// the rows show, and never falls short of them. It counts none of the
-	// units whose process tree this platform cannot sample: an unsampled peak
-	// is not a peak below the reservation, so it is neither an overrun nor
-	// evidence against one. It is absent where this process ran no heavy unit
-	// at all, and zero where it ran them and none overran.
-	AnalyzerOverrunUnits *int64 `json:"analyzer_overrun_units,omitempty"`
-	UnitsReused          *int64 `json:"units_reused,omitempty"`
-	UnitsParsed          *int64 `json:"units_parsed,omitempty"`
+	UnitsReused       *int64      `json:"units_reused,omitempty"`
+	UnitsParsed       *int64      `json:"units_parsed,omitempty"`
 	// NeedClasses is one page of this repository's learned per-file need
 	// models, in key order: for each class, how many parsed files it learned
 	// from, how many of them used more than they were reserved, and the
@@ -506,34 +477,6 @@ type NeedClass struct {
 	MaxDriftBytes int64  `json:"max_drift_bytes"`
 }
 
-// An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
-// ObservedPeakBytes are absent rather than zero where the host does not expose
-// available memory and where the platform cannot sample a process tree: a zero
-// there would claim a measurement nobody made (Section 23).
-type AnalyzerUnit struct {
-	ScopeKey           string  `json:"scope_key"`
-	Family             string  `json:"family"`
-	ReservationBytes   uint64  `json:"reservation_bytes"`
-	HeapCapBytes       uint64  `json:"heap_cap_bytes"`
-	ExportHeapCapBytes uint64  `json:"export_heap_cap_bytes"`
-	AllocationBytes    *uint64 `json:"allocation_bytes,omitempty"`
-	ObservedPeakBytes  *uint64 `json:"observed_peak_bytes,omitempty"`
-}
-
-// OverranReservation reports that this unit's process tree peaked above the
-// reservation it was admitted against, which is the one direction of the
-// memory accounting that can take memory the machine had promised to another
-// unit. It is the ONE place that comparison is spelled, so the count on the
-// report and the row an operator reads cannot disagree about which units it
-// covers.
-//
-// A unit whose tree this platform never sampled carries no peak and answers
-// false: nothing was measured, which is not a measurement below the
-// reservation and must never be counted as one either way.
-func (u AnalyzerUnit) OverranReservation() bool {
-	return u.ObservedPeakBytes != nil && *u.ObservedPeakBytes > u.ReservationBytes
-}
-
 // Validate enforces the signed-64 storage bound on every measured byte count
 // and rejects a negative count.
 func (r ResourceReport) Validate() error {
@@ -574,7 +517,6 @@ func (r ResourceReport) Validate() error {
 	}{
 		{"resources.live_subprocesses", r.LiveSubprocesses},
 		{"resources.pending_events", r.PendingEvents},
-		{"resources.analyzer_overrun_units", r.AnalyzerOverrunUnits},
 		{"resources.units_reused", r.UnitsReused},
 		{"resources.units_parsed", r.UnitsParsed},
 	} {
@@ -590,34 +532,6 @@ func (r ResourceReport) Validate() error {
 	}
 	if err := validateStuckFrees("resources", r.StuckFrees, r.StuckFreesOmitted); err != nil {
 		return err
-	}
-	if len(r.AnalyzerUnits) > MaxRecordsPerResult {
-		return invalid("resources.analyzer_units holds %d rows, more than the %d a bounded response carries",
-			len(r.AnalyzerUnits), MaxRecordsPerResult)
-	}
-	for _, u := range r.AnalyzerUnits {
-		for _, f := range []struct {
-			field string
-			value uint64
-		}{
-			{"resources.analyzer_units.reservation_bytes", u.ReservationBytes},
-			{"resources.analyzer_units.heap_cap_bytes", u.HeapCapBytes},
-			{"resources.analyzer_units.export_heap_cap_bytes", u.ExportHeapCapBytes},
-		} {
-			if err := boundSigned64(f.field, f.value); err != nil {
-				return err
-			}
-		}
-		if u.AllocationBytes != nil {
-			if err := boundSigned64("resources.analyzer_units.allocation_bytes", *u.AllocationBytes); err != nil {
-				return err
-			}
-		}
-		if u.ObservedPeakBytes != nil {
-			if err := boundSigned64("resources.analyzer_units.observed_peak_bytes", *u.ObservedPeakBytes); err != nil {
-				return err
-			}
-		}
 	}
 	if err := validateNeedClasses(r.NeedClasses, r.NeedClassesOmitted); err != nil {
 		return err
@@ -951,9 +865,8 @@ type RunRecord struct {
 	// coordinator's first stage, which is earlier than any generation, so it
 	// and not the generation is what names a run.
 	RunID string `json:"run_id"`
-	// Kind is `index`, `deferred` or `overlay`: an ordinary indexing run, a
-	// deferred publication, or the per-process run that carries work with no
-	// generation of its own.
+	// Kind is `index` or `overlay`: an ordinary indexing run, or the
+	// per-process run that carries work with no generation of its own.
 	Kind string `json:"kind"`
 	// RepositoryID is the repository the run indexed, hex-encoded.
 	RepositoryID string `json:"repository_id"`
@@ -967,16 +880,15 @@ type RunRecord struct {
 	// WallMS is the run's elapsed time: its measured wall once FinishedAt is
 	// set, and its elapsed time so far while it is live.
 	WallMS int64 `json:"wall_ms"`
-	// Outcome is one of `running`, `ok`, `failed`, `subdivided`, `reused`,
-	// `skipped` or `interrupted`; `interrupted` is a run whose process ended
-	// without finishing it.
-	Outcome         string `json:"outcome"`
-	FileCount       int64  `json:"file_count"`
-	SourceBytes     int64  `json:"source_bytes"`
-	UnitsPlanned    int64  `json:"units_planned"`
-	UnitsSucceeded  int64  `json:"units_succeeded"`
-	UnitsFailed     int64  `json:"units_failed"`
-	UnitsSubdivided int64  `json:"units_subdivided"`
+	// Outcome is one of `running`, `ok`, `failed`, `reused` or
+	// `interrupted`; `interrupted` is a run whose process ended without
+	// finishing it.
+	Outcome        string `json:"outcome"`
+	FileCount      int64  `json:"file_count"`
+	SourceBytes    int64  `json:"source_bytes"`
+	UnitsPlanned   int64  `json:"units_planned"`
+	UnitsSucceeded int64  `json:"units_succeeded"`
+	UnitsFailed    int64  `json:"units_failed"`
 	// EventsDropped counts the accounting events the bounded bus refused
 	// because the collector was behind. A run never waits on its own
 	// accounting, so the loss is counted rather than prevented: above zero,
@@ -1079,7 +991,6 @@ func validateRunLedger(field string, run *RunRecord, stages []StageRecord, omitt
 			{field + ".run.units_planned", run.UnitsPlanned},
 			{field + ".run.units_succeeded", run.UnitsSucceeded},
 			{field + ".run.units_failed", run.UnitsFailed},
-			{field + ".run.units_subdivided", run.UnitsSubdivided},
 			{field + ".run.events_dropped", run.EventsDropped},
 		} {
 			if err := requireNonNegative(c.name, c.value); err != nil {

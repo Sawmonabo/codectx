@@ -20,9 +20,7 @@ const (
 	OutcomeRunning     Outcome = "running"
 	OutcomeOK          Outcome = "ok"
 	OutcomeFailed      Outcome = "failed"
-	OutcomeSubdivided  Outcome = "subdivided"
 	OutcomeReused      Outcome = "reused"
-	OutcomeSkipped     Outcome = "skipped"
 	OutcomeInterrupted Outcome = "interrupted"
 	OutcomeUnavailable Outcome = "unavailable"
 )
@@ -40,15 +38,13 @@ const ReasonNotAdmitted = "the unit was planned but never reached admission"
 // so in the same two columns every other non-ok row uses.
 const ReasonInterrupted = "the span was still running when its run ended"
 
-// A Kind is what opened a run: an index run, the deferred publication of a
-// generation whose run had already ended, or the per-process overlay a
+// A Kind is what opened a run: an index run, or the per-process overlay a
 // language server's startup hangs under when no run is live.
 type Kind string
 
 const (
-	KindIndex    Kind = "index"
-	KindDeferred Kind = "deferred"
-	KindOverlay  Kind = "overlay"
+	KindIndex   Kind = "index"
+	KindOverlay Kind = "overlay"
 )
 
 // Why a span carries no CPU figures. The empty value means the figures are
@@ -97,7 +93,7 @@ type Measured struct {
 }
 
 // A Span is one bracketed piece of work: a run's root, a stage, a unit under a
-// stage, a part of a subdivided unit. A nil *Span is valid and does nothing,
+// stage, a part of a unit. A nil *Span is valid and does nothing,
 // which is what a caller that was handed no run gets, so instrumenting a code
 // path never requires the caller to know whether a ledger is open.
 type Span struct {

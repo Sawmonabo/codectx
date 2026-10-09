@@ -71,9 +71,9 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 	const windows = 4
 	path := filepath.Join(served, "big")
 	writeFile(t, path, windows*Window)
-	beforeSteps, freed := steps.Load(), FreedByPurpose()[AnalyzerOutput]
+	beforeSteps, freed := steps.Load(), FreedByPurpose()[LeaseReclamation]
 
-	if err := r.remove(AnalyzerOutput, path); err != nil {
+	if err := r.remove(LeaseReclamation, path); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
@@ -96,7 +96,7 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 	if got := steps.Load() - beforeSteps; got != windows {
 		t.Fatalf("the reclaimer freed %d windows; want %d", got, windows)
 	}
-	if got := FreedByPurpose()[AnalyzerOutput] - freed; got != int64(windows)*Window {
+	if got := FreedByPurpose()[LeaseReclamation] - freed; got != int64(windows)*Window {
 		t.Fatalf("attributed %d bytes to the purpose; want %d", got, int64(windows)*Window)
 	}
 	got := waits()
@@ -245,7 +245,7 @@ func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
 	}
 	// The purposes are read in name order, so the refused tree is the entry
 	// the reclaimer reaches first and the file is the one queued behind it.
-	if err := r.remove(AnalyzerOutput, tree); err != nil {
+	if err := r.remove(LeaseReclamation, tree); err != nil {
 		t.Fatal(err)
 	}
 	const windows = 4
@@ -269,8 +269,8 @@ func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
 	if len(stuck) != 1 {
 		t.Fatalf("the reclaimer reported %v as stuck; want exactly the refused tree", stuck)
 	}
-	if !strings.HasPrefix(stuck[0].Entry, string(AnalyzerOutput)+string(filepath.Separator)) {
-		t.Fatalf("the stuck entry is named %q; want it named under %s", stuck[0].Entry, AnalyzerOutput)
+	if !strings.HasPrefix(stuck[0].Entry, string(LeaseReclamation)+string(filepath.Separator)) {
+		t.Fatalf("the stuck entry is named %q; want it named under %s", stuck[0].Entry, LeaseReclamation)
 	}
 	if stuck[0].Reason == "" {
 		t.Fatal("the stuck entry carries no reason, so what is holding the space is not disclosed")
@@ -425,7 +425,7 @@ func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t 
 			return nil
 		})
 	})
-	refusedDir := filepath.Join(set, string(AnalyzerOutput))
+	refusedDir := filepath.Join(set, string(LeaseReclamation))
 	if err := os.MkdirAll(refusedDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -452,8 +452,8 @@ func TestAnEntryTheReclaimerCannotStatIsRecordedStuckRatherThanRetriedForever(t 
 	if len(stuck) != 1 {
 		t.Fatalf("the reclaimer reported %v as stuck; want exactly the entry it could not stat", stuck)
 	}
-	if !strings.HasPrefix(stuck[0].Entry, string(AnalyzerOutput)+string(filepath.Separator)) {
-		t.Fatalf("the stuck entry is named %q; want it named under %s", stuck[0].Entry, AnalyzerOutput)
+	if !strings.HasPrefix(stuck[0].Entry, string(LeaseReclamation)+string(filepath.Separator)) {
+		t.Fatalf("the stuck entry is named %q; want it named under %s", stuck[0].Entry, LeaseReclamation)
 	}
 	if !strings.Contains(stuck[0].Reason, "permission denied") {
 		t.Fatalf("the stuck entry's reason is %q; want the refusal the filesystem gave", stuck[0].Reason)

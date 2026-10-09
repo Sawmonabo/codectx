@@ -117,11 +117,11 @@ func TestSpanTreeRoundTrips(t *testing.T) {
 
 	stageCtx, stage := ledger.Start(ctx, "structural_parse", "")
 	stage.AddIn(3)
-	unitCtx, unit := ledger.StartProvider(stageCtx, "engine_unit", "pkg/one", "structural")
-	_, part := ledger.Start(unitCtx, "engine_unit", "pkg/one#0")
+	unitCtx, unit := ledger.StartProvider(stageCtx, "unit", "pkg/one", "structural")
+	_, part := ledger.Start(unitCtx, "unit", "pkg/one#0")
 	part.AddOut(11)
 	part.End(ledger.OutcomeOK, ledger.Measured{}, nil)
-	unit.End(ledger.OutcomeSubdivided, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
+	unit.End(ledger.OutcomeReused, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	stage.AddOut(4)
 	stage.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	run.Finish(ledger.OutcomeOK)
@@ -148,8 +148,8 @@ func TestSpanTreeRoundTrips(t *testing.T) {
 		outcome  ledger.Outcome
 	}{
 		{"structural_parse", "", "", -1, 3, 4, ledger.OutcomeOK},
-		{"engine_unit", "pkg/one", "structural", 0, 0, 0, ledger.OutcomeSubdivided},
-		{"engine_unit", "pkg/one#0", "", 1, 0, 11, ledger.OutcomeOK},
+		{"unit", "pkg/one", "structural", 0, 0, 0, ledger.OutcomeReused},
+		{"unit", "pkg/one#0", "", 1, 0, 11, ledger.OutcomeOK},
 	} {
 		got := view.Spans[i]
 		if got.Seq != int64(i) {
@@ -341,9 +341,9 @@ func TestUnadmittedUnitReachesASubscriberLikeAnyOtherEnding(t *testing.T) {
 	}
 
 	run, ctx := newRun(t, l)
-	_, ran := ledger.StartProvider(ctx, "engine_unit", "pkg/ran", "structural")
+	_, ran := ledger.StartProvider(ctx, "unit", "pkg/ran", "structural")
 	ran.End(ledger.OutcomeOK, ledger.Measured{}, nil)
-	ledger.Plan(ctx, "engine_unit", "pkg/unadmitted", "structural")
+	ledger.Plan(ctx, "unit", "pkg/unadmitted", "structural")
 	run.Finish(ledger.OutcomeOK)
 
 	// Published when the run ends, not when the process does: a client waiting
@@ -392,7 +392,7 @@ func TestSpansPastOnePageAreCountedAsOmitted(t *testing.T) {
 	l, dir := openLedger(t)
 	run, ctx := newRun(t, l)
 	for i := 0; i < model.MaxRecordsPerResult+beyond; i++ {
-		_, span := ledger.Start(ctx, "engine_unit", "pkg/"+strconv.Itoa(i))
+		_, span := ledger.Start(ctx, "unit", "pkg/"+strconv.Itoa(i))
 		span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	}
 	run.Finish(ledger.OutcomeOK)
@@ -419,8 +419,8 @@ func TestSpansPastOnePageAreCountedAsOmitted(t *testing.T) {
 // TestARunReadsItsOwnRowsAndNotAnotherLiveRuns protects the answer a run gets
 // when it reports on itself.
 //
-// One process holds one ledger and more than one live run: a deferred
-// publication ticks while an index runs. The latest-run query sorts a live run
+// One process holds one ledger and more than one live run: a language
+// server's overlay run is still open while an index runs. The latest-run query sorts a live run
 // first, so a run that asked for "the latest run of this repository" would be
 // handed the other one and would report another run's stages as its own -- a
 // completion block about work the caller never asked for. Asking by id is what
@@ -433,20 +433,20 @@ func TestARunReadsItsOwnRowsAndNotAnotherLiveRuns(t *testing.T) {
 	l, dir := openLedger(t)
 	defer l.Stop()
 	index, indexCtx := newRun(t, l)
-	deferredRun, err := l.NewRun(ledger.KindDeferred, repositoryID)
+	overlay, err := l.NewRun(ledger.KindOverlay, repositoryID)
 	if err != nil {
-		t.Fatalf("new deferred run: %v", err)
+		t.Fatalf("new overlay run: %v", err)
 	}
-	_, publishing := ledger.Start(deferredRun.Context(context.Background()), "collection", "")
-	publishing.AddOut(2)
+	_, starting := ledger.Start(overlay.Context(context.Background()), "server_start", "")
+	starting.AddOut(2)
 
 	_, activation := ledger.Start(indexCtx, "activation", "")
 	activation.AddIn(9)
 	activation.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	index.Report(ledger.Totals{FileCount: 4})
 	index.Finish(ledger.OutcomeOK)
-	// The deferred run stays live and unfinished, exactly as a tick that is
-	// still publishing when the index returns.
+	// The overlay run stays live and unfinished, exactly as a server start
+	// that is still going when the index returns.
 	if err := l.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -478,12 +478,12 @@ func TestARunReadsItsOwnRowsAndNotAnotherLiveRuns(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("latest run: %v, found=%v", err, found)
 	}
-	if latestView.Run.RunID != deferredRun.ID() {
-		t.Fatalf("the latest run is %s, want the live deferred run %s; the fixture no longer poses the hazard the read by id exists for",
-			latestView.Run.RunID, deferredRun.ID())
+	if latestView.Run.RunID != overlay.ID() {
+		t.Fatalf("the latest run is %s, want the live overlay run %s; the fixture no longer poses the hazard the read by id exists for",
+			latestView.Run.RunID, overlay.ID())
 	}
-	publishing.End(ledger.OutcomeOK, ledger.Measured{}, nil)
-	deferredRun.Finish(ledger.OutcomeOK)
+	starting.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	overlay.Finish(ledger.OutcomeOK)
 }
 
 // TestDetachAndAttachAgainRecordsBothHolds protects the invariant the handle
@@ -592,80 +592,6 @@ func runByID(t *testing.T, dir, id string) ledger.RunView {
 		t.Fatalf("run %s is not in the file", id)
 	}
 	return view
-}
-
-// TestALearnedPeakSurvivesRunRetention protects the reservation a heavy scope
-// is admitted against. A scope's measured process-tree peak is what the next
-// plan raises its reservation to, and the run history is swept with the
-// generations the store retains: a scope no run since the oldest retained
-// generation touched -- a watch session editing elsewhere -- would otherwise
-// be sized from the family constants again and overrun the host. The other half is the absence rule: a
-// scope whose span carried no peak answers no observation, never a peak of
-// zero, which would read as work that costs nothing.
-//
-// Mutation: answer the lookup from the spans table (or delete scope_peaks rows
-// in SweepRuns) and the heavy scope's peak is gone once its run is swept; skip
-// the familyPrefix fallback and the unmeasured sibling answers no
-// observation; write a row for an absent peak and the unsampled scope answers
-// observed.
-func TestALearnedPeakSurvivesRunRetention(t *testing.T) {
-	ctx := context.Background()
-	l, dir := openLedger(t)
-	defer func() {
-		if err := l.Stop(); err != nil {
-			t.Errorf("stop the ledger: %v", err)
-		}
-	}()
-	const heavy, unsampled = "pkg:javascript:app", "pkg:python:tool"
-	run, runCtx := newRun(t, l)
-	for _, bytes := range []uint64{4 << 30, 9 << 30} {
-		_, span := ledger.Start(runCtx, "parse", heavy)
-		span.End(ledger.OutcomeOK, ledger.Measured{PeakRSSBytes: &bytes}, nil)
-	}
-	_, span := ledger.Start(runCtx, "parse", unsampled)
-	span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
-	run.Finish(ledger.OutcomeOK)
-	// A later run that touches neither scope publishes the one generation the
-	// store retains, so the run that measured them is before the cutoff and
-	// is swept.
-	later, laterCtx := newRun(t, l)
-	_, capture := ledger.Start(laterCtx, "capture", "")
-	capture.End(ledger.OutcomeOK, ledger.Measured{}, nil)
-	later.AttachGeneration(1)
-	later.Finish(ledger.OutcomeOK)
-	if err := l.Flush(ctx); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-	onlyTheLater := func(_ context.Context, gen int64) (bool, error) { return gen == 1, nil }
-	if err := l.SweepRuns(ctx, repositoryID, onlyTheLater); err != nil {
-		t.Fatalf("sweep the runs: %v", err)
-	}
-	reader, open, err := ledger.OpenReader(ctx, dir)
-	if err != nil || !open {
-		t.Fatalf("open the reader: %v (open %v)", err, open)
-	}
-	defer reader.Close()
-	if _, found, err := reader.Run(ctx, run.ID()); err != nil || found {
-		t.Fatalf("the measuring run reads back found=%v (%v); the test must sweep it to mean anything", found, err)
-	}
-	for _, tc := range []struct {
-		scope, prefix string
-		want          int64
-		observed      bool
-	}{
-		{scope: heavy, want: 9 << 30, observed: true},
-		{scope: "pkg:javascript:lib", prefix: "pkg:javascript:", want: 9 << 30, observed: true},
-		{scope: unsampled, prefix: "pkg:python:", observed: false},
-	} {
-		peak, observed, err := reader.RecordedPeak(ctx, repositoryID, tc.scope, tc.prefix)
-		if err != nil {
-			t.Fatalf("recorded peak of %s: %v", tc.scope, err)
-		}
-		if observed != tc.observed || (observed && peak != tc.want) {
-			t.Fatalf("scope %s answers peak %d observed=%v, want %d observed=%v",
-				tc.scope, peak, observed, tc.want, tc.observed)
-		}
-	}
 }
 
 // runIfAny is runByID for a run that may no longer be in the file.

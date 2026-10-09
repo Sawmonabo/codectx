@@ -208,7 +208,6 @@ func runRecord(view ledger.RunView) (*model.RunRecord, []model.StageRecord, int6
 		UnitsPlanned:        view.Run.UnitsPlanned,
 		UnitsSucceeded:      view.Run.UnitsSucceeded,
 		UnitsFailed:         view.Run.UnitsFailed,
-		UnitsSubdivided:     view.Run.UnitsSubdivided,
 		EventsDropped:       view.Run.EventsDropped,
 		ProcessPeakRSSBytes: view.Run.ProcessPeakRSSBytes,
 	}

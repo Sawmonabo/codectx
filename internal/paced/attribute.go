@@ -14,11 +14,6 @@ import "sync"
 type Purpose string
 
 const (
-	// AnalyzerOutput is a file a foreign writer produced for this run to read
-	// once -- an indexer's index, a dependence engine's export. The product
-	// does not choose its layout or its length, so it cannot be written over
-	// and has to be removed.
-	AnalyzerOutput Purpose = "analyzer-output"
 	// Materialization is a copy of snapshot files made for an analyzer to
 	// read as a source tree. One unit's copy cannot be handed to another --
 	// the files in it are that unit's, and an analyzer writes into its own
