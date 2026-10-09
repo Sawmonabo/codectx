@@ -3,7 +3,6 @@ package dependence_test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -71,9 +71,9 @@ func (b *fakeBackend) Engine() dependence.Engine {
 		Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
 }
 
-func (b *fakeBackend) Argv(dependence.Family) []string { return []string{"--pinned"} }
+func (b *fakeBackend) Argv(link.Family) []string { return []string{"--pinned"} }
 
-func (b *fakeBackend) NeutralOptions(dependence.Family) []string { return nil }
+func (b *fakeBackend) NeutralOptions(link.Family) []string { return nil }
 
 func (b *fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
 	b.parses++
@@ -174,7 +174,7 @@ func newProviderIn(t *testing.T, b *fakeBackend, dataDir string) provider.Provid
 	// reader can import, so the fault injection has to replace both.
 	p, err := dependence.NewWithImporter(b, fakeImporter{}, dependence.Options{DataDir: dataDir,
 		Timeout: 2 * time.Minute, CacheBytes: 1 << 20, Limits: providertest.Limits,
-		Machine: dependence.Machine{AvailableBytes: 32 << 30, Observed: true}})
+		Machine: admission.Machine{AvailableBytes: 32 << 30, Observed: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,43 +336,14 @@ func TestCleanGraphIsReused(t *testing.T) {
 	}
 }
 
-// TestPlanUnits protects the unit shapes the parity measurements settled:
-// splitting a project loses more than half of its resolved calls, and a
-// module nested in another module analysed twice would double every fact it
-// holds.
-func TestPlanUnits(t *testing.T) {
-	h := providertest.New(t, repo)
-	p, err := dependence.PlanUnits(context.Background(), h.View)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan := p.Units
-	var keys []string
-	for _, u := range plan {
-		keys = append(keys, u.ScopeKey)
-	}
-	want := []string{"pkg:go:", "pkg:go:tool"}
-	if !slices.Equal(keys, want) {
-		t.Fatalf("plan = %v, want %v", keys, want)
-	}
-	if plan[0].Contains("tool/tool.go") {
-		t.Error("the outer module owns the nested module's file; it would be analysed twice")
-	}
-	if !plan[1].Contains("tool/tool.go") {
-		t.Error("the nested module does not own its own file")
-	}
-	if plan[0].Files != 1 || plan[0].Bytes == 0 {
-		t.Errorf("outer module folded %d files and %d bytes; the governor sizes the heap cap from these",
-			plan[0].Files, plan[0].Bytes)
-	}
-
-	// A unit's cache key and its planned identity are its semantic closure and
-	// nothing else (Section 11.6). Failure mode on the wide side: a
-	// documentation edit invalidates the heaviest unit in the product, which is
-	// a full engine parse and export. Failure mode on the narrow side, which is
-	// the one that corrupts answers: a source file or a lock file leaves the
-	// key, so the unit is reused across a change it never saw and serves stale
-	// dependence facts as fresh.
+// TestUnitIdentityIsTheClosure protects the dependence unit's planned
+// identity: it is its semantic closure and nothing else (Section 11.6).
+// Failure mode on the wide side: a documentation edit invalidates the
+// heaviest unit in the product, which is a full engine parse and export.
+// Failure mode on the narrow side, which is the one that corrupts answers: a
+// source file or a lock file leaves the key, so the unit is reused across a
+// change it never saw and serves stale dependence facts as fresh.
+func TestUnitIdentityIsTheClosure(t *testing.T) {
 	base := dependenceUnitID(t, repo)
 	if got := dependenceUnitID(t, edited(repo, "docs/overview.md", "# overview, revised\n")); got != base {
 		t.Error("editing a documentation file changed the dependence unit's identity; every README edit would reparse the module")
@@ -383,56 +354,11 @@ func TestPlanUnits(t *testing.T) {
 	if got := dependenceUnitID(t, edited(repo, "go.sum", "example.com/dep v1.2.3 h1:abc=\n")); got == base {
 		t.Error("editing the module's lock file did not change its identity; the unit would be reused across a dependency change")
 	}
-
-	// The same closure on the marker half, for a lock file the snapshot holds
-	// as a tombstone.
-	vendored := map[string]string{"go.mod": repo["go.mod"], "app.go": repo["app.go"]}
-	for i := 0; i < 2; i++ {
-		vendored[fmt.Sprintf("vendored/m%02d/go.sum", i)] = fmt.Sprintf("example.com/m%02d v1.0.0 h1:x=\n", i)
-	}
-	vh := providertest.New(t, vendored)
-	// A lock file the previous generation's unit declared and this snapshot
-	// holds as a tombstone. Failure mode, and the reason membership is a
-	// predicate rather than a list built from the live manifest: a deleted
-	// member the unit does not recognise leaves the scope eligible for carry
-	// (Section 13.3), so the planner emits a carry that AttachCarried refuses
-	// because one of the unit's inputs no longer exists in the snapshot.
-	const tombstone = "vendored/m02/go.sum"
-	view := withTombstone{SnapshotView: vh.View,
-		row: model.FileVersion{ID: model.NewFileID(vh.Repo, tombstone), Path: tombstone, Status: model.FileDeleted}}
-	vp, err := dependence.PlanUnits(context.Background(), view)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(vp.Units) != 1 || vp.Units[0].ScopeKey != rootScope {
-		t.Fatalf("plan = %v, want one %s unit", vp.Units, rootScope)
-	}
-	if !vp.Units[0].OwnsInput(tombstone) {
-		t.Errorf("the unit does not own %s, a lock file the snapshot holds as a tombstone; the scope stays carry-eligible after a member is deleted", tombstone)
-	}
-}
-
-// withTombstone is a snapshot view with one deleted manifest row appended.
-// providertest retains live files only, and a tombstone is precisely the row
-// the planner must still resolve to a member. The row is yielded whatever the
-// selection says; both callers pass an empty FileSelection. It is appended
-// last, and the path is chosen to sort after every fixture path, so the view's
-// ascending-path order is preserved.
-type withTombstone struct {
-	model.SnapshotView
-	row model.FileVersion
-}
-
-func (v withTombstone) EachFile(ctx context.Context, sel model.FileSelection, fn func(model.FileVersion) error) error {
-	if err := v.SnapshotView.EachFile(ctx, sel, fn); err != nil {
-		return err
-	}
-	return fn(v.row)
 }
 
 // planStub is the dependence provider as the planner sees it. The planner
 // dispatches on descriptor identity and asks a dependence provider nothing
-// else -- the scopes come from dependence.PlanUnits over the snapshot -- so
+// else -- the scopes come from link.PlanUnits over the snapshot -- so
 // the closure rows above need no engine.
 type planStub struct{}
 
@@ -500,9 +426,9 @@ func edited(files map[string]string, path, content string) map[string]string {
 // ceiling by another name.
 func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	g := dependence.NewGovernor(0, testBaseFootprintBytes)
-	plenty := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}
+	plenty := admission.Machine{AvailableBytes: 32 << 30, Observed: true}
 
-	small := g.Reserve(dependence.FamilyGo, 1<<20, plenty)
+	small := g.Reserve(link.FamilyGo, 1<<20, plenty)
 	if small.HeapCapBytes != dependence.DefaultUnitMemoryFloorBytes {
 		t.Errorf("a tiny unit got a %d-byte cap, want the floor", small.HeapCapBytes)
 	}
@@ -532,7 +458,7 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	// And the cap comes from what the unit needs, not from what the machine
 	// has: the largest JavaScript project measured ran at full speed under
 	// 4 GiB, so a 157 MB one must not be handed the whole allocation.
-	big := g.Reserve(dependence.FamilyJavaScript, 157<<20, plenty)
+	big := g.Reserve(link.FamilyJavaScript, 157<<20, plenty)
 	if big.HeapCapBytes >= big.AllocationBytes {
 		t.Errorf("a 157 MB JavaScript unit was capped at the allocation (%d of %d): the cap is sized to the machine, not to the need",
 			big.HeapCapBytes, big.AllocationBytes)
@@ -541,7 +467,7 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 		t.Errorf("a 157 MB JavaScript unit was capped at %d, below the 4 GiB the measured project needed", big.HeapCapBytes)
 	}
 
-	huge := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
+	huge := g.Reserve(link.FamilyPython, 1<<30, plenty)
 	if huge.HeapCapBytes != huge.AllocationBytes {
 		t.Errorf("cap %d is not bounded by the machine-derived allocation %d", huge.HeapCapBytes, huge.AllocationBytes)
 	}
@@ -549,7 +475,7 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 		t.Errorf("retry cap = %d, want none: the first attempt already had the whole allocation", got)
 	}
 
-	unknown := g.Reserve(dependence.FamilyPython, 1<<30, dependence.Machine{})
+	unknown := g.Reserve(link.FamilyPython, 1<<30, admission.Machine{})
 	if unknown.AllocationBytes != 0 {
 		t.Error("an unobserved machine reports an allocation; unavailable must stay unavailable")
 	}
@@ -584,7 +510,7 @@ func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 
 	// 32 GiB available: the allocation is half of it, 16 GiB, which is exactly
 	// four of these reservations.
-	big := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 32 << 30, Observed: true}))
+	big := plan.NewScheduler(schedulerLedger(t, admission.Machine{AvailableBytes: 32 << 30, Observed: true}))
 	var releases []func()
 	for i := 0; i < 4; i++ {
 		admitted, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -614,7 +540,7 @@ func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
 	// The same reservation on an 8 GiB machine: the allocation is 4 GiB, so
 	// exactly one runs, and it runs because an idle scheduler admits any single
 	// unit whatever it reserves -- work is never refused for memory.
-	small := plan.NewScheduler(schedulerLedger(t, dependence.Machine{AvailableBytes: 8 << 30, Observed: true}))
+	small := plan.NewScheduler(schedulerLedger(t, admission.Machine{AvailableBytes: 8 << 30, Observed: true}))
 	release, err := small.Admit(context.Background(), unit)
 	if err != nil {
 		t.Fatalf("an 8 GiB machine admitted nothing: %v", err)
@@ -853,7 +779,7 @@ func TestTheAdmittedReservationIsTheOneComparedAndRecorded(t *testing.T) {
 	}
 	// The planner's figure: the constants for this unit, raised to a learned
 	// peak well above them. The tree then peaks between the two.
-	admitted := dependence.NewGovernor(0, 0).Reserve(dependence.FamilyGo, 1<<10, dependence.Machine{})
+	admitted := dependence.NewGovernor(0, 0).Reserve(link.FamilyGo, 1<<10, admission.Machine{})
 	derived := admitted.Bytes()
 	admitted.ObservedPeakBytes = 4 * derived
 	peak := 2 * derived
@@ -892,7 +818,7 @@ func TestTheAdmittedReservationIsTheOneComparedAndRecorded(t *testing.T) {
 // to, over the allocation this machine observation derives. The allocation and
 // the running total belong to the one ledger every heavy child of the process
 // shares.
-func schedulerLedger(t *testing.T, m dependence.Machine) *admission.Ledger {
+func schedulerLedger(t *testing.T, m admission.Machine) *admission.Ledger {
 	t.Helper()
 	allocation, _ := m.SchedulingAllocation(testBaseFootprintBytes)
 	l, err := admission.NewLedger(allocation, testDiskAllocationBytes)
@@ -942,7 +868,7 @@ const testBaseFootprintBytes int64 = 32<<20 + 16*(32<<20) + 32<<20 + 16<<20
 // at its footprint was allocated 8589934592" -- an invented figure that
 // admits several children onto memory the host does not have.
 func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
-	const margin = dependence.DefaultSafetyMarginBytes
+	const margin = admission.DefaultSafetyMarginBytes
 	// A 128-core host: 32 MiB idle + 128 x 32 MiB + 32 MiB + 16 MiB.
 	const base128 = 32<<20 + 128*(32<<20) + 32<<20 + 16<<20
 
@@ -958,7 +884,7 @@ func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 		{"at the footprint: nothing is left over", base128 + margin, base128, 0, "subtraction"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			m := dependence.Machine{AvailableBytes: c.available, Observed: true}
+			m := admission.Machine{AvailableBytes: c.available, Observed: true}
 			got, observed := m.SchedulingAllocation(c.base)
 			if !observed {
 				t.Errorf("an observed host's allocation of %d was reported as a stand-in", got)
@@ -973,7 +899,7 @@ func TestAllocationSubtractsTheDerivedBaseFootprint(t *testing.T) {
 	// The same machine, a larger base footprint, must leave the children less.
 	// This is the whole point of deriving it: a host with more cores reserves
 	// more for itself.
-	m := dependence.Machine{AvailableBytes: 8 << 30, Observed: true}
+	m := admission.Machine{AvailableBytes: 8 << 30, Observed: true}
 	bigger, _ := m.SchedulingAllocation(testBaseFootprintBytes)
 	smaller, _ := m.SchedulingAllocation(base128)
 	if bigger <= smaller {

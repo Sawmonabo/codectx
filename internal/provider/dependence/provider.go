@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -19,6 +20,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -103,7 +105,7 @@ type Options struct {
 	// reservation here, and it sizes it against this reading so the provider
 	// never observes the machine a second time. The zero value is a host that
 	// exposes no available memory.
-	Machine Machine
+	Machine admission.Machine
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
 	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
@@ -281,12 +283,12 @@ func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Pol
 	var inputs []string
 	var languages, truncated bool
 	err := workspace.Walk(ctx, root, policy, func(f workspace.File) error {
-		if !languages && FamilyOf(lang.Of(f.Path)) != "" {
+		if !languages && link.FamilyOf(lang.Of(f.Path)) != "" {
 			languages = true
 		}
 		base := filepath.Base(f.Path)
-		for _, fam := range Families {
-			if slices.Contains(projectMarkers[fam], base) {
+		for _, fam := range link.Families {
+			if slices.Contains(link.ProjectMarkers(fam), base) {
 				if len(inputs) < provider.MaxDetectionInputs {
 					inputs = append(inputs, f.Path)
 				} else {
@@ -363,7 +365,7 @@ type Report struct {
 // a no-op here by construction and the retry is sized exactly as it is under
 // the coordinator.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-	rep, err := p.importUnit(ctx, req, sink, ImportOptions{}, func(u Unit) (*admitted, error) {
+	rep, err := p.importUnit(ctx, req, sink, ImportOptions{}, func(u link.Unit) (*admitted, error) {
 		return &admitted{res: p.gov.Reserve(u.Family, u.Bytes, p.opts.Machine),
 			readmit: func(context.Context, Reservation) error { return nil }}, nil
 	})
@@ -383,7 +385,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		return Report{}, internalErr("the dependence unit was handed no admitted reservation and no way to re-admit it; " +
 			"the coordinator carries both from the plan")
 	}
-	return p.importUnit(ctx, req, sink, opts, func(u Unit) (*admitted, error) {
+	return p.importUnit(ctx, req, sink, opts, func(u link.Unit) (*admitted, error) {
 		if opts.Reservation.Family != u.Family {
 			return nil, internalErr("the dependence unit " + truncate(u.ScopeKey, 128) + " is family " + string(u.Family) +
 				" and was admitted at a reservation sized for family " + string(opts.Reservation.Family))
@@ -395,7 +397,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 // importUnit is the body both forms share. admit answers the unit's one
 // admission once the unit is known; nothing below it sizes another.
 func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink,
-	opts ImportOptions, admit func(Unit) (*admitted, error)) (Report, error) {
+	opts ImportOptions, admit func(link.Unit) (*admitted, error)) (Report, error) {
 
 	// A zero timeout is no wall clock: a monorepo unit is large, not wedged,
 	// and the stall detector on every child is what catches a wedged one. The
@@ -520,17 +522,17 @@ func (p *Provider) importUnit(ctx context.Context, req provider.UnitRequest, sin
 // The whole plan is returned with the unit because what the plan refused is
 // part of what this unit must publish: a family with an unplannable project is
 // not fresh anywhere.
-func (p *Provider) unitFor(ctx context.Context, req provider.UnitRequest) (Unit, Plan, error) {
-	plan, err := PlanUnits(ctx, req.Content)
+func (p *Provider) unitFor(ctx context.Context, req provider.UnitRequest) (link.Unit, link.Plan, error) {
+	plan, err := link.PlanUnits(ctx, req.Content)
 	if err != nil {
-		return Unit{}, Plan{}, err
+		return link.Unit{}, link.Plan{}, err
 	}
 	for _, u := range plan.Units {
 		if u.ScopeKey == req.Unit.ScopeKey {
 			return u, plan, nil
 		}
 	}
-	return Unit{}, Plan{}, invalid("the dependence provider has no unit for scope " + truncate(req.Unit.ScopeKey, 128) + " in this snapshot")
+	return link.Unit{}, link.Plan{}, invalid("the dependence provider has no unit for scope " + truncate(req.Unit.ScopeKey, 128) + " in this snapshot")
 }
 
 // runDir is one unit's private working directory. Everything the analyzer
@@ -619,7 +621,7 @@ func (r *runDir) close(req provider.UnitRequest) {
 }
 
 // build runs the whole analysis for one unit and returns what it must publish.
-func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
+func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit link.Unit, adm *admitted,
 	run *runDir, sink provider.Sink, opts ImportOptions) (publication, ImportReport, error) {
 
 	// Membership is decided file by file, by the unit itself: only the files
@@ -634,7 +636,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	// from the planner's Unit.Files, which foldSizes arbitrates across the
 	// whole plan: only this pass knows what reached the frontend.
 	var files int64
-	handed := unit.handed(unit.Root)
+	handed := handed(unit, unit.Root)
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
 		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
 			Include: func(fv model.FileVersion) bool {
@@ -709,7 +711,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 // produced and the export read it -- so the only consequence is the reparse
 // the next refresh pays, which is what the line says. A user who disabled the
 // cache is not told about it every unit.
-func (p *Provider) keep(req provider.UnitRequest, unit Unit, g parsedGraph) {
+func (p *Provider) keep(req provider.UnitRequest, unit link.Unit, g parsedGraph) {
 	if g.reused {
 		return
 	}
@@ -723,7 +725,7 @@ func (p *Provider) keep(req provider.UnitRequest, unit Unit, g parsedGraph) {
 // in the parse or in the export -- and renders what the caller publishes: a
 // partial result naming the subdivided scope and the failing pass and
 // exception, never a failed unit.
-func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
+func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit link.Unit, adm *admitted,
 	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files int64) (publication, ImportReport, error) {
 
 	report, overParts, err := p.subdivide(ctx, req, unit, adm, run, source, sink, crash, decision, files)
@@ -760,7 +762,7 @@ type parsedGraph struct {
 // outcome is FailureEngine when the unit crashed reproducibly and the caller
 // must subdivide, and the crashDecision says how that was established; every
 // other failure class is already an error by then.
-func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
+func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit link.Unit, adm *admitted,
 	run *runDir, source string) (parsedGraph, error) {
 
 	key, err := CacheKey(ctx, req.Content, unit, p.backend.Argv(unit.Family), p.engine,
@@ -845,7 +847,7 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 }
 
 // parse runs one parse step and validates that it left a graph behind.
-func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
+func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit link.Unit, adm *admitted,
 	source, graph string, extra []string) (Outcome, error) {
 
 	_ = paced.RemoveFor(paced.AnalyzerOutput, graph)
@@ -898,7 +900,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 // option for this step, so the confirmation is the same argv a second time
 // and what it yields is a second observation of the same class, which is what
 // subdivision rests on.
-func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
+func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit link.Unit, adm *admitted,
 	run *runDir, graph string, files int64) (Outcome, error) {
 
 	out, err := p.runExport(ctx, req, unit, adm, unit.ScopeKey, graph, run.path("export"))
@@ -943,7 +945,7 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 // scope is what the step's span and any failure it records are named after:
 // the unit's scope key, or one part's directory when the unit was subdivided.
 // dir is the export directory the step writes.
-func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
+func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit link.Unit, adm *admitted,
 	scope, graph, dir string) (ExportOutcome, error) {
 
 	timeout, err := remaining(ctx)
@@ -1002,7 +1004,7 @@ func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit
 // (docs/providers-dependence.md §Refresh and delta). A run handed the previous
 // unit's key set publishes only the relations whose key changed; a run handed
 // none publishes every one.
-func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, unit Unit,
+func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, unit link.Unit,
 	source, unitRoot, dir string, sink provider.Sink, opts ImportOptions) (ImportReport, error) {
 
 	scratch := scratchRoot(p.opts.DataDir)
@@ -1027,7 +1029,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows, OnPhase: onPhase,
 		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles, StagingCacheKiB: p.opts.StagingCacheKiB,
-		MaxEvidencePerFact: p.opts.MaxEvidencePerFact, Expected: unit.handed(unitRoot),
+		MaxEvidencePerFact: p.opts.MaxEvidencePerFact, Expected: handed(unit, unitRoot),
 		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
@@ -1046,7 +1048,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 // unit. Nothing about the result is presented as equivalent to a whole-unit
 // run: the caller publishes every capability as partial with the failed unit
 // and the backend failure. If no child produces anything, the unit fails.
-func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, adm *admitted,
+func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit link.Unit, adm *admitted,
 	run *runDir, source string, sink provider.Sink, crash Outcome, decision crashDecision, files int64) (ImportReport, int, error) {
 
 	children, err := childProjects(source)
@@ -1167,8 +1169,8 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 // outsideParts counts the unit's own source files that lie under no imported
 // part of a subdivided unit, and names the first in path order. It streams the
 // pinned manifest and holds only the count and that one path.
-func outsideParts(ctx context.Context, view model.SnapshotView, unit Unit, imported map[string]bool) (int64, string, error) {
-	handed := unit.handed(unit.Root)
+func outsideParts(ctx context.Context, view model.SnapshotView, unit link.Unit, imported map[string]bool) (int64, string, error) {
+	handed := handed(unit, unit.Root)
 	var n int64
 	var first string
 	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
@@ -1283,7 +1285,7 @@ func merge(a, b ImportReport) ImportReport {
 // absent one would otherwise be handed to the engine as a missing path or, for
 // the repository root, as an empty tree that parses to an empty graph
 // indistinguishable from a crashed frontend helper.
-func unitSource(root string, unit Unit) (string, error) {
+func unitSource(root string, unit link.Unit) (string, error) {
 	dir := root
 	if unit.Root != "" {
 		dir = filepath.Join(root, filepath.FromSlash(unit.Root))
@@ -1335,4 +1337,17 @@ func remaining(ctx context.Context) (time.Duration, error) {
 			Message: "the dependence unit's deadline expired before the next analysis step could start"}
 	}
 	return left, nil
+}
+
+// handed is the predicate for the files the engine is handed when it parses
+// the directory root of unit u -- the unit's root, or one part's directory
+// when the unit is subdivided: a live source file of the unit's own family
+// that the unit owns and that lies under root. It is the same membership the
+// materialization counts as the unit's source files.
+func handed(u link.Unit, root string) func(model.FileVersion) bool {
+	under := link.Unit{Root: root}
+	return func(fv model.FileVersion) bool {
+		return fv.Status != model.FileDeleted && under.Contains(fv.Path) && u.Contains(fv.Path) &&
+			link.FamilyOf(lang.Of(fv.Path)) == u.Family
+	}
 }

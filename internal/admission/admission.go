@@ -12,11 +12,12 @@
 // the other needs. Two reservers each holding a running total bounded by the
 // same allocation is not one gate: it lets a process reserve a multiple of the
 // machine's memory and freeze the host, which is the failure this package
-// exists to make impossible. Nothing here observes the machine or derives the
-// allocations: the composition root derives both and hands the figures over,
-// and re-derives the memory figure from the kernel's before every admission
-// (RederiveBeforeEachAdmission, SetAllocation), so there is exactly one place
-// a second total could ever be introduced.
+// exists to make impossible. The ledger observes nothing and derives no
+// allocation: the composition root reads the machine (ObserveMachine,
+// Machine.SchedulingAllocation) and the disk, derives both and hands the
+// figures over, and re-derives the memory figure from the kernel's before
+// every admission (RederiveBeforeEachAdmission, SetAllocation), so there is
+// exactly one place a second total could ever be introduced.
 //
 // A holding's memory can move while it is held (Holding.Adjust): a parser
 // worker holds the base it reports for its lifetime, and a reported figure
@@ -124,7 +125,7 @@ type waiter struct {
 // keep, has nothing to give a child, and every child that wants that
 // dimension then runs alone rather than being refused. An unobservable figure
 // is NOT zero and must not be passed as one; the composition root stands a
-// conservative figure in for it (dependence.Machine.SchedulingAllocation for
+// conservative figure in for it (Machine.SchedulingAllocation for
 // memory), because an admission gate with no bound is not a gate. Whether a
 // figure was observed is not the ledger's concern: it gates against the
 // figure either way, and the composition root tells the surfaces that

@@ -1,6 +1,6 @@
 //go:build linux
 
-package dependence
+package admission
 
 import (
 	"bufio"

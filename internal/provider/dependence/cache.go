@@ -28,6 +28,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // cacheDirBatch is how many directory entries one read of the cache
@@ -50,7 +51,7 @@ const cacheKeyDomain = "dependence-graph-cache"
 // unit's name. The cost is the other direction of the same rule: a
 // configuration edit that cannot change what the parse produces still reparses.
 // A reuse boundary that disagrees with unit identity is the worse of the two.
-func CacheKey(ctx context.Context, view model.SnapshotView, u Unit, argv []string, e Engine,
+func CacheKey(ctx context.Context, view model.SnapshotView, u link.Unit, argv []string, e Engine,
 	providerVersion, analysisConfigHash string) (string, error) {
 
 	h := model.NewHasher(cacheKeyDomain)

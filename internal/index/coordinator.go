@@ -32,7 +32,6 @@ package index
 import (
 	"context"
 	"errors"
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -41,6 +40,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
@@ -171,7 +171,7 @@ type Options struct {
 	// planner sizes every heavy unit's reservation and heap caps against the
 	// same reading. The coordinator never observes the machine itself. The
 	// zero value is a host that exposes no available memory.
-	Machine dependence.Machine
+	Machine admission.Machine
 	// RunLedgerReader reads back the rows this process's runs recorded: how a
 	// finished run states in its own result what it did, and what this
 	// workspace has already measured its heavy units to cost, which the plan

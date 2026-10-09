@@ -300,7 +300,7 @@ type Inputs struct {
 	// of its own, taken while memory is momentarily free, would size caps
 	// from a moment the composition never saw. The zero value is a host that
 	// exposes no available memory.
-	Machine dependence.Machine
+	Machine admission.Machine
 	Config  config.Config
 	// TempDir is where the planner spills the sorted input run of whole-snapshot
 	// units. Empty takes the process temporary directory. The spill lives only
@@ -523,7 +523,7 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 // that rebuilt every table would reuse the linking unit sealed over the old
 // ones. The registry orders the structural provider before the linking
 // provider that depends on it, so its version is already classified here.
-func (b *builder) linkKeys(family dependence.Family) ([]string, error) {
+func (b *builder) linkKeys(family link.Family) ([]string, error) {
 	i := slices.IndexFunc(b.fileProviders, func(fp fileProvider) bool { return fp.id == tslang.ProviderID })
 	if i < 0 {
 		return nil, internalErr("the linking provider is planned without the structural provider whose tables it reads")
@@ -532,7 +532,7 @@ func (b *builder) linkKeys(family dependence.Family) ([]string, error) {
 	// model.MaxIdentifierBytes: a prefix could push it past the bound
 	// UnitBuild.Validate holds every dependency key to.
 	keys := []string{b.fileProviders[i].version}
-	if family == dependence.FamilyC {
+	if family == link.FamilyC {
 		keys = append(keys, b.headerKey)
 	}
 	return keys, nil
@@ -913,7 +913,7 @@ func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) fun
 // unobserved peak unconditionally is the one mistake here that would collapse
 // every reservation in the product, which is why the raise is inside the
 // observation test.
-func (b *builder) reserve(ctx context.Context, gov dependence.Governor, s *semantic, m dependence.Machine) dependence.Reservation {
+func (b *builder) reserve(ctx context.Context, gov dependence.Governor, s *semantic, m admission.Machine) dependence.Reservation {
 	r := gov.Reserve(s.family, s.bytes, m)
 	if peak, observed := b.recordedPeak(ctx, s); observed {
 		r.ObservedPeakBytes = peak
@@ -944,7 +944,7 @@ func (b *builder) recordedPeak(ctx context.Context, s *semantic) (int64, bool) {
 	// in for this scope's own, so only its own key is asked about.
 	prefix := ""
 	if s.family != "" {
-		prefix = dependence.ScopeKeyPrefix(s.family)
+		prefix = link.ScopeKeyPrefix(s.family)
 	}
 	return b.in.RecordedPeak(ctx, s.scopeKey, prefix)
 }

@@ -11,9 +11,9 @@ package scip
 //
 // A project is what the language's own toolchain calls a project, because an
 // indexer run at the wrong boundary resolves a different set of symbols. The
-// dependence provider's unit planner answers the same question and does not
+// linking provider's project planner answers the same question and does not
 // answer it the same way: it still folds a non-nesting family's inner
-// directories into the outermost one (internal/provider/dependence/units.go,
+// directories into the outermost one (internal/provider/link/projects.go,
 // nestedFamilies), so that planner's javascript, python and rust units are
 // coarser than the projects below. The two are deliberately read as separate
 // rulings here and not shared, so neither drifts by inheriting the other.

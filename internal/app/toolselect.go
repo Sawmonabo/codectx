@@ -10,7 +10,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -26,8 +26,8 @@ const cpgKind = "cpg"
 
 // SelectedTools is the lock entries one repository's own manifests and sources
 // select. It reads the mappings that already decide them -- the SCIP indexers'
-// triggers, the language servers' root markers, the dependence families'
-// project markers, and lang.Of/dependence.FamilyOf for the source check below
+// triggers, the language servers' root markers, the linking provider's
+// project markers, and lang.Of/link.FamilyOf for the source check below
 // -- from the packages that own them. There is deliberately no table here: a
 // second copy of the mapping that decides what gets downloaded would drift
 // from the one that decides what runs.
@@ -102,8 +102,8 @@ func SelectedTools(dir string) ([]string, error) {
 	// engine or its runtime, and the user discovered that mid-index on the
 	// offline runner prefetching exists to serve. Either signal selects the
 	// engine: a project marker of any family, or a source file of any family.
-	for _, family := range dependence.Families {
-		for _, m := range dependence.ProjectMarkers(family) {
+	for _, family := range link.Families {
+		for _, m := range link.ProjectMarkers(family) {
 			markers[m] = true
 		}
 	}
@@ -138,11 +138,11 @@ func SelectedTools(dir string) ([]string, error) {
 	}
 	if cpg := cpgEntries(lock); len(cpg) > 0 {
 		wanted := hasDependenceSource
-		for _, family := range dependence.Families {
+		for _, family := range link.Families {
 			if wanted {
 				break
 			}
-			for _, marker := range dependence.ProjectMarkers(family) {
+			for _, marker := range link.ProjectMarkers(family) {
 				if present[marker] {
 					wanted = true
 					break
@@ -215,7 +215,7 @@ func (s *signals) observe(rel string) {
 	if s.markers[base] {
 		s.present[base] = true
 	}
-	if !s.source && dependence.FamilyOf(lang.Of(base)) != "" {
+	if !s.source && link.FamilyOf(lang.Of(base)) != "" {
 		s.source = true
 	}
 }

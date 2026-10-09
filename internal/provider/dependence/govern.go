@@ -20,10 +20,14 @@ package dependence
 // is not a memory cap, so the reservation adds the resident memory the
 // frontend keeps outside the heap, measured per family in research Section 10.
 
-import "strconv"
+import (
+	"strconv"
+
+	"github.com/Sawmonabo/codectx/internal/admission"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
+)
 
 const (
-	kiB = 1 << 10
 	miB = 1 << 20
 	giB = 1 << 30
 )
@@ -32,37 +36,6 @@ const (
 // below it makes even a trivial project thrash; it mirrors
 // `providers.dependence.unit_memory_floor_bytes`.
 const DefaultUnitMemoryFloorBytes int64 = 768 * miB
-
-// DefaultSafetyMarginBytes is the headroom the machine-derived allocation
-// leaves for transient allocation and resident-set variation on top of the
-// base footprint its caller derives for this process (Section 23.3: degrade
-// concurrency before coverage, and leave headroom rather than allocate to the
-// last byte).
-const DefaultSafetyMarginBytes int64 = 1 * giB
-
-// UnobservedAllocationBytes is the allocation used on a host that does not
-// expose available memory. It is not a memory ceiling on the work: it is the
-// finite bound every queue and process admission must have, standing in for
-// the observation the platform withheld. Without it a host with no /proc
-// equivalent would admit every child at once, which is the one outcome worse
-// than a conservative allocation.
-const UnobservedAllocationBytes int64 = 8 * giB
-
-// hostShareDenominator is the second bound on the allocation: whatever the
-// machine had available when the run began, the allocation is at most that
-// divided by this, so the host keeps at least the rest of it.
-//
-// It is a design constant and not a setting. The product runs beside the
-// editor, the agents and the browser that the person indexing their
-// repository is using at the time, and "available memory minus two gigabytes"
-// is an allocation that treats the machine as the product's own: on a 47 GB
-// host it handed one analyzer a 42 GB heap cap, which then had to be
-// serialized against every other unit because no two such reservations fit.
-// Half is the share that leaves the machine usable by construction rather
-// than by the operator noticing; a unit whose estimate exceeds even that
-// still runs, whole, at the allocation, because refusing work for memory is
-// not a thing this product does (docs/research/00-synthesis.md Section 8).
-const hostShareDenominator = 2
 
 // heapPerSourceByte is how much frontend heap one byte of unit source is
 // estimated to need, per family. Each value is the smallest cap a measured
@@ -84,13 +57,13 @@ const hostShareDenominator = 2
 //
 // One unit system: the derivations below divide bytes by bytes, never binary
 // GiB by decimal MB.
-var heapPerSourceByte = map[Family]int64{
-	FamilyC:          160, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass and 8 GiB to run at full speed
-	FamilyGo:         384, // 438k-line Go module passed at a 4 GiB cap
-	FamilyJava:       256, // 1.5M-line Java repository wanted ~8 GiB to avoid collector thrashing
-	FamilyJavaScript: 52,  // 164,865,219 B over 4,984 files: 2 GiB fails closed, 4 GiB runs at the speed of no cap at all, so 2 x 4 GiB / 164,865,219 = 52.10
-	FamilyPython:     640, // 1.05M-line Python tree needed ~18 GiB uncapped and failed closed at 4 GiB
-	FamilyRust:       640, // 56k-line Cargo workspace peaked at 1.77 GB of tree RSS, most of it outside the heap
+var heapPerSourceByte = map[link.Family]int64{
+	link.FamilyC:          160, // 1.8M-line C repository: ~54 MB of source needed a 4 GiB cap to pass and 8 GiB to run at full speed
+	link.FamilyGo:         384, // 438k-line Go module passed at a 4 GiB cap
+	link.FamilyJava:       256, // 1.5M-line Java repository wanted ~8 GiB to avoid collector thrashing
+	link.FamilyJavaScript: 52,  // 164,865,219 B over 4,984 files: 2 GiB fails closed, 4 GiB runs at the speed of no cap at all, so 2 x 4 GiB / 164,865,219 = 52.10
+	link.FamilyPython:     640, // 1.05M-line Python tree needed ~18 GiB uncapped and failed closed at 4 GiB
+	link.FamilyRust:       640, // 56k-line Cargo workspace peaked at 1.77 GB of tree RSS, most of it outside the heap
 }
 
 // residentAboveHeap is the resident memory the frontend keeps outside the
@@ -111,25 +84,25 @@ var heapPerSourceByte = map[Family]int64{
 // units never filled their caps (peak minus cap of -190 and 87 MiB), so for
 // those five families this method yields no observation. That is recorded as
 // unavailable, which is not zero and is not a licence to lower a row.
-var residentAboveHeap = map[Family]int64{
-	FamilyC:    2662 * miB, // native parser memory
-	FamilyGo:   512 * miB,
-	FamilyJava: 448 * miB,
+var residentAboveHeap = map[link.Family]int64{
+	link.FamilyC:    2662 * miB, // native parser memory
+	link.FamilyGo:   512 * miB,
+	link.FamilyJava: 448 * miB,
 	// The syntax helper holds the whole project's trees outside the heap. From
 	// the reference run's ledger for this unit, the one datapoint recorded in
 	// bytes rather than in a rounded unit and taken at the cap the product
 	// itself chose: 10,099,015,680 B of peak tree residency against a
 	// 7,913,530,512 B heap cap leaves 2,185,485,168 B = 2084 MiB.
-	FamilyJavaScript: 2084 * miB,
-	FamilyPython:     1945 * miB,
-	FamilyRust:       256 * miB,
+	link.FamilyJavaScript: 2084 * miB,
+	link.FamilyPython:     1945 * miB,
+	link.FamilyRust:       256 * miB,
 }
 
 // helperAllowance is the fixed cost of a helper process that lives outside
 // the engine's managed heap altogether. Only the Rust frontend has one large
 // enough to matter
 // (research Section 10: about 0.8 GB, constant).
-var helperAllowance = map[Family]int64{FamilyRust: 832 * miB}
+var helperAllowance = map[link.Family]int64{link.FamilyRust: 832 * miB}
 
 // exportHeapDivisor sizes the export cap as a fraction of the parse cap, and
 // exportResident is the export step's own resident allowance. Export scales
@@ -148,7 +121,7 @@ const (
 // everything already running plus this one fit the machine-derived
 // allocation, and there is no count beside that sum.
 type Reservation struct {
-	Family Family
+	Family link.Family
 	// HeapCapBytes is the cap placed on the frontend heap for the parse step,
 	// and ExportHeapCapBytes the export step's own, smaller cap.
 	HeapCapBytes       int64
@@ -207,59 +180,6 @@ func (r Reservation) Bytes() int64 {
 	return max(r.ParseBytes(), r.ExportBytes(), r.ObservedPeakBytes)
 }
 
-// Machine is the observed memory of the host the allocation is derived from.
-// Available is zero and Observed false when the platform does not expose it.
-type Machine struct {
-	AvailableBytes int64
-	Observed       bool
-}
-
-// Allocation is the machine-derived allocation: available memory minus this
-// process's base footprint minus the safety margin, and never more than the
-// share of the machine this product takes (hostShareDenominator), so the host
-// keeps at least the rest of what was available when the run began. It is
-// zero when the host does not expose available memory, which means unknown,
-// and zero on an observed host whose available memory is at or below the
-// footprint and the margin, which means nothing is left over. Either way no
-// bound is placed on a unit's heap cap: inventing one would be a default
-// memory ceiling by another name, and the product has none.
-func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
-	if !m.Observed {
-		return 0
-	}
-	alloc := min(m.AvailableBytes-baseFootprint-safetyMargin, m.AvailableBytes/hostShareDenominator)
-	if alloc < 0 {
-		return 0
-	}
-	return alloc
-}
-
-// SchedulingAllocation is the one allocation every heavy child of this process
-// is admitted against, and whether it is an observation.
-//
-//   - An observed host: the machine-derived allocation (Allocation), observed.
-//     Where available memory is at or below this process's footprint and the
-//     safety margin, that is zero, which is a real reading and not an absence:
-//     nothing is left over for the children, so the admission ledger runs them
-//     one at a time (its runs-alone rule) rather than inventing room.
-//   - A host that does not expose available memory: UnobservedAllocationBytes,
-//     not observed, standing in for the observation the platform withheld,
-//     because a gate with no bound is not a gate.
-//
-// baseFootprintBytes is what this process holds for itself, which its caller
-// derives from this machine and the configuration (config.BaseFootprint). It
-// is a parameter and not a constant read from here because a figure typed into
-// this package could not follow the core count: the reservations the process
-// makes up front grow with the machine, and an allocation computed against a
-// fixed figure hands the children memory the parent has already promised
-// itself.
-func (m Machine) SchedulingAllocation(baseFootprintBytes int64) (allocation int64, observed bool) {
-	if !m.Observed {
-		return UnobservedAllocationBytes, false
-	}
-	return m.Allocation(baseFootprintBytes, DefaultSafetyMarginBytes), true
-}
-
 // Governor sizes reservations. It holds no state and reads nothing: the
 // machine observation is a parameter, so the sizing is a pure function a test
 // can drive across hosts it does not have.
@@ -271,14 +191,15 @@ type Governor struct {
 
 // NewGovernor applies the default floor when the caller left it at zero.
 // baseFootprintBytes is this process's own footprint on this machine, derived
-// by the caller exactly as SchedulingAllocation's is, so the allocation a unit
-// is sized against and the one it is admitted against are the same figure.
+// by the caller exactly as admission.Machine.SchedulingAllocation's is, so the
+// allocation a unit is sized against and the one it is admitted against are
+// the same figure.
 func NewGovernor(floorBytes, baseFootprintBytes int64) Governor {
 	if floorBytes <= 0 {
 		floorBytes = DefaultUnitMemoryFloorBytes
 	}
 	return Governor{FloorBytes: floorBytes,
-		BaseFootprint: baseFootprintBytes, SafetyMargin: DefaultSafetyMarginBytes}
+		BaseFootprint: baseFootprintBytes, SafetyMargin: admission.DefaultSafetyMarginBytes}
 }
 
 // Reserve sizes the reservation of a unit of sourceBytes bytes on machine m.
@@ -290,14 +211,14 @@ func NewGovernor(floorBytes, baseFootprintBytes int64) Governor {
 // Where the allocation is zero the cap is NOT bounded. On a machine that could
 // not be observed, a bound invented for it is a default memory ceiling by
 // another name, which docs/research/00-synthesis.md Section 8 forbids;
-// admission stands a figure in there (SchedulingAllocation), because a gate
-// with no bound is not a gate, so on those platforms a unit is sized without a
-// bound and admitted against the stand-in. On an observed machine with nothing
+// admission stands a figure in there (admission.Machine.SchedulingAllocation),
+// because a gate with no bound is not a gate, so on those platforms a unit is
+// sized without a bound and admitted against the stand-in. On an observed machine with nothing
 // left over the footprint, bounding the cap at zero would clamp every unit to
 // the floor and trade its facts for thrash; the unit keeps its estimate and
 // the admission ledger runs it alone, and no out-of-memory retry is offered
 // (RetryCap), because there is no more memory to retry with.
-func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
+func (g Governor) Reserve(f link.Family, sourceBytes int64, m admission.Machine) Reservation {
 	r := Reservation{Family: f, ResidentBytes: residentAboveHeap[f], HelperBytes: helperAllowance[f],
 		AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin), AllocationObserved: m.Observed}
 	estimate := sourceBytes * heapPerSourceByte[f]

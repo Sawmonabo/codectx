@@ -3,7 +3,7 @@
 // tables the structural provider stores with each file's unit, and never
 // parses a file.
 //
-// A unit is one project of the repository, the scopes dependence.PlanUnits
+// A unit is one project of the repository, the scopes PlanUnits
 // derives. Its inputs are the project's member files, each recording the
 // digest of the table it linked (model.UnitInput.Digest). A build whose every
 // member digest equals its predecessor's resolves nothing: it re-emits the

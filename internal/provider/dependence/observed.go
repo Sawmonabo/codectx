@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // MaxObservedUnits bounds the record's rows at the one figure a bounded
@@ -36,7 +37,7 @@ const MaxObservedUnits = model.MaxRecordsPerResult
 // this process.
 type UnitMemory struct {
 	ScopeKey string
-	Family   Family
+	Family   link.Family
 	// ReservationBytes is what the unit held when it ended -- the reservation
 	// it was admitted at, or the larger one it was re-admitted at for its
 	// out-of-memory retry -- HeapCapBytes the cap its parse last ran under and
@@ -107,7 +108,7 @@ func (a *admitted) observe(o Outcome) {
 // record stores what the unit held and used as its scope's row. It runs once
 // per unit, on every path out of the import, so the row describes the unit's
 // latest run whole.
-func (a *admitted) record(u Unit) {
+func (a *admitted) record(u link.Unit) {
 	row := UnitMemory{ScopeKey: u.ScopeKey, Family: u.Family, ReservationBytes: a.res.Bytes(),
 		HeapCapBytes: a.res.HeapCapBytes, ExportHeapCapBytes: a.res.ExportHeapCapBytes,
 		AllocationBytes: a.res.AllocationBytes, AllocationObserved: a.res.AllocationObserved, PeakBytes: a.peak, PeakUnsampled: !a.sampled}

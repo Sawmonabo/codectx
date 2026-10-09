@@ -9,6 +9,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // TestClassify protects the one thing this backend exists to get right: which
@@ -253,9 +254,9 @@ func TestClassifyReducesPunctuatedPaths(t *testing.T) {
 // the first half fails; in frontendArgs, return the Java suffix for every
 // family -> the second half fails.
 func TestParseArgsEndsWithTheFrontendDelimiter(t *testing.T) {
-	java := frontendArgs(dependence.FamilyJava)
+	java := frontendArgs(link.FamilyJava)
 	args := parseArgs([]string{"--base"}, dependence.ParseRequest{
-		Family: dependence.FamilyJava, SourceDir: "/src", OutputPath: "/out/graph"})
+		Family: link.FamilyJava, SourceDir: "/src", OutputPath: "/out/graph"})
 	tail := args[len(args)-len(java):]
 	if len(java) == 0 || strings.Join(tail, " ") != strings.Join(java, " ") {
 		t.Fatalf("the parse argv ends with %q, not with the frontend delimiter %q", tail, java)
@@ -264,8 +265,8 @@ func TestParseArgsEndsWithTheFrontendDelimiter(t *testing.T) {
 	if got := strings.Join(head, " "); !strings.HasSuffix(got, "/src --output /out/graph") {
 		t.Errorf("the paths do not precede the frontend delimiter: %q", got)
 	}
-	for _, f := range dependence.Families {
-		if f == dependence.FamilyJava {
+	for _, f := range link.Families {
+		if f == link.FamilyJava {
 			continue
 		}
 		args := parseArgs([]string{"--base"}, dependence.ParseRequest{Family: f, SourceDir: "/src", OutputPath: "/out/graph"})

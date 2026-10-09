@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -15,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/coverage"
@@ -96,7 +96,7 @@ const collectorBatchLimit = 200
 // reports no free-space figure for the data directory. It is not a
 // measurement and is never reported as one: it is the finite bound the gate
 // must have, standing in for the observation the platform withheld, exactly
-// as dependence.UnobservedAllocationBytes stands in for available memory.
+// as admission.UnobservedAllocationBytes stands in for available memory.
 //
 // It is deliberately one child's worth of staging and not a machine's. Where
 // memory is unobservable the stand-in may be generous, because the host's own
@@ -148,7 +148,7 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 // them, derived from one reading m of the kernel's figure: the smaller of
 // available memory plus the product's own observed residency, less the base
 // footprint and the safety margin, and half of that total
-// (dependence.Machine.SchedulingAllocation over the augmented reading).
+// (admission.Machine.SchedulingAllocation over the augmented reading).
 // Counting the product's own residency -- this process's resident set and
 // childResidentBytes, what its ledger children hold -- means its own growth
 // never throttles it: memory the product already holds is not memory another
@@ -163,7 +163,7 @@ func freeDiskAllocation(dataDir string, floorBytes int64) (int64, bool) {
 // counted as zero, and the allocation is the smaller figure available memory
 // alone leaves. An unobserved reading is the stand-in allocation, not
 // observed.
-func memoryAllocation(m dependence.Machine, baseFootprintBytes, childResidentBytes int64) (int64, bool) {
+func memoryAllocation(m admission.Machine, baseFootprintBytes, childResidentBytes int64) (int64, bool) {
 	if !m.Observed {
 		return m.SchedulingAllocation(baseFootprintBytes)
 	}
@@ -171,7 +171,7 @@ func memoryAllocation(m dependence.Machine, baseFootprintBytes, childResidentByt
 	if parent := residency.Read().Resident; parent != nil {
 		held += int64(*parent)
 	}
-	return dependence.Machine{AvailableBytes: m.AvailableBytes + held, Observed: true}.
+	return admission.Machine{AvailableBytes: m.AvailableBytes + held, Observed: true}.
 		SchedulingAllocation(baseFootprintBytes)
 }
 
@@ -210,7 +210,7 @@ func (a *ledgerAllocation) parserResidency(workerResidentBytes int64) {
 }
 
 func (a *ledgerAllocation) rederive() {
-	m := dependence.ObserveMachine()
+	m := admission.ObserveMachine()
 	if !m.Observed {
 		return
 	}
@@ -472,7 +472,7 @@ type stack struct {
 	// machine is the composition's observation of the host. The admission
 	// allocation starts from it, and it is handed to the coordinator's planner
 	// and the dependence provider, which size every heavy unit against it.
-	machine dependence.Machine
+	machine admission.Machine
 	// admissionMemoryObserved and admissionDiskObserved say whether each of
 	// the ledger's allocations came from a reading of this host rather than a
 	// stand-in, so the resource block never publishes a stand-in as a
@@ -775,7 +775,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// exposes no figure gets the stand-in; composition warns about it once, as
 	// it does about an observed zero, and the ledger's surfaces are told it is
 	// not an observation.
-	s.machine = dependence.ObserveMachine()
+	s.machine = admission.ObserveMachine()
 	baseFootprint := config.BaseFootprint(cfg)
 	var childMemory int64
 	childMemory, s.admissionMemoryObserved = memoryAllocation(s.machine, baseFootprint, 0)

@@ -10,7 +10,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
 
 // unit is one linking unit's member tables as the resolvers read them.
@@ -65,31 +64,31 @@ type Binding struct {
 // binds publishes nothing, and its structural call stands alone.
 type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
 
-// planned is the dependence plan's unit the request names. Planning from the
+// planned is the plan's unit the request names. Planning from the
 // pinned snapshot is what makes the members the ones the unit's inputs were
 // keyed on; a scope the plan does not hold is a disagreement with the
 // planner and fails rather than being guessed at.
-func planned(ctx context.Context, req provider.UnitRequest) (dependence.Unit, error) {
-	plan, err := dependence.PlanUnits(ctx, req.Content)
+func planned(ctx context.Context, req provider.UnitRequest) (Unit, error) {
+	plan, err := PlanUnits(ctx, req.Content)
 	if err != nil {
-		return dependence.Unit{}, err
+		return Unit{}, err
 	}
 	for _, pu := range plan.Units {
 		if pu.ScopeKey == req.Unit.ScopeKey {
 			return pu, nil
 		}
 	}
-	return dependence.Unit{}, &model.Error{Code: model.CodeArgumentInvalid,
+	return Unit{}, &model.Error{Code: model.CodeArgumentInvalid,
 		Message: "the linking provider has no unit for this scope in this snapshot",
 		Details: map[string]string{"scope_key": req.Unit.ScopeKey}}
 }
 
 // resolverFor is the resolution of decision 2 for a unit's language family.
-func resolverFor(f dependence.Family) resolver {
+func resolverFor(f Family) resolver {
 	switch f {
-	case dependence.FamilyJavaScript:
+	case FamilyJavaScript:
 		return resolveECMAScript
-	case dependence.FamilyPython:
+	case FamilyPython:
 		return resolvePython
 	}
 	return resolveStatic
@@ -101,7 +100,7 @@ func resolverFor(f dependence.Family) resolver {
 // are not members. The manifest is served in path order and a FileID is a
 // digest, so the order is an external sort that spills rather than a list
 // held in the heap.
-func sortMembers(ctx context.Context, view model.SnapshotView, pu dependence.Unit, dir string) (*pagination.SortedRun[model.FileVersion], error) {
+func sortMembers(ctx context.Context, view model.SnapshotView, pu Unit, dir string) (*pagination.SortedRun[model.FileVersion], error) {
 	s, err := pagination.NewExternalSort(dir, 0,
 		func(fv model.FileVersion) ([]byte, error) { return json.Marshal(fv) },
 		func(b []byte) (model.FileVersion, error) {
@@ -115,7 +114,7 @@ func sortMembers(ctx context.Context, view model.SnapshotView, pu dependence.Uni
 	}
 	defer s.Close()
 	err = view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
-		if fv.Status == model.FileDeleted || !pu.OwnsInput(fv.Path) || dependence.FamilyOf(srclang.Of(fv.Path)) != pu.Family {
+		if fv.Status == model.FileDeleted || !pu.OwnsInput(fv.Path) || FamilyOf(srclang.Of(fv.Path)) != pu.Family {
 			return nil
 		}
 		return s.Add(fv)

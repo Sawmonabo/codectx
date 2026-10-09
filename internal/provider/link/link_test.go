@@ -11,7 +11,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter"
@@ -203,7 +202,7 @@ int indirect() {
 }
 
 // TestCallsArriveForEveryGrammar runs the real structural provider over one
-// source per grammar, then the linking provider over the unit the dependence
+// source per grammar, then the linking provider over the unit the project
 // plan gives that source, and asserts what it published.
 //
 // Failure modes: `calls` missing for a language whose worker tables and
@@ -234,7 +233,7 @@ func TestCallsArriveForEveryGrammar(t *testing.T) {
 			// which is where the linker reads its tables.
 			linker := link.New(link.StoreTables(h.Store))
 
-			plan, err := dependence.PlanUnits(ctx, h.View)
+			plan, err := link.PlanUnits(ctx, h.View)
 			if err != nil {
 				t.Fatalf("PlanUnits: %v", err)
 			}
@@ -251,7 +250,7 @@ func TestCallsArriveForEveryGrammar(t *testing.T) {
 				}
 			}
 			if scope == "" {
-				t.Fatalf("the dependence plan gives %s no unit", tc.source)
+				t.Fatalf("the project plan gives %s no unit", tc.source)
 			}
 			u := h.Plan(t, linker, scope, inputs, structID)
 			out := &capture{UnitOutput: h.Begin(t, u, inputs)}

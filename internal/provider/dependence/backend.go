@@ -11,10 +11,10 @@
 // subpackage.
 //
 // This package owns the parts of Section 11.6 that survive an engine swap:
-// which units exist (units.go), what makes a cached graph reusable
-// (cache.go), how much memory a unit reserves (govern.go), how a failed or
-// degraded run is classified and published (failure.go) and the provider
-// contract itself (provider.go). The engine dialect — argv, environment,
+// which units exist (the linking provider's planner, link.PlanUnits), what
+// makes a cached graph reusable (cache.go), how much memory a unit reserves
+// (govern.go), how a failed or degraded run is classified and published
+// (failure.go) and the provider contract itself (provider.go). The engine dialect — argv, environment,
 // stderr vocabulary, payload digest — lives behind Backend.
 package dependence
 
@@ -25,6 +25,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // Engine identifies the resolved analysis payload. Version and Digest are the
@@ -70,11 +71,11 @@ type Backend interface {
 	// parse options, used once to confirm a crash reproduces before a unit is
 	// subdivided. It is empty for every frontend today (Section 11.6): every
 	// known option changes results, so there is nothing honest to retry with.
-	NeutralOptions(f Family) []string
+	NeutralOptions(f link.Family) []string
 	// Argv is the pinned parse argument array for f, without the paths. It is
 	// part of the cache key, so a change to the pinned arguments invalidates
 	// every cached graph rather than silently reusing one.
-	Argv(f Family) []string
+	Argv(f link.Family) []string
 }
 
 // ParseRequest is one parse step. SourceDir is a private materialization the
@@ -82,7 +83,7 @@ type Backend interface {
 type ParseRequest struct {
 	SourceDir  string
 	OutputPath string
-	Family     Family
+	Family     link.Family
 	// HeapCapBytes is the frontend heap cap. Section 11.6: a cap is lossless
 	// where it succeeds, so it bounds scheduling, not results.
 	HeapCapBytes int64
@@ -166,33 +167,6 @@ type ExportOutcome struct {
 	Live  bool
 	Bytes int64
 }
-
-// Family is the set of languages one parse of the engine handles together. It
-// is the product's own vocabulary, not the engine's frontend names: the nine
-// supported languages collapse onto six families, and the backend maps a
-// family to whatever the engine calls that frontend.
-type Family string
-
-const (
-	// FamilyC covers C and C++. Header resolution spans the whole tree, so it
-	// is the one family whose unit is the repository (Section 11.6).
-	FamilyC Family = "c"
-	// FamilyGo covers Go.
-	FamilyGo Family = "go"
-	// FamilyJava covers Java.
-	FamilyJava Family = "java"
-	// FamilyJavaScript covers JavaScript, TypeScript and TSX, which share one
-	// project and one frontend.
-	FamilyJavaScript Family = "javascript"
-	// FamilyPython covers Python.
-	FamilyPython Family = "python"
-	// FamilyRust covers Rust.
-	FamilyRust Family = "rust"
-)
-
-// Families is every family in a fixed order, so unit plans and reservations
-// are a function of the repository alone.
-var Families = []Family{FamilyC, FamilyGo, FamilyJava, FamilyJavaScript, FamilyPython, FamilyRust}
 
 // The import contract is the export reader's own, not a mirror of it. A
 // mirror drifts: the declared one carried five of the ten option fields the

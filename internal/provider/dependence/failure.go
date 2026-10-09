@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // Capabilities is the descriptor's capability list: empty, because this
@@ -155,7 +156,7 @@ const unreadRemediation = "check that this unit's source files hold method defin
 //
 // files is counted over the one pass that decided what the frontend was
 // given, so a zero there is "nothing reached the frontend" and not a guess.
-func emptyExport(unit Unit, o Outcome, r Reservation, files int64) *model.Error {
+func emptyExport(unit link.Unit, o Outcome, r Reservation, files int64) *model.Error {
 	return failure(FailureEmptyExport, unit.ScopeKey, o, r).
 		WithDetail("family", string(unit.Family)).
 		WithDetail("source_files", strconv.FormatInt(files, 10)).
@@ -191,7 +192,7 @@ type partTally struct {
 // produced a method. A unit with no part at all never reaches it: subdivide
 // refuses the split before the parts run. "no part produced an honest result" is the same
 // restatement emptyExport removes, so this names the tally instead.
-func subdivisionEmpty(unit Unit, crash Outcome, r Reservation, t partTally, files int64) *model.Error {
+func subdivisionEmpty(unit link.Unit, crash Outcome, r Reservation, t partTally, files int64) *model.Error {
 	err := failure(FailureEngine, unit.ScopeKey, crash, r).
 		WithDetail("source_files", strconv.FormatInt(files, 10)).
 		WithDetail("parts", strconv.Itoa(t.Parts)).
@@ -259,7 +260,7 @@ type publication struct {
 	// Family is the unit's language family, carried so the two user-set
 	// threshold reports below can name it: a capability row carries a scope
 	// key, and the project count they report is the family's, not the scope's.
-	Family Family
+	Family link.Family
 	// OverUnitsPerFamily is the project count that crossed a user-set
 	// providers.dependence.max_units_per_family (0 when it did not, or when
 	// the user set no threshold), and UnitsPerFamilyBound that threshold.

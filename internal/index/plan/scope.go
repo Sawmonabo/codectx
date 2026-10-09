@@ -103,7 +103,7 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 		}
 		return out, nil, nil
 	case dependence.ProviderID:
-		dp, err := dependence.PlanUnits(ctx, view)
+		dp, err := link.PlanUnits(ctx, view)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -118,7 +118,7 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			// product, so a documentation edit would reparse it; Section 13.1
 			// forbids exactly that.
 			//
-			// dependence.Unit.OwnsInput is that closure, and it is the same
+			// link.Unit.OwnsInput is that closure, and it is the same
 			// predicate the provider's own cache key folds, so a unit's
 			// planned identity and its graph cache key cannot drift apart. It
 			// answers for a tombstone as well as a live row, which is what
@@ -139,14 +139,14 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 		}
 		return out, unplanned, nil
 	case link.ProviderID:
-		// The linking provider's units are the dependence planner's projects,
-		// reused rather than re-derived, with the same membership: a project's
-		// member files are what its calls resolve across. A project that
+		// The linking provider's units are its own planner's projects
+		// (link.PlanUnits), with their membership: a project's member files
+		// are what its calls resolve across. A project that
 		// planner refused as a unit of its own is linked with the unit that
 		// encloses it, which loses no call, so nothing is unplanned here; the
 		// refusal is the dependence provider's to count, and counting it again
 		// under the same key would double it. It runs no heavy child.
-		dp, err := dependence.PlanUnits(ctx, view)
+		dp, err := link.PlanUnits(ctx, view)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -169,7 +169,7 @@ type semantic struct {
 	// planner can share one sorted input slice rather than copying it per unit.
 	allFiles bool
 	heavy    bool
-	family   dependence.Family
+	family   link.Family
 	// admit is what an external-indexer profile unit reserves in both
 	// dimensions while it runs; it is set only for a profile scope, and zero
 	// for every other unit.

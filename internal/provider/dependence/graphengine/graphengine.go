@@ -35,18 +35,19 @@ import (
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // frontend is the engine's own name for the parser of one language family.
 // The mapping lives here because those spellings are the engine's vocabulary,
 // not the product's.
-var frontend = map[dependence.Family]string{
-	dependence.FamilyC:          "c",
-	dependence.FamilyGo:         "golang",
-	dependence.FamilyJava:       "javasrc",
-	dependence.FamilyJavaScript: "jssrc",
-	dependence.FamilyPython:     "pythonsrc",
-	dependence.FamilyRust:       "rust",
+var frontend = map[link.Family]string{
+	link.FamilyC:          "c",
+	link.FamilyGo:         "golang",
+	link.FamilyJava:       "javasrc",
+	link.FamilyJavaScript: "jssrc",
+	link.FamilyPython:     "pythonsrc",
+	link.FamilyRust:       "rust",
 }
 
 // maxNumDef is the per-method definition cap the pinned parse always passes.
@@ -203,8 +204,8 @@ func (b *Backend) resolve(ctx context.Context) (dependence.Engine, error) {
 // parse tool. The frontend is pointed at a private materialization that
 // already holds exactly the files this unit owns, so which files exist for it
 // to read is the product's decision, not the frontend's default.
-func frontendArgs(f dependence.Family) []string {
-	if f == dependence.FamilyJava {
+func frontendArgs(f link.Family) []string {
+	if f == link.FamilyJava {
 		return []string{"--frontend-args", "--no-default-exclude"}
 	}
 	return nil
@@ -213,7 +214,7 @@ func frontendArgs(f dependence.Family) []string {
 // pinnedArgs is the pinned parse argument array for a family, without the
 // paths and without the frontend arguments that must trail them. Argv and
 // Parse both build on it so the cache key and the command line cannot drift.
-func pinnedArgs(f dependence.Family) []string {
+func pinnedArgs(f link.Family) []string {
 	return []string{"--language", frontend[f], "--max-num-def", maxNumDef}
 }
 
@@ -221,7 +222,7 @@ func pinnedArgs(f dependence.Family) []string {
 // is what the cache key folds in, so changing a pinned argument invalidates
 // every cached graph of that family instead of silently reusing one built
 // differently, and a family whose argv did not change keeps its graphs.
-func (b *Backend) Argv(f dependence.Family) []string {
+func (b *Backend) Argv(f link.Family) []string {
 	return append(pinnedArgs(f), frontendArgs(f)...)
 }
 
@@ -234,7 +235,7 @@ func (b *Backend) Argv(f dependence.Family) []string {
 // -- it changes which files are read, which is the whole point of it -- and it
 // is not a retry lever in any case: every Java parse passes it, so a
 // confirmation rerun carries it already.
-func (b *Backend) NeutralOptions(dependence.Family) []string { return nil }
+func (b *Backend) NeutralOptions(link.Family) []string { return nil }
 
 // Parse builds the graph for one unit. The heap cap reaches the frontend
 // through JAVA_OPTS, which the launcher forwards to the separate frontend

@@ -18,6 +18,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphcsv"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // goScope is the scope key of the root Go module of the trees below.
@@ -42,9 +43,9 @@ func (fakeBackend) Engine() dependence.Engine {
 		Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
 }
 
-func (fakeBackend) Argv(dependence.Family) []string { return []string{"--pinned"} }
+func (fakeBackend) Argv(link.Family) []string { return []string{"--pinned"} }
 
-func (fakeBackend) NeutralOptions(dependence.Family) []string { return nil }
+func (fakeBackend) NeutralOptions(link.Family) []string { return nil }
 
 func (fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dependence.Outcome, error) {
 	return dependence.Outcome{}, os.WriteFile(req.OutputPath, []byte("graph"), 0o600)

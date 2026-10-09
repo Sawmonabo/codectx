@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -244,17 +246,17 @@ func (f *fixture) request(p provider.Provider, b build) delta.Request {
 // would ask for one.
 func (f *fixture) reservation(b build) (dependence.Reservation, func(context.Context, dependence.Reservation) error) {
 	f.t.Helper()
-	units, err := dependence.PlanUnits(f.ctx, b.tree.view)
+	units, err := link.PlanUnits(f.ctx, b.tree.view)
 	if err != nil {
 		f.t.Fatalf("PlanUnits: %v", err)
 	}
 	for _, u := range units.Units {
 		if u.ScopeKey == b.scopeKey {
-			res := dependence.NewGovernor(0, 0).Reserve(u.Family, u.Bytes, dependence.Machine{})
+			res := dependence.NewGovernor(0, 0).Reserve(u.Family, u.Bytes, admission.Machine{})
 			return res, func(context.Context, dependence.Reservation) error { return nil }
 		}
 	}
-	f.t.Fatalf("the dependence plan of the tree names no unit %q", b.scopeKey)
+	f.t.Fatalf("the project plan of the tree names no unit %q", b.scopeKey)
 	return dependence.Reservation{}, nil
 }
 

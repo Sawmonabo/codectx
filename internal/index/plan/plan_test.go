@@ -7,10 +7,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // inputAt is a distinct, deterministic snapshot input. File identities are
@@ -353,12 +355,12 @@ func TestARecordedPeakOnlyEverRaisesAReservationAndAnAbsentOneChangesNothing(t *
 	)
 	unit := func(key string) *semantic {
 		return &semantic{providerID: dependence.ProviderID, scopeKey: key, heavy: true,
-			family: dependence.FamilyJavaScript, bytes: 1 << 20}
+			family: link.FamilyJavaScript, bytes: 1 << 20}
 	}
 	gov := dependence.NewGovernor(0, 0)
 	// An unobserved machine, so no allocation bound can mask the raise.
-	machine := dependence.Machine{}
-	derived := gov.Reserve(dependence.FamilyJavaScript, 1<<20, machine).Bytes()
+	machine := admission.Machine{}
+	derived := gov.Reserve(link.FamilyJavaScript, 1<<20, machine).Bytes()
 	if derived <= 0 {
 		t.Fatalf("the family constants derive %d bytes for a heavy unit; the test cannot tell a raise from a collapse", derived)
 	}

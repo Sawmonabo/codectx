@@ -1,22 +1,23 @@
-package dependence
+package link
 
-// Unit planning (Section 11.6). One parse handles exactly one language, so a
-// unit is one frontend-native project: a Go module, a Maven or Gradle module,
-// a `package.json`/`tsconfig.json` project, a Python package, a Cargo
-// workspace. C and C++ are one unit per repository because header resolution
-// spans the whole tree.
+// Project planning (Section 11.6). A linking unit is one project of the
+// repository: a Go module, a Maven or Gradle module, a `package.json`/
+// `tsconfig.json` project, a Python package, a Cargo workspace. C and C++ are
+// one unit per repository, because header resolution spans the whole tree and
+// a call into a header can land on any file of it.
 //
-// The rules are the parity results of docs/research/10-engine-empirical.md
-// Sections 5 to 8, not preferences. A TypeScript project is never split: the
-// four-way split of one project kept 99.7% of control-dependence edges but
-// only 46% of the calls that resolved to internal methods, because the
-// frontend needs the whole program to type a receiver. Python units are
-// packages, which keep every method and every dependence edge and alias their
-// cross-package calls by full name. Go units are modules found by walking
-// `go.mod`, because the frontend reads a `go.work` root module only and a
-// whole-repository parse of a multi-module workspace covered 36 files. Rust is
-// the Cargo workspace root; a directory of `.rs` files without a `Cargo.toml`
-// produces an empty graph and is therefore not a unit at all.
+// The boundaries are the ones linking needs, not preferences. A call resolves
+// only to a declaration the unit holds, so a unit is the set of files whose
+// calls resolve across each other. A TypeScript project is never split below
+// its own manifest: a receiver's type flows from anywhere in the program, and a
+// unit cut at a directory with no manifest of its own leaves the call
+// unresolved for want of the declaration on the other side of the cut. Python
+// units are packages, which hold every method a package's calls name and alias
+// their cross-package calls by full name. Go units are modules found by walking
+// `go.mod`, because a module is the unit of import resolution and a workspace
+// root names only some of its modules. Rust is the Cargo workspace root; a
+// directory of `.rs` files without a `Cargo.toml` is no crate and so no
+// project at all.
 //
 // A plan holds one descriptor per project and no repository-sized list at all
 // (Section 6): membership is a predicate over the project root, the nested
@@ -35,11 +36,61 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/Sawmonabo/codectx/internal/lang"
+	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider"
 )
 
-// Unit is one planned frontend-native project.
+// component is the slog component every entry of this package carries.
+const component = "provider.link"
+
+// Family is the set of languages one project links together. The nine
+// supported languages collapse onto six families: the languages of one family
+// share a project and its manifests.
+type Family string
+
+const (
+	// FamilyC covers C and C++. Header resolution spans the whole tree, so it
+	// is the one family whose unit is the repository (Section 11.6).
+	FamilyC Family = "c"
+	// FamilyGo covers Go.
+	FamilyGo Family = "go"
+	// FamilyJava covers Java.
+	FamilyJava Family = "java"
+	// FamilyJavaScript covers JavaScript, TypeScript and TSX, which share one
+	// project.
+	FamilyJavaScript Family = "javascript"
+	// FamilyPython covers Python.
+	FamilyPython Family = "python"
+	// FamilyRust covers Rust.
+	FamilyRust Family = "rust"
+)
+
+// Families is every family in a fixed order, so a plan is a function of the
+// repository alone.
+var Families = []Family{FamilyC, FamilyGo, FamilyJava, FamilyJavaScript, FamilyPython, FamilyRust}
+
+// FamilyOf maps a language tag to the family whose project covers it, or an
+// empty family for a language the linking provider does not link.
+func FamilyOf(language string) Family {
+	switch language {
+	case "go":
+		return FamilyGo
+	case "javascript", "typescript", "tsx":
+		return FamilyJavaScript
+	case "python":
+		return FamilyPython
+	case "java":
+		return FamilyJava
+	case "c", "cpp":
+		return FamilyC
+	case "rust":
+		return FamilyRust
+	}
+	return ""
+}
+
+// Unit is one planned project.
 type Unit struct {
 	// ScopeKey is `pkg:<family>:<root>` for a project unit and `workspace` for
 	// the C/C++ unit, which is the whole repository.
@@ -49,18 +100,18 @@ type Unit struct {
 	// repository root.
 	Root string
 	// Excluded are the root-relative directories of nested projects of the
-	// same family that this unit does not own. They are never materialized for
-	// this unit, so a nested module is analysed once, by its own unit.
+	// same family that this unit does not own. They are never members of this
+	// unit, so a nested module is linked once, by its own unit.
 	Excluded []string
 	// Files and Bytes are the unit's own source files and their byte count:
-	// the governor sizes the heap cap from Bytes, and a unit with no files is
-	// never scheduled.
+	// the planner weighs a unit from Bytes, and a unit with no files is never
+	// scheduled.
 	Files int64
 	Bytes int64
 }
 
 // markers names the manifest, lock and project files of a family. The first
-// group defines a project root; the second only contributes to the cache key.
+// group defines a project root; the second only joins the unit's closure.
 var (
 	projectMarkers = map[Family][]string{
 		FamilyGo:         {"go.mod"},
@@ -83,50 +134,39 @@ var (
 	nestedFamilies = map[Family]bool{FamilyGo: true, FamilyJava: true}
 )
 
-// FamilyOf maps a language tag to the family whose single parse covers it, or
-// an empty family for a language this provider does not analyse.
-func FamilyOf(language string) Family {
-	switch language {
-	case "go":
-		return FamilyGo
-	case "javascript", "typescript", "tsx":
-		return FamilyJavaScript
-	case "python":
-		return FamilyPython
-	case "java":
-		return FamilyJava
-	case "c", "cpp":
-		return FamilyC
-	case "rust":
-		return FamilyRust
-	}
-	return ""
-}
+// ProjectMarkers are the manifest files whose presence makes a directory a
+// project root of one family. It is the single source of that mapping: the
+// planner reads it here, and `codectx tools prefetch --for-repo` reads the
+// same table to decide which payloads a repository would ever need, rather
+// than carrying a second copy that drifts from the one that plans the units.
+//
+// The result is a copy: the table is package state and a caller must not be
+// able to reach into it. A family the linking provider does not link has no
+// markers and returns nil.
+func ProjectMarkers(f Family) []string { return slices.Clone(projectMarkers[f]) }
 
-// Plan is one snapshot's dependence units together with what could not be
+// Plan is one snapshot's project units together with what could not be
 // planned as a unit of its own. A refused project is not a silent omission:
-// its files are analysed by the unit enclosing them, at a coarser boundary
-// than they own, so the family that owns it cannot be published fresh, and
-// Unplanned is how the provider knows that at publication time.
+// its files are members of the unit enclosing them, at a coarser boundary
+// than they own, and Unplanned is how a consumer knows that.
 type Plan struct {
 	// Units are the planned units, sorted by scope key.
 	Units []Unit
-	// Projects counts, per family, the frontend-native projects the planner
-	// found -- before a scope key refuses one and before an empty unit is
-	// dropped, so it is the repository's project count and not the surviving
-	// unit count. Nothing bounds it: a plan holds one descriptor per project
-	// whatever the count, and `providers.dependence.max_units_per_family` is a
-	// reporting threshold the provider compares this against, never a refusal
-	// (it holds one int per family, of which there are five).
+	// Projects counts, per family, the projects the planner found -- before a
+	// scope key refuses one and before an empty unit is dropped, so it is the
+	// repository's project count and not the surviving unit count. Nothing
+	// bounds it: a plan holds one descriptor per project whatever the count,
+	// and a consumer that reports it against a threshold of its own never
+	// refuses a project for it (it holds one int per family, of which there
+	// are six).
 	Projects map[Family]int
 	// Unplanned counts, per family, the projects planFamily refused because
 	// their scope key does not fit model.MaxScopeKeyBytes. Their files are
-	// analysed by the unit that encloses them, so nothing is lost, but at a
-	// coarser boundary than the project owns — which is what the family
-	// publishes partial for. It is a count and not the paths: the only paths
-	// that can appear here are longer than two kilobytes each, and a plan never
-	// holds a repository-sized list of them (Section 6). The refusal's locus is
-	// on the warning this package logs.
+	// members of the unit that encloses them, so nothing is lost, but at a
+	// coarser boundary than the project owns. It is a count and not the
+	// paths: the only paths that can appear here are longer than two
+	// kilobytes each, and a plan never holds a repository-sized list of them
+	// (Section 6). The refusal's locus is on the warning this package logs.
 	Unplanned map[Family]int
 }
 
@@ -142,7 +182,7 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 		}
 		dir, base := path.Split(fv.Path)
 		dir = strings.TrimSuffix(dir, "/")
-		if f := FamilyOf(lang.Of(fv.Path)); f != "" {
+		if f := FamilyOf(srclang.Of(fv.Path)); f != "" {
 			present[f] = true
 		}
 		for _, f := range Families {
@@ -197,7 +237,7 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 	if f == FamilyC {
 		// Header resolution spans the tree, so C and C++ are the one family
 		// whose unit is the repository itself.
-		return []Unit{{ScopeKey: ScopeWorkspace, Family: f}}, 0, 1, nil
+		return []Unit{{ScopeKey: provider.ScopeWorkspace, Family: f}}, 0, 1, nil
 	}
 	dirs := make([]string, 0, len(roots))
 	for d := range roots {
@@ -214,15 +254,11 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 		// and it is the difference between what the two lose. The precise
 		// collapse cost located facts for a project nobody had planned a unit
 		// for; this collapse keeps the outer project whole, and the outer
-		// project is the program these frontends resolve calls across. Every
-		// file of it is parsed together, so a call from the nested directory
-		// into the rest of the project, or back, resolves to the method it
-		// names, which a separate parse of the nested directory could only
-		// publish as a call to a stub outside its graph. No split at a nested
-		// manifest has been measured; the measured splits are at directories
-		// inside one project (docs/research/10-engine-empirical.md Section 8),
-		// and they lose cross-directory calls for exactly this reason. Neither
-		// rule inherits the other.
+		// project is the program whose calls are linked across each other.
+		// Every file of it is one unit, so a call from the nested directory
+		// into the rest of the project, or back, resolves to the declaration
+		// it names, which a separate unit for the nested directory could not
+		// hold. Neither rule inherits the other.
 		dirs = slices.DeleteFunc(dirs, func(d string) bool {
 			for _, outer := range dirs {
 				if outer != d && within(d, outer) {
@@ -234,10 +270,9 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 	}
 	// How many projects one family holds is a property of the repository. A
 	// monorepo is planned whole: every project gets its own unit, because
-	// collapsing them into a coarser one would silently change which facts the
-	// analysis can resolve, and refusing the plan would refuse the repository.
-	// The count travels out as Plan.Projects and the provider reports it
-	// against a user-set `providers.dependence.max_units_per_family`.
+	// collapsing them into a coarser one would silently change which calls
+	// resolve, and refusing the plan would refuse the repository. The count
+	// travels out as Plan.Projects.
 	projects := len(dirs)
 	// A project whose scope key does not fit is refused as a project, not as
 	// source. Refusing here is what keeps the failure in the planner: the unit
@@ -248,52 +283,52 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 	// directory is excluded from nothing and its files fall back to the unit
 	// that encloses it — the enclosing project, or the family's
 	// repository-root unit. No file of a family is ever orphaned — except
-	// loose Rust source outside every crate, which is deliberately left
-	// unanalysed (see the FamilyRust guard below) — and for every other
-	// family that is what guarantees the degradation below always has a unit
-	// to be published on. It is still a degradation: that source is analysed at a
-	// coarser project boundary than it owns, with the neighbouring projects'
-	// files around it, so the caller publishes the family partial and the
-	// refusal is counted rather than swallowed. The path is logged truncated
-	// because it is what locates the project for an operator and a whole one
-	// is over two kilobytes.
-	planned := make([]string, 0, len(dirs))
+	// loose Rust source outside every crate, which belongs to no project (see
+	// the FamilyRust guard below). It is still a degradation: that source is
+	// linked at a coarser project boundary than it owns, with the
+	// neighbouring projects' files around it, and the refusal is counted
+	// rather than swallowed. The path is logged truncated because it is what
+	// locates the project for an operator and a whole one is over two
+	// kilobytes.
+	kept := make([]string, 0, len(dirs))
 	unplanned := 0
 	for _, d := range dirs {
 		if _, ok := scopeKey(f, d); !ok {
 			unplanned++
-			slog.Warn("a dependence project is not planned as its own unit: its scope key exceeds the identity bound",
-				"component", component, "family", string(f), "path", truncate(d, model.MaxIdentifierBytes),
+			bounded, _ := model.TruncateField(d, model.MaxIdentifierBytes)
+			slog.Warn("a project is not planned as its own unit: its scope key exceeds the identity bound",
+				"component", component, "family", string(f), "path", bounded,
 				"path_bytes", len(d), "bound", model.MaxScopeKeyBytes)
 			continue
 		}
-		planned = append(planned, d)
+		kept = append(kept, d)
 	}
-	units := make([]Unit, 0, len(planned)+1)
-	for _, d := range planned {
+	units := make([]Unit, 0, len(kept)+1)
+	for _, d := range kept {
 		key, _ := scopeKey(f, d)
 		units = append(units, Unit{ScopeKey: key, Family: f, Root: d,
-			Excluded: nested(d, planned)})
+			Excluded: nested(d, kept)})
 	}
-	if f != FamilyRust && !slices.Contains(planned, "") {
-		// Source of this family outside every project still has facts worth
-		// having; the engine parses a bare directory happily. Rust does not:
-		// without a Cargo.toml its helper produces an empty graph, which would
-		// be indistinguishable from a crashed helper, so loose Rust files are
-		// left unanalysed rather than published as an empty unit.
+	if f != FamilyRust && !slices.Contains(kept, "") {
+		// Source of this family outside every project still has calls worth
+		// linking, so the family's repository root is a unit of its own. Rust
+		// is not: a crate is declared by its Cargo.toml, and loose Rust files
+		// outside every crate belong to no project, so they are left unlinked
+		// rather than published as a unit no crate declares.
 		//
 		// A project rooted at the repository root already owns this scope key.
-		// Emitting a second unit under the same key would leave unitFor
-		// choosing between them by sort position, so it is not emitted at all.
-		// The root key is "pkg:<family>:", always within the bound.
+		// Emitting a second unit under the same key would leave a lookup by
+		// scope key choosing between them by sort position, so it is not
+		// emitted at all. The root key is "pkg:<family>:", always within the
+		// bound.
 		//
 		// Excluded is every project of the family that is planned as its own
 		// unit, and only those: a refused directory is not excluded here, so
 		// its files — and its manifests, which belong in this unit's semantic
 		// closure now that it owns them — fall back to this unit rather than
-		// being analysed by nobody.
+		// being linked by nobody.
 		key, _ := scopeKey(f, "")
-		units = append(units, Unit{ScopeKey: key, Family: f, Excluded: planned})
+		units = append(units, Unit{ScopeKey: key, Family: f, Excluded: kept})
 	}
 	return units, unplanned, projects, nil
 }
@@ -301,7 +336,7 @@ func planFamily(f Family, roots map[string]bool) ([]Unit, int, int, error) {
 // foldSizes counts each unit's own files and bytes in one streaming pass.
 func foldSizes(ctx context.Context, view model.SnapshotView, plan []Unit) error {
 	return view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
-		f := FamilyOf(lang.Of(fv.Path))
+		f := FamilyOf(srclang.Of(fv.Path))
 		if f == "" || fv.Status == model.FileDeleted {
 			return nil
 		}
@@ -330,23 +365,10 @@ func (u Unit) Contains(p string) bool {
 	return true
 }
 
-// handed is the predicate for the files the engine is handed when it parses
-// the directory root of this unit -- the unit's root, or one part's directory
-// when the unit is subdivided: a live source file of the unit's own family
-// that the unit owns and that lies under root. It is the same membership the
-// materialization counts as the unit's source files.
-func (u Unit) handed(root string) func(model.FileVersion) bool {
-	return func(fv model.FileVersion) bool {
-		return fv.Status != model.FileDeleted && within(fv.Path, root) && u.Contains(fv.Path) &&
-			FamilyOf(lang.Of(fv.Path)) == u.Family
-	}
-}
-
 // OwnsInput reports whether path is part of this unit's semantic closure
 // (Section 11.6): a source file of its own family that it owns, or a manifest
-// or lock file it owns. It is the manifest half of the cache key (CacheKey)
-// and of the unit's declared inputs, which is exactly "any of these changing
-// invalidates the unit".
+// or lock file it owns. It is the manifest half of the unit's declared
+// inputs, which is exactly "any of these changing invalidates the unit".
 //
 // It is a predicate over the path and not a lookup in a stored list of marker
 // paths, for two reasons. It answers for a tombstone, which a list built from
@@ -360,7 +382,7 @@ func (u Unit) OwnsInput(p string) bool {
 	if !u.Contains(p) {
 		return false
 	}
-	if FamilyOf(lang.Of(p)) == u.Family {
+	if FamilyOf(srclang.Of(p)) == u.Family {
 		return true
 	}
 	base := path.Base(p)
@@ -379,15 +401,14 @@ func (u Unit) OwnsInput(p string) bool {
 // exactly this prefix, with an empty root.
 func ScopeKeyPrefix(f Family) string { return "pkg:" + string(f) + ":" }
 
-// scopeKey is the unit's capability and alias scope. It names the family in
-// the product's own vocabulary, never the engine's frontend name.
+// scopeKey is the unit's capability and alias scope, named by its family.
 //
 // A key that does not fit model.MaxScopeKeyBytes is refused, not truncated.
 // Truncation is a colliding identity claim: two deep project directories with
 // a long common prefix would cut to the same key, and every capability row,
-// alias scope and cache entry of one would then be attributed to the other.
-// The planner drops such a project instead, which loses one project's facts
-// openly rather than mixing two projects' facts silently.
+// alias scope and stored resolution of one would then be attributed to the
+// other. The planner drops such a project instead, which loses one project's
+// boundary openly rather than mixing two projects' facts silently.
 func scopeKey(f Family, root string) (string, bool) {
 	key := ScopeKeyPrefix(f) + root
 	if len(key) > model.MaxScopeKeyBytes {
