@@ -109,8 +109,13 @@ Besides the joined declarations, sites and values, the table carries what the re
   `d → a::c`). An import of every member of a path (a Go dot import, a Java on-demand import, a C++ using-directive,
   a Rust glob, a Python `from m import *`) is named `ImportAll`. An include or a side-effect import has no name;
 - `Decl.Prototype`: a C or C++ function declaration without a body (`wire.Decl.Prototype`);
-- `Decl.Default`: an ECMAScript declaration an `export default` statement declares, decided from the pinned bytes
-  before the declaration (the keywords `export default`, with only whitespace and block comments between).
+- `Import.Original`: the name a local import name denotes in the imported module when the import renames it (`a`
+  for `import { a as b }`, `default` for a default import, `*` for a namespace import, `A` for `from m import A as B`);
+- `Reexports`: what an ECMAScript module's `export` statements export under a name of their own or from another
+  module (`wire.Reexport`): `export default foo` and a default-exported declaration, `export { a as b }`,
+  `export { x } from`, `export * from`, `export * as ns from`;
+- `Unions`: the type sets a `TypeUnion` names, every type the worker recovered for a value that disagreeing reaching
+  definitions or arms reach.
 
 **The digest** (`Table.Digest`, `table.go:160-183`) covers everything resolution reads. That is every name, kind,
 shape, type fact, candidate and index, the package and the imports, and the order of every list. It covers no byte range, position, node identity
@@ -154,9 +159,15 @@ through the file's imports of every member. Only a name that no scope or import 
 to every type of that name in the unit (`hierarchy.typesIn`).
 
 - **JavaScript, TypeScript, TSX** (`resolveECMAScript`, `internal/provider/link/resolve_ecmascript.go`): direct
-  binding through imports and scopes. Member sites bind through receivers recovered by flow-based type inference,
-  then `hierarchy.dispatch`. Field-based resolution binds a site to the functions written to the property it calls
-  through. Class-hierarchy analysis applies where `extends` declares a subtype.
+  binding through imports and scopes. A bare name binds only the declarations its scope sees, those of the innermost
+  scope declaring it (`Table.Visible`), never a class member. A module's exports follow its `export` statements and
+  re-exports, closed over chains of re-exports (`export *` passes on every name but `default`), and a renamed or
+  default import reads the name it denotes. Member sites bind through receivers recovered by flow-based type
+  inference, then `hierarchy.dispatch`; a class object binds the method its class declares or inherits, never an
+  override. A construction binds the constructor the class declares or inherits. Field-based resolution binds a
+  member site to the functions written to the property it calls through, a class's methods included, only when no
+  value reached its receiver once the inference settled. Class-hierarchy analysis applies where `extends` declares
+  a subtype.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
   `from … import` and modules. A call of a class is its construction and binds its `__init__` when declared.
   Receivers come from flow-based type inference, then dispatch in method resolution order. Field-based resolution
@@ -168,7 +179,9 @@ recovered inside each function (`wire.Type`, `wire/link.go:136-169`):
 - a parameter is `TypeParam`;
 - another call's result is `TypeResult`;
 - a field read is `TypeField`;
-- an imported module is `TypeModule`.
+- an imported module is `TypeModule`;
+- a class object (a class name as a value) is `TypeClass`;
+- a value two or more disagreeing types reach is `TypeUnion`, each member evaluated as itself.
 
 It then propagates them across functions and files, iterated to the least fixed point, with no fixed round count:
 - a parameter takes the types every bound caller passes;

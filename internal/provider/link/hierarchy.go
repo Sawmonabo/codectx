@@ -45,7 +45,9 @@ const (
 	// written in it is read in.
 	keyFile = "f\x00"
 	// keyImport + refKey(file, 0) + name: the path a name the file's imports
-	// introduce denotes (Aux), ImportAll for an import of every member.
+	// introduce denotes (Aux), ImportAll for an import of every member, and
+	// the name it denotes in that path's module when the import renames it
+	// (Sig, Import.Original).
 	keyImport = "i\x00"
 	// keyGoDir + directory: a Go package declared in that directory, its
 	// name in Aux, which an import path ending in the directory reaches.
@@ -65,9 +67,14 @@ const (
 	// `use` or a `module::T` path reaches.
 	keyTypeModule = "tm\x00"
 	// keyTypeExport + a module path without extension + name: a top-level
-	// type an ECMAScript module exports or a Python module declares, which
-	// an import of that module reaches (moduleBases).
+	// type an ECMAScript module exports (under its own name or one an
+	// `export` statement gives it) or a Python module declares, which an
+	// import of that module reaches (moduleBases).
 	keyTypeExport = "te\x00"
+	// keyTypeReexport + a module path without extension + name: an
+	// ECMAScript module's re-export of the name Sig of the module whose path
+	// is Aux, name "*" for `export * from`.
+	keyTypeReexport = "tr\x00"
 	// keyFunc + family + scope + name: a free function visible under its
 	// simple name in that scope (Go's package, C's and C++'s one linkage
 	// scope with the namespace in Aux, Rust's file), its signature in Sig.
@@ -305,7 +312,7 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		if imp.Name == "" {
 			continue
 		}
-		if err := s.Add(entry{Key: keyImport + fileKey + imp.Name, Aux: imp.Path}); err != nil {
+		if err := s.Add(entry{Key: keyImport + fileKey + imp.Name, Aux: imp.Path, Sig: imp.Original}); err != nil {
 			return err
 		}
 	}
@@ -359,6 +366,9 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 				return err
 			}
 		}
+	}
+	if fc.family == "js" {
+		return addTypeReexports(s, file, t, bases)
 	}
 	return nil
 }
@@ -587,8 +597,10 @@ func (h *hierarchy) qualifiedTypes(fc fileCtx, name, head, rest string, yield fu
 
 // importedType yields the type declarations the path p an import binds the
 // type name local to denotes. An ECMAScript or Python import's path is its
-// module, which declares the type under the name the import binds; an
-// import that renames it is read under the local name.
+// module, which exports the type under the name the import names
+// (Import.Original: `Foo` for `import { Foo as Bar }` and `from m import Foo
+// as Bar`, `default` for a default import), the local name when it does not
+// rename it; a namespace import binds a module, never a type.
 func (h *hierarchy) importedType(fc fileCtx, local, p string, yield func(entry) error) error {
 	switch fc.family {
 	case "rust":
@@ -598,6 +610,13 @@ func (h *hierarchy) importedType(fc fileCtx, local, p string, yield func(entry) 
 		}
 		return h.decls.lookup(keyTypeModule+rustPath(fc.path, module)+"\x00"+last, yield)
 	case "js", "python":
+		original, err := h.importOriginal(fc, local, p)
+		switch {
+		case err != nil || original == ImportAll:
+			return err
+		case original != "":
+			local = original
+		}
 		return h.moduleType(fc, p, local, yield)
 	case "go":
 		// A Go import binds a package, never a type.
@@ -626,13 +645,111 @@ func (h *hierarchy) memberType(fc fileCtx, p, name string, yield func(entry) err
 }
 
 // moduleType yields the top-level type named name of the module an
-// ECMAScript or Python import spec written in fc's file names.
+// ECMAScript or Python import spec written in fc's file names, following
+// the module's re-exports.
 func (h *hierarchy) moduleType(fc fileCtx, spec, name string, yield func(entry) error) error {
 	base, ok := moduleBase(fc.path, spec, fc.family == "python")
 	if !ok {
 		return nil
 	}
-	return h.decls.lookup(keyTypeExport+base+"\x00"+name, yield)
+	return h.exportedType(base, name, map[string]bool{}, yield)
+}
+
+// exportedType yields the types the module whose path is base exports as
+// name: its own, else those a re-export of the name passes on, else those
+// an `export *` passes on (never `default`). seen holds the module names
+// already asked, so a cycle of re-exports ends.
+func (h *hierarchy) exportedType(base, name string, seen map[string]bool, yield func(entry) error) error {
+	key := base + "\x00" + name
+	if seen[key] {
+		return nil
+	}
+	seen[key] = true
+	found := false
+	err := h.decls.lookup(keyTypeExport+key, func(e entry) error {
+		found = true
+		return yield(e)
+	})
+	if err != nil || found {
+		return err
+	}
+	err = h.decls.lookup(keyTypeReexport+key, func(e entry) error { return h.exportedType(e.Aux, e.Sig, seen, yield) })
+	if err != nil || name == "default" {
+		return err
+	}
+	return h.decls.lookup(keyTypeReexport+base+"\x00*", func(e entry) error { return h.exportedType(e.Aux, name, seen, yield) })
+}
+
+// addTypeReexports adds what an ECMAScript file's `export` statements make
+// of its types and its re-exports, under each module path bases names the
+// file by: a module-level type a local export names, under the exported
+// name (`export default C`, `export { C as D }`), and a re-export of
+// another module's name, a local export of an import binding included.
+func addTypeReexports(s *pagination.ExternalSort[entry], file int32, t *Table, bases []string) error {
+	add := func(prefix, name string, e entry) error {
+		for _, b := range bases {
+			e.Key = prefix + b + "\x00" + name
+			if err := s.Add(e); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	from := func(name, spec, original string) error {
+		target, ok := moduleBase(t.Path, spec, false)
+		if !ok || original == "*" && name != "*" {
+			return nil
+		}
+		return add(keyTypeReexport, name, entry{Aux: target, Sig: original})
+	}
+	for _, x := range t.Reexports {
+		if x.From != "" {
+			if err := from(x.Name, x.From, x.Original); err != nil {
+				return err
+			}
+			continue
+		}
+		local := false
+		for i := range t.Decls {
+			if d := &t.Decls[i]; d.Parent < 0 && d.Name == x.Original && isType(d.Kind) {
+				local = true
+				e := entry{Ref: Ref{File: file, Index: int32(i)}, Sig: d.Signature, Flags: flagsOf(d)}
+				if err := add(keyTypeExport, x.Name, e); err != nil {
+					return err
+				}
+			}
+		}
+		if local {
+			continue
+		}
+		for _, imp := range t.Imports {
+			if imp.Name != x.Original {
+				continue
+			}
+			original := imp.Original
+			if original == "" {
+				original = imp.Name
+			}
+			if err := from(x.Name, imp.Path, original); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// importOriginal is the name the import of fc's file binding local to path p
+// denotes in p's module when the import renames it ("default" for a default
+// import, "*" for a namespace import), else empty.
+func (h *hierarchy) importOriginal(fc fileCtx, local, p string) (string, error) {
+	original := ""
+	err := h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+local, func(e entry) error {
+		if e.Aux == p && e.Sig != "" {
+			original = e.Sig
+		}
+		return nil
+	})
+	return original, err
 }
 
 // imports yields the path each import of fc's file binding name denotes,
