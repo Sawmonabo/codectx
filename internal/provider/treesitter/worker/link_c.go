@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 
+	ts "github.com/tree-sitter/go-tree-sitter"
+
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
@@ -16,21 +18,23 @@ import (
 //
 // What each table holds:
 //
-//   - Exports: every function definition, every prototype the structural
-//     extraction captures (a declaration directly under the translation
-//     unit, a C++ namespace body or class body, and a C++ member
+//   - Exports: every function definition, every C++ member function
+//     defined without a body (pure virtual, which is Abstract, defaulted or
+//     deleted), every prototype the structural extraction captures (a
+//     declaration at file scope, cLinkSyntax.fileScope: under the
+//     translation unit, a C++ namespace body or class body, through any
+//     preprocessor conditional arm or C++ template, and a C++ member
 //     declaration) and every function-like macro, keyed by the token the
-//     extraction names the declaration by. A pure virtual function, a
-//     defaulted or deleted one, and a prototype under a preprocessor
-//     conditional or a template are no declaration of the extraction, so
-//     they get no Export.
+//     extraction names the declaration by.
 //   - Supertypes: each base of a C++ class, struct or union.
 //   - Sites: every call the structural queries capture, keyed by its callee
 //     token: `f()` (bare, or indirect when f is a local, a parameter, a
 //     file-scope object or a data member of the enclosing class),
 //     `x.f()`/`x->f()` (member, or indirect through a data member: always in
-//     C, which has no member functions), `N::f()` (static) and `f<T>()`
-//     (bare). A call is listed after the calls inside it, so the call an
+//     C, which has no member functions), `N::f()` (static), `f<T>()`
+//     (bare), `(*fp)()` (indirect through fp, bare when fp names a
+//     function) and `tbl[i]()` (always indirect, typed by the element type
+//     tbl declares). A call is listed after the calls inside it, so the call an
 //     argument or a receiver is the result of has the lower index.
 //   - Values: every function taken as a value: `&f` and `&C::m`, and a name
 //     in a position that stores or passes its value (an argument, an
@@ -328,7 +332,7 @@ func (k *cLinker) definition(n Node) {
 	d := n.ChildByFieldId(s.fDeclarator)
 	c := k.chain(d)
 	receiver := k.receiver(c.scope)
-	if !n.ChildByFieldId(s.fBody).IsNull() {
+	if !n.ChildByFieldId(s.fBody).IsNull() || k.bodiless(n) {
 		k.export(n, d, receiver)
 	}
 	m, base, self := k.names.mark(), k.base, k.self
@@ -347,9 +351,12 @@ func (k *cLinker) definition(n Node) {
 // extraction captures one, a local's binding inside a callable, and the
 // sites and values of its initializers.
 func (k *cLinker) declaration(n Node) {
-	p := n.Parent().KindId()
 	x := k.x
-	if p == x.translationUnit || k.s.cpp && (p == x.declarationList || p == x.fieldDeclarationList) {
+	p := n.Parent()
+	for !p.IsNull() && x.in(x.conditional, p.KindId()) {
+		p = p.Parent()
+	}
+	if x.fileScope(cKind(p)) {
 		receiver := k.receiver(Node{})
 		k.declarators(n, func(d Node) { k.export(n, d, receiver) })
 		return
@@ -432,8 +439,55 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 	e.Params, e.Variadic = n, variadic
 	structor := owner.ChildByFieldId(s.fType).IsNull() && c.name.KindId() != k.x.destructorName && c.name.KindId() != s.operatorCast
 	e.Static = receiver == "" || structor || k.storage(owner, "static")
+	e.Abstract = k.pure(owner, d)
 	e.Returns = k.returns(owner, d, c.fn)
 	k.out.Exports = append(k.out.Exports, e)
+}
+
+// bodiless reports a C++ function definition that ends with a clause
+// instead of a body: `= 0`, `= default` or `= delete`.
+func (k *cLinker) bodiless(n Node) bool {
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		if k.x.in(k.x.clause, c.KindId()) && c.IsNamed() {
+			return true
+		}
+	}
+	return false
+}
+
+// pure reports a pure virtual member function, declarator d of owner: a
+// definition ending with `= 0`, or a member declaration whose declarator is
+// followed by the literal 0, which is how the grammar may read the same
+// `virtual int f() = 0;`.
+func (k *cLinker) pure(owner, d Node) bool {
+	if !k.s.cpp {
+		return false
+	}
+	switch owner.KindId() {
+	case k.x.functionDefinition:
+		for c := owner.first(); !c.IsNull(); c = c.next() {
+			if c.KindId() == k.x.pureVirtualClause && c.IsNamed() {
+				return true
+			}
+		}
+	case k.x.fieldDeclaration:
+		c := owner.Walk()
+		defer c.Close()
+		after := false
+		for ok := c.GotoFirstChild(); ok; ok = c.GotoNextSibling() {
+			n := c.Node()
+			switch {
+			case c.FieldId() == k.s.fDeclarator:
+				if after {
+					return false
+				}
+				after = n == d
+			case after && n.IsNamed() && !n.IsExtra():
+				return n.KindId() == k.s.numberLiteral && string(textOf(k.src, n)) == "0"
+			}
+		}
+	}
+	return false
 }
 
 // macro appends the Export of a function-like macro: its parameter count,
@@ -506,7 +560,7 @@ func (k *cLinker) call(n Node) {
 			site.Shape, site.Receiver, site.Signature = wire.ShapeIndirect, k.declType(d), k.funcSig(d, 0)
 		}
 	case s.fieldExpression:
-		field := cLastNamed(callee)
+		field := lastNamed(callee)
 		if cKind(field) != s.fieldIdentifier {
 			return
 		}
@@ -533,6 +587,33 @@ func (k *cLinker) call(n Node) {
 			return
 		}
 		site.Name, site.Shape = wireSpan(spanOf(name)), wire.ShapeBare
+	case k.x.paren:
+		// `(*fp)(x)`: the one pattern the queries capture, so no other
+		// parenthesized callee has a call reference to join.
+		deref := firstNamed(callee)
+		if cKind(deref) != s.pointerExpression || cKind(deref.ChildByFieldId(s.fOperator)) != s.star {
+			return
+		}
+		ptr := deref.ChildByFieldId(s.fArgument)
+		if cKind(ptr) != s.identifier {
+			return
+		}
+		site.Name, site.Shape = wireSpan(spanOf(ptr)), wire.ShapeBare
+		if d, ok := k.object(textOf(k.src, ptr)); ok {
+			site.Shape, site.Receiver, site.Signature = wire.ShapeIndirect, k.declType(d), k.funcSig(d, 0)
+		}
+	case s.subscriptExpression:
+		// `tbl[i](x)` calls an element, never a function named tbl. funcSig
+		// reads the function type below the declarator's arrays and
+		// pointers, the element's type.
+		tbl := callee.ChildByFieldId(s.fArgument)
+		if cKind(tbl) != s.identifier {
+			return
+		}
+		site.Name, site.Shape = wireSpan(spanOf(tbl)), wire.ShapeIndirect
+		if d, ok := k.object(textOf(k.src, tbl)); ok {
+			site.Signature = k.funcSig(d, 0)
+		}
 	default:
 		return
 	}
@@ -618,7 +699,7 @@ func (k *cLinker) position(n Node) (field string, ok bool) {
 			return "", false
 		}
 		if l := k.unparen(p.ChildByFieldId(s.fLeft)); cKind(l) == s.fieldExpression {
-			if f := cLastNamed(l); cKind(f) == s.fieldIdentifier {
+			if f := lastNamed(l); cKind(f) == s.fieldIdentifier {
 				return string(textOf(k.src, f)), true
 			}
 		}
@@ -708,7 +789,7 @@ func (k *cLinker) recover(e Node) wire.Type {
 		}
 		return k.recover(a)
 	case s.fieldExpression:
-		if f := cLastNamed(e); cKind(f) == s.fieldIdentifier {
+		if f := lastNamed(e); cKind(f) == s.fieldIdentifier {
 			if m, ok := k.member(k.recover(e.ChildByFieldId(s.fArgument)), textOf(k.src, f)); ok && !m.fn {
 				return k.declType(m.cDecl)
 			}
@@ -1144,17 +1225,6 @@ func cFirst(n Node) Node {
 	return n.first()
 }
 
-// cLastNamed is n's last named child that is not an extra, or null.
-func cLastNamed(n Node) Node {
-	var last Node
-	for c := cFirst(n); !c.IsNull(); c = c.next() {
-		if c.IsNamed() && !c.IsExtra() {
-			last = c
-		}
-	}
-	return last
-}
-
 // cLinkSyntax holds the kind ids the C-family linker matches beyond the
 // lowering's (cSyntax), resolved once per grammar. A kind the language does
 // not have is 0, which no node has.
@@ -1166,8 +1236,33 @@ type cLinkSyntax struct {
 	// C++ only.
 	classSpecifier, baseClassClause, templateType, trailingReturnType, placeholderTypeSpecifier,
 	namespaceDefinition, declarationList, aliasDeclaration, optionalParameterDeclaration,
-	variadicParameterDeclaration, abstractReferenceDeclarator, destructorName uint16
+	variadicParameterDeclaration, abstractReferenceDeclarator, destructorName, pureVirtualClause uint16
+
+	// declaration is the declaration kind; object marks the declarators
+	// that make an object of their operand's type (pointer, array,
+	// reference), which cRefine reads.
+	declaration uint16
+	object      []bool
+	// conditional marks, by kind id, the nodes a file-scope declaration may
+	// sit in without leaving file scope: every preprocessor conditional arm,
+	// and in C++ a template declaration. clause marks the C++ clauses that
+	// end a member function defined without a body (`= 0`, `= default`,
+	// `= delete`).
+	conditional, clause []bool
 }
+
+// fileScope reports whether a declaration whose nearest ancestor outside
+// every conditional (cLinkSyntax.conditional) has the kind id is at file
+// scope as the structural queries capture it: directly under the
+// translation unit, and in C++ also under a namespace or linkage body or a
+// class body. cRefine and cLinker.declaration both decide by it, so a
+// prototype the extraction declares is the one the linker exports.
+func (x *cLinkSyntax) fileScope(id uint16) bool {
+	return id == x.translationUnit || x.classSpecifier != 0 && (id == x.declarationList || id == x.fieldDeclarationList)
+}
+
+// in reports whether id is marked in set.
+func (x *cLinkSyntax) in(set []bool, id uint16) bool { return int(id) < len(set) && set[id] }
 
 var (
 	cLinkOnce, cppLinkOnce   sync.Once
@@ -1176,17 +1271,21 @@ var (
 
 // cLinkSyntaxOf resolves language's table once; a name the grammar does not
 // define panics, as cSyntaxOf's do.
-func cLinkSyntaxOf(language string) *cLinkSyntax {
+func cLinkSyntaxOf(language string) *cLinkSyntax { return cLinkSyntaxIn(language, mustGrammar) }
+
+// cLinkSyntaxIn is cLinkSyntaxOf with the grammar supplied by tl, which the
+// extraction's declarator hook (cRefine) passes from the grammar it parses
+// with: the grammar table holds that hook, so it may not look itself up.
+func cLinkSyntaxIn(language string, tl func(string) *ts.Language) *cLinkSyntax {
 	if language == "cpp" {
-		cppLinkOnce.Do(func() { cppLinkTable = resolveCLinkSyntax(language) })
+		cppLinkOnce.Do(func() { cppLinkTable = resolveCLinkSyntax(language, tl(language)) })
 		return cppLinkTable
 	}
-	cLinkOnce.Do(func() { cLinkTable = resolveCLinkSyntax(language) })
+	cLinkOnce.Do(func() { cLinkTable = resolveCLinkSyntax(language, tl(language)) })
 	return cLinkTable
 }
 
-func resolveCLinkSyntax(language string) *cLinkSyntax {
-	tl := mustGrammar(language)
+func resolveCLinkSyntax(language string, tl *ts.Language) *cLinkSyntax {
 	kind := func(name string) uint16 { return mustKind(tl, language, name, true) }
 	x := &cLinkSyntax{
 		translationUnit:            kind("translation_unit"),
@@ -1205,6 +1304,14 @@ func resolveCLinkSyntax(language string) *cLinkSyntax {
 		abstractFunctionDeclarator: kind("abstract_function_declarator"),
 		paren:                      kind("parenthesized_expression"),
 		ellipsis:                   mustKind(tl, language, "...", false),
+		declaration:                kind("declaration"),
+		object:                     make([]bool, tl.NodeKindCount()),
+		conditional:                make([]bool, tl.NodeKindCount()),
+		clause:                     make([]bool, tl.NodeKindCount()),
+	}
+	x.object[kind("pointer_declarator")], x.object[kind("array_declarator")] = true, true
+	for _, name := range []string{"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef"} {
+		x.conditional[kind(name)] = true
 	}
 	if language == "cpp" {
 		x.classSpecifier, x.baseClassClause, x.templateType = kind("class_specifier"), kind("base_class_clause"), kind("template_type")
@@ -1213,6 +1320,12 @@ func resolveCLinkSyntax(language string) *cLinkSyntax {
 		x.optionalParameterDeclaration = kind("optional_parameter_declaration")
 		x.variadicParameterDeclaration = kind("variadic_parameter_declaration")
 		x.abstractReferenceDeclarator, x.destructorName = kind("abstract_reference_declarator"), kind("destructor_name")
+		x.pureVirtualClause = kind("pure_virtual_clause")
+		x.object[kind("reference_declarator")] = true
+		x.conditional[kind("template_declaration")] = true
+		for _, name := range []string{"pure_virtual_clause", "default_method_clause", "delete_method_clause"} {
+			x.clause[kind(name)] = true
+		}
 	} else {
 		x.variadicParameter = kind("variadic_parameter")
 	}

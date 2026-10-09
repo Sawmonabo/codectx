@@ -4,6 +4,9 @@
 (class_specifier name: (_) @name body: (_) @body) @def.class
 (declaration_list (declaration declarator: (_) @declarator) @def.variable)
 (field_declaration_list (declaration declarator: (_) @declarator) @def.variable)
+(template_declaration (declaration declarator: (_) @declarator) @def.variable)
+; A member function defined without a body: pure virtual, defaulted, deleted.
+(function_definition declarator: (_) @declarator [(pure_virtual_clause) (default_method_clause) (delete_method_clause)]) @def.function
 (alias_declaration name: (type_identifier) @name) @def.class
 (using_declaration (_) @import.path) @import
 
