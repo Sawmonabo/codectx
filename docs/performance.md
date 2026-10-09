@@ -129,12 +129,12 @@ percentile over `n` samples.
 |---|---|---|---|---|
 | 1 | `version --json` startup | 50 ms | p95 **2.96 ms** / 20 | PASS |
 | 2 | Exact symbol/path query | 50 ms | p95 **1.09 ms** / 50 | PASS |
-| 3 | Lexical (FTS) search | 150 ms | p95 **28.7 ms** / 50 | PASS — at enterprise scale see the first-page table below |
+| 3 | Lexical search | 150 ms | not yet measured on the search index | UNMEASURED — recorded from the integrated binary ([ADR-0013](adr/ADR-0013-search-index.md), decision 9); the search index at scale is below |
 | 4 | One-hop caller/callee | 100 ms | p95 **5.72 ms** / 50 | PASS |
 | 5 | Context plan, ≤50k visited nodes | 1 s | p95 **74.8 ms** / 10 | PASS |
 | 6 | Context plan visited nodes | ≤ 50 000 | **103 visited / 40 edges / 39 entries**, not truncated | PASS |
 | 7 | Ten-file base refresh after debounce | 1.5 s | p95 **144 ms** / 5 | PASS |
-| 8 | No-change refresh: no parser work, no FTS body rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
+| 8 | No-change refresh: no parser work, no search-index rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
 | 9 | Cold base index of the reference fixture | 3 min | **1 min 32.1 s** over 10 000 files / 1 052 933 lines / 86 064 203 B (the corrected Section 23.1 size); process-tree peak **145.3 MiB** | PASS — re-measured after the external-merge planner and batched provider sinks landed (earlier: 2 min 56.3 s / 912.6 MiB) |
 | 10 | Indexing process-tree peak | 768 MiB | **110.8 MiB** at small-real scale; **145.3 MiB** on the corrected reference corpus (sampled at 250 ms and 50 ms, two cold runs within 0.1 MiB) | PASS — the earlier 912.6 MiB at reference scale was measured before the planner's external merge sort and the batched provider sinks |
 | 11 | Idle MCP RSS | 128 MiB | **64.0 MiB** | PASS — re-measured under the corrected semantics (see below); the earlier 61.5 MiB was a startup-window sample |
@@ -161,20 +161,20 @@ row asserts is the invariant, not the counts — both counts clear 200, the firs
 page carries fewer than the 200-record ceiling, and a cursor is issued — so a
 different growth curve cannot make it pass vacuously.
 
-Retained unchanged generations adding no duplicate blobs, graph facts or FTS
-bodies is covered by row 8's instrument (248 units reused, 0 files parsed, the
+Retained unchanged generations adding no duplicate blobs, graph facts or search
+documents is covered by row 8's instrument (248 units reused, 0 files parsed, the
 lexical shape byte-identical) and by the end-to-end retained-read row in
 `internal/e2e`.
 
 ### 3.1 Published benchmarks
 
 `go test ./internal/bench -run '^$' -bench . -benchmem -count=5`, same host and
-build, five runs each:
+build, five runs each. `BenchmarkLexicalSearch` is recorded from the integrated
+binary with row 3.
 
 ```
 BenchmarkVersionStartup-16      520    2308981 ns/op    13542 B/op      73 allocs/op
 BenchmarkExactQuery-16         1886     614143 ns/op    44715 B/op     947 allocs/op
-BenchmarkLexicalSearch-16        44   25071726 ns/op  7338075 B/op  152235 allocs/op
 BenchmarkOneHopTraversal-16     265    4559743 ns/op   779765 B/op   13342 allocs/op
 BenchmarkContextPlan-16         405    2732277 ns/op   313500 B/op    7395 allocs/op
 BenchmarkTenFileRefresh-16        9  997187150 ns/op 28662835 B/op  281603 allocs/op
@@ -213,58 +213,30 @@ and one is not:
   work limit like this one should default to unlimited at all is a separate
   question and is not answered by this measurement.
 
-### Row 3 at enterprise scale — first-page latency on a 13 223-file repository
+### Row 3 at scale — the search index on a 546 613-document export
 
-Row 3's 150 ms target is measured at small-real scale. On a 13 223-file,
-1.36 GiB store the first page of a corpus-frequent term costs far more, and
-the dominant term was never the ranking: a first page hydrated the *whole*
-answer -- every hit past the page was read out of the CAS, block-hash
-verified and scanned for line and column positions on its way into the
-continuation spool. Hydration is now paid by the page that serves a hit.
+Row 3's 150 ms target is measured at small-real scale. At scale, the search
+index was measured on kubernetes: 546 613 search documents in 47 995 units,
+exported by the production filesystem and tree-sitter providers, with a 30-query
+set in bands by document frequency plus two-term queries and phrases
+([ADR-0013](adr/ADR-0013-search-index.md);
+[research 22](research/22-search-library-evaluation.md) holds every command
+and raw result line).
 
-Two further costs have since been taken out of the ranking itself. The
-lexical tier read every column of a candidate page to get its token count
-and then threw the row away, so the ranker re-read the identical page for
-path, kind, name and identity: one read per page now carries both. And the
-two-pass external sort that deduplicates and orders the candidate set
-encoded every candidate as JSON; a packed, fixed-order codec replaced it.
+| Measure | The search index |
+|---|---|
+| Index build, all documents | 9.0 s wall, 48.8 s CPU, 0.85 GB peak (16 threads, one commit); 18.1 s and 0.49 GB on 1 thread |
+| Index on disk | 337–387 MB |
+| Activation | no postings work: segments merge in the background |
+| 30 queries, first page of 200, warm | 4.04 s when every match is scored under our exact formula; 0.016 s for the library's own pruned top 200 under its own scoring |
+| The 5 most frequent terms, every match scored under our formula | 413–709 ms each |
+| Kind filter / folder filter, under our formula | 18.6 ms / 5.5 ms |
 
-| Query | Before hydration fix | After hydration fix | After one read + packed sort |
-|---|---|---|---|
-| `search function` | 4.17 s | 1.71 s | **1.27 s** |
-| `search <global>` (a framework global name) | 4.94 s | 2.10 s | **1.18 s** |
-| `search return` | 1.49 s | 0.79 s | **0.60 s** |
-| `search user` | 0.87 s | 0.40 s | **0.38 s** |
-| `search <rare>` (an application identifier, 6 hits) | 0.08 s | 0.11 s | **0.14 s** |
-| continuation page 2 | 0.17 s | 0.20 s | not re-measured |
-
-Warm, median of three, default config, same store and same battery in every
-column. `<rare>` matches six hits and never reaches the ranking work
-these two changes touch; its three runs spread 0.11-0.17 s, so its column is
-run-to-run noise on a query that is already two orders of magnitude inside
-the target. Peak RSS is unchanged within noise (32-125 MB across the five
-terms); the ranking fold holds one candidate page less than it did.
-
-Every page of every one of the five queries is byte-identical before and
-after -- each was paged to completion and the ordered item sequence
-compared byte for byte (30 022 items over 151 pages for `function`, 44 448
-over 223 for `<global>`), together with each page's meta minus `next_cursor`,
-whose per-run lease id and expiry can never match across processes. The set,
-the global ranking, every served field, every reason and every page boundary
-are unchanged.
-
-`function` and `<global>` still miss the 1 s first-page target. What is left
-is measured, and it is not addressable inside the search package: of the
-1.27 s `function` profile, 0.33 s is the posting-list walk that scores each
-candidate, 0.18 s the per-term document frequencies, 0.16 s the candidate
-page read, 0.09 s the match page and 0.09 s the corpus statistics -- all of
-it stepping the index, and none of it absorbed by the tier's statistics
-cache, which a one-shot process always starts cold -- and 0.21 s the
-two-pass external sort. The two
-schema-level alternatives that would touch the posting walk (pushing the
-ranking function down into the index, and a persisted per-term index) were
-measured earlier and rejected: neither can reproduce the served ranking
-byte for byte.
+A ranked page is the pruned top k (ADR-0013 decision 5), so the figure row 3
+answers to is our formula's pruned page. That pruned collector
+returned pages 1 to 3 identical to exhaustive scoring on 2 436 of 2 436
+query-page pairs on a fixture, at 1 and 4 search threads; its kubernetes run is
+being measured, and row 3 is recorded from the integrated binary.
 
 ## 4. Misses, skips and unproven platforms
 
@@ -275,7 +247,7 @@ and the difference is stated rather than rounded away.
 | Item | State | What it would take |
 |---|---|---|
 | **Row 9 — cold index of the Section 23.1 reference fixture (1M lines / 10k files / ~80 MiB) within 3 min** | **Measured at the file count, not at the line and byte count.** The verification pass cold-indexed `corpusReference` in 1 min 14.8 s with an 85.2 MiB process-tree peak — but that corpus yields **262 551 lines / 5.70 MiB**, where Section 23.1 specifies ≈1M lines and ≈80 MiB. The corpus is ~3.8× short on lines and ~14× short on bytes, so row 9's PASS stands for the 10 000-file shape only. | Done: the generator now yields 10 000 files / 1 052 933 lines / 82.08 MiB. The first cold index at that size measured 2 min 56.3 s with a 912.6 MiB process-tree peak (a row 10 MISS); after the planner's external merge sort and the batched provider sinks landed it measures **1 min 32.1 s** with a **145.3 MiB** peak, and both rows PASS. |
-| **Row 13 — base storage ≤ 3.5× eligible source bytes** | **MISS, by 21×.** On the 10 000-file generated corpus the store held 427 282 345 bytes over 5 697 273 eligible source bytes — **75.00×**, re-measured at **73.86×**: a 421 MB database over 5.70 MiB of source. The content store itself is exactly source-sized (1.00×). Two facts bound how this number should be read. The corpus averages ~570 bytes per file where Section 23.1's reference is ~8 KiB per file, so per-file fixed cost dominates it more than it would at the specified size (see row 9). And the amplifier is identified, not guessed: **per-row identity width** — 32-byte BLOB identities and wide TEXT keys replicated into every secondary index, with `WITHOUT ROWID` secondary indexes re-storing the full primary key. Per-table accounting puts relations at ~22% of the file, evidence ~22%, native_aliases ~20% and nodes ~20%. FTS content duplication, JSON payloads, WAL size and page fill were each measured and ruled out. The earlier explanation on this page — that small generated files simply cannot amortise a fixed cost — is withdrawn; it does not survive a 421 MB database. | Re-measured on the corrected reference corpus: **16.10×** (1.30 GB database over 82.08 MiB of source) — still a MISS by 4.6×, with the same amplifier. The storage-layout redesign (integer surrogate identities and key interning) has **landed**; the decision, the alternatives refused on the way and its sources are recorded in [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md). Measured on a real 4 019-file repository indexed twice, once by each binary, with identical row counts in every identity table: 1 005 887 488 → 632 266 752 stored bytes and **5 732.8 → 3 603.5 bytes per indexed symbol, −37.1 %**. That is the per-symbol regression metric, not this row: the ratio has **not** been re-measured since, so row 13 stays a MISS and is re-recorded only from a re-run on the reference corpus **and** on real repositories. |
+| **Row 13 — base storage ≤ 3.5× eligible source bytes** | **MISS, by 21×.** On the 10 000-file generated corpus the store held 427 282 345 bytes over 5 697 273 eligible source bytes — **75.00×**, re-measured at **73.86×**: a 421 MB database over 5.70 MiB of source. The content store itself is exactly source-sized (1.00×). Two facts bound how this number should be read. The corpus averages ~570 bytes per file where Section 23.1's reference is ~8 KiB per file, so per-file fixed cost dominates it more than it would at the specified size (see row 9). And the amplifier is identified, not guessed: **per-row identity width** — 32-byte BLOB identities and wide TEXT keys replicated into every secondary index, with `WITHOUT ROWID` secondary indexes re-storing the full primary key. Per-table accounting puts relations at ~22% of the file, evidence ~22%, native_aliases ~20% and nodes ~20%. Search-text duplication, JSON payloads, WAL size and page fill were each measured and ruled out. The earlier explanation on this page — that small generated files simply cannot amortise a fixed cost — is withdrawn; it does not survive a 421 MB database. | Re-measured on the corrected reference corpus: **16.10×** (1.30 GB database over 82.08 MiB of source) — still a MISS by 4.6×, with the same amplifier. The storage-layout redesign (integer surrogate identities and key interning) has **landed**; the decision, the alternatives refused on the way and its sources are recorded in [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md). Measured on a real 4 019-file repository indexed twice, once by each binary, with identical row counts in every identity table: 1 005 887 488 → 632 266 752 stored bytes and **5 732.8 → 3 603.5 bytes per indexed symbol, −37.1 %**. That is the per-symbol regression metric, not this row: the ratio has **not** been re-measured since, so row 13 stays a MISS and is re-recorded only from a re-run on the reference corpus **and** on real repositories. |
 | **`darwin/amd64` and `darwin/arm64`** | **UNPROVEN PLATFORM.** No macOS SDK or macOS host was available to the measuring environment, and the release rule forbids a cross-built binary or bundle. Nothing on this page was measured on darwin, and no darwin archive or bundle was produced or exercised here. These targets are **built only by the release workflow's native legs; unproven on the measuring host.** | A native macOS leg of the release workflow. Until one runs, darwin is declared, not proved. |
 | **`windows/arm64`** | **UNPROVEN PLATFORM.** The structural parser is CGo, so every target needs a native C toolchain, and the measuring host's toolchain set carries no aarch64 Windows cross-compiler — only the i686 and x86_64 ones. The target is therefore **built only by the release workflow's native legs; unproven on the measuring host.** | A native `windows/arm64` leg of the release workflow. |
 | **Section 3 figures on any platform but `linux/amd64`** | **Not measured.** Every latency and memory number in Section 3 is `linux/amd64`. Of the build proof: `linux/amd64` was built and run natively, `linux/arm64` was built and run under emulation, and `windows/amd64` was built but not executed. No Section 3 figure was taken on any of them, and none is accepted from a cross-compiled binary. | Native legs per target, each reporting its own figures. |
