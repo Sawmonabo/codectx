@@ -14,19 +14,20 @@
 //     one, hand storage the replaced set and carry the rest over;
 //  4. store the fresh delta state and seal.
 //
-// The linking provider's applier (link.go) is the third, and its delta is the
-// coarsest: one digest per member file's link tables. When every member keeps
-// its predecessor's digest it hands Link the predecessor's resolution instead
-// of resolving; either way Link republishes every fact, so it carries nothing
-// over.
+// The linking provider's applier (link.go) is the third, and its delta is one
+// digest per member file's link table. When every member keeps its
+// predecessor's digest it hands Link the predecessor's resolution instead of
+// resolving, Link republishes only the facts of the members whose bytes
+// changed, and the applier carries the rest over with those members named
+// replaced. Otherwise Link resolves and republishes everything.
 //
 // A predecessor that is absent, stored no state, or stored state this build
 // cannot read is not an error: the unit is built in full and Result.Full and
 // Result.FullReason say so. That degradation covers provider-written state
-// only — the SCIP document manifest and the dependence key set. A failure to
-// read what storage itself holds (the predecessor's declared inputs) is not a
-// recoverable state but a broken store, and fails the unit like any other
-// storage error. Everything else is likewise a typed failure of the whole
+// only — the SCIP document manifest, the dependence key set and the link
+// resolution. A failure to read what storage itself holds (the predecessor's
+// declared inputs) is not a recoverable state but a broken store, and fails
+// the unit like any other storage error. Everything else is likewise a typed failure of the whole
 // unit, which leaves the predecessor sealed, published and untouched — the new
 // unit's rows, carried ones included, are its own copies and Fail deletes
 // them.
@@ -155,10 +156,10 @@ type Result struct {
 	// it (Replaced.IndexLevel, and the dependence applier's re-iterability
 	// refusal) must be sound against what this build chose, not against a
 	// report from the producer they are guarding. The link applier sets it
-	// when it hands Link the predecessor's resolution, from that hand-off
-	// alone. A delta whose Filtered is false re-imported everything and
-	// inherited nothing, even
-	// though the predecessor was present and usable — for the dependence
+	// when it hands Link the predecessor's resolution and the edited members,
+	// from that hand-off alone, and only then carries anything over. A delta
+	// whose Filtered is false re-imported everything and inherited nothing,
+	// even though the predecessor was present and usable — for the dependence
 	// applier that is every refresh that changed or removed a declared file.
 	// Result.Carried being all zero does not distinguish that from a
 	// predecessor with nothing to give.
@@ -188,9 +189,6 @@ func workDir(req Request) (string, error) {
 	return dir, nil
 }
 
-// writeState spills a stored delta-state payload to a file the provider's own
-// loader can open. Both loaders validate what they read, so a corrupt payload
-// is refused there rather than trusted here.
 // previousState streams the predecessor's artifact of kind into a file
 // named name under dir and returns its path. A predecessor that stored none
 // returns an empty path and no error.

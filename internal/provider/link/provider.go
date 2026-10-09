@@ -5,10 +5,11 @@
 //
 // A unit is one project of the repository, the scopes dependence.PlanUnits
 // derives. Its inputs are the project's member files, each recording the
-// digest of the table it linked (model.UnitInput.Digest). A build whose every
-// member digest equals its predecessor's resolves nothing: it re-emits the
-// predecessor's resolution with the ranges and identities of the fresh
-// tables (docs/providers-link.md).
+// MemberDigest of the table it linked (model.UnitInput.Digest). A build whose
+// every member digest equals its predecessor's resolves nothing: it inherits
+// the predecessor's resolution, republishes only the facts of the members
+// whose content changed, and the build carries the rest over
+// (docs/providers-link.md).
 //
 // Resolution is decision 2's, per language family: class-hierarchy analysis
 // for Java; direct binding, the signature-keyed address-taken × indirect-site
@@ -81,8 +82,16 @@ const (
 // LinkOptions is what the delta build hands one unit's link.
 type LinkOptions struct {
 	// Previous streams the predecessor's resolution state when every member
-	// table keeps its predecessor's digest; nil resolves in full.
+	// keeps its predecessor's MemberDigest; nil resolves in full. The build
+	// validates it first (ValidateState): Link refuses a corrupt one.
 	Previous io.Reader
+	// Edited, with Previous, streams the FileIDs of the members whose content
+	// changed since the predecessor, in ascending order; it may name files
+	// that are not members and must yield the same IDs on every walk. Link
+	// then publishes only the facts whose evidence lies in an edited member
+	// and takes the coverage from Previous: the build carries the
+	// predecessor's other facts over. Nil publishes every fact.
+	Edited func(yield func(model.FileID) error) error
 	// State receives this unit's resolution state, which the build stores
 	// under ResolutionKind; nil writes none.
 	State io.Writer
@@ -120,10 +129,14 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 }
 
 // Link links one unit: it streams the members' tables, resolves every site
-// (or re-emits opts.Previous), publishes `calls` and writes the resolution
-// state to opts.State.
+// (or inherits opts.Previous), publishes `calls` (every fact, or with
+// opts.Edited only the edited members') and writes the resolution state to
+// opts.State.
 func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts LinkOptions) (model.ProviderResult, error) {
 	failed := model.ProviderResult{RunID: req.Run, State: model.RunFailed}
+	if opts.Edited != nil && opts.Previous == nil {
+		return failed, internalErr("a link that publishes only the edited members needs the predecessor's resolution")
+	}
 	pu, err := planned(ctx, req)
 	if err != nil {
 		return failed, err
@@ -160,8 +173,9 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		defer mu.Unlock()
 		return sorted.Add(b)
 	}
+	var inherited coverage
 	if opts.Previous != nil {
-		err = readState(opts.Previous, emit)
+		inherited, err = readState(opts.Previous, emit)
 	} else {
 		err = resolverFor(pu.Family)(ctx, u, emit)
 	}
@@ -173,16 +187,19 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		return failed, err
 	}
 	defer bindings.Close()
-	if opts.State != nil {
-		if err := writeState(opts.State, bindings); err != nil {
-			return failed, err
-		}
-	}
 
-	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: members.Len()}
+	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: members.Len(), edited: opts.Edited}
+	if opts.Edited != nil {
+		pub.cov = inherited
+	}
 	if err := pub.publish(bindings); err != nil {
 		failed.RecordsEmitted = pub.records
 		return failed, err
+	}
+	if opts.State != nil {
+		if err := writeState(opts.State, bindings, pub.cov); err != nil {
+			return failed, err
+		}
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
 		Capabilities: []model.CapabilityState{pub.capability()}}, nil
