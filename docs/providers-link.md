@@ -22,8 +22,8 @@ InvalidationScope package
 Required          false
 ```
 
-`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:37-50`, and the descriptor is
-`Provider.Descriptor` (`provider.go:98-101`). The id is not `dependence`, which is never reused (decision 9). The
+`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:38-54`, and the descriptor is
+`Provider.Descriptor` (`provider.go:106-109`). The id is not `dependence`, which is never reused (decision 9). The
 provider is not required: a failed link degrades `calls` and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 
@@ -35,7 +35,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `calls` | `calls` | caller → ambiguous callee node | `ambiguous` |
 | `calls` | `may_refer_to` | caller → each candidate of an ambiguous site | `ambiguous call target` |
 
-The details are the `Detail*` constants (`provider.go:54-75`). Each one names the technique that bound the site:
+The details are the `Detail*` constants (`provider.go:58-79`). Each one names the technique that bound the site:
 - `direct`: the callee names the declaration by its package, module, import or scope;
 - `hierarchy`: class-hierarchy analysis over the receiver's static type and its subtypes;
 - `address_taken`: an indirect site joined to an address-taken function of the same signature;
@@ -90,12 +90,12 @@ A unit is one project of the repository, the scope `dependence.PlanUnits` derive
 `units.go:359`). The planner is reused rather than copied.
 
 The unit's inputs are its member files. Each input records `model.UnitInput.Digest`, the digest of the link table
-the unit read for that file (`internal/model/storage.go:89-104`). The digest is outside the unit's identity:
+the unit read for that file (`internal/model/storage.go:92-103`). The digest is outside the unit's identity:
 `UnitInputHasher` does not read it, because the content hash already decides the table.
 
 **The link tables.** For each file with a lowering, the worker sends one `KindLink` message (`wire.Link`). The
 structural provider joins it to the declarations and call references it validated, and stores the result as a
-`link.Table` with the file's structural unit, under `link.TableKind` (`provider.go:40-42`). It stores it through
+`link.Table` with the file's structural unit, under `link.TableKind` (`provider.go:44-46`). It stores it through
 `provider.StateSink` (`internal/provider/sink.go:240-249`), so the table shares the unit's lifetime. The linker
 reads a table back through `link.Tables` (`internal/provider/link/tables.go:14-50`): the structural unit the
 generation selects for the file's scope, then that unit's state. A file with no lowering, or whose dependence or link
@@ -121,16 +121,16 @@ site to the same declarations, by index; only the ranges and identities the edge
 
 The delta build compares each member's fresh digest with its predecessor's, in FileID order, as one merge join
 against the predecessor unit's stored inputs. When membership and every digest are equal, it hands `Link` the
-predecessor's resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`, `provider.go:43-46` and
-`provider.go:77-85`). The linker then resolves nothing. It re-emits the stored bindings with the ranges and
+predecessor's resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`, `provider.go:47-50` and
+`provider.go:82-93`). The linker then resolves nothing. It re-emits the stored bindings with the ranges and
 identities of the fresh tables, because the state names each site and target by position (`Ref`,
-`internal/provider/link/unit.go:38-41`). So an edit inside a function body that changes neither table relinks
+`internal/provider/link/unit.go:43-47`). So an edit inside a function body that changes neither table relinks
 nothing. Any other build resolves in full and stores its state for the next.
 
 ## Resolution
 
-Each resolver reads the unit's tables one at a time, in FileID order (`unit.Files`, `unit.go:24-34`), and emits each
-`Binding` it finds (`unit.go:43-54`). The core sorts every binding by site and target in an external sort that
+Each resolver reads the unit's tables one at a time, in FileID order (`unit.Files`, `unit.go:27-41`), and emits each
+`Binding` it finds (`unit.go:54-60`). The core sorts every binding by site and target in an external sort that
 spills to disk, and publishes from the sorted stream. Every join is an ordered merge over sorted runs. Nothing the
 size of the project is held in memory. No binding is justified by the callee's name alone: each rests on a scope,
 an import, a type or a signature.
@@ -139,7 +139,7 @@ The members' language family picks the resolver:
 - **Java** (`resolveStatic`, `internal/provider/link/resolve_static.go`): class-hierarchy analysis. A static,
   constructor or `super` site binds directly, and a bare call a static import names binds the imported method. A
   member site binds by its receiver's static type to that type's method and to every override in a subtype
-  (`hierarchy.dispatch`, `internal/provider/link/hierarchy.go:20-25`). A call of an abstract method (a functional
+  (`hierarchy.dispatch`, `internal/provider/link/hierarchy.go:814-821`). A call of an abstract method (a functional
   interface's) also joins every method reference of that method's signature.
 - **Go, Rust, C, C++** (`resolveStatic`): direct binding and class-hierarchy analysis over interfaces and traits.
   Bare and static sites bind by the language's scoping: same package, import, `use`, namespace and
@@ -163,7 +163,7 @@ to every type of that name in the unit (`hierarchy.typesIn`).
   covers attribute calls. `self` and `cls` are the enclosing class.
 
 **Flow-based type inference** (`inferTypes`, `internal/provider/link/infer.go`) starts from the types the worker
-recovered inside each function (`wire.Type`, `wire/link.go:134-167`):
+recovered inside each function (`wire.Type`, `wire/link.go:136-169`):
 - a `new C()` or an annotation is `TypeNamed`;
 - a parameter is `TypeParam`;
 - another call's result is `TypeResult`;
@@ -178,10 +178,13 @@ It then propagates them across functions and files, iterated to the least fixed 
 ## Capability states
 
 The `calls` row is published at the unit's scope:
-- `fresh` when every member had a table and no table dropped an entry;
-- `partial` when a member has no table, or a table's `Dropped` is non-zero (`table.go:43-47`), with the counts in the
-  row's details. A dropped entry is a worker entry the structural provider could not join to a declaration or a call
-  reference of the file, or whose range did not fit the pinned bytes. It is never fatal.
+- `fresh` when every member had a table, no table dropped an entry, and every bound site was published;
+- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:190-211`), when
+  a member has no table (`members_without_table`), a table's `Dropped` is non-zero (`dropped_table_entries`,
+  `table.go:43-47`), or an ambiguous site's `link:` key would exceed `model.MaxNativeKeyBytes` and so has no callee
+  node to mint (`unkeyed_ambiguous_sites`). The row also counts the unit's `members`. A dropped entry is a worker
+  entry the structural provider could not join to a declaration or a call reference of the file, or whose range did
+  not fit the pinned bytes. None of these is fatal.
 
 A file whose link pass failed in the worker is disclosed as `wire.Done.LinkFailure`
 (`internal/provider/treesitter/wire/wire.go:235-239`) on that file's structural capability rows. It stores no table,
