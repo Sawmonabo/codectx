@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"unicode"
@@ -46,6 +47,9 @@ type javaLinker struct {
 	// siteAt maps a call node to its index in out.Sites, which a later
 	// site's TypeResult names.
 	siteAt map[uintptr]uint32
+	// anonymousBodies counts the file's anonymous class bodies walked so
+	// far, which names the next one.
+	anonymousBodies int
 }
 
 // javaBound is what a name in scope is known to hold.
@@ -56,13 +60,20 @@ type javaBound struct {
 
 // javaFrame is one enclosing type body: name is the type `this` denotes,
 // named false for an anonymous class body or an enum constant's body, whose
-// type has no name and whose static type is the type it instantiates.
+// type has no name in the source and is sent under the name `#k`, k its
+// one-based ordinal among the file's anonymous bodies in source order: a
+// name no Java identifier can spell (JLS §3.8), declared a subtype of the
+// type it instantiates (JLS §15.9.5, §8.9.1).
 type javaFrame struct {
 	name  string
 	named bool
-	// super is the class a named class extends, as erased; empty when it
-	// names none.
+	// super is the class a named class extends, as erased, or the type an
+	// anonymous body instantiates; empty when it names none.
 	super string
+	// final reports a body no class extends, whose methods no subtype
+	// overrides: a `final` class, a record (JLS §8.10), an enum none of
+	// whose constants has a body (JLS §8.9), an anonymous body.
+	final bool
 }
 
 // javaMark is where the three scopes stood, the point restore returns to.
@@ -220,11 +231,24 @@ func (k *javaLinker) typeDecl(n Node) {
 	if n.KindId() == j.recordDecl {
 		k.params(n.ChildByFieldId(j.fParameters), true)
 	}
-	k.frames = append(k.frames, javaFrame{name: name, named: true, super: super})
+	final := n.KindId() == j.recordDecl || k.hasModifier(x.modifiersOf(n), "final") ||
+		n.KindId() == j.enumDecl && !k.constantBodies(n.ChildByFieldId(j.fBody))
+	k.frames = append(k.frames, javaFrame{name: name, named: true, super: super, final: final})
 	k.members(n.ChildByFieldId(j.fBody))
 	k.children(n)
 	k.frames = k.frames[:len(k.frames)-1]
 	k.restore(m)
+}
+
+// constantBodies reports an enum body with a constant that has a class
+// body.
+func (k *javaLinker) constantBodies(body Node) bool {
+	for c := javaFirst(body); !c.IsNull(); c = c.next() {
+		if c.KindId() == k.k.enumConstant && !k.x.kid(c, k.k.classBody).IsNull() {
+			return true
+		}
+	}
+	return false
 }
 
 // supertypes appends one supertype of the type name for every type listed
@@ -315,6 +339,8 @@ func (k *javaLinker) callable(n Node) {
 		} else {
 			mods := x.modifiersOf(n)
 			e.Static = k.hasModifier(mods, "static")
+			e.Final = k.hasModifier(mods, "final") || k.hasModifier(mods, "private") ||
+				len(k.frames) > 0 && k.frames[len(k.frames)-1].final
 			e.Abstract = n.ChildByFieldId(j.fBody).IsNull() && !k.hasModifier(mods, "native")
 			if rt := x.child(n, x.fType); !rt.IsNull() && rt.KindId() != x.voidType {
 				k.typeText(&sig, rt)
@@ -467,14 +493,11 @@ func (k *javaLinker) qualifiedSuper(n Node) bool {
 	return false
 }
 
-// superOf is the receiver of `super.m()` in frame f: the supertypes of a
-// named type, or, in an anonymous body, the type it instantiates.
+// superOf is the receiver of `super.m()` in frame f: the supertypes of its
+// type, named or anonymous.
 func (k *javaLinker) superOf(f int) wire.Type {
 	if f < 0 || k.frames[f].name == "" {
 		return wire.Type{}
-	}
-	if !k.frames[f].named {
-		return wire.Type{Kind: wire.TypeNamed, Name: k.frames[f].name}
 	}
 	return wire.Type{Kind: wire.TypeSuper, Name: k.frames[f].name}
 }
@@ -622,12 +645,18 @@ func (k *javaLinker) enumConstant(n Node) {
 	}
 }
 
-// anonymous walks the body of an anonymous class of the type super. The
-// methods it declares are declared on super, the only type their
-// declaration names, so a call on super may reach them as overrides.
+// anonymous walks the body of an anonymous class of the type super, under
+// the name `#k` (javaFrame), sent as a subtype of super: the methods it
+// declares are its own, which a call on super may reach as overrides and a
+// call on another subtype of super never does.
 func (k *javaLinker) anonymous(super string, body Node) {
 	m := k.mark()
-	k.frames = append(k.frames, javaFrame{name: super})
+	k.anonymousBodies++
+	name := "#" + strconv.Itoa(k.anonymousBodies)
+	if super != "" {
+		k.out.Supertypes = append(k.out.Supertypes, wire.Supertype{Type: name, Super: super})
+	}
+	k.frames = append(k.frames, javaFrame{name: name, super: super, final: true})
 	k.members(body)
 	k.visit(body)
 	k.frames = k.frames[:len(k.frames)-1]
