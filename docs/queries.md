@@ -302,55 +302,59 @@ warning, so an incomplete answer never reads as a complete one.
 
 ## What `search` reads for the lexical tier
 
-The lexical tier scores a single-token term from the generation's packed term
-statistics — the term's document frequency, the visible-document count and
-total token length, and the term's per-document, column-ascending
-`(column, count)` sequence — which activation wrote once
-([ADR-0007](adr/ADR-0007-lexical-first-page.md), Decision 1;
-[storage.md](storage.md) describes the streams). A request therefore steps no
-vocabulary row, no document row and no generation-membership probe per posting
-instance, and builds no temporary index for a document frequency. Nothing about
-the answer changes: the packed values are the scorer's inputs, not its outputs,
-and every floating-point operation stays where it was, consuming the same
-numbers in the same order.
+The lexical tier reads the generation's search index
+([ADR-0013](adr/ADR-0013-search-index.md); [storage.md](storage.md#the-search-index)
+describes it). A custom collector runs inside the index's search loop and reads,
+for each matching document, the per-column term frequencies from the postings
+and `token_count`, `kind`, the path ordinal and the search key from fast fields.
+The statistics are exact for the generation being searched: N and the total
+token count are sums of per-unit totals, and a term's document frequency counts
+visible documents only, so a document the generation hides never changes a
+score.
 
-A **phrase** — two or more tokens that must be adjacent — keeps reading the
-index directly, because testing adjacency needs the token offsets the packed
-form deliberately does not store.
+The score is BM25F over five columns — `name`, `qualified_name`, `signature`,
+`path` and `body`, weighted 5, 5, 2, 2 and 1, with k1 1.2 and b 0.75 — as one
+saturation over the weighted term frequency. It is computed in f64 and quantized
+to 1e-6, with one pinned logarithm implementation on both sides of the boundary.
+Whether document length is weighted per column is **pending**: the weighted form
+is adopted if it raises MRR@10 on two of the three quality sets and lowers it on
+none; otherwise the unweighted total stays.
 
-## How `search` serves its first page
+A **phrase** — two or more tokens that must be adjacent — is answered from the
+positions the index stores. A **kind filter** is a set of term ordinals and a
+**folder filter** a contiguous ordinal range of the sorted path dictionary;
+both are tested per document inside the collector, never as a separate scan.
 
-The first request scores every candidate the query matches — there is no
-candidate cap and no top-k approximation — and selects the page it serves
-through a **bounded heap** of one page plus one entry, ordered by exactly the
-comparator the full sort uses ([ADR-0007](adr/ADR-0007-lexical-first-page.md),
-Decision 3). The heap's page is therefore the fully ordered answer's first
-page by construction, not by approximation.
+## How `search` serves a page
+
+A ranked search answers with its best results, a page at a time
+([ADR-0013](adr/ADR-0013-search-index.md), decision 5;
+[ADR-0001](adr/ADR-0001-scale-posture.md) §2.4). Page n is collected as the top
+200·n by (quantized score, content tie key) with a heap of that size, so page 1
+holds 200 entries whatever the match count. Block-max WAND, with BM25F upper
+bounds per block of the union postings, skips every document that cannot enter
+the top k; it changes the work and never the results, so the page equals
+exhaustive scoring's. The match count is exact when every match was visited,
+and otherwise a lower bound marked as one. Nothing is spooled and nothing is
+sorted to disk. The exact tiers (path and symbol lookup) are not ranked: they
+walk their whole keyset and return every match.
 
 **The order guarantee.** Results are served in the Section 14.2 order: tier,
-then descending score, then path, then start byte, then the keys derived from
-the file's bytes (end byte, kind, name, qualified name, signature), and last
-the identity keys. Every key is an integer or an exact string, and the order is
-a pure function of the repository's content — the same tree indexed at another
-root, or re-indexed as a delta, answers in the same order. Concatenating the
-pages of a walk yields exactly the fully ordered answer.
-
-**What a continuation resumes.** An answer that fits one page ends there: it
-writes no continuation state at all. An answer that runs past it is spooled
-whole, unordered, while the first page is served. The *first* continuation
-request sorts that spool once, writes the ordered remainder, and serves from
-it; every later page seeks straight to the byte offset its cursor carries. So
-the full sort is paid exactly once, by the request that needs it, and no page
-costs the remainder behind it.
+then descending score, then the content tie key — path, then start byte, then
+the keys derived from the file's bytes (end byte, kind, name, qualified name,
+signature), and last the identity keys. Every key is an integer or an exact
+string, and the order is a pure function of the repository's content — the same
+tree indexed at another root, or re-indexed as a delta, answers in the same
+order. A cursor carries the last served position by content, not by document
+address, so it survives the index's background merges between pages.
 
 A cursor pins the generation, the analysis key and the query with its filters.
 Resubmitting a continuation with a different query or filter set, or against a
 re-analysed generation, is `CTX_CURSOR_INVALID` rather than a quietly different
-answer under a continued page number. Continuation state is retained by a lease
-that each page renews where the process holds the writer, and by the expiry
-recorded in the state itself where it does not; either way it is released as
-soon as the walk reaches its end, and reclaimed on its deadline by the next
-sweep in any process if the walk is abandoned.
+answer under a continued page number. The generation a cursor pins is retained
+by the cursor's lease for `storage.query_cursor_ttl`, which each page renews
+where the process holds the writer; a search keeps no other state between
+pages.
 
 ## Configuration these commands read
 
@@ -366,7 +370,7 @@ where the workspace is composed, and handed to it.
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Unlimited by default, so an unbounded walk answers in full. |
 | traversal slots (half this machine's cores, at least one) | Process-wide gate on concurrent graph queries; it is derived from the machine and is not a setting. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
-| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills the edges it has collected to the walk's own scratch and carries on reading, so it bounds the memory a level costs and never the edges the answer holds. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For `search` it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the query — which is what keeps the deduplicated and ranked sets off the heap: runs spill to disk and merge. It is a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on both paths is a function of this number rather than of the graph or the match count. |
+| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills the edges it has collected to the walk's own scratch and carries on reading, so it bounds the memory a level costs and never the edges the answer holds. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For the context compiler it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the compile — a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on these paths is a function of this number rather than of the graph or the candidate count. A ranked `search` holds one top-k heap of 200·n entries for page n, whatever the match count. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
 
 ## Context compilation reads the same facts
@@ -393,13 +397,13 @@ It reads these further keys:
 A compile runs as a pipeline of sorted streams joined by merge: seeds and the
 required scope, file hydration, relation attributes, route scoring, per-package
 centrality, boosts, measurement, packing and emission. No stage holds a
-structure sized by the candidate count. Every stage sorts through the same
-external sort `search` uses, so its in-memory run budget is the quarter share of
+structure sized by the candidate count. Every stage sorts through the
+external sort the index planner uses, so its in-memory run budget is the quarter share of
 `resources.query_memory_bytes` described above and peak heap is a function of
 that number and of the resolved budget, never of how wide the task's scope is.
 
 Run files are written under the workspace's spool directory and removed on every
-exit path, including the error paths. Like the sort runs `search` writes, they
+exit path, including the error paths. They
 are not charged against `resources.max_temp_bytes`: a run set is sized by the
 candidate count, and charging it would let that budget refuse a wide task
 outright. Size the directory for the widest compile you expect in addition to
