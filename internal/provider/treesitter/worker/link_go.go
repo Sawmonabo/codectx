@@ -538,7 +538,9 @@ func (x *goLink) enter(n Node) {
 		if name := n.ChildByFieldId(k.fName); !name.IsNull() && !x.blankDecl(n, name) {
 			x.supertypes(n, name)
 		}
-	case k.varSpec, k.constSpec, k.fieldDeclaration:
+	case k.fieldDeclaration:
+		x.fieldExports(n)
+	case k.varSpec, k.constSpec:
 		x.eachName(n, func(id Node) { x.blankDecl(n, id) })
 		if n.KindId() == k.varSpec {
 			x.values(n.ChildByFieldId(k.fValue), func(int) string { return "" })
@@ -842,10 +844,16 @@ func (x *goLink) exprType(e Node) wire.Type {
 		if f.IsNull() || x.isImport(o) {
 			return wire.Type{}
 		}
+		// A field of a type the file declares has the type its declaration
+		// says. Any other field of a known owner is spelled "Owner.field",
+		// which the linker reads through the owner's field declarations
+		// (its own or promoted) in any file; a field of an unknown owner
+		// is the field name alone.
 		if t := x.exprType(o); t.Kind == wire.TypeNamed {
 			if v, ok := x.types[t.Name][x.text(f)]; ok {
 				return v.typ
 			}
+			return wire.Type{Kind: wire.TypeField, Name: t.Name + "." + x.text(f)}
 		}
 		return wire.Type{Kind: wire.TypeField, Name: x.text(f)}
 	}
@@ -1074,6 +1082,22 @@ func (x *goLink) supertypes(spec, name Node) {
 			}
 		})
 	}
+}
+
+// fieldExports appends an export for each name a struct field declaration
+// declares, its Returns the field's declared type reduced by goLink.baseName,
+// so the linker can type a receiver that reads the field from another file;
+// a field whose type names no declaration (a slice, a map, a literal type)
+// sends none.
+func (x *goLink) fieldExports(n Node) {
+	typ := x.baseName(n.ChildByFieldId(x.k.fType))
+	x.eachName(n, func(id Node) {
+		if x.blankDecl(n, id) || typ == "" {
+			return
+		}
+		x.out.Exports = append(x.out.Exports, wire.Export{Name: goSpan(id),
+			Returns: wire.Type{Kind: wire.TypeNamed, Name: strings.Clone(typ)}})
+	})
 }
 
 // boundFunctions appends the export of every name a short variable

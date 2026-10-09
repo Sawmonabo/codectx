@@ -380,7 +380,8 @@ func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) e
 // member resolves a call of method on a receiver: by class-hierarchy
 // analysis over its declared type, or over the types the targets of the
 // call it is the result of return; along the enclosing class's supertypes
-// for `super`; or as a qualified call through a module.
+// for `super`; as a qualified call through a module; or, for Go, over the
+// declared type of the field it reads (fieldGo).
 func (r *staticFile) member(caller int32, recv wire.Type, method string, bind func(string) func(entry) error) error {
 	switch recv.Kind {
 	case wire.TypeNamed:
@@ -395,6 +396,10 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, bind fu
 		})
 	case wire.TypeModule:
 		return r.qualified(caller, recv.Name, method, bind(DetailDirect))
+	case wire.TypeField:
+		if r.fc.family == "go" {
+			return r.fieldGo(recv.Name, func(typ Ref) error { return r.dispatch(typ, method, bind) })
+		}
 	}
 	return nil
 }
