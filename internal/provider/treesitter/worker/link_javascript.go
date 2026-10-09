@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -68,24 +69,37 @@ import (
 // call site's value, TypeModule for `require("m")`, TypeField for a property
 // read, and the operand's type through await, `!`, `satisfies`, an
 // assignment, a sequence's last element, and both arms of a conditional or
-// a short-circuit operator. Definitions or arms that disagree merge to
-// TypeUnknown: one Type is sent, and it is never a guess between two.
+// a short-circuit operator. A class declaration's name is TypeClass, the
+// class object itself. Definitions or arms that disagree merge to a
+// TypeUnion of every type they recover (Link.Unions), so every type that
+// reaches a receiver or an argument is sent; one that recovers nothing adds
+// nothing to it.
 //
 // A name a callable reads but does not declare resolves to the variable of
-// that name in the innermost enclosing callable that declares one, with the
-// merge of every definition that callable makes of it; a parameter of an
-// enclosing callable is no parameter of this one, so its TypeParam is not
-// carried in.
+// that name in the innermost enclosing callable that declares one, and of
+// those to the one declared in the innermost block holding the read (a
+// `var`, a parameter or an import is the callable's own), with the merge of
+// every definition that callable makes of it; a parameter of an enclosing
+// callable is no parameter of this one, so its TypeParam is not carried in.
 //
 // # Values
 //
 // Every value written to a property (`o.f = v`, an object literal's member,
-// a class field's initializer) whose type is recovered, and every function
-// or imported value passed as an argument, assigned, or placed in an array
-// literal, is a Value. A function is TypeFunction of its name as written: a
-// function declaration's or function-valued variable's name, an object
-// literal method's or a function-valued class field's name; an imported
-// value is its TypeModule (see Imports).
+// a class field's initializer, a class's method under its own name) whose
+// type is recovered, and every function or imported value passed as an
+// argument, assigned, or placed in an array literal, is a Value. A function
+// is TypeFunction of its name as written: a function declaration's or
+// function-valued variable's name; a member's name qualified by what holds
+// it, `C.m` for a class's method or function-valued field and `o.m` for a
+// method of the object literal initializing o (a bare name when nothing
+// names the object); an imported value is its TypeModule (see Imports).
+//
+// # Re-exports
+//
+// Each `export` statement that exports a name under a name of its own or
+// from another module is a Reexport: `export default x` and a default-
+// exported declaration, `export { a as b }`, `export { x } from "./m"`,
+// `export * from "./m"` and `export * as ns from "./m"`.
 type javaScriptLinker struct {
 	language string
 	// k and x are the grammar's kind tables and l its lowering, resolved on
@@ -105,9 +119,14 @@ type javaScriptLinker struct {
 	// values are the file's values in the order function found them.
 	values []wire.Value
 	// vars are every analysed callable's named variables by name, each with
-	// the callable's span and the merge of its definitions, in the order the
-	// callables were analysed: an enclosing callable before those it holds.
+	// the callable's span, its scope's span and the merge of its
+	// definitions, in the order the callables were analysed: an enclosing
+	// callable before those it holds.
 	vars map[string][]jsVar
+	// unions are the file's type sets (Link.Unions), each once: unionAt
+	// finds a set's index by its canonical spelling.
+	unions  [][]wire.Type
+	unionAt map[string]uint32
 
 	// The callable being analysed: its node, graph, the uses of its named
 	// variables (uses, with ends the running maximum of each name's ends),
@@ -129,10 +148,11 @@ type jsUse struct {
 	v, n       int32
 }
 
-// jsVar is one named variable of the callable spanning at.
+// jsVar is one named variable of the callable spanning at, declared in the
+// block spanning scope.
 type jsVar struct {
-	at  flow.Span
-	val jsVal
+	at, scope flow.Span
+	val       jsVal
 }
 
 // jsVal is what a name or a definition says of a value: its type, its
@@ -154,18 +174,16 @@ var jsUnknown = jsVal{set: true}
 func typed(t wire.Type) jsVal { return jsVal{t: t, set: true} }
 
 // merge is the value a and b both describe: the one said of a value when the
-// other says nothing, else their common type, signature and flags, a type
-// or signature they disagree on being unknown.
-func (a jsVal) merge(b jsVal) jsVal {
+// other says nothing, else the union of their types and their common
+// signature and flags, a signature they disagree on being unknown.
+func (k *javaScriptLinker) merge(a, b jsVal) jsVal {
 	switch {
 	case !a.set:
 		return b
 	case !b.set:
 		return a
 	}
-	if a.t != b.t {
-		a.t = wire.Type{}
-	}
+	a.t = k.mergeType(a.t, b.t)
 	if a.sig != b.sig {
 		a.sig = ""
 	}
@@ -174,12 +192,64 @@ func (a jsVal) merge(b jsVal) jsVal {
 	return a
 }
 
-// mergeType is merge over two types.
-func mergeType(a, b wire.Type) wire.Type {
-	if a != b {
-		return wire.Type{}
+// mergeType is the type of a value of type a or b: the one type when they
+// agree or one is unknown, else the TypeUnion of both's members.
+func (k *javaScriptLinker) mergeType(a, b wire.Type) wire.Type {
+	switch {
+	case a == b || b.Kind == wire.TypeUnknown:
+		return a
+	case a.Kind == wire.TypeUnknown:
+		return b
 	}
-	return a
+	return k.union(append(k.members(a), k.members(b)...))
+}
+
+// members is the types t stands for: a union's members, t itself, or none
+// for an unknown type.
+func (k *javaScriptLinker) members(t wire.Type) []wire.Type {
+	switch t.Kind {
+	case wire.TypeUnknown:
+		return nil
+	case wire.TypeUnion:
+		return slices.Clone(k.unions[t.Index])
+	}
+	return []wire.Type{t}
+}
+
+// union is the type of the set ts: unknown when empty, its one member, or
+// the TypeUnion of the file's set of those members, added once.
+func (k *javaScriptLinker) union(ts []wire.Type) wire.Type {
+	slices.SortFunc(ts, func(a, b wire.Type) int {
+		return cmp.Or(cmp.Compare(a.Kind, b.Kind), strings.Compare(a.Name, b.Name), cmp.Compare(a.Index, b.Index))
+	})
+	ts = slices.Compact(ts)
+	switch len(ts) {
+	case 0:
+		return wire.Type{}
+	case 1:
+		return ts[0]
+	}
+	var key strings.Builder
+	for _, t := range ts {
+		key.WriteByte(byte(t.Kind))
+		key.WriteString(t.Name)
+		key.WriteByte(0)
+		key.WriteString(strconv.FormatUint(uint64(t.Index), 10))
+		key.WriteByte(0)
+	}
+	i, ok := k.unionAt[key.String()]
+	if !ok {
+		i = uint32(len(k.unions))
+		k.unions = append(k.unions, ts)
+		k.unionAt[key.String()] = i
+	}
+	return wire.Type{Kind: wire.TypeUnion, Index: i}
+}
+
+// without is t less its members of kind drop.
+func (k *javaScriptLinker) without(t wire.Type, drop wire.TypeKind) wire.Type {
+	ms := k.members(t)
+	return k.union(slices.DeleteFunc(ms, func(m wire.Type) bool { return m.Kind == drop }))
 }
 
 func newJavaScriptLinker(language string) *javaScriptLinker {
@@ -209,6 +279,7 @@ func (k *javaScriptLinker) ready(src []byte) {
 	k.returns = map[uint32]wire.Type{}
 	k.vars = map[string][]jsVar{}
 	k.seen = map[uint64]bool{}
+	k.unionAt = map[string]uint32{}
 }
 
 // syntax is the grammar's lowering table, resolved once.
@@ -236,7 +307,7 @@ func (k *javaScriptLinker) function(fn Node, g *flow.Graph, du flow.Edges, src [
 			}
 		case k.x.returnStatement:
 			k.query()
-			ret = ret.merge(typed(k.typeOf(firstNamed(n))))
+			ret = k.merge(ret, typed(k.typeOf(firstNamed(n))))
 		case kk.assignmentExpression:
 			k.assigned(n)
 		case kk.variableDeclarator:
@@ -257,11 +328,15 @@ func (k *javaScriptLinker) function(fn Node, g *flow.Graph, du flow.Edges, src [
 				k.values = append(k.values, wire.Value{At: wireSpan(spanOf(n)), Field: string(textOf(k.src, n)), Type: v.t})
 			}
 		case kk.methodDefinition:
-			if n != fn && jsKindOf(n.Parent()) == k.x.object {
+			// An object literal's method and a class's method are functions
+			// written to the property they name; a constructor is no
+			// property's value.
+			if p := jsKindOf(n.Parent()); n != fn && (p == k.x.object || p == kk.classBody) {
 				if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == k.x.propertyIdentifier {
-					text := string(textOf(k.src, name))
-					k.values = append(k.values, wire.Value{At: wireSpan(spanOf(n)), Field: text,
-						Type: wire.Type{Kind: wire.TypeFunction, Name: text}})
+					if text := string(textOf(k.src, name)); text != "constructor" || p == k.x.object {
+						k.values = append(k.values, wire.Value{At: wireSpan(spanOf(n)), Field: text,
+							Type: wire.Type{Kind: wire.TypeFunction, Name: qualify(k.receiverOf(n), text)}})
+					}
 				}
 			}
 		case kk.fieldDefinition, kk.publicFieldDefinition:
@@ -368,9 +443,9 @@ func (k *javaScriptLinker) reaching(u, v int32) jsVal {
 		p := int32(uint32(k.reach[i]))
 		switch {
 		case holds(k.g.Defs(p), v):
-			r = r.merge(k.defined(p, v, false))
+			r = k.merge(r, k.defined(p, v, false))
 		case holds(k.g.MayDefs(p), v):
-			r = r.merge(k.defined(p, v, true))
+			r = k.merge(r, k.defined(p, v, true))
 		}
 	}
 	return r
@@ -399,7 +474,7 @@ func (k *javaScriptLinker) defined(p, v int32, may bool) jsVal {
 		// right side's value, or keeps the one it held.
 		prior := k.reaching(p, v)
 		if jsKindOf(k.l.unparen(n.ChildByFieldId(kk.fLeft))) == kk.identifier {
-			return prior.merge(typed(k.typeOf(n.ChildByFieldId(kk.fRight))))
+			return k.merge(prior, typed(k.typeOf(n.ChildByFieldId(kk.fRight))))
 		}
 		return prior
 	case kk.assignmentExpression, kk.updateExpression, kk.unaryExpression, kk.memberExpression, kk.subscriptExpression:
@@ -446,7 +521,12 @@ func (k *javaScriptLinker) def(n Node) jsVal {
 	case kk.assignmentExpression:
 		return typed(k.typeOf(n.ChildByFieldId(kk.fRight)))
 	case kk.classDeclaration, kk.abstractClassDeclaration:
-		return jsVal{set: true, decl: true, static: true}
+		// The class's name holds the class object.
+		v := jsVal{set: true, decl: true, static: true}
+		if name := n.ChildByFieldId(kk.fName); !name.IsNull() {
+			v.t = wire.Type{Kind: wire.TypeClass, Name: string(textOf(k.src, name))}
+		}
+		return v
 	case kk.requiredParameter, kk.optionalParameter:
 		// A parameter's default: the Branch spanning the whole parameter.
 		return k.bound(n.ChildByFieldId(kk.fPattern))
@@ -591,26 +671,27 @@ func (k *javaScriptLinker) annotated(a Node) jsVal {
 }
 
 // captured is the variable name an enclosing callable of the position s
-// declares: the merge of the innermost such callable's variables of that
-// name, a parameter's TypeParam left out.
+// declares: the merge of the variables of that name declared in the
+// innermost scope holding s, a parameter's TypeParam left out. Every scope
+// holding s lies inside the next, across callables too, so the smallest is
+// the nearest binding.
 func (k *javaScriptLinker) captured(name string, s flow.Span) jsVal {
-	vs := k.vars[name]
 	var r jsVal
 	var in flow.Span
 	found := false
-	for i := len(vs) - 1; i >= 0; i-- {
-		e := vs[i]
-		if found && e.at != in {
-			break
+	holds := func(o flow.Span) bool { return o.Start <= s.Start && s.End <= o.End }
+	for _, e := range k.vars[name] {
+		if !holds(e.at) || !holds(e.scope) {
+			continue
 		}
-		if e.at.Start <= s.Start && s.End <= e.at.End {
-			found, in = true, e.at
-			r = r.merge(e.val)
+		switch {
+		case !found || e.scope.End-e.scope.Start < in.End-in.Start:
+			found, in, r = true, e.scope, e.val
+		case e.scope == in:
+			r = k.merge(r, e.val)
 		}
 	}
-	if r.t.Kind == wire.TypeParam {
-		r.t = wire.Type{}
-	}
+	r.t = k.without(r.t, wire.TypeParam)
 	return r
 }
 
@@ -622,13 +703,13 @@ func (k *javaScriptLinker) summarize(fn Node, g *flow.Graph) {
 		for _, v := range g.Defs(u) {
 			if _, named := g.Declared(v); named {
 				k.query()
-				vals[v] = vals[v].merge(k.defined(u, v, false))
+				vals[v] = k.merge(vals[v], k.defined(u, v, false))
 			}
 		}
 		for _, v := range g.MayDefs(u) {
 			if _, named := g.Declared(v); named {
 				k.query()
-				vals[v] = vals[v].merge(k.defined(u, v, true))
+				vals[v] = k.merge(vals[v], k.defined(u, v, true))
 			}
 		}
 	}
@@ -636,9 +717,26 @@ func (k *javaScriptLinker) summarize(fn Node, g *flow.Graph) {
 	for v := range int32(g.Vars()) {
 		if d, named := g.Declared(v); named {
 			name := string(k.src[d.Start:d.End])
-			k.vars[name] = append(k.vars[name], jsVar{at: at, val: vals[v]})
+			k.vars[name] = append(k.vars[name], jsVar{at: at, scope: k.scopeOf(d, fn), val: vals[v]})
 		}
 	}
+}
+
+// scopeOf is the span of the scope the name declared at d belongs to: the
+// innermost block, loop, switch body or catch clause of fn holding a `let`,
+// `const`, class or function declaration, and fn itself for a `var`, a
+// parameter, an import or a name whose declaration is not found.
+func (k *javaScriptLinker) scopeOf(d flow.Span, fn Node) flow.Span {
+	kk := k.k
+	for n := k.exact(d); !n.IsNull() && n != fn; n = n.Parent() {
+		switch n.KindId() {
+		case kk.variableDeclaration, k.x.formalParameters, kk.importStatement:
+			return spanOf(fn)
+		case kk.statementBlock, kk.forStatement, kk.forInStatement, kk.switchBody, kk.catchClause:
+			return spanOf(n)
+		}
+	}
+	return spanOf(fn)
 }
 
 // typeOf is the type of the expression e's value.
@@ -685,11 +783,11 @@ func (k *javaScriptLinker) typeOf(e Node) wire.Type {
 	case kk.assignmentExpression:
 		return k.typeOf(e.ChildByFieldId(kk.fRight))
 	case kk.ternaryExpression:
-		return mergeType(k.typeOf(e.ChildByFieldId(kk.fConsequence)), k.typeOf(e.ChildByFieldId(kk.fAlternative)))
+		return k.mergeType(k.typeOf(e.ChildByFieldId(kk.fConsequence)), k.typeOf(e.ChildByFieldId(kk.fAlternative)))
 	case kk.binaryExpression:
 		if op := e.ChildByFieldId(kk.fOperator); !op.IsNull() {
 			if o := op.KindId(); o == kk.and || o == kk.or || o == kk.nullish {
-				return mergeType(k.typeOf(e.ChildByFieldId(kk.fLeft)), k.typeOf(e.ChildByFieldId(kk.fRight)))
+				return k.mergeType(k.typeOf(e.ChildByFieldId(kk.fLeft)), k.typeOf(e.ChildByFieldId(kk.fRight)))
 			}
 		}
 	case kk.sequenceExpression:
@@ -899,10 +997,20 @@ func (k *javaScriptLinker) field(n Node) {
 	}
 	switch k.l.unparen(value).KindId() {
 	case k.x.arrowFunction, k.k.functionExpression:
-		k.values = append(k.values, wire.Value{At: wireSpan(spanOf(value)), Field: name, Type: wire.Type{Kind: wire.TypeFunction, Name: name}})
+		k.values = append(k.values, wire.Value{At: wireSpan(spanOf(value)), Field: name,
+			Type: wire.Type{Kind: wire.TypeFunction, Name: qualify(k.className(n.Parent()), name)}})
 	default:
 		k.written(value, name)
 	}
+}
+
+// qualify is a member's name as written qualified by the name of what holds
+// it, the name alone when nothing names the holder.
+func qualify(holder, name string) string {
+	if holder == "" {
+		return name
+	}
+	return holder + "." + name
 }
 
 // fieldParts is a class field's name, when it is a property name, and its
@@ -985,6 +1093,8 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 			k.class(out, n)
 		case x.interfaceDeclaration:
 			k.supertypes(out, n.ChildByFieldId(kk.fName), kindChild(n, x.extendsTypeClause))
+		case kk.exportStatement:
+			k.reexports(out, n)
 		}
 		if c.GotoFirstChild() {
 			continue
@@ -999,7 +1109,8 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 }
 
 // finish numbers every TypeResult by the site it names, a site not sent
-// making it unknown, and appends the values in source order.
+// making it unknown (and leaving the union holding it), sends the unions,
+// and appends the values in source order.
 func (k *javaScriptLinker) finish(out *wire.Link, numbered map[uint32]uint32) {
 	number := func(t *wire.Type) {
 		if t.Kind != wire.TypeResult {
@@ -1010,6 +1121,12 @@ func (k *javaScriptLinker) finish(out *wire.Link, numbered map[uint32]uint32) {
 		} else {
 			*t = wire.Type{}
 		}
+	}
+	for _, u := range k.unions {
+		for j := range u {
+			number(&u[j])
+		}
+		out.Unions = append(out.Unions, slices.DeleteFunc(u, func(t wire.Type) bool { return t.Kind == wire.TypeUnknown }))
 	}
 	for i := range out.Sites {
 		s := &out.Sites[i]
@@ -1030,6 +1147,67 @@ func (k *javaScriptLinker) finish(out *wire.Link, numbered map[uint32]uint32) {
 			out.Values = append(out.Values, v)
 		}
 	}
+}
+
+// reexports appends what the export statement n exports under a name of
+// its own or from another module (wire.Reexport).
+func (k *javaScriptLinker) reexports(out *wire.Link, n Node) {
+	kk, x := k.k, k.x
+	add := func(name, original, from string) {
+		if name != "" && original != "" {
+			out.Reexports = append(out.Reexports, wire.Reexport{Name: name, Original: original, From: from})
+		}
+	}
+	if hasToken(n, x.defaultKw) {
+		if d := n.ChildByFieldId(kk.fDeclaration); !d.IsNull() {
+			if name := d.ChildByFieldId(kk.fName); !name.IsNull() {
+				add("default", string(textOf(k.src, name)), "")
+			}
+		} else if v := k.l.unparen(n.ChildByFieldId(kk.fValue)); jsKindOf(v) == kk.identifier {
+			add("default", string(textOf(k.src, v)), "")
+		}
+		return
+	}
+	from := ""
+	if s := kindChild(n, x.str); !s.IsNull() {
+		from = k.unquote(s)
+	}
+	namespace := false
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		switch {
+		case !c.IsNamed() || c.IsExtra():
+		case c.KindId() == x.namespaceExport:
+			namespace = true
+			add(k.exportName(firstNamed(c)), "*", from)
+		case c.KindId() == x.exportClause:
+			for s := c.first(); !s.IsNull(); s = s.next() {
+				if s.KindId() != x.exportSpecifier {
+					continue
+				}
+				original := k.exportName(s.ChildByFieldId(kk.fName))
+				name := original
+				if alias := s.ChildByFieldId(kk.imports.fAlias); !alias.IsNull() {
+					name = k.exportName(alias)
+				}
+				add(name, original, from)
+			}
+		}
+	}
+	if from != "" && !namespace && hasToken(n, x.star) {
+		add("*", "*", from)
+	}
+}
+
+// exportName is a module export name as written: an identifier, or a
+// string's contents.
+func (k *javaScriptLinker) exportName(n Node) string {
+	switch jsKindOf(n) {
+	case jsNoKind:
+		return ""
+	case k.x.str:
+		return k.unquote(n)
+	}
+	return string(textOf(k.src, n))
 }
 
 // export appends the Export of the declaration named name whose callable is
@@ -1331,7 +1509,11 @@ type jsLinkSyntax struct {
 	shorthandPropertyIdentifier, array, returnStatement, arrowFunction, typeAnnotation, assertsAnnotation,
 	typePredicateAnnotation, typeIdentifier, nestedTypeIdentifier, genericType, predefinedType, functionType,
 	implementsClause, extendsTypeClause, interfaceDeclaration, interfaceBody, objectType, typeAliasDeclaration,
-	methodSignature, abstractMethodSignature, functionSignature uint16
+	methodSignature, abstractMethodSignature, functionSignature, exportClause, exportSpecifier,
+	namespaceExport uint16
+	// defaultKw and star are the anonymous `default` and `*` tokens of an
+	// export statement.
+	defaultKw, star uint16
 }
 
 // jsLinkGrammar is one grammar's jsLinkSyntax, resolved once, on first use.
@@ -1366,7 +1548,9 @@ func (g *jsLinkGrammar) syntax() *jsLinkSyntax {
 			interfaceDeclaration: k("interface_declaration"), interfaceBody: k("interface_body"),
 			objectType: k("object_type"), typeAliasDeclaration: k("type_alias_declaration"),
 			methodSignature: k("method_signature"), abstractMethodSignature: k("abstract_method_signature"),
-			functionSignature: k("function_signature"),
+			functionSignature: k("function_signature"), exportClause: k("export_clause"),
+			exportSpecifier: k("export_specifier"), namespaceExport: k("namespace_export"),
+			defaultKw: tl.IdForNodeKind("default", false), star: tl.IdForNodeKind("*", false),
 		}
 	})
 	return &g.s

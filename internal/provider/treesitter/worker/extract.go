@@ -47,16 +47,20 @@ type importRec struct {
 	path  string
 	names []string
 	// originals holds, parallel to names, the name each denotes in the
-	// imported module where the import renames it, else "" (wire.Import).
+	// imported module when it is not the local name (wire.Import.Originals).
 	originals []string
 	// seen holds names, so a statement naming thousands of bindings (a
 	// generated barrel import) is deduplicated in linear time.
 	seen map[string]bool
 }
 
-// add appends one local name the statement binds, once, with the name it
-// denotes in the imported module when the import renames it.
-func (r *importRec) add(name, original string) {
+// add appends one local name the statement binds, once.
+func (r *importRec) add(name string) { r.addAs(name, "") }
+
+// addAs appends one local name the statement binds, once, with the name
+// original it denotes in the imported module, empty when that is the local
+// name.
+func (r *importRec) addAs(name, original string) {
 	if name != "" && !r.seen[name] {
 		r.seen[name] = true
 		r.names = append(r.names, name)
@@ -64,14 +68,13 @@ func (r *importRec) add(name, original string) {
 	}
 }
 
-// renamed is originals when any name is renamed, else nil.
-func (r *importRec) renamed() []string {
-	for _, o := range r.originals {
-		if o != "" {
-			return r.originals
-		}
+// wireOriginals is the record's Originals: nil when every local name is the
+// name it denotes.
+func (r *importRec) wireOriginals() []string {
+	if len(r.originals) != len(r.names) || !slices.ContainsFunc(r.originals, func(o string) bool { return o != "" }) {
+		return nil
 	}
-	return nil
+	return r.originals
 }
 
 type refRec struct {
@@ -284,16 +287,40 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 		original = o[0].Utf8Text(e.src)
 	}
 	for _, n := range caps["import.name"] {
-		rec.add(n.Utf8Text(e.src), original)
+		rec.addAs(n.Utf8Text(e.src), original)
 	}
 	if clauses := caps["import.clause"]; len(clauses) > 0 {
 		ids := e.g.importSyntax(e.l.Name)
 		for i := range clauses {
 			cur := clauses[i].Walk()
-			importClauseBindings(cur, ids, func(local *ts.Node, _ bool) { rec.add(local.Utf8Text(e.src), "") })
+			importClauseBindings(cur, ids, func(local *ts.Node, _ bool) {
+				rec.addAs(local.Utf8Text(e.src), importOriginal(local, ids, e.src))
+			})
 			cur.Close()
 		}
 	}
+}
+
+// importOriginal is the name the local binding of an ECMAScript import
+// clause denotes in the imported module: "default" for a default binding,
+// "*" for a namespace binding, a specifier's exported name when an alias
+// renames it, and empty when the local name is the exported name.
+func importOriginal(local *ts.Node, s *importSyntax, src []byte) string {
+	p := local.Parent()
+	if p == nil {
+		return ""
+	}
+	switch p.KindId() {
+	case s.namespaceImport:
+		return "*"
+	case s.importSpecifier:
+		alias, name := p.ChildByFieldId(s.fAlias), p.ChildByFieldId(s.fName)
+		if alias == nil || name == nil || alias.StartByte() != local.StartByte() {
+			return ""
+		}
+		return strings.Trim(name.Utf8Text(src), "\"'`")
+	}
+	return "default"
 }
 
 // importSyntax holds the kind and field ids an ECMAScript import clause is
@@ -560,7 +587,7 @@ func (e *extraction) emit(out *emitter) error {
 			localNames[n] = true
 		}
 		if err := out.imp(wire.Import{Start: uint32(rec.start), End: uint32(rec.end), Path: rec.path, Names: rec.names,
-			Originals: rec.renamed()}); err != nil {
+			Originals: rec.wireOriginals()}); err != nil {
 			return err
 		}
 	}
