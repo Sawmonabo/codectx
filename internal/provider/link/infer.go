@@ -50,8 +50,8 @@ import (
 //
 // A module's exports are its exported declarations, the names its own
 // `export` statements give them, and what it re-exports from other modules
-// (`export { x } from`, `export *`, `export * as ns from`), closed over
-// chains of re-exports before the rounds start.
+// (`export { x } from`, `export *`, `export * as ns from`), each name
+// resolved as ECMA-262 ResolveExport does (hierarchy.resolveExport).
 //
 // No binding joins on the callee name alone: the name is looked up only in
 // the declarations its scope, its import or its receiver's type selects.
@@ -59,9 +59,9 @@ import (
 // Every relation is a sorted run (pagination.ExternalSort) and every join
 // between relations an ordered merge of two runs, iterated semi-naively
 // until a round adds no value: the least fixed point, with no fixed round
-// count. The class hierarchy is read by point lookups into its index
-// (hierarchy). Nothing the size of the unit is resident beyond one merge
-// group.
+// count. The class hierarchy and the modules' exports are read by point
+// lookups into the hierarchy's index. Nothing the size of the unit is
+// resident beyond one merge group.
 type types struct {
 	// bindingRun is every binding the fixed point found, sorted by site and
 	// target, one per pair with its best technique.
@@ -240,45 +240,16 @@ type binding struct {
 }
 
 // lookup asks for the method Name the type Class declares, or else inherits
-// from its supertypes, at Depth supertypes from the type the call named.
-// Unbound reports a Python call through the class object, which passes an
-// instance method its receiver as the first argument.
+// (hierarchy.declared: the nearest along each supertype path, Python's
+// method resolution order for a Python class). Unbound reports a Python call
+// through the class object, which passes an instance method its receiver as
+// the first argument.
 type lookup struct {
 	Class   Ref
 	Name    string
-	Depth   int32
 	Call    call
 	Rank    byte
 	Unbound bool
-}
-
-// member is a method Class declares; Static reports one called without a
-// receiver (a static or class method).
-type member struct {
-	Class  Ref
-	Name   string
-	Method Ref
-	Static bool
-}
-
-// super is one declared supertype of Class.
-type super struct{ Class, Super Ref }
-
-// export is a module-level callable or type declaration a module path makes
-// importable under Name, or, when Module is set, the module whose path is
-// Module (`export * as ns from`).
-type export struct {
-	Base, Name string
-	Decl       Ref
-	Type       bool
-	Module     string
-}
-
-// reexport makes the export Original of the module From importable from the
-// module Base under Name; Name and Original are "*" for every name but
-// `default` (`export * from`).
-type reexport struct {
-	Base, Name, From, Original string
 }
 
 // exportReq asks for the export Name of the module Base for Call.
@@ -313,18 +284,12 @@ type argRec struct {
 type inference struct {
 	u *unit
 	h *hierarchy
-	// types counts the unit's type declarations: an inheritance chain that
-	// visits more types than exist has looped, so a lookup ends there.
-	types int32
 	// python reports a Python unit. A unit is one language family, and
 	// Python's constructor is `__init__`.
 	python bool
 
 	// The relations the file pass fills and the rounds read.
 	watches *pagination.SortedRun[watch]
-	members *pagination.SortedRun[member]
-	supers  *pagination.SortedRun[super]
-	exports *pagination.SortedRun[export]
 	decls   *pagination.SortedRun[declRec]
 	args    *pagination.SortedRun[argRec]
 
@@ -565,18 +530,6 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 		return err
 	}
 	watches.WithFold(keepFirst[watch])
-	members, err := newSort(in, memberCodec)
-	if err != nil {
-		return err
-	}
-	supers, err := newSort(in, superCodec)
-	if err != nil {
-		return err
-	}
-	exports, err := newSort(in, exportCodec)
-	if err != nil {
-		return err
-	}
 	decls, err := newSort(in, declRecCodec)
 	if err != nil {
 		return err
@@ -585,28 +538,15 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 	if err != nil {
 		return err
 	}
-	reexports, err := newSort(in, reexportCodec)
-	if err != nil {
-		return err
-	}
 	err = in.u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
 		f := &fileScan{in: in, r: r, file: file, t: t, python: t.Language == "python"}
 		in.python = in.python || f.python
-		return f.scan(ctx, r, watches, members, supers, exports, reexports, decls, args)
+		return f.scan(ctx, r, watches, decls, args)
 	})
 	if err != nil {
 		return err
 	}
 	if in.watches, err = sorted(in, watches); err != nil {
-		return err
-	}
-	if in.members, err = sorted(in, members); err != nil {
-		return err
-	}
-	if in.supers, err = sorted(in, supers); err != nil {
-		return err
-	}
-	if in.exports, err = in.closeExports(exports, reexports); err != nil {
 		return err
 	}
 	if in.decls, err = sorted(in, decls); err != nil {
@@ -629,53 +569,20 @@ type fileScan struct {
 }
 
 func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.ExternalSort[watch],
-	members *pagination.ExternalSort[member], supers *pagination.ExternalSort[super],
-	exports *pagination.ExternalSort[export], reexports *pagination.ExternalSort[reexport],
 	decls *pagination.ExternalSort[declRec], args *pagination.ExternalSort[argRec],
 ) error {
-	t, in := f.t, f.in
-	bases := moduleBases(t.Path, f.python)
+	t := f.t
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		ref := Ref{File: f.file, Index: int32(i)}
-		if isType(d.Kind) {
-			in.types++
-		}
-		if d.Parent == -1 && (f.python || d.Exported) && (isType(d.Kind) || isCallable(d.Kind)) {
-			for _, b := range bases {
-				if err := exports.Add(export{Base: b, Name: d.Name, Decl: ref, Type: isType(d.Kind)}); err != nil {
-					return err
-				}
-			}
-		}
-		if !isCallable(d.Kind) {
+		if !callable(d) {
 			continue
-		}
-		if d.Parent >= 0 && int(d.Parent) < len(t.Decls) && isType(t.Decls[d.Parent].Kind) {
-			if err := members.Add(member{Class: Ref{File: f.file, Index: d.Parent}, Name: d.Name, Method: ref, Static: d.Static}); err != nil {
-				return err
-			}
 		}
 		err := f.eval(ctx, int32(i), d.Returns, func(op operand) error {
 			return decls.Add(declRec{Decl: ref, Ret: op})
 		})
 		if err != nil {
 			return err
-		}
-	}
-	if err := f.reexports(bases, exports, reexports); err != nil {
-		return err
-	}
-	for _, st := range t.Supertypes {
-		for i := range t.Decls {
-			if d := &t.Decls[i]; d.Name != st.Type || !isType(d.Kind) {
-				continue
-			}
-			class := Ref{File: f.file, Index: int32(i)}
-			err := in.h.types(ctx, f.file, st.Super, func(s Ref) error { return supers.Add(super{Class: class, Super: s}) })
-			if err != nil {
-				return err
-			}
 		}
 	}
 	for i := range t.Sites {
@@ -699,148 +606,6 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 		}
 	}
 	return nil
-}
-
-// reexports records what the file's `export` statements make importable
-// from its module paths bases (wire.Reexport): a local name is the module-
-// level declaration it names (`export default foo`, `export { a as b }`),
-// or what the import binding it names denotes (`import { x } from "./m";
-// export { x }`); a name from another module is a re-export of that
-// module's export, and `export * as ns` makes that module itself an export.
-// A module the unit cannot hold (a package specifier) re-exports nothing.
-func (f *fileScan) reexports(bases []string, exports *pagination.ExternalSort[export], reexports *pagination.ExternalSort[reexport]) error {
-	t := f.t
-	add := func(name string, x export) error {
-		for _, b := range bases {
-			x.Base, x.Name = b, name
-			if err := exports.Add(x); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	from := func(name, spec, original string) error {
-		target, ok := moduleBase(t.Path, spec, f.python)
-		if !ok {
-			return nil
-		}
-		if original == "*" && name != "*" {
-			return add(name, export{Module: target})
-		}
-		for _, b := range bases {
-			if err := reexports.Add(reexport{Base: b, Name: name, From: target, Original: original}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for _, x := range t.Reexports {
-		if x.From != "" {
-			if err := from(x.Name, x.From, x.Original); err != nil {
-				return err
-			}
-			continue
-		}
-		local := false
-		for i := range t.Decls {
-			if d := &t.Decls[i]; d.Parent == -1 && d.Name == x.Original && (isType(d.Kind) || isCallable(d.Kind)) {
-				local = true
-				if err := add(x.Name, export{Decl: Ref{File: f.file, Index: int32(i)}, Type: isType(d.Kind)}); err != nil {
-					return err
-				}
-			}
-		}
-		if local {
-			continue
-		}
-		for _, imp := range t.Imports {
-			if imp.Name != x.Original {
-				continue
-			}
-			original := imp.Original
-			if original == "" {
-				original = imp.Name
-			}
-			if err := from(x.Name, imp.Path, original); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// closeExports is the exports relation closed over the re-exports: each
-// export of a module a re-export names is also an export of the
-// re-exporting module, under the re-export's name, and `export *` passes on
-// every name but `default`. Each pass joins the re-exports with the exports
-// the last pass added, until a pass adds none.
-func (in *inference) closeExports(exports *pagination.ExternalSort[export], reexports *pagination.ExternalSort[reexport]) (*pagination.SortedRun[export], error) {
-	all, err := sorted(in, exports)
-	if err != nil {
-		return nil, err
-	}
-	rx, err := sorted(in, reexports)
-	if err != nil {
-		return nil, err
-	}
-	if rx.Len() == 0 {
-		return all, nil
-	}
-	delta := all
-	for delta.Len() > 0 {
-		found, err := newSort(in, exportCodec)
-		if err != nil {
-			return nil, err
-		}
-		found.WithFold(keepFirst[export])
-		err = join(rx, delta, func(x reexport, e export) int { return cmp.Compare(x.From, e.Base) },
-			func(x reexport, es []export) error {
-				for _, e := range es {
-					switch {
-					case x.Original == "*":
-						if e.Name == "default" {
-							continue
-						}
-						e.Base = x.Base
-					case x.Original == e.Name:
-						e.Base, e.Name = x.Base, x.Name
-					default:
-						continue
-					}
-					if err := found.Add(e); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-		if err != nil {
-			return nil, err
-		}
-		got, err := sorted(in, found)
-		if err != nil {
-			return nil, err
-		}
-		fresh, err := newSort(in, exportCodec)
-		if err != nil {
-			return nil, err
-		}
-		err = join(got, all, exportCodec.cmp, func(e export, old []export) error {
-			if len(old) == 0 {
-				return fresh.Add(e)
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		if delta, err = sorted(in, fresh); err != nil {
-			return nil, err
-		}
-		if all, err = unionRuns(in, exportCodec, all, delta); err != nil {
-			return nil, err
-		}
-	}
-	return all, nil
 }
 
 // site records one site: its arguments, the bindings and values its own
@@ -1053,7 +818,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 	if f.callables == nil {
 		f.callables = make(map[string][]int32)
 		for i := range t.Decls {
-			if d := &t.Decls[i]; isCallable(d.Kind) {
+			if d := &t.Decls[i]; callable(d) {
 				f.callables[d.Name] = append(f.callables[d.Name], int32(i))
 			}
 		}
@@ -1139,8 +904,9 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 	return nil
 }
 
-// step joins one round: export requests to exports, constructions to
-// constructors, lookups up the supertypes, the round's bindings against
+// step joins one round: export requests to what the modules export,
+// constructions to constructors and lookups to methods (both read from the
+// class hierarchy, in method resolution order), the round's bindings against
 // every earlier one, the new bindings' arguments and returns into edges and
 // values, and the values through the edges. It answers the values new this
 // round.
@@ -1149,27 +915,18 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 	if err != nil {
 		return nil, err
 	}
-	err = join(reqs, in.exports, func(q exportReq, e export) int {
-		return cmp.Or(cmp.Compare(q.Base, e.Base), cmp.Compare(q.Name, e.Name))
-	},
-		func(q exportReq, es []export) error {
-			for _, e := range es {
-				switch {
-				case e.Module != "":
-					// A module is no callable.
-					continue
-				case e.Type:
-					if err := in.receive(ctx, r, recv{Call: q.Call, Role: roleConstruct, X: value{Kind: valInstance, Ref: e.Decl}}); err != nil {
-						return err
-					}
-					continue
-				}
-				if err := r.bindings.Add(binding{Site: q.Call.Site, Target: e.Decl, Rank: rankDirect, Flow: true}); err != nil {
-					return err
-				}
+	err = reqs.Each(func(q exportReq) error {
+		return in.h.moduleExport(q.Base, q.Name, func(e entry) error {
+			switch e.Aux {
+			case exportType:
+				return in.receive(ctx, r, recv{Call: q.Call, Role: roleConstruct, X: value{Kind: valInstance, Ref: e.Ref}})
+			case exportFunc:
+				return r.bindings.Add(binding{Site: q.Call.Site, Target: e.Ref, Rank: rankDirect, Flow: true})
 			}
+			// A module is no callable.
 			return nil
 		})
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1224,24 +981,18 @@ func (in *inference) seedImports(r *round) error {
 	if err != nil {
 		return err
 	}
-	return join(names, in.exports, func(q exportReq, e export) int {
-		return cmp.Or(cmp.Compare(q.Base, e.Base), cmp.Compare(q.Name, e.Name))
-	},
-		func(q exportReq, es []export) error {
-			for _, e := range es {
-				x := value{Kind: valFunction, Ref: e.Decl}
-				switch {
-				case e.Module != "":
-					x = value{Kind: valModule, Path: e.Module}
-				case e.Type:
-					x.Kind = valClass
-				}
-				if err := r.facts.Add(fact{V: importVar(q.Base, q.Name), X: x}); err != nil {
-					return err
-				}
+	return names.Each(func(q exportReq) error {
+		return in.h.moduleExport(q.Base, q.Name, func(e entry) error {
+			x := value{Kind: valFunction, Ref: e.Ref}
+			switch e.Aux {
+			case exportModule:
+				x = value{Kind: valModule, Path: e.Sig}
+			case exportType:
+				x.Kind = valClass
 			}
-			return nil
+			return r.facts.Add(fact{V: importVar(q.Base, q.Name), X: x})
 		})
+	})
 }
 
 // importVar is the variable of the name a module path exports.
@@ -1249,62 +1000,19 @@ func importVar(base, name string) variable {
 	return variable{Kind: varImport, Name: base + "\x00" + name}
 }
 
-// resolveLookups answers each lookup by the methods its type declares, and
-// a type that declares none by its supertypes', one level per pass.
+// resolveLookups answers each lookup by the method its type declares or
+// inherits (hierarchy.declared).
 func (in *inference) resolveLookups(r *round) error {
-	cur, err := sorted(in, r.lookups)
+	ls, err := sorted(in, r.lookups)
 	if err != nil {
 		return err
 	}
-	for cur.Len() > 0 {
-		missing, err := newSort(in, lookupCodec)
-		if err != nil {
-			return err
-		}
-		err = join(cur, in.members, func(l lookup, m member) int { return cmp.Or(compareRef(l.Class, m.Class), cmp.Compare(l.Name, m.Name)) },
-			func(l lookup, ms []member) error {
-				if len(ms) == 0 {
-					return missing.Add(l)
-				}
-				for _, m := range ms {
-					b := binding{Site: l.Call.Site, Target: m.Method, Rank: l.Rank, Flow: true, Shift: l.Unbound && !m.Static}
-					if err := r.bindings.Add(b); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-		if err != nil {
-			return err
-		}
-		miss, err := sorted(in, missing)
-		if err != nil {
-			return err
-		}
-		next, err := newSort(in, lookupCodec)
-		if err != nil {
-			return err
-		}
-		err = join(miss, in.supers, func(l lookup, s super) int { return compareRef(l.Class, s.Class) },
-			func(l lookup, ss []super) error {
-				if l.Depth >= in.types {
-					return nil
-				}
-				for _, s := range ss {
-					if err := next.Add(lookup{Class: s.Super, Name: l.Name, Depth: l.Depth + 1, Call: l.Call, Rank: l.Rank, Unbound: l.Unbound}); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-		if err != nil {
-			return err
-		}
-		if cur, err = sorted(in, next); err != nil {
-			return err
-		}
-	}
-	return nil
+	return ls.Each(func(l lookup) error {
+		return in.h.declared(l.Class, l.Name, func(e entry) error {
+			b := binding{Site: l.Call.Site, Target: e.Ref, Rank: l.Rank, Flow: true, Shift: l.Unbound && e.Flags&flagStatic == 0}
+			return r.bindings.Add(b)
+		})
+	})
 }
 
 // mergeBindings folds the round's bindings into every earlier one and
@@ -1909,55 +1617,16 @@ var lookupCodec = codec[lookup]{
 	put: func(w *wbuf, l lookup) {
 		w.ref(l.Class)
 		w.str(l.Name)
-		w.i32(l.Depth)
 		w.call(l.Call)
 		w.u8(l.Rank)
 		w.flag(l.Unbound)
 	},
 	get: func(r *rbuf) lookup {
-		return lookup{Class: r.ref(), Name: r.str(), Depth: r.i32(), Call: r.call(), Rank: r.u8(), Unbound: r.flag()}
+		return lookup{Class: r.ref(), Name: r.str(), Call: r.call(), Rank: r.u8(), Unbound: r.flag()}
 	},
 	cmp: func(a, b lookup) int {
 		return cmp.Or(compareRef(a.Class, b.Class), cmp.Compare(a.Name, b.Name), cmpCall(a.Call, b.Call),
-			cmp.Compare(a.Rank, b.Rank), cmp.Compare(a.Depth, b.Depth), cmpBool(a.Unbound, b.Unbound))
-	},
-}
-
-var memberCodec = codec[member]{
-	put: func(w *wbuf, m member) { w.ref(m.Class); w.str(m.Name); w.ref(m.Method); w.flag(m.Static) },
-	get: func(r *rbuf) member { return member{Class: r.ref(), Name: r.str(), Method: r.ref(), Static: r.flag()} },
-	cmp: func(a, b member) int {
-		return cmp.Or(compareRef(a.Class, b.Class), cmp.Compare(a.Name, b.Name), compareRef(a.Method, b.Method))
-	},
-}
-
-var superCodec = codec[super]{
-	put: func(w *wbuf, s super) { w.ref(s.Class); w.ref(s.Super) },
-	get: func(r *rbuf) super { return super{Class: r.ref(), Super: r.ref()} },
-	cmp: func(a, b super) int { return cmp.Or(compareRef(a.Class, b.Class), compareRef(a.Super, b.Super)) },
-}
-
-var exportCodec = codec[export]{
-	put: func(w *wbuf, e export) { w.str(e.Base); w.str(e.Name); w.ref(e.Decl); w.flag(e.Type); w.str(e.Module) },
-	get: func(r *rbuf) export {
-		return export{Base: r.str(), Name: r.str(), Decl: r.ref(), Type: r.flag(), Module: r.str()}
-	},
-	cmp: func(a, b export) int {
-		return cmp.Or(cmp.Compare(a.Base, b.Base), cmp.Compare(a.Name, b.Name), compareRef(a.Decl, b.Decl),
-			cmp.Compare(a.Module, b.Module))
-	},
-}
-
-// reexportCodec orders re-exports by the module they read from, the order
-// closeExports joins them in.
-var reexportCodec = codec[reexport]{
-	put: func(w *wbuf, x reexport) { w.str(x.From); w.str(x.Original); w.str(x.Base); w.str(x.Name) },
-	get: func(r *rbuf) reexport {
-		return reexport{From: r.str(), Original: r.str(), Base: r.str(), Name: r.str()}
-	},
-	cmp: func(a, b reexport) int {
-		return cmp.Or(cmp.Compare(a.From, b.From), cmp.Compare(a.Original, b.Original), cmp.Compare(a.Base, b.Base),
-			cmp.Compare(a.Name, b.Name))
+			cmp.Compare(a.Rank, b.Rank), cmpBool(a.Unbound, b.Unbound))
 	},
 }
 
