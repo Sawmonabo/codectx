@@ -319,7 +319,10 @@ func (k *rustLinker) member(n Node) bool {
 }
 
 // export records the Export of a function item or signature whose name is
-// an identifier, the declarations the structural queries capture.
+// an identifier, the declarations the structural queries capture. A self
+// parameter is the receiver, never one of Params, and its presence is what
+// makes the callable not Static; a path call `T::m(x, a)` of such a method
+// passes the receiver x as its first argument.
 func (k *rustLinker) export(n Node) {
 	s := k.k
 	name := n.ChildByFieldId(s.fName)
@@ -341,7 +344,10 @@ func (k *rustLinker) export(n Node) {
 			case k.isSelf(p):
 				x.Static = false
 			case p.KindId() == s.variadicParameter:
+				// A C variadic `...` of a foreign function takes any number
+				// of arguments, none included (wire.Export.Params).
 				x.Params++
+				x.Optional++
 				x.Variadic = true
 			case !k.paramType(p).IsNull():
 				x.Params++
