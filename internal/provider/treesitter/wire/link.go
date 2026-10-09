@@ -32,8 +32,9 @@ type Link struct {
 	Unions [][]Type
 }
 
-// Export describes one declaration of the file that a call may bind to, or a
-// type whose linkage decides which files' names reach it, with the
+// Export describes one declaration of the file that a call may bind to, a
+// type whose linkage decides which files' names reach it, or a Go struct
+// field whose declared type types a receiver that reads it, with the
 // language's type facts the linker reads. A declaration the worker sends
 // no Export for is still a declaration (Decl); it has no type facts.
 type Export struct {
@@ -89,7 +90,8 @@ type Export struct {
 	Internal bool
 	// Returns is the type the callable returns: its declared result type,
 	// or the type the worker recovered from its return statements inside the
-	// file. TypeUnknown when neither says.
+	// file. TypeUnknown when neither says. For a Go struct field it is the
+	// field's declared type, reduced as a Go receiver is (`*T` is T).
 	Returns Type
 }
 
@@ -196,7 +198,12 @@ const (
 	// `super` receiver.
 	TypeSuper TypeKind = 5
 	// TypeField is the value of any field or property Name: what the file's
-	// and the package's Values write to that field.
+	// and the package's Values write to that field. In Go, a field of a
+	// receiver whose type is known is spelled "Owner.field", Owner as
+	// written: the field a selector of that name denotes on Owner, its own or
+	// promoted, whose declared type (Export.Returns) types the value; a bare
+	// name is a field of an unknown owner and types nothing. ECMAScript and
+	// Python send the bare field name.
 	TypeField TypeKind = 6
 	// TypeFunction is the function or method Name, as written, taken as a
 	// value. Index is the receiver parameters the value takes ahead of the

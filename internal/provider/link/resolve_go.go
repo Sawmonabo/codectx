@@ -47,3 +47,24 @@ func goMethodExpression(written, sig string) string {
 	}
 	return "(" + recv + "," + sig[1:]
 }
+
+// fieldGo yields the types a Go field receiver written "Owner.field" holds:
+// for each type Owner denotes in the file, the field a selector of that name
+// on it denotes, its own or promoted through embedding (keyGoField), and the
+// declarations its declared type names, read in the file that declares the
+// field. A field receiver with no owner binds nothing: a field name alone
+// names no type.
+func (r *staticFile) fieldGo(written string, yield func(Ref) error) error {
+	owner, field, ok := cutLast(written, ".")
+	if !ok {
+		return nil
+	}
+	return r.h.typesIn(r.ctx, r.fc, owner, func(typ entry) error {
+		return r.h.links.lookup(keyGoField+refKey(typ.Ref)+field, func(f entry) error {
+			if f.Sig == "" {
+				return nil
+			}
+			return r.h.types(r.ctx, f.Ref.File, f.Sig, yield)
+		})
+	})
+}
