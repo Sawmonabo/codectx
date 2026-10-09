@@ -76,7 +76,7 @@ name (docs/providers-treesitter.md). What a call can bind to differs by family, 
 |---|---|---|
 | Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods | the enclosing class, interface, record or enum |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
-| Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body) | the impl's self type; the trait for a trait method |
+| Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
 | C, C++ | functions and methods, in-class and out-of-class; `Abstract` for a pure virtual function or a declaration a subtype supplies | the enclosing class or struct, or the qualifier of an out-of-class definition |
 | JavaScript, TypeScript, TSX | functions, class methods, object-literal methods | the class |
 | Python | functions and methods; `Static` for `@staticmethod` and `@classmethod` | the class |
@@ -148,6 +148,15 @@ The members' language family picks the resolver:
   indirect site joins every function taken as a value whose declared signature equals the site's
   (`wire.Export.Signature`, `wire/link.go:42-49`). This is the address-taken × indirect-site cross-product, with no
   reachability fixed point.
+
+A Rust path is read through the module it names in its own crate (`internal/provider/link/resolve_rust.go`). A
+crate is the directory Cargo's layout makes its root: the nearest `src` (`lib.rs` and `main.rs` are the root,
+`a/b.rs` is `a::b`, `a/mod.rs` is `a`), or `src/bin`, `tests`, `examples` or `benches`, each of whose files is a
+crate root. Every function and type is keyed by its module, inline `mod` items included. From a file, `crate` is the
+root, `self` its module, each `super` one module up, and any other first component a module the file's module
+declares, once a `use` binding it has been read. A path that leaves the crate binds nothing, and no Rust
+declaration is reached by a suffix of its qualified name. For example, `use crate::a::util; util::f()` binds
+`src/a/util.rs`'s `f` and never `src/b/util.rs`'s.
 
 A type name is read in the file's scopes, then through the import that names it (which decides alone), then
 through the file's imports of every member. Only a name that no scope or import of the file can supply falls back
