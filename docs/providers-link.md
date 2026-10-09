@@ -7,9 +7,11 @@ call site to the declarations it may call, and publishes each binding as a `call
 provider's own nodes.
 
 The structural provider still publishes its syntax-tier `calls` (docs/providers-treesitter.md, Unit scope and node
-identity): a call it resolves inside the file, and the callee reference node of every call it cannot. The linker adds
-the bindings that need another file, a type or a hierarchy. A site it cannot bind publishes nothing here, and the
-structural call stands alone.
+identity): a call it resolves inside the file, and the callee reference node of every call it cannot. The linker
+publishes every binding it can justify, inside the file as well as across files: a site the structural provider bound
+in its file is bound again when the linker reaches the same declaration, and the two edges have one relation id (the
+caller, the kind and the target decide it), so the pair is one relation with both providers' evidence. A site the
+linker cannot bind publishes nothing here, and the structural call stands alone.
 
 ## Descriptor
 
@@ -131,8 +133,11 @@ nothing. Any other build resolves in full and stores its state for the next.
 
 Each resolver reads the unit's tables one at a time, in FileID order (`unit.Files`, `unit.go:27-41`), and emits each
 `Binding` it finds (`unit.go:54-60`). The core sorts every binding by site and target in an external sort that
-spills to disk, and publishes from the sorted stream. Every join is an ordered merge over sorted runs. Nothing the
-size of the project is held in memory. No binding is justified by the callee's name alone: each rests on a scope,
+spills to disk, and publishes from the sorted stream. The type and declaration questions a resolver asks (which
+declarations a name, a package or a module holds; a type's supertypes, subtypes and members) are point lookups into
+sorted index files the hierarchy writes to scratch: a lookup reads from the 32 KiB block that holds its key to the
+key's last entry, located by the first key of every block, which is the one part of an index held in memory (`index`, `internal/provider/link/hierarchy.go`).
+Nothing else the size of the project is held in memory. No binding is justified by the callee's name alone: each rests on a scope,
 an import, a type or a signature.
 
 The members' language family picks the resolver:
