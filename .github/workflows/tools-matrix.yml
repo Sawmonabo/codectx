@@ -4,7 +4,7 @@
 # analyzers. "Unverified against a real tool" is a failure of this workflow, not
 # a label a document may carry.
 #
-# It is not part of CI on every push: one leg downloads about 2.6 GB. It runs
+# It is not part of CI on every push: one leg downloads about 0.75 GB. It runs
 # when the lock, the toolchain runtime or this workflow changes, on demand, and
 # weekly -- the weekly run is what catches an upstream asset that disappeared
 # from the publisher's release while its digest in the lock stayed valid.
@@ -134,7 +134,8 @@ jobs:
           "$CODECTX" tools status --json > "tools-status-${{ matrix.os }}.json"
 
       # The gate itself: nine languages, including C++ and TSX explicitly, each
-      # indexed by the pinned analyzer and parsed by the pinned graph engine.
+      # indexed by the pinned analyzer or, where the lock ships no indexer for
+      # this platform, carried by the pinned language server.
       - name: Smoke every language against the polyglot fixture
         run: go run ./.github/tools-matrix --store "$CODECTX_TOOL_STORE"
 
