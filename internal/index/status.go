@@ -39,7 +39,7 @@ var errWorktreeChanged = errors.New("index: worktree changed")
 
 // StatusOptions are what a status report reads. Store is the handle the report
 // is answered from and Repo the identity it is scoped by; Git and Root are the
-// worktree comparison, and States the composition-time capability rows.
+// worktree comparison.
 //
 // Repo is supplied rather than derived so the derivation keeps exactly one
 // spelling in the process -- Coordinator.New's -- and a reader built beside a
@@ -50,7 +50,6 @@ type StatusOptions struct {
 	Store  *sqlite.Store
 	Git    *git.Git
 	Repo   model.RepositoryID
-	States []model.CapabilityState
 	Logger *slog.Logger
 }
 
@@ -97,8 +96,7 @@ func NewStatusReader(o StatusOptions) (*StatusReader, error) {
 
 // StatusReader is this coordinator's status path over the given store handle,
 // carrying everything the coordinator knows: the repository identity it
-// derived, the composition-time capability rows, and its own watch and
-// retention state.
+// derived and its own watch and retention state.
 //
 // The handle is a parameter because the serving composition answers this
 // report from its read-only handle while the coordinator itself writes through
@@ -106,7 +104,7 @@ func NewStatusReader(o StatusOptions) (*StatusReader, error) {
 // `codectx status` takes.
 func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
 	r, err := NewStatusReader(StatusOptions{Root: c.opts.Root, Config: c.opts.Config, Store: store,
-		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, Logger: c.log})
+		Git: c.opts.Git, Repo: c.repo, Logger: c.log})
 	if err != nil {
 		return nil, err
 	}
@@ -119,11 +117,8 @@ func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
 // workspace is a read, which is why it is legal without the workspace indexing
 // lock.
 //
-// The composition-time rows of StatusOptions.States are folded into the
-// published completeness and the whole list is brought back inside its bound
-// here, so a capability whose provider could not be constructed is reported
-// even by a generation published before it failed, and the answer still
-// validates.
+// The stored completeness is brought back inside its bound here, as the
+// indexing path does before publishing, so the answer validates.
 func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 	gen, err := r.opts.Store.ActiveGeneration(ctx, r.opts.Repo)
 	if err != nil {
@@ -143,7 +138,6 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	states = composedStates(states, enabledComposedStates(r.opts.Config, r.opts.States))
 	states, aggregated := boundStates(states, r.log)
 	coherence, warnings, err := r.coherence(ctx, snap)
 	if err != nil {
@@ -457,22 +451,6 @@ type failureRow struct {
 
 func newCapabilityReport() *capabilityReport {
 	return &capabilityReport{rows: map[string]model.CapabilityState{}, failures: map[string]*failureRow{}}
-}
-
-// newCapabilityReport seeds a report with the composition-time rows of
-// Options.States, minus those of a provider the configuration disabled. A
-// provider that could not be constructed never reaches the registry, so
-// nothing on the indexing path would otherwise report its capabilities at all,
-// and the operator would have to run a second, different command to learn that
-// a capability is unavailable. Seeding here rather than merging above this
-// package is what puts those rows inside the MaxCapabilityStates bound instead
-// of past it.
-func (c *Coordinator) newCapabilityReport() *capabilityReport {
-	r := newCapabilityReport()
-	for _, st := range enabledComposedStates(c.opts.Config, c.opts.States) {
-		r.add(st)
-	}
-	return r
 }
 
 func stateKey(providerID, capability, scope string, state model.CapabilityStateValue) string {
@@ -937,8 +915,8 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 // it must also SUM the counts of the rows it merges.
 //
 // The distinction matters and is not cosmetic. Before the collapse, two rows
-// on one primary key are two assertions about the same scope -- a
-// composition-time row meeting a stored one, say -- and summing their `scopes`
+// on one primary key are two assertions about the same scope -- a planner
+// degradation meeting a failed unit's row, say -- and summing their `scopes`
 // would count one scope twice. After it, collapseScopes has keyed by provider
 // capability AND state, written a `scopes` detail on every row it emits and
 // rewritten each to the workspace scope; the rows that now collide therefore
@@ -975,8 +953,8 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 // boundStates brings an assembled capability list inside
 // model.MaxCapabilityStates and reports how many rows it had to omit. It is
 // the one place the bound is applied: the indexing path calls it through
-// finish, and Status calls it after folding in the composition-time rows, so a
-// published list can never exceed the bound its own contract validates against.
+// finish and Status over the stored list, so a reported list can never exceed
+// the bound its own contract validates against.
 //
 // It is also the one place the primary key of generation_capabilities is
 // closed. Every caller's list is folded to one row per (provider, capability,
@@ -988,7 +966,7 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 // row per provider capability and state, and only if that is still too long is
 // it ordered by severity -- failed, stale, partial, unavailable, then fresh --
 // and cut from the tail. Truncating the assembly order instead would drop the
-// failures and carries, which are appended last, and keep the fresh rows:
+// failures, which are appended last, and keep the fresh rows:
 // Section 13.3 allows a report to under-claim and never to over-claim.
 // Truncation only removes rows, so the folded key stays closed.
 func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.CapabilityState, bool) {
@@ -1058,30 +1036,6 @@ func severityRank(s model.CapabilityStateValue) int {
 		return 5
 	}
 	return 4
-}
-
-// composedStates folds the composition-time rows of Options.States into a list
-// read back from a published generation. A generation this build published
-// already holds them, so the fold is keyed by provider capability and the
-// published row wins: one published under an older build, or by a process
-// whose provider did construct, gains the row it is missing rather than
-// growing a duplicate.
-func composedStates(published, composed []model.CapabilityState) []model.CapabilityState {
-	if len(composed) == 0 {
-		return published
-	}
-	have := make(map[string]bool, len(published))
-	for _, s := range published {
-		have[s.ProviderID+"\x00"+s.Capability] = true
-	}
-	out := slices.Clone(published)
-	for _, s := range composed {
-		if have[s.ProviderID+"\x00"+s.Capability] {
-			continue
-		}
-		out = append(out, s)
-	}
-	return out
 }
 
 // collapseScopes folds every per-scope row of one provider capability and

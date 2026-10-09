@@ -142,27 +142,14 @@ CREATE TABLE unit_dependencies (
     PRIMARY KEY(unit_id, dependency_id),
     CHECK(unit_id <> dependency_id)
 ) WITHOUT ROWID;
--- carried marks the Section 13.3 stale-with-distance member: the scope's
--- previous sealed unit, kept in the generation while its fresh rebuild is
--- still running. Such a unit's inputs differ from the generation's snapshot by
--- definition, so AttachCarried admits it where AttachUnit refuses, and the two
--- distance columns record how far behind it is (generations, and changed files
--- between its snapshot and this one). All three columns are folded into the
--- membership digest, and therefore into the AnalysisKey: without them a
--- generation carrying a stale unit would be byte-identical to one that rebuilt
--- it, and a stale answer would be indistinguishable from a fresh one.
 CREATE TABLE generation_units (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
     provider_id TEXT NOT NULL,
     scope_key TEXT NOT NULL,
     unit_id INTEGER NOT NULL,
-    carried INTEGER NOT NULL CHECK(carried IN (0,1)),
-    distance_generations INTEGER NOT NULL CHECK(distance_generations >= 0),
-    distance_files INTEGER NOT NULL CHECK(distance_files >= 0),
     PRIMARY KEY(generation_id, provider_id, scope_key),
     UNIQUE(generation_id, unit_id),
-    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key),
-    CHECK(carried = 1 OR (distance_generations = 0 AND distance_files = 0))
+    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key)
 ) WITHOUT ROWID;
 CREATE TABLE generation_capabilities (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
@@ -176,13 +163,6 @@ CREATE TABLE generation_capabilities (
     -- provider's own bounded budget: a remediation charged to it could be the
     -- entry a busy row drops.
     remediation TEXT NOT NULL DEFAULT '',
-    -- units_running is how many scopes of this capability were still being
-    -- built in the background when the generation was published. It is stored
-    -- because it is the only way a process other than the one doing the work
-    -- learns that the capability has work in flight. It is NOT folded into
-    -- the capability digest: it is what was in flight at publication, which is
-    -- scheduling and not content.
-    units_running INTEGER NOT NULL DEFAULT 0 CHECK(units_running >= 0),
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;

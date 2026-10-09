@@ -190,7 +190,7 @@ func (f *providerFailures) add(scopeKey string, failure unitFailure) {
 // otherwise, and the deferred finish closes the run on every exit path --
 // including the one that aborts the staging generation.
 func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res model.IndexResult, err error) {
-	g := &generation{c: c, req: req, started: c.now(), caps: c.newCapabilityReport()}
+	g := &generation{c: c, req: req, started: c.now(), caps: newCapabilityReport()}
 	g.ledgerRun = c.newRun(ledger.KindIndex)
 	ctx = g.ledgerRun.Context(ctx)
 	// The reclaimer's own total when this run opened. What it gave back while

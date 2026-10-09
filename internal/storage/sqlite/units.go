@@ -1436,7 +1436,7 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 				return err
 			}
 		}
-		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey, false, Carry{})
+		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey)
 	})
 	if err != nil {
 		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
@@ -1460,15 +1460,13 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	return err
 }
 
-// attach inserts the generation membership row for a unit. carried and its
-// distance are zero for every fresh or reused member; only AttachCarried
-// passes a nonzero carry (Section 13.3).
-func (s *Store) attach(ctx context.Context, tx *sql.Tx, gen model.GenerationID, unitRow int64, providerID, scopeKey string, carried bool, c Carry) error {
+// attach inserts the generation membership row for a unit.
+func (s *Store) attach(ctx context.Context, tx *sql.Tx, gen model.GenerationID, unitRow int64, providerID, scopeKey string) error {
 	if _, err := s.generationRow(ctx, tx, gen, model.GenerationStaging); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO generation_units(generation_id, provider_id, scope_key, unit_id, carried, distance_generations, distance_files)
-		VALUES(?, ?, ?, ?, ?, ?, ?)`, int64(gen), providerID, scopeKey, unitRow, boolInt(carried), c.DistanceGenerations, c.DistanceFiles)
+	_, err := tx.ExecContext(ctx, `INSERT INTO generation_units(generation_id, provider_id, scope_key, unit_id)
+		VALUES(?, ?, ?, ?)`, int64(gen), providerID, scopeKey, unitRow)
 	if err != nil {
 		wrapped := wrap("generation_units", err)
 		if typed, ok := wrapped.(*model.Error); ok && typed.Code == model.CodeArgumentInvalid {
@@ -1517,7 +1515,7 @@ func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit mod
 				Message: fmt.Sprintf("unit cannot be reused: %d of its inputs differ from the selected snapshot", mismatched),
 				Details: map[string]string{"unit_id": string(unit)}}
 		}
-		return s.attach(ctx, tx, gen, row, providerID, scopeKey, false, Carry{})
+		return s.attach(ctx, tx, gen, row, providerID, scopeKey)
 	})
 }
 
@@ -1602,28 +1600,16 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			{"members that are not sealed", `SELECT count(*) FROM generation_units gu JOIN units u ON u.id = gu.unit_id WHERE gu.generation_id = ?1 AND u.state <> 'sealed'`},
 			{"member dependencies that are not members", `SELECT count(*) FROM generation_units gu JOIN unit_dependencies ud ON ud.unit_id = gu.unit_id
 				WHERE gu.generation_id = ?1 AND NOT EXISTS (SELECT 1 FROM generation_units g2 WHERE g2.generation_id = ?1 AND g2.unit_id = ud.dependency_id)`},
-			// A carried member is exempt from input equality and from it alone:
-			// Section 13.3 carries the previous sealed unit precisely because
-			// its inputs no longer match the snapshot. What still holds for it
-			// is that its inputs exist — a unit whose files were deleted is
-			// never carried — so the carried rows are checked for existence
-			// instead, and both checks run over the frozen membership.
-			//
-			// Neither check is reachable from the store's own writers, and no
-			// test guards either: AttachUnit and AttachCarried apply the same
-			// two predicates against the same generation's snapshot, and a
+			// Not reachable from the store's own writers: AttachUnit applies the
+			// same predicate against the same generation's snapshot, and a
 			// snapshot's snapshot_files rows are immutable once PutSnapshot
 			// returns, so the set cannot move between attach and activation.
-			// They are defence in depth over the one moment that publishes
-			// facts to every reader, and they are deliberately symmetric: do
-			// not "simplify" either away believing a test protects it, and do
-			// not delete one without the other.
+			// It is defence in depth over the one moment that publishes facts
+			// to every reader; no test guards it, so do not remove it believing
+			// one does.
 			{"member inputs that differ from the snapshot", `SELECT count(*) FROM generation_units gu JOIN unit_inputs ui ON ui.unit_id = gu.unit_id
-				WHERE gu.generation_id = ?1 AND gu.carried = 0 AND NOT EXISTS (SELECT 1 FROM snapshot_files sf JOIN generations g ON g.snapshot_id = sf.snapshot_id
+				WHERE gu.generation_id = ?1 AND NOT EXISTS (SELECT 1 FROM snapshot_files sf JOIN generations g ON g.snapshot_id = sf.snapshot_id
 				WHERE g.id = ?1 AND sf.file_id = ui.file_id AND sf.content_hash = ui.content_hash AND sf.executable = ui.executable AND sf.status <> 'deleted')`},
-			{"carried member inputs that no longer exist in the snapshot", `SELECT count(*) FROM generation_units gu JOIN unit_inputs ui ON ui.unit_id = gu.unit_id
-				WHERE gu.generation_id = ?1 AND gu.carried = 1 AND NOT EXISTS (SELECT 1 FROM snapshot_files sf JOIN generations g ON g.snapshot_id = sf.snapshot_id
-				WHERE g.id = ?1 AND sf.file_id = ui.file_id AND sf.status <> 'deleted')`},
 			{"relation endpoints with no visible node fact", `SELECT count(*) FROM generation_units gu JOIN relation_facts rf ON rf.unit_id = gu.unit_id
 				JOIN relation_ids ri ON ri.id = rf.relation_id WHERE gu.generation_id = ?1 AND (
 				NOT EXISTS (SELECT 1 FROM node_facts nf JOIN generation_units g2 ON g2.unit_id = nf.unit_id WHERE g2.generation_id = ?1 AND nf.node_id = ri.from_node_id)
@@ -1653,8 +1639,8 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if _, err := tx.ExecContext(ctx, `DELETE FROM generation_capabilities WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("generation_capabilities", err)
 		}
-		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, units_running, details_json)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, details_json)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
@@ -1665,18 +1651,15 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 				return err
 			}
 			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State),
-				c.DiagnosticCode, c.Remediation, c.UnitsRunning, details); err != nil {
+				c.DiagnosticCode, c.Remediation, details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 		}
 
-		// The membership digest folds each member's staleness with its key.
-		// Folding the key alone would make a generation that carries a stale
-		// unit byte-identical to one that rebuilt it over the same snapshot,
-		// so the two would share an AnalysisKey and a stale answer could not
-		// be told from a fresh one (Section 20.2 determinism).
+		// The membership digest folds every member's unit key in key order
+		// (Section 20.2 determinism).
 		membership := model.NewHasher(domainMembership)
-		if err := foldColumn(ctx, tx, membership, `SELECT lower(hex(u.unit_key)) || char(0) || gu.carried || char(0) || gu.distance_generations || char(0) || gu.distance_files
+		if err := foldColumn(ctx, tx, membership, `SELECT lower(hex(u.unit_key))
 			FROM generation_units gu JOIN units u ON u.id = gu.unit_id WHERE gu.generation_id = ? ORDER BY u.unit_key`, g.id); err != nil {
 			return err
 		}
@@ -1684,12 +1667,6 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		// they were written. remediation is in it because it is a function of
 		// the typed failure, exactly as diagnostic_code and the message inside
 		// details_json are: two identical runs produce the same string.
-		// units_running is deliberately NOT, and must not be added: it records
-		// how many scopes happened to still be in flight at the moment the
-		// generation was published, which is scheduling and not content, so
-		// two rebuilds of one workspace under one configuration can
-		// legitimately differ on it and folding it in would make the digest
-		// nondeterministic (Section 20.2).
 		capsHash := model.NewHasher(domainCapabilities)
 		if err := foldColumn(ctx, tx, capsHash, `SELECT provider_id || char(0) || capability || char(0) || scope_key || char(0) || state || char(0) || diagnostic_code
 			|| char(0) || remediation || char(0) || details_json

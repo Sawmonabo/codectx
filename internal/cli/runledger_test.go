@@ -271,8 +271,9 @@ func ledgerCommand() (*cobra.Command, *bytes.Buffer) {
 // against two failures that look opposite and are both silent.
 //
 // The rows reach every subscriber from every run this process records, so a
-// deferred run recorded by a late seal tick would print its stages into an
-// index command's output, where an operator reads them as that command's work.
+// run another caller in the same process records would print its stages into
+// an index command's output, where an operator reads them as that command's
+// work.
 //
 // The second failure is the fix's own: the run id does not exist when the
 // subscription is made, so a filter that captures it once captures nothing and

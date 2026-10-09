@@ -342,9 +342,9 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 			"The answer also carries the package rollup that summarises it: distinct " +
 			"package-to-package pairs with their evidence counts. A rollup pair is a summary, " +
 			"never a precise symbol-level call.\n\n" +
-			"The same bounds as the call commands apply, and a capability that is still building " +
-			"is reported as a warning: the result then states that it is not exhaustive rather " +
-			"than claiming complete impact.\n\n" + nameArgumentHelp,
+			"The same bounds as the call commands apply, and a capability that is unavailable or " +
+			"failed is named in a warning, so the result never claims complete impact over facts " +
+			"it did not have.\n\n" + nameArgumentHelp,
 		Args:          cobra.RangeArgs(1, model.MaxStartNodes),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -512,9 +512,7 @@ func emitQuery[T any](cmd *cobra.Command, build model.BuildInfo, args []string, 
 // what was asked (a page bound clamped to the wire ceiling, say). All three
 // reach the operator on both output paths -- an answer that is not exhaustive,
 // or not the answer that was asked for, and does not say so is the failure
-// Section 13.3 names. A capability's count of units still building is not
-// repeated in its note: the text path prints it on the row's own line
-// (writeCapabilities) and the JSON path carries it as the row's units_running.
+// Section 13.3 names.
 func queryWarnings(meta model.QueryMeta) []string {
 	var warnings []string
 	warnings = append(warnings, meta.Notices...)

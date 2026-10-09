@@ -39,10 +39,7 @@ type IndexResult struct {
 	Completeness []CapabilityState `json:"completeness"`
 	UnitsReused  int64             `json:"units_reused"`
 	UnitsBuilt   int64             `json:"units_built"`
-	// UnitsCarried counts sealed units of a refreshing semantic scope carried
-	// into this generation as stale with provenance distance (Section 13.3);
 	// UnitsInvalidated counts previously reusable units this run had to rebuild.
-	UnitsCarried     int64 `json:"units_carried"`
 	UnitsInvalidated int64 `json:"units_invalidated"`
 	FilesParsed      int64 `json:"files_parsed"`
 	FilesCaptured    int64 `json:"files_captured"`
