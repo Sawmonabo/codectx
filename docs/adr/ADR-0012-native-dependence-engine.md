@@ -40,6 +40,8 @@ goldens, each derived twice, the second derivation blind, plus one test pass, on
 engine's importer publishes no relation from that change on, and the engine is then deleted. The two call-resolution
 targets of the measurements section, ≥ 95% on a configured typed repository and ≥ 85% on an unconfigured or
 dynamic-language one, are not gates of phases 4 and 5. They are measured in the proofs after the engine's deletion.
+Decision 9's `calls` keying is amended in place: the linking unit is keyed on its files' content, and the table
+digests decide what a rebuild costs.
 Decisions 1, 2, 4, 5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
 but impact still excludes them (`internal/graph/cost.go:83-89`) and no program-dependence relation set joins them.
 
@@ -643,9 +645,22 @@ what it is, and the retirement gate's parity condition is what proves the label 
   file's structural facts.
   The structural provider is Required, and a failed unit fails the generation
   (`internal/index/generation.go:1392-1394`).
-- **`calls`.** A new package-scoped linking provider publishes `calls`. It is keyed on per-file digests of each file's
-  export table and call-site table, so an edit inside a function body does not trigger a relink. Unit inputs are files
-  today (`internal/index/delta/delta.go:56-72`), so this is a model addition.
+- **`calls`.** A new package-scoped linking provider publishes `calls`. As accepted, it was to be keyed on per-file
+  digests of each file's export table and call-site table, so that an edit inside a function body would not trigger a
+  relink. **Amended 2026-10-08:** the unit is keyed on its member files' content, like every unit (`Request.Inputs`,
+  `internal/index/delta/delta.go:63-80`), and the digests decide what a rebuild costs.
+  - *Why not the digests.* The published facts bind their evidence to each file's bytes and ranges
+    (`model.NewEvidenceID`), and units are reused only on a full fingerprint match. A unit keyed on the digests would
+    be reused after a body edit with evidence about bytes that are gone.
+  - *What a body edit costs.* Each structural unit stores its table's member digest beside the table, and each linking
+    input records it (`model.UnitInput.Digest`, a model addition). The rebuild reads one small digest per member and
+    decodes no table to compare them. When membership and every digest hold, it resolves nothing. It inherits the
+    predecessor's resolution and coverage, and republishes only the facts whose evidence lies in a file whose bytes
+    changed. Every other fact is carried over with those files named replaced. A table is read only when that
+    republication needs it: the edited file's, and the tables of the declarations its sites bind.
+  - *What it does not save.* The edited file's own facts are republished. The rebuild also walks the unit's inputs
+    without reading a table: to compare the digests, and to name the changed files to each publication pass and to the
+    carry-over.
 - **Per-file reindexing.** The four file-local families reuse structural file units on a fingerprint match.
 - **The `dependence` id is never reused.** That keeps two conditions measurable: phase 3's zero dependence-provider rows
   and retirement condition 2.

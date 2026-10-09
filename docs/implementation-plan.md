@@ -1094,6 +1094,10 @@ CREATE TABLE unit_inputs (
     file_id BLOB NOT NULL REFERENCES files(id),
     content_hash BLOB NOT NULL REFERENCES blobs(hash),
     executable INTEGER NOT NULL CHECK(executable IN (0,1)),
+    -- digest is the digest of the table another unit derived from the file
+    -- that this unit read in place of its bytes (model.UnitInput.Digest): for
+    -- a linking unit, the file's link tables. NULL for an input read as bytes.
+    digest BLOB CHECK(digest IS NULL OR length(digest) = 32),
     PRIMARY KEY(unit_id, file_id)
 ) WITHOUT ROWID;
 CREATE TABLE unit_dependencies (

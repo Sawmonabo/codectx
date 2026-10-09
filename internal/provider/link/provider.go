@@ -5,10 +5,11 @@
 //
 // A unit is one project of the repository, the scopes dependence.PlanUnits
 // derives. Its inputs are the project's member files, each recording the
-// digest of the table it linked (model.UnitInput.Digest). A build whose every
-// member digest equals its predecessor's resolves nothing: it re-emits the
-// predecessor's resolution with the ranges and identities of the fresh
-// tables (docs/providers-link.md).
+// MemberDigest of the table it linked (model.UnitInput.Digest). A build whose
+// every member digest equals its predecessor's resolves nothing: it inherits
+// the predecessor's resolution, republishes only the facts of the members
+// whose content changed, and the build carries the rest over
+// (docs/providers-link.md).
 //
 // Resolution is decision 2's, per language family: class-hierarchy analysis
 // for Java; direct binding, the signature-keyed address-taken × indirect-site
@@ -28,9 +29,11 @@ import (
 	"strconv"
 	"sync"
 
+	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -81,8 +84,22 @@ const (
 // LinkOptions is what the delta build hands one unit's link.
 type LinkOptions struct {
 	// Previous streams the predecessor's resolution state when every member
-	// table keeps its predecessor's digest; nil resolves in full.
+	// keeps its predecessor's MemberDigest; nil resolves in full. The build
+	// validates it first (ValidateState): Link refuses a corrupt one.
 	Previous io.Reader
+	// Edited, with Previous, streams the FileIDs of the members whose content
+	// changed since the predecessor, in ascending order; it may name files
+	// that are not members and must yield the same IDs on every walk. Link
+	// then publishes only the facts whose evidence lies in an edited member
+	// and takes the coverage from Previous: the build carries the
+	// predecessor's other facts over. Nil publishes every fact.
+	Edited func(yield func(model.FileID) error) error
+	// Members, when set, streams the unit's inputs as file versions in
+	// ascending FileID order, the members among them and possibly other
+	// inputs (a manifest); Link keeps the unit's members of them and does
+	// not sort the manifest for them. It must yield the same files on every
+	// walk. Nil finds the members in the pinned snapshot.
+	Members func(yield func(model.FileVersion) error) error
 	// State receives this unit's resolution state, which the build stores
 	// under ResolutionKind; nil writes none.
 	State io.Writer
@@ -120,10 +137,14 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 }
 
 // Link links one unit: it streams the members' tables, resolves every site
-// (or re-emits opts.Previous), publishes `calls` and writes the resolution
-// state to opts.State.
+// (or inherits opts.Previous), publishes `calls` (every fact, or with
+// opts.Edited only the edited members') and writes the resolution state to
+// opts.State.
 func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts LinkOptions) (model.ProviderResult, error) {
 	failed := model.ProviderResult{RunID: req.Run, State: model.RunFailed}
+	if opts.Edited != nil && opts.Previous == nil {
+		return failed, internalErr("a link that publishes only the edited members needs the predecessor's resolution")
+	}
 	// The unit's sorted runs spill into a directory of its own, removed
 	// through the pace when the link ends.
 	dir, err := os.MkdirTemp(opts.Dir, "codectx-link-")
@@ -132,14 +153,41 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	defer paced.RemoveAll(dir)
 
-	members, err := planMembers(ctx, req, dir)
-	if err != nil {
-		return failed, err
+	// The delta build hands the unit its planned inputs (opts.Members), whose
+	// membership the planner already decided, so they are kept by family and
+	// liveness alone and the snapshot is not walked. Without them the unit
+	// plans its own members in one read of the manifest.
+	var pu dependence.Unit
+	var each func(yield func(model.FileVersion) error) error
+	var count int64
+	if opts.Members != nil {
+		family, root, ok := dependence.ParseScopeKey(req.Unit.ScopeKey)
+		if !ok {
+			return failed, &model.Error{Code: model.CodeArgumentInvalid, Message: "the linking provider has no unit for this scope",
+				Details: map[string]string{"scope_key": req.Unit.ScopeKey}}
+		}
+		pu = dependence.Unit{ScopeKey: req.Unit.ScopeKey, Family: family, Root: root}
+		each = func(yield func(model.FileVersion) error) error {
+			return opts.Members(func(fv model.FileVersion) error {
+				if fv.Status == model.FileDeleted || dependence.FamilyOf(srclang.Of(fv.Path)) != family {
+					return nil
+				}
+				return yield(fv)
+			})
+		}
+		if err := each(func(model.FileVersion) error { count++; return nil }); err != nil {
+			return failed, err
+		}
+	} else {
+		members, err := planMembers(ctx, req, dir)
+		if err != nil {
+			return failed, err
+		}
+		defer members.Close()
+		pu, each, count = members.unit, members.Each, members.Len()
 	}
-	defer members.Close()
-	pu := members.unit
 	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir, root: pu.Root, content: req.Content,
-		members: members.Each}
+		members: each}
 
 	sorted, err := newBindingSort(dir, compareSiteTarget)
 	if err != nil {
@@ -157,8 +205,9 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		defer mu.Unlock()
 		return sorted.Add(b)
 	}
+	var inherited coverage
 	if opts.Previous != nil {
-		err = readState(opts.Previous, emit)
+		inherited, err = readState(opts.Previous, emit)
 	} else {
 		err = resolverFor(pu.Family)(ctx, u, emit)
 	}
@@ -170,16 +219,19 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		return failed, err
 	}
 	defer bindings.Close()
-	if opts.State != nil {
-		if err := writeState(opts.State, bindings); err != nil {
-			return failed, err
-		}
-	}
 
-	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: members.Len()}
+	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: count, edited: opts.Edited}
+	if opts.Edited != nil {
+		pub.cov = inherited
+	}
 	if err := pub.publish(bindings); err != nil {
 		failed.RecordsEmitted = pub.records
 		return failed, err
+	}
+	if opts.State != nil {
+		if err := writeState(opts.State, bindings, pub.cov); err != nil {
+			return failed, err
+		}
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
 		Capabilities: []model.CapabilityState{pub.capability()}}, nil

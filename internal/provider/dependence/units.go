@@ -429,7 +429,7 @@ func nested(d string, dirs []string) []string {
 // whole snapshot: PlanUnits reads the manifest twice for every family, and a
 // unit that only needs its own membership pays for none of that.
 func PlanUnit(ctx context.Context, view model.SnapshotView, scopeKey string, candidate func(model.FileVersion) error) (Unit, bool, error) {
-	f, root, ok := parseScopeKey(scopeKey)
+	f, root, ok := ParseScopeKey(scopeKey)
 	if !ok {
 		return Unit{}, false, nil
 	}
@@ -462,9 +462,9 @@ func PlanUnit(ctx context.Context, view model.SnapshotView, scopeKey string, can
 	return Unit{}, false, nil
 }
 
-// parseScopeKey is the family and root a unit's scope key names (scopeKey),
+// ParseScopeKey is the family and root a unit's scope key names (scopeKey),
 // and false for a key no unit carries.
-func parseScopeKey(key string) (Family, string, bool) {
+func ParseScopeKey(key string) (Family, string, bool) {
 	if key == ScopeWorkspace {
 		return FamilyC, "", true
 	}

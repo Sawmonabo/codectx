@@ -325,7 +325,9 @@ func (b *builder) enclosing(byStart []int, s wire.Span) int32 {
 }
 
 // storeTable stores the file's link table with the unit, under
-// link.TableKind, when the builder joined one.
+// link.TableKind, when the builder joined one, and its link.MemberDigest
+// beside it under link.DigestKind, which a linking unit's delta reads in
+// place of the table.
 func (b *builder) storeTable(sink provider.StateSink) error {
 	if b.table == nil {
 		return nil
@@ -334,6 +336,13 @@ func (b *builder) storeTable(sink provider.StateSink) error {
 	if err != nil {
 		return &model.Error{Code: model.CodeInternal, Message: "link table of " + bound(b.fv.Path, 256) + ": " + err.Error()}
 	}
+	digest, err := link.MemberDigest(b.table)
+	if err != nil {
+		return &model.Error{Code: model.CodeInternal, Message: "link table digest of " + bound(b.fv.Path, 256) + ": " + err.Error()}
+	}
 	b.table = nil
-	return sink.PutState(b.ctx, link.TableKind, payload)
+	if err := sink.PutState(b.ctx, link.TableKind, payload); err != nil {
+		return err
+	}
+	return sink.PutState(b.ctx, link.DigestKind, []byte(digest))
 }

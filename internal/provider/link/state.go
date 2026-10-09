@@ -14,15 +14,17 @@ import (
 
 // The resolution state is a unit's bindings, positional: each names its site
 // and its target by member ordinal and table index, never by range or node
-// identity. A later build whose every member table keeps its digest holds
-// the same declarations and sites at the same indices, so it re-emits the
-// state against its own fresh tables and publishes the fresh ranges and
-// identities without resolving anything.
+// identity, and the unit's coverage. A later build whose every member keeps
+// its MemberDigest holds the same declarations and sites at the same indices
+// and drops the same entries, so it inherits the bindings and the coverage
+// without resolving anything.
 //
 // The stored form is the binding count, then each binding in site-then-target
 // order: site file, site index, target file, target index (unsigned varints)
-// and the technique as one byte. The count comes first so a stored state is
-// never empty, which storage refuses, and so a short state is detected.
+// and the technique as one byte; then the coverage: the members without a
+// table and the table entries dropped (unsigned varints). The count comes
+// first so a stored state is never empty, which storage refuses, and so a
+// short state is detected.
 
 // details is every technique a binding can carry, in its stored order.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField}
@@ -96,8 +98,8 @@ func keepOne(a, b Binding) (Binding, error) {
 	return a, nil
 }
 
-// writeState stores run, the unit's folded bindings, to w.
-func writeState(w io.Writer, run *pagination.SortedRun[Binding]) error {
+// writeState stores run, the unit's folded bindings, and cov to w.
+func writeState(w io.Writer, run *pagination.SortedRun[Binding], cov coverage) error {
 	bw := bufio.NewWriter(w)
 	if _, err := bw.Write(binary.AppendUvarint(nil, uint64(run.Len()))); err != nil {
 		return internalErr("link resolution state: " + err.Error())
@@ -111,6 +113,9 @@ func writeState(w io.Writer, run *pagination.SortedRun[Binding]) error {
 		return err
 	})
 	if err == nil {
+		_, err = bw.Write(binary.AppendUvarint(binary.AppendUvarint(nil, uint64(cov.untabled)), uint64(cov.dropped)))
+	}
+	if err == nil {
 		err = bw.Flush()
 	}
 	if err != nil {
@@ -119,39 +124,56 @@ func writeState(w io.Writer, run *pagination.SortedRun[Binding]) error {
 	return nil
 }
 
-// readState streams a stored state's bindings to add, in their stored order.
-// A state that is short, long or malformed is corrupt storage.
-func readState(r io.Reader, add func(Binding) error) error {
+// readState streams a stored state's bindings to add, in their stored order,
+// and returns its coverage. A state that is short, long or malformed is
+// corrupt storage.
+func readState(r io.Reader, add func(Binding) error) (coverage, error) {
 	br := bufio.NewReader(r)
 	n, err := binary.ReadUvarint(br)
 	if err != nil {
-		return stateCorrupt("its binding count is unreadable")
+		return coverage{}, stateCorrupt("its binding count is unreadable")
 	}
 	for i := uint64(0); i < n; i++ {
 		var rec []byte
 		for range 4 {
 			v, err := binary.ReadUvarint(br)
 			if err != nil {
-				return stateCorrupt("binding " + strconv.FormatUint(i, 10) + " of " + strconv.FormatUint(n, 10) + " is short")
+				return coverage{}, stateCorrupt("binding " + strconv.FormatUint(i, 10) + " of " + strconv.FormatUint(n, 10) + " is short")
 			}
 			rec = binary.AppendUvarint(rec, v)
 		}
 		code, err := br.ReadByte()
 		if err != nil {
-			return stateCorrupt("binding " + strconv.FormatUint(i, 10) + " of " + strconv.FormatUint(n, 10) + " is short")
+			return coverage{}, stateCorrupt("binding " + strconv.FormatUint(i, 10) + " of " + strconv.FormatUint(n, 10) + " is short")
 		}
 		b, err := decodeBinding(append(rec, code))
 		if err != nil {
-			return stateCorrupt(err.Error())
+			return coverage{}, stateCorrupt(err.Error())
 		}
 		if err := add(b); err != nil {
-			return err
+			return coverage{}, err
 		}
 	}
-	if _, err := br.ReadByte(); err != io.EOF {
-		return stateCorrupt("it holds more than its " + strconv.FormatUint(n, 10) + " bindings")
+	var cov coverage
+	for _, v := range [...]*int64{&cov.untabled, &cov.dropped} {
+		c, err := binary.ReadUvarint(br)
+		if err != nil || c > 1<<63-1 {
+			return coverage{}, stateCorrupt("its coverage is unreadable")
+		}
+		*v = int64(c)
 	}
-	return nil
+	if _, err := br.ReadByte(); err != io.EOF {
+		return coverage{}, stateCorrupt("it holds more than its " + strconv.FormatUint(n, 10) + " bindings and its coverage")
+	}
+	return cov, nil
+}
+
+// ValidateState reads a stored resolution state through and reports whether
+// it is well formed, so a build can resolve in full instead of handing Link a
+// state it would refuse once it had begun publishing.
+func ValidateState(r io.Reader) error {
+	_, err := readState(r, func(Binding) error { return nil })
+	return err
 }
 
 func stateCorrupt(msg string) *model.Error {
