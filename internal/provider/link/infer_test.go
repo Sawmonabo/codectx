@@ -72,7 +72,10 @@ func TestInferGoldens(t *testing.T) {
 		return Binding{Site: Ref{File: sf, Index: si}, Target: Ref{File: tf, Index: ti}, Detail: detail}
 	}
 	cases := []struct {
-		name   string
+		name string
+		// anchor is the language reference, by standard title and section,
+		// the expected bindings are read from.
+		anchor string
 		source string
 		tables []*Table
 		want   []Binding
@@ -80,6 +83,9 @@ func TestInferGoldens(t *testing.T) {
 		mutation string
 	}{{
 		name: "assignment flow through a field",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree on every binding.
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors), §13.3.5 (The new Operator), §13.3.6 (Function Calls)",
 		source: `class Engine { start() {} }
 class Car {
   constructor() { this.engine = new Engine(); }
@@ -99,6 +105,9 @@ class Car {
 		mutation: "a field write that adds no edge into the field's variable leaves `this.engine.start()` unbound",
 	}, {
 		name: "parameter flow across an import",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree on every binding.
+		anchor: "ECMA-262 (15th edition, 2024) §16.2.2 (Imports: NameSpaceImport), §13.3.6 (Function Calls: argument binding)",
 		source: `// src/a.js
 import * as b from './b.js';
 class Job { exec() {} }
@@ -121,6 +130,9 @@ export function run(task) { task.exec(); }`,
 		mutation: "connecting an argument to a parameter of the caller instead of the callee leaves `task.exec()` unbound",
 	}, {
 		name: "return flow",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree on every binding.
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.6 (Function Calls), §14.10 (The return Statement)",
 		source: `class Logger { write() {} }
 function make() { return new Logger(); }
 function use() { const l = make(); l.write(); }`,
@@ -136,6 +148,11 @@ function use() { const l = make(); l.write(); }`,
 		mutation: "dropping a bound target's returns from the site's result leaves `l.write()` unbound",
 	}, {
 		name: "field-based resolution",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree on every binding. The second derivation noted that
+		// nothing in the case passes `fire` an argument, so flow alone binds nothing; both take the field-
+		// based answer, onClick, which is the technique the case is for.
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors), §13.15.2 (Assignment to a property)",
 		source: `function onClick() {}
 const handlers = {};
 handlers.click = onClick;
@@ -149,6 +166,9 @@ export function fire(h) { h.click(); }`,
 		mutation: "a member site that watches only its receiver, not the field it calls, leaves `h.click()` unbound",
 	}, {
 		name: "an imported function written to a field",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree on every binding.
+		anchor: "ECMA-262 (15th edition, 2024) §16.2.2 (Imports: ImportSpecifier `as`), §13.3.2 (Property Accessors)",
 		source: `// src/a.js
 import { onSave as save } from './h.js';
 const actions = {};
@@ -172,6 +192,9 @@ export function save() {}`,
 		mutation: "evaluating `./h.js#onSave` as a module path leaves `x.save()` unbound; looking up the local name binds h.js save",
 	}, {
 		name: "class-hierarchy analysis and super",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree on every binding.
+		anchor: "ECMA-262 (15th edition, 2024) §15.7 (Class Definitions: extends), §13.3.7 (The super Keyword)",
 		source: `class Shape {
   area() { return 0; }
   describe() { return this.area(); }
@@ -202,7 +225,7 @@ class Circle extends Shape {}`,
 			}
 			slices.SortFunc(got, func(a, b Binding) int { return cmpBinding(a, b) })
 			if !slices.Equal(got, c.want) {
-				t.Fatalf("source:\n%s\ngot  %v\nwant %v\n(fails under: %s)", c.source, got, c.want, c.mutation)
+				t.Fatalf("%s\nsource:\n%s\ngot  %v\nwant %v\n(fails under: %s)", c.anchor, c.source, got, c.want, c.mutation)
 			}
 		})
 	}
