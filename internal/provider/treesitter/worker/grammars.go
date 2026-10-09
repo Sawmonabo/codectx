@@ -18,6 +18,8 @@ import (
 	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
 	tree_sitter_rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
+
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 )
 
 // grammar binds one pinned language to its compiled parser and the small set
@@ -493,71 +495,14 @@ func firstSegment(s, sep string) string {
 	return s
 }
 
-// rustUseNames derives the local names of a use path: the last segment, an
-// `as` alias, or every leaf of a `{a, b as c}` list, nested lists included. A
-// list is split only at its own commas, so `{b::{c, d}, e}` binds c, d and e
-// rather than a leaf that carries a brace. A list carries its prefix to its
-// leaves, since `self` in a list names the prefix itself: `std::io::{self,
-// Write}` binds io and Write, never "self", which would make every
-// `self.m()` of the file read as a call through an import. A glob and an
-// underscore alias bind nothing.
-func rustUseNames(p string) []string { return rustUseLeaves("", p) }
-
-// rustUseLeaves is rustUseNames for the use tree p inside a list whose path
-// so far is prefix.
-func rustUseLeaves(prefix, p string) []string {
-	p = strings.TrimSpace(p)
-	if i := strings.IndexByte(p, '{'); i >= 0 {
-		if head := strings.TrimSuffix(strings.TrimSpace(p[:i]), "::"); head != "" {
-			if prefix != "" {
-				head = prefix + "::" + head
-			}
-			prefix = head
+// rustUseNames is the local names a use path binds: every leaf of its use
+// tree (lang.RustUse) but a glob, which binds no name of its own.
+func rustUseNames(p string) []string {
+	var out []string
+	lang.RustUse(p, func(name, _ string) {
+		if name != lang.RustGlob {
+			out = append(out, name)
 		}
-		inner := strings.TrimSuffix(strings.TrimSpace(p[i+1:]), "}")
-		var out []string
-		depth, from := 0, 0
-		for j := 0; j <= len(inner); j++ {
-			if j < len(inner) {
-				switch inner[j] {
-				case '{':
-					depth++
-					continue
-				case '}':
-					depth--
-					continue
-				case ',':
-					if depth > 0 {
-						continue
-					}
-				default:
-					continue
-				}
-			}
-			if item := strings.TrimSpace(inner[from:j]); item != "" {
-				out = append(out, rustUseLeaves(prefix, item)...)
-			}
-			from = j + 1
-		}
-		return out
-	}
-	if f := strings.Fields(p); len(f) >= 3 && f[len(f)-2] == "as" {
-		if alias := f[len(f)-1]; alias != "_" {
-			return []string{alias}
-		}
-		return nil
-	}
-	switch leaf := lastSegment(p, "::"); leaf {
-	case "*":
-		return nil
-	case "self":
-		// `self` alone in a list binds the list's own path by its last
-		// segment; with no path before it there is nothing to bind.
-		if prefix == "" {
-			return nil
-		}
-		return []string{lastSegment(prefix, "::")}
-	default:
-		return []string{leaf}
-	}
+	})
+	return out
 }

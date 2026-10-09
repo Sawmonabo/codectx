@@ -379,6 +379,15 @@ Names and types are spelled as the source writes them, and `Export.Signature` an
 normalisation rule, so equal strings join an indirect site to an address-taken function. The worker resolves nothing
 outside the file.
 
+For Rust (`worker/link_rust.go`), a method's `self` parameter is its receiver, not one of `Params`, and a foreign
+function's `...` counts as one parameter a call may leave out (`Optional`). A value's declared type loses the
+references and the standard smart pointer around it (`&Box<dyn Handler>`, `Rc<T>`, `Arc<T>`, `Pin<P>`), as a method
+call's auto-dereference does, so the receiver names the owned type; an impl's self type and a trait bound keep
+theirs. A call of a method the pointer itself answers through a standard trait (`clone`, `as_ref`, `fmt`, …) on a
+binding or field declared as a pointer carries no receiver type. A macro invocation is not a call site: the query pack
+captures none (`lang/queries/rust.scm`), since a macro's name is in its own namespace and its expansion is never
+parsed.
+
 The parent joins the tables to the declarations and call references it validated: every call reference becomes a
 site of the stored `link.Table` (`internal/provider/link/table.go`), with its shape from the joined wire site or,
 when none joins, from the reference itself, and with the declarations of this file its callee name can mean as its
@@ -683,7 +692,7 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
 | `@bind.names` + `@bind.values` | the name list and the value list of a Go short variable declaration whose values hold a function literal, each captured once per statement under `@def.function`; the worker pairs the i-th name with the i-th value and declares each identifier bound to a function literal, so `x, f := 1, func() {}` declares f alone. The value list must hold a function literal for the pattern to match, so a plain `x := v` is never walked |
 | `@import.clause` | an ECMAScript import clause, captured once per statement; the worker walks its default, namespace and named bindings in source order. No pattern captures each entry of a list and then a later sibling of that list: the matcher would keep one partial match per entry open until the sibling, which is quadratic in the entry count |
-| `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`) |
+| `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`). A Rust macro invocation is not one |
 | `@ref.type` | a type reference |
 | `@package` | the package/module clause |
 | `@export` + `@export.name` | an export wrapper or export list entry |

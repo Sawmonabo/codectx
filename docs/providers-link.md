@@ -78,7 +78,7 @@ name (docs/providers-treesitter.md). What a call can bind to differs by family, 
 |---|---|---|
 | Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#k` for an anonymous class body or an enum constant's body, the k-th in the file in source order, sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
-| Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body) | the impl's self type; the trait for a trait method |
+| Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
 | C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
 | JavaScript, TypeScript, TSX | functions, class methods, object-literal methods | the class |
 | Python | functions and methods; `Static` for `@staticmethod` and `@classmethod` | the class |
@@ -200,6 +200,15 @@ A C or C++ definition takes `virtual`, `final` and default arguments from its pr
 its receiver as the first argument. A call the worker did not describe (`Site.Described` false) carries no argument list and is not filtered. A receiver that is
 another call's result (`TypeResult`) has the types that call's targets return, each read in its target's file
 (`staticFile.results`).
+
+A Rust path is read through the module it names in its own crate (`internal/provider/link/resolve_rust.go`). A
+crate is the directory Cargo's layout makes its root: the nearest `src` (`lib.rs` and `main.rs` are the root,
+`a/b.rs` is `a::b`, `a/mod.rs` is `a`), or `src/bin`, `tests`, `examples` or `benches`, each of whose files is a
+crate root. Every function and type is keyed by its module, inline `mod` items included. From a file, `crate` is the
+root, `self` its module, each `super` one module up, and any other first component a module the file's module
+declares, once a `use` binding it has been read. A path that leaves the crate binds nothing, and no Rust
+declaration is reached by a suffix of its qualified name. For example, `use crate::a::util; util::f()` binds
+`src/a/util.rs`'s `f` and never `src/b/util.rs`'s.
 
 A type name is read in the file's scopes, then through the import that names it (which decides alone), then
 through the file's imports of every member. A name none of them can supply falls back to every type of that name
