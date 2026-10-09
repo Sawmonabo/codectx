@@ -28,8 +28,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphengine"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
@@ -186,8 +184,8 @@ func memoryAllocation(m admission.Machine, baseFootprintBytes, childResidentByte
 // back (admission.Ledger.SetAllocation).
 //
 // The ledger children's residency it adds back has two parts:
-//   - runners' children that state a memory reservation -- dependence units,
-//     external indexers, language servers -- at each one's live anonymous
+//   - runners' children that state a memory reservation -- external
+//     indexers' profile units, language servers -- at each one's live anonymous
 //     resident set (process.Runner.ReservedResidentBytes), read at this
 //     admission. A child with no reading is left out, never counted as zero
 //     or at its reservation;
@@ -470,8 +468,7 @@ type stack struct {
 	// to reserve a multiple of the machine's memory.
 	admission *admission.Ledger
 	// machine is the composition's observation of the host. The admission
-	// allocation starts from it, and it is handed to the coordinator's planner
-	// and the dependence provider, which size every heavy unit against it.
+	// allocation starts from it.
 	machine admission.Machine
 	// admissionMemoryObserved and admissionDiskObserved say whether each of
 	// the ledger's allocations came from a reading of this host rather than a
@@ -502,12 +499,6 @@ type stack struct {
 	// rather than openQueries because it needs the graph factory, which is a
 	// Workspace method and therefore does not exist until the workspace does.
 	compiler *contextpkg.Compiler
-
-	// states are the capability rows detection can never publish because the
-	// provider could not be constructed at all. A provider missing from the
-	// registry is a capability that vanishes silently; these rows are what the
-	// coordinator folds in so it does not (Section 13.3).
-	states []model.CapabilityState
 }
 
 // openStack composes the workspace. The order is load-bearing: the executable
@@ -540,8 +531,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 	// The tool store is derived from the configured data directory and must
 	// stay there whatever cache this run writes: a rebuild that moved it would
-	// re-fetch every managed payload, which for the analysis engine alone is
-	// roughly two gigabytes for a flag that is about the database.
+	// re-fetch every managed payload for a flag that is about the database.
 	toolCfg := cfg
 	if o.rebuild {
 		if cfg.Storage.DataDir, err = makeRebuildDir(cfg.Storage.DataDir, time.Now()); err != nil {
@@ -749,8 +739,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	s.leases = pagination.NewLeases(s.store, cfg.Storage.QueryCursorTTL.Std())
 	s.gate = newGraphGate()
 
-	// One allocation, and every heavy child of this process -- graph engine
-	// runs, SCIP indexers, language servers, parser files -- admitted against
+	// One allocation, and every heavy child of this process -- SCIP
+	// indexers, language servers, parser files -- admitted against
 	// it by the sum of what they reserve. Nothing here is a count of children
 	// and nothing is configurable: the allocation is available memory plus the
 	// product's own residency, less this process's footprint and the safety
@@ -765,8 +755,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// available memory and subtracting the footprint leaves what the product
 	// already holds out of what its children compete for.
 	//
-	// s.machine is the reading taken here, at composition, and the one the
-	// planner and the dependence provider size units against. The ledger's
+	// s.machine is the reading taken here, at composition. The ledger's
 	// allocation starts from it and is then re-derived from a fresh reading
 	// before every admission on it (ledgerAllocation.rederive). On a host that exposes
 	// available memory the allocation is derived from that reading, and where
@@ -800,8 +789,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}
 	// The admission ledger is the one memory gate for every child of this
 	// process, and nothing beneath it may bind below it. Every child that
-	// reserves memory -- a dependence unit, an external indexer's profile, a
-	// language server, a parser file -- is admitted on the ledger first, and the
+	// reserves memory -- an external indexer's profile, a language server, a
+	// parser file -- is admitted on the ledger first, and the
 	// ledger's allocation is re-derived before every admission, upward as well
 	// as down. A runner budget taken from the composition-time allocation would be
 	// a second, stale gate: once the allocation rose, it would queue what the
@@ -932,11 +921,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 
 	// The linking provider reads the link tables the structural provider
 	// stores with each file's unit, from this store, and publishes `calls`.
-	providers := []provider.Provider{fs, mf, s.ts, sp, link.New(link.StoreTables(s.store))}
-	if dp := s.openDependence(ctx, shared); dp != nil {
-		providers = append(providers, dp)
-	}
-	if s.registry, err = provider.NewRegistry(providers...); err != nil {
+	if s.registry, err = provider.NewRegistry(fs, mf, s.ts, sp, link.New(link.StoreTables(s.store))); err != nil {
 		return nil, err
 	}
 	if s.pool, err = provider.NewPool(cfg.Index.QueueBytes); err != nil {
@@ -1053,90 +1038,6 @@ func makeRebuildDir(dataDir string, now time.Time) (string, error) {
 	return "", &model.Error{Code: model.CodeArgumentInvalid,
 		Message: "a new rebuild cache cannot be named beside " + dataDir +
 			": every candidate from " + base + " onwards already exists. Remove the rebuild caches you no longer need, or wait a second and run the command again."}
-}
-
-// openDependence builds the dependence provider, or reports its absence.
-//
-// A provider the configuration disables is not constructed and records no
-// capability row: work nobody asked for is not an unavailable capability, and
-// the run names every disabled provider once, in providers_disabled. A
-// provider that is enabled but cannot be constructed, because its analysis
-// payload does not resolve, is different: that is an optional tool that is
-// absent, which must not fail a healthy base generation (Section 11.1) and
-// must not disappear either, so its reason becomes the capability row the
-// coordinator publishes.
-func (s *stack) openDependence(ctx context.Context, runner *process.Runner) provider.Provider {
-	if s.cfg.Providers.Dependence.Enabled == config.Disabled {
-		return nil
-	}
-	// Nothing here installs anything: the locator reports the pinned identity
-	// of a payload the store does not hold and the first unit that needs the
-	// engine resolves it. The report path therefore needs no second,
-	// force-offline resolver, which would report a merely-uninstalled payload
-	// as CTX_TOOL_OFFLINE and tell an operator to turn off an offline mode
-	// they never enabled.
-	locator, err := graphengine.NewLocator(s.resolver)
-	if err == nil {
-		var backend *graphengine.Backend
-		if backend, err = graphengine.New(ctx, locator, runner); err == nil {
-			var p *dependence.Provider
-			p, err = dependence.New(backend, dependence.Options{
-				DataDir:              s.dataDir,
-				AnalysisConfigHash:   s.cfg.AnalysisConfigHash(),
-				Timeout:              s.cfg.Providers.Dependence.Timeout.Std(),
-				StallTimeout:         s.cfg.Providers.Dependence.StallTimeout.Std(),
-				CacheBytes:           s.cfg.Providers.Dependence.CacheBytes,
-				UnitMemoryFloorBytes: s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
-				BaseFootprintBytes:   config.BaseFootprint(s.cfg),
-				Machine:              s.machine,
-				MaxUnitsPerFamily:    s.cfg.Providers.Dependence.MaxUnitsPerFamily,
-				MaxStagedRows:        s.cfg.Providers.Dependence.MaxStagedRows,
-				MaxDerivedRows:       s.cfg.Providers.Dependence.MaxDerivedRows,
-				MaxExportFiles:       s.cfg.Providers.Dependence.MaxExportFiles,
-				StagingCacheKiB:      s.cfg.Providers.Dependence.StagingCacheKiB,
-				MaxEvidencePerFact:   evidenceClip(s.cfg),
-				Limits: provider.Limits{
-					BatchRecords:   s.cfg.Index.BatchRecords,
-					BatchBytes:     s.cfg.Index.BatchBytes,
-					MaxRecordBytes: s.cfg.Resources.MaxProviderRecordBytes.Value(),
-				},
-			})
-			if err == nil {
-				return p
-			}
-		}
-	}
-	// `auto` treats an absent payload as honest absence; an explicitly
-	// requested provider that cannot run is a failed capability.
-	state := model.CapabilityUnavailable
-	if s.cfg.Providers.Dependence.Enabled == config.Enabled {
-		state = model.CapabilityFailed
-	}
-	var typed *model.Error
-	code := model.CodeProviderUnavailable
-	if errors.As(err, &typed) {
-		code = typed.Code
-	}
-	s.dependenceAbsent(state, code, err)
-	return nil
-}
-
-// dependenceAbsent records the capability rows of the dependence provider when
-// it could not be built. The capability names come from the provider package
-// rather than from a literal list here, so a provider that gains a capability
-// does not quietly stop reporting it when it is absent. It is deliberately
-// specific to this provider: a general helper taking a provider ID would
-// publish this provider's capability names under another provider's identity
-// the first time a second one failed to construct.
-func (s *stack) dependenceAbsent(state model.CapabilityStateValue, code string, cause error) {
-	for _, capability := range dependence.Capabilities {
-		s.states = append(s.states, model.CapabilityState{ProviderID: dependence.ProviderID, Capability: capability,
-			Scope: provider.ScopeWorkspace, State: state, DiagnosticCode: code})
-	}
-	if cause != nil {
-		s.logger.Info("an optional provider is not available in this workspace",
-			"component", "app", "provider_id", dependence.ProviderID, "state", string(state), "error_code", code)
-	}
 }
 
 // setEngineTempDir names where every engine handle in this process spills.
