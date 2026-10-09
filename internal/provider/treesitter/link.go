@@ -8,6 +8,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
@@ -191,7 +192,7 @@ func (b *builder) linkTable() error {
 // linkImports is the names the file's import records introduce, each with
 // the path it denotes (link.Import). The worker's record is one statement:
 // its path as written and the local names it binds. A Rust use tree is
-// split into one path per leaf. An import of every member of a path (a Go
+// split into one path per leaf (lang.RustUse). An import of every member of a path (a Go
 // dot import, a Java on-demand import `a.b.*`, a C++ using-directive, a Rust
 // glob, a Python `from m import *`) is named link.ImportAll, which the
 // statement's own bytes tell; an import binding no name (an include, an
@@ -203,7 +204,8 @@ func (b *builder) linkImports() []link.Import {
 		names := imp.Names
 		switch b.lang.Name {
 		case "rust":
-			rustUse("", imp.Path, func(name, p string) { out = append(out, link.Import{Name: name, Path: p}) })
+			// A glob's name is lang.RustGlob, which is link.ImportAll.
+			lang.RustUse(imp.Path, func(name, p string) { out = append(out, link.Import{Name: name, Path: p}) })
 			continue
 		case "go":
 			if len(names) == 1 && names[0] == "." {
@@ -234,72 +236,6 @@ func (b *builder) linkImports() []link.Import {
 		}
 	}
 	return out
-}
-
-// rustUse yields every leaf of the Rust use tree p, written inside a list
-// whose path so far is prefix: the name it binds and the full path it names
-// (`a::{b, c as d}` binds b to a::b and d to a::c). A glob yields the module
-// it imports from as link.ImportAll; `self` in a
-// list binds the list's own path; `as _` binds nothing.
-func rustUse(prefix, p string, yield func(name, path string)) {
-	join := func(a, b string) string {
-		if a == "" {
-			return b
-		}
-		if b == "" {
-			return a
-		}
-		return a + "::" + b
-	}
-	p = strings.TrimSpace(p)
-	if i := strings.IndexByte(p, '{'); i >= 0 {
-		prefix = join(prefix, strings.TrimSuffix(strings.TrimSpace(p[:i]), "::"))
-		inner := strings.TrimSuffix(strings.TrimSpace(p[i+1:]), "}")
-		depth, from := 0, 0
-		for j := 0; j <= len(inner); j++ {
-			if j < len(inner) {
-				switch inner[j] {
-				case '{':
-					depth++
-					continue
-				case '}':
-					depth--
-					continue
-				case ',':
-					if depth > 0 {
-						continue
-					}
-				default:
-					continue
-				}
-			}
-			if item := strings.TrimSpace(inner[from:j]); item != "" {
-				rustUse(prefix, item, yield)
-			}
-			from = j + 1
-		}
-		return
-	}
-	if f := strings.Fields(p); len(f) >= 3 && f[len(f)-2] == "as" {
-		if alias := f[len(f)-1]; alias != "_" {
-			yield(alias, join(prefix, strings.Join(f[:len(f)-2], "")))
-		}
-		return
-	}
-	leaf := p
-	if i := strings.LastIndex(p, "::"); i >= 0 {
-		leaf = p[i+2:]
-	}
-	switch leaf {
-	case "*":
-		yield(link.ImportAll, join(prefix, strings.TrimSuffix(strings.TrimSuffix(p, "*"), "::")))
-	case "self":
-		if prefix != "" {
-			yield(prefix[strings.LastIndex(prefix, ":")+1:], prefix)
-		}
-	default:
-		yield(leaf, join(prefix, p))
-	}
 }
 
 // enclosing is the index of the innermost declaration whose range contains
