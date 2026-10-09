@@ -142,4 +142,166 @@ pub fn run(s: S) -> i32 {
 		},
 		fails: "a macro invocation taken as a call of the same-named function binds `bail!()`; an argument count that excludes the receiver of `S::m(&s, 1)` drops it",
 	},
+	{
+		name:   "inline-module-scope",
+		anchor: "The Rust Reference, \"Paths\" (`super`), \"Names: Scopes\" (items of a module are in scope in that module only, not in nested or enclosing modules), \"Modules\"",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "inline"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `pub fn h() {} // @top
+
+pub mod m {
+    pub fn h() {} // @mh
+
+    pub fn g() { // @mg
+        h(); // @g1
+    }
+
+    pub mod inner {
+        pub fn k() {
+            super::h(); // @k1
+        }
+    }
+}
+
+pub fn run() {
+    h(); // @r1
+    m::g(); // @r2
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"g1 h -> mh h",
+			"k1 h -> mh h",
+			"r1 h -> top h",
+			"r2 g -> mg g",
+		},
+		fails: "a bare name looked up at the file's top level from inside `mod m`, or `super` read from the file, binds the crate root's h",
+	},
+	{
+		name:   "glob-use-of-the-parent",
+		anchor: "The Rust Reference, \"Use declarations\" (glob imports), \"Paths\" (`super`)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "globs"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `pub mod a;
+`,
+			"src/a.rs": `pub fn h() {} // @ah
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t() {
+        h(); // @t1
+    }
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding. The tests module exists only under
+		// `#[cfg(test)]`; both read the call as the test build defines it.
+		want: []string{
+			"t1 h -> ah h",
+		},
+		fails: "a glob `use super::*` not followed leaves `h()` in the tests module unbound",
+	},
+	{
+		name:   "sibling-crate-paths",
+		anchor: "The Rust Reference, \"Paths\" (a path's first segment naming an extern crate), \"Crates and source files\" (crate names: `-` becomes `_`)",
+		files: map[string]string{
+			"Cargo.toml": `[workspace]
+members = ["app", "qlib"]
+`,
+			"qlib/Cargo.toml": `[package]
+name = "q-lib"
+version = "0.1.0"
+edition = "2021"
+`,
+			"qlib/src/lib.rs": `pub mod x;
+`,
+			"qlib/src/x.rs": `pub fn f() {} // @qf
+`,
+			"app/Cargo.toml": `[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+q-lib = { path = "../qlib" }
+`,
+			"app/src/lib.rs": `pub mod x;
+
+pub fn run() {
+    q_lib::x::f(); // @r1
+    crate::x::f(); // @r2
+}
+`,
+			"app/src/x.rs": `pub fn f() {} // @af
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"r1 f -> qf f",
+			"r2 f -> af f",
+		},
+		fails: "a first path segment that names another crate of the workspace, read as a module of this crate, binds app's f or nothing",
+	},
+	{
+		name:   "pointer-results-and-method-values",
+		anchor: "The Rust Reference, \"Method-call expressions\" (the first receiver type with a matching method wins: `Rc<Foo>` has its own `clone`), \"Call expressions\", \"Function pointer types\", \"Paths\" (a method path as a function value)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "pointers"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `use std::rc::Rc;
+
+pub struct Foo;
+
+impl Clone for Foo {
+    fn clone(&self) -> Foo { Foo } // @fclone
+}
+
+impl Foo {
+    pub fn m(&self, x: i32) -> i32 { x } // @fm
+    pub fn n(&self, x: i32) -> i32 { x + 1 } // @fn2
+}
+
+fn make() -> Rc<Foo> { Rc::new(Foo) } // @mk
+
+fn other(_f: &Foo, x: i32) -> i32 { x } // @other
+
+pub fn run(foo: Foo) -> i32 {
+    let _a = make().clone(); // @c1
+    let _b = foo.clone(); // @c2
+    let g: fn(&Foo, i32) -> i32 = Foo::m;
+    let h: fn(&Foo, i32) -> i32 = other;
+    g(&foo, 1) // @c3
+        + h(&foo, 2) // @c4
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"c1 make -> mk make",
+			"c2 clone -> fclone clone",
+			"c3 g -> fm m",
+			"c3 g -> other other",
+			"c4 h -> fm m",
+			"c4 h -> other other",
+		},
+		fails: "a pointer result unwrapped before its own methods binds `make().clone()` to Foo::clone; a method path spelled without its self parameter misses the fn(&Foo, i32) sites",
+	},
 }

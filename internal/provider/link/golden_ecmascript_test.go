@@ -177,4 +177,97 @@ function make() {
 		},
 		fails: "a constructor not inherited by a derived class binds `new Kid(1)` to the class instead of Base's constructor",
 	},
+	{
+		name:   "resolve-export-precedence",
+		anchor: "ECMA-262 (15th edition, 2024) §16.2.1.6.3 (ResolveExport: own export, then indirect export, then star exports; `default` never through `export *`; two star sources disagreeing are ambiguous), §10.4.6 (Module Namespace Exotic Objects)",
+		files: map[string]string{
+			"src/x.js": `export function f() {} // @xf
+export function g() {} // @xg
+export function h() {} // @xh
+export default function dx() {} // @dx
+`,
+			"src/y.js": `export function g() {} // @yg
+export function h() {} // @yh
+export function k() {} // @yk
+`,
+			"src/z.js": `export function h() {} // @zh
+`,
+			"src/m.js": `export function f() {} // @mf
+export { h } from './z.js';
+export * from './x.js';
+export * from './y.js';
+`,
+			"src/main.js": `import { f, h, k } from './m.js';
+import * as mm from './m.js';
+
+export function run() {
+  f(); // @c1
+  h(); // @c2
+  k(); // @c3
+  mm.g(); // @c4
+  mm.default(); // @c5
+  mm.f(); // @c6
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"c1 f -> mf f",
+			"c2 h -> zh h",
+			"c3 k -> yk k",
+			"c6 f -> mf f",
+		},
+		fails: "star exports read before own and named exports, `default` passed through `export *`, or a disagreeing pair resolved to either side gives f, h, g or default the wrong target",
+	},
+	{
+		name:   "export-as-exports-only-the-new-name",
+		anchor: "ECMA-262 (15th edition, 2024) §16.2.3 (Exports: ExportSpecifier `a as b` exports the name `b`), §16.2.1.6.3 (ResolveExport), §10.4.6",
+		files: map[string]string{
+			"src/a.js": `function a() {} // @a
+export { a as b };
+`,
+			"src/main.js": `import { b } from './a.js';
+import * as ns from './a.js';
+
+export function run() {
+  b(); // @c1
+  ns.a(); // @c2
+  ns.b(); // @c3
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"c1 b -> a a",
+			"c3 b -> a a",
+		},
+		fails: "an `export {a as b}` that also exports the local name binds `ns.a()`",
+	},
+	{
+		name:   "class-field-arrow",
+		anchor: "ECMA-262 (15th edition, 2024) §15.7 (Class Definitions: FieldDefinition, ClassFieldDefinitionEvaluation), §13.3.2 (Property Accessors), §13.3.6 (Function Calls)",
+		files: map[string]string{
+			"src/c.js": `class C { // @cls
+  handler = () => {}; // @fh
+  run() { // @run
+    this.handler(); // @r
+  }
+}
+function go() {
+  const c = new C(); // @n
+  c.run(); // @g
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"r handler -> fh handler",
+			"n C -> cls C",
+			"g run -> run run",
+		},
+		fails: "a class field holding a function not recorded as a value of that field leaves `this.handler()` unbound",
+	},
 }

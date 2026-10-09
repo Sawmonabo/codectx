@@ -259,4 +259,45 @@ def run():
 		},
 		fails: "`super()` resolved by B's own bases alone loses C.m; dispatched like `self.m()` it binds B.m itself",
 	},
+	{
+		name:   "argument-flow-follows-the-mro",
+		anchor: "The Python Language Reference §6.3.4 (Calls: arguments bind to the called function's parameters); \"The Python 2.3 Method Resolution Order\" (C3 linearisation)",
+		files: map[string]string{
+			"flow.py": `class Y:  # @yc
+    def ping(self):  # @yp
+        pass
+
+
+class A:
+    def m(self, y):  # @am
+        y.ping()  # @ap
+
+
+class B(A):
+    pass
+
+
+class C(A):
+    def m(self, y):  # @cm
+        y.ping()  # @cp
+
+
+class D(B, C):  # @dc
+    pass
+
+
+def run():
+    D().m(Y())  # @r1
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"r1 D -> dc D",
+			"r1 m -> cm m",
+			"r1 Y -> yc Y",
+			"cp ping -> yp ping",
+		},
+		fails: "arguments sent to every same-named method rather than the one the method resolution order reaches bind A.m's `y.ping()`",
+	},
 }

@@ -202,4 +202,39 @@ int go() { return cfun(); } // @go
 		},
 		fails: "a braceless linkage-specification prototype not captured, or bound instead of its definition, leaves the call on the header",
 	},
+	{
+		name:   "unnamed-namespace-types",
+		anchor: "ISO/IEC 14882 (C++) [basic.link] (a name in an unnamed namespace has internal linkage, so each translation unit's `Impl` is a distinct type), [namespace.unnamed], [class.mfct]",
+		files: map[string]string{
+			"a.cpp": `namespace {
+struct Impl {
+  void run() {} // @arun
+};
+}
+
+void fa() {
+  Impl i;
+  i.run(); // @fa
+}
+`,
+			"b.cpp": `namespace {
+struct Impl {
+  void run() {} // @brun
+};
+}
+
+void fb() {
+  Impl i;
+  i.run(); // @fb
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"fa run -> arun run",
+			"fb run -> brun run",
+		},
+		fails: "two unnamed-namespace types of one name merged across files bind each `i.run()` to both",
+	},
 }
