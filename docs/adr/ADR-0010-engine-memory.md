@@ -95,7 +95,7 @@ was the measurement for this family at this size.
 
    *Where the figure itself is missing*: a child reserves disk only where its expected bytes are a
    figure the product already states. The language servers state one (`DiskBudgetBytes` per
-   profile) and reserve it. The analysis engine does not: `providers.dependence.max_staged_rows`
+   profile) and reserve it. The analysis engine does not: its staged-row bound (a key deleted with the engine)
    bounds rows, is unlimited by default, and nothing anywhere records bytes per staged row. An
    engine unit is therefore admitted on memory alone, and that is said at the call site rather than
    papered over with a constant derived from source bytes — putting an underived number into the

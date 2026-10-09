@@ -10,7 +10,7 @@ engine and the import this record governs were deleted under its phase 6.
 The dependence provider imports one unit's analysis export -- a directory of
 node and edge CSV files -- by staging it in a private SQLite database and
 deriving the unit's facts by ordered query.
-Measured with the phase-by-phase harness in `internal/provider/dependence/graphcsv/scale_test.go`,
+Measured with the importer's phase-by-phase harness (deleted with the engine),
 the staging wrote 34.5 times the export's bytes for a 9 MB synthetic export
 and 42 times for a 47 MB one, and an uncapped index of the reference
 repository left a 12.7 GB staging file behind a 1 GB store, writing at the
@@ -80,7 +80,7 @@ The staging is written the way a bulk load writes, and nothing else:
    plus the same evidence fields, about 420 bytes. Ranges are six decimal
    coordinates, a fifth of their JSON.
 5. **A bounded cache that is also the sort buffer.** The staging database's
-   page cache is `providers.dependence.staging_cache_kib` (256 MiB by
+   page cache was the provider's staging cache key, deleted with the engine (256 MiB by
    default); it bounds the memory one import holds for its staging and is
    the buffer the engine sorts in ([PRAGMA cache_size](https://sqlite.org/pragma.html#pragma_cache_size)),
    so a table smaller than it is ordered without a spill file and a larger
