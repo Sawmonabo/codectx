@@ -1,0 +1,33 @@
+query                       hits | ours cold ours warm |     library warm  x | library-all warm  x |     product warm  x
+vendor                    253589 |     9.78s     5.89s |      1.24ms   4753x |     32.54ms    181x |    708.56ms      8x
+func                      201750 |     7.99s     7.11s |      1.49ms   4786x |     26.85ms    265x |    525.64ms     14x
+src                       169436 |     5.05s     4.86s |      0.86ms   5643x |     10.57ms    460x |    457.28ms     11x
+staging                   167943 |     5.18s     5.34s |      1.01ms   5269x |     10.75ms    497x |    469.66ms     11x
+org                       167741 |     4.10s     4.15s |      0.99ms   4201x |      9.37ms    443x |    413.02ms     10x
+output                      9987 |     1.03s     1.00s |      0.26ms   3878x |      1.45ms    691x |     90.48ms     11x
+metrics                     9985 |     0.88s     0.79s |      0.29ms   2718x |      1.51ms    526x |     91.08ms      9x
+net                        10033 |     1.03s     0.95s |      0.53ms   1788x |      1.99ms    478x |     95.28ms     10x
+service                     9946 |     1.03s     0.97s |      0.28ms   3459x |      1.52ms    638x |     89.25ms     11x
+meta                        9930 |     0.77s     0.74s |      0.23ms   3225x |      2.42ms    304x |     83.11ms      9x
+actions                     1000 |     0.48s     0.41s |      0.13ms   3067x |      1.38ms    295x |     16.41ms     25x
+progress                     999 |     0.50s     0.43s |      0.24ms   1771x |      1.01ms    425x |     17.78ms     24x
+tracker                      997 |     0.39s     0.31s |      0.14ms   2205x |      1.03ms    300x |     18.37ms     17x
+encrypt                      996 |     0.33s     0.28s |      0.14ms   1973x |      1.18ms    233x |     18.23ms     15x
+indicate                     996 |     0.50s     0.44s |      0.46ms    970x |      0.99ms    446x |     17.21ms     26x
+comparelock                    2 |     0.14s     0.08s |      0.01ms  10157x |      0.02ms   4304x |      0.41ms    195x
+currentutilizationval          4 |     0.14s     0.09s |      0.01ms   9760x |      0.03ms   3361x |      0.40ms    217x
+messageoptionsr                2 |     0.15s     0.08s |      0.01ms   5968x |      0.02ms   4431x |      0.47ms    170x
+cachedresource                 7 |     0.15s     0.09s |      0.01ms   6586x |      0.05ms   1865x |      0.50ms    188x
+defaultstubrefreshtoken        6 |     0.14s     0.08s |      0.04ms   2074x |      0.04ms   2111x |      0.50ms    155x
+pod scheduler              36309 |     2.05s     1.99s |      0.85ms   2356x |      3.58ms    556x |    169.83ms     12x
+resource version           48699 |     2.84s     2.74s |      0.94ms   2923x |      4.14ms    661x |    188.31ms     15x
+node status                31325 |     2.18s     2.09s |      1.00ms   2087x |      2.94ms    713x |    166.37ms     13x
+client config              65848 |     2.88s     2.88s |      1.04ms   2772x |      4.73ms    610x |    234.34ms     12x
+volume mount               14606 |     1.20s     1.10s |      0.44ms   2486x |      1.89ms    583x |    115.14ms     10x
+"resource version"           485 |     0.96s     0.51s |      1.38ms    371x |      1.83ms    280x |      8.89ms     58x
+"garbage collector"          851 |     0.22s     0.19s |      0.22ms    855x |      1.08ms    174x |      7.18ms     26x
+"service account"           1052 |     0.51s     0.39s |      0.26ms   1487x |      1.19ms    328x |     15.73ms     25x
+"node name"                  935 |     1.68s     1.06s |      1.18ms    897x |      2.00ms    531x |     14.20ms     75x
+"admission controller"       309 |     0.55s     0.34s |      0.35ms    983x |      1.23ms    275x |      5.27ms     64x
+sum warm: ours 47.4s; library 16.0ms; library-all 129.3ms; product 4038.9ms
+product first page identical to ours: 22/30
