@@ -32,8 +32,12 @@ import (
 //   - an assignment or `:=`: its annotation, else the value's type;
 //   - a call that is a site: TypeResult of that site (the linker decides
 //     whether it constructs a class);
-//   - `x.f` read as a value: TypeField f; `super()` as a receiver: TypeSuper
-//     of the enclosing class;
+//   - `x.f` read as a value: a method value when x is a class of the file,
+//     or an instance of one (self included), whose body declares a def f
+//     that is no property: TypeFunction of that def's qualified name (`C.f`
+//     for a top-level class C), the name the declaration table carries;
+//     otherwise TypeField f; `super()` as a receiver: TypeSuper of the
+//     enclosing class;
 //   - a name `import a.b` binds (a) or `import a.b as c` binds (c): the
 //     module (TypeModule "a" or "a.b"); a name `from m import f as g` binds:
 //     TypeModule "m.f", the imported name spelled through its module so an
@@ -41,13 +45,22 @@ import (
 //   - a def: TypeFunction of its name, where it is taken as a value;
 //   - a class named as a receiver: TypeNamed of the class.
 //
-// A name that is not a variable of the callable (a module name seen from a
-// nested callable, a builtin) is read from the module's own bindings. Where
+// A name that is not a variable of the callable (a free name of a nested
+// callable, a builtin) is read from the enclosing function, lambda and
+// comprehension scopes, innermost first, and then from the module's own
+// bindings; a class body is no enclosing scope, and a name the callable
+// declares global is read from the module alone. What an enclosing scope's
+// variable is, is every definition of it joined, recorded when that scope
+// was read (it is read first: the callables come in preorder); a closure
+// reads its free variables when it is called, so any of them may reach it.
+// An enclosing parameter's index means nothing to the closure, so a
+// recovered TypeParam is recorded as a value of unknown type. Where
 // the definitions reaching a read disagree the type is TypeUnknown; a
 // definition that recovers nothing does not count against one that does.
 //
-// Shapes: a name callee is ShapeIndirect when it is a variable the callable
-// or the module assigns a value to (a parameter, an assignment), carrying the
+// Shapes: a name callee is ShapeIndirect when it is a variable the callable,
+// an enclosing scope or the module assigns a value to (a parameter, an
+// assignment, a function or method assigned as a value), carrying the
 // value's type as Receiver, and ShapeBare otherwise (a def, a class, an
 // import, a builtin), a from-imported name with its TypeModule. An attribute
 // callee is ShapeStatic exactly when its object is an imported module (`mod.f()`,
@@ -59,6 +72,15 @@ type pythonLinker struct {
 	// the first callable: what a nested callable's free name refers to.
 	moduleNames map[string]pyVal
 	modulesRead bool
+	// scopes are what each read function, lambda or comprehension that
+	// nests a callable binds, by the callable's span: what a free name of
+	// the callables nested in it refers to.
+	scopes map[flow.Span]map[string]pyRead
+	// methods maps `C.m`, a class's name and the name of a def its body
+	// declares (no property), to the qualified names of every such def in
+	// the file; built on the first method value read.
+	methods     map[string][]string
+	methodsRead bool
 	// sites and values are the file's, in the order function found them;
 	// a TypeResult indexes sites.
 	sites  []wire.Site
@@ -89,11 +111,18 @@ type pythonLinker struct {
 	assigns []Node
 	rets    []Node
 	callAt  map[flow.Span]uint32
+	// nests reports that fn's code creates a nested callable.
+	nests bool
+	// globals are the names fn declares global, read on the first free
+	// name looked up past fn.
+	globals     map[string]bool
+	globalsRead bool
 }
 
 func newPythonLinker() *pythonLinker {
 	return &pythonLinker{returns: map[uint32]wire.Type{}, names: map[string]int32{},
-		binds: map[flow.Span]pyBind{}, callAt: map[flow.Span]uint32{}}
+		binds: map[flow.Span]pyBind{}, callAt: map[flow.Span]uint32{}, scopes: map[flow.Span]map[string]pyRead{},
+		globals: map[string]bool{}}
 }
 
 // pyOrigin says what kind of thing a pyVal is.
@@ -131,6 +160,35 @@ type pyBind struct {
 type pyUse struct {
 	v, node    int32
 	start, end uint32
+}
+
+// pyRead is what a read of a variable refers to: the definitions' values
+// joined, and whether a value is assigned to it (a parameter, an assignment,
+// anything but a def, class or import statement), which makes a call of it
+// indirect.
+type pyRead struct {
+	val      pyVal
+	variable bool
+}
+
+// reach folds definition p of a variable into r.
+func (k *pythonLinker) reach(r pyRead, p int32) pyRead {
+	x := k.defined(p)
+	if x.o == pyValue || x.o == pyUnknown || (x.o == pyFunction && !k.binds[k.g.Span(p)].expr.IsNull()) {
+		r.variable = true
+	}
+	r.val = join(r.val, x)
+	return r
+}
+
+// read is what the read refers to, and whether it is a variable: a module,
+// an imported name or a class is never called indirectly.
+func (r pyRead) read() (pyVal, bool) {
+	switch r.val.o {
+	case pyValue, pyUnknown, pyFunction:
+		return r.val, r.variable
+	}
+	return r.val, false
 }
 
 type pyMemo struct {
@@ -198,6 +256,9 @@ func (k *pythonLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byt
 	for _, a := range k.assigns {
 		k.assignValues(a)
 	}
+	if k.nests && fn.KindId() != kn.module && fn.KindId() != kn.classDefinition {
+		k.recordScope(fn)
+	}
 	if fn.KindId() == kn.functionDefinition && fn.ChildByFieldId(kn.fReturnType).IsNull() {
 		var r pyVal
 		for _, e := range k.rets {
@@ -213,6 +274,8 @@ func (k *pythonLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byt
 // nodes, keeping the lists' capacity.
 func (k *pythonLinker) release() {
 	k.g, k.src, k.fn = nil, nil, Node{}
+	k.nests, k.globalsRead = false, false
+	clear(k.globals)
 	clear(k.names)
 	clear(k.binds)
 	clear(k.callAt)
@@ -568,6 +631,7 @@ func (k *pythonLinker) visit(n Node) {
 // binds a def or class statement's name.
 func (k *pythonLinker) header(n Node) {
 	kn := k.k
+	k.nests = true
 	switch n.KindId() {
 	case kn.functionDefinition, kn.classDefinition, kn.lambda:
 		if n.KindId() != kn.lambda {
@@ -691,8 +755,8 @@ func (k *pythonLinker) site(c Node) wire.Site {
 		switch {
 		case v.o == pyImported:
 			s.Receiver = v.t
-		case variable && (v.o == pyValue || v.o == pyUnknown):
-			s.Shape, s.Receiver = wire.ShapeIndirect, v.t
+		case variable:
+			s.Shape, s.Receiver = wire.ShapeIndirect, v.asValue()
 		}
 	} else {
 		obj := f.ChildByFieldId(kn.fObject)
@@ -799,10 +863,17 @@ func (k *pythonLinker) typeOf(e Node) pyVal {
 		if f.IsNull() || f == e.ChildByFieldId(kn.fObject) {
 			return pyVal{}
 		}
-		if o := k.typeOf(e.ChildByFieldId(kn.fObject)); o.o == pyModule || o.o == pyImported {
-			return pyVal{o: o.o, t: wire.Type{Kind: wire.TypeModule, Name: o.t.Name + "." + string(textOf(k.src, f))}}
+		name := string(textOf(k.src, f))
+		o := k.typeOf(e.ChildByFieldId(kn.fObject))
+		switch {
+		case o.o == pyModule || o.o == pyImported:
+			return pyVal{o: o.o, t: wire.Type{Kind: wire.TypeModule, Name: o.t.Name + "." + name}}
+		case o.o == pyClass || (o.o == pyValue && o.t.Kind == wire.TypeNamed):
+			if m := k.method(o.t.Name, name); m != "" {
+				return pyVal{o: pyFunction, t: wire.Type{Name: m}}
+			}
 		}
-		return pyVal{o: pyValue, t: wire.Type{Kind: wire.TypeField, Name: string(textOf(k.src, f))}}
+		return pyVal{o: pyValue, t: wire.Type{Kind: wire.TypeField, Name: name}}
 	case kn.namedExpression:
 		return k.typeOf(e.ChildByFieldId(kn.fValue))
 	case kn.await:
@@ -826,6 +897,9 @@ func (k *pythonLinker) nameOf(n Node) (pyVal, bool) {
 		if k.fn.KindId() == k.k.module {
 			return pyVal{}, false
 		}
+		if r, ok := k.enclosing(text); ok {
+			return r.read()
+		}
 		m, ok := k.moduleNames[text]
 		return m, ok && m.o == pyValue
 	}
@@ -833,27 +907,167 @@ func (k *pythonLinker) nameOf(n Node) (pyVal, bool) {
 	if u < 0 {
 		return pyVal{}, true
 	}
-	var r pyVal
-	variable := false
+	var r pyRead
 	lo, _ := slices.BinarySearch(k.defs, uint64(uint32(u))<<32)
 	for _, d := range k.defs[lo:] {
 		if int32(d>>32) != u {
 			break
 		}
-		p := int32(uint32(d))
-		if !holds(k.g.Defs(p), v) {
+		if p := int32(uint32(d)); holds(k.g.Defs(p), v) {
+			r = k.reach(r, p)
+		}
+	}
+	return r.read()
+}
+
+// recordScope records what each named variable of fn, a function, lambda
+// or comprehension that nests a callable, is over all its definitions: what
+// the nested callables read it as.
+func (k *pythonLinker) recordScope(fn Node) {
+	g := k.g
+	reads := make([]pyRead, g.Vars())
+	for p := range int32(g.Len()) {
+		for _, v := range g.Defs(p) {
+			reads[v] = k.reach(reads[v], p)
+		}
+	}
+	scope := make(map[string]pyRead, len(k.names))
+	for name, v := range k.names {
+		r := reads[v]
+		if r.val.o == pyValue && r.val.t.Kind == wire.TypeParam {
+			r.val = pyVal{o: pyValue}
+		}
+		scope[name] = r
+	}
+	k.scopes[spanOf(fn)] = scope
+}
+
+// enclosing is what free name text of fn refers to in the scopes enclosing
+// fn, innermost first: every function, lambda and comprehension around it
+// but a comprehension whose first iterable holds fn, which its enclosing
+// callable evaluates. A class body is no scope of the callables it nests,
+// and a name fn declares global is the module's.
+func (k *pythonLinker) enclosing(text string) (pyRead, bool) {
+	kn := k.k
+	if !k.globalsRead {
+		k.globalsRead = true
+		if body := k.fn.ChildByFieldId(kn.fBody); k.fn.KindId() != kn.lambda && !body.IsNull() {
+			k.declaredGlobal(body)
+		}
+	}
+	if k.globals[text] {
+		return pyRead{}, false
+	}
+	at := spanOf(k.fn)
+	for p := k.fn.Parent(); !p.IsNull() && p.KindId() != kn.module; p = p.Parent() {
+		if !pythonLowering.isCallable(p) || p.KindId() == kn.classDefinition || k.inFirstIterable(p, at) {
 			continue
 		}
-		x := k.defined(p)
-		if x.o == pyValue || x.o == pyUnknown {
-			variable = true
+		if r, ok := k.scopes[spanOf(p)][text]; ok {
+			return r, true
 		}
-		r = join(r, x)
 	}
-	if r.o != pyValue && r.o != pyUnknown {
-		variable = false
+	return pyRead{}, false
+}
+
+// inFirstIterable reports whether span at lies in the first iterable of
+// comprehension c; false when c is no comprehension.
+func (k *pythonLinker) inFirstIterable(c Node, at flow.Span) bool {
+	kn := k.k
+	switch c.KindId() {
+	case kn.functionDefinition, kn.lambda:
+		return false
 	}
-	return r, variable
+	for x := c.first(); !x.IsNull(); x = x.next() {
+		if x.KindId() != kn.forInClause {
+			continue
+		}
+		in := func(n Node) bool { s := spanOf(n); return s.Start <= at.Start && at.End <= s.End }
+		left := x.ChildByFieldId(kn.fLeft)
+		return in(x) && (left.IsNull() || !in(left))
+	}
+	return false
+}
+
+// declaredGlobal records the names the global statements of n, a part of
+// fn's own code, declare.
+func (k *pythonLinker) declaredGlobal(n Node) {
+	kn := k.k
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		switch {
+		case !c.IsNamed() || pythonLowering.isCallable(c):
+		case c.KindId() == kn.globalStatement:
+			for x := c.first(); !x.IsNull(); x = x.next() {
+				if x.KindId() == kn.identifier {
+					k.globals[string(textOf(k.src, x))] = true
+				}
+			}
+		default:
+			k.declaredGlobal(c)
+		}
+	}
+}
+
+// method is the qualified name of the def m that the body of the file's one
+// class named class declares, or "" when no class or several declare one,
+// or the def is a property (its read calls it).
+func (k *pythonLinker) method(class, m string) string {
+	if !k.methodsRead {
+		k.methodsRead = true
+		k.methods = map[string][]string{}
+		root := k.fn
+		for p := root.Parent(); !p.IsNull(); p = p.Parent() {
+			root = p
+		}
+		k.indexMethods(root, "")
+	}
+	if q := k.methods[class+"."+m]; len(q) == 1 {
+		return q[0]
+	}
+	return ""
+}
+
+// indexMethods indexes the methods of every class under n, whose enclosing
+// defs and classes qualify a declaration by prefix.
+func (k *pythonLinker) indexMethods(n Node, prefix string) {
+	kn := k.k
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		if !c.IsNamed() {
+			continue
+		}
+		id := c.KindId()
+		if id != kn.functionDefinition && id != kn.classDefinition {
+			k.indexMethods(c, prefix)
+			continue
+		}
+		name := string(textOf(k.src, c.ChildByFieldId(kn.fName)))
+		inner := prefix + name + "."
+		if id == kn.classDefinition {
+			for s := c.ChildByFieldId(kn.fBody).first(); !s.IsNull(); s = s.next() {
+				d := s
+				if d.KindId() == kn.decoratedDefinition {
+					d = d.ChildByFieldId(kn.fDefinition)
+				}
+				if d.IsNull() || d.KindId() != kn.functionDefinition || k.property(d) {
+					continue
+				}
+				m := string(textOf(k.src, d.ChildByFieldId(kn.fName)))
+				k.methods[name+"."+m] = append(k.methods[name+"."+m], inner+m)
+			}
+		}
+		k.indexMethods(c.ChildByFieldId(kn.fBody), inner)
+	}
+}
+
+// property reports whether def d is a property or one of its accessors,
+// which a read of the attribute calls rather than yields.
+func (k *pythonLinker) property(d Node) bool {
+	for _, p := range []string{"property", "cached_property", "getter", "setter", "deleter"} {
+		if k.decorated(d, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // defined is the value defining node p binds.
