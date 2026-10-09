@@ -34,6 +34,10 @@ import (
 type hierarchy struct {
 	decls *index
 	links *index
+	// goModule is a Go unit's module path, read from the go.mod at its
+	// project root goRoot ("." for the repository root); empty when there
+	// is none, and then no Go import path names a package of the unit.
+	goModule, goRoot string
 }
 
 // The keys of the two indexes. A family groups the languages whose files
@@ -251,6 +255,9 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 			_ = h.close()
 		}
 	}()
+	if err := h.readGoModule(ctx, u); err != nil {
+		return nil, err
+	}
 	decls, err := newEntrySort(u.dir)
 	if err != nil {
 		return nil, err
@@ -271,8 +278,9 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		return nil, err
 	}
 	defer links.Close()
-	// methodSets pairs each Go interface's abstract methods with each Go
-	// type's methods under one name-and-signature key, interfaces first.
+	// methodSets holds each Go type's own methods and embedded types, from
+	// which satisfy derives the method sets and Go's implicit interface
+	// satisfaction.
 	methodSets, err := newEntrySort(u.dir)
 	if err != nil {
 		return nil, err
@@ -386,8 +394,10 @@ func flagsOf(d *Decl) byte {
 	return f
 }
 
-// addLinks adds t's methods under the types that declare them, its declared
-// supertypes in both directions, and, for Go, its method-set entries.
+// addLinks adds t's methods under the types that declare them and its
+// declared supertypes in both directions. A Go table's methods and embedded
+// types also go to methodSets, and its embeddings are promotion, not
+// subtyping (goEmbeddings).
 func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.ExternalSort[entry], file int32, t *Table) error {
 	fc := contextOf(file, t)
 	for i := range t.Decls {
@@ -405,12 +415,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			if fc.family != "go" {
 				return nil
 			}
-			// Go declares a method without a body only in an interface.
-			m := entry{Key: d.Name + "\x00" + d.Signature, Ref: typ}
-			if !d.Abstract {
-				m.Tag = 1
-			}
-			return methodSets.Add(m)
+			return addGoMethod(methodSets, typ, d.Name, e)
 		}
 		if p := d.Parent; p >= 0 && isType(t.Decls[p].Kind) {
 			if err := add(Ref{File: file, Index: p}); err != nil {
@@ -425,6 +430,9 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		if err != nil {
 			return err
 		}
+	}
+	if fc.family == "go" {
+		return h.goEmbeddings(ctx, links, methodSets, fc, t)
 	}
 	for _, st := range t.Supertypes {
 		err := h.typesIn(ctx, fc, st.Type, func(sub entry) error {
