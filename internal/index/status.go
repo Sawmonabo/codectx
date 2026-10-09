@@ -51,12 +51,7 @@ type StatusOptions struct {
 	Git    *git.Git
 	Repo   model.RepositoryID
 	States []model.CapabilityState
-	// RunLedger reads the run ledger beside the store for the deferred units a
-	// failed publication abandoned (recordedAbandonment). It only reads, so a
-	// status process that never builds reads what the building one recorded.
-	// Nil reads none.
-	RunLedger RunLedgerReader
-	Logger    *slog.Logger
+	Logger *slog.Logger
 }
 
 // StatusReader answers the Sections 13.2/13.3 status report from ONE store
@@ -66,7 +61,7 @@ type StatusOptions struct {
 //
 // It is separate from Coordinator because a status report is a read and needs
 // none of what a coordinator owns -- no capture, no provider runtime, no delta
-// appliers, no deferred sealer, no work directory. That is what lets the one
+// appliers, no work directory. That is what lets the one
 // process that indexes and answers at the same time serve this report from its
 // read-only handle: that handle has no writer connection, so a status call
 // cannot commit the ingestion group the same process's own refresh has open,
@@ -81,12 +76,6 @@ type StatusReader struct {
 	// from does not change what they project.
 	watch     *watchState
 	retention *retentionState
-	// late is the coordinator's deferred sealer, whose units a failed
-	// publication abandoned are projected over the active generation's rows
-	// (projectAbandoned) in the process that holds them. It is nil for a
-	// reader built without a coordinator, and it performs no store call
-	// either.
-	late *lateSealer
 }
 
 // NewStatusReader validates the dependencies and builds the reader.
@@ -117,11 +106,11 @@ func NewStatusReader(o StatusOptions) (*StatusReader, error) {
 // `codectx status` takes.
 func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
 	r, err := NewStatusReader(StatusOptions{Root: c.opts.Root, Config: c.opts.Config, Store: store,
-		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, RunLedger: c.opts.RunLedgerReader, Logger: c.log})
+		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, Logger: c.log})
 	if err != nil {
 		return nil, err
 	}
-	r.watch, r.retention, r.late = &c.watch, &c.retention, c.late
+	r.watch, r.retention = &c.watch, &c.retention
 	return r, nil
 }
 
@@ -155,24 +144,10 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		return model.IndexStatus{}, err
 	}
 	states = composedStates(states, enabledComposedStates(r.opts.Config, r.opts.States))
-	abandoned := r.late.abandonedFailures(binding.SnapshotID)
-	var ledgerWarning string
-	if len(abandoned) == 0 && reportsDeferred(states) {
-		if abandoned, err = r.recordedAbandonment(ctx, binding.GenerationID); err != nil {
-			logTyped(r.log, "the run ledger could not be read for abandoned deferred units", err,
-				"component", component, "repository_id", string(r.opts.Repo))
-			ledgerWarning = "the run ledger could not be read, so deferred units a failed publication " +
-				"abandoned may be reported as still running"
-		}
-	}
-	states = projectAbandoned(states, abandoned)
 	states, aggregated := boundStates(states, r.log)
 	coherence, warnings, err := r.coherence(ctx, snap)
 	if err != nil {
 		return model.IndexStatus{}, err
-	}
-	if ledgerWarning != "" {
-		warnings = append(warnings, ledgerWarning)
 	}
 	if aggregated {
 		// Section 18.2: a report that aggregated says so. Nothing was omitted
@@ -441,14 +416,13 @@ func (w *watchState) heartbeat() (session string, lastPass *time.Time, pending *
 
 // capabilityReport accumulates one generation's capability rows and publishes
 // a bounded, deterministic list. Rows are bounded by model.MaxCapabilityStates
-// whatever the repository holds: a per-unit failure or carry is aggregated
+// whatever the repository holds: a per-unit failure is aggregated
 // rather than published one row per unit, because the list must fit the same
 // bound on a repository with one unit and one with ten thousand.
 type capabilityReport struct {
 	order    []string
 	rows     map[string]model.CapabilityState
 	failures map[string]*failureRow
-	carried  []model.CapabilityState
 }
 
 // failureRow aggregates every failed unit of one provider capability: how many
@@ -474,12 +448,6 @@ type failureRow struct {
 	scopes  []string
 	planned int
 	units   int
-	// running is how many scopes of this provider capability were still being
-	// built when the row was published. A failure row outranks the deferred
-	// row in the fold, so without this the one generation that most needs the
-	// disclosure -- one scope failed, one published, one still running --
-	// published a `partial` row and said nothing about the work in flight.
-	running int
 	// covered records that another scope of this provider capability DID
 	// publish into this generation. A capability with facts in it is partial,
 	// never failed: Section 13.3 lets a report under-claim, and reporting a
@@ -768,73 +736,6 @@ func (r *capabilityReport) addUnavailable(providerID, capability string) {
 		Details:        map[string]string{"reason": "no_units_planned"}})
 }
 
-// addDeferred publishes the row of a capability whose work is still running in
-// the background (Section 11.6): the deferred scope has no member in
-// this generation, so the capability cannot be reported as fresh coverage.
-//
-// A `fresh` row already recorded for one of the provider's other scopes is
-// demoted rather than left to win: it was added while the run was in flight,
-// and keeping it would publish "this capability is fresh" for a capability one
-// of whose scopes has nothing behind it at all -- the over-claim Section 13.3
-// forbids. Any other row (stale, partial, failed) already under-claims and
-// stays.
-func (r *capabilityReport) addDeferred(providerID, capability string, running int) {
-	key := stateKey(providerID, capability, provider.ScopeWorkspace, model.CapabilityFresh)
-	if _, ok := r.rows[key]; ok {
-		delete(r.rows, key)
-		r.order = slices.DeleteFunc(r.order, func(k string) bool { return k == key })
-	}
-	if r.reported(providerID, capability) {
-		return
-	}
-	r.add(model.CapabilityState{ProviderID: providerID, Capability: capability,
-		Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
-		DiagnosticCode: model.CodeProviderUnavailable, UnitsRunning: running,
-		Details: map[string]string{"reason": reasonUnitsDeferred}})
-}
-
-// reasonUnitsDeferred is the reason detail of the row addDeferred publishes.
-const reasonUnitsDeferred = "units_deferred"
-
-// reportsDeferred reports whether any row counts deferred units still
-// running, the only rows an abandonment rewrites.
-func reportsDeferred(states []model.CapabilityState) bool {
-	return slices.ContainsFunc(states, func(s model.CapabilityState) bool {
-		return s.Details["reason"] == reasonUnitsDeferred
-	})
-}
-
-// recordedAbandonment is the deferred units a failed publication abandoned
-// while generation gen was active, as the run ledger holds them, per provider:
-// every deferred run since gen's own that carries an abandonment marker scoped
-// to gen, and that run's unit spans (markAbandoned). Each named unit carries
-// its own run's code, message and id, so the row names the run whose
-// publication lost it. This is what status reads in a process other than the
-// one whose publication failed, which holds no in-process record; retention
-// keeps those runs while gen is retained (ledger.Reader.MarkedUnits). A
-// reader with no ledger, and a workspace that has recorded no run, answer none.
-func (r *StatusReader) recordedAbandonment(ctx context.Context, gen model.GenerationID) (map[string]*providerFailures, error) {
-	if r.opts.RunLedger == nil {
-		return nil, nil
-	}
-	marked, err := r.opts.RunLedger.MarkedUnits(ctx, string(r.opts.Repo), int64(gen), stageAbandonment,
-		maxFailedScopesNamed)
-	if err != nil {
-		return nil, err
-	}
-	failed := make(map[string]*providerFailures, len(marked))
-	for _, m := range marked {
-		agg := &providerFailures{units: int(m.Units)}
-		for _, u := range m.Named {
-			agg.named = append(agg.named, failedScope{scopeKey: u.ScopeKey, failure: unitFailure{
-				code: u.DiagnosticCode, message: u.Failure,
-				details: map[string]string{"reason": reasonPublicationFailed, detailRunID: u.RunID}}})
-		}
-		failed[m.Provider] = agg
-	}
-	return failed, nil
-}
-
 // addFailures records one provider capability's failed units. The aggregate
 // arrives whole rather than one unit at a time, because the row publishes
 // figures -- how many failed of how many planned, which scopes -- that only
@@ -847,7 +748,7 @@ func (r *StatusReader) recordedAbandonment(ctx context.Context, gen model.Genera
 // message and details travel with the scope they belong to -- a published row
 // naming one scope's key and another scope's reason is arrival-ordered again,
 // in a shape that also misreports.
-func (r *capabilityReport) addFailures(providerID, capability string, f *providerFailures, running int) {
+func (r *capabilityReport) addFailures(providerID, capability string, f *providerFailures) {
 	if f == nil || len(f.named) == 0 {
 		return
 	}
@@ -859,7 +760,7 @@ func (r *capabilityReport) addFailures(providerID, capability string, f *provide
 	r.failures[providerID+"\x00"+capability] = &failureRow{providerID: providerID, capability: capability,
 		scope: exemplar.scopeKey, code: exemplar.failure.code, message: exemplar.failure.message,
 		remediation: exemplar.failure.remediation, details: exemplar.failure.details,
-		scopes: scopes, planned: f.planned, units: f.units, running: running}
+		scopes: scopes, planned: f.planned, units: f.units}
 }
 
 // coveredElsewhere records that this provider capability has a scope that did
@@ -872,17 +773,6 @@ func (r *capabilityReport) coveredElsewhere(providerID, capability string) {
 	}
 }
 
-// addCarried records the provenance distance of one carried stale scope
-// (Section 13.3).
-func (r *capabilityReport) addCarried(providerID, capability, scope string, generations, files int) {
-	r.carried = append(r.carried, model.CapabilityState{ProviderID: providerID, Capability: capability,
-		Scope: scope, State: model.CapabilityStale, DiagnosticCode: model.CodeSnapshotChanged,
-		Details: map[string]string{
-			"stale_generations":   strconv.Itoa(generations),
-			"stale_changed_files": strconv.Itoa(files),
-		}})
-}
-
 // reported answers whether anything was already published for this provider
 // capability, in any state and at any scope.
 func (r *capabilityReport) reported(providerID, capability string) bool {
@@ -892,15 +782,8 @@ func (r *capabilityReport) reported(providerID, capability string) bool {
 			return true
 		}
 	}
-	if _, ok := r.failures[providerID+"\x00"+capability]; ok {
-		return true
-	}
-	for _, c := range r.carried {
-		if c.ProviderID == providerID && c.Capability == capability {
-			return true
-		}
-	}
-	return false
+	_, ok := r.failures[providerID+"\x00"+capability]
+	return ok
 }
 
 // publish builds the one capability row that stands for every failed unit of
@@ -910,7 +793,7 @@ func (r *capabilityReport) reported(providerID, capability string) bool {
 // `failed` and never `unavailable`. That choice is load-bearing: healthOf
 // makes partial, stale and failed degrade the generation and deliberately
 // leaves unavailable fresh, because `unavailable` is the state of a capability
-// nobody attempted -- no units planned, or units still deferred. A provider
+// nobody attempted -- no units planned. A provider
 // whose every planned unit failed WAS attempted and is broken, so reporting it
 // unavailable would publish a fresh generation over a provider that answers
 // nothing.
@@ -926,7 +809,7 @@ func (f *failureRow) publish() model.CapabilityState {
 	}
 	row := model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
 		Scope: provider.ScopeWorkspace, State: state, DiagnosticCode: f.code,
-		Remediation: f.remediation, UnitsRunning: f.running,
+		Remediation: f.remediation,
 		Details: map[string]string{unitsFailedDetail: strconv.Itoa(f.units),
 			scopeKeyDetail: model.TruncateDetail(f.scope)}}
 	if f.planned > 0 {
@@ -971,12 +854,9 @@ func withoutRawOutput(details map[string]string) map[string]string {
 	return out
 }
 
-// finish publishes the bounded list and how many rows the bound omitted. The
-// per-scope carry rows are collapsed per provider capability before anything is
-// dropped, because a stale capability with an aggregate distance is still an
-// honest stale answer while a truncated list silently loses one.
+// finish publishes the bounded list.
 func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
-	out := make([]model.CapabilityState, 0, len(r.order)+len(r.failures)+len(r.carried))
+	out := make([]model.CapabilityState, 0, len(r.order)+len(r.failures))
 	for _, key := range r.order {
 		out = append(out, r.rows[key])
 	}
@@ -993,20 +873,6 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 	for _, f := range failures {
 		out = append(out, f.publish())
 	}
-	carried := slices.Clone(r.carried)
-	slices.SortFunc(carried, func(a, b model.CapabilityState) int {
-		if a.ProviderID != b.ProviderID {
-			return compareString(a.ProviderID, b.ProviderID)
-		}
-		if a.Capability != b.Capability {
-			return compareString(a.Capability, b.Capability)
-		}
-		return compareString(a.Scope, b.Scope)
-	})
-	if len(out)+len(carried) > model.MaxCapabilityStates {
-		carried = collapseCarried(carried)
-	}
-	out = append(out, carried...)
 	rows, _ := boundStates(out, log)
 	return rows
 }
@@ -1016,7 +882,7 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 // by -- its primary key does not carry the state. The three assembly buckets
 // above key their own rows by state as well, and the bound's own collapse
 // keys by state too, so one provider capability reaches here more than once at
-// one scope in four shapes, each of which failed the insert and took `codectx
+// one scope in three shapes, each of which failed the insert and took `codectx
 // index` down on a constraint error instead of publishing the degraded
 // generation it had built:
 //
@@ -1025,13 +891,10 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 //   - the planner's and the registry's `partial` degradations are workspace
 //     scoped too (plan.builder.partial, provider detection), so they collide
 //     with that same `failed` fold;
-//   - a carried scope whose key is itself the workspace scope -- a dependence
-//     family planned as one whole-workspace unit -- publishes `stale` beside
-//     either of those;
 //   - above the bound, collapseScopes folds by provider capability AND state
 //     and rewrites every fold's scope to the workspace scope, so two states of
 //     one provider capability that fold separately come back out as two
-//     workspace-scoped rows (collapseCarried can add a third). That shape is
+//     workspace-scoped rows. That shape is
 //     regenerated after the first fold, which is why boundStates folds again
 //     on the far side of the collapse rather than trusting its input.
 //
@@ -1042,11 +905,6 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 // published row is a function of the set and not of the order the concurrent
 // unit workers reported in -- the determinism the exemplar choices above exist
 // for, because these rows fold into the AnalysisKey.
-//
-// It does not make addDeferred's demotion redundant. That one deletes the
-// fresh row so that reported() stops finding it and the deferred row is added
-// at all; without the delete the capability publishes one `fresh` row, alone,
-// and this fold has nothing to out-rank it with.
 func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 	at := make(map[string]int, len(rows))
 	out := make([]model.CapabilityState, 0, len(rows))
@@ -1058,10 +916,6 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 				survivor, other = c, out[i]
 			}
 			merged := mergeDetails(survivor, other)
-			// The greater and never the sum: every row of one provider
-			// capability carries the same figure, so adding them would count
-			// one running unit once per row it appears on.
-			merged.UnitsRunning = max(out[i].UnitsRunning, c.UnitsRunning)
 			// The counts do not add here: the two rows are two assertions
 			// about the SAME scope, so the greater of them is the number of
 			// scopes the merged row stands for and summing would count one
@@ -1113,13 +967,7 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 		// severe row holds. Only `scopes` is written here, because its sum
 		// must count a row that carries no count at all as the one scope it
 		// stands for.
-		merged := mergeDetails(survivor, other).WithDetail(scopesDetail, strconv.Itoa(scopes))
-		// `scopes` sums here because the two rows stand for disjoint scope
-		// sets; units_running does not, for the reason foldToPrimaryKey gives:
-		// it is one figure per provider capability, repeated on every row of
-		// it, not a per-row count.
-		merged.UnitsRunning = max(out[i].UnitsRunning, c.UnitsRunning)
-		out[i] = merged
+		out[i] = mergeDetails(survivor, other).WithDetail(scopesDetail, strconv.Itoa(scopes))
 	}
 	return out
 }
@@ -1258,7 +1106,6 @@ func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 	var order []string
 	folds := map[string]model.CapabilityState{}
 	counts := map[string]int{}
-	running := map[string]int{}
 	scoped := map[string]bool{}
 	for _, c := range rows {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + string(c.State)
@@ -1271,17 +1118,12 @@ func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 			scoped[key] = c.Scope != provider.ScopeWorkspace
 		}
 		counts[key] += countDetail(c)
-		// The exemplar row is published whole, so its own units_running would
-		// be the only one kept; the figure is the same on every row of one
-		// provider capability, so the greatest of them is that figure.
-		running[key] = max(running[key], c.UnitsRunning)
 	}
 	out := make([]model.CapabilityState, 0, len(order))
 	for _, key := range order {
 		row := folds[key]
 		exemplar := row.Scope
 		row.Scope = provider.ScopeWorkspace
-		row.UnitsRunning = running[key]
 		if scoped[key] {
 			row = row.WithDetail(scopeKeyDetail, model.TruncateDetail(exemplar))
 		}
@@ -1304,47 +1146,6 @@ func betterExemplar(candidate, best model.CapabilityState, haveScoped bool) bool
 		return candidate.Scope < best.Scope
 	}
 	return candidate.DiagnosticCode < best.DiagnosticCode
-}
-
-// collapseCarried folds every carried scope of one provider capability into
-// one row carrying the scope count and the greatest distance, which is the
-// distance a reader must assume for that capability.
-func collapseCarried(carried []model.CapabilityState) []model.CapabilityState {
-	type fold struct {
-		row                 model.CapabilityState
-		scopes, gens, files int
-	}
-	var order []string
-	folds := map[string]*fold{}
-	for _, c := range carried {
-		key := c.ProviderID + "\x00" + c.Capability
-		f, ok := folds[key]
-		if !ok {
-			f = &fold{row: c}
-			folds[key] = f
-			order = append(order, key)
-		}
-		f.scopes++
-		f.gens = max(f.gens, atoiDetail(c, "stale_generations"))
-		f.files = max(f.files, atoiDetail(c, "stale_changed_files"))
-	}
-	out := make([]model.CapabilityState, 0, len(order))
-	for _, key := range order {
-		f := folds[key]
-		out = append(out, model.CapabilityState{ProviderID: f.row.ProviderID, Capability: f.row.Capability,
-			Scope: provider.ScopeWorkspace, State: model.CapabilityStale, DiagnosticCode: f.row.DiagnosticCode,
-			Details: map[string]string{"stale_scopes": strconv.Itoa(f.scopes),
-				"stale_generations": strconv.Itoa(f.gens), "stale_changed_files": strconv.Itoa(f.files)}})
-	}
-	return out
-}
-
-func atoiDetail(s model.CapabilityState, key string) int {
-	n, err := strconv.Atoi(s.Details[key])
-	if err != nil {
-		return 0
-	}
-	return n
 }
 
 func compareString(a, b string) int {
