@@ -45,8 +45,8 @@ const UnobservedIdleFootprintBytes int64 = 32 * (1 << 20)
 
 // BaseFootprint is what this process holds for itself on this machine under
 // configuration c: its idle resident set above, plus the reservations it
-// makes up front -- one query slot's memory per core, the parsed-graph cache, the
-// indexing queue, and every page cache it opens: the store writer
+// makes up front -- one query slot's memory per core, the cache reservation
+// (resources.cache_bytes), the indexing queue, and every page cache it opens: the store writer
 // connection's (storage.writer_cache_kib), every reader connection's
 // (storage.reader_cache_kib) in both reader pools of every store handle
 // (ReadConnections for the writer's handle, QueryReadConnections for the

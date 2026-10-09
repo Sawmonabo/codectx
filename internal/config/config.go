@@ -74,11 +74,10 @@ func (e *Enablement) UnmarshalTOML(v any) error {
 
 // Duration is a TOML duration written in Go's syntax ("250ms", "45m"). A
 // duration is never negative. Almost every duration must also be positive; the
-// exceptions are the two analysis timeouts (providers.scip.timeout and
-// providers.dependence.timeout), where 0 means no wall-clock limit at all,
-// because a deadline that fails an analysis unit is a scale refusal wearing a
-// deadline's clothes. A hung subprocess is caught by the stall timeouts
-// instead, which detect absence of progress rather than duration of work.
+// exceptions are resources.query_timeout and the analysis timeout
+// providers.scip.timeout, where 0 means no wall-clock limit at all, because a
+// deadline that fails an analysis unit is a scale refusal wearing a deadline's
+// clothes. A hung subprocess is caught by the stall timeouts instead, which detect absence of progress rather than duration of work.
 type Duration time.Duration
 
 // UnmarshalText parses the Go duration spelling used throughout Section 20.1.
@@ -269,7 +268,6 @@ type Providers struct {
 	TreeSitter TreeSitter `toml:"tree_sitter"`
 	SCIP       SCIP       `toml:"scip"`
 	LSP        LSP        `toml:"lsp"`
-	Dependence Dependence `toml:"dependence"`
 	Manifest   Manifest   `toml:"manifest"`
 }
 
@@ -395,67 +393,6 @@ type LSP struct {
 	// pinned bytes cached for coordinate conversion, and the bytes sent to and
 	// received from a server over its lifetime.
 	MaxOverlayBytes Limit `toml:"max_overlay_bytes"`
-}
-
-// Dependence configures the fallback call provider of Section 11.6.
-// Everything here is scheduling and admission policy: which backend produces
-// the facts is a tool-lock entry the product owns and never a configuration
-// value, so no key names one.
-type Dependence struct {
-	// Enabled defaults to auto: dependence units run as low-priority
-	// background work once the base generation is active, and their
-	// capability is unavailable with the reason units_deferred until they
-	// seal. true blocks the index on those units; false disables the provider.
-	Enabled Enablement `toml:"enabled"`
-	// Timeout bounds one whole unit. 0, the default, means no wall-clock
-	// limit; StallTimeout is what catches a wedged unit.
-	Timeout Duration `toml:"timeout"`
-	// StallTimeout is the same progress-based hang detector SCIP.StallTimeout
-	// describes, applied to one dependence unit.
-	StallTimeout Duration `toml:"stall_timeout"`
-	// CacheBytes budgets the per-unit parsed-graph cache under the private
-	// data directory. That cache is what makes an unchanged unit cost nothing
-	// on refresh, so it has its own budget rather than sharing the query cache.
-	CacheBytes int64 `toml:"cache_bytes"`
-	// UnitMemoryFloorBytes is the smallest allocation a unit may be sized to.
-	// Sizing a unit near its live set costs time instead of memory, so the
-	// floor keeps a small unit from being starved into a much slower run.
-	UnitMemoryFloorBytes int64 `toml:"unit_memory_floor_bytes"`
-	// MaxUnitsPerFamily is how many projects of one language family the user
-	// wants a plan to hold. Unlimited by default: a monorepo's project count
-	// is a property of the repository, not something the product refuses on
-	// the user's behalf. A user-set value never drops a project and never
-	// refuses the plan -- exceeding it is reported on the family's capability
-	// rows, naming the family, the project count and this bound.
-	MaxUnitsPerFamily Limit `toml:"max_units_per_family"`
-	// MaxStagedRows is how many rows the user wants one unit's import to
-	// stage. Unlimited by default: staging is an on-disk, keyset-paged
-	// database, so the row count bounds disk rather than heap. A user-set
-	// value never fails the unit and never stops the import -- exceeding it is
-	// reported on the unit's capability rows with the staged count and this
-	// bound.
-	MaxStagedRows Limit `toml:"max_staged_rows"`
-	// MaxDerivedRows is how many relation occurrences the user wants one
-	// unit's import to project from its staged rows. Unlimited by default: the
-	// projection is computed and paged inside the same on-disk staging
-	// database, so the occurrence count bounds disk rather than heap. A
-	// user-set value never fails the unit and never truncates the projection --
-	// exceeding it is reported on the unit's capability rows with the derived
-	// count and this bound.
-	MaxDerivedRows Limit `toml:"max_derived_rows"`
-	// MaxExportFiles is how many entries the user allows in one analysis
-	// export directory before the import refuses it. Unlimited by default: the
-	// count is a property of the export's label vocabulary rather than of the
-	// repository, and the directory is read one entry at a time. A user-set
-	// value is the only thing that refuses an import here, and the refusal
-	// names this key.
-	MaxExportFiles Limit `toml:"max_export_files"`
-	// StagingCacheKiB is the page cache of the staging database one unit's
-	// import stages the engine's export in. It bounds the memory an import
-	// holds for its staging, and it is the buffer the engine sorts in when it
-	// builds each ordered copy the import reads, so a table smaller than it
-	// is sorted without a spill file.
-	StagingCacheKiB int `toml:"staging_cache_kib"`
 }
 
 // Tools is the managed analyzer toolchain policy of Section 11.7. The product
@@ -687,18 +624,6 @@ func Defaults() Config {
 				MaxOutstandingRequests: Unlimited,
 				IdleTTL:                Duration(60 * time.Second),
 				MaxOverlayBytes:        Unlimited,
-			},
-			Dependence: Dependence{
-				Enabled:              Auto,
-				Timeout:              0,
-				StallTimeout:         Duration(5 * time.Minute),
-				CacheBytes:           4294967296,
-				UnitMemoryFloorBytes: 805306368,
-				MaxUnitsPerFamily:    Unlimited,
-				MaxStagedRows:        Unlimited,
-				MaxDerivedRows:       Unlimited,
-				MaxExportFiles:       Unlimited,
-				StagingCacheKiB:      262144,
 			},
 			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited,
 				MaxTOMLLines: Unlimited, MaxXMLElements: Unlimited},
