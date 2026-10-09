@@ -36,12 +36,15 @@ func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name strin
 }
 
 // goEmbeddings records each type declaration of a Go table, the fields
-// each declares and what each embeds. An embedded field or an embedded interface promotes the embedded
-// type's methods into the embedding type's method set (The Go Programming
-// Language Specification, "Struct types", "Interface types"): it is walked
-// upward from the embedding type, as a supertype, and never makes the
-// embedding type a subtype a call on the embedded one dispatches into.
-func (h *hierarchy) goEmbeddings(ctx context.Context, links, methodSets *pagination.ExternalSort[entry], fc fileCtx, t *Table) error {
+// each declares and what each embeds. An embedded field or an embedded
+// interface promotes the embedded type's methods into the embedding type's
+// method set (The Go Programming Language Specification, "Struct types",
+// "Interface types"), which satisfy lists in full under the embedding type.
+// It is no subtype relation in either direction: a call on the embedded type
+// never dispatches into the embedding type, and a call on the embedding type
+// reaches only what its method set holds, never a promoted method a
+// shallower name hides.
+func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.ExternalSort[entry], fc fileCtx, t *Table) error {
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		if !isType(d.Kind) {
@@ -70,9 +73,6 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, links, methodSets *paginat
 			return h.typesIn(ctx, fc, st.Super, func(super entry) error {
 				if sub.Ref == super.Ref {
 					return nil
-				}
-				if err := links.Add(entry{Key: keySuper + refKey(sub.Ref), Ref: super.Ref}); err != nil {
-					return err
 				}
 				field := entry{Key: refKey(sub.Ref), Tag: goFieldRecord, Aux: lastComponent(typeName(st.Super), ".")}
 				if err := methodSets.Add(field); err != nil {
