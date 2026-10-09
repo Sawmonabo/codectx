@@ -61,8 +61,8 @@ const (
 	// name in the unit, read only for a name no scope or import of the file
 	// can supply (typesIn).
 	keyTypeName = "tn\x00"
-	// keyTypeModule + a Rust file module's name + name: a top-level type a
-	// `use` or a `module::T` path reaches.
+	// keyTypeModule + a Rust module (rustModuleKey) + name: a type that module
+	// declares, which a `use` or a `module::T` path reaches.
 	keyTypeModule = "tm\x00"
 	// keyTypeExport + a module path without extension + name: a top-level
 	// type an ECMAScript module exports or a Python module declares, which
@@ -74,10 +74,10 @@ const (
 	keyFunc = "u\x00"
 	// keyFuncQualified + family + a qualified suffix of two or more
 	// components: a free function a qualified name reaches (`pkg.F`,
-	// `ns::f`, an in-file Rust `m::f`).
+	// `ns::f`).
 	keyFuncQualified = "uq\x00"
-	// keyFuncModule + a Rust file module's name + name: a free function a
-	// `module::f` path reaches.
+	// keyFuncModule + a Rust module (rustModuleKey) + name: a free function
+	// that module declares, which a `use` or a `module::f` path reaches.
 	keyFuncModule = "um\x00"
 	// keyMethod + refKey(type) + name: a method or constructor the type
 	// declares, its signature in Sig.
@@ -334,8 +334,10 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		case isType(d.Kind):
 			prefix, qualifiedPrefix = keyType, keyTypeQualified
 			keys = append(keys, keyTypeName+fc.family+"\x00"+d.Name)
-			if d.Parent < 0 && fc.family == "rust" {
-				keys = append(keys, keyTypeModule+rustModule(t.Path)+"\x00"+d.Name)
+			if fc.family == "rust" {
+				if m, ok := rustDeclModule(t, d); ok {
+					keys = append(keys, keyTypeModule+m+"\x00"+d.Name)
+				}
 			}
 			if d.Parent < 0 && (fc.family == "python" || fc.family == "js" && d.Exported) {
 				for _, b := range bases {
@@ -344,14 +346,21 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 			}
 		case isCallable(d.Kind) && d.Receiver == "" && (d.Parent < 0 || !isType(t.Decls[d.Parent].Kind)):
 			prefix, qualifiedPrefix = keyFunc, keyFuncQualified
-			if fc.family == "rust" && d.Parent < 0 {
-				keys = append(keys, keyFuncModule+rustModule(t.Path)+"\x00"+d.Name)
+			if fc.family == "rust" {
+				if m, ok := rustDeclModule(t, d); ok {
+					keys = append(keys, keyFuncModule+m+"\x00"+d.Name)
+				}
 			}
 		default:
 			continue
 		}
 		keys = append(keys, prefix+fc.family+"\x00"+scope+"\x00"+d.Name)
-		qualifiedSuffixes(d.Qualified, fc.sep, func(q string) { keys = append(keys, qualifiedPrefix+fc.family+"\x00"+q) })
+		// A Rust path is read through the module it names (keyFuncModule,
+		// keyTypeModule), never by a suffix of a qualified name, which any
+		// module of the same name in any crate would match.
+		if fc.family != "rust" {
+			qualifiedSuffixes(d.Qualified, fc.sep, func(q string) { keys = append(keys, qualifiedPrefix+fc.family+"\x00"+q) })
+		}
 		e := entry{Ref: ref, Aux: ns, Sig: d.Signature, Flags: flagsOf(d)}
 		for _, k := range keys {
 			e.Key = k
