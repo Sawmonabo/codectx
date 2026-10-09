@@ -118,9 +118,9 @@ func TestASecondProcessReadsWhyAUnitFailedAndWhatIsStillRunning(t *testing.T) {
 	// this package can reach, so it holds the store and the second handle to
 	// the figure and not to the counting; what counts it is internal/index's
 	// holdsFreshUnit, over generation_units.
-	otherProvider := model.CapabilityState{ProviderID: "dependence", Capability: "calls",
+	otherProvider := model.CapabilityState{ProviderID: "link", Capability: "calls",
 		Scope: "workspace", State: model.CapabilityUnavailable, DiagnosticCode: model.CodeProviderUnavailable,
-		UnitsRunning: 2, Details: map[string]string{"reason": "units_deferred"}}
+		UnitsRunning: 2}
 	if _, err = f.s.Activate(f.ctx, gen, 0, model.HealthDegraded,
 		[]model.CapabilityState{interleaved, otherProvider}, "norm-v1"); err != nil {
 		t.Fatalf("Activate: %v", err)
