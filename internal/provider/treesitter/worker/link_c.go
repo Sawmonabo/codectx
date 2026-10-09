@@ -30,7 +30,8 @@ import (
 //     arguments fit it (cArity), whether a namespace-scope function has
 //     internal linkage (declared `static` anywhere in the file, or in an
 //     unnamed namespace) and whether a C++ member is virtual or final as its
-//     declaration says.
+//     declaration says. A class, struct, union or enum definition in an
+//     unnamed namespace is exported too, with Internal alone.
 //   - Supertypes: each base of a C++ class, struct or union.
 //   - Sites: every call the structural queries capture, keyed by its callee
 //     token: `f()` (bare, or indirect when f is a local, a parameter, a
@@ -368,6 +369,9 @@ func (k *cLinker) walk(n Node) {
 		return
 	case k.record(n):
 		k.supertypes(n)
+		k.internalType(n)
+	case id == s.enumSpecifier:
+		k.internalType(n)
 	case id == x.preprocFunctionDef:
 		k.macro(n)
 		return
@@ -644,6 +648,20 @@ func (k *cLinker) storage(owner Node, word string) bool {
 		}
 	}
 	return false
+}
+
+// internalType appends the Export of the class, struct, union or enum
+// definition n when an unnamed namespace encloses it: the type has internal
+// linkage ([basic.link]), so only its own file names it. Nothing else of a
+// type is exported.
+func (k *cLinker) internalType(n Node) {
+	name, body := n.ChildByFieldId(k.s.fName), n.ChildByFieldId(k.s.fBody)
+	if cKind(name) != k.s.typeIdentifier || body.IsNull() {
+		return
+	}
+	if _, unnamed := k.enclosingNamespaces(n); unnamed {
+		k.out.Exports = append(k.out.Exports, wire.Export{Name: wireSpan(spanOf(name)), Internal: true})
+	}
 }
 
 // supertypes appends each base class of the record n.
