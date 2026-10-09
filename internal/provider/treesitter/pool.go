@@ -205,9 +205,8 @@ type pool struct {
 	wg    sync.WaitGroup
 	// totals is the open structural-parse total of every run parsing through
 	// this pool, which is what a worker's span hangs off. It is keyed by the
-	// run and not held as one span because a deferred publication's tick runs
-	// units of its own, and its workers belong to its run rather than to
-	// whatever index run happens to be live.
+	// run and not held as one span, so a worker's span belongs to the run its
+	// parse was started for rather than to whatever run happens to be live.
 	totals map[*ledger.Run]*stageTotal
 
 	started, exited, parses, retries uint64

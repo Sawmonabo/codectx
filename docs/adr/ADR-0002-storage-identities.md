@@ -2,6 +2,9 @@
 
 - **Status:** Accepted (implemented)
 - **Date:** 2026-09-14
+- **Amended 2026-10-08:** the `fact_keys` table this record sizes and indexes (§2.5) was deleted
+  with the per-fact-key delta when the hosted dependence engine, its only producer, was retired
+  under [ADR-0012](ADR-0012-native-dependence-engine.md) phase 6.
 - **Refines:** [`ADR-0001 — Scale posture`](ADR-0001-scale-posture.md) §2.8, which took the
   decision to make this change; this record carries the shape that was built, the alternatives that
   were refused on the way, and the sources cited for it
