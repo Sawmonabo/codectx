@@ -1,8 +1,10 @@
 package treesitter
 
 import (
+	"bytes"
 	"cmp"
 	"slices"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -48,8 +50,8 @@ func (b *builder) linkTable() error {
 	if b.ex.done.DependenceFailure != "" || b.ex.done.LinkFailure != "" {
 		return outputInvalid("a file whose dependence or link pass failed also sent link tables")
 	}
-	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Supertypes: wl.Supertypes,
-		Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
+	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Package: b.ex.done.Package, Imports: b.linkImports(),
+		Supertypes: wl.Supertypes, Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
 			Name: b.module.Node.Name, Qualified: b.module.Node.QualifiedName, Range: *b.fileRng}}
 
 	// siteAt maps each worker site to its index in t.Sites, -1 for one that
@@ -127,7 +129,8 @@ func (b *builder) linkTable() error {
 	for i := range b.decls {
 		d := &b.decls[i]
 		t.Decls[i] = link.Decl{Endpoint: link.Endpoint{Node: d.res.Node.ID, CanonicalKey: d.res.CanonicalKey, Kind: d.kind,
-			Name: d.Name, Qualified: d.Qualified, Range: *d.rng}, Parent: int32(d.Parent), Exported: d.Exported}
+			Name: d.Name, Qualified: d.Qualified, Range: *d.rng}, Parent: int32(d.Parent), Exported: d.Exported,
+			Prototype: d.Prototype, Default: d.Parent < 0 && d.Exported && ecmaScript[b.lang.Name] && exportsDefault(b.src, d.Start)}
 	}
 	for _, x := range wl.Exports {
 		i, ok := b.nameAt[x.Name]
@@ -154,6 +157,159 @@ func (b *builder) linkTable() error {
 	}
 	b.table = t
 	return nil
+}
+
+// ecmaScript are the languages whose `export default` names a declaration.
+var ecmaScript = map[string]bool{"javascript": true, "typescript": true, "tsx": true}
+
+// exportsDefault reports that the exported declaration starting at start is
+// the declaration of an `export default` statement: the grammar puts the
+// keyword `default` right before the declaration and `export` right before
+// it, with only whitespace and comments between the tokens (a decorator is
+// part of the class declaration it decorates). A line comment between them
+// is not read back and leaves the declaration a named export only.
+func exportsDefault(src []byte, start uint32) bool {
+	before := src[:start]
+	for _, word := range []string{"default", "export"} {
+		before = trimBlockComments(before)
+		if !bytes.HasSuffix(before, []byte(word)) {
+			return false
+		}
+		before = before[:len(before)-len(word)]
+		if n := len(before); n > 0 && isIdentByte(before[n-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+// trimBlockComments drops the whitespace and block comments b ends with.
+func trimBlockComments(b []byte) []byte {
+	for {
+		b = bytes.TrimRight(b, " \t\r\n\f\v")
+		if !bytes.HasSuffix(b, []byte("*/")) {
+			return b
+		}
+		i := bytes.LastIndex(b[:len(b)-2], []byte("/*"))
+		if i < 0 {
+			return b
+		}
+		b = b[:i]
+	}
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || c == '$' || c >= 0x80 || '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
+}
+
+// linkImports is the names the file's import records introduce, each with
+// the path it denotes (link.Import). The worker's record is one statement:
+// its path as written and the local names it binds. A Rust use tree is
+// split into one path per leaf. An import of every member of a path (a Go
+// dot import, a Java on-demand import `a.b.*`, a C++ using-directive, a Rust
+// glob, a Python `from m import *`) is named link.ImportAll, which the
+// statement's own bytes tell; an import binding no name (an include, an
+// ECMAScript side-effect import) has an empty name.
+func (b *builder) linkImports() []link.Import {
+	var out []link.Import
+	for _, imp := range b.ex.imports {
+		text := string(b.src[imp.Start:imp.End])
+		names := imp.Names
+		switch b.lang.Name {
+		case "rust":
+			rustUse("", imp.Path, func(name, p string) { out = append(out, link.Import{Name: name, Path: p}) })
+			continue
+		case "go":
+			if len(names) == 1 && names[0] == "." {
+				names = []string{link.ImportAll}
+			}
+		case "java", "python":
+			if strings.Contains(text, "*") {
+				names = []string{link.ImportAll}
+			}
+		case "c", "cpp":
+			switch f := strings.Fields(text); {
+			case len(f) > 2 && f[0] == "using" && f[1] == "namespace":
+				names = []string{link.ImportAll}
+			case len(f) < 2 || f[0] != "using":
+				// An include binds no name.
+				names = nil
+			}
+		}
+		if len(names) == 0 {
+			out = append(out, link.Import{Path: imp.Path})
+		}
+		for _, n := range names {
+			out = append(out, link.Import{Name: n, Path: imp.Path})
+		}
+	}
+	return out
+}
+
+// rustUse yields every leaf of the Rust use tree p, written inside a list
+// whose path so far is prefix: the name it binds and the full path it names
+// (`a::{b, c as d}` binds b to a::b and d to a::c). A glob yields the module
+// it imports from as link.ImportAll; `self` in a
+// list binds the list's own path; `as _` binds nothing.
+func rustUse(prefix, p string, yield func(name, path string)) {
+	join := func(a, b string) string {
+		if a == "" {
+			return b
+		}
+		if b == "" {
+			return a
+		}
+		return a + "::" + b
+	}
+	p = strings.TrimSpace(p)
+	if i := strings.IndexByte(p, '{'); i >= 0 {
+		prefix = join(prefix, strings.TrimSuffix(strings.TrimSpace(p[:i]), "::"))
+		inner := strings.TrimSuffix(strings.TrimSpace(p[i+1:]), "}")
+		depth, from := 0, 0
+		for j := 0; j <= len(inner); j++ {
+			if j < len(inner) {
+				switch inner[j] {
+				case '{':
+					depth++
+					continue
+				case '}':
+					depth--
+					continue
+				case ',':
+					if depth > 0 {
+						continue
+					}
+				default:
+					continue
+				}
+			}
+			if item := strings.TrimSpace(inner[from:j]); item != "" {
+				rustUse(prefix, item, yield)
+			}
+			from = j + 1
+		}
+		return
+	}
+	if f := strings.Fields(p); len(f) >= 3 && f[len(f)-2] == "as" {
+		if alias := f[len(f)-1]; alias != "_" {
+			yield(alias, join(prefix, strings.Join(f[:len(f)-2], "")))
+		}
+		return
+	}
+	leaf := p
+	if i := strings.LastIndex(p, "::"); i >= 0 {
+		leaf = p[i+2:]
+	}
+	switch leaf {
+	case "*":
+		yield(link.ImportAll, join(prefix, strings.TrimSuffix(strings.TrimSuffix(p, "*"), "::")))
+	case "self":
+		if prefix != "" {
+			yield(prefix[strings.LastIndex(prefix, ":")+1:], prefix)
+		}
+	default:
+		yield(leaf, join(prefix, p))
+	}
 }
 
 // enclosing is the index of the innermost declaration whose range contains

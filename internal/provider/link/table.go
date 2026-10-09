@@ -21,6 +21,14 @@ const tableDigestDomain = "link.table"
 type Table struct {
 	Path     string `json:"path"`
 	Language string `json:"language"`
+	// Package is the file's package or module clause as written (Go's
+	// package name, Java's package), empty when the language has none.
+	Package string `json:"package,omitempty"`
+	// Imports are the names the file's imports introduce, in source order:
+	// one per local name, ImportAll for an import of every member of a
+	// path, and one with an empty Name for an import that binds no name (an
+	// include, a side-effect import).
+	Imports []Import `json:"imports,omitempty"`
 	// Module is the file's module node, the caller of a site outside every
 	// declaration.
 	Module Endpoint `json:"module"`
@@ -39,6 +47,24 @@ type Table struct {
 	Dropped int `json:"dropped,omitempty"`
 }
 
+// Import is one name an import introduces into the file. Path is what the
+// name denotes as the language writes it: a Go package's import path (Name
+// its local name, "_" for a blank import); the qualified name of a Java type
+// or static member; the `::` path a C++ using-declaration names; the full
+// `::` path of one leaf of a Rust use tree; the module specifier of an
+// ECMAScript or Python import as written; an include's header. For an
+// ImportAll import it is the package, type, namespace or module whose
+// members it imports.
+type Import struct {
+	Name string `json:"name,omitempty"`
+	Path string `json:"path"`
+}
+
+// ImportAll is the Name of an import of every member of its Path: a Go dot
+// import, a Java on-demand import, a C++ using-directive, a Rust glob, a
+// Python `from m import *`.
+const ImportAll = "*"
+
 // Endpoint is a node of the structural provider as the parent resolved it:
 // what the linker publishes an occurrence of when a `calls` edge names it, so
 // the edge's endpoint is the structural node itself and no second identity.
@@ -56,16 +82,22 @@ type Endpoint struct {
 // Export for; its type fields are then zero.
 type Decl struct {
 	Endpoint
-	Parent    int32     `json:"parent"`
-	Exported  bool      `json:"exported,omitempty"`
-	Described bool      `json:"described,omitempty"`
-	Receiver  string    `json:"receiver,omitempty"`
-	Signature string    `json:"signature,omitempty"`
-	Params    uint32    `json:"params,omitempty"`
-	Variadic  bool      `json:"variadic,omitempty"`
-	Static    bool      `json:"static,omitempty"`
-	Abstract  bool      `json:"abstract,omitempty"`
-	Returns   wire.Type `json:"returns"`
+	Parent    int32  `json:"parent"`
+	Exported  bool   `json:"exported,omitempty"`
+	Described bool   `json:"described,omitempty"`
+	Receiver  string `json:"receiver,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Params    uint32 `json:"params,omitempty"`
+	Variadic  bool   `json:"variadic,omitempty"`
+	Static    bool   `json:"static,omitempty"`
+	Abstract  bool   `json:"abstract,omitempty"`
+	// Prototype is a C or C++ function declaration without a body: it
+	// announces a definition and yields to one wherever one is declared.
+	Prototype bool `json:"prototype,omitempty"`
+	// Default is an ECMAScript declaration its module exports as
+	// `default` (`export default class C {}`).
+	Default bool      `json:"default,omitempty"`
+	Returns wire.Type `json:"returns"`
 }
 
 // Site is one call site: the structural provider's call reference joined to
@@ -116,16 +148,18 @@ func DecodeTable(b []byte) (*Table, error) {
 }
 
 // Digest is the digest of what the linker's resolution reads of t: every
-// name, kind, shape, type fact, candidate and index, and the order of every
-// list, but no byte range, position, node identity or dropped count. A structural node's
-// identity is derived from its range, and an edit that shifts a range moves
-// neither a name nor a type, so two tables with one digest resolve every site
+// name, kind, shape, type fact, candidate and index, the package and the
+// imports, and the order of every list, but no byte range, position, node
+// identity or dropped count. A structural node's identity is derived from
+// its range, and an edit that shifts a range moves neither a name nor a
+// type, so two tables with one digest resolve every site
 // to the same declarations by index; only the ranges and identities the
 // edges are published with differ, and those are read from the fresh table.
 // That is what lets an edit inside a function body that changes neither
 // table relink nothing.
 func (t *Table) Digest() (string, error) {
-	c := Table{Path: t.Path, Language: t.Language, Supertypes: t.Supertypes, Values: make([]Value, len(t.Values))}
+	c := Table{Path: t.Path, Language: t.Language, Package: t.Package, Imports: t.Imports, Supertypes: t.Supertypes,
+		Values: make([]Value, len(t.Values))}
 	c.Module = Endpoint{Kind: t.Module.Kind, Name: t.Module.Name, Qualified: t.Module.Qualified}
 	c.Decls = make([]Decl, len(t.Decls))
 	for i, d := range t.Decls {

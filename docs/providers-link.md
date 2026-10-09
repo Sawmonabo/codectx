@@ -43,7 +43,7 @@ The details are the `Detail*` constants (`provider.go:54-75`). Each one names th
 - `field`: a function written to the field the site calls through.
 
 **Caller and target.** The caller is the declaration enclosing the site, or the file's module node when no
-declaration encloses it (`Site.Caller`, -1 for the module, `internal/provider/link/table.go:74-95`). A target is a
+declaration encloses it (`Site.Caller`, -1 for the module, `internal/provider/link/table.go:106-127`). A target is a
 declaration of any member file of the unit.
 
 **Evidence.** Every fact is `static_analysis`. A site publishes one evidence row per edge, at the call expression's
@@ -52,7 +52,7 @@ range (`Site.Range`). Its native key is the call-site key, spelled as the struct
 `Site.NameEnd`).
 
 **Endpoints are the structural nodes.** The linker mints no second identity for a declaration. Each table carries
-an `Endpoint` for each declaration and for the module (`table.go:45-52`): the node id, canonical key, kind, names
+an `Endpoint` for each declaration and for the module (`table.go:71-78`): the node id, canonical key, kind, names
 and range the structural unit resolved. The linker publishes an occurrence of every endpoint an edge names, with its
 own evidence at the declaration's range. So the edge joins the structural node, and through it the cross-provider
 `decl:` key and the call-site key of docs/providers-treesitter.md.
@@ -101,8 +101,19 @@ reads a table back through `link.Tables` (`internal/provider/link/tables.go:14-5
 generation selects for the file's scope, then that unit's state. A file with no lowering, or whose dependence or link
 pass failed, has no table.
 
-**The digest** (`Table.Digest`, `table.go:118-149`) covers everything resolution reads. That is every name, kind,
-shape, type fact, candidate and index, and the order of every list. It covers no byte range, position, node identity
+Besides the joined declarations, sites and values, the table carries what the resolvers read a name in
+(`table.go:21-66`, filled by `internal/provider/treesitter/link.go`):
+- `Package`: the file's package or module clause (`wire.Done.Package`);
+- `Imports`: one `Import{Name, Path}` per name an import introduces, `Path` being what the name denotes as the
+  language writes it. A Rust use tree is split into one path per leaf (`use a::{b, c as d}` gives `b → a::b` and
+  `d → a::c`). An import of every member of a path (a Go dot import, a Java on-demand import, a C++ using-directive,
+  a Rust glob, a Python `from m import *`) is named `ImportAll`. An include or a side-effect import has no name;
+- `Decl.Prototype`: a C or C++ function declaration without a body (`wire.Decl.Prototype`);
+- `Decl.Default`: an ECMAScript declaration an `export default` statement declares, decided from the pinned bytes
+  before the declaration (the keywords `export default`, with only whitespace and block comments between).
+
+**The digest** (`Table.Digest`, `table.go:160-183`) covers everything resolution reads. That is every name, kind,
+shape, type fact, candidate and index, the package and the imports, and the order of every list. It covers no byte range, position, node identity
 or dropped count. An edit that shifts a range moves no name and no type. So two tables with one digest resolve every
 site to the same declarations, by index; only the ranges and identities the edges are published with differ.
 
@@ -126,13 +137,22 @@ an import, a type or a signature.
 
 The members' language family picks the resolver:
 - **Java** (`resolveStatic`, `internal/provider/link/resolve_static.go`): class-hierarchy analysis. A static,
-  constructor or `super` site binds directly. A member site binds by its receiver's static type to that type's
-  method and to every override in a subtype (`hierarchy.dispatch`, `internal/provider/link/hierarchy.go:20-25`).
+  constructor or `super` site binds directly, and a bare call a static import names binds the imported method. A
+  member site binds by its receiver's static type to that type's method and to every override in a subtype
+  (`hierarchy.dispatch`, `internal/provider/link/hierarchy.go:20-25`). A call of an abstract method (a functional
+  interface's) also joins every method reference of that method's signature.
 - **Go, Rust, C, C++** (`resolveStatic`): direct binding and class-hierarchy analysis over interfaces and traits.
-  Bare and static sites bind by the language's scoping: same package, import, `use`, namespace, or a header
-  prototype to its definition. Go's implicit interface satisfaction is derived from method sets. An indirect site
-  joins every function taken as a value whose declared signature equals the site's (`wire.Export.Signature`,
-  `wire/link.go:42-49`). This is the address-taken × indirect-site cross-product, with no reachability fixed point.
+  Bare and static sites bind by the language's scoping: same package, import, `use`, namespace and
+  using-directive, and a prototype yields to the definition it announces (`Decl.Prototype`). A Go `pkg.F` binds the
+  package whose directory ends the import path. Go's implicit interface satisfaction is derived from method sets. An
+  indirect site joins every function taken as a value whose declared signature equals the site's
+  (`wire.Export.Signature`, `wire/link.go:42-49`). This is the address-taken × indirect-site cross-product, with no
+  reachability fixed point.
+
+A type name is read in the file's scopes, then through the import that names it (which decides alone), then
+through the file's imports of every member. Only a name that no scope or import of the file can supply falls back
+to every type of that name in the unit (`hierarchy.typesIn`).
+
 - **JavaScript, TypeScript, TSX** (`resolveECMAScript`, `internal/provider/link/resolve_ecmascript.go`): direct
   binding through imports and scopes. Member sites bind through receivers recovered by flow-based type inference,
   then `hierarchy.dispatch`. Field-based resolution binds a site to the functions written to the property it calls
@@ -159,7 +179,7 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 The `calls` row is published at the unit's scope:
 - `fresh` when every member had a table and no table dropped an entry;
-- `partial` when a member has no table, or a table's `Dropped` is non-zero (`table.go:35-39`), with the counts in the
+- `partial` when a member has no table, or a table's `Dropped` is non-zero (`table.go:43-47`), with the counts in the
   row's details. A dropped entry is a worker entry the structural provider could not join to a declaration or a call
   reference of the file, or whose range did not fit the pinned bytes. It is never fatal.
 

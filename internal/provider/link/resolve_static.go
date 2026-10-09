@@ -3,6 +3,7 @@ package link
 import (
 	"context"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -37,7 +38,7 @@ func resolveStatic(ctx context.Context, u *unit, emit func(Binding) error) error
 	}
 	defer bySignature.Close()
 	err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
-		r := staticFile{h: h, ctx: ctx, file: file, t: t, fc: contextOf(t), emit: emit}
+		r := staticFile{h: h, ctx: ctx, file: file, t: t, fc: contextOf(file, t), emit: emit}
 		for i := range t.Sites {
 			if err := r.site(int32(i), bySignature); err != nil {
 				return err
@@ -103,8 +104,6 @@ type staticFile struct {
 	t    *Table
 	fc   fileCtx
 	emit func(Binding) error
-	// importNames is imports' answer, computed on first use.
-	importNames map[string]bool
 }
 
 // site resolves site i by its shape, and adds an indirect site with a
@@ -125,7 +124,7 @@ func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) 
 	case wire.ShapeBare:
 		return r.bare(s.Caller, s.Callee, bind)
 	case wire.ShapeStatic:
-		return r.qualified(s.Caller, s.Qualifier, s.Callee, s.QualifierIsImport, bind(DetailDirect))
+		return r.qualified(s.Caller, s.Qualifier, s.Callee, bind(DetailDirect))
 	case wire.ShapeConstructor:
 		name := s.Qualifier
 		if name == "" {
@@ -135,7 +134,23 @@ func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) 
 			return r.h.methods(typ.Ref, lastComponent(typeName(name), r.fc.sep), bind(DetailDirect))
 		})
 	case wire.ShapeMember:
-		return r.member(s.Caller, s.Receiver, s.Callee, bind)
+		err := r.member(s.Caller, s.Receiver, s.Callee, bind)
+		if err != nil || r.fc.language != "java" || s.Receiver.Kind != wire.TypeNamed {
+			return err
+		}
+		// A Java call of an abstract method (a functional interface's, on a
+		// field or local holding a method reference) is an indirect call
+		// of that method's signature: it joins every method reference of
+		// that signature, as an indirect site joins the address-taken
+		// functions of its declared type.
+		return r.h.typesIn(r.ctx, r.fc, s.Receiver.Name, func(typ entry) error {
+			return r.h.declared(typ.Ref, s.Callee, func(e entry) error {
+				if e.Flags&flagAbstract == 0 || e.Sig == "" {
+					return nil
+				}
+				return bySignature.Add(entry{Key: e.Sig, Tag: 1, Ref: ref})
+			})
+		})
 	case wire.ShapeIndirect:
 		if s.Receiver.Kind == wire.TypeFunction {
 			if err := r.function(s.Caller, s.Receiver.Name, bind(DetailDirect)); err != nil {
@@ -163,38 +178,126 @@ func (r *staticFile) bare(caller int32, callee string, bind func(string) func(en
 				return bind(DetailHierarchy)(e)
 			})
 		})
-		if err != nil || found || r.fc.language == "java" {
+		if err != nil || found {
 			return err
+		}
+		if r.fc.language == "java" {
+			return r.staticImport(callee, bind(DetailDirect))
 		}
 	}
 	return r.free(caller, callee, bind(DetailDirect))
 }
 
-// free yields the free functions named callee visible to code in caller.
+// staticImport yields the static methods named callee a Java file's static
+// imports bring into scope: `import static a.b.C.m;` names C's m, and
+// `import static a.b.C.*;` every member of C. A single-static import of the
+// name decides alone.
+func (r *staticFile) staticImport(callee string, yield func(entry) error) error {
+	member := func(typePath, method string) error {
+		return r.h.decls.lookup(keyTypeQualified+r.fc.family+"\x00"+typePath, func(typ entry) error {
+			return r.h.declared(typ.Ref, method, yield)
+		})
+	}
+	imported := false
+	err := r.h.imports(r.fc, callee, func(p string) error {
+		imported = true
+		if typePath, method, ok := cutLast(p, "."); ok {
+			return member(typePath, method)
+		}
+		return nil
+	})
+	if err != nil || imported {
+		return err
+	}
+	return r.h.imports(r.fc, ImportAll, func(p string) error { return member(p, callee) })
+}
+
+// free yields the free functions named callee visible to code in caller:
+// those its scope declares and, when it declares none, those its imports
+// bring into scope (a Go dot import, a C++ using-declaration or
+// using-directive, a Rust `use`).
 func (r *staticFile) free(caller int32, callee string, yield func(entry) error) error {
-	if r.fc.family != "c" {
-		return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, yield)
+	found := false
+	hit := func(e entry) error {
+		found = true
+		return yield(e)
 	}
-	// The caller's own scope: its namespaces and enclosing classes.
-	from := ""
+	switch r.fc.family {
+	case "c":
+		return r.freeC(caller, callee, yield)
+	case "go":
+		if err := r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, hit); err != nil || found {
+			return err
+		}
+		return r.h.imports(r.fc, ImportAll, func(p string) error {
+			return r.h.goPackages(p, func(scope string) error {
+				return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+scope+"\x00"+callee, yield)
+			})
+		})
+	case "rust":
+		if err := r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, hit); err != nil || found {
+			return err
+		}
+		imported := false
+		err := r.h.imports(r.fc, callee, func(p string) error {
+			imported = true
+			if module, last, ok := cutLast(p, "::"); ok {
+				return r.h.decls.lookup(keyFuncModule+rustPath(r.t.Path, module)+"\x00"+last, yield)
+			}
+			return nil
+		})
+		if err != nil || imported {
+			return err
+		}
+		return r.h.imports(r.fc, ImportAll, func(p string) error {
+			return r.h.decls.lookup(keyFuncModule+rustPath(r.t.Path, p)+"\x00"+callee, yield)
+		})
+	}
+	return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, yield)
+}
+
+// freeC is free for C and C++: the functions of the one linkage scope whose
+// namespace encloses the caller or a namespace a using-directive of the
+// file names, a prototype yielding to its definition; else the function a
+// using-declaration of the name names.
+func (r *staticFile) freeC(caller int32, callee string, yield func(entry) error) error {
+	from := []string{""}
 	if caller >= 0 {
-		from = namespaceOf(&r.t.Decls[caller], r.fc.sep)
+		from[0] = namespaceOf(&r.t.Decls[caller], r.fc.sep)
 	}
-	return preferDefinitions(func(f func(entry) error) error {
+	for _, imp := range r.t.Imports {
+		if imp.Name == ImportAll {
+			from = append(from, imp.Path)
+		}
+	}
+	found := false
+	err := preferDefinitions(func(f func(entry) error) error {
 		return r.h.decls.lookup(keyFunc+r.fc.family+"\x00\x00"+callee, func(e entry) error {
-			if visible(e.Aux, from) {
+			if slices.ContainsFunc(from, func(ns string) bool { return visible(e.Aux, ns) }) {
 				return f(e)
 			}
 			return nil
 		})
-	}, yield)
+	}, func(e entry) error {
+		found = true
+		return yield(e)
+	})
+	if err != nil || found {
+		return err
+	}
+	return r.h.imports(r.fc, callee, func(p string) error {
+		return preferDefinitions(func(f func(entry) error) error {
+			return r.h.decls.lookup(keyFuncQualified+r.fc.family+"\x00"+p, f)
+		}, yield)
+	})
 }
 
 // qualified resolves a call of name through qualifier q: a type's static
 // method or associated function (Rust's `Self` is the caller's impl type), a
-// package's function when q is an import (Go), a namespace's function (C++),
-// or a Rust module's function.
-func (r *staticFile) qualified(caller int32, q, name string, imported bool, yield func(entry) error) error {
+// package's function when q is a Go import (by the import's path), a
+// namespace's function (C++), or a Rust module's function (through the
+// `use` that binds q's first component, when one does).
+func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) error) error {
 	found := false
 	hit := func(e entry) error {
 		found = true
@@ -203,8 +306,17 @@ func (r *staticFile) qualified(caller int32, q, name string, imported bool, yiel
 	if r.fc.language == "rust" && q == "Self" {
 		return r.enclosingTypes(caller, func(typ Ref) error { return r.h.declared(typ, name, yield) })
 	}
-	if r.fc.family == "go" && imported {
-		return r.h.decls.lookup(keyFuncQualified+r.fc.family+"\x00"+q+"."+name, yield)
+	if r.fc.family == "go" {
+		imported := false
+		err := r.h.imports(r.fc, q, func(p string) error {
+			imported = true
+			return r.h.goPackages(p, func(scope string) error {
+				return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+scope+"\x00"+name, yield)
+			})
+		})
+		if err != nil || imported {
+			return err
+		}
 	}
 	err := r.h.typesIn(r.ctx, r.fc, q, func(typ entry) error { return r.h.declared(typ.Ref, name, hit) })
 	if err != nil || found {
@@ -216,6 +328,19 @@ func (r *staticFile) qualified(caller int32, q, name string, imported bool, yiel
 			return r.h.decls.lookup(keyFuncQualified+r.fc.family+"\x00"+q+r.fc.sep+name, f)
 		}, yield)
 	case "rust":
+		// A path whose first component a `use` binds is read from that
+		// use's path: `u::f()` after `use crate::util as u`.
+		head, rest, ok := strings.Cut(q, "::")
+		err := r.h.imports(r.fc, head, func(p string) error {
+			q = p
+			if ok {
+				q += "::" + rest
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 		module := rustPath(r.t.Path, q)
 		if err := r.h.decls.lookup(keyFuncModule+module+"\x00"+name, hit); err != nil || found {
 			return err
@@ -241,7 +366,7 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, bind fu
 			})
 		})
 	case wire.TypeModule:
-		return r.qualified(caller, recv.Name, method, true, bind(DetailDirect))
+		return r.qualified(caller, recv.Name, method, bind(DetailDirect))
 	}
 	return nil
 }
@@ -264,21 +389,7 @@ func (r *staticFile) function(caller int32, written string, yield func(entry) er
 	if q == "this" || q == "self" {
 		return r.enclosingTypes(caller, func(typ Ref) error { return r.h.dispatchEntries(r.ctx, typ, last, yield) })
 	}
-	return r.qualified(caller, q, last, r.fc.family == "go" && r.imports()[q], yield)
-}
-
-// imports is the import names this file's static sites record, the only
-// import names a table carries.
-func (r *staticFile) imports() map[string]bool {
-	if r.importNames == nil {
-		r.importNames = map[string]bool{}
-		for i := range r.t.Sites {
-			if s := &r.t.Sites[i]; s.QualifierIsImport {
-				r.importNames[s.Qualifier] = true
-			}
-		}
-	}
-	return r.importNames
+	return r.qualified(caller, q, last, yield)
 }
 
 // rustPath is the module a Rust path q written in the file at p names: its
