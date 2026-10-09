@@ -308,9 +308,9 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 // -data is derived from it too, and re-creating that after an upgrade is the
 // safe direction. The previous payload's directory is left in place: nothing
 // under <data_dir>/lsp is reclaimed today (the tool store under
-// <data_dir>/tools is swept by `codectx tools gc`, and dependence sweeps its
-// own private tree; neither touches this one), so a machine keeps one tree per
-// java server version it has been pinned to.
+// <data_dir>/tools is swept by `codectx tools gc`, which does not touch this
+// one), so a machine keeps one tree per java server version it has been pinned
+// to.
 // That bound is the cost of not rewriting a configuration underneath a running
 // server, and reclaiming it belongs to whoever owns data-directory retention.
 //

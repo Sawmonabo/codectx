@@ -11,7 +11,7 @@
 //
 //	go run ./internal/tools/toollock                 # produce, publish, write the lock
 //	go run ./internal/tools/toollock -check          # re-download every asset and confirm digests
-//	go run ./internal/tools/toollock -tools joern    # limit to one tool
+//	go run ./internal/tools/toollock -tools gopls    # limit to one tool
 package main
 
 import (

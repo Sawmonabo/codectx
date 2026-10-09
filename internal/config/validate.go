@@ -45,8 +45,6 @@ func (c Config) validate() error {
 		{"resources.max_page_items", int64(c.Resources.MaxPageItems)},
 		{"storage.writer_cache_kib", int64(c.Storage.WriterCacheKiB)},
 		{"storage.reader_cache_kib", int64(c.Storage.ReaderCacheKiB)},
-		{"providers.dependence.cache_bytes", c.Providers.Dependence.CacheBytes},
-		{"providers.dependence.unit_memory_floor_bytes", c.Providers.Dependence.UnitMemoryFloorBytes},
 		{"tools.max_fetch_bytes", c.Tools.MaxFetchBytes},
 		{"context.default_estimated_tokens", c.Context.DefaultEstimatedTokens},
 		{"context.default_max_bytes", c.Context.DefaultMaxBytes},
@@ -93,10 +91,6 @@ func (c Config) validate() error {
 		{"context.max_seeds", c.Context.MaxSeeds},
 		{"context.max_start_nodes", c.Context.MaxStartNodes},
 		{"coverage.max_unconfirmed_chunks_per_session", c.Coverage.MaxUnconfirmedChunksPerSession},
-		{"providers.dependence.max_units_per_family", c.Providers.Dependence.MaxUnitsPerFamily},
-		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},
-		{"providers.dependence.max_derived_rows", c.Providers.Dependence.MaxDerivedRows},
-		{"providers.dependence.max_export_files", c.Providers.Dependence.MaxExportFiles},
 		{"index.watch_max_directories", c.Index.WatchMaxDirectories},
 		{"index.max_evidence_per_fact", c.Index.MaxEvidencePerFact},
 		{"providers.manifest.max_dependencies", c.Providers.Manifest.MaxDependencies},
@@ -143,14 +137,13 @@ func (c Config) validate() error {
 		{"providers.scip.stall_timeout", c.Providers.SCIP.StallTimeout},
 		{"providers.lsp.stall_timeout", c.Providers.LSP.StallTimeout},
 		{"providers.lsp.idle_ttl", c.Providers.LSP.IdleTTL},
-		{"providers.dependence.stall_timeout", c.Providers.Dependence.StallTimeout},
 		{"coverage.session_ttl", c.Coverage.SessionTTL},
 	} {
 		if d.v <= 0 {
 			return configInvalid("%s is %s; a duration must be positive", d.key, d.v)
 		}
 	}
-	// The query deadline and the two analysis timeouts are the exception: 0
+	// The query deadline and the analysis timeout are the exception: 0
 	// means no wall-clock limit. A query that carries no deadline runs to the
 	// complete answer, and a deadline that fails an analysis unit would refuse a
 	// repository for being large. The stall timeouts above are what catch a
@@ -161,7 +154,6 @@ func (c Config) validate() error {
 	}{
 		{"resources.query_timeout", c.Resources.QueryTimeout},
 		{"providers.scip.timeout", c.Providers.SCIP.Timeout},
-		{"providers.dependence.timeout", c.Providers.Dependence.Timeout},
 	} {
 		if d.v < 0 {
 			return configInvalid("%s is %s; use 0 for no wall-clock limit", d.key, d.v)

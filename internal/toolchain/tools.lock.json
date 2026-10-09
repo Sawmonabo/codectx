@@ -171,7 +171,7 @@
           "upstream_digest": "sha256:ccf2e51f527d542a70ba5794a600d3aac04b4e967950e227834c7566cb1bec7b"
         }
       },
-      "notes": "Eclipse Temurin 21 LTS JDK; runtime for scip-java, jdtls and the dependence engine."
+      "notes": "Eclipse Temurin 21 LTS JDK; runtime for scip-java and jdtls."
     },
     "jdtls": {
       "name": "jdtls",
@@ -242,84 +242,6 @@
         "java"
       ],
       "notes": "One platform-independent tarball carrying config_linux, config_mac and config_win; launched as `java -jar <equinox launcher>`."
-    },
-    "joern": {
-      "name": "joern",
-      "version": "4.0.627",
-      "kind": "cpg",
-      "license": "Apache-2.0",
-      "upstream": "https://github.com/joernio/joern",
-      "runtime": "jdk",
-      "entry": "joern-cli/joern-parse",
-      "entry_sha256": "",
-      "platforms": {
-        "darwin_amd64": {
-          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-macos-x86_64.zip",
-          "sha256": "d64b04ac064fae83519abf1953874f19bc6fe5db2988bd5e63c0ac2982047313",
-          "size": 1788168850,
-          "entry": "joern-cli/joern-parse",
-          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
-          "provenance": "upstream",
-          "upstream_digest": "sha512:66df6519dccc738f7d3e97bbd02c4ba01dde823696dfff85f762c70013db460f268c3eee1856160d52f345f63d65bc6e5fc6406b129f26aeac65d997431fc808"
-        },
-        "darwin_arm64": {
-          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-macos-arm64.zip",
-          "sha256": "7981b5ca98b72e75775df49b4ab5a1b178b0bc356a17b69ea150bf1bc95abfe6",
-          "size": 1782363526,
-          "entry": "joern-cli/joern-parse",
-          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
-          "provenance": "upstream",
-          "upstream_digest": "sha512:7390e85475760d959a687767c448b174760bbca5032aa27855d750869610f85f861191b3dd6ac4909c17c7fc6aae38b0c49c05d879058efdd6af8f084cc30807"
-        },
-        "linux_amd64": {
-          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-linux-x86_64.zip",
-          "sha256": "083528101fc5c8a802c652e50896c709b7162ed0e74729c3ad0ac3dee1b83cb0",
-          "size": 1858298613,
-          "entry": "joern-cli/joern-parse",
-          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
-          "provenance": "upstream",
-          "upstream_digest": "sha512:f4ecca6132b70a530c54aa30554172d5f17cd4856547667f4043d06027451da4a73b5ca2446a2a1b3f183d0247810db378941ae36e3cb8ba03fba715ae5d1b67"
-        },
-        "linux_arm64": {
-          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-linux-arm64.zip",
-          "sha256": "957baed63f6d9575822291616b89de7728ba56097eb2384d51927fb2d7d4d5ab",
-          "size": 1855668243,
-          "entry": "joern-cli/joern-parse",
-          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
-          "provenance": "upstream",
-          "upstream_digest": "sha512:cd5fa7fcc1dec27e43be1949cca7de946b1e214761f9e645a32438f7e850ee10e8fe16ced2dec2712cb171ed3204d76dca10df9d28b97a896af4c8391436430c"
-        },
-        "windows_amd64": {
-          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-windows-x86_64.zip",
-          "sha256": "9ede70b1526d9df28e1b5906b8ef622d246b26118cb017f3c4976942129a21be",
-          "size": 1809069240,
-          "entry": "joern-cli/joern-parse.bat",
-          "entry_sha256": "db35da2f77ce97036b52adec3fbe83323243d3745e4e1427f02eb152f328c368",
-          "provenance": "upstream",
-          "upstream_digest": "sha512:768c287800b3d31301399c07cb9ae2c95ec7c4cfd2cb19486effef35d2be68a51ce4139912c9a4aac09e2a1be912d766243cb9599ac0c09e411dfd998447e285"
-        },
-        "windows_arm64": {
-          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-windows-arm64.zip",
-          "sha256": "4b0ce42888a5695a18cd07b505150853cd8125f70bf861772b2aecd5469aab07",
-          "size": 1803909501,
-          "entry": "joern-cli/joern-parse.bat",
-          "entry_sha256": "db35da2f77ce97036b52adec3fbe83323243d3745e4e1427f02eb152f328c368",
-          "provenance": "upstream",
-          "upstream_digest": "sha512:6472ee939ede652037102d6cd4935dc4d6d3868a90bf0fb65690f6bd2dc067e9d4b60cc47f8a03f2492b24fb9abd1848c919b5a6cdd6b6c7d147a07f41c7cfe0"
-        }
-      },
-      "languages": [
-        "go",
-        "typescript",
-        "tsx",
-        "javascript",
-        "python",
-        "java",
-        "c",
-        "cpp",
-        "rust"
-      ],
-      "notes": "Backend of the `dependence` provider. The sibling `joern-export` lives beside the entry in the same payload root."
     },
     "node": {
       "name": "node",

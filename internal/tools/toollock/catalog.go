@@ -47,7 +47,7 @@ type platformPayload struct {
 type toolSpec struct {
 	Name      string
 	Version   string
-	Kind      string // indexer | server | cpg | runtime
+	Kind      string // indexer | server | runtime
 	License   string
 	Upstream  string
 	Runtime   string // "", "node", "jdk"
@@ -75,7 +75,6 @@ const (
 	clangdVersion = "22.1.6"
 	jdtlsVersion  = "1.61.0"
 	jdtlsStamp    = "202609031315"
-	joernVersion  = "4.0.627"
 	goplsVersion  = "v0.23.0"
 	scipGoVersion = "v0.2.7"
 	// scipGoPkg is the module's own declared path. The repository moved under a
@@ -156,13 +155,6 @@ func sidecarSHA256(repo, tag, file string) digestSpec {
 	}
 }
 
-func sidecarSHA512(repo, tag, file string) digestSpec {
-	return digestSpec{
-		Algo: "sha512",
-		URL:  fmt.Sprintf("https://github.com/%s/releases/download/%s/%s.sha512", repo, tag, file),
-	}
-}
-
 // npmAll returns the same platform-independent npm build under every platform
 // key. The six published assets are byte-identical and therefore share one
 // SHA-256; that is expected, not a bug.
@@ -198,10 +190,6 @@ func goAll(pkg, unixEntry, winEntry string) map[string]platformPayload {
 // tool's map is unavailable there and is reported as such by the runtime; it is
 // never a failure.
 func catalog() []toolSpec {
-	joern := func(file string) *source {
-		return ghSource("joernio/joern", "v"+joernVersion, file, archiveZip, 0, "",
-			sidecarSHA512("joernio/joern", "v"+joernVersion, file))
-	}
 	ra := func(file string, kind archiveKind) *source {
 		return ghSource("rust-lang/rust-analyzer", raVersion, file, kind, 0, strings.TrimSuffix(file, ".gz"), digestSpec{})
 	}
@@ -234,7 +222,7 @@ func catalog() []toolSpec {
 			License:  "GPL-2.0-only WITH Classpath-exception-2.0",
 			Upstream: "https://adoptium.net/temurin/releases/?version=21",
 			Entry:    "bin/java",
-			Notes:    "Eclipse Temurin 21 LTS JDK; runtime for scip-java, jdtls and the dependence engine.",
+			Notes:    "Eclipse Temurin 21 LTS JDK; runtime for scip-java and jdtls.",
 			Platforms: map[string]platformPayload{
 				"linux_amd64":   {Entry: "*/bin/java", Src: jdkSource("OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz")},
 				"linux_arm64":   {Entry: "*/bin/java", Src: jdkSource("OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.12.1_1.tar.gz")},
@@ -359,21 +347,6 @@ func catalog() []toolSpec {
 				Strip:  0,
 				Digest: digestSpec{Algo: "sha256", URL: "https://download.eclipse.org/jdtls/milestones/" + jdtlsVersion + "/jdt-language-server-" + jdtlsVersion + "-" + jdtlsStamp + ".tar.gz.sha256"},
 			}),
-		},
-		{
-			Name: "joern", Version: joernVersion, Kind: "cpg",
-			License: "Apache-2.0", Upstream: "https://github.com/joernio/joern",
-			Runtime: "jdk", Entry: "*/joern-parse",
-			Languages: []string{"go", "typescript", "tsx", "javascript", "python", "java", "c", "cpp", "rust"},
-			Notes:     "Backend of the `dependence` provider. The sibling `joern-export` lives beside the entry in the same payload root.",
-			Platforms: map[string]platformPayload{
-				"linux_amd64":   {Entry: "*/joern-parse", Src: joern("joern-cli-linux-x86_64.zip")},
-				"linux_arm64":   {Entry: "*/joern-parse", Src: joern("joern-cli-linux-arm64.zip")},
-				"darwin_amd64":  {Entry: "*/joern-parse", Src: joern("joern-cli-macos-x86_64.zip")},
-				"darwin_arm64":  {Entry: "*/joern-parse", Src: joern("joern-cli-macos-arm64.zip")},
-				"windows_amd64": {Entry: "*/joern-parse.bat", Src: joern("joern-cli-windows-x86_64.zip")},
-				"windows_arm64": {Entry: "*/joern-parse.bat", Src: joern("joern-cli-windows-arm64.zip")},
-			},
 		},
 	}
 }

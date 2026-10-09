@@ -95,7 +95,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			// Status is the cheap report: presence and publication, no rehashing,
-			// so it stays usable for every lock entry including the 1.8 GB engine.
+			// so it stays cheap however large an installed payload is.
 			return emitToolReport(cmd, build, args, report(store, res.Status(cmd.Context()), nil), false, nil)
 		},
 	}
@@ -107,7 +107,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 			"tools to install, pass --for-repo to install what one repository's " +
 			"own root selects, or pass --all for every entry the " +
 			"lock carries for this platform; one of the three is required, so a " +
-			"bare prefetch never downloads gigabytes by accident. It also removes " +
+			"bare prefetch never downloads the whole lock by accident. It also removes " +
 			"any payload directory in the store that no lock entry names, which is " +
 			"what `verify` reports as unlisted.",
 		Args:          cobra.ArbitraryArgs,

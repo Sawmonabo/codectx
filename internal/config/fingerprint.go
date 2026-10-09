@@ -90,19 +90,16 @@ func (c Config) AnalysisConfigHash() string {
 	// bounds are here for the same reason: past either one the manifest provider
 	// truncates and flags the unit's facts, so a unit cached under a lower bound
 	// holds fewer dependencies than the same manifest yields under a higher one.
-	// These keys are deliberately absent.
-	// providers.dependence.max_export_files REFUSES an import rather than cutting
-	// it, and a failed unit is never reused as a complete one;
-	// index.capture_max_retries, index.capture_retry_deadline and
-	// index.watch_max_directories are scheduling and coverage policy, which
-	// changes how the work is driven and never what it concludes.
+	// These keys are deliberately absent: index.capture_max_retries,
+	// index.capture_retry_deadline and index.watch_max_directories are
+	// scheduling and coverage policy, which changes how the work is driven and
+	// never what it concludes.
 	h.AddString(quoteLimit(c.Providers.Manifest.MaxDependencies))
 	h.AddString(quoteLimit(c.Providers.Manifest.MaxEntries))
 	h.AddString(quoteLimit(c.Providers.Manifest.MaxTOMLLines))
 	h.AddString(quoteLimit(c.Providers.Manifest.MaxXMLElements))
 	h.AddString(quoteLimit(c.Providers.TreeSitter.MaxCalleeReferences))
 	h.AddString(c.Providers.LSP.Enabled.String())
-	h.AddString(c.Providers.Dependence.Enabled.String())
 	// index.max_evidence_per_fact cuts evidence rows out of the sealed facts:
 	// a unit sealed under a user-set clip carries fewer occurrences of the same
 	// fact than the same bytes yield under a higher one, so raising it must

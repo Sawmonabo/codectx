@@ -274,7 +274,7 @@ func openWorkspace(tb testing.TB, ctx context.Context, repo, home, extra string)
 }
 
 // writeConfig writes the user-level configuration the measurements run under.
-// The three optional providers are off: an "auto" provider that is unavailable
+// The two optional providers are off: an "auto" provider that is unavailable
 // on this host would make a budget a statement about the host. extra is
 // appended verbatim so a row can vary one block.
 func writeConfig(tb testing.TB, home, dataDir, extra string) {
@@ -285,8 +285,7 @@ func writeConfig(tb testing.TB, home, dataDir, extra string) {
 	}
 	body := "[storage]\ndata_dir = \"" + dataDir + "\"\n" +
 		"[tools]\noffline = true\n" +
-		"[providers.scip]\nenabled = false\n[providers.lsp]\nenabled = false\n" +
-		"[providers.dependence]\nenabled = false\n" + extra
+		"[providers.scip]\nenabled = false\n[providers.lsp]\nenabled = false\n" + extra
 	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(body), 0o600); err != nil {
 		tb.Fatalf("write config: %v", err)
 	}

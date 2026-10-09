@@ -60,9 +60,9 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   `index.workers = 0` chooses the count from available CPUs and reservations.
 
   **How much runs at once is not configurable at all.** How many heavy children
-  — analysis engine runs, external indexers, language servers — run beside each
-  other is decided by one observation of the machine: each is admitted while the
-  sum of the memory they reserve fits the machine-derived allocation (available
+  — external indexers, language servers — run beside each other is decided by
+  one observation of the machine: each is admitted while the sum of the memory
+  they reserve fits the machine-derived allocation (available
   memory less this process's own footprint and a safety margin, and never more
   than half of what was available). A child larger than the whole allocation
   runs alone. CPU-bound work — the structural parser workers, the query and
@@ -78,8 +78,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[index]` | `max_retained_bytes` (no byte budget; retention is then governed by `retain_refs` alone), `watch_max_directories`, `max_evidence_per_fact` |
   | `[resources]` | `query_timeout`, `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes`, `max_outstanding_requests` |
-  | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files`, `staging_cache_kib` |
-  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds`, `max_start_nodes`, `max_capsule_records_per_list`, `max_capsule_coverage_files` |
+    | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds`, `max_start_nodes`, `max_capsule_records_per_list`, `max_capsule_coverage_files` |
   | `[providers.tree_sitter]` | `max_callee_references` |
   | `[providers.manifest]` | `max_dependencies`, `max_entries`, `max_toml_lines`, `max_xml_elements` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
@@ -287,7 +286,7 @@ directories and network posture are product code, not configuration.
 
 | Key | Required | Meaning |
 |---|---|---|
-| `executable` | yes | Absolute path of a directly executable launcher. A bare command name is rejected: what `PATH` resolves to is not what was named. It must be a file the operating system can start on its own — not a `.jar` and not a `.js` entry point, even where the pinned tool is one: an override replaces the binary and never the invocation, so no managed runtime is composed around it and nothing supplies a `java -jar` or a `node` prefix. Overriding `scip-java`, `jdtls`, `scip-typescript`, `scip-python` or `typescript-language-server` therefore means naming a wrapper script, not the jar or the script the lock names. An override of the graph engine (`joern`) carries a second constraint: it must be that payload's own `joern-parse` launcher, because the export tool the same unit runs is derived from this file's name and must sit beside it under the same directory; an override named anything else is refused with `CTX_TOOL_OVERRIDE_INVALID`. |
+| `executable` | yes | Absolute path of a directly executable launcher. A bare command name is rejected: what `PATH` resolves to is not what was named. It must be a file the operating system can start on its own — not a `.jar` and not a `.js` entry point, even where the pinned tool is one: an override replaces the binary and never the invocation, so no managed runtime is composed around it and nothing supplies a `java -jar` or a `node` prefix. Overriding `scip-java`, `jdtls`, `scip-typescript`, `scip-python` or `typescript-language-server` therefore means naming a wrapper script, not the jar or the script the lock names. |
 | `version` | yes | The exact version this binary is, not a constraint. It is recorded as the identity of the tool behind the units it produces. |
 | `checksum` | yes | Lowercase hex SHA-256 of `executable`, verified at the start of every run. It is required, not optional: an override names a binary the lock does not describe, so without it the entry would admit whatever happens to sit at that path on the next run. |
 
@@ -313,16 +312,6 @@ directories and network posture are product code, not configuration.
 | `lsp.max_outstanding_requests` | `0` (unlimited) | user | In-flight requests per server. Unlimited by default: every caller already waits on a gate of its own -- one request at a time per tool call, and tool calls by the machine's query slots -- so no second count is needed here. A value you set makes a request wait for a slot under its own context. |
 | `lsp.idle_ttl` | `"60s"` | user | Idle time before a server is stopped. |
 | `lsp.max_overlay_bytes` | `0` (unlimited) | user | Unlimited by default. When set, it bounds, separately, the materialized snapshot (files that do not fit are named in the log and left out, never refused), admission of one file to the pinned coordinate cache (a file over the bound is reported and the query answers about the rest), and the bytes sent to a server in one rolling minute. Unlimited still keeps a finite ceiling on the pinned cache, whose eviction costs a re-read and no answer. A value you set must be at least `resources.max_source_response_bytes`. |
-| `dependence.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. `"auto"` runs dependence units as low-priority background work once the base generation is active; until a unit seals, its capability is `unavailable` with the reason `units_deferred`, which every answer discloses. `true` blocks the index on them. The provider never delays base readiness: nothing is installed when the workspace is opened, and the analysis payload is fetched by the first unit that needs it. A one-shot building command -- `codectx index` or `codectx refresh` -- prints its own generation as soon as that generation is active and then stays until the deferred queue is empty, publishing each batch as a further generation; interrupting it keeps everything already published and reports how much is still queued. `false` is the opt-out: it plans no dependence unit at all. |
-| `dependence.timeout` | `"0s"` (no limit) | user | Wall-clock deadline for one dependence unit. `0` by default, for the same reason as `scip.timeout`. |
-| `dependence.stall_timeout` | `"5m"` | user | The same progress-based hang detector as `scip.stall_timeout`, applied to one dependence unit. |
-| `dependence.cache_bytes` | `4294967296` | user | Budget for the per-unit parsed-graph cache, which is what makes an unchanged unit cost nothing on refresh. |
-| `dependence.unit_memory_floor_bytes` | `805306368` | user | Smallest allocation a unit may be sized to. Sizing a unit near its live set costs time rather than memory, so the floor keeps a small unit from being starved into a much slower run. |
-| `dependence.max_units_per_family` | `0` (unlimited) | user | How many frontend-native projects of one language family you want a plan to hold. Unlimited by default: a monorepo's project count belongs to the repository, so every project is planned as its own unit and a crashed unit is still split along every one of its parts. A set value refuses nothing and drops nothing — crossing it marks the family's capability rows partial with `CTX_RESOURCE_LIMIT`, naming the family, the project count and this value. |
-| `dependence.max_staged_rows` | `0` (unlimited) | user | How many rows you want one unit's import to stage. Unlimited by default: staging is an on-disk database read back one keyset page at a time, so the row count bounds disk (a few times the export's bytes), not memory. A set value never fails the unit and never stops the import — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the staged count and this value. |
-| `dependence.max_derived_rows` | `0` (unlimited) | user | How many relation occurrences you want one unit's import to project from its staged rows. Unlimited by default: the projection is computed and paged inside the same on-disk staging database, so the occurrence count bounds disk rather than memory, and it belongs to the source. A set value never fails the unit and never truncates the projection — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the derived count and this value. |
-| `dependence.max_export_files` | `0` (unlimited) | user | How many entries one analysis export directory may hold. Unlimited by default: the file count follows the export's label vocabulary rather than the repository, and the directory is read one entry at a time. A set value is the only thing that refuses an import here, with `CTX_RESOURCE_LIMIT` naming this key. |
-| `dependence.staging_cache_kib` | `262144` | user | Page cache of the staging database one unit's import stages the engine's export in (256 MiB). It bounds the memory an import holds for its staging and is the buffer the engine sorts in when it builds each ordered copy the import reads (see [the dependence provider](providers-dependence.md#the-staging-database)); a table smaller than it is sorted in memory, a larger one spills to a file under the data directory's `tmp/`. |
 | `manifest.max_dependencies` | `0` (unlimited) | user | How many dependencies you want one manifest file to declare. Unlimited by default: a `go.mod`, `package.json` or `pom.xml` declares what the repository declares. A set value cuts the list at the bound and marks that file's capability row partial with `CTX_RESOURCE_LIMIT`, carrying `max_dependencies` as the count that crossed it against this value. A manifest is one file whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory, never the repository's. |
 | `manifest.max_entries` | `0` (unlimited) | user | The same contract for the other lists one manifest declares: modules, replaced and excluded modules, workspace members and Maven properties, and a Markdown document's headings and source links. Crossing it is reported as `max_entries` on that file's capability row. |
 | `manifest.max_toml_lines` | `0` (unlimited) | user | How many lines of one TOML manifest (`Cargo.toml`, `pyproject.toml`) the evidence-range line scan places. Unlimited by default: how many lines a manifest has is a property of the repository. A set value stops the scan at that line — facts declared before it keep their exact byte ranges and only facts past it carry evidence without a range, never a guessed one — and marks that file's capability row partial with `CTX_RESOURCE_LIMIT`, carrying `max_toml_lines` as the file's line count against this value. |
@@ -330,8 +319,8 @@ directories and network posture are product code, not configuration.
 
 ### Timeouts here are hang detectors, not size limits
 
-`providers.scip.timeout` and `providers.dependence.timeout` are `0` by default,
-which means **no wall-clock limit at all**. A wall clock cannot tell a large
+`providers.scip.timeout` is `0` by default, which means **no wall-clock limit
+at all**. A wall clock cannot tell a large
 analysis unit from a wedged one — on a monorepo the legitimate run is the long
 one — so a deadline that fails a unit is a refusal of the repository for its
 size.
@@ -342,8 +331,8 @@ read from the child's stdout or stderr (counted before any output bound, and
 whether or not the bytes are kept) and, where the platform can sample a running
 tree, the tree's consumed CPU time. A child that produces none of those signals
 for the whole window is terminated, and the unit fails with reason `stalled`
-and is reported. Setting either `stall_timeout` to `0` disables the detector for
-that provider; a negative value is rejected.
+and is reported. A `stall_timeout` must be positive: `0` and negative values
+are rejected.
 
 ## Analyzer profiles are not configurable
 
