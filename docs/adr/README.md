@@ -25,3 +25,4 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | [ADR-0010](ADR-0010-engine-memory.md) | Engine memory: the heap is sized to the unit's need, and the host keeps half of what it had | Accepted, 2026-09-16 |
 | [ADR-0011](ADR-0011-run-ledger.md) | The run ledger: a run records what each stage cost, in its own database, read live | Accepted, 2026-09-16 |
 | [ADR-0012](ADR-0012-native-dependence-engine.md) | Dependence is computed in process, and the hosted engine is retired against measured conditions | Accepted, 2026-09-26 |
+| [ADR-0013](ADR-0013-search-index.md) | The lexical tier is an embedded search index, scored by our own BM25F | Accepted, 2026-10-08 |
