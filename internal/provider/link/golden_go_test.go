@@ -187,4 +187,73 @@ func helper() {} // @otherhelper
 		},
 		fails: "a call result receiver resolved to nothing leaves Start unbound; a bare call looked up outside the package binds other.helper",
 	},
+	{
+		name:   "field-hides-promotion",
+		anchor: "The Go Programming Language Specification, \"Selectors\" (the shallowest depth decides; a field hides a deeper method), \"Method sets\", \"Struct types\"",
+		files: map[string]string{
+			"p.go": `package p
+
+type Closer interface{ Close() }
+
+type Base struct{}
+
+func (Base) Close() {} // @bclose
+
+type T struct {
+	Base
+	Close func()
+}
+
+func stop() {} // @stop
+
+func build() T { return T{Close: stop} }
+
+func viaField(t T) { t.Close() } // @vf
+
+func viaIface(c Closer) { c.Close() } // @vi
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"vf Close -> stop stop",
+			"vi Close -> bclose Close",
+		},
+		fails: "a promoted method not hidden by a shallower field lets T satisfy Closer and binds `t.Close()` to Base.Close",
+	},
+	{
+		name:   "field-and-method-at-one-depth",
+		anchor: "The Go Programming Language Specification, \"Selectors\" (a selector with more than one field or method at the shallowest depth is illegal), \"Struct types\"",
+		files: map[string]string{
+			"p.go": `package p
+
+type A struct{}
+
+func (A) Run() {} // @arun
+
+type B struct{ Run func() }
+
+type X struct {
+	A
+	B
+}
+
+type Y struct {
+	A
+}
+
+func useX(x X) { x.Run() } // @ux
+
+func useY(y Y) { y.Run() } // @uy
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding. The selector `x.Run` is illegal (a method
+		// and a field at the shallowest depth), so the program never runs that call; both take that as no
+		// target.
+		want: []string{
+			"uy Run -> arun Run",
+		},
+		fails: "a selector resolved at the shallowest depth despite a second name there binds `x.Run()` to A.Run",
+	},
 }
