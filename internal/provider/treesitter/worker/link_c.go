@@ -1099,10 +1099,10 @@ func (k *cLinker) funcSig(d cDecl, depth int) string {
 }
 
 // cArity is what a parameter list says of the calls that fit it: params
-// counts every parameter, `...` and a parameter pack included; optional
-// counts the trailing ones a call may leave out, each with a default
-// argument and a final `...` or pack; variadic reports a final `...` or
-// pack. typed is false for a parameter list of the old identifier form,
+// counts every parameter, `...` and a parameter pack included, as every
+// other family's worker counts its variadic parameter; optional counts the
+// trailing ones with a default argument, which a call may leave out;
+// variadic reports a final `...` or pack. typed is false for a parameter list of the old identifier form,
 // which declares no types; empty reports a list with nothing in it, `()`,
 // which `(void)` is not.
 type cArity struct {
@@ -1163,15 +1163,12 @@ func (k *cLinker) params(b []byte, ps Node) ([]byte, cArity) {
 		case ellipsis:
 			b = append(b, "..."...)
 			a.variadic = true
-			a.optional++
 		case knr:
 			a.typed = false
 		default:
 			b = k.param(b, c)
-			if id == x.variadicParameterDeclaration && id != 0 {
-				a.variadic = true
-				a.optional++
-			} else if id == x.optionalParameterDeclaration && id != 0 {
+			a.variadic = a.variadic || id == x.variadicParameterDeclaration && id != 0
+			if id == x.optionalParameterDeclaration && id != 0 {
 				a.optional++
 			}
 			only = c
