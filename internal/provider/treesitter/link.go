@@ -1,7 +1,6 @@
 package treesitter
 
 import (
-	"bytes"
 	"cmp"
 	"slices"
 	"strings"
@@ -32,7 +31,7 @@ const detailLinkFailure = "link_failure"
 // member call, any other a bare one), keeps the reference's qualifier and
 // carries no recovered type. A
 // TypeResult names a worker site and is remapped to that site's index in
-// Table.Sites. An entry that joins nothing, joins what an earlier entry
+// Table.Sites, inside a union too; the unions and re-exports are copied. An entry that joins nothing, joins what an earlier entry
 // already joined, names a range that does not fit the pinned bytes, or names
 // a site that joined nothing is dropped and counted in Table.Dropped, never
 // fatal: the table is the file's best account, and a non-zero count makes
@@ -100,7 +99,10 @@ func (b *builder) linkTable() error {
 			t.Dropped++
 		}
 	}
-	typ := func(x wire.Type) wire.Type {
+	// result remaps a TypeResult to its site's index in t.Sites; typ also
+	// checks a TypeUnion's index. A union is remapped in place, keeping its
+	// index, and a union member that is itself a union is dropped.
+	result := func(x wire.Type) wire.Type {
 		if x.Kind != wire.TypeResult {
 			return x
 		}
@@ -110,6 +112,31 @@ func (b *builder) linkTable() error {
 		}
 		t.Dropped++
 		return wire.Type{}
+	}
+	if len(wl.Unions) > 0 {
+		t.Unions = make([][]wire.Type, len(wl.Unions))
+		for i, u := range wl.Unions {
+			t.Unions[i] = make([]wire.Type, 0, len(u))
+			for _, x := range u {
+				if x.Kind == wire.TypeUnion {
+					t.Dropped++
+					continue
+				}
+				if x = result(x); x.Kind != wire.TypeUnknown {
+					t.Unions[i] = append(t.Unions[i], x)
+				}
+			}
+		}
+	}
+	typ := func(x wire.Type) wire.Type {
+		if x.Kind == wire.TypeUnion {
+			if uint64(x.Index) < uint64(len(t.Unions)) {
+				return x
+			}
+			t.Dropped++
+			return wire.Type{}
+		}
+		return result(x)
 	}
 	for i, w := range joined {
 		if w < 0 {
@@ -130,7 +157,7 @@ func (b *builder) linkTable() error {
 		d := &b.decls[i]
 		t.Decls[i] = link.Decl{Endpoint: link.Endpoint{Node: d.res.Node.ID, CanonicalKey: d.res.CanonicalKey, Kind: d.kind,
 			Name: d.Name, Qualified: d.Qualified, Range: *d.rng}, Parent: int32(d.Parent), Exported: d.Exported,
-			Prototype: d.Prototype, Default: d.Parent < 0 && d.Exported && ecmaScript[b.lang.Name] && exportsDefault(b.src, d.Start)}
+			Prototype: d.Prototype}
 	}
 	for _, x := range wl.Exports {
 		i, ok := b.nameAt[x.Name]
@@ -139,9 +166,11 @@ func (b *builder) linkTable() error {
 			continue
 		}
 		d := &t.Decls[i]
-		d.Described, d.Receiver, d.Signature, d.Params, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Variadic
-		d.Static, d.Abstract, d.Returns = x.Static, x.Abstract, typ(x.Returns)
+		d.Described, d.Receiver, d.Signature, d.Params, d.Optional, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Optional, x.Variadic
+		d.Static, d.Abstract, d.Virtual, d.Final, d.Internal = x.Static, x.Abstract, x.Virtual, x.Final, x.Internal
+		d.Returns = typ(x.Returns)
 	}
+	t.Reexports = wl.Reexports
 
 	if len(wl.Values) > 0 {
 		byStart := b.declsByStart()
@@ -157,49 +186,6 @@ func (b *builder) linkTable() error {
 	}
 	b.table = t
 	return nil
-}
-
-// ecmaScript are the languages whose `export default` names a declaration.
-var ecmaScript = map[string]bool{"javascript": true, "typescript": true, "tsx": true}
-
-// exportsDefault reports that the exported declaration starting at start is
-// the declaration of an `export default` statement: the grammar puts the
-// keyword `default` right before the declaration and `export` right before
-// it, with only whitespace and comments between the tokens (a decorator is
-// part of the class declaration it decorates). A line comment between them
-// is not read back and leaves the declaration a named export only.
-func exportsDefault(src []byte, start uint32) bool {
-	before := src[:start]
-	for _, word := range []string{"default", "export"} {
-		before = trimBlockComments(before)
-		if !bytes.HasSuffix(before, []byte(word)) {
-			return false
-		}
-		before = before[:len(before)-len(word)]
-		if n := len(before); n > 0 && isIdentByte(before[n-1]) {
-			return false
-		}
-	}
-	return true
-}
-
-// trimBlockComments drops the whitespace and block comments b ends with.
-func trimBlockComments(b []byte) []byte {
-	for {
-		b = bytes.TrimRight(b, " \t\r\n\f\v")
-		if !bytes.HasSuffix(b, []byte("*/")) {
-			return b
-		}
-		i := bytes.LastIndex(b[:len(b)-2], []byte("/*"))
-		if i < 0 {
-			return b
-		}
-		b = b[:i]
-	}
-}
-
-func isIdentByte(c byte) bool {
-	return c == '_' || c == '$' || c >= 0x80 || '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 }
 
 // linkImports is the names the file's import records introduce, each with
@@ -239,8 +225,12 @@ func (b *builder) linkImports() []link.Import {
 		if len(names) == 0 {
 			out = append(out, link.Import{Path: imp.Path})
 		}
-		for _, n := range names {
-			out = append(out, link.Import{Name: n, Path: imp.Path})
+		for i, n := range names {
+			li := link.Import{Name: n, Path: imp.Path}
+			if len(imp.Originals) == len(names) {
+				li.Original = imp.Originals[i]
+			}
+			out = append(out, li)
 		}
 	}
 	return out

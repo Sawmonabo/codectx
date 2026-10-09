@@ -25,6 +25,11 @@ type Link struct {
 	Supertypes []Supertype
 	Sites      []Site
 	Values     []Value
+	Reexports  []Reexport
+	// Unions are the type sets a TypeUnion names by index: each is every
+	// type that reaches one value along some path (two reaching definitions
+	// of a receiver that disagree), none of them a TypeUnion.
+	Unions [][]Type
 }
 
 // Export describes one declaration of the file that a call may bind to, with
@@ -48,8 +53,13 @@ type Export struct {
 	// the address-taken × indirect-site join key (ADR-0012 decision 2).
 	Signature string
 	// Params is the number of declared parameters, Variadic that the last
-	// one takes any number of arguments.
+	// one takes any number of arguments, Optional how many trailing
+	// parameters a call may leave out (a C++ default argument, a Python or
+	// ECMAScript default value, a TypeScript optional parameter). A call fits
+	// the callable when it passes at least Params-Optional arguments and, unless
+	// Variadic, at most Params.
 	Params   uint32
+	Optional uint32
 	Variadic bool
 	// Static reports a callable invoked without a receiver value: a static
 	// or class method, an associated function, a free function.
@@ -58,6 +68,20 @@ type Export struct {
 	// supplies: an interface or trait method, an abstract method, a pure
 	// virtual function.
 	Abstract bool
+	// Virtual reports a C++ member function declared `virtual`, or with an
+	// `override` or `final` virt-specifier. A C++ call through a receiver
+	// dispatches into subtypes only from a member that is virtual or
+	// overrides a virtual one ([class.virtual]).
+	Virtual bool
+	// Final reports a method no subtype can override: a Java `final` or
+	// `private` method or a method of a `final` class, a C++ member declared
+	// `final` or of a `final` class. A call of it never dispatches into a
+	// subtype.
+	Final bool
+	// Internal reports a function with internal linkage: a C or C++ `static`
+	// function at namespace scope, or one declared in a C++ unnamed
+	// namespace. Only its own file can call it by name.
+	Internal bool
 	// Returns is the type the callable returns: its declared result type,
 	// or the type the worker recovered from its return statements inside the
 	// file. TypeUnknown when neither says.
@@ -70,6 +94,21 @@ type Export struct {
 // and is never sent; the linker derives it from method sets.
 type Supertype struct {
 	Type, Super string
+}
+
+// Reexport is one name the file's module exports under a name of its own or
+// from another module, for the ECMAScript family: `export default foo;`,
+// `export { a as b }`, `export { x } from './m'`, `export * from './m'`.
+type Reexport struct {
+	// Name is the name the module exports: "default" for a default export,
+	// "*" for `export * from`, the alias of a namespace re-export
+	// (`export * as ns from './m'`).
+	Name string
+	// Original is the name it denotes: a declaration of this file when From
+	// is empty, else a name From exports; "*" for a whole module.
+	Original string
+	// From is the module specifier as written, empty for a local export.
+	From string
 }
 
 // Site is one call site: a "call" Ref of the file, with the callee
@@ -157,6 +196,14 @@ const (
 	// TypeFunction is the function or method Name, as written, taken as a
 	// value.
 	TypeFunction TypeKind = 7
+	// TypeClass is the type Name itself as a value, not an instance of it: a
+	// class object (`A.make()` in Python, `C.m()` in ECMAScript). A call on
+	// it binds Name's own member or the nearest inherited one, never a
+	// subtype's override.
+	TypeClass TypeKind = 8
+	// TypeUnion is every type of Link.Unions[Index]: a value two or more
+	// disagreeing types reach.
+	TypeUnion TypeKind = 9
 )
 
 // Type is a value's type as the worker recovered it inside the file: a name
@@ -172,12 +219,15 @@ type Type struct {
 // string is its length and UTF-8 bytes, a flag is one byte 0 or 1, and every
 // list is its length followed by its elements:
 //
-//	exports    n × (name start, end; receiver; signature; params;
-//	                variadic, static, abstract flags; returns type)
+//	exports    n × (name start, end; receiver; signature; params; optional;
+//	                variadic, static, abstract, virtual, final, internal
+//	                flags; returns type)
 //	supertypes n × (type; super)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
 //	                signature; args n × type)
 //	values     n × (at start, end; field; type)
+//	reexports  n × (name; original; from)
+//	unions     n × (n × type)
 //	type       kind byte; name; index
 func AppendLink(dst []byte, l *Link) []byte {
 	e := encoder{b: dst}
@@ -187,9 +237,13 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.str(x.Receiver)
 		e.str(x.Signature)
 		e.u32(x.Params)
+		e.u32(x.Optional)
 		e.flag(x.Variadic)
 		e.flag(x.Static)
 		e.flag(x.Abstract)
+		e.flag(x.Virtual)
+		e.flag(x.Final)
+		e.flag(x.Internal)
 		e.typ(x.Returns)
 	}
 	e.u32(uint32(len(l.Supertypes)))
@@ -214,6 +268,19 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.span(v.At)
 		e.str(v.Field)
 		e.typ(v.Type)
+	}
+	e.u32(uint32(len(l.Reexports)))
+	for _, r := range l.Reexports {
+		e.str(r.Name)
+		e.str(r.Original)
+		e.str(r.From)
+	}
+	e.u32(uint32(len(l.Unions)))
+	for _, u := range l.Unions {
+		e.u32(uint32(len(u)))
+		for _, t := range u {
+			e.typ(t)
+		}
 	}
 	return e.b
 }
@@ -245,14 +312,15 @@ var ErrMalformedLink = errors.New("wire: malformed link message")
 func DecodeLink(payload []byte) (Link, error) {
 	d := decoder{b: payload, malformed: ErrMalformedLink}
 	var l Link
-	// The smallest export is 8 span, 4+4 strings, 4 params, 3 flags and a
-	// 9-byte type; a supertype two strings; a site 8 span, 1 shape, 4
-	// qualifier, 9 type, 4 signature and 4 args; a value 8 span, 4 field and
-	// 9 type.
-	l.Exports = make([]Export, 0, d.count(36))
+	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
+	// flags and a 9-byte type; a supertype two strings; a site 8 span, 1
+	// shape, 4 qualifier, 9 type, 4 signature and 4 args; a value 8 span, 4
+	// field and 9 type; a reexport three strings; a union its count.
+	l.Exports = make([]Export, 0, d.count(39))
 	for range cap(l.Exports) {
-		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32()}
+		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32(), Optional: d.u32()}
 		x.Variadic, x.Static, x.Abstract = d.flag(), d.flag(), d.flag()
+		x.Virtual, x.Final, x.Internal = d.flag(), d.flag(), d.flag()
 		x.Returns = d.typ()
 		l.Exports = append(l.Exports, x)
 	}
@@ -272,6 +340,18 @@ func DecodeLink(payload []byte) (Link, error) {
 	l.Values = make([]Value, 0, d.count(21))
 	for range cap(l.Values) {
 		l.Values = append(l.Values, Value{At: d.span(), Field: d.str(), Type: d.typ()})
+	}
+	l.Reexports = make([]Reexport, 0, d.count(12))
+	for range cap(l.Reexports) {
+		l.Reexports = append(l.Reexports, Reexport{Name: d.str(), Original: d.str(), From: d.str()})
+	}
+	l.Unions = make([][]Type, 0, d.count(4))
+	for range cap(l.Unions) {
+		u := make([]Type, 0, d.count(9))
+		for range cap(u) {
+			u = append(u, d.typ())
+		}
+		l.Unions = append(l.Unions, u)
 	}
 	if d.err == nil && len(d.b) != 0 {
 		d.fail(fmt.Sprintf("%d bytes past the message's end", len(d.b)))
@@ -313,7 +393,7 @@ func (d *decoder) shape() Shape {
 
 func (d *decoder) typ() Type {
 	k := TypeKind(d.u8())
-	if d.err == nil && k > TypeFunction {
+	if d.err == nil && k > TypeUnion {
 		d.fail("an unknown type kind")
 	}
 	return Type{Kind: k, Name: d.str(), Index: d.u32()}

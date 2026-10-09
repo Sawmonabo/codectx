@@ -22,6 +22,12 @@ type unit struct {
 	// dir is the unit's private scratch directory, where a resolver's
 	// external sorts spill.
 	dir string
+	// root is the project's root-relative directory (dependence.Unit.Root),
+	// the empty string the repository root, and content the pinned snapshot
+	// its manifests are read from (a Go module's go.mod, which decides which
+	// import paths are the project's own).
+	root    string
+	content model.SnapshotView
 }
 
 // Files streams the unit's member tables in ascending FileID order, one

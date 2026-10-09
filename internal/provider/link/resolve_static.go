@@ -2,8 +2,6 @@ package link
 
 import (
 	"context"
-	"path"
-	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -217,79 +215,15 @@ func (r *staticFile) staticImport(callee string, yield func(entry) error) error 
 // bring into scope (a Go dot import, a C++ using-declaration or
 // using-directive, a Rust `use`).
 func (r *staticFile) free(caller int32, callee string, yield func(entry) error) error {
-	found := false
-	hit := func(e entry) error {
-		found = true
-		return yield(e)
-	}
 	switch r.fc.family {
 	case "c":
 		return r.freeC(caller, callee, yield)
 	case "go":
-		if err := r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, hit); err != nil || found {
-			return err
-		}
-		return r.h.imports(r.fc, ImportAll, func(p string) error {
-			return r.h.goPackages(p, func(scope string) error {
-				return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+scope+"\x00"+callee, yield)
-			})
-		})
+		return r.freeGo(callee, yield)
 	case "rust":
-		if err := r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, hit); err != nil || found {
-			return err
-		}
-		imported := false
-		err := r.h.imports(r.fc, callee, func(p string) error {
-			imported = true
-			if module, last, ok := cutLast(p, "::"); ok {
-				return r.h.decls.lookup(keyFuncModule+rustPath(r.t.Path, module)+"\x00"+last, yield)
-			}
-			return nil
-		})
-		if err != nil || imported {
-			return err
-		}
-		return r.h.imports(r.fc, ImportAll, func(p string) error {
-			return r.h.decls.lookup(keyFuncModule+rustPath(r.t.Path, p)+"\x00"+callee, yield)
-		})
+		return r.freeRust(callee, yield)
 	}
 	return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, yield)
-}
-
-// freeC is free for C and C++: the functions of the one linkage scope whose
-// namespace encloses the caller or a namespace a using-directive of the
-// file names, a prototype yielding to its definition; else the function a
-// using-declaration of the name names.
-func (r *staticFile) freeC(caller int32, callee string, yield func(entry) error) error {
-	from := []string{""}
-	if caller >= 0 {
-		from[0] = namespaceOf(&r.t.Decls[caller], r.fc.sep)
-	}
-	for _, imp := range r.t.Imports {
-		if imp.Name == ImportAll {
-			from = append(from, imp.Path)
-		}
-	}
-	found := false
-	err := preferDefinitions(func(f func(entry) error) error {
-		return r.h.decls.lookup(keyFunc+r.fc.family+"\x00\x00"+callee, func(e entry) error {
-			if slices.ContainsFunc(from, func(ns string) bool { return visible(e.Aux, ns) }) {
-				return f(e)
-			}
-			return nil
-		})
-	}, func(e entry) error {
-		found = true
-		return yield(e)
-	})
-	if err != nil || found {
-		return err
-	}
-	return r.h.imports(r.fc, callee, func(p string) error {
-		return preferDefinitions(func(f func(entry) error) error {
-			return r.h.decls.lookup(keyFuncQualified+r.fc.family+"\x00"+p, f)
-		}, yield)
-	})
 }
 
 // qualified resolves a call of name through qualifier q: a type's static
@@ -307,14 +241,7 @@ func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) e
 		return r.enclosingTypes(caller, func(typ Ref) error { return r.h.declared(typ, name, yield) })
 	}
 	if r.fc.family == "go" {
-		imported := false
-		err := r.h.imports(r.fc, q, func(p string) error {
-			imported = true
-			return r.h.goPackages(p, func(scope string) error {
-				return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+scope+"\x00"+name, yield)
-			})
-		})
-		if err != nil || imported {
+		if imported, err := r.qualifiedGo(q, name, yield); err != nil || imported {
 			return err
 		}
 	}
@@ -324,28 +251,9 @@ func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) e
 	}
 	switch r.fc.family {
 	case "c":
-		return preferDefinitions(func(f func(entry) error) error {
-			return r.h.decls.lookup(keyFuncQualified+r.fc.family+"\x00"+q+r.fc.sep+name, f)
-		}, yield)
+		return r.qualifiedC(q, name, yield)
 	case "rust":
-		// A path whose first component a `use` binds is read from that
-		// use's path: `u::f()` after `use crate::util as u`.
-		head, rest, ok := strings.Cut(q, "::")
-		err := r.h.imports(r.fc, head, func(p string) error {
-			q = p
-			if ok {
-				q += "::" + rest
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		module := rustPath(r.t.Path, q)
-		if err := r.h.decls.lookup(keyFuncModule+module+"\x00"+name, hit); err != nil || found {
-			return err
-		}
-		return r.h.decls.lookup(keyFuncQualified+r.fc.family+"\x00"+q+r.fc.sep+name, yield)
+		return r.qualifiedRust(q, name, yield)
 	}
 	return nil
 }
@@ -390,24 +298,6 @@ func (r *staticFile) function(caller int32, written string, yield func(entry) er
 		return r.enclosingTypes(caller, func(typ Ref) error { return r.h.dispatchEntries(r.ctx, typ, last, yield) })
 	}
 	return r.qualified(caller, q, last, yield)
-}
-
-// rustPath is the module a Rust path q written in the file at p names: its
-// last component, with `self` the file's own module, `super` its parent's
-// and `crate` the crate root.
-func rustPath(p, q string) string {
-	module := lastComponent(q, "::")
-	switch module {
-	case "self":
-		return rustModule(p)
-	case "super":
-		dir := path.Dir(p)
-		if path.Base(p) == "mod.rs" {
-			dir = path.Dir(dir)
-		}
-		return path.Base(dir)
-	}
-	return module
 }
 
 // enclosingTypes yields the types caller is a member of: the type

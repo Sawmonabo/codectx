@@ -16,8 +16,8 @@ const tableDigestDomain = "link.table"
 // parent resolved. The linker reads nothing else of the file.
 //
 // Indices are file-local: Decl.Parent, Site.Caller and Value.Caller index
-// Decls (-1 is the file's module), Site.Candidates index Decls, and a
-// wire.Type of kind TypeResult indexes Sites.
+// Decls (-1 is the file's module), Site.Candidates index Decls, a wire.Type
+// of kind TypeResult indexes Sites and one of kind TypeUnion indexes Unions.
 type Table struct {
 	Path     string `json:"path"`
 	Language string `json:"language"`
@@ -40,6 +40,12 @@ type Table struct {
 	// call references.
 	Sites  []Site  `json:"sites"`
 	Values []Value `json:"values,omitempty"`
+	// Reexports are the names the module exports under a name of its own
+	// or from another module (wire.Reexport), ECMAScript's `export default`
+	// included.
+	Reexports []wire.Reexport `json:"reexports,omitempty"`
+	// Unions are the type sets a wire.Type of kind TypeUnion names.
+	Unions [][]wire.Type `json:"unions,omitempty"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes. They are dropped, never fatal to the unit, and
@@ -58,6 +64,10 @@ type Table struct {
 type Import struct {
 	Name string `json:"name,omitempty"`
 	Path string `json:"path"`
+	// Original is the name Name denotes in Path's module as written, when
+	// the import renames it (wire.Import.Originals): `a` for `import { a as
+	// b }`, "default" for a default import, "*" for a namespace import.
+	Original string `json:"original,omitempty"`
 }
 
 // ImportAll is the Name of an import of every member of its Path: a Go dot
@@ -88,16 +98,41 @@ type Decl struct {
 	Receiver  string `json:"receiver,omitempty"`
 	Signature string `json:"signature,omitempty"`
 	Params    uint32 `json:"params,omitempty"`
+	Optional  uint32 `json:"optional,omitempty"`
 	Variadic  bool   `json:"variadic,omitempty"`
 	Static    bool   `json:"static,omitempty"`
 	Abstract  bool   `json:"abstract,omitempty"`
+	Virtual   bool   `json:"virtual,omitempty"`
+	Final     bool   `json:"final,omitempty"`
+	Internal  bool   `json:"internal,omitempty"`
 	// Prototype is a C or C++ function declaration without a body: it
 	// announces a definition and yields to one wherever one is declared.
-	Prototype bool `json:"prototype,omitempty"`
-	// Default is an ECMAScript declaration its module exports as
-	// `default` (`export default class C {}`).
-	Default bool      `json:"default,omitempty"`
-	Returns wire.Type `json:"returns"`
+	Prototype bool      `json:"prototype,omitempty"`
+	Returns   wire.Type `json:"returns"`
+}
+
+// Visible reports that declaration cand can be named by a bare name in code
+// that declaration caller encloses (-1 the module), as ECMAScript and Python
+// read a bare name: it is declared at module level, or in a function that
+// encloses caller. A member of a class is never named bare; neither is a
+// declaration nested in a function that does not enclose the caller.
+func (t *Table) Visible(cand, caller int32) bool {
+	if cand < 0 || int(cand) >= len(t.Decls) {
+		return false
+	}
+	p := t.Decls[cand].Parent
+	if p < 0 {
+		return true
+	}
+	if int(p) >= len(t.Decls) || isType(t.Decls[p].Kind) {
+		return false
+	}
+	for i := caller; i >= 0 && int(i) < len(t.Decls); i = t.Decls[i].Parent {
+		if i == p {
+			return true
+		}
+	}
+	return false
 }
 
 // Site is one call site: the structural provider's call reference joined to
@@ -148,8 +183,8 @@ func DecodeTable(b []byte) (*Table, error) {
 }
 
 // Digest is the digest of what the linker's resolution reads of t: every
-// name, kind, shape, type fact, candidate and index, the package and the
-// imports, and the order of every list, but no byte range, position, node
+// name, kind, shape, type fact, candidate and index, the package, the
+// imports, the re-exports and the unions, and the order of every list, but no byte range, position, node
 // identity or dropped count. A structural node's identity is derived from
 // its range, and an edit that shifts a range moves neither a name nor a
 // type, so two tables with one digest resolve every site
@@ -159,7 +194,7 @@ func DecodeTable(b []byte) (*Table, error) {
 // table relink nothing.
 func (t *Table) Digest() (string, error) {
 	c := Table{Path: t.Path, Language: t.Language, Package: t.Package, Imports: t.Imports, Supertypes: t.Supertypes,
-		Values: make([]Value, len(t.Values))}
+		Reexports: t.Reexports, Unions: t.Unions, Values: make([]Value, len(t.Values))}
 	c.Module = Endpoint{Kind: t.Module.Kind, Name: t.Module.Name, Qualified: t.Module.Qualified}
 	c.Decls = make([]Decl, len(t.Decls))
 	for i, d := range t.Decls {

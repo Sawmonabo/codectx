@@ -141,7 +141,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		return failed, err
 	}
 	defer members.Close()
-	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir,
+	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir, root: pu.Root, content: req.Content,
 		members: func(yield func(model.FileVersion) error) error { return members.Each(yield) }}
 
 	sorted, err := newBindingSort(dir, compareSiteTarget)

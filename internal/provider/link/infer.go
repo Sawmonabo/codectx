@@ -543,6 +543,13 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 ) error {
 	t, in := f.t, f.in
 	bases := moduleBases(t.Path, f.python)
+	// defaults are the declarations an ECMAScript `export default` names.
+	defaults := map[string]bool{}
+	for _, r := range t.Reexports {
+		if r.Name == "default" && r.From == "" {
+			defaults[r.Original] = true
+		}
+	}
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		ref := Ref{File: f.file, Index: int32(i)}
@@ -553,7 +560,7 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 			// An ECMAScript default export is also the module's `default`,
 			// which a default import names (`spec#default`).
 			names := []string{d.Name}
-			if d.Default {
+			if defaults[d.Name] {
 				names = append(names, "default")
 			}
 			for _, b := range bases {

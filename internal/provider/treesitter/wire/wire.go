@@ -183,6 +183,12 @@ type Import struct {
 	Path  string `json:"path"`
 	// Names are the local names the statement introduces, when known.
 	Names []string `json:"names,omitempty"`
+	// Originals is nil, or holds for each of Names the name it denotes in
+	// the imported module as written, empty where the local name is that
+	// name: `a` for `b` in `import { a as b }`, "default" for a default
+	// import, "*" for a namespace import, `A` for `B` in
+	// `from m import A as B`.
+	Originals []string `json:"originals,omitempty"`
 }
 
 // Ref is one reference occurrence: a call site or a type reference.
