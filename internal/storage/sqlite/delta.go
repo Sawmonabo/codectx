@@ -626,8 +626,8 @@ func (w *UnitWriter) clipEvidence(ctx context.Context, tx *sql.Tx) error {
 }
 
 // PutDeltaState stores one provider-owned incremental-refresh artifact with
-// the unit it describes: the SCIP DocumentManifest, the dependence KeySet, or
-// whatever a later provider needs to diff its next run without recomputing the
+// the unit it describes: the SCIP DocumentManifest, or whatever a later
+// provider needs to diff its next run without recomputing the
 // previous one. The payload is opaque to storage and read from src in parts,
 // so an artifact is never held whole; there is no bound on its size. It
 // shares the unit's lifetime exactly, so a retired unit takes its artifact

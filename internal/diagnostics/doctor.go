@@ -14,8 +14,8 @@ import (
 
 // Check names. They are stable identifiers an operator and a script both key
 // on, so they are declared once here rather than spelled at the call site.
-// None of them names an analyzer backend by its product name: Section 21 keeps
-// the dependence engine anonymous everywhere, and a diagnostic report is not an
+// None of them names an analyzer by its product name: Section 21 keeps analyzer
+// identities out of operator output, and a diagnostic report is not an
 // exception.
 const (
 	checkBuild            = "build"

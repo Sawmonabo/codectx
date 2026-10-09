@@ -233,8 +233,7 @@ var errWalkBound = errors.New("directory traversal reached its bound")
 // executable re-executed under its worker subcommand, so its comm equals this
 // process's own. comm is truncated to 15 bytes by the kernel, and comparing two
 // equally truncated values is unaffected by that. Every other descendant -- a
-// Git plumbing command, a language server, a SCIP indexer, the dependence
-// engine -- is native.
+// Git plumbing command, a language server, a SCIP indexer -- is native.
 //
 // Membership is by parent chain, not by process group, because each child is
 // its own group leader (internal/process places it there) and there is no

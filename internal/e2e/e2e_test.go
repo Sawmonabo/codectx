@@ -119,8 +119,7 @@ func newSandbox(t *testing.T) *sandbox {
 		"[tools]\noffline = true\n" +
 		"[mcp]\nwatch = false\n" +
 		"[providers.scip]\nenabled = false\n" +
-		"[providers.lsp]\nenabled = false\n" +
-		"[providers.dependence]\nenabled = false\n"
+		"[providers.lsp]\nenabled = false\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}

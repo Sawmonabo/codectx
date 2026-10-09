@@ -35,7 +35,7 @@ var writeRange = WriteRange
 // cannot instrument -- writes, so that they reach the disk as they are
 // written instead of as one burst when the kernel's flusher wakes.
 //
-// Measured: an analysis child dirtied 1.5 GB of its export at 50 MB/s with
+// Measured: an analysis child dirtied 1.5 GB of its output at 50 MB/s with
 // nothing reaching the disk, and the kernel then submitted 714 MB in one
 // second with 407 requests in flight, which is what stalls every other
 // process on the machine. The child cannot be asked to pace itself, but its
