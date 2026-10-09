@@ -1,5 +1,7 @@
 package link
 
+import "strings"
+
 // freeGo is free for Go: the package's own functions, else those of a
 // package a dot import brings into scope.
 func (r *staticFile) freeGo(callee string, yield func(entry) error) error {
@@ -28,4 +30,20 @@ func (r *staticFile) qualifiedGo(q, name string, yield func(entry) error) (impor
 		})
 	})
 	return imported, err
+}
+
+// goMethodExpression is the signature of a Go method expression taken as a
+// value, written "T.M" (or "*T.M" for `(*T).M`), whose method's signature
+// is sig: the method's, with the receiver type as its first parameter
+// (The Go Programming Language Specification, "Method expressions"), so it
+// joins the indirect sites of type `func(T, …)`.
+func goMethodExpression(written, sig string) string {
+	recv, _, ok := cutLast(written, ".")
+	if !ok || !strings.HasPrefix(sig, "(") {
+		return sig
+	}
+	if strings.HasPrefix(sig, "()") {
+		return "(" + recv + sig[1:]
+	}
+	return "(" + recv + "," + sig[1:]
 }

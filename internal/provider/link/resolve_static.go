@@ -51,7 +51,11 @@ func resolveStatic(ctx context.Context, u *unit, emit func(Binding) error) error
 				if e.Sig == "" {
 					return nil
 				}
-				return bySignature.Add(entry{Key: e.Sig, Ref: e.Ref})
+				sig := e.Sig
+				if r.fc.family == "go" && v.Type.Index > 0 {
+					sig = goMethodExpression(v.Type.Name, sig)
+				}
+				return bySignature.Add(entry{Key: sig, Ref: e.Ref})
 			})
 			if err != nil {
 				return err

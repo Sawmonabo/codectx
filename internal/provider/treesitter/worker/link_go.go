@@ -24,7 +24,11 @@ import (
 // pointer, the parentheses and a generic type's arguments are stripped, so
 // `*T`, `(T)` and `T[int]` all name T, and a qualified `pkg.T` keeps its
 // qualifier as written. A method value or method expression is spelled
-// "T.M" with T so reduced, and a value of package pkg as "pkg.F".
+// "T.M" with T so reduced ("*T.M" for a method expression `(*T).M`), and a
+// value of package pkg as "pkg.F". A method expression's value is the
+// method with its receiver as the first parameter ("Method expressions"):
+// its TypeFunction carries Index 1, the receiver parameters it takes ahead
+// of the method's own, and every other function value Index 0.
 type goLinker struct{}
 
 func newGoLinker() *goLinker { return &goLinker{} }
@@ -703,8 +707,8 @@ func (x *goLink) valueVar(e Node) goVar {
 		}
 	}
 	if e.KindId() == x.k.selectorExpression {
-		if fn := x.selected(e); fn != "" {
-			return goVar{typ: wire.Type{Kind: wire.TypeFunction, Name: fn}}
+		if fn := x.selected(e); fn.Name != "" {
+			return goVar{typ: fn}
 		}
 	}
 	return goVar{typ: x.exprType(e)}
@@ -872,6 +876,23 @@ func (x *goLink) isType(o Node) bool {
 	return ok
 }
 
+// methodExprReceiver is the receiver a method expression's operand names,
+// "T" for `T` and "*T" for `(*T)` where T is a type the file declares, or
+// empty when the operand is not a type ("Method expressions").
+func (x *goLink) methodExprReceiver(o Node) string {
+	if x.isType(o) {
+		return x.text(o)
+	}
+	if x.is(o, x.k.unaryExpression) {
+		if op := o.ChildByFieldId(x.k.fOperator); !op.IsNull() && op.KindId() == x.k.star {
+			if t := x.unparen(o.ChildByFieldId(x.k.fOperand)); x.isType(t) {
+				return "*" + x.text(t)
+			}
+		}
+	}
+	return ""
+}
+
 // copiedReceiver is a method declaration's receiver base type, copied.
 func (x *goLink) copiedReceiver(m Node) string { return strings.Clone(x.receiverOf(m)) }
 
@@ -909,9 +930,12 @@ func (x *goLink) site(call Node) {
 		}
 	} else {
 		o := x.unparen(f.ChildByFieldId(k.fOperand))
+		recv := x.methodExprReceiver(o)
 		switch {
-		case x.isImport(o) || x.isType(o):
+		case x.isImport(o):
 			s.Shape, s.Qualifier = wire.ShapeStatic, x.copied(o)
+		case recv != "":
+			s.Shape, s.Qualifier = wire.ShapeStatic, strings.Clone(recv)
 		default:
 			s.Shape = wire.ShapeMember
 			t := x.exprType(o)
@@ -962,48 +986,55 @@ func (x *goLink) value(e Node, field string) {
 	if e.IsNull() {
 		return
 	}
-	var fn string
+	var fn wire.Type
 	switch e.KindId() {
 	case k.identifier:
 		name := x.text(e)
 		if v, ok := x.lookup(name); ok {
 			if v.typ.Kind == wire.TypeFunction {
-				fn = v.typ.Name
+				fn = v.typ
 			}
 			break
 		}
 		if _, ok := x.types[name]; ok || x.consts[name] || x.imports[name] || goPredeclared[name] {
 			break
 		}
-		fn = name
+		fn = wire.Type{Kind: wire.TypeFunction, Name: name}
 	case k.selectorExpression:
 		fn = x.selected(e)
 	}
-	if fn == "" {
+	if fn.Name == "" {
 		return
 	}
-	x.out.Values = append(x.out.Values, wire.Value{At: goSpan(e), Field: field,
-		Type: wire.Type{Kind: wire.TypeFunction, Name: strings.Clone(fn)}})
+	x.out.Values = append(x.out.Values, wire.Value{At: goSpan(e), Field: field, Type: goCopiedType(fn)})
 }
 
-// selected is the function a selector takes as a value: "pkg.F" through an
-// import, "T.M" for a method expression on a file type, and "T.M" for a
-// method value whose receiver's type T is recovered and declares no field M;
-// empty for any other selector.
-func (x *goLink) selected(e Node) string {
-	o, f := x.unparen(e.ChildByFieldId(x.k.fOperand)), goChild(e, x.k.fField)
+// selected is the function a selector takes as a value, a TypeFunction:
+// "pkg.F" through an import; "T.M" for a method expression `T.M` on a file
+// type and "*T.M" for `(*T).M`, each with Index 1; and "T.M" for a method
+// value whose receiver's type T is recovered and declares no field M. It is
+// TypeUnknown for any other selector.
+func (x *goLink) selected(e Node) wire.Type {
+	k := x.k
+	o, f := x.unparen(e.ChildByFieldId(k.fOperand)), goChild(e, k.fField)
+	fn := func(name string, receivers uint32) wire.Type {
+		return wire.Type{Kind: wire.TypeFunction, Name: name + "." + x.text(f), Index: receivers}
+	}
 	switch {
 	case f.IsNull():
-		return ""
-	case x.isImport(o) || x.isType(o):
-		return x.text(o) + "." + x.text(f)
+		return wire.Type{}
+	case x.isImport(o):
+		return fn(x.text(o), 0)
+	}
+	if recv := x.methodExprReceiver(o); recv != "" {
+		return fn(recv, 1)
 	}
 	if t := x.exprType(o); t.Kind == wire.TypeNamed {
 		if _, isField := x.types[t.Name][x.text(f)]; !isField {
-			return t.Name + "." + x.text(f)
+			return fn(t.Name, 0)
 		}
 	}
-	return ""
+	return wire.Type{}
 }
 
 // goPredeclared are the predeclared identifiers that are values but never

@@ -174,11 +174,18 @@ The members' language family picks the resolver:
   interface's) also joins every method reference of that method's signature.
 - **Go, Rust, C, C++** (`resolveStatic`): direct binding and class-hierarchy analysis over interfaces and traits.
   Bare and static sites bind by the language's scoping: same package, import, `use`, namespace and
-  using-directive, and a prototype yields to the definition it announces (`Decl.Prototype`). A Go `pkg.F` binds the
-  package whose directory ends the import path. Go's implicit interface satisfaction is derived from method sets. An
+  using-directive, and a prototype yields to the definition it announces (`Decl.Prototype`). A Go import path names
+  a package of the unit only through the module path of the `go.mod` at the unit's root: the module path is the
+  root, a path under it the directory it continues with, any other path the root's `vendor` copy; a unit with no
+  `go.mod` binds no import path (`hierarchy.goPackages`, `internal/provider/link/hierarchy_go.go`). A Go type's method
+  set is its own methods and, depth by depth, those its embedded fields and embedded interfaces promote; a name two
+  embedding paths reach at one depth of a struct is ambiguous and promotes nothing. Embedding is promotion, never
+  subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
+  under the embedding type, and implicit interface satisfaction compares whole method sets (`hierarchy.satisfy`). An
   indirect site joins every function taken as a value whose declared signature equals the site's
-  (`wire.Export.Signature`, `wire/link.go:42-49`). This is the address-taken × indirect-site cross-product, with no
-  reachability fixed point.
+  (`wire.Export.Signature`, `wire/link.go:42-49`); a Go method expression `T.M` taken as a value has the method's
+  signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
+  cross-product, with no reachability fixed point.
 
 A type name is read in the file's scopes, then through the import that names it (which decides alone), then
 through the file's imports of every member. Only a name that no scope or import of the file can supply falls back
