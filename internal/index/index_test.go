@@ -4,8 +4,6 @@ package index
 // ten changed files, a new symbol and dependency, a delete and a rename, an
 // optional provider's failure, a required provider's failure, a concurrent
 // refresh, and a watcher overflow.
-// A ninth test covers the carry-distance paging the coordinator feeds the
-// planner.
 //
 // Failure modes these protect, all of which are silent:
 //   - a refresh that rebuilds units nothing changed, rewriting lexical bodies
@@ -17,9 +15,7 @@ package index
 //     or a required provider's failure publishing a generation anyway;
 //   - two concurrent refreshes publishing over one another's unseen pointer;
 //   - a watch overflow dropping the paths it collapsed, so the index reports
-//     coverage it does not have;
-//   - a carry fold that reads one page of the previous generation's stale
-//     members, reporting a unit stale for many generations as stale for one.
+//     coverage it does not have.
 
 import (
 	"bytes"
@@ -1214,12 +1210,6 @@ func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
 	// the scip provider, so selection is asked about a provider that is
 	// registered AND off.
 	c := f.coordinator(f.providers(true))
-	// What the composition root records for a provider it could not build --
-	// and it never even tries to build one the configuration disabled, which
-	// is the second way these rows reached the report.
-	c.opts.States = append(c.opts.States, model.CapabilityState{ProviderID: scip.ID,
-		Capability: "references", Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
-		DiagnosticCode: model.CodeProviderUnavailable})
 	res, err := c.Index(f.ctx, model.IndexRequest{})
 	if err != nil {
 		t.Fatalf("Index: %v", err)

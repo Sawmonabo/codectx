@@ -34,7 +34,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -122,7 +121,7 @@ type Locker interface {
 }
 
 // Options are the coordinator's dependencies. Every field except Lock,
-// Watcher, States, Logger and Now is required; the workspace lock is the
+// Watcher, Logger and Now is required; the workspace lock is the
 // caller's and is never closed here.
 type Options struct {
 	Root     workspace.Root
@@ -173,14 +172,6 @@ type Options struct {
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
 	// reported incomplete because that is what it is.
 	Watcher *watch.Watcher
-	// States are the composition-time capability rows of providers that could
-	// not be constructed at all -- an absent analyzer payload, a profile that
-	// did not resolve. They are folded into every capability report
-	// (IndexResult.Completeness, IndexStatus.Completeness) before the
-	// MaxCapabilityStates bound is applied, so a degradation the operator must
-	// see is never the row that truncation drops and never pushes the
-	// published list past its own contract.
-	States []model.CapabilityState
 	// SuppliedIndexes are the already-built indexes this run was handed --
 	// today the `--scip-index` path. The coordinator records each one against
 	// every generation it publishes, whether or not the path resolved, because
@@ -784,27 +775,6 @@ func disabledProviders(cfg config.Config) []string {
 	}
 	if p.LSP.Enabled == config.Disabled {
 		out = append(out, lspOverlayID)
-	}
-	return out
-}
-
-// composedStates are Options.States without the rows of a provider the
-// configuration disabled. The composition root records a capability row for a
-// provider it could not construct, and a provider that is off is one it does
-// not even try to construct; that row is the same misreading the selection no
-// longer produces, so it is dropped at the one place both capability reports
-// read those rows from.
-func enabledComposedStates(cfg config.Config, states []model.CapabilityState) []model.CapabilityState {
-	disabled := disabledProviders(cfg)
-	if len(disabled) == 0 {
-		return states
-	}
-	out := make([]model.CapabilityState, 0, len(states))
-	for _, st := range states {
-		if slices.Contains(disabled, st.ProviderID) {
-			continue
-		}
-		out = append(out, st)
 	}
 	return out
 }
