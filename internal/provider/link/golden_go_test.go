@@ -256,4 +256,63 @@ func useY(y Y) { y.Run() } // @uy
 		},
 		fails: "a selector resolved at the shallowest depth despite a second name there binds `x.Run()` to A.Run",
 	},
+	{
+		name:   "field-receivers-across-files",
+		anchor: "The Go Programming Language Specification, \"Selectors\" (a selector of a field, including a promoted field of an embedded pointer, has the field's type; a method call on it selects that type's method), \"Struct types\" (embedded fields, promoted fields)",
+		files: map[string]string{
+			"server.go": `package p
+
+type Server struct {
+	cfg Config
+	*DBHolder
+}
+
+type DBHolder struct {
+	db DB
+}
+`,
+			"types.go": `package p
+
+type Config struct {
+	store Store
+}
+
+func (Config) Load() {} // @load
+
+type DB struct{}
+
+func (*DB) Query() {} // @query
+`,
+			"store.go": `package p
+
+type Store struct{}
+
+func (Store) Get() {} // @get
+`,
+			"use.go": `package p
+
+import "example.com/ext"
+
+func (s *Server) Start() {
+	s.cfg.Load()  // @u1
+	s.db.Query()  // @u2
+	s.cfg.store.Get() // @u4
+}
+
+func other(v ext.Server) {
+	v.Cfg.Load() // @u3
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding. Both read `s.db.Query()` as legal: the
+		// field reached through the embedded pointer is addressable, so the pointer-receiver method is called
+		// on its address ("Calls").
+		want: []string{
+			"u1 Load -> load Load",
+			"u2 Query -> query Query",
+			"u4 Get -> get Get",
+		},
+		fails: "a member call through a field typed in another file, or through a promoted field of an embedded pointer, or through a chain of fields, left unbound; a field read on a receiver of unknown type bound by the field's name",
+	},
 }
