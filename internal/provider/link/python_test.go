@@ -55,7 +55,8 @@ func pyMethod(q string, class int32) Decl { return pyDecl(model.NodeMethod, q, c
 //     binds the enclosing class's own override (drop the Parent filter in
 //     resolvePythonSuper → "super" fails);
 //   - flow: a receiver recovered through an assignment, a parameter or a
-//     return binds nothing (skip types.receivers → the three flow cases
+//     return binds nothing (dispatch only the receiver types the file
+//     names, never the ones inference recovers → the three flow cases
 //     fail);
 //   - field: a function stored on an attribute is not what the attribute's
 //     call binds (skip types.functions → "field-based" fails);
@@ -67,7 +68,10 @@ func pyMethod(q string, class int32) Decl { return pyDecl(model.NodeMethod, q, c
 func TestResolvePythonGoldens(t *testing.T) {
 	type want = Binding
 	cases := []struct {
-		name   string
+		name string
+		// anchor is the language reference, by standard title and section,
+		// the expected bindings are read from.
+		anchor string
 		tables []*Table
 		want   []want
 	}{
@@ -75,10 +79,14 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// util.py: def helper(): return 1
 			// main.py: import util / def run(): util.helper()
 			name: "module import",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §7.11 (The import statement), §6.3.1 (Attribute references)",
 			tables: []*Table{
 				{Path: "util.py", Decls: []Decl{pyFunc("helper")}},
 				{Path: "main.py", Decls: []Decl{pyFunc("run")}, Sites: []Site{
-					{Caller: 0, Callee: "helper", Shape: wire.ShapeStatic, Qualifier: "util", QualifierIsImport: true}}},
+					{Caller: 0, Callee: "helper", Shape: wire.ShapeStatic, Qualifier: "util", QualifierIsImport: true,
+						Receiver: wire.Type{Kind: wire.TypeModule, Name: "util"}}}},
 			},
 			want: []want{{Site: Ref{1, 0}, Target: Ref{0, 0}, Detail: DetailDirect}},
 		},
@@ -87,6 +95,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// class Square: pass
 			// def make(): Circle(1); Square()
 			name: "construction",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §3.3.1 (Basic customization: `__init__`), §6.3.4 (Calls of a class)",
 			tables: []*Table{{Path: "shapes.py",
 				Decls: []Decl{pyClass("Circle"), pyMethod("Circle.__init__", 0), pyClass("Square"), pyFunc("make")},
 				Sites: []Site{
@@ -103,6 +114,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// class Base: def area(self): return 0 / def show(self): self.area()
 			// class Sq(Base): def area(self): return 4
 			name: "self and subtypes",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §3.3 (attribute lookup through the method resolution order)",
 			tables: []*Table{{Path: "shapes.py",
 				Decls: []Decl{pyClass("Base"), pyMethod("Base.area", 0), pyMethod("Base.show", 0),
 					pyClass("Sq"), pyMethod("Sq.area", 3)},
@@ -118,6 +132,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// class Dog: def bark(self): pass
 			// def main(): d = Dog(); d.bark()
 			name: "assignment flow",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §7.2 (Assignment statements), §6.3.4 (Calls)",
 			tables: []*Table{{Path: "pets.py",
 				Decls: []Decl{pyClass("Dog"), pyMethod("Dog.bark", 0), pyFunc("main")},
 				Sites: []Site{
@@ -134,6 +151,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// def speak(c): c.meow()
 			// def main(): speak(Cat())
 			name: "parameter flow",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §6.3.4 (Calls: argument binding to parameters)",
 			tables: []*Table{{Path: "pets.py",
 				Decls: []Decl{pyClass("Cat"), pyMethod("Cat.meow", 0), {Endpoint: Endpoint{Kind: model.NodeFunction,
 					Name: "speak", Qualified: "speak"}, Parent: -1, Described: true, Params: 1}, pyFunc("main")},
@@ -154,6 +174,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// def open_conn(): return Conn()
 			// def main(): c = open_conn(); c.close()
 			name: "return flow",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §7.6 (The return statement), §6.3.4 (Calls)",
 			tables: []*Table{{Path: "db.py",
 				Decls: []Decl{pyClass("Conn"), pyMethod("Conn.close", 0), {Endpoint: Endpoint{Kind: model.NodeFunction,
 					Name: "open_conn", Qualified: "open_conn"}, Parent: -1, Described: true,
@@ -174,6 +197,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// class Button: def __init__(self): self.handler = on_click
 			//               def press(self): self.handler()
 			name: "field-based",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §3.3 (instance attribute lookup before the class), §6.3.1 (Attribute references)",
 			tables: []*Table{{Path: "ui.py",
 				Decls:  []Decl{pyFunc("on_click"), pyClass("Button"), pyMethod("Button.__init__", 1), pyMethod("Button.press", 1)},
 				Values: []Value{{Caller: 2, Field: "handler", Type: wire.Type{Kind: wire.TypeFunction, Name: "on_click"}}},
@@ -185,6 +211,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// class A: def greet(self): pass
 			// class B(A): def greet(self): super().greet()
 			name: "super",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §3.3; \"The Python 2.3 Method Resolution Order\"; the Python Library Reference, \"Built-in Functions: super\"",
 			tables: []*Table{{Path: "greet.py",
 				Decls:      []Decl{pyClass("A"), pyMethod("A.greet", 0), pyClass("B"), pyMethod("B.greet", 2)},
 				Supertypes: []wire.Supertype{{Type: "B", Super: "A"}},
@@ -198,6 +227,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// util.py: def helper(): return 1
 			// main.py: from util import helper / def run(): helper()
 			name: "from-import",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §7.11 (The import statement: `from m import a`)",
 			tables: []*Table{
 				{Path: "util.py", Decls: []Decl{pyFunc("helper")}},
 				{Path: "main.py", Decls: []Decl{pyFunc("run")}, Sites: []Site{{Caller: 0, Callee: "helper",
@@ -209,6 +241,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// a.py: def helper(): return 1
 			// b.py: def run(): helper()
 			name: "no import",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §4.2.2 (Resolution of names: an unbound global name raises NameError)",
 			tables: []*Table{
 				{Path: "a.py", Decls: []Decl{pyFunc("helper")}},
 				{Path: "b.py", Decls: []Decl{pyFunc("run")}, Sites: []Site{{Caller: 0, Callee: "helper", Shape: wire.ShapeBare}}},
@@ -218,11 +253,15 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// models.py: class User: def __init__(self, name): self.name = name / def save(self): pass
 			// app.py: import models / def create(): u = models.User("x"); u.save()
 			name: "constructed across files",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §7.11 (The import statement), §3.3.1 (`__init__`)",
 			tables: []*Table{
 				{Path: "models.py", Decls: []Decl{pyClass("User"), pyMethod("User.__init__", 0), pyMethod("User.save", 0)}},
 				{Path: "app.py", Decls: []Decl{pyFunc("create")}, Sites: []Site{
 					{Caller: 0, Callee: "User", Shape: wire.ShapeStatic, Qualifier: "models", QualifierIsImport: true,
-						Args: []wire.Type{{}}},
+						Receiver: wire.Type{Kind: wire.TypeModule, Name: "models"},
+						Args:     []wire.Type{{}}},
 					{Caller: 0, Callee: "save", Shape: wire.ShapeMember, Receiver: wire.Type{Kind: wire.TypeResult, Index: 0}},
 				}},
 			},
@@ -236,11 +275,15 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// util.py: def helper(): return 1
 			// main.py: import util / def run(): util.helper()
 			name: "same-named module elsewhere",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §5.3 (Searching: the module search path, the program's directory first)",
 			tables: []*Table{
 				{Path: "tests/util.py", Decls: []Decl{pyFunc("helper")}},
 				{Path: "util.py", Decls: []Decl{pyFunc("helper")}},
 				{Path: "main.py", Decls: []Decl{pyFunc("run")}, Sites: []Site{
-					{Caller: 0, Callee: "helper", Shape: wire.ShapeStatic, Qualifier: "util", QualifierIsImport: true}}},
+					{Caller: 0, Callee: "helper", Shape: wire.ShapeStatic, Qualifier: "util", QualifierIsImport: true,
+						Receiver: wire.Type{Kind: wire.TypeModule, Name: "util"}}}},
 			},
 			want: []want{{Site: Ref{2, 0}, Target: Ref{1, 0}, Detail: DetailDirect}},
 		},
@@ -250,6 +293,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// lib/b.py: def f(): pass
 			// pkg/a.py: from .b import f / def g(): f()
 			name: "relative import",
+			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+			// the binding rules alone); the two agree on every binding.
+			anchor: "The Python Language Reference §5.7 (Package Relative Imports)",
 			tables: []*Table{
 				{Path: "pkg/__init__.py"},
 				{Path: "pkg/b.py", Decls: []Decl{pyFunc("f")}},
@@ -293,7 +339,7 @@ func TestResolvePythonGoldens(t *testing.T) {
 			want := slices.Clone(tc.want)
 			slices.SortFunc(want, order)
 			if !slices.Equal(got, want) {
-				t.Fatalf("bindings\n got %v\nwant %v", got, want)
+				t.Fatalf("%s\nbindings\n got %v\nwant %v", tc.anchor, got, want)
 			}
 		})
 	}
