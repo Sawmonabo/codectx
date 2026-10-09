@@ -547,6 +547,29 @@ and `CTX_SOURCE_INTEGRITY`:
 Open sessions, cursors and receipts do not survive a rebuild. That is correct:
 they cite a generation that no longer exists.
 
+## The search index on disk
+
+The lexical tier's index is a directory of its own under the workspace's data
+directory, beside the database ([storage](storage.md#the-search-index)). One
+index holds the search documents of every retained unit; a generation is the
+set of units it makes visible, so the directory does not grow a copy per
+snapshot. Its segments merge in the background, and a unit's documents leave
+it when collection frees the unit.
+
+The index commits before the database activates a generation, with that
+generation's id as its commit payload, so a generation the database has
+activated is always in the index. A crash between the two leaves an index commit
+the database never activated; on the next start, reconciliation deletes the
+documents of units no generation references and re-plans any unit whose
+documents never reached a commit, as it does any unsealed unit. There is
+nothing to run by hand.
+
+Like everything else in the data directory, the index is not a source of
+truth. A damaged index directory is recovered the way the store is: remove the
+data directory and re-index ([Rebuilding a workspace](#rebuilding-a-workspace)).
+Removing the index directory alone is not a supported repair, because the
+database's activated generations assume the documents it holds.
+
 ## What a run cost, while it is still running
 
 `codectx status --resources` reports two things. One is the resource
