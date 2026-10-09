@@ -101,7 +101,11 @@ var typeKinds = []model.NodeKind{model.NodeClass, model.NodeInterface, model.Nod
 
 func isType(k model.NodeKind) bool { return slices.Contains(typeKinds, k) }
 
-func isCallable(k model.NodeKind) bool { return k == model.NodeFunction || k == model.NodeMethod }
+// isCallable reports the declaration kinds a call can reach; a test is a
+// function the extractor marks as a test.
+func isCallable(k model.NodeKind) bool {
+	return k == model.NodeFunction || k == model.NodeMethod || k == model.NodeTest
+}
 
 // familyOf groups the languages whose files name each other's declarations:
 // a header is C or C++ by the repository's census, and the ECMAScript
