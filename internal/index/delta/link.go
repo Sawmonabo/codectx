@@ -250,7 +250,12 @@ func (j *digestJoin) pull() error {
 }
 
 // match accounts one fresh input: every predecessor member before it is gone,
-// an equal FileID compares digests, and anything else is an addition.
+// an equal FileID compares digests, and anything else is an addition. An
+// input with no digest on either side carries no table (a manifest such as
+// go.mod or package.json, or a member whose link pass failed) and is compared
+// by its bytes instead: a resolver may read it (a Go module path decides which
+// imports are the project's own), so its edit moves every binding while every
+// table digest holds.
 func (j *digestJoin) match(in model.UnitInput) error {
 	for j.has && j.old.FileID < in.FileID {
 		j.stats.Removed++
@@ -259,7 +264,8 @@ func (j *digestJoin) match(in model.UnitInput) error {
 		}
 	}
 	if j.has && j.old.FileID == in.FileID {
-		if j.old.Digest == in.Digest {
+		untabled := j.old.Digest == "" && in.Digest == ""
+		if j.old.Digest == in.Digest && (!untabled || j.old.ContentHash == in.ContentHash) {
 			j.stats.Unchanged++
 		} else {
 			j.stats.Changed++

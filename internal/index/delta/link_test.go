@@ -47,7 +47,10 @@ func TestMain(m *testing.M) {
 // Mutations that fail it: resolve in full whatever opts.Previous holds (b.go's
 // table is read); publish every fact on the inheriting path (b.go's table is
 // read, nothing is carried); carry a.go's facts instead of republishing them
-// (the carry-over is refused, a.go's bytes having changed).
+// (the carry-over is refused, a.go's bytes having changed). Its last step
+// renames the module in go.mod, which moves no table digest but decides which
+// imports are the project's own: the build must resolve. Mutation: compare a
+// tableless input by digest alone (go.mod counts unchanged, Filtered is set).
 func TestLinkBodyEditRelinksNothing(t *testing.T) {
 	f := newFixture(t)
 	ts := f.structuralProvider()
@@ -120,6 +123,19 @@ func TestLinkBodyEditRelinksNothing(t *testing.T) {
 		t.Fatal("the rebuilt unit holds no call: Twice's calls of Run are lost")
 	}
 	sameFacts(t, db, full.Build.Spec.ID, refresh.Build.Spec.ID)
+
+	renamed := f.snapshot(map[string]string{"go.mod": "module example.com/renamed\n\ngo 1.27\n", "a.go": after, "b.go": caller})
+	renamedGen := f.generation(renamed)
+	f.attach(renamedGen, calleeUnit)
+	f.attach(renamedGen, callerUnit)
+	moved, err := a.Apply(f.ctx, f.request(lp, build{tree: renamed, gen: renamedGen, cfgHash: "config", scopeKey: goScope,
+		paths: paths, previous: refresh.Build.Spec.ID}))
+	if err != nil {
+		t.Fatalf("Apply after the module rename: %v", err)
+	}
+	if moved.Filtered || moved.Delta != (delta.Stats{Changed: 1, Unchanged: 2}) {
+		t.Errorf("after the module rename the build is %+v, want go.mod changed and the unit resolved", moved)
+	}
 }
 
 // countedTables counts the tables read, by path; digests are not counted.

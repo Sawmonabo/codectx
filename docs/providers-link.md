@@ -138,7 +138,7 @@ published with differ. The member digest adds the table's `Dropped` count, which
 
 The delta build reads each member's digest, one small read per member and no table decoded, and compares it with
 its predecessor's in FileID order, as one merge join against the predecessor unit's stored inputs
-(`internal/index/delta/link.go`). When membership and every digest are equal, it hands `Link` the predecessor's
+(`internal/index/delta/link.go`). An input with no table (a manifest such as `go.mod`, or a member whose link pass failed) is compared by its bytes, because a resolver may read it: a Go module path decides which imports are the project's own. When membership, every digest and every tableless input are equal, it hands `Link` the predecessor's
 resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`) and the stream of members whose bytes
 changed (`LinkOptions.Edited`, `provider.go:84-110`). The state names each site and target by position (`Ref`,
 `internal/provider/link/unit.go`) and holds the unit's coverage, so the linker resolves nothing. It republishes only
