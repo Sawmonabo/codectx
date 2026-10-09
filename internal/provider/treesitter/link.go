@@ -35,7 +35,10 @@ const detailLinkFailure = "link_failure"
 // already joined, names a range that does not fit the pinned bytes, or names
 // a site that joined nothing is dropped and counted in Table.Dropped, never
 // fatal: the table is the file's best account, and a non-zero count makes
-// the unit's `calls` partial.
+// the unit's `calls` partial. Each callable whose analysis failed in the
+// worker is counted there too: the worker's linker never saw it, so its
+// values and its sites' recovered receiver and argument types are missing
+// from the table, and the sites resolve on less than the file says.
 //
 // A file whose module has no identity (build gave up on an over-long path)
 // has no endpoint to link from and stores no table; neither does a file whose
@@ -52,6 +55,11 @@ func (b *builder) linkTable() error {
 	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Package: b.ex.done.Package, Imports: b.linkImports(),
 		Supertypes: wl.Supertypes, Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
 			Name: b.module.Node.Name, Qualified: b.module.Node.QualifiedName, Range: *b.fileRng}}
+	for i := range b.ex.functions {
+		if b.ex.functions[i].Failed {
+			t.Dropped++
+		}
+	}
 
 	// siteAt maps each worker site to its index in t.Sites, -1 for one that
 	// joined no call reference; it is filled before any type is remapped,
