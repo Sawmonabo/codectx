@@ -965,42 +965,19 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("reader2.Close: %v", err)
 	}
 
-	// Phase: stale carry and its identity (Section 13.3). A semantic unit
-	// still rebuilding after an edit is carried into the new generation so its
-	// capability can answer `stale` with a distance instead of `pending`. The
-	// failure mode guarded here is the one that makes a stale answer
-	// indistinguishable from a fresh one: either the carried unit cannot be
-	// published at all, or it publishes under an AnalysisKey identical to a
-	// fresh generation's.
-	//
-	// The identity half is proved over snap2 with gen2's own membership: the
-	// same two unit keys, the same capabilities, the same snapshot and the
-	// same normalization and semantic hashes, with exactly one member marked
-	// carried. Nothing else can move the key, so a key equal to gen2's would
-	// mean the carried marker and the distance never reached the fold. A
-	// genuinely stale unit would have a different unit key and the two keys
-	// would differ for the old reason, proving nothing.
-	genCarry, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "feature")
+	// A second ref selecting gen2's membership over the same snapshot, so
+	// retention below has four refs to rank.
+	genFeature, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "feature")
 	if err != nil {
-		t.Fatalf("BeginGeneration(carry): %v", err)
+		t.Fatalf("BeginGeneration(feature): %v", err)
 	}
-	if err := f.s.AttachUnit(ctx, genCarry, unitA); err != nil {
-		t.Fatalf("AttachUnit(unitA) into the carry generation: %v", err)
+	if err := f.s.AttachUnit(ctx, genFeature, unitA); err != nil {
+		t.Fatalf("AttachUnit(unitA) into the feature generation: %v", err)
 	}
-	if err := f.s.AttachCarried(ctx, genCarry, unitB2, store.Carry{DistanceGenerations: 2, DistanceFiles: 1}); err != nil {
-		t.Fatalf("AttachCarried(unitB2): %v", err)
+	if err := f.s.AttachUnit(ctx, genFeature, unitB2); err != nil {
+		t.Fatalf("AttachUnit(unitB2) into the feature generation: %v", err)
 	}
-	bindCarry := f.activate(genCarry, gen2)
-	if bindCarry.AnalysisKey == bind2.AnalysisKey {
-		t.Fatal("a generation carrying a stale unit has the same analysis key as the fresh generation with the same membership; a stale answer is indistinguishable from a fresh one")
-	}
-	carried, err := f.s.CarriedUnits(ctx, genCarry, "", "", 0)
-	if err != nil {
-		t.Fatalf("CarriedUnits: %v", err)
-	}
-	if len(carried) != 1 || carried[0].Unit != unitB2 || carried[0].Carry != (store.Carry{DistanceGenerations: 2, DistanceFiles: 1}) {
-		t.Fatalf("CarriedUnits = %+v, want only unitB2 with its recorded distance", carried)
-	}
+	bindFeature := f.activate(genFeature, gen2)
 
 	// A ref of its own, holding a unit no other generation selects. Every
 	// generation so far selects exactly the same two units, so deleting any of
@@ -1016,7 +993,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err := f.s.SealUnit(ctx, wOwn); err != nil {
 		t.Fatalf("SealUnit(release): %v", err)
 	}
-	f.activate(genOwn, genCarry)
+	f.activate(genOwn, genFeature)
 	// genOwn's unit indexes b.go a second time under its own config, so the
 	// corpus now holds a second document containing "changed" that gen2 does
 	// not select. Its rowid is the probe the stability leg below uses.
@@ -1033,9 +1010,9 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("ownReader.Close: %v", err)
 	}
 
-	// The publication half: over a snapshot whose a.go changed, unitA can no
-	// longer be reused, and carrying it must be admitted at attach AND at
-	// activation, where the membership input check runs again.
+	// Reuse is refused once a unit's inputs move: over a snapshot whose a.go
+	// changed, unitA is CTX_SNAPSHOT_CHANGED, and the generation publishes
+	// with the unit whose input did not change.
 	a2 := f.file("pkg/a.go", "package pkg\nfunc A() { changed() }\n")
 	snap3 := f.snapshot("three", a2, b2)
 	genStale, err := f.s.BeginGeneration(ctx, f.repo, snap3.ID, model.H("semantic"), "topic")
@@ -1047,26 +1024,23 @@ func TestStorePublicationScenario(t *testing.T) {
 	} else {
 		wantCode(t, err, model.CodeSnapshotChanged)
 	}
-	if err := f.s.AttachCarried(ctx, genStale, unitA, store.Carry{DistanceGenerations: 1, DistanceFiles: 1}); err != nil {
-		t.Fatalf("AttachCarried(stale unitA): %v", err)
-	}
 	if err := f.s.AttachUnit(ctx, genStale, unitB2); err != nil {
 		t.Fatalf("AttachUnit(unitB2): %v", err)
 	}
 	bindStale := f.activate(genStale, genOwn)
-	if bindStale.AnalysisKey == bindCarry.AnalysisKey {
+	if bindStale.AnalysisKey == bindFeature.AnalysisKey {
 		t.Fatal("two generations over different snapshots share an analysis key")
 	}
 
-	// A unit whose inputs no longer exist is not carried: answering from it
-	// would describe source the snapshot does not have.
+	// Nor is a unit reused whose input file is gone from the snapshot:
+	// answering from it would describe source the snapshot does not have.
 	snap4 := f.snapshot("four", b2)
 	genGone, err := f.s.BeginGeneration(ctx, f.repo, snap4.ID, model.H("semantic"), "topic")
 	if err != nil {
 		t.Fatalf("BeginGeneration(deleted input): %v", err)
 	}
-	if err := f.s.AttachCarried(ctx, genGone, unitA, store.Carry{DistanceGenerations: 1}); err == nil {
-		t.Fatal("AttachCarried carried a unit whose input file is gone from the snapshot")
+	if err := f.s.AttachUnit(ctx, genGone, unitA); err == nil {
+		t.Fatal("AttachUnit reused a unit whose input file is gone from the snapshot")
 	} else {
 		wantCode(t, err, model.CodeSnapshotChanged)
 	}
@@ -1075,7 +1049,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	}
 
 	// Phase: retention by distinct ref (Section 12.4). Four refs have been
-	// indexed — "main" (gen2), "feature" (genCarry), "release" (genOwn) and
+	// indexed — "main" (gen2), "feature" (genFeature), "release" (genOwn) and
 	// "topic" (genStale, active) — so retention keeps each ref's most recent
 	// generation and sweeps what no retained ref keeps. A byte limit then
 	// evicts the least recently used refs first. The failure mode is
@@ -1101,7 +1075,7 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("RetainByRef(%+v) reported no reclaimable bytes although two non-active "+
 			"generations are retained; it is measured even when retention is unlimited", r1)
 	}
-	for _, gen := range []model.GenerationID{gen2, genCarry, genOwn, genStale} {
+	for _, gen := range []model.GenerationID{gen2, genFeature, genOwn, genStale} {
 		if _, err := f.s.GenerationStatus(ctx, gen); err != nil {
 			t.Fatalf("retention swept generation %d, which is its ref's most recent: %v", gen, err)
 		}
@@ -1143,7 +1117,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	if r2.RefsRetained != 1 || r2.GenerationsSwept != 2 {
 		t.Fatalf("RetainByRef(byte limit) = %+v, want only the active ref retained and the two collectable generations swept", r2)
 	}
-	for _, gen := range []model.GenerationID{genCarry, genOwn} {
+	for _, gen := range []model.GenerationID{genFeature, genOwn} {
 		if _, err := f.s.GenerationStatus(ctx, gen); err == nil {
 			t.Fatalf("an evicted ref's generation %d survived the byte limit", gen)
 		}
