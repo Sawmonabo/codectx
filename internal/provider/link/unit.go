@@ -72,15 +72,13 @@ type Binding struct {
 // binds publishes nothing, and its structural call stands alone.
 type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
 
-// resolverFor is the resolution of decision 2 for a unit's language family.
+// resolverFor is the flow family's resolution of decision 2 (resolve has
+// the static family's).
 func resolverFor(f Family) resolver {
-	switch f {
-	case FamilyJavaScript:
-		return resolveECMAScript
-	case FamilyPython:
+	if f == FamilyPython {
 		return resolvePython
 	}
-	return resolveStatic
+	return resolveECMAScript
 }
 
 // members is a unit's member files in ascending FileID order: each live
@@ -104,9 +102,6 @@ func (m *members) Each(yield func(model.FileVersion) error) error {
 		return yield(fv)
 	})
 }
-
-// Len is the member count.
-func (m *members) Len() int64 { return m.n }
 
 // Close releases the sorted run.
 func (m *members) Close() error { return m.run.Close() }
@@ -162,9 +157,11 @@ func planMembers(ctx context.Context, req provider.UnitRequest, dir string) (*me
 	return m, nil
 }
 
-// coverage is what the unit's tables leave out: members with no table, whose
-// sites the linker cannot see, and the worker entries their parent dropped.
+// coverage is what the unit's facts leave out: members with no table, whose
+// sites the linker cannot see, the worker entries their parent dropped, and
+// the ambiguous sites whose call-site key does not fit a native key.
 type coverage struct {
 	untabled int64
 	dropped  int64
+	unkeyed  int64
 }

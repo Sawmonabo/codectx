@@ -23,16 +23,17 @@ import (
 // The unit's identity is still its inputs' content: the facts it publishes
 // bind their evidence to each file's bytes and ranges, so a unit keyed on the
 // digests alone would be reused with evidence about bytes that are gone. What
-// the digests decide is what the rebuild costs. When the unit has its
-// predecessor's members, each with its predecessor's digest, it hands Link the
-// predecessor's resolution and the stream of members whose content changed:
-// Link resolves nothing and republishes only the facts of those members and
-// of the members whose sites bind their declarations (an edit that moves a
-// declaration's range moves its identity), and the rest of the predecessor is
-// carried over with the members Link republished named replaced. That is the
-// path an edit inside a function body takes: it republishes the edited file's
-// facts and its callers', and reads only the tables that republication needs.
-// Any other build resolves in full, publishes every fact and carries nothing.
+// the digests decide is what the rebuild costs. Whenever the predecessor's
+// resolution state is readable, the applier hands it to Link with the stored
+// digests: Link classifies the members against it, finds the bindings again
+// only when a table digest, the membership or a manifest field the linker
+// reads moved, and republishes only the members whose facts changed; the
+// rest of the predecessor is carried over with those members, and the
+// predecessor's members that are gone, named replaced. A body edit that
+// keeps its table's digest republishes its own file and reads no other
+// table; one that moves it republishes its own file and the files whose
+// bindings or targeted declarations moved. Without a readable predecessor
+// state the unit is resolved and published in full and nothing is carried.
 type linkApplier struct {
 	store   *sqlite.Store
 	p       *link.Provider
@@ -52,9 +53,12 @@ func (a *linkApplier) Kind() string { return link.ResolutionKind }
 // Apply builds the unit. Result.Filtered reports the inheriting path: it is
 // set from what this build handed Link, never from what Link reported.
 // Result.Delta counts member inputs: Changed are those whose digest moved or
-// that are new, Unchanged those whose digest held, Removed the predecessor's
-// members this unit no longer has. Result.Carried is what the inheriting path
-// carried over, and zero on the other.
+// that are new, and an input with no digest on either side (a manifest) whose
+// bytes moved; Unchanged the others; Removed the predecessor's inputs this
+// unit no longer has. The counts describe the inputs, not the work: a
+// go.mod whose version line moved is Changed and moves no binding, since
+// Link compares the manifest fields it reads. Result.Carried is what the
+// inheriting path carried over, and zero on the other.
 func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 	if a.store == nil || a.p == nil || a.digests == nil {
 		return Result{}, invalid("the link delta applier needs a store, a provider and the stored digests")
@@ -76,20 +80,10 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 		b.res.Full, b.res.FullReason = true, FullNoPredecessor
 	}
 	statePath := filepath.Join(dir, "resolution")
-	// replacedPath holds, one per line in ascending order, the FileIDs whose
-	// facts the inheriting path republished (LinkOptions.Replaced), which the
-	// carry-over names replaced.
+	// replacedPath holds, one per line in ascending order, the FileIDs Link
+	// named replaced (LinkOptions.Replaced): the members it republished and
+	// the predecessor's members that are gone.
 	replacedPath := filepath.Join(dir, "replaced")
-	// edited streams the files the predecessor declared that this unit does
-	// not declare with the same bytes, in ascending FileID order, from the
-	// merge join of the two units' stored inputs, walked afresh each time so
-	// no list of them is held. On the inheriting path the members and their
-	// digests are the predecessor's, so every file it names is one whose
-	// content changed. It walks the coordinator's inputs, not the digested
-	// stream, whose walks restart the digest join.
-	edited := func(yield func(model.FileID) error) error {
-		return replacedInputs(ctx, a.store, req.Previous, inputs, yield)
-	}
 
 	b.index = func(ctx context.Context, ureq provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
 		// The members are the unit's inputs, already in FileID order, read
@@ -104,7 +98,7 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 				return yield(fv)
 			})
 		}}
-		if req.Previous != "" && j.same() {
+		if req.Previous != "" {
 			prev, reason, err := a.previous(ctx, req, dir)
 			if err != nil {
 				return model.ProviderResult{}, err
@@ -115,7 +109,7 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 				return model.ProviderResult{}, internal("link resolution state: " + err.Error())
 			} else {
 				defer f.Close()
-				opts.Previous, opts.Edited = f, edited
+				opts.Previous, opts.Digests = f, a.digests
 			}
 		}
 		b.res.Filtered = opts.Previous != nil
@@ -162,10 +156,10 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 	b.complete = func(ctx context.Context, w *sqlite.UnitWriter) error {
 		b.res.Delta = j.stats
 		if b.res.Filtered {
-			// The republished members' facts were published again;
-			// everything else of the predecessor is carried. Nothing is
-			// index-level: every fact the linker publishes is located in a
-			// member.
+			// The files Link named replaced were published again or are
+			// gone; everything else of the predecessor is carried. Nothing
+			// is index-level: every fact the linker publishes is located in
+			// a member.
 			var filesErr error
 			replaced := sqlite.Replaced{Files: func(yield func(model.FileID) bool) {
 				filesErr = replacedFiles(replacedPath, yield)
@@ -188,7 +182,7 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 // path, or an empty path and the reason the unit is built in full: the
 // predecessor stored none (FullNoState), or stored one this build cannot read
 // (FullStateUnreadable), which is warned about and resolved in full rather
-// than failing the unit on every build until a digest moves.
+// than failing the unit on every build.
 func (a *linkApplier) previous(ctx context.Context, req Request, dir string) (string, string, error) {
 	path, err := previousState(ctx, a.store, dir, "previous-resolution", req.Previous, link.ResolutionKind)
 	if err != nil {
@@ -252,15 +246,15 @@ func (a *linkApplier) digested(ctx context.Context, req Request, j *digestJoin) 
 }
 
 // digestJoin is the merge join of a unit's digested inputs against its
-// predecessor's stored ones, both in ascending FileID order (see inputs.go).
-// With no predecessor next is nil and every input counts as changed.
+// predecessor's stored ones, both in ascending FileID order (see inputs.go),
+// which counts Result.Delta. With no predecessor next is nil and every input
+// counts as changed.
 type digestJoin struct {
-	next     func() (model.UnitInput, error, bool)
-	last     model.FileID
-	old      model.UnitInput
-	has      bool
-	stats    Stats
-	complete bool
+	next  func() (model.UnitInput, error, bool)
+	last  model.FileID
+	old   model.UnitInput
+	has   bool
+	stats Stats
 }
 
 func (j *digestJoin) pull() error {
@@ -276,10 +270,8 @@ func (j *digestJoin) pull() error {
 // match accounts one fresh input: every predecessor member before it is gone,
 // an equal FileID compares digests, and anything else is an addition. An
 // input with no digest on either side carries no table (a manifest such as
-// go.mod or package.json, or a member whose link pass failed) and is compared
-// by its bytes instead: a resolver may read it (a Go module path decides which
-// imports are the project's own), so its edit moves every binding while every
-// table digest holds.
+// go.mod or package.json, or a member whose link pass failed) and is counted
+// by its bytes.
 func (j *digestJoin) match(in model.UnitInput) error {
 	for j.has && j.old.FileID < in.FileID {
 		j.stats.Removed++
@@ -300,9 +292,7 @@ func (j *digestJoin) match(in model.UnitInput) error {
 	return nil
 }
 
-// finish counts the predecessor's members past the last fresh input and
-// marks the join whole, which same requires: a walk that stopped early has
-// compared only part of the unit.
+// finish counts the predecessor's members past the last fresh input.
 func (j *digestJoin) finish() error {
 	for j.has {
 		j.stats.Removed++
@@ -310,14 +300,7 @@ func (j *digestJoin) finish() error {
 			return err
 		}
 	}
-	j.complete = true
 	return nil
-}
-
-// same reports that the unit has its predecessor's members, each with its
-// predecessor's digest.
-func (j *digestJoin) same() bool {
-	return j.complete && j.stats.Changed == 0 && j.stats.Removed == 0
 }
 
 // replacedFiles yields the FileIDs the file at path lists, one per line, until

@@ -5,109 +5,14 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// resolveStatic resolves the sites of a Java, Go, Rust, C or C++ unit: direct
-// binding, the signature-keyed address-taken × indirect-site cross-product
-// without a reachability fixed point, and class-hierarchy analysis, for Java
-// over classes and interfaces and for the others over interfaces and traits.
-//
-// Every binding is justified by a scope, an import, a type or a signature:
-// a bare name by the scope the language reads it in (Java's and C++'s
-// enclosing class, Go's package, C's and C++'s linkage scope and enclosing
-// namespaces, Rust's file), a qualified name by the type, package, namespace
-// or module it names, a member by its receiver's declared type, and an
-// indirect call by its declared function type. The cross-product is one
-// ordered merge: the address-taken functions and the indirect sites sorted
-// together by signature, each signature's functions read before its sites.
-func resolveStatic(ctx context.Context, u *unit, emit func(Binding) error) error {
-	h, err := buildHierarchy(ctx, u)
-	if err != nil {
-		return err
-	}
-	defer h.close()
-	// bySignature holds the address-taken functions (tag 0), the indirect
-	// sites (tag 1) and the abstract methods a Java call binds when no
-	// function joins it (tag 2) under their declared signatures.
-	bySignature, err := newEntrySort(u.dir)
-	if err != nil {
-		return err
-	}
-	defer bySignature.Close()
-	err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
-		r := staticFile{h: h, ctx: ctx, file: file, t: t, fc: contextOf(file, t), emit: emit, returns: map[int32][]returned{}}
-		for i := range t.Sites {
-			if err := r.site(int32(i), bySignature); err != nil {
-				return err
-			}
-		}
-		for i := range t.Values {
-			v := &t.Values[i]
-			if v.Type.Kind != wire.TypeFunction {
-				continue
-			}
-			err := r.function(v.Caller, v.Type.Name, func(e entry) error {
-				if e.Sig == "" {
-					return nil
-				}
-				sig := e.Sig
-				if r.fc.family == "go" && v.Type.Index > 0 {
-					sig = goMethodExpression(v.Type.Name, sig)
-				}
-				return bySignature.Add(entry{Key: sig, Ref: e.Ref})
-			})
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	return crossProduct(bySignature, emit)
-}
-
-// crossProduct joins each indirect site to every address-taken function of
-// its signature, and binds a Java call of an abstract method to that method
-// (tag 2: the site, the method's Ref in Aux, the detail in Sig) only when
-// no function of its signature is taken as a value. Only one signature's
-// functions are held at a time.
-func crossProduct(bySignature *pagination.ExternalSort[entry], emit func(Binding) error) error {
-	run, err := bySignature.Sorted()
-	if err != nil {
-		return err
-	}
-	defer run.Close()
-	var sig string
-	var functions []Ref
-	return run.Each(func(e entry) error {
-		if e.Key != sig {
-			sig, functions = e.Key, functions[:0]
-		}
-		switch e.Tag {
-		case 0:
-			if n := len(functions); n == 0 || functions[n-1] != e.Ref {
-				functions = append(functions, e.Ref)
-			}
-			return nil
-		case 2:
-			if len(functions) > 0 {
-				return nil
-			}
-			return emit(Binding{Site: e.Ref, Target: refOf(e.Aux), Detail: e.Sig})
-		}
-		for _, f := range functions {
-			if err := emit(Binding{Site: e.Ref, Target: f, Detail: DetailAddressTaken}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
+// sigSink receives what a site or value joins the cross-product with
+// (staticRun.signature): an address-taken function (tag 0), an indirect site
+// (tag 1) or a Java call of an abstract method (tag 2, the method's Ref in
+// Aux, the detail in Sig), each under its declared signature in Key.
+type sigSink func(entry) error
 
 // staticFile resolves the sites and values of one member table.
 type staticFile struct {
@@ -135,13 +40,13 @@ type returned struct {
 // A Java call of an abstract method binds that declaration only when no
 // method reference of its signature does (crossProduct): a call runs a
 // body, and the abstract method is the target only when no body is known.
-func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) error {
+func (r *staticFile) site(i int32, bySignature sigSink) error {
 	ref := Ref{File: r.file, Index: i}
 	s := &r.t.Sites[i]
 	joins := r.fc.language == "java" && s.Shape == wire.ShapeMember && s.Receiver.Kind == wire.TypeNamed
 	return r.resolve(i, bySignature, func(e entry, detail string) error {
 		if joins && e.Flags&flagAbstract != 0 && e.Sig != "" {
-			return bySignature.Add(entry{Key: e.Sig, Tag: 2, Ref: ref, Aux: refKey(e.Ref), Sig: detail})
+			return bySignature(entry{Key: e.Sig, Tag: 2, Ref: ref, Aux: refKey(e.Ref), Sig: detail})
 		}
 		return r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail})
 	})
@@ -152,7 +57,7 @@ func (r *staticFile) site(i int32, bySignature *pagination.ExternalSort[entry]) 
 // passing the site's arguments can call is yielded (fits). With
 // bySignature, an indirect site with a declared function type, and a Java
 // call of an abstract method, also join it.
-func (r *staticFile) resolve(i int32, bySignature *pagination.ExternalSort[entry], yield func(entry, string) error) error {
+func (r *staticFile) resolve(i int32, bySignature sigSink, yield func(entry, string) error) error {
 	s := &r.t.Sites[i]
 	_, known := r.returns[i]
 	if !known {
@@ -181,7 +86,7 @@ func (r *staticFile) resolve(i int32, bySignature *pagination.ExternalSort[entry
 }
 
 // shape resolves site s, at index i, by its shape.
-func (r *staticFile) shape(i int32, s *Site, bySignature *pagination.ExternalSort[entry], bind func(string) func(entry) error) error {
+func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, bind func(string) func(entry) error) error {
 	switch s.Shape {
 	case wire.ShapeBare:
 		return r.bare(s.Caller, s.Callee, bind)
@@ -210,7 +115,7 @@ func (r *staticFile) shape(i int32, s *Site, bySignature *pagination.ExternalSor
 				if e.Flags&flagAbstract == 0 || e.Sig == "" {
 					return nil
 				}
-				return bySignature.Add(entry{Key: e.Sig, Tag: 1, Ref: Ref{File: r.file, Index: i}})
+				return bySignature(entry{Key: e.Sig, Tag: 1, Ref: Ref{File: r.file, Index: i}})
 			})
 		})
 	case wire.ShapeIndirect:
@@ -222,7 +127,7 @@ func (r *staticFile) shape(i int32, s *Site, bySignature *pagination.ExternalSor
 		if s.Signature == "" || bySignature == nil {
 			return nil
 		}
-		return bySignature.Add(entry{Key: s.Signature, Tag: 1, Ref: Ref{File: r.file, Index: i}})
+		return bySignature(entry{Key: s.Signature, Tag: 1, Ref: Ref{File: r.file, Index: i}})
 	}
 	return nil
 }

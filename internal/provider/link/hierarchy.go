@@ -33,14 +33,46 @@ import (
 // that resolves each method's receiver, each declared supertype and Go's
 // method-set satisfaction against decls (the methods of each type, its
 // subtypes and its supertypes). Every lookup reads one block range of one
-// file; only the first key of each block is held in memory.
+// file; only the first key of each block is held in memory. Beside them is the
+// identity table (idTable), which spells a member ordinal or a table index
+// as the file or declaration it denotes, so a lookup can be recorded under a
+// key that means the same thing in every build (trace.go). A static-family
+// unit's state keeps all three, and a refresh of the same layout reads them
+// back instead of building them (refresh.layout).
 type hierarchy struct {
 	decls *index
 	links *index
+	// ids translates the unit's ordinals to identities (idTable).
+	ids *idTable
 	// goModule is a Go unit's module path, read from the go.mod at its
 	// project root goRoot ("." for the repository root); empty when there
 	// is none, and then no Go import path names a package of the unit.
 	goModule, goRoot string
+	// note, while a member's reads are recorded (record), is told each
+	// read by its trace key.
+	note func(TraceKey) error
+}
+
+// record has the indexes report every key looked up, and goPackages every
+// read of the module path, to note by trace key until record(nil) stops
+// it: the reads of the one member being resolved. A unit's members are
+// resolved one at a time, so one recorder serves the hierarchy.
+func (h *hierarchy) record(note func(TraceKey) error) {
+	h.note = note
+	if note == nil {
+		h.decls.trace, h.links.trace = nil, nil
+		return
+	}
+	trace := func(scope string) func(string) error {
+		return func(key string) error {
+			k, err := h.ids.traceKey(scope, key)
+			if err != nil {
+				return err
+			}
+			return note(k)
+		}
+	}
+	h.decls.trace, h.links.trace = trace(scopeDecls), trace(scopeLinks)
 }
 
 // The keys of the two indexes. A family groups the languages whose files
@@ -323,9 +355,30 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		return nil, err
 	}
 	defer decls.Close()
-	err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
+	if h.ids, err = newIDTable(u.dir); err != nil {
+		return nil, err
+	}
+	var file int32 = -1
+	err = u.members(func(fv model.FileVersion) error {
+		file++
+		t, ok, err := u.tables.Table(ctx, u.gen, fv)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			t = nil
+		}
+		if err := h.ids.add(fv.ID, t); err != nil {
+			return err
+		}
+		if t == nil {
+			return nil
+		}
 		return addDecls(decls, file, t)
 	})
+	if err == nil {
+		err = h.ids.finish()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1410,8 +1463,12 @@ func (h *hierarchy) virtual(typ Ref, method string) (bool, error) {
 
 // close releases what the hierarchy spilled.
 func (h *hierarchy) close() error {
+	if h == nil {
+		return nil
+	}
 	h.decls.close()
 	h.links.close()
+	h.ids.close()
 	return nil
 }
 
@@ -1551,6 +1608,9 @@ const indexBlockBytes = 32 << 10
 type index struct {
 	lease *scratch.Lease
 	f     *os.File
+	// trace, when set, is told every key looked up, before the lookup: the
+	// hierarchy's current-member recorder (hierarchy.record).
+	trace func(key string) error
 	// size is the file's logical length: the pooled surface is never
 	// truncated, and the bytes past size are a previous tenant's.
 	size  int64
@@ -1606,7 +1666,15 @@ func writeIndex(dir string, s *pagination.ExternalSort[entry]) (*index, error) {
 
 // lookup yields every entry whose key is key, in order.
 func (ix *index) lookup(key string, yield func(entry) error) error {
-	if ix == nil || len(ix.first) == 0 {
+	if ix == nil {
+		return nil
+	}
+	if ix.trace != nil {
+		if err := ix.trace(key); err != nil {
+			return err
+		}
+	}
+	if len(ix.first) == 0 {
 		return nil
 	}
 	// Every block before the one preceding the first block whose first key
@@ -1637,6 +1705,35 @@ func (ix *index) lookup(key string, yield func(entry) error) error {
 			if err := yield(e); err != nil {
 				return err
 			}
+		}
+	}
+}
+
+// each yields every entry of the index, in order.
+func (ix *index) each(yield func(entry) error) error {
+	if ix == nil {
+		return nil
+	}
+	r := bufio.NewReader(io.NewSectionReader(ix.f, 0, ix.size))
+	var buf []byte
+	for {
+		n, err := binary.ReadUvarint(r)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		buf = slices.Grow(buf[:0], int(n))[:n]
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return err
+		}
+		e, err := decodeEntry(buf)
+		if err != nil {
+			return err
+		}
+		if err := yield(e); err != nil {
+			return err
 		}
 	}
 }
