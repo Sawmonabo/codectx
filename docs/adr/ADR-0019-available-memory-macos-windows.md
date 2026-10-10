@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-10-09, by the owner's ruling. Not yet implemented. The admission rule this reading feeds is
+Accepted, 2026-10-09, by the owner's ruling. The admission rule this reading feeds is
 [ADR-0012](ADR-0012-native-dependence-engine.md) decision 5. The survey behind it is
 [research 28](../research/28-available-memory-macos-windows.md).
 
@@ -76,12 +76,24 @@ a container could be over-admitted.
 Without it, an observed reading counts the children's use twice, once inside the operating system's figure and again
 as reservations on the ledger, and the allocation shrinks as the product's own children grow.
 
-- **The product's resident set:** `task_info` on macOS; `GetProcessMemoryInfo` through a lazily loaded `psapi`
-  procedure on Windows.
-- **Each child's resident memory:** `proc_pid_rusage` per child pid on macOS; on Windows, the job each child already
-  runs in (`internal/process/process_windows.go:20`), its process list, and each process's memory counters.
-- A figure a platform does not report stays absent, never zero (`internal/residency/residency.go:7-8`). Where the
+- **The product's resident set:** the task's own memory counters (`task_info`, `TASK_VM_INFO`) on macOS: the
+  resident set, its peak and the resident anonymous pages. On Windows, the process memory counters
+  (`K32GetProcessMemoryInfo`, the `kernel32` export of `GetProcessMemoryInfo`, lazily loaded): the working set and its
+  peak; Windows reports no anonymous part of the working set there, so that figure stays absent.
+- **Each child's resident memory:** `proc_pid_rusage` for every process in the child's process group on macOS; on
+  Windows, the job each child already runs in (`internal/process/process_windows.go`), its process list, and each
+  member's memory counters, each member confirmed in the job through the handle opened on it.
+- **Which figure is added back for a child.** What a child holds of its own is its anonymous resident memory, and
+  neither platform reports exactly that for another process. macOS reports the physical footprint (also counting
+  compressed pages that are no longer resident) and the resident set (also counting the shared executable and library
+  pages, which stay in the available figure); Windows reports the working set (also counting shared pages) and the
+  private commit (also counting committed pages never touched). The anonymous resident part is within both, so the
+  smaller of the two is added back: adding back more than the child holds would widen the allocation past what the
+  host has.
+- A figure a platform does not report stays absent, never zero (`internal/residency/residency.go`). Where the
   readers report, the idle-footprint stand-in (`internal/config/machine.go:29`) stops applying.
+- Only the children's anonymous resident memory is sampled on these platforms; the running tree's resident peak and
+  its transferred bytes are reported unavailable there.
 
 ### 4. One rule for a host that cannot be read
 

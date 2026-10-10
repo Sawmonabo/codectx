@@ -5,6 +5,7 @@ package process
 import (
 	"io/fs"
 	"os/exec"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -19,6 +20,24 @@ import (
 // still contains rather than leaving orphaned analyzers behind.
 type jobObject struct {
 	handle windows.Handle
+	// pid is the child the job holds, once started has assigned and resumed
+	// it, and zero before.
+	pid uint32
+}
+
+// runningJobs maps a started child's process ID to its job, from started
+// until close, so the tree sampler, which the runner hands the child's ID,
+// can read the job's process list (treesample_windows.go). The job outlives
+// the sampler: the runner stops sampling before it closes the job.
+var runningJobs sync.Map
+
+// runningJob is the job registered for the child pid.
+func runningJob(pid uint32) (windows.Handle, bool) {
+	h, ok := runningJobs.Load(pid)
+	if !ok {
+		return 0, false
+	}
+	return h.(windows.Handle), true
 }
 
 func newJobControl() (jobControl, error) {
@@ -80,6 +99,8 @@ func (j *jobObject) started(cmd *exec.Cmd) error {
 		windows.TerminateProcess(handle, 1)
 		return err
 	}
+	j.pid = pid
+	runningJobs.Store(pid, j.handle)
 	return nil
 }
 
@@ -142,6 +163,12 @@ func (j *jobObject) terminate(cmd *exec.Cmd, force bool) {
 // close releases the job. Kill-on-close means anything still in it dies here,
 // so no analyzer outlives the run that started it.
 func (j *jobObject) close() {
+	if j.pid != 0 {
+		// Only this job's entry is removed: once the child is reaped its ID
+		// may already name another runner's child, registered since.
+		runningJobs.CompareAndDelete(j.pid, j.handle)
+		j.pid = 0
+	}
 	if j.handle != 0 {
 		windows.CloseHandle(j.handle)
 		j.handle = 0

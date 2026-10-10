@@ -665,6 +665,18 @@ controls the platform provides, and reports when only admission and monitoring
 are available. Under memory pressure it reduces concurrency and caches before it
 refuses work, and it degrades concurrency before it degrades coverage.
 
+The memory heavy children are admitted against is derived from the host's
+available memory, read again before every admission: on Linux `MemAvailable`,
+capped by the headroom the process's control groups leave; on macOS free pages
+less speculative ones plus file-backed pages, from one kernel snapshot (a cgo
+build); on Windows the smaller of available physical memory and the memory the
+process can still commit. The product's own resident set and its admitted
+children's anonymous resident memory are added back, so its own growth never
+narrows the room it admits against. Only a
+platform with no reader, a macOS build without cgo, or a reading that fails
+admits against a fixed 8 GiB stand-in, and the stand-in is reported as not
+observed (ADR-0019).
+
 Process-tree termination itself is enforced: on Unix every child runs in its own
 process group and the whole group is signalled, and on Windows every child is
 created suspended, assigned to a Job Object with kill-on-close, and only then

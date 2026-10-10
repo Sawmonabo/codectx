@@ -4,42 +4,41 @@
 // process, measures each file's need through it. It imports nothing outside the
 // standard library, so every one of them can depend on it.
 //
+// Linux reads the per-process status file (residency_linux.go), macOS the
+// task's own memory counters (residency_darwin.go, a cgo build) and Windows
+// the process memory counters (residency_windows.go). Elsewhere every figure
+// is absent (residency_other.go).
+//
 // A figure the platform does not report is absent (nil), never zero: a
 // missing reading is not a process holding no memory.
 package residency
 
 import (
 	"math"
-	"os"
 	"strconv"
 	"strings"
 )
 
-// statusPath is the kernel's per-process status file. Outside Linux it does
-// not exist, and every figure is absent.
-const statusPath = "/proc/self/status"
-
-// Reading is one read of the status file, in bytes. Each figure is nil where
-// the file cannot be read or does not carry it in the form expected, and each
-// present figure fits int64.
+// Reading is one reading of this process's resident memory, in bytes. Each
+// figure is nil where the platform does not report it or the reading failed,
+// and each present figure fits int64.
 type Reading struct {
-	// Peak is the resident high-water mark (VmHWM): the kernel's own, over
-	// the whole process life or since it was last reset.
+	// Peak is the resident high-water mark: the kernel's own, over the whole
+	// process life or, on Linux, since it was last reset (VmHWM).
 	Peak *uint64
-	// Resident is the resident set now (VmRSS).
+	// Resident is the resident set now (VmRSS on Linux).
 	Resident *uint64
-	// Anon is the anonymous part of the resident set (RssAnon).
+	// Anon is the anonymous part of the resident set (RssAnon on Linux).
 	Anon *uint64
 }
 
-// Read reads this process's status file once. Every figure is absent where the
-// file cannot be read.
-func Read() Reading {
-	raw, err := os.ReadFile(statusPath)
-	if err != nil {
-		return Reading{}
+// figure is a reported count of bytes as a Reading field: absent where it
+// does not fit int64, which no real resident figure exceeds.
+func figure(bytes uint64) *uint64 {
+	if bytes > math.MaxInt64 {
+		return nil
 	}
-	return Parse(string(raw))
+	return &bytes
 }
 
 // Parse reads VmHWM, VmRSS and RssAnon, which the kernel states in kB
