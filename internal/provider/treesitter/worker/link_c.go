@@ -526,6 +526,41 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 	}
 	e.Returns = k.returns(owner, d, c.fn)
 	k.out.Exports = append(k.out.Exports, e)
+	k.parameters(e.Name, c.fn.ChildByFieldId(s.fParameters), a.params)
+}
+
+// parameters appends a Parameter for each named parameter of the list ps of
+// the function named callable, at the identifier the lowering declares its
+// variable by, numbered from 1 in the positions params (cArity) counts: a
+// `...` or an unnamed parameter takes its position and is not sent, and a
+// `(void)` list, whose count is 0, has none.
+func (k *cLinker) parameters(callable wire.Span, ps Node, params uint32) {
+	s, x := k.s, k.x
+	if params == 0 {
+		return
+	}
+	var index uint32
+	for c := cFirst(ps); !c.IsNull(); c = c.next() {
+		id := c.KindId()
+		ellipsis := !c.IsNamed() && id == x.ellipsis || c.IsNamed() && id == x.variadicParameter && id != 0
+		knr := c.IsNamed() && id == s.identifier
+		if c.IsExtra() || !ellipsis && !knr && !k.parameter(c) {
+			continue
+		}
+		index++
+		name := c
+		if !knr {
+			if ellipsis {
+				continue
+			}
+			name = k.chain(c.ChildByFieldId(s.fDeclarator)).name
+		}
+		if name.IsNull() || name.KindId() != s.identifier {
+			continue
+		}
+		k.out.Parameters = append(k.out.Parameters, wire.Parameter{Callable: callable, Name: wireSpan(spanOf(name)),
+			Index: index, Variadic: id == x.variadicParameterDeclaration && id != 0})
+	}
 }
 
 // virtual reports whether the member function of the class receiver that
@@ -615,6 +650,7 @@ func (k *cLinker) pure(owner, d Node) bool {
 }
 
 // macro appends the Export of a function-like macro: its parameter count,
+// each named parameter as a Parameter numbered from 1,
 // and no types. Every parameter is optional: an argument of a macro
 // invocation may be empty (`G()` passes G one empty argument, ISO C
 // 6.10.3p4), and an empty argument is no expression of the call's argument
@@ -630,6 +666,7 @@ func (k *cLinker) macro(n Node) {
 		switch {
 		case p.KindId() == k.s.identifier && p.IsNamed():
 			e.Params++
+			k.out.Parameters = append(k.out.Parameters, wire.Parameter{Callable: e.Name, Name: wireSpan(spanOf(p)), Index: e.Params})
 		case p.KindId() == k.x.ellipsis && !p.IsNamed():
 			e.Params++
 			e.Variadic = true

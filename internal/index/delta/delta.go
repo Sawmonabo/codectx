@@ -13,12 +13,12 @@
 //  4. store the fresh delta state and seal.
 //
 // The linking provider's applier (link.go) is the second, and its delta is
-// one digest per member file's link table. When every member keeps its
-// predecessor's digest it hands Link the predecessor's resolution instead of
-// resolving, Link republishes only the facts of the members whose bytes
-// changed and of the members whose sites bind their declarations, and the
-// applier carries the rest over with those members named replaced. Otherwise
-// Link resolves and republishes everything.
+// measured in member digests. It hands Link the predecessor's resolution
+// state whenever that state is readable; Link keeps the predecessor's
+// bindings unless a member's table digest, the membership or a manifest
+// field it reads moved, republishes only the members whose facts changed,
+// and names those and the members that are gone replaced, and the applier
+// carries the rest over.
 //
 // A predecessor that is absent, stored no state, or stored state this build
 // cannot read is not an error: the unit is built in full and Result.Full and
@@ -121,8 +121,8 @@ type Result struct {
 	// deliberate — the replaced-set decision keyed on it
 	// (Replaced.IndexLevel) must be sound against what this build chose, not
 	// against a report from the producer it is guarding. The link applier
-	// sets it when it hands Link the predecessor's resolution and the edited
-	// members, from that hand-off alone, and only then carries anything over.
+	// sets it when it hands Link the predecessor's resolution state, from
+	// that hand-off alone, and only then carries anything over.
 	// A delta whose Filtered is false re-imported everything and inherited
 	// nothing. Result.Carried being all zero does not distinguish that from a
 	// predecessor with nothing to give.

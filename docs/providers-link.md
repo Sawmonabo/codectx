@@ -70,7 +70,17 @@ A site bound to exactly one declaration publishes one `calls` edge to it.
 ## Endpoint identity per family
 
 Every endpoint is a structural declaration node. Its scope is `file:<path>` and its native key is the qualified
-name (docs/providers-treesitter.md). What a call can bind to differs by family, and so does what the table's
+name (docs/providers-treesitter.md). Its identity is its file, kind, language, descriptor path (the qualified name
+along its ancestry) and disambiguator, never its byte range (ADR-0014, `reconcile.CanonicalKey`). The disambiguator
+is, in order, the parameter types as written where the language overloads (Java, C++, TypeScript), the conditional
+branches that enclose the declaration (`wire.Decl.Branch`: an `if`, `try`, `switch` or `match` arm, a preprocessor
+condition, a Rust `#[cfg]`), the parent's disambiguator for a nested declaration, the prototype mark of a C or C++
+declaration without a body, and, for exact duplicates left at one level, their content: the first keeps the plain
+identity and each later one is keyed by the digest of its bytes (`reconcile.SettleDuplicates`). A parameter is keyed
+by its callable's identity and its position (`wire.Link.Parameters`), the file's module by its path. Locals,
+anonymous functions and call-site nodes keep file-scoped identities that include their range. So a body edit, or a
+declaration inserted before another (an overload included), moves no endpoint, and an edge another file published
+toward it stays valid. What a call can bind to differs by family, and so does what the table's
 `Decl.Receiver` holds (`wire.Export`, `internal/provider/treesitter/wire/link.go:33-65`):
 
 | Family | Targets | `Receiver` |
@@ -99,7 +109,7 @@ publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenc
 is its qualified name, so a unit reused on a match of anything less would serve evidence about bytes that are gone.
 Each input also records `model.UnitInput.Digest`, the member digest of the file's link table (`link.MemberDigest`,
 `internal/provider/link/tables.go:39-50`). The digest is outside the unit's identity: `UnitInputHasher` does not
-read it. It decides what a rebuild costs (the fast path below).
+read it. It decides what a rebuild costs (Refresh, below).
 
 **The link tables.** For each file with a lowering, the worker sends one `KindLink` message (`wire.Link`). The
 structural provider joins it to the declarations and call references it validated, and stores the result as a
@@ -127,38 +137,62 @@ Besides the joined declarations, sites and values, the table carries what the re
 - `Unions`: the type sets a `TypeUnion` names, every type the worker recovered for a value that disagreeing reaching
   definitions or arms reach.
 
-**The digest.** `Table.Digest` (`table.go:185-218`) covers everything resolution reads. That is every name, kind,
-shape, type fact, candidate and index, the package, the imports and re-exports, and the order of every list. It
-covers no byte range, position or node identity. An edit that shifts a range moves no name and no type. So two tables
-with one digest resolve every site to the same declarations, by index; only the ranges and identities the edges are
-published with differ. The member digest adds the table's `Dropped` count, which decides the unit's coverage.
+**Two summaries.** Each table has an interface summary and a sites summary, each with its own digest
+(`Table.Interface`, `InterfaceDigest`, `SitesDigest`, `internal/provider/link/summary.go`). The interface is
+everything another file's resolution reads from the file: its declarations with their node identities, signatures,
+flags and returns, its supertypes, imports, package, re-exports, the unions they name, and its values (the functions
+it takes as values and the fields it writes). Its entries are keyed by stable identity (a declaration's node, an
+export's name, a field's name) and hashed, so two interfaces differ entry by entry. The sites summary is the file's own
+call sites. Neither covers a byte range. The member digest folds both and the table's `Dropped` count
+(`MemberDigest`, `tables.go`).
 
-## The fast path
+## Refresh
 
-The delta build reads each member's digest, one small read per member and no table decoded, and compares it with
-its predecessor's in FileID order, as one merge join against the predecessor unit's stored inputs
-(`internal/index/delta/link.go`). An input with no table (a manifest such as `go.mod`, or a member whose link pass failed) is compared by its bytes, because a resolver may read it: a Go module path decides which imports are the project's own. When membership, every digest and every tableless input are equal, it hands `Link` the predecessor's
-resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`) and the stream of members whose bytes
-changed (`LinkOptions.Edited`, `provider.go:84-117`). The state names each site and target by position (`Ref`,
-`internal/provider/link/unit.go`) and holds the unit's coverage, so the linker resolves nothing. It republishes only
-the facts whose evidence lies in a republished member: the occurrences of its declarations that an edge names, and
-its sites' `calls`, `may_refer_to` and ambiguous callee nodes. The republished members are the edited ones and every
-member with a site bound to a declaration of an edited one (`publisher.dependents`, `publish.go`): a declaration's
-node is keyed on its file and its exact range (`reconcile.CanonicalKey`), so a body edit that changes the body's
-length gives the enclosing declaration a new node, and its callers' `calls` must name the new one. Every other fact
-of the predecessor is carried over (`sqlite.CarryOver`) with the republished members, which `Link` hands back
-through `LinkOptions.Replaced`, named in `Replaced.Files`.
+A linking unit stores its resolution state under `link.ResolutionKind` (`internal/provider/link/state.go`): the
+manifest fields the linker reads, one record per member (its content hash, member, interface and sites digests, and
+its coverage: whether it has a table, the entries dropped, the ambiguous sites without a key), and every binding by
+identity: a site by its file and its index in that file's table, a target by its file and its declaration node. A
+site's index is valid across builds because a member whose bytes did not change has the same table, and a member
+whose bytes changed re-resolves whole. For Go, Java, Rust, C and C++ the state also holds what the refresh re-runs
+from: a hash of each hierarchy index key's entries, the reverse index from every key a file's resolution read to that
+file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
+identities their positions denote. Everything is a sorted run on disk; nothing the size of the unit is held in memory.
 
-A table is read only when what is republished needs it: a republished member's, and an untouched member's when a
-republished site binds one of its declarations. Finding the dependents reads no table: the bindings, sorted by
-target, are merged with the members. An untouched member whose path is long enough that an ambiguous site's
-`link:` key could exceed `model.MaxNativeKeyBytes` is also walked, to count `unkeyed_ambiguous_sites`, and publishes
-nothing. So an edit inside a function body resolves nothing and republishes the edited file's facts and those of
-the files that call into it.
+The delta build hands `Link` the predecessor's state whenever the predecessor stored one this build can read
+(`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
+classifies every member against its record (unchanged, content changed with the same table, table changed, added,
+removed) and every manifest by the fields the linker reads (`manifestFields`, `refresh.go`): a Go module's `module`
+path and a Cargo manifest's crate names. Nothing else of a manifest is read: `tsconfig.json`, `package.json` and the
+Python and Java project files decide only which unit a file belongs to, so a change to them is a change of
+membership or nothing. A dependency version bump in `go.mod` changes no field, and a new nested `go.mod` moves its
+files out of one unit into another, a removal from one and an addition to the other.
 
-A predecessor that stored no state, or a state the build cannot read (`link.ValidateState`), resolves in full,
-with `Result.FullReason` `no_previous_state` or `unreadable_previous_state`. Any other build resolves in full,
-publishes every fact, carries nothing, and stores its state for the next.
+What re-resolves:
+- **Nothing**, when no table, member or field moved: the predecessor's bindings stand.
+- **Go, Java, Rust, C, C++** (`rerunStatic`, `static.go`): every resolution read is recorded at the hierarchy's one
+  lookup point (`index.lookup`, lookups that found nothing included), at the Go module path (`goPackages`) and at the
+  signature cross-product, as a trace key that names files and declaration nodes, never positions
+  (`internal/provider/link/trace.go`). A refresh re-runs the members whose table moved, the added members, the members
+  whose reverse-index keys name a changed index group or a changed manifest field, and then the members whose
+  indirect sites read a signature whose set of taken functions changed. A file re-runs whole, since its sites read
+  each other's results. When the layout holds (the same members, the same fields, and every member whose table moved
+  keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
+  and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
+- **Python, JavaScript, TypeScript, TSX**: any moved table resolves the unit in full. Their resolution is one least
+  fixed point of value flow and binding, and a least fixed point under removals cannot be resumed from its previous
+  result: a value that flowed around a cycle would keep supporting itself after its source is gone. The bindings are
+  then compared per site with the predecessor's.
+
+What is republished (`refresh.diff`): the members whose bytes changed, the added members, the members whose bindings
+changed, and the members whose set of targeted declarations changed (a target's occurrence node is published in its
+own file's facts, so a declaration that becomes or stops being a target republishes its file). Those and the removed
+members are named replaced (`LinkOptions.Replaced`); every other fact is carried over (`sqlite.CarryOver`). So a body
+edit, with or without a new call, republishes the edited file; a rename republishes the edited file and the files
+whose sites named the old name; an inserted overload republishes its file and keeps every existing overload's node.
+
+A predecessor that stored no state, or a state this build cannot read (its format tag, `link.ValidateState`), resolves
+in full, with `Result.FullReason` `no_previous_state` or `unreadable_previous_state`, publishes every fact, carries
+nothing, and stores its state for the next.
 
 ## Resolution
 

@@ -1,9 +1,7 @@
 package link
 
 import (
-	"cmp"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"iter"
@@ -16,86 +14,37 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// Publication. A binding names its target by member ordinal and table
-// index, and the target's table is another file's, so publication is three
-// ordered merges over the members and never holds more than one table:
+// Publication. Every binding names its site and its target by identity
+// (idBinding), and the members are walked in FileID order, so publication is
+// two ordered merges of the bindings with the members, each reading only the
+// tables of the members it republishes, one at a time:
 //
-//  1. the bindings, in site order, are merged with the members to mark what
-//     each site's file needs (siteUse), and go into a sort by target;
-//  2. those, sorted by target, are merged with the tables in member order;
-//     each target's endpoint is read from its table, its occurrence node is
-//     published, and every binding whose site is used goes on, carrying the
-//     endpoint, into a sort by site;
-//  3. those, sorted by site, are merged with the tables again; each site's
-//     caller is read from its table, and the site publishes its `calls`
-//     occurrence, or its ambiguous callee and candidates.
+//  1. the declarations the bindings target, by target, with the members: a
+//     republished member's targeted declarations are found in its table by
+//     node and their occurrences published;
+//  2. the bindings, by site, with the members: a republished member's sites
+//     publish their `calls` occurrences, or their ambiguous callee and
+//     candidates, and every member's record is taken, from its fresh table
+//     when it is republished and from the predecessor's state otherwise.
 //
-// Every target's node is handed over in the second merge, before any
-// relation, and every caller's and callee's in the third, before the
-// relations of its site, so no relation reaches the sink ahead of an
-// identity it names.
+// Every target's node is handed over in the first merge, before any relation
+// of the second, so no relation reaches the sink ahead of an identity it
+// names. A site's relation needs only its target's node, which the binding
+// carries, so a site is published without reading its target's table.
 //
-// A unit that inherits its predecessor's resolution (publisher.edited set)
-// republishes only the facts whose evidence lies in a republished member:
-// the occurrences of its declarations and the facts of its sites. The
-// republished members are the edited ones and every member with a site bound
-// to a declaration of an edited member (dependents): a declaration's identity
-// is minted from its file and its exact range (reconcile.CanonicalKey), so an
-// edit that moves a declaration's range gives it a new node, and a call of it
-// recorded in an untouched file must name the new one. Its predecessor's
-// other facts are carried over by the delta build, which names the
-// republished members replaced (publisher.replaced), and a table is read only
-// when what is republished needs it: a republished member's, and an untouched
-// member's that a republished site targets.
+// The republished members are every member on a full build, and otherwise
+// the ones a refresh found changed (refresh): content-changed, added, those
+// whose bindings changed and those whose set of targeted declarations
+// changed. Their predecessor's facts are replaced; every other member's are
+// carried over by the delta build.
 
 // occurrence is a structural node a published edge names, with the file it
 // is declared in.
 type occurrence struct {
 	Endpoint
-	File     model.FileID `json:"file"`
-	Hash     string       `json:"hash"`
-	Language string       `json:"language"`
-}
-
-// resolved is a binding with its target's endpoint, and whether its site is
-// published or only counted.
-type resolved struct {
-	Binding
-	To      occurrence `json:"to"`
-	Publish bool       `json:"publish,omitempty"`
-}
-
-// siteUse is what publication does with a binding's site.
-type siteUse byte
-
-const (
-	// siteCarried: the site's file is untouched, so its facts are carried.
-	siteCarried siteUse = iota
-	// siteCounted: the site's file is untouched, but its path is long
-	// enough that an ambiguous site of it may have no key, so its sites
-	// are walked to count those and publish nothing.
-	siteCounted
-	// sitePublished: the site's facts are published.
-	sitePublished
-)
-
-// marked is a binding with its site's use.
-type marked struct {
-	Binding
-	Use siteUse
-}
-
-func encodeMarked(m marked) ([]byte, error) {
-	b, err := encodeBinding(m.Binding)
-	return append(b, byte(m.Use)), err
-}
-
-func decodeMarked(raw []byte) (marked, error) {
-	if len(raw) == 0 || raw[len(raw)-1] > byte(sitePublished) {
-		return marked{}, errors.New("a marked binding is malformed")
-	}
-	b, err := decodeBinding(raw[:len(raw)-1])
-	return marked{Binding: b, Use: siteUse(raw[len(raw)-1])}, err
+	File     model.FileID
+	Hash     string
+	Language string
 }
 
 // publisher publishes one unit's bindings.
@@ -104,340 +53,116 @@ type publisher struct {
 	req  provider.UnitRequest
 	sink provider.Sink
 	u    *unit
-	// edited, when set, streams the FileIDs of the members whose content
-	// changed since the predecessor whose resolution the unit inherits, in
-	// ascending order (it may name files that are not members); publish
-	// widens it to the republished members, the edited ones and their
-	// dependents. Only their facts are published, and cov is the
-	// predecessor's. Nil publishes every fact and takes cov from the tables.
-	edited func(yield func(model.FileID) error) error
-	// replaced, when set with edited, receives once publication is done
-	// every FileID the widened edited stream names, in ascending order: the
-	// files whose facts the delta build must not carry over.
-	replaced func(model.FileID) error
-	// members is the unit's member count, from which the members with no
-	// table are counted.
-	members int64
+	// republished, when set, is the FileIDs whose facts are published,
+	// ascending, and prev the predecessor's records the other members keep;
+	// nil publishes every member's facts.
+	republished *pagination.SortedRun[model.FileID]
+	prev        *pagination.SortedRun[record]
+	// cov is the unit's coverage, summed over the members' records.
 	cov     coverage
-	// unkeyed counts the ambiguous sites whose call-site key does not fit a
-	// native key, which have no identity to mint and are not published.
-	unkeyed int64
 	records uint64
 }
 
-// publish runs the three merges over run, the unit's folded bindings in site
-// order, after widening edited to the republished members.
-func (p *publisher) publish(run *pagination.SortedRun[Binding]) error {
-	if p.edited != nil {
-		dependents, err := p.dependents(run)
-		if err != nil {
-			return err
-		}
-		defer dependents.Close()
-		edited := p.edited
-		p.edited = func(yield func(model.FileID) error) error { return unionIDs(edited, dependents, yield) }
+// publish runs the two merges: occurrences of targets, then sites, and
+// returns every member's record, by FileID.
+func (p *publisher) publish(bindings *pagination.SortedRun[idBinding], targets *pagination.SortedRun[target]) (*pagination.SortedRun[record], error) {
+	if err := p.publishTargets(targets); err != nil {
+		return nil, err
 	}
-	if err := p.publishFacts(run); err != nil {
-		return err
-	}
-	if p.edited != nil && p.replaced != nil {
-		return p.edited(p.replaced)
-	}
-	return nil
+	return p.publishSites(bindings)
 }
 
-// publishFacts runs the three merges over run.
-func (p *publisher) publishFacts(run *pagination.SortedRun[Binding]) error {
-	byTarget, err := pagination.NewExternalSort(p.u.dir, 0, encodeMarked, decodeMarked,
-		func(a, b marked) int { return compareTargetSite(a.Binding, b.Binding) })
-	if err != nil {
-		return err
-	}
-	defer byTarget.Close()
-	if err := p.markSites(run, byTarget); err != nil {
-		return err
-	}
-	targets, err := byTarget.Sorted()
-	if err != nil {
-		return err
-	}
-	defer targets.Close()
-	bySite, err := pagination.NewExternalSort(p.u.dir, 0,
-		func(r resolved) ([]byte, error) { return json.Marshal(r) },
-		func(b []byte) (resolved, error) {
-			var r resolved
-			err := json.Unmarshal(b, &r)
-			return r, err
-		},
-		func(a, b resolved) int { return compareSiteTarget(a.Binding, b.Binding) })
-	if err != nil {
-		return err
-	}
-	defer bySite.Close()
-	if err := p.joinTargets(targets, bySite); err != nil {
-		return err
-	}
-	sites, err := bySite.Sorted()
-	if err != nil {
-		return err
-	}
-	defer sites.Close()
-	return p.publishSites(sites)
+// cursor answers, for FileIDs asked in ascending order, whether run holds
+// each.
+type cursor struct {
+	next func() (model.FileID, bool, error)
+	stop func()
+	cur  model.FileID
+	ok   bool
 }
 
-// dependents is the FileIDs, ascending and each once, of the members with a
-// site bound to a declaration of an edited member. It reads
-// no table: the bindings, sorted by target, are merged with the members to
-// find the sites' members, and those, sorted, are merged with the members
-// again to name them.
-func (p *publisher) dependents(run *pagination.SortedRun[Binding]) (*pagination.SortedRun[model.FileID], error) {
-	byTarget, err := newBindingSort(p.u.dir, compareTargetSite)
-	if err != nil {
-		return nil, err
-	}
-	defer byTarget.Close()
-	if err := run.Each(byTarget.Add); err != nil {
-		return nil, err
-	}
-	targets, err := byTarget.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer targets.Close()
-	ordinals, err := pagination.NewExternalSort(p.u.dir, 0, encodeOrdinal, decodeOrdinal, cmp.Compare[int32])
-	if err != nil {
-		return nil, err
-	}
-	defer ordinals.Close()
-	ordinals.WithFold(func(a, _ int32) (int32, error) { return a, nil })
-	edited, stopEdited := p.editedCursor()
-	defer stopEdited()
-	next, stop := pull(targets)
-	defer stop()
-	cur, ok, err := next()
-	if err != nil {
-		return nil, err
-	}
-	var file int32 = -1
-	err = p.u.members(func(fv model.FileVersion) error {
-		file++
-		if !ok || cur.Target.File != file {
-			return nil
-		}
-		e, err := edited(fv.ID)
-		if err != nil {
-			return err
-		}
-		for ok && cur.Target.File == file {
-			if e {
-				if err := ordinals.Add(cur.Site.File); err != nil {
-					return err
-				}
-			}
-			if cur, ok, err = next(); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if ok {
-		return nil, untabledRef("target", cur.Target)
-	}
-	sites, err := ordinals.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer sites.Close()
-	ids, err := pagination.NewExternalSort(p.u.dir, 0,
-		func(id model.FileID) ([]byte, error) { return []byte(id), nil },
-		func(b []byte) (model.FileID, error) { return model.FileID(b), nil }, cmp.Compare[model.FileID])
-	if err != nil {
-		return nil, err
-	}
-	defer ids.Close()
-	nextSite, stopSites := pull(sites)
-	defer stopSites()
-	site, more, err := nextSite()
-	if err != nil {
-		return nil, err
-	}
-	file = -1
-	err = p.u.members(func(fv model.FileVersion) error {
-		file++
-		if !more || site != file {
-			return nil
-		}
-		if err := ids.Add(fv.ID); err != nil {
-			return err
-		}
-		site, more, err = nextSite()
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	if more {
-		return nil, untabledRef("site", Ref{File: site})
-	}
-	return ids.Sorted()
-}
-
-// unionIDs yields, in ascending order and each once, the FileIDs of edited
-// and of more, both ascending.
-func unionIDs(edited func(yield func(model.FileID) error) error, more *pagination.SortedRun[model.FileID],
-	yield func(model.FileID) error) error {
-	next, stop := pull(more)
-	defer stop()
-	cur, ok, err := next()
-	if err != nil {
-		return err
-	}
-	err = edited(func(id model.FileID) error {
-		for ok && cur < id {
-			if err := yield(cur); err != nil {
-				return err
-			}
-			if cur, ok, err = next(); err != nil {
-				return err
-			}
-		}
-		if ok && cur == id {
-			if cur, ok, err = next(); err != nil {
-				return err
-			}
-		}
-		return yield(id)
-	})
-	for err == nil && ok {
-		if err = yield(cur); err == nil {
-			cur, ok, err = next()
-		}
-	}
-	return err
-}
-
-func encodeOrdinal(v int32) ([]byte, error) { return binary.AppendUvarint(nil, uint64(v)), nil }
-
-func decodeOrdinal(raw []byte) (int32, error) {
-	n, w := binary.Uvarint(raw)
-	if w != len(raw) || n > 1<<31-1 {
-		return 0, errors.New("a member ordinal is malformed")
-	}
-	return int32(n), nil
-}
-
-// markSites is the first merge. It reads no table.
-func (p *publisher) markSites(run *pagination.SortedRun[Binding], out *pagination.ExternalSort[marked]) error {
+func newCursor(run *pagination.SortedRun[model.FileID]) (*cursor, error) {
 	next, stop := pull(run)
-	defer stop()
-	edited, stopEdited := p.editedCursor()
-	defer stopEdited()
-	cur, ok, err := next()
+	c := &cursor{next: next, stop: stop}
+	var err error
+	c.cur, c.ok, err = next()
 	if err != nil {
-		return err
+		stop()
+		return nil, err
 	}
-	var file int32 = -1
-	err = p.u.members(func(fv model.FileVersion) error {
-		file++
-		if !ok || cur.Site.File != file {
-			return nil
-		}
-		use := siteCarried
-		e, err := edited(fv.ID)
-		switch {
-		case err != nil:
-			return err
-		case e:
-			use = sitePublished
-		case mayBeUnkeyed(fv.Path):
-			use = siteCounted
-		}
-		for ok && cur.Site.File == file {
-			if err := out.Add(marked{Binding: cur, Use: use}); err != nil {
-				return err
-			}
-			if cur, ok, err = next(); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if ok {
-		return untabledRef("site", cur.Site)
-	}
-	return nil
+	return c, nil
 }
 
-// joinTargets is the second merge. Publishing every fact, it also takes the
-// unit's coverage, since it is then the one walk that reads every table.
-func (p *publisher) joinTargets(targets *pagination.SortedRun[marked], out *pagination.ExternalSort[resolved]) error {
+func (c *cursor) has(id model.FileID) (bool, error) {
+	for c.ok && c.cur < id {
+		var err error
+		if c.cur, c.ok, err = c.next(); err != nil {
+			return false, err
+		}
+	}
+	return c.ok && c.cur == id, nil
+}
+
+// republishes returns the answer, member by member in ascending order, to
+// whether the member's facts are published, and the function that stops it.
+func (p *publisher) republishes() (func(model.FileID) (bool, error), func(), error) {
+	if p.republished == nil {
+		return func(model.FileID) (bool, error) { return true, nil }, func() {}, nil
+	}
+	c, err := newCursor(p.republished)
+	if err != nil {
+		return nil, nil, err
+	}
+	return c.has, c.stop, nil
+}
+
+// publishTargets is the first merge.
+func (p *publisher) publishTargets(targets *pagination.SortedRun[target]) error {
 	next, stop := pull(targets)
 	defer stop()
-	edited, stopEdited := p.editedCursor()
-	defer stopEdited()
 	cur, ok, err := next()
 	if err != nil {
 		return err
 	}
-	var tabled int64
-	var file int32 = -1
+	republished, stopRep, err := p.republishes()
+	if err != nil {
+		return err
+	}
+	defer stopRep()
 	err = p.u.members(func(fv model.FileVersion) error {
-		file++
-		var t *Table
-		load := func() error {
-			if t != nil {
-				return nil
-			}
-			var has bool
-			var err error
-			if t, has, err = p.u.tables.Table(p.ctx, p.u.gen, fv); err != nil || !has {
-				return err
-			}
-			tabled++
-			p.cov.dropped += int64(t.Dropped)
+		if ok && cur.File < fv.ID {
+			return notMember("target", cur.File)
+		}
+		if !ok || cur.File != fv.ID {
 			return nil
 		}
-		if p.edited == nil {
-			if err := load(); err != nil {
-				return err
-			}
-		}
-		if !ok || cur.Target.File != file {
-			return nil
-		}
-		e, err := edited(fv.ID)
+		publish, err := republished(fv.ID)
 		if err != nil {
 			return err
+		}
+		var t *Table
+		var byNode map[model.NodeID]int32
+		if publish {
+			var has bool
+			if t, has, err = p.u.tables.Table(p.ctx, p.u.gen, fv); err != nil {
+				return err
+			}
+			if !has {
+				return internalErr("a binding targets a declaration of " + fv.Path + ", which has no link table")
+			}
+			byNode = make(map[model.NodeID]int32, len(t.Decls))
+			for i := len(t.Decls) - 1; i >= 0; i-- {
+				byNode[t.Decls[i].Node] = int32(i)
+			}
 		}
 		var nodes []model.NodeFact
-		last := int32(-1)
-		for ok && cur.Target.File == file {
-			if e || cur.Use != siteCarried {
-				if err := load(); err != nil {
-					return err
+		for ok && cur.File == fv.ID {
+			if publish {
+				i, found := byNode[cur.Node]
+				if !found {
+					return internalErr("a binding targets node " + string(cur.Node) + ", which the link table of " + fv.Path + " does not declare")
 				}
-				if t == nil {
-					return untabledRef("target", cur.Target)
-				}
-				if cur.Target.Index >= int32(len(t.Decls)) {
-					return outOfTable("target", cur.Target, fv.Path)
-				}
-				o := occurrenceOf(fv, t, t.Decls[cur.Target.Index].Endpoint)
-				if e && cur.Target.Index != last {
-					nodes = append(nodes, p.occurrenceFact(o))
-					last = cur.Target.Index
-				}
-				if cur.Use != siteCarried {
-					if err := out.Add(resolved{Binding: cur.Binding, To: o, Publish: cur.Use == sitePublished}); err != nil {
-						return err
-					}
-				}
+				nodes = append(nodes, p.occurrenceFact(occurrenceOf(fv, t, t.Decls[i].Endpoint)))
 			}
 			if cur, ok, err = next(); err != nil {
 				return err
@@ -449,119 +174,144 @@ func (p *publisher) joinTargets(targets *pagination.SortedRun[marked], out *pagi
 		return err
 	}
 	if ok {
-		return untabledRef("target", cur.Target)
-	}
-	if p.edited == nil {
-		p.cov.untabled = p.members - tabled
+		return notMember("target", cur.File)
 	}
 	return nil
 }
 
-// publishSites is the third merge. It reads the table of a member only when
-// one of its sites is used.
-func (p *publisher) publishSites(sites *pagination.SortedRun[resolved]) error {
-	next, stop := pull(sites)
+// publishSites is the second merge.
+func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pagination.SortedRun[record], error) {
+	next, stop := pull(bindings)
 	defer stop()
 	cur, ok, err := next()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var group []resolved
-	var file int32 = -1
-	err = p.u.members(func(fv model.FileVersion) error {
-		file++
-		if !ok || cur.Site.File != file {
-			return nil
+	republished, stopRep, err := p.republishes()
+	if err != nil {
+		return nil, err
+	}
+	defer stopRep()
+	var prev func() (record, bool, error)
+	var old record
+	var hasOld bool
+	if p.prev != nil {
+		var stopPrev func()
+		prev, stopPrev = pull(p.prev)
+		defer stopPrev()
+		if old, hasOld, err = prev(); err != nil {
+			return nil, err
 		}
+	}
+	records, err := newRecordSort(p.u.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer records.Close()
+	var group []idBinding
+	err = p.u.members(func(fv model.FileVersion) error {
+		if ok && cur.SiteFile < fv.ID {
+			return notMember("site", cur.SiteFile)
+		}
+		for hasOld && old.File < fv.ID {
+			if old, hasOld, err = prev(); err != nil {
+				return err
+			}
+		}
+		publish, err := republished(fv.ID)
+		if err != nil {
+			return err
+		}
+		if !publish {
+			if !hasOld || old.File != fv.ID {
+				return internalErr("the member " + fv.Path + " is carried over but the predecessor's state holds no record of it")
+			}
+			for ok && cur.SiteFile == fv.ID {
+				if cur, ok, err = next(); err != nil {
+					return err
+				}
+			}
+			return p.keep(records, old)
+		}
+		rec := record{File: fv.ID, Content: fv.ContentHash}
 		t, has, err := p.u.tables.Table(p.ctx, p.u.gen, fv)
 		if err != nil {
 			return err
 		}
-		if !has {
-			return untabledRef("site", cur.Site)
+		if has {
+			if rec.Interface, err = t.InterfaceDigest(); err != nil {
+				return err
+			}
+			if rec.Sites, err = t.SitesDigest(); err != nil {
+				return err
+			}
+			rec.Digest, rec.Tabled, rec.Dropped = memberDigest(rec.Interface, rec.Sites, t.Dropped), true, int64(t.Dropped)
 		}
-		f := filePublication{p: p, fv: fv, t: t, publish: cur.Publish, seen: map[model.NodeID]bool{}}
-		for ok && cur.Site.File == file {
+		f := filePublication{p: p, fv: fv, t: t, seen: map[model.NodeID]bool{}}
+		for ok && cur.SiteFile == fv.ID {
+			if !has {
+				return internalErr("a binding names a site of " + fv.Path + ", which has no link table")
+			}
 			site := cur.Site
-			if site.Index >= int32(len(t.Sites)) {
-				return outOfTable("site", site, fv.Path)
+			if site >= int32(len(t.Sites)) {
+				return internalErr("a binding names site " + strconv.Itoa(int(site)) + " past the link table of " + fv.Path)
 			}
 			group = group[:0]
-			for ok && cur.Site == site {
+			for ok && cur.SiteFile == fv.ID && cur.Site == site {
 				group = append(group, cur)
 				if cur, ok, err = next(); err != nil {
 					return err
 				}
 			}
-			if err := f.site(&t.Sites[site.Index], group); err != nil {
+			if err := f.site(&t.Sites[site], group); err != nil {
 				return err
 			}
 		}
-		return p.put(f.nodes, f.rels)
+		rec.Unkeyed = f.unkeyed
+		if err := p.put(f.nodes, f.rels); err != nil {
+			return err
+		}
+		return p.keep(records, rec)
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if ok {
-		return untabledRef("site", cur.Site)
+		return nil, notMember("site", cur.SiteFile)
 	}
-	return nil
+	return records.Sorted()
 }
 
-// editedCursor answers, for members asked in ascending FileID order, whether
-// each was edited, by a merge with p.edited; every member is edited when
-// p.edited is nil.
-func (p *publisher) editedCursor() (func(model.FileID) (bool, error), func()) {
-	if p.edited == nil {
-		return func(model.FileID) (bool, error) { return true, nil }, func() {}
+// keep adds rec to records and to the unit's coverage.
+func (p *publisher) keep(records *pagination.ExternalSort[record], rec record) error {
+	if !rec.Tabled {
+		p.cov.untabled++
 	}
-	var walkErr error
-	next, stop := iter.Pull(func(yield func(model.FileID) bool) {
-		walkErr = p.edited(func(id model.FileID) error {
-			if !yield(id) {
-				return errStopped
-			}
-			return nil
-		})
-	})
-	cur, ok := next()
-	return func(id model.FileID) (bool, error) {
-		for ok && cur < id {
-			cur, ok = next()
-		}
-		if !ok && walkErr != nil && !errors.Is(walkErr, errStopped) {
-			return false, walkErr
-		}
-		return ok && cur == id, nil
-	}, stop
-}
-
-// mayBeUnkeyed reports whether an ambiguous site of path can have a `link:`
-// key over model.MaxNativeKeyBytes: whether the key at the widest offsets a
-// file can have does not fit.
-func mayBeUnkeyed(path string) bool {
-	widest := strconv.FormatUint(uint64(wire.MaxSourceOffset)+1, 10)
-	return len("link:callsite:"+path+":"+widest+"-"+widest) > model.MaxNativeKeyBytes
+	p.cov.dropped += rec.Dropped
+	p.cov.unkeyed += rec.Unkeyed
+	return records.Add(rec)
 }
 
 // filePublication is what one file's sites publish, handed to the sink once
 // the file's last site is done.
 type filePublication struct {
-	p  *publisher
-	fv model.FileVersion
-	t  *Table
-	// publish is false for a file whose sites are only counted.
-	publish bool
-	seen    map[model.NodeID]bool
-	nodes   []model.NodeFact
-	rels    []model.RelationFact
+	p     *publisher
+	fv    model.FileVersion
+	t     *Table
+	seen  map[model.NodeID]bool
+	nodes []model.NodeFact
+	rels  []model.RelationFact
+	// unkeyed counts the file's ambiguous sites whose call-site key does not
+	// fit a native key, which have no identity to mint and are not
+	// published.
+	unkeyed int64
 }
 
 // site publishes one site bound to the declarations of group: one `calls`
 // occurrence to a single target, or, for two or more, the ambiguous family
 // the structural provider publishes its own ambiguous calls into, with every
 // candidate.
-func (f *filePublication) site(s *Site, group []resolved) error {
+func (f *filePublication) site(s *Site, group []idBinding) error {
 	caller := f.t.Module
 	if s.Caller >= 0 {
 		if s.Caller >= int32(len(f.t.Decls)) {
@@ -571,29 +321,24 @@ func (f *filePublication) site(s *Site, group []resolved) error {
 	}
 	// Two declarations that are occurrences of one node are one target, so
 	// a repeated identity is neither a second candidate nor an ambiguity.
-	targets := make([]resolved, 0, len(group))
+	targets := make([]idBinding, 0, len(group))
 	distinct := make(map[model.NodeID]bool, len(group))
-	for _, r := range group {
-		if !distinct[r.To.Node] {
-			distinct[r.To.Node] = true
-			targets = append(targets, r)
+	for _, b := range group {
+		if !distinct[b.Target] {
+			distinct[b.Target] = true
+			targets = append(targets, b)
 		}
 	}
 	rng := located(s.Range)
 	key := callsiteKey(f.fv.Path, s.NameStart, s.NameEnd)
 	if len(targets) == 1 {
-		if f.publish {
-			f.node(occurrenceOf(f.fv, f.t, caller))
-			f.relation(caller.Node, model.RelCalls, targets[0].To.Node, rng, key, targets[0].Detail)
-		}
+		f.node(occurrenceOf(f.fv, f.t, caller))
+		f.relation(caller.Node, model.RelCalls, targets[0].Target, rng, key, targets[0].Detail)
 		return nil
 	}
 	native := "link:" + key
 	if key == "" || len(native) > model.MaxNativeKeyBytes {
-		f.p.unkeyed++
-		return nil
-	}
-	if !f.publish {
+		f.unkeyed++
 		return nil
 	}
 	f.node(occurrenceOf(f.fv, f.t, caller))
@@ -622,8 +367,8 @@ func (f *filePublication) site(s *Site, group []resolved) error {
 			Evidence: []model.Evidence{f.p.evidence(callee.ID, "", f.fv.ID, f.fv.ContentHash, rng, native, "")}})
 	}
 	f.relation(caller.Node, model.RelCalls, callee.ID, rng, key, DetailAmbiguous)
-	for _, r := range targets {
-		f.relation(caller.Node, model.RelMayReferTo, r.To.Node, rng, key, DetailAmbiguousTarget)
+	for _, b := range targets {
+		f.relation(caller.Node, model.RelMayReferTo, b.Target, rng, key, DetailAmbiguousTarget)
 	}
 	return nil
 }
@@ -732,6 +477,12 @@ func pull[T any](run *pagination.SortedRun[T]) (func() (T, bool, error), func())
 		}
 		return v, ok, nil
 	}, stop
+}
+
+// notMember is a binding naming a site or target in a file that is not a
+// member of the unit, which no resolution of it can have found.
+func notMember(what string, file model.FileID) error {
+	return internalErr("a binding's " + what + " is in file " + string(file) + ", which is not a member of the unit")
 }
 
 // untabledRef is a binding naming a member with no table, which no resolver

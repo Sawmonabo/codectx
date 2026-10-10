@@ -55,7 +55,13 @@ func NewFileID(repo RepositoryID, normalizedPath string) FileID {
 
 // NewNodeID derives node identity from the canonical entity key. The key
 // identifies a declaration or a provider-local unresolved entity; it is not an
-// assertion of timeless semantic continuity, and an edit may change it.
+// assertion of timeless semantic continuity. A declaration's key is its file,
+// kind, language, descriptor path and disambiguator, never its byte range
+// (ADR-0014), so an edit that moves its bytes keeps it, and only an edit to
+// one of those parts gives the declaration a new identity; lineage across a
+// rename or a move is carried by renamed_from and moved_from relations.
+// Locals, anonymous functions and call sites keep file-scoped keys that
+// include their range.
 func NewNodeID(repo RepositoryID, kind NodeKind, canonicalKey string) NodeID {
 	return NodeID(H(domainNode, string(repo), string(kind), canonicalKey))
 }

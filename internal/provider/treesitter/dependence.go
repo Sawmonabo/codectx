@@ -8,6 +8,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/reconcile"
 )
 
 // capabilities is the descriptor's capability list in its published order:
@@ -58,6 +59,7 @@ func (b *builder) functions() error {
 	if err != nil {
 		return err
 	}
+	params := b.parameters()
 	byStart := b.declsByStart()
 	for i := range b.ex.functions {
 		f := &b.ex.functions[i]
@@ -69,7 +71,7 @@ func (b *builder) functions() error {
 		for j, v := range f.Vars {
 			fv := vars[v]
 			if !fv.resolved {
-				if fv.id, err = b.variable(v, fv, claims, ownerQualified); err != nil {
+				if fv.id, err = b.variable(v, fv, claims, ownerQualified, params[v]); err != nil {
 					return err
 				}
 				fv.resolved = true
@@ -211,7 +213,7 @@ func (b *builder) variables() (map[wire.Span]fileVar, map[string]int, error) {
 // native key that does not fit drops the variable and answers the empty id,
 // which drops its facts with it. A name or qualified name over its storage
 // ceiling is cut and flagged, as a declaration's is.
-func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, ownerQualified string) (model.NodeID, error) {
+func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, ownerQualified string, param parameter) (model.NodeID, error) {
 	key := b.rangeKey("var:", v.Start, v.End)
 	if key == "" {
 		b.dropped[dependence]++
@@ -228,6 +230,7 @@ func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, owner
 	res, err := b.resolve(model.NodeCandidate{
 		ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key, Kind: model.NodeVariable, Language: b.lang.Name,
 		Name: name, QualifiedName: qualified, FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: fv.rng,
+		Descriptor: param.descriptor, Disambiguator: param.disambiguator,
 	})
 	if err != nil {
 		return "", err
@@ -244,6 +247,35 @@ func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, owner
 		b.putAlias(b.scope, fv.declKey, res.Node.ID)
 	}
 	return res.Node.ID, nil
+}
+
+// parameter is a parameter variable's identity inputs: its declaring
+// callable's descriptor path, and that callable's disambiguator with the
+// parameter's position. The zero value is a local's, which keeps a
+// file-scoped identity keyed by its range.
+type parameter struct{ descriptor, disambiguator string }
+
+// parameters is the identity of every declared parameter the worker named
+// (wire.Link.Parameters), by its name token. A parameter is keyed by its
+// callable's identity and its position, not its range, because a bound call
+// in another file publishes the flow of its arguments into it (ADR-0014
+// decision 1): a body edit, or an edit anywhere before the callable, keeps
+// the parameter's node. A parameter whose callable has no descriptor path,
+// or is not a declaration of the file, stays file-scoped.
+func (b *builder) parameters() map[wire.Span]parameter {
+	if b.ex.link == nil || len(b.ex.link.Parameters) == 0 {
+		return nil
+	}
+	out := make(map[wire.Span]parameter, len(b.ex.link.Parameters))
+	for _, p := range b.ex.link.Parameters {
+		i, ok := b.nameAt[p.Callable]
+		if !ok || b.decls[i].descriptor == "" {
+			continue
+		}
+		d := &b.decls[i]
+		out[p.Name] = parameter{descriptor: d.descriptor, disambiguator: reconcile.ParameterDisambiguator(d.disambiguator, p.Index)}
+	}
+	return out
 }
 
 // capabilities is the file's five capability rows: the structure row as the
