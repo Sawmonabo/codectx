@@ -78,7 +78,18 @@ const (
 	// those with no virtual occurrence, are walked now, and it climbs no
 	// further, having climbed when it was first admitted.
 	stepRest
+	// stepDescend is a callee a callees walk admitted again because a call
+	// that can dispatch, or a descent, also reached it after it was first
+	// admitted as an exact call's target: its overrides are walked now, and
+	// its own calls are not, having been walked when it was first admitted.
+	stepDescend
 )
+
+// dispatches reports whether a callees walk descends from a node admitted
+// with step s to the overrides that may run in its place.
+func (s dispatchStep) dispatches() bool {
+	return s == stepVirtual || s == stepOverride || s == stepDescend
+}
 
 // DispatchReader is the OPTIONAL seam a GraphReader may also implement: for
 // each relation, whether any of its occurrences is a virtual call, and the
@@ -186,8 +197,9 @@ func (d dispatchRule) direction(walk model.Direction) model.Direction {
 // others from a base admitted again as a caller -- and every outgoing
 // `overrides` entry, which climbs, but the one that admitted the owner. A callees walk keeps the owner's
 // outgoing entries of the requested kinds and every outgoing `routes_to`
-// entry, and an incoming `overrides` entry only from a node a virtual call or
-// an earlier descent reached. Nothing else is kept: the scan reads both lists
+// entry -- but none from a node admitted again only to descend -- and an
+// incoming `overrides` entry only from a node a virtual call or an earlier
+// descent reached. Nothing else is kept: the scan reads both lists
 // only to find the step's edges.
 func (d dispatchRule) entry(owner frontierState, e Edge) (keep bool, step dispatchStep, virtual bool) {
 	switch d.mode {
@@ -207,6 +219,9 @@ func (d dispatchRule) entry(owner frontierState, e Edge) (keep bool, step dispat
 		return false, stepDirect, false
 	case dispatchCallees:
 		if e.Outgoing {
+			if owner.Step == stepDescend {
+				return false, stepDirect, false
+			}
 			if e.Kind == d.routes && d.routes != 0 {
 				return true, stepDirect, false
 			}
@@ -215,7 +230,7 @@ func (d dispatchRule) entry(owner frontierState, e Edge) (keep bool, step dispat
 			}
 			return true, stepDirect, e.Kind == d.calls
 		}
-		if e.Kind == d.overrides && (owner.Step == stepVirtual || owner.Step == stepOverride) {
+		if e.Kind == d.overrides && owner.Step.dispatches() {
 			return true, stepOverride, false
 		}
 		return false, stepDirect, false

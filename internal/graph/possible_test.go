@@ -504,3 +504,50 @@ func TestAPossibleRouteHasPreciseLegsAroundTheHop(t *testing.T) {
 		t.Errorf("path(main, leaf) = %+v, want main->run, the name-only hop, handle->leaf", p)
 	}
 }
+
+// TestAPossibleRouteTakesAsManyNameOnlyHopsAsItNeeds pins that the search,
+// not a fixed count, decides the name-only hops: main's `obj.handle()` may
+// call handle, and handle's `obj.finish()` may call finish, so path(main,
+// finish) is the two hops, possible, at twice the dearest cost, and the
+// answer counts both.
+//
+// Mutation caught: a fixed count of one hop (no route at all).
+func TestAPossibleRouteTakesAsManyNameOnlyHopsAsItNeeds(t *testing.T) {
+	f := newCallFixture("possible_hops", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "main", Kind: model.NodeFunction, File: "main.py", Bytes: [2]uint64{0, 40}},
+			{Key: "first", Name: "handle", Kind: model.NodeFunction, File: "main.py", Bytes: [2]uint64{20, 30},
+				Metadata: openSite(model.CallShapeMember, 0)},
+			{Name: "handle", Kind: model.NodeMethod, File: "lib.py", Bytes: [2]uint64{0, 40}},
+			{Key: "second", Name: "finish", Kind: model.NodeFunction, File: "lib.py", Bytes: [2]uint64{20, 30},
+				Metadata: openSite(model.CallShapeMember, 0)},
+			{Name: "finish", Kind: model.NodeMethod, File: "end.py", Bytes: [2]uint64{0, 30}},
+		},
+		Relations: []fixtureFact{
+			{From: "main", Kind: model.RelCalls, To: "first", Occurrences: site(20)},
+			{From: "handle", Kind: model.RelCalls, To: "second", Occurrences: site(20)},
+		},
+	})
+	res, err := f.engine(t).ShortestPath(context.Background(), model.PathRequest{From: f.id(t, "main"),
+		To: f.id(t, "finish"), Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("path(main, finish): %v", err)
+	}
+	repo := f.binding.RepositoryID
+	want := []model.RelationID{
+		model.NewRelationID(repo, f.id(t, "main"), model.RelMayCall, f.id(t, "handle")),
+		model.NewRelationID(repo, f.id(t, "handle"), model.RelMayCall, f.id(t, "finish"))}
+	if len(res.Paths) != 1 || !res.Paths[0].Possible || !slices.Equal(res.Paths[0].Relations, want) ||
+		res.Paths[0].CostUnits != 2*Cost(model.RelMayCall) {
+		t.Fatalf("path(main, finish) = %+v, want the two name-only hops %v", res.Paths, want)
+	}
+	counted := false
+	for _, n := range res.Meta.Notices {
+		if strings.Contains(n, "takes 2 calls no analysis bound") {
+			counted = true
+		}
+	}
+	if !counted {
+		t.Errorf("notices %q do not count the route's two name-only hops", res.Meta.Notices)
+	}
+}

@@ -126,12 +126,14 @@ and `callers Animal.sound` never lists `direct`, whose call can only run
 at any depth, marked `may_dispatch` and counted as `may_dispatch`. A site bound
 by value flow to several classes is marked `value_set` with its set size ("1
 of 2"). `path` and a forward `impact` take the same downward step, a path
-only from a call that can dispatch; `impact` of a method lists the methods
+only from a call that can dispatch, at that call's cost even when a cheaper
+exact call reaches the same method; `impact` of a method lists the methods
 overriding it; `refs` of a method includes the references of every method in
 its override family, up and down. The step belongs to the command, not to the
 relation list: a walk over `calls` alone takes it. A base method the climb
 reached that is also a caller of a symbol in the walk has the rest of its
-callers walked too, and an `overrides` row is listed once even when the
+callers walked too, a callee first reached by an exact call and later by one
+that can dispatch has its overrides listed too, and an `overrides` row is listed once even when the
 request names `overrides`. When a method marks no override and its class extends a type outside the
 indexed project, the callers answer says that calls through that type are found
 only for overrides the language marks.
@@ -159,9 +161,10 @@ Java and Rust, with parameters that take the call's arguments. Each is a
   imported by, the same unit, then anywhere.
 - `refs` lists the callers of those open sites after every precise
   reference, at `heuristic` precision.
-- `path`, only when the search proved no precise route exists, offers the
-  cheapest route with one `may_call` hop between two precise legs, marked
-  `possible`, the hop costed as the dearest relation, and says so.
+- `path`, only when the search proved no precise route exists, searches
+  again with `may_call` admitted at the dearest relation cost, so the cheapest
+  route takes as many name-only hops as it needs and no more; it is marked
+  `possible`, each hop carries its call sites, and the notice counts the hops.
 - `impact` counts, per depth, the open sites naming an affected symbol
   (`open_sites_by_depth`) and does not list their callers as affected; an MCP
   request whose `relations` name `may_call` walks on through them, one depth

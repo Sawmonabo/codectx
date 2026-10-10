@@ -421,3 +421,78 @@ func TestAPathDescendsOnlyFromAVirtualCall(t *testing.T) {
 		t.Errorf("path(viaSuper, Dog.sound) finds %d routes; a super call never runs the override", n)
 	}
 }
+
+// exactThenVirtual is `main` calling `Animal.sound` exactly (a qualified
+// call) and through `helper`, whose call to it can dispatch, with `Dog.sound`
+// overriding it; `other` calls it virtually too.
+func exactThenVirtual() *callFixture {
+	return newCallFixture("exact_then_virtual", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "Animal.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{0, 50}},
+			{Name: "Dog.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{60, 90}},
+			{Name: "helper", Kind: model.NodeFunction, File: "b.py", Bytes: [2]uint64{0, 30}},
+			{Name: "main", Kind: model.NodeFunction, File: "c.py", Bytes: [2]uint64{0, 40}},
+			{Name: "other", Kind: model.NodeFunction, File: "d.py", Bytes: [2]uint64{0, 30}},
+		},
+		Relations: []fixtureFact{
+			{From: "Dog.sound", Kind: model.RelOverrides, To: "Animal.sound"},
+			{From: "main", Kind: model.RelCalls, To: "Animal.sound", Occurrences: exactAt(5)},
+			{From: "main", Kind: model.RelCalls, To: "helper", Occurrences: exactAt(20)},
+			{From: "helper", Kind: model.RelCalls, To: "Animal.sound", Occurrences: virtualAt(5)},
+			{From: "other", Kind: model.RelCalls, To: "Animal.sound", Occurrences: virtualAt(5)},
+		},
+	})
+}
+
+// TestACalleeReachedAgainByAVirtualCallDescends pins admission per reason in
+// a callees walk: `Animal.sound` is first reached by main's exact call, which
+// runs it alone, and one level later by helper's call that can dispatch, so
+// its override `Dog.sound` is listed, marked may_dispatch. Reached on one
+// level by both an exact and a virtual call (from main and other at once),
+// the virtual reach is the one admitted.
+//
+// Mutations caught: admitting a callee once whatever reached it (callees(main)
+// omits Dog.sound); preferring the exact reach within a level (callees of
+// main and other omits it).
+func TestACalleeReachedAgainByAVirtualCallDescends(t *testing.T) {
+	f := exactThenVirtual()
+	sub := f.rel(t, "Dog.sound", model.RelOverrides, "Animal.sound")
+	res := callAnswer(t, f, "main", model.DirectionOutgoing)
+	if ms := marksOf(res, sub); !hasRelation(res, sub) || len(ms) != 1 || ms[0].Kind != model.MarkMayDispatch {
+		t.Errorf("callees(main) lists Dog.sound with marks %+v (listed %v), want it marked may_dispatch: "+
+			"helper's a.sound() may run it", ms, hasRelation(res, sub))
+	}
+
+	both, err := f.engine(t).Neighbors(context.Background(), model.GraphRequest{
+		Start: []model.NodeID{f.id(t, "main"), f.id(t, "other")}, Direction: model.DirectionOutgoing,
+		Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("callees(main, other): %v", err)
+	}
+	if !hasRelation(both, sub) {
+		t.Errorf("callees(main, other) omits Dog.sound; other's a.sound() may run it")
+	}
+}
+
+// TestAPathDescendsFromACostlierVirtualReach pins the path search's descent
+// per reach: main reaches Animal.sound cheapest by an exact call, which runs
+// it alone, and one step dearer through helper's call that can dispatch, so
+// path(main, Dog.sound) is the precise route through helper at that call's
+// cost.
+//
+// Mutation caught: deciding the descent from the cheapest reach only (no
+// precise route, or a possible one).
+func TestAPathDescendsFromACostlierVirtualReach(t *testing.T) {
+	f := exactThenVirtual()
+	res, err := f.engine(t).ShortestPath(context.Background(), model.PathRequest{From: f.id(t, "main"),
+		To: f.id(t, "Dog.sound"), Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("path(main, Dog.sound): %v", err)
+	}
+	want := []model.RelationID{f.rel(t, "main", model.RelCalls, "helper"),
+		f.rel(t, "helper", model.RelCalls, "Animal.sound"), f.rel(t, "Dog.sound", model.RelOverrides, "Animal.sound")}
+	if len(res.Paths) != 1 || res.Paths[0].Possible || !slices.Equal(res.Paths[0].Relations, want) ||
+		res.Paths[0].CostUnits != 2*Cost(model.RelCalls)+Cost(model.RelOverrides) {
+		t.Errorf("path(main, Dog.sound) = %+v, want the precise route %v", res.Paths, want)
+	}
+}
