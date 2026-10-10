@@ -201,7 +201,7 @@ All **user** trust.
 |---|---|---|
 | `query_memory_bytes` | `33554432` | Reservation per concurrent query. |
 | `cache_bytes` | `33554432` | Total cache reservation. |
-| `max_temp_bytes` | `0` (unlimited) | Temporary bytes across materializations. Unlimited by default, so no default setting refuses a large repository's temporary work; a value you set must exceed `min_free_disk_bytes`, which stays the host-safety floor and is enforced against actual free space either way. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest is the budget for the materializations the heavy children stage. Temporary sort runs written while a query is being ranked share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the match count and charging it would let this budget refuse a wide query outright; size the directory for the ranked working set of the largest query you expect in addition to the live continuation spools the budget does cover. |
+| `max_temp_bytes` | `0` (unlimited) | Temporary bytes across materializations. Unlimited by default, so no default setting refuses a large repository's temporary work; a value you set must exceed `min_free_disk_bytes`, which stays the host-safety floor and is enforced against actual free space either way. One eighth of it is the budget for the paging spools that hold the ranked remainder of a graph answer (`impact`, its package rollup, `refs`) between pages; the rest is the budget for the materializations the heavy children stage. A ranked `codectx search` spools nothing: it collects its best results in memory, a page at a time. Temporary sort runs the context compiler writes share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the candidate count and charging it would let this budget refuse a wide task outright; size the directory for the widest compile you expect in addition to the live continuation spools the budget does cover. |
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve the host keeps whatever the product is doing. It also sizes child admission's disk allocation: the free space under the data directory less this floor is what heavy children may stage between them, and a child that does not fit waits rather than filling the device. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
 | `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
@@ -219,7 +219,7 @@ All **user** trust.
 |---|---|---|
 | `data_dir` | `""` | Absolute path for all cache and state. Empty resolves to a user-private per-workspace directory (below). |
 | `busy_timeout` | `"5s"` | SQLite busy timeout. |
-| `read_connections` | `0` | Connections in each of a store handle's two reader pools. `0` sizes each by the goroutines that read it: the short-read pool, which every unit being built and every tool call reads, holds one connection per unit a generation builds at once (`index.workers`, or one per core) plus one per concurrent tool call (one per core); the posting-stream pool, which only a search's candidate walk holds, one per concurrent tool call. The serving composition's query-only handle builds nothing, so its short-read pool holds one connection per concurrent tool call alone. A set value sizes every pool. Each connection may cache up to `reader_cache_kib`, and the process's base footprint counts every one. |
+| `read_connections` | `0` | Connections in a store handle's reader pool. `0` sizes it by the goroutines that read it: every unit being built and every tool call reads it, so it holds one connection per unit a generation builds at once (`index.workers`, or one per core) plus one per concurrent tool call (one per core). The serving composition's query-only handle builds nothing, so its pool holds one connection per concurrent tool call alone. A set value sizes every pool. Each connection may cache up to `reader_cache_kib`, and the process's base footprint counts every one. |
 | `writer_cache_kib` | `1048576` | Writer page cache. An index run commits in groups this size: the group commits the moment the cache would spill (see [storage](storage.md#how-an-index-run-commits)), so this is also the memory an index run holds for its writes and the largest log it leaves behind. |
 | `reader_cache_kib` | `4096` | Per-reader page cache. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
@@ -557,8 +557,8 @@ relationships that must hold:
   this process's own resident set, read once at load (32 MiB stands in for it
   where the platform reports no resident set) + (query slots on this
   machine) × `query_memory_bytes` + `cache_bytes` + `queue_bytes` + every page
-  cache the process opens (the store's writer and reader pools, lexical staging
-  for each unit built at once, the tokenizer and the run ledger). How many queries run at
+  cache the process opens (the store's writer and reader pools and the run
+  ledger). How many queries run at
   once comes from the cores, so a host with more cores has a larger base
   footprint and leaves the analyzers and language servers it starts a smaller
   allocation. There is no figure here for you to exceed and no core count that

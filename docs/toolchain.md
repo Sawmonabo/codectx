@@ -463,8 +463,38 @@ to, with the full pair in the `--json` envelope as `entry_sha256` and
 or corrupt, and the row beside it says which. `tools status` never prints a
 `disk:` digest, because it does not rehash.
 
+## Building the binary: the search index's crate
+
+The managed toolchain above is what codectx runs. Building codectx needs one
+more toolchain of its own. The lexical tier's index is an embedded search
+library, a Rust crate in this repository that is built as a static library and
+linked through cgo into the one codectx binary
+([ADR-0013](adr/ADR-0013-search-index.md), decision 1). The binary already needs
+cgo for its parser grammars, and every release leg already builds on a runner of
+its own target, so the crate adds a compiler to each leg rather than a new kind
+of leg:
+
+- **A pinned Rust toolchain on every native leg.** Every release and CI leg
+  installs one exact Rust toolchain version, pinned the way the Go toolchain is,
+  and builds the crate for that leg's own target. The release never builds with
+  a toolchain it did not pin.
+- **Windows uses the GNU targets.** Go's cgo links through the MinGW toolchain,
+  so the crate is built for `x86_64-pc-windows-gnu` on amd64 and for
+  `aarch64-pc-windows-gnullvm` on arm64, never for the MSVC targets.
+- **The crate tree is locked and vendored.** `Cargo.lock` pins every crate the
+  library depends on, and the tree is vendored in the repository, so a release
+  build fetches nothing from a registry and the same commit builds the same
+  bytes.
+- **Nothing reaches the user.** The crate is linked into the binary, so the
+  user installs no Rust toolchain and no library; codectx is still one
+  executable.
+
 ## Licenses
 
 Every pinned payload's license is recorded in the lock entry and in
 `THIRD_PARTY_LICENSES.md`. No pinned tool requires a paid service, a network
 service at query time, or an AI API key.
+
+The search index's crate tree is part of the same inventory: every crate in
+`Cargo.lock`, the library itself included, is recorded in
+`THIRD_PARTY_LICENSES.md` with its version and license.

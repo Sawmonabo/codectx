@@ -1,6 +1,6 @@
 # ADR-0001 — Scale posture: unlimited by default, bounded by page
 
-- **Status:** Accepted (decisions 1–7 implemented; decisions 8 and 9 accepted and scheduled)
+- **Status:** Accepted (decisions 1–7 implemented; decisions 8 and 9 accepted and scheduled); §2.4 is the rule of [ADR-0013](ADR-0013-search-index.md) decision 5, 2026-10-08
 - **Date:** 2026-09-14
 - **Amended 2026-10-08:** the hosted dependence engine this record governs was deleted under
   [ADR-0012](ADR-0012-native-dependence-engine.md) phase 6.
@@ -23,6 +23,9 @@ first hard.
 > truncate an answer.** Every count or size bound is user-set only; `0` (or the spelling
 > `"unlimited"`) means unlimited, and the *default* is unlimited. Exceeding a user-set limit is
 > reported, never silent. A field-length bound truncates and flags; it never fails a unit.
+
+The rule governs the data an index produces: files, units, facts, rows and exact lookups. A ranked
+result list is not that data. A ranked search serves its best results, a page at a time, under §2.4.
 
 > **"Unlimited" is never "load everything into heap."** Peak resident memory must be a function of
 > page or batch size, not of repository size.
@@ -330,72 +333,71 @@ scope key per planned file unit, or 50–80 MiB at 300 000 files with two file p
 is named for verification rather than claimed as solved. A new I/O characteristic is also
 named: each whole-snapshot unit re-reads the merged file, where it previously read memory.
 
-### 2.4 Search: a lossless ranked set
+### 2.4 Search: the best results, a page at a time
 
-**Decision.** The ranked result set stops refusing new distinct keys past a fixed ceiling (ten
-times the page size, hard-coded). It keeps every distinct key; the tail goes to the disk-backed
-spool and is served by a cursor. Spool exhaustion ends a **page** with page 1 served and the
-dropped-hit count reported — never the query, page 1 included. Oversized spool records are split
-across continuation frames rather than refused. The per-tier candidate ceiling on exact-match tiers
-is removed and the tiers walk their whole keyset.
+**Decision.** A ranked search answers with its best-scoring results and does not enumerate every
+match. The rule of §1.1 governs the data an index produces — files, units, facts, rows and exact
+lookups are never dropped or truncated. A ranked list is a different thing: its value is its head,
+and no search a person or an AI client runs needs the 253 589th-best match for a common word. The
+rule for ranked search is therefore
+([ADR-0013](ADR-0013-search-index.md), decision 5):
+
+- **Top-k collection.** Page n is collected as the top 200·n by (quantized score, content tie key),
+  with a heap of that size. Page 1 holds 200 entries whatever the match count, so peak memory is a
+  function of the page, never of the match count.
+- **Exact pruning.** Block-max WAND, with BM25F upper bounds per block of the union postings, skips
+  every document that cannot enter the top k. It changes the work, never the results: the top k
+  equal exhaustive scoring's top k.
+- **Match count.** The count is exact when every match was visited, and otherwise a lower bound
+  marked as one.
+- **No spool, no sort to disk.** The ranked set is never written to disk and never sorted
+  externally.
+
+The exact tier (path and symbol lookup) is not ranked. It walks its whole keyset and returns every
+match, paged by its cursor, under the rule of §1.1.
 
 **Alternatives considered.**
 
-*A fixed-size min-heap top-K and accept that the tail is lost.* A size-K heap streamed over
-candidates is O(K) regardless of candidate count, so no spill is needed **for ranking**. It was
-rejected as the whole answer because the rule forbids discarding the tail of the corpus: the
-requirement is not "the top K are correct", it is "nothing is dropped without saying so". The heap
-remains the right shape for the ranking step; the spool is what makes the tail retrievable.
+*Score every match and keep a heap after a cursor, so every page down to the last match is
+reachable.* It costs a full scoring of every match for every page — 4.04 s for a 30-query set on a
+546 613-document export, against milliseconds pruned — a price paid for depth no search uses.
+Rejected.
 
-*Truncate an oversized spool record's largest field and flag it, as field bounds do.* Rejected at
-this layer: the record is JSON, and truncating it produces invalid JSON — a size bound converted
-into a corruption bug. Chunking across frames is the correct answer, with the assembly bound set to
-the spool's own byte budget so no record can exceed what the budget already admitted.
+*Sort the whole ranked set to disk and serve the tail from a spool.* It makes page 1 pay for the
+last page, and it adds temporary disk proportional to the match count. Rejected for the same
+reason.
 
-*A new `spool_bytes` configuration key.* Rejected: the temporary-disk budget is a single number, and a second key lets its consumers
-be configured to oversubscribe the very budget the first key exists to enforce. The divisor stays a
-documented derivation of the one budget. The same reasoning governs the sort-run budget, which is a
-*share* of the query memory admission rather than a key of its own — a memory budget treated as a
-first-class parameter and divided among workers with a floor is the shape mature search engines use
-[S22]. The floor raises rather than refuses, because refusing over a performance knob is the
-class-D failure this posture exists to remove.
+*An approximate top k (a candidate cap, or pruning that may miss).* Rejected: the pages a search
+serves must equal exhaustive scoring's, because a ranking that depends on how the work was cut is
+not repeatable.
 
-**Why it was chosen.** The published designs for deep result retrieval make the same split: a
-point-in-time view plus a cursor keyed on the last row, rather than an offset or a memory-resident
-scroll state [S14], with collectors that stream candidates rather than materialise them [S30]. The
-tail belongs on disk behind a cursor, not in a ceiling.
+**Why it was chosen.** Collectors that stream candidates rather than materialise them [S30], and a
+count reported as a lower bound once pruning skipped work, are how mature search engines answer a
+ranked query. Block-max WAND is exact up to k (its sources are in ADR-0013).
 
-**What was measured.** A 5 000-result answer returns the full set in exactly the order an
-in-memory oracle produces. Mutation (restore the 2000-key refusal) fails with *"a 5000-result
-answer reported itself truncated"*. A one-byte spool store, so that the header alone exhausts it,
-still serves page 1; mutation (restore the failure) fails with *"a full spool failed page 1 instead
-of ending it"*. Chunking: mutation (restore the record-size refusal) fails with *"a record larger
-than one frame was refused instead of chunked"*.
+**What still spools.** The graph answers that rank a whole walk — `impact`, its package rollup and
+the `refs` list — keep a disk-backed spool behind their cursor, because a walk's answer is the data
+the rule of §1.1 protects. An oversized spool record is split across continuation frames rather
+than refused; mutation (restore the record-size refusal) fails with *"a record larger than one
+frame was refused instead of chunked"*. Truncating such a record's largest field instead was
+rejected: the record is JSON, and truncating it produces invalid JSON. The spool budget is a
+documented share of the one temporary-disk budget, not a `spool_bytes` key of its own: a second key
+would let the budget's consumers be configured to oversubscribe the budget it exists to enforce,
+and a memory or disk budget divided among its consumers with a floor is the shape mature search
+engines use [S22].
 
-**The duplicate-primitive incident, and the one-primitive resolution.** Two parallel changes on
-different problems — the planner's input sort and the search top-K — each independently
-created a bounded external sort at the *same path* in the pagination package. Both are correct;
-they differ in that the second adds a capped merge fan-in (excess runs are collapsed in groups
-first, so the live set stays constant instead of growing with the input) and derives its run budget
-from the query memory admission. The resolution was one primitive, not two: the planner's sorter
-was extended with the capped fan-in, a collapse that removes each group's inputs as the group
-completes (so peak temporary disk stays at the run set plus the one run being written), a run byte
-budget derived from the query memory admission, a fold applied exactly once over the fully ordered
-stream (which is what keeps the planner's digest byte-identical: runs are stable-sorted and ties break
-by run index over runs written in arrival order), and a live-record high-water mark for the
-structural memory assertion. The second implementation was not merged. Search's deduplication and
-ranking now stream through this one primitive.
+**The one external sort primitive.** The bounded external sort in the pagination package is one
+primitive, used by the planner (§2.3) and the context compiler (§2.10): a capped merge fan-in
+(excess runs are collapsed in groups first, so the live set stays constant instead of growing with
+the input), a collapse that removes each group's inputs as the group completes (so peak temporary
+disk stays at the run set plus the one run being written), a run byte budget derived from the query
+memory admission, a fold applied exactly once over the fully ordered stream (which keeps the
+planner's digest byte-identical: runs are stable-sorted and ties break by run index over runs
+written in arrival order), and a live-record high-water mark for the structural memory assertion.
 
-**Consequences.** The ranked set and the candidate-deduplication set are no longer heap-resident in
-proportion to the answer or to the range scan: two sort passes (deduplicate and fold, then rank) feed
-one page and a streamed spool tail, so peak heap on this path is the run budget plus the merge fan-in's
-blocks plus one page, independent of the match count. Measured live-record high-water mark: 190
-records at 20 000 candidates and 189 at 200 000; the mutation that removes the run budget raises it
-to the match count (20 000 and 65 536) and the assertion fails. One residual is named rather than
-claimed: per-request sort runs are not charged to the temporary-bytes reservation, though they live
-under the same spool directory and are counted as real disk by the sweeper. The continuation page
-that once materialised the whole spooled tail before re-spooling the remainder is closed: a
-continuation now allocates one page and streams the rest into the next spool.
+**Consequences.** A ranked search holds one heap of 200·n entries and nothing on disk. The exact
+tier pages its whole keyset. A caller that wants a match past the head of a ranked list narrows the
+query or its filters; the marked lower-bound count tells it that more matches exist.
 
 ### 2.5 Field bounds truncate and flag
 
@@ -725,7 +727,7 @@ whose lists are shorter than the counts the seal pinned.
 passes — the admitted-candidate slice and its dedupe map, the hydrated file table, the relation and
 precision maps, the nested per-package centrality map, and the budget pass's five candidate-sized
 structures — become sorted streams joined by merge and reduced by streaming aggregation, over the
-same external sort the ranked search answer already uses. Peak heap is a function of that sort's run
+same external sort the index planner uses (§2.3, §2.4). Peak heap is a function of that sort's run
 budget (the quarter share of `resources.query_memory_bytes`) and of the resolved budget, which is the
 caller's own declared window, and never of how wide the task's scope is. The plan is required to be
 byte-for-byte what the whole-set pipeline produced: the same entries, ordinals, slices, exclusions
@@ -736,7 +738,7 @@ to forbid: it would make a wide task return a narrower plan rather than the same
 and `scope_complete` would start reporting a ceiling rather than a fact about the repository.
 
 **Where the runs live.** Under the workspace's spool directory, removed on every exit path including
-the error paths, and — like the sort runs `search` writes — deliberately not charged against
+the error paths, and deliberately not charged against
 `resources.max_temp_bytes`, because a run set is sized by the candidate count and charging it would
 let that budget refuse a wide compile outright.
 
@@ -768,7 +770,7 @@ let that budget refuse a wide compile outright.
 | Index planning | Sort run buffer + fan-in × block size; the plan's own unit list remains and is named |
 | Graph traversal | Resumed frontier (frontier byte budget) + this page's admissions (page items) + one level's probes + one page of relations + one spool record |
 | Providers | One batch (batch records / batch bytes) + the per-sink pool reservation; truncation bounds each row |
-| Search | Sort run buffer + merge fan-in blocks + one page |
+| Ranked search | One top-k heap of 200·n entries for page n; nothing on disk |
 | Process tree | Fixed capture buffers; admission reservations taken together under one lock |
 | Storage writes | One batch; interning is a bounded cache flushed per batch |
 
@@ -804,11 +806,9 @@ duplicates an existing assertion.
 - **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage records' to
   close (§2.8). The indexing peak, 912.6 MiB when first measured, re-measured at 145.3 MiB against
   the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
-- **Search heap**: the ranked set and the candidate-deduplication set now stream through the one
-  external sort primitive (§2.4), so peak heap on this path is the sort run buffer plus the merge
-  fan-in's blocks plus one page, independent of the match count. The one residual §2.4 names is the
-  one that stands: per-request sort runs are not charged to the temporary-byte reservation, though
-  they live under the same spool directory and the sweeper counts them as real disk.
+- **Search heap**: a ranked search holds one top-k heap of 200·n entries for page n and writes
+  nothing to disk (§2.4), so peak heap on this path is a function of the page, independent of the
+  match count.
 - The smaller residuals this document recorded at their sites are **closed**, each with a reader.
   The cut on a joined documentation body is disclosed: the composed search body is bounded through
   the declaration's own truncation helper, which records the field and its original length. The
@@ -950,7 +950,7 @@ arguments constant across pages; the cursor contract (§2.2).
 
 [S14] https://www.elastic.co/docs/reference/elasticsearch/rest-apis/paginate-search-results —
 keyset continuation plus a point-in-time view, and why offset and scroll pagination cost memory;
-the deep-retrieval evidence behind §2.2 and §2.4.
+the deep-retrieval evidence behind §2.2.
 
 [S15] https://lucene.apache.org/core/8_5_2/core/org/apache/lucene/util/OfflineSorter.html — an
 explicit external-sort bound of partitions-in-RAM × buffer size; the auditable bound adopted in

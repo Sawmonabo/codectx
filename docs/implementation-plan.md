@@ -9,9 +9,9 @@
 **Project license:** Apache License 2.0  
 **Goal:** Build a deterministic codebase-intelligence and context-management system that indexes software repositories, exposes precise structural and semantic queries through a Go CLI and MCP server, and compiles task-specific, snapshot-pinned context for AI agents without requiring any paid service, AI API, embedding API, cloud database, or token purchase.
 
-**Architecture:** A Go application with immutable source snapshots, reusable immutable analysis units, generation-qualified canonical facts, SQLite/FTS5, bounded local analyzer workers, a query engine, a deterministic context compiler, and an actor-scoped source-coverage and workflow gate. CLI and MCP share typed application services.
+**Architecture:** A Go application with immutable source snapshots, reusable immutable analysis units, generation-qualified canonical facts, SQLite for the store and an embedded search library (a Rust crate linked through cgo) for the lexical index, bounded local analyzer workers, a query engine, a deterministic context compiler, and an actor-scoped source-coverage and workflow gate. CLI and MCP share typed application services.
 
-**Tech stack:** Go 1.27 language baseline with Go 1.27.1 as the initial exact toolchain pin; official MCP Go SDK v1.7.0 with MCP 2026-07-28; `modernc.org/sqlite` v1.58.0 as the initial driver pin; SQLite FTS5; official Tree-sitter Go bindings and pinned grammars; SCIP protobuf; local LSP; in-process control-flow, dependence and call-linking analysis; Git; `fsnotify`; Cobra; TOML; Go standard-library cryptography, logging, process, I/O, and testing packages. Go and MCP pins are supported by the published release records, not inferred from version numbers. [1](#ref-1) [2](#ref-2) [22](#ref-22)
+**Tech stack:** Go 1.27 language baseline with Go 1.27.1 as the initial exact toolchain pin; official MCP Go SDK v1.7.0 with MCP 2026-07-28; `modernc.org/sqlite` v1.58.0 as the initial driver pin; an embedded search library, a Rust crate built as a static library under a pinned Rust toolchain with a locked and vendored crate tree, linked through cgo; official Tree-sitter Go bindings and pinned grammars; SCIP protobuf; local LSP; in-process control-flow, dependence and call-linking analysis; Git; `fsnotify`; Cobra; TOML; Go standard-library cryptography, logging, process, I/O, and testing packages. Go and MCP pins are supported by the published release records, not inferred from version numbers. [1](#ref-1) [2](#ref-2) [22](#ref-22)
 
 **Reading this revision:** All 33 design sections and all 21 implementation tasks are included. The product scope remains intact. Changes remove contradictory migration requirements, avoid whole-graph duplication, specify measurable aggregate resource budgets, close source/provenance/workflow gaps, and repair implementation dependencies. Performance figures are engineering acceptance targets, not measured claims. The supplied material is a specification, not an application repository; no claim of a bug-free executable is made.
 
@@ -126,7 +126,7 @@
    - [Task 10: Implement the LSP Snapshot-Qualified Working-Tree Overlay](#task-10-implement-the-lsp-snapshot-qualified-working-tree-overlay)
    - [Task 11: Implement In-Process Dependence Facts and Call Linking](#task-11-implement-in-process-dependence-facts-and-call-linking)
    - [Task 12: Implement the Index Coordinator, Incremental Invalidation, Watch Mode, and Atomic Refresh](#task-12-implement-the-index-coordinator-incremental-invalidation-watch-mode-and-atomic-refresh)
-   - [Task 13: Implement Exact, Symbol, Path, and Generation-Scoped FTS5 Search](#task-13-implement-exact-symbol-path-and-generation-scoped-fts5-search)
+   - [Task 13: Implement Exact, Symbol, Path, and Generation-Scoped Lexical Search on the Embedded Search Index](#task-13-implement-exact-symbol-path-and-generation-scoped-lexical-search-on-the-embedded-search-index)
    - [Task 14: Implement Bounded Graph Traversal, Dependency Paths, and Impact Analysis](#task-14-implement-bounded-graph-traversal-dependency-paths-and-impact-analysis)
    - [Task 15: Implement the Deterministic Context Compiler, Required Scope, Budgeting, and Slicing](#task-15-implement-the-deterministic-context-compiler-required-scope-budgeting-and-slicing)
    - [Task 16: Implement Snapshot-Pinned Source Serving and Actor-Scoped Receipt Coverage](#task-16-implement-snapshot-pinned-source-serving-and-actor-scoped-receipt-coverage)
@@ -138,6 +138,7 @@
    - [Task 22: Implement the Managed Analyzer Toolchain, Lock, Store, and Full Language Matrix](#task-22-implement-the-managed-analyzer-toolchain-lock-store-and-full-language-matrix)
    - [Task 23: Implement Early Cutoff on Declaration-Only Signature Digests](#task-23-implement-early-cutoff-on-declaration-only-signature-digests)
    - [Task 24: Scale posture](#task-24-scale-posture)
+   - [Task 25: Move the lexical tier onto the embedded search index](#task-25-move-the-lexical-tier-onto-the-embedded-search-index)
 - [31. Verification Matrix](#31-verification-matrix)
 - [32. Definition of Done](#32-definition-of-done)
 - [33. Authoritative References](#33-authoritative-references)
@@ -263,7 +264,7 @@ The first generally usable release shall provide:
 - Common manifest extraction for `go.mod`, `package.json`, `pyproject.toml`, `Cargo.toml`, and `pom.xml`.
 - Markdown and plain-text documentation indexing.
 - A canonical graph with evidence and precision classes.
-- SQLite persistence and FTS5 lexical retrieval.
+- SQLite persistence, and lexical retrieval over an embedded search index scored by our own BM25F.
 - Exact-symbol, definition, reference, implementation, caller, callee, dependency, test, configuration, documentation, path, and impact queries.
 - Deterministic context plans for `sweep`, `verify`, and `consolidate` phases.
 - Context slicing when required context exceeds a budget.
@@ -358,7 +359,7 @@ These constraints apply to every task and to all dispatched workers.
 | Indexing | One cross-process indexing owner per workspace; completed immutable units may be reused only when their entire input/dependency fingerprint matches. Failed or unsealed units are invisible. |
 | Publication | The active-generation pointer changes atomically only after validation. Optional failure cannot leak partial invalid facts or promote stale evidence as fresh. |
 | Queries | Pin a generation and retention lease at request start; all reads, pages, evidence, and source references use that binding. Public lists are paginated and all graph work is bounded. |
-| Determinism | Canonical hashes exclude operational IDs/timestamps where appropriate and include all semantic configuration, analyzer versions, unit inputs, ranking versions, and policy inputs. Another generation's FTS contents cannot change a pinned result. |
+| Determinism | Canonical hashes exclude operational IDs/timestamps where appropriate and include all semantic configuration, analyzer versions, unit inputs, ranking versions, and policy inputs. Another generation's search documents cannot change a pinned result. |
 | Source | Retain every eligible nondeleted file in CAS. Serving never falls back to the live checkout. Byte positions are authoritative; returned encoding must preserve bytes exactly. |
 | Coverage | Coverage belongs to one actor session and source hash. No receipt sharing across subagents, no search-snippet credit, no acknowledgment substituted for comprehension, and no strict readiness obtained through a waiver. |
 | Freshness | Historical read completeness is distinct from permission to modify the current worktree. A superseded or changed scope must be revalidated before the orchestrator writes. |
@@ -386,7 +387,7 @@ Go toolchain release facts are documented in [1](#ref-1) and [32](#ref-32). SQLi
        +-------------------------+-------------------------+
                                  |
             Generation-qualified canonical fact store
-                SQLite + FTS5 + immutable unit membership
+      SQLite + immutable unit membership + embedded search index
                                  |
        +-------------------------+-------------------------+
        |                         |                         |
@@ -430,9 +431,10 @@ Acquire workspace indexing lock and resource reservation
   -> create staging generation and provider plan
   -> execute bounded base units; run managed optional providers
   -> validate/seal each unit and normalize its facts with provenance
-  -> build lexical documents once per unit; reconcile deterministic identities
-  -> validate generation membership, source bindings, capabilities and FTS
-  -> atomically publish active-generation pointer
+  -> add each unit's search documents to the search index once; reconcile deterministic identities
+  -> validate generation membership, source bindings and capabilities
+  -> commit the search index with the generation as its payload, then
+     atomically publish the active-generation pointer
   -> release temporary files, reservations and lock
 ```
 
@@ -448,7 +450,7 @@ Watcher hint or periodic filesystem/Git reconciliation
   -> compare unit input/dependency fingerprints
   -> reuse matching sealed units by flat generation membership
   -> invalidate affected file/package/workspace/derived units
-  -> execute only invalid units, without cloning unchanged facts or FTS bodies
+  -> execute only invalid units, without cloning unchanged facts or search documents
   -> validate complete staging membership and atomically publish
 ```
 
@@ -862,7 +864,7 @@ Support generic local `.scip` import and the six managed indexer profiles of Sec
 
 Decode top-level protobuf wire fields incrementally with a bounded reader; official generated messages are used only for bounded individual records. Do not `io.ReadAll` or unmarshal an entire index, and do not assume one document is small. Bound nested message length, field size, recursion, occurrences, and total spool bytes before allocation. Large document records are walked incrementally; a disk-backed native-symbol map or two-pass import resolves forward references and external symbols without an unbounded in-memory symbol table. Keep local symbols document-scoped; duplicate occurrences deduplicate by semantic evidence key without collapsing distinct source ranges.
 
-**Delta import.** A managed indexer always re-indexes its whole unit (no indexer except `scip-java` has a partial mode, and narrowing `scip-typescript` or `scip-python` changes symbol names), but the importer never rewrites the whole unit. SCIP documents are independent and global symbol strings are position-free, so a refreshed unit is applied as a per-document delta against the stored unit: hash each canonical document, replace only documents whose hash changed (delete-then-insert by path; the format carries no recency marker), delete stored documents whose path is absent from the fresh index (a deleted file yields no document, not an empty one), and reject documents whose path escapes the project root (Go test mains in the build cache). The changed-document set is computed from the index, never from the git diff: adding a method to an interface changes the implementing file's document with no edit to it. Measured on five corpora, a one-file edit changes one document of 141, 954, 76, 1,316 and 2, so the import, FTS and reconcile cost falls to about 0.01–2% of a rewrite while the indexer's own wall time is unchanged. Index the unit's `external_symbols` separately; they are index-level, not per document. [6](#ref-6) [23](#ref-23)
+**Delta import.** A managed indexer always re-indexes its whole unit (no indexer except `scip-java` has a partial mode, and narrowing `scip-typescript` or `scip-python` changes symbol names), but the importer never rewrites the whole unit. SCIP documents are independent and global symbol strings are position-free, so a refreshed unit is applied as a per-document delta against the stored unit: hash each canonical document, replace only documents whose hash changed (delete-then-insert by path; the format carries no recency marker), delete stored documents whose path is absent from the fresh index (a deleted file yields no document, not an empty one), and reject documents whose path escapes the project root (Go test mains in the build cache). The changed-document set is computed from the index, never from the git diff: adding a method to an interface changes the implementing file's document with no edit to it. Measured on five corpora, a one-file edit changes one document of 141, 954, 76, 1,316 and 2, so the import, search-index and reconcile cost falls to about 0.01–2% of a rewrite while the indexer's own wall time is unchanged. Index the unit's `external_symbols` separately; they are index-level, not per document. [6](#ref-6) [23](#ref-23)
 
 Validate UTF-8/UTF-16/UTF-32 positions against the exact file. Project root, a matching path, timestamps, or an indexer version alone do not prove the index analyzed these bytes. A codectx-invoked profile records captured input hashes. A supplied index must have matching embedded source text or a verified input-hash manifest to qualify as exact-source compiler evidence. Without that association, import remains available but is marked `source_binding=unverified`, isolated from strict canonical compiler facts, and surfaced for discovery/diagnosis. Never silently upgrade stale externally supplied data to precise evidence.
 
@@ -952,7 +954,7 @@ PRAGMA cache_size = -1048576;
 
 One write connection and at most two read connections are the default **per workspace owner process**. Separate short-lived CLI readers have their own small budget; report them where observable and avoid a background service solely to centralize every command. Configure per-connection pragmas using a supported driver hook/connector or DSN mechanism and verify them on new pooled connections. Setting a pragma on one arbitrary pooled connection is insufficient. Foreign keys and database ownership are validated before serving. [11](#ref-11) [13](#ref-13) [28](#ref-28)
 
-Use short transactions and prepared statements. No large transaction contains an entire analyzer run. The WAL writer opens with `PRAGMA synchronous = NORMAL` by default and `storage.synchronous = "full"` opts back into a per-commit fsync (ADR-0004); readers are pinned to `FULL`. Batching amortizes write synchronization. Because there is one writer connection, this setting covers session and receipt writes too: under NORMAL a receipt is durable against an application crash or kill at commit, and against a power loss only from the next checkpoint or clean close. That window is stated, not implied, and `storage.synchronous = "full"` closes it (ADR-0004 Decision 1a). A future less-durable index-only mode must not weaken receipt durability further than that, and must not weaken it silently. `quick_check`, full FTS integrity checking, VACUUM, and whole-CAS verification run on initialization, an explicit `doctor --deep`, recovery, or scheduled maintenance, not every short-lived query invocation; an ordinary `doctor` reads the header, the schema fingerprint and the journal mode and reports the content walk `unverified`.
+Use short transactions and prepared statements. No large transaction contains an entire analyzer run. The WAL writer opens with `PRAGMA synchronous = NORMAL` by default and `storage.synchronous = "full"` opts back into a per-commit fsync (ADR-0004); readers are pinned to `FULL`. Batching amortizes write synchronization. Because there is one writer connection, this setting covers session and receipt writes too: under NORMAL a receipt is durable against an application crash or kill at commit, and against a power loss only from the next checkpoint or clean close. That window is stated, not implied, and `storage.synchronous = "full"` closes it (ADR-0004 Decision 1a). A future less-durable index-only mode must not weaken receipt durability further than that, and must not weaken it silently. `quick_check`, the search index's consistency check against the active generation, VACUUM, and whole-CAS verification run on initialization, an explicit `doctor --deep`, recovery, or scheduled maintenance, not every short-lived query invocation; an ordinary `doctor` reads the header, the schema fingerprint and the journal mode and reports the content walk `unverified`.
 
 A writer-owned passive checkpoint runs outside latency-sensitive queries. Monitor WAL size and checkpoint progress; long-lived read transactions must not pin WAL indefinitely. A WAL high-water threshold triggers checkpointing and indexing backpressure. `journal_size_limit` is not represented as a hard live-WAL cap. The operating disk quota includes DB, WAL, CAS, temporary files, and analyzer artifacts, with a reserved free-space margin.
 
@@ -1270,61 +1272,21 @@ CREATE TABLE search_units (
     search_key BLOB NOT NULL CHECK(length(search_key) = 32),
     node_id INTEGER,
     file_id BLOB NOT NULL,
-    path TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    name TEXT NOT NULL DEFAULT '',
-    qualified_name TEXT NOT NULL DEFAULT '',
-    signature TEXT NOT NULL DEFAULT '',
     start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
     end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
-    token_count INTEGER NOT NULL CHECK(token_count >= 0),
-    -- The search_fts rowid holding this document's indexed text. It is the
-    -- DOCUMENT's identity, not the row's: a delta carry-over copies this
-    -- column forward with the rest of the row, so the carried unit points at
-    -- the posting the text was originally indexed into instead of re-deriving
-    -- a body the producer never published (a producer's Body is not the source
-    -- over [start_byte,end_byte) -- see internal/provider/treesitter/facts.go).
-    -- Sharing is confined to one carry chain: CarryOver refuses a predecessor
-    -- of another provider or scope key, and generation_units is keyed by
-    -- (generation_id, provider_id, scope_key), so at most one row of a chain
-    -- is visible in any generation and a doc_id still names one document
-    -- there. The posting is released like node_ids: deleteUnit removes it only
-    -- when no other unit's row still names it.
-    doc_id INTEGER NOT NULL CHECK(doc_id > 0),
-    -- The lexical segment this document's postings were folded into, or NULL
-    -- while the unit is still building. It is the DOCUMENT's segment, not the
-    -- row's: a carry-over copies it forward with doc_id, which is what makes a
-    -- carried unit own exactly the segments that hold at least one of its
-    -- carried documents rather than every segment its predecessor ever owned.
-    -- The reference is NO ACTION: a segment a document still names must not be
-    -- collectable. It is the SOURCE OF TRUTH for which segments a generation
-    -- reads and for which segments are garbage: a compaction re-points every
-    -- row of its inputs at the merged segment, so no row names an absorbed
-    -- segment afterwards and a retired unit that is attached again finds its
-    -- documents where its rows point.
-    segment_id INTEGER REFERENCES lexical_segments(id),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
 );
--- The lexical tier stores no second copy of the source (ADR-0003 §2.1).
--- search_units carries no `body` column and search_fts is CONTENTLESS, so the
--- indexed body text exists only as index postings. That makes the postings
--- irreplaceable rather than merely economical: no row of this database can
--- reconstruct the text a document was indexed with, which is why a carry-over
--- REUSES a carried document's posting through search_units.doc_id instead of
--- rebuilding one. `contentless_delete=1` is
--- what keeps DELETE and INSERT OR REPLACE available on unit invalidation
--- (https://sqlite.org/fts5.html#contentless_tables, engine floor 3.43.0; the
--- embedded engine is 3.53.4). Snippets and highlights are served from the
--- content store through the verified range reader, over the file_id and byte
--- range each row already carries -- never from this index. The index's rebuild
--- source is therefore the content store, not the database (docs/storage.md).
-CREATE VIRTUAL TABLE search_fts USING fts5(
-    name, qualified_name, signature, path, body,
-    content='', contentless_delete=1, tokenize='unicode61', detail='full'
+-- A search document's text, columns, kind, path and token count live in the
+-- search index (Section 12.4); this row is only its identity, from search key
+-- to node, with the file and byte range a hit's source window is read from. The per-unit totals are what make N and the total
+-- token count of a generation exact sums over its visible units.
+CREATE TABLE search_unit_totals (
+    unit_id INTEGER PRIMARY KEY REFERENCES units(id) ON DELETE CASCADE,
+    document_count INTEGER NOT NULL CHECK(document_count >= 0),
+    token_count INTEGER NOT NULL CHECK(token_count >= 0)
 );
-CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'instance');
 CREATE TABLE context_manifests (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     generation_id INTEGER NOT NULL,
@@ -1773,8 +1735,8 @@ Storage invariants beyond DDL:
 - `node_facts` and `relation_facts` have supporting evidence before seal. Native aliases remain scoped. `unit_dependencies` is acyclic and references sealed dependencies.
 - Session history, context entries, observation references, leases, and capsule scope must belong to the session/manifest's generation and snapshot. Exact actor identity is checked by the application on every session operation.
 - Immutable unit tables are never updated after seal. Source manifests, sealed manifests, and capsules are also immutable. Current session pointers and versioned workflow state are explicitly mutable.
-- Insert/delete FTS content and index rows in the same write transaction. Before deleting `search_units`, issue the FTS delete with its old indexed values. Cascading content deletion is not a substitute for maintaining the FTS index. Unit/GC deletion uses the store's deletion procedure, not raw `DELETE units`.
-- FTS row counts alone do not prove consistency. Use supported FTS integrity checking against external content on initial/release/deep validation; normal unit sealing validates that its transaction emitted the exact expected document keys. Do not perform a global FTS rebuild for a tiny refresh. [12](#ref-12)
+- A unit's search documents are added to the search index once, when the unit is first built, and deleted from it (by term on the `unit` field) only when collection frees the unit. Unit/GC deletion uses the store's deletion procedure, not raw `DELETE units`; the procedure deletes the unit's documents from the search index as well as its rows.
+- The search index commits first, with the generation's id as its commit payload, and SQLite activates the generation after that, so a generation SQLite has activated is always committed in the search index. On start, reconciliation deletes the documents of units no SQLite generation references and re-plans any unit whose documents never reached a commit, like any other unsealed unit. Normal unit sealing validates that the unit emitted the exact expected document keys; nothing rebuilds the whole index for a small refresh.
 
 <a id="123-generation-activation-and-failure-isolation"></a>
 ### 12.3 Generation Activation and Failure Isolation
@@ -1803,12 +1765,12 @@ An active-generation lookup and its retention lease are acquired consistently un
 <a id="124-search-isolation-storage-growth-and-cleanup"></a>
 ### 12.4 Search Isolation, Storage Growth, and Cleanup
 
-A shared FTS corpus contains documents from several immutable units and retained generations. SQLite's built-in BM25 uses corpus-wide document statistics; filtering rows afterward does not make its statistics generation-local. Therefore canonical lexical ranking uses **generation-scoped BM25 statistics**, not the shared table's raw `bm25()` result. This is an architectural consequence of immutable snapshot queries, not a claim that SQLite implements generation filtering itself. [12](#ref-12)
+The lexical index is one embedded search index, linked into the binary, that holds the search documents of every retained unit: compressed postings with frequencies and positions in immutable segments read through memory maps, a dictionary per column, and fast (columnar) fields for `unit`, `kind`, the path and `token_count`. The index keeps only its latest commit, so a snapshot is not an index directory: a generation is a **visibility set** of units over the one index. The set comes from SQLite's list of the generation's units, is resolved once per term ordinal of the `unit` fast field, and is expanded per segment into a bitset over document ids. Hidden documents are never candidates, and they never count in the document count N, in the total token count or in document frequency, so another generation's documents cannot change a pinned result. Canonical lexical ranking therefore uses **generation-scoped BM25F statistics**, exact for the generation being searched: N and the total token count are sums of per-unit totals held in SQLite, and df is counted over visible postings. The route that applies the set (the segment's alive set, a query wrapper or the collector) is **pending**: it is chosen by its time on the reference export at 10% and 50% of units hidden, and all three routes give identical pages. [12](#ref-12)
 
-Obtain matching terms and occurrences from FTS/vocabulary using the same tokenizer, restrict documents through `generation_units`, and compute document frequency/length statistics for that membership. Use a tiny temporary FTS query-token table on a connection when tokenizer access requires it; do not reimplement Unicode tokenization. Stream per-query aggregates and rank with a bounded heap or disk-backed result spool. Cache only small scalar/term statistics keyed by AnalysisKey and the exact query with a byte cap. No second full corpus token index or graph-sized Go map is needed. Section 14 defines scoring and pagination.
+Each document is tokenized once, when its unit is added. The tokenizer forms tokens from letters, numbers and private-use characters, treats everything else as a separator, folds case and removes diacritics, and has no silent length cut. Whether a **code-aware form** replaces it is **pending**: that form emits the whole identifier and also its camelCase and snake_case parts at the same position, and it is adopted if it lifts the subword set, holds the name set within 0.01 MRR@10 and does not lower the doc set. The writer's thread count and memory budget, the merge threads and the search executor are derived from the admission's measured need like every other worker, with no fixed constant. The index commits once per generation activation, never once per unit, and its background merges replace any merge at activation. Section 14 defines scoring and pagination.
 
-Retention keeps the results of the last `retain_refs` distinct refs (branches or commits) the user actually indexed, not the last N index snapshots: switching A → B → C → A must find A's SCIP and link units still on disk and reuse them without a run. Each activated generation records the ref it was built from; a ref's most recent generation is retained while the ref is among the last `retain_refs` worked on, and every unit any retained generation references is retained with it. Sealed but not yet activated units (a link unit still refreshing when the user switched away) are retained by the same rule through the generation they were produced for. There is no default size limit on this store; `[index] max_retained_bytes` is user-set only, `0` by default, and when set it evicts least-recently-used refs first and never the active one, exactly the user-set-only posture memory has. Generation removal deletes only membership and metadata after leases/session references are resolved. Units referenced by another retained generation or unit dependency remain. Remove unreachable units in reverse dependency order through the FTS-aware store procedure, then orphan identities and origin runs, then unreferenced source blobs using the GC grace protocol. Report disk categories separately; generation pruning does not justify unbounded retained completed sessions or query spools.
-An alias may identify a node defined by a completed dependency rather than copying its attributes into the alias-owning unit; the seal validator requires that target to be visible through the unit/dependency closure. An idempotency-key collision with a different open-request hash fails rather than reusing a session. Snapshot header counts are computed/validated at seal, not rescanned on every status call. Query spools are bounded private files whose signed cursor header and durable lease bind their generation, expiry and immutable query; no second database catalog is introduced.
+Retention keeps the results of the last `retain_refs` distinct refs (branches or commits) the user actually indexed, not the last N index snapshots: switching A → B → C → A must find A's SCIP and link units still on disk and reuse them without a run. Each activated generation records the ref it was built from; a ref's most recent generation is retained while the ref is among the last `retain_refs` worked on, and every unit any retained generation references is retained with it. Sealed but not yet activated units (a link unit still refreshing when the user switched away) are retained by the same rule through the generation they were produced for. There is no default size limit on this store; `[index] max_retained_bytes` is user-set only, `0` by default, and when set it evicts least-recently-used refs first and never the active one, exactly the user-set-only posture memory has. Generation removal deletes only membership and metadata after leases/session references are resolved. Units referenced by another retained generation or unit dependency remain. Remove unreachable units in reverse dependency order through the store's deletion procedure, which also deletes their documents from the search index, then orphan identities and origin runs, then unreferenced source blobs using the GC grace protocol. Report disk categories separately; generation pruning does not justify unbounded retained completed sessions or graph query spools.
+An alias may identify a node defined by a completed dependency rather than copying its attributes into the alias-owning unit; the seal validator requires that target to be visible through the unit/dependency closure. An idempotency-key collision with a different open-request hash fails rather than reusing a session. Snapshot header counts are computed/validated at seal, not rescanned on every status call. Graph query spools are bounded private files whose signed cursor header and durable lease bind their generation, expiry and immutable query; no second database catalog is introduced.
 
 
 ---
@@ -1821,7 +1783,7 @@ An alias may identify a node defined by a completed dependency rather than copyi
 
 The coordinator owns tool and trigger detection, the provider DAG, resource reservations, unit scheduling, reuse, capability reporting, and activation. Reuse must be demonstrated by equal UnitID and validated input/dependency membership, not assumed because a file's path is unchanged. File-local providers reprocess changed files only; semantic providers use their declared package/workspace unit. A source addition, deletion, rename, changed manifest, build flag, query/grammar version, or dependency catalog can invalidate downstream units.
 
-Stage data on disk; compute dependency closure with bounded queues and indexed reverse dependency lookups. If a semantic provider cannot safely invalidate locally, rerun its declared larger unit and report it. Do not secretly rerun every base provider over the full repository on each small edit. A no-op refresh emits reuse counts and performs no parse or FTS rewrite. Early cutoff: a semantic unit's inputs are keyed on a declaration-only signature digest of each member file (exports, types, function signatures, imports; not bodies) in addition to the content hash of the unit's own files, so an edit confined to function bodies in file F re-runs only F's own unit and never the SCIP or dependence units of modules that merely depend on F's module. The digest is per language, conservative (anything the language can observe across files is in it), and proven by differential tests before a language may use it (Task 23); until proven, that language falls back to content-hash invalidation. Late-sealing optional units (Section 11.6) publish the same way: a new generation reusing every active unit plus the sealed one, then one atomic activation; the active generation is never edited in place.
+Stage data on disk; compute dependency closure with bounded queues and indexed reverse dependency lookups. If a semantic provider cannot safely invalidate locally, rerun its declared larger unit and report it. Do not secretly rerun every base provider over the full repository on each small edit. A no-op refresh emits reuse counts and performs no parse and no search-index write. Early cutoff: a semantic unit's inputs are keyed on a declaration-only signature digest of each member file (exports, types, function signatures, imports; not bodies) in addition to the content hash of the unit's own files, so an edit confined to function bodies in file F re-runs only F's own unit and never the SCIP or link units of modules that merely depend on F's module; the link provider's own delta compares each file's interface summary, inferred values included, and reruns only the sites whose recorded reads changed (ADR-0014). The digest is per language, conservative (anything the language can observe across files is in it), and proven by differential tests before a language may use it (Task 23); until proven, that language falls back to content-hash invalidation. Late-sealing optional units (Section 11.6) publish the same way: a new generation reusing every active unit plus the sealed one, then one atomic activation; the active generation is never edited in place.
 
 Independent ready units run only when global byte/worker/disk admission permits. Acquire reservations in a fixed order to avoid deadlock, and release exactly once on all paths. Batches are written serially but providers can prepare bounded work concurrently. A blocked sink must propagate cancellation back to the producer. Repeated failures have a bounded retry policy; no busy loop or retry storm.
 
@@ -1886,13 +1848,15 @@ All arrays, query text, filters, offsets, and limits are validated before work b
 <a id="142-retrieval-and-deterministic-ranking"></a>
 ### 14.2 Retrieval and Deterministic Ranking
 
-Retrieval tiers are exact normalized path, exact qualified name, qualified-name prefix, exact short name, and lexical FTS. Case-sensitive identities are not indiscriminately lowercased. Normalize query whitespace and path separators carefully; SQL parameters and an explicit literal-text FTS encoder prevent SQL/FTS syntax injection. Prefix queries use indexed ranges and escaped semantics, not an unbounded leading-wildcard scan.
+Retrieval tiers are exact normalized path, exact qualified name, qualified-name prefix, exact short name, and lexical. The exact tiers are not ranked and return every match. Case-sensitive identities are not indiscriminately lowercased. Normalize query whitespace and path separators carefully; SQL parameters, and query terms built as literal terms for the search index rather than parsed query syntax, prevent SQL and query-syntax injection. Prefix queries use indexed ranges and escaped semantics, not an unbounded leading-wildcard scan.
 
-Lexical retrieval retains BM25 relevance, with membership-scoped statistics as specified in Section 12.4. Use the same versioned formula and column weights for a pinned analysis: name 5, qualified name 5, signature 2, path 2, body 1; `k1=1.2`, `b=0.75`. Compute membership-specific document count, average token length, phrase/term frequency, and document frequency. Do not use a score from the shared global corpus and call it generation-local. Quoted multi-token phrases use actual phrase occurrences, not the sum of unrelated individual tokens. [12](#ref-12)
+Lexical retrieval ranks with BM25F, with membership-scoped statistics as specified in Section 12.4: term frequency is weighted across columns and saturated once, not scored per column and summed. Use the same versioned formula and column weights for a pinned analysis: name 5, qualified name 5, signature 2, path 2, body 1; `k1=1.2`, `b=0.75`. The score is computed by our own collector inside the search index's search loop, reading per-column term frequencies from the postings and `token_count`, `kind`, the path ordinal and the search key from fast fields. Scores are f64 and quantized to 1e-6; document length is the exact `token_count`, never a rounded length code; the logarithm implementation is pinned so the Go and Rust sides compute it identically, which a shared test vector proves. Whether document length is **weighted per column** (Σ weight(c)·length(c)) instead of the unweighted total is **pending**: the weighted form is adopted if it raises MRR@10 on two of the three quality sets and lowers it on none, and otherwise the unweighted total stays. Do not use a score whose statistics count hidden or deleted documents and call it generation-local. Quoted multi-token phrases use actual phrase occurrences from the index's positions, not the sum of unrelated individual tokens. Kind and folder filters are tested per document inside the collector from fast fields (a set of term ordinals; a contiguous ordinal range of the sorted path dictionary), never as a separate scan. [12](#ref-12)
+
+A ranked search serves its best results, never every match: page n is collected as the top 200·n by (quantized score, content tie key) with a heap of that size, and block-max WAND with BM25F upper bounds per block of the union postings skips every document that cannot enter the top k without changing the top k. The match count is exact when every match was visited and otherwise a lower bound marked as one. Nothing of a ranked answer is sorted or spooled to disk.
 
 Map the score to a fixed integer ranking component with documented rounding. Validate identical ranking on all supported release targets; any platform-sensitive numerical edge must be resolved in the shared scorer before claiming cross-platform canonical equivalence. Integer graph contributions and deterministic final tie-breakers do not alone fix an unstable floating input. Canonical regression fixtures include near-ties, duplicate occurrences, punctuation, and unrelated generation activation/pruning.
 
-Tie-break by retrieval tier, descending score, normalized path, start byte, NodeID, then evidence/search key. Deduplicate hits by canonical entity or file chunk as the endpoint specifies, preserving bounded reasons and occurrence counts. Search documents carry signatures and linked source positions; generic results never return source bodies. Raw source is obtained through a context session only.
+Tie-break by retrieval tier, descending score, then content-derived keys only (normalized path, start byte, then the remaining content keys and the identity keys), never by an internal document address, which changes with threads and merges. Deduplicate hits by canonical entity or file chunk as the endpoint specifies, preserving bounded reasons and occurrence counts. Search documents carry signatures and linked source positions; generic results never return source bodies. Raw source is obtained through a context session only.
 
 <a id="143-graph-queries-and-impact"></a>
 ### 14.3 Graph Queries and Impact
@@ -1906,9 +1870,9 @@ Impact expands an explicit relation allowlist, prioritizing implementations/over
 <a id="144-cursor-and-cache-contracts"></a>
 ### 14.4 Cursor and Cache Contracts
 
-One shared internal cursor codec signs bounded versioned payloads with an installation-local private random key. Payload includes endpoint, generation/AnalysisKey, normalized query/filter/ordering hash, last sort tuple or spool ID, lease ID, and expiry. Reject tampering, expired state, another endpoint/query/filter, and unknown versions. A cursor key is not a user authentication system.
+One shared internal cursor codec signs bounded versioned payloads with an installation-local private random key. Payload includes endpoint, generation/AnalysisKey, normalized query/filter/ordering hash, the last sort tuple (for a ranked search, the last quantized score and content tie key) or, for a graph answer, its spool ID, lease ID, and expiry. Reject tampering, expired state, another endpoint/query/filter, and unknown versions. A cursor key is not a user authentication system.
 
-Use keyset pagination or bounded spools, not growing SQL offsets. Deduplication precedes paging so duplicates cannot hide later hits. Temporary query spools count against disk quotas, have TTLs, and retain the generation they reference. Replaying a cursor is deterministic and non-destructive. Small cache entries are byte-accounted and generation-qualified; no persistent whole-graph cache is justified. Cancellation closes rows, rolls back transactions, cancels subprocess requests, and releases leases/reservations.
+Use keyset pagination or bounded spools, not growing SQL offsets; a ranked search is keyset-paged and spools nothing, and a cursor that depends on content only survives index merges between pages. Deduplication precedes paging so duplicates cannot hide later hits. Temporary graph query spools count against disk quotas, have TTLs, and retain the generation they reference. Replaying a cursor is deterministic and non-destructive. Small cache entries are byte-accounted and generation-qualified; no persistent whole-graph cache is justified. Cancellation closes rows, rolls back transactions, cancels subprocess requests, and releases leases/reservations.
 Generation membership filtering occurs before scoring, deduplication and top-K/page limits. Timeouts/cancellation return an explicit noncanonical incomplete response and never persist a supposedly reproducible completed manifest. Deterministic work-limit prefixes use stable ordering; time-dependent cutoffs are not canonical compiler inputs.
 
 
@@ -1988,7 +1952,7 @@ Only sweep and verify can open a new session. Consolidate is compiled by the wor
 <a id="152-seed-discovery-and-required-scope"></a>
 ### 15.2 Seed Discovery and Required Scope
 
-Resolve explicit seeds first; then backtick-delimited identifiers/paths, path-like tokens, qualified identifiers, exact resolution, FTS terms, and low-priority changed files. Preserve ambiguity; no LLM rewrites task intent. An empty or ambiguous scope produces a discovery result, not an implementation-ready plan.
+Resolve explicit seeds first; then backtick-delimited identifiers/paths, path-like tokens, qualified identifiers, exact resolution, lexical terms, and low-priority changed files. Preserve ambiguity; no LLM rewrites task intent. An empty or ambiguous scope produces a discovery result, not an implementation-ready plan.
 
 For verify, every selected implementation file and its relevant callers, callees, contracts/types, state ownership, dependencies, configuration, tests, documentation, and integration/registration boundaries must be assigned a full-file requirement when it informs the decision. Follow reachability through actual wiring, exports, registries, reflection/config conventions, and shared helpers, not just textual references. The graph is a starting point, not proof that all dynamic or external dependencies were found.
 
@@ -2511,7 +2475,7 @@ CTX_TOOL_OVERRIDE_INVALID
 
 Errors have a typed code, safe message, bounded structured details, retryability and remediation. Cancellation is not logged as an unexpected crash. Retry only transient operations with a fixed attempt/deadline budget; never retry a malformed input, bad source hash or denied trust decision as if it were a temporary network fault.
 
-`doctor` checks build/toolchain pins, workspace/data-directory permissions, free space, SQLite schema/FTS/WAL, active pointer, recent capture/freshness, sample CAS blocks, bundled grammar availability, managed toolchain status per lock entry, orphan temporary state and session/lease retention. `--deep` performs expensive integrity and parser smoke checks explicitly. No full database scan occurs on every version/search command.
+`doctor` checks build/toolchain pins, workspace/data-directory permissions, free space, SQLite schema/WAL, the search index, active pointer, recent capture/freshness, sample CAS blocks, bundled grammar availability, managed toolchain status per lock entry, orphan temporary state and session/lease retention. `--deep` performs expensive integrity and parser smoke checks explicitly. No full database scan occurs on every version/search command.
 
 Status exposes current and peak parent RSS, aggregate base-worker RSS, Go-managed memory, native-worker memory, query/cache/queue reservations, live subprocesses, pending events, DB/WAL/temp/CAS bytes, unit reuse and parse counts, capability limits, and per-stage timing. Record unavailable metrics as unavailable, not zero. Peak process-tree memory is sampled concurrently, not calculated by adding unrelated per-process historical peaks. There is no remote metrics or telemetry endpoint in V1.
 
@@ -2536,18 +2500,18 @@ Base means parent process **plus all mandatory parser workers**, not only Go hea
 |---|---:|
 | `version --json` / help, no DB or analyzer startup | p95 at most 50 ms process wall time |
 | Exact symbol/path query, warm store, end-to-end CLI | p95 at most 50 ms |
-| FTS lexical search, warm store, bounded page | p95 at most 150 ms |
+| Lexical search, warm store, bounded page | p95 at most 150 ms |
 | One-hop caller/callee query, ordinary fanout | p95 at most 100 ms |
 | Context plan with up to 50,000 visited nodes | p95 at most 1 s |
 | Ten changed medium files, base refresh | p95 at most 1.5 s after debounce, excluding a scheduled full reconciliation |
-| No-change base refresh | No parser work and no FTS body rewrite; p95 at most 250 ms for ordinary metadata reconciliation |
+| No-change base refresh | No parser work and no search-index write; p95 at most 250 ms for ordinary metadata reconciliation |
 | Cold base index, full reference fixture | At most 3 min |
 | Idle MCP process after caches settle and parser workers expire | RSS at most 128 MiB |
 | Interactive base process-tree peak | At most 256 MiB for the specified query concurrency |
 | Base indexing process-tree peak | At most 768 MiB, including native parser workers |
 | Source chunk, default | 64 KiB raw; explicit 1-MiB raw configurable ceiling |
 | Base storage, one active snapshot | At most 3.5 times eligible source bytes; report graph-heavy fixture misses separately |
-| Retained unchanged generations | No duplicate source blobs, graph facts or FTS bodies; only bounded membership/audit metadata growth |
+| Retained unchanged generations | No duplicate source blobs, graph facts or search documents; only bounded membership/audit metadata growth |
 
 The no-change fast path does not replace scheduled content verification. Measure full reconciliation cost separately and expose its staleness interval. High-fanout or adversarial requests have correctness/bounded-resource targets rather than an unconditional sub-100-ms promise. Cold and warm runs, concurrent indexing/query load, low-memory mode and long-lived watch/MCP soak are all reported.
 
@@ -2558,7 +2522,7 @@ Go's memory limit is a soft runtime control and does not cover arbitrary native 
 
 Concrete defaults are in Section 20. Reserve bytes before reading/decoding a file, allocating provider batches, starting parser work, storing graph frontiers, serializing responses or materializing analyzer input. The scheduler uses the smaller of effective CPU capacity and memory-admissible worker count, with a default two-parser-worker ceiling. Leave headroom for transient allocations and RSS variation. Degrade concurrency before coverage.
 
-The aggregate resource report must include queue payloads, retained slice capacities, duplicated strings/JSON, native trees, pending LSP responses, SQLite connection caches, vocabulary/query spools, source buffers and child IPC. Caches have byte and entry limits with one owner; oversized buffers are not returned to a pool that retains them forever. Avoid `sync.Pool` as a correctness or memory-bound mechanism. Copy only at explicit ownership boundaries, release source/AST references after extraction, and stream large outputs to bounded destinations. No forced GC after every file or unmeasured allocator trick is accepted as a speed improvement.
+The aggregate resource report must include queue payloads, retained slice capacities, duplicated strings/JSON, native trees, pending LSP responses, SQLite connection caches, the search index's writer budget, graph query spools, source buffers and child IPC. Caches have byte and entry limits with one owner; oversized buffers are not returned to a pool that retains them forever. Avoid `sync.Pool` as a correctness or memory-bound mechanism. Copy only at explicit ownership boundaries, release source/AST references after extraction, and stream large outputs to bounded destinations. No forced GC after every file or unmeasured allocator trick is accepted as a speed improvement.
 
 Hard OS memory enforcement is platform-dependent. Use supported cgroup/job/process controls where available, report when only admission/monitoring is available, and stop a worker approaching its budget without admitting incomplete output. An OOM-killed optional provider yields explicit degradation, not application-wide silent data loss. A 2-GiB test environment must still run the full base feature set with fewer workers, subject to documented slower throughput and the same semantic results.
 
@@ -2572,7 +2536,7 @@ Hard OS memory enforcement is platform-dependent. Use supported cgroup/job/proce
 | Parser | Lazy bounded worker pool; explicit native closure; no all-repository AST cache. |
 | Provider import | Length bounds before allocation; disk-backed mappings for global identifiers. |
 | Storage | Prepared bounded batches, short transactions, byte-limited connection pools, no full integrity scan on query startup. |
-| Search | Indexed exact lookup, generation-scoped ranking, bounded top-K/spool, no global corpus clone. |
+| Search | Indexed exact lookup returning every match; generation-scoped ranking served as a pruned top k with no spool; no global corpus clone. |
 | Graph | Indexed batched adjacency, bounded compact frontier/visited state, no N+1 hydration. |
 | Context | Metadata-only planning, bounded reasons, ordinal slice references, no source bundle in heap. |
 | Source | Indexed line checkpoints plus per-block integrity; no full-file rehash for each chunk. |
@@ -2681,7 +2645,7 @@ This is a falsifiable definition of acceptance, not a claim that static analysis
 | Reused unit misses an indirect dependency | Stale caller/type/impact facts | Full input/dependency fingerprint, reverse invalidation, add/delete/rename fixture. |
 | Weak canonical merging | False calls or lost overloads | Scoped strong aliases, name-path identities with parameter-type disambiguators (ADR-0014), name-only candidates kept apart as `may_call` (ADR-0015). |
 | Partial provider output becomes visible | Corrupt or overstated capability | Seal/admit independent complete units only; failed unit invisible; explicit per-scope completeness. |
-| Shared FTS corpus changes pinned ranking | Nondeterministic context | Generation-scoped statistics and unrelated-generation activation/pruning regression. |
+| Shared search index changes pinned ranking | Nondeterministic context | Visibility sets with statistics over visible documents only, and unrelated-generation activation/pruning regression. |
 | Native parser allocates outside Go heap or crashes | OOM or MCP crash | Small parser subprocess pool, native closure, aggregate RSS and callback-path soak. |
 | A single protobuf/CSV/XML record is huge | OOM despite top-level streaming | Length/depth/field caps before allocation and on-disk mappings. |
 | Current worktree is confused with Git blobs or LSP state | Wrong source with apparently precise evidence | Actual-byte CAS capture, private materialization, exact hash/encoding checks. |
@@ -2772,7 +2736,8 @@ There is no `migrations/`, legacy provider path, duplicate graph/search cursor i
 | Live semantics | Small bounded LSP client/manager | Only required read-only methods and profiles, not an editor or generic command executor. |
 | Deep analysis | In-process control-flow, dependence and call-linking analysis in the structural and linking providers | No external analyzer or runtime; each algorithm chosen against a named alternative (ADR-0012 decision 2); authored goldens per language. |
 | Analyzer distribution | Product-owned tool lock with re-hosted payloads and a stdlib fetch/verify/extract path | No package manager, npm, coursier or `go install` at runtime; runtimes (Node, JDK) are lock entries too. |
-| Database/FTS | SQLite through `modernc.org/sqlite`, FTS5 | Embedded indexed store; own generation membership/scoped ranking where required. |
+| Database | SQLite through `modernc.org/sqlite` | Embedded indexed store; generation membership. |
+| Lexical index | An embedded search library: a Rust crate linked through cgo, under a pinned Rust toolchain with a locked and vendored crate tree | Compressed postings, positions and fast fields; ranking stays ours (BM25F in a custom collector). |
 | Watch | `fsnotify` with reconciliation | Notifications are hints; avoid a bespoke filesystem watcher. |
 | CLI/config | Cobra and pinned TOML parser | Own strict policy validation, not a global dynamic configuration framework. |
 | Source/CAS/graph/context/coverage | Small Go domain implementations | These exact snapshot/evidence/actor semantics are the product differentiator. |
@@ -2942,7 +2907,7 @@ git diff --check
 <a id="task-5-implement-the-current-sqlite-schema-reusable-units-leases-and-atomic-activation"></a>
 ### Task 5: Implement the Current SQLite Schema, Reusable Units, Leases, and Atomic Activation
 
-**Deliverable:** One initialized schema, reusable immutable unit storage, pinned readers, FTS ownership, actor/workflow persistence and crash-safe publication, without migrations.
+**Deliverable:** One initialized schema, reusable immutable unit storage, pinned readers, search-document identity rows and per-unit totals, actor/workflow persistence and crash-safe publication, without migrations.
 
 **Files and ownership:** `internal/storage/sqlite/open.go`, `schema.go`, `schema.sql`, `units.go`, `query.go`, `state.go`; `internal/pagination/` for the one signed cursor/lease/spool utility. Extend existing focused storage tests.
 
@@ -2951,9 +2916,9 @@ git diff --check
 **Produces / contract:** `Store.BeginGeneration`, `BeginUnit`, `SealUnit`, `AttachUnit`, `Activate`, `Abort`, `PinGeneration`, bounded query methods and transactional state methods. `PinnedReader` exposes Binding, bounded reads and `Close() error`. Cursor signing and lease APIs are shared by search/graph/context, with receipt signing reusing the same cryptographic framing primitives.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One storage integration scenario proves staging invisibility, unchanged unit reuse across two snapshots, changed-input rejection, failed activation rollback, retained original provider provenance, cross-snapshot FK rejection, FTS-aware deletion and a lease/GC race. Exercise schema initialization/mismatch, not migration history.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One storage integration scenario proves staging invisibility, unchanged unit reuse across two snapshots, changed-input rejection, failed activation rollback, retained original provider provenance, cross-snapshot FK rejection, unit deletion and a lease/GC race. Exercise schema initialization/mismatch, not migration history.
 - [ ] **Step 2: Implement the complete production path.** Pin the Section 12 driver/libc versions, verify the embedded SQLite WAL-reset fix/version, and implement the complete Section 12 DDL, per-connection pragmas, bounded read/write pools, prepared byte-limited batches and strict typed JSON columns. Store source manifest rows instead of a whole JSON manifest. Facts join via generation_units; orphan identities never imply visible facts. Validate whole-unit evidence/aliases/endpoints/source inputs before seal. Preserve provider run provenance across generation deletion. Configure session/receipt writes under the store's stated durability window (ADR-0004 Decision 1a), short read transactions and scheduled passive checkpoint/backpressure. Store/schema fingerprint mismatch fails closed; rebuild is explicit and creates a separate cache.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Implement signed bounded cursors, keyset/spool storage and TTL leases before parallel query tasks. Do not maintain FTS only through cascades or row counts: explicit index/content updates share a transaction. Pin acquisition and GC publication use one coordination protocol. Schema SQL and Go constraints must agree on partial-null ranges, current manifest binding and invalid state changes. Update storage/operations docs and prove every public read excludes unsealed units.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Implement signed bounded cursors, keyset/spool storage and TTL leases before parallel query tasks. The unit-deletion procedure is the one place a unit's rows go; the search index's documents follow it (Task 25). Pin acquisition and GC publication use one coordination protocol. Schema SQL and Go constraints must agree on partial-null ranges, current manifest binding and invalid state changes. Update storage/operations docs and prove every public read excludes unsealed units.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
@@ -3149,10 +3114,10 @@ git diff --check
 - [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
 
 
-<a id="task-13-implement-exact-symbol-path-and-generation-scoped-fts5-search"></a>
-### Task 13: Implement Exact, Symbol, Path, and Generation-Scoped FTS5 Search
+<a id="task-13-implement-exact-symbol-path-and-generation-scoped-lexical-search-on-the-embedded-search-index"></a>
+### Task 13: Implement Exact, Symbol, Path, and Generation-Scoped Lexical Search on the Embedded Search Index
 
-**Deliverable:** Paginated exact/lexical discovery whose canonical ranking is stable while other generations are built or pruned.
+**Deliverable:** Paginated exact/lexical discovery whose canonical ranking is stable while other generations are built or pruned. The exact tiers return every match; the lexical tier serves its best results as a pruned top k.
 
 **Files and ownership:** `internal/search/` exact/lexical/scoring code; reuse `internal/pagination/` and bounded storage query methods.
 
@@ -3162,8 +3127,8 @@ git diff --check
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One search fixture proves exact-before-lexical ranking, prefix/Unicode/literal punctuation handling, occurrence deduplication, tampered/stale cursors and unchanged scores after unrelated staging/activation/GC. Compare canonical domain data rather than CLI/MCP duplicate goldens.
-- [ ] **Step 2: Implement the complete production path.** Use indexed normalized exact lookup and FTS candidate matching. Derive generation-local BM25 document/term/phrase statistics using visible units and the actual FTS tokenizer; no raw shared-corpus ranking. Stream aggregates/candidates with bounded heap or disk spool, quantize scores consistently and apply complete stable tie-breaks. Keep source text out of generic result payloads. Do not use an unbounded token dictionary or scan all source into memory.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Query plans and representative high-frequency terms must be measured; batching/caching is keyed by AnalysisKey and byte-limited. Use shared signed keyset/spool cursors and leases, enforce deadlines/work/page limits, close rows on cancellation and report when a hard bound prevents completeness. Verify supported-platform near-tie determinism before claiming cross-build canonical parity.
+- [ ] **Step 2: Implement the complete production path.** Use indexed normalized exact lookup and the search index's candidate matching. Derive generation-local BM25F document/term/phrase statistics over visible units, with the index's own tokenizer; no statistics that count hidden documents. Collect page n as the top 200·n in a heap, prune with block-max WAND, report the match count exact or as a marked lower bound, quantize scores consistently and apply complete content-only tie-breaks; nothing is spooled. Keep source text out of generic result payloads. Do not use an unbounded token dictionary or scan all source into memory.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Query plans and representative high-frequency terms must be measured; batching/caching is keyed by AnalysisKey and byte-limited. Use shared signed keyset cursors and leases, enforce deadlines/work/page limits, close rows on cancellation and report when a hard bound prevents completeness. Verify supported-platform near-tie determinism before claiming cross-build canonical parity.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
@@ -3213,7 +3178,7 @@ git diff --check
 **Produces / contract:** `Compiler.Compile(ctx, model.ContextRequest) (model.ContextManifest,error)`, bounded manifest entry/slice/exclusion pages and the byte-length token heuristic.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One deterministic context fixture proves required source/test/contract/caller selection, an unresolved boundary, scoped FTS stability, exact byte/slice floors, an overlarge single file and a multi-slice complete scope. Recompile after reopen and compare canonical hashes, not volatile session metadata.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One deterministic context fixture proves required source/test/contract/caller selection, an unresolved boundary, generation-scoped lexical stability, exact byte/slice floors, an overlarge single file and a multi-slice complete scope. Recompile after reopen and compare canonical hashes, not volatile session metadata.
 - [ ] **Step 2: Implement the complete production path.** Extract seeds exactly in Section 15 order and record all unresolved ambiguity. Build bounded required scope over the graph and caller/state/dependency/integration boundaries; no score-based silent removal of a required consumer. Use integer graph scoring and bounded path reasons. Deduplicate selected files globally, count actual serialized overhead, estimate tokens from metadata without loading source, and keep the estimator explicitly heuristic.
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Persist immutable headers/normalized entries plus ordinal slice references, canonical request/analysis/policy hash and incomplete-scope diagnostics. A required single file too large returns its minimum budget, not snippets labeled full. Inclusion of newly discovered files creates a new manifest for workflow use. Generic plan output is metadata/paged content, not an unbounded source bundle. Update scope/budget docs and shared type consumers together.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
@@ -3565,6 +3530,35 @@ go vet ./...
 
 ---
 
+<a id="task-25-move-the-lexical-tier-onto-the-embedded-search-index"></a>
+### Task 25: Move the lexical tier onto the embedded search index
+
+**Deliverable:** The lexical tier answered from one embedded search index linked into the binary, scored by our own BM25F in a custom collector, with generations as visibility sets over that index, a ranked search served as an exactly pruned top k, and the SQLite lexical tables, staging, compaction and ranked-set spool removed.
+
+**Files and ownership:** the Rust crate in this repository (built as a static library, with its `Cargo.lock` and vendored crate tree), the cgo bridge in `internal/search`, `internal/search` (collector, cursor, tokenizer parity), `internal/storage/sqlite` (`schema.sql` identity rows and per-unit totals, unit deletion, activation and start-up reconciliation; the lexical staging, segment, compaction and posting-reader code deleted), `internal/config` (the base footprint without lexical staging or the query tokenizer), the release and CI legs, `THIRD_PARTY_LICENSES.md`, docs (`docs/storage.md`, `docs/queries.md`, `docs/configuration.md`, `docs/performance.md`, `docs/toolchain.md`, `docs/operations.md`).
+
+**Dependencies / consumes:** The dependence engine's retirement of [ADR-0012](adr/ADR-0012-native-dependence-engine.md) lands first; this task lands before the profiled performance batch. Consumes Task 5 unit storage and activation, Task 13 search contracts, Task 20 admission and resource accounting, Task 21 release legs.
+
+**Produces / contract:** A coarse boundary to the crate: add one unit's documents, delete units, commit with a payload, open a generation's view, answer one page as one packed buffer. Every export catches a panic and returns an error as a code and a message. `Search` keeps its contract: exact tiers return every match, then the lexical tier's top k by (quantized score, content tie key), with a match count that is exact or a marked lower bound.
+
+**Rulings applied:** [ADR-0013 — The lexical tier is an embedded search index](adr/ADR-0013-search-index.md). Ranking, statistics, tie-breaks and exact lengths stay ours; the library's own scoring is not adopted. Pending inside it, each with its deciding condition: per-column weighted document length (adopted if it raises MRR@10 on two of the three quality sets and lowers it on none); the code-aware tokenizer (adopted if it lifts subword, holds name within 0.01 MRR@10 and does not lower doc); the visibility route (alive set, query wrapper or collector, chosen by its time on the reference export at 10% and 50% hidden).
+
+- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing, including every reader of the lexical tables being removed.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Tests that name their mutation: (1) on a multi-language fixture, the collector's pages and hit counts equal the scorer they replace; (2) a generation with hidden units ranks exactly like an index of only its visible documents; (3) a crash between the search-index commit and the SQLite activation recovers to the last activated generation, with nothing visible that it does not hold; (4) a panic inside an export returns an error and does not end the process; (5) a delta's pages equal a fresh index's. A shared test vector proves the Go and Rust logarithms agree.
+- [ ] **Step 2: Implement the complete production path.** The crate and its cgo bridge; the tokenizer; the collector with fast-field filters; the visibility set; block-max WAND pruning whose pages equal exhaustive scoring; the writer, its derived thread count and memory budget, one commit per activation and background merges; the crash order (search-index commit first, then SQLite activation) and start-up reconciliation; deletion of the full-text table, the throwaway tokenizer table, lexical staging databases, packed lexical segments and their tables, lexical compaction, the Go posting and statistics readers, the document-frequency cache, the ranked-set sort and spool, and the `search_units` text columns.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Every release and CI leg builds with the pinned Rust toolchain; Windows builds the crate for `x86_64-pc-windows-gnu`, and `aarch64-pc-windows-gnullvm` on arm64, to link against Go's MinGW toolchain; the crate tree is locked, vendored and added to the license inventory.
+- [ ] **Step 4: Run the focused verification below.** Repeat the reference-export measurement on the integrated binary and record it in research 22.
+
+```bash
+go test ./internal/search ./internal/storage/... ./internal/config -count=1
+go vet ./...
+git diff --check
+```
+
+- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate.
+
+---
+
 <a id="31-verification-matrix"></a>
 ## 31. Verification Matrix
 
@@ -3575,11 +3569,11 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 | Full-file read, caller/contract/state/dependency/integration tracing by every worker | 5.1, 6, 30.1 | All | Task read/trace/reuse note tied to real revision; lead review of complete changed files and consumers. |
 | Greenfield in-place changes; no legacy/migration paths | 5, 6, 12, 28 | All | Current schema only; no obsolete config/API/consumer/registration paths; focused architecture review. |
 | Reuse before new code; consolidate emerging duplication | 5, 7, 28–30 | All | Existing shared implementations inspected; one actual owner for process, source conversion, signing, storage and domain logic. |
-| Go-only product logic and exact dependencies | 6, 24, 29 | 1–11, 19, 21 | Module/toolchain/checksum inventory; native assets separately licensed; reproducible build metadata. |
+| Go-only product logic and exact dependencies | 6, 24, 29 | 1–11, 19, 21, 25 | Module/toolchain/checksum inventory; the lexical index's Rust crate is the one non-Go component, under a pinned Rust toolchain with a locked, vendored and license-inventoried crate tree; native assets separately licensed; reproducible build metadata. |
 | Zero paid/AI/cloud core dependency | 2, 4, 6, 20–21 | 1, 3, 18–21 | Strict config and offline full workflow; no core outbound attempts. |
 | Exact retained source and safe materialization | 9–10, 21 | 3–5, 16, 20 | Worktree/Git transformation and history-change fixture; safe opener, block/hash checks, no writable hard links. |
 | Streaming bounded memory | 6, 10–14, 20, 23 | 3–16, 20–21 | Byte reservations and measurements; large nested record case; no whole-source/graph/index collections. |
-| Genuine incremental unit reuse | 9, 12–13, 23 | 5–9, 11–14 | No-change parse/FTS counters; changed dependency/add/delete/rename invalidation; retained provenance. |
+| Genuine incremental unit reuse | 9, 12–13, 23 | 5–9, 11–14 | No-change parse and search-index write counters; changed dependency/add/delete/rename invalidation; retained provenance. |
 | Atomic publication and optional failure isolation | 11–13 | 5–12, 20 | Unsealed invisibility, failed-unit cleanup, rollback, concurrent reader and workspace-lock checks. |
 | Complete bundled structural baseline | 4, 11.3 | 7–8, 21 | All nine grammars in shared polyglot fixture and native-target smoke; no optional tool required. |
 | Exact-source SCIP | 11.4 | 9, 22 | Source-binding/position/local-symbol/occurrence fixtures, streamed memory check and real-tool smoke for all six indexers. |
@@ -3587,7 +3581,7 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 | Full supported LSP overlay | 11.5 | 10, 22 | Actual protocol fake-server lifecycle and required-method table; private pinned input and cleanup. |
 | Dependence facts and call linking | 11.6 | 7, 8, 11 | Authored golden tables per language, each derived twice, the second blind. |
 | Canonical node and relation provenance | 9, 11–12 | 2, 5–11 | Node facts, aliases and range-bearing relation evidence with scope/source identity; ambiguity retained. |
-| Stable generation-scoped lexical ranking | 12.4, 14 | 5, 13, 15 | Scores/hash unchanged by unrelated unit/generation insert/activation/pruning; near-tie platform checks. |
+| Stable generation-scoped lexical ranking | 12.4, 14 | 5, 13, 15 | Scores/hash unchanged by unrelated unit/generation insert/activation/pruning; near-tie platform checks; hidden units rank exactly like an index of only the visible documents. |
 | Bounded graph and pagination | 14 | 5, 13–14 | Cycle/fanout, edge/node/depth/work limits, signed cursor, lease and deterministic continuation. |
 | Complete required context with honest budgets | 15 | 15, 17 | Full selected files, boundary gaps visible, exact wire budgets, single-file floor and coherent slices. |
 | Actor-specific delivery and full-file coverage | 16 | 16–19 | Wrong-actor/receipt/hash rejection, broken delivery, interval union, empty/long/invalid-UTF8 cases. |
@@ -3686,9 +3680,9 @@ Pin exact dependency/grammar/profile revisions and checksums during implementati
    Reader/writer/checkpoint behavior and documented WAL-reset fix.
 
 <a id="ref-12"></a>
-12. **SQLite FTS5**  
-   <https://www.sqlite.org/fts5.html>  
-   Corpus-scoped BM25, vocabulary data and external-content consistency.
+12. **Robertson and Zaragoza, *The Probabilistic Relevance Framework: BM25 and Beyond***  
+   <https://staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf>  
+   BM25F: one saturation over weighted per-column term frequencies, and the weighted document length.
 
 <a id="ref-13"></a>
 13. **modernc.org/sqlite documentation**  

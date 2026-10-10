@@ -1,6 +1,6 @@
 # ADR-0003 — Storage tier 2: the lexical and provenance tiers, and the gate
 
-- **Status:** Partially accepted — §2.1 and §2.3 implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.4, §2.5 still proposed
+- **Status:** Partially accepted — §2.1 and §2.3 implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.4, §2.5 still proposed. Its lexical tier — §2.1, its place in the §2.6 sequence and its §3 consequences for indexing throughput and recovery — is superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08
 - **Date:** 2026-09-15
 - **Follows:** [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md), which removed
   identity width as the amplifier and left the lexical and provenance tiers as the remaining cost
