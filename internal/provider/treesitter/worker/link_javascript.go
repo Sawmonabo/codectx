@@ -1412,8 +1412,12 @@ func (k *javaScriptLinker) params(fn Node) (n uint32, variadic bool) {
 }
 
 // signature is fn's parameter and result types as written, by the rule of
-// wire.Export.Signature; empty when fn declares no type, as every
-// JavaScript function does.
+// wire.Export.Signature, a parameter or result without an annotation
+// spelled empty. It is empty for JavaScript, which declares no types. A
+// TypeScript callable always has one, annotated or not, since its
+// parameter list is what tells its overloads apart; no indirect site's
+// signature equals one without a result, since a function type always
+// declares its result.
 func (k *javaScriptLinker) signature(fn Node) string {
 	ps := fn.ChildByFieldId(k.k.fParameters)
 	ret := k.returnAnnotation(fn)
@@ -1422,7 +1426,7 @@ func (k *javaScriptLinker) signature(fn Node) string {
 	if !ret.IsNull() {
 		result, declared = k.spell(firstNamed(ret)), true
 	}
-	if !declared {
+	if !declared && k.language == "javascript" {
 		return ""
 	}
 	return "(" + types + ")(" + result + ")"
