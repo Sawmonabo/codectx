@@ -134,7 +134,7 @@ func TestPossibleRoutesListEveryEqualCostRoute(t *testing.T) {
 	}
 	n := 0
 	for _, note := range res.Meta.Notices {
-		if strings.Contains(note, "route 1 of 2 takes one call") || strings.Contains(note, "route 2 of 2 takes one call") {
+		if strings.Contains(note, "route 1 takes one call") || strings.Contains(note, "route 2 takes one call") {
 			n++
 		}
 	}

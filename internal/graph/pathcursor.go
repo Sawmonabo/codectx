@@ -63,11 +63,9 @@ type pathCursor struct {
 	Visited int64 `json:"visited"`
 	Edges   int64 `json:"edges"`
 	// Routes marks a continuation of the equal-cost route list rather than
-	// of the search: After is the position the next page starts after (the
-	// enumeration keys of the last route subtree finished), Listed the routes
-	// listed so far, and Count and AtLeast the routes' count.
+	// of the search, whose position is in the retained state: Listed is the
+	// routes listed so far, and Count and AtLeast the routes' count.
 	Routes    bool      `json:"routes,omitempty"`
-	After     []string  `json:"after,omitempty"`
 	Listed    int64     `json:"listed,omitempty"`
 	Count     int64     `json:"count,omitempty"`
 	AtLeast   bool      `json:"at_least,omitempty"`
@@ -108,13 +106,8 @@ func (c pathCursor) validate() error {
 	if c.BucketCost < 0 || c.Visited < 0 || c.Edges < 0 || c.Listed < 0 || c.Count < 0 {
 		return cursorInvalid("cursor carries a negative position or budget")
 	}
-	if len(c.After) > model.MaxRelationsPerPath || (!c.Routes && (len(c.After) > 0 || c.Listed > 0)) {
-		return cursorInvalid("cursor route position exceeds its bound")
-	}
-	for _, k := range c.After {
-		if len(k) > 2*model.MaxIdentifierBytes+1 {
-			return cursorInvalid("cursor route position exceeds its bound")
-		}
+	if !c.Routes && c.Listed > 0 {
+		return cursorInvalid("cursor lists routes of a search that is not listing them")
 	}
 	if c.ExpiresAt.IsZero() {
 		return cursorInvalid("cursor has no expiry")
@@ -281,7 +274,6 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 		Visited:      w.visited,
 		Edges:        w.spent,
 		Routes:       w.routing,
-		After:        w.routeAfter,
 		Listed:       w.routesListed,
 		Count:        w.routeCount,
 		AtLeast:      w.routeCountAtLeast,

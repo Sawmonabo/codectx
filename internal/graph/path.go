@@ -195,8 +195,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		// the counters nor doubles them.
 		w.visited, w.spent = resume.Cursor.Visited, resume.Cursor.Edges
 		w.bucketCost, w.lastSettled = resume.Cursor.BucketCost, resume.Cursor.LastNode
-		w.routing = resume.Cursor.Routes
-		w.routeAfter, w.routesListed = resume.Cursor.After, resume.Cursor.Listed
+		w.routing, w.routesListed = resume.Cursor.Routes, resume.Cursor.Listed
 		w.routeCount, w.routeCountAtLeast = resume.Cursor.Count, resume.Cursor.AtLeast
 	}
 	if w.routing {
@@ -266,7 +265,12 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 			return model.PathResult{}, err
 		}
 		if page.more {
+			// The position goes in the retained state, not the token: a
+			// route's keys are too long for one.
 			w.routeAfter = page.after
+			if err := w.saveProgress(); err != nil {
+				return model.PathResult{}, err
+			}
 			if res.Meta.NextCursor, err = e.nextPathCursor(ctx, sc, queryHash, w); err != nil {
 				return model.PathResult{}, err
 			}
@@ -342,7 +346,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		if err := e.locateHops(ctx, &res, vias); err != nil {
 			return model.PathResult{}, err
 		}
-		res.Meta.Notices = append(res.Meta.Notices, possibleNotices(routes)...)
+		res.Meta.Notices = append(res.Meta.Notices, possibleNotices(routes, w.routesListed-int64(len(routes)))...)
 	}
 	return res, nil
 }
@@ -378,9 +382,11 @@ func (e *Engine) locateHops(ctx context.Context, res *model.PathResult, vias map
 	return nil
 }
 
-// possibleNotices says, for each route the name-only search returned, how
-// many calls it takes that no analysis bound.
-func possibleNotices(routes [][]model.Relation) []string {
+// possibleNotices says, for each route of this page of the name-only
+// search's list, how many calls it takes that no analysis bound; before is
+// the routes earlier pages listed, so a route is named by its place in the
+// whole list.
+func possibleNotices(routes [][]model.Relation, before int64) []string {
 	out := make([]string, 0, len(routes))
 	for i, route := range routes {
 		hops := 0
@@ -394,8 +400,8 @@ func possibleNotices(routes [][]model.Relation) []string {
 			calls = fmt.Sprintf("%d calls", hops)
 		}
 		which := "the route given"
-		if len(routes) > 1 {
-			which = fmt.Sprintf("route %d of %d", i+1, len(routes))
+		if len(routes) > 1 || before > 0 {
+			which = fmt.Sprintf("route %d", before+int64(i)+1)
 		}
 		out = append(out, fmt.Sprintf("no precise route connects the two nodes; %s takes %s no analysis bound, "+
 			"matched by name only (`may_call`), and it may not run", which, calls))
@@ -717,11 +723,17 @@ func (w *pathWalk) resumable() bool {
 // loadProgress restores what the previous page left in the state file: the
 // expansion position, the depth-pruned disclosure and the search's phase.
 func (w *pathWalk) loadProgress() error {
-	var after, hops string
+	var after, hops, routeAfter string
 	var pruned, scanDone, possible int
-	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_pruned, scan_done, hop_pos, possible
-		FROM progress WHERE k = 0`, nil, &after, &pruned, &scanDone, &hops, &possible); err != nil {
+	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_pruned, scan_done, hop_pos, possible, route_after
+		FROM progress WHERE k = 0`, nil, &after, &pruned, &scanDone, &hops, &possible, &routeAfter); err != nil {
 		return err
+	}
+	w.routeAfter = nil
+	if routeAfter != "" {
+		if err := json.Unmarshal([]byte(routeAfter), &w.routeAfter); err != nil {
+			return internalErr("path scratch: the route list position: " + err.Error())
+		}
 	}
 	w.hopPos = hopPos{}
 	if hops != "" {
@@ -752,9 +764,18 @@ func (w *pathWalk) saveProgress() error {
 	if err != nil {
 		return internalErr("path scratch: the name-only position: " + err.Error())
 	}
+	routeAfter := ""
+	if len(w.routeAfter) > 0 {
+		b, err := json.Marshal(w.routeAfter)
+		if err != nil {
+			return internalErr("path scratch: the route list position: " + err.Error())
+		}
+		routeAfter = string(b)
+	}
 	return w.sc.exec(w.scCtx, `UPDATE progress SET expand_after = ?, depth_pruned = ?, scan_done = ?,
-		hop_pos = ?, possible = ? WHERE k = 0`,
-		encodeEdgePos(w.expandAfter), flag(w.depthPruned), flag(w.scanDone), string(hops), flag(w.possible))
+		hop_pos = ?, possible = ?, route_after = ? WHERE k = 0`,
+		encodeEdgePos(w.expandAfter), flag(w.depthPruned), flag(w.scanDone), string(hops), flag(w.possible),
+		routeAfter)
 }
 
 // markPending records the nodes settled here as owing an expansion.
