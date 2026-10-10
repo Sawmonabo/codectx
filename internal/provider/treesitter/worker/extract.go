@@ -104,6 +104,9 @@ type extraction struct {
 	exportNames  map[string]bool
 	// truncated reports that the query cursor exceeded its match limit.
 	truncated bool
+	// branchAt is the branch path of each declaration node a conditional
+	// encloses, by its range (branches).
+	branchAt map[span]*branchLink
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -139,6 +142,7 @@ func (e *extraction) run(q *ts.Query, root *ts.Node, emit *emitter) error {
 	if cursor.DidExceedMatchLimit() {
 		e.truncated = true
 	}
+	e.branches(root)
 	return e.emit(emit)
 }
 
@@ -486,6 +490,9 @@ func (e *extraction) emit(out *emitter) error {
 	var stack []frame
 	nameSpans := make(map[span]bool, len(decls))
 	wireDecls := make([]wire.Decl, 0, len(decls))
+	// paths holds, parallel to wireDecls, each declaration's branch path,
+	// which its children's branches are measured from.
+	paths := make([]*branchLink, 0, len(decls))
 	scopeIdx := 0
 	// blank is the range of the last declaration of the grammar's blank
 	// name: a declaration strictly inside it is not extracted either (the
@@ -554,8 +561,12 @@ func (e *extraction) emit(out *emitter) error {
 		w := wire.Decl{ID: len(wireDecls), Parent: -1, Kind: d.kind, Name: d.name, Qualified: strings.Join(parts, e.l.Separator),
 			Start: uint32(start), End: uint32(end), NameStart: uint32(d.nameStart), NameEnd: uint32(d.nameEnd), SigEnd: uint32(end),
 			Exported: d.exported, Test: d.test, Prototype: d.prototype, Macro: d.macro, Impl: d.impl}
+		path := e.branchAt[span{start, end}]
 		if d.parentIdx >= 0 {
 			w.Parent = d.parentIdx
+			w.Branch = branchText(path, paths[d.parentIdx])
+		} else {
+			w.Branch = branchText(path, nil)
 		}
 		if d.body != nil && d.body.StartByte() > start {
 			w.SigEnd = uint32(d.body.StartByte())
@@ -566,6 +577,7 @@ func (e *extraction) emit(out *emitter) error {
 		nameSpans[span{d.nameStart, d.nameEnd}] = true
 		stack = append(stack, frame{span: span{start, end}, idx: w.ID, name: d.name, kind: d.kind})
 		wireDecls = append(wireDecls, w)
+		paths = append(paths, path)
 	}
 	for _, w := range wireDecls {
 		if err := out.decl(w); err != nil {
