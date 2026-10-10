@@ -154,6 +154,12 @@ type declFact struct {
 	descriptor, disambiguator string
 	// truncated names the fields this declaration's storage ceilings cut.
 	truncated truncations
+	// decorators are the declaration's decorators and annotations as they
+	// are published under model.MetaDecorators, in source order: every one
+	// the worker sent whose name fits its bound, each range validated
+	// against the pinned bytes. The worker's own list stays on Decl, every
+	// range of it validated too, for the route table.
+	decorators []model.Decorator
 
 	// body is the search document's text: the attached documentation and the
 	// signature, composed and bounded once at extraction so a cut is recorded
@@ -328,6 +334,9 @@ func (b *builder) validateDecls() error {
 		// signature each at their own ceiling compose to more than one body
 		// holds, so this bound really does cut and must disclose it.
 		f.body = f.truncated.cut("body", searchBody(f.doc, f.sig), maxDocBytes)
+		if err := b.validateDecorators(&f); err != nil {
+			return err
+		}
 		b.decls = append(b.decls, f)
 		b.byName[f.Name] = append(b.byName[f.Name], i)
 		name := wire.Span{Start: d.NameStart, End: d.NameEnd}
@@ -336,6 +345,70 @@ func (b *builder) validateDecls() error {
 		}
 	}
 	return nil
+}
+
+// validateDecorators checks every decorator the worker sent for d against the
+// pinned bytes, as every other worker offset is: the decorator's range and
+// each argument's go through rangeOf, and each argument lies inside its
+// decorator (model.Decorator.Validate). A decorator need not lie inside its
+// declaration: a Python decorator and a Rust attribute precede the
+// definition they apply to. A name the source spells longer than the bound
+// is valid source this provider cannot store: that one decorator is left
+// out of the published list and counted, so the file reports partial.
+func (b *builder) validateDecorators(d *declFact) error {
+	for _, w := range d.Decorators {
+		if w.Name == "" || !utf8.ValidString(w.Name) {
+			return outputInvalid("decorator name is empty or not UTF-8")
+		}
+		if _, err := b.rangeOf(w.Start, w.End); err != nil {
+			return err
+		}
+		m := model.Decorator{Name: w.Name, Bytes: model.ByteRange{Start: uint64(w.Start), End: uint64(w.End)}}
+		for _, a := range w.Arguments {
+			if _, err := b.rangeOf(a.Start, a.End); err != nil {
+				return err
+			}
+			m.Arguments = append(m.Arguments, model.ByteRange{Start: uint64(a.Start), End: uint64(a.End)})
+		}
+		if len(w.Name) > model.MaxQualifiedNameBytes {
+			b.dropped[structure]++
+			continue
+		}
+		if err := m.Validate(); err != nil {
+			return outputInvalid(err.Error())
+		}
+		d.decorators = append(d.decorators, m)
+	}
+	return nil
+}
+
+// fitDecorators sets meta's decorators to the longest prefix of decorators,
+// in source order, whose metadata still fits model.MaxMetadataBytes, and
+// returns how many that is. The serialized size grows with every decorator
+// added, so the longest fitting prefix is found by bisection.
+func fitDecorators(meta map[string]any, decorators []model.Decorator) int {
+	fits := func(n int) bool {
+		if n == 0 {
+			delete(meta, model.MetaDecorators)
+		} else {
+			meta[model.MetaDecorators] = decorators[:n]
+		}
+		raw, err := json.Marshal(meta)
+		return err == nil && len(raw) <= model.MaxMetadataBytes
+	}
+	if fits(len(decorators)) {
+		return len(decorators)
+	}
+	lo, hi := 0, len(decorators)
+	for hi-lo > 1 {
+		if mid := (lo + hi) / 2; fits(mid) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	fits(lo)
+	return lo
 }
 
 // resolveModule mints the file's module node: the container every top-level
@@ -403,6 +476,12 @@ func (b *builder) resolveDecls() error {
 			// answer built from it says which stored values were cut and how
 			// long they were. Distinct from result truncation by name.
 			meta["truncated_fields"] = d.truncated
+		}
+		if _, seen := b.nodeAt[res.Node.ID]; !seen && len(d.decorators) > 0 {
+			// Only the first occurrence's metadata is published, so only its
+			// decorators are fitted to the bound; the ones past it are
+			// counted, never dropped in silence.
+			b.dropped[structure] += len(d.decorators) - fitDecorators(meta, d.decorators)
 		}
 		first := b.putNode(structure, res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)
@@ -1002,6 +1081,10 @@ func (b *builder) putNode(fam family, res model.Resolution, rng *model.SourceRan
 	if len(meta) > 0 {
 		if raw, err := json.Marshal(meta); err == nil && len(raw) <= model.MaxMetadataBytes {
 			node.Metadata = raw
+		} else {
+			// Metadata that does not fit its bound is not published, and
+			// the loss is counted so the file reports partial.
+			b.dropped[fam]++
 		}
 	}
 	b.nodes = append(b.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey,

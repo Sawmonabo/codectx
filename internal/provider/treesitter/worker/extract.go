@@ -655,6 +655,9 @@ func (e *extraction) emit(out *emitter) error {
 		if ds, de, ok := e.doc(d); ok {
 			w.DocStart, w.DocEnd = uint32(ds), uint32(de)
 		}
+		if e.g.decorators != nil {
+			w.Decorators = e.g.decorators(e, d)
+		}
 		nameSpans[span{d.nameStart, d.nameEnd}] = true
 		stack = append(stack, frame{span: span{start, end}, idx: w.ID, name: d.name, kind: d.kind})
 		wireDecls = append(wireDecls, w)

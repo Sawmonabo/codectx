@@ -20,6 +20,7 @@ import (
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
 // grammar binds one pinned language to its compiled parser and the small set
@@ -47,6 +48,9 @@ type grammar struct {
 	// syntax; it runs once containment is known, so it sees only top-level
 	// declarations.
 	exported func(e *extraction, d *decl) bool
+	// decorators lists a declaration's decorators, annotations or
+	// attributes in source order, for a language that has them.
+	decorators func(e *extraction, d *decl) []wire.Decorator
 	// blank is the name that declares nothing in the language, or empty
 	// when every name it extracts binds one. A declaration of it is not
 	// extracted, and neither is any declaration nested inside it.
@@ -66,6 +70,10 @@ type grammar struct {
 	// first use by importSyntax.
 	importsOnce sync.Once
 	imports     importSyntax
+	// deco is the grammar's decorator table, resolved on first use by
+	// decoSyntax.
+	decoOnce sync.Once
+	deco     decoSyntax
 	// kinds are the node kind ids the extraction and the hooks compare,
 	// resolved on first use by kindIDs.
 	kindsOnce sync.Once
@@ -82,8 +90,8 @@ type kindIDs struct {
 	identifier, funcLiteral             uint16
 	// Go: the type a type_spec declares, and a method receiver's type.
 	structType, interfaceType, typeIdentifier, parameterDeclaration uint16
-	// Python docstrings.
-	expressionStatement, str uint16
+	// Python docstrings and the `__main__` guard.
+	expressionStatement, str, comparisonOperator, stringStart uint16
 	// Java and Rust modifiers, Rust macros and attributes.
 	modifiers, visibilityModifier, macroDefinition, attributeItem uint16
 	// ECMAScript function values and the bindings a function-valued
@@ -135,6 +143,8 @@ func (g *grammar) kindIDs() *kindIDs {
 			parameterDeclaration:  id("parameter_declaration"),
 			expressionStatement:   id("expression_statement"),
 			str:                   id("string"),
+			comparisonOperator:    id("comparison_operator"),
+			stringStart:           id("string_start"),
 			modifiers:             id("modifiers"),
 			visibilityModifier:    id("visibility_modifier"),
 			macroDefinition:       id("macro_definition"),
@@ -162,7 +172,7 @@ func (g *grammar) kindIDs() *kindIDs {
 // C string on every call. A field the grammar does not define is 0, which
 // ChildByFieldId answers with no child, as a lookup by an unknown name does.
 type fieldIDs struct {
-	body, declarator, name, receiver, scope, typ uint16
+	body, declarator, name, receiver, scope, typ, condition uint16
 	// ECMAScript pairs and assignments.
 	key, value, left, right uint16
 }
@@ -178,6 +188,7 @@ func (g *grammar) fieldIDs() *fieldIDs {
 			receiver:   tl.FieldIdForName("receiver"),
 			scope:      tl.FieldIdForName("scope"),
 			typ:        tl.FieldIdForName("type"),
+			condition:  tl.FieldIdForName("condition"),
 			key:        tl.FieldIdForName("key"),
 			value:      tl.FieldIdForName("value"),
 			left:       tl.FieldIdForName("left"),
@@ -318,15 +329,17 @@ var grammars = map[string]*grammar{
 		blank:      "_",
 		flatFields: goFields,
 	},
-	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
-	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
-	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
+	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
+	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
+	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
 	"python": {
-		language: tree_sitter_python.Language,
-		wrappers: []string{"decorated_definition"},
-		comments: []string{"comment"},
+		language:   tree_sitter_python.Language,
+		wrappers:   []string{"decorated_definition"},
+		comments:   []string{"comment"},
+		refine:     pyMainGuard,
+		decorators: pyDecorators,
 		docstring: func(d *decl) (uint, uint, bool) {
-			if d.body == nil {
+			if d.body == nil || d.kind == "endpoint" {
 				return 0, 0, false
 			}
 			k := d.ex.k
@@ -359,6 +372,7 @@ var grammars = map[string]*grammar{
 		},
 		isTest:      func(d *decl, _ string, _ []byte) bool { return d.test },
 		importNames: func(p string) []string { return []string{lastSegment(p, ".")} },
+		decorators:  javaDecorators,
 		flatFields:  javaFields,
 	},
 	"rust": {
@@ -381,14 +395,15 @@ var grammars = map[string]*grammar{
 			return false
 		},
 		importNames: rustUseNames,
+		decorators:  rustDecorators,
 		// The Rust Reference, Constant items: a free constant may be unnamed
 		// by writing an underscore for its name, and such a constant is not
 		// nameable. No other item the extraction reads may be named `_`.
 		blank:      "_",
 		flatFields: rustFields,
 	},
-	"c":   {language: tree_sitter_c.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, flatFields: cFields},
-	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }, flatFields: cppFields},
+	"c":   {language: tree_sitter_c.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, decorators: cDecorators, flatFields: cFields},
+	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, decorators: cDecorators, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }, flatFields: cppFields},
 }
 
 // jsWrappers are the statements a declaration's doc comment and export
@@ -420,6 +435,49 @@ func jsRefine(d *decl, _ []byte) {
 			break
 		}
 	}
+}
+
+// pyMainGuard keeps a module-level `if` the query captured as a `__main__`
+// guard only when its condition is exactly `__name__ == "__main__"`, in either
+// operand order: one comparison of two operands with the operator `==`, and
+// a string that is not a bytes literal. Anything else (`!=`, `is`, a chained
+// comparison, `b"__main__"`) is no guard and declares nothing.
+func pyMainGuard(d *decl, src []byte) {
+	if d.kind != "endpoint" {
+		return
+	}
+	k, f := d.ex.k, d.ex.f
+	cond := d.node.ChildByFieldId(f.condition)
+	if cond == nil || cond.KindId() != k.comparisonOperator || !pyEqualsGuard(cond, k, src) {
+		d.name = ""
+	}
+}
+
+// pyEqualsGuard reports a comparison of exactly two operands joined by one
+// `==`, whose string operand is not a bytes literal.
+func pyEqualsGuard(cond *ts.Node, k *kindIDs, src []byte) bool {
+	cur := cond.Walk()
+	defer cur.Close()
+	operands, operators := 0, 0
+	for ok := cur.GotoFirstChild(); ok; ok = cur.GotoNextSibling() {
+		n := cur.Node()
+		switch {
+		case n.IsExtra():
+		case n.IsNamed():
+			operands++
+			if n.KindId() == k.str {
+				if start := childOfKind(*n, k.stringStart); start == nil || strings.ContainsAny(start.Utf8Text(src), "bB") {
+					return false
+				}
+			}
+		default:
+			operators++
+			if n.Utf8Text(src) != "==" {
+				return false
+			}
+		}
+	}
+	return operands == 2 && operators == 1
 }
 
 var cWrappers = []string{"template_declaration", "declaration_list"}
