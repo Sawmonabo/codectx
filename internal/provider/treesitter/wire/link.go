@@ -30,6 +30,14 @@ type Link struct {
 	// type that reaches one value along some path (two reaching definitions
 	// of a receiver that disagree), none of them a TypeUnion.
 	Unions [][]Type
+	// Parameters are the declared parameters of the file's callables, each
+	// keyed by its callable's name token, in declaration order within each
+	// callable. An argument at a bound call site flows to the parameter its
+	// position, keyword and spread match.
+	Parameters []Parameter
+	// DynamicImports are the file's imports whose path does not fold to a
+	// constant, each with the path's literal fragments.
+	DynamicImports []DynamicImport
 }
 
 // Export describes one declaration of the file that a call may bind to, a
@@ -140,6 +148,67 @@ type Site struct {
 	// Args has one entry per argument, in order, each the argument's type as
 	// the worker recovered it, TypeUnknown where it recovered nothing.
 	Args []Type
+	// Arguments has one entry per argument, in order, each where the argument
+	// is and how it is passed: Arguments[i] and Args[i] describe the same
+	// argument. It is empty when the worker sent no argument positions.
+	Arguments []Argument
+}
+
+// Argument is one argument of a call site.
+type Argument struct {
+	// At is the argument expression, without its keyword or spread marker.
+	At Span
+	// Keyword is the parameter name a keyword argument names, as written
+	// (`timeout` in `f(timeout=3)`); empty for a positional argument.
+	Keyword string
+	Spread  Spread
+}
+
+// Spread is how an argument expands into several parameters.
+type Spread byte
+
+const (
+	// SpreadNone is an argument passed as one value.
+	SpreadNone Spread = 0
+	// SpreadPositional expands into the remaining positional parameters:
+	// Python `*xs`, ECMAScript `...xs`, Go `xs...`.
+	SpreadPositional Spread = 1
+	// SpreadKeyword expands into keyword parameters: Python `**kw`.
+	SpreadKeyword Spread = 2
+)
+
+// Parameter is one declared parameter of a callable.
+type Parameter struct {
+	// Callable is the declaring callable's name token, the Export.Name of
+	// its export.
+	Callable Span
+	// Name is the parameter's name token, where the dependence pass declares
+	// the parameter's variable.
+	Name Span
+	// Index is the parameter's position: 0 for an explicit receiver or self
+	// parameter (a Go receiver, Python `self` or `cls`, a Rust `self`), 1 for
+	// the first declared parameter after it, and so on; a callable without a
+	// receiver parameter starts at 1.
+	Index uint32
+	// Variadic is a parameter that collects the remaining arguments: Python
+	// `*args`, ECMAScript `...rest`, Go `xs ...T`, C `...`. A variadic
+	// keyword-only parameter collects the remaining keyword arguments
+	// (Python `**kwargs`).
+	Variadic bool
+	// KeywordOnly is a parameter that only a keyword argument fills: one
+	// declared after Python's `*` or `*args`, or `**kwargs`.
+	KeywordOnly bool
+}
+
+// DynamicImport is one import whose path does not fold to a constant:
+// `require("./x/" + name)`, `import(expr)`, `importlib.import_module(expr)`,
+// `__import__(expr)`, `#include MACRO` with MACRO undefined in the file.
+type DynamicImport struct {
+	// At is the import expression or directive.
+	At Span
+	// Fragments are the path's literal parts, in source order; empty when
+	// the path has none.
+	Fragments []string
 }
 
 // Value is one value stored where a call can later reach it without naming
@@ -241,10 +310,14 @@ type Type struct {
 //	                flags; returns type)
 //	supertypes n × (type; super)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
-//	                signature; args n × type)
+//	                signature; args n × type; arguments n × (at start, end;
+//	                keyword; spread byte))
 //	values     n × (at start, end; field; type)
 //	reexports  n × (name; original; from)
 //	unions     n × (n × type)
+//	parameters n × (callable start, end; name start, end; index; variadic,
+//	                keyword-only flags)
+//	dynamic    n × (at start, end; fragments n × string)
 //	type       kind byte; name; index
 func AppendLink(dst []byte, l *Link) []byte {
 	e := encoder{b: dst}
@@ -279,6 +352,12 @@ func AppendLink(dst []byte, l *Link) []byte {
 		for _, a := range s.Args {
 			e.typ(a)
 		}
+		e.u32(uint32(len(s.Arguments)))
+		for _, a := range s.Arguments {
+			e.span(a.At)
+			e.str(a.Keyword)
+			e.b = append(e.b, byte(a.Spread))
+		}
 	}
 	e.u32(uint32(len(l.Values)))
 	for _, v := range l.Values {
@@ -297,6 +376,22 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.u32(uint32(len(u)))
 		for _, t := range u {
 			e.typ(t)
+		}
+	}
+	e.u32(uint32(len(l.Parameters)))
+	for _, p := range l.Parameters {
+		e.span(p.Callable)
+		e.span(p.Name)
+		e.u32(p.Index)
+		e.flag(p.Variadic)
+		e.flag(p.KeywordOnly)
+	}
+	e.u32(uint32(len(l.DynamicImports)))
+	for _, x := range l.DynamicImports {
+		e.span(x.At)
+		e.u32(uint32(len(x.Fragments)))
+		for _, f := range x.Fragments {
+			e.str(f)
 		}
 	}
 	return e.b
@@ -318,8 +413,8 @@ func (e *encoder) flag(v bool) {
 func (e *encoder) typ(t Type) { e.b = append(e.b, byte(t.Kind)); e.str(t.Name); e.u32(t.Index) }
 
 // ErrMalformedLink reports a link message no writer of this protocol
-// produces: a short or overlong payload, an unknown shape, type kind or flag
-// byte, or a string that is not UTF-8.
+// produces: a short or overlong payload, an unknown shape, type kind, spread
+// or flag byte, or a string that is not UTF-8.
 var ErrMalformedLink = errors.New("wire: malformed link message")
 
 // DecodeLink decodes one KindLink payload. Every list's length is checked
@@ -331,8 +426,11 @@ func DecodeLink(payload []byte) (Link, error) {
 	var l Link
 	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
 	// flags and a 9-byte type; a supertype two strings; a site 8 span, 1
-	// shape, 4 qualifier, 9 type, 4 signature and 4 args; a value 8 span, 4
-	// field and 9 type; a reexport three strings; a union its count.
+	// shape, 4 qualifier, 9 type, 4 signature, 4 args and 4 arguments; an
+	// argument 8 span, 4 keyword and 1 spread; a value 8 span, 4 field and 9
+	// type; a reexport three strings; a union its count; a parameter two 8
+	// spans, 4 index and 2 flags; a dynamic import 8 span and 4 fragments; a
+	// fragment its length.
 	l.Exports = make([]Export, 0, d.count(39))
 	for range cap(l.Exports) {
 		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32(), Optional: d.u32()}
@@ -345,12 +443,16 @@ func DecodeLink(payload []byte) (Link, error) {
 	for range cap(l.Supertypes) {
 		l.Supertypes = append(l.Supertypes, Supertype{Type: d.str(), Super: d.str()})
 	}
-	l.Sites = make([]Site, 0, d.count(30))
+	l.Sites = make([]Site, 0, d.count(34))
 	for range cap(l.Sites) {
 		s := Site{Name: d.span(), Shape: d.shape(), Qualifier: d.str(), Receiver: d.typ(), Signature: d.str()}
 		s.Args = make([]Type, 0, d.count(9))
 		for range cap(s.Args) {
 			s.Args = append(s.Args, d.typ())
+		}
+		s.Arguments = make([]Argument, 0, d.count(13))
+		for range cap(s.Arguments) {
+			s.Arguments = append(s.Arguments, Argument{At: d.span(), Keyword: d.str(), Spread: d.spread()})
 		}
 		l.Sites = append(l.Sites, s)
 	}
@@ -369,6 +471,21 @@ func DecodeLink(payload []byte) (Link, error) {
 			u = append(u, d.typ())
 		}
 		l.Unions = append(l.Unions, u)
+	}
+	l.Parameters = make([]Parameter, 0, d.count(22))
+	for range cap(l.Parameters) {
+		p := Parameter{Callable: d.span(), Name: d.span(), Index: d.u32()}
+		p.Variadic, p.KeywordOnly = d.flag(), d.flag()
+		l.Parameters = append(l.Parameters, p)
+	}
+	l.DynamicImports = make([]DynamicImport, 0, d.count(12))
+	for range cap(l.DynamicImports) {
+		x := DynamicImport{At: d.span()}
+		x.Fragments = make([]string, 0, d.count(4))
+		for range cap(x.Fragments) {
+			x.Fragments = append(x.Fragments, d.str())
+		}
+		l.DynamicImports = append(l.DynamicImports, x)
 	}
 	if d.err == nil && len(d.b) != 0 {
 		d.fail(fmt.Sprintf("%d bytes past the message's end", len(d.b)))
@@ -404,6 +521,14 @@ func (d *decoder) shape() Shape {
 	s := Shape(d.u8())
 	if d.err == nil && (s < ShapeBare || s > ShapeConstructor) {
 		d.fail("an unknown call shape")
+	}
+	return s
+}
+
+func (d *decoder) spread() Spread {
+	s := Spread(d.u8())
+	if d.err == nil && s > SpreadKeyword {
+		d.fail("an unknown argument spread")
 	}
 	return s
 }

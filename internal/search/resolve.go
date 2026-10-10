@@ -154,7 +154,7 @@ func fileNodeKey(n sqlite.StoredNode) string {
 func parseResolveKey(key string) (int, string, error) {
 	head, within, ok := strings.Cut(key, "\x00")
 	rank, err := strconv.Atoi(head)
-	if !ok || err != nil || rank < 0 || rank >= model.TierLexicalFTS.Rank() || within == "" {
+	if !ok || err != nil || rank < 0 || rank >= model.TierLexical.Rank() || within == "" {
 		return noTierRank, "", &model.Error{Code: model.CodeCursorInvalid, Message: "symbol cursor does not carry a symbol-tier position"}
 	}
 	// The within-tier position is the keyset of the tier that wrote it: the

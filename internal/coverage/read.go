@@ -40,6 +40,12 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 	if err := req.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err
 	}
+	if !req.InSession() {
+		// A read outside a session earns no receipt and no coverage, so this
+		// service, which exists to issue both, never serves one.
+		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: "the coverage service reads only within a session; this read names no session_id"}
+	}
 
 	// The one endpoint that touches the CAS and the filesystem runs under the
 	// same resources.query_timeout deadline as every other request -- and
@@ -204,8 +210,7 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 		Content:     content,
 		PartialLine: chunk.PartialLine,
 		NextOffset:  chunk.NextOffset,
-		Receipt:     receipt,
-		Coverage:    cov.State,
+		Session:     &model.ReadSession{Receipt: receipt, Coverage: cov.State},
 	}
 	if err := resp.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err

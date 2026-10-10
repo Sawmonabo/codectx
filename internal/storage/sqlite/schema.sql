@@ -231,6 +231,8 @@ CREATE TABLE evidence (
     end_byte INTEGER,
     native_key_id INTEGER NOT NULL REFERENCES native_keys(id),
     detail TEXT NOT NULL DEFAULT '',
+    dispatch TEXT NOT NULL DEFAULT '' CHECK(dispatch IN ('', 'virtual', 'exact')),
+    set_size INTEGER NOT NULL DEFAULT 0 CHECK(set_size = 0 OR set_size >= 2),
     content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),

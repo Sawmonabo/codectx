@@ -371,7 +371,7 @@ func legLessChain(t *testing.T, _ *fixture) {
 	// A tier with a worse score still outranks a better-scoring later tier:
 	// tier is the FIRST key, not a tiebreak after score.
 	exact := scoredOf(rankedOf(model.TierExactQualifiedName, 0, "z", 99, "n9", "k9"), model.NodeFunction, "m9", 100)
-	lexical := scoredOf(rankedOf(model.TierLexicalFTS, 9_999_999, "a", 0, "n0", "k0"), model.NodeFunction, "m0", 1)
+	lexical := scoredOf(rankedOf(model.TierLexical, 9_999_999, "a", 0, "n0", "k0"), model.NodeFunction, "m0", 1)
 	if cmpScored(exact, lexical) >= 0 {
 		t.Error("a zero-scored exact hit must outrank a high-scoring lexical hit")
 	}
@@ -410,12 +410,12 @@ func legFoldOrderIndependent(t *testing.T, _ *fixture) {
 	// Three candidates sharing one document node as their deduplication key,
 	// plus a two-tier group: an exact-name hit and a lexical hit of one node.
 	group := []scored{
-		scoredOf(rankedOf(model.TierLexicalFTS, 900, "docs/skill.md", 0, "n-doc", "k-h1"), model.NodeDocument, "Skill: Reverse-Proxy Config Hunt", 34),
-		scoredOf(rankedOf(model.TierLexicalFTS, 700, "docs/skill.md", 5474, "n-doc", "k-h2"), model.NodeDocument, "1. Map the config surface", 5504),
-		scoredOf(rankedOf(model.TierLexicalFTS, 900, "docs/skill.md", 5771, "n-doc", "k-h3"), model.NodeDocument, "2. Config failure patterns", 5802),
+		scoredOf(rankedOf(model.TierLexical, 900, "docs/skill.md", 0, "n-doc", "k-h1"), model.NodeDocument, "Skill: Reverse-Proxy Config Hunt", 34),
+		scoredOf(rankedOf(model.TierLexical, 700, "docs/skill.md", 5474, "n-doc", "k-h2"), model.NodeDocument, "1. Map the config surface", 5504),
+		scoredOf(rankedOf(model.TierLexical, 900, "docs/skill.md", 5771, "n-doc", "k-h3"), model.NodeDocument, "2. Config failure patterns", 5802),
 		scoredOf(rankedOf(model.TierExactName, 0, "pkg/cfg.go", 12, "n-fn", "k-fn-x"), model.NodeFunction, "Config", 40),
-		scoredOf(rankedOf(model.TierLexicalFTS, 5000, "pkg/cfg.go", 12, "n-fn", "k-fn-y"), model.NodeFunction, "Config", 40),
-		scoredOf(rankedOf(model.TierLexicalFTS, 100, "pkg/other.go", 3, "n-o", "k-o"), model.NodeFunction, "configure", 20),
+		scoredOf(rankedOf(model.TierLexical, 5000, "pkg/cfg.go", 12, "n-fn", "k-fn-y"), model.NodeFunction, "Config", 40),
+		scoredOf(rankedOf(model.TierLexical, 100, "pkg/other.go", 3, "n-o", "k-o"), model.NodeFunction, "configure", 20),
 	}
 	// Every permutation of six candidates is 720 orders. These five are chosen
 	// so that EVERY member of each deduplication group leads its group in at
@@ -449,12 +449,12 @@ func legFoldOrderIndependent(t *testing.T, _ *fixture) {
 	// The two-tier group ranks first -- it keeps the LOWER tier rank -- and it
 	// is served at the higher score, carrying the reasons of both sides in a
 	// fixed order.
-	if want[0] != "exact_name|5000|pkg/cfg.go|Config|2|[matched the exact_name tier matched the lexical_fts tier]" {
+	if want[0] != "exact_name|5000|pkg/cfg.go|Config|2|[matched the exact_name tier matched the lexical tier]" {
 		t.Errorf("the two-tier group served %q, want the exact tier at the lexical score", want[0])
 	}
 	// The survivor of the Markdown group is decided by content, not by which
 	// heading arrived first: highest score, then the earliest start byte.
-	if want[1] != "lexical_fts|900|docs/skill.md|Skill: Reverse-Proxy Config Hunt|3|[matched the lexical_fts tier]" {
+	if want[1] != "lexical|900|docs/skill.md|Skill: Reverse-Proxy Config Hunt|3|[matched the lexical tier]" {
 		t.Errorf("the Markdown group served %q, want the highest-scoring, earliest heading", want[1])
 	}
 }
@@ -492,9 +492,9 @@ func legQuantization(t *testing.T, _ *fixture) {
 // understate its occurrence count.
 func legDedupFolds(t *testing.T, _ *fixture) {
 	c := collectorFor(t)
-	add(t, c, rankedOf(model.TierLexicalFTS, 4_200_000, "pkg/alpha.go", 0, "node-a", "doc-a1"), "lexical_fts match")
+	add(t, c, rankedOf(model.TierLexical, 4_200_000, "pkg/alpha.go", 0, "node-a", "doc-a1"), "lexical match")
 	add(t, c, rankedOf(model.TierExactName, 0, "pkg/alpha.go", 0, "node-a", "doc-a2"), "exact_name match")
-	add(t, c, rankedOf(model.TierLexicalFTS, 1_000_000, "pkg/beta.go", 0, "node-b", "doc-b1"), "lexical_fts match")
+	add(t, c, rankedOf(model.TierLexical, 1_000_000, "pkg/beta.go", 0, "node-b", "doc-b1"), "lexical match")
 	got := resultsOf(t, c)
 	if len(got) != 2 {
 		t.Fatalf("results = %d hits, want 2 after deduplication", len(got))
@@ -528,10 +528,10 @@ func legDedupFolds(t *testing.T, _ *fixture) {
 // hit.
 func legDedupFileKey(t *testing.T, _ *fixture) {
 	c := collectorFor(t)
-	add(t, c, rankedOf(model.TierLexicalFTS, 3, "pkg/alpha.go", 0, "", "doc-1"))
-	add(t, c, rankedOf(model.TierLexicalFTS, 5, "pkg/alpha.go", 0, "", "doc-2"))
-	add(t, c, rankedOf(model.TierLexicalFTS, 7, "pkg/alpha.go", 64, "", "doc-3"))
-	add(t, c, rankedOf(model.TierLexicalFTS, 9, "pkg/beta.go", 0, "", "doc-4"))
+	add(t, c, rankedOf(model.TierLexical, 3, "pkg/alpha.go", 0, "", "doc-1"))
+	add(t, c, rankedOf(model.TierLexical, 5, "pkg/alpha.go", 0, "", "doc-2"))
+	add(t, c, rankedOf(model.TierLexical, 7, "pkg/alpha.go", 64, "", "doc-3"))
+	add(t, c, rankedOf(model.TierLexical, 9, "pkg/beta.go", 0, "", "doc-4"))
 	got := resultsOf(t, c)
 	if len(got) != 3 {
 		t.Fatalf("results = %d hits, want 3: (path,start) separates chunks, and folds only the pair that shares one", len(got))
@@ -564,7 +564,7 @@ func legRankedSetLossless(t *testing.T, _ *fixture) {
 	// kept only a prefix of what it was offered cannot pass.
 	for i := range distinct {
 		n := (i * 2237) % distinct
-		r := rankedOf(model.TierLexicalFTS, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
+		r := rankedOf(model.TierLexical, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
 			model.NodeID("n"+strconv.Itoa(n)), "k"+strconv.Itoa(n))
 		oracle = append(oracle, r)
 		add(t, c, r, "lexical")
@@ -588,7 +588,7 @@ func legRankedSetLossless(t *testing.T, _ *fixture) {
 	again := collectorFor(t)
 	for i := range distinct {
 		n := (i * 2237) % distinct
-		add(t, again, rankedOf(model.TierLexicalFTS, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
+		add(t, again, rankedOf(model.TierLexical, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
 			model.NodeID("n"+strconv.Itoa(n)), "k"+strconv.Itoa(n)), "lexical")
 	}
 	add(t, again, oracle[0], "exact")
@@ -604,7 +604,7 @@ func legReasonBounds(t *testing.T, _ *fixture) {
 	c := collectorFor(t)
 	long := strings.Repeat("x", model.MaxReasonBytes+64)
 	for i := range model.MaxReasonsPerEntry + 4 {
-		add(t, c, rankedOf(model.TierLexicalFTS, 1, "p", 0, "n", "k"), "reason "+strconv.Itoa(i), long, "reason 0")
+		add(t, c, rankedOf(model.TierLexical, 1, "p", 0, "n", "k"), "reason "+strconv.Itoa(i), long, "reason 0")
 	}
 	got := resultsOf(t, c)[0]
 	if len(got.Reasons) != model.MaxReasonsPerEntry {
@@ -619,7 +619,7 @@ func legReasonBounds(t *testing.T, _ *fixture) {
 		t.Errorf("Reasons repeats an entry: %v", got.Reasons)
 	}
 	hit := model.SearchHit{FileID: model.NewFileID("r", "p"), Path: "p", Kind: model.NodeFunction,
-		Tier: model.TierLexicalFTS, Reasons: got.Reasons}
+		Tier: model.TierLexical, Reasons: got.Reasons}
 	if err := hit.Validate(); err != nil {
 		t.Errorf("a folded hit does not validate: %v", err)
 	}
@@ -842,7 +842,7 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 
 	start := uint64(len(filler))
 	span := model.ByteRange{Start: start, End: start + uint64(len(target))}
-	hits := []model.SearchHit{{FileID: file, Path: "pkg/café.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	hits := []model.SearchHit{{FileID: file, Path: "pkg/café.go", Kind: model.NodeFunction, Tier: model.TierLexical}}
 	if err := h.hydratePage(ctx, hits, []model.ByteRange{span}); err != nil {
 		t.Fatalf("hydratePage: %v", err)
 	}
@@ -868,7 +868,7 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 
 	// A second hit in the same file reuses the cached blob record.
 	before := counter.reads
-	more := []model.SearchHit{{FileID: file, Path: "pkg/café.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	more := []model.SearchHit{{FileID: file, Path: "pkg/café.go", Kind: model.NodeFunction, Tier: model.TierLexical}}
 	if err := h.hydratePage(ctx, more, []model.ByteRange{{Start: 0, End: 0}}); err != nil {
 		t.Fatalf("hydratePage(empty span): %v", err)
 	}
@@ -901,7 +901,7 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 		stubBlobs{sparseRec.Hash: sparseRec},
 		&countingCAS{cas: cas})
 	sparseCounter := sh.content.(*countingCAS)
-	sparseHits := []model.SearchHit{{FileID: sparseFile, Path: "pkg/sparse.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	sparseHits := []model.SearchHit{{FileID: sparseFile, Path: "pkg/sparse.go", Kind: model.NodeFunction, Tier: model.TierLexical}}
 	if err := sh.hydratePage(ctx, sparseHits, []model.ByteRange{span}); err != nil {
 		t.Fatalf("hydratePage over a file with no checkpoints: %v: a sparse checkpoint index must "+
 			"degrade to more reads, never to a failed answer", err)
@@ -944,7 +944,7 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 		stubBlobs{longRec.Hash: longRec},
 		&countingCAS{cas: cas})
 	longCounter := lh.content.(*countingCAS)
-	longHits := []model.SearchHit{{FileID: file, Path: "web/bundle.min.js", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	longHits := []model.SearchHit{{FileID: file, Path: "web/bundle.min.js", Kind: model.NodeFunction, Tier: model.TierLexical}}
 	if err := lh.hydratePage(ctx, longHits, []model.ByteRange{longSpan}); err != nil {
 		t.Fatalf("hydratePage over a %d-byte line: %v: a long line must cost more reads, never a failed answer",
 			len(longLine), err)
@@ -1043,9 +1043,9 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 			continue
 		}
 		lexicalHit = true
-		if hit.Tier != model.TierLexicalFTS || hit.ScoreMicros != wantLexicalMicros {
+		if hit.Tier != model.TierLexical || hit.ScoreMicros != wantLexicalMicros {
 			t.Errorf("the beta hit is tier %q at %d, want %q at the BM25F value %d",
-				hit.Tier, hit.ScoreMicros, model.TierLexicalFTS, wantLexicalMicros)
+				hit.Tier, hit.ScoreMicros, model.TierLexical, wantLexicalMicros)
 		}
 	}
 	if !lexicalHit {
@@ -1058,7 +1058,7 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 		// the exact candidate. The exemption is read off the hit's own
 		// reasons, with the production spelling, so it can only apply to a
 		// hit the lexical tier really contributed to.
-		lexical := hit.Tier == model.TierLexicalFTS || slices.Contains(hit.Reasons, reasonFor(model.TierLexicalFTS))
+		lexical := hit.Tier == model.TierLexical || slices.Contains(hit.Reasons, reasonFor(model.TierLexical))
 		if !lexical && hit.ScoreMicros != 0 {
 			t.Errorf("hit %d is tier %q with ScoreMicros = %d, want 0", i, hit.Tier, hit.ScoreMicros)
 		}
@@ -1665,7 +1665,7 @@ func legRankedSetIsBoundedByItsRunBudget(t *testing.T, f *fixture) {
 			// shares no prefix with either sort order, so every run spills a
 			// scattered key range and the merge is a real one.
 			k := (i * 2237) % n
-			add(t, c, rankedOf(model.TierLexicalFTS, int64(k), "pkg/f"+strconv.Itoa(k%97)+".go", uint64(k),
+			add(t, c, rankedOf(model.TierLexical, int64(k), "pkg/f"+strconv.Itoa(k%97)+".go", uint64(k),
 				model.NodeID("n"+strconv.Itoa(k)), "k"+strconv.Itoa(k)), "lexical")
 		}
 		got := resultsOf(t, c)
@@ -1894,7 +1894,7 @@ func legStreamedWalkParity(t *testing.T, f *fixture) {
 	const wide, page = model.MaxPageItems*2 + model.MaxPageItems/4, 7
 	for i := range wide {
 		k := (i * 2237) % wide
-		r := rankedOf(model.TierLexicalFTS, 1_000_000, "pkg/w.go", uint64(k%3),
+		r := rankedOf(model.TierLexical, 1_000_000, "pkg/w.go", uint64(k%3),
 			model.NodeID("w"+strconv.Itoa(k)), "wk"+strconv.Itoa(k))
 		facts := hitFacts{hit: model.SearchHit{NodeID: r.NodeID, FileID: f.files["pkg/handler.go"],
 			Path: r.Path, Kind: model.NodeFunction, Name: "w" + strconv.Itoa(k%5),

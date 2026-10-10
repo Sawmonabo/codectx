@@ -15,14 +15,14 @@ import (
 func TestCandidateCodecRoundTripsEveryField(t *testing.T) {
 	full := scored{
 		ranked: ranked{
-			Tier: model.TierLexicalFTS, ScoreMicros: -4321, Path: "pkg/a/b.go", StartByte: 1 << 40,
+			Tier: model.TierLexical, ScoreMicros: -4321, Path: "pkg/a/b.go", StartByte: 1 << 40,
 			NodeID: "n-1", SearchKey: "sk-1", RowID: 987654321, Occurrences: 7,
 		},
 		Reasons: []string{"matched the body text", "matched the name"},
 		Hit: model.SearchHit{
 			NodeID: "n-1", FileID: "f-1", Path: "pkg/a/b.go", Kind: "function", Name: "Do",
 			QualifiedName: "pkg/a.Do", Signature: "func Do(ctx context.Context) error",
-			Tier: model.TierLexicalFTS, ScoreMicros: -4321,
+			Tier: model.TierLexical, ScoreMicros: -4321,
 			Range: &model.SourceRange{
 				Start: model.Position{Byte: 10, Line: 2, Column: 3},
 				End:   model.Position{Byte: 4_000_000_000, Line: 99, Column: 1},

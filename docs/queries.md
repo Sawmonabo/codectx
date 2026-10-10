@@ -73,7 +73,7 @@ comes back with no `range` and an `unresolved_fields` object naming the field
 that could not be resolved against the typed reason it failed with:
 
 ```json
-{ "path": "pkg/gone.go", "tier": "lexical_fts",
+{ "path": "pkg/gone.go", "tier": "lexical",
   "unresolved_fields": { "range": "CTX_SOURCE_INTEGRITY: blob is missing from the content-addressed store" } }
 ```
 

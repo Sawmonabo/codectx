@@ -49,8 +49,13 @@ type Function struct {
 	Writes []Access
 }
 
-// Span is a byte range [Start, End) of the source.
-type Span struct{ Start, End uint32 }
+// Span is a byte range [Start, End) of the source. The binary encodings
+// carry it as two integers; a JSON record (a Decorator's arguments) carries
+// it as an object with these keys.
+type Span struct {
+	Start uint32 `json:"start"`
+	End   uint32 `json:"end"`
+}
 
 // Pair is one relation between two variables of a Function, evidenced at
 // one of its nodes.

@@ -386,8 +386,8 @@ const carryEvidencePage = 2000
 // already proved is this unit's declared hash for that file.
 func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, stats *CarryOverStats) error {
 	ins, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id,
-		start_byte, end_byte, native_key_id, detail, content_hash_bound)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
+		start_byte, end_byte, native_key_id, detail, dispatch, set_size, content_hash_bound)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
 	if err != nil {
 		return wrap("evidence", err)
 	}
@@ -425,7 +425,7 @@ func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64
 			// refs are already this unit's refs and re-resolving them would
 			// only repeat the lookup the page already did.
 			res, err := ins.ExecContext(ctx, idRaw, w.rowID, nullNode(row.node), nullRelation(row.rel), string(e.Precision), fileRaw,
-				start, end, int64(row.native), e.Detail, boolInt(row.bound))
+				start, end, int64(row.native), e.Detail, string(e.Dispatch), e.SetSize, boolInt(row.bound))
 			if err != nil {
 				return wrap("evidence", err)
 			}
@@ -460,7 +460,7 @@ type carriedEvidence struct {
 // already a fact of this unit.
 func (w *UnitWriter) readEvidencePage(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, after []byte) ([]carriedEvidence, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.node_id, ni.canonical, e.relation_id, ri.canonical, e.precision, e.file_id,
-		e.start_byte, e.end_byte, e.native_key_id, nk.key, e.detail, e.content_hash_bound
+		e.start_byte, e.end_byte, e.native_key_id, nk.key, e.detail, e.dispatch, e.set_size, e.content_hash_bound
 		FROM evidence e
 		LEFT JOIN node_ids ni ON ni.id = e.node_id
 		LEFT JOIN relation_ids ri ON ri.id = e.relation_id
@@ -483,7 +483,7 @@ func (w *UnitWriter) readEvidencePage(ctx context.Context, tx *sql.Tx, prevRow i
 		var bound int
 		var row carriedEvidence
 		if err := rows.Scan(&id, &nodeRow, &node, &relRow, &relation, &row.evidence.Precision, &file, &start, &end,
-			&native, &row.evidence.NativeKey, &row.evidence.Detail, &bound); err != nil {
+			&native, &row.evidence.NativeKey, &row.evidence.Detail, &row.evidence.Dispatch, &row.evidence.SetSize, &bound); err != nil {
 			return nil, wrap("evidence", err)
 		}
 		row.raw = id

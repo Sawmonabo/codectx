@@ -22,13 +22,13 @@ func (f fixedAliases) LookupAliases(_ context.Context, _ []model.UnitID, _, _ st
 // scale-posture rule that a repository property never fails an analysis unit.
 //
 // Mutation that fails it: return CTX_PROVIDER_OUTPUT_INVALID for a native key
-// aliased to more identities than model.MaxAmbiguousCandidates. One heavily
+// aliased to more identities than some fixed count (18 here). One heavily
 // overloaded symbol name then refuses the whole dependency output — the unit
 // produces nothing, not even the facts that had no ambiguity at all. What the
 // dependencies published is the only bound; the resolver keeps every
 // alternative the lookup returned so no may_refer_to edge is silently lost.
 func TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit(t *testing.T) {
-	const n = model.MaxAmbiguousCandidates + 2 // over the ambiguity threshold
+	const n = 18 // more alternatives than any fixed candidate count a resolver might impose
 	var store fixedAliases
 	for i := 0; i < n; i++ {
 		id := model.NodeID(fmt.Sprintf("%064x", i+1))

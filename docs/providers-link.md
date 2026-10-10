@@ -63,8 +63,7 @@ own evidence at the declaration's range. So the edge joins the structural node, 
 provider already uses. The linker mints a callee node in scope `file:<path>` with native key
 `link:<call-site key>`, located in the site's file at the site's range, and metadata `{"resolution":"ambiguous","candidates":n,"callee":"<name>"}`. It publishes a
 `calls` edge to that node and one `may_refer_to` edge per candidate. Nothing is capped: every candidate is published
-and counted in `candidates`. This differs from the structural provider's in-file family, which keeps at most
-`model.MaxAmbiguousCandidates` candidates and counts the rest as dropped.
+and counted in `candidates`, as in the structural provider's in-file family.
 
 A site bound to exactly one declaration publishes one `calls` edge to it.
 
