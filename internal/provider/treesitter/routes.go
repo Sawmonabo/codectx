@@ -543,8 +543,6 @@ func keywordOf(text string) (string, int) {
 	return kw, i
 }
 
-func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
-
 func isIdent(c byte, first bool) bool {
 	return c == '_' || c == '$' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || !first && '0' <= c && c <= '9'
 }
