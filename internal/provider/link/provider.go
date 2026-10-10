@@ -71,8 +71,9 @@ const (
 	// DetailDirect: the callee names the declaration directly, by its
 	// package, module, import or scope.
 	DetailDirect = "direct"
-	// DetailHierarchy: class-hierarchy analysis over the receiver's static
-	// type and its subtypes.
+	// DetailHierarchy: the method the receiver's static type declares or
+	// inherits, found by walking its supertypes; the occurrence's dispatch
+	// says whether an override in a subtype may run instead.
 	DetailHierarchy = "hierarchy"
 	// DetailAddressTaken: an indirect site joined to an address-taken
 	// function of the same signature.
