@@ -78,9 +78,6 @@ type types struct {
 	recvRun *pagination.SortedRun[recv]
 	cursor  *seeker[recv]
 	calls   *seeker[binding]
-	// externals is each type declaration's supertypes outside the project
-	// (keyExternalSuper), which externalMember reads.
-	externals *index
 }
 
 // inferTypes runs the inference over the unit's tables.
@@ -88,8 +85,6 @@ func inferTypes(ctx context.Context, u *unit, h *hierarchy) (*types, error) {
 	in := &inference{u: u, h: h}
 	t, err := in.run(ctx)
 	in.closeAll()
-	// Set only when the run failed after the scan.
-	in.externalIx.close()
 	return t, err
 }
 
@@ -159,7 +154,6 @@ func (t *types) close() error {
 		t.calls.stop()
 	}
 	t.bindingRun.Close()
-	t.externals.close()
 	return t.recvRun.Close()
 }
 
@@ -342,11 +336,6 @@ type inference struct {
 	fieldWatches *pagination.ExternalSort[watch]
 	receivers    *pagination.ExternalSort[recv]
 	fielded      bool
-	// externals collects each type's supertypes outside the project, which
-	// the file scan reads from the tables' supertype rows, and externalIx
-	// is them once the scan is done.
-	externals  *pagination.ExternalSort[entry]
-	externalIx *index
 
 	open []interface{ Close() error }
 }
@@ -378,18 +367,11 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		return nil, err
 	}
 	in.receivers.WithFold(keepFirst[recv])
-	if in.externals, err = newEntrySort(in.u.dir); err != nil {
-		return nil, err
-	}
-	in.keep(in.externals)
 	r, err := in.newRound()
 	if err != nil {
 		return nil, err
 	}
 	if err := in.scan(ctx, r); err != nil {
-		return nil, err
-	}
-	if in.externalIx, err = writeIndex(in.u.dir, in.externals); err != nil {
 		return nil, err
 	}
 	if in.facts, err = emptyRun(in, factCodec); err != nil {
@@ -452,9 +434,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 	}
 	// The answer's runs belong to the types the inference returns.
 	in.open = slices.DeleteFunc(in.open, func(c interface{ Close() error }) bool { return c == in.bound })
-	externals := in.externalIx
-	in.externalIx = nil
-	return &types{bindingRun: in.bound, recvRun: recvs, externals: externals}, nil
+	return &types{bindingRun: in.bound, recvRun: recvs}, nil
 }
 
 // addFieldWatches adds the field watch of every member site the field may
@@ -526,7 +506,7 @@ func (in *inference) fieldDecides(x value, method string) (bool, error) {
 	if err := in.h.declared(x.Ref, method, func(entry) error { declares = true; return nil }); err != nil || declares {
 		return false, err
 	}
-	outside, err := outsideSupertypes(in.h, in.externalIx, x.Ref)
+	outside, err := outsideSupertypes(in.h, x.Ref)
 	return len(outside) == 0, err
 }
 
@@ -668,9 +648,6 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 			return err
 		}
 	}
-	if err := f.externalSupertypes(ctx); err != nil {
-		return err
-	}
 	for _, v := range t.Values {
 		if v.Field == "" {
 			continue
@@ -688,36 +665,6 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 	}
 	return nil
 }
-
-// externalSupertypes records each supertype row of the file whose supertype
-// is outside the project (hierarchy.externalName) under every type
-// declaration the row's subtype names (keyExternalSuper).
-func (f *fileScan) externalSupertypes(ctx context.Context) error {
-	if len(f.t.Supertypes) == 0 {
-		return nil
-	}
-	fc := contextOf(f.file, f.t)
-	for _, st := range f.t.Supertypes {
-		q, ok, err := f.in.h.externalName(ctx, fc, st.Super)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		err = f.in.h.types(ctx, f.file, st.Type, func(sub Ref) error {
-			return f.in.externals.Add(entry{Key: keyExternalSuper + refKey(sub), Aux: q})
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// keyExternalSuper + refKey(type): a supertype of the type outside the
-// project, its qualified name (hierarchy.externalName) in Aux.
-const keyExternalSuper = "xs\x00"
 
 // namesOutside reports a receiver term that names a module, or a type or a
 // supertype no declaration of the unit is: what it names decides the call,
@@ -1390,7 +1337,7 @@ func (t *types) externalMember(h *hierarchy, family string, site, typ Ref, metho
 // A type with no supertype outside the project emits nothing. It reports
 // whether it emitted.
 func (t *types) outsideCall(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
-	outside, err := outsideSupertypes(h, t.externals, typ)
+	outside, err := outsideSupertypes(h, typ)
 	if err != nil {
 		return false, err
 	}
@@ -1405,36 +1352,17 @@ func (t *types) outsideCall(h *hierarchy, family string, site, typ Ref, method s
 }
 
 // outsideSupertypes is the qualified names of the supertypes outside the
-// project in typ's supertype closure, typ's own included, each once, read
-// from externals (keyExternalSuper).
-func outsideSupertypes(h *hierarchy, externals *index, typ Ref) ([]string, error) {
+// project of typ and of each of its supertypes of the unit, each once
+// (hierarchy.externalSupertypes).
+func outsideSupertypes(h *hierarchy, typ Ref) ([]string, error) {
 	var outside []string
-	seen := map[Ref]bool{typ: true}
-	queue := []Ref{typ}
-	for len(queue) > 0 {
-		x := queue[0]
-		queue = queue[1:]
-		err := externals.lookup(keyExternalSuper+refKey(x), func(e entry) error {
-			if !slices.Contains(outside, e.Aux) {
-				outside = append(outside, e.Aux)
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
+	err := h.externalSupertypes(typ, true, func(e entry) error {
+		if !slices.Contains(outside, e.Aux) {
+			outside = append(outside, e.Aux)
 		}
-		err = h.links.lookup(keySuper+refKey(x), func(e entry) error {
-			if !seen[e.Ref] {
-				seen[e.Ref] = true
-				queue = append(queue, e.Ref)
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	return outside, nil
+		return nil
+	})
+	return outside, err
 }
 
 // externalReceiver emits the virtual FactCall of member site s, at site in
