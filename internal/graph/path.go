@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -534,11 +535,10 @@ type pathWalk struct {
 	// spent. It is a position in the CURRENT batch's scan and is cleared when
 	// that batch is fully expanded.
 	expandAfter EdgePos
-	// scanDone and hopsAfter extend that position past the scan: the batch's
-	// stored lists are all read, and that many of its name-only steps are
-	// relaxed (nameOnly).
-	scanDone  bool
-	hopsAfter int64
+	// scanDone and hopPos extend that position past the scan: the batch's
+	// stored lists are all read, and where its name-only steps are (nameOnly).
+	scanDone bool
+	hopPos   hopPos
 	// possible is the search that also takes name-only calls, run when the
 	// precise search proved no route exists (startPossible).
 	possible bool
@@ -663,11 +663,17 @@ func (w *pathWalk) resumable() bool {
 // loadProgress restores what the previous page left in the state file: the
 // expansion position, the depth-pruned disclosure and the search's phase.
 func (w *pathWalk) loadProgress() error {
-	var after string
+	var after, hops string
 	var pruned, scanDone, possible int
-	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_pruned, scan_done, hops_after, possible
-		FROM progress WHERE k = 0`, nil, &after, &pruned, &scanDone, &w.hopsAfter, &possible); err != nil {
+	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_pruned, scan_done, hop_pos, possible
+		FROM progress WHERE k = 0`, nil, &after, &pruned, &scanDone, &hops, &possible); err != nil {
 		return err
+	}
+	w.hopPos = hopPos{}
+	if hops != "" {
+		if err := json.Unmarshal([]byte(hops), &w.hopPos); err != nil {
+			return internalErr("path scratch: the name-only position: " + err.Error())
+		}
 	}
 	w.scanDone, w.possible = scanDone != 0, possible != 0
 	pos, err := decodeEdgePos(after)
@@ -688,9 +694,13 @@ func (w *pathWalk) saveProgress() error {
 		}
 		return 0
 	}
+	hops, err := json.Marshal(w.hopPos)
+	if err != nil {
+		return internalErr("path scratch: the name-only position: " + err.Error())
+	}
 	return w.sc.exec(w.scCtx, `UPDATE progress SET expand_after = ?, depth_pruned = ?, scan_done = ?,
-		hops_after = ?, possible = ? WHERE k = 0`,
-		encodeEdgePos(w.expandAfter), flag(w.depthPruned), flag(w.scanDone), w.hopsAfter, flag(w.possible))
+		hop_pos = ?, possible = ? WHERE k = 0`,
+		encodeEdgePos(w.expandAfter), flag(w.depthPruned), flag(w.scanDone), string(hops), flag(w.possible))
 }
 
 // markPending records the nodes settled here as owing an expansion.
@@ -893,7 +903,7 @@ func (w *pathWalk) drain(ctx context.Context) error {
 				return err
 			}
 		}
-		w.expandAfter, w.scanDone, w.hopsAfter = EdgePos{}, false, 0
+		w.expandAfter, w.scanDone, w.hopPos = EdgePos{}, false, hopPos{}
 		if err := w.saveProgress(); err != nil {
 			return err
 		}
@@ -1228,19 +1238,24 @@ func (w *pathWalk) virtualCalls(ctx context.Context, edges []Edge, relIDs []mode
 }
 
 // nameOnly relaxes the batch's `may_call` steps once its stored lists are
-// read: from a node holding an open call site to each candidate of it,
-// against the edges from a candidate to each holder of a site naming it for
-// an incoming search, both for both. Each step costs the dearest relation
+// read: from a node holding an open call site to each candidate of it, and,
+// against the edges for an incoming search, from a candidate to each caller
+// of a site naming it; both for both. Each step costs the dearest relation
 // cost, is charged to the edge budget as one entry per call site relation
-// that makes it, and records those relations (`hopvia`) for the answer. The
-// steps come in a fixed order from the pinned generation, so the count of
-// those already relaxed (hopsAfter) is the position a page that stops on the
-// budget resumes from. A dispatch state takes none: its method's steps are
-// its own state's.
+// that makes it, and records that relation (`hopvia`) for the answer.
+//
+// Every list the step reads is streamed, never held: a node's calls and a
+// site's callers through resumable adjacency scans, a name's declarations a
+// page at a time by node id. hopPos is the position inside them -- the node,
+// the site, the declaration last finished and the scan position -- so a page
+// the edge budget stops resumes at the step it did not charge, and a batch
+// holds one declaration page and one scan entry whatever a name's count. A
+// dispatch state takes no step: its method's steps are its own state's.
 func (w *pathWalk) nameOnly(ctx context.Context, batch []model.NodeID,
 	dists map[model.NodeID]int64, depths map[model.NodeID]int) (bool, error) {
 	dr := declarationReader(w.reader)
-	if dr == nil {
+	calls, ok := w.reader.Kinds().Code(model.RelCalls)
+	if dr == nil || !ok {
 		return false, nil
 	}
 	var nodes []model.NodeID
@@ -1249,53 +1264,227 @@ func (w *pathWalk) nameOnly(ctx context.Context, batch []model.NodeID,
 			nodes = append(nodes, n)
 		}
 	}
-	if len(nodes) == 0 {
+	nodes = sortedNodes(nodes)
+	s := &hopStep{w: w, dr: dr, calls: calls, repo: w.reader.Binding().RepositoryID, dists: dists, depths: depths}
+	for phase := w.hopPos.Phase; phase <= hopBackward; phase++ {
+		if (phase == hopForward && w.direction == model.DirectionIncoming) ||
+			(phase == hopBackward && w.direction == model.DirectionOutgoing) {
+			continue
+		}
+		for _, n := range nodes {
+			resuming := w.hopPos.Node != "" && w.hopPos.Phase == phase
+			if resuming && n < w.hopPos.Node {
+				continue
+			}
+			if !resuming || n != w.hopPos.Node {
+				w.hopPos = hopPos{Phase: phase, Node: n}
+			}
+			var stopped bool
+			var err error
+			if phase == hopForward {
+				stopped, err = s.forward(ctx, n)
+			} else {
+				stopped, err = s.backward(ctx, n)
+			}
+			if err != nil {
+				return false, err
+			}
+			if stopped {
+				return true, w.saveProgress()
+			}
+		}
+		w.hopPos = hopPos{Phase: phase + 1}
+	}
+	return false, w.saveProgress()
+}
+
+// The two passes of a batch's name-only steps, in order.
+const (
+	hopForward  = 0
+	hopBackward = 1
+)
+
+// hopPos is the resume position inside a batch's name-only steps: the pass
+// and the node it is at, the site whose callers are being read (backward),
+// the last declaration finished in the name's list, and the position in the
+// adjacency scan being read. The zero value is the start.
+type hopPos struct {
+	Phase int          `json:"p"`
+	Node  model.NodeID `json:"n,omitempty"`
+	Site  model.NodeID `json:"s,omitempty"`
+	After model.NodeID `json:"a,omitempty"`
+	Edge  string       `json:"e,omitempty"`
+}
+
+// hopStep is one batch's name-only steps.
+type hopStep struct {
+	w      *pathWalk
+	dr     DeclarationReader
+	calls  KindCode
+	repo   model.RepositoryID
+	dists  map[model.NodeID]int64
+	depths map[model.NodeID]int
+}
+
+// take relaxes one step, or reports that the page's edge budget is spent.
+func (s *hopStep) take(at, next, caller, callee model.NodeID, via model.RelationID) (bool, error) {
+	w := s.w
+	if w.maxEdges.Exceeded(w.pageEdges + 1) {
+		w.edgesHit = true
 		return false, nil
 	}
-	nodes = sortedNodes(nodes)
-	repo := w.reader.Binding().RepositoryID
-	var seen int64
-	stopped := false
-	var ferr error
-	step := func(at, next, caller, callee model.NodeID, via model.RelationID) {
-		if stopped || ferr != nil {
-			return
-		}
-		if seen++; seen <= w.hopsAfter {
-			return
-		}
-		if w.maxEdges.Exceeded(w.pageEdges + 1) {
-			w.edgesHit, stopped = true, true
-			return
-		}
-		w.spent++
-		w.pageEdges++
-		w.hopsAfter = seen
-		hop := model.NewRelationID(repo, caller, model.RelMayCall, callee)
-		if ferr = w.sc.exec(w.scCtx,
-			`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
-			dists[at]+Cost(model.RelMayCall), string(next), string(hop), string(at), string(model.RelMayCall),
-			depths[at]+1); ferr != nil {
-			return
-		}
-		ferr = w.sc.exec(w.scCtx, `INSERT OR IGNORE INTO hopvia(rel, via) VALUES(?, ?)`, string(hop), string(via))
+	w.spent++
+	w.pageEdges++
+	hop := model.NewRelationID(s.repo, caller, model.RelMayCall, callee)
+	if err := w.sc.exec(w.scCtx,
+		`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
+		s.dists[at]+Cost(model.RelMayCall), string(next), string(hop), string(at), string(model.RelMayCall),
+		s.depths[at]+1); err != nil {
+		return false, err
 	}
-	if w.direction != model.DirectionIncoming {
-		if err := candidatesOfSites(ctx, w.reader, dr, nodes, map[model.NodeID]bool{},
-			func(c, k model.NodeID, via model.RelationID) { step(c, k, c, k, via) }); err != nil {
+	return true, w.sc.exec(w.scCtx, `INSERT OR IGNORE INTO hopvia(rel, via) VALUES(?, ?)`, string(hop), string(via))
+}
+
+// one resolves a single scan entry's relation and other endpoint.
+func (s *hopStep) one(ctx context.Context, e Edge) (model.RelationID, model.NodeID, error) {
+	rels, err := s.w.reader.RelationIDs(ctx, []RelRef{e.Rel})
+	if err != nil {
+		return "", "", err
+	}
+	others, err := s.w.reader.NodeIDs(ctx, []NodeRef{e.Neighbour})
+	if err != nil {
+		return "", "", err
+	}
+	return rels[0], others[0], nil
+}
+
+// scan streams one node's list of `calls` entries in direction from the
+// saved position, stopping where visit asks to.
+func (s *hopStep) scan(ctx context.Context, n model.NodeID, direction model.Direction,
+	visit func(e Edge, first bool) (bool, error)) (bool, error) {
+	refs, err := s.w.reader.Resolve(ctx, []model.NodeID{n})
+	if err != nil || len(refs) == 0 || refs[0] == 0 {
+		return false, err
+	}
+	from, err := decodeEdgePos(s.w.hopPos.Edge)
+	if err != nil {
+		return false, err
+	}
+	first, stopped := true, false
+	var verr error
+	pos, err := s.w.reader.Neighbours(ctx, refs, direction, []KindCode{s.calls}, from, func(e Edge) error {
+		ok, err := visit(e, first)
+		first = false
+		if err != nil {
+			verr = err
+			return ErrStopScan
+		}
+		if !ok {
+			stopped = true
+			return ErrStopScan
+		}
+		return nil
+	})
+	if verr != nil {
+		return false, verr
+	}
+	if err != nil {
+		return false, err
+	}
+	if stopped {
+		s.w.hopPos.Edge = encodeEdgePos(pos)
+	}
+	return stopped, nil
+}
+
+// forward takes the steps from node c: for each of its calls into an open
+// site, to each declaration that fits the site, a page of the name at a time.
+func (s *hopStep) forward(ctx context.Context, c model.NodeID) (bool, error) {
+	return s.scan(ctx, c, model.DirectionOutgoing, func(e Edge, first bool) (bool, error) {
+		via, target, err := s.one(ctx, e)
+		if err != nil || via == "" || target == "" {
+			return err == nil, err
+		}
+		decls, err := s.dr.Declared(ctx, []model.NodeID{target})
+		if err != nil || len(decls) == 0 {
+			return err == nil, err
+		}
+		site, ok := openCallSite(decls[0])
+		if !ok || site.Reason == model.ReasonComputed || site.Name == "" {
+			return true, nil
+		}
+		after := model.NodeID("")
+		if first {
+			after = s.w.hopPos.After
+		}
+		for {
+			page, next, err := s.dr.Declarations(ctx, site.Name, shapeKinds(site.Shape), after, model.MaxPageItems)
+			if err != nil {
+				return false, err
+			}
+			for _, d := range page {
+				if site.fits(d.Node) {
+					ok, err := s.take(c, d.Node.ID, c, d.Node.ID, via)
+					if err != nil || !ok {
+						s.w.hopPos.After = after
+						return false, err
+					}
+				}
+				after = d.Node.ID
+			}
+			if next == "" {
+				break
+			}
+			after = next
+		}
+		s.w.hopPos.After = ""
+		return true, nil
+	})
+}
+
+// backward takes the steps into node k: for each open site whose candidates
+// include it, a page of k's name at a time, to each caller of the site.
+func (s *hopStep) backward(ctx context.Context, k model.NodeID) (bool, error) {
+	decls, err := s.dr.Declared(ctx, []model.NodeID{k})
+	if err != nil || len(decls) == 0 {
+		return false, err
+	}
+	n := decls[0].Node
+	if !isDeclared(n) || n.Name == "" {
+		return false, nil
+	}
+	after := s.w.hopPos.After
+	for {
+		page, next, err := s.dr.Declarations(ctx, n.Name, nil, after, model.MaxPageItems)
+		if err != nil {
 			return false, err
 		}
-	}
-	if w.direction != model.DirectionOutgoing {
-		if err := callersOfSites(ctx, w.reader, dr, nodes, map[model.NodeID]bool{},
-			func(c, k model.NodeID, via model.RelationID) { step(k, c, c, k, via) }); err != nil {
-			return false, err
+		for _, d := range page {
+			site, ok := openCallSite(d)
+			if ok && site.Reason != model.ReasonComputed && site.fits(n) {
+				if s.w.hopPos.Site != d.Node.ID {
+					s.w.hopPos.Site, s.w.hopPos.Edge = d.Node.ID, ""
+				}
+				stopped, err := s.scan(ctx, d.Node.ID, model.DirectionIncoming, func(e Edge, _ bool) (bool, error) {
+					via, caller, err := s.one(ctx, e)
+					if err != nil || via == "" || caller == "" {
+						return err == nil, err
+					}
+					return s.take(k, caller, caller, k, via)
+				})
+				if err != nil || stopped {
+					s.w.hopPos.After = after
+					return stopped, err
+				}
+				s.w.hopPos.Site, s.w.hopPos.Edge = "", ""
+			}
+			after = d.Node.ID
 		}
+		if next == "" {
+			return false, nil
+		}
+		after = next
 	}
-	if ferr != nil {
-		return false, ferr
-	}
-	return stopped, w.saveProgress()
 }
 
 // hopVias is the call site relations behind each `may_call` step on routes.
@@ -1340,7 +1529,7 @@ func (w *pathWalk) startPossible() error {
 	}
 	w.possible, w.resumed = true, false
 	w.bucketCost, w.lastSettled = 0, ""
-	w.expandAfter, w.scanDone, w.hopsAfter = EdgePos{}, false, 0
+	w.expandAfter, w.scanDone, w.hopPos = EdgePos{}, false, hopPos{}
 	w.depthPruned, w.targetSettled = false, false
 	return w.saveProgress()
 }

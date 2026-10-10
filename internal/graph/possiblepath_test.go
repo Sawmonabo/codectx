@@ -32,16 +32,22 @@ func manyHandles(width int) *callFixture {
 // search over f, on its own scratch.
 func callWalk(t *testing.T, f *callFixture, frontier int64, maxEdges config.Limit) *pathWalk {
 	t.Helper()
+	return walkOver(t, f.reader(), model.DirectionOutgoing, frontier, maxEdges)
+}
+
+// walkOver is the path walk over reader in direction, on its own scratch.
+func walkOver(t *testing.T, reader GraphReader, direction model.Direction, frontier int64,
+	maxEdges config.Limit) *pathWalk {
+	t.Helper()
 	sc, err := openPathScratch(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatalf("scratch: %v", err)
 	}
 	t.Cleanup(func() { sc.close() })
-	reader := f.reader()
 	kinds := []model.RelationKind{model.RelCalls}
 	codes, absent := kindCodesFor(reader, kinds)
 	return &pathWalk{reader: reader, kinds: kinds, kindCodes: codes, kindsAbsent: absent,
-		direction: model.DirectionOutgoing, descent: pathDescentFor(reader, model.DirectionOutgoing, kinds),
+		direction: direction, descent: pathDescentFor(reader, direction, kinds),
 		maxEdges: maxEdges, frontierBytes: frontier, sc: sc, scCtx: context.Background()}
 }
 
@@ -184,5 +190,109 @@ func TestAPageNeverOvershootsTheEdgeBudgetOnAnOverridesList(t *testing.T) {
 		next.resumed = true
 		next.visited, next.spent, next.bucketCost, next.lastSettled = w.visited, w.spent, w.bucketCost, w.lastSettled
 		w = &next
+	}
+}
+
+// countedDecls counts the rows a reader hands out of one name's declarations,
+// so a test can see how much of that list one page read.
+type countedDecls struct {
+	*locatedGraph
+	name string
+	rows int
+}
+
+func (c *countedDecls) Declarations(ctx context.Context, name string, kinds []model.NodeKind, after model.NodeID,
+	limit int) ([]Declaration, model.NodeID, error) {
+	page, next, err := c.locatedGraph.Declarations(ctx, name, kinds, after, limit)
+	if name == c.name {
+		c.rows += len(page)
+	}
+	return page, next, err
+}
+
+// pagesOf runs w to the end page by page, as continuations would, and
+// returns the declaration rows each page read; it fails a page that spends
+// more than the edge budget.
+func pagesOf(t *testing.T, w *pathWalk, reader *countedDecls, from, to model.NodeID, budget int64) ([]int, *pathWalk) {
+	t.Helper()
+	base := *w
+	var rows []int
+	for page := 0; ; page++ {
+		if page == 1000 {
+			t.Fatalf("the walk did not finish in 1000 pages")
+		}
+		reader.rows = 0
+		if err := w.run(context.Background(), from, to); err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		rows = append(rows, reader.rows)
+		if w.pageEdges > budget {
+			t.Fatalf("page %d spent %d edges, over the budget of %d", page, w.pageEdges, budget)
+		}
+		if !w.edgesHit {
+			return rows, w
+		}
+		next := base
+		next.resumed = true
+		next.visited, next.spent, next.bucketCost, next.lastSettled = w.visited, w.spent, w.bucketCost, w.lastSettled
+		w = &next
+	}
+}
+
+// TestNameOnlyStepsPageTheirLists pins that a name-only step streams the
+// lists it reads: a name with five pages of declarations, as an open site's
+// candidates (forward) and as the sites naming a method (backward), is read
+// a page at a time across pages the edge budget ends, and the steps resume
+// inside the list. Each page reads at most two declaration pages, and the
+// pages together take every step exactly once.
+//
+// Mutation caught: reading a name's whole list per step (a page reads all
+// five declaration pages, and a resumed page reads them again).
+func TestNameOnlyStepsPageTheirLists(t *testing.T) {
+	width := 5 * model.MaxPageItems
+	const budget = 50
+	limit := 2 * model.MaxPageItems
+
+	f := manyHandles(width)
+	reader := &countedDecls{locatedGraph: f.reader(), name: "handle"}
+	w := walkOver(t, reader, model.DirectionOutgoing, 1<<20, budget)
+	w.possible = true
+	rows, last := pagesOf(t, w, reader, f.id(t, "main"), f.id(t, "leaf"), budget)
+	for page, n := range rows {
+		if n > limit {
+			t.Errorf("forward: page %d read %d declaration rows; a step reads one page of a name at a time", page, n)
+		}
+	}
+	// main's call into the open site, then one step per candidate, once each.
+	if last.spent != int64(1+width) {
+		t.Errorf("forward: the pages spent %d edges, want %d: every step taken exactly once", last.spent, 1+width)
+	}
+
+	nodes := []fixtureDecl{
+		{Name: "handle", Kind: model.NodeMethod, File: "lib.py", Bytes: [2]uint64{0, 30}},
+		{Name: "lonely", Kind: model.NodeFunction, File: "lonely.py", Bytes: [2]uint64{0, 20}},
+	}
+	var rels []fixtureFact
+	for i := range width {
+		s, c := fmt.Sprintf("s%04d", i), fmt.Sprintf("c%04d", i)
+		nodes = append(nodes,
+			fixtureDecl{Name: c, Kind: model.NodeFunction, File: c + ".py", Bytes: [2]uint64{0, 40}},
+			fixtureDecl{Key: s, Name: "handle", Kind: model.NodeFunction, File: c + ".py", Bytes: [2]uint64{20, 30},
+				Metadata: openSite(model.CallShapeMember, 0)})
+		rels = append(rels, fixtureFact{From: c, Kind: model.RelCalls, To: s, Occurrences: site(20)})
+	}
+	g := newCallFixture("many_sites", fixtureScenario{Nodes: nodes, Relations: rels})
+	reader = &countedDecls{locatedGraph: g.reader(), name: "handle"}
+	w = walkOver(t, reader, model.DirectionIncoming, 1<<20, budget)
+	w.possible = true
+	rows, last = pagesOf(t, w, reader, g.id(t, "handle"), g.id(t, "lonely"), budget)
+	for page, n := range rows {
+		if n > limit {
+			t.Errorf("backward: page %d read %d declaration rows; the sites naming a method are read a page at a time",
+				page, n)
+		}
+	}
+	if last.spent != int64(width) {
+		t.Errorf("backward: the pages spent %d edges, want %d: one step per site's caller, once each", last.spent, width)
 	}
 }
