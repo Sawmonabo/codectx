@@ -30,8 +30,8 @@ the wrong one is a wrong answer the caller cannot detect.
 | Command | Answers | Walks |
 |---|---|---|
 | `refs <name-or-id>` | the sealed reference occurrences of one node | incoming `references` and `calls` |
-| `callers <name-or-id>...` | who reaches these symbols | incoming `calls` |
-| `callees <name-or-id>...` | what these symbols reach | outgoing `calls` |
+| `callers <name-or-id>...` | who reaches these symbols | incoming `calls`, and the virtual calls into every method they override |
+| `callees <name-or-id>...` | what these symbols reach | outgoing `calls`, the overrides a virtual call may run, and an endpoint's `routes_to` |
 | `path <from> <to>` | the cheapest dependency routes between two nodes | the default relation allowlist |
 | `impact <name-or-id>...` | what a change to these symbols may affect, ranked | both directions over the impact allowlist |
 
@@ -86,6 +86,106 @@ index, not a clamped range, and still fails the query with
 as itself rather than arriving as a complete answer with per-hit footnotes. Run
 `codectx doctor --deep` to verify the content store when hits carry this flag.
 
+## What a call answer carries
+
+**Where everything is.** A `callers`, `callees` or `path` answer carries a
+`locations` entry for every node it lists — the file, its path in the pinned
+snapshot and the node's byte range — and an `occurrences` entry for every call
+site behind every `calls` relation it lists, each with its file, byte range,
+`dispatch` (`virtual` when the call can run an override of its target, `exact`
+when it cannot) and, for a site bound to several targets, its `set_size`. One
+answer is enough to open a call hierarchy: no follow-up `symbol` or `refs` call
+is needed to place a caller or a call. A relation with more call sites than one
+answer holds lists its first sites and a notice gives the exact count. The
+MCP `codectx_callers` and `codectx_callees` tools walk `calls` when `relations`
+is empty, exactly as these commands do; a request that names relations walks
+those.
+
+**Calls through a base class are found at query time.** A call is stored once,
+against the method its receiver's declared type declares: in
+
+```python
+class Animal:
+    def sound(self): ...
+class Dog(Animal):
+    def sound(self): ...
+def speak(a: Animal): a.sound()
+def direct(d: Dog): d.sound()
+```
+
+`speak` calls `Animal.sound`. So `callers Dog.sound` lists `direct`, then climbs
+`overrides` to `Animal.sound` — at any depth, so a `Puppy.sound` under `Dog`
+reaches both — and lists `speak`, whose call is virtual, marked
+`through_base` with the base and how many methods override it. The
+`overrides` row it climbed is in the answer, the row lists only the call's
+virtual sites, and `counts` reports `direct` and `through_base` apart. A
+through-base row is a call that **may** run the method, never one that must:
+`super().sound()` and a qualified `Animal::sound()` are exact and never appear,
+and `callers Animal.sound` never lists `direct`, whose call can only run
+`Dog.sound`. `callees speak` lists `Animal.sound` and then every override of it,
+at any depth, marked `may_dispatch` and counted as `may_dispatch`. A site bound
+by value flow to several classes is marked `value_set` with its set size ("1
+of 2"). `path` and a forward `impact` take the same downward step, a path
+only from a call that can dispatch, at that call's cost even when a cheaper
+exact call reaches the same method; `impact` of a method lists the methods
+overriding it; `refs` of a method includes the references of every method in
+its override family, up and down. The step belongs to the command, not to the
+relation list: a walk over `calls` alone takes it. A base method the climb
+reached that is also a caller of a symbol in the walk has the rest of its
+callers walked too, a callee first reached by an exact call and later by one
+that can dispatch has its overrides listed too, and an `overrides` row is listed once even when the
+request names `overrides`. When a method marks no override and its class extends a type outside the
+indexed project, the callers answer says that calls through that type are found
+only for overrides the language marks.
+
+**Calls no analysis bound are listed by name, after every precise row.** When
+the linker cannot bind a call — `obj.handle()` with nothing known about `obj` —
+it publishes one open-site node for the call, located at it, named by the
+callee and carrying its shape (`bare`, `member`, `value`, `construct`) and
+argument count; the caller's `calls` edge goes to that node, and it replaces the
+structural `call:<name>` placeholder for the same site, so an open call is one
+row, on whichever page the open site falls. Its candidates are computed per query, never stored: the declarations of
+the same name, of a kind the shape can call (methods for a member call,
+functions for a bare or value call, classes for a construction), in the same
+language family (C with C++, JavaScript with TypeScript), and, in C, C++, Go,
+Java and Rust, with parameters that take the call's arguments. Each is a
+`may_call` relation, marked `name_only`: it may not be what runs.
+
+- `callers` lists, after the precise callers, the callers of every open site
+  the symbol is a candidate of, and counts them as `may_call` beside
+  `open_sites`; with no caller at all, by analysis or by name, the notice
+  quotes the linker's site counts (sites, bound, open, computed, external)
+  rather than reporting a bare zero.
+- `callees` lists the open-site node and then its candidates, nearest first:
+  the same file, the same directory, a file the call's file imports or is
+  imported by, the same unit, then anywhere.
+- `refs` lists the callers of those open sites after every precise
+  reference, at `heuristic` precision.
+- `path`, only when the search proved no precise route exists, searches
+  again with `may_call` admitted at the dearest relation cost, so the cheapest
+  route takes as many name-only hops as it needs and no more. It is the same
+  disk-backed search, paged the same way, and lists every equal-cost route as
+  the precise search does; each route is marked `possible`, each hop carries
+  its call sites, and a notice per route counts its hops.
+- `impact` counts, per depth, the open sites naming an affected symbol
+  (`open_sites_by_depth`) and does not list their callers as affected; an MCP
+  request whose `relations` name `may_call` walks on through them, one depth
+  deeper per hop, on routes marked `possible`.
+
+The possible rows are one hop from the start symbols; an MCP request whose
+`relations` name `may_call` walks on through them, to the callers of the
+callers' open sites and so on, up to its depth bound. A name declared thousands of times has an exact count
+and is paged, never cut. An import whose path does not fold to a constant
+(`require("./plugins/" + name)`) is an open import site with its literal
+fragments, and an outgoing `imports` answer lists, after the precise imports,
+every file whose path matches them as `may_import`, also by name only and not
+walked on unless a request's `relations` name `may_import`.
+
+**Endpoints.** `routes_to` (endpoint to handler) is not a call and is not in the
+`callers` or `callees` relation set, but a `callees` walk from an endpoint
+follows it to the handler first, then the handler's calls. `impact` walks it,
+so a changed handler marks the endpoints that route to it affected.
+
 ## Flags
 
 | Flag | Commands | Meaning |
@@ -93,8 +193,8 @@ as itself rather than arriving as a complete answer with per-hit footnotes. Run
 | `--repo` | all | Workspace root to answer from. |
 | `--generation` | all | Answer from this generation instead of the active one. It is not combinable with `--cursor`: a cursor already pins its generation. |
 | `--timeout` | all | Deadline for this invocation, and the only thing that bounds one: `resources.query_timeout` is a default and not a ceiling, and it is unlimited, so a command you do not bound answers in full. Every command honours that — `search`, `symbol`, the graph walks, `context plan`, the coverage and workflow commands, and the MCP tools alike. A value here **sets** the deadline for the call — above a configured `resources.query_timeout` as readily as below it. What a call does when it expires depends on whether there is anything to resume past. `search`, `symbol`, the graph walks and `context plan` accumulate work across pages or passes, so a bounded call ends with a continuation cursor and the next call carries on from it. The coverage commands (`coverage read`, `coverage next`, `coverage ack`, `coverage session`, `coverage status`) and the workflow commands (`workflow advance`, `workflow close`, `workflow include`, `workflow status`) answer one bounded read or apply one mutation, so there is no partial state for a cursor to name: an expiry there is reported as `CTX_QUERY_DEADLINE`, naming `resources.query_timeout` / `--timeout` as the setting to move. Zero asks for no deadline of its own and leaves the configured value in charge. |
-| `--limit` | all but `path` | Items in one page. A route set is bounded by the reason-path cap rather than paged, so `path` declares no `--limit`. |
-| `--cursor` | all | Continue a previous page — on `path`, continue the same search. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
+| `--limit` | all | Items in one page; on `path`, the equal-cost routes one page lists. |
+| `--cursor` | all | Continue a previous page — on `path`, continue the same search, or the list of its equal-cost routes. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
@@ -254,9 +354,12 @@ what was admitted, in the one global order — and never a continuation of the
 walk past `N`. The default, `0`, sets no bound: the walk runs to exhaustion and
 its pages concatenate to the whole answer.
 
-`path` is the third shape, and it is neither of those. It declares no `--limit`
-because a route set is bounded by the reason-path cap rather than paged into
-items, but the **search** behind it is paged: `--visited` is a per-page work
+`path` is the third shape, and it is neither of those. Its answer is the list
+of every equal-cost route, paged by `--limit` with `next` and counted whole in
+`route_count` (counted over the shortest-path graph, not by listing; "at least"
+when the deadline lands first, and exact on the last page). The routes are
+listed in relation order from the search's kept state, a page at a time, never
+held all at once. The **search** behind it is paged too: `--visited` is a per-page work
 budget there, and a page that spends it ends with `next` rather than an answer.
 Following that cursor resumes the same search from the state it kept, so the
 routes it finally reports are the ones an unbounded search would report. The
@@ -363,7 +466,7 @@ where the workspace is composed, and handed to it.
 | `context.max_graph_depth` | Default and ceiling for `--depth`. Unlimited by default. |
 | `context.max_visited_nodes` | Default and ceiling for `--visited`. Unlimited by default. |
 | `context.max_graph_edges` | Default and ceiling for `--edges`. Unlimited by default. |
-| `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. |
+| `context.max_reason_paths_per_entry` | Explanation routes a context entry stores. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. It does not bound `path`, which lists every equal-cost route. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Unlimited by default, so an unbounded walk answers in full. |
 | traversal slots (half this machine's cores, at least one) | Process-wide gate on concurrent graph queries; it is derived from the machine and is not a setting. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
@@ -536,3 +639,64 @@ one of them: either precedence silently ignores something the operator typed.
 A workspace that cannot be opened fails the command. It is not answered with an
 empty page, because an empty map and an unopenable workspace are different
 facts and rendering one as the other is the single thing a map must never say.
+
+## Reading source — `codectx source`
+
+```sh
+codectx source <node-id | file-id | path> [--offset N] [--max-bytes N] [--generation N] [--json]
+```
+
+`codectx source` prints the indexed bytes of one node or one file, outside any
+context session. It is the command-line half of `codectx_read_source` without a
+`session_id`, and it reads exactly what that tool reads.
+
+- **A node id** prints the node's range as the pinned generation holds it. A
+  node keeps its id across generations while its range moves, so the range read
+  is always the asked generation's: pass the `--generation` of the answer that
+  named the node, and the bytes match that answer's ranges exactly. A node the
+  generation does not hold — deleted, or only a language-server overlay row,
+  which is never a canonical fact — is refused as **not in this generation**
+  (`CTX_ARGUMENT_INVALID`). A node whose stored range or content hash disagrees
+  with the generation's manifest is `CTX_SOURCE_INTEGRITY`, a damaged index
+  rather than a wrong argument.
+- **A file id or a path** prints the file from `--offset` (default 0) to its
+  end. A node is printed from its own start and takes no `--offset`.
+- **An argument of 64 lowercase hex characters is an id**: it is read as a node
+  id, and as a file id when the generation holds no such node. With `--offset`
+  it can only be a file id.
+- **A path** is the root-relative path the index stores. It is only turned into
+  a file id and looked up in the generation's manifest; nothing is opened on it.
+  A path the snapshot does not hold — one that climbs out of the tree with
+  `../`, an ignored file, a symbolic link the capture skipped, anything under
+  the data directory — is refused as not in this generation. The bytes come
+  from the content store, never from the working tree, so an edit made since the
+  index ran does not show.
+
+Without `--generation` the active generation is read. The whole span is
+printed: the command reads it in chunks of `--max-bytes` raw bytes (0, the
+default, is the configured `coverage.chunk_bytes`; a value above
+`coverage.max_chunk_bytes` is clamped to it) and holds one chunk at a time.
+Every chunk after the first is asked for by the signed continuation the previous
+chunk carried, so the span comes from the generation the first chunk was read
+from, and that continuation holds a retention lease, so a retention pass between
+two chunks cannot collect that generation. Because the lease is a write, this
+command opens the workspace the way the context commands do: during another
+process's indexing write it waits for that write to commit.
+
+Text output is the span's bytes and nothing else — a chunk that is not valid
+UTF-8 is decoded back to its bytes — so `codectx source <id> > out` reproduces
+them exactly, CRLF line endings and a missing final newline included. `--json`
+writes one envelope per chunk, in order. Each carries the generation `binding`,
+`file_id`, `node_id` for a node read, `content_hash`, the `byte_range` and
+`line_range` of that chunk, `encoding` (`utf8`, or `base64` where the bytes are
+not valid UTF-8), `content`, `partial_line`, and `next_offset` and
+`next_cursor` while the span continues. No envelope carries a `session` block:
+a read outside a session issues no receipt and earns no coverage.
+
+Through the tool, `codectx_read_source` without `session_id` takes exactly one
+of `node_id`, `file_id` or `path`, plus `offset` for a file, `max_bytes` for the
+chunk size and `generation_id`; or, to continue, `cursor` alone (with
+`max_bytes` if wanted). A node that fits one chunk — nearly every symbol — comes
+back whole in one call; a longer span pages with `next_cursor` to the node's or
+the file's end. The source response bound, `resources.max_source_response_bytes`,
+applies exactly as it does to a session read.

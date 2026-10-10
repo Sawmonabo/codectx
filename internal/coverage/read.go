@@ -42,7 +42,8 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 	}
 	if !req.InSession() {
 		// A read outside a session earns no receipt and no coverage, so this
-		// service, which exists to issue both, never serves one.
+		// service, which exists to issue both, never serves one: the
+		// application facade serves it from the pinned generation directly.
 		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the coverage service reads only within a session; this read names no session_id"}
 	}

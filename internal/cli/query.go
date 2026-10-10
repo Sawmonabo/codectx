@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -45,7 +48,170 @@ func newQueryCommands(build model.BuildInfo) []*cobra.Command {
 		newCalleesCommand(build),
 		newPathCommand(build),
 		newImpactCommand(build),
+		newSourceCommand(build),
 	}
+}
+
+// newSourceCommand builds `codectx source`: the indexed bytes of one node or
+// one file, read outside any context session.
+//
+// It loops the chunks itself and writes the whole span, holding one chunk in
+// memory at a time. Every chunk after the first is asked for by the signed
+// continuation the previous one carried, so the whole span comes from the one
+// generation the first chunk was read from, and that continuation's lease keeps
+// the generation from being collected between two chunks. That lease is a
+// write, which is why this command opens the workspace the way the context
+// commands do rather than through the writerless query composition.
+func newSourceCommand(build model.BuildInfo) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "source <node-id | file-id | path>",
+		Short: "Print the indexed source of one node or file, outside any session",
+		Long: "Prints source bytes exactly as the index captured them, from the content store and never " +
+			"from the working tree, so the bytes match the ranges a query answer of the same generation " +
+			"reported.\n\n" +
+			"A node id prints that node's range as the pinned generation holds it: a node that moved " +
+			"between generations is read where the asked generation has it, and a node that generation " +
+			"does not hold is refused as not in this generation. A file id or a path prints the file from " +
+			"--offset to its end. A path is the root-relative path the index stores; it is only turned " +
+			"into a file id and looked up in the generation's manifest, never opened, so a path the " +
+			"snapshot does not hold -- outside the tree, ignored, or a symbolic link the capture skipped " +
+			"-- is refused as not in this generation. An argument of 64 lowercase hex characters is an " +
+			"id: it is read as a node id and, when no such node is in the generation, as a file id.\n\n" +
+			"Text output is the span's bytes and nothing else, so redirecting it reproduces them " +
+			"exactly; a chunk that is not valid UTF-8 is decoded back to its bytes. --json writes one " +
+			"envelope per chunk, in order, each carrying the generation binding, the byte and line " +
+			"ranges and the content, base64 where the bytes are not valid UTF-8.\n\n" +
+			"A read outside a session earns no coverage: it issues no receipt, and no context session " +
+			"counts these bytes as read.",
+		Args:          cobra.ExactArgs(1),
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			gen, err := generationFlag(cmd)
+			if err != nil {
+				return err
+			}
+			offset, err := contextOffsetValue(cmd)
+			if err != nil {
+				return err
+			}
+			maxBytes, err := contextMaxBytesValue(cmd)
+			if err != nil {
+				return err
+			}
+			// Both requests are screened before a workspace is opened: a
+			// rejection that first opened the database paid for work it will
+			// not do.
+			first, alternate := sourceRequests(args[0], gen, offset, maxBytes)
+			for _, req := range []*model.ReadChunkRequest{&first, alternate} {
+				if req == nil {
+					continue
+				}
+				if err := req.Validate(); err != nil {
+					return err
+				}
+			}
+			asJSON := jsonRequested(cmd, args)
+			return runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
+				resp, err := svc.Read(ctx, first)
+				if alternate != nil && refusedArgument(err) {
+					var fileErr error
+					if resp, fileErr = svc.Read(ctx, *alternate); fileErr != nil {
+						return neitherNodeNorFile(args[0], err, fileErr)
+					}
+					err = nil
+				}
+				for {
+					if err != nil {
+						return err
+					}
+					if err := writeSourceChunk(cmd, build, asJSON, resp); err != nil {
+						return err
+					}
+					if resp.NextCursor == "" {
+						return nil
+					}
+					resp, err = svc.Read(ctx, model.ReadChunkRequest{Cursor: resp.NextCursor, MaxBytes: maxBytes})
+				}
+			})
+		},
+	}
+	addQueryFlags(cmd, false)
+	cmd.Flags().Int64(contextOffsetFlag, 0, "for a file id or a path, the byte to start printing from; a node is printed from its own start and takes no offset")
+	cmd.Flags().Int64(contextMaxBytesFlag, 0,
+		fmt.Sprintf("raw bytes in one chunk, which is all this command holds in memory at once: 0 uses coverage.chunk_bytes, otherwise at least %d and at most %d; a value above coverage.max_chunk_bytes is clamped to it rather than rejected. The whole span is printed whatever the chunk size",
+			utf8.UTFMax, model.MaxRawChunkBytes))
+	return cmd
+}
+
+// sourceRequests turns the argument of `codectx source` into the first read
+// and, for a 64-hex argument, the read to fall back to. An id cannot say
+// whether it names a node or a file, so it is asked for as a node first --
+// unless an offset was given, which only a file read takes -- and as a file
+// when the generation holds no such node. Anything else is a root-relative
+// path; its separators are made forward slashes, the spelling the index
+// stores, and nothing on disk is consulted.
+func sourceRequests(arg string, gen model.GenerationID, offset uint64, maxBytes uint32) (model.ReadChunkRequest, *model.ReadChunkRequest) {
+	base := model.ReadChunkRequest{GenerationID: gen, Offset: offset, MaxBytes: maxBytes}
+	if !model.ValidHexID(arg) {
+		base.Path = filepath.ToSlash(arg)
+		return base, nil
+	}
+	file := base
+	file.FileID = model.FileID(arg)
+	if offset != 0 {
+		return file, nil
+	}
+	node := base
+	node.NodeID = model.NodeID(arg)
+	return node, &file
+}
+
+// refusedArgument reports whether err is a typed refusal of the request's
+// argument, the answer a node id that names no node of the generation gets.
+func refusedArgument(err error) bool {
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid
+}
+
+// neitherNodeNorFile reports an id read both ways and refused both ways. A
+// fallback refusal of its own would hide why the id was not a node, so both
+// answers are named.
+func neitherNodeNorFile(id string, asNode, asFile error) error {
+	if !refusedArgument(asFile) {
+		return asFile
+	}
+	var node, file *model.Error
+	errors.As(asNode, &node)
+	errors.As(asFile, &file)
+	return (&model.Error{Code: model.CodeArgumentInvalid,
+		Message: fmt.Sprintf("%s is neither a node nor a file this generation can read: as a node, %s; as a file, %s",
+			id, node.Message, file.Message),
+		Remediation: "pass the generation_id of the answer that named it with --" + queryGenerationFlag}).
+		WithDetail("argument", id)
+}
+
+// writeSourceChunk writes one chunk of the span. Text output is the chunk's
+// bytes verbatim, a base64 chunk decoded back to the bytes it carries, so the
+// whole command writes the span and nothing else. --json writes the chunk's
+// answer as one envelope.
+func writeSourceChunk(cmd *cobra.Command, build model.BuildInfo, asJSON bool, resp model.ReadChunkResponse) error {
+	out := cmd.OutOrStdout()
+	if asJSON {
+		return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), resp))
+	}
+	body := []byte(resp.Content)
+	if resp.Encoding == model.EncodingBase64 {
+		decoded, err := base64.StdEncoding.DecodeString(resp.Content)
+		if err != nil {
+			return &model.Error{Code: model.CodeInternal, Message: "a base64 source chunk did not decode: " + err.Error()}
+		}
+		body = decoded
+	}
+	if _, err := out.Write(body); err != nil {
+		return outputFailure(err)
+	}
+	return nil
 }
 
 // newRefsCommand builds `codectx refs`.
@@ -229,8 +395,7 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				fmt.Fprintf(b, "direction   %s\nwalked      %d visited, %d %s, depth %d\n",
 					result.Direction, result.VisitedCount, result.EdgeCount,
 					plural(int(result.EdgeCount), "edge", "edges"), result.MaxDepth)
-				writeNodeTable(b, result.Nodes)
-				writeRelationTable(b, result.Relations)
+				writeCallAnswer(b, result)
 			})
 		},
 	}
@@ -313,6 +478,14 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			}
 			return emitQuery(cmd, build, args, result, result.Meta, func(b *strings.Builder) {
 				fmt.Fprintf(b, "walked      %d visited\n", result.VisitedCount)
+				if result.RouteCount > 0 {
+					atLeast := ""
+					if result.RouteCountAtLeast {
+						atLeast = "at least "
+					}
+					fmt.Fprintf(b, "routes      %s%d equal-cost, this page lists %d\n", atLeast, result.RouteCount,
+						len(result.Paths))
+				}
 				writePaths(b, result.Paths)
 				writeNodeTable(b, result.Nodes)
 			})
@@ -324,6 +497,9 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 	addQueryFlags(cmd, true)
 	addTraversalFlags(cmd, false, false)
 	addPathDirectionFlag(cmd)
+	// The equal-cost routes are a list, paged like any other: --limit is the
+	// routes one page lists.
+	addLimitFlag(cmd)
 	// A path search IS resumable now: a page that spends its deadline or its
 	// visited budget keeps its state and prints the token that continues it.
 	addCursorFlag(cmd)
@@ -569,6 +745,89 @@ func writeRelationTable(b *strings.Builder, relations []model.Relation) {
 	for _, r := range relations {
 		fmt.Fprintf(b, "  %s  %-18s %s -> %s\n", r.ID, clip(string(r.Kind), 18), r.From, r.To)
 	}
+}
+
+// writeCallAnswer renders a callers or callees answer as a call hierarchy:
+// each node with where it is, each relation with how it may run -- through a
+// base method, an override a call may dispatch to, one of n targets, a call
+// matched by name only -- and the byte ranges of its call sites, then the
+// structured counts. Byte ranges are printed as bytes: the answer carries no
+// line numbers, and a byte offset is never presented as one.
+func writeCallAnswer(b *strings.Builder, result model.GraphResult) {
+	where := map[model.NodeID]model.NodeLocation{}
+	for _, l := range result.Locations {
+		where[l.NodeID] = l
+	}
+	if len(result.Nodes) == 0 {
+		b.WriteString("nodes       none\n")
+	} else {
+		fmt.Fprintf(b, "nodes       %d\n", len(result.Nodes))
+		for _, n := range result.Nodes {
+			name := n.QualifiedName
+			if name == "" {
+				name = n.Name
+			}
+			at := ""
+			if l, ok := where[n.ID]; ok {
+				at = fmt.Sprintf("  %s bytes %d-%d", l.Path, l.Bytes.Start, l.Bytes.End)
+			}
+			fmt.Fprintf(b, "  %s  %-12s %s%s\n", n.ID, clip(string(n.Kind), 12), clip(name, 80), at)
+		}
+	}
+	marks := map[model.RelationID][]model.GraphRowMark{}
+	for _, m := range result.Marks {
+		marks[m.RelationID] = append(marks[m.RelationID], m)
+	}
+	sites := map[model.RelationID][]model.RelationOccurrence{}
+	for _, o := range result.Occurrences {
+		sites[o.RelationID] = append(sites[o.RelationID], o)
+	}
+	paths := map[model.FileID]string{}
+	for _, l := range result.Locations {
+		paths[l.FileID] = l.Path
+	}
+	if len(result.Relations) == 0 {
+		b.WriteString("relations   none\n")
+	} else {
+		fmt.Fprintf(b, "relations   %d\n", len(result.Relations))
+		for _, r := range result.Relations {
+			fmt.Fprintf(b, "  %s  %-18s %s -> %s\n", r.ID, clip(string(r.Kind), 18), r.From, r.To)
+			for _, m := range marks[r.ID] {
+				fmt.Fprintf(b, "      %s\n", markText(m))
+			}
+			for _, o := range sites[r.ID] {
+				file := paths[o.FileID]
+				if file == "" {
+					file = string(o.FileID)
+				}
+				dispatch := ""
+				if o.Dispatch != "" {
+					dispatch = " " + string(o.Dispatch)
+				}
+				fmt.Fprintf(b, "      site %s bytes %d-%d%s\n", file, o.Bytes.Start, o.Bytes.End, dispatch)
+			}
+		}
+	}
+	c := result.Counts
+	if c != (model.GraphCounts{}) {
+		fmt.Fprintf(b, "counts      direct %d, through base %d, may dispatch %d, may call %d, open sites %d\n",
+			c.Direct, c.ThroughBase, c.MayDispatch, c.MayCall, c.OpenSites)
+	}
+}
+
+// markText says in words how a marked relation may run.
+func markText(m model.GraphRowMark) string {
+	switch m.Kind {
+	case model.MarkThroughBase:
+		return fmt.Sprintf("through base %s (overridden %d times): may not run this method", m.Base, m.BaseOverrides)
+	case model.MarkMayDispatch:
+		return "may dispatch to this override: it may not run"
+	case model.MarkValueSet:
+		return fmt.Sprintf("1 of %d targets bound at the site", m.SetSize)
+	case model.MarkNameOnly:
+		return "matched by name only: no analysis bound this call, and it may not run"
+	}
+	return string(m.Kind)
 }
 
 // writeOccurrences renders a reference page, keeping the Section 9.2

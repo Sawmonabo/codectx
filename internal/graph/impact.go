@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -63,6 +64,8 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		// rather than repeating a single-shot total.
 		VisitedCount: b.visited,
 		EdgeCount:    b.edges,
+		// Whole-walk counts, carried by every continuation.
+		OpenSitesByDepth: b.openSites,
 	}
 	if err := result.Validate(); err != nil {
 		return model.ImpactResult{}, err
@@ -200,8 +203,29 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return answer, nil, nil, "", err
 		}
 		names := &levelNames{}
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry,
+		// Every affected node is also counted, per depth, by the open call
+		// sites it is a candidate of: possibly affected through a call no
+		// analysis bound, counted and not walked.
+		sites := newOpenSiteCounter(declarationReader(reader), b)
+		emit := func(rec impactRecord) error {
+			if err := sites.note(ctx, rec); err != nil {
+				return err
+			}
+			return retain.addEntry(rec)
+		}
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, emit,
 			names, kindNames(reader))
+		// Impact takes a call walk's dispatch step: a change to a method
+		// affects the callers of every method it overrides whose call may
+		// run it, and forward impact descends to the overrides a virtual
+		// call may run. The base a callers step climbs through is a route,
+		// not an affected entity.
+		mode := dispatchFor(req.Direction, kinds)
+		dispatches := e.dispatchReader()
+		if dispatches == nil {
+			mode = dispatchNone
+		}
+		acc.climbs = mode == dispatchCallers
 		// ONE streamed pass, TEED: the rollup's batching drives the walk, so
 		// every admitted edge reaches the entity record and the package pair as
 		// it is read and nothing is held between the edge that produced it and
@@ -235,7 +259,9 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				// The per-level canonical resolution the accumulator reads. One
 				// pointer, refilled by the walk before each level's edges are
 				// delivered, so a record is named without a round trip per edge.
-				Names: names,
+				Names:      names,
+				Dispatch:   mode,
+				Dispatches: dispatches,
 			}, func(fs frontierState, edge Edge) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never
@@ -251,6 +277,12 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return werr
 		}, retain.addPair, e.rollupProbe())
 		if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
+			return answer, nil, nil, "", err
+		}
+		// Counted before any continuation is minted, so the token carries
+		// this leg's last level too. The count reads the store and is
+		// delivery, not walking, so it runs past the deadline.
+		if err := sites.flush(context.WithoutCancel(ctx)); err != nil {
 			return answer, nil, nil, "", err
 		}
 	}
@@ -291,6 +323,24 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// Nodes at the depth bound were admitted but never expanded; an impact
 		// answer that stopped there is not the whole blast radius.
 		markTruncated(&meta, reasonDepth)
+	}
+
+	// A request that names `may_call` walks on through the open call sites:
+	// once the precise walk is exhausted, the possible callers (or callees)
+	// of every affected node join the retained input before it is ranked,
+	// and so on from them up to the depth bound. It runs once, in the request
+	// that finished the walk, so a mid-rank continuation ranks it with the
+	// rest.
+	if acc != nil && slices.Contains(kinds, model.RelMayCall) {
+		reader, err := e.Reader()
+		if err != nil {
+			return answer, nil, nil, "", err
+		}
+		if err := e.expandOpenSites(ctx, reader, req, maxDepth, retain); err != nil {
+			if err := impactPhaseError(ctx, err, &meta); err != nil {
+				return answer, nil, nil, "", err
+			}
+		}
 	}
 
 	// The walk is exhausted. Both passes now run over every record EVERY leg of
@@ -494,7 +544,7 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 		entry := model.ImpactEntry{NodeID: r.NodeID, Direction: r.Direction, Depth: r.Depth,
 			ScoreMicros: r.scoreMicros(), Reasons: r.Reasons}
 		if len(r.Route) > 0 && len(r.Route) <= model.MaxRelationsPerPath && !reasonPaths.Exceeded(1) {
-			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: r.Cost}}
+			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: r.Cost, Possible: r.Possible}}
 		}
 		entries = append(entries, entry)
 	}
@@ -906,6 +956,10 @@ type impactAccumulator struct {
 	// kinds names a relation kind from the generation's kind code, so a reason
 	// and a cost are read off the edge without a dictionary lookup per edge.
 	kinds []model.RelationKind
+	// climbs is set on a walk that takes the callers dispatch step: an
+	// `overrides` edge it climbs reaches a base method only as the route to
+	// that base's virtual callers, so the base is not listed as affected.
+	climbs bool
 }
 
 // newImpactAccumulator builds the visitor for one LEG of a walk. resume is the
@@ -994,6 +1048,9 @@ func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 		return nil
 	}
 	kind := a.kindOf(e.Kind)
+	if a.climbs && kind == model.RelOverrides && e.Outgoing {
+		return nil
+	}
 	direction := model.DirectionOutgoing
 	if !e.Outgoing {
 		direction = model.DirectionIncoming
