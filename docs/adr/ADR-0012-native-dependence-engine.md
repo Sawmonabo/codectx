@@ -680,6 +680,9 @@ what it is, and the retirement gate's parity condition is what proves the label 
     predecessor's resolution and coverage, and republishes only the facts whose evidence lies in a file whose bytes
     changed. Every other fact is carried over with those files named replaced. A table is read only when that
     republication needs it: the edited file's, and the tables of the declarations its sites bind.
+  - **Amended 2026-10-09:** identity no longer moves with bytes, and the delta reruns only the sites whose recorded
+    reads changed: [ADR-0014](ADR-0014-stable-identity-incremental-linking.md). The single digest and positional
+    resolution above are replaced by its two summaries, per-site traces and identity-keyed resolution.
   - *What it does not save.* The edited file's own facts are republished. The rebuild also walks the unit's inputs
     without reading a table: to compare the digests, and to name the changed files to each publication pass and to the
     carry-over.

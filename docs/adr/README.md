@@ -24,4 +24,5 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | [ADR-0009](ADR-0009-import-staging.md) | The dependence import stages its export the way a bulk load writes | Superseded by ADR-0012, 2026-10-08 |
 | [ADR-0010](ADR-0010-engine-memory.md) | Engine memory: the heap is sized to the unit's need, and the host keeps half of what it had | Superseded by ADR-0012, 2026-10-08 |
 | [ADR-0011](ADR-0011-run-ledger.md) | The run ledger: a run records what each stage cost, in its own database, read live | Accepted, 2026-09-16; amended 2026-10-08 |
-| [ADR-0012](ADR-0012-native-dependence-engine.md) | Dependence is computed in process, and the hosted engine is retired against measured conditions | Accepted, 2026-09-26; amended 2026-10-08, the engine deleted |
+| [ADR-0012](ADR-0012-native-dependence-engine.md) | Dependence is computed in process, and the hosted engine is retired against measured conditions | Accepted, 2026-09-26; amended 2026-10-08, the engine deleted; decision 9 amended 2026-10-09 by ADR-0014 |
+| [ADR-0014](ADR-0014-stable-identity-incremental-linking.md) | A declaration's identity is its name path, and an edit relinks only what read what changed | Accepted, 2026-10-09 |
