@@ -1,7 +1,9 @@
 package delta_test
 
 import (
+	"maps"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -18,7 +20,10 @@ import (
 // C++, TypeScript); a conditional redefinition, then an edit inside one of
 // its arms; a changed returned value (`return Dog()` becomes `return Cat()`)
 // that changes the binding of a call in another file (Python, JavaScript,
-// TypeScript); a field write moved to another file; a body edit of a
+// TypeScript, TSX); the argument of a value cycle through two untouched
+// files changed (`hop_a(Dog())` becomes `hop_a(Cat())`, the Dog passed on
+// from ring_a to ring_b to ring_c and back); a call removed; a field write
+// moved to another file; a body edit of a
 // function another file passes arguments to, which must keep its parameters'
 // identities; a file added, deleted and renamed; and for Go a dependency
 // version bump, a new nested go.mod that moves a package into a unit of its
@@ -34,7 +39,10 @@ import (
 // not have); skip the reverse index for a manifest field (the module path
 // change leaves the importer's call bound to the package it no longer
 // imports); republish only the edited file after a rename or a deletion (the
-// carried calls of the old name keep their bindings).
+// carried calls of the old name keep their bindings); re-derive only the
+// edited file from the values the others stored (the Dog that cycled
+// through ring_b and ring_c back into ring_a keeps ring_b's call bound to
+// Dog.speak, and the full build binds Cat.speak alone).
 func TestIncrementalLinkEqualsFullBuild(t *testing.T) {
 	for _, sc := range differentialScripts {
 		t.Run(sc.name, func(t *testing.T) {
@@ -49,8 +57,63 @@ func TestIncrementalLinkEqualsFullBuild(t *testing.T) {
 	}
 }
 
-var differentialScripts = []script{goScript, pythonScript, javascriptScript, typescriptScript,
+var differentialScripts = []script{goScript, pythonScript, javascriptScript, typescriptScript, tsxScript,
 	javaLangScript, cScript, cppScript, rustScript}
+
+// tsxScript is the JavaScript project with every source file a TSX file,
+// which links in the ECMAScript family.
+var tsxScript = script{name: "tsx", base: renamed(javascriptScript.base, ".js", ".tsx"), edits: ecmascriptEdits(".tsx")}
+
+// renamed is files with each path ending in from ending in to instead.
+func renamed(files map[string]string, from, to string) map[string]string {
+	out := map[string]string{}
+	for p, src := range files {
+		if q, ok := strings.CutSuffix(p, from); ok {
+			p = q + to
+		}
+		out[p] = src
+	}
+	return out
+}
+
+// TestIncrementalFlowLinkEqualsFullBuildInAnotherOrder drives the Python
+// and ECMAScript projects through their edits in a second order, the value
+// cycle and the changed returned value first and the removals in between,
+// and compares each refresh with a full build of the same tree, fact for
+// fact, as TestIncrementalLinkEqualsFullBuild does. A refresh re-derives a
+// region of files from the boundary values the others stored, so which
+// values are stored when an edit arrives depends on the edits before it.
+//
+// Mutation: re-derive only the edited file's sites from every other file's
+// stored values (no closure over the cycle through it) -> after the value
+// cycle edit, ring_b's speak call keeps Dog.speak, which ring_a no longer
+// passes and the full build does not bind. Mutation: leave the second
+// stratum's inputs in the first -> a field-based call whose receiver binds
+// in the full build also binds through the field.
+func TestIncrementalFlowLinkEqualsFullBuildInAnotherOrder(t *testing.T) {
+	order := []string{"value cycle through untouched files", "changed returned value", "removed call",
+		"body edit keeps the parameters", "moved field write", "body adding a call", "file added", "new declaration",
+		"rename", "body only", "file deleted", "file renamed"}
+	for _, sc := range []script{pythonScript, javascriptScript, typescriptScript, tsxScript} {
+		t.Run(sc.name, func(t *testing.T) {
+			byName := map[string]edit{}
+			for _, e := range sc.edits {
+				byName[e.name] = e
+			}
+			s := newSession(t)
+			files := sc.base
+			s.check("base", s.advance(files))
+			for _, name := range order {
+				e, ok := byName[name]
+				if !ok {
+					t.Fatalf("the %s script has no edit %q", sc.name, name)
+				}
+				files = e.apply(t, files)
+				s.check(e.name, s.advance(files))
+			}
+		})
+	}
+}
 
 var goScript = script{
 	name: "go",
@@ -175,6 +238,30 @@ class Button:
     def press(self):
         self.handler()
 `,
+		"ring_a.py": `from ring_b import hop_b
+from pets import Dog, Cat
+
+
+def hop_a(v):
+    return hop_b(v)
+
+
+def kick():
+    return hop_a(Dog())
+`,
+		"ring_b.py": `from ring_c import hop_c
+
+
+def hop_b(v):
+    v.speak()
+    return hop_c(v)
+`,
+		"ring_c.py": `from ring_a import hop_a
+
+
+def hop_c(v):
+    return hop_a(v)
+`,
 	},
 	edits: []edit{
 		{name: "body only", replace: []sub{{"pets.py", `return "woof"`, `return "woof woof"`}}},
@@ -189,6 +276,8 @@ class Button:
 		}},
 		{name: "one arm of the conditional redefinition", replace: []sub{{"factory.py", "return 2\n", "return 2 + 20\n"}}},
 		{name: "changed returned value", replace: []sub{{"factory.py", "return Dog()", "return Cat()"}}},
+		{name: "value cycle through untouched files", replace: []sub{{"ring_a.py", "hop_a(Dog())", "hop_a(Cat())"}}},
+		{name: "removed call", replace: []sub{{"main.py", "    run(1)\n", ""}}},
 		{name: "moved field write", replace: []sub{{"ui.py", "self.handler = on_click", "self.handler = None"}},
 			write: map[string]string{"widgets.py": "from ui import on_click\n\n\ndef wire(b):\n    b.handler = on_click\n"}},
 		{name: "body edit keeps the parameters", replace: []sub{{"factory.py", "    return pet.speak()\n", "    said = pet.speak()\n    return said\n"}}},
@@ -196,6 +285,45 @@ class Button:
 		{name: "file deleted", remove: []string{"pets.py"}},
 		{name: "file renamed", move: [][2]string{{"factory.py", "maker.py"}}},
 	},
+}
+
+// ecmascriptRing is a value cycle through three files with extension ext:
+// ring_a passes a Dog to hopA, which hands it to ring_b's hopB, which calls
+// speak on it and hands it to ring_c's hopC, which hands it back to hopA.
+func ecmascriptRing(ext string) map[string]string {
+	return map[string]string{
+		"ring_a" + ext: `import { hopB } from "./ring_b";
+import { Dog, Cat } from "./pets";
+
+export function hopA(v) {
+  return hopB(v);
+}
+
+export function kick() {
+  return hopA(new Dog());
+}
+`,
+		"ring_b" + ext: `import { hopC } from "./ring_c";
+
+export function hopB(v) {
+  v.speak();
+  return hopC(v);
+}
+`,
+		"ring_c" + ext: `import { hopA } from "./ring_a";
+
+export function hopC(v) {
+  return hopA(v);
+}
+`,
+	}
+}
+
+// withFiles is base with every file of extra added.
+func withFiles(base map[string]string, extra map[string]string) map[string]string {
+	out := maps.Clone(base)
+	maps.Copy(out, extra)
+	return out
 }
 
 // ecmascriptEdits are the JavaScript and TypeScript edits both scripts
@@ -228,6 +356,8 @@ export function feed(`},
 		}},
 		{name: "one arm of the conditional redefinition", replace: []sub{{factory, "return 2;", "return 2 + 20;"}}},
 		{name: "changed returned value", replace: []sub{{factory, "return new Dog();", "return new Cat();"}}},
+		{name: "value cycle through untouched files", replace: []sub{{"ring_a" + ext, "hopA(new Dog())", "hopA(new Cat())"}}},
+		{name: "removed call", replace: []sub{{main, "  run(1);\n", ""}}},
 		{name: "moved field write", replace: []sub{{ui, "this.handler = onClick;", "this.handler = null;"}},
 			write: map[string]string{"widgets" + ext: "import { onClick } from \"./ui\";\n\nexport function wire(b) {\n  b.handler = onClick;\n}\n"}},
 		{name: "body edit keeps the parameters", replace: []sub{{factory, "  return pet.speak();\n", "  const said = pet.speak();\n  return said;\n"}}},
@@ -239,7 +369,7 @@ export function feed(`},
 
 var javascriptScript = script{
 	name: "javascript",
-	base: map[string]string{
+	base: withFiles(map[string]string{
 		"package.json": "{\n  \"name\": \"app\",\n  \"type\": \"module\"\n}\n",
 		"pets.js": `export class Dog {
   speak() {
@@ -291,13 +421,13 @@ export class Button {
   }
 }
 `,
-	},
+	}, ecmascriptRing(".js")),
 	edits: ecmascriptEdits(".js"),
 }
 
 var typescriptScript = script{
 	name: "typescript",
-	base: map[string]string{
+	base: withFiles(map[string]string{
 		"tsconfig.json": "{\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    \"paths\": {\n      \"@lib/*\": [\"lib/*\"]\n    }\n  }\n}\n",
 		"pets.ts": `export class Dog {
   speak(): string {
@@ -365,7 +495,7 @@ export class Button {
   }
 }
 `,
-	},
+	}, ecmascriptRing(".ts")),
 	// The overload goes in right after the rename, while main.ts still
 	// binds both existing overloads and so carries calls naming their nodes.
 	edits: append(slices.Insert(ecmascriptEdits(".ts"), 4,
