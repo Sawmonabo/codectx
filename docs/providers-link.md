@@ -85,7 +85,8 @@ target carries no `set_size`. Nothing is capped: every target is published.
 call can run an override of its target, `exact` when it cannot. It is computed per occurrence, from the site, never
 from the technique that bound it: a `super` call, a qualified call (`a.Animal::sound()`, `Base.m(self)`), a call on a
 constructed object (`Dog().sound()`, `new C().m()`), a static, final, private or non-virtual method, a C++ call
-through a declaration that is not `virtual`, and every function an address-taken or field set reaches are `exact`. A
+through a declaration that is not `virtual` or on an object declared by value (`Dog d; d.sound()`; a pointer or a
+reference stays `virtual`), and every function an address-taken or field set reaches are `exact`. A
 member call on a receiver with a declared static type publishes one `calls` to the method that type declares or
 inherits, even when it is abstract or an interface or trait method, and never one edge per override:
 `speak(a: Animal) { a.sound() }` with `Dog` and `Cat` overriding `sound` publishes `speak calls Animal.sound`,
@@ -137,7 +138,8 @@ scope, keyed `openimport:<path>:<first byte>-<last byte>`, named `import`, of ki
 of the target the argument binds (ADR-0017), and an unbound site publishes none. Arguments are matched as the
 target's language binds them (`argumentFlows`, `internal/provider/link/args.go`): by position, then a keyword
 argument by its parameter's name, a spread or `*args` to the rest from its position, and the arguments past the last
-named parameter to a variadic one; a parameter an omitted default fills receives nothing. A receiver passed first (a
+named parameter to a variadic one; a parameter an omitted default fills receives nothing. A call through a function value flows into
+every function the address-taken join binds it to. A receiver passed first (a
 Go method expression, a Rust path naming a method, Python `C.m(obj)`) binds the first parameter. A parameter with no
 node of its own receives no edge.
 
