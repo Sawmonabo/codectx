@@ -496,3 +496,39 @@ func TestAPathDescendsFromACostlierVirtualReach(t *testing.T) {
 		t.Errorf("path(main, Dog.sound) = %+v, want the precise route %v", res.Paths, want)
 	}
 }
+
+// TestADescentGoesOnPastAnOverrideReachedCheaper pins the descent per reach
+// one level down: main reaches Dog.sound cheapest by an exact call, and
+// through its virtual call to Animal.sound by a descent, so Dog.sound's own
+// override Puppy.sound is on the route path(main, Puppy.sound).
+//
+// Mutation caught: deciding an override's descent from its cheapest reach
+// (the exact call, which runs Dog.sound alone, leaves no route).
+func TestADescentGoesOnPastAnOverrideReachedCheaper(t *testing.T) {
+	f := newCallFixture("descent_chain", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "Animal.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{0, 30}},
+			{Name: "Dog.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{40, 70}},
+			{Name: "Puppy.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{80, 110}},
+			{Name: "main", Kind: model.NodeFunction, File: "b.py", Bytes: [2]uint64{0, 40}},
+		},
+		Relations: []fixtureFact{
+			{From: "Dog.sound", Kind: model.RelOverrides, To: "Animal.sound"},
+			{From: "Puppy.sound", Kind: model.RelOverrides, To: "Dog.sound"},
+			{From: "main", Kind: model.RelCalls, To: "Dog.sound", Occurrences: exactAt(5)},
+			{From: "main", Kind: model.RelCalls, To: "Animal.sound", Occurrences: virtualAt(20)},
+		},
+	})
+	res, err := f.engine(t).ShortestPath(context.Background(), model.PathRequest{From: f.id(t, "main"),
+		To: f.id(t, "Puppy.sound"), Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("path(main, Puppy.sound): %v", err)
+	}
+	want := []model.RelationID{f.rel(t, "main", model.RelCalls, "Animal.sound"),
+		f.rel(t, "Dog.sound", model.RelOverrides, "Animal.sound"),
+		f.rel(t, "Puppy.sound", model.RelOverrides, "Dog.sound")}
+	if len(res.Paths) != 1 || res.Paths[0].Possible || !slices.Equal(res.Paths[0].Relations, want) ||
+		res.Paths[0].CostUnits != Cost(model.RelCalls)+2*Cost(model.RelOverrides) {
+		t.Errorf("path(main, Puppy.sound) = %+v, want the precise route %v", res.Paths, want)
+	}
+}

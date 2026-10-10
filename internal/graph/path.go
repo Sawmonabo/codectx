@@ -167,10 +167,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	}()
 
 	codes, absent := kindCodesFor(e.reader, kinds)
-	descent := pathDescentFor(e.reader, direction, kinds, codes)
-	if descent.active {
-		codes = append(slices.Clone(codes), descent.overrides)
-	}
+	descent := pathDescentFor(e.reader, direction, kinds)
 	w := &pathWalk{
 		descent:     descent,
 		reader:      e.reader,
@@ -834,10 +831,6 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 	if len(refs) == 0 {
 		return false, nil
 	}
-	descends, err := w.descendable(byRef)
-	if err != nil {
-		return false, err
-	}
 	pend := make([]Edge, 0, adjacencyBatch)
 	stopped := false
 	var ferr error
@@ -851,11 +844,8 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 		pend = pend[:0]
 		return nil
 	}
-	pos, err := w.reader.Neighbours(ctx, refs, w.descent.direction(w.direction), w.kindCodes, w.expandAfter,
+	pos, err := w.reader.Neighbours(ctx, refs, w.direction, w.kindCodes, w.expandAfter,
 		func(e Edge) error {
-			if !w.descent.keep(e, descends) {
-				return nil
-			}
 			// Both stops are checked BEFORE the entry is consumed, so the
 			// position the port reports for a stopped scan -- the entry it
 			// just delivered -- still names the first entry this page did NOT
@@ -1004,10 +994,12 @@ func (w *pathWalk) relax(ctx context.Context, pend []Edge, byRef map[NodeRef]mod
 			depths[from]+1); err != nil {
 			return err
 		}
-		if virtual[rel] {
+		if _, descending := pathState(from); virtual[rel] || descending {
 			// A call that can dispatch reaches the callee a second way: as
 			// the method whose overrides it may run, at this call's own
-			// cost, whatever cheaper way the callee itself is reached.
+			// cost, whatever cheaper way the callee itself is reached. An
+			// override a descent reached is reached that way too, and may
+			// itself be overridden.
 			if err := w.sc.exec(w.scCtx,
 				`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
 				dists[from]+Cost(kind), string(dispatchState(to)), string(rel), string(from), string(kind),
@@ -1113,6 +1105,11 @@ func (w *pathWalk) expandDispatched(ctx context.Context, states []model.NodeID,
 		EdgePos{}, func(e Edge) error { pend = append(pend, e); return nil }); err != nil {
 		return err
 	}
+	// Charged to the edge budget like every entry the search reads. The scan
+	// is not cut on it -- a repeat would charge it again -- so the page's
+	// next scan, which is resumable, is the one the budget stops.
+	w.spent += int64(len(pend))
+	w.pageEdges += int64(len(pend))
 	for start := 0; start < len(pend); start += adjacencyBatch {
 		if err := w.relax(ctx, pend[start:min(start+adjacencyBatch, len(pend))], byRef, dists, depths); err != nil {
 			return err
@@ -1201,10 +1198,6 @@ func (w *pathWalk) routes(from, to model.NodeID, want int) ([][]model.Relation, 
 	}
 	var out [][]model.Relation
 	var cur []model.Relation
-	// A method's two states can carry one relation sequence twice: a call
-	// that ties with a descent into the same method reaches both, and both
-	// step to its overrides. The answer names each sequence once.
-	seen := map[string]bool{}
 	steps := 0
 	capped := false
 	var walk func(n model.NodeID) error
@@ -1214,18 +1207,12 @@ func (w *pathWalk) routes(from, to model.NodeID, want int) ([][]model.Relation, 
 		}
 		if n == to {
 			route := make([]model.Relation, len(cur))
-			var key strings.Builder
 			for i, r := range cur {
 				r.From, _ = pathState(r.From)
 				r.To, _ = pathState(r.To)
 				route[i] = r
-				key.WriteString(string(r.ID))
-				key.WriteByte(0)
 			}
-			if !seen[key.String()] {
-				seen[key.String()] = true
-				out = append(out, route)
-			}
+			out = append(out, route)
 			return nil
 		}
 		if atBound(w.maxDepth, len(cur)) || len(cur) >= model.MaxRelationsPerPath {
@@ -1270,18 +1257,19 @@ func (e *Engine) scratchDir() string {
 	return e.spools.SortDir()
 }
 
-// pathDescent is an outgoing call search's downward step: the scan reads
-// both lists, keeps the outgoing entries of the requested kinds, and keeps an
-// incoming `overrides` entry of a method a virtual call reached, which relaxes
-// from it to an override of it. It is inactive for every other search.
+// pathDescent is an outgoing call search's downward step. A call that can
+// dispatch reaches its callee's dispatch state too, and a dispatch state
+// relaxes only the method's incoming `overrides` entries, each to the
+// override itself and to the override's own dispatch state, so a descent
+// goes on as deep as the overrides do. A node's own scan reads only its
+// outgoing entries of the requested kinds. It is inactive for every other
+// search.
 type pathDescent struct {
 	active    bool
 	overrides KindCode
-	requested map[KindCode]bool
 }
 
-func pathDescentFor(r GraphReader, direction model.Direction, kinds []model.RelationKind,
-	codes []KindCode) pathDescent {
+func pathDescentFor(r GraphReader, direction model.Direction, kinds []model.RelationKind) pathDescent {
 	if direction != model.DirectionOutgoing || !slices.Contains(kinds, model.RelCalls) {
 		return pathDescent{}
 	}
@@ -1289,53 +1277,7 @@ func pathDescentFor(r GraphReader, direction model.Direction, kinds []model.Rela
 	if !ok {
 		return pathDescent{}
 	}
-	d := pathDescent{active: true, overrides: code, requested: map[KindCode]bool{}}
-	for _, c := range codes {
-		d.requested[c] = true
-	}
-	return d
-}
-
-func (d pathDescent) direction(walk model.Direction) model.Direction {
-	if d.active {
-		return model.DirectionBoth
-	}
-	return walk
-}
-
-// keep decides one scanned entry: an outgoing entry of a requested kind, or
-// an incoming `overrides` entry of an owner the descent may leave.
-func (d pathDescent) keep(e Edge, descends map[NodeRef]bool) bool {
-	if !d.active {
-		return true
-	}
-	if e.Outgoing {
-		return d.requested[e.Kind]
-	}
-	return e.Kind == d.overrides && descends[e.Owner]
-}
-
-// descendable is the batch's owners the downward step may leave in their
-// plain state: a method an earlier descent reached, whose own overrides a
-// virtual call into its base may run too. A method reached by a call that can
-// dispatch descends from its dispatch state instead (expandDispatched), at
-// that call's cost however the method itself was reached; one reached only by
-// exact calls -- a `super` call, a qualified call -- runs as itself, and the
-// start of the search was reached by no call at all.
-func (w *pathWalk) descendable(byRef map[NodeRef]model.NodeID) (map[NodeRef]bool, error) {
-	out := map[NodeRef]bool{}
-	if !w.descent.active {
-		return out, nil
-	}
-	for ref, node := range byRef {
-		var n int64
-		if _, err := w.sc.row(w.scCtx, `SELECT count(*) FROM parent WHERE node = ? AND kind = ?`,
-			[]any{string(node), string(model.RelOverrides)}, &n); err != nil {
-			return nil, err
-		}
-		out[ref] = n > 0
-	}
-	return out, nil
+	return pathDescent{active: true, overrides: code}
 }
 
 // possiblePath answers a pair with no precise route (ADR-0015 decision 3) by
@@ -1570,7 +1512,7 @@ func (s *possibleSearch) expand(ctx context.Context, batch []model.NodeID) error
 			plain = append(plain, n)
 		}
 	}
-	if err := s.adjacent(ctx, plain, s.descent.direction(s.direction), s.codes, false); err != nil {
+	if err := s.adjacent(ctx, plain, s.direction, s.codes, false); err != nil {
 		return err
 	}
 	if s.descent.active {
@@ -1581,10 +1523,9 @@ func (s *possibleSearch) expand(ctx context.Context, batch []model.NodeID) error
 	return s.nameOnly(ctx, plain)
 }
 
-// adjacent relaxes the stored relations out of states. A node keeps what the
-// precise search's descent keeps: an incoming `overrides` entry only when a
-// descent reached it, and a call that can dispatch also reaches its callee's
-// dispatch state.
+// adjacent relaxes the stored relations out of states as the precise search
+// does: a call that can dispatch also reaches its callee's dispatch state, and
+// an override a dispatch state reached also reaches its own.
 func (s *possibleSearch) adjacent(ctx context.Context, states []model.NodeID, direction model.Direction,
 	kinds []KindCode, fromDispatch bool) error {
 	if len(states) == 0 || len(kinds) == 0 {
@@ -1600,14 +1541,12 @@ func (s *possibleSearch) adjacent(ctx context.Context, states []model.NodeID, di
 		return err
 	}
 	owner := map[NodeRef]model.NodeID{}
-	descends := map[NodeRef]bool{}
 	var live []NodeRef
 	for i, ref := range refs {
 		if ref == 0 {
 			continue
 		}
 		owner[ref] = states[i]
-		descends[ref] = fromDispatch || s.tree[states[i]].rel.Kind == model.RelOverrides
 		live = append(live, ref)
 	}
 	if len(live) == 0 {
@@ -1615,9 +1554,7 @@ func (s *possibleSearch) adjacent(ctx context.Context, states []model.NodeID, di
 	}
 	var edges []Edge
 	if _, err := r.Neighbours(ctx, ascending(live), direction, kinds, EdgePos{}, func(ed Edge) error {
-		if fromDispatch || s.descent.keep(ed, descends) {
-			edges = append(edges, ed)
-		}
+		edges = append(edges, ed)
 		return nil
 	}); err != nil {
 		return err
@@ -1655,7 +1592,7 @@ func (s *possibleSearch) adjacent(ctx context.Context, states []model.NodeID, di
 				rel.From, rel.To = next, here
 			}
 			s.reach(at, next, rel, nil)
-			if virtual[relIDs[i]] {
+			if virtual[relIDs[i]] || fromDispatch {
 				s.reach(at, dispatchState(next), rel, nil)
 			}
 		}
