@@ -13,35 +13,45 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// resolvePython resolves the sites of a Python unit: direct binding through
-// imports and modules, a call of a class as its construction, flow-based type
-// inference (inferTypes), field-based resolution of a receiver that recovered
-// nothing, and the method a receiver's class declares or inherits in method
-// resolution order.
-//
-// It reads the unit's tables once to resolve. Each site that stays inside
-// its file (a bare call of a name the file declares, a receiver whose type
-// the file or the inference recovered, a called value the inference traced)
-// binds while its table is in hand. A site that names a module (`mod.f()`, a
-// name a `from mod import f` introduced, which the worker spells as a
-// TypeModule) and each import become lookups that the unit's declarations
-// and modules answer through one ordered merge: every declaration and every
-// file's module is indexed under each dotted module name its path can be
-// imported as, and both kinds of record are sorted together, so a lookup
-// meets the records of its key with nothing else resident. A second read
-// emits the argument flows of every site bound to a declaration of the unit,
-// which needs the site's arguments and what the merge bound.
+// resolvePython resolves every site of a Python unit: direct binding
+// through imports and modules, a call of a class as its construction,
+// flow-based type inference (inferTypes), field-based resolution of a
+// receiver that recovered nothing, and the method a receiver's class
+// declares or inherits in method resolution order, over the unit's own
+// hierarchy (emitPython).
 func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error {
 	h, err := buildHierarchy(ctx, u)
 	if err != nil {
 		return err
 	}
 	defer h.close()
-	t, err := inferTypes(ctx, u, h)
+	t, err := inferTypes(ctx, u, h, nil, nil)
 	if err != nil {
 		return err
 	}
 	defer t.close()
+	return emitPython(ctx, u, h, t, nil, emit)
+}
+
+// emitPython emits the facts of the members only names (every member when
+// nil), whose sites the inference t bound.
+//
+// It reads the unit's tables once. Each site that stays inside its file (a
+// bare call of a name the file declares, a receiver whose type the file or
+// the inference recovered, a called value the inference traced) binds while
+// its table is in hand. A site that names a module (`mod.f()`, a name a
+// `from mod import f` introduced, which the worker spells as a TypeModule)
+// and each import become lookups that the unit's declarations and modules
+// answer through one ordered merge: every member's declarations and module
+// are indexed under each dotted module name its path can be imported as,
+// and both kinds of record are sorted together, so a lookup meets the
+// records of its key with nothing else resident. Every member's table is
+// read for that index; only the members only names resolve their sites and
+// imports. A second read of those members emits the argument flows of every
+// site bound to a declaration of the unit, which needs the site's arguments
+// and what the merge bound.
+func emitPython(ctx context.Context, u *unit, h *hierarchy, t *types, only *pagination.SortedRun[int32],
+	emit func(Binding) error) error {
 	keys, err := pagination.NewExternalSort(filepath.Join(u.dir, "python-modules"), 0,
 		encodeJSON[pyRecord], decodeJSON[pyRecord], comparePyRecord)
 	if err != nil {
@@ -67,14 +77,26 @@ func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error
 		}
 		return calls.Add(pyCall{Site: b.Site, Target: b.Target, First: receiverFirst})
 	}
+	resolves := func(int32) (bool, error) { return true, nil }
+	if only != nil {
+		in, err := newOrdinals(only)
+		if err != nil {
+			return err
+		}
+		defer in.stop()
+		resolves = in.has
+	}
 	err = u.Files(ctx, func(file int32, _ model.FileVersion, tab *Table) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
+		if err := indexPythonDecls(file, tab, keys); err != nil {
 			return err
 		}
-		if err := indexPythonDecls(file, tab, keys); err != nil {
+		if ok, err := resolves(file); err != nil || !ok {
+			return err
+		}
+		if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
 			return err
 		}
 		if err := addPythonImports(file, tab, keys); err != nil {
@@ -94,7 +116,7 @@ func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error
 	if err := joinPythonModules(ctx, keys, hits, emit, call); err != nil {
 		return err
 	}
-	return pythonFlows(ctx, u, h, calls, emit)
+	return pythonFlows(ctx, u, h, calls, only, emit)
 }
 
 // pyRecord is one record of the module merge: a declaration, or a file's
@@ -1057,10 +1079,12 @@ func initFrom(hits []pyHit, file int32) bool {
 	return false
 }
 
-// pythonFlows reads the tables a second time and emits the argument flows
-// of every call fact to a declaration of the unit (emitFlows), the sites
-// asked in ascending order against calls, sorted by site.
-func pythonFlows(ctx context.Context, u *unit, h *hierarchy, calls *pagination.ExternalSort[pyCall], emit func(Binding) error) error {
+// pythonFlows reads the tables of the members only names (every member
+// when nil) a second time and emits the argument flows of every call fact
+// to a declaration of the unit (emitFlows), the sites asked in ascending
+// order against calls, sorted by site.
+func pythonFlows(ctx context.Context, u *unit, h *hierarchy, calls *pagination.ExternalSort[pyCall],
+	only *pagination.SortedRun[int32], emit func(Binding) error) error {
 	run, err := calls.Sorted()
 	if err != nil {
 		return err
@@ -1071,7 +1095,7 @@ func pythonFlows(ctx context.Context, u *unit, h *hierarchy, calls *pagination.E
 	}
 	at := newSeeker(run, func(c pyCall) Ref { return c.Site })
 	defer at.stop()
-	return u.Files(ctx, func(file int32, _ model.FileVersion, tab *Table) error {
+	return u.filesOf(ctx, only, func(file int32, _ model.FileVersion, tab *Table) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

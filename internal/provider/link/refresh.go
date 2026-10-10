@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
-	"strconv"
+	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -30,8 +30,10 @@ import (
 // recorded reads changed (static.go, trace.go), and keeps every other
 // member's bindings; when the membership and manifest fields hold and every
 // moved table keeps its interface (layout), it also keeps the predecessor's
-// hierarchy and reads only the tables of the members that re-run; a Python or ECMAScript unit resolves every site, its
-// inference being one fixed point over the unit. The bindings are then
+// hierarchy and reads only the tables of the members that re-run. A Python
+// or ECMAScript unit whose layout holds re-derives only the region of
+// members its moved boundary values reach (resolveFlow, below), and any
+// other resolves every site. The bindings are then
 // diffed against the predecessor's: a file whose facts of any kind changed is
 // republished, and so is a file the set of whose targeted declarations,
 // modules or parameters changed, since a target's occurrence is published in
@@ -301,177 +303,805 @@ func diffGroups[T any, K cmp.Ordered](a, b *pagination.SortedRun[T], key func(T)
 	return nil
 }
 
-// halfBinding is a positional fact whose target is already named by
-// identity, on its way to its entry's file: Site is its positional entry and
-// ID the fact with every field but SiteFile set.
-type halfBinding struct {
-	Site Ref
-	ID   idBinding
-}
-
-func encodeHalf(h halfBinding) ([]byte, error) {
-	if h.Site.File < 0 || h.Site.Index < 0 {
-		return nil, internalErr("a fact on its way to identity is malformed")
-	}
-	rest, err := encodeIDBinding(h.ID)
-	if err != nil {
-		return nil, err
-	}
-	out := binary.AppendUvarint(binary.AppendUvarint(nil, uint64(h.Site.File)), uint64(h.Site.Index))
-	return append(out, rest...), nil
-}
-
-func decodeHalf(raw []byte) (halfBinding, error) {
-	r := byteReader{b: raw}
-	site := Ref{File: r.index(), Index: r.index()}
-	if r.err != nil {
-		return halfBinding{}, errors.New("a fact on its way to identity is malformed")
-	}
-	id, err := decodeIDBinding(r.b)
-	if err != nil {
-		return halfBinding{}, err
-	}
-	return halfBinding{Site: site, ID: id}, nil
-}
-
-// identify names run's positional facts (canonical, by compareBinding) by
-// identity, by two ordered merges with the members: the facts with a target
-// of the unit by target, whose table gives the target's node (a
-// declaration's, the module's for a FactImport, the parameter's for a
-// FactFlow), then every fact by entry, whose member gives its file. A table
-// is read only for a member some fact targets, and is held only while its
-// targets are named. A FactFlow into a parameter with no node is dropped.
+// The flow family's resolution (Python, ECMAScript) is one stratified least
+// fixed point over the unit (infer.go), whose answer for a member depends on
+// the values the other members send it. A refresh maintains it by
+// delete-and-rederive at the granularity of members (Gupta, Mumick and
+// Subrahmanian, "Maintaining Views Incrementally", SIGMOD 1993): every
+// value a member sends across its boundary is stored as a contribution
+// (contribution: a callable's returns, an argument into another member's
+// parameter, a field write), with the boundary entries each member read
+// (flowRead), and a refresh re-derives a region of members from the stored
+// contributions of the members outside it.
 //
-// It is the flow family's hand-off from its resolver's positional facts to
-// the facts publication and the state read (resolve): any resolution of the
-// family that yields a sorted run of positional facts plugs in here.
-func identify(ctx context.Context, u *unit, run *pagination.SortedRun[Binding]) (*pagination.SortedRun[idBinding], error) {
-	byTarget, err := newBindingSort(u.dir, compareTargetSite)
-	if err != nil {
-		return nil, err
-	}
-	defer byTarget.Close()
-	halves, err := pagination.NewExternalSort(u.dir, 0, encodeHalf, decodeHalf,
-		func(a, b halfBinding) int { return cmp.Or(compareRef(a.Site, b.Site), compareIDSite(a.ID, b.ID)) })
-	if err != nil {
-		return nil, err
-	}
-	defer halves.Close()
-	err = run.Each(func(b Binding) error {
-		if b.External == "" && b.Kind.hasTarget() {
-			return byTarget.Add(b)
+// The region starts as the members whose table moved, closed under every
+// path between them in the predecessor's boundary graph (a member sends to
+// another when it contributed a value to an entry the other reads): a value
+// that cycled from a moved member through untouched ones back to it is
+// re-derived with the whole cycle, so nothing the moved member no longer
+// produces can support itself through the stored contributions. Once the
+// region is re-derived, every entry whose values (and the stratum each
+// arrives at) differ from the predecessor's names its readers outside the
+// region; when there are none the refresh stops there (an edited member
+// whose boundary values come out equal costs its own sites only), and
+// otherwise the region grows by those readers and everything they reach in
+// the predecessor's graph, and is re-derived again. Every member outside
+// the final region read exactly what it read before, so its stored
+// bindings, contributions and reads stand.
+//
+// It applies when the refresh's layout is its predecessor's: then member
+// ordinals, declaration indices and every answer of the hierarchy are the
+// predecessor's (the hierarchy is a function of the interfaces alone), so
+// the stored contributions, positional, mean the same thing, and the stored
+// hierarchy is reused. Any other refresh resolves the unit in full.
+
+// resolveFlow is a flow-family unit's resolution, in full or, when the
+// refresh's layout holds, of the region its refresh re-derives (above).
+func resolveFlow(ctx context.Context, u *unit, rf *refresh) (*resolution, error) {
+	res := &resolution{}
+	ok := false
+	defer func() {
+		if !ok {
+			res.close()
 		}
-		return halves.Add(halfBinding{Site: b.Site, ID: unnamed("", b)})
-	})
-	if err != nil {
+	}()
+	incremental := rf.prev != nil && rf.layout && rf.prev.h != nil
+	var err error
+	if incremental {
+		res.h = rf.prev.h
+	} else if res.h, err = buildHierarchy(ctx, u); err != nil {
 		return nil, err
 	}
-	targets, err := byTarget.Sorted()
-	if err != nil {
+	if res.groups, err = emptyOf(newGroupSort(u.dir)); err != nil {
 		return nil, err
 	}
-	defer targets.Close()
-	next, stop := pull(targets)
-	cur, ok, err := next()
-	if err != nil {
-		stop()
+	if res.reads, err = emptyOf(newReadSort(u.dir, compareRead)); err != nil {
 		return nil, err
 	}
-	var file int32 = -1
-	err = u.members(func(fv model.FileVersion) error {
-		file++
-		if !ok || cur.Target.File != file {
-			return nil
+	if res.taken, err = emptyOf(newTakenSort(u.dir, compareTakenFrom)); err != nil {
+		return nil, err
+	}
+	var fr *flowRefresh
+	var t *types
+	if incremental {
+		if fr, err = newFlowRefresh(ctx, u, rf); err != nil {
+			return nil, err
 		}
-		t, has, err := u.tables.Table(ctx, u.gen, fv)
+		defer fr.close()
+		if t, err = fr.rederive(ctx, res.h); err != nil {
+			return nil, err
+		}
+	} else if t, err = inferTypes(ctx, u, res.h, nil, nil); err != nil {
+		return nil, err
+	}
+	defer t.close()
+
+	facts, err := newIDBindingSort(u.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer facts.Close()
+	// A resolver may emit from any goroutine; the sort has one producer.
+	var mu sync.Mutex
+	ids := res.h.ids
+	emit := func(b Binding) error {
+		file, err := ids.file(b.Site.File)
 		if err != nil {
 			return err
 		}
-		if !has {
-			return untabledRef("target", cur.Target)
+		id, ok, err := ids.identify(file, b)
+		if err != nil || !ok {
+			return err
 		}
-		for ok && cur.Target.File == file {
-			node, err := tableTarget(t, cur, fv.Path)
-			if err != nil {
-				return err
-			}
-			if node != "" {
-				h := halfBinding{Site: cur.Site, ID: unnamed("", cur)}
-				h.ID.TargetFile, h.ID.Target = fv.ID, node
-				if err := halves.Add(h); err != nil {
-					return err
-				}
-			}
-			if cur, ok, err = next(); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	stop()
+		mu.Lock()
+		defer mu.Unlock()
+		return facts.Add(id)
+	}
+	emitFacts := emitECMAScript
+	if u.family == FamilyPython {
+		emitFacts = emitPython
+	}
+	var only *pagination.SortedRun[int32]
+	if fr != nil {
+		only = fr.region
+	}
+	if err := emitFacts(ctx, u, res.h, t, only, emit); err != nil {
+		return nil, err
+	}
+	contributions, err := newSort0(u.dir, contributionCodec, earliest)
 	if err != nil {
 		return nil, err
 	}
-	if ok {
-		return nil, untabledRef("target", cur.Target)
-	}
-	sites, err := halves.Sorted()
+	defer contributions.Close()
+	reads, err := newSort0(u.dir, flowReadCodec, keepFirst[flowRead])
 	if err != nil {
 		return nil, err
 	}
-	defer sites.Close()
-	out, err := newIDBindingSort(u.dir)
+	defer reads.Close()
+	if fr != nil {
+		if err := fr.carry(facts, contributions, reads); err != nil {
+			return nil, err
+		}
+	}
+	if err := t.contributions.Each(contributions.Add); err != nil {
+		return nil, err
+	}
+	if err := t.reads.Each(reads.Add); err != nil {
+		return nil, err
+	}
+	if res.bindings, err = facts.Sorted(); err != nil {
+		return nil, err
+	}
+	if res.contributions, err = contributions.Sorted(); err != nil {
+		return nil, err
+	}
+	if res.flowReads, err = reads.Sorted(); err != nil {
+		return nil, err
+	}
+	ok = true
+	return res, nil
+}
+
+// flowRefresh is one refresh of a flow-family unit: the predecessor's
+// boundary graph, each relation sorted the ways the region's walks read it,
+// and the region, the member ordinals re-derived, ascending.
+type flowRefresh struct {
+	u  *unit
+	rf *refresh
+	// byEntry and reads are the predecessor's contributions and reads as
+	// stored, by entry; byFrom the contributions by contributing member and
+	// readsByFile the reads by reading member.
+	byEntry     *pagination.SortedRun[contribution]
+	byFrom      *pagination.SortedRun[contribution]
+	reads       *pagination.SortedRun[flowRead]
+	readsByFile *pagination.SortedRun[flowRead]
+	region      *pagination.SortedRun[int32]
+}
+
+func newFlowRefresh(ctx context.Context, u *unit, rf *refresh) (*flowRefresh, error) {
+	fr := &flowRefresh{u: u, rf: rf, byEntry: rf.prev.contributions, reads: rf.prev.flowReads}
+	ok := false
+	defer func() {
+		if !ok {
+			fr.close()
+		}
+	}()
+	var err error
+	if fr.byFrom, err = resort(u.dir, fr.byEntry, contributionCodec, func(a, b contribution) int {
+		return cmp.Or(cmp.Compare(a.From, b.From), contributionCodec.cmp(a, b))
+	}); err != nil {
+		return nil, err
+	}
+	if fr.readsByFile, err = resort(u.dir, fr.reads, flowReadCodec, func(a, b flowRead) int {
+		return cmp.Or(cmp.Compare(a.File, b.File), flowReadCodec.cmp(a, b))
+	}); err != nil {
+		return nil, err
+	}
+	seeds, err := fr.seeds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer seeds.Close()
+	ahead, err := fr.closure(seeds, fr.forward)
+	if err != nil {
+		return nil, err
+	}
+	defer ahead.Close()
+	behind, err := fr.closure(seeds, fr.backward)
+	if err != nil {
+		return nil, err
+	}
+	defer behind.Close()
+	if fr.region, err = fr.both(ahead, behind); err != nil {
+		return nil, err
+	}
+	ok = true
+	return fr, nil
+}
+
+func (fr *flowRefresh) close() {
+	fr.byFrom.Close()
+	fr.readsByFile.Close()
+	fr.region.Close()
+}
+
+// seeds is the ordinals of the members whose table moved (refresh.moved).
+func (fr *flowRefresh) seeds(ctx context.Context) (*pagination.SortedRun[int32], error) {
+	moved, err := fr.rf.moved.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer moved.Close()
+	c, err := newCursor(moved)
+	if err != nil {
+		return nil, err
+	}
+	defer c.stop()
+	out, err := newOrdinalSort(fr.u.dir)
 	if err != nil {
 		return nil, err
 	}
 	defer out.Close()
-	nextSite, stopSites := pull(sites)
-	defer stopSites()
-	h, more, err := nextSite()
-	if err != nil {
-		return nil, err
-	}
-	file = -1
-	err = u.members(func(fv model.FileVersion) error {
+	var file int32 = -1
+	err = fr.u.members(func(fv model.FileVersion) error {
 		file++
-		for more && h.Site.File == file {
-			id := h.ID
-			id.SiteFile = fv.ID
-			if err := out.Add(id); err != nil {
-				return err
-			}
-			if h, more, err = nextSite(); err != nil {
-				return err
-			}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		return nil
+		in, err := c.has(fv.ID)
+		if err != nil || !in {
+			return err
+		}
+		return out.Add(file)
 	})
 	if err != nil {
 		return nil, err
 	}
-	if more {
-		return nil, untabledRef("site", h.Site)
+	return out.Sorted()
+}
+
+// rederive re-derives the region (above) until no member outside it reads
+// a boundary entry whose values moved, and answers the last inference,
+// which binds the region's sites.
+func (fr *flowRefresh) rederive(ctx context.Context, h *hierarchy) (*types, error) {
+	for {
+		inputs, err := fr.inputs()
+		if err != nil {
+			return nil, err
+		}
+		t, err := inferTypes(ctx, fr.u, h, fr.region, inputs)
+		inputs.Close()
+		if err != nil {
+			return nil, err
+		}
+		readers, err := fr.dirty(t)
+		if err != nil {
+			t.close()
+			return nil, err
+		}
+		if readers.Len() == 0 {
+			readers.Close()
+			return t, nil
+		}
+		t.close()
+		grown, err := fr.closure(readers, fr.forward)
+		readers.Close()
+		if err != nil {
+			return nil, err
+		}
+		region, err := unionOrdinals(fr.u.dir, fr.region, grown)
+		grown.Close()
+		if err != nil {
+			return nil, err
+		}
+		fr.region.Close()
+		fr.region = region
+	}
+}
+
+// inputs is what the members outside the region send into it, by entry:
+// every stored contribution of a member outside it into a parameter of a
+// member inside it, into a field, or of a callable's returns.
+func (fr *flowRefresh) inputs() (*pagination.SortedRun[contribution], error) {
+	outside, err := newSort0(fr.u.dir, contributionCodec, earliest)
+	if err != nil {
+		return nil, err
+	}
+	defer outside.Close()
+	if err := keepOutside(fr.byFrom, fr.region, func(c contribution) int32 { return c.From }, outside.Add); err != nil {
+		return nil, err
+	}
+	run, err := outside.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer run.Close()
+	out, err := newSort0(fr.u.dir, contributionCodec, earliest)
+	if err != nil {
+		return nil, err
+	}
+	defer out.Close()
+	// By entry, a parameter's contributions come first and by owner, which
+	// the region's cursor is asked in ascending order.
+	in, err := newOrdinals(fr.region)
+	if err != nil {
+		return nil, err
+	}
+	defer in.stop()
+	err = run.Each(func(c contribution) error {
+		if c.Entry.Kind == varParam {
+			inside, err := in.has(c.Entry.File)
+			if err != nil || !inside {
+				return err
+			}
+		}
+		return out.Add(c)
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out.Sorted()
 }
 
-// tableTarget is the node of b's target in t, its member's table: the
-// declaration's, the module's for a FactImport, the parameter's for a
-// FactFlow, which is empty when the structural provider minted none.
-func tableTarget(t *Table, b Binding, path string) (model.NodeID, error) {
-	if b.Kind == FactImport {
-		return t.Module.Node, nil
+// keepOutside adds every record of run (sorted by member ascending) whose
+// member region does not hold.
+func keepOutside[T any](run *pagination.SortedRun[T], region *pagination.SortedRun[int32], member func(T) int32,
+	add func(T) error) error {
+	in, err := newOrdinals(region)
+	if err != nil {
+		return err
 	}
-	if b.Target.Index >= int32(len(t.Decls)) {
-		return "", outOfTable("target", b.Target, path)
+	defer in.stop()
+	return run.Each(func(v T) error {
+		inside, err := in.has(member(v))
+		if err != nil || inside {
+			return err
+		}
+		return add(v)
+	})
+}
+
+// entryValue is one value an entry holds, early when some contribution
+// sends it in the first stratum.
+type entryValue struct {
+	Entry variable
+	X     value
+	Early bool
+}
+
+// dirty is the members outside the region that read an entry whose values
+// t's region moved: the entry's values, each with its stratum, before
+// (every stored contribution) and now (the stored ones of the members
+// outside the region and t's), compared entry by entry. A parameter is read
+// by its own member; any other entry by the members whose stored reads name
+// it.
+func (fr *flowRefresh) dirty(t *types) (*pagination.SortedRun[int32], error) {
+	now, err := newSort0(fr.u.dir, contributionCodec, earliest)
+	if err != nil {
+		return nil, err
 	}
-	d := &t.Decls[b.Target.Index]
-	if b.Kind != FactFlow {
-		return d.Node, nil
+	defer now.Close()
+	if err := keepOutside(fr.byFrom, fr.region, func(c contribution) int32 { return c.From }, now.Add); err != nil {
+		return nil, err
 	}
-	if b.Param >= int32(len(d.Parameters)) {
-		return "", internalErr("a fact names parameter " + strconv.Itoa(int(b.Param)) + " past the parameters of " +
-			string(d.Node) + " in " + path)
+	if err := t.contributions.Each(now.Add); err != nil {
+		return nil, err
 	}
-	return d.Parameters[b.Param].Node, nil
+	after, err := now.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer after.Close()
+	changed, err := newSort0(fr.u.dir, codec[variable]{put: func(w *wbuf, v variable) { w.variable(v) },
+		get: func(r *rbuf) variable { return r.variable() }, cmp: cmpVar}, keepFirst[variable])
+	if err != nil {
+		return nil, err
+	}
+	defer changed.Close()
+	if err := diffEntries(fr.byEntry, after, changed.Add); err != nil {
+		return nil, err
+	}
+	entries, err := changed.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer entries.Close()
+	readers, err := newOrdinalSort(fr.u.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer readers.Close()
+	if err := fr.readersOf(entries, readers.Add); err != nil {
+		return nil, err
+	}
+	all, err := readers.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer all.Close()
+	out, err := newOrdinalSort(fr.u.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer out.Close()
+	if err := keepOutside(all, fr.region, func(f int32) int32 { return f }, out.Add); err != nil {
+		return nil, err
+	}
+	return out.Sorted()
+}
+
+// readersOf yields the readers of each entry of entries (ascending): a
+// parameter's member, and the members whose stored reads name any other.
+func (fr *flowRefresh) readersOf(entries *pagination.SortedRun[variable], yield func(int32) error) error {
+	return join(entries, fr.reads, func(v variable, r flowRead) int { return cmpVar(v, r.Entry) },
+		func(v variable, rs []flowRead) error {
+			if v.Kind == varParam {
+				return yield(v.File)
+			}
+			for _, r := range rs {
+				if err := yield(r.File); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+}
+
+// diffEntries merges two runs of contributions sorted by entry and value
+// and calls changed for each entry (ascending, once) whose values, each
+// with its stratum, differ between them.
+func diffEntries(a, b *pagination.SortedRun[contribution], changed func(variable) error) error {
+	na, sa := pull(a)
+	defer sa()
+	nb, sb := pull(b)
+	defer sb()
+	// next folds the contributions of one entry and value into one.
+	next := func(n func() (contribution, bool, error), head *contribution, have *bool) (entryValue, bool, error) {
+		if !*have {
+			return entryValue{}, false, nil
+		}
+		v := entryValue{Entry: head.Entry, X: head.X, Early: !head.Late}
+		for {
+			c, ok, err := n()
+			if err != nil {
+				return entryValue{}, false, err
+			}
+			if !ok || cmpVar(c.Entry, v.Entry) != 0 || cmpValue(c.X, v.X) != 0 {
+				*head, *have = c, ok
+				return v, true, nil
+			}
+			v.Early = v.Early || !c.Late
+		}
+	}
+	var ha, hb contribution
+	var oka, okb bool
+	var err error
+	if ha, oka, err = na(); err != nil {
+		return err
+	}
+	if hb, okb, err = nb(); err != nil {
+		return err
+	}
+	x, xok, err := next(na, &ha, &oka)
+	if err != nil {
+		return err
+	}
+	y, yok, err := next(nb, &hb, &okb)
+	if err != nil {
+		return err
+	}
+	var last variable
+	marked := false
+	mark := func(v variable) error {
+		if marked && cmpVar(last, v) == 0 {
+			return nil
+		}
+		last, marked = v, true
+		return changed(v)
+	}
+	for xok || yok {
+		var c int
+		switch {
+		case !yok:
+			c = -1
+		case !xok:
+			c = 1
+		default:
+			c = cmp.Or(cmpVar(x.Entry, y.Entry), cmpValue(x.X, y.X))
+		}
+		switch {
+		case c < 0:
+			err = mark(x.Entry)
+		case c > 0:
+			err = mark(y.Entry)
+		case x.Early != y.Early:
+			err = mark(x.Entry)
+		}
+		if err != nil {
+			return err
+		}
+		if c <= 0 {
+			if x, xok, err = next(na, &ha, &oka); err != nil {
+				return err
+			}
+		}
+		if c >= 0 {
+			if y, yok, err = next(nb, &hb, &okb); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// forward yields the members that read an entry a member of frontier
+// contributed to in the predecessor.
+func (fr *flowRefresh) forward(frontier *pagination.SortedRun[int32], yield func(int32) error) error {
+	entries, err := fr.entrySort()
+	if err != nil {
+		return err
+	}
+	defer entries.Close()
+	err = keepInside(fr.byFrom, frontier, func(c contribution) int32 { return c.From },
+		func(c contribution) error { return entries.Add(c.Entry) })
+	if err != nil {
+		return err
+	}
+	run, err := entries.Sorted()
+	if err != nil {
+		return err
+	}
+	defer run.Close()
+	return fr.readersOf(run, yield)
+}
+
+// backward yields the members that contributed in the predecessor to an
+// entry a member of frontier read: its stored reads and its parameters.
+func (fr *flowRefresh) backward(frontier *pagination.SortedRun[int32], yield func(int32) error) error {
+	entries, err := fr.entrySort()
+	if err != nil {
+		return err
+	}
+	defer entries.Close()
+	err = keepInside(fr.readsByFile, frontier, func(r flowRead) int32 { return r.File },
+		func(r flowRead) error { return entries.Add(r.Entry) })
+	if err != nil {
+		return err
+	}
+	// By entry, the parameters' contributions come first and by owner.
+	in, err := newOrdinals(frontier)
+	if err != nil {
+		return err
+	}
+	err = fr.byEntry.Each(func(c contribution) error {
+		if c.Entry.Kind != varParam {
+			return nil
+		}
+		inside, err := in.has(c.Entry.File)
+		if err != nil || !inside {
+			return err
+		}
+		return entries.Add(c.Entry)
+	})
+	in.stop()
+	if err != nil {
+		return err
+	}
+	run, err := entries.Sorted()
+	if err != nil {
+		return err
+	}
+	defer run.Close()
+	return join(run, fr.byEntry, func(v variable, c contribution) int { return cmpVar(v, c.Entry) },
+		func(_ variable, cs []contribution) error {
+			for _, c := range cs {
+				if err := yield(c.From); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+}
+
+func (fr *flowRefresh) entrySort() (*pagination.ExternalSort[variable], error) {
+	return newSort0(fr.u.dir, codec[variable]{put: func(w *wbuf, v variable) { w.variable(v) },
+		get: func(r *rbuf) variable { return r.variable() }, cmp: cmpVar}, keepFirst[variable])
+}
+
+// closure is seeds and every member step reaches from them, transitively:
+// each round steps from the members the last one added, until a round adds
+// none.
+func (fr *flowRefresh) closure(seeds *pagination.SortedRun[int32],
+	step func(*pagination.SortedRun[int32], func(int32) error) error) (*pagination.SortedRun[int32], error) {
+	dir := fr.u.dir
+	reached, err := unionOrdinals(dir, seeds, nil)
+	if err != nil {
+		return nil, err
+	}
+	frontier, err := unionOrdinals(dir, seeds, nil)
+	if err != nil {
+		reached.Close()
+		return nil, err
+	}
+	for frontier.Len() > 0 {
+		next, err := newOrdinalSort(dir)
+		if err == nil {
+			err = step(frontier, next.Add)
+		}
+		var stepped *pagination.SortedRun[int32]
+		if err == nil {
+			stepped, err = next.Sorted()
+		}
+		if next != nil {
+			next.Close()
+		}
+		frontier.Close()
+		if err != nil {
+			reached.Close()
+			return nil, err
+		}
+		fresh, err := newOrdinalSort(dir)
+		if err == nil {
+			err = keepOutside(stepped, reached, func(f int32) int32 { return f }, fresh.Add)
+		}
+		stepped.Close()
+		if err == nil {
+			frontier, err = fresh.Sorted()
+		}
+		if fresh != nil {
+			fresh.Close()
+		}
+		if err != nil {
+			reached.Close()
+			return nil, err
+		}
+		grown, err := unionOrdinals(dir, reached, frontier)
+		reached.Close()
+		if err != nil {
+			frontier.Close()
+			return nil, err
+		}
+		reached = grown
+	}
+	frontier.Close()
+	return reached, nil
+}
+
+// both is the members a and b both hold.
+func (fr *flowRefresh) both(a, b *pagination.SortedRun[int32]) (*pagination.SortedRun[int32], error) {
+	out, err := newOrdinalSort(fr.u.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer out.Close()
+	if err := keepInside(a, b, func(f int32) int32 { return f }, out.Add); err != nil {
+		return nil, err
+	}
+	return out.Sorted()
+}
+
+// carry adds to the fresh relations what the members outside the region
+// keep of the predecessor: their facts, contributions and reads.
+func (fr *flowRefresh) carry(facts *pagination.ExternalSort[idBinding], contributions *pagination.ExternalSort[contribution],
+	reads *pagination.ExternalSort[flowRead]) error {
+	ids, err := newFileIDSort(fr.u.dir)
+	if err != nil {
+		return err
+	}
+	defer ids.Close()
+	in, err := newOrdinals(fr.region)
+	if err != nil {
+		return err
+	}
+	var file int32 = -1
+	err = fr.u.members(func(fv model.FileVersion) error {
+		file++
+		inside, err := in.has(file)
+		if err != nil || !inside {
+			return err
+		}
+		return ids.Add(fv.ID)
+	})
+	in.stop()
+	if err != nil {
+		return err
+	}
+	region, err := ids.Sorted()
+	if err != nil {
+		return err
+	}
+	defer region.Close()
+	if err := keepExcept(fr.rf.prev.bindings, region, func(b idBinding) model.FileID { return b.SiteFile }, facts.Add); err != nil {
+		return err
+	}
+	if err := keepOutside(fr.byFrom, fr.region, func(c contribution) int32 { return c.From }, contributions.Add); err != nil {
+		return err
+	}
+	return keepOutside(fr.readsByFile, fr.region, func(r flowRead) int32 { return r.File }, reads.Add)
+}
+
+// keepInside adds every record of run (sorted by member ascending) whose
+// member set holds.
+func keepInside[T any](run *pagination.SortedRun[T], set *pagination.SortedRun[int32], member func(T) int32,
+	add func(T) error) error {
+	in, err := newOrdinals(set)
+	if err != nil {
+		return err
+	}
+	defer in.stop()
+	return run.Each(func(v T) error {
+		inside, err := in.has(member(v))
+		if err != nil || !inside {
+			return err
+		}
+		return add(v)
+	})
+}
+
+// resort is run sorted by order instead, in dir.
+func resort[T any](dir string, run *pagination.SortedRun[T], c codec[T], order func(a, b T) int) (*pagination.SortedRun[T], error) {
+	s, err := newSort0(dir, codec[T]{put: c.put, get: c.get, cmp: order}, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	if err := run.Each(s.Add); err != nil {
+		return nil, err
+	}
+	return s.Sorted()
+}
+
+// newSort0 is a sort of c's records in dir, folding equal ones by fold
+// (none when nil), outside any inference's lifetime.
+func newSort0[T any](dir string, c codec[T], fold func(a, b T) (T, error)) (*pagination.ExternalSort[T], error) {
+	s, err := pagination.NewExternalSort(dir, 0, encodeWith(c), decodeWith(c, "a spilled boundary record"), c.cmp)
+	if err != nil {
+		return nil, err
+	}
+	if fold != nil {
+		s.WithFold(fold)
+	}
+	return s, nil
+}
+
+// newOrdinalSort is a sort of member ordinals, each once.
+func newOrdinalSort(dir string) (*pagination.ExternalSort[int32], error) {
+	s, err := pagination.NewExternalSort(dir, 0,
+		func(v int32) ([]byte, error) { return binary.BigEndian.AppendUint32(nil, uint32(v)), nil },
+		func(b []byte) (int32, error) {
+			if len(b) != 4 {
+				return 0, errors.New("a member ordinal is malformed")
+			}
+			return int32(binary.BigEndian.Uint32(b)), nil
+		}, cmp.Compare[int32])
+	if err != nil {
+		return nil, err
+	}
+	return s.WithFold(func(a, _ int32) (int32, error) { return a, nil }), nil
+}
+
+// unionOrdinals is the ordinals a and b hold (b may be nil).
+func unionOrdinals(dir string, a, b *pagination.SortedRun[int32]) (*pagination.SortedRun[int32], error) {
+	s, err := newOrdinalSort(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	if err := a.Each(s.Add); err != nil {
+		return nil, err
+	}
+	if err := b.Each(s.Add); err != nil {
+		return nil, err
+	}
+	return s.Sorted()
+}
+
+// ordinals answers membership in a run of ordinals for ordinals asked in
+// ascending order, in one forward pass.
+type ordinals struct {
+	next func() (int32, bool, error)
+	stop func()
+	cur  int32
+	ok   bool
+}
+
+func newOrdinals(run *pagination.SortedRun[int32]) (*ordinals, error) {
+	next, stop := pull(run)
+	o := &ordinals{next: next, stop: stop}
+	var err error
+	if o.cur, o.ok, err = next(); err != nil {
+		stop()
+		return nil, err
+	}
+	return o, nil
+}
+
+func (o *ordinals) has(k int32) (bool, error) {
+	for o.ok && o.cur < k {
+		var err error
+		if o.cur, o.ok, err = o.next(); err != nil {
+			return false, err
+		}
+	}
+	return o.ok && o.cur == k, nil
 }
