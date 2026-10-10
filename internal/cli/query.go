@@ -423,8 +423,8 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			"the same search where it stopped. The routes found so far are returned, marked " +
 			"truncated with the reason; pass the cursor back with --cursor, or raise --visited " +
 			"or --timeout to let one page reach the target.\n\n" +
-			"This command takes no --limit or --edges: a route set is bounded by the reason-path " +
-			"cap, not paged.\n\n" +
+			"Equal-cost routes are paged: --limit is the routes one page lists, the answer counts " +
+			"every equal-cost route, and the cursor lists the rest. This command takes no --edges.\n\n" +
 			"--direction chooses which way edges are followed. The default, outgoing, answers " +
 			"\"what does the first node depend on, on the way to the second\". A node that is only " +
 			"ever CALLED has no outgoing route to its callers, so a search for one reports no path " +
