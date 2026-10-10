@@ -108,3 +108,38 @@ func TestGoParametersCarryTheirPositions(t *testing.T) {
 		t.Fatalf("M's parameters %+v, want %+v", got, want)
 	}
 }
+
+// TestGoImportBindsItsConventionalName protects the name a Go import binds
+// when its spec names none: the path's last element, past a major-version
+// element (`.../chi/v5` binds chi) or a gopkg.in .vN suffix
+// (`gopkg.in/yaml.v3` binds yaml), as the extraction names it. A call through
+// that name is a call through the package, a static site qualified by it,
+// which the linker resolves by the import's path.
+//
+// Mutation: name the import by the last path element -> `chi.NewRouter()`
+// and `yaml.Marshal()` are member calls on an unknown receiver, and `v5` and
+// `yaml.v3` are names no call writes.
+func TestGoImportBindsItsConventionalName(t *testing.T) {
+	src := `package p
+
+import (
+	"github.com/go-chi/chi/v5"
+	"gopkg.in/yaml.v3"
+)
+
+func f() {
+	chi.NewRouter()
+	yaml.Marshal(nil)
+}
+`
+	l, _ := linkOf(t, "go", "p.go", src)
+	for _, c := range []struct{ callee, qualifier string }{{"NewRouter", "chi"}, {"Marshal", "yaml"}} {
+		s := siteNamed(l, textAt(t, src, c.callee, 0))
+		if s == nil {
+			t.Fatalf("no site for %s", c.callee)
+		}
+		if s.Shape != wire.ShapeStatic || s.Qualifier != c.qualifier {
+			t.Errorf("%s.%s() is shape %d qualifier %q, want a static site qualified %q", c.qualifier, c.callee, s.Shape, s.Qualifier, c.qualifier)
+		}
+	}
+}

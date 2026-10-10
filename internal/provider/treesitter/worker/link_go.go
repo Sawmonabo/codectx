@@ -229,8 +229,9 @@ func (x *goLink) eachName(n Node, visit func(id Node)) {
 }
 
 // importName is the name an import spec binds: its explicit name, or the
-// last segment of its path, as the extraction derives it (grammars.go). A
-// blank or dot import binds no name of its own.
+// name the extraction derives from its path (goImportName: the last element,
+// past a major-version element or a gopkg.in .vN suffix). A blank or dot
+// import binds no name of its own.
 func (x *goLink) importName(spec Node) string {
 	if name := spec.ChildByFieldId(x.k.fName); !name.IsNull() {
 		if name.KindId() != x.k.packageIdentifier {
@@ -242,7 +243,7 @@ func (x *goLink) importName(spec Node) string {
 	if path.IsNull() {
 		return ""
 	}
-	return lastSegment(x.text(path), "/")
+	return goImportName(x.text(path))
 }
 
 // typeFields records the fields of a declared type, its embedded fields by
