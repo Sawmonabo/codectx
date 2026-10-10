@@ -390,6 +390,37 @@ main(); // @top
 		fails: "a declared type published per override (the subtype walk) gives `a.sound()` three targets and `s.talk()` the two classes' methods; a declared type's call made exact loses the override",
 	},
 	{
+		name:   "typescript-external-implements-and-extends",
+		anchor: "TypeScript Language Specification §8.1.1 (Class Heritage Specification: the `extends` clause names the base class, the `implements` clause the interfaces the class implements); TypeScript 4.3 `override` modifier (a member that overrides a base class member); ECMA-262 (15th edition, 2024) §16.2.2 (Imports)",
+		files: map[string]string{
+			"tasks.ts": `import { Runnable } from "tasks";
+import { Thread } from "threads";
+
+class A implements Runnable { // @ta
+    run(): void {} // @arun
+}
+
+class B extends Thread { // @tb
+    override run(): void {} // @brun
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every fact. Both modules are outside the project, so
+		// each imported name is its module's: an `implements` clause names an interface, an `extends`
+		// clause a class. A's run carries no `override` modifier, so it publishes no override of a type
+		// outside the project. Unprobed: no TypeScript compiler checked the source.
+		want: []string{},
+		facts: []string{
+			"ta A implements external tasks.Runnable",
+			"tb B extends external threads.Thread",
+			"brun run overrides external threads.Thread.run",
+		},
+		// Mutation: read every external supertype of a class as a class -> `A implements Runnable` is
+		// published as `A extends Runnable`.
+		fails: "a class's `implements` clause naming a type outside the project published as `extends` of an external class",
+	},
+	{
 		name:   "super-under-declared-types",
 		anchor: "TypeScript Language Specification §4.9.2 (Super property access), §3.11; ECMA-262 (15th edition, 2024) §13.3.7 (The super Keyword), §13.3.5 (The new Operator)",
 		files: map[string]string{
