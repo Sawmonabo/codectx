@@ -1438,63 +1438,6 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 	return nil
 }
 
-// dispatch yields every method declaration a call of method on a receiver
-// whose static type is the declaration typ may run: the method typ declares
-// or inherits, and every override in a subtype of typ, each once. A
-// declaration without a body is yielded only when no declaration with one is
-// reachable, since a call runs a body. Value-flow inference reads it for a
-// receiver known only by its declared type; a static-family call binds the
-// one method typ declares or inherits (declared) instead.
-func (h *hierarchy) dispatch(ctx context.Context, typ Ref, method string, yield func(Ref) error) error {
-	var concrete, abstract []entry
-	collect := func(e entry) error {
-		if e.Flags&flagAbstract != 0 {
-			abstract = append(abstract, e)
-		} else {
-			concrete = append(concrete, e)
-		}
-		return nil
-	}
-	if err := h.declared(typ, method, collect); err != nil {
-		return err
-	}
-	seen := map[Ref]bool{typ: true}
-	queue := []Ref{typ}
-	for len(queue) > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		t := queue[0]
-		queue = queue[1:]
-		err := h.links.lookup(keySub+refKey(t), func(e entry) error {
-			if seen[e.Ref] {
-				return nil
-			}
-			seen[e.Ref] = true
-			queue = append(queue, e.Ref)
-			return h.methods(e.Ref, method, collect)
-		})
-		if err != nil {
-			return err
-		}
-	}
-	out := concrete
-	if len(out) == 0 {
-		out = abstract
-	}
-	yielded := map[Ref]bool{}
-	for _, e := range out {
-		if yielded[e.Ref] {
-			continue
-		}
-		yielded[e.Ref] = true
-		if err := yield(e.Ref); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // overridable reports that a call of method on a receiver of static type
 // typ can run an override of what it names (DispatchVirtual), given found,
 // the nearest declarations of it typ declares or inherits, by the rule of
