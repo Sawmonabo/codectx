@@ -779,8 +779,9 @@ func (b *builder) imports() error {
 }
 
 // refs publishes call sites and type references. Resolution is file-local
-// (Section 11.1 precision syntax): a call to a name declared exactly once in
-// this file names that declaration; every other call names a provider-local
+// (Section 11.1 precision syntax): a bare or path-qualified call to a name
+// declared exactly once in this file names that declaration; every other
+// call, a call of a member on a receiver value included, names a provider-local
 // callee reference node carrying the Section 9.3 resolution and candidates
 // attributes, never a guess at another file's symbol, and a name declared
 // several times here is additionally retained as may_refer_to edges.
@@ -911,11 +912,12 @@ func calleeKey(r wire.Ref, targets []int) string {
 // callee is the node a call reference, or a handler a route names, stands
 // for, with the Section 9.3 resolution its relation carries and whether the
 // node exists. A name declared exactly once in this file names that
-// declaration, and the edge to a located declaration of this same file
-// states that resolution structurally rather than as an attribute on a node
-// that also describes the declaration itself. Every other name -- declared
-// several times here, qualified by an imported name, or not declared here --
-// names a provider-local callee reference node carrying the resolution and
+// declaration when callTargets keeps it, and the edge to a located
+// declaration of this same file states that resolution structurally rather
+// than as an attribute on a node that also describes the declaration itself.
+// Every other name -- declared several times here, a member of a receiver
+// value, qualified by an imported name, or not declared here -- names a
+// provider-local callee reference node carrying the resolution and
 // candidates attributes, one per key, never a guess at another file's
 // symbol. Past a user-set tree_sitter.max_callee_references the node is not
 // minted: the reference is counted into dropped and reports false, so a file

@@ -46,8 +46,8 @@ func (b *builder) entryPoints() []endpointFact {
 
 // guardCalls are the handlers of a `__main__` guard: what each call its block
 // makes directly (a reference whose scope is the guard itself) names, once
-// each, in source order. A call to a name declared exactly once in this file
-// routes to that declaration; any other routes to the callee reference the
+// each, in source order. A bare or path-qualified call to a name declared
+// exactly once in this file routes to that declaration; any other routes to the callee reference the
 // call names.
 func (b *builder) guardCalls(guard int) []handler {
 	var out []handler

@@ -429,8 +429,9 @@ app.get("/inline", (req, res) => { helper(); });
 // to it when it calls it.
 //
 // Mutations it catches: qualify it under the guard (`__main__.f`); export it
-// by the underscore rule; drop the branch from its identity (the two f's are
-// one node).
+// by the underscore rule; drop the branch from its identity (the guarded f is
+// then a duplicate settled by content, and its node moves when its body is
+// edited).
 func TestAFunctionInAMainGuardKeepsItsName(t *testing.T) {
 	p := newProvider(t)
 	c := extracted(t, p, "guarded.py", `def f():
@@ -473,6 +474,32 @@ if __name__ == "__main__":
 	guard := c.node(t, model.NodeEndpoint, "__main__")
 	if got := c.targets(model.RelRoutesTo, guard.ID); !slices.Contains(got, "f") {
 		t.Errorf("the guard routes to %v, want f", got)
+	}
+	// The branch, not the bytes, tells the guarded f apart: editing its body
+	// keeps its node. Without the branch the two f's would be duplicates
+	// settled by content, and the later one's node would move with its body.
+	edited := extracted(t, p, "guarded.py", `def f():
+    return 1
+
+if __name__ == "__main__":
+    def f():
+        return 3
+    f()
+`)
+	var after []model.Node
+	for _, n := range edited.all(model.NodeFunction, "f") {
+		if n.Range != nil {
+			after = append(after, n)
+		}
+	}
+	if len(after) != 2 {
+		t.Fatalf("%d located f nodes after the edit, want two", len(after))
+	}
+	before := map[model.NodeID]bool{located[0].ID: true, located[1].ID: true}
+	for _, n := range after {
+		if !before[n.ID] {
+			t.Errorf("f at %v has a new node %s after its body was edited", n.Range, n.ID)
+		}
 	}
 }
 
