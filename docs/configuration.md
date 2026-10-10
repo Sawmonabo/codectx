@@ -447,34 +447,57 @@ routes beyond it are reported as a count, never silently dropped.
 roots of the Section 15.2 boundary walk, and is unlimited by default: every
 resolvable seed is walked from. Setting it leaves the seeds past it unexplored,
 and the manifest carries one exclusion row naming the limit and the number of
-roots that did not start — the overflow is never quietly re-walked as a second
-request, because one walk ranks its boundaries globally and a second walk would
-answer its own local ranking instead of extending the first one's order.
+roots that did not start — the overflow is never quietly re-walked as a further
+request. The walks the compiler does run are one per distinct root weight
+(explicit seeds, then the exact matches, then each lexical score level), with
+the roots of one weight walked together, and an entity several walks reach keeps
+its best (requirement, score) pair ([ADR-0016](adr/ADR-0016-seed-budget.md)
+decision 1).
 
 One residual bound stands behind the unlimited default: a single traversal
 request's start list is validated against a structural wire ceiling of 250000
 node ids, which applies to externally supplied `impact` and `graph` requests and
-also to the request the compiler issues for its own walk. It is far wider than
-the seed set one task can produce — the task text is clipped to a fixed byte
-bound and each identity it names resolves through one page of declarations — so
-it does not cut a compile in practice; a start list that reached it would be
-reported, never trimmed.
+also to each request the compiler issues for its own walks — one per root
+weight, so the ceiling applies to the roots of one weight. The named roots are
+bounded by the request: the task text is clipped to a fixed byte bound and each
+identity it names resolves through one page of declarations. The lexical roots
+follow the plan's file budget rather than the size of the index: the lexical
+matches are read only until no unread match can rank above the packed files
+(below). A start list that reached the ceiling is refused and reported, never
+trimmed.
 
 `max_seeds` bounds seed discovery — the Section 15.2 pass that turns a task's
 words into the candidates a plan starts from — and is unlimited by default. What
 bounds the identity steps with no value set is the **request**, not the
 repository: the task text is clipped to a fixed byte bound before any scanning,
-and each identity it names is resolved by exactly one page of declarations. The
-two steps that read the repository — the lexical matches of the task text and
-the captured working-tree changes — are paged to exhaustion on their own keyset
-cursors, so a branch with more changed files than one page contributes all of
-them rather than the prefix a page boundary happened to cut. What keeps those
-two from dominating a plan is the ranking (both score last) and
+and each identity it names is resolved by exactly one page of declarations.
+Two steps read the repository. The captured working-tree changes are paged to
+exhaustion on their keyset cursor, so a branch with more changed files than one
+page contributes all of them rather than the prefix a page boundary happened to
+cut; a changed file is not a walk root, and its seed keeps the active-change
+score. The lexical matches of the task text are read in score order until no
+unread match can rank above the packed files
+([ADR-0016](adr/ADR-0016-seed-budget.md) decision 3): the read stops once the
+matches read fill more than the plan's file budget with files that each fit one
+slice, at a score margin derived from the ranking's boost constants, and a
+later round reads every match inside the files the plan keeps (decision 5). The
+manifest says when the read stopped and at which score. Every read is one page
+at a time. A value you do set is disclosed where it bites: the step that stopped
+is named in the manifest's exclusions, with the key and the value that stopped
+it, and the scope is reported incomplete.
+
+What keeps those two steps from dominating a plan is the ranking and
 `max_manifest_bytes`, which names every candidate it drops in the plan's
-excluded projection; every read is one page at a time. A value you do set is
-disclosed where it bites: the step that stopped is named in the manifest's
-exclusions, with the key and the value that stopped it, and the scope is reported
-incomplete.
+excluded projection. Each lexical seed scores in proportion to its match score
+relative to the task's top match, always below an exact match, and lends what
+its walk reaches the same proportion; a lexical root never makes an entry
+required (decision 1). The centrality boost counts only the edges walked from
+named roots — explicit seeds and exact matches (decision 2) — so a task with no
+named seed ranks by lexical score and routes alone. The name-only candidates of
+an open call site the walk reaches join the plan as optional context after
+every precise entry, never as required scope, and the manifest says how many
+were admitted, or that the lookup was unavailable
+([ADR-0015](adr/ADR-0015-open-call-sites-and-dispatch.md) decision 3).
 
 The ranking weights themselves are **not** configuration. They are compile-time
 constants labelled by the manifest's `policy_version`, so changing one changes

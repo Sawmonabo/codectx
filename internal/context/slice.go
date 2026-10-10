@@ -105,3 +105,100 @@ func packPlanStream(ctx context.Context, groups *pagination.SortedRun[groupRec],
 		})
 	})
 }
+
+// packOutcome is what the round decision reads from one round's pack
+// (ADR-0016 decisions 4 and 5): the files it kept, the rank key of the first
+// group it dropped for the file limit or the slice limit, and how many of the
+// read's witness files it dropped as oversized.
+//
+// It is read from P-H's verdict stream and P-G's group stream rather than
+// recorded while packing, so every boundary that carries those two streams
+// -- the one behind P-H included -- resumes into the same decision with no
+// carry of its own.
+type packOutcome struct {
+	// Kept is the kept files in file-id order, at most the plan's file budget
+	// beside the required files the budget check admitted.
+	Kept []model.FileID
+	// LimitDrop is set when a group was dropped for the file or slice limit;
+	// LimitPossible, LimitRequirement and LimitScore are then the rank key of
+	// the first such group in group order.
+	LimitDrop        bool
+	LimitPossible    bool
+	LimitRequirement model.Requirement
+	LimitScore       int64
+	// OversizedWitnesses counts the witness files dropped because their group
+	// does not fit one slice.
+	OversizedWitnesses int64
+}
+
+// readPackOutcome walks the verdicts once, in file order, for the kept files,
+// the oversized witnesses and the lowest group rank dropped for a limit, then
+// the groups in rank order up to that rank for its key. Both walks hold one
+// record of each stream; the witness set is the read's, at most F+1+Extra
+// files.
+func readPackOutcome(ctx context.Context, m *measuredPlan, p *packedPlan, witnesses []model.FileID) (packOutcome, error) {
+	if m == nil || m.Groups == nil || p == nil || p.Verdicts == nil {
+		return packOutcome{}, &model.Error{Code: model.CodeInternal,
+			Message: "the round decision was reached with no packed plan to read"}
+	}
+	witness := make(map[model.FileID]bool, len(witnesses))
+	for _, id := range witnesses {
+		witness[id] = true
+	}
+	var out packOutcome
+	limitAt := int64(-1)
+	if err := p.Verdicts.Each(func(v packVerdict) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		switch {
+		case v.Decision.Keep:
+			out.Kept = append(out.Kept, v.Decision.FileID)
+		case v.Reason == dropOversized:
+			if witness[v.Decision.FileID] {
+				out.OversizedWitnesses++
+			}
+		case v.Reason == dropFileLimit || v.Reason == dropSliceLimit:
+			if limitAt < 0 || v.MinIndex < limitAt {
+				limitAt = v.MinIndex
+			}
+		}
+		return nil
+	}); err != nil {
+		return packOutcome{}, err
+	}
+	if limitAt < 0 {
+		return out, nil
+	}
+	next, stop := pullRun(m.Groups)
+	defer stop()
+	for {
+		g, ok, err := next()
+		if err != nil {
+			return packOutcome{}, err
+		}
+		if !ok {
+			return packOutcome{}, &model.Error{Code: model.CodeInternal,
+				Message: "the packer dropped a group the measured plan does not hold"}
+		}
+		if g.MinIndex == limitAt {
+			out.LimitDrop = true
+			out.LimitPossible, out.LimitRequirement, out.LimitScore = g.KeyPossible, g.KeyRequirement, g.KeyScore
+			return out, nil
+		}
+	}
+}
+
+// certified reports whether the pack's certificate holds against the stop
+// (ADR-0016 decision 4): the first group dropped for a limit ranks above
+// (recommended, tau) -- a precise group whose requirement ranks above
+// recommended, or a recommended one scoring above tau. A pack that dropped
+// nothing for a limit is not bound by the file budget, so it certifies
+// nothing.
+func (o packOutcome) certified(tau int64) bool {
+	if !o.LimitDrop || o.LimitPossible {
+		return false
+	}
+	rank, rec := requirementRank(o.LimitRequirement), requirementRank(model.RequirementRecommended)
+	return rank < rec || (rank == rec && o.LimitScore > tau)
+}

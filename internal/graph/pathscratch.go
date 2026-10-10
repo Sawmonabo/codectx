@@ -118,6 +118,8 @@ DROP TABLE IF EXISTS bucket;
 DROP TABLE IF EXISTS reach;
 DROP TABLE IF EXISTS pending;
 DROP TABLE IF EXISTS progress;
+DROP TABLE IF EXISTS hopvia;
+DROP TABLE IF EXISTS pathcount;
 `
 
 const pathScratchSchema = `
@@ -129,8 +131,12 @@ CREATE TABLE bucket(cost INTEGER NOT NULL, node TEXT NOT NULL, rel TEXT NOT NULL
 	kind TEXT NOT NULL, depth INTEGER NOT NULL, PRIMARY KEY(cost, node, rel)) WITHOUT ROWID;
 CREATE TABLE reach(node TEXT PRIMARY KEY) WITHOUT ROWID;
 CREATE TABLE pending(node TEXT PRIMARY KEY) WITHOUT ROWID;
-CREATE TABLE progress(k INTEGER PRIMARY KEY, expand_after TEXT NOT NULL, depth_pruned INTEGER NOT NULL);
-INSERT INTO progress(k, expand_after, depth_pruned) VALUES(0, '', 0);
+CREATE TABLE hopvia(rel TEXT NOT NULL, via TEXT NOT NULL, PRIMARY KEY(rel, via)) WITHOUT ROWID;
+CREATE TABLE pathcount(node TEXT NOT NULL, len INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY(node, len)) WITHOUT ROWID;
+CREATE TABLE progress(k INTEGER PRIMARY KEY, expand_after TEXT NOT NULL, depth_pruned INTEGER NOT NULL,
+	scan_done INTEGER NOT NULL, hop_pos TEXT NOT NULL, possible INTEGER NOT NULL, route_after TEXT NOT NULL);
+INSERT INTO progress(k, expand_after, depth_pruned, scan_done, hop_pos, possible, route_after)
+	VALUES(0, '', 0, 0, '', 0, '');
 `
 
 // pending and progress are what make the search RESUMABLE, and they are here
@@ -147,8 +153,13 @@ INSERT INTO progress(k, expand_after, depth_pruned) VALUES(0, '', 0);
 //
 // progress carries the expansion's keyset position inside the batch in flight,
 // so a resumed page does not re-read edges it has already charged against the
-// edge budget, and the depth-pruned flag, which is an answer-level disclosure
-// that must survive the page that discovered it.
+// edge budget, whether the batch's stored lists are done and where its name-only
+// steps are, the depth-pruned flag, which is an answer-level
+// disclosure that must survive the page that discovered it, whether the
+// search is the one that takes name-only calls, and where the list of its
+// equal-cost routes is (route_after). hopvia holds the call site
+// relations behind each name-only step, and pathcount the
+// routes reaching each state by length, which counts the equal-cost routes.
 
 // openPathScratch opens the search's database on a surface of the store's
 // scratch pool under parent, emptied of whatever the search before it left

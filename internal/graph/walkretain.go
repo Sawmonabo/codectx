@@ -137,6 +137,17 @@ type retainedWalk struct {
 	// being scanned?", which the direction dedup rule asks of every delivered
 	// entry, without holding the level in heap.
 	frontier *pagedBitset
+	// based and rested serve a callers walk's dispatch step: based holds
+	// the nodes admitted as a base method a climb reached, whose virtual
+	// callers alone were walked, and rested those of them admitted again
+	// because the walk also reached them as a caller, so the rest of their
+	// callers are walked once (dispatch.go, stepRest).
+	based, rested *pagedBitset
+	// dispatched serves a callees walk's: the nodes admitted with a step
+	// that descends to their overrides, so a node first admitted as an
+	// exact call's target and reached again by a call that can dispatch
+	// descends once (dispatch.go, stepDescend).
+	dispatched *pagedBitset
 	// owned marks a directory this request created and must remove itself if
 	// nothing adopts it. A directory REOPENED from the store is owned by the
 	// store, and is released through the consumed continuation instead --
@@ -204,7 +215,16 @@ func (w *retainedWalk) openSets(max walkBounds, probe *heapProbe) error {
 	if w.bits, err = openBitset(w.home, bitsetNodeFile, uint64(max.Node), probe); err != nil {
 		return err
 	}
-	w.frontier, err = openBitset(w.home, bitsetFrontierFile, uint64(max.Node), probe)
+	if w.frontier, err = openBitset(w.home, bitsetFrontierFile, uint64(max.Node), probe); err != nil {
+		return err
+	}
+	if w.based, err = openBitset(w.home, bitsetBasedFile, uint64(max.Node), probe); err != nil {
+		return err
+	}
+	if w.rested, err = openBitset(w.home, bitsetRestedFile, uint64(max.Node), probe); err != nil {
+		return err
+	}
+	w.dispatched, err = openBitset(w.home, bitsetDispatchedFile, uint64(max.Node), probe)
 	return err
 }
 
@@ -298,7 +318,7 @@ func (w *retainedWalk) discard() {
 
 func (w *retainedWalk) close() error {
 	var first error
-	for _, b := range []*pagedBitset{w.bits, w.frontier} {
+	for _, b := range []*pagedBitset{w.bits, w.frontier, w.based, w.rested, w.dispatched} {
 		if b == nil {
 			continue
 		}
@@ -306,7 +326,7 @@ func (w *retainedWalk) close() error {
 			first = err
 		}
 	}
-	w.bits, w.frontier = nil, nil
+	w.bits, w.frontier, w.based, w.rested, w.dispatched = nil, nil, nil, nil, nil
 	for _, f := range []*retainFile{w.entries, w.pairs} {
 		if f == nil {
 			continue
@@ -707,6 +727,7 @@ func encodeFrontierState(fs frontierState) []byte {
 	buf = binary.AppendUvarint(buf, uint64(fs.Cost))
 	buf = binary.AppendUvarint(buf, uint64(fs.Node))
 	buf = binary.AppendUvarint(buf, uint64(fs.Via))
+	buf = append(buf, byte(fs.Step))
 	buf = binary.AppendUvarint(buf, uint64(len(fs.Route)))
 	for _, r := range fs.Route {
 		buf = binary.AppendUvarint(buf, uint64(r))
@@ -721,6 +742,7 @@ func decodeFrontierState(b []byte) (frontierState, error) {
 	fs.Cost = int64(d.uvarint())
 	fs.Node = NodeRef(d.uvarint())
 	fs.Via = RelRef(d.uvarint())
+	fs.Step = dispatchStep(d.byteAt())
 	n := d.uvarint()
 	if d.err != nil {
 		return frontierState{}, d.err
@@ -755,6 +777,7 @@ func admitState(r levelRecord, costs kindCosts) frontierState {
 		Node:  r.Edge.Neighbour,
 		Via:   r.Edge.Rel,
 		Route: appendRoute(r.Owner.Route, r.Edge.Rel),
+		Step:  r.Step,
 	}
 }
 
@@ -775,6 +798,22 @@ func compareAdmitRoute(a, b levelRecord, costs kindCosts) int {
 		return c
 	}
 	return cmp.Compare(a.OwnerID, b.OwnerID)
+}
+
+// admitsBefore reports whether r survives over best inside one neighbour
+// group: a record that reaches the node as a caller beats one that reaches it
+// only as a climb's base method, whose callers it would walk only in part, and
+// a record that reaches a callee by a call that can dispatch beats an exact
+// one, whose admission would walk the callee's calls but not its overrides;
+// otherwise compareAdmitRoute decides.
+func admitsBefore(r, best levelRecord, costs kindCosts) bool {
+	if (r.Step == stepBase) != (best.Step == stepBase) {
+		return best.Step == stepBase
+	}
+	if r.Step.dispatches() != best.Step.dispatches() {
+		return r.Step.dispatches()
+	}
+	return compareAdmitRoute(r, best, costs) < 0
 }
 
 // admitLevel is the level transition's COMMIT, and the order of its effects is
@@ -814,13 +853,83 @@ func (w *retainedWalk) admitLevel(ctx context.Context, s *sortedLevel, level int
 	if err := w.applyAdmitted(file, w.frontier); err != nil {
 		return 0, err
 	}
-	if err := w.bits.sync(); err != nil {
+	if err := w.applySteps(file); err != nil {
 		return 0, err
 	}
-	if err := w.frontier.sync(); err != nil {
-		return 0, err
+	for _, b := range []*pagedBitset{w.bits, w.frontier, w.based, w.rested, w.dispatched} {
+		if err := b.sync(); err != nil {
+			return 0, err
+		}
 	}
 	return count, nil
+}
+
+// applySteps records which admitted states were a climb's base method, which
+// a base method admitted again as a caller, and which descend to their
+// overrides. Like applyAdmitted it is idempotent, so a re-applied level
+// changes nothing.
+func (w *retainedWalk) applySteps(file *retainFile) error {
+	var based, rested, dispatched []NodeRef
+	if err := file.each(func(b []byte) error {
+		fs, err := decodeFrontierState(b)
+		if err != nil {
+			return err
+		}
+		switch fs.Step {
+		case stepBase:
+			based = append(based, fs.Node)
+		case stepRest:
+			rested = append(rested, fs.Node)
+		}
+		if fs.Step.dispatches() {
+			dispatched = append(dispatched, fs.Node)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(based) > 0 {
+		if _, err := bitsetSet(w.based, based); err != nil {
+			return err
+		}
+	}
+	if len(rested) > 0 {
+		if _, err := bitsetSet(w.rested, rested); err != nil {
+			return err
+		}
+	}
+	if len(dispatched) > 0 {
+		if _, err := bitsetSet(w.dispatched, dispatched); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// again is the step a node the walk already admitted is admitted once more
+// with, reached now by a record of step reached: stepRest, stepDescend, or
+// stepDirect when this reason was already served and the node is not admitted
+// again.
+func (w *retainedWalk) again(node NodeRef, reached dispatchStep) (dispatchStep, error) {
+	switch {
+	case reached == stepDirect:
+		based, err := w.based.test(uint64(node))
+		if err != nil || !based {
+			return stepDirect, err
+		}
+		rested, err := w.rested.test(uint64(node))
+		if err != nil || rested {
+			return stepDirect, err
+		}
+		return stepRest, nil
+	case reached == stepVirtual || reached == stepOverride:
+		dispatched, err := w.dispatched.test(uint64(node))
+		if err != nil || dispatched {
+			return stepDirect, err
+		}
+		return stepDescend, nil
+	}
+	return stepDirect, nil
 }
 
 // writeAdmitted builds admitted.<level>, or counts the one a previous attempt
@@ -862,8 +971,21 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 		}
 		have = false
 		in, err := w.bits.test(uint64(best.Edge.Neighbour))
-		if err != nil || in {
+		if err != nil {
 			return err
+		}
+		if in {
+			// Admitted once per reason. A base method a climb admitted had
+			// only its virtual callers walked, so reached again as a caller
+			// it is admitted once more for the rest of them; a callee an
+			// exact call admitted had its calls walked but not its
+			// overrides, so reached again by a call that can dispatch, or by
+			// a descent, it is admitted once more to descend.
+			again, err := w.again(best.Edge.Neighbour, best.Step)
+			if err != nil || again == stepDirect {
+				return err
+			}
+			best.Step = again
 		}
 		count++
 		return sorter.Add(admitState(best, costs))
@@ -877,7 +999,7 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 				return err
 			}
 		}
-		if !have || compareAdmitRoute(r, best, costs) < 0 {
+		if !have || admitsBefore(r, best, costs) {
 			best, have = r, true
 		}
 		return nil

@@ -52,6 +52,13 @@ type levelRecord struct {
 	OwnerID model.NodeID
 	NodeID  model.NodeID
 	RelID   model.RelationID
+	// Step is the dispatch step the neighbour is admitted with when this
+	// record wins its group (dispatch.go); stepDirect outside a call walk.
+	Step dispatchStep
+	// check marks a collected record whose keep or step depends on whether
+	// its relation has a virtual occurrence. It is settled before the record
+	// is appended to the level and never written.
+	check bool
 }
 
 // encodeLevelRecord frames one record: uvarints for every number and every
@@ -63,6 +70,7 @@ func encodeLevelRecord(r levelRecord) []byte {
 	buf = binary.AppendUvarint(buf, uint64(r.Owner.Cost))
 	buf = binary.AppendUvarint(buf, uint64(r.Owner.Node))
 	buf = binary.AppendUvarint(buf, uint64(r.Owner.Via))
+	buf = append(buf, byte(r.Owner.Step))
 	buf = binary.AppendUvarint(buf, uint64(len(r.Owner.Route)))
 	for _, rel := range r.Owner.Route {
 		buf = binary.AppendUvarint(buf, uint64(rel))
@@ -75,7 +83,7 @@ func encodeLevelRecord(r levelRecord) []byte {
 	if r.Edge.Outgoing {
 		outgoing = 1
 	}
-	buf = append(buf, outgoing)
+	buf = append(buf, outgoing, byte(r.Step))
 	for _, id := range []string{string(r.OwnerID), string(r.NodeID), string(r.RelID)} {
 		buf = binary.AppendUvarint(buf, uint64(len(id)))
 		buf = append(buf, id...)
@@ -93,6 +101,7 @@ func decodeLevelRecord(b []byte) (levelRecord, error) {
 	r.Owner.Cost = int64(d.uvarint())
 	r.Owner.Node = NodeRef(d.uvarint())
 	r.Owner.Via = RelRef(d.uvarint())
+	r.Owner.Step = dispatchStep(d.byteAt())
 	routeLen := d.uvarint()
 	if d.err == nil {
 		if routeLen > model.MaxRelationsPerPath+1 {
@@ -111,6 +120,7 @@ func decodeLevelRecord(b []byte) (levelRecord, error) {
 	r.Edge.Rel = RelRef(d.uvarint())
 	r.Edge.Kind = KindCode(d.byteAt())
 	r.Edge.Outgoing = d.byteAt() == 1
+	r.Step = dispatchStep(d.byteAt())
 	r.OwnerID = model.NodeID(d.text())
 	r.NodeID = model.NodeID(d.text())
 	r.RelID = model.RelationID(d.text())

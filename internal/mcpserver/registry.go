@@ -46,15 +46,22 @@ func register(s *mcp.Server, h *handlers) {
 
 	// --- traversal -------------------------------------------------------
 	addTool(s, "codectx_callers", "Callers",
-		"Bounded inbound call neighborhood of one or more nodes.", h.callers)
+		"Bounded inbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
+			"names others. Every node carries its range and every call its call-site ranges. Calls "+
+			"into a method this one overrides are listed as through that base: they may not run it. "+
+			"`may_call` rows follow every precise row and are matched by name only.", h.callers)
 	addTool(s, "codectx_callees", "Callees",
-		"Bounded outbound call neighborhood of one or more nodes.", h.callees)
+		"Bounded outbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
+			"names others. Every node carries its range and every call its call-site ranges. The "+
+			"overrides a virtual call may dispatch to are listed and marked: they may not run. "+
+			"`may_call` rows follow every precise row and are matched by name only.", h.callees)
 	addTool(s, "codectx_dependency_path", "Dependency path",
 		"Bounded shortest dependency path between two resolved nodes. `direction` chooses "+
 			"which way edges are followed: \"outgoing\" (the default: what `from` depends on), "+
 			"\"incoming\" (what depends on it) or \"both\" (either way). A node that is only ever "+
 			"called has no outgoing route to its callers, so a pair connected against the edge "+
-			"direction reports no path until `direction` is incoming or both.", h.dependencyPath)
+			"direction reports no path until `direction` is incoming or both. Every equal-cost "+
+			"route is listed, a page at a time by next_cursor, and `route_count` counts them all.", h.dependencyPath)
 	addTool(s, "codectx_impact", "Impact",
 		"Affected scope and required package boundaries, with completeness.", h.impact)
 
@@ -70,7 +77,10 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_context_include", "Include seeds",
 		"Widen a session's scope with additional seeds.", h.contextInclude)
 	addTool(s, "codectx_read_source", "Read source",
-		"The only tool that returns source bytes: one bounded chunk with a receipt.", h.readSource)
+		"The only tool that returns source bytes. With session_id, one bounded chunk of a session's "+
+			"file and its receipt. Without it, a node's range by node_id, or a byte range by file_id or "+
+			"path, from generation_id or the active generation, paged by next_cursor to the node's or "+
+			"file's end; such a read earns no coverage.", h.readSource)
 
 	// --- review gate and capsule ------------------------------------------
 	addTool(s, "codectx_context_acknowledge", "Acknowledge",

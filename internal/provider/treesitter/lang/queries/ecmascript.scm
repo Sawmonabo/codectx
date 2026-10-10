@@ -14,6 +14,15 @@
 (class_declaration name: (_) @name body: (_) @body) @def.class
 (method_definition name: (property_identifier) @name body: (_) @body) @def.method
 (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)] @body) @def.function
+; A function-valued property or assignment is a function declaration named by
+; the name it is stored under, the shapes the grammar's reference tags define
+; as function definitions: `f = () => …`, `a.b = function () {…}` and
+; `{ k: () => … }`. The object a member assignment stores into is captured for
+; the declaration's descriptor path (`a.b`); a pair's path is read from the
+; bindings around its object. A string or computed key declares nothing.
+(assignment_expression left: (identifier) @name right: [(arrow_function) (function_expression)] @body) @def.function
+(assignment_expression left: (member_expression object: (_) @name.scope property: (property_identifier) @name) right: [(arrow_function) (function_expression)] @body) @def.function
+(pair key: (property_identifier) @name value: [(arrow_function) (function_expression)] @body) @def.function
 (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant)
 (variable_declarator name: (identifier) @name) @def.variable
 

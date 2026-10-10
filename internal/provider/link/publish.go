@@ -441,7 +441,7 @@ type filePublication struct {
 // external, computed or open.
 func (f *filePublication) site(i int32, group []idBinding) error {
 	s := &f.t.Sites[i]
-	caller, err := f.caller(s.Caller)
+	caller, err := f.caller(s)
 	if err != nil {
 		return err
 	}
@@ -530,8 +530,17 @@ func (f *filePublication) target(b idBinding) (model.NodeID, error) {
 	return n.ID, err
 }
 
-// caller is the declaration at index c of the file's table, -1 its module.
-func (f *filePublication) caller(c int32) (Endpoint, error) {
+// caller is the node site s's calls are published from: the route handler
+// literal it is made in (Site.Handler), else the declaration Caller, else the
+// file's module.
+func (f *filePublication) caller(s *Site) (Endpoint, error) {
+	if s.Handler > 0 {
+		if int(s.Handler) > len(f.t.Handlers) {
+			return Endpoint{}, internalErr("a link table site of " + f.fv.Path + " names a route handler the table does not hold")
+		}
+		return f.t.Handlers[s.Handler-1], nil
+	}
+	c := s.Caller
 	if c < 0 {
 		return f.t.Module, nil
 	}

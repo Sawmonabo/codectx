@@ -80,7 +80,11 @@ type fixtureFileSpec struct {
 }
 
 var fixtureFiles = []fixtureFileSpec{
-	{"internal/order/ports.go", "Repository", model.NodeInterface, "package order\n\ntype Repository interface{ Save(Order) error }\n", false},
+	// The port's symbol is identifier-shaped (an upper-case letter after its
+	// first rune), so a task word naming it goes to exact resolution; a
+	// capitalised plain word such as "Repository" is prose and is never sent
+	// there (identifierShaped).
+	{"internal/order/ports.go", "RepositoryPort", model.NodeInterface, "package order\n\ntype Repository interface{ Save(Order) error }\n", false},
 	{"internal/order/service.go", "Place", model.NodeFunction, "package order\n\nfunc Place(r Repository, o Order) error { return r.Save(o) }\n", true},
 	{"internal/order/handler.go", "Handle", model.NodeFunction, "package order\n\nfunc Handle(r Repository) error { return Place(r, Order{}) }\n", false},
 	{"internal/order/service_test.go", "TestPlace", model.NodeTest, "package order\n\nfunc TestPlace(t *testing.T) { _ = Place }\n", false},
@@ -187,10 +191,21 @@ func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFix
 		t.Fatalf("EnsureRepository: %v", err)
 	}
 
+	// One file per distinct path, in first-appearance order. A path the table
+	// names more than once is one file declaring several nodes: its first row
+	// supplies the content and the change status, and every row of it one node.
 	versions := make([]model.FileVersion, 0, len(specs))
+	declared := make([][]fixtureFileSpec, 0, len(specs))
+	at := map[string]int{}
 	var sourceBytes uint64
 	for _, f := range specs {
+		if i, ok := at[f.path]; ok {
+			declared[i] = append(declared[i], f)
+			continue
+		}
+		at[f.path] = len(versions)
 		versions = append(versions, fx.putBlob(f.path, f.content, f.modified))
+		declared = append(declared, []fixtureFileSpec{f})
 		sourceBytes += uint64(len(f.content))
 	}
 	manifest := model.H("codectx.test.manifest", "task-15")
@@ -223,9 +238,9 @@ func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFix
 	if err != nil {
 		t.Fatalf("BeginProviderRun: %v", err)
 	}
-	units := make([]model.UnitID, 0, len(specs))
-	for i, f := range specs {
-		units = append(units, fx.sealUnit(run, versions[i], f.symbol, f.kind))
+	units := make([]model.UnitID, 0, len(versions))
+	for i, fv := range versions {
+		units = append(units, fx.sealUnitNodes(run, fv, declared[i]))
 	}
 	// After every endpoint is a sealed node fact -- SealUnit refuses an edge
 	// whose endpoints are not visible through the unit's dependency closure --
@@ -283,6 +298,16 @@ func (f *contextFixture) putBlob(path, content string, modified bool) model.File
 // dependency so its endpoints are visible through the closure seal checks.
 func (f *contextFixture) sealUnit(run model.ProviderRunID, fv model.FileVersion, symbol string, kind model.NodeKind) model.UnitID {
 	f.t.Helper()
+	return f.sealUnitNodes(run, fv, []fixtureFileSpec{{path: fv.Path, symbol: symbol, kind: kind}})
+}
+
+// sealUnitNodes is sealUnit for a file declaring one node per row of nodes, in
+// row order. A file of one node spans the whole file; a file of several splits
+// its bytes into consecutive spans, one per node, so each node and each
+// lexical document has a range of its own. Every node's lexical document holds
+// its symbol, which is what the lexical tier scores.
+func (f *contextFixture) sealUnitNodes(run model.ProviderRunID, fv model.FileVersion, nodes []fixtureFileSpec) model.UnitID {
+	f.t.Helper()
 	in := model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash}
 	h := model.NewUnitInputHasher()
 	if err := h.Add(in); err != nil {
@@ -297,26 +322,42 @@ func (f *contextFixture) sealUnit(run model.ProviderRunID, fv model.FileVersion,
 	if err != nil {
 		f.t.Fatalf("BeginUnit(%s): %v", fv.Path, err)
 	}
-	key := model.CanonicalNodeKey(fv.Path, symbol)
-	id := model.NewNodeID(f.Repo, kind, key)
-	rng := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1},
-		End: model.Position{Byte: uint64(fv.Size), Line: 1}}
-	ev := model.Evidence{UnitID: w.UnitID(), ProviderID: fixtureProviderID, ProviderVersion: fixtureProviderVersion,
-		OriginRunID: run, NodeID: id, Precision: model.PrecisionSyntax, FileID: fv.ID,
-		ContentHash: fv.ContentHash, Range: rng}
-	ev.ID = model.NewEvidenceID(ev)
-	node := model.Node{ID: id, Kind: kind, Language: "go", Name: symbol, QualifiedName: fv.Path + "." + symbol,
-		FileID: fv.ID, ContentHash: fv.ContentHash, Range: rng}
-	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, CanonicalKey: key, Evidence: []model.Evidence{ev}}}); err != nil {
+	size := uint64(fv.Size)
+	n := uint64(len(nodes))
+	facts := make([]model.NodeFact, 0, len(nodes))
+	aliases := make([]model.NativeAlias, 0, len(nodes))
+	docs := make([]model.SearchUnit, 0, len(nodes))
+	for i, nd := range nodes {
+		lo, hi := size*uint64(i)/n, size*uint64(i+1)/n
+		key := model.CanonicalNodeKey(fv.Path, nd.symbol)
+		id := model.NewNodeID(f.Repo, nd.kind, key)
+		rng := &model.SourceRange{Start: model.Position{Byte: lo, Line: 1},
+			End: model.Position{Byte: hi, Line: 1}}
+		ev := model.Evidence{UnitID: w.UnitID(), ProviderID: fixtureProviderID, ProviderVersion: fixtureProviderVersion,
+			OriginRunID: run, NodeID: id, Precision: model.PrecisionSyntax, FileID: fv.ID,
+			ContentHash: fv.ContentHash, Range: rng}
+		ev.ID = model.NewEvidenceID(ev)
+		node := model.Node{ID: id, Kind: nd.kind, Language: "go", Name: nd.symbol, QualifiedName: fv.Path + "." + nd.symbol,
+			FileID: fv.ID, ContentHash: fv.ContentHash, Range: rng}
+		facts = append(facts, model.NodeFact{Node: node, CanonicalKey: key, Evidence: []model.Evidence{ev}})
+		aliases = append(aliases, model.NativeAlias{ScopeKey: fv.Path, NativeKey: nd.symbol, NodeID: id})
+		// A file's first document is named by its path and content hash; a
+		// further one adds its symbol.
+		docID := model.H("codectx.test.search", fv.Path, fv.ContentHash)
+		if i > 0 {
+			docID = model.H("codectx.test.search", fv.Path, fv.ContentHash, nd.symbol)
+		}
+		docs = append(docs, model.SearchUnit{ID: docID, NodeID: id, FileID: fv.ID,
+			Path: fv.Path, Kind: nd.kind, Name: nd.symbol, QualifiedName: fv.Path + "." + nd.symbol,
+			Bytes: model.ByteRange{Start: lo, End: hi}, Body: nd.symbol})
+	}
+	if err := w.PutNodes(f.ctx, facts); err != nil {
 		f.t.Fatalf("PutNodes(%s): %v", fv.Path, err)
 	}
-	if err := w.PutAliases(f.ctx, []model.NativeAlias{{ScopeKey: fv.Path, NativeKey: symbol, NodeID: id}}); err != nil {
+	if err := w.PutAliases(f.ctx, aliases); err != nil {
 		f.t.Fatalf("PutAliases(%s): %v", fv.Path, err)
 	}
-	doc := model.SearchUnit{ID: model.H("codectx.test.search", fv.Path, fv.ContentHash), NodeID: id, FileID: fv.ID,
-		Path: fv.Path, Kind: kind, Name: symbol, QualifiedName: fv.Path + "." + symbol,
-		Bytes: model.ByteRange{Start: 0, End: uint64(fv.Size)}, Body: symbol}
-	if err := w.PutSearchUnits(f.ctx, []model.SearchUnit{doc}); err != nil {
+	if err := w.PutSearchUnits(f.ctx, docs); err != nil {
 		f.t.Fatalf("PutSearchUnits(%s): %v", fv.Path, err)
 	}
 	if err := f.Store.SealUnit(f.ctx, w); err != nil {
@@ -382,7 +423,8 @@ func (f *contextFixture) sealRelations(run model.ProviderRunID, anyFile model.Fi
 }
 
 // Node returns the fixture node identity for path, which is how a row names an
-// expansion seed without recomputing the canonical key.
+// expansion seed without recomputing the canonical key. For a file declaring
+// several nodes it is the first one; NodeOf names any of them.
 func (f *contextFixture) Node(path string) model.NodeID {
 	f.t.Helper()
 	for _, spec := range f.Specs {
@@ -391,6 +433,18 @@ func (f *contextFixture) Node(path string) model.NodeID {
 		}
 	}
 	f.t.Fatalf("fixture has no node for %q", path)
+	return ""
+}
+
+// NodeOf returns the identity of the node path declares under symbol.
+func (f *contextFixture) NodeOf(path, symbol string) model.NodeID {
+	f.t.Helper()
+	for _, spec := range f.Specs {
+		if spec.path == path && spec.symbol == symbol {
+			return model.NewNodeID(f.Repo, spec.kind, model.CanonicalNodeKey(path, spec.symbol))
+		}
+	}
+	f.t.Fatalf("fixture has no node %q in %q", symbol, path)
 	return ""
 }
 
@@ -562,10 +616,11 @@ func TestContextCompilerScenario(t *testing.T) {
 				// path token, a free term and a path that names nothing.
 				sink := &collectSeeds{}
 				seeds, err := c.extractSeeds(fx.ctx, reader, fx.Gen, model.ContextRequest{
-					Task:  "Update `Place` so internal/order/handler.go keeps working; check Repository and docs/missing.md",
+					Task:  "Update `Place` so internal/order/handler.go keeps working; check RepositoryPort and docs/missing.md",
 					Seeds: []string{"internal/order/ports.go"},
 					Phase: model.PhaseVerify,
-				}, sink)
+				}, resolvedBudget{MaxBytes: fx.Cfg.Context.DefaultMaxBytes, MaxTokens: fx.Cfg.Context.DefaultEstimatedTokens,
+					MaxFiles: fx.Cfg.Context.DefaultMaxFiles, MaxSlices: fx.Cfg.Context.MaxSlices}, roundInputs{}, sink)
 				if err != nil {
 					t.Fatalf("extractSeeds: %v", err)
 				}
@@ -934,11 +989,16 @@ func TestContextCompilerScenario(t *testing.T) {
 						To: fx.Node("internal/order/service.go")},
 				}
 
+				// The seed and the entry its walk reached carry the explicit
+				// seed's root weight and class, as the expansion gives them
+				// (ADR-0016 decision 1): boosts and routes are lent whole, and
+				// the walked edges feed centrality.
 				cands := []candidate{
 					{FileID: impl.ID, Path: impl.Path, Requirement: model.RequirementFull,
-						Origin: originExplicitSeed, Status: impl.Status},
+						Origin: originExplicitSeed, Status: impl.Status, RootWeight: seedContribution, Named: true},
 					{NodeID: fx.Node("internal/order/handler.go"), FileID: caller.ID, Path: caller.Path,
 						Requirement: model.RequirementRecommended, Origin: originExpansion, Depth: 1,
+						RootWeight: seedContribution, Named: true,
 						Status: caller.Status, Paths: []model.RelationPath{
 							{Relations: []model.RelationID{edge}},
 							{Relations: []model.RelationID{second}},
@@ -1705,7 +1765,7 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 	adj := &scopeAdjacency{binding: f.Binding, nodes: map[model.NodeID]model.Node{}, relations: rels, caps: caps}
 	for _, spec := range f.Specs {
 		fv := f.File(spec.path)
-		id := f.Node(spec.path)
+		id := f.NodeOf(spec.path, spec.symbol)
 		adj.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
 			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash}
 	}
@@ -1760,8 +1820,13 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 // edge declares one fixture relation by the paths it connects.
 func (f *contextFixture) edge(from string, kind model.RelationKind, to string) model.Relation {
 	f.t.Helper()
-	a, b := f.Node(from), f.Node(to)
-	return model.Relation{ID: model.NewRelationID(f.Repo, a, kind, b), From: a, Kind: kind, To: b}
+	return f.nodeEdge(f.Node(from), kind, f.Node(to))
+}
+
+// nodeEdge declares one fixture relation by the nodes it connects, for a file
+// that declares more than one.
+func (f *contextFixture) nodeEdge(from model.NodeID, kind model.RelationKind, to model.NodeID) model.Relation {
+	return model.Relation{ID: model.NewRelationID(f.Repo, from, kind, to), From: from, Kind: kind, To: to}
 }
 
 // seedOf is the resolved seed a scope row starts from.
@@ -1798,7 +1863,13 @@ func searchService(t *testing.T, fx *contextFixture) *search.Service {
 	if err != nil {
 		t.Fatalf("OpenCAS: %v", err)
 	}
+	stored := map[string]bool{}
 	for _, spec := range fx.Specs {
+		// A file declaring several nodes has one content, on its first row.
+		if stored[spec.path] {
+			continue
+		}
+		stored[spec.path] = true
 		if _, err := cas.Put(fx.ctx, strings.NewReader(spec.content)); err != nil {
 			t.Fatalf("CAS.Put(%s): %v", spec.path, err)
 		}

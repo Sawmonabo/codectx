@@ -97,6 +97,10 @@ type symbolInfoOutput struct {
 
 // graphInput omits direction entirely: codectx_callers and codectx_callees fix
 // it from the tool name, so a client cannot ask callers for outbound edges.
+// An empty Relations walks `calls` alone, as the CLI's callers and callees
+// commands do: a call hierarchy is the answer both tools are named for, and
+// the engine's wider default would return containment and data-flow edges
+// beside the calls.
 type graphInput struct {
 	GenerationID model.GenerationID   `json:"generation_id,omitempty"`
 	Start        []model.NodeID       `json:"start"`

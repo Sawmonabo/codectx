@@ -38,8 +38,9 @@ type limits struct {
 	// What bounds an answer instead:
 	// the generic tools are bounded by resources.max_page_items plus the
 	// bounded record fields of each model type, and codectx_read_source -- the
-	// only tool that returns source bytes -- is bounded by
-	// resources.max_source_response_bytes (7 MiB) in its own handler. A
+	// only tool that returns source bytes, within a session or outside one --
+	// is bounded by resources.max_source_response_bytes (7 MiB) in its own
+	// handler, in both modes. A
 	// response gate here would have to marshal every answer twice to weigh it,
 	// and any fixed ceiling below the source bound would refuse the source
 	// chunks above it.

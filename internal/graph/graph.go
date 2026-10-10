@@ -99,6 +99,10 @@ type Options struct {
 // walk resumes on the next page. The cumulative counts are still carried by the
 // cursor and reported, so a caller sees the total the walk has spent.
 //
+// MaxReasonPaths is context.max_reason_paths_per_entry: whether an impact
+// entry carries the route that admitted it. It does not bound a path answer,
+// which lists every equal-cost route a page at a time.
+//
 // MaxPageItems, CursorTTL and FrontierBytes stay strictly positive: a page with
 // no item ceiling is a wire-security bound (class B), not a scale bound, and a
 // frontier with no byte ceiling has no heap bound at all. QueryTimeout does
@@ -257,6 +261,11 @@ type frontierState struct {
 	// bound, so a consumer can tell "too long to report" from "exactly at the
 	// bound" -- which is what keeps the frontier's per-node cost bounded.
 	Route []RelRef
+	// Step is how a call walk's dispatch step reached this node
+	// (dispatch.go): directly, up an override to a base method whose virtual
+	// callers are walked, or down a virtual call or an override to a method
+	// the call may run instead. Every other walk leaves it stepDirect.
+	Step dispatchStep
 }
 
 // appendRoute extends a parent's route with the edge that left it, copying
@@ -365,7 +374,13 @@ type budget struct {
 	// visited and edges above stay cumulative because the cursor carries them
 	// and the answer reports them.
 	pageVisited, pageEdges int64
-	deadline               time.Time
+	// calls are a call walk's structured counts, cumulative and
+	// cursor-carried like visited and edges.
+	calls model.GraphCounts
+	// openSites are an impact walk's open call sites per depth (index 0 is
+	// depth 1), cumulative and cursor-carried like calls.
+	openSites []int64
+	deadline  time.Time
 	// now is the engine clock the deadline was measured on. A budget whose
 	// deadline comes from e.now() must be compared against e.now(): mixing in
 	// time.Now would make a test clock's deadline either unreachable or
@@ -459,6 +474,14 @@ type expandOptions struct {
 	// be named without a round trip per edge. Nil means the visitor needs no
 	// names (the package rollup, which reads refs only).
 	Names *levelNames
+	// Dispatch is the call walk's dispatch step (dispatch.go): a callers walk
+	// also climbs every override to the method it overrides and walks that
+	// base's virtual callers; a callees walk also descends from a virtual
+	// call's target to every override that may run instead. Zero is no step.
+	Dispatch dispatchMode
+	// Dispatches reports, per relation, whether any occurrence is virtual. It
+	// is required when Dispatch is set; a walk without it takes no step.
+	Dispatches DispatchReader
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.

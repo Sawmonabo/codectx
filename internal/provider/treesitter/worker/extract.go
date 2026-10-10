@@ -31,8 +31,13 @@ type decl struct {
 	prototype  bool
 	macro      bool
 	impl       string
-	parentIdx  int
-	ex         *extraction
+	// prefix is the path a function-valued property is stored under, as
+	// written, ahead of its name in the qualified name and so in the
+	// descriptor path: `a` for `a.b = () => …`, the bindings around the
+	// object of a pair. Empty for every other declaration.
+	prefix    string
+	parentIdx int
+	ex        *extraction
 }
 
 // scopeNode is a non-declaration node that contributes to qualified names and
@@ -107,6 +112,8 @@ type extraction struct {
 	// branchAt is the branch path of each declaration node a conditional
 	// encloses, by its range (branches).
 	branchAt map[span]*branchLink
+	// all is a Python module's `__all__` (pyAll).
+	all pyAll
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -142,6 +149,7 @@ func (e *extraction) run(q *ts.Query, root *ts.Node, emit *emitter) error {
 	if cursor.DidExceedMatchLimit() {
 		e.truncated = true
 	}
+	e.settleAll()
 	e.branches(root)
 	return e.emit(emit)
 }
@@ -174,6 +182,13 @@ func (e *extraction) dispatch(caps map[string][]ts.Node) {
 		case name == "package":
 			e.pkg = nodes[0].Utf8Text(e.src)
 			return
+		case name == "all":
+			op := pyAllOp{node: nodes[0]}
+			if m := caps["all.method"]; len(m) > 0 {
+				op.method = m[0].Utf8Text(e.src)
+			}
+			e.all.ops = append(e.all.ops, op)
+			return
 		case name == "export":
 			for _, n := range nodes {
 				e.exportRanges[span{n.StartByte(), n.EndByte()}] = true
@@ -201,6 +216,12 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 	case len(caps["name"]) > 0:
 		n := caps["name"][0]
 		d.name, d.nameStart, d.nameEnd = n.Utf8Text(e.src), n.StartByte(), n.EndByte()
+		switch {
+		case len(caps["name.scope"]) > 0:
+			d.prefix = collapseSpace(caps["name.scope"][0].Utf8Text(e.src))
+		case node.KindId() == e.k.pair:
+			d.prefix = e.pairPath(node)
+		}
 	case len(caps["test.name"]) > 0:
 		n := caps["test.name"][0]
 		d.name, d.nameStart, d.nameEnd = strings.Trim(n.Utf8Text(e.src), "\"'`"), n.StartByte(), n.EndByte()
@@ -238,6 +259,60 @@ func (e *extraction) addBoundFunctions(kind string, node, names, values ts.Node)
 			name: n.Utf8Text(e.src), nameStart: n.StartByte(), nameEnd: n.EndByte()})
 	}
 }
+
+// pairPath is the path of the bindings around the object a pair is a key
+// of, outermost first and joined with the language's separator: the key of
+// every pair whose value the object is, and the left side of an assignment
+// whose value it is (`module.exports` of `module.exports = { k: () => … }`).
+// A binding the containment stack already names, a variable declarator or a
+// field whose value the object is, ends the path, as does any other
+// expression around the object (an argument, a return value): an object with
+// no binding adds nothing, and its keys are qualified by the enclosing
+// declaration alone.
+func (e *extraction) pairPath(pair ts.Node) string {
+	var keys []string
+	obj := pair.Parent()
+	for obj != nil && obj.KindId() == e.k.object {
+		p := obj.Parent()
+		if p == nil {
+			break
+		}
+		if p.KindId() == e.k.pair {
+			if v := p.ChildByFieldId(e.f.value); v != nil && v.Id() == obj.Id() {
+				if key := p.ChildByFieldId(e.f.key); key != nil {
+					keys = append(keys, propertyKey(key, e.k, e.src))
+					obj = p.Parent()
+					continue
+				}
+			}
+		}
+		if p.KindId() == e.k.assignmentExpression {
+			if r := p.ChildByFieldId(e.f.right); r != nil && r.Id() == obj.Id() {
+				if l := p.ChildByFieldId(e.f.left); l != nil {
+					keys = append(keys, collapseSpace(l.Utf8Text(e.src)))
+				}
+			}
+		}
+		break
+	}
+	slices.Reverse(keys)
+	return strings.Join(keys, e.l.Separator)
+}
+
+// propertyKey is a pair key as a path component: a name as written, a
+// string key's text without its quotes, and any other key (a number, a
+// computed key) as written.
+func propertyKey(key *ts.Node, k *kindIDs, src []byte) string {
+	text := key.Utf8Text(src)
+	if key.KindId() == k.str {
+		return strings.Trim(text, "\"'`")
+	}
+	return collapseSpace(text)
+}
+
+// collapseSpace folds every run of whitespace in s into one space, so a path
+// written across lines is spelled as one.
+func collapseSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // nextEntry moves cur to the next entry of the list it walks, or to the
 // first when first is set, and reports whether there is one. Punctuation and
@@ -296,6 +371,9 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	for _, n := range caps["import.name"] {
 		rec.addAs(n.Utf8Text(e.src), original)
 	}
+	if len(caps["import.fn"]) > 0 {
+		e.requireBindings(node, rec)
+	}
 	if clauses := caps["import.clause"]; len(clauses) > 0 {
 		ids := e.g.importSyntax(e.l.Name)
 		for i := range clauses {
@@ -304,6 +382,59 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 				rec.addAs(local.Utf8Text(e.src), importOriginal(local, ids, e.src))
 			})
 			cur.Close()
+		}
+	}
+}
+
+// requireBindings adds the local names a `require(...)` call binds when it
+// is the value of a variable declarator: `const x = require("m")` binds x to
+// the module's exports object, a namespace binding ("*"), and
+// `const { a, b: c, d = 1 } = require("m")` binds a, c (denoting b) and d.
+// A rest element, a computed key and a nested pattern bind no name of the
+// module's, and a call that is not a declarator's whole value (a member of
+// its result, an argument) binds nothing.
+func (e *extraction) requireBindings(call ts.Node, rec *importRec) {
+	k, f := e.k, e.f
+	decl := call.Parent()
+	if decl == nil || decl.KindId() != k.variableDeclarator {
+		return
+	}
+	if v := decl.ChildByFieldId(f.value); v == nil || v.Id() != call.Id() {
+		return
+	}
+	name := decl.ChildByFieldId(f.name)
+	if name == nil {
+		return
+	}
+	switch name.KindId() {
+	case k.identifier:
+		rec.addAs(name.Utf8Text(e.src), "*")
+	case k.objectPattern:
+		for i := range name.NamedChildCount() {
+			p := name.NamedChild(i)
+			switch p.KindId() {
+			case k.shorthandPattern:
+				rec.addAs(p.Utf8Text(e.src), "")
+			case k.objectAssignmentPattern:
+				if l := p.ChildByFieldId(f.left); l != nil && l.KindId() == k.shorthandPattern {
+					rec.addAs(l.Utf8Text(e.src), "")
+				}
+			case k.pairPattern:
+				key, v := p.ChildByFieldId(f.key), p.ChildByFieldId(f.value)
+				if key == nil || v == nil || (key.KindId() != k.propertyIdentifier && key.KindId() != k.str) {
+					continue
+				}
+				if v.KindId() == k.assignmentPattern {
+					v = v.ChildByFieldId(f.left)
+				}
+				if v != nil && v.KindId() == k.identifier {
+					original := propertyKey(key, k, e.src)
+					if original == v.Utf8Text(e.src) {
+						original = ""
+					}
+					rec.addAs(v.Utf8Text(e.src), original)
+				}
+			}
 		}
 	}
 }
@@ -493,6 +624,10 @@ func (e *extraction) emit(out *emitter) error {
 	// paths holds, parallel to wireDecls, each declaration's branch path,
 	// which its children's branches are measured from.
 	paths := make([]*branchLink, 0, len(decls))
+	// scopes holds, parallel to wireDecls, each declaration's enclosing
+	// scope: its parent, or the endpoint declaration around it that is a
+	// scope but no parent.
+	scopes := make([]int, 0, len(decls))
 	scopeIdx := 0
 	// blank is the range of the last declaration of the grammar's blank
 	// name: a declaration strictly inside it is not extracted either (the
@@ -533,7 +668,22 @@ func (e *extraction) emit(out *emitter) error {
 		if e.pkg != "" && (e.l.Name == "go" || e.l.Name == "java") {
 			parts = append(parts, e.pkg)
 		}
+		// scope is the innermost open declaration, the one a reference in
+		// this declaration's range but outside its own is made from.
+		// guarded reports a declaration inside an endpoint declaration (a
+		// Python `__main__` guard), which is a scope but no container: what
+		// it defines keeps its own name at its level, told apart from a
+		// definition outside the guard by the branch it sits in, and is not
+		// exported.
+		scope, guarded := -1, false
 		for _, f := range stack {
+			if f.idx >= 0 {
+				scope = f.idx
+			}
+			if f.kind == "endpoint" {
+				guarded = true
+				continue
+			}
 			parts = append(parts, f.name)
 			if f.idx >= 0 {
 				d.parentIdx = f.idx
@@ -551,8 +701,14 @@ func (e *extraction) emit(out *emitter) error {
 		if d.impl != "" && !slices.Contains(parts, d.impl) {
 			parts = append(parts, d.impl)
 		}
+		if d.prefix != "" {
+			parts = append(parts, d.prefix)
+		}
 		if d.parentIdx < 0 && e.exportNames[d.name] {
 			d.exported = true
+		}
+		if e.g.exported != nil {
+			d.exported = d.parentIdx < 0 && !guarded && e.g.exported(e, d)
 		}
 		if e.g.isTest != nil && e.g.isTest(d, e.path, e.src) {
 			d.kind, d.test = "test", true
@@ -574,9 +730,13 @@ func (e *extraction) emit(out *emitter) error {
 		if ds, de, ok := e.doc(d); ok {
 			w.DocStart, w.DocEnd = uint32(ds), uint32(de)
 		}
+		if e.g.decorators != nil {
+			w.Decorators = e.g.decorators(e, d)
+		}
 		nameSpans[span{d.nameStart, d.nameEnd}] = true
 		stack = append(stack, frame{span: span{start, end}, idx: w.ID, name: d.name, kind: d.kind})
 		wireDecls = append(wireDecls, w)
+		scopes = append(scopes, scope)
 		paths = append(paths, path)
 	}
 	for _, w := range wireDecls {
@@ -622,7 +782,7 @@ func (e *extraction) emit(out *emitter) error {
 		}
 		w := wire.Ref{Kind: r.kind, Start: uint32(r.start), End: uint32(r.end),
 			NameStart: uint32(r.nameSpan.start), NameEnd: uint32(r.nameSpan.end),
-			Name: r.name, Scope: enclosing(wireDecls, r.span)}
+			Name: r.name, Scope: enclosing(wireDecls, scopes, r.span)}
 		if r.qualifier != nil {
 			q := r.qualifier.Utf8Text(e.src)
 			// The import decision is made on the receiver as written; only
@@ -698,8 +858,9 @@ func pop(stack []frame, offset uint) []frame {
 	return stack
 }
 
-// enclosing returns the innermost declaration containing r, or -1.
-func enclosing(decls []wire.Decl, r span) int {
+// enclosing returns the innermost declaration containing r, or -1, walking
+// each declaration's enclosing scope (scopes).
+func enclosing(decls []wire.Decl, scopes []int, r span) int {
 	i, _ := slices.BinarySearchFunc(decls, r.start, func(d wire.Decl, start uint) int { return cmpUint(uint(d.Start), start) })
 	// i is the first declaration starting after r.start (or at it, for a
 	// declaration whose own range is r); walk back to the last starting at or
@@ -710,7 +871,7 @@ func enclosing(decls []wire.Decl, r span) int {
 	if i >= len(decls) || uint(decls[i].Start) > r.start {
 		return -1
 	}
-	for j := i; j >= 0; j = decls[j].Parent {
+	for j := i; j >= 0; j = scopes[j] {
 		if uint(decls[j].Start) <= r.start && r.end <= uint(decls[j].End) && !(uint(decls[j].Start) == r.start && uint(decls[j].End) == r.end) {
 			return j
 		}

@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
@@ -11,6 +14,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/search"
+	"github.com/Sawmonabo/codectx/internal/source"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workflow"
 )
@@ -115,6 +119,10 @@ type ExploreService interface {
 	Graph(ctx context.Context, req model.GraphRequest) (model.GraphResult, error)
 	Path(ctx context.Context, req model.PathRequest) (model.PathResult, error)
 	Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error)
+	// Read serves a read outside a session (no session_id): one node or one
+	// byte range of a pinned generation, earning no coverage. A session read
+	// goes through ContextService.Read, which writes the issued chunk.
+	Read(ctx context.Context, req model.ReadChunkRequest) (model.ReadChunkResponse, error)
 }
 
 // ContextService is the Section 16/17 session lifecycle end to end: plan, read
@@ -501,10 +509,24 @@ func (s *Services) Include(ctx context.Context, req model.IncludeRequest) (model
 }
 
 // Read serves one bounded chunk of snapshot-pinned source. It is the only
-// method on this facade that returns source bytes.
+// method on this facade that returns source bytes, and it has two modes.
+//
+// A session read goes to the coverage service, which checks the actor and the
+// session's scope, persists the issued chunk and signs its receipt.
+//
+// A read outside a session is served here and never reaches the coverage
+// service: it names a node or a byte range of one generation, writes no
+// issued chunk, signs no receipt and changes no coverage. See readOutside.
 func (s *Services) Read(ctx context.Context, req model.ReadChunkRequest) (model.ReadChunkResponse, error) {
 	if err := req.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err
+	}
+	if !req.InSession() {
+		res, err := s.readOutside(ctx, req)
+		if err != nil {
+			return model.ReadChunkResponse{}, s.fail("read source", err)
+		}
+		return res, nil
 	}
 	res, err := s.w.s.coverage.Read(ctx, req)
 	if err != nil {
@@ -1009,4 +1031,392 @@ func cursorInvalid(message string) error {
 func expiredSession(err error) bool {
 	var typed *model.Error
 	return errors.As(err, &typed) && typed.Code == model.CodeSessionExpired
+}
+
+// --- ContextService: reading outside a session -----------------------------
+
+// readSourceEndpoint pins the continuation a read outside a session issues, so
+// a search, graph or manifest token cannot be replayed here.
+const readSourceEndpoint = "read_source"
+
+// readSourceQueryHashDomain versions the read cursor's query-hash preimage.
+// Changing what the preimage folds without changing this label would let an
+// old token resume a span it no longer describes.
+const readSourceQueryHashDomain = "codectx.app.read_source.v1"
+
+// spanKind is what a read outside a session names: one node, or one file.
+type spanKind string
+
+const (
+	spanNode spanKind = "node"
+	spanFile spanKind = "file"
+)
+
+// spanKey is the selector of a read outside a session and the byte its chunk
+// starts at. A first call builds it from the request; a continuation reads it
+// from the signed cursor, which is why the request names no selector beside a
+// cursor. at is unset on a first node read, which starts at the node.
+type spanKey struct {
+	kind spanKind
+	id   string
+	at   uint64
+	set  bool
+	// label is how a refusal names what was asked for: the path as the caller
+	// spelled it, or the id.
+	label string
+}
+
+// queryHash folds the selector, which is what makes two spans different. The
+// position travels in the cursor's sort key, beside it.
+func (k spanKey) queryHash() string {
+	return model.H(readSourceQueryHashDomain, readSourceEndpoint, string(k.kind), k.id)
+}
+
+// lastKey renders the continuation's sort key: the selector and the next
+// chunk's first byte.
+func (k spanKey) lastKey(next uint64) string {
+	return string(k.kind) + ":" + k.id + ":" + strconv.FormatUint(next, 10)
+}
+
+// parseSpanKey reads a continuation's sort key back. The token is signed, so a
+// malformed key is a cursor this endpoint never minted.
+func parseSpanKey(lastKey string) (spanKey, error) {
+	kind, rest, ok := strings.Cut(lastKey, ":")
+	id, at, ok2 := strings.Cut(rest, ":")
+	if !ok || !ok2 || (spanKind(kind) != spanNode && spanKind(kind) != spanFile) || !model.ValidHexID(id) {
+		return spanKey{}, cursorInvalid("cursor does not name a node or a file to read")
+	}
+	offset, err := strconv.ParseUint(at, 10, 64)
+	if err != nil {
+		return spanKey{}, cursorInvalid("cursor does not name a byte to continue from")
+	}
+	return spanKey{kind: spanKind(kind), id: id, at: offset, set: true, label: id}, nil
+}
+
+// requestSpanKey is the selector a first call names. A path is only hashed
+// into the file id the index derives from the same root-relative path; nothing
+// is opened on it, so a path the snapshot does not hold -- one climbing out of
+// the tree, or one the capture skipped as a symbolic link -- is simply a file
+// id the manifest has no row for.
+func requestSpanKey(repo model.RepositoryID, req model.ReadChunkRequest) spanKey {
+	switch {
+	case req.NodeID != "":
+		return spanKey{kind: spanNode, id: string(req.NodeID), label: string(req.NodeID)}
+	case req.FileID != "":
+		return spanKey{kind: spanFile, id: string(req.FileID), at: req.Offset, set: true, label: string(req.FileID)}
+	}
+	return spanKey{kind: spanFile, id: string(model.NewFileID(repo, req.Path)), at: req.Offset, set: true,
+		label: strconv.Quote(req.Path)}
+}
+
+// sourceSpan is one resolved read: the file it reads, the pinned manifest row's
+// content hash and size, and the bytes [at, end) still to serve.
+type sourceSpan struct {
+	file    model.FileID
+	node    model.NodeID
+	hash    string
+	at, end uint64
+}
+
+// readOutside serves one chunk of a node or a byte range of one generation,
+// outside any session.
+//
+// The generation is the one the request names, the active one when it names
+// none, or the one a continuation's token pins -- never the active one for a
+// continuation, so a later page cannot describe another generation than the
+// first. It is pinned by a query lease for the call, exactly as every query
+// is, and the bytes come from the snapshot view's verified content store, never
+// from the working tree.
+//
+// The chunk is cut by the same rules a session read uses: source.PlanChunk for
+// every boundary and the base64 fallback, the same size arithmetic against
+// coverage.chunk_bytes, coverage.max_chunk_bytes and
+// resources.max_source_response_bytes. The span's end is handed to the planner
+// as its end of input, so a node's last chunk ends at the node's last byte and
+// is not trimmed back to a line break, and a span longer than one chunk
+// continues by a signed cursor that holds a cursor lease, so the generation
+// cannot be collected between pages.
+//
+// It reads through the facade's own handle: the reader handle on a reader
+// facade, which records no lease and mints a continuation bound to its expiry
+// alone, the way every other answer on that handle does.
+func (s *Services) readOutside(ctx context.Context, req model.ReadChunkRequest) (_ model.ReadChunkResponse, err error) {
+	st := s.w.s
+	ctx, cancel := model.QueryDeadline(ctx, st.cfg.Resources.QueryTimeout.Std())
+	defer cancel()
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "read source", err) }()
+
+	now := time.Now()
+	gen := req.GenerationID
+	var key spanKey
+	var resumed *pagination.Cursor
+	if req.Cursor == "" {
+		key = requestSpanKey(st.repo, req)
+	} else {
+		c, err := st.signer.DecodeCursor(req.Cursor, readSourceEndpoint, now)
+		if err != nil {
+			return model.ReadChunkResponse{}, err
+		}
+		if c.SpoolID != "" {
+			return model.ReadChunkResponse{}, cursorInvalid("cursor carries spooled state this endpoint does not produce")
+		}
+		if key, err = parseSpanKey(c.LastKey); err != nil {
+			return model.ReadChunkResponse{}, err
+		}
+		if c.QueryHash != key.queryHash() {
+			return model.ReadChunkResponse{}, cursorInvalid("cursor was issued for a different node or file")
+		}
+		gen, resumed = c.GenerationID, &c
+	}
+
+	store, leases := st.store, st.leases
+	if s.read && st.queryStore != st.store {
+		store, leases = st.queryStore, nil
+	}
+	reader, err := store.PinGeneration(ctx, st.repo, gen, st.cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		if resumed != nil && sqlite.IsGenerationCollected(err) {
+			return model.ReadChunkResponse{}, cursorInvalid("the generation this cursor pins has been collected; read the span from its start again")
+		}
+		return model.ReadChunkResponse{}, err
+	}
+	defer func() {
+		if cerr := reader.Close(); cerr != nil {
+			st.logger.Warn("a pinned query lease could not be released",
+				"component", "app", "error", cerr.Error())
+		}
+	}()
+	binding := reader.Binding()
+	if resumed != nil && (resumed.GenerationID != binding.GenerationID || resumed.AnalysisKey != binding.AnalysisKey) {
+		return model.ReadChunkResponse{}, cursorInvalid("cursor was issued against a different generation")
+	}
+
+	span, err := resolveSpan(ctx, reader, key)
+	if err != nil {
+		return model.ReadChunkResponse{}, err
+	}
+	view, err := st.view(ctx, binding.SnapshotID)
+	if err != nil {
+		return model.ReadChunkResponse{}, err
+	}
+	// The coverage service's own sizer, so a chunk is the same size in and
+	// outside a session.
+	raw, err := coverageLimits(st.cfg).RawChunkBytes(req.MaxBytes, span.at)
+	if err != nil {
+		return model.ReadChunkResponse{}, err
+	}
+	end := min(span.at+uint64(raw), span.end)
+
+	// The view returns exactly [at, end) with the whole-file position of each
+	// end and the bytes before at that decide whether it is a boundary; the
+	// planner is handed the span's end as its end of input.
+	window, _, err := view.Read(ctx, span.file, model.ByteRange{Start: span.at, End: end})
+	if err != nil {
+		return model.ReadChunkResponse{}, err
+	}
+	if uint64(len(window.Bytes)) != end-span.at {
+		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
+			"the source returned %d bytes for the %d-byte window [%d,%d)", len(window.Bytes), end-span.at, span.at, end)}
+	}
+	chunk, err := source.PlanChunk(window.Before, window.Bytes, span.at, span.end, raw)
+	if err != nil {
+		return model.ReadChunkResponse{}, err
+	}
+	start, stop := window.Start, window.End
+	if chunk.Range.End != end {
+		cursor, err := source.NewCursorAt(window.Before, window.Bytes, span.at, window.Start.Line)
+		if err != nil {
+			return model.ReadChunkResponse{}, err
+		}
+		if stop, err = cursor.PositionAt(chunk.Range.End); err != nil {
+			return model.ReadChunkResponse{}, err
+		}
+		if stop.Line == window.Start.Line {
+			// The cursor counts columns from the window, which begins mid-line
+			// whenever the span does; the view resolved the start's real column.
+			stop.Column += window.Start.Column
+		}
+	}
+	// window.Bytes aliases the view's buffer; both encodings copy it into a
+	// fresh string, so nothing outliving this call holds it.
+	body := window.Bytes[:chunk.Range.End-chunk.Range.Start]
+	content := string(body)
+	if chunk.Encoding == model.EncodingBase64 {
+		content = base64.StdEncoding.EncodeToString(body)
+	}
+
+	resp := model.ReadChunkResponse{
+		Binding:     binding,
+		FileID:      span.file,
+		NodeID:      span.node,
+		ContentHash: span.hash,
+		ByteRange:   chunk.Range,
+		LineRange:   model.SourceRange{Start: start, End: stop},
+		Encoding:    chunk.Encoding,
+		Content:     content,
+		PartialLine: chunk.PartialLine,
+		NextOffset:  chunk.NextOffset,
+	}
+	if err := resp.Validate(); err != nil {
+		return model.ReadChunkResponse{}, err
+	}
+	if chunk.NextOffset == nil {
+		// The span is served whole: the lease the presented token held has
+		// nothing left to retain. A handle that records no lease ends nothing,
+		// because the row a writer minted is not this handle's to end.
+		if resumed != nil && resumed.LeaseID != "" && leases.Retains() {
+			if rerr := leases.Release(context.WithoutCancel(ctx), resumed.LeaseID); rerr != nil {
+				st.logger.Warn("a source read continuation lease could not be released",
+					"component", "app", "error", rerr.Error())
+			}
+		}
+		return resp, nil
+	}
+	if resp.NextCursor, err = s.readSourceCursor(ctx, leases, binding, key, *chunk.NextOffset, resumed, now); err != nil {
+		return model.ReadChunkResponse{}, err
+	}
+	return resp, nil
+}
+
+// resolveSpan turns a selector into the bytes it reads, in the pinned
+// generation and nowhere else.
+//
+// A node resolves in that generation: one node id can live in several
+// generations at different ranges, and the pinned generation's range and file
+// row agree by construction, so a node that moved is read where the asked
+// generation has it. A node or a file the generation does not hold -- deleted,
+// never captured, or a working-tree overlay row, which is never a canonical
+// fact -- is "not in this generation". A node whose content hash, file row or
+// range disagrees with the pinned manifest is an integrity failure of the
+// index, not a refusal of the request.
+func resolveSpan(ctx context.Context, reader *sqlite.PinnedReader, key spanKey) (sourceSpan, error) {
+	gen := reader.Binding().GenerationID
+	if key.kind == spanNode {
+		n, err := reader.Node(ctx, model.NodeID(key.id))
+		if err != nil {
+			if argumentInvalid(err) {
+				return sourceSpan{}, notInGeneration("node", key.label, gen)
+			}
+			return sourceSpan{}, err
+		}
+		if n.Bytes == nil || n.Node.FileID == "" {
+			return sourceSpan{}, (&model.Error{Code: model.CodeArgumentInvalid,
+				Message: fmt.Sprintf("node %s has no source range in generation %d", key.label, gen)}).
+				WithDetail("generation_id", strconv.FormatInt(int64(gen), 10))
+		}
+		fv, err := reader.File(ctx, n.Node.FileID)
+		if err != nil {
+			if argumentInvalid(err) {
+				return sourceSpan{}, sourceIntegrity(key.label, gen, "its file is not in the generation's manifest")
+			}
+			return sourceSpan{}, err
+		}
+		switch {
+		case fv.Status == model.FileDeleted:
+			return sourceSpan{}, sourceIntegrity(key.label, gen, "its file is a deletion in the generation's manifest")
+		case n.Node.ContentHash != fv.ContentHash:
+			return sourceSpan{}, sourceIntegrity(key.label, gen, "its content hash disagrees with the manifest's")
+		case n.Bytes.Start > n.Bytes.End || n.Bytes.End > uint64(fv.Size):
+			return sourceSpan{}, sourceIntegrity(key.label, gen, "its range does not lie within its file")
+		}
+		at := n.Bytes.Start
+		if key.set {
+			if key.at < n.Bytes.Start || key.at > n.Bytes.End {
+				return sourceSpan{}, cursorInvalid("cursor continues outside the node it names")
+			}
+			at = key.at
+		}
+		return sourceSpan{file: n.Node.FileID, node: n.Node.ID, hash: fv.ContentHash, at: at, end: n.Bytes.End}, nil
+	}
+	fv, err := reader.File(ctx, model.FileID(key.id))
+	if err != nil {
+		if argumentInvalid(err) {
+			return sourceSpan{}, notInGeneration("file", key.label, gen)
+		}
+		return sourceSpan{}, err
+	}
+	if fv.Status == model.FileDeleted {
+		return sourceSpan{}, notInGeneration("file", key.label, gen)
+	}
+	size := uint64(fv.Size)
+	if key.at > size {
+		return sourceSpan{}, &model.Error{Code: model.CodeArgumentInvalid, Message: fmt.Sprintf(
+			"read_chunk.offset is %d, past the %d-byte file", key.at, size)}
+	}
+	return sourceSpan{file: fv.ID, hash: fv.ContentHash, at: key.at, end: size}, nil
+}
+
+// readSourceCursor signs the continuation of a span longer than one chunk.
+//
+// A first page takes a fresh cursor-owned retention lease, never the call's
+// query lease, which is released when this call returns. A later page renews
+// the lease its token carries and hands it forward, so a span read to its end
+// holds one lease however many pages it took, and the generation outlives a
+// retention pass between any two of them. A handle that records no lease
+// mints the token anyway, bound to its expiry alone: a token that already names
+// a lease keeps that lease's expiry, and one that names none is good for one
+// cursor lifetime from now.
+func (s *Services) readSourceCursor(ctx context.Context, leases *pagination.Leases, b model.Binding,
+	key spanKey, next uint64, resumed *pagination.Cursor, now time.Time) (string, error) {
+	st := s.w.s
+	c := pagination.Cursor{
+		Endpoint:     readSourceEndpoint,
+		GenerationID: b.GenerationID,
+		AnalysisKey:  b.AnalysisKey,
+		QueryHash:    key.queryHash(),
+		LastKey:      key.lastKey(next),
+		ExpiresAt:    now.Add(st.cfg.Storage.QueryCursorTTL.Std()),
+	}
+	var minted string
+	switch {
+	case resumed != nil && resumed.LeaseID != "" && leases.Retains():
+		expires, err := leases.Renew(ctx, resumed.LeaseID)
+		if err != nil {
+			return "", err
+		}
+		c.LeaseID, c.ExpiresAt = resumed.LeaseID, expires
+	case resumed != nil && resumed.LeaseID != "":
+		c.LeaseID, c.ExpiresAt = resumed.LeaseID, resumed.ExpiresAt
+	case leases.Retains():
+		lease, err := leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return "", err
+		}
+		c.LeaseID, c.ExpiresAt, minted = lease.ID, lease.ExpiresAt, lease.ID
+	}
+	token, err := st.signer.EncodeCursor(c)
+	if err != nil {
+		if minted != "" {
+			if rerr := leases.Release(context.WithoutCancel(ctx), minted); rerr != nil {
+				st.logger.Warn("a source read continuation lease could not be released",
+					"component", "app", "error", rerr.Error())
+			}
+		}
+		return "", err
+	}
+	return token, nil
+}
+
+// argumentInvalid reports whether err is the store's refusal of an id the
+// pinned generation does not hold.
+func argumentInvalid(err error) bool {
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid
+}
+
+// notInGeneration is the one refusal of a node, file or path the pinned
+// generation does not hold.
+func notInGeneration(what, label string, gen model.GenerationID) error {
+	return (&model.Error{Code: model.CodeArgumentInvalid,
+		Message:     fmt.Sprintf("%s %s is not in this generation (%d)", what, label, gen),
+		Remediation: "pass the generation_id of the answer that named it, or look it up again in this generation"}).
+		WithDetail("generation_id", strconv.FormatInt(int64(gen), 10))
+}
+
+// sourceIntegrity is a node whose stored range or hash disagrees with the
+// pinned manifest it was published against.
+func sourceIntegrity(label string, gen model.GenerationID, why string) error {
+	return (&model.Error{Code: model.CodeSourceIntegrity,
+		Message: fmt.Sprintf("node %s cannot be read from generation %d: %s", label, gen, why)}).
+		WithDetail("generation_id", strconv.FormatInt(int64(gen), 10))
 }
