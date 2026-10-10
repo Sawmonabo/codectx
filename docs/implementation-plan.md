@@ -2055,8 +2055,8 @@ type ReadChunkRequest struct {
     NodeID NodeID `json:"node_id,omitempty"`                   // outside a session, exactly one of node_id, file_id, path
     FileID FileID `json:"file_id,omitempty"`
     Path string `json:"path,omitempty"`
-    Offset uint64 `json:"offset"`
-    MaxBytes uint32 `json:"max_bytes"`
+    Offset uint64 `json:"offset,omitempty"`
+    MaxBytes uint32 `json:"max_bytes,omitempty"`
     Cursor string `json:"cursor,omitempty"`
     ConfirmReceipts []string `json:"confirm_receipts,omitempty"`
 }

@@ -118,12 +118,14 @@ time [S11][S12]; the stored hop is the same match made once per bound site.
 best-known route models say so themselves ("relative paths of subrouters are not modeled") [S14]. Routes from the
 running application's OpenAPI document: needs the application to run, which the index never does.
 
-### 9. All eight are built before the one test pass
+### 9. All eight are one change
 
-**Alternatives.** Six small gaps now and argument flow and routes later: a second test pass, a second review and a
-second release proof for two pieces that are exact once their form is fixed. Routes later alone: endpoint nodes change
-what existing answers return (the kind filter, the walk from endpoints), so deferring them moves a behaviour change past
-the test pass.
+The eight facts are designed, built and verified together, each in the form above.
+
+**Alternatives.** The six small facts now, argument flow and routes later: the two larger facts are exact once their
+form is fixed, and splitting them off means a second round of verification for the same answers. Routes later alone:
+endpoint nodes change what existing answers return (the kind filter, the walk from endpoints), so that change would
+reach those answers without the verification the rest receives.
 
 ### 10. Proof
 
