@@ -1,0 +1,1734 @@
+[
+  {
+    "schema_id": "f329796272b9314200433ac342cbc15c"
+  },
+  {
+    "predicate": "python.Name.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": ""
+      }
+    ]
+  },
+  {
+    "predicate": "python.Module.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "name": {
+            "id": 0,
+            "key": "use"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "src.FileLanguage.1",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "language": 7
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "src.FileLines.1",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "endsInNewline": true,
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "hasUnicodeOrTabs": false,
+          "lengths": [
+            32,
+            1,
+            1,
+            22,
+            14,
+            1,
+            1,
+            20,
+            14
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "digest.FileDigest.1",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "digest": {
+            "hash": "796fd6eb2a8eb15b1c99bc1a49c22b5992ee01df77cb953894ede3aefb6232c5",
+            "size": 106
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.DeclarationLocation.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "module": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 106,
+            "start": 0
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "imp": {
+              "id": 0,
+              "key": {
+                "as_name": {
+                  "id": 0,
+                  "key": "use.Animal"
+                },
+                "from_name": {
+                  "id": 0,
+                  "key": "animals.Animal"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 6,
+            "start": 20
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "imp": {
+              "id": 0,
+              "key": {
+                "as_name": {
+                  "id": 0,
+                  "key": "use.Dog"
+                },
+                "from_name": {
+                  "id": 0,
+                  "key": "animals.Dog"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 3,
+            "start": 28
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.speak.<locals>.a"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 1,
+            "start": 44
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "func": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.speak"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 35,
+            "start": 34
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.direct.<locals>.d"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 1,
+            "start": 83
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "func": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.direct"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 33,
+            "start": 72
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.DefinitionLocation.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "definition": {
+            "module": {
+              "id": 0,
+              "key": {
+                "module": {
+                  "id": 0,
+                  "key": {
+                    "name": {
+                      "id": 0,
+                      "key": "use"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 106,
+            "start": 0
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "definition": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "container": {
+                  "func": {
+                    "id": 0,
+                    "key": {
+                      "name": {
+                        "id": 0,
+                        "key": "use.speak"
+                      }
+                    }
+                  }
+                },
+                "declaration": {
+                  "id": 0,
+                  "key": {
+                    "name": {
+                      "id": 0,
+                      "key": "use.speak.<locals>.a"
+                    }
+                  }
+                },
+                "typeInfo": {
+                  "displayType": {
+                    "id": 0,
+                    "key": "Animal"
+                  },
+                  "xrefs": [
+                    {
+                      "source": {
+                        "length": 6,
+                        "start": 0
+                      },
+                      "target": {
+                        "id": 0,
+                        "key": "animals.Animal"
+                      }
+                    },
+                    {
+                      "source": {
+                        "length": 6,
+                        "start": 0
+                      },
+                      "target": {
+                        "id": 0,
+                        "key": "use.Animal"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 1,
+            "start": 44
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "definition": {
+            "func": {
+              "id": 0,
+              "key": {
+                "container": {
+                  "module": {
+                    "id": 0,
+                    "key": {
+                      "name": {
+                        "id": 0,
+                        "key": "use"
+                      }
+                    }
+                  }
+                },
+                "declaration": {
+                  "id": 0,
+                  "key": {
+                    "name": {
+                      "id": 0,
+                      "key": "use.speak"
+                    }
+                  }
+                },
+                "is_async": false,
+                "kwonly_params": [],
+                "params": [
+                  {
+                    "name": {
+                      "id": 0,
+                      "key": "a"
+                    },
+                    "typeInfo": {
+                      "displayType": {
+                        "id": 0,
+                        "key": "Animal"
+                      },
+                      "xrefs": [
+                        {
+                          "source": {
+                            "length": 6,
+                            "start": 0
+                          },
+                          "target": {
+                            "id": 0,
+                            "key": "animals.Animal"
+                          }
+                        },
+                        {
+                          "source": {
+                            "length": 6,
+                            "start": 0
+                          },
+                          "target": {
+                            "id": 0,
+                            "key": "use.Animal"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "posonly_params": []
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 35,
+            "start": 34
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "definition": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "container": {
+                  "func": {
+                    "id": 0,
+                    "key": {
+                      "name": {
+                        "id": 0,
+                        "key": "use.direct"
+                      }
+                    }
+                  }
+                },
+                "declaration": {
+                  "id": 0,
+                  "key": {
+                    "name": {
+                      "id": 0,
+                      "key": "use.direct.<locals>.d"
+                    }
+                  }
+                },
+                "typeInfo": {
+                  "displayType": {
+                    "id": 0,
+                    "key": "Dog"
+                  },
+                  "xrefs": [
+                    {
+                      "source": {
+                        "length": 3,
+                        "start": 0
+                      },
+                      "target": {
+                        "id": 0,
+                        "key": "animals.Dog"
+                      }
+                    },
+                    {
+                      "source": {
+                        "length": 3,
+                        "start": 0
+                      },
+                      "target": {
+                        "id": 0,
+                        "key": "use.Dog"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 1,
+            "start": 83
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "definition": {
+            "func": {
+              "id": 0,
+              "key": {
+                "container": {
+                  "module": {
+                    "id": 0,
+                    "key": {
+                      "name": {
+                        "id": 0,
+                        "key": "use"
+                      }
+                    }
+                  }
+                },
+                "declaration": {
+                  "id": 0,
+                  "key": {
+                    "name": {
+                      "id": 0,
+                      "key": "use.direct"
+                    }
+                  }
+                },
+                "is_async": false,
+                "kwonly_params": [],
+                "params": [
+                  {
+                    "name": {
+                      "id": 0,
+                      "key": "d"
+                    },
+                    "typeInfo": {
+                      "displayType": {
+                        "id": 0,
+                        "key": "Dog"
+                      },
+                      "xrefs": [
+                        {
+                          "source": {
+                            "length": 3,
+                            "start": 0
+                          },
+                          "target": {
+                            "id": 0,
+                            "key": "animals.Dog"
+                          }
+                        },
+                        {
+                          "source": {
+                            "length": 3,
+                            "start": 0
+                          },
+                          "target": {
+                            "id": 0,
+                            "key": "use.Dog"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "posonly_params": []
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "span": {
+            "length": 33,
+            "start": 72
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.ImportStarLocation.4",
+    "facts": []
+  },
+  {
+    "predicate": "python.FileCall.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "call_args": [],
+          "callee_span": {
+            "length": 9,
+            "start": 60
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "call_args": [],
+          "callee_span": {
+            "length": 9,
+            "start": 96
+          },
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.CalleeToCaller.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "callee": {
+            "id": 0,
+            "key": "animals.Animal.sound"
+          },
+          "caller": {
+            "id": 0,
+            "key": "use.speak"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "callee": {
+            "id": 0,
+            "key": "animals.Dog.sound"
+          },
+          "caller": {
+            "id": 0,
+            "key": "use.direct"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.ContainingTopLevelDeclaration.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "module": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "module": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "module": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "imp": {
+              "id": 0,
+              "key": {
+                "as_name": {
+                  "id": 0,
+                  "key": "use.Animal"
+                },
+                "from_name": {
+                  "id": 0,
+                  "key": "animals.Animal"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "module": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "imp": {
+              "id": 0,
+              "key": {
+                "as_name": {
+                  "id": 0,
+                  "key": "use.Dog"
+                },
+                "from_name": {
+                  "id": 0,
+                  "key": "animals.Dog"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "func": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.speak"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.speak.<locals>.a"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "module": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "func": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.speak"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "func": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.direct"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.direct.<locals>.d"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "module": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "func": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "use.direct"
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.XRefsViaNameByFile.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "xrefs": [
+            {
+              "source": {
+                "length": 7,
+                "start": 5
+              },
+              "target": {
+                "id": 0,
+                "key": "animals"
+              }
+            },
+            {
+              "source": {
+                "length": 6,
+                "start": 20
+              },
+              "target": {
+                "id": 0,
+                "key": "animals.Animal"
+              }
+            },
+            {
+              "source": {
+                "length": 3,
+                "start": 28
+              },
+              "target": {
+                "id": 0,
+                "key": "animals.Dog"
+              }
+            },
+            {
+              "source": {
+                "length": 6,
+                "start": 47
+              },
+              "target": {
+                "id": 0,
+                "key": "animals.Animal"
+              }
+            },
+            {
+              "source": {
+                "length": 6,
+                "start": 47
+              },
+              "target": {
+                "id": 0,
+                "key": "use.Animal"
+              }
+            },
+            {
+              "source": {
+                "length": 3,
+                "start": 86
+              },
+              "target": {
+                "id": 0,
+                "key": "animals.Dog"
+              }
+            },
+            {
+              "source": {
+                "length": 3,
+                "start": 86
+              },
+              "target": {
+                "id": 0,
+                "key": "use.Dog"
+              }
+            },
+            {
+              "source": {
+                "length": 5,
+                "start": 62
+              },
+              "target": {
+                "id": 0,
+                "key": "animals.Animal.sound"
+              }
+            },
+            {
+              "source": {
+                "length": 1,
+                "start": 60
+              },
+              "target": {
+                "id": 0,
+                "key": "use.speak.<locals>.a"
+              }
+            },
+            {
+              "source": {
+                "length": 5,
+                "start": 98
+              },
+              "target": {
+                "id": 0,
+                "key": "animals.Dog.sound"
+              }
+            },
+            {
+              "source": {
+                "length": 1,
+                "start": 96
+              },
+              "target": {
+                "id": 0,
+                "key": "use.direct.<locals>.d"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.XRefsViaNameByTarget.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 6,
+              "start": 20
+            },
+            {
+              "length": 6,
+              "start": 47
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "animals.Animal"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 5,
+              "start": 98
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "animals.Dog.sound"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 7,
+              "start": 5
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "animals"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 1,
+              "start": 96
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "use.direct.<locals>.d"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 3,
+              "start": 86
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "use.Dog"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 1,
+              "start": 60
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "use.speak.<locals>.a"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 6,
+              "start": 47
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "use.Animal"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 5,
+              "start": 62
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "animals.Animal.sound"
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "spans": [
+            {
+              "length": 3,
+              "start": 28
+            },
+            {
+              "length": 3,
+              "start": 86
+            }
+          ],
+          "target": {
+            "id": 0,
+            "key": "animals.Dog"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.xrefs.XRefsByFile.1",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "file": {
+            "id": 0,
+            "key": "use.py"
+          },
+          "xrefs": [
+            {
+              "source": {
+                "length": 7,
+                "start": 5
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "animals.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "animals"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 6,
+                "start": 20
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "animals.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "animals.Animal"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 3,
+                "start": 28
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "animals.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "animals.Dog"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 6,
+                "start": 47
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "animals.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "animals.Animal"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 6,
+                "start": 47
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "use.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "use.Animal"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 3,
+                "start": 86
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "animals.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "animals.Dog"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 3,
+                "start": 86
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "use.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "use.Dog"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 5,
+                "start": 62
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "animals.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "animals.Animal.sound"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 1,
+                "start": 60
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "use.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "use.speak.<locals>.a"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 5,
+                "start": 98
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "animals.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "animals.Dog.sound"
+                }
+              }
+            },
+            {
+              "source": {
+                "length": 1,
+                "start": 96
+              },
+              "target": {
+                "file": {
+                  "id": 0,
+                  "key": "use.py"
+                },
+                "name": {
+                  "id": 0,
+                  "key": "use.direct.<locals>.d"
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "python.DeclarationDocstring.4",
+    "facts": []
+  },
+  {
+    "predicate": "python.NameToSName.4",
+    "facts": [
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": ""
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": ""
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "use"
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "animals"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "animals"
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.Animal"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "Animal"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "animals.Animal"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "Animal"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "animals"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.Dog"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "Dog"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "animals.Dog"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "Dog"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "animals"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.speak"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "speak"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.speak.<locals>"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "<locals>"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "speak"
+                },
+                "parent": {
+                  "id": 0,
+                  "key": {
+                    "local_name": {
+                      "id": 0,
+                      "key": "use"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.speak.<locals>.a"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "a"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "<locals>"
+                },
+                "parent": {
+                  "id": 0,
+                  "key": {
+                    "local_name": {
+                      "id": 0,
+                      "key": "speak"
+                    },
+                    "parent": {
+                      "id": 0,
+                      "key": {
+                        "local_name": {
+                          "id": 0,
+                          "key": "use"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.direct"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "direct"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "use"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.direct.<locals>"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "<locals>"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "direct"
+                },
+                "parent": {
+                  "id": 0,
+                  "key": {
+                    "local_name": {
+                      "id": 0,
+                      "key": "use"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "use.direct.<locals>.d"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "d"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "<locals>"
+                },
+                "parent": {
+                  "id": 0,
+                  "key": {
+                    "local_name": {
+                      "id": 0,
+                      "key": "direct"
+                    },
+                    "parent": {
+                      "id": 0,
+                      "key": {
+                        "local_name": {
+                          "id": 0,
+                          "key": "use"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "predicate": "gencode.GenCode.1",
+    "facts": []
+  }
+]

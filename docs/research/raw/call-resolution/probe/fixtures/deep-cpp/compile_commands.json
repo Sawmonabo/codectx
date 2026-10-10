@@ -1,0 +1,1 @@
+[{"directory": "<probe>/fixtures/deep-cpp", "file": "<probe>/fixtures/deep-cpp/deep.cpp", "arguments": ["clang++", "-std=c++17", "-c", "<probe>/fixtures/deep-cpp/deep.cpp"]}]

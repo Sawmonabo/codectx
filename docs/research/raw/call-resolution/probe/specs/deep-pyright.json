@@ -1,0 +1,72 @@
+{
+ "name": "pyright",
+ "cmd": [
+  "node",
+  "<probe>/third_party/npm-lsp/node_modules/pyright/langserver.index.js",
+  "--stdio"
+ ],
+ "root": "<probe>/fixtures/deep-py",
+ "settings": {
+  "python": {
+   "analysis": {
+    "diagnosticMode": "openFilesOnly"
+   }
+  },
+  "python.analysis": {
+   "diagnosticMode": "openFilesOnly"
+  },
+  "pyright": {}
+ },
+ "open": [
+  {
+   "path": "deep.py",
+   "languageId": "python"
+  }
+ ],
+ "ready": {
+  "sleep": 4
+ },
+ "queries": [
+  {
+   "label": "Animal.sound",
+   "file": "deep.py",
+   "find": "def sound",
+   "nth": 1,
+   "offset": 4
+  },
+  {
+   "label": "Dog.sound",
+   "file": "deep.py",
+   "find": "def sound",
+   "nth": 2,
+   "offset": 4
+  },
+  {
+   "label": "Puppy.sound",
+   "file": "deep.py",
+   "find": "def sound",
+   "nth": 3,
+   "offset": 4
+  },
+  {
+   "label": "speak",
+   "file": "deep.py",
+   "find": "def speak",
+   "nth": 1,
+   "offset": 4,
+   "ops": [
+    "outgoing"
+   ]
+  },
+  {
+   "label": "walk",
+   "file": "deep.py",
+   "find": "def walk",
+   "nth": 1,
+   "offset": 4,
+   "ops": [
+    "outgoing"
+   ]
+  }
+ ]
+}

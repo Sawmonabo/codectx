@@ -1,0 +1,76 @@
+{
+ "name": "clangd",
+ "cmd": [
+  "<tools>/clangd/22.1.6/clangd_22.1.6/bin/clangd",
+  "--compile-commands-dir=<probe>/fixtures/deep-cpp",
+  "--background-index",
+  "-j=2",
+  "--log=info",
+  "--pch-storage=memory"
+ ],
+ "root": "<probe>/fixtures/deep-cpp",
+ "open": [
+  {
+   "path": "deep.cpp",
+   "languageId": "cpp"
+  }
+ ],
+ "ready": {
+  "sleep": 5
+ },
+ "max_passes": 6,
+ "pass_sleep": 5,
+ "queries": [
+  {
+   "label": "Animal::sound",
+   "file": "deep.cpp",
+   "find": "void sound()",
+   "nth": 1,
+   "offset": 5
+  },
+  {
+   "label": "Dog::sound",
+   "file": "deep.cpp",
+   "find": "void sound()",
+   "nth": 2,
+   "offset": 5
+  },
+  {
+   "label": "Puppy::sound",
+   "file": "deep.cpp",
+   "find": "void sound()",
+   "nth": 3,
+   "offset": 5
+  },
+  {
+   "label": "speak",
+   "file": "deep.cpp",
+   "find": "void speak(",
+   "nth": 1,
+   "offset": 5,
+   "ops": [
+    "outgoing"
+   ]
+  },
+  {
+   "label": "walk",
+   "file": "deep.cpp",
+   "find": "void walk(",
+   "nth": 1,
+   "offset": 5,
+   "ops": [
+    "outgoing"
+   ]
+  },
+  {
+   "label": "exact (qualified a.Animal::sound())",
+   "file": "deep.cpp",
+   "find": "void exact(",
+   "nth": 1,
+   "offset": 5,
+   "ops": [
+    "outgoing"
+   ]
+  }
+ ]
+}

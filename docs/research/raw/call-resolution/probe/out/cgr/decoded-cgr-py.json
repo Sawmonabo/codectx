@@ -1,0 +1,396 @@
+{
+  "nodes": [
+    {
+      "fields": {
+        "end_line": 2,
+        "is_exported": true,
+        "name": "Animal",
+        "qualified_name": "cgr-py.animals.Animal",
+        "start_line": 1
+      },
+      "kind": "class_node"
+    },
+    {
+      "fields": {
+        "end_line": 6,
+        "is_exported": true,
+        "name": "Cat",
+        "qualified_name": "cgr-py.animals.Cat",
+        "start_line": 5
+      },
+      "kind": "class_node"
+    },
+    {
+      "fields": {
+        "end_line": 4,
+        "is_exported": true,
+        "name": "Dog",
+        "qualified_name": "cgr-py.animals.Dog",
+        "start_line": 3
+      },
+      "kind": "class_node"
+    },
+    {
+      "fields": {
+        "extension": ".py",
+        "name": "animals.py",
+        "path": "animals.py"
+      },
+      "kind": "file"
+    },
+    {
+      "fields": {
+        "ast_branch_fingerprints": [
+          "dc1e21545119d843"
+        ],
+        "ast_fingerprint": "1d41676db4732a8b",
+        "ast_fingerprint_nodes": 7,
+        "end_line": 10,
+        "is_exported": true,
+        "name": "direct",
+        "param_types": [
+          "Dog"
+        ],
+        "qualified_name": "cgr-py.animals.direct",
+        "start_line": 9
+      },
+      "kind": "function"
+    },
+    {
+      "fields": {
+        "ast_branch_fingerprints": [
+          "dc1e21545119d843"
+        ],
+        "ast_fingerprint": "1d41676db4732a8b",
+        "ast_fingerprint_nodes": 7,
+        "end_line": 8,
+        "is_exported": true,
+        "name": "speak",
+        "param_types": [
+          "Animal"
+        ],
+        "qualified_name": "cgr-py.animals.speak",
+        "start_line": 7
+      },
+      "kind": "function"
+    },
+    {
+      "fields": {
+        "ast_fingerprint": "f437b84a435d3d17",
+        "ast_fingerprint_nodes": 3,
+        "end_line": 2,
+        "name": "sound",
+        "param_types": [
+          ""
+        ],
+        "qualified_name": "cgr-py.animals.Animal.sound",
+        "start_line": 2
+      },
+      "kind": "method"
+    },
+    {
+      "fields": {
+        "ast_fingerprint": "f437b84a435d3d17",
+        "ast_fingerprint_nodes": 3,
+        "end_line": 6,
+        "name": "sound",
+        "param_types": [
+          ""
+        ],
+        "qualified_name": "cgr-py.animals.Cat.sound",
+        "start_line": 6
+      },
+      "kind": "method"
+    },
+    {
+      "fields": {
+        "ast_fingerprint": "f437b84a435d3d17",
+        "ast_fingerprint_nodes": 3,
+        "end_line": 4,
+        "name": "sound",
+        "param_types": [
+          ""
+        ],
+        "qualified_name": "cgr-py.animals.Dog.sound",
+        "start_line": 4
+      },
+      "kind": "method"
+    },
+    {
+      "fields": {
+        "name": "animals.py",
+        "path": "animals.py",
+        "qualified_name": "cgr-py.animals"
+      },
+      "kind": "module"
+    },
+    {
+      "fields": {
+        "name": "cgr-py"
+      },
+      "kind": "project"
+    }
+  ],
+  "relationships": [
+    {
+      "properties": {},
+      "source_id": "cgr-py",
+      "source_label": "Project",
+      "target_id": "animals.py",
+      "target_label": "File",
+      "type": "CONTAINS_FILE"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py",
+      "source_label": "Project",
+      "target_id": "cgr-py.animals",
+      "target_label": "Module",
+      "type": "CONTAINS_MODULE"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.Animal",
+      "target_label": "Class",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.Cat",
+      "target_label": "Class",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.Dog",
+      "target_label": "Class",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.direct",
+      "target_label": "Function",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.speak",
+      "target_label": "Function",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {
+        "arg_count": 1.0,
+        "col": 28.0,
+        "end_col": 41.0,
+        "end_line": 11.0,
+        "kwarg_names": [],
+        "line": 11.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.direct",
+      "target_label": "Function",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 1.0,
+        "col": 0.0,
+        "end_col": 12.0,
+        "end_line": 11.0,
+        "kwarg_names": [],
+        "line": 11.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.speak",
+      "target_label": "Function",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 1.0,
+        "col": 14.0,
+        "end_col": 26.0,
+        "end_line": 11.0,
+        "kwarg_names": [],
+        "line": 11.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.speak",
+      "target_label": "Function",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 20.0,
+        "end_col": 25.0,
+        "end_line": 11.0,
+        "kwarg_names": [],
+        "line": 11.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.Cat",
+      "target_label": "Class",
+      "type": "INSTANTIATES"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 6.0,
+        "end_col": 11.0,
+        "end_line": 11.0,
+        "kwarg_names": [],
+        "line": 11.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.Dog",
+      "target_label": "Class",
+      "type": "INSTANTIATES"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 35.0,
+        "end_col": 40.0,
+        "end_line": 11.0,
+        "kwarg_names": [],
+        "line": 11.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals",
+      "source_label": "Module",
+      "target_id": "cgr-py.animals.Dog",
+      "target_label": "Class",
+      "type": "INSTANTIATES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals.Animal",
+      "source_label": "Class",
+      "target_id": "cgr-py.animals.Animal.sound",
+      "target_label": "Method",
+      "type": "DEFINES_METHOD"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals.Cat",
+      "source_label": "Class",
+      "target_id": "cgr-py.animals.Cat.sound",
+      "target_label": "Method",
+      "type": "DEFINES_METHOD"
+    },
+    {
+      "properties": {
+        "base_index": 0.0
+      },
+      "source_id": "cgr-py.animals.Cat",
+      "source_label": "Class",
+      "target_id": "cgr-py.animals.Animal",
+      "target_label": "Class",
+      "type": "INHERITS"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals.Cat.sound",
+      "source_label": "Method",
+      "target_id": "cgr-py.animals.Animal.sound",
+      "target_label": "Method",
+      "type": "OVERRIDES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals.Dog",
+      "source_label": "Class",
+      "target_id": "cgr-py.animals.Dog.sound",
+      "target_label": "Method",
+      "type": "DEFINES_METHOD"
+    },
+    {
+      "properties": {
+        "base_index": 0.0
+      },
+      "source_id": "cgr-py.animals.Dog",
+      "source_label": "Class",
+      "target_id": "cgr-py.animals.Animal",
+      "target_label": "Class",
+      "type": "INHERITS"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals.Dog.sound",
+      "source_label": "Method",
+      "target_id": "cgr-py.animals.Animal.sound",
+      "target_label": "Method",
+      "type": "OVERRIDES"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 4.0,
+        "end_col": 13.0,
+        "end_line": 10.0,
+        "kwarg_names": [],
+        "line": 10.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals.direct",
+      "source_label": "Function",
+      "target_id": "cgr-py.animals.Dog.sound",
+      "target_label": "Method",
+      "type": "CALLS"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals.direct",
+      "source_label": "Function",
+      "target_id": "cgr-py.animals.Dog",
+      "target_label": "Class",
+      "type": "ACCEPTS"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 4.0,
+        "end_col": 13.0,
+        "end_line": 8.0,
+        "kwarg_names": [],
+        "line": 8.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-py.animals.speak",
+      "source_label": "Function",
+      "target_id": "cgr-py.animals.Animal.sound",
+      "target_label": "Method",
+      "type": "CALLS"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-py.animals.speak",
+      "source_label": "Function",
+      "target_id": "cgr-py.animals.Animal",
+      "target_label": "Class",
+      "type": "ACCEPTS"
+    }
+  ]
+}

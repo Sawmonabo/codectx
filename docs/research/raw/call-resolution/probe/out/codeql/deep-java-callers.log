@@ -1,0 +1,10 @@
+Resolving data extensions.
+Finished resolving data extensions.
+Loading data extensions.
+Finished loading data extensions.
+WARNING: Not caching stages during query-loading, since max heap size is only 1250 MB.
+Compiling query plan for <probe>/scripts/codeql/java/callers.ql.
+[1/1] Found in cache: <probe>/scripts/codeql/java/callers.ql.
+Starting evaluation of probe/java-dispatch/callers.ql.
+[1/1 eval 403ms] Evaluation done; writing results to <probe>/out/codeql/deep-java-callers.bqrs.
+Shutting down query evaluator.

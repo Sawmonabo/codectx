@@ -1,0 +1,1 @@
+{"fixture_i": ["fixture_i.Dog", "fixture_i.Dog.sound", "fixture_i.speak", "fixture_i.Animal", "fixture_i.Cat"], "fixture_i.Animal": [], "fixture_i.Dog": [], "fixture_i.Cat": [], "fixture_i.speak": ["fixture_i.Dog.sound", "fixture_i.Cat.sound"], "fixture_i.Dog.sound": [], "fixture_i.Cat.sound": []}

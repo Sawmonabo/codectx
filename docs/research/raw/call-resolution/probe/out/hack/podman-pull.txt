@@ -1,0 +1,7 @@
+Trying to pull docker.io/hhvm/hhvm:2023.02.17...
+Getting image source signatures
+Copying blob sha256:fea8040c99d5646bdbbfec9ece9b0974c8f3986aabf73105ba065fa57974a1af
+Copying blob sha256:b549f31133a955f68f9fa0d93f18436c4a180e12184b999a8ecf14f7eaa83309
+Copying config sha256:aae3047d0f3bbf891b0c7bc9ce70f0caf8078971b3a8901aae1cc4256d0e93fc
+Writing manifest to image destination
+aae3047d0f3bbf891b0c7bc9ce70f0caf8078971b3a8901aae1cc4256d0e93fc

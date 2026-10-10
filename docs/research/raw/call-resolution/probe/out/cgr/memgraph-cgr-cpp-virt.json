@@ -1,0 +1,166 @@
+{
+  "all_relationship_counts": {
+    "CALLS": 5,
+    "CONTAINS_FILE": 1,
+    "CONTAINS_MODULE": 1,
+    "DEFINES": 6,
+    "DEFINES_METHOD": 4,
+    "INHERITS": 2,
+    "OVERRIDES": 2
+  },
+  "query": "\nMATCH (a)-[r]->(b)\nWHERE type(r) IN ['CALLS', 'REFERENCES', 'INSTANTIATES', 'INHERITS',\n                  'OVERRIDES', 'IMPLEMENTS', 'ACCEPTS']\n  AND (a.qualified_name STARTS WITH $prefix OR a.name = $project)\nRETURN labels(a) AS from_labels, coalesce(a.qualified_name, a.name) AS from_qn,\n       type(r) AS rel, properties(r) AS props,\n       labels(b) AS to_labels, coalesce(b.qualified_name, b.name) AS to_qn\nORDER BY rel, from_qn, to_qn, props.line, props.col\n",
+  "rows": [
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.direct",
+      "props": {
+        "arg_count": 0,
+        "col": 22,
+        "end_col": 31,
+        "end_line": 5,
+        "kwarg_names": [],
+        "line": 5,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Method"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.Dog.sound"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.main",
+      "props": {
+        "arg_count": 1,
+        "col": 47,
+        "end_col": 56,
+        "end_line": 6,
+        "kwarg_names": [],
+        "line": 6,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Function"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.direct"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.main",
+      "props": {
+        "arg_count": 1,
+        "col": 27,
+        "end_col": 35,
+        "end_line": 6,
+        "kwarg_names": [],
+        "line": 6,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Function"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.speak"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.main",
+      "props": {
+        "arg_count": 1,
+        "col": 37,
+        "end_col": 45,
+        "end_line": 6,
+        "kwarg_names": [],
+        "line": 6,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Function"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.speak"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.speak",
+      "props": {
+        "arg_count": 0,
+        "col": 24,
+        "end_col": 33,
+        "end_line": 4,
+        "kwarg_names": [],
+        "line": 4,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Method"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.Animal.sound"
+    },
+    {
+      "from_labels": [
+        "Class"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.Cat",
+      "props": {
+        "base_index": 0
+      },
+      "rel": "INHERITS",
+      "to_labels": [
+        "Class"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.Animal"
+    },
+    {
+      "from_labels": [
+        "Class"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.Dog",
+      "props": {
+        "base_index": 0
+      },
+      "rel": "INHERITS",
+      "to_labels": [
+        "Class"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.Animal"
+    },
+    {
+      "from_labels": [
+        "Method"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.Cat.sound",
+      "props": {},
+      "rel": "OVERRIDES",
+      "to_labels": [
+        "Method"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.Animal.sound"
+    },
+    {
+      "from_labels": [
+        "Method"
+      ],
+      "from_qn": "cgr-cpp-virt__3a853b01.virt.Dog.sound",
+      "props": {},
+      "rel": "OVERRIDES",
+      "to_labels": [
+        "Method"
+      ],
+      "to_qn": "cgr-cpp-virt__3a853b01.virt.Animal.sound"
+    }
+  ]
+}

@@ -1,0 +1,405 @@
+{
+ "server": "jdtls",
+ "cmd": [
+  "nice",
+  "-n",
+  "10",
+  "<tools>/jdk/21.0.12.1+1/jdk-21.0.12.1+1/bin/java",
+  "-Declipse.application=org.eclipse.jdt.ls.core.id1",
+  "-Dosgi.bundles.defaultStartLevel=4",
+  "-Declipse.product=org.eclipse.jdt.ls.core.product",
+  "-Dosgi.checkConfiguration=true",
+  "-Dlog.level=ALL",
+  "-Xmx768m",
+  "-Xms128m",
+  "-XX:+UseSerialGC",
+  "-XX:ActiveProcessorCount=2",
+  "--add-modules=ALL-SYSTEM",
+  "--add-opens",
+  "java.base/java.util=ALL-UNNAMED",
+  "--add-opens",
+  "java.base/java.lang=ALL-UNNAMED",
+  "-jar",
+  "<tools>/jdtls/1.61.0/plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+  "-configuration",
+  "<probe>/third_party/jdtls-run/config_linux",
+  "-data",
+  "<probe>/third_party/jdtls-run/workspace-deep"
+ ],
+ "root": "<probe>/fixtures/deep-java",
+ "started": "2026-10-09 09:25:29 PM EDT",
+ "server_info": {
+  "name": "JDT Language Server (Standard)",
+  "version": "1.61.0-SNAPSHOT"
+ },
+ "call_hierarchy_provider": true,
+ "ready": {
+  "type": "Started",
+  "message": "Ready"
+ },
+ "ready_wait_s": 0.0,
+ "passes_run": 2,
+ "stable": true,
+ "results": [
+  {
+   "label": "Animal.sound",
+   "position": "Main.java:2:10",
+   "prepare": [
+    {
+     "name": "sound() : void",
+     "detail": "Animal",
+     "kind": 6,
+     "at": "Main.java:2:10  void sound() {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak(Animal) : void",
+      "detail": "Main",
+      "kind": 6,
+      "at": "Main.java:19:11  a.sound();",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:19:11  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "Main.java:19:11  a.sound();"
+   ],
+   "references_with_decl": [
+    "Main.java:12:10  void sound() {",
+    "Main.java:19:11  a.sound();",
+    "Main.java:2:10  void sound() {}",
+    "Main.java:7:10  void sound() {}"
+   ],
+   "implementation": [
+    "Main.java:12:10  void sound() {",
+    "Main.java:7:10  void sound() {}"
+   ]
+  },
+  {
+   "label": "Dog.sound",
+   "position": "Main.java:7:10",
+   "prepare": [
+    {
+     "name": "sound() : void",
+     "detail": "Dog",
+     "kind": 6,
+     "at": "Main.java:7:10  void sound() {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "sound() : void",
+      "detail": "Puppy",
+      "kind": 6,
+      "at": "Main.java:13:15  super.sound();",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:13:15  super.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "speak(Animal) : void",
+      "detail": "Main",
+      "kind": 6,
+      "at": "Main.java:19:11  a.sound();",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:19:11  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "walk(Dog) : void",
+      "detail": "Main",
+      "kind": 6,
+      "at": "Main.java:23:11  d.sound();",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:23:11  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "Main.java:13:15  super.sound();",
+    "Main.java:19:11  a.sound();",
+    "Main.java:23:11  d.sound();"
+   ],
+   "references_with_decl": [
+    "Main.java:12:10  void sound() {",
+    "Main.java:13:15  super.sound();",
+    "Main.java:19:11  a.sound();",
+    "Main.java:23:11  d.sound();",
+    "Main.java:7:10  void sound() {}"
+   ],
+   "implementation": [
+    "Main.java:12:10  void sound() {"
+   ]
+  },
+  {
+   "label": "Puppy.sound",
+   "position": "Main.java:12:10",
+   "prepare": [
+    {
+     "name": "sound() : void",
+     "detail": "Puppy",
+     "kind": 6,
+     "at": "Main.java:12:10  void sound() {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak(Animal) : void",
+      "detail": "Main",
+      "kind": 6,
+      "at": "Main.java:19:11  a.sound();",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:19:11  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "walk(Dog) : void",
+      "detail": "Main",
+      "kind": 6,
+      "at": "Main.java:23:11  d.sound();",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:23:11  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound() : void",
+      "detail": "Dog",
+      "kind": 6,
+      "at": "Main.java:7:10  void sound() {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:13:9  super.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ],
+   "references": [
+    "Main.java:19:11  a.sound();",
+    "Main.java:23:11  d.sound();"
+   ],
+   "references_with_decl": [
+    "Main.java:12:10  void sound() {",
+    "Main.java:19:11  a.sound();",
+    "Main.java:23:11  d.sound();"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "speak",
+   "position": "Main.java:18:17",
+   "prepare": [
+    {
+     "name": "speak(Animal) : void",
+     "detail": "Main",
+     "kind": 6,
+     "at": "Main.java:18:17  static void speak(Animal a) {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound() : void",
+      "detail": "Animal",
+      "kind": 6,
+      "at": "Main.java:2:10  void sound() {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:19:9  a.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "walk",
+   "position": "Main.java:22:17",
+   "prepare": [
+    {
+     "name": "walk(Dog) : void",
+     "detail": "Main",
+     "kind": 6,
+     "at": "Main.java:22:17  static void walk(Dog d) {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound() : void",
+      "detail": "Dog",
+      "kind": 6,
+      "at": "Main.java:7:10  void sound() {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "Main.java:23:9  d.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  }
+ ],
+ "finished": "2026-10-09 09:25:47 PM EDT"
+}

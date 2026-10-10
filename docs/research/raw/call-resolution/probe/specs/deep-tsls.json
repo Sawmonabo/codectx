@@ -1,0 +1,67 @@
+{
+ "name": "typescript-language-server",
+ "cmd": [
+  "node",
+  "<probe>/third_party/npm-lsp/node_modules/typescript-language-server/lib/cli.mjs",
+  "--stdio"
+ ],
+ "root": "<probe>/fixtures/deep-ts",
+ "init_options": {
+  "tsserver": {
+   "path": "<probe>/third_party/npm-ts6/node_modules/typescript/lib/tsserver.js"
+  },
+  "hostInfo": "dispatch-probe"
+ },
+ "open": [
+  {
+   "path": "deep.ts",
+   "languageId": "typescript"
+  }
+ ],
+ "ready": {
+  "sleep": 5
+ },
+ "queries": [
+  {
+   "label": "Animal.sound",
+   "file": "deep.ts",
+   "find": "sound(): void",
+   "nth": 1,
+   "offset": 0
+  },
+  {
+   "label": "Dog.sound",
+   "file": "deep.ts",
+   "find": "sound(): void",
+   "nth": 2,
+   "offset": 0
+  },
+  {
+   "label": "Puppy.sound",
+   "file": "deep.ts",
+   "find": "sound(): void",
+   "nth": 3,
+   "offset": 0
+  },
+  {
+   "label": "speak",
+   "file": "deep.ts",
+   "find": "function speak",
+   "nth": 1,
+   "offset": 9,
+   "ops": [
+    "outgoing"
+   ]
+  },
+  {
+   "label": "walk",
+   "file": "deep.ts",
+   "find": "function walk",
+   "nth": 1,
+   "offset": 9,
+   "ops": [
+    "outgoing"
+   ]
+  }
+ ]
+}

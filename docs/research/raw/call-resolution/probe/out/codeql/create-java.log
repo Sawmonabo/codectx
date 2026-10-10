@@ -1,0 +1,24 @@
+Initializing database at <probe>/out/codeql/db-java.
+Running build command: []
+Running command in <probe>/fixtures/java: [<probe>/third_party/codeql/codeql/java/tools/autobuild.sh]
+[2026-10-09 21:30:15] [build-stdout] [2026-10-09 21:30:15] Extracting Java with build-mode=none.
+[2026-10-09 21:30:16] [build-stdout] [2026-10-09 21:30:16] No usable build tool found. Neither JDK version recommendation nor precise dependency recommendations will be available.
+[2026-10-09 21:30:16] [build-stdout] [2026-10-09 21:30:16] Found no Java toolchains in a toolchains file, inspecting environment variables...
+[2026-10-09 21:30:16] [build-stdout] [2026-10-09 21:30:16] No specific JDK inferred from the project being analysed; using the java on the PATH
+[2026-10-09 21:30:16] [build-stdout] [2026-10-09 21:30:16] [autobuild] Scanning for files in <probe>/fixtures/java...
+[2026-10-09 21:30:16] [build-stdout] [2026-10-09 21:30:16] [autobuild] <probe>/out/codeql/db-java: Indexing files in in <probe>/fixtures/java...
+[2026-10-09 21:30:16] [build-stdout] [2026-10-09 21:30:16] [autobuild] Running command in <probe>/fixtures/java: [<probe>/third_party/codeql/codeql/java/tools/index-files.sh, <probe>/out/codeql/db-java/working/files-to-index1537949698518908814.list]
+Finalizing database at <probe>/out/codeql/db-java.
+Running pre-finalize script <probe>/third_party/codeql/codeql/java/tools/pre-finalize.sh in <probe>/fixtures/java.
+Running command in <probe>/fixtures/java: [<probe>/third_party/codeql/codeql/java/tools/pre-finalize.sh]
+[2026-10-09 21:30:23] [build-stderr] Scanning for files in <probe>/fixtures/java...
+[2026-10-09 21:30:24] [build-stderr] Scanning for files in <probe>/fixtures/java...
+Pre-finalize script <probe>/third_party/codeql/codeql/java/tools/pre-finalize.sh completed in 1645 ms.
+Running TRAP import for CodeQL database at <probe>/out/codeql/db-java...
+WARNING: Rounding --ram up to the minimum of 2048
+Importing TRAP files
+Merging relations
+Finished writing database (relations: 439.31 KiB; string pool: 2.41 MiB).
+TRAP import complete (1.2s).
+Finished zipping source archive (530.00 B).
+Successfully created database at <probe>/out/codeql/db-java.

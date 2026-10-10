@@ -1,0 +1,10 @@
+Creating DB using handle glean@<unknown>
+Wrote /out/pyrefly-fixture-filtered/9594c6e96f1ace36d97ec8c687b9266c8b98902287f1bfa64bde7bced34a8d54.json
+Wrote /out/pyrefly-fixture-filtered/666356cce67c2ea4c5f57bc347428514e890894ffb83ce88c5787509d13f3e71.json
+## derive DeclarationUses
+I1010 01:29:47.307688   250 Open.hs:499] d/0: opened
+I1010 01:29:47.634809   250 Open.hs:501] d/0: schema has 1089 predicates
+I1010 01:29:47.646175   245 Stats.hs:223] mut_lat:     - [    -] mut_thp:         - [        -] ded_thp:         - [        -] dup_thp:         - [        -] rnm_thp:         - [        -] cmt_thp:         - [        -] ibk_mis:     - [    -] tbi_mis:     - [    -] fbi_mis:     - [    -] lch_mem: 0B lch_cnt: 0
+glean: IncompleteDependencies {incompleteDependencies_incomplete = [PredicateRef {predicateRef_name = "python.ImportStatementByAsName", predicateRef_version = 4}]}
+## all DeclarationUses
+## EntityUses for Animal.sound

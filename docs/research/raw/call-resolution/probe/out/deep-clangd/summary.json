@@ -1,0 +1,421 @@
+{
+ "server": "clangd",
+ "cmd": [
+  "<tools>/clangd/22.1.6/clangd_22.1.6/bin/clangd",
+  "--compile-commands-dir=<probe>/fixtures/deep-cpp",
+  "--background-index",
+  "-j=2",
+  "--log=info",
+  "--pch-storage=memory"
+ ],
+ "root": "<probe>/fixtures/deep-cpp",
+ "started": "2026-10-09 09:23:53 PM EDT",
+ "server_info": {
+  "name": "clangd",
+  "version": "clangd version 22.1.6 (https://github.com/llvm/llvm-project fc4aad7b5db3fff421df9a9637605b9ca5667881) linux+grpc x86_64-unknown-linux-gnu"
+ },
+ "call_hierarchy_provider": true,
+ "ready_wait_s": 0.0,
+ "passes_run": 2,
+ "stable": true,
+ "results": [
+  {
+   "label": "Animal::sound",
+   "position": "deep.cpp:3:18",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": null,
+     "kind": 6,
+     "at": "deep.cpp:3:18  virtual void sound() {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "exact",
+      "detail": "exact",
+      "kind": 12,
+      "at": "deep.cpp:22:6  void exact(Animal& a) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:23:15  a.Animal::sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "speak",
+      "detail": "speak",
+      "kind": 12,
+      "at": "deep.cpp:14:6  void speak(Animal& a) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:15:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "deep.cpp:15:7  a.sound();",
+    "deep.cpp:23:15  a.Animal::sound();"
+   ],
+   "references_with_decl": [
+    "deep.cpp:15:7  a.sound();",
+    "deep.cpp:23:15  a.Animal::sound();",
+    "deep.cpp:3:18  virtual void sound() {}",
+    "deep.cpp:7:10  void sound() override {}"
+   ],
+   "implementation": [
+    "deep.cpp:7:10  void sound() override {}"
+   ]
+  },
+  {
+   "label": "Dog::sound",
+   "position": "deep.cpp:7:10",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": null,
+     "kind": 6,
+     "at": "deep.cpp:7:10  void sound() override {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "exact",
+      "detail": "exact",
+      "kind": 12,
+      "at": "deep.cpp:22:6  void exact(Animal& a) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:23:15  a.Animal::sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "speak",
+      "detail": "speak",
+      "kind": 12,
+      "at": "deep.cpp:14:6  void speak(Animal& a) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:15:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "walk",
+      "detail": "walk",
+      "kind": 12,
+      "at": "deep.cpp:18:6  void walk(Dog& d) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:19:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "deep.cpp:15:7  a.sound();",
+    "deep.cpp:19:7  d.sound();",
+    "deep.cpp:23:15  a.Animal::sound();",
+    "deep.cpp:3:18  virtual void sound() {}"
+   ],
+   "references_with_decl": [
+    "deep.cpp:11:10  void sound() override {}",
+    "deep.cpp:15:7  a.sound();",
+    "deep.cpp:19:7  d.sound();",
+    "deep.cpp:23:15  a.Animal::sound();",
+    "deep.cpp:3:18  virtual void sound() {}",
+    "deep.cpp:7:10  void sound() override {}"
+   ],
+   "implementation": [
+    "deep.cpp:11:10  void sound() override {}"
+   ]
+  },
+  {
+   "label": "Puppy::sound",
+   "position": "deep.cpp:11:10",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": null,
+     "kind": 6,
+     "at": "deep.cpp:11:10  void sound() override {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "walk",
+      "detail": "walk",
+      "kind": 12,
+      "at": "deep.cpp:18:6  void walk(Dog& d) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:19:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "deep.cpp:15:7  a.sound();",
+    "deep.cpp:19:7  d.sound();",
+    "deep.cpp:23:15  a.Animal::sound();",
+    "deep.cpp:3:18  virtual void sound() {}",
+    "deep.cpp:7:10  void sound() override {}"
+   ],
+   "references_with_decl": [
+    "deep.cpp:11:10  void sound() override {}",
+    "deep.cpp:15:7  a.sound();",
+    "deep.cpp:19:7  d.sound();",
+    "deep.cpp:23:15  a.Animal::sound();",
+    "deep.cpp:3:18  virtual void sound() {}",
+    "deep.cpp:7:10  void sound() override {}"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "speak",
+   "position": "deep.cpp:14:6",
+   "prepare": [
+    {
+     "name": "speak",
+     "detail": null,
+     "kind": 12,
+     "at": "deep.cpp:14:6  void speak(Animal& a) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Animal::sound",
+      "kind": 6,
+      "at": "deep.cpp:3:18  virtual void sound() {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:15:7  a.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "walk",
+   "position": "deep.cpp:18:6",
+   "prepare": [
+    {
+     "name": "walk",
+     "detail": null,
+     "kind": 12,
+     "at": "deep.cpp:18:6  void walk(Dog& d) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Dog::sound",
+      "kind": 6,
+      "at": "deep.cpp:7:10  void sound() override {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:19:7  d.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "exact (qualified a.Animal::sound())",
+   "position": "deep.cpp:22:6",
+   "prepare": [
+    {
+     "name": "exact",
+     "detail": null,
+     "kind": 12,
+     "at": "deep.cpp:22:6  void exact(Animal& a) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Animal::sound",
+      "kind": 6,
+      "at": "deep.cpp:3:18  virtual void sound() {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.cpp:23:15  a.Animal::sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  }
+ ],
+ "finished": "2026-10-09 09:24:03 PM EDT"
+}

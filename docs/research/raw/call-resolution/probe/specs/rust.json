@@ -1,0 +1,20 @@
+{
+ "name": "rust-analyzer",
+ "cmd": ["<home>/.cargo/bin/rust-analyzer"],
+ "root": "<probe>/fixtures/rust",
+ "experimental_caps": {"serverStatusNotification": true},
+ "init_options": {"checkOnSave": false, "check": {"workspace": false}, "cargo": {"buildScripts": {"enable": false}}, "procMacro": {"enable": false}, "cachePriming": {"enable": true, "numThreads": 2}, "numThreads": 2},
+ "open": [{"path": "src/main.rs", "languageId": "rust"}],
+ "ready": {"kind": "ra-quiescent", "timeout": 240, "sleep": 2},
+ "queries": [
+  {"label": "Animal::sound (trait decl)", "file": "src/main.rs", "find": "fn sound", "nth": 1, "offset": 3},
+  {"label": "Dog::sound (impl)", "file": "src/main.rs", "find": "fn sound", "nth": 2, "offset": 3},
+  {"label": "Cat::sound (impl)", "file": "src/main.rs", "find": "fn sound", "nth": 3, "offset": 3},
+  {"label": "speak (dyn)", "file": "src/main.rs", "find": "fn speak(", "offset": 3, "ops": ["incoming", "outgoing"]},
+  {"label": "speak_g (generic)", "file": "src/main.rs", "find": "fn speak_g", "offset": 3, "ops": ["incoming", "outgoing"]},
+  {"label": "direct (concrete)", "file": "src/main.rs", "find": "fn direct", "offset": 3, "ops": ["incoming", "outgoing"]},
+  {"label": "call site a.sound() in speak", "file": "src/main.rs", "find": "a.sound()", "nth": 1, "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "call site a.sound() in speak_g", "file": "src/main.rs", "find": "a.sound()", "nth": 2, "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "call site d.sound() in direct", "file": "src/main.rs", "find": "d.sound()", "nth": 1, "offset": 2, "ops": ["definition", "implementation"]}
+ ]
+}

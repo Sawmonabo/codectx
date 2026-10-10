@@ -1,0 +1,56 @@
+hackc-a5769b09ba32a00f493a496aa3b871b96f4f5750-6.33.0-dev
+[2026-10-10 01:47:07.074] Server version is not set
+[2026-10-10 01:47:07.074] Loading config exception: (Sys_error "/etc/hh.conf: No such file or directory")
+[2026-10-10 01:47:07.074] Could not load config at /etc/hh.conf
+*** Overrides from --config:
+lazy_decl = true
+lazy_init2 = true
+lazy_parse = true
+symbol_write_include_hhi = false
+symbolindex_search_provider = NoIndex
+
+** Combined config:
+lazy_decl = true
+lazy_init2 = true
+lazy_parse = true
+symbol_write_include_hhi = false
+symbolindex_search_provider = NoIndex
+
+** Saved state rollout flags:
+dummy_one = false
+dummy_two = false
+dummy_three = false
+
+[2026-10-10 01:47:07.087] Will run once in check mode then exit.
+[2026-10-10 01:47:07.087] Version: hackc-a5769b09ba32a00f493a496aa3b871b96f4f5750-6.33.0-dev
+[2026-10-10 01:47:07.087] Hostname: 21f9ef3f6c4f
+[2026-10-10 01:47:07.102] Not using dfind or watchman
+[2026-10-10 01:47:07.102] Init id: A8P8jEB4Uo
+[2026-10-10 01:47:07.102] Initing with approach: Server_args_writing_symbol_info
+[2026-10-10 01:47:07.102] ServerInit: lazy_lev=ServerInitTypes.Init
+[2026-10-10 01:47:07.102] ServerInit: init_approach=ServerInitTypes.Write_symbol_info
+[2026-10-10 01:47:07.102] write symbol info initialization
+[2026-10-10 01:47:07.104] indexing
+[2026-10-10 01:47:07.105] indexing lazy.nt.indexing: 0.000010
+[2026-10-10 01:47:07.105] parsing
+[2026-10-10 01:47:07.397] Parsing lazy.nt.parsing: 0.292387
+[2026-10-10 01:47:07.397] resolving symbol references
+[2026-10-10 01:47:07.406] Naming write_symbol_info.naming: 0.008873
+[2026-10-10 01:47:07.407] Indexing: 1 files
+[2026-10-10 01:47:07.407] Writing JSON to: /out
+[2026-10-10 01:47:07.407] Ownership mode: false
+[2026-10-10 01:47:07.407] Gen_sym_hash: false
+[2026-10-10 01:47:07.414] [worker-1] Wrote 11.7627K of JSON facts on 1 files
+[2026-10-10 01:47:07.414] [worker-1] Processed batch in 0m0s
+[2026-10-10 01:47:07.414] Wrote 2.01465K of JSON facts on 1 files
+[2026-10-10 01:47:07.414] Reindexed: www/animals.hack
+[2026-10-10 01:47:07.414] Processed all batches (cumulated time) in  0m0s
+[2026-10-10 01:47:07.414] Processed all batches in  0m0s
+[2026-10-10 01:47:07.414] updating search index...
+[2026-10-10 01:47:07.414] Search provider set to [Symbol index disabled] based on configuration value [NoIndex]
+No errors!
+[2026-10-10 01:47:07.414] Waiting for daemon(s) to be ready...
+[2026-10-10 01:47:07.414] wrapping up init...
+[2026-10-10 01:47:07.414] Hashtable load factor: 15550 / 262144 (0.06) with 15550 nonempty slots
+[2026-10-10 01:47:07.414] Running in check mode
+hh-exit=0

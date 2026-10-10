@@ -1,0 +1,65 @@
+{
+  "analyzer_version": "0.1.64",
+  "artifacts": {
+    "index.bin": {
+      "sha256": "34302ecb92a12ddd46d4a201c5d15b0f7cf7b40eac6225fd8388c014f9905181"
+    }
+  },
+  "capture": {
+    "node_labels": [
+      "Class",
+      "Enum",
+      "ExternalModule",
+      "ExternalPackage",
+      "File",
+      "Folder",
+      "Function",
+      "Interface",
+      "Method",
+      "Module",
+      "ModuleImplementation",
+      "ModuleInterface",
+      "Package",
+      "Project",
+      "Section",
+      "Type",
+      "Union"
+    ],
+    "relationships": [
+      "ACCEPTS",
+      "CALLS",
+      "CONTAINS_FILE",
+      "CONTAINS_FOLDER",
+      "CONTAINS_MODULE",
+      "CONTAINS_PACKAGE",
+      "CONTAINS_SECTION",
+      "DEFINES",
+      "DEFINES_METHOD",
+      "DEPENDS_ON_EXTERNAL",
+      "EXPORTS",
+      "EXPORTS_MODULE",
+      "IMPLEMENTS",
+      "IMPLEMENTS_MODULE",
+      "IMPORTS",
+      "INHERITS",
+      "INSTANTIATES",
+      "LINKS_TO",
+      "OVERRIDES",
+      "REFERENCES",
+      "RETURNS"
+    ]
+  },
+  "codec_schema_sha256": "8a050c9c3b26250be423edb1d91747ef14a033be3efc6bb0372657678b92066e",
+  "coverage": {
+    "cpp": {
+      "flow_covered": 0,
+      "modules": 1
+    }
+  },
+  "created_at": "2026-10-10T01:17:52+00:00",
+  "manifest_version": 1,
+  "source": {
+    "commit": "882da78f4b8848547bad2e5ee75b1634bdd36319",
+    "dirty": false
+  }
+}

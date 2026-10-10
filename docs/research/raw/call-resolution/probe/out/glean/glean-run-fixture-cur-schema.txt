@@ -1,0 +1,83 @@
+## create
+glean: lexical error at line 55, column 17
+## write
+glean: lexical error at line 55, column 17
+## derive
+derive python.ImportStatementByAsName FAILED
+glean: lexical error at line 55, column 17
+derive python.DeclarationsByFile FAILED
+glean: lexical error at line 55, column 17
+derive python.SNameToName FAILED
+glean: lexical error at line 55, column 17
+derive python.ModuleBySName FAILED
+glean: lexical error at line 55, column 17
+derive python.ClassBySName FAILED
+glean: lexical error at line 55, column 17
+derive python.FunctionBySName FAILED
+glean: lexical error at line 55, column 17
+derive python.VariableBySName FAILED
+glean: lexical error at line 55, column 17
+derive python.DeclarationDefinition FAILED
+glean: lexical error at line 55, column 17
+derive python.DefinitionsByFile FAILED
+glean: lexical error at line 55, column 17
+derive python.ImportStarsByFile FAILED
+glean: lexical error at line 55, column 17
+derive python.BaseClassToDerived FAILED
+glean: lexical error at line 55, column 17
+derive python.Contains FAILED
+glean: lexical error at line 55, column 17
+derive python.ContainedByTopLevelDeclaration FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchClassByName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchModuleByName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchFieldByName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchVariableByName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchFunctionByName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchMethodByName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchClassByLowerCaseName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchModuleByLowerCaseName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchFieldByLowerCaseName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchVariableByLowerCaseName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchFunctionByLowerCaseName FAILED
+glean: lexical error at line 55, column 17
+derive python.SearchMethodByLowerCaseName FAILED
+glean: lexical error at line 55, column 17
+## finish
+glean: lexical error at line 55, column 17
+## query: python.CalleeToCaller _
+glean: lexical error at line 55, column 17
+## query: python.MethodOverrides _
+glean: lexical error at line 55, column 17
+## query: python.MethodOverriden _
+glean: lexical error at line 55, column 17
+## query: python.DirectXRefsByFile _
+glean: lexical error at line 55, column 17
+## query: python.xrefs.XRefDeclarationsByFile _
+glean: lexical error at line 55, column 17
+## query: codemarkup.python.PythonFileEntityXRefLocations _
+glean: lexical error at line 55, column 17
+## query: python.DeclarationUses { declaration = { func = { name = "animals.Animal.sound" } } }
+glean: lexical error at line 55, column 17
+## query: python.DeclarationUses { declaration = { func = { name = "animals.Dog.sound" } } }
+glean: lexical error at line 55, column 17
+## query: python.DeclarationUses { declaration = { func = { name = "animals.Cat.sound" } } }
+glean: lexical error at line 55, column 17
+## query: python.DeclarationUses { declaration = { func = { name = "zoo.Base.sound" } } }
+glean: lexical error at line 55, column 17
+## query: python.DeclarationUses { declaration = { func = { name = "zoo.Dog.sound" } } }
+glean: lexical error at line 55, column 17
+## query: python.XRefsViaNameByTarget { target = "zoo.Animal.sound" }
+glean: lexical error at line 55, column 17
+## query: python.DeclarationWithName { name = "zoo.Animal.sound" }
+glean: lexical error at line 55, column 17

@@ -1,0 +1,463 @@
+{
+ "server": "rust-analyzer",
+ "cmd": [
+  "<home>/.cargo/bin/rust-analyzer"
+ ],
+ "root": "<probe>/fixtures/rust",
+ "started": "2026-10-09 09:13:41 PM EDT",
+ "server_info": {
+  "name": "rust-analyzer",
+  "version": "1.98.1 (48a229c 2026-09-01)"
+ },
+ "call_hierarchy_provider": true,
+ "ready": true,
+ "ready_wait_s": 3.9,
+ "passes_run": 2,
+ "stable": true,
+ "results": [
+  {
+   "label": "Animal::sound (trait decl)",
+   "position": "src/main.rs:2:8",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "fn sound(&self)",
+     "kind": 12,
+     "at": "src/main.rs:2:8  fn sound(&self);",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "fn speak(a: &dyn Animal)",
+      "kind": 12,
+      "at": "src/main.rs:16:4  fn speak(a: &dyn Animal) {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:17:7  a.sound()"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "speak_g",
+      "detail": "fn speak_g<T>(a: &T)\nwhere\n    T: Animal,",
+      "kind": 12,
+      "at": "src/main.rs:20:4  fn speak_g<T: Animal>(a: &T) {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:21:7  a.sound()"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "direct",
+      "detail": "fn direct(d: &Dog)",
+      "kind": 12,
+      "at": "src/main.rs:24:4  fn direct(d: &Dog) {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:25:7  d.sound()"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:17:7  a.sound()",
+    "src/main.rs:21:7  a.sound()",
+    "src/main.rs:25:7  d.sound()",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ],
+   "references_with_decl": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:17:7  a.sound()",
+    "src/main.rs:21:7  a.sound()",
+    "src/main.rs:25:7  d.sound()",
+    "src/main.rs:2:8  fn sound(&self);",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ],
+   "implementation": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ]
+  },
+  {
+   "label": "Dog::sound (impl)",
+   "position": "src/main.rs:9:8",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "fn sound(&self)",
+     "kind": 12,
+     "at": "src/main.rs:9:8  fn sound(&self) {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "direct",
+      "detail": "fn direct(d: &Dog)",
+      "kind": 12,
+      "at": "src/main.rs:24:4  fn direct(d: &Dog) {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:25:7  d.sound()"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "src/main.rs:25:7  d.sound()"
+   ],
+   "references_with_decl": [
+    "src/main.rs:25:7  d.sound()",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ],
+   "implementation": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ]
+  },
+  {
+   "label": "Cat::sound (impl)",
+   "position": "src/main.rs:13:8",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "fn sound(&self)",
+     "kind": 12,
+     "at": "src/main.rs:13:8  fn sound(&self) {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [],
+   "outgoing": [],
+   "references": [],
+   "references_with_decl": [
+    "src/main.rs:13:8  fn sound(&self) {}"
+   ],
+   "implementation": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ]
+  },
+  {
+   "label": "speak (dyn)",
+   "position": "src/main.rs:16:4",
+   "prepare": [
+    {
+     "name": "speak",
+     "detail": "fn speak(a: &dyn Animal)",
+     "kind": 12,
+     "at": "src/main.rs:16:4  fn speak(a: &dyn Animal) {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "fn main()",
+      "kind": 12,
+      "at": "src/main.rs:28:4  fn main() {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:29:5  speak(&Dog);",
+      "src/main.rs:30:5  speak(&Cat);"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "fn sound(&self)",
+      "kind": 12,
+      "at": "src/main.rs:2:8  fn sound(&self);",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:17:7  a.sound()"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "speak_g (generic)",
+   "position": "src/main.rs:20:4",
+   "prepare": [
+    {
+     "name": "speak_g",
+     "detail": "fn speak_g<T>(a: &T)\nwhere\n    T: Animal,",
+     "kind": 12,
+     "at": "src/main.rs:20:4  fn speak_g<T: Animal>(a: &T) {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "fn main()",
+      "kind": 12,
+      "at": "src/main.rs:28:4  fn main() {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:31:5  speak_g(&Dog);",
+      "src/main.rs:32:5  speak_g(&Cat);"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "fn sound(&self)",
+      "kind": 12,
+      "at": "src/main.rs:2:8  fn sound(&self);",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:21:7  a.sound()"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "direct (concrete)",
+   "position": "src/main.rs:24:4",
+   "prepare": [
+    {
+     "name": "direct",
+     "detail": "fn direct(d: &Dog)",
+     "kind": 12,
+     "at": "src/main.rs:24:4  fn direct(d: &Dog) {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "fn main()",
+      "kind": 12,
+      "at": "src/main.rs:28:4  fn main() {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:33:5  direct(&Dog);"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "fn sound(&self)",
+      "kind": 12,
+      "at": "src/main.rs:9:8  fn sound(&self) {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "src/main.rs:25:7  d.sound()"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "call site a.sound() in speak",
+   "position": "src/main.rs:17:7",
+   "implementation": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ],
+   "definition": [
+    "src/main.rs:2:8  fn sound(&self);"
+   ]
+  },
+  {
+   "label": "call site a.sound() in speak_g",
+   "position": "src/main.rs:21:7",
+   "implementation": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ],
+   "definition": [
+    "src/main.rs:2:8  fn sound(&self);"
+   ]
+  },
+  {
+   "label": "call site d.sound() in direct",
+   "position": "src/main.rs:25:7",
+   "implementation": [
+    "src/main.rs:13:8  fn sound(&self) {}",
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ],
+   "definition": [
+    "src/main.rs:9:8  fn sound(&self) {}"
+   ]
+  }
+ ],
+ "finished": "2026-10-09 09:13:51 PM EDT"
+}

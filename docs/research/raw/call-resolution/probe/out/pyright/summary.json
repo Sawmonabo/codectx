@@ -1,0 +1,394 @@
+{
+ "server": "pyright",
+ "cmd": [
+  "node",
+  "<probe>/third_party/npm-lsp/node_modules/pyright/langserver.index.js",
+  "--stdio"
+ ],
+ "root": "<probe>/fixtures/py",
+ "started": "2026-10-09 09:45:16 PM EDT",
+ "server_info": null,
+ "call_hierarchy_provider": true,
+ "ready_wait_s": 0.0,
+ "passes_run": 2,
+ "stable": true,
+ "results": [
+  {
+   "label": "Animal.sound",
+   "position": "animals.py:2:9",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "class Animal (animals.py)",
+     "kind": 6,
+     "at": "animals.py:2:9  def sound(self):",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "(animals.py)",
+      "kind": 12,
+      "at": "animals.py:16:5  def speak(a: Animal):",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.py:17:7  a.sound()",
+      "animals.py:17:7  a.sound()"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.py:17:7  a.sound()"
+   ],
+   "references_with_decl": [
+    "animals.py:17:7  a.sound()",
+    "animals.py:2:9  def sound(self):"
+   ],
+   "implementation": {
+    "error": {
+     "code": -32601,
+     "message": "Unhandled method textDocument/implementation"
+    }
+   }
+  },
+  {
+   "label": "Dog.sound",
+   "position": "animals.py:7:9",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "class Dog (animals.py)",
+     "kind": 6,
+     "at": "animals.py:7:9  def sound(self):",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "direct",
+      "detail": "(animals.py)",
+      "kind": 12,
+      "at": "animals.py:24:5  def direct(d: Dog):",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.py:25:7  d.sound()",
+      "animals.py:25:7  d.sound()"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.py:25:7  d.sound()"
+   ],
+   "references_with_decl": [
+    "animals.py:25:7  d.sound()",
+    "animals.py:7:9  def sound(self):"
+   ],
+   "implementation": {
+    "error": {
+     "code": -32601,
+     "message": "Unhandled method textDocument/implementation"
+    }
+   }
+  },
+  {
+   "label": "Cat.sound",
+   "position": "animals.py:12:9",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "class Cat (animals.py)",
+     "kind": 6,
+     "at": "animals.py:12:9  def sound(self):",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [],
+   "outgoing": [],
+   "references": [],
+   "references_with_decl": [
+    "animals.py:12:9  def sound(self):"
+   ],
+   "implementation": {
+    "error": {
+     "code": -32601,
+     "message": "Unhandled method textDocument/implementation"
+    }
+   }
+  },
+  {
+   "label": "speak (a: Animal)",
+   "position": "animals.py:16:5",
+   "prepare": [
+    {
+     "name": "speak",
+     "detail": "(animals.py)",
+     "kind": 12,
+     "at": "animals.py:16:5  def speak(a: Animal):",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "(animals.py)",
+      "kind": 12,
+      "at": "animals.py:28:5  def main():",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.py:29:5  speak(Dog())",
+      "animals.py:30:5  speak(Cat())"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "class Animal (animals.py) \u00b7 Workspace",
+      "kind": 6,
+      "at": "animals.py:2:9  def sound(self):",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.py:17:7  a.sound()"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "speak_u (untyped a)",
+   "position": "animals.py:20:5",
+   "prepare": [
+    {
+     "name": "speak_u",
+     "detail": "(animals.py)",
+     "kind": 12,
+     "at": "animals.py:20:5  def speak_u(a):",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "(animals.py)",
+      "kind": 12,
+      "at": "animals.py:28:5  def main():",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.py:31:5  speak_u(Dog())"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": []
+  },
+  {
+   "label": "direct (d: Dog)",
+   "position": "animals.py:24:5",
+   "prepare": [
+    {
+     "name": "direct",
+     "detail": "(animals.py)",
+     "kind": 12,
+     "at": "animals.py:24:5  def direct(d: Dog):",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "(animals.py)",
+      "kind": 12,
+      "at": "animals.py:28:5  def main():",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.py:32:5  direct(Dog())"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "class Dog (animals.py) \u00b7 Workspace",
+      "kind": 6,
+      "at": "animals.py:7:9  def sound(self):",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.py:25:7  d.sound()"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "call site a.sound() in speak",
+   "position": "animals.py:17:7",
+   "implementation": {
+    "error": {
+     "code": -32601,
+     "message": "Unhandled method textDocument/implementation"
+    }
+   },
+   "definition": [
+    "animals.py:2:9  def sound(self):"
+   ]
+  },
+  {
+   "label": "call site a.sound() in speak_u",
+   "position": "animals.py:21:7",
+   "implementation": {
+    "error": {
+     "code": -32601,
+     "message": "Unhandled method textDocument/implementation"
+    }
+   },
+   "definition": []
+  },
+  {
+   "label": "call site d.sound() in direct",
+   "position": "animals.py:25:7",
+   "implementation": {
+    "error": {
+     "code": -32601,
+     "message": "Unhandled method textDocument/implementation"
+    }
+   },
+   "definition": [
+    "animals.py:7:9  def sound(self):"
+   ]
+  }
+ ],
+ "finished": "2026-10-09 09:45:24 PM EDT"
+}

@@ -1,0 +1,8 @@
+"file","caller","line","site","callee","imprecision","quality"
+"deep.ts","sound",11,"super.sound()","(no callee)",-1,"incomplete"
+"deep.ts","speak",16,"a.sound()","sound@2",0,"incomplete"
+"deep.ts","speak",16,"a.sound()","sound@10",0,"incomplete"
+"deep.ts","walk",20,"d.sound()","sound@6",0,"incomplete"
+"deep.ts","walk",20,"d.sound()","sound@10",0,"incomplete"
+"deep.ts","constructor",5,"super(...args)","constructor@1",0,"-"
+"deep.ts","constructor",9,"super(...args)","constructor@5",0,"-"

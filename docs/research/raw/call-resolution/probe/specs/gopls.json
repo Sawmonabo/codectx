@@ -1,0 +1,17 @@
+{
+ "name": "gopls",
+ "cmd": ["<home>/go/bin/gopls", "serve"],
+ "root": "<probe>/fixtures/go",
+ "env": {"GOTOOLCHAIN": "local", "GOFLAGS": "-mod=mod", "GOMAXPROCS": "2"},
+ "open": [{"path": "main.go", "languageId": "go"}],
+ "ready": {"sleep": 4},
+ "queries": [
+  {"label": "Animal.Sound (interface method)", "file": "main.go", "find": "Sound()", "nth": 1, "offset": 0},
+  {"label": "Dog.Sound", "file": "main.go", "find": "(Dog) Sound", "offset": 6},
+  {"label": "Cat.Sound", "file": "main.go", "find": "(Cat) Sound", "offset": 6},
+  {"label": "speak", "file": "main.go", "find": "func speak", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "direct", "file": "main.go", "find": "func direct", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "call site a.Sound() in speak", "file": "main.go", "find": "a.Sound()", "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "call site d.Sound() in direct", "file": "main.go", "find": "d.Sound()", "offset": 2, "ops": ["definition", "implementation"]}
+ ]
+}

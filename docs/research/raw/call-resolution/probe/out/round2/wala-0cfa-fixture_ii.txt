@@ -1,0 +1,11 @@
+algo=0cfa entrypoints=all dir=<probe>/fixtures/r2-java/ii-classes
+node zoo.Main.speak(Lzoo/Animal;)V ctx=Everywhere
+  site pc=1 invocationCode=VIRTUAL declaredTarget=zoo.Animal.sound()V getNumberOfTargets=1
+    target zoo.Animal.sound()V
+callers of zoo.Animal.sound()V (nodes=1):
+  caller com.ibm.wala.FakeRootClass.fakeRootMethod()V site pc=3 invocationCode=VIRTUAL declaredTarget=zoo.Animal.sound()V
+  caller zoo.Main.speak(Lzoo/Animal;)V site pc=1 invocationCode=VIRTUAL declaredTarget=zoo.Animal.sound()V
+callers of zoo.Dog.sound()V (nodes=1):
+  caller com.ibm.wala.FakeRootClass.fakeRootMethod()V site pc=6 invocationCode=VIRTUAL declaredTarget=zoo.Dog.sound()V
+callers of zoo.Cat.sound()V (nodes=1):
+  caller com.ibm.wala.FakeRootClass.fakeRootMethod()V site pc=26 invocationCode=VIRTUAL declaredTarget=zoo.Cat.sound()V

@@ -1,0 +1,5 @@
+java\/(?!lang\/Object$)(?!lang\/String$).*
+javax\/.*
+jdk\/.*
+sun\/.*
+com\/sun\/.*

@@ -1,0 +1,28 @@
+nodes=13 relationships=21
+NODE class_node cgr-cpp-virt.virt.Animal
+NODE class_node cgr-cpp-virt.virt.Cat
+NODE class_node cgr-cpp-virt.virt.Dog
+NODE file       virt.cpp
+NODE function   cgr-cpp-virt.virt.direct
+NODE function   cgr-cpp-virt.virt.main
+NODE function   cgr-cpp-virt.virt.speak
+NODE method     cgr-cpp-virt.virt.Animal.sound
+NODE method     cgr-cpp-virt.virt.Animal.~Animal
+NODE method     cgr-cpp-virt.virt.Cat.sound
+NODE method     cgr-cpp-virt.virt.Dog.sound
+NODE module     cgr-cpp-virt.virt
+NODE project    cgr-cpp-virt
+relationship counts: {"CALLS": 5, "CONTAINS_FILE": 1, "CONTAINS_MODULE": 1, "DEFINES": 6, "DEFINES_METHOD": 4, "INHERITS": 2, "OVERRIDES": 2}
+DEFINES_METHOD Class:cgr-cpp-virt.virt.Animal -> Method:cgr-cpp-virt.virt.Animal.sound  {}
+DEFINES_METHOD Class:cgr-cpp-virt.virt.Animal -> Method:cgr-cpp-virt.virt.Animal.~Animal  {}
+DEFINES_METHOD Class:cgr-cpp-virt.virt.Cat -> Method:cgr-cpp-virt.virt.Cat.sound  {}
+INHERITS      Class:cgr-cpp-virt.virt.Cat -> Class:cgr-cpp-virt.virt.Animal  {"base_index": 0.0}
+OVERRIDES     Method:cgr-cpp-virt.virt.Cat.sound -> Method:cgr-cpp-virt.virt.Animal.sound  {}
+DEFINES_METHOD Class:cgr-cpp-virt.virt.Dog -> Method:cgr-cpp-virt.virt.Dog.sound  {}
+INHERITS      Class:cgr-cpp-virt.virt.Dog -> Class:cgr-cpp-virt.virt.Animal  {"base_index": 0.0}
+OVERRIDES     Method:cgr-cpp-virt.virt.Dog.sound -> Method:cgr-cpp-virt.virt.Animal.sound  {}
+CALLS         Function:cgr-cpp-virt.virt.direct -> Method:cgr-cpp-virt.virt.Dog.sound  {"arg_count": 0.0, "col": 22.0, "end_col": 31.0, "end_line": 5.0, "kwarg_names": [], "line": 5.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp-virt.virt.main -> Function:cgr-cpp-virt.virt.direct  {"arg_count": 1.0, "col": 47.0, "end_col": 56.0, "end_line": 6.0, "kwarg_names": [], "line": 6.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp-virt.virt.main -> Function:cgr-cpp-virt.virt.speak  {"arg_count": 1.0, "col": 27.0, "end_col": 35.0, "end_line": 6.0, "kwarg_names": [], "line": 6.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp-virt.virt.main -> Function:cgr-cpp-virt.virt.speak  {"arg_count": 1.0, "col": 37.0, "end_col": 45.0, "end_line": 6.0, "kwarg_names": [], "line": 6.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp-virt.virt.speak -> Method:cgr-cpp-virt.virt.Animal.sound  {"arg_count": 0.0, "col": 24.0, "end_col": 33.0, "end_line": 4.0, "kwarg_names": [], "line": 4.0, "resolution": "exact"}

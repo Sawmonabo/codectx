@@ -1,0 +1,126 @@
+{
+ "name": "jdtls",
+ "cmd": [
+  "nice",
+  "-n",
+  "10",
+  "<tools>/jdk/21.0.12.1+1/jdk-21.0.12.1+1/bin/java",
+  "-Declipse.application=org.eclipse.jdt.ls.core.id1",
+  "-Dosgi.bundles.defaultStartLevel=4",
+  "-Declipse.product=org.eclipse.jdt.ls.core.product",
+  "-Dosgi.checkConfiguration=true",
+  "-Dlog.level=ALL",
+  "-Xmx768m",
+  "-Xms128m",
+  "-XX:+UseSerialGC",
+  "-XX:ActiveProcessorCount=2",
+  "--add-modules=ALL-SYSTEM",
+  "--add-opens",
+  "java.base/java.util=ALL-UNNAMED",
+  "--add-opens",
+  "java.base/java.lang=ALL-UNNAMED",
+  "-jar",
+  "<tools>/jdtls/1.61.0/plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+  "-configuration",
+  "<probe>/third_party/jdtls-run/config_linux",
+  "-data",
+  "<probe>/third_party/jdtls-run/workspace-deep"
+ ],
+ "root": "<probe>/fixtures/deep-java",
+ "env": {
+  "JAVA_HOME": "<tools>/jdk/21.0.12.1+1/jdk-21.0.12.1+1"
+ },
+ "init_timeout": 300,
+ "init_options": {
+  "settings": {
+   "java": {
+    "import": {
+     "gradle": {
+      "enabled": false
+     },
+     "maven": {
+      "enabled": false
+     }
+    },
+    "autobuild": {
+     "enabled": true
+    }
+   }
+  },
+  "extendedClientCapabilities": {
+   "progressReportProvider": false,
+   "classFileContentsSupport": false
+  }
+ },
+ "settings": {
+  "java": {
+   "import": {
+    "gradle": {
+     "enabled": false
+    },
+    "maven": {
+     "enabled": false
+    }
+   },
+   "autobuild": {
+    "enabled": true
+   }
+  }
+ },
+ "open": [
+  {
+   "path": "Main.java",
+   "languageId": "java"
+  }
+ ],
+ "ready": {
+  "kind": "jdtls",
+  "timeout": 300,
+  "sleep": 8
+ },
+ "max_passes": 6,
+ "pass_sleep": 6,
+ "queries": [
+  {
+   "label": "Animal.sound",
+   "file": "Main.java",
+   "find": "void sound()",
+   "nth": 1,
+   "offset": 5
+  },
+  {
+   "label": "Dog.sound",
+   "file": "Main.java",
+   "find": "void sound()",
+   "nth": 2,
+   "offset": 5
+  },
+  {
+   "label": "Puppy.sound",
+   "file": "Main.java",
+   "find": "void sound()",
+   "nth": 3,
+   "offset": 5
+  },
+  {
+   "label": "speak",
+   "file": "Main.java",
+   "find": "void speak(",
+   "nth": 1,
+   "offset": 5,
+   "ops": [
+    "outgoing"
+   ]
+  },
+  {
+   "label": "walk",
+   "file": "Main.java",
+   "find": "void walk(",
+   "nth": 1,
+   "offset": 5,
+   "ops": [
+    "outgoing"
+   ]
+  }
+ ]
+}

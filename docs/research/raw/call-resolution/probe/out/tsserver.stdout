@@ -1,0 +1,704 @@
+{
+ "server": "typescript-language-server",
+ "cmd": [
+  "node",
+  "<probe>/third_party/npm-lsp/node_modules/typescript-language-server/lib/cli.mjs",
+  "--stdio"
+ ],
+ "root": "<probe>/fixtures/ts",
+ "started": "2026-10-09 09:17:40 PM EDT",
+ "server_info": null,
+ "call_hierarchy_provider": true,
+ "ready_wait_s": 0.0,
+ "passes_run": 2,
+ "stable": true,
+ "results": [
+  {
+   "label": "Animal.sound",
+   "position": "animals.ts:2:5",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "Animal",
+     "kind": 6,
+     "at": "animals.ts:2:5  sound(): void {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:13:10  function speak(a: Animal): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:14:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "direct",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:17:10  function direct(d: Dog): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:18:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.ts:10:5  sound(): void {}",
+    "animals.ts:14:7  a.sound();",
+    "animals.ts:18:7  d.sound();",
+    "animals.ts:6:5  sound(): void {}"
+   ],
+   "references_with_decl": [
+    "animals.ts:10:5  sound(): void {}",
+    "animals.ts:14:7  a.sound();",
+    "animals.ts:18:7  d.sound();",
+    "animals.ts:2:5  sound(): void {}",
+    "animals.ts:6:5  sound(): void {}"
+   ],
+   "implementation": [
+    "animals.ts:10:5  sound(): void {}",
+    "animals.ts:2:5  sound(): void {}",
+    "animals.ts:6:5  sound(): void {}"
+   ]
+  },
+  {
+   "label": "Dog.sound",
+   "position": "animals.ts:6:5",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "Dog",
+     "kind": 6,
+     "at": "animals.ts:6:5  sound(): void {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:13:10  function speak(a: Animal): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:14:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "direct",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:17:10  function direct(d: Dog): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:18:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.ts:10:5  sound(): void {}",
+    "animals.ts:14:7  a.sound();",
+    "animals.ts:18:7  d.sound();",
+    "animals.ts:2:5  sound(): void {}"
+   ],
+   "references_with_decl": [
+    "animals.ts:10:5  sound(): void {}",
+    "animals.ts:14:7  a.sound();",
+    "animals.ts:18:7  d.sound();",
+    "animals.ts:2:5  sound(): void {}",
+    "animals.ts:6:5  sound(): void {}"
+   ],
+   "implementation": [
+    "animals.ts:6:5  sound(): void {}"
+   ]
+  },
+  {
+   "label": "Cat.sound",
+   "position": "animals.ts:10:5",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "Cat",
+     "kind": 6,
+     "at": "animals.ts:10:5  sound(): void {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:13:10  function speak(a: Animal): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:14:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "direct",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:17:10  function direct(d: Dog): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:18:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.ts:14:7  a.sound();",
+    "animals.ts:18:7  d.sound();",
+    "animals.ts:2:5  sound(): void {}",
+    "animals.ts:6:5  sound(): void {}"
+   ],
+   "references_with_decl": [
+    "animals.ts:10:5  sound(): void {}",
+    "animals.ts:14:7  a.sound();",
+    "animals.ts:18:7  d.sound();",
+    "animals.ts:2:5  sound(): void {}",
+    "animals.ts:6:5  sound(): void {}"
+   ],
+   "implementation": [
+    "animals.ts:10:5  sound(): void {}"
+   ]
+  },
+  {
+   "label": "Speaker.talk (interface)",
+   "position": "animals.ts:22:5",
+   "prepare": [
+    {
+     "name": "talk",
+     "detail": "",
+     "kind": 6,
+     "at": "animals.ts:22:5  talk(): void;",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "chat",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:33:10  function chat(s: Speaker): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:34:7  s.talk();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.ts:26:5  talk(): void {}",
+    "animals.ts:30:5  talk(): void {}",
+    "animals.ts:34:7  s.talk();"
+   ],
+   "references_with_decl": [
+    "animals.ts:22:5  talk(): void;",
+    "animals.ts:26:5  talk(): void {}",
+    "animals.ts:30:5  talk(): void {}",
+    "animals.ts:34:7  s.talk();"
+   ],
+   "implementation": [
+    "animals.ts:26:5  talk(): void {}",
+    "animals.ts:30:5  talk(): void {}"
+   ]
+  },
+  {
+   "label": "Parrot.talk",
+   "position": "animals.ts:26:5",
+   "prepare": [
+    {
+     "name": "talk",
+     "detail": "Parrot",
+     "kind": 6,
+     "at": "animals.ts:26:5  talk(): void {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "chat",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:33:10  function chat(s: Speaker): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:34:7  s.talk();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.ts:22:5  talk(): void;",
+    "animals.ts:30:5  talk(): void {}",
+    "animals.ts:34:7  s.talk();"
+   ],
+   "references_with_decl": [
+    "animals.ts:22:5  talk(): void;",
+    "animals.ts:26:5  talk(): void {}",
+    "animals.ts:30:5  talk(): void {}",
+    "animals.ts:34:7  s.talk();"
+   ],
+   "implementation": [
+    "animals.ts:26:5  talk(): void {}"
+   ]
+  },
+  {
+   "label": "Robot.talk",
+   "position": "animals.ts:30:5",
+   "prepare": [
+    {
+     "name": "talk",
+     "detail": "Robot",
+     "kind": 6,
+     "at": "animals.ts:30:5  talk(): void {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "chat",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:33:10  function chat(s: Speaker): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:34:7  s.talk();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "animals.ts:22:5  talk(): void;",
+    "animals.ts:26:5  talk(): void {}",
+    "animals.ts:34:7  s.talk();"
+   ],
+   "references_with_decl": [
+    "animals.ts:22:5  talk(): void;",
+    "animals.ts:26:5  talk(): void {}",
+    "animals.ts:30:5  talk(): void {}",
+    "animals.ts:34:7  s.talk();"
+   ],
+   "implementation": [
+    "animals.ts:30:5  talk(): void {}"
+   ]
+  },
+  {
+   "label": "speak",
+   "position": "animals.ts:13:10",
+   "prepare": [
+    {
+     "name": "speak",
+     "detail": "",
+     "kind": 12,
+     "at": "animals.ts:13:10  function speak(a: Animal): void {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:37:10  function main(): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:38:5  speak(new Dog());",
+      "animals.ts:39:5  speak(new Cat());"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Animal",
+      "kind": 6,
+      "at": "animals.ts:2:5  sound(): void {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:14:5  a.sound();",
+      "animals.ts:14:5  a.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "direct",
+   "position": "animals.ts:17:10",
+   "prepare": [
+    {
+     "name": "direct",
+     "detail": "",
+     "kind": 12,
+     "at": "animals.ts:17:10  function direct(d: Dog): void {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:37:10  function main(): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:40:5  direct(new Dog());"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Dog",
+      "kind": 6,
+      "at": "animals.ts:6:5  sound(): void {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:18:5  d.sound();",
+      "animals.ts:18:5  d.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "chat",
+   "position": "animals.ts:33:10",
+   "prepare": [
+    {
+     "name": "chat",
+     "detail": "",
+     "kind": 12,
+     "at": "animals.ts:33:10  function chat(s: Speaker): void {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "",
+      "kind": 12,
+      "at": "animals.ts:37:10  function main(): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:41:5  chat(new Parrot());",
+      "animals.ts:42:5  chat(new Robot());"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "talk",
+      "detail": "",
+      "kind": 6,
+      "at": "animals.ts:22:5  talk(): void;",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "animals.ts:34:5  s.talk();",
+      "animals.ts:34:5  s.talk();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "call site a.sound() in speak",
+   "position": "animals.ts:14:7",
+   "implementation": [
+    "animals.ts:10:5  sound(): void {}",
+    "animals.ts:2:5  sound(): void {}",
+    "animals.ts:6:5  sound(): void {}"
+   ],
+   "definition": [
+    "animals.ts:2:5  sound(): void {}"
+   ]
+  },
+  {
+   "label": "call site d.sound() in direct",
+   "position": "animals.ts:18:7",
+   "implementation": [
+    "animals.ts:6:5  sound(): void {}"
+   ],
+   "definition": [
+    "animals.ts:6:5  sound(): void {}"
+   ]
+  },
+  {
+   "label": "call site s.talk() in chat",
+   "position": "animals.ts:34:7",
+   "implementation": [
+    "animals.ts:26:5  talk(): void {}",
+    "animals.ts:30:5  talk(): void {}"
+   ],
+   "definition": [
+    "animals.ts:22:5  talk(): void;"
+   ]
+  }
+ ],
+ "finished": "2026-10-09 09:17:51 PM EDT"
+}

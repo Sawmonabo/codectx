@@ -1,0 +1,12 @@
+(21:34:29) No configuration file found.
+(21:34:29) No pyproject.toml file found.
+(21:34:29) Total Project Files 2
+(21:34:29) Indexing <probe>/fixtures/glean-py with version test
+(21:34:29) Evaluating python environment dependencies
+(21:34:29)   Gathering environment information
+(21:34:29) Parse and search for dependencies
+(21:34:29) Index workspace and track project files
+(21:34:29) Analyze project and dependencies
+(21:34:29) Parse and emit SCIP
+(21:34:29) Writing external symbols to SCIP index
+(21:34:29) Sucessfully wrote SCIP index to <probe>/out/glean/scip/index.scip

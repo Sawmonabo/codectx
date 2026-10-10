@@ -1,0 +1,468 @@
+{
+ "server": "typescript-language-server",
+ "cmd": [
+  "node",
+  "<probe>/third_party/npm-lsp/node_modules/typescript-language-server/lib/cli.mjs",
+  "--stdio"
+ ],
+ "root": "<probe>/fixtures/deep-ts",
+ "started": "2026-10-09 09:25:18 PM EDT",
+ "server_info": null,
+ "call_hierarchy_provider": true,
+ "ready_wait_s": 0.0,
+ "passes_run": 2,
+ "stable": true,
+ "results": [
+  {
+   "label": "Animal.sound",
+   "position": "deep.ts:2:5",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "Animal",
+     "kind": 6,
+     "at": "deep.ts:2:5  sound(): void {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "",
+      "kind": 12,
+      "at": "deep.ts:15:10  function speak(a: Animal): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:16:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Puppy",
+      "kind": 6,
+      "at": "deep.ts:10:5  sound(): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:11:15  super.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "walk",
+      "detail": "",
+      "kind": 12,
+      "at": "deep.ts:19:10  function walk(d: Dog): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:20:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "deep.ts:10:5  sound(): void {",
+    "deep.ts:11:15  super.sound();",
+    "deep.ts:16:7  a.sound();",
+    "deep.ts:20:7  d.sound();",
+    "deep.ts:6:5  sound(): void {}"
+   ],
+   "references_with_decl": [
+    "deep.ts:10:5  sound(): void {",
+    "deep.ts:11:15  super.sound();",
+    "deep.ts:16:7  a.sound();",
+    "deep.ts:20:7  d.sound();",
+    "deep.ts:2:5  sound(): void {}",
+    "deep.ts:6:5  sound(): void {}"
+   ],
+   "implementation": [
+    "deep.ts:10:5  sound(): void {",
+    "deep.ts:2:5  sound(): void {}",
+    "deep.ts:6:5  sound(): void {}"
+   ]
+  },
+  {
+   "label": "Dog.sound",
+   "position": "deep.ts:6:5",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "Dog",
+     "kind": 6,
+     "at": "deep.ts:6:5  sound(): void {}",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "",
+      "kind": 12,
+      "at": "deep.ts:15:10  function speak(a: Animal): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:16:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Puppy",
+      "kind": 6,
+      "at": "deep.ts:10:5  sound(): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:11:15  super.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "walk",
+      "detail": "",
+      "kind": 12,
+      "at": "deep.ts:19:10  function walk(d: Dog): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:20:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "deep.ts:10:5  sound(): void {",
+    "deep.ts:11:15  super.sound();",
+    "deep.ts:16:7  a.sound();",
+    "deep.ts:20:7  d.sound();",
+    "deep.ts:2:5  sound(): void {}"
+   ],
+   "references_with_decl": [
+    "deep.ts:10:5  sound(): void {",
+    "deep.ts:11:15  super.sound();",
+    "deep.ts:16:7  a.sound();",
+    "deep.ts:20:7  d.sound();",
+    "deep.ts:2:5  sound(): void {}",
+    "deep.ts:6:5  sound(): void {}"
+   ],
+   "implementation": [
+    "deep.ts:10:5  sound(): void {",
+    "deep.ts:6:5  sound(): void {}"
+   ]
+  },
+  {
+   "label": "Puppy.sound",
+   "position": "deep.ts:10:5",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": "Puppy",
+     "kind": 6,
+     "at": "deep.ts:10:5  sound(): void {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "",
+      "kind": 12,
+      "at": "deep.ts:15:10  function speak(a: Animal): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:16:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Puppy",
+      "kind": 6,
+      "at": "deep.ts:10:5  sound(): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:11:15  super.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "walk",
+      "detail": "",
+      "kind": 12,
+      "at": "deep.ts:19:10  function walk(d: Dog): void {",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:20:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Dog",
+      "kind": 6,
+      "at": "deep.ts:6:5  sound(): void {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:11:9  super.sound();",
+      "deep.ts:11:9  super.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ],
+   "references": [
+    "deep.ts:11:15  super.sound();",
+    "deep.ts:16:7  a.sound();",
+    "deep.ts:20:7  d.sound();",
+    "deep.ts:2:5  sound(): void {}",
+    "deep.ts:6:5  sound(): void {}"
+   ],
+   "references_with_decl": [
+    "deep.ts:10:5  sound(): void {",
+    "deep.ts:11:15  super.sound();",
+    "deep.ts:16:7  a.sound();",
+    "deep.ts:20:7  d.sound();",
+    "deep.ts:2:5  sound(): void {}",
+    "deep.ts:6:5  sound(): void {}"
+   ],
+   "implementation": [
+    "deep.ts:10:5  sound(): void {"
+   ]
+  },
+  {
+   "label": "speak",
+   "position": "deep.ts:15:10",
+   "prepare": [
+    {
+     "name": "speak",
+     "detail": "",
+     "kind": 12,
+     "at": "deep.ts:15:10  function speak(a: Animal): void {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Animal",
+      "kind": 6,
+      "at": "deep.ts:2:5  sound(): void {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:16:5  a.sound();",
+      "deep.ts:16:5  a.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "walk",
+   "position": "deep.ts:19:10",
+   "prepare": [
+    {
+     "name": "walk",
+     "detail": "",
+     "kind": 12,
+     "at": "deep.ts:19:10  function walk(d: Dog): void {",
+     "keys": [
+      "detail",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Dog",
+      "kind": 6,
+      "at": "deep.ts:6:5  sound(): void {}",
+      "keys": [
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "deep.ts:20:5  d.sound();",
+      "deep.ts:20:5  d.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  }
+ ],
+ "finished": "2026-10-09 09:25:29 PM EDT"
+}

@@ -1,0 +1,241 @@
+Initializing database at <probe>/out/codeql/db-ts.
+Running build command: []
+Running command in <probe>/fixtures/ts: [<probe>/third_party/codeql/codeql/javascript/tools/autobuild.sh]
+[2026-10-09 21:30:44] [build-stdout] Parallel extraction with 2 threads.
+[2026-10-09 21:30:44] [build-stdout] Found Node.js at: node
+[2026-10-09 21:30:44] [build-stdout] Found Node.js version: v26.10.0
+[2026-10-09 21:30:44] [build-stdout] Memory for TypeScript process: 1000 MB, and 400 MB reserve
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/fixtures/ts/animals.ts
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/fixtures/ts/animals.ts (75 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/fixtures/ts/tsconfig.json
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/fixtures/ts/tsconfig.json (2 ms)
+[2026-10-09 21:30:45] [build-stderr] No externs trap cache found
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/repl.js
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/net.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/repl.js (46 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/timers.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/timers.js (15 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/assert_legacy.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/assert_legacy.js (3 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/assert.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/net.js (77 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/process.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/process.js (2 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/constants.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/assert.js (14 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/punycode.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/punycode.js (9 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/child_process.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/child_process.js (91 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/events.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/events.js (6 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/url.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/constants.js (112 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/string_decoder.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/url.js (6 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/os.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/string_decoder.js (4 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/readline.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/readline.js (11 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/dns.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/os.js (19 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/domain.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/domain.js (9 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/https.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/dns.js (18 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/sys.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/sys.js (2 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/tty.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/https.js (14 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/v8.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/tty.js (9 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/cluster.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/v8.js (5 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/zlib.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/zlib.js (45 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/path.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/cluster.js (60 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/module.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/module.js (5 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/crypto.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/path.js (27 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/vm.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/vm.js (14 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/querystring.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/querystring.js (5 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/util.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/util.js (17 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/dgram.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/crypto.js (59 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/tls.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/dgram.js (12 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/console.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/console.js (1 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/fs.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/tls.js (36 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/buffer.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/buffer.js (8 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/stream.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/stream.js (50 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/http.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/fs.js (111 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/globals.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/http.js (38 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es6.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es6.js (82 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/proxy.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/nodejs/globals.js (104 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es6_collections.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/proxy.js (2 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es5.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es6_collections.js (7 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/intl.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es5.js (12 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es2017.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es2017.js (2 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es3.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/intl.js (7 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es2016.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es2016.js (1 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/should.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/should.js (18 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/vows.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/vows.js (17 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/bdd.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/bdd.js (5 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/jquery-3.2.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/es/es3.js (90 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_geolocation.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_geolocation.js (6 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/window.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/window.js (4 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_event.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_event.js (20 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_dom.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_dom.js (27 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/html5.js
+[2026-10-09 21:30:45] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/lib/jquery-3.2.js (116 ms)
+[2026-10-09 21:30:45] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_rtc.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_rtc.js (75 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_permissions.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_permissions.js (4 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/streamsapi.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/streamsapi.js (16 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_encoding.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_encoding.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_indexeddb.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_indexeddb.js (27 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_event.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_event.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_screen_orientation.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_screen_orientation.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_dom.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/html5.js (145 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom1.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_dom.js (27 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_event3.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_event3.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webgl.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom1.js (31 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_requestidlecallback.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_requestidlecallback.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_serviceworker.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_serviceworker.js (21 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_xml.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_xml.js (12 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/fileapi.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/fileapi.js (30 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_anim_timing.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_anim_timing.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_gamepad.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_gamepad.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_event.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_event.js (8 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_xml.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_xml.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/page_visibility.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/page_visibility.js (1 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/mediasource.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/mediasource.js (6 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_webcrypto.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_webcrypto.js (12 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_notifications.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webgl.js (109 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/url.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_notifications.js (7 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_elementtraversal.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/url.js (4 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_css.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_elementtraversal.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_event.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_event.js (4 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_css.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_css.js (7 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_css.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_css.js (8 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_dom.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_css.js (48 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_pointer_events.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_pointer_events.js (5 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/flash.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/flash.js (6 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/intl.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/intl.js (8 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom3.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_dom.js (52 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_device_sensor_event.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_device_sensor_event.js (4 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_selectors.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_selectors.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_touch_event.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_touch_event.js (8 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_navigation_timing.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom3.js (23 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_css.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_navigation_timing.js (9 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom4.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom4.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webstorage.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webstorage.js (4 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_vml.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/ie_vml.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_range.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_range.js (10 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_css3d.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_css3d.js (6 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/fetchapi.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/fetchapi.js (18 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom2.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_css.js (68 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/iphone.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/iphone.js (6 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_batterystatus.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_batterystatus.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_usercontent.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/webkit_usercontent.js (1 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_ext.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/gecko_ext.js (1 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/chrome.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/chrome.js (24 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_midi.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_midi.js (11 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/whatwg_encoding.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/whatwg_encoding.js (2 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/jsshell.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/web/w3c_dom2.js (76 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/rhino.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/rhino.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/spidermonkey.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/spidermonkey.js (1 ms)
+[2026-10-09 21:30:46] [build-stdout] Extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/v8.js
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/v8.js (3 ms)
+[2026-10-09 21:30:46] [build-stdout] Done extracting <probe>/third_party/codeql/codeql/javascript/tools/data/externs/vm/jsshell.js (24 ms)
+Finalizing database at <probe>/out/codeql/db-ts.
+Running TRAP import for CodeQL database at <probe>/out/codeql/db-ts...
+WARNING: Rounding --ram up to the minimum of 2048
+Importing TRAP files
+Merging relations
+Finished writing database (relations: 3.76 MiB; string pool: 4.78 MiB).
+TRAP import complete (2s).
+Finished zipping source archive (257.75 KiB).
+Successfully created database at <probe>/out/codeql/db-ts.

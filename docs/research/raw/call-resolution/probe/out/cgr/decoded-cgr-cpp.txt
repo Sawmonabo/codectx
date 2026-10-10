@@ -1,0 +1,20 @@
+nodes=10 relationships=15
+NODE class_node cgr-cpp.templ.Cat
+NODE class_node cgr-cpp.templ.Dog
+NODE file       templ.cpp
+NODE function   cgr-cpp.templ.direct
+NODE function   cgr-cpp.templ.main
+NODE function   cgr-cpp.templ.speak_t
+NODE method     cgr-cpp.templ.Cat.sound
+NODE method     cgr-cpp.templ.Dog.sound
+NODE module     cgr-cpp.templ
+NODE project    cgr-cpp
+relationship counts: {"CALLS": 6, "CONTAINS_FILE": 1, "CONTAINS_MODULE": 1, "DEFINES": 5, "DEFINES_METHOD": 2}
+DEFINES_METHOD Class:cgr-cpp.templ.Cat -> Method:cgr-cpp.templ.Cat.sound  {}
+DEFINES_METHOD Class:cgr-cpp.templ.Dog -> Method:cgr-cpp.templ.Dog.sound  {}
+CALLS         Function:cgr-cpp.templ.direct -> Method:cgr-cpp.templ.Dog.sound  {"arg_count": 0.0, "col": 23.0, "end_col": 32.0, "end_line": 4.0, "kwarg_names": [], "line": 4.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp.templ.main -> Function:cgr-cpp.templ.direct  {"arg_count": 0.0, "col": 51.0, "end_col": 59.0, "end_line": 5.0, "kwarg_names": [], "line": 5.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp.templ.main -> Function:cgr-cpp.templ.speak_t  {"arg_count": 1.0, "col": 27.0, "end_col": 37.0, "end_line": 5.0, "kwarg_names": [], "line": 5.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp.templ.main -> Function:cgr-cpp.templ.speak_t  {"arg_count": 1.0, "col": 39.0, "end_col": 49.0, "end_line": 5.0, "kwarg_names": [], "line": 5.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp.templ.speak_t -> Method:cgr-cpp.templ.Cat.sound  {"arg_count": 0.0, "col": 43.0, "end_col": 52.0, "end_line": 3.0, "kwarg_names": [], "line": 3.0, "resolution": "exact"}
+CALLS         Function:cgr-cpp.templ.speak_t -> Method:cgr-cpp.templ.Dog.sound  {"arg_count": 0.0, "col": 43.0, "end_col": 52.0, "end_line": 3.0, "kwarg_names": [], "line": 3.0, "resolution": "exact"}

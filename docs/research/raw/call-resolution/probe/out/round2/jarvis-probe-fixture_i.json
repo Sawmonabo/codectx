@@ -1,0 +1,37 @@
+{
+ "moduleEntry": [
+  "fixture_i",
+  "fixture_i.Animal.sound",
+  "fixture_i.Dog.sound",
+  "fixture_i.Cat.sound",
+  "fixture_i.speak"
+ ],
+ "entered_counts": {
+  "fixture_i": 2,
+  "fixture_i.Animal": 2,
+  "fixture_i.Animal.sound": 1,
+  "fixture_i.Cat": 2,
+  "fixture_i.Cat.sound": 2,
+  "fixture_i.Dog": 2,
+  "fixture_i.Dog.sound": 2,
+  "fixture_i.speak": 4
+ },
+ "cg": {
+  "fixture_i": [
+   "fixture_i.Animal",
+   "fixture_i.Cat",
+   "fixture_i.Dog",
+   "fixture_i.Dog.sound",
+   "fixture_i.speak"
+  ],
+  "fixture_i.Animal": [],
+  "fixture_i.Dog": [],
+  "fixture_i.Cat": [],
+  "fixture_i.speak": [
+   "fixture_i.Cat.sound",
+   "fixture_i.Dog.sound"
+  ],
+  "fixture_i.Dog.sound": [],
+  "fixture_i.Cat.sound": []
+ }
+}

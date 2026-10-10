@@ -1,0 +1,52 @@
+Initializing database at <probe>/out/codeql/db-py.
+Running build command: []
+Running command in <probe>/fixtures/py: [<probe>/third_party/codeql/codeql/python/tools/autobuild.sh]
+[2026-10-09 21:30:37] [build-stderr] /bin/sh: 1: python2: not found
+[2026-10-09 21:30:37] [build-stdout] No directories containing root identifiers were found. Returning working directory as root.
+[2026-10-09 21:30:37] [build-stdout] Will try to guess Python version, as it was not specified in `lgtm.yml`
+[2026-10-09 21:30:37] [build-stdout] Trying to guess Python version based on Trove classifiers in setup.py
+[2026-10-09 21:30:37] [build-stdout] Did not find setup.py (expected it to be at <probe>/fixtures/py/setup.py)
+[2026-10-09 21:30:37] [build-stdout] Trying to guess Python version based on travis file
+[2026-10-09 21:30:37] [build-stdout] Did not find any travis files (expected them at either ['<probe>/fixtures/py/.travis.yml', '<probe>/fixtures/py/travis.yml'])
+[2026-10-09 21:30:37] [build-stdout] Trying to guess Python version based on installed versions
+[2026-10-09 21:30:37] [build-stdout] Wanted to run Python 2, but it is not available. Using Python 3 instead
+[2026-10-09 21:30:37] [build-stdout] This script is running Python 3, but Python 2 is also available (as 'python3')
+[2026-10-09 21:30:37] [build-stdout] Could not guess Python version, will use default: Python 3
+[2026-10-09 21:30:37] [build-stdout] Calling python3 -S <probe>/third_party/codeql/codeql/python/tools/python_tracer.py --verbosity 3 -z all -c <probe>/out/codeql/db-py/working/trap_cache -R <probe>/fixtures/py
+[2026-10-09 21:30:38] [build-stdout] INFO: The Python extractor has recently stopped extracting the standard library by default. If you encounter problems, please let us know by submitting an issue to https://github.com/github/codeql. It is possible to re-enable extraction of the standard library by setting the environment variable CODEQL_EXTRACTOR_PYTHON_EXTRACT_STDLIB.
+[2026-10-09 21:30:38] [build-stdout] [INFO] Extraction will use the Python 3 standard library.
+[2026-10-09 21:30:38] [build-stdout] [INFO] sys_path is: ['<probe>/third_party/codeql/codeql/python/tools', '/usr/lib/python314.zip', '/usr/lib/python3.14', '/usr/lib/python3.14/lib-dynload']
+[2026-10-09 21:30:38] [build-stdout] [WARN] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [INFO] Python version 3.14.4
+[2026-10-09 21:30:38] [build-stdout] [INFO] Python extractor version 7.1.11
+[2026-10-09 21:30:38] [build-stdout] [WARN] [2] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [INFO] [2] Extracted file <probe>/fixtures/py/animals.py in 15ms
+[2026-10-09 21:30:38] [build-stdout] [WARN] [9] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [1] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [6] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [3] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [10] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [5] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [4] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [8] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [15] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [16] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [12] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [13] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [7] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [11] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [WARN] [14] Failed to find dynload path
+[2026-10-09 21:30:38] [build-stdout] [INFO] Processed 1 modules in 0.41s
+Finalizing database at <probe>/out/codeql/db-py.
+Running pre-finalize script <probe>/third_party/codeql/codeql/python/tools/pre-finalize.sh in <probe>/fixtures/py.
+Running command in <probe>/fixtures/py: [<probe>/third_party/codeql/codeql/python/tools/pre-finalize.sh]
+[2026-10-09 21:30:39] [build-stderr] Scanning for files in <probe>/fixtures/py...
+Pre-finalize script <probe>/third_party/codeql/codeql/python/tools/pre-finalize.sh completed in 589 ms.
+Running TRAP import for CodeQL database at <probe>/out/codeql/db-py...
+WARNING: Rounding --ram up to the minimum of 2048
+Importing TRAP files
+Merging relations
+Finished writing database (relations: 43.88 KiB; string pool: 2.06 MiB).
+TRAP import complete (847ms).
+Finished zipping source archive (411.00 B).
+Successfully created database at <probe>/out/codeql/db-py.

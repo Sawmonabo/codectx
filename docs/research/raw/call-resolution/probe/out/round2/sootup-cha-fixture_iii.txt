@@ -1,0 +1,12 @@
+algo=cha entry=[<zoo.Main: void main(java.lang.String[])>] dir=<probe>/fixtures/r2-java/iii-classes
+containsMethod(<zoo.Animal: void sound()>) = false (not a node in the call graph)
+callsTo(<zoo.Dog: void sound()>):
+  Call:<zoo.Main: void main(java.lang.String[])> -> <zoo.Dog: void sound()> via virtualinvoke $stack3.<zoo.Dog: void sound()>(); declaredFromStmt=JVirtualInvokeExpr <zoo.Dog: void sound()>
+  Call:<zoo.Main: void speak(zoo.Animal)> -> <zoo.Dog: void sound()> via virtualinvoke l0.<zoo.Animal: void sound()>(); declaredFromStmt=JVirtualInvokeExpr <zoo.Animal: void sound()>
+callSourcesTo(<zoo.Dog: void sound()>) = [<zoo.Main: void speak(zoo.Animal)>, <zoo.Main: void main(java.lang.String[])>]
+callsTo(<zoo.Cat: void sound()>):
+  Call:<zoo.Main: void speak(zoo.Animal)> -> <zoo.Cat: void sound()> via virtualinvoke l0.<zoo.Animal: void sound()>(); declaredFromStmt=JVirtualInvokeExpr <zoo.Animal: void sound()>
+callSourcesTo(<zoo.Cat: void sound()>) = [<zoo.Main: void speak(zoo.Animal)>]
+callsFrom(<zoo.Main: void speak(zoo.Animal)>):
+  Call:<zoo.Main: void speak(zoo.Animal)> -> <zoo.Dog: void sound()> via virtualinvoke l0.<zoo.Animal: void sound()>(); declaredFromStmt=JVirtualInvokeExpr <zoo.Animal: void sound()>
+  Call:<zoo.Main: void speak(zoo.Animal)> -> <zoo.Cat: void sound()> via virtualinvoke l0.<zoo.Animal: void sound()>(); declaredFromStmt=JVirtualInvokeExpr <zoo.Animal: void sound()>

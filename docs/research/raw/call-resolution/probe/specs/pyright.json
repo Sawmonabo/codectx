@@ -1,0 +1,19 @@
+{
+ "name": "pyright",
+ "cmd": ["node", "<probe>/third_party/npm-lsp/node_modules/pyright/langserver.index.js", "--stdio"],
+ "root": "<probe>/fixtures/py",
+ "settings": {"python": {"analysis": {"diagnosticMode": "openFilesOnly"}}, "python.analysis": {"diagnosticMode": "openFilesOnly"}, "pyright": {}},
+ "open": [{"path": "animals.py", "languageId": "python"}],
+ "ready": {"sleep": 4},
+ "queries": [
+  {"label": "Animal.sound", "file": "animals.py", "find": "def sound", "nth": 1, "offset": 4},
+  {"label": "Dog.sound", "file": "animals.py", "find": "def sound", "nth": 2, "offset": 4},
+  {"label": "Cat.sound", "file": "animals.py", "find": "def sound", "nth": 3, "offset": 4},
+  {"label": "speak (a: Animal)", "file": "animals.py", "find": "def speak(", "offset": 4, "ops": ["incoming", "outgoing"]},
+  {"label": "speak_u (untyped a)", "file": "animals.py", "find": "def speak_u", "offset": 4, "ops": ["incoming", "outgoing"]},
+  {"label": "direct (d: Dog)", "file": "animals.py", "find": "def direct", "offset": 4, "ops": ["incoming", "outgoing"]},
+  {"label": "call site a.sound() in speak", "file": "animals.py", "find": "a.sound()", "nth": 1, "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "call site a.sound() in speak_u", "file": "animals.py", "find": "a.sound()", "nth": 2, "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "call site d.sound() in direct", "file": "animals.py", "find": "d.sound()", "offset": 2, "ops": ["definition", "implementation"]}
+ ]
+}

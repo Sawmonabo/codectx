@@ -1,0 +1,7 @@
+"file","caller","line","site","target","calltype"
+"deep.py","sound",13,"ControlFlowNode for Attribute()","Dog.sound","CallTypeNormalMethod"
+"deep.py","sound",13,"ControlFlowNode for super()","(no target)","-"
+"deep.py","speak",17,"ControlFlowNode for Attribute()","Animal.sound","CallTypeNormalMethod"
+"deep.py","speak",17,"ControlFlowNode for Attribute()","Puppy.sound","CallTypeNormalMethod"
+"deep.py","walk",21,"ControlFlowNode for Attribute()","Dog.sound","CallTypeNormalMethod"
+"deep.py","walk",21,"ControlFlowNode for Attribute()","Puppy.sound","CallTypeNormalMethod"

@@ -1,0 +1,99 @@
+## create
+Creating DB using handle glean@<unknown>
+## write
+Wrote /out/pyrefly-fixture-filtered/666356cce67c2ea4c5f57bc347428514e890894ffb83ce88c5787509d13f3e71.json
+Wrote /out/pyrefly-fixture-filtered/9594c6e96f1ace36d97ec8c687b9266c8b98902287f1bfa64bde7bced34a8d54.json
+## derive
+## finish
+
+## query: python.CalleeToCaller _
+{"id":1069,"key":{"callee":{"id":1068,"key":"animals.Animal.sound"},"caller":{"id":1043,"key":"use.speak"}}}
+{"id":1071,"key":{"callee":{"id":1070,"key":"animals.Dog.sound"},"caller":{"id":1049,"key":"use.direct"}}}
+
+## query: python.MethodOverrides _
+{"id":1334,"key":{"derived":{"id":1135,"key":{"name":{"id":1070,"key":"animals.Dog.sound"}}},"base":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}}}}
+{"id":1335,"key":{"derived":{"id":1141,"key":{"name":{"id":1140,"key":"animals.Cat.sound"}}},"base":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}}}}
+
+## query: python.MethodOverriden _
+{"id":1334,"key":{"base":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}},"derived":{"id":1135,"key":{"name":{"id":1070,"key":"animals.Dog.sound"}}}}}
+{"id":1335,"key":{"base":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}},"derived":{"id":1141,"key":{"name":{"id":1140,"key":"animals.Cat.sound"}}}}}
+
+## query: python.DirectXRefsByFile _
+{"id":1334,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"module":{"id":1114,"key":{"name":{"id":1079,"key":"animals"}}}},"source":{"start":5,"length":7}}}}
+{"id":1335,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"cls":{"id":1120,"key":{"name":{"id":1032,"key":"animals.Animal"}}}},"source":{"start":20,"length":6}}}}
+{"id":1336,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"cls":{"id":1122,"key":{"name":{"id":1036,"key":"animals.Dog"}}}},"source":{"start":28,"length":3}}}}
+{"id":1337,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"cls":{"id":1120,"key":{"name":{"id":1032,"key":"animals.Animal"}}}},"source":{"start":47,"length":6}}}}
+{"id":1338,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"imp":{"id":1034,"key":{"from_name":{"id":1032,"key":"animals.Animal"},"as_name":{"id":1033,"key":"use.Animal"}}}},"source":{"start":47,"length":6}}}}
+{"id":1339,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"cls":{"id":1122,"key":{"name":{"id":1036,"key":"animals.Dog"}}}},"source":{"start":86,"length":3}}}}
+{"id":1340,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"imp":{"id":1038,"key":{"from_name":{"id":1036,"key":"animals.Dog"},"as_name":{"id":1037,"key":"use.Dog"}}}},"source":{"start":86,"length":3}}}}
+{"id":1341,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"func":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}}},"source":{"start":62,"length":5}}}}
+{"id":1342,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"variable":{"id":1041,"key":{"name":{"id":1040,"key":"use.speak.<locals>.a"}}}},"source":{"start":60,"length":1}}}}
+{"id":1343,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"func":{"id":1135,"key":{"name":{"id":1070,"key":"animals.Dog.sound"}}}},"source":{"start":98,"length":5}}}}
+{"id":1344,"key":{"file":{"id":1027,"key":"use.py"},"xref":{"target":{"variable":{"id":1047,"key":{"name":{"id":1046,"key":"use.direct.<locals>.d"}}}},"source":{"start":96,"length":1}}}}
+{"id":1345,"key":{"file":{"id":1115,"key":"animals.py"},"xref":{"target":{"cls":{"id":1120,"key":{"name":{"id":1032,"key":"animals.Animal"}}}},"source":{"start":75,"length":6}}}}
+{"id":1346,"key":{"file":{"id":1115,"key":"animals.py"},"xref":{"target":{"cls":{"id":1120,"key":{"name":{"id":1032,"key":"animals.Animal"}}}},"source":{"start":146,"length":6}}}}
+
+## query: python.DeclarationUses { declaration = { func = { name = "animals.Animal.sound" } } }
+{"id":1328,"key":{"declaration":{"func":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}}},"file":{"id":1027,"key":"use.py"},"span":{"start":62,"length":5}}}
+
+## query: python.DeclarationWithName { name = "animals.Animal.sound" }
+{"id":1334,"key":{"name":{"id":1068,"key":"animals.Animal.sound"},"declaration":{"func":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}}}}}
+
+## query: python.DeclarationUses { declaration = { func = { name = "animals.Dog.sound" } } }
+{"id":1330,"key":{"declaration":{"func":{"id":1135,"key":{"name":{"id":1070,"key":"animals.Dog.sound"}}}},"file":{"id":1027,"key":"use.py"},"span":{"start":98,"length":5}}}
+
+## query: python.DeclarationWithName { name = "animals.Dog.sound" }
+{"id":1334,"key":{"name":{"id":1070,"key":"animals.Dog.sound"},"declaration":{"func":{"id":1135,"key":{"name":{"id":1070,"key":"animals.Dog.sound"}}}}}}
+
+## query: python.DeclarationUses { declaration = { func = { name = "animals.Cat.sound" } } }
+
+## query: python.DeclarationWithName { name = "animals.Cat.sound" }
+{"id":1334,"key":{"name":{"id":1140,"key":"animals.Cat.sound"},"declaration":{"func":{"id":1141,"key":{"name":{"id":1140,"key":"animals.Cat.sound"}}}}}}
+
+## query: python.DeclarationUses { declaration = { func = { name = "zoo.Base.sound" } } }
+
+## query: python.DeclarationWithName { name = "zoo.Base.sound" }
+
+## query: python.DeclarationUses { declaration = { func = { name = "zoo.Dog.sound" } } }
+
+## query: python.DeclarationWithName { name = "zoo.Dog.sound" }
+
+## query: python.DeclarationUses { declaration = { func = { name = "zoo.Animal.sound" } } }
+
+## query: python.DeclarationWithName { name = "zoo.Animal.sound" }
+
+## query: codemarkup.EntityUses { target = { python = { decl = { func = { name = "animals.Animal.sound" } } } } }
+{"id":1334,"key":{"target":{"python":{"decl":{"func":{"id":1130,"key":{"name":{"id":1068,"key":"animals.Animal.sound"}}}}}},"file":{"id":1027,"key":"use.py"},"span":{"start":62,"length":5}}}
+
+## query: codemarkup.EntityUses { target = { python = { decl = { func = { name = "animals.Dog.sound" } } } } }
+{"id":1334,"key":{"target":{"python":{"decl":{"func":{"id":1135,"key":{"name":{"id":1070,"key":"animals.Dog.sound"}}}}}},"file":{"id":1027,"key":"use.py"},"span":{"start":98,"length":5}}}
+
+## query: codemarkup.EntityUses { target = { python = { decl = { func = { name = "zoo.Base.sound" } } } } }
+
+## query: codemarkup.EntityUses { target = { python = { decl = { func = { name = "zoo.Dog.sound" } } } } }
+
+## image schema DeclarationUses / DirectXRefsByFile definitions
+196:predicate DeclarationUses:
+197-  {
+198-    declaration: Declaration,
+199-    file: src.File,
+200-    span: src.ByteSpan,
+201-  }
+202-  stored {Decl, File, Span} where
+203-  XRefsViaNameByFile { File, XRefs };
+204-  { target = Name, source = Span } = XRefs[..];
+205-  DeclarationWithName {Name, Decl};
+206-
+207:predicate DirectXRefsByFile:
+208-  {
+209-    file: src.File,
+210-    xref: DirectXRef,
+211-  }
+212-  {File, XRef} where
+213-  XRefsViaNameByFile { File, XRefsViaName };
+214-  { target = Name, source = Source } = XRefsViaName[..];
+215-  DeclarationWithName {Name, Decl};
+216-  XRef = DirectXRef {target = Decl, source = Source};
+217-
+218-type DirectXRef =
+219-  {

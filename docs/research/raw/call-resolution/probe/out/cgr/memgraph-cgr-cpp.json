@@ -1,0 +1,132 @@
+{
+  "all_relationship_counts": {
+    "CALLS": 6,
+    "CONTAINS_FILE": 1,
+    "CONTAINS_MODULE": 1,
+    "DEFINES": 5,
+    "DEFINES_METHOD": 2
+  },
+  "query": "\nMATCH (a)-[r]->(b)\nWHERE type(r) IN ['CALLS', 'REFERENCES', 'INSTANTIATES', 'INHERITS',\n                  'OVERRIDES', 'IMPLEMENTS', 'ACCEPTS']\n  AND (a.qualified_name STARTS WITH $prefix OR a.name = $project)\nRETURN labels(a) AS from_labels, coalesce(a.qualified_name, a.name) AS from_qn,\n       type(r) AS rel, properties(r) AS props,\n       labels(b) AS to_labels, coalesce(b.qualified_name, b.name) AS to_qn\nORDER BY rel, from_qn, to_qn, props.line, props.col\n",
+  "rows": [
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp__e6b4af70.templ.direct",
+      "props": {
+        "arg_count": 0,
+        "col": 23,
+        "end_col": 32,
+        "end_line": 4,
+        "kwarg_names": [],
+        "line": 4,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Method"
+      ],
+      "to_qn": "cgr-cpp__e6b4af70.templ.Dog.sound"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp__e6b4af70.templ.main",
+      "props": {
+        "arg_count": 0,
+        "col": 51,
+        "end_col": 59,
+        "end_line": 5,
+        "kwarg_names": [],
+        "line": 5,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Function"
+      ],
+      "to_qn": "cgr-cpp__e6b4af70.templ.direct"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp__e6b4af70.templ.main",
+      "props": {
+        "arg_count": 1,
+        "col": 27,
+        "end_col": 37,
+        "end_line": 5,
+        "kwarg_names": [],
+        "line": 5,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Function"
+      ],
+      "to_qn": "cgr-cpp__e6b4af70.templ.speak_t"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp__e6b4af70.templ.main",
+      "props": {
+        "arg_count": 1,
+        "col": 39,
+        "end_col": 49,
+        "end_line": 5,
+        "kwarg_names": [],
+        "line": 5,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Function"
+      ],
+      "to_qn": "cgr-cpp__e6b4af70.templ.speak_t"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp__e6b4af70.templ.speak_t",
+      "props": {
+        "arg_count": 0,
+        "col": 43,
+        "end_col": 52,
+        "end_line": 3,
+        "kwarg_names": [],
+        "line": 3,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Method"
+      ],
+      "to_qn": "cgr-cpp__e6b4af70.templ.Cat.sound"
+    },
+    {
+      "from_labels": [
+        "Function"
+      ],
+      "from_qn": "cgr-cpp__e6b4af70.templ.speak_t",
+      "props": {
+        "arg_count": 0,
+        "col": 43,
+        "end_col": 52,
+        "end_line": 3,
+        "kwarg_names": [],
+        "line": 3,
+        "resolution": "exact"
+      },
+      "rel": "CALLS",
+      "to_labels": [
+        "Method"
+      ],
+      "to_qn": "cgr-cpp__e6b4af70.templ.Dog.sound"
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+/glean-demo:
+bin
+code
+db
+docker_entrypoint.sh
+schema
+
+/glean-demo/bin:
+glean
+glean-hyperlink
+glean-server
+
+/usr/local/bin:
+flow
+Missing: 
+(create | write | finish | unfinish | list | db-latest | status | dump | 
+  delete | derive | query | backup | restore | validate | validate-schema | 
+Usage: glean index (--db NAME/INSTANCE | --db-name NAME --db-instance INSTANCE) 
+                   (cpp-cmake | external | flow | hack | haskell-hie | go | 
+                     java-lsif | lsif | scip | rust-lsif | rust-scip | 
+                     typescript | python-scip | dotnet-scip) ROOT
+
+  Index some source code
+
+Available options:
+  -h,--help                Show this help text
+  --db NAME/INSTANCE       identifies the database
+  --db-name NAME           name of the database
+  --db-instance INSTANCE   instance of the database
+
+Available commands:
+  cpp-cmake                Index C++ code with CMake (via Clang)
+  external                 A generic indexer that runs an external binary
+  flow                     Index JS/Flow code
+  hack                     Index Hack code
+  haskell-hie              Index Haskell code
+  go                       Index Go code
+  java-lsif                Index Java via LSIF
+  lsif                     Index an LSIF file
+  scip                     Index a SCIP file
+  rust-lsif                Index Rust code via LSIF
+  rust-scip                Index Rust code with `rust-analyzer scip`
+  typescript               Index Typescript code
+  python-scip              Index Python code with `scip-python`
+  dotnet-scip              Index C# code with `scip-dotnet`
+bash: rg: command not found
+# Copyright (c) Facebook, Inc. and its affiliates.
+
+schema python.4 {
+import builtin.1
+import src.1

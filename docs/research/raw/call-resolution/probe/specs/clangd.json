@@ -1,0 +1,30 @@
+{
+ "name": "clangd",
+ "cmd": ["<tools>/clangd/22.1.6/clangd_22.1.6/bin/clangd", "--compile-commands-dir=<probe>/fixtures/clangd", "--background-index", "-j=2", "--log=info", "--pch-storage=memory"],
+ "root": "<probe>/fixtures/clangd",
+ "open": [{"path": "fp.c", "languageId": "c"}, {"path": "virt.cpp", "languageId": "cpp"}],
+ "ready": {"sleep": 5},
+ "max_passes": 6,
+ "pass_sleep": 5,
+ "queries": [
+  {"label": "C f", "file": "fp.c", "find": "void f(void)", "offset": 5},
+  {"label": "C h", "file": "fp.c", "find": "void h(void)", "offset": 5},
+  {"label": "C global pointer gfp", "file": "fp.c", "find": "(*gfp)", "offset": 2},
+  {"label": "C local pointer fp (in g)", "file": "fp.c", "find": "(*fp)", "offset": 2},
+  {"label": "C parameter cb (in run)", "file": "fp.c", "find": "(*cb)", "offset": 2},
+  {"label": "C g", "file": "fp.c", "find": "void g(void)", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "C g2", "file": "fp.c", "find": "void g2(void)", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "C run", "file": "fp.c", "find": "void run(", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "C k", "file": "fp.c", "find": "void k(void)", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "C call site fp() in g", "file": "fp.c", "find": "    fp();", "nth": 1, "offset": 4, "ops": ["definition"]},
+  {"label": "C call site gfp() in g2", "file": "fp.c", "find": "gfp();", "offset": 0, "ops": ["definition"]},
+  {"label": "C++ Animal::sound", "file": "virt.cpp", "find": "void sound()", "nth": 1, "offset": 5},
+  {"label": "C++ Dog::sound", "file": "virt.cpp", "find": "void sound()", "nth": 2, "offset": 5},
+  {"label": "C++ Cat::sound", "file": "virt.cpp", "find": "void sound()", "nth": 3, "offset": 5},
+  {"label": "C++ speak", "file": "virt.cpp", "find": "void speak(", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "C++ direct", "file": "virt.cpp", "find": "void direct(", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "C++ speak_t (template)", "file": "virt.cpp", "find": "void speak_t(", "offset": 5, "ops": ["incoming", "outgoing"]},
+  {"label": "C++ call site a.sound() in speak", "file": "virt.cpp", "find": "a.sound();", "nth": 1, "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "C++ call site a.sound() in speak_t", "file": "virt.cpp", "find": "a.sound();", "nth": 2, "offset": 2, "ops": ["definition", "implementation"]}
+ ]
+}

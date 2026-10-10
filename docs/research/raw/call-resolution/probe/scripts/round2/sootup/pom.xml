@@ -1,0 +1,8 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>probe</groupId><artifactId>sootup-probe</artifactId><version>0</version>
+  <dependencies>
+    <dependency><groupId>org.soot-oss</groupId><artifactId>sootup.callgraph</artifactId><version>3.0.1</version></dependency>
+    <dependency><groupId>org.soot-oss</groupId><artifactId>sootup.java.bytecode.frontend</artifactId><version>3.0.1</version></dependency>
+  </dependencies>
+</project>

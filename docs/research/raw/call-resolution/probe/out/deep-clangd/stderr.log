@@ -1,0 +1,133 @@
+I[21:23:53.266] clangd version 22.1.6 (https://github.com/llvm/llvm-project fc4aad7b5db3fff421df9a9637605b9ca5667881)
+I[21:23:53.266] Features: linux+grpc
+I[21:23:53.266] PID: 3875768
+I[21:23:53.266] Working directory: <probe>/fixtures/deep-cpp
+I[21:23:53.266] argv[0]: <tools>/clangd/22.1.6/clangd_22.1.6/bin/clangd
+I[21:23:53.266] argv[1]: --compile-commands-dir=<probe>/fixtures/deep-cpp
+I[21:23:53.266] argv[2]: --background-index
+I[21:23:53.266] argv[3]: -j=2
+I[21:23:53.266] argv[4]: --log=info
+I[21:23:53.266] argv[5]: --pch-storage=memory
+I[21:23:53.266] Starting LSP over stdin/stdout
+I[21:23:53.266] <-- initialize(1)
+I[21:23:53.277] --> reply:initialize(1) 10 ms
+I[21:23:53.277] <-- initialized
+I[21:23:53.278] <-- textDocument/didOpen
+I[21:23:53.278] Loaded compilation database from <probe>/fixtures/deep-cpp/compile_commands.json
+I[21:23:53.278] --> window/workDoneProgress/create(0)
+I[21:23:53.278] ASTWorker building file <probe>/fixtures/deep-cpp/deep.cpp version 1 with command 
+[<probe>/fixtures/deep-cpp]
+/usr/bin/clang++ --driver-mode=g++ -std=c++17 -c -resource-dir=<tools>/clangd/22.1.6/clangd_22.1.6/lib/clang/22 -- <probe>/fixtures/deep-cpp/deep.cpp
+I[21:23:53.278] Enqueueing 1 commands for indexing
+I[21:23:53.279] <-- reply(0)
+I[21:23:53.279] --> $/progress
+I[21:23:53.279] --> $/progress
+I[21:23:53.279] --> $/progress
+I[21:23:53.279] --> $/progress
+I[21:23:53.279] --> $/progress
+I[21:23:53.283] Indexed <probe>/fixtures/deep-cpp/deep.cpp (11 symbols, 25 refs, 1 files)
+I[21:23:53.283] --> $/progress
+I[21:23:53.285] Built preamble of size 247656 for file <probe>/fixtures/deep-cpp/deep.cpp version 1 in 0.00 seconds
+I[21:23:53.286] Indexing c++17 standard library in the context of <probe>/fixtures/deep-cpp/deep.cpp
+I[21:23:53.290] --> textDocument/publishDiagnostics
+I[21:23:53.871] Indexed c++17 standard library (incomplete due to errors): 14013 symbols, 2332 filtered
+I[21:23:58.278] <-- textDocument/prepareCallHierarchy(2)
+I[21:23:58.278] --> reply:textDocument/prepareCallHierarchy(2) 0 ms
+I[21:23:58.279] <-- callHierarchy/incomingCalls(3)
+I[21:23:58.279] --> reply:callHierarchy/incomingCalls(3) 0 ms
+I[21:23:58.280] <-- callHierarchy/outgoingCalls(4)
+I[21:23:58.280] --> reply:callHierarchy/outgoingCalls(4) 0 ms
+I[21:23:58.280] <-- textDocument/references(5)
+I[21:23:58.280] --> reply:textDocument/references(5) 0 ms
+I[21:23:58.281] <-- textDocument/references(6)
+I[21:23:58.281] --> reply:textDocument/references(6) 0 ms
+I[21:23:58.281] <-- textDocument/implementation(7)
+I[21:23:58.281] --> reply:textDocument/implementation(7) 0 ms
+I[21:23:58.282] <-- textDocument/prepareCallHierarchy(8)
+I[21:23:58.282] --> reply:textDocument/prepareCallHierarchy(8) 0 ms
+I[21:23:58.282] <-- callHierarchy/incomingCalls(9)
+I[21:23:58.282] --> reply:callHierarchy/incomingCalls(9) 0 ms
+I[21:23:58.283] <-- callHierarchy/outgoingCalls(10)
+I[21:23:58.283] --> reply:callHierarchy/outgoingCalls(10) 0 ms
+I[21:23:58.283] <-- textDocument/references(11)
+I[21:23:58.283] --> reply:textDocument/references(11) 0 ms
+I[21:23:58.283] <-- textDocument/references(12)
+I[21:23:58.283] --> reply:textDocument/references(12) 0 ms
+I[21:23:58.284] <-- textDocument/implementation(13)
+I[21:23:58.284] --> reply:textDocument/implementation(13) 0 ms
+I[21:23:58.284] <-- textDocument/prepareCallHierarchy(14)
+I[21:23:58.284] --> reply:textDocument/prepareCallHierarchy(14) 0 ms
+I[21:23:58.284] <-- callHierarchy/incomingCalls(15)
+I[21:23:58.284] --> reply:callHierarchy/incomingCalls(15) 0 ms
+I[21:23:58.285] <-- callHierarchy/outgoingCalls(16)
+I[21:23:58.285] --> reply:callHierarchy/outgoingCalls(16) 0 ms
+I[21:23:58.285] <-- textDocument/references(17)
+I[21:23:58.285] --> reply:textDocument/references(17) 0 ms
+I[21:23:58.286] <-- textDocument/references(18)
+I[21:23:58.286] --> reply:textDocument/references(18) 0 ms
+I[21:23:58.287] <-- textDocument/implementation(19)
+I[21:23:58.287] --> reply:textDocument/implementation(19) 0 ms
+I[21:23:58.287] <-- textDocument/prepareCallHierarchy(20)
+I[21:23:58.287] --> reply:textDocument/prepareCallHierarchy(20) 0 ms
+I[21:23:58.288] <-- callHierarchy/outgoingCalls(21)
+I[21:23:58.288] --> reply:callHierarchy/outgoingCalls(21) 0 ms
+I[21:23:58.288] <-- textDocument/prepareCallHierarchy(22)
+I[21:23:58.288] --> reply:textDocument/prepareCallHierarchy(22) 0 ms
+I[21:23:58.289] <-- callHierarchy/outgoingCalls(23)
+I[21:23:58.289] --> reply:callHierarchy/outgoingCalls(23) 0 ms
+I[21:23:58.289] <-- textDocument/prepareCallHierarchy(24)
+I[21:23:58.289] --> reply:textDocument/prepareCallHierarchy(24) 0 ms
+I[21:23:58.290] <-- callHierarchy/outgoingCalls(25)
+I[21:23:58.290] --> reply:callHierarchy/outgoingCalls(25) 0 ms
+I[21:24:03.291] <-- textDocument/prepareCallHierarchy(26)
+I[21:24:03.291] --> reply:textDocument/prepareCallHierarchy(26) 0 ms
+I[21:24:03.291] <-- callHierarchy/incomingCalls(27)
+I[21:24:03.292] --> reply:callHierarchy/incomingCalls(27) 0 ms
+I[21:24:03.292] <-- callHierarchy/outgoingCalls(28)
+I[21:24:03.292] --> reply:callHierarchy/outgoingCalls(28) 0 ms
+I[21:24:03.292] <-- textDocument/references(29)
+I[21:24:03.292] --> reply:textDocument/references(29) 0 ms
+I[21:24:03.293] <-- textDocument/references(30)
+I[21:24:03.293] --> reply:textDocument/references(30) 0 ms
+I[21:24:03.293] <-- textDocument/implementation(31)
+I[21:24:03.293] --> reply:textDocument/implementation(31) 0 ms
+I[21:24:03.293] <-- textDocument/prepareCallHierarchy(32)
+I[21:24:03.293] --> reply:textDocument/prepareCallHierarchy(32) 0 ms
+I[21:24:03.294] <-- callHierarchy/incomingCalls(33)
+I[21:24:03.294] --> reply:callHierarchy/incomingCalls(33) 0 ms
+I[21:24:03.294] <-- callHierarchy/outgoingCalls(34)
+I[21:24:03.294] --> reply:callHierarchy/outgoingCalls(34) 0 ms
+I[21:24:03.295] <-- textDocument/references(35)
+I[21:24:03.295] --> reply:textDocument/references(35) 0 ms
+I[21:24:03.295] <-- textDocument/references(36)
+I[21:24:03.295] --> reply:textDocument/references(36) 0 ms
+I[21:24:03.295] <-- textDocument/implementation(37)
+I[21:24:03.295] --> reply:textDocument/implementation(37) 0 ms
+I[21:24:03.296] <-- textDocument/prepareCallHierarchy(38)
+I[21:24:03.296] --> reply:textDocument/prepareCallHierarchy(38) 0 ms
+I[21:24:03.296] <-- callHierarchy/incomingCalls(39)
+I[21:24:03.296] --> reply:callHierarchy/incomingCalls(39) 0 ms
+I[21:24:03.296] <-- callHierarchy/outgoingCalls(40)
+I[21:24:03.296] --> reply:callHierarchy/outgoingCalls(40) 0 ms
+I[21:24:03.297] <-- textDocument/references(41)
+I[21:24:03.297] --> reply:textDocument/references(41) 0 ms
+I[21:24:03.297] <-- textDocument/references(42)
+I[21:24:03.297] --> reply:textDocument/references(42) 0 ms
+I[21:24:03.298] <-- textDocument/implementation(43)
+I[21:24:03.298] --> reply:textDocument/implementation(43) 0 ms
+I[21:24:03.298] <-- textDocument/prepareCallHierarchy(44)
+I[21:24:03.298] --> reply:textDocument/prepareCallHierarchy(44) 0 ms
+I[21:24:03.298] <-- callHierarchy/outgoingCalls(45)
+I[21:24:03.298] --> reply:callHierarchy/outgoingCalls(45) 0 ms
+I[21:24:03.298] <-- textDocument/prepareCallHierarchy(46)
+I[21:24:03.298] --> reply:textDocument/prepareCallHierarchy(46) 0 ms
+I[21:24:03.299] <-- callHierarchy/outgoingCalls(47)
+I[21:24:03.299] --> reply:callHierarchy/outgoingCalls(47) 0 ms
+I[21:24:03.299] <-- textDocument/prepareCallHierarchy(48)
+I[21:24:03.299] --> reply:textDocument/prepareCallHierarchy(48) 0 ms
+I[21:24:03.299] <-- callHierarchy/outgoingCalls(49)
+I[21:24:03.299] --> reply:callHierarchy/outgoingCalls(49) 0 ms
+I[21:24:03.300] <-- shutdown(50)
+I[21:24:03.300] --> reply:shutdown(50) 0 ms
+I[21:24:03.300] <-- exit
+I[21:24:03.300] LSP finished, exiting with status 0

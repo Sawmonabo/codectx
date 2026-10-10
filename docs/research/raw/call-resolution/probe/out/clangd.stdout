@@ -1,0 +1,964 @@
+{
+ "server": "clangd",
+ "cmd": [
+  "<tools>/clangd/22.1.6/clangd_22.1.6/bin/clangd",
+  "--compile-commands-dir=<probe>/fixtures/clangd",
+  "--background-index",
+  "-j=2",
+  "--log=info",
+  "--pch-storage=memory"
+ ],
+ "root": "<probe>/fixtures/clangd",
+ "started": "2026-10-09 09:14:48 PM EDT",
+ "server_info": {
+  "name": "clangd",
+  "version": "clangd version 22.1.6 (https://github.com/llvm/llvm-project fc4aad7b5db3fff421df9a9637605b9ca5667881) linux+grpc x86_64-unknown-linux-gnu"
+ },
+ "call_hierarchy_provider": true,
+ "ready_wait_s": 0.0,
+ "passes_run": 2,
+ "stable": true,
+ "results": [
+  {
+   "label": "C f",
+   "position": "fp.c:1:6",
+   "prepare": [
+    {
+     "name": "f",
+     "detail": null,
+     "kind": 12,
+     "at": "fp.c:1:6  void f(void) {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "g",
+      "detail": "g",
+      "kind": 12,
+      "at": "fp.c:6:6  void g(void) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:7:24  void (*fp)(void) = f;"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "k",
+      "detail": "k",
+      "kind": 12,
+      "at": "fp.c:19:6  void k(void) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:20:9  run(f);",
+      "fp.c:21:5  f();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "fp.c:20:9  run(f);",
+    "fp.c:21:5  f();",
+    "fp.c:7:24  void (*fp)(void) = f;"
+   ],
+   "references_with_decl": [
+    "fp.c:1:6  void f(void) {}",
+    "fp.c:20:9  run(f);",
+    "fp.c:21:5  f();",
+    "fp.c:7:24  void (*fp)(void) = f;"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "C h",
+   "position": "fp.c:2:6",
+   "prepare": [
+    {
+     "name": "h",
+     "detail": null,
+     "kind": 12,
+     "at": "fp.c:2:6  void h(void) {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "gfp",
+      "detail": "gfp",
+      "kind": 13,
+      "at": "fp.c:4:8  void (*gfp)(void) = h;",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:4:21  void (*gfp)(void) = h;"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "fp.c:4:21  void (*gfp)(void) = h;"
+   ],
+   "references_with_decl": [
+    "fp.c:2:6  void h(void) {}",
+    "fp.c:4:21  void (*gfp)(void) = h;"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "C global pointer gfp",
+   "position": "fp.c:4:8",
+   "prepare": [
+    {
+     "name": "gfp",
+     "detail": null,
+     "kind": 13,
+     "at": "fp.c:4:8  void (*gfp)(void) = h;",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "g2",
+      "detail": "g2",
+      "kind": 12,
+      "at": "fp.c:11:6  void g2(void) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:12:5  gfp();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "h",
+      "detail": "h",
+      "kind": 12,
+      "at": "fp.c:2:6  void h(void) {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:4:21  void (*gfp)(void) = h;"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ],
+   "references": [
+    "fp.c:12:5  gfp();"
+   ],
+   "references_with_decl": [
+    "fp.c:12:5  gfp();",
+    "fp.c:4:8  void (*gfp)(void) = h;"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "C local pointer fp (in g)",
+   "position": "fp.c:7:12",
+   "prepare": [],
+   "incoming": [],
+   "outgoing": [],
+   "references": [
+    "fp.c:8:5  fp();"
+   ],
+   "references_with_decl": [
+    "fp.c:7:12  void (*fp)(void) = f;",
+    "fp.c:8:5  fp();"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "C parameter cb (in run)",
+   "position": "fp.c:15:17",
+   "prepare": [],
+   "incoming": [],
+   "outgoing": [],
+   "references": [
+    "fp.c:16:5  cb();"
+   ],
+   "references_with_decl": [
+    "fp.c:15:17  void run(void (*cb)(void)) {",
+    "fp.c:16:5  cb();"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "C g",
+   "position": "fp.c:6:6",
+   "prepare": [
+    {
+     "name": "g",
+     "detail": null,
+     "kind": 12,
+     "at": "fp.c:6:6  void g(void) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "main",
+      "kind": 12,
+      "at": "fp.c:24:5  int main(void) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:25:5  g();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "f",
+      "detail": "f",
+      "kind": 12,
+      "at": "fp.c:1:6  void f(void) {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:7:24  void (*fp)(void) = f;"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "C g2",
+   "position": "fp.c:11:6",
+   "prepare": [
+    {
+     "name": "g2",
+     "detail": null,
+     "kind": 12,
+     "at": "fp.c:11:6  void g2(void) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "main",
+      "kind": 12,
+      "at": "fp.c:24:5  int main(void) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:26:5  g2();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": []
+  },
+  {
+   "label": "C run",
+   "position": "fp.c:15:6",
+   "prepare": [
+    {
+     "name": "run",
+     "detail": null,
+     "kind": 12,
+     "at": "fp.c:15:6  void run(void (*cb)(void)) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "k",
+      "detail": "k",
+      "kind": 12,
+      "at": "fp.c:19:6  void k(void) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:20:5  run(f);"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": []
+  },
+  {
+   "label": "C k",
+   "position": "fp.c:19:6",
+   "prepare": [
+    {
+     "name": "k",
+     "detail": null,
+     "kind": 12,
+     "at": "fp.c:19:6  void k(void) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "main",
+      "kind": 12,
+      "at": "fp.c:24:5  int main(void) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:27:5  k();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "f",
+      "detail": "f",
+      "kind": 12,
+      "at": "fp.c:1:6  void f(void) {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:20:9  run(f);",
+      "fp.c:21:5  f();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    },
+    {
+     "other": {
+      "name": "run",
+      "detail": "run",
+      "kind": 12,
+      "at": "fp.c:15:6  void run(void (*cb)(void)) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "fp.c:20:5  run(f);"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "C call site fp() in g",
+   "position": "fp.c:8:5",
+   "definition": [
+    "fp.c:7:12  void (*fp)(void) = f;"
+   ]
+  },
+  {
+   "label": "C call site gfp() in g2",
+   "position": "fp.c:12:5",
+   "definition": [
+    "fp.c:4:8  void (*gfp)(void) = h;"
+   ]
+  },
+  {
+   "label": "C++ Animal::sound",
+   "position": "virt.cpp:3:18",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": null,
+     "kind": 6,
+     "at": "virt.cpp:3:18  virtual void sound() {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "speak",
+      "kind": 12,
+      "at": "virt.cpp:14:6  void speak(Animal& a) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:15:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "virt.cpp:15:7  a.sound();"
+   ],
+   "references_with_decl": [
+    "virt.cpp:11:10  void sound() override {}",
+    "virt.cpp:15:7  a.sound();",
+    "virt.cpp:3:18  virtual void sound() {}",
+    "virt.cpp:7:10  void sound() override {}"
+   ],
+   "implementation": [
+    "virt.cpp:11:10  void sound() override {}",
+    "virt.cpp:7:10  void sound() override {}"
+   ]
+  },
+  {
+   "label": "C++ Dog::sound",
+   "position": "virt.cpp:7:10",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": null,
+     "kind": 6,
+     "at": "virt.cpp:7:10  void sound() override {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "direct",
+      "detail": "direct",
+      "kind": 12,
+      "at": "virt.cpp:18:6  void direct(Dog& d) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:19:7  d.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    },
+    {
+     "other": {
+      "name": "speak",
+      "detail": "speak",
+      "kind": 12,
+      "at": "virt.cpp:14:6  void speak(Animal& a) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:15:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "virt.cpp:15:7  a.sound();",
+    "virt.cpp:19:7  d.sound();",
+    "virt.cpp:3:18  virtual void sound() {}"
+   ],
+   "references_with_decl": [
+    "virt.cpp:15:7  a.sound();",
+    "virt.cpp:19:7  d.sound();",
+    "virt.cpp:3:18  virtual void sound() {}",
+    "virt.cpp:7:10  void sound() override {}"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "C++ Cat::sound",
+   "position": "virt.cpp:11:10",
+   "prepare": [
+    {
+     "name": "sound",
+     "detail": null,
+     "kind": 6,
+     "at": "virt.cpp:11:10  void sound() override {}",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "speak",
+      "detail": "speak",
+      "kind": 12,
+      "at": "virt.cpp:14:6  void speak(Animal& a) {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:15:7  a.sound();"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [],
+   "references": [
+    "virt.cpp:15:7  a.sound();",
+    "virt.cpp:3:18  virtual void sound() {}"
+   ],
+   "references_with_decl": [
+    "virt.cpp:11:10  void sound() override {}",
+    "virt.cpp:15:7  a.sound();",
+    "virt.cpp:3:18  virtual void sound() {}"
+   ],
+   "implementation": []
+  },
+  {
+   "label": "C++ speak",
+   "position": "virt.cpp:14:6",
+   "prepare": [
+    {
+     "name": "speak",
+     "detail": null,
+     "kind": 12,
+     "at": "virt.cpp:14:6  void speak(Animal& a) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "main",
+      "kind": 12,
+      "at": "virt.cpp:27:5  int main() {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:30:5  speak(d);",
+      "virt.cpp:31:5  speak(c);"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Animal::sound",
+      "kind": 6,
+      "at": "virt.cpp:3:18  virtual void sound() {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:15:7  a.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "C++ direct",
+   "position": "virt.cpp:18:6",
+   "prepare": [
+    {
+     "name": "direct",
+     "detail": null,
+     "kind": 12,
+     "at": "virt.cpp:18:6  void direct(Dog& d) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "main",
+      "kind": 12,
+      "at": "virt.cpp:27:5  int main() {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:32:5  direct(d);"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": [
+    {
+     "other": {
+      "name": "sound",
+      "detail": "Dog::sound",
+      "kind": 6,
+      "at": "virt.cpp:7:10  void sound() override {}",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:19:7  d.sound();"
+     ],
+     "call_keys": [
+      "fromRanges",
+      "to"
+     ]
+    }
+   ]
+  },
+  {
+   "label": "C++ speak_t (template)",
+   "position": "virt.cpp:23:6",
+   "prepare": [
+    {
+     "name": "speak_t",
+     "detail": null,
+     "kind": 12,
+     "at": "virt.cpp:23:6  void speak_t(T& a) {",
+     "keys": [
+      "data",
+      "kind",
+      "name",
+      "range",
+      "selectionRange",
+      "uri"
+     ]
+    }
+   ],
+   "incoming": [
+    {
+     "other": {
+      "name": "main",
+      "detail": "main",
+      "kind": 12,
+      "at": "virt.cpp:27:5  int main() {",
+      "keys": [
+       "data",
+       "detail",
+       "kind",
+       "name",
+       "range",
+       "selectionRange",
+       "uri"
+      ]
+     },
+     "ranges": [
+      "virt.cpp:33:5  speak_t(d);",
+      "virt.cpp:34:5  speak_t(c);"
+     ],
+     "call_keys": [
+      "from",
+      "fromRanges"
+     ]
+    }
+   ],
+   "outgoing": []
+  },
+  {
+   "label": "C++ call site a.sound() in speak",
+   "position": "virt.cpp:15:7",
+   "implementation": [
+    "virt.cpp:11:10  void sound() override {}",
+    "virt.cpp:7:10  void sound() override {}"
+   ],
+   "definition": [
+    "virt.cpp:3:18  virtual void sound() {}"
+   ]
+  },
+  {
+   "label": "C++ call site a.sound() in speak_t",
+   "position": "virt.cpp:24:7",
+   "implementation": [],
+   "definition": [
+    "virt.cpp:11:10  void sound() override {}",
+    "virt.cpp:3:18  virtual void sound() {}",
+    "virt.cpp:7:10  void sound() override {}"
+   ]
+  }
+ ],
+ "finished": "2026-10-09 09:14:58 PM EDT"
+}

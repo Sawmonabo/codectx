@@ -1,0 +1,24 @@
+Initializing database at <probe>/out/codeql/db-deep-java.
+Running build command: []
+Running command in <probe>/fixtures/deep-java: [<probe>/third_party/codeql/codeql/java/tools/autobuild.sh]
+[2026-10-09 21:30:26] [build-stdout] [2026-10-09 21:30:26] Extracting Java with build-mode=none.
+[2026-10-09 21:30:26] [build-stdout] [2026-10-09 21:30:26] No usable build tool found. Neither JDK version recommendation nor precise dependency recommendations will be available.
+[2026-10-09 21:30:26] [build-stdout] [2026-10-09 21:30:26] Found no Java toolchains in a toolchains file, inspecting environment variables...
+[2026-10-09 21:30:26] [build-stdout] [2026-10-09 21:30:26] No specific JDK inferred from the project being analysed; using the java on the PATH
+[2026-10-09 21:30:27] [build-stdout] [2026-10-09 21:30:27] [autobuild] Scanning for files in <probe>/fixtures/deep-java...
+[2026-10-09 21:30:27] [build-stdout] [2026-10-09 21:30:27] [autobuild] <probe>/out/codeql/db-deep-java: Indexing files in in <probe>/fixtures/deep-java...
+[2026-10-09 21:30:27] [build-stdout] [2026-10-09 21:30:27] [autobuild] Running command in <probe>/fixtures/deep-java: [<probe>/third_party/codeql/codeql/java/tools/index-files.sh, <probe>/out/codeql/db-deep-java/working/files-to-index1812997129056565956.list]
+Finalizing database at <probe>/out/codeql/db-deep-java.
+Running pre-finalize script <probe>/third_party/codeql/codeql/java/tools/pre-finalize.sh in <probe>/fixtures/deep-java.
+Running command in <probe>/fixtures/deep-java: [<probe>/third_party/codeql/codeql/java/tools/pre-finalize.sh]
+[2026-10-09 21:30:34] [build-stderr] Scanning for files in <probe>/fixtures/deep-java...
+[2026-10-09 21:30:35] [build-stderr] Scanning for files in <probe>/fixtures/deep-java...
+Pre-finalize script <probe>/third_party/codeql/codeql/java/tools/pre-finalize.sh completed in 1760 ms.
+Running TRAP import for CodeQL database at <probe>/out/codeql/db-deep-java...
+WARNING: Rounding --ram up to the minimum of 2048
+Importing TRAP files
+Merging relations
+Finished writing database (relations: 438.27 KiB; string pool: 2.41 MiB).
+TRAP import complete (1.2s).
+Finished zipping source archive (477.00 B).
+Successfully created database at <probe>/out/codeql/db-deep-java.

@@ -1,0 +1,29 @@
+code.hack.angle
+code.python.angle
+code.scip.angle
+codemarkup.angle
+codemarkup.hack.angle
+codemarkup.python.angle
+codemarkup.scip.angle
+digest.angle
+gencode.angle
+hack.angle
+python.angle
+scip.angle
+search.hack.angle
+search.python.angle
+src.angle
+185:predicate XRefsViaNameByFile:
+196:predicate DeclarationUses:
+246:predicate FileCall :
+254:predicate CalleeToCaller :
+574:predicate MethodOverrides :
+/glean-demo/schema/source/scip.angle:3:schema scip.1 {
+/glean-demo/schema/source/src.angle:3:schema src.1 {
+Usage: glean index scip [--input ARG]
+
+  Index a SCIP file
+
+Available options:
+  -h,--help                Show this help text
+  --input ARG              Optional path to a specific scip index file

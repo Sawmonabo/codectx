@@ -1,0 +1,22 @@
+{
+ "name": "typescript-language-server",
+ "cmd": ["node", "<probe>/third_party/npm-lsp/node_modules/typescript-language-server/lib/cli.mjs", "--stdio"],
+ "root": "<probe>/fixtures/ts",
+ "init_options": {"tsserver": {"path": "<probe>/third_party/npm-ts6/node_modules/typescript/lib/tsserver.js"}, "hostInfo": "dispatch-probe"},
+ "open": [{"path": "animals.ts", "languageId": "typescript"}],
+ "ready": {"sleep": 5},
+ "queries": [
+  {"label": "Animal.sound", "file": "animals.ts", "find": "sound(): void", "nth": 1, "offset": 0},
+  {"label": "Dog.sound", "file": "animals.ts", "find": "sound(): void", "nth": 2, "offset": 0},
+  {"label": "Cat.sound", "file": "animals.ts", "find": "sound(): void", "nth": 3, "offset": 0},
+  {"label": "Speaker.talk (interface)", "file": "animals.ts", "find": "talk(): void", "nth": 1, "offset": 0},
+  {"label": "Parrot.talk", "file": "animals.ts", "find": "talk(): void", "nth": 2, "offset": 0},
+  {"label": "Robot.talk", "file": "animals.ts", "find": "talk(): void", "nth": 3, "offset": 0},
+  {"label": "speak", "file": "animals.ts", "find": "function speak", "offset": 9, "ops": ["incoming", "outgoing"]},
+  {"label": "direct", "file": "animals.ts", "find": "function direct", "offset": 9, "ops": ["incoming", "outgoing"]},
+  {"label": "chat", "file": "animals.ts", "find": "function chat", "offset": 9, "ops": ["incoming", "outgoing"]},
+  {"label": "call site a.sound() in speak", "file": "animals.ts", "find": "a.sound()", "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "call site d.sound() in direct", "file": "animals.ts", "find": "d.sound()", "offset": 2, "ops": ["definition", "implementation"]},
+  {"label": "call site s.talk() in chat", "file": "animals.ts", "find": "s.talk()", "offset": 2, "ops": ["definition", "implementation"]}
+ ]
+}

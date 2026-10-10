@@ -1,0 +1,282 @@
+{
+  "nodes": [
+    {
+      "fields": {
+        "end_line": 2,
+        "name": "Cat",
+        "qualified_name": "cgr-cpp.templ.Cat",
+        "start_line": 2
+      },
+      "kind": "class_node"
+    },
+    {
+      "fields": {
+        "end_line": 1,
+        "name": "Dog",
+        "qualified_name": "cgr-cpp.templ.Dog",
+        "start_line": 1
+      },
+      "kind": "class_node"
+    },
+    {
+      "fields": {
+        "extension": ".cpp",
+        "name": "templ.cpp",
+        "path": "templ.cpp"
+      },
+      "kind": "file"
+    },
+    {
+      "fields": {
+        "ast_branch_fingerprints": [
+          "9917c4bedc2b555e"
+        ],
+        "ast_fingerprint": "0e2c36b5a3a6f5c2",
+        "ast_fingerprint_nodes": 10,
+        "end_line": 4,
+        "name": "direct",
+        "qualified_name": "cgr-cpp.templ.direct",
+        "return_type": "void",
+        "start_line": 4
+      },
+      "kind": "function"
+    },
+    {
+      "fields": {
+        "ast_branch_fingerprints": [
+          "da8b89508d4e2fe5"
+        ],
+        "ast_fingerprint": "fd34341455df1656",
+        "ast_fingerprint_nodes": 24,
+        "end_line": 5,
+        "name": "main",
+        "qualified_name": "cgr-cpp.templ.main",
+        "return_type": "int",
+        "start_line": 5
+      },
+      "kind": "function"
+    },
+    {
+      "fields": {
+        "ast_branch_fingerprints": [
+          "9917c4bedc2b555e"
+        ],
+        "ast_fingerprint": "1771d52cf94d276b",
+        "ast_fingerprint_nodes": 7,
+        "end_line": 3,
+        "name": "speak_t",
+        "qualified_name": "cgr-cpp.templ.speak_t",
+        "start_line": 3
+      },
+      "kind": "function"
+    },
+    {
+      "fields": {
+        "ast_fingerprint": "b7d003c943326e31",
+        "ast_fingerprint_nodes": 1,
+        "end_line": 2,
+        "name": "sound",
+        "qualified_name": "cgr-cpp.templ.Cat.sound",
+        "return_type": "void",
+        "start_line": 2
+      },
+      "kind": "method"
+    },
+    {
+      "fields": {
+        "ast_fingerprint": "b7d003c943326e31",
+        "ast_fingerprint_nodes": 1,
+        "end_line": 1,
+        "name": "sound",
+        "qualified_name": "cgr-cpp.templ.Dog.sound",
+        "return_type": "void",
+        "start_line": 1
+      },
+      "kind": "method"
+    },
+    {
+      "fields": {
+        "name": "templ.cpp",
+        "path": "templ.cpp",
+        "qualified_name": "cgr-cpp.templ"
+      },
+      "kind": "module"
+    },
+    {
+      "fields": {
+        "name": "cgr-cpp"
+      },
+      "kind": "project"
+    }
+  ],
+  "relationships": [
+    {
+      "properties": {},
+      "source_id": "cgr-cpp",
+      "source_label": "Project",
+      "target_id": "templ.cpp",
+      "target_label": "File",
+      "type": "CONTAINS_FILE"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp",
+      "source_label": "Project",
+      "target_id": "cgr-cpp.templ",
+      "target_label": "Module",
+      "type": "CONTAINS_MODULE"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp.templ",
+      "source_label": "Module",
+      "target_id": "cgr-cpp.templ.Cat",
+      "target_label": "Class",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp.templ",
+      "source_label": "Module",
+      "target_id": "cgr-cpp.templ.Dog",
+      "target_label": "Class",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp.templ",
+      "source_label": "Module",
+      "target_id": "cgr-cpp.templ.direct",
+      "target_label": "Function",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp.templ",
+      "source_label": "Module",
+      "target_id": "cgr-cpp.templ.main",
+      "target_label": "Function",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp.templ",
+      "source_label": "Module",
+      "target_id": "cgr-cpp.templ.speak_t",
+      "target_label": "Function",
+      "type": "DEFINES"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp.templ.Cat",
+      "source_label": "Class",
+      "target_id": "cgr-cpp.templ.Cat.sound",
+      "target_label": "Method",
+      "type": "DEFINES_METHOD"
+    },
+    {
+      "properties": {},
+      "source_id": "cgr-cpp.templ.Dog",
+      "source_label": "Class",
+      "target_id": "cgr-cpp.templ.Dog.sound",
+      "target_label": "Method",
+      "type": "DEFINES_METHOD"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 23.0,
+        "end_col": 32.0,
+        "end_line": 4.0,
+        "kwarg_names": [],
+        "line": 4.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-cpp.templ.direct",
+      "source_label": "Function",
+      "target_id": "cgr-cpp.templ.Dog.sound",
+      "target_label": "Method",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 51.0,
+        "end_col": 59.0,
+        "end_line": 5.0,
+        "kwarg_names": [],
+        "line": 5.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-cpp.templ.main",
+      "source_label": "Function",
+      "target_id": "cgr-cpp.templ.direct",
+      "target_label": "Function",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 1.0,
+        "col": 27.0,
+        "end_col": 37.0,
+        "end_line": 5.0,
+        "kwarg_names": [],
+        "line": 5.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-cpp.templ.main",
+      "source_label": "Function",
+      "target_id": "cgr-cpp.templ.speak_t",
+      "target_label": "Function",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 1.0,
+        "col": 39.0,
+        "end_col": 49.0,
+        "end_line": 5.0,
+        "kwarg_names": [],
+        "line": 5.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-cpp.templ.main",
+      "source_label": "Function",
+      "target_id": "cgr-cpp.templ.speak_t",
+      "target_label": "Function",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 43.0,
+        "end_col": 52.0,
+        "end_line": 3.0,
+        "kwarg_names": [],
+        "line": 3.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-cpp.templ.speak_t",
+      "source_label": "Function",
+      "target_id": "cgr-cpp.templ.Cat.sound",
+      "target_label": "Method",
+      "type": "CALLS"
+    },
+    {
+      "properties": {
+        "arg_count": 0.0,
+        "col": 43.0,
+        "end_col": 52.0,
+        "end_line": 3.0,
+        "kwarg_names": [],
+        "line": 3.0,
+        "resolution": "exact"
+      },
+      "source_id": "cgr-cpp.templ.speak_t",
+      "source_label": "Function",
+      "target_id": "cgr-cpp.templ.Dog.sound",
+      "target_label": "Method",
+      "type": "CALLS"
+    }
+  ]
+}

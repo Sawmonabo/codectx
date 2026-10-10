@@ -1,0 +1,7 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>probe</groupId><artifactId>wala-probe</artifactId><version>0</version>
+  <dependencies>
+    <dependency><groupId>com.ibm.wala</groupId><artifactId>com.ibm.wala.core</artifactId><version>1.8.0</version></dependency>
+  </dependencies>
+</project>

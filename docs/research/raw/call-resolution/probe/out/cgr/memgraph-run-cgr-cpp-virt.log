@@ -1,0 +1,37 @@
+Warning: --repo-path is not a Git repository: <probe>/fixtures/cgr-cpp-virt
+Updating knowledge graph for: <probe>/fixtures/cgr-cpp-virt
+Auto-excluding common directories (venv, node_modules, .git, etc.). Use --interactive-setup to customize.
+Cleaning database...
+2026-10-09 21:23:28.845 | INFO     | codebase_rag.services.graph_service:clean_database:506 - --- Cleaning database... ---
+2026-10-09 21:23:29.045 | INFO     | codebase_rag.services.graph_service:clean_database:508 - --- Database cleaned. ---
+2026-10-09 21:23:29.045 | WARNING  | codebase_rag.vector_store:_get_vector_store:153 - Vector store backend 'qdrant' dependencies are not available
+2026-10-09 21:23:29.218 | INFO     | codebase_rag.services.graph_service:ensure_constraints:527 - Ensuring constraints...
+2026-10-09 21:23:34.467 | INFO     | codebase_rag.services.graph_service:ensure_constraints:534 - Constraints checked/created.
+2026-10-09 21:23:34.467 | INFO     | codebase_rag.services.graph_service:_ensure_indexes:584 - Ensuring label-property indexes for MERGE performance...
+2026-10-09 21:23:43.351 | INFO     | codebase_rag.services.graph_service:_ensure_indexes:598 - Indexes checked/created.
+2026-10-09 21:23:43.351 | INFO     | codebase_rag.parser_loader:load_parsers:560 - Parser registry ready; grammars load on first use.
+ast-grep-py unavailable; ast-grep language tier disabled
+2026-10-09 21:23:43.352 | INFO     | codebase_rag.graph_updater:run:2159 - Ensuring Project: cgr-cpp-virt__3a853b01
+2026-10-09 21:23:43.353 | INFO     | codebase_rag.graph_updater:run:2213 - --- Pass 1: Identifying Packages and Folders ---
+2026-10-09 21:23:43.517 | INFO     | codebase_rag.graph_updater:run:2219 - Identified 0 packages and 0 folders
+2026-10-09 21:23:43.517 | INFO     | codebase_rag.graph_updater:run:2248 - 
+--- Pass 2: Processing Files, Caching ASTs, and Collecting Definitions ---
+2026-10-09 21:23:43.722 | SUCCESS  | codebase_rag.parser_loader:_process_language:446 - Successfully loaded cpp grammar.
+2026-10-09 21:23:43.724 | INFO     | codebase_rag.graph_updater:_log_process_counts:6372 - Re-indexing 1 changed files
+2026-10-09 21:23:43.757 | WARNING  | codebase_rag.graph_updater:_run_cpp_frontend:1488 - C/C++ libclang frontend enabled but libclang is unavailable; using tree-sitter only (no macro Function nodes or #include IMPORTS). Enable it with: pip install "code-graph-rag[cpp]"
+2026-10-09 21:23:44.197 | INFO     | codebase_rag.graph_updater:_resolve_deferred_definitions:2066 - Resolved 2 deferred C++ inheritance bases
+2026-10-09 21:23:44.197 | INFO     | codebase_rag.graph_updater:run:2297 - 
+--- Found 10 functions/methods in codebase ---
+2026-10-09 21:23:44.198 | INFO     | codebase_rag.graph_updater:run:2311 - --- Pass 3: Processing Function Calls from AST Cache ---
+2026-10-09 21:23:46.568 | INFO     | codebase_rag.services.graph_service:_flush_nodes:715 - Flushed 13 of 13 buffered nodes.
+2026-10-09 21:23:49.791 | INFO     | codebase_rag.services.graph_service:flush_relationships:883 - Flushed 19 relationships (19 successful, 0 failed).
+2026-10-09 21:23:49.955 | INFO     | codebase_rag.parsers.class_ingest.method_override:process_all_method_overrides:29 - --- Pass 4: Processing Method Override Relationships ---
+2026-10-09 21:23:49.955 | INFO     | codebase_rag.graph_updater:run:2346 - 
+--- Analysis complete. Flushing all data to database... ---
+2026-10-09 21:23:50.097 | INFO     | codebase_rag.services.graph_service:flush_relationships:883 - Flushed 2 relationships (2 successful, 0 failed).
+2026-10-09 21:23:50.097 | INFO     | codebase_rag.graph_updater:_prune_orphan_nodes:7870 - --- Pruning orphan nodes from graph ---
+2026-10-09 21:23:51.296 | INFO     | codebase_rag.graph_updater:_prune_orphan_nodes:7956 - No orphan nodes found. Graph is clean.
+2026-10-09 21:23:51.961 | INFO     | codebase_rag.graph_updater:_generate_semantic_embeddings:8202 - Skipping semantic embedding generation (--no-embeddings / CGR_SKIP_EMBEDDINGS)
+2026-10-09 21:23:51.967 | INFO     | codebase_rag.graph_updater:_publish_hash_cache:743 - Saved hash cache with 1 entries to <probe>/fixtures/cgr-cpp-virt/.cgr-hash-cache.json
+Knowledge graph sync done for 'cgr-cpp-virt__3a853b01' in 23.54s.
+Graph update completed!

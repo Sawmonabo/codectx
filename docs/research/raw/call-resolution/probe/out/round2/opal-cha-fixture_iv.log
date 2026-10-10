@@ -1,0 +1,17 @@
+[info][OPAL] using 1 thread(s) for CPU bound tasks (can be changed by setting the system property org.opalj.threads.CPUBoundTasks; the number should be equal to the number of physical – not hyperthreaded – cores)[0m
+[info][OPAL] using at most 1 thread(s) for IO bound tasks (can be changed by setting the system property org.opalj.threads.IOBoundTasks; the number should be between 1 and 2 times the number of (hyperthreaded) cores)[0m
+[info][project configuration] the classPath is <probe>/fixtures/r2-java/iv-classes[0m
+Fri Oct 09 21:37:01 EDT 2026
+quiescence -> 3
+Callers of zoo.Dog{ void sound() }:
+	zoo.Main{ void main(java.lang.String[]) }, 27
+	zoo.Main{ void speak(zoo.Animal) }, 1
+
+Callers of zoo.Animal{ void sound() }:
+	
+
+Callers of zoo.Cat{ void sound() }:
+	zoo.Main{ void speak(zoo.Animal) }, 1
+
+evaluation time: 1.7514 s
+Fri Oct 09 21:37:03 EDT 2026

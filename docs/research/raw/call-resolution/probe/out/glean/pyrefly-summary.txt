@@ -1,0 +1,55 @@
+=== file use.py ( 666356cce67c2ea4c5f57bc347428514e890894ffb83ce88c5787509d13f3e71.json )
+  XRefViaName  line 1 'animals'    -> animals
+  XRefViaName  line 1 'Animal'     -> animals.Animal
+  XRefViaName  line 1 'Dog'        -> animals.Dog
+  XRefViaName  line 4 'Animal'     -> animals.Animal
+  XRefViaName  line 4 'Animal'     -> use.Animal
+  XRefViaName  line 8 'Dog'        -> animals.Dog
+  XRefViaName  line 8 'Dog'        -> use.Dog
+  XRefViaName  line 5 'sound'      -> animals.Animal.sound
+  XRefViaName  line 5 'a'          -> use.speak.<locals>.a
+  XRefViaName  line 9 'sound'      -> animals.Dog.sound
+  XRefViaName  line 9 'd'          -> use.direct.<locals>.d
+  xrefs.XRef   line 5 'sound'      -> name=animals.Animal.sound file=animals.py
+  xrefs.XRef   line 9 'sound'      -> name=animals.Dog.sound file=animals.py
+  CalleeToCaller callee=animals.Animal.sound caller=use.speak
+  CalleeToCaller callee=animals.Dog.sound caller=use.direct
+  FileCall     line 5 'a.sound()'
+  FileCall     line 9 'd.sound()'
+  predicates: ['digest.FileDigest.1', 'python.CalleeToCaller.4', 'python.ContainingTopLevelDeclaration.4', 'python.DeclarationLocation.4', 'python.DefinitionLocation.4', 'python.FileCall.4', 'python.Module.4', 'python.Name.4', 'python.NameToSName.4', 'python.XRefsViaNameByFile.4', 'python.XRefsViaNameByTarget.4', 'python.xrefs.XRefsByFile.1', 'src.FileLanguage.1', 'src.FileLines.1']
+=== file animals.py ( 9594c6e96f1ace36d97ec8c687b9266c8b98902287f1bfa64bde7bced34a8d54.json )
+  XRefViaName  line 6 'Animal'     -> animals.Animal
+  XRefViaName  line 11 'Animal'     -> animals.Animal
+  XRefViaName  line 2 'str'        -> str
+  XRefViaName  line 7 'str'        -> str
+  XRefViaName  line 12 'str'        -> str
+  predicates: ['digest.FileDigest.1', 'python.ContainingTopLevelDeclaration.4', 'python.DeclarationLocation.4', 'python.DefinitionLocation.4', 'python.Module.4', 'python.Name.4', 'python.NameToSName.4', 'python.XRefsViaNameByFile.4', 'python.XRefsViaNameByTarget.4', 'python.xrefs.XRefsByFile.1', 'src.FileLanguage.1', 'src.FileLines.1']
+=== file zoo.py ( 0ded954bf8a34d9e39df869d2aafcb1036202b30425230287d4e717df6dbcfc2.json )
+  XRefViaName  line 6 'Base'       -> zoo.Base
+  XRefViaName  line 10 'Animal'     -> zoo.Animal
+  XRefViaName  line 2 'str'        -> str
+  XRefViaName  line 11 'str'        -> str
+  predicates: ['digest.FileDigest.1', 'python.ContainingTopLevelDeclaration.4', 'python.DeclarationLocation.4', 'python.DefinitionLocation.4', 'python.Module.4', 'python.Name.4', 'python.NameToSName.4', 'python.XRefsViaNameByFile.4', 'python.XRefsViaNameByTarget.4', 'python.xrefs.XRefsByFile.1', 'src.FileLanguage.1', 'src.FileLines.1']
+=== file calls.py ( 4c71dec9e7f56490b2a4d3548e8c4c83b0641c69e79a86deed877138b6778165.json )
+  XRefViaName  line 1 'zoo'        -> zoo
+  XRefViaName  line 1 'Animal'     -> zoo.Animal
+  XRefViaName  line 1 'Dog'        -> zoo.Dog
+  XRefViaName  line 4 'Animal'     -> zoo.Animal
+  XRefViaName  line 4 'Animal'     -> calls.Animal
+  XRefViaName  line 12 'sound'      -> zoo.Dog.sound
+  XRefViaName  line 12 'Dog'        -> zoo.Dog
+  XRefViaName  line 12 'Dog'        -> calls.Dog
+  XRefViaName  line 5 'sound'      -> zoo.Animal.sound
+  XRefViaName  line 5 'a'          -> calls.speak.<locals>.a
+  XRefViaName  line 9 'sound'      -> calls.untyped.<locals>.x.sound
+  XRefViaName  line 9 'x'          -> calls.untyped.<locals>.x
+  xrefs.XRef   line 12 'sound'      -> name=zoo.Dog.sound file=zoo.py
+  xrefs.XRef   line 5 'sound'      -> name=zoo.Animal.sound file=zoo.py
+  xrefs.XRef   line 9 'sound'      -> name=calls.untyped.<locals>.x.sound file=calls.py
+  CalleeToCaller callee=zoo.Animal.sound caller=calls.speak
+  CalleeToCaller callee=calls.untyped.<locals>.x.sound caller=calls.untyped
+  FileCall     line 12 'Dog().sound()'
+  FileCall     line 12 'Dog()'
+  FileCall     line 5 'a.sound()'
+  FileCall     line 9 'x.sound()'
+  predicates: ['digest.FileDigest.1', 'python.CalleeToCaller.4', 'python.ContainingTopLevelDeclaration.4', 'python.DeclarationLocation.4', 'python.DefinitionLocation.4', 'python.FileCall.4', 'python.Module.4', 'python.Name.4', 'python.NameToSName.4', 'python.XRefsViaNameByFile.4', 'python.XRefsViaNameByTarget.4', 'python.xrefs.XRefsByFile.1', 'src.FileLanguage.1', 'src.FileLines.1']

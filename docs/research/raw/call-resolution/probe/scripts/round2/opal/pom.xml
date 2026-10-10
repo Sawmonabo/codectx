@@ -1,0 +1,7 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>probe</groupId><artifactId>opal-probe</artifactId><version>0</version>
+  <dependencies>
+    <dependency><groupId>de.opal-project</groupId><artifactId>tools_3</artifactId><version>7.0.0</version></dependency>
+  </dependencies>
+</project>

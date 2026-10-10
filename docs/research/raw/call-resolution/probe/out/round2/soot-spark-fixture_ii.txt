@@ -1,0 +1,5 @@
+algo=spark all-reachable=true dir=<probe>/fixtures/r2-java/ii-classes
+edgesInto(<zoo.Animal: void sound()>):
+edgesInto(<zoo.Dog: void sound()>):
+edgesInto(<zoo.Cat: void sound()>):
+edgesOutOf(<zoo.Main: void speak(zoo.Animal)>):
