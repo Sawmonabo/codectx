@@ -60,8 +60,9 @@ func resolveECMAScript(ctx context.Context, u *unit, emit func(Binding) error) e
 // resolveECMAScriptSite emits the facts of one site of tab, the table of the
 // file of fc: each binding the inference found, with its argument flows;
 // for a member site, the external method of each receiver type outside the
-// project and of each receiver class of the unit that reaches the method
-// only through a supertype outside it (externalMember); and, for a site
+// project, and for a member or static site that of each receiver class of
+// the unit that reaches the method only through a supertype outside it
+// (externalMember); and, for a site
 // nothing bound, a FactExternalSite when it calls through a package's module
 // or constructs a class outside the project. A computed site binds nothing.
 func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileCtx, tab *Table, site Ref, emit func(Binding) error) error {
@@ -100,6 +101,18 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 				return err
 			}
 			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if s.Shape == wire.ShapeStatic && s.Qualifier != "" {
+		// `C.m()` on a class of the unit, which the scan bound through the
+		// class itself.
+		err = h.types(ctx, site.File, s.Qualifier, func(typ Ref) error {
+			ok, err := t.externalMember(h, fc.family, site, typ, s.Callee, emit)
+			external = external || ok
+			return err
 		})
 		if err != nil {
 			return err
