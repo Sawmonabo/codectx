@@ -80,7 +80,7 @@ func declNamed(t *testing.T, tbl *link.Table, name string) *link.Decl {
 }
 
 const linkTableSrc = `def callee(a, b):
-    return a
+    return a + b
 
 
 def caller(x):

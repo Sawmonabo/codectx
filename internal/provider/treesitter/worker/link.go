@@ -187,6 +187,11 @@ func (r *readIndex) run(uses []readUse) readRun {
 // spanning id reads. It reports false for an identifier no node reads as a
 // variable (a type, a module, a field, a name the lowering binds nothing to).
 func (r *readIndex) variable(id Node) (wire.Span, bool) {
+	if len(r.runs) == 0 {
+		// No analysed callable read a named variable, so no identifier
+		// reads one; r.src is unset when no callable was analysed at all.
+		return wire.Span{}, false
+	}
 	text, s := textOf(r.src, id), spanOf(id)
 	var best readUse
 	found := false
