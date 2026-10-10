@@ -61,7 +61,11 @@ func (u *unit) packageJSON(ctx context.Context) error {
 		}
 		sections[sec.key] = deps
 	}
-	spans, err := jsonSpans(u.data)
+	keys := make([]string, len(npmSections))
+	for i, sec := range npmSections {
+		keys[i] = sec.key
+	}
+	spans, err := jsonSpans(u.data, keys)
 	if err != nil {
 		u.malformed()
 		return nil
@@ -128,26 +132,27 @@ func (u *unit) packageJSON(ctx context.Context) error {
 // span is a half-open byte interval.
 type span struct{ start, end int }
 
-// jsonLayout holds the byte spans of a package.json's top-level members and
+// jsonLayout holds the byte spans of a JSON manifest's top-level members and
 // of the members of its dependency tables, from key to value end.
 type jsonLayout struct {
 	top    map[string]span
 	nested map[string]map[string]span
 }
 
-// jsonSpans walks the document's tokens once. encoding/json reports the
-// offset after each token; the key's opening quote is found by scanning back
-// from its closing quote, which is exact because a JSON string ends at the
-// first unescaped quote.
-func jsonSpans(data []byte) (jsonLayout, error) {
+// jsonSpans walks the document's tokens once, recording the member spans of
+// the top-level objects named by tables. encoding/json reports the offset
+// after each token; the key's opening quote is found by scanning back from
+// its closing quote, which is exact because a JSON string ends at the first
+// unescaped quote.
+func jsonSpans(data []byte, tables []string) (jsonLayout, error) {
 	out := jsonLayout{top: map[string]span{}, nested: map[string]map[string]span{}}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return out, malformedJSON(err)
 	}
 	wanted := map[string]bool{}
-	for _, s := range npmSections {
-		wanted[s.key] = true
+	for _, key := range tables {
+		wanted[key] = true
 	}
 	for {
 		tok, err := dec.Token()
@@ -227,7 +232,7 @@ func skipValue(dec *json.Decoder, depth int) error {
 func skipRest(dec *json.Decoder, depth int) error {
 	for depth > 0 {
 		if depth > maxJSONDepth {
-			return &model.Error{Code: model.CodeResourceLimit, Message: "package.json nests deeper than the parser bound"}
+			return &model.Error{Code: model.CodeResourceLimit, Message: "the JSON manifest nests deeper than the parser bound"}
 		}
 		tok, err := dec.Token()
 		if err != nil {
@@ -266,7 +271,7 @@ func keyStart(data []byte, end int) int {
 
 func malformedJSON(err error) error {
 	if err == nil || err == io.EOF {
-		return &model.Error{Code: model.CodeArgumentInvalid, Message: "package.json is not a JSON object"}
+		return &model.Error{Code: model.CodeArgumentInvalid, Message: "the JSON manifest is not an object"}
 	}
-	return &model.Error{Code: model.CodeArgumentInvalid, Message: "package.json is malformed: " + err.Error()}
+	return &model.Error{Code: model.CodeArgumentInvalid, Message: "the JSON manifest is malformed: " + err.Error()}
 }

@@ -1,11 +1,13 @@
 // Package manifest is the Section 11.2 build-metadata and documentation
 // provider: package, module, dependency and configuration nodes parsed from
-// go.mod, go.work, package.json, Cargo.toml, pyproject.toml and pom.xml, and
-// the headings and source links of Markdown documents. Every parser is a
-// static reader of the pinned bytes: nothing is fetched, evaluated, executed
-// or resolved against another file, and a value the format leaves dynamic
-// (a workspace-inherited version, a Maven property reference, a PEP 621
-// dynamic field) stays unresolved and says so.
+// go.mod, go.work, package.json, composer.json, Cargo.toml, pyproject.toml,
+// pip requirements files and pom.xml, and the headings and source links of
+// Markdown documents. Every parser is a static reader of the pinned bytes:
+// nothing is fetched, evaluated or executed, and a value the format leaves
+// dynamic (a workspace-inherited version, a Maven property reference, a PEP
+// 621 dynamic field, a pip option or environment variable) stays unresolved
+// and says so. The one manifest that reads another file is a requirements
+// file: its `-r` and `-c` includes are followed through the same snapshot.
 //
 // One unit is one manifest file and depends on the filesystem unit of
 // the same file, whose file node the manifest's `defines` relation starts
@@ -125,7 +127,7 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 // rootManifests are the well-known manifests detection reports when they sit
 // at the workspace root. Detection is informational: the provider is
 // available regardless, because documents are everywhere.
-var rootManifests = []string{"go.mod", "go.work", "package.json", "Cargo.toml", "pyproject.toml", "pom.xml"}
+var rootManifests = []string{"go.mod", "go.work", "package.json", "composer.json", "Cargo.toml", "pyproject.toml", "requirements.txt", "pom.xml"}
 
 // Detect reports the root manifests present without walking anything.
 func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Policy) (provider.Detection, error) {
@@ -141,13 +143,50 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 // Recognize reports whether the path is one this provider parses, which is
 // how the coordinator decides that a manifest unit exists for a file.
 func Recognize(rel string) bool {
-	return capabilityFor(filesystem.Classify(rel).Format) != ""
+	return capabilityFor(formatOf(rel)) != ""
+}
+
+// The two formats this provider recognizes by name on its own. The
+// filesystem classification knows a requirements file only as text, and
+// composer.json not at all; neither changes what the filesystem unit emits.
+const (
+	formatComposer     = "composer"
+	formatRequirements = "requirements"
+)
+
+// formatOf is the format this provider parses a path as: composer.json and
+// pip requirements files by name, every other format by the filesystem
+// classification.
+func formatOf(rel string) string {
+	switch {
+	case path.Base(rel) == "composer.json":
+		return formatComposer
+	case isRequirements(rel):
+		return formatRequirements
+	}
+	return filesystem.Classify(rel).Format
+}
+
+// isRequirements reports whether a path names a pip requirements file: a
+// `.txt` or `.in` file whose name contains "requirements" (requirements.txt,
+// requirements-dev.txt, dev-requirements.in, ...), or any `.txt` or `.in` file
+// directly inside a directory named `requirements`. pip itself accepts any
+// name; a file outside this set is read only when a recognized one includes
+// it.
+func isRequirements(rel string) bool {
+	lower := strings.ToLower(path.Base(rel))
+	ext := path.Ext(lower)
+	if ext != ".txt" && ext != ".in" {
+		return false
+	}
+	return strings.Contains(strings.TrimSuffix(lower, ext), "requirements") || path.Base(path.Dir(rel)) == "requirements"
 }
 
 // capabilityFor maps a parsed format to the capability it reports under.
 func capabilityFor(format string) string {
 	switch format {
-	case filesystem.FormatGoMod, filesystem.FormatGoWork, filesystem.FormatPackageJSON, filesystem.FormatCargo, filesystem.FormatPyProject, filesystem.FormatPom:
+	case filesystem.FormatGoMod, filesystem.FormatGoWork, filesystem.FormatPackageJSON, filesystem.FormatCargo, filesystem.FormatPyProject, filesystem.FormatPom,
+		formatComposer, formatRequirements:
 		return CapabilityManifests
 	case filesystem.FormatMarkdown, "adr":
 		return CapabilityDocumentation
@@ -161,8 +200,8 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if err != nil {
 		return model.ProviderResult{}, err
 	}
-	cls := filesystem.Classify(rel)
-	capability := capabilityFor(cls.Format)
+	format := formatOf(rel)
+	capability := capabilityFor(format)
 	if capability == "" {
 		return model.ProviderResult{}, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the manifest provider was assigned a file it does not parse", Details: map[string]string{"path": rel}}
@@ -186,21 +225,26 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	}
 	e.AddBytes(uint64(len(data)))
 	u := &unit{e: e, data: data, cursor: source.NewCursor(data), capability: capability, state: model.CapabilityFresh,
+		content: req.Content, repo: req.Binding.RepositoryID, maxParse: p.opts.MaxParseFileBytes,
 		deps: p.opts.MaxDependencies, entries: p.opts.MaxEntries,
 		tomlLines: p.opts.MaxTOMLLines, xmlElements: p.opts.MaxXMLElements}
-	switch cls.Format {
+	switch format {
 	case filesystem.FormatGoMod:
 		err = u.goMod(ctx)
 	case filesystem.FormatGoWork:
 		err = u.goWork(ctx)
 	case filesystem.FormatPackageJSON:
 		err = u.packageJSON(ctx)
+	case formatComposer:
+		err = u.composerJSON(ctx)
 	case filesystem.FormatCargo:
 		err = u.cargo(ctx)
 	case filesystem.FormatPyProject:
 		err = u.pyproject(ctx)
 	case filesystem.FormatPom:
 		err = u.pom(ctx)
+	case formatRequirements:
+		err = u.requirements(ctx)
 	default:
 		err = u.markdown(ctx)
 	}
@@ -222,6 +266,13 @@ type unit struct {
 	e      *filesystem.Emitter
 	data   []byte
 	cursor *source.Cursor
+
+	// content, repo and maxParse let a requirements file read the files it
+	// includes from the same snapshot, under the same parse admission as
+	// the unit's own file.
+	content  model.SnapshotView
+	repo     model.RepositoryID
+	maxParse config.Limit
 
 	// file is the file node `defines` starts from, resolved on first use.
 	// A format that defines nothing from the file (Markdown emits its
@@ -401,6 +452,16 @@ func (u *unit) pathTarget(ctx context.Context, target string, dir bool, rng *mod
 	}
 	node, err := u.e.Node(ctx, filesystem.PathCandidate(ID, kind, rel), attrs)
 	return node, err == nil, err
+}
+
+// referencedFile is the file node at a workspace path this unit names but
+// did not observe, or the unit's own file node when the path is its own.
+func (u *unit) referencedFile(ctx context.Context, rel string, rng *model.SourceRange) (model.Node, error) {
+	if rel == u.e.File().Path {
+		return u.fileNode(ctx)
+	}
+	return u.e.Node(ctx, filesystem.PathCandidate(ID, model.NodeFile, rel), filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng,
+		Metadata: filesystem.Metadata(map[string]any{"resolution": "referenced"})})
 }
 
 // resolveRelative joins a manifest-relative path onto the manifest's

@@ -2,6 +2,7 @@ package manifest_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -719,5 +720,150 @@ func TestDeepHeadingTrailDoesNotFailTheUnit(t *testing.T) {
 	}
 	if len(qualified) != 7 {
 		t.Fatalf("7 headings yielded %d distinct section identities", len(qualified))
+	}
+}
+
+// relationLines renders every relation occurrence leaving a node of kind
+// from as "relation target key=value ...", the detail keys sorted, so a test
+// can state the exact facts one manifest published.
+func relationLines(t *testing.T, cap *capture, from model.NodeKind) []string {
+	t.Helper()
+	var out []string
+	for _, r := range cap.relations {
+		if cap.nodes[r.Relation.From].Kind != from {
+			continue
+		}
+		to := cap.nodes[r.Relation.To]
+		for _, ev := range r.Evidence {
+			line := fmt.Sprintf("%s %s %s", r.Relation.Kind, to.Kind, to.QualifiedName)
+			if ev.Detail != "" {
+				var detail map[string]string
+				if err := json.Unmarshal([]byte(ev.Detail), &detail); err != nil {
+					t.Fatalf("evidence detail %q: %v", ev.Detail, err)
+				}
+				for _, k := range sortedMapKeys(detail) {
+					line += " " + k + "=" + detail[k]
+				}
+			}
+			if ev.Range != nil {
+				line += " ranged"
+			}
+			out = append(out, line)
+		}
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+func sortedMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestRequirementsIncludeCycleYieldsExactlyItsPackages is C-T3. A
+// requirements file with markers, extras, comments, a continuation, a
+// per-requirement hash, a constraints file and an `-r` include that includes
+// the file back must publish exactly its packages and end. Mutation caught:
+// following includes without the visited guard never returns from the unit
+// (the walk grows until the test's time or memory runs out), and dropping the comment rule publishes the comment text as a requirement.
+func TestRequirementsIncludeCycleYieldsExactlyItsPackages(t *testing.T) {
+	files := map[string]string{
+		"requirements.txt": "# pinned for production\n" +
+			"requests[security]>=2.31 ; python_version >= \"3.8\"  # http client\n" +
+			"Django==4.2 \\\n    --hash=sha256:abc\n" +
+			"-r dev/requirements-dev.txt\n" +
+			"-c constraints.txt\n" +
+			"--index-url https://pypi.example/simple\n" +
+			"-e ./local-pkg\n" +
+			"./vendor/thing-1.0.tar.gz\n",
+		"dev/requirements-dev.txt": "pytest>=7  # tests\n-r ../requirements.txt\nTyping_Extensions ; python_version < \"3.11\"\n",
+		"constraints.txt":          "urllib3<2\n",
+	}
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &capture{}
+	states := map[string]model.CapabilityState{}
+	runUnit(t, providertest.New(t, files), mf, "requirements.txt", cap, states)
+	got := relationLines(t, cap, model.NodeConfiguration)
+	want := []string{
+		"configures dependency pypi:urllib3 constraint=true kind=runtime requirement=<2 via=constraints.txt",
+		"configures file constraints.txt include=constraint ranged",
+		"configures file dev/requirements-dev.txt include=requirement ranged",
+		"configures file requirements.txt include=requirement via=dev/requirements-dev.txt",
+		"depends_on dependency pypi:django kind=runtime options=--hash=sha256:abc requirement===4.2 ranged",
+		"depends_on dependency pypi:pytest kind=runtime requirement=>=7 via=dev/requirements-dev.txt",
+		`depends_on dependency pypi:requests kind=runtime requirement=[security]>=2.31 ; python_version >= "3.8" ranged`,
+		`depends_on dependency pypi:typing-extensions kind=runtime requirement=; python_version < "3.11" via=dev/requirements-dev.txt`,
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("requirements facts differ:\n--- got\n%s\n--- want\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	var meta struct {
+		Unresolved []map[string]string `json:"unresolved"`
+	}
+	for _, n := range cap.nodes {
+		if n.Kind == model.NodeConfiguration {
+			if err := json.Unmarshal(n.Metadata, &meta); err != nil {
+				t.Fatalf("configuration metadata %s: %v", n.Metadata, err)
+			}
+		}
+	}
+	var lines []string
+	for _, u := range meta.Unresolved {
+		lines = append(lines, u["line"])
+	}
+	wantLines := []string{"--index-url https://pypi.example/simple", "-e ./local-pkg", "./vendor/thing-1.0.tar.gz"}
+	if !slices.Equal(lines, wantLines) {
+		t.Fatalf("unresolved lines = %q, want %q", lines, wantLines)
+	}
+	if cs := states[manifest.ID+" "+manifest.CapabilityManifests+" "+filesystem.ScopeKey("requirements.txt")]; cs.State != model.CapabilityFresh {
+		t.Fatalf("a fully read requirements file published %s/%s, want fresh", cs.State, cs.DiagnosticCode)
+	}
+}
+
+// TestComposerRequireAndRequireDev guards composer.json's two link tables.
+// Mutation caught: dropping require-dev loses the dev dependency, and
+// reading the platform entries as ordinary packages loses `platform`.
+func TestComposerRequireAndRequireDev(t *testing.T) {
+	files := map[string]string{
+		"app/composer.json": `{
+  "name": "Acme/App",
+  "type": "project",
+  "require": {"php": "^8.2", "ext-mbstring": "*", "monolog/monolog": "^3.0"},
+  "require-dev": {"phpunit/phpunit": "^11.0"}
+}
+`,
+	}
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &capture{}
+	states := map[string]model.CapabilityState{}
+	runUnit(t, providertest.New(t, files), mf, "app/composer.json", cap, states)
+	got := relationLines(t, cap, model.NodePackage)
+	want := []string{
+		"depends_on dependency composer:ext-mbstring kind=runtime platform=true requirement=* ranged",
+		"depends_on dependency composer:monolog/monolog kind=runtime requirement=^3.0 ranged",
+		"depends_on dependency composer:php kind=runtime platform=true requirement=^8.2 ranged",
+		"depends_on dependency composer:phpunit/phpunit kind=dev requirement=^11.0 ranged",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("composer facts differ:\n--- got\n%s\n--- want\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	found := false
+	for _, n := range cap.nodes {
+		if n.Kind == model.NodePackage && n.QualifiedName == "composer:acme/app" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("composer.json did not define package composer:acme/app")
 	}
 }
