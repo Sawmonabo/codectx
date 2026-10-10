@@ -7,9 +7,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// tableDigestDomain is the hash domain of a table's digest.
-const tableDigestDomain = "link.table"
-
 // Table is one file's link tables as the structural provider stores them with
 // its unit, under TableKind: the worker's wire.Link joined to the
 // declarations and call sites the parent validated, with every identity the
@@ -193,39 +190,4 @@ func DecodeTable(b []byte) (*Table, error) {
 		return nil, err
 	}
 	return &t, nil
-}
-
-// Digest is the digest of what the linker's resolution reads of t: every
-// name, kind, shape, type fact, candidate and index, the package, the
-// imports, the re-exports and the unions, and the order of every list, but no byte range, position, node
-// identity or dropped count. A structural node's identity is derived from
-// its range, and an edit that shifts a range moves neither a name nor a
-// type, so two tables with one digest resolve every site
-// to the same declarations by index; only the ranges and identities the
-// edges are published with differ, and those are read from the fresh table.
-// That is what lets an edit inside a function body that changes neither
-// table relink nothing.
-func (t *Table) Digest() (string, error) {
-	c := Table{Path: t.Path, Language: t.Language, Package: t.Package, Imports: t.Imports, Supertypes: t.Supertypes,
-		Reexports: t.Reexports, Unions: t.Unions, Values: make([]Value, len(t.Values))}
-	c.Module = Endpoint{Kind: t.Module.Kind, Name: t.Module.Name, Qualified: t.Module.Qualified}
-	c.Decls = make([]Decl, len(t.Decls))
-	for i, d := range t.Decls {
-		d.Endpoint = Endpoint{Kind: d.Kind, Name: d.Name, Qualified: d.Qualified}
-		c.Decls[i] = d
-	}
-	c.Sites = make([]Site, len(t.Sites))
-	for i, s := range t.Sites {
-		s.Range, s.NameStart, s.NameEnd = model.SourceRange{}, 0, 0
-		c.Sites[i] = s
-	}
-	for i, v := range t.Values {
-		v.Range = model.SourceRange{}
-		c.Values[i] = v
-	}
-	b, err := json.Marshal(&c)
-	if err != nil {
-		return "", err
-	}
-	return model.H(tableDigestDomain, string(b)), nil
 }

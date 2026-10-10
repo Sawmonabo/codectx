@@ -37,16 +37,27 @@ const DigestKind = "link.table_digest"
 const memberDigestDomain = "link.member"
 
 // MemberDigest is what a linking unit records for one member
-// (model.UnitInput.Digest): the table's Digest, which decides every binding,
-// and its Dropped count, which decides the unit's coverage. A unit whose every
-// member keeps its digest therefore resolves the same bindings and has the
-// same coverage, which is what lets it inherit both.
+// (model.UnitInput.Digest): the table's two summaries (InterfaceDigest,
+// SitesDigest), which decide every binding, and its Dropped count, which
+// decides the unit's coverage. A member that keeps its digest therefore keeps
+// its bindings, the bindings into it and its share of the coverage; one whose
+// digest moved is read, and its two summaries tell which of them moved.
 func MemberDigest(t *Table) (string, error) {
-	d, err := t.Digest()
+	iface, err := t.InterfaceDigest()
 	if err != nil {
 		return "", err
 	}
-	return model.H(memberDigestDomain, d, strconv.Itoa(t.Dropped)), nil
+	sites, err := t.SitesDigest()
+	if err != nil {
+		return "", err
+	}
+	return memberDigest(iface, sites, t.Dropped), nil
+}
+
+// memberDigest is MemberDigest from a table's two summary digests and its
+// dropped count.
+func memberDigest(iface, sites string, dropped int) string {
+	return model.H(memberDigestDomain, iface, sites, strconv.Itoa(dropped))
 }
 
 // StoreTables reads tables and digests from the store: the structural unit a
