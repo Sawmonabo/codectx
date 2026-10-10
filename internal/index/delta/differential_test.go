@@ -1,6 +1,9 @@
 package delta_test
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // TestIncrementalLinkEqualsFullBuild drives one project per language the
 // linker handles through a scripted sequence of edits, refreshes the linking
@@ -363,10 +366,12 @@ export class Button {
 }
 `,
 	},
-	edits: append(ecmascriptEdits(".ts"),
-		edit{name: "overload inserted before the existing ones", replace: []sub{{"maker.ts",
+	// The overload goes in right after the rename, while main.ts still
+	// binds both existing overloads and so carries calls naming their nodes.
+	edits: append(slices.Insert(ecmascriptEdits(".ts"), 4,
+		edit{name: "overload inserted before the existing ones", replace: []sub{{"factory.ts",
 			"export function parse(s: string): number;\n",
-			"export function parse(b: boolean): number;\nexport function parse(s: string): number;\n"}}},
+			"export function parse(b: boolean): number;\nexport function parse(s: string): number;\n"}}}),
 		edit{name: "tsconfig paths change", replace: []sub{{"tsconfig.json", `["lib/*"]`, `["src/lib/*"]`}}},
 	),
 }
