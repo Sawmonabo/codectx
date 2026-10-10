@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -70,9 +71,9 @@ func newTakenSort(dir string, order func(a, b taken) int) (*pagination.ExternalS
 }
 
 // sigUse is a site that joins the address-taken functions of Sig: an
-// indirect site, which binds each of them, or a Java call of an abstract
-// method, which binds the method (Site's target and detail) when there is
-// none.
+// indirect site, which binds each of them, exact, or a Java call of an
+// abstract method, which binds the method (Site's target and detail),
+// virtual, when there is none. Site is the call fact the join completes.
 type sigUse struct {
 	Sig      string
 	Abstract bool
@@ -188,11 +189,15 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 	s.h.record(note)
 	defer s.h.record(nil)
 	emit := func(b Binding) error {
-		to, err := s.h.ids.node(b.Target)
-		if err != nil {
+		if b.Site.File != file {
+			return internalErr("a resolver emitted a fact about member " + strconv.Itoa(int(b.Site.File)) +
+				" while resolving member " + strconv.Itoa(int(file)))
+		}
+		id, ok, err := s.h.ids.identify(fv.ID, b)
+		if err != nil || !ok {
 			return err
 		}
-		return s.bindings.Add(idBinding{SiteFile: fv.ID, Site: b.Site.Index, TargetFile: to.File, Target: to.Node, Detail: b.Detail})
+		return s.bindings.Add(id)
 	}
 	signature := func(e entry) error {
 		switch e.Tag {
@@ -206,7 +211,8 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 			if err := note(signatureKey(e.Key)); err != nil {
 				return err
 			}
-			return s.uses.Add(sigUse{Sig: e.Key, Site: idBinding{SiteFile: fv.ID, Site: e.Ref.Index, Detail: DetailAddressTaken}})
+			return s.uses.Add(sigUse{Sig: e.Key, Site: idBinding{Kind: FactCall, SiteFile: fv.ID, Site: e.Ref.Index,
+				Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
 		}
 		if err := note(signatureKey(e.Key)); err != nil {
 			return err
@@ -215,8 +221,11 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 		if err != nil {
 			return err
 		}
-		return s.uses.Add(sigUse{Sig: e.Key, Abstract: true,
-			Site: idBinding{SiteFile: fv.ID, Site: e.Ref.Index, TargetFile: to.File, Target: to.Node, Detail: e.Sig}})
+		if _, ok := detailCode(e.Sig); !ok {
+			return internalErr("a resolver joined an abstract method with the unknown technique " + strconv.Quote(e.Sig))
+		}
+		return s.uses.Add(sigUse{Sig: e.Key, Abstract: true, Site: idBinding{Kind: FactCall, SiteFile: fv.ID,
+			Site: e.Ref.Index, TargetFile: to.File, Target: to.Node, Detail: e.Sig, Dispatch: model.DispatchVirtual}})
 	}
 	r := staticFile{h: s.h, ctx: s.ctx, file: file, t: t, fc: contextOf(file, t), emit: emit, returns: map[int32][]returned{}}
 	for i := range t.Sites {
@@ -279,9 +288,10 @@ func (s *staticRun) members(run *pagination.SortedRun[model.FileID]) error {
 
 // crossProduct binds each signature use of uses (by signature) against the
 // address-taken functions of its signature in taken (by signature), into
-// out: an indirect site to every one of them, a Java call of an abstract
-// method to that method only when there is none. Only one signature's
-// functions are held at a time.
+// out: an indirect site to every one of them, each a call fact of dispatch
+// exact (the function the value holds is the one that runs), a Java call of
+// an abstract method to that method, virtual, only when there is none. Only
+// one signature's functions are held at a time.
 func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun[sigUse], out *pagination.ExternalSort[idBinding]) error {
 	next, stop := pull(taken)
 	defer stop()

@@ -55,7 +55,7 @@ func externalLanguage(family string) string {
 // method node keyed by its scope, qualified name, kind and language and no
 // file (reconcile.CanonicalKey's structural case), with its descriptor set to
 // that qualified name. ok is false for a key no externalType or
-// externalMethod wrote.
+// externalMethod wrote, and for one whose names exceed a node's bounds.
 func externalCandidate(key string) (c model.NodeCandidate, ok bool) {
 	parts := strings.Split(key, "\x00")
 	c = model.NodeCandidate{ProviderID: ProviderID, ScopeKey: externalScope}
@@ -80,7 +80,10 @@ func externalCandidate(key string) (c model.NodeCandidate, ok bool) {
 	default:
 		return model.NodeCandidate{}, false
 	}
-	c.NativeKey, c.Descriptor = "external:"+c.QualifiedName, c.QualifiedName
+	if len(c.Name) > model.MaxNameBytes || len(c.QualifiedName) > model.MaxQualifiedNameBytes {
+		return model.NodeCandidate{}, false
+	}
+	c.NativeKey, c.Descriptor = fitKey("external:"+c.QualifiedName), c.QualifiedName
 	return c, true
 }
 

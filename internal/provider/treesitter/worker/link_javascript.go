@@ -40,7 +40,20 @@ import (
 //     a required module's TypeModule, `this` the enclosing class, `super`
 //     its supertypes (TypeSuper).
 //
+// Every site, and every computed site, carries its arguments (Arguments):
+// where each is, a spread `...xs` positional at xs, and the named variables
+// it reads (readIndex), none through a call's result or a nested callable.
+// A call whose callee names nothing (`o[k]()`, `f()()`, `(a || b)()`, a
+// function called where it is written) is a computed site (Link.Computed)
+// at its callee expression, ShapeIndirect. A method or function-valued
+// field with the TypeScript `override` modifier is marked Override.
+//
 // # Imports
+//
+// Every `import(expr)`, and a `require(expr)` whose first argument is not a
+// string literal, is a dynamic import: its path's literal parts (strings
+// joined by `+`, a template's literal text), or the one path they fold to
+// when every part is literal (Constant).
 //
 // The table carries no import list, so an import's origin travels in the
 // types: a named import `import {f as g} from "./a"` is TypeModule
@@ -103,6 +116,7 @@ import (
 // exported declaration, `export { a }` and `export { a as b }`, `export { x }
 // from "./m"`, `export * from "./m"` and `export * as ns from "./m"`.
 type javaScriptLinker struct {
+	linkReads
 	language string
 	// k and x are the grammar's kind tables and l its lowering, resolved on
 	// the first call (ready); src is the file's bytes.
@@ -115,6 +129,9 @@ type javaScriptLinker struct {
 	// byte; a TypeResult among them names its site by that byte too, until
 	// file numbers the sites.
 	sites map[uint32]wire.Site
+	// computed are the calls whose callee names nothing (wire.Link.Computed)
+	// that function recovered, by their callee expression's span.
+	computed map[wire.Span]wire.Site
 	// returns are the types the callables return, by the callable's first
 	// byte.
 	returns map[uint32]wire.Type
@@ -278,6 +295,7 @@ func (k *javaScriptLinker) ready(src []byte) {
 	k.x = jsLinkTables[k.language].syntax()
 	k.l, _ = LoweringFor(k.language)
 	k.sites = map[uint32]wire.Site{}
+	k.computed = map[wire.Span]wire.Site{}
 	k.returns = map[uint32]wire.Type{}
 	k.vars = map[string][]jsVar{}
 	k.seen = map[uint64]bool{}
@@ -306,6 +324,9 @@ func (k *javaScriptLinker) function(fn Node, g *flow.Graph, du flow.Edges, src [
 			if tok, ok := k.callee(n); ok {
 				k.query()
 				k.sites[uint32(tok.StartByte())] = k.site(n, tok)
+			} else if f, ok := k.computedCallee(n); ok {
+				k.query()
+				k.computed[wireSpan(spanOf(f))] = k.computedSite(n, f)
 			}
 		case k.x.returnStatement:
 			k.query()
@@ -935,18 +956,159 @@ func (k *javaScriptLinker) site(n, tok Node) wire.Site {
 			s.Receiver = k.typeOf(obj)
 		}
 	}
-	if a := n.ChildByFieldId(kk.fArguments); jsKindOf(a) == x.arguments {
-		for c := a.first(); !c.IsNull(); c = c.next() {
-			switch {
-			case !c.IsNamed() || c.IsExtra():
-			case c.KindId() == kk.spreadElement:
-				s.Args = append(s.Args, wire.Type{})
-			default:
-				s.Args = append(s.Args, k.typeOf(c))
+	k.arguments(n, &s)
+	return s
+}
+
+// arguments fills s.Args and s.Arguments from the call n's argument list,
+// one entry each per argument: a spread `...xs` is SpreadPositional at xs,
+// of unknown type, and every argument carries the named variables it reads.
+func (k *javaScriptLinker) arguments(n Node, s *wire.Site) {
+	kk := k.k
+	a := n.ChildByFieldId(kk.fArguments)
+	if jsKindOf(a) != k.x.arguments {
+		return
+	}
+	for c := a.first(); !c.IsNull(); c = c.next() {
+		if !c.IsNamed() || c.IsExtra() {
+			continue
+		}
+		arg := wire.Argument{At: wireSpan(spanOf(c))}
+		at := c
+		if c.KindId() == kk.spreadElement {
+			if e := firstNamed(c); !e.IsNull() {
+				at = e
 			}
+			arg.At, arg.Spread = wireSpan(spanOf(at)), wire.SpreadPositional
+			s.Args = append(s.Args, wire.Type{})
+		} else {
+			s.Args = append(s.Args, k.typeOf(c))
+		}
+		arg.Reads = k.reads().argReads(at, k.readName, k.readSkip, nil)
+		s.Arguments = append(s.Arguments, arg)
+	}
+}
+
+// readName reports an identifier an argument reads a variable through: a
+// name in value position, or an object literal's shorthand property (`{x}`
+// reads x). A property name, a label or a type name is of another kind.
+func (k *javaScriptLinker) readName(n Node) bool {
+	return n.KindId() == k.k.identifier || n.KindId() == k.x.shorthandPropertyIdentifier
+}
+
+// readSkip reports a subtree whose names an argument does not read: a call
+// or a construction, whose result is what the argument passes, and a nested
+// callable or class body, whose code runs elsewhere.
+func (k *javaScriptLinker) readSkip(n Node) bool {
+	id := n.KindId()
+	return id == k.k.callExpression || id == k.k.newExpression || k.l.isCallable(n) || k.l.isAmbient(n)
+}
+
+// computedCallee is the callee expression of the call n when it names
+// nothing, so no call reference covers the call (the structural query
+// captures a callee that is an identifier or a member with a property
+// name): a subscript `o[k]()`, a call's result `f()()`, a parenthesized,
+// logical or conditional expression, a function called where it is written.
+// A dynamic `import(…)` and a `super(…)` constructor call are no such call.
+func (k *javaScriptLinker) computedCallee(n Node) (Node, bool) {
+	if n.KindId() != k.k.callExpression {
+		return Node{}, false
+	}
+	if _, named := k.callee(n); named {
+		return Node{}, false
+	}
+	f := n.ChildByFieldId(k.k.fFunction)
+	switch jsKindOf(f) {
+	case jsNoKind, k.x.importKw, k.x.super:
+		return Node{}, false
+	}
+	return f, true
+}
+
+// computedSite is the computed call n's site: its callee expression f,
+// ShapeIndirect, with its arguments.
+func (k *javaScriptLinker) computedSite(n, f Node) wire.Site {
+	s := wire.Site{Name: wireSpan(spanOf(f)), Shape: wire.ShapeIndirect}
+	k.arguments(n, &s)
+	return s
+}
+
+// dynamicImport appends the dynamic import the call n makes, if any: every
+// `import(expr)`, and a `require(expr)` whose first argument is not a
+// string literal (a literal one is an import record of the structural
+// query). Its fragments are the path's literal parts; a path every part of
+// which is literal folds to one constant path.
+func (k *javaScriptLinker) dynamicImport(out *wire.Link, n Node) {
+	kk := k.k
+	f := n.ChildByFieldId(kk.fFunction)
+	switch {
+	case jsKindOf(f) == k.x.importKw:
+	case jsKindOf(f) == kk.identifier && string(textOf(k.src, f)) == "require":
+		if jsKindOf(firstOf(n.ChildByFieldId(kk.fArguments))) == k.x.str {
+			return
+		}
+	default:
+		return
+	}
+	path := firstOf(n.ChildByFieldId(kk.fArguments))
+	if jsKindOf(n.ChildByFieldId(kk.fArguments)) != k.x.arguments || path.IsNull() {
+		return
+	}
+	var (
+		frags    []string
+		lit      strings.Builder
+		pending  bool
+		constant = true
+	)
+	flush := func() {
+		if pending {
+			frags = append(frags, lit.String())
+			lit.Reset()
+			pending = false
 		}
 	}
-	return s
+	literal := func(text string) {
+		if text != "" {
+			lit.WriteString(text)
+			pending = true
+		}
+	}
+	var walk func(e Node)
+	walk = func(e Node) {
+		e = k.l.unparen(e)
+		switch jsKindOf(e) {
+		case k.x.str:
+			literal(k.unquote(e))
+			return
+		case k.x.templateString:
+			for c := e.first(); !c.IsNull(); c = c.next() {
+				switch {
+				case !c.IsNamed() || c.IsExtra():
+				case c.KindId() == k.x.templateSubstitution:
+					constant = false
+					flush()
+				default:
+					literal(string(textOf(k.src, c)))
+				}
+			}
+			return
+		case kk.binaryExpression:
+			if op := e.ChildByFieldId(kk.fOperator); !op.IsNull() && string(textOf(k.src, op)) == "+" {
+				walk(e.ChildByFieldId(kk.fLeft))
+				walk(e.ChildByFieldId(kk.fRight))
+				return
+			}
+		}
+		constant = false
+		flush()
+	}
+	walk(path)
+	flush()
+	d := wire.DynamicImport{At: wireSpan(spanOf(n)), Fragments: frags, Constant: constant}
+	if constant {
+		d.Fragments = []string{strings.Join(frags, "")}
+	}
+	out.DynamicImports = append(out.DynamicImports, d)
 }
 
 // assigned records the value an assignment writes to a property, or the
@@ -1062,6 +1224,16 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 				}
 				numbered[at] = uint32(len(out.Sites))
 				out.Sites = append(out.Sites, s)
+			} else if f, ok := k.computedCallee(n); ok {
+				s, ok := k.computed[wireSpan(spanOf(f))]
+				if !ok {
+					k.query()
+					s = k.computedSite(n, f)
+				}
+				out.Computed = append(out.Computed, s)
+			}
+			if n.KindId() == kk.callExpression {
+				k.dynamicImport(out, n)
 			}
 		case kk.functionDeclaration, kk.generatorFunctionDeclaration:
 			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == kk.identifier {
@@ -1075,6 +1247,7 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == x.propertyIdentifier {
 				abstract := n.KindId() != kk.methodDefinition
 				k.export(out, name, n, k.receiverOf(n), !abstract && hasToken(n, kk.staticKw), abstract)
+				out.Exports[len(out.Exports)-1].Override = !kindChild(n, x.overrideModifier).IsNull()
 			}
 		case kk.variableDeclarator:
 			name, value := n.ChildByFieldId(kk.fName), n.ChildByFieldId(kk.fValue)
@@ -1088,6 +1261,7 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 					key = kk.fProperty
 				}
 				k.export(out, n.ChildByFieldId(key), value, k.className(n.Parent()), hasToken(n, kk.staticKw), false)
+				out.Exports[len(out.Exports)-1].Override = !kindChild(n, x.overrideModifier).IsNull()
 			}
 		case kk.classDeclaration, kk.abstractClassDeclaration, kk.class:
 			k.class(out, n)
@@ -1133,6 +1307,11 @@ func (k *javaScriptLinker) finish(out *wire.Link, numbered map[uint32]uint32) {
 		number(&s.Receiver)
 		for j := range s.Args {
 			number(&s.Args[j])
+		}
+	}
+	for i := range out.Computed {
+		for j := range out.Computed[i].Args {
+			number(&out.Computed[i].Args[j])
 		}
 	}
 	for i := range out.Exports {
@@ -1592,7 +1771,9 @@ type jsLinkSyntax struct {
 	typePredicateAnnotation, typeIdentifier, nestedTypeIdentifier, genericType, predefinedType, functionType,
 	implementsClause, extendsTypeClause, interfaceDeclaration, interfaceBody, objectType, typeAliasDeclaration,
 	methodSignature, abstractMethodSignature, functionSignature, exportClause, exportSpecifier,
-	namespaceExport uint16
+	namespaceExport, templateString, templateSubstitution, overrideModifier uint16
+	// importKw is the `import` of a dynamic import's call.
+	importKw uint16
 	// defaultKw and star are the anonymous `default` and `*` tokens of an
 	// export statement.
 	defaultKw, star uint16
@@ -1632,6 +1813,8 @@ func (g *jsLinkGrammar) syntax() *jsLinkSyntax {
 			methodSignature: k("method_signature"), abstractMethodSignature: k("abstract_method_signature"),
 			functionSignature: k("function_signature"), exportClause: k("export_clause"),
 			exportSpecifier: k("export_specifier"), namespaceExport: k("namespace_export"),
+			templateString: k("template_string"), templateSubstitution: k("template_substitution"),
+			overrideModifier: k("override_modifier"), importKw: k("import"),
 			defaultKw: tl.IdForNodeKind("default", false), star: tl.IdForNodeKind("*", false),
 		}
 	})

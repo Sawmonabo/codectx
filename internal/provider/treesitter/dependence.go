@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
@@ -48,8 +49,13 @@ const (
 // declaring identifier in the file: a closure's message that names a
 // variable an enclosing function declared names the same node, and an
 // identifier that is a declaration's name token names that declaration.
+//
+// It then completes the link table's variable endpoints from the same nodes
+// (tableVariables), so a parameter or an argument's read in the table is the
+// variable node these facts publish, never a second one.
 func (b *builder) functions() error {
 	if len(b.ex.functions) == 0 {
+		b.tableVariables(nil)
 		return nil
 	}
 	if b.ex.done.DependenceFailure != "" {
@@ -71,13 +77,13 @@ func (b *builder) functions() error {
 		for j, v := range f.Vars {
 			fv := vars[v]
 			if !fv.resolved {
-				if fv.id, err = b.variable(v, fv, claims, ownerQualified, params[v]); err != nil {
+				if fv.ep, err = b.variable(v, fv, claims, ownerQualified, params[v]); err != nil {
 					return err
 				}
 				fv.resolved = true
 				vars[v] = fv
 			}
-			ids[j] = fv.id
+			ids[j] = fv.ep.Node
 		}
 		nodes := make([]*model.SourceRange, len(f.Nodes))
 		for j, n := range f.Nodes {
@@ -104,7 +110,46 @@ func (b *builder) functions() error {
 			b.dependsOn(owner, model.RelWrites, ids[a.Var], nodes[a.Node], ownerKey, detail)
 		}
 	}
+	b.tableVariables(vars)
 	return nil
+}
+
+// tableVariables completes the variable endpoints linkTable left with their
+// identifier's range alone: each declared parameter and each argument's read
+// becomes the endpoint of the variable node functions resolved for the
+// identifier at that range. A parameter no analysed function names keeps an
+// empty Node; a read with no node is left out of its argument.
+func (b *builder) tableVariables(vars map[wire.Span]fileVar) {
+	if b.table == nil {
+		return
+	}
+	resolved := func(r model.SourceRange) (link.Endpoint, bool) {
+		fv, ok := vars[wire.Span{Start: uint32(r.Start.Byte), End: uint32(r.End.Byte)}]
+		return fv.ep, ok && fv.resolved && fv.ep.Node != ""
+	}
+	for i := range b.table.Decls {
+		for j := range b.table.Decls[i].Parameters {
+			p := &b.table.Decls[i].Parameters[j]
+			if ep, ok := resolved(p.Range); ok {
+				p.Endpoint = ep
+			}
+		}
+	}
+	for i := range b.table.Sites {
+		for j := range b.table.Sites[i].Arguments {
+			a := &b.table.Sites[i].Arguments[j]
+			kept := a.Reads[:0]
+			for _, r := range a.Reads {
+				if ep, ok := resolved(r.Range); ok {
+					kept = append(kept, ep)
+				}
+			}
+			if len(kept) == 0 {
+				kept = nil
+			}
+			a.Reads = kept
+		}
+	}
 }
 
 // dependsOn publishes one occurrence of a dependence fact, or counts it when
@@ -144,10 +189,11 @@ func (b *builder) owner(byStart []int, s wire.Span) (model.NodeID, string, strin
 }
 
 // fileVar is one declaring identifier the file's analysed functions name:
-// the node it resolved to once resolved is set, its located range, and the
-// cross-provider declaration key over it, empty when over its bound.
+// the endpoint of the node it resolved to once resolved is set (an empty
+// Node when its key did not fit), its located range, and the cross-provider
+// declaration key over it, empty when over its bound.
 type fileVar struct {
-	id       model.NodeID
+	ep       link.Endpoint
 	resolved bool
 	rng      *model.SourceRange
 	declKey  string
@@ -189,7 +235,7 @@ func (b *builder) variables() (map[wire.Span]fileVar, map[string]int, error) {
 				return nil, nil, err
 			}
 			if d, ok := b.nameAt[v]; ok {
-				vars[v] = fileVar{id: b.decls[d].res.Node.ID, resolved: true}
+				vars[v] = fileVar{ep: b.declEndpoint(d), resolved: true}
 				continue
 			}
 			key := b.declKey(string(b.src[v.Start:v.End]), v.Start, v.End, rng)
@@ -212,12 +258,13 @@ func (b *builder) variables() (map[wire.Span]fileVar, map[string]int, error) {
 // omitted and counted. A key over its bound is omitted, never truncated: a
 // native key that does not fit drops the variable and answers the empty id,
 // which drops its facts with it. A name or qualified name over its storage
-// ceiling is cut and flagged, as a declaration's is.
-func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, ownerQualified string, param parameter) (model.NodeID, error) {
+// ceiling is cut and flagged, as a declaration's is. It answers the
+// variable's endpoint, as the link table names it.
+func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, ownerQualified string, param parameter) (link.Endpoint, error) {
 	key := b.rangeKey("var:", v.Start, v.End)
 	if key == "" {
 		b.dropped[dependence]++
-		return "", nil
+		return link.Endpoint{}, nil
 	}
 	name := string(b.src[v.Start:v.End])
 	qualified := name
@@ -233,7 +280,7 @@ func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, owner
 		Descriptor: param.descriptor, Disambiguator: param.disambiguator,
 	})
 	if err != nil {
-		return "", err
+		return link.Endpoint{}, err
 	}
 	var meta map[string]any
 	if len(truncated) > 0 {
@@ -246,7 +293,8 @@ func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, owner
 	} else {
 		b.putAlias(b.scope, fv.declKey, res.Node.ID)
 	}
-	return res.Node.ID, nil
+	return link.Endpoint{Node: res.Node.ID, CanonicalKey: res.CanonicalKey, Kind: model.NodeVariable, Name: name,
+		Qualified: qualified, Range: *fv.rng}, nil
 }
 
 // parameter is a parameter variable's identity inputs: its declaring

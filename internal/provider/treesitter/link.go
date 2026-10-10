@@ -41,6 +41,18 @@ const detailLinkFailure = "link_failure"
 // values and its sites' recovered receiver and argument types are missing
 // from the table, and the sites resolve on less than the file says.
 //
+// A joined site also takes the worker's arguments (wire.Site.Arguments), each
+// with its range, keyword, spread and reads; a read is a variable endpoint
+// carrying its identifier's range here, which functions fills with the
+// variable node the dependence facts publish and drops when no node was
+// minted for it (tableVariables). The worker's computed sites, calls whose
+// callee names nothing, follow the reference-joined sites as sites of their
+// own (link.Site.Computed). A declaration takes its export's override mark
+// and alias and its declared parameters (wire.Link.Parameters), each a
+// variable endpoint functions fills the same way. A dynamic import becomes a
+// link.DynamicImport, or, when its path folds to a constant, an ordinary
+// import appended to Table.Imports.
+//
 // A file whose module has no identity (build gave up on an over-long path)
 // has no endpoint to link from and stores no table; neither does a file whose
 // dependence or link pass failed, and the worker sending link tables for one
@@ -53,7 +65,11 @@ func (b *builder) linkTable() error {
 	if b.ex.done.DependenceFailure != "" || b.ex.done.LinkFailure != "" {
 		return outputInvalid("a file whose dependence or link pass failed also sent link tables")
 	}
-	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Package: b.ex.done.Package, Imports: b.linkImports(),
+	imports, err := b.linkImports()
+	if err != nil {
+		return err
+	}
+	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Package: b.ex.done.Package, Imports: imports,
 		Supertypes: wl.Supertypes, Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
 			Name: b.module.Node.Name, Qualified: b.module.Node.QualifiedName, Range: *b.fileRng}}
 	for i := range b.ex.functions {
@@ -154,19 +170,27 @@ func (b *builder) linkTable() error {
 		}
 		ws := &wl.Sites[w]
 		t.Sites[i].Receiver = typ(ws.Receiver)
-		if len(ws.Args) > 0 {
-			t.Sites[i].Args = make([]wire.Type, len(ws.Args))
-			for j, a := range ws.Args {
-				t.Sites[i].Args[j] = typ(a)
-			}
+		t.Sites[i].Args, t.Sites[i].Arguments = b.linkArgs(ws, typ, &t.Dropped)
+	}
+	byStart := b.declsByStart()
+	for i := range wl.Computed {
+		ws := &wl.Computed[i]
+		rng, err := b.rangeOf(ws.Name.Start, ws.Name.End)
+		if err != nil || ws.Shape != wire.ShapeIndirect {
+			t.Dropped++
+			continue
 		}
+		s := link.Site{Caller: b.enclosing(byStart, ws.Name), Range: *rng, NameStart: ws.Name.Start, NameEnd: ws.Name.End,
+			Callee: bound(string(b.src[ws.Name.Start:ws.Name.End]), model.MaxNameBytes), Shape: wire.ShapeIndirect,
+			Described: true, Computed: true}
+		s.Args, s.Arguments = b.linkArgs(ws, typ, &t.Dropped)
+		t.Sites = append(t.Sites, s)
 	}
 
 	t.Decls = make([]link.Decl, len(b.decls))
 	for i := range b.decls {
 		d := &b.decls[i]
-		t.Decls[i] = link.Decl{Endpoint: link.Endpoint{Node: d.res.Node.ID, CanonicalKey: d.res.CanonicalKey, Kind: d.kind,
-			Name: d.Name, Qualified: d.Qualified, Range: *d.rng}, Parent: int32(d.Parent), Exported: d.Exported,
+		t.Decls[i] = link.Decl{Endpoint: b.declEndpoint(i), Parent: int32(d.Parent), Exported: d.Exported,
 			Prototype: d.Prototype, Macro: d.Macro}
 	}
 	for _, x := range wl.Exports {
@@ -179,11 +203,44 @@ func (b *builder) linkTable() error {
 		d.Described, d.Receiver, d.Signature, d.Params, d.Optional, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Optional, x.Variadic
 		d.Static, d.Abstract, d.Virtual, d.Final, d.Internal = x.Static, x.Abstract, x.Virtual, x.Final, x.Internal
 		d.Returns = typ(x.Returns)
+		d.Override, d.Alias = x.Override, x.Alias
+	}
+	for _, p := range wl.Parameters {
+		i, ok := b.nameAt[p.Callable]
+		if !ok {
+			t.Dropped++
+			continue
+		}
+		rng, err := b.rangeOf(p.Name.Start, p.Name.End)
+		if err != nil {
+			t.Dropped++
+			continue
+		}
+		t.Decls[i].Parameters = append(t.Decls[i].Parameters, link.Parameter{
+			Endpoint: link.Endpoint{Kind: model.NodeVariable, Name: bound(string(b.src[p.Name.Start:p.Name.End]), model.MaxNameBytes), Range: *rng},
+			Index:    p.Index, Variadic: p.Variadic, KeywordOnly: p.KeywordOnly})
 	}
 	t.Reexports = wl.Reexports
+	for _, x := range wl.DynamicImports {
+		rng, err := b.rangeOf(x.At.Start, x.At.End)
+		if err != nil {
+			t.Dropped++
+			continue
+		}
+		scope := b.enclosing(byStart, x.At)
+		if !x.Constant {
+			t.DynamicImports = append(t.DynamicImports, link.DynamicImport{Caller: scope, Range: *rng,
+				Fragments: append([]string{}, x.Fragments...)})
+			continue
+		}
+		if len(x.Fragments) != 1 || x.Fragments[0] == "" || len(x.Fragments[0]) > model.MaxQualifiedNameBytes {
+			t.Dropped++
+			continue
+		}
+		t.Imports = append(t.Imports, link.Import{Path: x.Fragments[0], Scope: scope, Range: *rng})
+	}
 
 	if len(wl.Values) > 0 {
-		byStart := b.declsByStart()
 		t.Values = make([]link.Value, 0, len(wl.Values))
 		for _, v := range wl.Values {
 			rng, err := b.rangeOf(v.At.Start, v.At.End)
@@ -198,25 +255,80 @@ func (b *builder) linkTable() error {
 	return nil
 }
 
+// linkArgs is a worker site's argument types, remapped by typ, and its
+// arguments: each argument's range, keyword and spread, and its reads as
+// variable endpoints carrying the identifier's range, which tableVariables
+// completes. Arguments that are not one per argument type, or one whose
+// range does not fit, leave the site without arguments and count once in
+// dropped; a read whose range does not fit is left out and counted.
+func (b *builder) linkArgs(ws *wire.Site, typ func(wire.Type) wire.Type, dropped *int) ([]wire.Type, []link.Argument) {
+	var args []wire.Type
+	if len(ws.Args) > 0 {
+		args = make([]wire.Type, len(ws.Args))
+		for j, a := range ws.Args {
+			args[j] = typ(a)
+		}
+	}
+	if len(ws.Arguments) == 0 {
+		return args, nil
+	}
+	if len(ws.Arguments) != len(ws.Args) {
+		*dropped++
+		return args, nil
+	}
+	out := make([]link.Argument, len(ws.Arguments))
+	for j, a := range ws.Arguments {
+		rng, err := b.rangeOf(a.At.Start, a.At.End)
+		if err != nil {
+			*dropped++
+			return args, nil
+		}
+		out[j] = link.Argument{Range: *rng, Keyword: a.Keyword, Spread: a.Spread}
+		for _, r := range a.Reads {
+			rr, err := b.rangeOf(r.Start, r.End)
+			if err != nil || r.End <= r.Start {
+				*dropped++
+				continue
+			}
+			out[j].Reads = append(out[j].Reads, link.Endpoint{Kind: model.NodeVariable, Range: *rr})
+		}
+	}
+	return args, out
+}
+
+// declEndpoint is declaration i's link endpoint.
+func (b *builder) declEndpoint(i int) link.Endpoint {
+	d := &b.decls[i]
+	return link.Endpoint{Node: d.res.Node.ID, CanonicalKey: d.res.CanonicalKey, Kind: d.kind, Name: d.Name,
+		Qualified: d.Qualified, Range: *d.rng}
+}
+
 // linkImports is the names the file's import records introduce, each with
-// the path it denotes and the declaration it is written in (link.Import). The worker's record is one statement:
+// the path it denotes, the declaration it is written in and the record's
+// range (link.Import). The worker's record is one statement:
 // its path as written and the local names it binds. A Rust use tree is
 // split into one path per leaf (lang.RustUse). An import of every member of a path (a Go
 // dot import, a Java on-demand import `a.b.*`, a C++ using-directive, a Rust
 // glob, a Python `from m import *`) is named link.ImportAll, which the
 // statement's own bytes tell; an import binding no name (an include, an
 // ECMAScript side-effect import) has an empty name.
-func (b *builder) linkImports() []link.Import {
+func (b *builder) linkImports() ([]link.Import, error) {
 	var out []link.Import
 	byStart := b.declsByStart()
 	for _, imp := range b.ex.imports {
+		rng, err := b.rangeOf(imp.Start, imp.End)
+		if err != nil {
+			return nil, err
+		}
 		text := string(b.src[imp.Start:imp.End])
 		names := imp.Names
 		scope := b.enclosing(byStart, wire.Span{Start: imp.Start, End: imp.End})
 		switch b.lang.Name {
 		case "rust":
 			// A glob's name is lang.RustGlob, which is link.ImportAll.
-			lang.RustUse(imp.Path, func(name, p string) { out = append(out, link.Import{Name: name, Path: p, Scope: scope}) })
+			lang.RustUse(imp.Path, func(name, p string) {
+				out = append(out, link.Import{Name: name, Path: p, Scope: scope, Range: *rng})
+			})
 			continue
 		case "go":
 			if len(names) == 1 && names[0] == "." {
@@ -236,17 +348,17 @@ func (b *builder) linkImports() []link.Import {
 			}
 		}
 		if len(names) == 0 {
-			out = append(out, link.Import{Path: imp.Path, Scope: scope})
+			out = append(out, link.Import{Path: imp.Path, Scope: scope, Range: *rng})
 		}
 		for i, n := range names {
-			li := link.Import{Name: n, Path: imp.Path, Scope: scope}
+			li := link.Import{Name: n, Path: imp.Path, Scope: scope, Range: *rng}
 			if len(imp.Originals) == len(names) {
 				li.Original = imp.Originals[i]
 			}
 			out = append(out, li)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // enclosing is the index of the innermost declaration whose range contains

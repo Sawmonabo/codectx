@@ -188,10 +188,10 @@ func (s *session) only(units []linkBuild) linkBuild {
 // republished rows are alike in storage (a carried evidence row is minted
 // again under the new unit), so it is read from what the carry-over
 // inherited: every evidence row the predecessor located in a file that was
-// not republished, and none of a republished file's. A file the refresh
-// republished without naming it is short of its carried rows, which the
-// insert of the fresh copy pre-empted; a file it named replaced is not
-// carried at all. Each witness must hold evidence in the predecessor, or
+// not republished, none of a republished file's, and none of the index-level
+// bucket's. A file the refresh republished without naming it is short of its
+// carried rows, which the insert of the fresh copy pre-empted; a file it
+// named replaced is not carried at all. Each witness must hold evidence in the predecessor, or
 // its republication could not be told from its carrying.
 func (s *session) wantRepublished(step string, b linkBuild, republished []string, witnesses ...string) {
 	s.t.Helper()
@@ -214,7 +214,9 @@ func (s *session) wantRepublished(step string, b linkBuild, republished []string
 			s.t.Fatal(err)
 		}
 		per[file] = n
-		if _, ok := ids[file]; !ok {
+		// The index-level bucket (evidence of no file: the external nodes)
+		// is replaced on every refresh and published again, never carried.
+		if _, ok := ids[file]; !ok && file != "" {
 			want += n
 		}
 	}
