@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -89,6 +90,11 @@ type Compiler struct {
 	// called after the plan is decided, it cannot change one, and a compile
 	// with no observer set does not pay for it.
 	observeSorts func([]sortObservation)
+	// fullRead, when set, reads every lexical match to the end instead of
+	// stopping at the floor (ADR-0016 decision 3). It is the reference a test
+	// compares a stopped plan against, never a configuration key: a compile
+	// built by New never sets it.
+	fullRead bool
 }
 
 // New validates the options and builds a Compiler. Every dependency is
@@ -301,22 +307,44 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// that boundary's carry and answers a continuation cursor instead of a
 	// plan. A deadline is therefore never a lost compile, whichever pass it
 	// lands behind.
+	//
+	// The passes run in rounds (ADR-0016 decisions 4 and 5): after each
+	// round's P-H, nextRound decides from that pack whether the plan is done or
+	// another round runs with new inputs, and P-I runs once, on the final
+	// round. A resumed call re-enters the recorded round at the recorded pass
+	// and continues the loop from there. A round rebuilds the pipeline from
+	// P-A with fresh sorts in the same sort area, and the area's deferred
+	// release removes every round's runs: a compile's temporary disk is the
+	// sum of its rounds' runs, each round's no larger than a one-round compile
+	// of the same inputs. No halt lands between two rounds -- a round that has
+	// not started has no carry to checkpoint -- so the next round's P-A is the
+	// first place the stop is asked again.
 	st := &compileState{pass: passIngest}
 	if resumed != nil {
 		if err := c.restoreAt(sorts, resumed, st); err != nil {
 			return CompileResult{}, err
 		}
 	}
-	if err := c.runPasses(ctx, reader, gen, req, sorts, resolved, st,
-		func(int) bool { return paging && c.deadlineReached(ctx) }); err != nil {
-		return CompileResult{}, err
-	}
-	if st.halted {
-		token, cerr := c.checkpointAt(ctx, binding, requestHash, st)
-		if cerr != nil {
-			return CompileResult{}, cerr
+	for {
+		if err := c.runPasses(ctx, reader, gen, req, sorts, resolved, st,
+			func(int) bool { return paging && c.deadlineReached(ctx) }); err != nil {
+			return CompileResult{}, err
 		}
-		return CompileResult{Truncated: true, TruncationReason: truncationDeadline, NextCursor: token}, nil
+		if st.halted {
+			token, cerr := c.checkpointAt(ctx, binding, requestHash, st)
+			if cerr != nil {
+				return CompileResult{}, cerr
+			}
+			return CompileResult{Truncated: true, TruncationReason: truncationDeadline, NextCursor: token}, nil
+		}
+		next, done, err := nextRound(ctx, st)
+		if err != nil {
+			return CompileResult{}, err
+		}
+		if done {
+			break
+		}
+		st.beginRound(next)
 	}
 	scoped, scopeComplete := st.scope, st.scopeComplete
 
@@ -419,8 +447,8 @@ type compileState struct {
 	// ingest is P-A's live sink, and is set ONLY while the walk is halted
 	// mid-pass: a deadline that fires between two of graph.Impact's pages ends
 	// P-A here, and this is the carry the passIngest boundary checkpoints (its
-	// four pre-fold sorts, the walk's cursor, the root list and the arrival
-	// counter). Every other boundary leaves it nil, because the pass that
+	// pre-fold sorts, the closure's reached set among them, the walk's cursor,
+	// the walk groups and the arrival counter). Every other boundary leaves it nil, because the pass that
 	// produced it has finished.
 	ingest *seedIngest
 
@@ -430,6 +458,131 @@ type compileState struct {
 	// checkpoint's scalar record.
 	scope         scopeResult
 	scopeComplete bool
+
+	// round and the round's inputs. A compile whose lexical read stopped at
+	// its floor runs further rounds of P-A..P-H (ADR-0016 decisions 4 and 5):
+	// the closure round reads inside the files the previous round kept, and a
+	// failed certificate raises the witness count and reads to a lower floor.
+	// Both inputs are bounded by the resolved budget, so they are checkpoint
+	// scalars.
+	round  int
+	inputs roundInputs
+	// history is every earlier round's inputs, in round order: a next round
+	// whose inputs repeat any of them would loop, so nextRound refuses it.
+	// Each entry is bounded by the resolved budget and there is one per round.
+	history []roundInputs
+}
+
+// nextRound decides, after a round's P-H, whether the plan is done or which
+// inputs the next round runs with (ADR-0016 decisions 4 and 5):
+//
+//   - a read that met every match is done;
+//   - a round with no kept files whose pack kept some runs a closure round
+//     over them, with the same witness count;
+//   - otherwise the pack's certificate is checked. Failing, the next round
+//     needs one more witness per witness file the pack dropped as oversized,
+//     and closes this pack's kept files; failing with none dropped is an
+//     internal error, never another round. Holding over the same kept files
+//     the round closed is done; holding over different ones closes those.
+//
+// A pack that kept nothing in a round with no kept files has nothing to close,
+// so it goes to the certificate directly.
+//
+// Two outcomes leave the stop unconfirmed, and both end the rounds with this
+// round's plan and its scope marked incomplete (ADR-0016 decision 6), the
+// reason recorded on the stop for the manifest notice: a certificate that fails
+// with no witness file dropped as oversized, which a deeper read cannot repair,
+// and a next round whose inputs repeat this round's or an earlier one's, which
+// would loop. P-I follows this decision in the same call with no boundary
+// between them, so the reason needs no checkpoint of its own.
+func nextRound(ctx context.Context, st *compileState) (roundInputs, bool, error) {
+	stop := st.scope.Stop
+	if !stop.Stopped {
+		return roundInputs{}, true, nil
+	}
+	out, err := readPackOutcome(ctx, st.measured, st.packed, stop.Witnesses)
+	if err != nil {
+		return roundInputs{}, false, contextErr(ctx, err)
+	}
+	next := roundInputs{Extra: st.inputs.Extra, Kept: out.Kept}
+	switch {
+	case len(st.inputs.Kept) == 0 && len(out.Kept) > 0:
+		// The closure round: next already closes this pack's kept files.
+	case !out.certified(stop.Tau):
+		if out.OversizedWitnesses == 0 {
+			st.unconfirmed("the packed files are not bound by the file budget above the stop and no witness file was dropped as oversized, so reading further cannot confirm it")
+			return roundInputs{}, true, nil
+		}
+		next.Extra += out.OversizedWitnesses
+	case slices.Equal(out.Kept, st.inputs.Kept):
+		return roundInputs{}, true, nil
+	}
+	same := func(r roundInputs) bool { return r.Extra == next.Extra && slices.Equal(r.Kept, next.Kept) }
+	if same(st.inputs) || slices.ContainsFunc(st.history, same) {
+		st.unconfirmed(fmt.Sprintf("closing the packed files changed which files are packed, and the next round would repeat an earlier one (%d extra witness file(s), %d kept file(s))",
+			next.Extra, len(next.Kept)))
+		return roundInputs{}, true, nil
+	}
+	return next, false, nil
+}
+
+// unconfirmed ends the rounds on a stop the pack could not confirm: the scope
+// is incomplete, and the stop carries why for the manifest notice.
+func (st *compileState) unconfirmed(why string) {
+	st.scope.Stop.Unconfirmed = why
+	st.scopeComplete = false
+}
+
+// beginRound starts the next round at P-A. Every pass clears the carry slots
+// it was the last reader of, so the slots P-I would have read are the only
+// ones left to clear; P-A rebuilds the scope verdict.
+func (st *compileState) beginRound(next roundInputs) {
+	st.history = append(st.history, st.inputs)
+	st.round++
+	st.inputs = next
+	st.pass = passIngest
+	st.measured, st.packed = nil, nil
+}
+
+// roundInputs is what one round of the compile takes from the round before it.
+type roundInputs struct {
+	// Extra is how many witness files beyond F+1 the read must find before it
+	// stops: the witness groups earlier rounds' packing skipped as oversized.
+	Extra int64 `json:"extra,omitempty"`
+	// Kept is the files the previous round's packing kept, in file-id order.
+	// A closure round reads every lexical match inside them and walks their
+	// unreached nodes. Empty on the first round. At most the plan's file
+	// budget.
+	Kept []model.FileID `json:"kept,omitempty"`
+}
+
+// seedStop is how the lexical read ended (ADR-0016 decision 3). It is bounded
+// by the resolved budget -- the witness list holds at most F+1+Extra files --
+// so it travels in the scope verdict and in the checkpoint's scalars.
+type seedStop struct {
+	// Stopped is set when the read ended at its floor rather than at the last
+	// match. A read that met every match leaves the zero value.
+	Stopped bool `json:"stopped,omitempty"`
+	// Read is how many lexical matches were read (the notice's N), and
+	// FileBudget the plan's file budget F the witnesses were counted against.
+	Read       int64 `json:"read,omitempty"`
+	FileBudget int   `json:"file_budget,omitempty"`
+	// TopScore is the score of the first lexical-tier match, which every
+	// lexical contribution is relative to.
+	TopScore int64 `json:"top_score,omitempty"`
+	// NextScore and NextContribution are the score and contribution of the
+	// first match not read (the notice's X), and Tau is lexicalTau of it: no
+	// unread match lends anything a rank key above (recommended, Tau).
+	NextScore        int64 `json:"next_score,omitempty"`
+	NextContribution int64 `json:"next_contribution,omitempty"`
+	Tau              int64 `json:"tau,omitempty"`
+	// Witnesses are the distinct witness files the stop counted, in the order
+	// the read met them: files whose encoded source fits one slice.
+	Witnesses []model.FileID `json:"witnesses,omitempty"`
+	// Unconfirmed is why the packed plan could not confirm the stop
+	// (nextRound), empty when it did or when the read met every match. A plan
+	// that carries it has an incomplete scope.
+	Unconfirmed string `json:"unconfirmed,omitempty"`
 }
 
 // compileStage is one pass of the pipeline: the index a checkpoint behind it
@@ -461,7 +614,7 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 			// index, so a deadline inside the walk and a deadline behind it
 			// mint the identical continuation, and a non-paging compile (which
 			// has no continuation on offer) never halts inside the walk either.
-			return c.stageIngest(ctx, reader, gen, req, sorts, st, func() bool { return stop(passIngest) })
+			return c.stageIngest(ctx, reader, gen, req, sorts, b, st, func() bool { return stop(passIngest) })
 		}},
 		{passHydrate, func() error { return c.stageHydrate(ctx, reader, sorts, st) }},
 		{passAttributes, func() error { return c.stageAttributes(ctx, reader, gen, sorts, st) }},
@@ -527,7 +680,7 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 // answer of an unmatched task token or the CTX_SCOPE_INCOMPLETE of an explicit
 // boundary, and it can only decide that if it sees the exclusions.
 func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
-	req model.ContextRequest, sorts *compileSorts, st *compileState, stop func() bool,
+	req model.ContextRequest, sorts *compileSorts, b resolvedBudget, st *compileState, stop func() bool,
 ) error {
 	ingest := st.ingest
 	if ingest == nil {
@@ -538,7 +691,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 		if ingest, err = c.newSeedIngest(sorts); err != nil {
 			return err
 		}
-		seeds, err := c.extractSeeds(ctx, reader, gen, req, ingest)
+		seeds, err := c.extractSeeds(ctx, reader, gen, req, b, st.inputs, ingest)
 		if err != nil {
 			return contextErr(ctx, err)
 		}
@@ -558,6 +711,17 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 		if seeds.Unresolved {
 			ingest.scope.ScopeComplete = false
 		}
+		ingest.scope.Stop = seeds.Stop
+		if ingest.closure = keptClosureOf(st.inputs, seeds.Stop); ingest.closure != nil {
+			if ingest.closure.reached, err = newIDSort(sorts, "closure-reached"); err != nil {
+				return err
+			}
+		}
+	}
+	// The closure's reader and query are this call's, on every leg: a
+	// continuation carries neither.
+	if cl := ingest.closure; cl != nil {
+		cl.reader, cl.query = reader, clipUTF8(boundTask(req.Task), model.MaxQueryTextBytes)
 	}
 	// Re-read on every leg of the walk, resumed or not: dropping caps on the
 	// continuation would move Completeness, and with it ScopeComplete and the
@@ -578,7 +742,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 	}
 	if halted {
 		// The walk stopped between two pages. The sink itself is the carry --
-		// its four pre-fold sorts, its arrival counter, its root list and the
+		// its pre-fold sorts, its arrival counter, its walk groups and the
 		// walk's cursor -- and the scalars are copied out here because
 		// checkpointAt reads them from st: the tail below never ran, so
 		// nothing else would have set them.
@@ -695,19 +859,48 @@ func (c *Compiler) stageCentrality(ctx context.Context, sorts *compileSorts, st 
 	return nil
 }
 
-// stageBoosts is P-F. The ranked sort's comparator IS the Section 15.3 total
-// order, so draining it is the reading order the plan is packed and stored in.
+// stageBoosts is P-F. Every scored record first goes through the entity fold:
+// an entity a seed and several walks reached holds one record per pair, and it
+// keeps the one that ranks first, the lexicographic maximum of its pairs
+// (ADR-0016 decision 1). The fold runs only here, after every record is
+// scored, because a pair's rank key is known only once its boosts are. The
+// survivors then go to the ranked sort, whose comparator IS the Section 15.3
+// total order, so draining it is the reading order the plan is packed and
+// stored in.
+//
+// The name-only candidates the fold keeps are counted on the way through,
+// which is the count the manifest notice reports: a candidate whose entity
+// also has a precise record lost the fold and is not in the plan.
 func (c *Compiler) stageBoosts(ctx context.Context, sorts *compileSorts, st *compileState) error {
+	bestSort, err := newSort(sorts, "best", lessEntityFold, sizeOfCand)
+	if err != nil {
+		return err
+	}
+	bestSort = bestSort.WithFold(foldBestRank)
+	if err := c.passFBoosts(ctx, st.scored, st.counts, bestSort); err != nil {
+		return contextErr(ctx, err)
+	}
+	best, err := sortedRun(sorts, bestSort)
+	if err != nil {
+		return err
+	}
 	rankedSort, err := newSort(sorts, "ranked", lessRank, sizeOfCand)
 	if err != nil {
 		return err
 	}
-	if err := c.passFBoosts(ctx, st.scored, st.counts, rankedSort); err != nil {
+	var candidates int64
+	if err := best.Each(func(r candRec) error {
+		if r.Possible && r.Excluded == "" {
+			candidates++
+		}
+		return rankedSort.Add(r)
+	}); err != nil {
 		return contextErr(ctx, err)
 	}
 	if st.ranked, err = sortedRun(sorts, rankedSort); err != nil {
 		return err
 	}
+	st.scope.Candidates = candidates
 	st.scored, st.counts = nil, nil
 	return nil
 }
@@ -832,6 +1025,22 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []strin
 	if n := packed.RelationsClipped; n > 0 {
 		add("%d evidence route(s) were stored clipped to the first %d relations; the route reaches further than the manifest records",
 			n, model.MaxRelationsPerPath)
+	}
+	if st := scoped.Stop; st.Stopped {
+		add("Lexical matches scoring below %d were not read. %d matches above it fill more than the plan's file budget of %d, "+
+			"so no unread match can rank above the packed files. Every match and walk entry inside the packed files is included. "+
+			"Explanations list routes from the %d matches read.",
+			st.NextScore, st.Read, st.FileBudget, st.Read)
+		if st.Unconfirmed != "" {
+			add("The read's stop could not be confirmed after packing: %s; the scope is marked incomplete.", st.Unconfirmed)
+		}
+	}
+	if n := scoped.Candidates; n > 0 {
+		add("%d name-only call candidate(s) of open call sites were admitted as possible context after every precise entry; none is required scope",
+			n)
+	}
+	if why := scoped.CandidatesUnavailable; why != "" {
+		add("name-only call candidates are unavailable for this plan: %s", why)
 	}
 	return out
 }
@@ -980,6 +1189,23 @@ type candidate struct {
 	Paths       []model.RelationPath // <= cfg.Context.MaxReasonPathsPerEntry
 	MorePaths   int64                // routes not enumerated (Section 15.3)
 	Excluded    string               // non-empty => excluded, with this reason
+
+	// RootWeight is the weight w of the root this record's (requirement,
+	// score) pair comes from (ADR-0016 decision 1): a seed's own origin
+	// contribution, or the weight of the walk group that reached a walk entry.
+	// Zero on a record that is no root's: a captured change, a candidate.
+	RootWeight int64
+	// Named marks a record that comes from a named root: an explicit seed, one
+	// of the four exact steps, or a walk from them. Only named records feed
+	// centrality (ADR-0016 decision 2), and only a lexical record has its
+	// requirement capped.
+	Named bool
+	// Possible marks a name-only call candidate (ADR-0015 decision 3). Every
+	// possible record ranks after every precise one, in Closeness order, then
+	// by Compatible (how many compatible declarations its name has).
+	Possible   bool
+	Closeness  int32
+	Compatible int64
 }
 
 // originKind names the Section 15.2 seed step, in discovery order.
@@ -994,6 +1220,10 @@ const (
 	originLexical
 	originChangedFile
 	originExpansion
+	// originCandidate is a name-only call candidate of an open call site the
+	// walk reached (ADR-0015 decision 3); it is never a root and never
+	// required.
+	originCandidate
 )
 
 // entityID is the final, unique tie-break key: the node identity when the
@@ -1059,11 +1289,13 @@ func overflowErr(a, b int64) *model.Error {
 // (internal/graph/cost.go:5-14 states why). A relation kind absent from this
 // map contributes nothing and is not admitted to a path.
 var contributionWeight = map[model.RelationKind]int64{
-	model.RelImplements:       940_000,
-	model.RelOverrides:        940_000,
-	model.RelExtends:          940_000,
-	model.RelTests:            920_000,
-	model.RelCalls:            900_000,
+	model.RelImplements: 940_000,
+	model.RelOverrides:  940_000,
+	model.RelExtends:    940_000,
+	model.RelTests:      920_000,
+	model.RelCalls:      900_000,
+	// An endpoint is bound to its handler as firmly as a call is.
+	model.RelRoutesTo:         900_000,
 	model.RelReads:            880_000,
 	model.RelWrites:           880_000,
 	model.RelDataFlowsTo:      880_000,
@@ -1101,7 +1333,42 @@ const (
 	boostCentralityMax  int64 = 50_000
 	maxBoostMicros      int64 = boostTaskIdentifier + boostActiveChange +
 		boostAssociatedTest + boostCentralityMax
+	// lexicalContributionMax is the largest origin contribution a lexical
+	// match takes: the top match of a task's read, and any match of a
+	// non-lexical tier. It is derived, not tuned -- one micro below an exact
+	// match, so a lexical match never ranks with one (ADR-0016 decision 1).
+	lexicalContributionMax int64 = exactContribution - 1
+	// rootBoostMicros is every boost a root can lend what it reaches: all but
+	// the task-identifier boost, which only an origin the task named takes.
+	rootBoostMicros int64 = boostActiveChange + boostAssociatedTest + boostCentralityMax
 )
+
+// scaleBoost scales a record's total boost by the weight of the root its pair
+// comes from (ADR-0016 decision 1). A root at the full scale lends boosts
+// whole; a weaker root lends them in proportion. It is the ONE scaling, used
+// by the ranking pass and by lexicalTau, so the read's stop bound and the
+// scores it bounds are computed by the same integer arithmetic.
+func scaleBoost(weight, boost int64) (int64, error) {
+	if weight >= scale {
+		return boost, nil
+	}
+	if weight <= 0 {
+		return 0, nil
+	}
+	return mulScaled(weight, boost)
+}
+
+// lexicalTau is the largest final score anything derived from a lexical match
+// of contribution c can reach: its own origin pair, or a route from it at most
+// at the full scale, plus every boost a root lends, scaled by c (ADR-0016
+// decision 3). Nothing derived from that match ranks above (recommended, tau).
+func lexicalTau(c int64) (int64, error) {
+	b, err := scaleBoost(c, rootBoostMicros)
+	if err != nil {
+		return 0, err
+	}
+	return c + b, nil
+}
 
 // compilerPolicyVersion is the code-side ranking/budget policy label stored in
 // every manifest header and folded into its request and canonical hashes. It
@@ -1110,7 +1377,7 @@ const (
 // budget.max_manifest_bytes is part of the request hash and the canonical
 // projection because a caller budget that decides whether a plan is admitted is
 // part of a request's identity.
-const compilerPolicyVersion = "codectx.context.v2"
+const compilerPolicyVersion = "codectx.context.v3"
 
 // The model.H domains. Two code paths computing a different preimage would make
 // the Section 15.1 immutable-manifest reuse lookup silently never hit, so the

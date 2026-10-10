@@ -17,7 +17,10 @@ package context
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -108,8 +111,34 @@ type refScope struct {
 // ambiguous extracted scope is NOT an error: it yields a discovery answer with
 // ScopeComplete false, no required entry and every unresolved token kept as its
 // own reasoned exclusion (Section 15.2).
+//
+// expandScope is the expansion of a lexical read that met every match: no
+// lexical walk carries a derived depth bound and no seed is a kept-file seed.
+// expandScopeAfter is the same expansion after a read that ended at stop.
 func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID, cfg config.Context,
 	seeds []candidate, caps []model.CapabilityState) (refScope, error) {
+	return expandScopeAfter(ctx, eng, gen, cfg, seeds, caps, seedStop{})
+}
+
+// expandScopeAfter walks the seeds' roots one group per root weight (ADR-0016
+// decision 1), the groups in descending weight with the named group first on
+// a tie, every group read to exhaustion:
+//
+//   - The seeds fold among themselves, the earliest step keeping an entity. A
+//     seed the caller or the task named and that carries no root weight takes
+//     its step's named weight, as the streamed sink's Admit gives it.
+//   - A walk entry is its own record, never folded against a seed or against
+//     another group's entry: each lends the entity its own (requirement,
+//     score) pair, and keepBestRecords keeps the entity's best one after rank.
+//     A lexical group's requirements are capped at recommended.
+//   - A lexical group of a stopped read walks to its derived depth bound
+//     (lexicalDepthCap), a depth truncation that bound caused does not narrow
+//     the scope, and a group no depth of which can lend a pair above the stop
+//     is not walked. A kept-file seed is never a root.
+//   - After each walk page, the open call sites among its entries have their
+//     name-only candidates admitted (referenceCandidates).
+func expandScopeAfter(ctx context.Context, eng *graph.Engine, gen model.GenerationID, cfg config.Context,
+	seeds []candidate, caps []model.CapabilityState, stop seedStop) (refScope, error) {
 	if eng == nil {
 		return refScope{}, argumentInvalid("scope expansion requires a graph engine")
 	}
@@ -118,11 +147,14 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 	}
 
 	res := refScope{
-		scopeResult: scopeResult{ScopeComplete: true},
+		scopeResult: scopeResult{ScopeComplete: true, Stop: stop},
 		Candidates:  make([]candidate, 0, len(seeds)),
 	}
+	// admitted is the seed fold's key set. The name-only candidates join it:
+	// the streamed side pushes them into the seed survivors' fold, so a
+	// candidate of an entity a seed or an earlier candidate holds is dropped.
 	admitted := make(map[string]bool, len(seeds))
-	start := make([]model.NodeID, 0, len(seeds))
+	var roots []walkRoot
 	resolved := 0
 
 	for _, s := range seeds {
@@ -142,11 +174,8 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 				// One file surfaces from several Section 15.2 steps -- an
 				// explicit seed is also a changed file, a backtick token also
 				// resolves exactly. Ambiguity that must be preserved is several
-				// DISTINCT entities for one name, not one entity found twice:
-				// context_entries is keyed by ordinal, not by node, so a second
-				// copy would persist as a duplicate entry and an EntryCount
-				// nothing rejects. The earliest step wins, which is the
-				// strongest origin.
+				// DISTINCT entities for one name, not one entity found twice.
+				// The earliest step wins, which is the strongest origin.
 				continue
 			}
 			admitted[id] = true
@@ -155,27 +184,30 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 		if s.Requirement == "" {
 			// Every Section 15.2 seed producer assigns its own requirement:
 			// full for a named identity, recommended for a lexical hit,
-			// optional for a captured change. Promoting all of them here would
-			// put a merely modified or lexically matched file into the
-			// required_full prefix the coverage gate reads as mandatory, which
-			// Section 15.2 forbids. The default stands only for a
+			// optional for a captured change. The default stands only for a
 			// seed that carries none, which would otherwise rank below optional
 			// and be droppable.
 			s.Requirement = model.RequirementFull
 		}
-		res.Candidates = append(res.Candidates, s)
-		if s.NodeID != "" && !cfg.MaxStartNodes.Exceeded(int64(len(start))+1) {
-			start = append(start, s.NodeID)
-		} else if s.NodeID != "" {
-			// More seeds than the user-set context.max_start_nodes admits: the
-			// boundaries of the seeds that did not start are unexplored, and
-			// the answer says so rather than reading as an exhaustive scope.
-			// The streamed side also emits one discloseUnwalkedRoots row here;
-			// as with the max_seeds cut, this reference mirrors the WIDTH rule
-			// and not the disclosure, because both keys are unlimited in every
-			// parity fixture and neither row is produced.
-			res.ScopeComplete = false
+		if s.RootWeight == 0 && (s.Origin == originExplicitSeed || namedByTask(s.Origin)) {
+			s.RootWeight, s.Named = namedRootWeight(s.Origin), true
 		}
+		res.Candidates = append(res.Candidates, s)
+		if s.NodeID == "" || keptFileSeed(candRecOf(s, 0), stop) {
+			continue
+		}
+		if !cfg.MaxStartNodes.Exceeded(int64(len(roots)) + 1) {
+			roots = append(roots, walkRoot{node: s.NodeID, weight: s.RootWeight, named: s.Named})
+			continue
+		}
+		// More seeds than the user-set context.max_start_nodes admits: the
+		// boundaries of the seeds that did not start are unexplored, and the
+		// answer says so rather than reading as an exhaustive scope. The
+		// streamed side also emits one discloseUnwalkedRoots row here; as with
+		// the max_seeds cut, this reference mirrors the WIDTH rule and not the
+		// disclosure, because both keys are unlimited in every parity fixture
+		// and neither row is produced.
+		res.ScopeComplete = false
 	}
 
 	switch {
@@ -184,7 +216,7 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 		// run. Seeds already carry their own exclusion reasons.
 		res.ScopeComplete = false
 		return res, nil
-	case len(start) == 0:
+	case len(roots) == 0:
 		// Files resolved but no symbol did, so no boundary can be walked from
 		// them. Each seed keeps the requirement its Section 15.2 step assigned;
 		// the scope is not complete.
@@ -193,77 +225,248 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 		return res, nil
 	}
 
-	// The reference reads the walk to exhaustion, exactly as the streamed pass
-	// does: graph.Impact answers one globally ranked page plus the cursor that
+	groups, err := referenceWalkGroups(roots, stop)
+	if err != nil {
+		return refScope{}, err
+	}
+	// Each walk is read to exhaustion, exactly as the streamed pass reads it:
+	// graph.Impact answers one globally ranked page plus the cursor that
 	// continues it, and a reference that stopped at page one would make parity
 	// prove only that the two pipelines agree on the first page.
 	var disclosed []model.CapabilityState
-	cursor := ""
-	for {
-		impact, err := eng.Impact(ctx, model.ImpactRequest{
-			// The generation is pinned by the cursor on a continuation, and
-			// naming both is refused: a cursor already carries the generation
-			// its first page was answered from.
-			GenerationID: pinnedGeneration(gen, cursor),
-			Start:        start,
-			Relations:    scopeRelations,
-			// Both directions: a caller reaches the seed through an incoming edge
-			// and a callee through an outgoing one, and Section 15.2 requires both.
-			Direction:  model.DirectionBoth,
-			MaxDepth:   cfg.MaxGraphDepth.Int(),
-			MaxVisited: cfg.MaxVisitedNodes.Int(),
-			MaxEdges:   cfg.MaxGraphEdges.Int(),
-			// No limit: the engine's own page width resolves on page one and
-			// every continuation is bound to it, so the reference reads the
-			// same globally ranked list whatever width the compiler configured.
-			Page: model.PageRequest{Cursor: cursor},
-		})
-		if err != nil {
-			return refScope{}, contextErr(ctx, err)
-		}
-		if impact.Meta.Truncated {
-			res.ScopeComplete = false
-		}
-		disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
+	for _, group := range groups {
+		depth, derivedDepth := walkDepth(group.MaxDepth, cfg.MaxGraphDepth)
+		cursor := ""
+		for {
+			impact, err := eng.Impact(ctx, model.ImpactRequest{
+				// The generation is pinned by the cursor on a continuation, and
+				// naming both is refused: a cursor already carries the generation
+				// its first page was answered from.
+				GenerationID: pinnedGeneration(gen, cursor),
+				Start:        group.Start,
+				Relations:    scopeRelations,
+				// Both directions: a caller reaches the seed through an incoming edge
+				// and a callee through an outgoing one, and Section 15.2 requires both.
+				Direction:  model.DirectionBoth,
+				MaxDepth:   depth,
+				MaxVisited: cfg.MaxVisitedNodes.Int(),
+				MaxEdges:   cfg.MaxGraphEdges.Int(),
+				// No limit: the engine's own page width resolves on page one and
+				// every continuation is bound to it, so the reference reads the
+				// same globally ranked list whatever width the compiler configured.
+				Page: model.PageRequest{Cursor: cursor},
+			})
+			if err != nil {
+				return refScope{}, contextErr(ctx, err)
+			}
+			// A depth truncation the group's derived bound caused is the stop's
+			// own answer, not a cut (ADR-0016 decision 3).
+			derivedCut := derivedDepth && strings.HasPrefix(impact.Meta.TruncationReason, walkDepthReason)
+			if impact.Meta.Truncated && !derivedCut {
+				res.ScopeComplete = false
+			}
+			disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
 
-		for _, e := range impact.Entries {
-			c := candidate{
-				NodeID: e.NodeID,
-				FileID: e.FileID,
-				// Path is deliberately left empty: candidate.Path is a FILE PATH
-				// everywhere else, and ImpactEntry.Name is a qualified name.
-				// Writing the name here made hydrateFiles (compiler.go) skip the
-				// entry -- it fills Path only when it is empty -- so the file path
-				// the FileID resolves to never reached the candidate, and
-				// rank.go's packageOf() bucketed qualified names instead of
-				// directories.
-				Requirement: boundaryRequirement(e.Kind, e.Depth),
-				Origin:      originExpansion,
-				Depth:       e.Depth,
+			for _, e := range impact.Entries {
+				requirement := boundaryRequirement(e.Kind, e.Depth)
+				if !group.Named && requirementRank(requirement) < requirementRank(model.RequirementRecommended) {
+					// A lexical root never makes an entry required.
+					requirement = model.RequirementRecommended
+				}
+				c := candidate{
+					NodeID: e.NodeID,
+					FileID: e.FileID,
+					// Path is deliberately left empty: candidate.Path is a FILE PATH
+					// everywhere else, and ImpactEntry.Name is a qualified name.
+					// Writing the name here made hydrateFiles (compiler.go) skip the
+					// entry -- it fills Path only when it is empty -- so the file path
+					// the FileID resolves to never reached the candidate, and
+					// rank.go's packageOf() bucketed qualified names instead of
+					// directories.
+					Requirement: requirement,
+					Origin:      originExpansion,
+					Depth:       e.Depth,
+					RootWeight:  group.Weight,
+					Named:       group.Named,
+				}
+				var dropped, truncated int64
+				c.Reasons, dropped, truncated = boundReasons(e.Reasons)
+				res.ReasonsDropped += dropped
+				res.ReasonsTruncated += truncated
+				c.Paths, c.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
+				res.Candidates = append(res.Candidates, c)
 			}
-			var dropped, truncated int64
-			c.Reasons, dropped, truncated = boundReasons(e.Reasons)
-			res.ReasonsDropped += dropped
-			res.ReasonsTruncated += truncated
-			c.Paths, c.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
-			if admitted[c.entityID()] {
-				// A seed the walk reached again keeps its seed requirement, which
-				// is the strongest one; re-adding it would double an entry.
-				continue
+			if err := referenceCandidates(ctx, eng, gen, impact.Entries, admitted, &res); err != nil {
+				return refScope{}, err
 			}
-			admitted[c.entityID()] = true
-			res.Candidates = append(res.Candidates, c)
+			if impact.Meta.NextCursor == "" {
+				break
+			}
+			cursor = impact.Meta.NextCursor
 		}
-		if impact.Meta.NextCursor == "" {
-			break
-		}
-		cursor = impact.Meta.NextCursor
 	}
 	res.Completeness = degradedCapabilities(caps, disclosed)
 	if len(res.Completeness) > 0 {
 		res.ScopeComplete = false
 	}
 	return res, nil
+}
+
+// referenceWalkGroups cuts the started roots into one walk per (weight, class)
+// in seq order, sorts the walks by descending weight with the named walk first
+// on a tie, and bounds each lexical walk of a stopped read by its derived
+// depth, dropping one no depth of which can lend a pair above the stop.
+func referenceWalkGroups(roots []walkRoot, stop seedStop) ([]walkGroup, error) {
+	type key struct {
+		weight int64
+		named  bool
+	}
+	at := map[key]int{}
+	var groups []walkGroup
+	for _, r := range roots {
+		k := key{r.weight, r.named}
+		i, ok := at[k]
+		if !ok {
+			i = len(groups)
+			at[k] = i
+			groups = append(groups, walkGroup{Weight: r.weight, Named: r.named})
+		}
+		groups[i].Start = append(groups[i].Start, r.node)
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].Weight != groups[j].Weight {
+			return groups[i].Weight > groups[j].Weight
+		}
+		return groups[i].Named && !groups[j].Named
+	})
+	out := make([]walkGroup, 0, len(groups))
+	for _, g := range groups {
+		if !g.Named && stop.Stopped {
+			depth, err := lexicalDepthCap(g.Weight, stop.Tau)
+			if err != nil {
+				return nil, err
+			}
+			if depth == 0 {
+				continue
+			}
+			g.MaxDepth = depth
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+// referenceCandidates admits the name-only candidates of every open call site
+// among one walk page's entries (ADR-0015 decision 3), in the page's order and
+// each site's candidates in their ranked order, every lookup paged to
+// exhaustion. A candidate whose entity the seeds or an earlier candidate hold
+// is not admitted. An unavailable lookup is recorded on the verdict and no
+// further site is asked; every other failure ends the expansion.
+func referenceCandidates(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
+	entries []model.ImpactEntry, admitted map[string]bool, res *refScope) error {
+	if len(entries) == 0 || res.CandidatesUnavailable != "" {
+		return nil
+	}
+	r, err := eng.Reader()
+	if err != nil {
+		return contextErr(ctx, err)
+	}
+	ids := make([]model.NodeID, len(entries))
+	for i, e := range entries {
+		ids[i] = e.NodeID
+	}
+	nodes, err := r.NodesByID(ctx, ids)
+	if err != nil {
+		return contextErr(ctx, err)
+	}
+	byID := make(map[model.NodeID]model.Node, len(nodes))
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	for _, e := range entries {
+		site, ok := byID[e.NodeID]
+		if !ok {
+			continue
+		}
+		open, err := namedOpenSite(site)
+		if err != nil {
+			return err
+		}
+		if !open {
+			continue
+		}
+		cursor := ""
+		for {
+			page, err := graph.Candidates(ctx, r, model.CandidateRequest{
+				GenerationID: pinnedGeneration(gen, cursor),
+				Site:         site.ID,
+				Page:         model.PageRequest{Limit: model.MaxPageItems, Cursor: cursor},
+			})
+			if err != nil {
+				var typed *model.Error
+				if errors.As(err, &typed) && typed.Code == model.CodeProviderUnavailable {
+					why, _ := model.TruncateField(typed.Message, model.MaxReasonBytes)
+					if why == "" {
+						why = "the candidate lookup is unavailable"
+					}
+					res.CandidatesUnavailable = why
+					return nil
+				}
+				return contextErr(ctx, err)
+			}
+			candIDs := make([]model.NodeID, len(page.Candidates))
+			for i, cd := range page.Candidates {
+				candIDs[i] = cd.NodeID
+			}
+			found, err := r.NodesByID(ctx, candIDs)
+			if err != nil {
+				return contextErr(ctx, err)
+			}
+			byCand := make(map[model.NodeID]model.Node, len(found))
+			for _, n := range found {
+				byCand[n.ID] = n
+			}
+			for _, cd := range page.Candidates {
+				n, ok := byCand[cd.NodeID]
+				if !ok {
+					return &model.Error{Code: model.CodeInternal,
+						Message: "a name-only candidate is not a node of the pinned generation"}
+				}
+				closeness, err := closenessOrdinal(cd.Closeness)
+				if err != nil {
+					return err
+				}
+				cand := candidate{
+					NodeID:      n.ID,
+					FileID:      n.FileID,
+					Requirement: model.RequirementOptional,
+					Origin:      originCandidate,
+					Reasons: []string{boundReason(fmt.Sprintf(
+						"the open call site %q may call this declaration: matched by name only (%s, %s), no analysis bound the call",
+						site.Name, cd.Resolution, cd.Closeness))},
+					Possible:   true,
+					Closeness:  closeness,
+					Compatible: page.Total,
+				}
+				if n.Range != nil {
+					cand.StartByte = int64(n.Range.Start.Byte)
+				}
+				if id := cand.entityID(); !admitted[id] {
+					admitted[id] = true
+					res.Candidates = append(res.Candidates, cand)
+				}
+			}
+			if page.Cursor == "" {
+				break
+			}
+			if page.Cursor == cursor {
+				return &model.Error{Code: model.CodeInternal,
+					Message: "the candidate lookup handed back the cursor it was given"}
+			}
+			cursor = page.Cursor
+		}
+	}
+	return nil
 }
 
 // rank scores every candidate in place and returns the same slice. It does NOT
@@ -285,6 +488,14 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 // a captured change; the compile hydrates file metadata once and the budget
 // pass reuses it.
 //
+// Each record is scored as its own (requirement, score) pair (ADR-0016
+// decision 1): its base is the larger of its origin contribution and its root
+// weight times its best route, and its boost total is scaled once by the
+// weight of the root its pair comes from. Centrality counts only the edges a
+// named root's record admitted (ADR-0016 decision 2). It scores every record
+// and keeps them all; keepBestRecords then keeps each entity's best one, as
+// the streamed fold after P-F does.
+//
 // It is not idempotent: it narrows each candidate's Paths to the routes it
 // retained, so a second call over the same slice would resolve precision for
 // only that subset and re-score against it. Rank once per compile.
@@ -299,7 +510,8 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 	}
 
 	// Pass one scores routes and records, per package, the distinct admitted
-	// edges this compile actually touched -- the walk-local centrality input.
+	// edges the named roots' records touched -- the walk-local centrality
+	// input.
 	routed := make([]routeScore, len(cands))
 	centrality := map[string]map[model.RelationID]struct{}{}
 	for i := range cands {
@@ -314,6 +526,9 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 			edges = map[model.RelationID]struct{}{}
 			centrality[pkg] = edges
 		}
+		if !cands[i].Named {
+			continue
+		}
 		for _, id := range r.admittedEdges {
 			edges[id] = struct{}{}
 		}
@@ -325,12 +540,20 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 	for i := range cands {
 		cands[i].Paths = routed[i].paths
 		cands[i].MorePaths = routed[i].morePaths
-		base := originContribution(cands[i].Origin)
-		if routed[i].best > base {
-			base = routed[i].best
+		base := originContribution(cands[i].Origin, cands[i].RootWeight)
+		lent, err := mulScaled(cands[i].RootWeight, routed[i].best)
+		if err != nil {
+			return nil, err
+		}
+		if lent > base {
+			base = lent
 		}
 		boosts, reasons := boostsFor(cands[i], routed[i], centrality)
-		score := base + boosts
+		scaled, err := scaleBoost(boostWeight(candRecOf(cands[i], 0)), boosts)
+		if err != nil {
+			return nil, err
+		}
+		score := base + scaled
 		if score > maxScoreMicros {
 			score = maxScoreMicros
 		}
@@ -351,6 +574,45 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 	}
 
 	return cands, nil
+}
+
+// keepBestRecords keeps, for every entity, the one record that ranks first
+// under the Section 15.3 order -- the lexicographic maximum of the (requirement,
+// score) pairs its seed and walks lent it, ties to the earliest record -- and
+// drops the rest (ADR-0016 decision 1). A record that names no entity, or that
+// an earlier pass excluded, is kept as it is. Survivors keep their own place in
+// admission order, which is where the streamed exclusion projection reads them
+// from. It answers the survivors and how many of them are name-only
+// candidates, the count the manifest notice reports.
+func keepBestRecords(cands []candidate) ([]candidate, int64) {
+	key := func(c candidate) string {
+		if c.Excluded != "" {
+			return ""
+		}
+		return c.entityID()
+	}
+	best := map[string]int{}
+	for i, c := range cands {
+		k := key(c)
+		if k == "" {
+			continue
+		}
+		if at, ok := best[k]; !ok || c.less(cands[at]) {
+			best[k] = i
+		}
+	}
+	out := make([]candidate, 0, len(cands))
+	var possible int64
+	for i, c := range cands {
+		if k := key(c); k != "" && best[k] != i {
+			continue
+		}
+		if c.Possible && c.Excluded == "" {
+			possible++
+		}
+		out = append(out, c)
+	}
+	return out, possible
 }
 
 // resolvePrecision maps every relation on every candidate route to its edge
@@ -888,11 +1150,21 @@ type packing struct {
 	dropped []drop
 }
 
-// less is the total Section 15.3 order: requirement rank, descending
-// ScoreMicros, normalized path, start byte, entity id.
+// less is the total Section 15.3 order: the name-only candidate tier last,
+// requirement rank, the tier's closeness and compatible-count keys,
+// descending ScoreMicros, normalized path, start byte, entity id.
 func (a candidate) less(b candidate) bool {
+	if a.Possible != b.Possible {
+		return !a.Possible
+	}
 	if ra, rb := requirementRank(a.Requirement), requirementRank(b.Requirement); ra != rb {
 		return ra < rb
+	}
+	if a.Closeness != b.Closeness {
+		return a.Closeness < b.Closeness
+	}
+	if a.Compatible != b.Compatible {
+		return a.Compatible < b.Compatible
 	}
 	if a.ScoreMicros != b.ScoreMicros {
 		return a.ScoreMicros > b.ScoreMicros
@@ -957,8 +1229,8 @@ type drop struct {
 }
 
 // referenceCompile is Compile as this package ran it before the streamed passes
-// replaced it: seeds, expandScope, hydrateFiles, relationsOnPaths, rank,
-// resolveBudget, buildPlan, kept verbatim from the pre-stream compiler.go.
+// replaced it: seeds, expandScope, hydrateFiles, relationsOnPaths, rank, the
+// entity fold, resolveBudget and buildPlan, each over the whole candidate set.
 //
 // It deliberately stops short of the two steps Compile does around the pipeline.
 // The manifest-reuse lookup is skipped because the reference is compared against
@@ -966,6 +1238,18 @@ type drop struct {
 // streamed plan with itself; and persistence is skipped because the reference
 // must not take the manifest identity the streamed compile is about to write.
 // The caller persists nothing here and compares against what Compile stored.
+//
+// It is ONE round: the compile's first round, with no kept files and no extra
+// witnesses. That is the whole compile whenever the lexical read meets every
+// match, and the parity fixtures are built so that it does: their tasks match
+// fewer files lexically than any row's file budget plus one, so the read never
+// finds the F+1 witness files a stop needs, Compiler.fullRead stays unset, and
+// both pipelines run a single round with no kept-file read and no closure walk.
+// The stop, the closure rounds and the post-pack certificate are proved by the
+// differential tests in seedbudget_test.go, which compare a stopped compile with
+// the same compile reading every match, not by this reference. A parity row
+// whose read stopped would show here as a "Lexical matches scoring below"
+// notice on the streamed side only.
 func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextRequest) (
 	plan, bool, []string, model.Budget, error) {
 	if err := req.Validate(); err != nil {
@@ -978,10 +1262,14 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	defer reader.Close()
 	gen := reader.Binding().GenerationID
 
+	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
 	// The reference pipeline keeps the whole-set shape it is the reference FOR,
 	// so it collects what discovery pushes into a slice of its own.
 	sink := &collectSeeds{}
-	seeds, err := c.extractSeeds(ctx, reader, gen, req, sink)
+	seeds, err := c.extractSeeds(ctx, reader, gen, req, resolved, roundInputs{}, sink)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
@@ -999,8 +1287,8 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	}
 	defer release()
 
-	scoped, err := expandScope(ctx, engine, gen, c.cfg.Context,
-		append(append([]candidate(nil), seedCands...), seeds.Excluded...), caps)
+	scoped, err := expandScopeAfter(ctx, engine, gen, c.cfg.Context,
+		append(append([]candidate(nil), seedCands...), seeds.Excluded...), caps, seeds.Stop)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
@@ -1024,10 +1312,7 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
-	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
-	if err != nil {
-		return plan{}, false, nil, model.Budget{}, err
-	}
+	ranked, scoped.scopeResult.Candidates = keepBestRecords(ranked)
 	packed, err := buildPlan(ranked, files, resolved)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
@@ -1065,14 +1350,14 @@ var parityRequests = []struct {
 		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 1}}, nil},
 	{"sweep phase, a different seed", model.ContextRequest{Task: "order placement", Phase: model.PhaseSweep}, nil},
 
-	// Two seeds whose expansions both reach `Repository`, at ONE hop from
-	// `Place` and at TWO from `Handle`. The scope dedupe therefore sees the
-	// same entity twice with DIFFERENT payloads, which is what makes the
-	// min-sequence fold observable: a fold that kept the later arrival would
-	// keep the other depth, and depth reaches the score, the ordinal and the
-	// stored entry. An edgeless row cannot show this -- it admits nothing
-	// twice -- and neither can two seeds at equal depth, whose two arrivals
-	// fold to the same record whichever side survives.
+	// Two seeds that both reach `RepositoryPort`, at ONE hop from `Place` and
+	// at TWO from `Handle`. Both are explicit seeds of one weight, so they are
+	// one walk group (ADR-0016 decision 1) and the walk reports the entity once,
+	// at the depth of its cheapest route; `Place` is also the task's backticked
+	// identifier, so the seed fold sees one entity from two steps and keeps the
+	// earlier. A walk that reported the entity at the farther root's depth, or
+	// a seed fold that kept the later step, changes the requirement, the score
+	// and the stored entry.
 	{"two seeds admit one entity at two depths", model.ContextRequest{
 		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
 		Phase: model.PhaseVerify}, routedScope},
@@ -1246,9 +1531,9 @@ func TestTheStreamedCompileIsByteForByteTheWholeSetPlanAtScale(t *testing.T) {
 }
 
 // routedScope is the shaped scope of the rows above: `Handle` calls `Place`,
-// `Place` calls `Repository` and is tested by `TestPlace`, documented by
+// `Place` calls `RepositoryPort` and is tested by `TestPlace`, documented by
 // `docs/order.md` and configured by `config/order.toml`. Seeded from both
-// `Place` and `Handle`, `Repository` is reached at two different depths and
+// `Place` and `Handle`, `RepositoryPort` is reached at two different depths and
 // every other artifact is reached on a route, so routes, package centrality,
 // multi-reason boosts and cross-file drops all have inputs.
 func routedScope(fx *contextFixture) []model.Relation {

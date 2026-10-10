@@ -524,9 +524,10 @@ func joinHopAttributes(s *compileSorts, hopsByRelation *pagination.SortedRun[hop
 // P-E -- walk-local centrality
 // ---------------------------------------------------------------------------
 
-// passECentrality counts, per package, the distinct admitted edges this compile
-// walked: a `centrality map[string]map[RelationID]struct{}` reduced to one row
-// per package.
+// passECentrality counts, per package, the distinct admitted edges this
+// compile's walks from named roots crossed (ADR-0016 decision 2; P-D feeds only
+// named records' edges): a `centrality map[string]map[RelationID]struct{}`
+// reduced to one row per package.
 //
 // edges is the sort P-D fed one (package, admitted edge) pair into, built with
 // foldPkgEdgeDistinct, so a repeated pair has already collapsed by the time the
