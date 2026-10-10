@@ -33,7 +33,12 @@ import (
 // that resolves each method's receiver, each declared supertype and Go's
 // method-set satisfaction against decls (the methods of each type, its
 // subtypes and its supertypes). Every lookup reads one block range of one
-// file; only the first key of each block is held in memory.
+// file; only the first key of each block is held in memory. Beside them is the
+// identity table (idTable), which spells a member ordinal or a table index
+// as the file or declaration it denotes, so a lookup can be recorded under a
+// key that means the same thing in every build (trace.go). A static-family
+// unit's state keeps all three, and a refresh of the same layout reads them
+// back instead of building them (refresh.layout).
 type hierarchy struct {
 	decls *index
 	links *index
@@ -44,30 +49,30 @@ type hierarchy struct {
 	// is none, and then no Go import path names a package of the unit.
 	goModule, goRoot string
 	// note, while a member's reads are recorded (record), is told each
-	// read by its stable key.
-	note func(stable string) error
+	// read by its trace key.
+	note func(TraceKey) error
 }
 
 // record has the indexes report every key looked up, and goPackages every
-// read of the module path, to note by stable key until record(nil) stops
+// read of the module path, to note by trace key until record(nil) stops
 // it: the reads of the one member being resolved. A unit's members are
 // resolved one at a time, so one recorder serves the hierarchy.
-func (h *hierarchy) record(note func(stable string) error) {
+func (h *hierarchy) record(note func(TraceKey) error) {
 	h.note = note
 	if note == nil {
 		h.decls.trace, h.links.trace = nil, nil
 		return
 	}
-	trace := func(prefix string) func(string) error {
+	trace := func(scope string) func(string) error {
 		return func(key string) error {
-			stable, err := h.ids.stableKey(prefix, key)
+			k, err := h.ids.traceKey(scope, key)
 			if err != nil {
 				return err
 			}
-			return note(stable)
+			return note(k)
 		}
 	}
-	h.decls.trace, h.links.trace = trace(traceDecls), trace(traceLinks)
+	h.decls.trace, h.links.trace = trace(scopeDecls), trace(scopeLinks)
 }
 
 // The keys of the two indexes. A family groups the languages whose files

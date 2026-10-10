@@ -177,8 +177,8 @@ func (s *staticRun) close() {
 // table is t, recording each read beyond t.
 func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 	seen := map[string]bool{}
-	note := func(stable string) error {
-		k := keyHash(stable)
+	note := func(key TraceKey) error {
+		k := key.hash()
 		if seen[k] {
 			return nil
 		}
@@ -203,12 +203,12 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 			}
 			return s.taken.Add(taken{Sig: e.Key, From: fv.ID, Target: to})
 		case 1:
-			if err := note(traceSig + e.Key); err != nil {
+			if err := note(signatureKey(e.Key)); err != nil {
 				return err
 			}
 			return s.uses.Add(sigUse{Sig: e.Key, Site: idBinding{SiteFile: fv.ID, Site: e.Ref.Index, Detail: DetailAddressTaken}})
 		}
-		if err := note(traceSig + e.Key); err != nil {
+		if err := note(signatureKey(e.Key)); err != nil {
 			return err
 		}
 		to, err := s.h.ids.node(refOf(e.Aux))
@@ -379,23 +379,32 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 	return res, nil
 }
 
-// indexGroups is every group h's indexes hold, with one per manifest field.
+// indexGroups is every group h's indexes hold, with one per manifest field
+// key.
 func indexGroups(dir string, h *hierarchy, fields []manifestField) (*pagination.SortedRun[group], error) {
 	groups, err := newGroupSort(dir)
 	if err != nil {
 		return nil, err
 	}
 	defer groups.Close()
-	if err := h.ids.groups(h.decls, traceDecls, groups); err != nil {
+	if err := h.ids.groups(h.decls, scopeDecls, groups); err != nil {
 		return nil, err
 	}
-	if err := h.ids.groups(h.links, traceLinks, groups); err != nil {
+	if err := h.ids.groups(h.links, scopeLinks, groups); err != nil {
 		return nil, err
 	}
-	for _, f := range fields {
-		if err := groups.Add(group{Key: keyHash(traceManifest + f.Key), Hash: model.H(groupDomain, f.Value)}); err != nil {
+	// fields is sorted by key; two manifests may give one key two values
+	// (two crates of one name), which are one group.
+	for i := 0; i < len(fields); {
+		j := i
+		var values []string
+		for ; j < len(fields) && fields[j].Key == fields[i].Key; j++ {
+			values = append(values, fields[j].Value)
+		}
+		if err := groups.Add(group{Key: manifestKey(fields[i].Key).hash(), Hash: model.H(groupDomain, values...)}); err != nil {
 			return nil, err
 		}
+		i = j
 	}
 	return groups.Sorted()
 }
@@ -596,7 +605,7 @@ func (rf *refresh) rerunStatic(s *staticRun, groups *pagination.SortedRun[group]
 	}
 	defer sigs.Close()
 	err = diffGroups(oldRun, newRun, func(t taken) string { return t.Sig }, func(a, b taken) bool { return a == b },
-		func(sig string) error { return sigs.Add(keyHash(traceSig + sig)) })
+		func(sig string) error { return sigs.Add(signatureKey(sig).hash()) })
 	if err != nil {
 		return nil, err
 	}

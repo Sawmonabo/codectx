@@ -33,22 +33,34 @@ import (
 // rebuilt indexes against the predecessor's, joins the changed keys with the
 // reverse index, and re-runs exactly the members whose reads changed.
 
-// The hash domains of a stable key and of a group.
+// The hash domains of a trace key and of a group.
 const (
 	traceKeyDomain = "link.trace_key"
 	groupDomain    = "link.trace_group"
 )
 
-// The stable spellings of what a trace key names, ahead of the key itself.
+// The scopes of a trace key (TraceKey.Scope).
 const (
-	traceDecls    = "d\x00" // a key of the decls index
-	traceLinks    = "l\x00" // a key of the links index
-	traceSig      = "s\x00" // the address-taken functions of a signature
-	traceManifest = "m\x00" // a manifest field (manifestFields)
+	scopeDecls     = "decls"     // a key of the decls index
+	scopeLinks     = "links"     // a key of the links index
+	scopeSignature = "signature" // the address-taken functions of a signature
+	scopeManifest  = "manifest"  // a manifest field (manifestFields)
 )
 
-// keyHash is the stored form of a stable key.
-func keyHash(stable string) string { return model.H(traceKeyDomain, stable) }
+// hash is the stored form of a trace key.
+func (k TraceKey) hash() string {
+	return model.H(traceKeyDomain, strconv.Itoa(int(k.Kind)), k.Scope, k.Name)
+}
+
+// signatureKey is the read of the address-taken functions of sig.
+func signatureKey(sig string) TraceKey {
+	return TraceKey{Kind: TraceScopeLookup, Scope: scopeSignature, Name: sig}
+}
+
+// manifestKey is the read of the manifest field field.
+func manifestKey(field string) TraceKey {
+	return TraceKey{Kind: TraceManifestField, Scope: scopeManifest, Name: field}
+}
 
 // read is one recorded read: the stable key's hash and the member that made
 // it. A refresh reads them sorted by key; their fold keeps one per pair.
@@ -107,79 +119,117 @@ func newGroupSort(dir string) (*pagination.ExternalSort[group], error) {
 
 // idTable is the unit's ordinals translated to identities: each member's
 // FileID, and each declaration's node, by member ordinal and table index. It
-// is two scratch files of fixed-width records, so one translation is one
-// positioned read and nothing of it is resident: members holds, per member,
-// its FileID and the position of its first declaration's node in nodes, and
-// its declaration count.
+// is three scratch files, so one translation is a few positioned reads and
+// nothing of it is resident: members holds, per member, where its FileID is
+// in strs, its first declaration's position in decls and its declaration
+// count; decls holds, per declaration, where its node is in strs.
 type idTable struct {
-	members, nodes       *os.File
-	memberLease, nodeLse *scratch.Lease
-	mw, nw               *bufio.Writer
-	count, decls         int64
+	files        [3]*os.File
+	leases       [3]*scratch.Lease
+	mw, dw, sw   *bufio.Writer
+	count, decls int64
+	strs         int64
 }
 
-// idRecord is the width of one member's record: its FileID, its first
-// declaration's position and its declaration count.
-const idRecord = model.IDHexLen + 8 + 4
+// The widths of a member's and a declaration's record: a string's position
+// and length, and for a member its first declaration and count.
+const (
+	idMember = 8 + 4 + 8 + 4
+	idDecl   = 8 + 4
+)
 
 func newIDTable(dir string) (*idTable, error) {
-	ml, mf, err := scratch.For(dir).TakeFile(scratch.SortRun)
-	if err != nil {
-		return nil, err
+	ids := &idTable{}
+	for i := range ids.files {
+		l, f, err := scratch.For(dir).TakeFile(scratch.SortRun)
+		if err != nil {
+			ids.close()
+			return nil, err
+		}
+		ids.leases[i], ids.files[i] = l, f
 	}
-	nl, nf, err := scratch.For(dir).TakeFile(scratch.SortRun)
-	if err != nil {
-		ml.Release()
-		return nil, err
-	}
-	return &idTable{members: mf, nodes: nf, memberLease: ml, nodeLse: nl, mw: bufio.NewWriter(mf), nw: bufio.NewWriter(nf)}, nil
+	ids.mw, ids.dw, ids.sw = bufio.NewWriter(ids.files[0]), bufio.NewWriter(ids.files[1]), bufio.NewWriter(ids.files[2])
+	return ids, nil
 }
 
-// add records the next member, fv's file, with t's declarations; t is nil
-// for a member without a table.
+// str appends s to strs and answers its position and length.
+func (ids *idTable) str(s string) ([]byte, error) {
+	rec := binary.BigEndian.AppendUint64(nil, uint64(ids.strs))
+	rec = binary.BigEndian.AppendUint32(rec, uint32(len(s)))
+	_, err := ids.sw.WriteString(s)
+	ids.strs += int64(len(s))
+	return rec, err
+}
+
+// add records the next member, file, with t's declarations; t is nil for a
+// member without a table.
 func (ids *idTable) add(file model.FileID, t *Table) error {
-	if !model.ValidHexID(string(file)) {
-		return internalErr("a member's file identity is not a digest: " + strconv.Quote(string(file)))
+	rec, err := ids.str(string(file))
+	if err != nil {
+		return err
 	}
-	rec := append([]byte(file), make([]byte, 12)...)
-	binary.BigEndian.PutUint64(rec[model.IDHexLen:], uint64(ids.decls))
+	rec = binary.BigEndian.AppendUint64(rec, uint64(ids.decls))
 	n := 0
 	if t != nil {
 		n = len(t.Decls)
 		for i := range t.Decls {
-			if !model.ValidHexID(string(t.Decls[i].Node)) {
-				return internalErr("a declaration of " + t.Path + " has a node identity that is not a digest")
+			d, err := ids.str(string(t.Decls[i].Node))
+			if err != nil {
+				return err
 			}
-			if _, err := ids.nw.WriteString(string(t.Decls[i].Node)); err != nil {
+			if _, err := ids.dw.Write(d); err != nil {
 				return err
 			}
 		}
 	}
-	binary.BigEndian.PutUint32(rec[model.IDHexLen+8:], uint32(n))
+	rec = binary.BigEndian.AppendUint32(rec, uint32(n))
 	ids.decls += int64(n)
 	ids.count++
-	_, err := ids.mw.Write(rec)
+	_, err = ids.mw.Write(rec)
 	return err
 }
 
 // finish makes what add wrote readable.
 func (ids *idTable) finish() error {
-	if err := ids.mw.Flush(); err != nil {
-		return err
+	for _, w := range []*bufio.Writer{ids.mw, ids.dw, ids.sw} {
+		if err := w.Flush(); err != nil {
+			return err
+		}
 	}
-	return ids.nw.Flush()
+	return nil
+}
+
+func (ids *idTable) readAt(part int, buf []byte, off int64) error {
+	if _, err := ids.files[part].ReadAt(buf, off); err != nil {
+		return internalErr("link identity table: " + err.Error())
+	}
+	return nil
+}
+
+// at reads the string a position-and-length record names.
+func (ids *idTable) at(rec []byte) (string, error) {
+	off, n := int64(binary.BigEndian.Uint64(rec)), int64(binary.BigEndian.Uint32(rec[8:]))
+	if off+n > ids.strs {
+		return "", internalErr("link identity table: a string is past its end")
+	}
+	buf := make([]byte, n)
+	if n == 0 {
+		return "", nil
+	}
+	err := ids.readAt(2, buf, off)
+	return string(buf), err
 }
 
 func (ids *idTable) member(file int32) (model.FileID, int64, int32, error) {
 	if file < 0 || int64(file) >= ids.count {
 		return "", 0, 0, internalErr("member " + strconv.Itoa(int(file)) + " is past the unit's members")
 	}
-	var rec [idRecord]byte
-	if _, err := ids.members.ReadAt(rec[:], int64(file)*idRecord); err != nil {
-		return "", 0, 0, internalErr("link identity table: " + err.Error())
+	var rec [idMember]byte
+	if err := ids.readAt(0, rec[:], int64(file)*idMember); err != nil {
+		return "", 0, 0, err
 	}
-	return model.FileID(rec[:model.IDHexLen]), int64(binary.BigEndian.Uint64(rec[model.IDHexLen:])),
-		int32(binary.BigEndian.Uint32(rec[model.IDHexLen+8:])), nil
+	id, err := ids.at(rec[:12])
+	return model.FileID(id), int64(binary.BigEndian.Uint64(rec[12:])), int32(binary.BigEndian.Uint32(rec[20:])), err
 }
 
 // file is the FileID of the member at ordinal file.
@@ -197,11 +247,12 @@ func (ids *idTable) node(r Ref) (target, error) {
 	if r.Index < 0 || r.Index >= n {
 		return target{}, internalErr("declaration " + strconv.Itoa(int(r.Index)) + " is past its member's table")
 	}
-	buf := make([]byte, model.IDHexLen)
-	if _, err := ids.nodes.ReadAt(buf, (first+int64(r.Index))*model.IDHexLen); err != nil {
-		return target{}, internalErr("link identity table: " + err.Error())
+	var rec [idDecl]byte
+	if err := ids.readAt(1, rec[:], (first+int64(r.Index))*idDecl); err != nil {
+		return target{}, err
 	}
-	return target{File: id, Node: model.NodeID(buf)}, nil
+	node, err := ids.at(rec[:])
+	return target{File: id, Node: model.NodeID(node)}, err
 }
 
 // scope is the stable spelling of a Ref that names a declaration, the module
@@ -219,12 +270,15 @@ func (ids *idTable) scope(r Ref) (string, error) {
 }
 
 func (ids *idTable) close() {
-	if ids == nil || ids.memberLease == nil {
+	if ids == nil {
 		return
 	}
-	ids.memberLease.Release()
-	ids.nodeLse.Release()
-	ids.memberLease, ids.nodeLse = nil, nil
+	for i, l := range ids.leases {
+		if l != nil {
+			l.Release()
+			ids.leases[i] = nil
+		}
+	}
 }
 
 // refPrefixes are the index keys that carry a refKey right after their
@@ -237,9 +291,16 @@ var refPrefixes = []struct {
 	{keyFile, true}, {keyImport, true}, {keyMethod, false}, {keySub, false}, {keySuper, false}, {keyGoField, false},
 }
 
-// stableKey is the stable spelling of key, a key of the index the spelling
-// prefix names (traceDecls, traceLinks).
-func (ids *idTable) stableKey(prefix, key string) (string, error) {
+// traceKey is the read of key in the index scope names (scopeDecls,
+// scopeLinks), spelled stably.
+func (ids *idTable) traceKey(scope, key string) (TraceKey, error) {
+	name, err := ids.stableKey(key)
+	return TraceKey{Kind: TraceScopeLookup, Scope: scope, Name: name}, err
+}
+
+// stableKey is key with the ref it carries, if any, spelled as the file or
+// declaration it denotes.
+func (ids *idTable) stableKey(key string) (string, error) {
 	for _, p := range refPrefixes {
 		rest, ok := strings.CutPrefix(key, p.prefix)
 		if !ok || len(rest) < 8 {
@@ -255,9 +316,9 @@ func (ids *idTable) stableKey(prefix, key string) (string, error) {
 		} else {
 			s, err = ids.scope(r)
 		}
-		return prefix + p.prefix + s + "\x00" + rest[8:], err
+		return p.prefix + s + "\x00" + rest[8:], err
 	}
-	return prefix + key, nil
+	return key, nil
 }
 
 // entryRef is the stable spelling of e's Ref under key: a declaration, a
@@ -277,22 +338,22 @@ func (ids *idTable) entryRef(key string, e entry) (string, error) {
 	return ids.scope(e.Ref)
 }
 
-// groups adds to out every key ix holds under prefix, with the hash of its
+// groups adds to out every key ix, the index scope names, holds, with the hash of its
 // entries in index order, each entry spelled stably. A key's entries are in
 // the same order in every build that holds them: ordinals ascend with
 // FileIDs and a table's indices with its declarations.
-func (ids *idTable) groups(ix *index, prefix string, out *pagination.ExternalSort[group]) error {
+func (ids *idTable) groups(ix *index, scope string, out *pagination.ExternalSort[group]) error {
 	var key string
 	var parts []string
 	flush := func() error {
 		if parts == nil {
 			return nil
 		}
-		stable, err := ids.stableKey(prefix, key)
+		k, err := ids.traceKey(scope, key)
 		if err != nil {
 			return err
 		}
-		err = out.Add(group{Key: keyHash(stable), Hash: model.H(groupDomain, parts...)})
+		err = out.Add(group{Key: k.hash(), Hash: model.H(groupDomain, parts...)})
 		parts = nil
 		return err
 	}
@@ -431,43 +492,54 @@ func readIndex(dir string, s stateReader) (*index, error) {
 	return ix, nil
 }
 
-// writeTo writes the table's member and declaration counts, then its two
-// files.
+// writeTo writes the table's member, declaration and string byte counts,
+// then its three files.
 func (ids *idTable) writeTo(w *bufio.Writer) error {
 	out := binary.AppendUvarint(binary.AppendUvarint(nil, uint64(ids.count)), uint64(ids.decls))
-	if _, err := w.Write(out); err != nil {
+	if _, err := w.Write(binary.AppendUvarint(out, uint64(ids.strs))); err != nil {
 		return err
 	}
-	if _, err := io.Copy(w, io.NewSectionReader(ids.members, 0, ids.count*idRecord)); err != nil {
-		return err
+	for i, n := range ids.sizes() {
+		if _, err := io.Copy(w, io.NewSectionReader(ids.files[i], 0, n)); err != nil {
+			return err
+		}
 	}
-	_, err := io.Copy(w, io.NewSectionReader(ids.nodes, 0, ids.decls*model.IDHexLen))
-	return err
+	return nil
+}
+
+// sizes is the byte length of each of the three files.
+func (ids *idTable) sizes() [3]int64 {
+	return [3]int64{ids.count * idMember, ids.decls * idDecl, ids.strs}
+}
+
+// readIDCounts reads the counts writeTo wrote.
+func readIDCounts(s stateReader) (count, decls, strs int64, err error) {
+	var v [3]uint64
+	for i := range v {
+		if v[i], err = s.uvarint("its identity table"); err != nil {
+			return 0, 0, 0, err
+		}
+	}
+	if v[0] > 1<<31 || v[1] > 1<<58 || v[2] > 1<<62 {
+		return 0, 0, 0, stateCorrupt("its identity table's counts are malformed")
+	}
+	return int64(v[0]), int64(v[1]), int64(v[2]), nil
 }
 
 // readIDTable reads a table writeTo wrote into files of dir's arena.
 func readIDTable(dir string, s stateReader) (*idTable, error) {
-	count, err := s.uvarint("its identity table")
+	count, decls, strs, err := readIDCounts(s)
 	if err != nil {
 		return nil, err
-	}
-	decls, err := s.uvarint("its identity table")
-	if err != nil {
-		return nil, err
-	}
-	if count > 1<<31 || decls > 1<<62/model.IDHexLen {
-		return nil, stateCorrupt("its identity table's counts are malformed")
 	}
 	ids, err := newIDTable(dir)
 	if err != nil {
 		return nil, err
 	}
-	ids.count, ids.decls = int64(count), int64(decls)
-	for _, part := range []struct {
-		w *bufio.Writer
-		n int64
-	}{{ids.mw, ids.count * idRecord}, {ids.nw, ids.decls * model.IDHexLen}} {
-		if n, err := io.CopyN(part.w, s.br, part.n); err != nil || n != part.n {
+	ids.count, ids.decls, ids.strs = count, decls, strs
+	for i, w := range []*bufio.Writer{ids.mw, ids.dw, ids.sw} {
+		n := ids.sizes()[i]
+		if m, err := io.CopyN(w, s.br, n); err != nil || m != n {
 			ids.close()
 			return nil, stateCorrupt("its identity table is short")
 		}
@@ -507,18 +579,11 @@ func skipHierarchy(s stateReader) error {
 			return stateCorrupt("a hierarchy index overruns its length")
 		}
 	}
-	count, err := s.uvarint("its identity table")
+	count, decls, strs, err := readIDCounts(s)
 	if err != nil {
 		return err
 	}
-	decls, err := s.uvarint("its identity table")
-	if err != nil {
-		return err
-	}
-	if count > 1<<31 || decls > 1<<62/model.IDHexLen {
-		return stateCorrupt("its identity table's counts are malformed")
-	}
-	n := int64(count)*idRecord + int64(decls)*model.IDHexLen
+	n := count*idMember + decls*idDecl + strs
 	if m, err := io.CopyN(io.Discard, s.br, n); err != nil || m != n {
 		return stateCorrupt("its identity table is short")
 	}

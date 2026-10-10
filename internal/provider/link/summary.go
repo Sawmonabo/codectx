@@ -12,10 +12,12 @@ import (
 
 // The incremental relink's vocabulary (ADR-0014 decisions 2 and 3). Each
 // file's table has two summaries, its interface and its own sites, each with
-// its own digest. The interface is a set of entries, every one something
-// another file's resolution reads; a refresh diffs it entry by entry. Every
-// site's resolution records a trace: each key it read, with that key's hash
-// at the time, so a refresh reruns exactly the sites whose reads changed.
+// its own digest (Interface, InterfaceDigest, SitesDigest). The interface is
+// a set of stable-keyed entries, every one something another file's
+// resolution reads. Every member's resolution records the keys it read
+// (TraceKey, trace.go); the state keeps, per key, the hash of what the
+// indexes hold under it, so a refresh re-runs exactly the members a changed
+// key was read by.
 
 // EntryKind is what one interface entry describes.
 type EntryKind uint8
@@ -32,8 +34,9 @@ const (
 	// EntryModule is the file's module identity: its package, module or
 	// namespace.
 	EntryModule EntryKind = 5
-	// EntryInferred is one function's inferred return and parameter values,
-	// where resolution follows values.
+	// EntryInferred is one value a declaration stores outside a field: a
+	// function taken as a value, which the cross-product reads, or a value
+	// the flow-based inference starts from.
 	EntryInferred EntryKind = 6
 	// EntryFieldWrite is the values the file writes to one field, where
 	// resolution is field-based.
@@ -58,37 +61,28 @@ type SummaryEntry struct {
 type TraceKeyKind uint8
 
 const (
-	// TraceScopeLookup is a name looked up in a scope: the result is what
-	// that scope declares under the name, so a declaration added or removed
-	// under it changes the read.
+	// TraceScopeLookup is a key looked up in a scope: an index key of the
+	// unit's hierarchy, whose answer is what the index holds under it, or a
+	// signature, whose answer is the functions taken as values under it.
+	// A declaration added or removed under it changes the read.
 	TraceScopeLookup TraceKeyKind = 1
-	// TraceInterfaceEntry is one entry of another file's interface summary.
-	TraceInterfaceEntry TraceKeyKind = 2
-	// TraceInferredSummary is one function's inferred values.
-	TraceInferredSummary TraceKeyKind = 3
 	// TraceManifestField is one field of a manifest's linker-read
-	// projection.
-	TraceManifestField TraceKeyKind = 4
+	// projection (manifestFields).
+	TraceManifestField TraceKeyKind = 2
 )
 
 // Valid reports whether k is a known trace key kind.
 func (k TraceKeyKind) Valid() bool { return k >= TraceScopeLookup && k <= TraceManifestField }
 
-// TraceKey names one read a site's resolution made. Scope is where the read
-// looked: the scope, file or manifest; Name is what it looked up there: the
-// name, the interface entry's Key, the function's descriptor, the manifest
-// field.
+// TraceKey names one read a member's resolution made. Scope is where the
+// read looked (scopeDecls, scopeLinks, scopeSignature, scopeManifest); Name
+// is what it looked up there, spelled stably: an index key with its member
+// ordinals and table indices spelled as the files and declarations they
+// denote (idTable.stableKey), a signature, a manifest field's key.
 type TraceKey struct {
 	Kind  TraceKeyKind
 	Scope string
 	Name  string
-}
-
-// TraceRead is one recorded read: the key and its hash when the site read it.
-// A site reruns when any of its reads now hashes differently.
-type TraceRead struct {
-	Key  TraceKey
-	Hash string
 }
 
 // The hash domains of the two summaries and of one interface entry.
