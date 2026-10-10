@@ -836,9 +836,12 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 	if err != nil {
 		return err
 	}
+	// A unit is one family: a Python unit's, or one whose scanned tables
+	// are Python's.
 	in.python = in.u.family == FamilyPython
 	err = in.u.filesOf(ctx, in.only, func(file int32, _ model.FileVersion, t *Table) error {
 		f := &fileScan{in: in, r: r, file: file, t: t, python: t.Language == "python"}
+		in.python = in.python || f.python
 		return f.scan(ctx, r, watches, decls, args, shapes)
 	})
 	if err != nil {
