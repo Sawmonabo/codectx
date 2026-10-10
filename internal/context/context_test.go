@@ -565,7 +565,8 @@ func TestContextCompilerScenario(t *testing.T) {
 					Task:  "Update `Place` so internal/order/handler.go keeps working; check Repository and docs/missing.md",
 					Seeds: []string{"internal/order/ports.go"},
 					Phase: model.PhaseVerify,
-				}, sink)
+				}, resolvedBudget{MaxBytes: fx.Cfg.Context.DefaultMaxBytes, MaxTokens: fx.Cfg.Context.DefaultEstimatedTokens,
+					MaxFiles: fx.Cfg.Context.DefaultMaxFiles, MaxSlices: fx.Cfg.Context.MaxSlices}, roundInputs{}, sink)
 				if err != nil {
 					t.Fatalf("extractSeeds: %v", err)
 				}

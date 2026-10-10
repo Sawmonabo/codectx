@@ -888,11 +888,21 @@ type packing struct {
 	dropped []drop
 }
 
-// less is the total Section 15.3 order: requirement rank, descending
-// ScoreMicros, normalized path, start byte, entity id.
+// less is the total Section 15.3 order: the name-only candidate tier last,
+// requirement rank, the tier's closeness and compatible-count keys,
+// descending ScoreMicros, normalized path, start byte, entity id.
 func (a candidate) less(b candidate) bool {
+	if a.Possible != b.Possible {
+		return !a.Possible
+	}
 	if ra, rb := requirementRank(a.Requirement), requirementRank(b.Requirement); ra != rb {
 		return ra < rb
+	}
+	if a.Closeness != b.Closeness {
+		return a.Closeness < b.Closeness
+	}
+	if a.Compatible != b.Compatible {
+		return a.Compatible < b.Compatible
 	}
 	if a.ScoreMicros != b.ScoreMicros {
 		return a.ScoreMicros > b.ScoreMicros
@@ -981,7 +991,11 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	// The reference pipeline keeps the whole-set shape it is the reference FOR,
 	// so it collects what discovery pushes into a slice of its own.
 	sink := &collectSeeds{}
-	seeds, err := c.extractSeeds(ctx, reader, gen, req, sink)
+	budget, err := resolveBudget(req.Budget, c.cfg.Context)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	seeds, err := c.extractSeeds(ctx, reader, gen, req, budget, roundInputs{}, sink)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}

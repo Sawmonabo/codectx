@@ -93,23 +93,35 @@ type checkpointScalars struct {
 	ScopeComplete    bool                    `json:"scope_complete"`
 	ReasonsDropped   int64                   `json:"reasons_dropped,omitempty"`
 	ReasonsTruncated int64                   `json:"reasons_truncated,omitempty"`
-	// WalkCursor, WalkStart and Seq are the passIngest boundary's own carry:
-	// the graph walk's continuation, the root list every leg of the walk must
-	// repeat byte for byte (it is inside the walk's query hash) and the seed
-	// sink's arrival counter. They are empty at every other boundary.
+	// WalkCursor, WalkGroups, WalkAt and Seq are the passIngest boundary's
+	// own carry: the current walk's continuation, the walk groups (each root
+	// list every leg of its walk must repeat byte for byte, since it is inside
+	// the walk's query hash), the group being walked and the seed sink's
+	// arrival counter. They are empty at every other boundary.
 	//
-	// WalkStart is the one field here sized by the seed set rather than by a
+	// WalkGroups is the one field here sized by the seed set rather than by a
 	// verdict, and it adds no memory class the pass does not already hold: P-A
-	// passes the identical slice to graph.Impact on every page, so a walk that
-	// can run at all can carry its own roots.
-	WalkCursor string         `json:"walk_cursor,omitempty"`
-	WalkStart  []model.NodeID `json:"walk_start,omitempty"`
-	Seq        int64          `json:"seq,omitempty"`
+	// passes each group's identical slice to graph.Impact on every page, so a
+	// walk that can run at all can carry its own roots.
+	WalkCursor string      `json:"walk_cursor,omitempty"`
+	WalkGroups []walkGroup `json:"walk_groups,omitempty"`
+	WalkAt     int         `json:"walk_at,omitempty"`
+	Seq        int64       `json:"seq,omitempty"`
 	// Stalls is the count of consecutive non-advancing walk pages. A stalled
 	// page mints the cursor the request arrived with, so this is the only
 	// state that can bound how often that token is handed back: without it the
 	// bound would restart at zero on every continuation.
 	Stalls int `json:"walk_stalls,omitempty"`
+
+	// Stop, Candidates and CandidatesUnavailable are scopeResult's fields of
+	// the same names.
+	Stop                  seedStop `json:"stop,omitempty"`
+	Candidates            int64    `json:"candidates,omitempty"`
+	CandidatesUnavailable string   `json:"candidates_unavailable,omitempty"`
+	// Round and Inputs are the compile's round and that round's inputs, both
+	// bounded by the resolved budget.
+	Round  int         `json:"round,omitempty"`
+	Inputs roundInputs `json:"inputs,omitempty"`
 }
 
 // checkpointFile is state.json's name inside the state directory. It does not
@@ -701,14 +713,20 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 	}
 	runBytes := pagination.SortRunBytes(int64(c.cfg.Resources.QueryMemoryBytes))
 	scalars := checkpointScalars{
-		Completeness:     st.scope.Completeness,
-		ScopeComplete:    st.scopeComplete,
-		ReasonsDropped:   st.scope.ReasonsDropped,
-		ReasonsTruncated: st.scope.ReasonsTruncated,
+		Completeness:          st.scope.Completeness,
+		ScopeComplete:         st.scopeComplete,
+		ReasonsDropped:        st.scope.ReasonsDropped,
+		ReasonsTruncated:      st.scope.ReasonsTruncated,
+		Stop:                  st.scope.Stop,
+		Candidates:            st.scope.Candidates,
+		CandidatesUnavailable: st.scope.CandidatesUnavailable,
+		Round:                 st.round,
+		Inputs:                st.inputs,
 	}
 	if st.ingest != nil {
 		scalars.WalkCursor = st.ingest.cursor
-		scalars.WalkStart = st.ingest.start
+		scalars.WalkGroups = st.ingest.walks
+		scalars.WalkAt = st.ingest.walkAt
 		scalars.Seq = st.ingest.seq
 		scalars.Stalls = st.ingest.stalls
 	}
@@ -760,12 +778,9 @@ func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) 
 		}
 	}
 	st.pass = r.State.Pass
-	st.scope = scopeResult{
-		Completeness:     r.State.Scalars.Completeness,
-		ReasonsDropped:   r.State.Scalars.ReasonsDropped,
-		ReasonsTruncated: r.State.Scalars.ReasonsTruncated,
-	}
+	st.scope = scalarScope(r.State.Scalars)
 	st.scopeComplete = r.State.Scalars.ScopeComplete
+	st.round, st.inputs = r.State.Scalars.Round, r.State.Scalars.Inputs
 	return nil
 }
 
@@ -783,15 +798,25 @@ func (c *Compiler) resumedIngest(s *compileSorts, sc checkpointScalars) *seedIng
 		sorts:   s,
 		cfg:     c.cfg.Context,
 		seq:     sc.Seq,
-		start:   sc.WalkStart,
+		walks:   sc.WalkGroups,
+		walkAt:  sc.WalkAt,
 		cursor:  sc.WalkCursor,
 		stalls:  sc.Stalls,
 		started: true,
-		scope: scopeResult{
-			Completeness:     sc.Completeness,
-			ScopeComplete:    sc.ScopeComplete,
-			ReasonsDropped:   sc.ReasonsDropped,
-			ReasonsTruncated: sc.ReasonsTruncated,
-		},
+		scope:   scalarScope(sc),
+	}
+}
+
+// scalarScope is the scope verdict a checkpoint's scalars carry, write-once-
+// false flag included.
+func scalarScope(sc checkpointScalars) scopeResult {
+	return scopeResult{
+		Completeness:          sc.Completeness,
+		ScopeComplete:         sc.ScopeComplete,
+		ReasonsDropped:        sc.ReasonsDropped,
+		ReasonsTruncated:      sc.ReasonsTruncated,
+		Stop:                  sc.Stop,
+		Candidates:            sc.Candidates,
+		CandidatesUnavailable: sc.CandidatesUnavailable,
 	}
 }

@@ -89,6 +89,11 @@ type Compiler struct {
 	// called after the plan is decided, it cannot change one, and a compile
 	// with no observer set does not pay for it.
 	observeSorts func([]sortObservation)
+	// fullRead, when set, reads every lexical match to the end instead of
+	// stopping at the floor (ADR-0016 decision 3). It is the reference a test
+	// compares a stopped plan against, never a configuration key: a compile
+	// built by New never sets it.
+	fullRead bool
 }
 
 // New validates the options and builds a Compiler. Every dependency is
@@ -430,6 +435,52 @@ type compileState struct {
 	// checkpoint's scalar record.
 	scope         scopeResult
 	scopeComplete bool
+
+	// round and the round's inputs. A compile whose lexical read stopped at
+	// its floor runs further rounds of P-A..P-H (ADR-0016 decisions 4 and 5):
+	// the closure round reads inside the files the previous round kept, and a
+	// failed certificate raises the witness count and reads to a lower floor.
+	// Both inputs are bounded by the resolved budget, so they are checkpoint
+	// scalars.
+	round  int
+	inputs roundInputs
+}
+
+// roundInputs is what one round of the compile takes from the round before it.
+type roundInputs struct {
+	// Extra is how many witness files beyond F+1 the read must find before it
+	// stops: the witness groups earlier rounds' packing skipped as oversized.
+	Extra int64 `json:"extra,omitempty"`
+	// Kept is the files the previous round's packing kept, in file-id order.
+	// A closure round reads every lexical match inside them and walks their
+	// unreached nodes. Empty on the first round. At most the plan's file
+	// budget.
+	Kept []model.FileID `json:"kept,omitempty"`
+}
+
+// seedStop is how the lexical read ended (ADR-0016 decision 3). It is bounded
+// by the resolved budget -- the witness list holds at most F+1+Extra files --
+// so it travels in the scope verdict and in the checkpoint's scalars.
+type seedStop struct {
+	// Stopped is set when the read ended at its floor rather than at the last
+	// match. A read that met every match leaves the zero value.
+	Stopped bool `json:"stopped,omitempty"`
+	// Read is how many lexical matches were read (the notice's N), and
+	// FileBudget the plan's file budget F the witnesses were counted against.
+	Read       int64 `json:"read,omitempty"`
+	FileBudget int   `json:"file_budget,omitempty"`
+	// TopScore is the score of the first lexical-tier match, which every
+	// lexical contribution is relative to.
+	TopScore int64 `json:"top_score,omitempty"`
+	// NextScore and NextContribution are the score and contribution of the
+	// first match not read (the notice's X), and Tau is lexicalTau of it: no
+	// unread match lends anything a rank key above (recommended, Tau).
+	NextScore        int64 `json:"next_score,omitempty"`
+	NextContribution int64 `json:"next_contribution,omitempty"`
+	Tau              int64 `json:"tau,omitempty"`
+	// Witnesses are the distinct witness files the stop counted, in the order
+	// the read met them: files whose encoded source fits one slice.
+	Witnesses []model.FileID `json:"witnesses,omitempty"`
 }
 
 // compileStage is one pass of the pipeline: the index a checkpoint behind it
@@ -461,7 +512,7 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 			// index, so a deadline inside the walk and a deadline behind it
 			// mint the identical continuation, and a non-paging compile (which
 			// has no continuation on offer) never halts inside the walk either.
-			return c.stageIngest(ctx, reader, gen, req, sorts, st, func() bool { return stop(passIngest) })
+			return c.stageIngest(ctx, reader, gen, req, sorts, b, st, func() bool { return stop(passIngest) })
 		}},
 		{passHydrate, func() error { return c.stageHydrate(ctx, reader, sorts, st) }},
 		{passAttributes, func() error { return c.stageAttributes(ctx, reader, gen, sorts, st) }},
@@ -527,7 +578,7 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 // answer of an unmatched task token or the CTX_SCOPE_INCOMPLETE of an explicit
 // boundary, and it can only decide that if it sees the exclusions.
 func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
-	req model.ContextRequest, sorts *compileSorts, st *compileState, stop func() bool,
+	req model.ContextRequest, sorts *compileSorts, b resolvedBudget, st *compileState, stop func() bool,
 ) error {
 	ingest := st.ingest
 	if ingest == nil {
@@ -538,7 +589,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 		if ingest, err = c.newSeedIngest(sorts); err != nil {
 			return err
 		}
-		seeds, err := c.extractSeeds(ctx, reader, gen, req, ingest)
+		seeds, err := c.extractSeeds(ctx, reader, gen, req, b, st.inputs, ingest)
 		if err != nil {
 			return contextErr(ctx, err)
 		}
@@ -558,6 +609,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 		if seeds.Unresolved {
 			ingest.scope.ScopeComplete = false
 		}
+		ingest.scope.Stop = seeds.Stop
 	}
 	// Re-read on every leg of the walk, resumed or not: dropping caps on the
 	// continuation would move Completeness, and with it ScopeComplete and the
@@ -833,6 +885,19 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []strin
 		add("%d evidence route(s) were stored clipped to the first %d relations; the route reaches further than the manifest records",
 			n, model.MaxRelationsPerPath)
 	}
+	if st := scoped.Stop; st.Stopped {
+		add("Lexical matches scoring below %d were not read. %d matches above it fill more than the plan's file budget of %d, "+
+			"so no unread match can rank above the packed files. Every match and walk entry inside the packed files is included. "+
+			"Explanations list routes from the %d matches read.",
+			st.NextScore, st.Read, st.FileBudget, st.Read)
+	}
+	if n := scoped.Candidates; n > 0 {
+		add("%d name-only call candidate(s) of open call sites were admitted as possible context after every precise entry; none is required scope",
+			n)
+	}
+	if why := scoped.CandidatesUnavailable; why != "" {
+		add("name-only call candidates are unavailable for this plan: %s", why)
+	}
 	return out
 }
 
@@ -980,6 +1045,23 @@ type candidate struct {
 	Paths       []model.RelationPath // <= cfg.Context.MaxReasonPathsPerEntry
 	MorePaths   int64                // routes not enumerated (Section 15.3)
 	Excluded    string               // non-empty => excluded, with this reason
+
+	// RootWeight is the weight w of the root this record's (requirement,
+	// score) pair comes from (ADR-0016 decision 1): a seed's own origin
+	// contribution, or the weight of the walk group that reached a walk entry.
+	// Zero on a record that is no root's: a captured change, a candidate.
+	RootWeight int64
+	// Named marks a record that comes from a named root: an explicit seed, one
+	// of the four exact steps, or a walk from them. Only named records feed
+	// centrality (ADR-0016 decision 2), and only a lexical record has its
+	// requirement capped.
+	Named bool
+	// Possible marks a name-only call candidate (ADR-0015 decision 3). Every
+	// possible record ranks after every precise one, in Closeness order, then
+	// by Compatible (how many compatible declarations its name has).
+	Possible   bool
+	Closeness  int32
+	Compatible int64
 }
 
 // originKind names the Section 15.2 seed step, in discovery order.
@@ -994,6 +1076,10 @@ const (
 	originLexical
 	originChangedFile
 	originExpansion
+	// originCandidate is a name-only call candidate of an open call site the
+	// walk reached (ADR-0015 decision 3); it is never a root and never
+	// required.
+	originCandidate
 )
 
 // entityID is the final, unique tie-break key: the node identity when the
@@ -1059,11 +1145,13 @@ func overflowErr(a, b int64) *model.Error {
 // (internal/graph/cost.go:5-14 states why). A relation kind absent from this
 // map contributes nothing and is not admitted to a path.
 var contributionWeight = map[model.RelationKind]int64{
-	model.RelImplements:       940_000,
-	model.RelOverrides:        940_000,
-	model.RelExtends:          940_000,
-	model.RelTests:            920_000,
-	model.RelCalls:            900_000,
+	model.RelImplements: 940_000,
+	model.RelOverrides:  940_000,
+	model.RelExtends:    940_000,
+	model.RelTests:      920_000,
+	model.RelCalls:      900_000,
+	// An endpoint is bound to its handler as firmly as a call is.
+	model.RelRoutesTo:         900_000,
 	model.RelReads:            880_000,
 	model.RelWrites:           880_000,
 	model.RelDataFlowsTo:      880_000,
@@ -1101,7 +1189,42 @@ const (
 	boostCentralityMax  int64 = 50_000
 	maxBoostMicros      int64 = boostTaskIdentifier + boostActiveChange +
 		boostAssociatedTest + boostCentralityMax
+	// lexicalContributionMax is the largest origin contribution a lexical
+	// match takes: the top match of a task's read, and any match of a
+	// non-lexical tier. It is derived, not tuned -- one micro below an exact
+	// match, so a lexical match never ranks with one (ADR-0016 decision 1).
+	lexicalContributionMax int64 = exactContribution - 1
+	// rootBoostMicros is every boost a root can lend what it reaches: all but
+	// the task-identifier boost, which only an origin the task named takes.
+	rootBoostMicros int64 = boostActiveChange + boostAssociatedTest + boostCentralityMax
 )
+
+// scaleBoost scales a record's total boost by the weight of the root its pair
+// comes from (ADR-0016 decision 1). A root at the full scale lends boosts
+// whole; a weaker root lends them in proportion. It is the ONE scaling, used
+// by the ranking pass and by lexicalTau, so the read's stop bound and the
+// scores it bounds are computed by the same integer arithmetic.
+func scaleBoost(weight, boost int64) (int64, error) {
+	if weight >= scale {
+		return boost, nil
+	}
+	if weight <= 0 {
+		return 0, nil
+	}
+	return mulScaled(weight, boost)
+}
+
+// lexicalTau is the largest final score anything derived from a lexical match
+// of contribution c can reach: its own origin pair, or a route from it at most
+// at the full scale, plus every boost a root lends, scaled by c (ADR-0016
+// decision 3). Nothing derived from that match ranks above (recommended, tau).
+func lexicalTau(c int64) (int64, error) {
+	b, err := scaleBoost(c, rootBoostMicros)
+	if err != nil {
+		return 0, err
+	}
+	return c + b, nil
+}
 
 // compilerPolicyVersion is the code-side ranking/budget policy label stored in
 // every manifest header and folded into its request and canonical hashes. It
@@ -1110,7 +1233,7 @@ const (
 // budget.max_manifest_bytes is part of the request hash and the canonical
 // projection because a caller budget that decides whether a plan is admitted is
 // part of a request's identity.
-const compilerPolicyVersion = "codectx.context.v2"
+const compilerPolicyVersion = "codectx.context.v3"
 
 // The model.H domains. Two code paths computing a different preimage would make
 // the Section 15.1 immutable-manifest reuse lookup silently never hit, so the

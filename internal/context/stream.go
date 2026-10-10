@@ -103,6 +103,15 @@ type candRec struct {
 	// applies before assigning Index, and mislabelling it shifts every later
 	// ordinal.
 	FileMissing bool `json:"fm,omitempty"`
+
+	// RootWeight, Named, Possible, Closeness and Compatible are candidate's
+	// fields of the same names: the record's pair weight, whether it comes
+	// from a named root, and the name-only candidate tier's keys.
+	RootWeight int64 `json:"rw,omitempty"`
+	Named      bool  `json:"nm,omitempty"`
+	Possible   bool  `json:"po,omitempty"`
+	Closeness  int32 `json:"cl,omitempty"`
+	Compatible int64 `json:"cc,omitempty"`
 }
 
 // pathRec is one route of one candidate: everything a model.RelationPath holds
@@ -190,6 +199,12 @@ type groupRec struct {
 	// `indexes` would have had, kept so a consumer can verify it saw every
 	// member of a run rather than assuming it did.
 	Count int64 `json:"c,omitempty"`
+	// KeyPossible, KeyRequirement and KeyScore are the rank key of the
+	// MinIndex member: the group's own rank key, which the post-pack
+	// certificate compares against (recommended, tau) (ADR-0016 decision 4).
+	KeyPossible    bool              `json:"kp,omitempty"`
+	KeyRequirement model.Requirement `json:"kr,omitempty"`
+	KeyScore       int64             `json:"ks,omitempty"`
 }
 
 // decisionRec is one packer verdict, the streaming form of packing.keep and
@@ -222,6 +237,8 @@ func candRecOf(c candidate, seq int64) candRec {
 		Requirement: c.Requirement, Origin: c.Origin, Depth: c.Depth,
 		StartByte: c.StartByte, ScoreMicros: c.ScoreMicros, SizeBytes: c.SizeBytes,
 		Status: c.Status, Reasons: c.Reasons, MorePaths: c.MorePaths, Excluded: c.Excluded,
+		RootWeight: c.RootWeight, Named: c.Named, Possible: c.Possible,
+		Closeness: c.Closeness, Compatible: c.Compatible,
 	}
 }
 
@@ -253,7 +270,8 @@ func (r candRec) candidate() candidate {
 		NodeID: r.NodeID, FileID: r.FileID, Requirement: r.Requirement, Origin: r.Origin,
 		Depth: r.Depth, StartByte: r.StartByte, ScoreMicros: r.ScoreMicros,
 		SizeBytes: r.SizeBytes, Status: r.Status, Reasons: r.Reasons, MorePaths: r.MorePaths,
-		Excluded: r.Excluded,
+		Excluded: r.Excluded, RootWeight: r.RootWeight, Named: r.Named, Possible: r.Possible,
+		Closeness: r.Closeness, Compatible: r.Compatible,
 	}
 }
 
@@ -307,13 +325,28 @@ func (r relAttrRec) precision() int64 {
 // the plan by one path and bucket centrality by another; the record carries
 // both because those two values can differ.
 //
+// The name-only candidate tier comes first in the key and is the one
+// difference from candidate.less's requirement-first order: every Possible
+// record sorts after every precise one (ADR-0015 decision 3), and inside the
+// tier by closeness step and by how few compatible declarations the name has.
+// A precise record carries zero in both, so they never reorder it.
+//
 // Totality is load-bearing beyond determinism: P-G assigns each survivor's
 // Index from this order, so a single unresolved tie shifts the ordinal of every
 // later entry and with it every stored slice membership. candidate.less already
 // ends in the unique entityID; Seq covers the one case entityID does not, a
 // candidate that names neither a node nor a file.
 func lessRank(a, b candRec) int {
+	if c := cmpBool(a.Possible, b.Possible); c != 0 {
+		return c
+	}
 	if c := cmpInt(int64(requirementRank(a.Requirement)), int64(requirementRank(b.Requirement))); c != 0 {
+		return c
+	}
+	if c := cmpInt(int64(a.Closeness), int64(b.Closeness)); c != 0 {
+		return c
+	}
+	if c := cmpInt(a.Compatible, b.Compatible); c != 0 {
 		return c
 	}
 	// Descending: a higher score ranks first.
@@ -436,6 +469,17 @@ func cmpInt(a, b int64) int {
 	return 0
 }
 
+// cmpBool orders false before true.
+func cmpBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case !a:
+		return -1
+	}
+	return 1
+}
+
 func cmpString(a, b string) int {
 	switch {
 	case a < b:
@@ -494,6 +538,7 @@ func foldGroup(a, b groupRec) (groupRec, error) {
 	a.Required = a.Required || b.Required
 	if b.MinIndex < a.MinIndex {
 		a.MinIndex, a.Path = b.MinIndex, b.Path
+		a.KeyPossible, a.KeyRequirement, a.KeyScore = b.KeyPossible, b.KeyRequirement, b.KeyScore
 	}
 	return a, nil
 }
@@ -571,7 +616,7 @@ func sizeOfPkgCount(r pkgCountRec) int64 {
 }
 
 func sizeOfGroup(r groupRec) int64 {
-	return int64(len(r.FileID)+len(r.Path)) + recordOverheadBytes
+	return int64(len(r.FileID)+len(r.Path)+len(r.KeyRequirement)) + recordOverheadBytes
 }
 
 func sizeOfDecision(r decisionRec) int64 {
@@ -1104,6 +1149,7 @@ func (c *Compiler) passGMeasure(ctx context.Context, s *compileSorts, in rankedS
 		return groupsByFile.Add(groupRec{
 			FileID: cand.FileID, Path: cand.Path, Required: isRequired(cand.Requirement),
 			Bytes: e.EstimatedBytes, Tokens: e.EstimatedTokens, MinIndex: r.Cand.Index, Count: 1,
+			KeyPossible: cand.Possible, KeyRequirement: cand.Requirement, KeyScore: cand.ScoreMicros,
 		})
 	}); err != nil {
 		return nil, err

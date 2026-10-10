@@ -38,6 +38,8 @@ type seedSet struct {
 	// stays what it has always been: every candidate, then every exclusion.
 	Excluded   []candidate
 	Unresolved bool
+	// Stop is how the lexical read ended (ADR-0016 decision 3).
+	Stop seedStop
 	// cutStages names the Section 15.2 steps already reported as having stopped
 	// at the context.max_seeds bound, so one bound that stops several later steps is named
 	// once per step rather than once per skipped identity. The key is the STEP,
@@ -176,7 +178,7 @@ func seedsFull(limit config.Limit, n int) bool {
 // manifest across two generations (Section 15.1). reader is that same pinned
 // reader, so a path token is checked against visible facts only.
 func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
-	req model.ContextRequest, sink seedSink,
+	req model.ContextRequest, b resolvedBudget, round roundInputs, sink seedSink,
 ) (seedSet, error) {
 	if sink == nil {
 		return seedSet{}, argumentInvalid("seed discovery requires an open seed sink")

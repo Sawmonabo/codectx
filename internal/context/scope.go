@@ -21,8 +21,12 @@ import (
 // contracts and types (implements, extends, overrides, defines), state
 // ownership (reads, writes, data_flows_to, control_depends_on), dependencies
 // (depends_on, imports), configuration (configures), tests (tests),
-// documentation (documents) and integration or registration boundaries
-// (references, exports).
+// documentation (documents), integration or registration boundaries
+// (references, exports) and an endpoint's handler (routes_to).
+//
+// `may_call` is deliberately absent: a name-only candidate may not run, so it
+// is never required scope and never a route the walk crosses. Candidates join
+// a plan as their own tier after every precise entry (ADR-0015 decision 3).
 //
 // Containment kinds are deliberately absent: `contains` and `owns` express
 // "same package or module", which Section 15.3 scores as a weak ranking
@@ -37,6 +41,7 @@ var scopeRelations = []model.RelationKind{
 	model.RelTests,
 	model.RelDocuments,
 	model.RelReferences, model.RelExports,
+	model.RelRoutesTo,
 }
 
 // scopeResult is the expansion pass's SCALAR verdict: the capability rows that
@@ -64,6 +69,29 @@ type scopeResult struct {
 	// actually needs. The compiler turns them into manifest notices.
 	ReasonsDropped   int64
 	ReasonsTruncated int64
+	// Stop is how the lexical read ended, for the manifest notice.
+	Stop seedStop
+	// Candidates counts the name-only call candidates the ranked plan holds
+	// after every entity took its best record; CandidatesUnavailable is the
+	// reason no candidate could be read, when the lookup is unavailable.
+	Candidates            int64
+	CandidatesUnavailable string
+}
+
+// walkGroup is one walk of P-A: the roots of one weight, walked together
+// (ADR-0016 decision 1). graph.Impact admits one parent per reached node, so
+// one walk cannot take a maximum over roots of different weights; roots of
+// equal weight share a walk, and an entity reached by several walks takes
+// its best record after ranking. Named groups are the explicit and exact
+// roots; a lexical group's requirements are capped at recommended.
+//
+// MaxDepth is the group's own derived depth bound, zero for none; it never
+// widens a user-set context.max_graph_depth.
+type walkGroup struct {
+	Weight   int64          `json:"weight"`
+	Named    bool           `json:"named,omitempty"`
+	MaxDepth int            `json:"max_depth,omitempty"`
+	Start    []model.NodeID `json:"start"`
 }
 
 // boundaryRequirement is how much of an admitted boundary the actor must read.
@@ -289,18 +317,20 @@ type seedIngest struct {
 	stages   []seedStage
 	scope    scopeResult
 
-	// start, cursor and started are P-A's mid-walk carry. start is the walk's
-	// root list, cursor the graph walk's continuation and started the record
-	// that foldSeeds has already run.
+	// walks, walkAt, cursor and started are P-A's mid-walk carry. walks are
+	// the groups foldSeeds built, walkAt the group being walked, cursor that
+	// walk's continuation and started the record that foldSeeds has already
+	// run.
 	//
 	// They are fields rather than locals because a plan deadline may end this
-	// pass INSIDE the walk: the checkpoint that boundary writes carries these
-	// three, and the call that resumes rebuilds a sink out of them. start
-	// cannot be recomputed on the continuation -- seedSort is consumed by
-	// foldSeeds and nothing after it reads seedSort, stages or resolved -- and
-	// it must be repeated byte for byte anyway, because graph.Impact binds the
-	// start list into the walk's own query hash.
-	start   []model.NodeID
+	// pass INSIDE the walk: the checkpoint that boundary writes carries them,
+	// and the call that resumes rebuilds a sink out of them. The groups cannot
+	// be recomputed on the continuation -- seedSort is consumed by foldSeeds
+	// and nothing after it reads seedSort, stages or resolved -- and each
+	// group's start list must be repeated byte for byte anyway, because
+	// graph.Impact binds it into the walk's own query hash.
+	walks   []walkGroup
+	walkAt  int
 	cursor  string
 	started bool
 	// stalls counts the CONSECUTIVE non-advancing pages the walk has met. It
@@ -604,7 +634,10 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 		if err != nil {
 			return nil, false, err
 		}
-		in.start, in.started = start, true
+		in.started = true
+		if len(start) > 0 {
+			in.walks = []walkGroup{{Weight: scale, Named: true, Start: start}}
+		}
 
 		switch {
 		case in.resolved == 0:
@@ -612,7 +645,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			// run. Seeds already carry their own exclusion reasons.
 			in.scope.ScopeComplete = false
 			return finish()
-		case len(in.start) == 0:
+		case len(in.walks) == 0:
 			// Files resolved but no symbol did, so no boundary can be walked from
 			// them. Each seed keeps the requirement its Section 15.2 step assigned;
 			// the scope is not complete.
@@ -621,7 +654,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			return finish()
 		}
 	}
-	start := in.start
+	start := in.walks[in.walkAt].Start
 
 	// The walk is read TO EXHAUSTION. graph.Impact answers one globally ranked
 	// PAGE and hands back the cursor that continues it; reading that page and
@@ -745,6 +778,9 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			if err := in.emitRoutes(seq, e.Paths); err != nil {
 				return nil, false, err
 			}
+		}
+		if err := c.admitCandidates(ctx, eng, gen, impact.Entries, in); err != nil {
+			return nil, false, err
 		}
 		if halt {
 			// The pass ends here with its four pre-fold sorts unfolded and the
