@@ -1,0 +1,81 @@
+[package]
+name = "tbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tantivy = { version = "=0.26.2", features = ["zstd-compression"] }
+tantivy-common = "=0.11.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[[bin]]
+name = "tblock"
+path = "src/bin/tblock.rs"
+
+[features]
+# The sstable term dictionary instead of the FST (tantivy's quickwit feature).
+sstable = ["tantivy/quickwit"]
+
+[profile.release]
+debug = false
+codegen-units = 1
+lto = "thin"
+
+[[bin]]
+name = "tindex"
+path = "src/bin/tindex.rs"
+
+[[bin]]
+name = "tquery"
+path = "src/bin/tquery.rs"
+
+[[bin]]
+name = "tdelta"
+path = "src/bin/tdelta.rs"
+
+[[bin]]
+name = "tgen"
+path = "src/bin/tgen.rs"
+
+[[bin]]
+name = "ttok"
+path = "src/bin/ttok.rs"
+
+[[bin]]
+name = "tcheck"
+path = "src/bin/tcheck.rs"
+
+[[bin]]
+name = "tlog"
+path = "src/bin/tlog.rs"
+
+[[bin]]
+name = "tcompare"
+path = "src/bin/tcompare.rs"
+
+[[bin]]
+name = "tqrels"
+path = "src/bin/tqrels.rs"
+
+[[bin]]
+name = "teval"
+path = "src/bin/teval.rs"
+
+[[bin]]
+name = "ttopk"
+path = "src/bin/ttopk.rs"
+
+[[bin]]
+name = "tspace"
+path = "src/bin/tspace.rs"
+
+[[bin]]
+name = "tsnap"
+path = "src/bin/tsnap.rs"
+
+[[bin]]
+name = "tpin"
+path = "src/bin/tpin.rs"

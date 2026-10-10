@@ -1,0 +1,31 @@
+=== t16-large-end 17:51:46 args: 16 large end
+tindex index-t16-large-end: 546613 docs, 47995 units, 1 commits, 2 segments, add 4474.8 ms, final 8635.5 ms, total 13110.7 ms, cpu 57868.9 ms, peak rss 1261699072 B, disk 353521961 B, token_count mismatches 0
+rc=0 17:51:59 du=353521961
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.14
+	Maximum resident set size (kbytes): 1232128
+=== t1-default-end 17:51:59 args: 1 default end
+tindex index-t1-default-end: 546613 docs, 47995 units, 1 commits, 13 segments, add 17326.9 ms, final 769.7 ms, total 18096.9 ms, cpu 26936.2 ms, peak rss 490524672 B, disk 337197345 B, token_count mismatches 0
+rc=0 17:52:18 du=337197345
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:18.13
+	Maximum resident set size (kbytes): 479028
+=== t16-default-end 17:52:18 args: 16 default end
+tindex index-t16-default-end: 546613 docs, 47995 units, 1 commits, 11 segments, add 4305.0 ms, final 4729.4 ms, total 9034.9 ms, cpu 48772.0 ms, peak rss 852480000 B, disk 361931795 B, token_count mismatches 0
+rc=0 17:52:27 du=361931795
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:09.07
+	Maximum resident set size (kbytes): 832500
+=== t16-default-every1000 17:52:27 args: 16 default every:1000
+tindex index-t16-default-every1000: 546613 docs, 47995 units, 48 commits, 12 segments, add 13244.8 ms, final 7196.6 ms, total 20442.4 ms, cpu 70021.6 ms, peak rss 862887936 B, disk 343084007 B, token_count mismatches 0
+rc=0 17:52:47 du=343084007
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:20.49
+	Maximum resident set size (kbytes): 842664
+=== t16-large-end-code 17:52:47 args: 16 large end --tokenizer code
+tindex index-t16-large-end-code: 546613 docs, 47995 units, 1 commits, 2 segments, add 4682.5 ms, final 8637.0 ms, total 13319.9 ms, cpu 66986.5 ms, peak rss 1356398592 B, disk 386816666 B, token_count mismatches 0
+rc=0 17:53:01 du=386816666
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.34
+	Maximum resident set size (kbytes): 1324608
+=== t1-default-unit 17:53:01 args: 1 default unit
+tindex index-t1-default-unit: 546613 docs, 47995 units, 47995 commits, 16 segments, add 954258.4 ms, final 116.2 ms, total 954375.3 ms, cpu 869121.6 ms, peak rss 234500096 B, disk 337399733 B, token_count mismatches 0
+rc=0 18:08:55 du=337399733
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 15:54.48
+	Maximum resident set size (kbytes): 229004
+ALLDONE

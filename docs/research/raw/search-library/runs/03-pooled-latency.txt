@@ -1,0 +1,21 @@
+Warm query latency on kubernetes, first page of 200: 30 queries x 5 warm runs each
+phase        arm          queries warm runs median, all runs sum of per-query medians
+speed        ours              30       150      779.09 ms             47391.7 ms
+speed        library           30       150        0.50 ms                16.0 ms
+speed        library-all       30       150        1.77 ms               129.3 ms
+speed        product           30       150       51.61 ms              4038.9 ms
+speed-kind   ours              30       150      730.42 ms             40147.6 ms
+speed-kind   library           30       150        0.76 ms                31.5 ms
+speed-kind   library-all       30       150        1.55 ms               114.4 ms
+speed-kind   product           30       150       18.60 ms              2054.3 ms
+speed-path   ours              30       150      748.49 ms             38899.1 ms
+speed-path   library           30       150        3.35 ms               100.2 ms
+speed-path   library-all       30       150        3.73 ms               120.7 ms
+speed-path   product           30       150        5.48 ms               824.5 ms
+speed-11seg  library           30       150        0.55 ms                17.9 ms
+speed-11seg  library-all       30       150        1.82 ms               137.5 ms
+speed-11seg  product           30       150       54.34 ms              4093.5 ms
+speed-t16    library           30       150        0.47 ms                11.8 ms
+speed-t16    library-all       30       150        1.57 ms               103.7 ms
+speed-kind: --kind function --kind method; speed-path: --path-prefix pkg; speed-11seg: the 11-segment index;
+speed-t16: 16 search threads (library arms only). Our arm has no 11seg or t16 phase.

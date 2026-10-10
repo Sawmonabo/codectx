@@ -1,0 +1,88 @@
+diff --git a/internal/storage/sqlite/units.go b/internal/storage/sqlite/units.go
+index e27aa74..993f290 100644
+--- a/internal/storage/sqlite/units.go
++++ b/internal/storage/sqlite/units.go
+@@ -495,12 +495,25 @@ func (s *Store) BeginUnit(ctx context.Context, gen model.GenerationID, build mod
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	var tbInputs []model.UnitInput
++	if TBObserve != nil {
++		inner := inputs
++		inputs = func(yield func(model.UnitInput) error) error {
++			return inner(func(in model.UnitInput) error {
++				tbInputs = append(tbInputs, in)
++				return yield(in)
++			})
++		}
++	}
+ 	if err := w.streamInputs(ctx, snapshot, inputs); err != nil {
+ 		// The unit row and any inputs already written must not linger as a
+ 		// building unit; a failure to remove them is reported alongside the
+ 		// cause rather than hidden behind it.
+ 		return nil, errors.Join(err, w.Fail(ctx))
+ 	}
++	if TBObserve != nil {
++		TBObserve.UnitBegun(w, tbInputs)
++	}
+ 	return w, nil
+ }
+ 
+@@ -630,7 +643,7 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
+ // column: the row would otherwise keep whichever description arrived first,
+ // and a delta-built unit would keep a different one from a full re-import of
+ // the same source. Nothing of a refused fact is stored, its evidence included.
+-func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) error {
++func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) (err error) {
+ 	if err := checkFactKeys(len(facts), keys); err != nil {
+ 		return err
+ 	}
+@@ -670,6 +683,13 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact,
+ 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
+ 		return err
+ 	}
++	if TBObserve != nil {
++		defer func() {
++			if err == nil {
++				TBObserve.NodesPut(w, facts)
++			}
++		}()
++	}
+ 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
+ 		return w.providerWrite(func() error {
+ 			defer w.endBatch()
+@@ -904,7 +924,14 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
+ 	// One tokenizer pass serves both the token counts and the unit's lexical
+ 	// staging. The staged rows carry the batch-local document number; the
+ 	// ingestion below resolves it to the document rowid it assigns.
++	var tbTerms [][]string
++	if TBObserve != nil {
++		tbTerms = make([][]string, len(docs))
++	}
+ 	tokenCounts, err := w.s.countTokens(ctx, docs, func(doc int64, term, col string, n int64) error {
++		if tbTerms != nil {
++			tbTerms[doc-1] = append(tbTerms[doc-1], term)
++		}
+ 		return w.lex.putTerm(ctx, batch, doc, term, col, n)
+ 	})
+ 	if err != nil {
+@@ -973,6 +1000,9 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
+ 		}
+ 	}
+ 	w.searchDocs += inserted
++	if TBObserve != nil {
++		TBObserve.SearchPut(w, docs, tokenCounts, tbTerms)
++	}
+ 	return nil
+ }
+ 
+@@ -1442,6 +1472,9 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
+ 		if closeErr := w.closeStage(); closeErr != nil {
+ 			return closeErr
+ 		}
++		if TBObserve != nil {
++			TBObserve.UnitSealed(w)
++		}
+ 		if w.evidenceClipped != 0 {
+ 			// One bounded line per sealed unit, and only when the bound
+ 			// actually truncated something: the clip is legitimate but it

@@ -1,0 +1,11 @@
+Our arm's document-level first page against the library arm's product mode (our rules, folded), 30 queries
+identical first page: 22/30; our served (folded) hit count equal to product hits: 30/30
+query                    1st diff ours docs    served   product  page len
+func                          117    201750    199866    199866   200/200
+currentutilizationval           3         4         2         2     4/2
+cachedresource                  5         7         5         5     7/5
+defaultstubrefreshtoken         5         6         4         4     6/4
+resource version              117     48699     45634     45634   200/200
+"resource version"            118       485       421       421   200/200
+"garbage collector"           172       851       300       300   200/200
+"admission controller"        170       309       261       261   200/200

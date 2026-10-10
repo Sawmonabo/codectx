@@ -1,0 +1,23 @@
+	Command being timed: "systemd-run --user --scope -q -p MemoryMax=12G <bench>/rust/target-next2/release/tindex <bench>/docs.jsonl <bench>/idx/code-next2 16 large end --tokenizer code"
+	User time (seconds): 69.19
+	System time (seconds): 7.34
+	Percent of CPU this job got: 357%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:21.44
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1309876
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 48
+	Minor (reclaiming a frame) page faults: 359659
+	Voluntary context switches: 742942
+	Involuntary context switches: 13047
+	Swaps: 0
+	File system inputs: 22488
+	File system outputs: 1601048
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

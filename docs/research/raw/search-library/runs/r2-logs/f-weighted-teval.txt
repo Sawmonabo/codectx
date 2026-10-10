@@ -1,0 +1,24 @@
+set name: 1000 queries
+arm/phase                           MRR@10    S@1    S@10     R@200  mean hits   zero  missing
+tantivy-product/q-name-total        0.8331 0.7640  0.9500    0.9460     9095.6      0        0
+tantivy-product/q-name-weighted     0.8566 0.7880  0.9670    0.9505     9095.6      0        0
+tantivy-product/qual-name           0.8331 0.7640  0.9500    0.9460     9095.6      0        0
+tantivy-product-code/o1-code-qual-name  0.8101 0.7440  0.9320    0.9198    50582.5      0        0
+tantivy-product-code/q-name-total   0.8101 0.7440  0.9320    0.9198    50582.5      0        0
+tantivy-product-code/q-name-weighted  0.8562 0.7940  0.9680    0.9308    50582.5      0        0
+set doc: 1000 queries
+arm/phase                           MRR@10    S@1    S@10     R@200  mean hits   zero  missing
+tantivy-product/q-doc-total         0.6843 0.5870  0.8650    0.9820    13689.9      0        0
+tantivy-product/q-doc-weighted      0.6703 0.5670  0.8630    0.9810    13689.9      0        0
+tantivy-product/qual-doc            0.6843 0.5870  0.8650    0.9820    13689.9      0        0
+tantivy-product-code/o1-code-qual-doc  0.6756 0.5740  0.8590    0.9830    16371.3      0        0
+tantivy-product-code/q-doc-total    0.6756 0.5740  0.8590    0.9830    16371.3      0        0
+tantivy-product-code/q-doc-weighted  0.6475 0.5400  0.8490    0.9790    16371.3      0        0
+set subword: 1000 queries
+arm/phase                           MRR@10    S@1    S@10     R@200  mean hits   zero  missing
+tantivy-product/q-subword-total     0.3793 0.2650  0.6490    0.2139     4181.1     13        0
+tantivy-product/q-subword-weighted  0.4346 0.3130  0.7050    0.2139     4181.1     13        0
+tantivy-product/qual-subword        0.3793 0.2650  0.6490    0.2139     4181.1     13        0
+tantivy-product-code/o1-code-qual-subword  0.5003 0.3450  0.8670    0.6299     5311.7      0        0
+tantivy-product-code/q-subword-total  0.5003 0.3450  0.8670    0.6299     5311.7      0        0
+tantivy-product-code/q-subword-weighted  0.5585 0.3940  0.9100    0.6444     5311.7      0        0
