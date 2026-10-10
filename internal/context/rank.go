@@ -24,10 +24,13 @@ import (
 )
 
 // centralityPerEdgeMicros is the package-centrality boost contributed by one
-// distinct admitted edge touching a candidate's package in THIS compile. The
-// input is deliberately walk-local rather than whole-graph centrality, which
-// would make a manifest depend on parts of the repository the request never
-// reached. It is an internal constant and not a configuration key: it belongs
+// distinct edge touching a candidate's package that this compile's walks from
+// NAMED roots admitted -- the explicit seeds and the four exact steps
+// (ADR-0016 decision 2). A lexical root's walk adds nothing: an unread match
+// would otherwise raise an entry already above the stop, so a task with no
+// named seed ranks without centrality. The input is deliberately walk-local
+// rather than whole-graph centrality, which would make a manifest depend on
+// parts of the repository the request never reached. It is an internal constant and not a configuration key: it belongs
 // to the frozen code-side policy that compilerPolicyVersion labels, so changing
 // it must change that label rather than one user's config. Ten distinct edges
 // saturate boostCentralityMax.
@@ -99,8 +102,12 @@ type routeScore struct {
 
 // scoreRoutes scores every route reaching cand and keeps the maximum. Section
 // 15.3 aggregates by maximum and never by a sum over routes: graph.Impact
-// admits one parent per node, so the maximum IS the admitted route, and summing
-// would let a cycle inflate an entity above an entity that genuinely matters.
+// admits one parent per node, so within the one walk group cand's record comes
+// from the maximum IS the admitted route, and summing would let a cycle inflate
+// an entity above an entity that genuinely matters. Across groups nothing is
+// combined either: each group's walk lends the entity its own record, and the
+// entity keeps the record whose (requirement, score) pair ranks first
+// (ADR-0016 decision 1).
 func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 	precision map[model.RelationID]int64, pathLimit config.Limit) (routeScore, error) {
 	out := routeScore{kinds: map[model.RelationKind]struct{}{}}
@@ -211,19 +218,21 @@ func scorePath(p model.RelationPath, relations map[model.RelationID]model.Relati
 }
 
 // originContribution is the non-relational contribution of the Section 15.2
-// step that discovered a candidate. Section 15.3 names exactly two: the
-// explicit seed and the exact symbol or path match. A candidate discovered
-// lexically or as a captured change therefore contributes nothing on its own
-// and is ranked by the routes that reach it plus its bounded boosts -- a
-// captured change is already worth boostActiveChange, and inventing a weight
-// for a lexical hit would put a number in the ranking that Section 15.3 does
-// not state.
-func originContribution(o originKind) int64 {
+// step that discovered a candidate: the explicit seed and the exact symbol or
+// path match at their fixed contributions, and a lexical match at its root
+// weight -- its score relative to the task's top lexical score, below an exact
+// match's contribution (ADR-0016 decision 1). A captured change, a walk entry
+// and a name-only candidate contribute nothing on their own: a captured change
+// is already worth boostActiveChange, and a walk entry's score is its group's
+// weight times its route.
+func originContribution(o originKind, rootWeight int64) int64 {
 	switch o {
 	case originExplicitSeed:
 		return seedContribution
 	case originBacktick, originPathToken, originQualified, originExactResolve:
 		return exactContribution
+	case originLexical:
+		return rootWeight
 	}
 	return 0
 }
@@ -241,8 +250,8 @@ func namedByTask(o originKind) bool {
 
 // boostsForCounts is boostsFor over the two facts the route pass and the
 // centrality aggregation reduce to: whether an admitted route arrived over a
-// test or contract edge, and how many distinct edges this compile walked in the
-// candidate's package. It is the ONE implementation of the boost set and of the
+// test or contract edge, and how many distinct edges the walks from named roots
+// admitted in the candidate's package. It is the ONE implementation of the boost set and of the
 // order its reasons are appended in, so the whole-set pass and the streamed
 // pass cannot drift: rank reaches it through boostsFor with the nested
 // centrality map, and P-F reaches it with P-E's streamed count.
@@ -268,7 +277,7 @@ func boostsForCounts(cand candidate, associated bool, edges int64) (int64, []str
 			boost = boostCentralityMax
 		}
 		total += boost
-		reasons = append(reasons, fmt.Sprintf("this compile walked %d distinct edges in %s", edges, packageLabel(pkg)))
+		reasons = append(reasons, fmt.Sprintf("the walks from the named seeds crossed %d distinct edges in %s", edges, packageLabel(pkg)))
 	}
 	if total > maxBoostMicros {
 		total = maxBoostMicros
@@ -290,8 +299,10 @@ func isCapturedChange(s model.FileStatus) bool {
 }
 
 // associatedTestOrContract reports whether the candidate is an associated test
-// or contract of the scope: an admitted route arrives over a tests, implements,
-// overrides or extends edge. The trigger is the edge and never the node kind,
+// or contract of the scope: one of THIS record's own admitted routes arrives
+// over a tests, implements, overrides or extends edge. It is per record, never
+// across the records of one entity, so a route from an unread root cannot lend
+// the boost to an entry another root reached (ADR-0016 decision 1). The trigger is the edge and never the node kind,
 // so a file merely named like a test cannot claim the boost without a sealed
 // relation saying it tests something in scope.
 func associatedTestOrContract(routed routeScore) bool {
@@ -381,8 +392,9 @@ func appendReason(reasons []string, reason string) []string {
 //   - Pkg is packageOf(PathAtRank), computed once by P-D. The
 //     centrality bucket and the boost reason read the AT-RANK path, while
 //     lessRank reads PathFinal. Storing the key keeps the two apart.
-//   - Base is max(originContribution(Origin), routed.best), the rank pass's
-//     `base` before boosts.
+//   - Base is the record's own pair score before boosts: the larger of
+//     originContribution(Origin, RootWeight) and mulScaled(RootWeight,
+//     routed.best) (ADR-0016 decision 1).
 //   - Associated is associatedTestOrContract(routed): the kind set exists only
 //     to answer that one question, so the answer travels and the set does not.
 type scoredRec struct {

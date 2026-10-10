@@ -747,19 +747,48 @@ func (c *Compiler) stageCentrality(ctx context.Context, sorts *compileSorts, st 
 	return nil
 }
 
-// stageBoosts is P-F. The ranked sort's comparator IS the Section 15.3 total
-// order, so draining it is the reading order the plan is packed and stored in.
+// stageBoosts is P-F. Every scored record first goes through the entity fold:
+// an entity a seed and several walks reached holds one record per pair, and it
+// keeps the one that ranks first, the lexicographic maximum of its pairs
+// (ADR-0016 decision 1). The fold runs only here, after every record is
+// scored, because a pair's rank key is known only once its boosts are. The
+// survivors then go to the ranked sort, whose comparator IS the Section 15.3
+// total order, so draining it is the reading order the plan is packed and
+// stored in.
+//
+// The name-only candidates the fold keeps are counted on the way through,
+// which is the count the manifest notice reports: a candidate whose entity
+// also has a precise record lost the fold and is not in the plan.
 func (c *Compiler) stageBoosts(ctx context.Context, sorts *compileSorts, st *compileState) error {
+	bestSort, err := newSort(sorts, "best", lessEntityFold, sizeOfCand)
+	if err != nil {
+		return err
+	}
+	bestSort = bestSort.WithFold(foldBestRank)
+	if err := c.passFBoosts(ctx, st.scored, st.counts, bestSort); err != nil {
+		return contextErr(ctx, err)
+	}
+	best, err := sortedRun(sorts, bestSort)
+	if err != nil {
+		return err
+	}
 	rankedSort, err := newSort(sorts, "ranked", lessRank, sizeOfCand)
 	if err != nil {
 		return err
 	}
-	if err := c.passFBoosts(ctx, st.scored, st.counts, rankedSort); err != nil {
+	var candidates int64
+	if err := best.Each(func(r candRec) error {
+		if r.Possible && r.Excluded == "" {
+			candidates++
+		}
+		return rankedSort.Add(r)
+	}); err != nil {
 		return contextErr(ctx, err)
 	}
 	if st.ranked, err = sortedRun(sorts, rankedSort); err != nil {
 		return err
 	}
+	st.scope.Candidates = candidates
 	st.scored, st.counts = nil, nil
 	return nil
 }

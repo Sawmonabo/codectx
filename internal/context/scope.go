@@ -83,7 +83,8 @@ type scopeResult struct {
 // one walk cannot take a maximum over roots of different weights; roots of
 // equal weight share a walk, and an entity reached by several walks takes
 // its best record after ranking. Named groups are the explicit and exact
-// roots; a lexical group's requirements are capped at recommended.
+// roots, and only their records feed centrality (ADR-0016 decision 2); a
+// lexical group's requirements are capped at recommended.
 //
 // MaxDepth is the group's own derived depth bound, zero for none; it never
 // widens a user-set context.max_graph_depth.
@@ -302,9 +303,11 @@ type seedIngest struct {
 	sorts *compileSorts
 	cfg   config.Context
 	// seedSort folds the identity-carrying seeds by entity, keeping the
-	// earliest; candSort is the admission-order spool every later pass replays;
-	// entitySort is the union fold the walk's entries join the survivors in;
-	// the two route sorts take the walk's routes as each page arrives.
+	// earliest; entitySort holds the seed survivors foldSeeds kept (re-folding
+	// them is idempotent, and it is the carry a halted walk checkpoints them
+	// in); candSort is the admission-order spool every later pass replays, and
+	// every walk entry goes straight to it; the two route sorts take the walk's
+	// routes as each page arrives.
 	seedSort, entitySort, candSort *pagination.ExternalSort[candRec]
 	pathSort                       *pagination.ExternalSort[pathRec]
 	hopSort                        *pagination.ExternalSort[hopRec]
@@ -362,10 +365,10 @@ func (c *Compiler) newSeedIngest(s *compileSorts) (*seedIngest, error) {
 	}
 	// The two route sorts are opened here rather than in finishIngest because
 	// the walk emits into them AS EACH PAGE ARRIVES: retaining the pages'
-	// entries until the fold had spoken would make the pass hold the whole
-	// walk, which a streamed compile never does. They therefore carry the
-	// routes of entries the fold later drops, and finishIngest filters them
-	// against the surviving candidate stream.
+	// entries would make the pass hold the whole walk, which a streamed
+	// compile never does. finishIngest keeps them against the candidate
+	// stream's seqs, and P-G's re-key drops the routes of every record the
+	// entity fold after ranking did not keep.
 	if in.pathSort, err = newSort[pathRec](s, "scope-path", lessPathSeq, sizeOfPath); err != nil {
 		return nil, err
 	}
@@ -413,6 +416,14 @@ func (in *seedIngest) Admit(sd candidate) error {
 		// otherwise rank below optional and be droppable.
 		sd.Requirement = model.RequirementFull
 	}
+	if sd.RootWeight == 0 && (sd.Origin == originExplicitSeed || namedByTask(sd.Origin)) {
+		// The same default for the root weight: a seed the caller or the task
+		// named is a named root of its step's weight (ADR-0016 decision 1)
+		// whether or not its producer spelled that out. Only these five steps
+		// take it; a lexical seed's weight is its own score's and a captured
+		// change is no root at all.
+		sd.RootWeight, sd.Named = namedRootWeight(sd.Origin), true
+	}
 	if sd.entityID() == "" {
 		// No identity, so no dedupe key and no fold: the seed goes straight to
 		// the admission spool in arrival order.
@@ -444,8 +455,10 @@ func (in *seedIngest) emitRoutes(seq int64, raw []model.RelationPath) error {
 }
 
 // foldSeeds drains the entity fold into seq order, applies the ONE count bound
-// over the seed set -- the user-set context.max_seeds -- and builds the walk's
-// start set from the survivors.
+// over the seed set -- the user-set context.max_seeds -- and builds the walk
+// groups from the survivors. It answers the walk's roots in seq order, every
+// group's together, so the caller can tell "no seed names a node" from "every
+// root's group was left unwalked by its derived depth bound".
 //
 // The bound is applied HERE, to the folded stream, and not by the producers:
 // a producer counting its own admissions counts duplicates the fold has not
@@ -487,6 +500,9 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 	// longer exists.
 	width := in.cfg.MaxStartNodes
 	start := []model.NodeID{}
+	// roots carries each started seed's weight and class beside start, so the
+	// groups are cut from the same width-bounded list in the same seq order.
+	var roots []walkRoot
 	unwalkedRoots := int64(0)
 	if err := seedSeqRun.Each(func(r candRec) error {
 		if !limit.IsUnlimited() && admitted >= limit.Value() {
@@ -505,6 +521,7 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 		}
 		if !width.Exceeded(int64(len(start)) + 1) {
 			start = append(start, r.NodeID)
+			roots = append(roots, walkRoot{node: r.NodeID, weight: r.RootWeight, named: r.Named})
 			return nil
 		}
 		// More seeds than the user-set root width admits: the boundaries of the
@@ -513,10 +530,9 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 		// counted and disclosed below -- an incomplete verdict on its own does
 		// not tell a caller whether one root or a thousand went unexplored.
 		//
-		// The overflow is never chunked into a second walk: graph.Impact ranks
-		// one walk's boundaries globally, so a second walk from the remaining
-		// roots would answer its own local ranking rather than extend this
-		// one's order.
+		// The overflow is never chunked into a further walk: the width bounds
+		// the whole root list, and the walks are cut by root weight
+		// (walkGroupsOf), never by how many roots one walk may carry.
 		unwalkedRoots++
 		in.scope.ScopeComplete = false
 		return nil
@@ -533,7 +549,148 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 			return nil, err
 		}
 	}
+	if in.walks, err = walkGroupsOf(roots, in.scope.Stop); err != nil {
+		return nil, err
+	}
 	return start, nil
+}
+
+// walkRoot is one started seed as the grouping reads it.
+type walkRoot struct {
+	node   model.NodeID
+	weight int64
+	named  bool
+}
+
+// walkGroupsOf cuts the started roots into one walk per root weight, roots of
+// equal weight together in seq order, the groups in descending weight
+// (ADR-0016 decision 1): the explicit roots, then the exact ones, then each
+// lexical level. graph.Impact admits one parent per reached node, so within
+// a group the cheapest route stands for the group; the roots of one group
+// share one weight, so that route's pair is the group's best. Across groups an
+// entity takes its best record after ranking.
+//
+// The class rides the key beside the weight. A weight level is either all
+// named or all lexical -- a lexical weight is below every exact one -- so this
+// splits nothing, and a level that ever mixed the two would walk them apart
+// rather than lend one class's rights to the other.
+//
+// A lexical group of a read that stopped at its floor carries its derived
+// depth bound, and a group no depth of which can lend a pair above the stop is
+// not walked at all (lexicalDepthCap).
+func walkGroupsOf(roots []walkRoot, stop seedStop) ([]walkGroup, error) {
+	type key struct {
+		weight int64
+		named  bool
+	}
+	at := map[key]int{}
+	var groups []walkGroup
+	for _, r := range roots {
+		k := key{r.weight, r.named}
+		i, ok := at[k]
+		if !ok {
+			i = len(groups)
+			at[k] = i
+			groups = append(groups, walkGroup{Weight: r.weight, Named: r.named})
+		}
+		groups[i].Start = append(groups[i].Start, r.node)
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].Weight != groups[j].Weight {
+			return groups[i].Weight > groups[j].Weight
+		}
+		return groups[i].Named && !groups[j].Named
+	})
+	out := groups[:0]
+	for _, g := range groups {
+		if !g.Named && stop.Stopped {
+			depth, err := lexicalDepthCap(g.Weight, stop.Tau)
+			if err != nil {
+				return nil, err
+			}
+			if depth == 0 {
+				continue
+			}
+			g.MaxDepth = depth
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+// lexicalDepthCap is the deepest a lexical root of weight w can lend what it
+// reaches a rank key above (recommended, tau) (ADR-0016 decision 3), zero when
+// no depth can.
+//
+// Two bounds meet. A lexical walk's requirement is capped at recommended and a
+// boundary is demoted one rank per hop past the first, so past the depth at
+// which the strongest kind falls below recommended nothing it reaches can rank
+// above the stop. Within that depth, the best route of d hops is scorePath's
+// own product over d hops of the strongest scope relation at full precision,
+// and the record's score is at most mulScaled(w, route) plus every boost a root
+// lends, scaled by w: the depth is kept while that bound is above tau.
+func lexicalDepthCap(w, tau int64) (int, error) {
+	hop, err := strongestHop()
+	if err != nil {
+		return 0, err
+	}
+	boost, err := scaleBoost(w, rootBoostMicros)
+	if err != nil {
+		return 0, err
+	}
+	limit := requirementRank(model.RequirementRecommended) - requirementRank(model.RequirementFull) + 1
+	route := scale
+	depth := 0
+	for d := 1; d <= limit; d++ {
+		if route, err = mulScaled(route, hop); err != nil {
+			return 0, err
+		}
+		if d > 1 {
+			if route, err = mulScaled(route, depthDecay); err != nil {
+				return 0, err
+			}
+		}
+		lent, err := mulScaled(w, route)
+		if err != nil {
+			return 0, err
+		}
+		if lent+boost > tau {
+			depth = d
+		}
+	}
+	return depth, nil
+}
+
+// strongestHop is the largest one-hop factor scorePath can multiply in: the
+// heaviest scope relation's contribution weight at the most precise evidence.
+func strongestHop() (int64, error) {
+	var weight, precision int64
+	for _, k := range scopeRelations {
+		if w := contributionWeight[k]; w > weight {
+			weight = w
+		}
+	}
+	for _, m := range precisionMultiplier {
+		if m > precision {
+			precision = m
+		}
+	}
+	return mulScaled(weight, precision)
+}
+
+// walkDepth is the depth bound one group's walk is asked with, and whether the
+// group's derived bound -- not the user's context.max_graph_depth -- is the one
+// that set it. A group with no derived bound walks to the user's bound
+// (unlimited is zero); a derived bound is never widened by the user's and
+// never passed as zero.
+func walkDepth(derived int, user config.Limit) (int, bool) {
+	if derived <= 0 {
+		return user.Int(), false
+	}
+	if user.IsUnlimited() || derived < user.Int() {
+		return derived, true
+	}
+	return user.Int(), false
 }
 
 // discloseUnwalkedRoots reports the resolved seeds that did not become walk
@@ -583,29 +740,28 @@ func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 	return nil
 }
 
-// expandScopeStream is expandScope as sorted streams. It produces the same
-// candidates, in the same admission order, with the same scope verdict, holding
-// one sort run buffer per sort instead of a whole-set candidate list and
-// `admitted map[string]bool`.
+// expandScopeStream is expandScope as sorted streams, holding one sort run
+// buffer per sort instead of a whole-set candidate list.
 //
-// The dedupe is two folds and no join. Seeds that participate in today's
-// dedupe (resolved, and carrying an entity identity) go through a first
-// lessEntityID/foldMinSeq sort so that `start` can be built from the survivors
-// before the walk runs; those survivors and every impact entry then go through
-// a second one. foldMinSeq over that union reproduces BOTH of today's dedupe
-// sites at once: a seed survivor's seq is always smaller than any impact
-// entry's, so a boundary the walk reaches again keeps its seed requirement,
-// and two impact entries fold to the earlier one.
-// Re-folding an already-folded seed survivor is idempotent.
+// The seeds fold among themselves and nothing else does. Seeds that carry an
+// entity identity go through the lessEntityID/foldMinSeq seed sort so that
+// the walk groups can be built from the survivors before any walk runs: the
+// earliest step that found an entity keeps it. Every walk entry then goes to
+// the admission spool as its own record, one per (entity, walk group) -- a walk
+// reports a node once, and a seed survivor and the walks that reach the same
+// entity each lend it their own (requirement, score) pair (ADR-0016 decision
+// 1). The entity takes its best record after P-F has scored every one
+// (stageBoosts), so no record is dropped here for having arrived later.
 //
 // It takes the sink the seeds were pushed into rather than a slice of them:
 // the seeds are already inside the sorts by the time this runs, and seq is the
-// sink's arrival counter continued by the walk.
-// stop is the pass's own halt question, asked after each page of the walk: a
-// true answer with more walk left ends the PASS with its carry intact instead
-// of ending the compile, and the caller checkpoints it. It is the
-// same predicate runPasses asks at a pass boundary, so a deadline that lands
-// inside the walk and one that lands behind it drive the identical continuation.
+// sink's arrival counter continued by the walks.
+// stop is the pass's own halt question, asked after each page of a walk: a
+// true answer with more walk left -- in this group or a later one -- ends the
+// PASS with its carry intact instead of ending the compile, and the caller
+// checkpoints it. It is the same predicate runPasses asks at a pass boundary,
+// so a deadline that lands inside the walk and one that lands behind it drive
+// the identical continuation.
 func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *graph.Engine,
 	gen model.GenerationID, caps []model.CapabilityState, stop func() bool) (*ingested, bool, error) {
 	if in == nil {
@@ -626,18 +782,15 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 		return done, false, err
 	}
 
-	// A resumed sink has already folded its seeds and carries the root list it
-	// built, so the fold and the two no-walk verdicts below run once per walk
-	// and never again on a continuation.
+	// A resumed sink has already folded its seeds and carries the groups it
+	// built, so the fold and the two no-walk verdicts below run once per
+	// compile and never again on a continuation.
 	if !in.started {
-		start, err := in.foldSeeds()
+		roots, err := in.foldSeeds()
 		if err != nil {
 			return nil, false, err
 		}
 		in.started = true
-		if len(start) > 0 {
-			in.walks = []walkGroup{{Weight: scale, Named: true, Start: start}}
-		}
 
 		switch {
 		case in.resolved == 0:
@@ -645,7 +798,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			// run. Seeds already carry their own exclusion reasons.
 			in.scope.ScopeComplete = false
 			return finish()
-		case len(in.walks) == 0:
+		case len(roots) == 0:
 			// Files resolved but no symbol did, so no boundary can be walked from
 			// them. Each seed keeps the requirement its Section 15.2 step assigned;
 			// the scope is not complete.
@@ -653,16 +806,20 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			in.scope.Completeness = degradedCapabilities(caps, nil)
 			return finish()
 		}
+		// Roots exist but in.walks may still be empty: every group was a
+		// lexical one whose derived depth bound is zero, because no depth of
+		// it can lend a pair above the stop. That is the stop's own answer and
+		// not a cut, so the loop below runs no walk and narrows nothing.
 	}
-	start := in.walks[in.walkAt].Start
 
-	// The walk is read TO EXHAUSTION. graph.Impact answers one globally ranked
-	// PAGE and hands back the cursor that continues it; reading that page and
-	// dropping the cursor delivered a fraction of the boundaries and reported
-	// the result as a whole scope. A page is the width of one read, never a
-	// ceiling on the walk: the only bounds that may end it are the user-set
-	// context.max_graph_depth / max_visited_nodes / max_graph_edges, which ride
-	// inside the request and are disclosed through Meta.Truncated.
+	// Each walk is read TO EXHAUSTION. graph.Impact answers one globally
+	// ranked PAGE and hands back the cursor that continues it; reading that
+	// page and dropping the cursor delivered a fraction of the boundaries and
+	// reported the result as a whole scope. A page is the width of one read,
+	// never a ceiling on the walk: the only bounds that may end it are the
+	// user-set context.max_graph_depth / max_visited_nodes / max_graph_edges,
+	// which ride inside the request and are disclosed through Meta.Truncated,
+	// and a lexical group's derived depth bound, which is not a cut.
 	//
 	// Every continuation repeats the issuing request byte for byte apart from
 	// the cursor, including the page limit: graph.Impact binds the limit into
@@ -671,130 +828,128 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 	//
 	// Nothing accumulates across pages except the seq counter and the
 	// deduplicated capability rows: each page's entries go straight into the
-	// dedupe sort and their routes straight into the route sorts, so the pass
-	// holds one page and its sorts' run buffers however long the walk runs.
+	// admission spool and their routes straight into the route sorts, so the
+	// pass holds one page and its sorts' run buffers however long the walks run.
 	pageSize := c.pageLimit()
 	// The per-page capability rows are the one thing the walk accumulates, so
 	// they are seeded from the carry a continuation restored: degradedCapabilities
 	// folds an already-folded list to itself, which is what makes resuming the
 	// walk leave the disclosure exactly where an uninterrupted walk leaves it.
 	disclosed := in.scope.Completeness
-	cursor := in.cursor
-	for {
-		impact, err := eng.Impact(ctx, model.ImpactRequest{
-			// The generation is pinned by the cursor on a continuation, and
-			// naming both is refused: a cursor already carries the generation
-			// its first page was answered from.
-			GenerationID: pinnedGeneration(gen, cursor),
-			Start:        start,
-			Relations:    scopeRelations,
-			Direction:    model.DirectionBoth,
-			MaxDepth:     cfg.MaxGraphDepth.Int(),
-			MaxVisited:   cfg.MaxVisitedNodes.Int(),
-			MaxEdges:     cfg.MaxGraphEdges.Int(),
-			Page:         model.PageRequest{Limit: pageSize, Cursor: cursor},
-		})
-		if err != nil {
-			return nil, false, contextErr(ctx, err)
-		}
-		// A page the deadline cut comes back truncated with neither a cursor
-		// nor an entry: the walk stalled before it could advance, and
-		// graph.Impact deliberately answers no continuation because it would be
-		// the cursor this request already carried (impact.go:243-253). Reading
-		// that empty cursor as exhaustion would serve a fraction of the walk as
-		// a whole scope, so the halt below re-issues this same page instead.
-		stalled := impact.Meta.Truncated && impact.Meta.NextCursor == "" && len(impact.Entries) == 0
-		next := impact.Meta.NextCursor
-		if stalled {
-			in.stalls++
-		} else {
-			in.stalls = 0
-		}
-		// A non-advancing page is re-issued exactly ONCE. Minting the request's
-		// own cursor back is only a continuation if the next call can get past
-		// it; a walk whose page cannot complete inside the deadline would
-		// otherwise hand out that same token for as long as a client kept
-		// presenting it, and the answer would never arrive. The second
-		// consecutive stall therefore ends the walk here with an INCOMPLETE
-		// scope -- the same verdict any truncated page leaves -- rather than
-		// with a token that cannot advance. The graph engine bounds its own
-		// repeats the same way.
-		if in.stalls > 1 {
-			in.scope.ScopeComplete = false
-			break
-		}
-		if stalled {
-			next = cursor
-		}
-		halt := stop != nil && stop() && (next != "" || stalled)
-		// A page whose truncation is the DEADLINE'S OWN does not narrow the
-		// scope when this call halts on it: the continuation is what answers
-		// that truncation, and narrowing would make a resumed plan report an
-		// incomplete scope the uninterrupted compile never reports.
-		//
-		// The reason is what decides it, and only the deadline's reason
-		// qualifies: a page can carry a user-set depth, frontier or visited
-		// bound AND arrive exactly as the halt fires, and suppressing THAT
-		// would publish a plan claiming a complete scope over a walk the
-		// operator's own bound cut. markTruncated keeps the FIRST reason, so a
-		// bound that fired before the deadline is the one on the page.
-		//
-		// Matched on the documented wire string (docs/queries.md) rather than
-		// imported: graph's reason constants are unexported, and the reason a
-		// caller reads is the contract both sides share.
-		deadlineCut := strings.HasPrefix(impact.Meta.TruncationReason, walkDeadlineReason)
-		if impact.Meta.Truncated && !(halt && deadlineCut) {
-			in.scope.ScopeComplete = false
-		}
-		// Deduplicated per page rather than appended: the rows are a property
-		// of the generation and every page repeats the same disclosure, so
-		// folding them as they arrive keeps this bounded by the number of
-		// distinct capabilities instead of by the number of pages.
-		disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
-		for j := range impact.Entries {
-			e := impact.Entries[j]
-			cand := candidate{
-				NodeID: e.NodeID,
-				FileID: e.FileID,
-				// Path is deliberately left empty: candidate.Path is a FILE PATH
-				// everywhere else and ImpactEntry.Name is a qualified name.
-				Requirement: boundaryRequirement(e.Kind, e.Depth),
-				Origin:      originExpansion,
-				Depth:       e.Depth,
+	for in.walkAt < len(in.walks) {
+		group := in.walks[in.walkAt]
+		depth, derivedDepth := walkDepth(group.MaxDepth, cfg.MaxGraphDepth)
+		cursor := in.cursor
+		for {
+			impact, err := eng.Impact(ctx, model.ImpactRequest{
+				// The generation is pinned by the cursor on a continuation, and
+				// naming both is refused: a cursor already carries the generation
+				// its first page was answered from.
+				GenerationID: pinnedGeneration(gen, cursor),
+				Start:        group.Start,
+				Relations:    scopeRelations,
+				Direction:    model.DirectionBoth,
+				MaxDepth:     depth,
+				MaxVisited:   cfg.MaxVisitedNodes.Int(),
+				MaxEdges:     cfg.MaxGraphEdges.Int(),
+				Page:         model.PageRequest{Limit: pageSize, Cursor: cursor},
+			})
+			if err != nil {
+				return nil, false, contextErr(ctx, err)
 			}
-			var dropped, truncated int64
-			cand.Reasons, dropped, truncated = boundReasons(e.Reasons)
-			in.scope.ReasonsDropped += dropped
-			in.scope.ReasonsTruncated += truncated
-			// Only the disclosure count is kept on the record; the routes
-			// themselves go to the route sorts, and finishIngest keeps the ones
-			// whose candidate survived the fold.
-			cand.MorePaths = countBoundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
-			seq := in.seq
-			in.seq++
-			if err := in.entitySort.Add(candRecOf(cand, seq)); err != nil {
+			// A page the deadline cut comes back truncated with neither a cursor
+			// nor an entry: the walk stalled before it could advance, and
+			// graph.Impact deliberately answers no continuation because it would be
+			// the cursor this request already carried (impact.go:243-253). Reading
+			// that empty cursor as exhaustion would serve a fraction of the walk as
+			// a whole scope, so the halt below re-issues this same page instead.
+			stalled := impact.Meta.Truncated && impact.Meta.NextCursor == "" && len(impact.Entries) == 0
+			next := impact.Meta.NextCursor
+			if stalled {
+				in.stalls++
+			} else {
+				in.stalls = 0
+			}
+			// A non-advancing page is re-issued exactly ONCE. Minting the request's
+			// own cursor back is only a continuation if the next call can get past
+			// it; a walk whose page cannot complete inside the deadline would
+			// otherwise hand out that same token for as long as a client kept
+			// presenting it, and the answer would never arrive. The second
+			// consecutive stall therefore ends THIS walk here with an INCOMPLETE
+			// scope -- the same verdict any truncated page leaves -- rather than
+			// with a token that cannot advance, and the next group's walk runs.
+			// The graph engine bounds its own repeats the same way.
+			if in.stalls > 1 {
+				in.scope.ScopeComplete = false
+				break
+			}
+			if stalled {
+				next = cursor
+			}
+			// more is whether THIS walk has a page left; a halt may also land
+			// after a walk's last page when a later group is still unwalked.
+			more := next != "" || stalled
+			halt := stop != nil && stop() && (more || in.walkAt+1 < len(in.walks))
+			// A page whose truncation is the DEADLINE'S OWN does not narrow the
+			// scope when this call halts on it with the walk to continue: the
+			// continuation is what answers that truncation, and narrowing would
+			// make a resumed plan report an incomplete scope the uninterrupted
+			// compile never reports.
+			//
+			// The reason is what decides it, and only the deadline's reason
+			// qualifies: a page can carry a user-set depth, frontier or visited
+			// bound AND arrive exactly as the halt fires, and suppressing THAT
+			// would publish a plan claiming a complete scope over a walk the
+			// operator's own bound cut. markTruncated keeps the FIRST reason, so a
+			// bound that fired before the deadline is the one on the page.
+			//
+			// A depth truncation is not a cut either when the group's derived
+			// bound set the depth: below it nothing the lexical root reaches can
+			// rank above the stop (ADR-0016 decision 3). When the user's
+			// context.max_graph_depth set it, it narrows the scope as any user
+			// bound does.
+			//
+			// Matched on the documented wire strings (docs/queries.md) rather
+			// than imported: graph's reason constants are unexported, and the
+			// reason a caller reads is the contract both sides share.
+			deadlineCut := strings.HasPrefix(impact.Meta.TruncationReason, walkDeadlineReason)
+			derivedCut := derivedDepth && strings.HasPrefix(impact.Meta.TruncationReason, walkDepthReason)
+			if impact.Meta.Truncated && !(halt && more && deadlineCut) && !derivedCut {
+				in.scope.ScopeComplete = false
+			}
+			// Deduplicated per page rather than appended: the rows are a property
+			// of the generation and every page repeats the same disclosure, so
+			// folding them as they arrive keeps this bounded by the number of
+			// distinct capabilities instead of by the number of pages.
+			disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
+			for j := range impact.Entries {
+				if err := in.admitEntry(impact.Entries[j], group); err != nil {
+					return nil, false, err
+				}
+			}
+			if err := c.admitCandidates(ctx, eng, gen, impact.Entries, in); err != nil {
 				return nil, false, err
 			}
-			if err := in.emitRoutes(seq, e.Paths); err != nil {
-				return nil, false, err
+			if halt {
+				// The pass ends here with its pre-fold sorts unfolded and the
+				// walk's place in hand. Nothing is finished and nothing is dropped:
+				// the caller checkpoints this sink and the next call re-enters the
+				// loop at `next` of this group, or at the first page of the next.
+				if more {
+					in.cursor = next
+				} else {
+					in.walkAt, in.cursor, in.stalls = in.walkAt+1, "", 0
+				}
+				in.scope.Completeness = disclosed
+				return nil, true, nil
 			}
+			if impact.Meta.NextCursor == "" {
+				break
+			}
+			cursor = impact.Meta.NextCursor
 		}
-		if err := c.admitCandidates(ctx, eng, gen, impact.Entries, in); err != nil {
-			return nil, false, err
-		}
-		if halt {
-			// The pass ends here with its four pre-fold sorts unfolded and the
-			// walk's place in hand. Nothing is finished and nothing is dropped:
-			// the caller checkpoints this sink and the next call re-enters the
-			// loop at `next`.
-			in.cursor = next
-			in.scope.Completeness = disclosed
-			return nil, true, nil
-		}
-		if impact.Meta.NextCursor == "" {
-			break
-		}
-		cursor = impact.Meta.NextCursor
+		// The next group's walk starts at its own first page.
+		in.walkAt, in.cursor, in.stalls = in.walkAt+1, "", 0
 	}
 	in.scope.Completeness = degradedCapabilities(caps, disclosed)
 	if len(in.scope.Completeness) > 0 {
@@ -803,10 +958,51 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 	return finish()
 }
 
+// admitEntry writes one walk entry to the admission spool as the record its
+// group lends it (ADR-0016 decision 1): the group's weight and class, and the
+// requirement of its kind at its depth from that group's roots, no stronger
+// than recommended for a lexical group -- a lexical root never makes an entry
+// required. Its routes go to the route sorts under the same seq.
+func (in *seedIngest) admitEntry(e model.ImpactEntry, group walkGroup) error {
+	requirement := boundaryRequirement(e.Kind, e.Depth)
+	if !group.Named && requirementRank(requirement) < requirementRank(model.RequirementRecommended) {
+		requirement = model.RequirementRecommended
+	}
+	cand := candidate{
+		NodeID: e.NodeID,
+		FileID: e.FileID,
+		// Path is deliberately left empty: candidate.Path is a FILE PATH
+		// everywhere else and ImpactEntry.Name is a qualified name.
+		Requirement: requirement,
+		Origin:      originExpansion,
+		Depth:       e.Depth,
+		RootWeight:  group.Weight,
+		Named:       group.Named,
+	}
+	var dropped, truncated int64
+	cand.Reasons, dropped, truncated = boundReasons(e.Reasons)
+	in.scope.ReasonsDropped += dropped
+	in.scope.ReasonsTruncated += truncated
+	// Only the disclosure count is kept on the record; the routes themselves
+	// go to the route sorts, and finishIngest keeps the ones whose candidate
+	// is on the spool.
+	cand.MorePaths = countBoundPaths(e.Paths, in.cfg.MaxReasonPathsPerEntry)
+	seq := in.seq
+	in.seq++
+	if err := in.candSort.Add(candRecOf(cand, seq)); err != nil {
+		return err
+	}
+	return in.emitRoutes(seq, e.Paths)
+}
+
 // walkDeadlineReason is graph.Impact's truncation reason for a page the query
 // deadline ended. It is matched as a PREFIX: the variant for a page that
 // stalled before it could advance extends it.
 const walkDeadlineReason = "query deadline reached"
+
+// walkDepthReason is graph.Impact's truncation reason for a walk its depth
+// bound ended, matched as a prefix as walkDeadlineReason is.
+const walkDepthReason = "graph depth budget exhausted"
 
 // pinnedGeneration is the generation a walk request carries: the pinned one on
 // the first page and none on a continuation, because a cursor already pins the
@@ -819,21 +1015,20 @@ func pinnedGeneration(gen model.GenerationID, cursor string) model.GenerationID 
 	return gen
 }
 
-// finishIngest drains the dedupe survivors into the output sort, materializes
-// the candidate spool in seq order, and keeps the routes of the entries that
-// survived.
+// finishIngest drains the seed survivors into the admission spool,
+// materializes the spool in seq order, and keeps the routes of the records on
+// it.
 //
 // It is the ONE tail of expandScopeStream: the two early returns above reach it
 // as well, so no path hands the next pass an unfinalized sort.
 //
-// The route streams arrive holding a record for EVERY entry the walk delivered,
-// because they are written page by page, before the fold has said which entries
-// survive. Keeping only the survivors' routes is a forward merge-join on seq:
-// both the candidate spool and each route stream ascend in it, so one walk over
-// each, with no side buffered, reproduces exactly the set today's loop over the
-// admitted candidates emitted. The filter is not optional -- P-C reads the hop
-// stream as its `wanted` set, and a dropped duplicate's hops would inflate that
-// count, resize the bitset and move the scan's early exit.
+// Every walk entry is on the spool (each walk reports a node once, and the
+// entity fold runs after ranking), so the join keeps every route the walks
+// delivered; it stays a forward merge-join on seq -- both the candidate spool
+// and each route stream ascend in it, one walk over each, no side buffered --
+// so the route streams are exactly the spool's, whatever reaches the spool.
+// P-C reads the hop stream as its `wanted` set, so a route with no record
+// behind it would inflate that count and move the scan's early exit.
 //
 // Only an expansion entry carries routes: a model.RelationPath is produced by a
 // graph walk, and every seed producer (seeds.go) resolves through search and

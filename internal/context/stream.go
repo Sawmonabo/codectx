@@ -309,8 +309,8 @@ func (r relAttrRec) precision() int64 {
 //   - TOTAL comparators (lessRank, lessHopSeq, lessPathSeq, lessFileIndex,
 //     lessPkgEdge, lessGroupIndex) end in a key no two records share, so the
 //     merged order is the only order and nothing depends on arrival.
-//   - JOIN comparators (lessEntityID, lessRelID, lessRelAttr, lessPkg,
-//     lessDecision) are deliberately single-key: they group the records one
+//   - JOIN comparators (lessEntityID, lessEntityFold, lessRelID, lessRelAttr,
+//     lessPkg, lessDecision) are deliberately single-key: they group the records one
 //     fold or one merge-join works on, and the merge's stability is what keeps
 //     equal records in arrival order (extsort.go:130-140). Adding a tie-break
 //     to one of these changes the order its fold sees -- the same class of
@@ -818,9 +818,10 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 
 // passAIngest — pass P-A. expandScope appends to the candidate spool in
 // admission order with a seq on every record instead of building
-// the whole-set candidate list (refScope.Candidates, stream_parity_test.go),
-// and its `admitted map[string]bool` becomes a sort under
-// lessEntityID folded with foldMinSeq. Excluded candidates are NOT diverted:
+// the whole-set candidate list (refScope.Candidates, stream_parity_test.go).
+// The seeds fold among themselves under lessEntityID with foldMinSeq; every
+// walk group's entries reach the spool as their own records, and the entity
+// takes its best one after ranking (ADR-0016 decision 1). Excluded candidates are NOT diverted:
 // they stay on the one spool with Excluded set, because relationsOnPaths
 // deliberately does not filter on it while hydrateFiles does, and P-I derives
 // the exclusion projection by replaying this spool in seq order.
@@ -928,9 +929,14 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 			return err
 		}
 		pkg := packageOf(rec.PathAtRank)
-		for _, id := range routed.admittedEdges {
-			if err := edges.Add(pkgEdgeRec{Pkg: pkg, RelationID: id}); err != nil {
-				return err
+		// Only a record of a named root feeds centrality (ADR-0016 decision 2):
+		// an unread lexical match's walk must not raise the boost of an entry
+		// already above the stop.
+		if rec.Named {
+			for _, id := range routed.admittedEdges {
+				if err := edges.Add(pkgEdgeRec{Pkg: pkg, RelationID: id}); err != nil {
+					return err
+				}
 			}
 		}
 		for idx, p := range routed.paths {
@@ -957,9 +963,17 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 		for _, reason := range append(morePathsReason(rec.MorePaths), routed.reasons...) {
 			rec.Reasons = appendReason(rec.Reasons, reason)
 		}
-		base := originContribution(rec.Origin)
-		if routed.best > base {
-			base = routed.best
+		// The record's own pair (ADR-0016 decision 1): a seed lends its origin
+		// contribution and carries no route, a walk entry lends its group's
+		// weight times its best route. The larger of the two is each record's
+		// base, so neither kind needs a branch.
+		base := originContribution(rec.Origin, rec.RootWeight)
+		lent, err := mulScaled(rec.RootWeight, routed.best)
+		if err != nil {
+			return err
+		}
+		if lent > base {
+			base = lent
 		}
 		return scored.Add(scoredRec{Cand: rec, Pkg: pkg, Base: base,
 			Associated: associatedTestOrContract(routed)})
@@ -975,24 +989,24 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 }
 
 // passFBoosts — pass P-F. Sorts the ranked stream by package,
-// merge-joins it with P-E's counts, applies boostsFor, clamps, appends the
-// reasons in today's order, and adds every record to the sort whose comparator
-// is lessRank. No fold.
+// merge-joins it with P-E's counts, applies boostsFor, scales the total by the
+// record's root weight, clamps, appends the reasons in today's order, and adds
+// every record to best, the entity fold stageBoosts drains into the ranked
+// sort.
 //
-// scored is P-D's output under
-// lessScoredPkg, counts is P-E's aggregate under lessPkg, and ranked is the sort
-// whose comparator is lessRank, which P-G consumes.
+// scored is P-D's output under lessScoredPkg, counts is P-E's aggregate under
+// lessPkg, and best is the sort under lessEntityFold with foldBestRank.
 //
-// The join is LEFT-outer on the package: a package this compile walked no edge
+// The join is LEFT-outer on the package: a package no named walk crossed an edge
 // in has no pkgCountRec, and its candidates take a zero centrality boost rather
 // than dropping out of the plan. That is what `len(centrality[pkg])` answers
 // today for a package the map never gained a key for.
-// It opens no sort of its own -- the ranked sort is P-G's and the caller owns
-// it -- so it takes no compileSorts.
+// It opens no sort of its own -- the fold's sort is stageBoosts' and the
+// caller owns it -- so it takes no compileSorts.
 func (c *Compiler) passFBoosts(ctx context.Context,
 	scored *pagination.SortedRun[scoredRec],
 	counts *pagination.SortedRun[pkgCountRec],
-	ranked *pagination.ExternalSort[candRec],
+	best *pagination.ExternalSort[candRec],
 ) error {
 	nextCount, stopCounts := pullRun(counts)
 	defer stopCounts()
@@ -1017,7 +1031,14 @@ func (c *Compiler) passFBoosts(ctx context.Context,
 		// boostsFor, so the boost set, the clamp and the reason ORDER are one
 		// definition and cannot drift between the two pipelines.
 		boosts, reasons := boostsForCounts(rec.Cand.rankCandidate(), rec.Associated, edges)
-		score := rec.Base + boosts
+		// The clamped total is scaled ONCE by the weight of the root the
+		// record's pair comes from (ADR-0016 decision 1), never boost by boost:
+		// the stop's bound (lexicalTau) is that same single scaling.
+		scaled, err := scaleBoost(boostWeight(rec.Cand), boosts)
+		if err != nil {
+			return err
+		}
+		score := rec.Base + scaled
 		if score > maxScoreMicros {
 			score = maxScoreMicros
 		}
@@ -1029,8 +1050,59 @@ func (c *Compiler) passFBoosts(ctx context.Context,
 		for _, reason := range reasons {
 			cand.Reasons = appendReason(cand.Reasons, reason)
 		}
-		return ranked.Add(cand)
+		return best.Add(cand)
 	})
+}
+
+// boostWeight is the weight a record's boosts are scaled by: the weight of the
+// root its pair comes from. A captured change and a name-only candidate are no
+// root's, so they take the full scale; every other record takes its own
+// RootWeight, zero included -- a lexical root of weight zero lends nothing, and
+// giving its records the full scale would put them above the stop's bound.
+func boostWeight(r candRec) int64 {
+	switch r.Origin {
+	case originChangedFile, originCandidate:
+		return scale
+	}
+	return r.RootWeight
+}
+
+// lessEntityFold groups the scored records by entity for the fold after
+// ranking (ADR-0016 decision 1). It is a join comparator on the entity id,
+// with one exception that keeps it from folding what has no identity to fold
+// on: a record that names no entity, or that an earlier pass excluded, never
+// shares a key with another record -- its Seq makes it its own group, so it
+// reaches the ranked sort untouched.
+func lessEntityFold(a, b candRec) int {
+	ka, kb := a.foldKey(), b.foldKey()
+	if c := cmpString(ka, kb); c != 0 {
+		return c
+	}
+	if ka == "" {
+		return cmpInt(a.Seq, b.Seq)
+	}
+	return 0
+}
+
+// foldKey is the entity a record folds under, empty for a record that does not
+// fold: one with no entity identity, or an exclusion carrying its reason.
+func (r candRec) foldKey() string {
+	if r.Excluded != "" {
+		return ""
+	}
+	return r.entityID()
+}
+
+// foldBestRank keeps the record that sorts first under lessRank: the
+// lexicographic maximum (requirement, score) pair an entity's seed and walks
+// lend it, ties to the lower Seq through lessRank's last key. A precise record
+// always beats a name-only candidate of the same entity, because lessRank puts
+// the candidate tier last. Order-independent: lessRank is total.
+func foldBestRank(a, b candRec) (candRec, error) {
+	if lessRank(b, a) < 0 {
+		return b, nil
+	}
+	return a, nil
 }
 
 // passGMeasure — pass P-G. Applies the three `sized` filters on ingest

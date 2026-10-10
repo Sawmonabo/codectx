@@ -325,7 +325,7 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 	for i := range cands {
 		cands[i].Paths = routed[i].paths
 		cands[i].MorePaths = routed[i].morePaths
-		base := originContribution(cands[i].Origin)
+		base := originContribution(cands[i].Origin, cands[i].RootWeight)
 		if routed[i].best > base {
 			base = routed[i].best
 		}
