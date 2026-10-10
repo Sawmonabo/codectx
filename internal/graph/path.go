@@ -246,7 +246,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		if res.Meta.Truncated || res.Meta.NextCursor != "" || !slices.Contains(kinds, model.RelCalls) {
 			return res, nil
 		}
-		return e.possiblePath(ctx, res, req.From, req.To, direction)
+		return e.possiblePath(ctx, res, req.From, req.To, direction, kinds, maxDepth, w.maxVisited)
 	}
 
 	paths, err := e.hydratePaths(ctx, routes)
@@ -822,6 +822,10 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 	if len(refs) == 0 {
 		return false, nil
 	}
+	descends, err := w.descendable(ctx, byRef)
+	if err != nil {
+		return false, err
+	}
 	pend := make([]Edge, 0, adjacencyBatch)
 	stopped := false
 	var ferr error
@@ -837,7 +841,7 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 	}
 	pos, err := w.reader.Neighbours(ctx, refs, w.descent.direction(w.direction), w.kindCodes, w.expandAfter,
 		func(e Edge) error {
-			if !w.descent.keep(e) {
+			if !w.descent.keep(e, descends) {
 				return nil
 			}
 			// Both stops are checked BEFORE the entry is consumed, so the
@@ -1123,8 +1127,8 @@ func (e *Engine) scratchDir() string {
 
 // pathDescent is an outgoing call search's downward step: the scan reads
 // both lists, keeps the outgoing entries of the requested kinds, and keeps an
-// incoming `overrides` entry, which relaxes from a method to an override of
-// it. It is inactive for every other search.
+// incoming `overrides` entry of a method a virtual call reached, which relaxes
+// from it to an override of it. It is inactive for every other search.
 type pathDescent struct {
 	active    bool
 	overrides KindCode
@@ -1154,97 +1158,390 @@ func (d pathDescent) direction(walk model.Direction) model.Direction {
 	return walk
 }
 
-func (d pathDescent) keep(e Edge) bool {
+// keep decides one scanned entry: an outgoing entry of a requested kind, or
+// an incoming `overrides` entry of an owner the descent may leave.
+func (d pathDescent) keep(e Edge, descends map[NodeRef]bool) bool {
 	if !d.active {
 		return true
 	}
 	if e.Outgoing {
 		return d.requested[e.Kind]
 	}
-	return e.Kind == d.overrides
+	return e.Kind == d.overrides && descends[e.Owner]
 }
 
-// possiblePath answers a pair with no precise route by one name-only hop
-// (ADR-0015 decision 3): `from` calls an open site `to` is a candidate of --
-// the other way round for an incoming search, either for both. The route is
-// marked Possible, costs the highest relation cost there is, carries the
-// site's occurrences, and the answer says it may not run. Only a route of
-// that one hop is offered: a name-only hop between two precise legs is not
-// searched for.
+// descendable is the batch's owners the downward step may leave: a method
+// settled through a call with a virtual occurrence, whose overrides that call
+// may run instead, or through an earlier descent. A method reached only by
+// exact calls -- a `super` call, a qualified call -- runs as itself, and the
+// start of the search was reached by no call at all. Each owner's settled
+// parents are read from the scratch, and their calls' dispatch in one batched
+// read, as a callers walk decides its base step.
+func (w *pathWalk) descendable(ctx context.Context, byRef map[NodeRef]model.NodeID) (map[NodeRef]bool, error) {
+	out := map[NodeRef]bool{}
+	if !w.descent.active {
+		return out, nil
+	}
+	dr, _ := w.reader.(DispatchReader)
+	calls := map[model.RelationID][]NodeRef{}
+	for ref, node := range byRef {
+		err := w.sc.each(w.scCtx, `SELECT rel, kind FROM parent WHERE node = ?`, []any{string(node)},
+			func(scan func(...any) error) error {
+				var rel, kind string
+				if err := scan(&rel, &kind); err != nil {
+					return internalErr("path scratch read: " + err.Error())
+				}
+				switch model.RelationKind(kind) {
+				case model.RelOverrides:
+					out[ref] = true
+				case model.RelCalls:
+					calls[model.RelationID(rel)] = append(calls[model.RelationID(rel)], ref)
+				}
+				return nil
+			})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if dr == nil || len(calls) == 0 {
+		return out, nil
+	}
+	ids := make([]model.RelationID, 0, len(calls))
+	for id := range calls {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for _, chunk := range impactChunkRelations(ids) {
+		sums, err := dr.RelationDispatch(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		if len(sums) != len(chunk) {
+			return nil, internalErr("graph: the reader summarized a different number of relations than it was given")
+		}
+		for i, id := range chunk {
+			if sums[i].Virtual {
+				for _, ref := range calls[id] {
+					out[ref] = true
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// possiblePath answers a pair with no precise route (ADR-0015 decision 3) by
+// the cheapest route that takes exactly one name-only `may_call` hop: a
+// precise leg from `from` to a node C, the hop from C to a candidate K of an
+// open call site C holds (the other way round for an incoming search, either
+// for both), and a precise leg from K to `to`. The hop costs the dearest
+// relation cost there is, the route is marked Possible and carries the site's
+// occurrences, and the answer says it may not run.
+//
+// The two legs are two cost-ordered searches over the same relation kinds,
+// one from each end, bounded by the request's depth bound and its visited
+// budget; a search the budget stops is reported truncated, never as "no
+// route". A route with two name-only hops is not searched for: the first
+// possible hop already makes the route a guess.
 func (e *Engine) possiblePath(ctx context.Context, res model.PathResult, from, to model.NodeID,
-	direction model.Direction) (model.PathResult, error) {
+	direction model.Direction, kinds []model.RelationKind, maxDepth, maxVisited config.Limit) (model.PathResult, error) {
 	dr := declarationReader(e.reader)
 	if dr == nil {
 		return res, nil
 	}
-	type hop struct{ caller, callee model.NodeID }
-	var hops []hop
-	switch direction {
-	case model.DirectionOutgoing:
-		hops = []hop{{from, to}}
-	case model.DirectionIncoming:
-		hops = []hop{{to, from}}
-	default:
-		hops = []hop{{from, to}, {to, from}}
+	codes, absent := kindCodesFor(e.reader, kinds)
+	if absent {
+		codes = nil
 	}
-	repo := e.reader.Binding().RepositoryID
-	for _, h := range hops {
-		var via []model.RelationID
-		if err := e.callersOfSites(ctx, e.reader, dr, []model.NodeID{h.callee}, map[model.NodeID]bool{},
-			func(caller, _ model.NodeID, rel model.RelationID) {
-				if caller == h.caller {
-					via = append(via, rel)
-				}
-			}); err != nil {
+	back := map[model.Direction]model.Direction{model.DirectionOutgoing: model.DirectionIncoming,
+		model.DirectionIncoming: model.DirectionOutgoing, model.DirectionBoth: model.DirectionBoth}[direction]
+	fwd, fcut, err := e.legTree(ctx, from, direction, codes, maxDepth, maxVisited)
+	if err != nil {
+		return model.PathResult{}, err
+	}
+	bwd, bcut, err := e.legTree(ctx, to, back, codes, maxDepth, maxVisited)
+	if err != nil {
+		return model.PathResult{}, err
+	}
+	// A hop joins C, the end the leg from `from` reached, to K, the end the
+	// leg to `to` reached; forward says C is the caller.
+	type hop struct {
+		c, k    model.NodeID
+		forward bool
+		via     []model.RelationID
+	}
+	hops := map[[2]model.NodeID]*hop{}
+	note := func(c, k model.NodeID, forward bool, via model.RelationID) {
+		if _, ok := bwd[k]; !ok {
+			return
+		}
+		key := [2]model.NodeID{c, k}
+		h, ok := hops[key]
+		if !ok {
+			h = &hop{c: c, k: k, forward: forward}
+			hops[key] = h
+		}
+		if h.forward != forward {
+			// Found both ways: keep the forward reading only.
+			if !forward {
+				return
+			}
+			h.forward, h.via = true, nil
+		}
+		if !slices.Contains(h.via, via) {
+			h.via = append(h.via, via)
+		}
+	}
+	reached := make([]model.NodeID, 0, len(fwd))
+	for id := range fwd {
+		reached = append(reached, id)
+	}
+	reached = sortedNodes(reached)
+	if direction != model.DirectionIncoming {
+		// Forward: C holds an open site, K is a candidate of it.
+		if err := e.candidatesOfSites(ctx, e.reader, dr, reached, map[model.NodeID]bool{},
+			func(c, k model.NodeID, via model.RelationID) { note(c, k, true, via) }); err != nil {
 			return model.PathResult{}, err
 		}
-		if len(via) == 0 {
+	}
+	if direction != model.DirectionOutgoing {
+		// Against the edges: C is a candidate of an open site K holds.
+		if err := e.callersOfSites(ctx, e.reader, dr, reached, map[model.NodeID]bool{},
+			func(k, c model.NodeID, via model.RelationID) { note(c, k, false, via) }); err != nil {
+			return model.PathResult{}, err
+		}
+	}
+	var pick *hop
+	var pickCost int64
+	for _, h := range hops {
+		f, b := fwd[h.c], bwd[h.k]
+		if maxDepth.Exceeded(int64(f.depth + 1 + b.depth)) {
 			continue
 		}
-		rel := model.Relation{ID: model.NewRelationID(repo, h.caller, model.RelMayCall, h.callee),
-			From: h.caller, Kind: model.RelMayCall, To: h.callee}
-		evidence, err := e.adjacency.EvidenceFor(ctx, via, model.MaxRelationsPerPath)
-		if err != nil {
-			return model.PathResult{}, err
+		cost := f.cost + Cost(model.RelMayCall) + b.cost
+		if pick == nil || cost < pickCost || (cost == pickCost && (h.c < pick.c || (h.c == pick.c && h.k < pick.k))) {
+			pick, pickCost = h, cost
 		}
-		p := model.RelationPath{Relations: []model.RelationID{rel.ID}, CostUnits: Cost(model.RelMayCall), Possible: true}
-		for _, v := range via {
-			for _, ev := range evidence[v] {
+	}
+	// A leg the budget stopped may have missed a cheaper hop, so the answer
+	// is truncated whether or not one was found, as the precise search's is.
+	if fcut || bcut {
+		pathTruncate(&res.Meta, pathReasonVisited)
+	}
+	if pick == nil {
+		return res, nil
+	}
+	slices.Sort(pick.via)
+	repo := e.reader.Binding().RepositoryID
+	caller, callee := pick.c, pick.k
+	if !pick.forward {
+		caller, callee = pick.k, pick.c
+	}
+	hopRel := model.Relation{ID: model.NewRelationID(repo, caller, model.RelMayCall, callee),
+		From: caller, Kind: model.RelMayCall, To: callee}
+	var route []model.Relation
+	route = append(route, fwd.chain(pick.c)...)
+	route = append(route, hopRel)
+	route = append(route, bwd.chainBack(pick.k)...)
+	if len(route) > model.MaxRelationsPerPath {
+		pathTruncate(&res.Meta, pathReasonDepth)
+		return res, nil
+	}
+	var precise []model.RelationID
+	for _, r := range route {
+		if r.ID != hopRel.ID {
+			precise = append(precise, r.ID)
+		}
+	}
+	evidence, err := e.adjacency.EvidenceFor(ctx, append(slices.Clone(precise), pick.via...), model.MaxRelationsPerPath)
+	if err != nil {
+		return model.PathResult{}, err
+	}
+	p := model.RelationPath{CostUnits: pickCost, Possible: true}
+	for _, r := range route {
+		p.Relations = append(p.Relations, r.ID)
+		ids := []model.RelationID{r.ID}
+		if r.ID == hopRel.ID {
+			ids = pick.via
+		}
+		for _, id := range ids {
+			for _, ev := range evidence[id] {
 				if len(p.Evidence) < model.MaxRelationsPerPath {
 					p.Evidence = append(p.Evidence, ev)
 				}
 			}
 		}
-		res.Paths = []model.RelationPath{p}
-		ids := sortedNodes([]model.NodeID{from, to})
-		if res.Nodes, err = e.adjacency.NodesByID(ctx, ids); err != nil {
-			return model.PathResult{}, err
+	}
+	res.Paths = []model.RelationPath{p}
+	ids := []model.NodeID{from}
+	for _, r := range route {
+		ids = append(ids, r.From, r.To)
+	}
+	ids = sortedNodes(ids)
+	if res.Nodes, err = e.adjacency.NodesByID(ctx, ids); err != nil {
+		return model.PathResult{}, err
+	}
+	var legs []model.Relation
+	for _, r := range route {
+		if r.ID != hopRel.ID {
+			legs = append(legs, r)
 		}
-		where, err := e.locate(ctx, ids, nil)
-		if err != nil {
-			return model.PathResult{}, err
-		}
-		res.Locations = where.locations
-		if loc, ok := e.reader.(SourceLocator); ok {
-			for _, v := range via {
-				listed, total, err := e.relationSites(ctx, loc, v, occurrenceBudget-len(res.Occurrences))
-				if err != nil {
-					return model.PathResult{}, err
-				}
-				for _, o := range listed {
-					o.RelationID = rel.ID
-					res.Occurrences = append(res.Occurrences, o)
-				}
-				if int64(len(listed)) < total {
-					res.Meta.Notices = append(res.Meta.Notices, fmt.Sprintf(
-						"the possible route's call site relation %s has %d located occurrences; %d are listed", v, total, len(listed)))
-				}
+	}
+	where, err := e.locate(ctx, ids, legs)
+	if err != nil {
+		return model.PathResult{}, err
+	}
+	res.Locations, res.Occurrences = where.locations, where.occurrences
+	res.Meta.Notices = append(res.Meta.Notices, where.notices...)
+	if loc, ok := e.reader.(SourceLocator); ok {
+		for _, v := range pick.via {
+			listed, total, err := e.relationSites(ctx, loc, v, occurrenceBudget-len(res.Occurrences))
+			if err != nil {
+				return model.PathResult{}, err
+			}
+			for _, o := range listed {
+				o.RelationID = hopRel.ID
+				res.Occurrences = append(res.Occurrences, o)
+			}
+			if int64(len(listed)) < total {
+				res.Meta.Notices = append(res.Meta.Notices, fmt.Sprintf(
+					"the possible route's call site relation %s has %d located occurrences; %d are listed", v, total, len(listed)))
 			}
 		}
-		res.Meta.Notices = append(res.Meta.Notices,
-			"no precise route connects the two nodes; the route given is a call no analysis bound, matched by name "+
-				"only (`may_call`), and it may not run")
-		return res, nil
 	}
+	res.Meta.Notices = append(res.Meta.Notices,
+		"no precise route connects the two nodes; the route given takes one call no analysis bound, matched by "+
+			"name only (`may_call`), and it may not run")
 	return res, nil
+}
+
+// legNode is one node of a leg search: its cost and depth from the root and
+// the relation and node it was reached by.
+type legNode struct {
+	cost  int64
+	depth int
+	rel   model.Relation
+	prev  model.NodeID
+}
+
+// legTree is one leg search's settled nodes.
+type legTree map[model.NodeID]legNode
+
+// chain is the relations from the root to n, in order.
+func (t legTree) chain(n model.NodeID) []model.Relation {
+	var out []model.Relation
+	for cur := t[n]; cur.prev != ""; cur = t[cur.prev] {
+		out = append(out, cur.rel)
+	}
+	slices.Reverse(out)
+	return out
+}
+
+// chainBack is the relations from n back to the root, in that order: the
+// search ran from the route's far end, so its chain is read forwards.
+func (t legTree) chainBack(n model.NodeID) []model.Relation {
+	var out []model.Relation
+	for cur := t[n]; cur.prev != ""; cur = t[cur.prev] {
+		out = append(out, cur.rel)
+	}
+	return out
+}
+
+// legTree runs one cost-ordered search from root over kinds in direction,
+// settling nodes cheapest first, up to the depth bound and the visited
+// budget; cut reports that the budget stopped it.
+func (e *Engine) legTree(ctx context.Context, root model.NodeID, direction model.Direction, kinds []KindCode,
+	maxDepth, maxVisited config.Limit) (tree legTree, cut bool, err error) {
+	tree = legTree{root: {}}
+	if kinds == nil {
+		return tree, false, nil
+	}
+	buckets := map[int64][]model.NodeID{0: {root}}
+	settled := map[model.NodeID]bool{}
+	for len(buckets) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		var cost int64 = -1
+		for c := range buckets {
+			if cost < 0 || c < cost {
+				cost = c
+			}
+		}
+		var batch []model.NodeID
+		for _, n := range sortedNodes(buckets[cost]) {
+			if !settled[n] && tree[n].cost == cost {
+				batch = append(batch, n)
+			}
+		}
+		delete(buckets, cost)
+		var expand []model.NodeID
+		for _, n := range batch {
+			if maxVisited.Exceeded(int64(len(settled) + 1)) {
+				return tree, true, nil
+			}
+			settled[n] = true
+			if !atBound(maxDepth, tree[n].depth) {
+				expand = append(expand, n)
+			}
+		}
+		if len(expand) == 0 {
+			continue
+		}
+		refs, err := e.reader.Resolve(ctx, expand)
+		if err != nil {
+			return nil, false, err
+		}
+		owner := map[NodeRef]model.NodeID{}
+		var live []NodeRef
+		for i, ref := range refs {
+			if ref != 0 {
+				owner[ref] = expand[i]
+				live = append(live, ref)
+			}
+		}
+		var edges []Edge
+		if len(live) > 0 {
+			if _, err := e.reader.Neighbours(ctx, ascending(live), direction, kinds, EdgePos{}, func(ed Edge) error {
+				edges = append(edges, ed)
+				return nil
+			}); err != nil {
+				return nil, false, err
+			}
+		}
+		for start := 0; start < len(edges); start += model.MaxPageItems {
+			chunk := edges[start:min(start+model.MaxPageItems, len(edges))]
+			rels := make([]RelRef, len(chunk))
+			others := make([]NodeRef, len(chunk))
+			for i, ed := range chunk {
+				rels[i], others[i] = ed.Rel, ed.Neighbour
+			}
+			relIDs, err := e.reader.RelationIDs(ctx, rels)
+			if err != nil {
+				return nil, false, err
+			}
+			otherIDs, err := e.reader.NodeIDs(ctx, others)
+			if err != nil {
+				return nil, false, err
+			}
+			for i, ed := range chunk {
+				kind, ok := e.reader.Kinds().Kind(ed.Kind)
+				if !ok || relIDs[i] == "" || otherIDs[i] == "" {
+					continue
+				}
+				at, next := owner[ed.Owner], otherIDs[i]
+				rel := model.Relation{ID: relIDs[i], From: at, Kind: kind, To: next}
+				if !ed.Outgoing {
+					rel.From, rel.To = next, at
+				}
+				c := tree[at].cost + Cost(kind)
+				if cur, seen := tree[next]; settled[next] || (seen && (next == root || cur.cost <= c)) {
+					continue
+				}
+				tree[next] = legNode{cost: c, depth: tree[at].depth + 1, rel: rel, prev: at}
+				buckets[c] = append(buckets[c], next)
+			}
+		}
+	}
+	return tree, false, nil
 }

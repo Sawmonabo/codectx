@@ -1323,8 +1323,11 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	notices = append(notices, where.notices...)
 	// One row per open call site: the structural placeholder for a site the
 	// linker published an open site for is not a second callee.
-	var dropped map[model.RelationID]bool
-	if nodes, relations, dropped = dropPlaceholders(nodes, relations, &where); len(dropped) > 0 {
+	nodes, relations, dropped, err := e.dropPlaceholders(finish, reader, nodes, relations, &where)
+	if err != nil {
+		return model.GraphResult{}, err
+	}
+	if len(dropped) > 0 {
 		calls.drop(dropped)
 	}
 	marks, occurrences, err := e.marks(finish, calls, where.occurrences, &b.calls)

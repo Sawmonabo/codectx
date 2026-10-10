@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"slices"
 	"context"
 	"encoding/json"
 	"errors"
@@ -324,6 +325,24 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		markTruncated(&meta, reasonDepth)
 	}
 
+	// A request that names `may_call` walks on through the open call sites:
+	// once the precise walk is exhausted, the possible callers (or callees)
+	// of every affected node join the retained input before it is ranked,
+	// and so on from them up to the depth bound. It runs once, in the request
+	// that finished the walk, so a mid-rank continuation ranks it with the
+	// rest.
+	if acc != nil && slices.Contains(kinds, model.RelMayCall) {
+		reader, err := e.Reader()
+		if err != nil {
+			return answer, nil, nil, "", err
+		}
+		if err := e.expandOpenSites(ctx, reader, req, maxDepth, retain); err != nil {
+			if err := impactPhaseError(ctx, err, &meta); err != nil {
+				return answer, nil, nil, "", err
+			}
+		}
+	}
+
 	// The walk is exhausted. Both passes now run over every record EVERY leg of
 	// it appended, which is what makes the served order the single unbounded
 	// walk's order however many requests the walk was spread over.
@@ -525,7 +544,7 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 		entry := model.ImpactEntry{NodeID: r.NodeID, Direction: r.Direction, Depth: r.Depth,
 			ScoreMicros: r.scoreMicros(), Reasons: r.Reasons}
 		if len(r.Route) > 0 && len(r.Route) <= model.MaxRelationsPerPath && !reasonPaths.Exceeded(1) {
-			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: r.Cost}}
+			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: r.Cost, Possible: r.Possible}}
 		}
 		entries = append(entries, entry)
 	}

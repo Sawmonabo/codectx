@@ -315,3 +315,109 @@ func TestImpactReferencesAndPathsTakeTheOverrideStep(t *testing.T) {
 		t.Errorf("path(speak -> Dog.sound) = %+v, want the route through Animal.sound %v", path.Paths, want)
 	}
 }
+
+// virtualAt and exactAt are one call site of each dispatch.
+func virtualAt(at uint64) []fixtureOccurrence {
+	return []fixtureOccurrence{{Bytes: [2]uint64{at, at + 10}, Dispatch: model.DispatchVirtual}}
+}
+
+func exactAt(at uint64) []fixtureOccurrence {
+	return []fixtureOccurrence{{Bytes: [2]uint64{at, at + 10}, Dispatch: model.DispatchExact}}
+}
+
+// TestABaseReachedAgainAsACallerHasAllItsCallersWalked pins admission per
+// reason: `Animal.sound` is first reached as the base `Dog.sound` overrides,
+// so only its virtual callers are walked, and one level later as a caller of
+// `helper`, so the rest of its callers -- `exact`, whose call cannot run an
+// override -- are walked too.
+//
+// Mutation caught: admitting a node once whatever reached it (exact is never
+// listed).
+func TestABaseReachedAgainAsACallerHasAllItsCallersWalked(t *testing.T) {
+	f := newCallFixture("base_and_caller", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "Animal.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{0, 50}},
+			{Name: "Dog.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{60, 90}},
+			{Name: "helper", Kind: model.NodeFunction, File: "b.py", Bytes: [2]uint64{0, 30}},
+			{Name: "speak", Kind: model.NodeFunction, File: "c.py", Bytes: [2]uint64{0, 30}},
+			{Name: "exact", Kind: model.NodeFunction, File: "d.py", Bytes: [2]uint64{0, 30}},
+		},
+		Relations: []fixtureFact{
+			{From: "Dog.sound", Kind: model.RelOverrides, To: "Animal.sound"},
+			{From: "helper", Kind: model.RelCalls, To: "Dog.sound", Occurrences: exactAt(5)},
+			{From: "Animal.sound", Kind: model.RelCalls, To: "helper", Occurrences: exactAt(20)},
+			{From: "speak", Kind: model.RelCalls, To: "Animal.sound", Occurrences: virtualAt(5)},
+			{From: "exact", Kind: model.RelCalls, To: "Animal.sound", Occurrences: exactAt(5)},
+		},
+	})
+	res := callAnswer(t, f, "Dog.sound", model.DirectionIncoming)
+	if !hasRelation(res, f.rel(t, "speak", model.RelCalls, "Animal.sound")) {
+		t.Errorf("callers(Dog.sound) omits speak, which calls the base virtually")
+	}
+	if !hasRelation(res, f.rel(t, "exact", model.RelCalls, "Animal.sound")) {
+		t.Errorf("callers(Dog.sound) omits exact: Animal.sound calls helper, which calls Dog.sound, " +
+			"so every caller of Animal.sound reaches Dog.sound")
+	}
+}
+
+// TestRequestedOverridesAreServedOnce pins the climb rule: a callers walk
+// that names `overrides` serves `Dog.sound overrides Animal.sound` when it
+// reaches Dog.sound, and does not serve it again by climbing back along it.
+//
+// Mutation caught: climbing the relation that admitted the owner.
+func TestRequestedOverridesAreServedOnce(t *testing.T) {
+	f := loadCallFixture(t, "two_subclasses")
+	res, err := f.engine(t).Neighbors(context.Background(), model.GraphRequest{
+		Start: []model.NodeID{f.id(t, "Animal.sound")}, Direction: model.DirectionIncoming,
+		Relations: []model.RelationKind{model.RelCalls, model.RelOverrides}})
+	if err != nil {
+		t.Fatalf("callers(Animal.sound): %v", err)
+	}
+	want := f.rel(t, "Dog.sound", model.RelOverrides, "Animal.sound")
+	n := 0
+	for _, r := range res.Relations {
+		if r.ID == want {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("Dog.sound overrides Animal.sound is served %d times, want once", n)
+	}
+}
+
+// TestAPathDescendsOnlyFromAVirtualCall pins the forward override step per
+// occurrence: a route reaches an override through a base only when the call
+// into the base can dispatch; a `super` call runs the base itself.
+//
+// Mutation caught: descending from every call into a base (viaSuper would
+// reach Dog.sound).
+func TestAPathDescendsOnlyFromAVirtualCall(t *testing.T) {
+	f := newCallFixture("path_descent", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "Animal.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{0, 50}},
+			{Name: "Dog.sound", Kind: model.NodeMethod, File: "a.py", Bytes: [2]uint64{60, 90}},
+			{Name: "viaSuper", Kind: model.NodeMethod, File: "b.py", Bytes: [2]uint64{0, 30}},
+			{Name: "speak", Kind: model.NodeFunction, File: "c.py", Bytes: [2]uint64{0, 30}},
+		},
+		Relations: []fixtureFact{
+			{From: "Dog.sound", Kind: model.RelOverrides, To: "Animal.sound"},
+			{From: "viaSuper", Kind: model.RelCalls, To: "Animal.sound", Occurrences: exactAt(5)},
+			{From: "speak", Kind: model.RelCalls, To: "Animal.sound", Occurrences: virtualAt(5)},
+		},
+	})
+	e := f.engine(t)
+	route := func(from string) int {
+		res, err := e.ShortestPath(context.Background(), model.PathRequest{From: f.id(t, from),
+			To: f.id(t, "Dog.sound"), Relations: []model.RelationKind{model.RelCalls}})
+		if err != nil {
+			t.Fatalf("path(%s, Dog.sound): %v", from, err)
+		}
+		return len(res.Paths)
+	}
+	if route("speak") != 1 {
+		t.Errorf("path(speak, Dog.sound) finds no route; speak's virtual call may run Dog.sound")
+	}
+	if n := route("viaSuper"); n != 0 {
+		t.Errorf("path(viaSuper, Dog.sound) finds %d routes; a super call never runs the override", n)
+	}
+}

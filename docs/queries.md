@@ -125,11 +125,14 @@ and `callers Animal.sound` never lists `direct`, whose call can only run
 `Dog.sound`. `callees speak` lists `Animal.sound` and then every override of it,
 at any depth, marked `may_dispatch` and counted as `may_dispatch`. A site bound
 by value flow to several classes is marked `value_set` with its set size ("1
-of 2"). `path` and a forward `impact` take the same downward step; `impact` of
-a method lists the methods overriding it; `refs` of a method includes the
-references of every method in its override family, up and down. The step
-belongs to the command, not to `--relations`: a walk over `calls` alone takes
-it. When a method marks no override and its class extends a type outside the
+of 2"). `path` and a forward `impact` take the same downward step, a path
+only from a call that can dispatch; `impact` of a method lists the methods
+overriding it; `refs` of a method includes the references of every method in
+its override family, up and down. The step belongs to the command, not to the
+relation list: a walk over `calls` alone takes it. A base method the climb
+reached that is also a caller of a symbol in the walk has the rest of its
+callers walked too, and an `overrides` row is listed once even when the
+request names `overrides`. When a method marks no override and its class extends a type outside the
 indexed project, the callers answer says that calls through that type are found
 only for overrides the language marks.
 
@@ -139,7 +142,7 @@ it publishes one open-site node for the call, located at it, named by the
 callee and carrying its shape (`bare`, `member`, `value`, `construct`) and
 argument count; the caller's `calls` edge goes to that node, and it replaces the
 structural `call:<name>` placeholder for the same site, so an open call is one
-row. Its candidates are computed per query, never stored: the declarations of
+row, on whichever page the open site falls. Its candidates are computed per query, never stored: the declarations of
 the same name, of a kind the shape can call (methods for a member call,
 functions for a bare or value call, classes for a construction), in the same
 language family (C with C++, JavaScript with TypeScript), and, in C, C++, Go,
@@ -156,10 +159,13 @@ Java and Rust, with parameters that take the call's arguments. Each is a
   imported by, the same unit, then anywhere.
 - `refs` lists the callers of those open sites after every precise
   reference, at `heuristic` precision.
-- `path` offers a route over one `may_call` hop, marked `possible` and costed
-  as the dearest relation, only when the search proved no precise route exists.
+- `path`, only when the search proved no precise route exists, offers the
+  cheapest route with one `may_call` hop between two precise legs, marked
+  `possible`, the hop costed as the dearest relation, and says so.
 - `impact` counts, per depth, the open sites naming an affected symbol
-  (`open_sites_by_depth`) and does not list their callers as affected.
+  (`open_sites_by_depth`) and does not list their callers as affected; an MCP
+  request whose `relations` name `may_call` walks on through them, one depth
+  deeper per hop, on routes marked `possible`.
 
 The possible rows are one hop from the start symbols; an MCP request whose
 `relations` name `may_call` walks on through them, to the callers of the

@@ -382,3 +382,125 @@ func TestStaticFamiliesMatchArgumentCounts(t *testing.T) {
 		t.Errorf("candidates of a two-argument Go call = %v, want grouped, two and variadic", names)
 	}
 }
+
+// TestAPlaceholderIsDroppedWhenItsOpenSiteIsOnAnotherPage pins that the
+// one-row-per-site rule is decided from the pinned generation: a page that
+// holds a placeholder's call but not the open site for the same call (that
+// row is on another page) still drops the placeholder.
+//
+// Mutation caught: deciding from the open sites on the page alone.
+func TestAPlaceholderIsDroppedWhenItsOpenSiteIsOnAnotherPage(t *testing.T) {
+	placeholder, _ := json.Marshal(map[string]any{"resolution": "unresolved", "candidates": 0, "callee": "handle"})
+	f := newCallFixture("split_site", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "run", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{0, 40}},
+			{Key: "site", Name: "handle", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{20, 30},
+				Metadata: openSite(model.CallShapeMember, 0)},
+			{Key: "placeholder", Name: "handle", Kind: model.NodeMethod, File: "app.py", Bytes: [2]uint64{20, 30},
+				Metadata: placeholder},
+		},
+		Relations: []fixtureFact{
+			{From: "run", Kind: model.RelCalls, To: "site", Occurrences: site(20)},
+			{From: "run", Kind: model.RelCalls, To: "placeholder", Occurrences: site(20)},
+		},
+	})
+	e := f.engine(t)
+	r := f.reader()
+	ctx := context.Background()
+	toPlaceholder := f.rel(t, "run", model.RelCalls, "placeholder")
+	page := []model.Relation{{ID: toPlaceholder, From: f.id(t, "run"), Kind: model.RelCalls, To: f.id(t, "placeholder")}}
+	nodes, err := f.NodesByID(ctx, []model.NodeID{f.id(t, "run"), f.id(t, "placeholder")})
+	if err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	where, err := e.locate(ctx, []model.NodeID{f.id(t, "run"), f.id(t, "placeholder")}, page)
+	if err != nil {
+		t.Fatalf("locate: %v", err)
+	}
+	_, rels, dropped, err := e.dropPlaceholders(ctx, r, nodes, page, &where)
+	if err != nil {
+		t.Fatalf("drop placeholders: %v", err)
+	}
+	if len(rels) != 0 || !dropped[toPlaceholder] {
+		t.Errorf("the page keeps %v: the open site for the same call is in the generation, on another page", rels)
+	}
+}
+
+// TestImpactWalksOpenSitesWhenAsked pins the other half of impact's rule: a
+// request naming `may_call` lists the callers of the open sites an affected
+// node is a candidate of, one depth deeper, on a route marked possible.
+//
+// Mutation caught: never expanding open sites (run is not listed).
+func TestImpactWalksOpenSitesWhenAsked(t *testing.T) {
+	f := newCallFixture("impact_through", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "base", Kind: model.NodeFunction, File: "lib.py", Bytes: [2]uint64{0, 30}},
+			{Name: "handle", Kind: model.NodeFunction, File: "lib.py", Bytes: [2]uint64{40, 70}},
+			{Name: "run", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{0, 40}},
+			{Key: "site", Name: "handle", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{20, 30},
+				Metadata: openSite(model.CallShapeBare, 0)},
+		},
+		Relations: []fixtureFact{
+			{From: "handle", Kind: model.RelCalls, To: "base", Occurrences: site(50)},
+			{From: "run", Kind: model.RelCalls, To: "site", Occurrences: site(20)},
+		},
+	})
+	res, err := f.engine(t).Impact(context.Background(), model.ImpactRequest{
+		Start: []model.NodeID{f.id(t, "base")}, Direction: model.DirectionIncoming,
+		Relations: []model.RelationKind{model.RelCalls, model.RelMayCall}})
+	if err != nil {
+		t.Fatalf("impact(base): %v", err)
+	}
+	var found bool
+	for _, en := range res.Entries {
+		if en.NodeID != f.id(t, "run") {
+			continue
+		}
+		found = true
+		if en.Depth != 2 || len(en.Paths) != 1 || !en.Paths[0].Possible {
+			t.Errorf("run is affected at depth %d with paths %+v, want depth 2 on a possible route", en.Depth, en.Paths)
+		}
+	}
+	if !found {
+		t.Errorf("impact(base) naming may_call omits run, whose handle() may call handle")
+	}
+}
+
+// TestAPossibleRouteHasPreciseLegsAroundTheHop pins the path search through
+// one name-only call: main calls run precisely, run's `obj.handle()` may call
+// handle, and handle calls leaf precisely, so path(main, leaf) is that route
+// of three relations, possible, at the legs' cost plus the dearest one.
+//
+// Mutation caught: offering only a route that is the name-only hop alone.
+func TestAPossibleRouteHasPreciseLegsAroundTheHop(t *testing.T) {
+	f := newCallFixture("possible_legs", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "main", Kind: model.NodeFunction, File: "main.py", Bytes: [2]uint64{0, 30}},
+			{Name: "run", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{0, 40}},
+			{Key: "site", Name: "handle", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{20, 30},
+				Metadata: openSite(model.CallShapeMember, 0)},
+			{Name: "handle", Kind: model.NodeMethod, File: "lib.py", Bytes: [2]uint64{0, 40}},
+			{Name: "leaf", Kind: model.NodeFunction, File: "lib.py", Bytes: [2]uint64{50, 80}},
+		},
+		Relations: []fixtureFact{
+			{From: "main", Kind: model.RelCalls, To: "run", Occurrences: site(5)},
+			{From: "run", Kind: model.RelCalls, To: "site", Occurrences: site(20)},
+			{From: "handle", Kind: model.RelCalls, To: "leaf", Occurrences: site(10)},
+		},
+	})
+	res, err := f.engine(t).ShortestPath(context.Background(), model.PathRequest{From: f.id(t, "main"),
+		To: f.id(t, "leaf"), Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("path(main, leaf): %v", err)
+	}
+	if len(res.Paths) != 1 {
+		t.Fatalf("path(main, leaf) = %+v, want one possible route", res.Paths)
+	}
+	p := res.Paths[0]
+	hop := model.NewRelationID(f.binding.RepositoryID, f.id(t, "run"), model.RelMayCall, f.id(t, "handle"))
+	want := []model.RelationID{f.rel(t, "main", model.RelCalls, "run"), hop, f.rel(t, "handle", model.RelCalls, "leaf")}
+	if !p.Possible || !slices.Equal(p.Relations, want) ||
+		p.CostUnits != 2*Cost(model.RelCalls)+Cost(model.RelMayCall) {
+		t.Errorf("path(main, leaf) = %+v, want main->run, the name-only hop, handle->leaf", p)
+	}
+}

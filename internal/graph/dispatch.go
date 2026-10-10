@@ -73,6 +73,11 @@ const (
 	stepVirtual
 	// stepOverride is an override a callees walk descended to.
 	stepOverride
+	// stepRest is a base method a callers walk admitted again because it
+	// also reached it as a caller: the calls into it its base step skipped,
+	// those with no virtual occurrence, are walked now, and it climbs no
+	// further, having climbed when it was first admitted.
+	stepRest
 )
 
 // DispatchReader is the OPTIONAL seam a GraphReader may also implement: for
@@ -177,8 +182,9 @@ func (d dispatchRule) direction(walk model.Direction) model.Direction {
 // collected batch, flush in traverse.go).
 //
 // A callers walk keeps the owner's incoming entries of the requested kinds --
-// only `calls`, and only virtual ones, from a base it climbed to -- and every
-// outgoing `overrides` entry, which climbs. A callees walk keeps the owner's
+// only `calls`, and only virtual ones, from a base it climbed to, and only the
+// others from a base admitted again as a caller -- and every outgoing
+// `overrides` entry, which climbs, but the one that admitted the owner. A callees walk keeps the owner's
 // outgoing entries of the requested kinds and every outgoing `routes_to`
 // entry, and an incoming `overrides` entry only from a node a virtual call or
 // an earlier descent reached. Nothing else is kept: the scan reads both lists
@@ -187,12 +193,15 @@ func (d dispatchRule) entry(owner frontierState, e Edge) (keep bool, step dispat
 	switch d.mode {
 	case dispatchCallers:
 		if !e.Outgoing {
-			if owner.Step == stepBase {
+			if owner.Step == stepBase || owner.Step == stepRest {
 				return e.Kind == d.calls, stepDirect, true
 			}
 			return d.requested[e.Kind], stepDirect, false
 		}
-		if e.Kind == d.overrides {
+		// The relation that admitted the owner is not climbed back along: an
+		// override reached through a requested `overrides` edge would
+		// otherwise serve that same edge a second time.
+		if e.Kind == d.overrides && owner.Step != stepRest && e.Rel != owner.Via {
 			return true, stepBase, false
 		}
 		return false, stepDirect, false
@@ -247,7 +256,9 @@ func (d dispatchRule) settle(ctx context.Context, dr DispatchReader, recs []leve
 			r.check = false
 			switch d.mode {
 			case dispatchCallers:
-				if !got[r.RelID] {
+				// A base's callers are its virtual ones; the rest of them,
+				// walked when it is admitted again, the others.
+				if got[r.RelID] == (r.Owner.Step == stepRest) {
 					continue
 				}
 			case dispatchCallees:

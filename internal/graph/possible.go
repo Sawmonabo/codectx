@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -593,42 +594,73 @@ func siteCounts(caps []model.CapabilityState) string {
 // dropPlaceholders removes, from one page of a call answer, the structural
 // provider's `call:<name>` placeholder for every site an open call site also
 // stands for (same file, overlapping call range): one row per open site, never
-// two. A placeholder relation keeps the occurrences no open site covers, and
-// is dropped only when none is left; a placeholder node no relation of the
-// page still names is dropped with it. It returns the relation ids it dropped.
-func dropPlaceholders(nodes []model.Node, relations []model.Relation, where *located) ([]model.Node,
-	[]model.Relation, map[model.RelationID]bool) {
-	open := map[model.NodeID]bool{}
+// two. Whether an open site covers a placeholder's site is read from the
+// pinned generation -- the caller's stored calls to open sites and their
+// occurrences -- and not from the page, so a placeholder whose open site is
+// served on another page is dropped all the same. A placeholder relation keeps
+// the occurrences no open site covers, and is dropped only when none is left;
+// a placeholder node no relation of the page still names is dropped with it.
+// It returns the relation ids it dropped.
+func (e *Engine) dropPlaceholders(ctx context.Context, r GraphReader, nodes []model.Node, relations []model.Relation,
+	where *located) ([]model.Node, []model.Relation, map[model.RelationID]bool, error) {
 	placeholder := map[model.NodeID]bool{}
 	for _, n := range nodes {
-		switch {
-		case isOpenCallSite(n):
-			open[n.ID] = true
-		case isCallPlaceholder(n):
+		if isCallPlaceholder(n) {
 			placeholder[n.ID] = true
 		}
 	}
-	if len(open) == 0 || len(placeholder) == 0 {
-		return nodes, relations, nil
-	}
-	toOpen := map[model.RelationID]bool{}
 	toPlaceholder := map[model.RelationID]bool{}
-	for _, r := range relations {
-		if r.Kind != model.RelCalls {
-			continue
+	var callers []model.NodeID
+	for _, rel := range relations {
+		if rel.Kind == model.RelCalls && placeholder[rel.To] {
+			toPlaceholder[rel.ID] = true
+			callers = append(callers, rel.From)
 		}
-		switch {
-		case open[r.To]:
-			toOpen[r.ID] = true
-		case placeholder[r.To]:
-			toPlaceholder[r.ID] = true
+	}
+	loc, locating := r.(SourceLocator)
+	dr := declarationReader(r)
+	if len(toPlaceholder) == 0 || !locating || dr == nil {
+		return nodes, relations, nil, nil
+	}
+	calls, err := storedList(ctx, r, callers, model.DirectionOutgoing, model.RelCalls)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var targets []model.NodeID
+	for _, ends := range calls {
+		for _, c := range ends {
+			targets = append(targets, c.Other)
+		}
+	}
+	open := map[model.NodeID]bool{}
+	if len(targets) > 0 {
+		decls, err := dr.Declared(ctx, sortedNodes(targets))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, d := range decls {
+			if isOpenCallSite(d.Node) {
+				open[d.Node.ID] = true
+			}
 		}
 	}
 	covered := map[model.FileID][]model.ByteRange{}
-	for _, o := range where.occurrences {
-		if toOpen[o.RelationID] {
-			covered[o.FileID] = append(covered[o.FileID], o.Bytes)
+	for _, caller := range sortedNodes(callers) {
+		for _, c := range calls[caller] {
+			if !open[c.Other] {
+				continue
+			}
+			sites, _, err := e.relationSites(ctx, loc, c.Rel, occurrenceBudget)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			for _, o := range sites {
+				covered[o.FileID] = append(covered[o.FileID], o.Bytes)
+			}
 		}
+	}
+	if len(covered) == 0 {
+		return nodes, relations, nil, nil
 	}
 	overlaps := func(o model.RelationOccurrence) bool {
 		for _, b := range covered[o.FileID] {
@@ -655,16 +687,16 @@ func dropPlaceholders(nodes []model.Node, relations []model.Relation, where *loc
 	dropped := map[model.RelationID]bool{}
 	named := map[model.NodeID]bool{}
 	rels := relations[:0:0]
-	for _, r := range relations {
-		if toPlaceholder[r.ID] && had[r.ID] && kept[r.ID] == 0 {
-			dropped[r.ID] = true
+	for _, rel := range relations {
+		if toPlaceholder[rel.ID] && had[rel.ID] && kept[rel.ID] == 0 {
+			dropped[rel.ID] = true
 			continue
 		}
-		rels = append(rels, r)
-		named[r.From], named[r.To] = true, true
+		rels = append(rels, rel)
+		named[rel.From], named[rel.To] = true, true
 	}
 	if len(dropped) == 0 {
-		return nodes, relations, nil
+		return nodes, relations, nil, nil
 	}
 	gone := map[model.NodeID]bool{}
 	out := nodes[:0:0]
@@ -682,7 +714,7 @@ func dropPlaceholders(nodes []model.Node, relations []model.Relation, where *loc
 		}
 	}
 	where.locations = locs
-	return out, rels, dropped
+	return out, rels, dropped, nil
 }
 
 // openSiteCounter counts, per depth of an impact walk, the open call sites
@@ -777,5 +809,106 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 		c.b.openSites = append(c.b.openSites, 0)
 	}
 	c.b.openSites[c.depth-1] += count
+	return nil
+}
+
+// expandOpenSites adds to an exhausted impact walk's retained input the nodes
+// reached through open call sites: for an incoming impact the callers of the
+// open sites an affected node is a candidate of, for an outgoing one the
+// candidates of the open sites it calls, at one more depth and the cost of a
+// `may_call` hop, and on from those, level by level, up to the depth bound.
+// Each record's route ends in the computed relation, so the ranking folds and
+// orders it with the precise records.
+//
+// The walk's records are read back once to find each affected node's best
+// depth, cost and route; that map is the size of the affected set, the price
+// of a request that asks to walk through name-only calls.
+func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.ImpactRequest, maxDepth config.Limit,
+	retain *retainedWalk) error {
+	if declarationReader(r) == nil {
+		return nil
+	}
+	var modes []tailMode
+	switch req.Direction {
+	case model.DirectionIncoming:
+		modes = []tailMode{tailCallers}
+	case model.DirectionOutgoing:
+		modes = []tailMode{tailCallees}
+	default:
+		modes = []tailMode{tailCallers, tailCallees}
+	}
+	best := map[model.NodeID]impactRecord{}
+	seed := map[model.NodeID]bool{}
+	for _, s := range req.Start {
+		seed[s] = true
+		best[s] = impactRecord{NodeID: s}
+	}
+	if err := retain.eachEntry(func(rec impactRecord) error {
+		if cur, ok := best[rec.NodeID]; !ok || rec.Depth < cur.Depth || (rec.Depth == cur.Depth && rec.Cost < cur.Cost) {
+			if !seed[rec.NodeID] {
+				best[rec.NodeID] = rec
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	byDepth := map[int][]model.NodeID{}
+	deepest := 0
+	for id, rec := range best {
+		byDepth[rec.Depth] = append(byDepth[rec.Depth], id)
+		deepest = max(deepest, rec.Depth)
+	}
+	for depth := 0; depth <= deepest; depth++ {
+		level := sortedNodes(byDepth[depth])
+		if len(level) == 0 || atBound(maxDepth, depth) {
+			continue
+		}
+		for _, mode := range modes {
+			list, err := e.possibleRows(ctx, r, mode, level, false, 0)
+			if err != nil {
+				return err
+			}
+			direction := model.DirectionIncoming
+			if mode == tailCallees {
+				direction = model.DirectionOutgoing
+			}
+			for _, row := range list.rows {
+				from, to := row.Rel.To, row.Rel.From
+				if mode == tailCallees {
+					from, to = row.Rel.From, row.Rel.To
+				}
+				if seed[to] {
+					continue
+				}
+				parent := best[from]
+				// The route is capped one past the path bound, as
+				// appendRoute caps a walk's.
+				route := slices.Clone(parent.Route)
+				if len(route) <= model.MaxRelationsPerPath {
+					route = append(route, row.Rel.ID)
+				}
+				rec := impactRecord{
+					NodeID:    to,
+					Depth:     depth + 1,
+					Cost:      parent.Cost + Cost(model.RelMayCall),
+					Direction: direction,
+					Via:       row.Rel.ID,
+					Parent:    from,
+					Route:     route,
+					Reasons:   []string{impactReason(model.RelMayCall, direction, depth+1)},
+					Possible:  true,
+				}
+				if err := retain.addEntry(rec); err != nil {
+					return err
+				}
+				if _, ok := best[to]; !ok {
+					best[to] = rec
+					byDepth[depth+1] = append(byDepth[depth+1], to)
+					deepest = max(deepest, depth+1)
+				}
+			}
+		}
+	}
 	return nil
 }
