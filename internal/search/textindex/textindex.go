@@ -16,7 +16,7 @@
 // `_build/` (docs/toolchain.md).
 package textindex
 
-//go:generate cargo build --release --locked --manifest-path Cargo.toml
+//go:generate cargo build --release --locked --manifest-path Cargo.toml --config "build.rustflags=[\"--remap-path-prefix=$HOME=~\"]"
 
 import (
 	"context"
@@ -115,8 +115,8 @@ type Hit struct {
 	Signature     string
 	Bytes         model.ByteRange
 	ScoreMicros   int64
-	// Occurrences counts the result's matching documents the search visited;
-	// OccurrencesExact says none of them was skipped.
+	// Occurrences counts the result's matching documents the search visited.
+	// OccurrencesExact says the count is exact; otherwise it is a lower bound.
 	Occurrences      int64
 	OccurrencesExact bool
 }

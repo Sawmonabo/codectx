@@ -194,6 +194,14 @@ func (x *Index) ReleaseWriter() error {
 	return statusErr("release writer", status, &errBuf)
 }
 
+// Writing reports whether this process holds an open writer, which may hold
+// changes no commit has made durable yet.
+func (x *Index) Writing() bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.writing
+}
+
 // mergeAll merges every searchable segment into one and summarizes it.
 func (x *Index) mergeAll(ctx context.Context) error {
 	return x.mutate(ctx, "merge", func(errBuf *C.cx_buf) C.int32_t {
