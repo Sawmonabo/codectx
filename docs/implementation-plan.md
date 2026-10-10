@@ -13,7 +13,7 @@
 
 **Tech stack:** Go 1.27 language baseline with Go 1.27.1 as the initial exact toolchain pin; official MCP Go SDK v1.7.0 with MCP 2026-07-28; `modernc.org/sqlite` v1.58.0 as the initial driver pin; an embedded search library, a Rust crate built as a static library under a pinned Rust toolchain with a locked and vendored crate tree, linked through cgo; official Tree-sitter Go bindings and pinned grammars; SCIP protobuf; local LSP; in-process control-flow, dependence and call-linking analysis; Git; `fsnotify`; Cobra; TOML; Go standard-library cryptography, logging, process, I/O, and testing packages. Go and MCP pins are supported by the published release records, not inferred from version numbers. [1](#ref-1) [2](#ref-2) [22](#ref-22)
 
-**Reading this revision:** All 33 design sections and all 21 implementation tasks are included. The product scope remains intact. Changes remove contradictory migration requirements, avoid whole-graph duplication, specify measurable aggregate resource budgets, close source/provenance/workflow gaps, and repair implementation dependencies. Performance figures are engineering acceptance targets, not measured claims. The supplied material is a specification, not an application repository; no claim of a bug-free executable is made.
+**Reading this revision:** All 33 design sections and all 25 implementation tasks are included. The product scope remains intact. Changes remove contradictory migration requirements, avoid whole-graph duplication, specify measurable aggregate resource budgets, close source/provenance/workflow gaps, and repair implementation dependencies. Performance figures are engineering acceptance targets, not measured claims. The supplied material is a specification, not an application repository; no claim of a bug-free executable is made.
 
 ---
 
@@ -595,11 +595,12 @@ const (
     RelMayReferTo        RelationKind = "may_refer_to"
     RelMayCall           RelationKind = "may_call"
     RelMayImport         RelationKind = "may_import"
+    RelRoutesTo          RelationKind = "routes_to"
 )
 
 ```
 
-Use a `NodeFunction`/`NodeMethod` provider-local target with explicit `resolution=unresolved` metadata when a call target is unknown, not a fabricated precise definition. A call site no analysis binds is an open site: one node per site with its reason, the caller's `calls` edge to it, and same-name candidates computed per query as `may_call` (precision `heuristic`, resolution `name_only` or `unique_name`), ranked, counted and paged, never stored and never folded into `calls`. An import whose path does not fold to a constant is an open import site with its literal fragments; the files whose paths match them are computed per query as `may_import`, ranked, counted and paged. A call through a declared base type targets the declared method; callers of an override add the dispatching callers of the methods it overrides, marked, at query time (ADR-0015). Reverse relations use indexed target columns rather than duplicated `called_by` rows. One canonical relation can have several call/reference occurrences; each occurrence has distinct range-bearing evidence. APIs distinguish relation count from occurrence count.
+Use a `NodeFunction`/`NodeMethod` provider-local target with explicit `resolution=unresolved` metadata when a call target is unknown, not a fabricated precise definition. A call site no analysis binds is an open site: one node per site with its reason, the caller's `calls` edge to it, and same-name candidates computed per query as `may_call` (precision `heuristic`, resolution `name_only` or `unique_name`), ranked, counted and paged, never stored and never folded into `calls`. An import whose path does not fold to a constant is an open import site with its literal fragments; the files whose paths match them are computed per query as `may_import`, ranked, counted and paged. A call through a declared base type targets the declared method; callers of an override add the dispatching callers of the methods it overrides, marked, at query time (ADR-0015). A supertype or a method outside the indexed project is a structural node with `resolution=external`, keyed by its qualified name (and, for a method, its name and disambiguator), so `extends`, `implements` and `overrides` reach the project boundary (ADR-0015). Reverse relations use indexed target columns rather than duplicated `called_by` rows. One canonical relation can have several call/reference occurrences; each occurrence has distinct range-bearing evidence. APIs distinguish relation count from occurrence count.
 
 ```go
 type Position struct {
@@ -636,12 +637,20 @@ type Relation struct {
 }
 ```
 
+An `endpoint` node is either a program entry point (a Python `__main__` guard, Go `package main` with `func main`, every Java `main` form the language specification defines, a script with a shebang) or a framework route (Flask, FastAPI, Django, Express, Spring, Go `net/http` and its common routers), and `routes_to` runs from it to the entry function or the handler. A route endpoint's metadata is `framework`, `method`, `route` exactly as written, `prefix` (`resolved` when every prefix in the chain, a blueprint, an `include_router`, a router mount or a class-level mapping, resolved statically, otherwise `unresolved`), and `path`, the full path, present only when `prefix` is `resolved`; an unresolved prefix is never joined as empty or guessed. An endpoint's identity is its file, kind and descriptor (the method and the route as written, or `__main__`/`main`), never its range (ADR-0017).
+
+A declaration carries its decorators and annotations as facts: each one's name as written, its range, and the range of each argument. These are the language-level facts the route table and the entry-point rules read (ADR-0017).
+
+A call site's arguments are ordered, and each carries its range, a keyword name when it is passed by keyword, and a spread or variadic mark (`...xs`, `*args`, `**kwargs`). A parameter carries its index, the receiver or `self` being 0, and its variadic and keyword-only marks. Parameters are keyed by their declaration's identity and index (ADR-0014). On a bound site only, `data_flows_to` runs from each argument's value to the parameter it matches: by position up to the first keyword argument, then by keyword name; a spread argument matches up to its position and then the variadic parameter; a parameter left at its default gets no edge. No edge runs from a callee's return to the call's result, so a walk never enters one call and leaves through another (ADR-0017).
+
+`imports` also runs from a file's module to each file module an import resolved to; an import matching several files publishes one `imports` per file with the evidence's `set_size`. Python and C publish `exports`: Python the names of a static `__all__`, otherwise every top-level name without a leading underscore; C every definition with external linkage, which is linkage, not shared-library visibility (ADR-0017).
+
 Every public result envelope carries `Binding`, completeness, and pagination. A stored fact is qualified by its producing UnitID; a public fact is qualified by its generation binding. Neither a provider candidate nor a mutable Node struct is a globally authoritative record.
 
 <a id="93-evidence-precision-and-source-coordinates"></a>
 ### 9.3 Evidence, Precision, and Source Coordinates
 
-Precision classes remain `compiler`, `language_server`, `static_analysis`, `syntax`, and `heuristic`. They describe origin, not calibrated confidence or guaranteed soundness. Deterministic ranking weights are not probabilities, and no numeric confidence is published anywhere: a name-resolved node carries factual attributes instead, `resolution` (`exact`, `import`, `same_module`, `unique_name`, `name_only`, `ambiguous`, `unresolved`) and `candidates` (the count considered), and ambiguity is a retained `may_refer_to` relation.
+Precision classes remain `compiler`, `language_server`, `static_analysis`, `syntax`, and `heuristic`. They describe origin, not calibrated confidence or guaranteed soundness. Deterministic ranking weights are not probabilities, and no numeric confidence is published anywhere: a name-resolved node carries factual attributes instead, `resolution` (`exact`, `import`, `same_module`, `unique_name`, `name_only`, `ambiguous`, `unresolved`, `external`) and `candidates` (the count considered), and ambiguity is a retained `may_refer_to` relation.
 
 ```go
 type Evidence struct {
@@ -658,10 +667,12 @@ type Evidence struct {
     Range *SourceRange `json:"range,omitempty"`
     NativeKey string `json:"native_key,omitempty"`
     Detail string `json:"detail,omitempty"`
+    Dispatch string `json:"dispatch,omitempty"` // virtual or exact; empty for evidence that is not a call
+    SetSize int64 `json:"set_size,omitempty"`  // targets of a several-target site; 0 otherwise
 }
 ```
 
-Exactly one of NodeID or RelationID is present. Every published node attribute set and relation has evidence. Evidence identity includes semantic unit identity, subject, precision, native key, source hash/range, and bounded detail; it excludes run timestamps and random run IDs. A reused unit retains its original producing run. A new run records a reuse link rather than pretending it produced old facts.
+Exactly one of NodeID or RelationID is present. Every published node attribute set and relation has evidence. A `calls` occurrence's `dispatch` is `virtual` when the call can run an override and `exact` when it cannot (a `super` call, a qualified call, a constructed object, a final, static or non-virtual method); it is computed per site, never read back from the technique that bound the call (ADR-0015). `set_size` is the number of targets a several-target site was bound to: the classes that flow into an untyped receiver, the functions of one signature or one field, the definitions of a C macro across `#if` arms, the files one import matched (ADR-0015, ADR-0017). Evidence identity includes semantic unit identity, subject, precision, native key, source hash/range, bounded detail, `dispatch` and `set_size`; it excludes run timestamps and random run IDs. A reused unit retains its original producing run. A new run records a reuse link rather than pretending it produced old facts.
 
 Byte ranges are half-open `[start,end)`, zero-based. Public line numbers are one-based, columns are zero-based UTF-8 byte columns; an EOF position is valid. CRLF is two bytes and one logical line break. A source range is absent, not zero-filled, for entities without source locations. SQLite-bound values must fit signed 64-bit integers and configured file-size limits. One shared source-position implementation converts provider UTF-8, UTF-16, or UTF-32 coordinates using the exact source hash and validates boundaries; it never guesses an unspecified encoding. SCIP explicitly defines all three encodings. [23](#ref-23)
 
@@ -1856,7 +1867,7 @@ A ranked search serves its best results, never every match: page n is collected 
 
 Map the score to a fixed integer ranking component with documented rounding. Validate identical ranking on all supported release targets; any platform-sensitive numerical edge must be resolved in the shared scorer before claiming cross-platform canonical equivalence. Integer graph contributions and deterministic final tie-breakers do not alone fix an unstable floating input. Canonical regression fixtures include near-ties, duplicate occurrences, punctuation, and unrelated generation activation/pruning.
 
-Tie-break by retrieval tier, descending score, then content-derived keys only (normalized path, start byte, then the remaining content keys and the identity keys), never by an internal document address, which changes with threads and merges. Deduplicate hits by canonical entity or file chunk as the endpoint specifies, preserving bounded reasons and occurrence counts. Search documents carry signatures and linked source positions; generic results never return source bodies. Raw source is obtained through a context session only.
+Tie-break by retrieval tier, descending score, then content-derived keys only (normalized path, start byte, then the remaining content keys and the identity keys), never by an internal document address, which changes with threads and merges. Deduplicate hits by canonical entity or file chunk as the endpoint specifies, preserving bounded reasons and occurrence counts. Search documents carry signatures and linked source positions; generic results never return source bodies. Raw source is obtained through `codectx_read_source` only, inside a context session or, without coverage credit, outside one (Section 16.2, ADR-0018).
 
 <a id="143-graph-queries-and-impact"></a>
 ### 14.3 Graph Queries and Impact
@@ -1864,6 +1875,17 @@ Tie-break by retrieval tier, descending score, then content-derived keys only (n
 Required operations remain definitions, references, implementations, callers, callees, incoming/outgoing neighbors, tests, documentation, configuration, shortest dependency paths, impact expansion, and package/module dependency rollups. BFS serves unweighted neighborhoods; Dijkstra uses nonnegative deterministic integer costs for weighted paths. Include direction, visited count, returned-edge count, and truncation reason.
 
 Fetch adjacency in bounded indexed batches across each frontier rather than one SQL query per node. Use the relation's target index for reverse queries. Bound seeds, depth, nodes, edges, frontier bytes, reason paths per result, total explanation bytes, and duration. Preserve visited/frontier state in a bounded disk-backed cursor spool when continuation needs it; never serialize a 50,000-node visited set into a token. A hit limit produces a continuation; exhausting a hard traversal budget produces an explicit incomplete result or a resumable bounded work state, never a claim of exhaustive impact.
+
+A `callers`, `callees` or `path` answer carries each node's full range and name range and, on each `calls` relation, the range of every call-site occurrence, so the answer locates every caller and call site without a follow-up lookup. With no relation list, the MCP call tools walk `calls`, as the CLI does (ADR-0017).
+
+Rows a query adds by dispatch or by name are marked, and every mark is possible, never certain (ADR-0015):
+
+- `through_base`: a caller of `m` reached through a method `b` that `m` overrides at any depth, by a call into `b` whose `dispatch` is `virtual`. The mark names `b` and `b`'s override count, and lists only the `virtual` occurrences of that relation. An override's direct callers are never added to a base method's callers.
+- `may_dispatch`: an override, at any depth, of a method a `callees` (or forward `path` or `impact`) step reached.
+- `value_set`: one of n targets of a several-target site, shown "1 of n" from the evidence's `set_size`.
+- `name_only`: a `may_call` candidate of an open site, computed per query; a `path` that used one is itself marked possible.
+
+A call answer counts, apart and exactly: `direct`, `through_base`, `may_dispatch`, `may_call`, and `open_sites` (the open sites naming the answer's nodes); `impact` reports its open sites per depth. When precise callers are zero and candidates exist the answer says so, and when none exist it states how many of the project's sites are bound and open; it never answers a bare zero.
 
 Impact expands an explicit relation allowlist, prioritizing implementations/overrides, calls, reads/writes, tests, configuration, documents, dependencies, and imports. Direction matters: callers can be impacted by a callee contract change; downstream dependencies may need reading without necessarily being modified. Every affected entry includes an evidence-backed reason. Package rollups aggregate distinct pairs and evidence counts without fabricating precise symbol calls.
 
@@ -1952,7 +1974,7 @@ Only sweep and verify can open a new session. Consolidate is compiled by the wor
 <a id="152-seed-discovery-and-required-scope"></a>
 ### 15.2 Seed Discovery and Required Scope
 
-Resolve explicit seeds first; then backtick-delimited identifiers/paths, path-like tokens, qualified identifiers, exact resolution, lexical terms, and low-priority changed files. Preserve ambiguity; no LLM rewrites task intent. An empty or ambiguous scope produces a discovery result, not an implementation-ready plan.
+Resolve explicit seeds first; then backtick-delimited identifiers/paths, path-like tokens, qualified identifiers, exact resolution, lexical terms, and low-priority changed files. Lexical matches are read in score order and the read stops below the score at which no unread match, with every boost it could lend, can rank above the packed files; a certificate after packing and a closure over the kept files make the stopped plan's ranked head, packed files and their entries equal to those of a full read, and the plan's notice states what was not read (ADR-0016). Preserve ambiguity; no LLM rewrites task intent. An empty or ambiguous scope produces a discovery result, not an implementation-ready plan.
 
 For verify, every selected implementation file and its relevant callers, callees, contracts/types, state ownership, dependencies, configuration, tests, documentation, and integration/registration boundaries must be assigned a full-file requirement when it informs the decision. Follow reachability through actual wiring, exports, registries, reflection/config conventions, and shared helpers, not just textual references. The graph is a starting point, not proof that all dynamic or external dependencies were found.
 
@@ -1979,7 +2001,7 @@ Use scaled integer weights for graph expansion. Defaults preserve the original i
 
 Precision multipliers are compiler 1.00, language server 0.95 for labeled overlay results, static analysis 0.90, syntax 0.72, heuristic 0.45. Canonical plans do not silently incorporate ephemeral overlay facts. Depth decay is 0.65 per hop after the first. Bounded boosts are exact task identifier +0.20, active captured change +0.12, associated test/contract +0.10, and package centrality up to +0.05. Compute only persisted or bounded centrality inputs, not whole-graph centrality during each plan.
 
-Specify integer scale `1_000_000`, multiplication/division rounding, overflow checks, deterministic path aggregation, and boost caps in the shared scorer. Default aggregation is the maximum supported path contribution plus unique bounded boosts, avoiding cycle/path-count inflation. Tie-break by requirement, descending score, normalized path, start byte, then entity ID. Bound stored explanation paths; report additional-path counts rather than growing an exponential path list.
+Specify integer scale `1_000_000`, multiplication/division rounding, overflow checks, deterministic path aggregation, and boost caps in the shared scorer. Each root lends an entry a (requirement, score) pair, the requirement from the entry's kind and its depth from that root capped by the root's class, the score the root's weight times the route's product plus that route's own boosts; the entry takes the lexicographic maximum of its origin pair and every root's pair, never a sum across routes, and root-independent boosts scale by the winning root's weight. Package centrality counts only edges walked from explicit and exact roots (ADR-0016). This avoids cycle/path-count inflation. Tie-break by requirement, descending score, normalized path, start byte, then entity ID. Bound stored explanation paths; report additional-path counts rather than growing an exponential path list.
 
 <a id="154-budgeting-and-context-slices"></a>
 ### 15.4 Budgeting and Context Slices
@@ -2027,16 +2049,21 @@ Every session belongs to a stable actor ID plus a unique session ID. The actor i
 
 ```go
 type ReadChunkRequest struct {
-    SessionID SessionID `json:"session_id"`
-    ActorID string `json:"actor_id"`
-    FileID FileID `json:"file_id"`
+    SessionID SessionID `json:"session_id,omitempty"` // with ActorID: a session read; both absent: a read outside a session
+    ActorID string `json:"actor_id,omitempty"`
+    GenerationID GenerationID `json:"generation_id,omitempty"` // outside a session; zero is the active generation
+    NodeID NodeID `json:"node_id,omitempty"`                   // outside a session, exactly one of node_id, file_id, path
+    FileID FileID `json:"file_id,omitempty"`
+    Path string `json:"path,omitempty"`
     Offset uint64 `json:"offset"`
     MaxBytes uint32 `json:"max_bytes"`
+    Cursor string `json:"cursor,omitempty"`
     ConfirmReceipts []string `json:"confirm_receipts,omitempty"`
 }
 type ReadChunkResponse struct {
     Binding Binding `json:"binding"`
     FileID FileID `json:"file_id"`
+    NodeID NodeID `json:"node_id,omitempty"`
     ContentHash string `json:"content_hash"`
     ByteRange ByteRange `json:"byte_range"`
     LineRange SourceRange `json:"line_range"`
@@ -2044,6 +2071,10 @@ type ReadChunkResponse struct {
     Content string `json:"content"`
     PartialLine bool `json:"partial_line"`
     NextOffset *uint64 `json:"next_offset,omitempty"`
+    NextCursor string `json:"next_cursor,omitempty"`
+    Session *ReadSession `json:"session,omitempty"` // present only for a session read
+}
+type ReadSession struct {
     Receipt string `json:"receipt"`
     Coverage string `json:"coverage"` // unserved, partial_served, full_served
 }
@@ -2056,9 +2087,11 @@ type AcknowledgeRequest struct {
 }
 ```
 
+A read outside a session (ADR-0018) takes no session or actor and exactly one selector: `node_id`, the node's range, or `file_id` or `path` with `offset` and `max_bytes`. The read is pinned by a query lease to the asked or the active generation; a node id resolves in that generation, at that generation's range, and a node or path that is not a member is refused as not in this generation. A `path` is only hashed to a file id and looked up in the manifest; nothing is opened on it, and bytes come from the content store, never the working tree. A node that fits one chunk is returned whole; a longer span pages losslessly with `next_offset` and a signed cursor that holds a lease, ending at the node's end; invalid UTF-8 is returned as base64 with byte ranges, by the same boundary rules as a session read. A read outside a session writes no issued chunk, signs no receipt and changes no coverage.
+
 `Kind=receipt` confirms one or more returned signed chunk tokens; `Kind=file` records a separately labeled client statement for a fully served file. These are distinct operations behind the existing acknowledgment surface, not interchangeable semantics. Cap receipt batches at 16. The next read may echo prior tokens to avoid an extra round trip; the final chunk still needs explicit confirmation. Acknowledging a file without full confirmed coverage fails.
 
-Read validates actor/session/TTL, manifest membership, offset/bounds and content hash, verifies the accessed CAS blocks, and persists an **issued**, not yet confirmed, chunk record. Its token binds session, actor, snapshot, file, hash, byte interval, issuance ID and expiry with the shared signing utility. Echoing that token transactionally marks it confirmed and merges served intervals. A broken output pipe, serialization failure, or disconnected MCP call cannot by itself add full-served credit. Duplicate confirmations are idempotent. Receipt possession is evidence of delivery to that client, not evidence of reading.
+A session read validates actor/session/TTL, manifest membership, offset/bounds and content hash, verifies the accessed CAS blocks, and persists an **issued**, not yet confirmed, chunk record. Its token binds session, actor, snapshot, file, hash, byte interval, issuance ID and expiry with the shared signing utility. Echoing that token transactionally marks it confirmed and merges served intervals. A broken output pipe, serialization failure, or disconnected MCP call cannot by itself add full-served credit. Duplicate confirmations are idempotent. Receipt possession is evidence of delivery to that client, not evidence of reading.
 
 The default raw source chunk is 64 KiB; configured raw maximum is 1 MiB. Source responses have a separately accounted wire budget allowing encoding/envelope expansion, with a 7-MiB hard ceiling. Generic tools remain under the much smaller metadata response limit. For a lower requested wire budget, reduce raw chunk size before emitting and never silently exceed it.
 
@@ -2251,7 +2284,7 @@ Existing SDK compatibility behavior is not a reason to implement or preserve par
 | `codectx_context_next` | Next required file/offset or manifest action; **metadata only**. |
 | `codectx_context_entries` | Paginated entries, slices or exclusions using a typed view selector. |
 | `codectx_context_include` | Add discovered scope to a pinned session; invalidate old scope review. |
-| `codectx_read_source` | Exact encoded source chunk plus issued receipt, session/actor required. |
+| `codectx_read_source` | Exact encoded source chunk: with a session and actor, plus an issued receipt; without one, a node or byte range from a pinned generation, no receipt and no coverage. |
 | `codectx_context_acknowledge` | Confirm signed receipts or separately record full-file client acknowledgment. |
 | `codectx_context_waive` | Auditable waiver; cannot grant strict implementation readiness. |
 | `codectx_context_record` | Validated explicit observations and source-backed scope review. |
@@ -2524,7 +2557,7 @@ Concrete defaults are in Section 20. Reserve bytes before reading/decoding a fil
 
 The aggregate resource report must include queue payloads, retained slice capacities, duplicated strings/JSON, native trees, pending LSP responses, SQLite connection caches, the search index's writer budget, graph query spools, source buffers and child IPC. Caches have byte and entry limits with one owner; oversized buffers are not returned to a pool that retains them forever. Avoid `sync.Pool` as a correctness or memory-bound mechanism. Copy only at explicit ownership boundaries, release source/AST references after extraction, and stream large outputs to bounded destinations. No forced GC after every file or unmeasured allocator trick is accepted as a speed improvement.
 
-Hard OS memory enforcement is platform-dependent. Use supported cgroup/job/process controls where available, report when only admission/monitoring is available, and stop a worker approaching its budget without admitting incomplete output. An OOM-killed optional provider yields explicit degradation, not application-wide silent data loss. A 2-GiB test environment must still run the full base feature set with fewer workers, subject to documented slower throughput and the same semantic results.
+Available memory is read on Linux (`MemAvailable` capped by cgroup headroom), macOS (free less speculative plus file-backed pages) and Windows (the smaller of available physical memory and available commit), together with the product's own and its children's resident memory; a conservative stand-in, reported as unobserved, applies only where no reader exists or a reading fails (ADR-0019). Hard OS memory enforcement is platform-dependent. Use supported cgroup/job/process controls where available, report when only admission/monitoring is available, and stop a worker approaching its budget without admitting incomplete output. An OOM-killed optional provider yields explicit degradation, not application-wide silent data loss. A 2-GiB test environment must still run the full base feature set with fewer workers, subject to documented slower throughput and the same semantic results.
 
 <a id="234-required-hot-path-design"></a>
 ### 23.4 Required Hot-Path Design
