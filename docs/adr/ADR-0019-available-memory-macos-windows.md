@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-10-09, by the owner's ruling. Not yet implemented. The admission rule this reading feeds is
+Accepted, 2026-10-09, by the owner's ruling. The admission rule this reading feeds is
 [ADR-0012](ADR-0012-native-dependence-engine.md) decision 5. The survey behind it is
 [research 28](../research/28-available-memory-macos-windows.md).
 
@@ -76,16 +76,29 @@ a container could be over-admitted.
 Without it, an observed reading counts the children's use twice, once inside the operating system's figure and again
 as reservations on the ledger, and the allocation shrinks as the product's own children grow.
 
-- **The product's resident set:** `task_info` on macOS; `GetProcessMemoryInfo` through a lazily loaded `psapi`
-  procedure on Windows.
-- **Each child's resident memory:** `proc_pid_rusage` per child pid on macOS; on Windows, the job each child already
-  runs in (`internal/process/process_windows.go:20`), its process list, and each process's memory counters.
-- A figure a platform does not report stays absent, never zero (`internal/residency/residency.go:7-8`). Where the
+- **The product's resident set:** the task's own memory counters (`task_info`, `TASK_VM_INFO`) on macOS: the
+  resident set, its peak and the resident anonymous pages. On Windows, the process memory counters
+  (`K32GetProcessMemoryInfo`, the `kernel32` export of `GetProcessMemoryInfo`, lazily loaded): the working set and its
+  peak; Windows reports no anonymous part of the working set there, so that figure stays absent.
+- **Each child's resident memory:** `proc_pid_rusage` for every process in the child's process group on macOS; on
+  Windows, the job each child already runs in (`internal/process/process_windows.go`), its process list, and each
+  member's memory counters, each member confirmed in the job through the handle opened on it.
+- **Which figure is added back for a child.** What a child holds of its own is its anonymous resident memory, and
+  neither platform reports exactly that for another process. macOS reports the physical footprint (also counting
+  compressed pages that are no longer resident) and the resident set (also counting the shared executable and library
+  pages, which stay in the available figure); Windows reports the working set (also counting shared pages) and the
+  private commit (also counting committed pages never touched). The anonymous resident part is within both, so the
+  smaller of the two is added back: adding back more than the child holds would widen the allocation past what the
+  host has.
+- A figure a platform does not report stays absent, never zero (`internal/residency/residency.go`). Where the
   readers report, the idle-footprint stand-in (`internal/config/machine.go:29`) stops applying.
+- Only the children's anonymous resident memory is sampled on these platforms; the running tree's resident peak and
+  its transferred bytes are reported unavailable there.
 
 ### 4. One rule for a host that cannot be read
 
-`Allocation` takes only an observed reading; its unobserved branch is removed. `SchedulingAllocation` is the single
+The derivation (`derivedAllocation`, `internal/admission/machine.go`) takes a figure of available memory, not a
+reading, so it has no unobserved case at all. `SchedulingAllocation` is the single
 place an unobserved machine becomes the 8 GiB stand-in, and it is reported as unobserved, never as a measured figure.
 With decisions 1 and 2, the stand-in remains only for other platforms and for a failed reading.
 
@@ -105,7 +118,9 @@ to zero, and the existing rule that a child larger than the allocation runs alon
   16 KiB page multiplying correctly, and an overflow reported as unobserved; the Windows minimum on fake structures,
   with a zero or failed call unobserved.
 - **One stand-in rule:** a forced unobserved machine gives the 8 GiB stand-in, unobserved, and re-derivation keeps it;
-  no other caller can turn an unobserved reading into an allocation (mutation: restore `Allocation`'s 0 branch).
+  no other caller can turn an unobserved reading into an allocation: the derivation takes a figure, so the guarantee
+  is structural, and the test fails if `SchedulingAllocation` derives from an unobserved reading's bytes or reports
+  the stand-in as observed.
 - **Residency (macOS and Windows):** the readers report a resident set for the test process, and a child that
   touches N MiB lowers the allocation by much less than N.
 - **Job limit (Windows):** after asserting that its own reading exceeds 512 MiB, the test re-runs itself inside a job

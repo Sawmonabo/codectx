@@ -1,13 +1,14 @@
-//go:build !linux
+//go:build !linux && !windows && !(darwin && cgo)
 
 package process
 
 import "time"
 
-// treeSampled is false here: no portable equivalent of /proc gives a running
-// process tree's resident memory, nor its transferred bytes. The runner reports
-// both figures as unavailable rather than as zero, so a caller never reads "no
-// measurement" as "no memory" or as "moved nothing" (Section 22).
+// treeSampled is false here: this build has no reader of a running process
+// tree's memory on this platform (or, on macOS, was built without cgo, which
+// the per-process counters need), nor of its transferred bytes. The runner
+// reports both figures as unavailable rather than as zero, so a caller never
+// reads "no measurement" as "no memory" or as "moved nothing" (Section 22).
 const treeSampled = false
 
 // treeSampler is the inert form for platforms with no tree sampling. It starts

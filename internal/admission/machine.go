@@ -16,12 +16,14 @@ const (
 // last byte).
 const DefaultSafetyMarginBytes int64 = 1 * giB
 
-// UnobservedAllocationBytes is the allocation used on a host that does not
-// expose available memory. It is not a memory ceiling on the work: it is the
-// finite bound every queue and process admission must have, standing in for
-// the observation the platform withheld. Without it a host with no /proc
-// equivalent would admit every child at once, which is the one outcome worse
-// than a conservative allocation.
+// UnobservedAllocationBytes is the allocation used where available memory
+// could not be read: a platform with no reader (Linux, macOS and Windows each
+// have one; ObserveMachine) or a reading that failed. It is not a memory
+// ceiling on the work: it is the finite bound every queue and process
+// admission must have, standing in for the observation the host withheld.
+// Without it such a host would admit every child at once, which is the one
+// outcome worse than a conservative allocation. SchedulingAllocation is the
+// only place it is applied.
 const UnobservedAllocationBytes int64 = 8 * giB
 
 // hostShareDenominator is the second bound on the allocation: whatever the
@@ -39,26 +41,26 @@ const UnobservedAllocationBytes int64 = 8 * giB
 const hostShareDenominator = 2
 
 // Machine is the observed memory of the host the allocation is derived from.
-// Available is zero and Observed false when the platform does not expose it.
+// Available is zero and Observed false when it could not be read.
 type Machine struct {
 	AvailableBytes int64
 	Observed       bool
 }
 
-// Allocation is the machine-derived allocation: available memory minus this
-// process's base footprint minus the safety margin, and never more than the
-// share of the machine this product takes (hostShareDenominator), so the host
-// keeps at least the rest of what was available when the run began. It is
-// zero when the host does not expose available memory, which means unknown,
-// and zero on an observed host whose available memory is at or below the
-// footprint and the margin, which means nothing is left over. Either way no
-// bound is placed on what one child may reserve: inventing one would be a
-// default memory ceiling by another name, and the product has none.
-func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
-	if !m.Observed {
-		return 0
-	}
-	alloc := min(m.AvailableBytes-baseFootprint-safetyMargin, m.AvailableBytes/hostShareDenominator)
+// derivedAllocation is the machine-derived allocation over an observed
+// figure of available memory: that figure minus this process's base
+// footprint minus the safety margin, and never more than the share of the
+// machine this product takes (hostShareDenominator), so the host keeps at
+// least the rest of what was available. It is zero where available memory is at or below
+// the footprint and the margin, which means nothing is left over, and no
+// bound is then placed on what one child may reserve: inventing one would be
+// a default memory ceiling by another name, and the product has none.
+//
+// It takes the figure and not a Machine, so it has no unobserved case to get
+// wrong: an unobserved reading reaches an allocation only through
+// SchedulingAllocation, which stands UnobservedAllocationBytes in for it.
+func derivedAllocation(availableBytes, baseFootprint, safetyMargin int64) int64 {
+	alloc := min(availableBytes-baseFootprint-safetyMargin, availableBytes/hostShareDenominator)
 	if alloc < 0 {
 		return 0
 	}
@@ -68,14 +70,16 @@ func (m Machine) Allocation(baseFootprint, safetyMargin int64) int64 {
 // SchedulingAllocation is the one allocation every heavy child of this process
 // is admitted against, and whether it is an observation.
 //
-//   - An observed host: the machine-derived allocation (Allocation), observed.
+//   - An observed host: the machine-derived allocation (derivedAllocation), observed.
 //     Where available memory is at or below this process's footprint and the
 //     safety margin, that is zero, which is a real reading and not an absence:
 //     nothing is left over for the children, so the admission ledger runs them
 //     one at a time (its runs-alone rule) rather than inventing room.
-//   - A host that does not expose available memory: UnobservedAllocationBytes,
-//     not observed, standing in for the observation the platform withheld,
-//     because a gate with no bound is not a gate.
+//   - A host whose available memory could not be read -- a platform with no
+//     reader, or a reading that failed: UnobservedAllocationBytes, not
+//     observed, standing in for the observation the host withheld, because a
+//     gate with no bound is not a gate. This is the one place an unobserved
+//     reading becomes an allocation.
 //
 // baseFootprintBytes is what this process holds for itself, which its caller
 // derives from this machine and the configuration (config.BaseFootprint). It
@@ -88,5 +92,5 @@ func (m Machine) SchedulingAllocation(baseFootprintBytes int64) (allocation int6
 	if !m.Observed {
 		return UnobservedAllocationBytes, false
 	}
-	return m.Allocation(baseFootprintBytes, DefaultSafetyMarginBytes), true
+	return derivedAllocation(m.AvailableBytes, baseFootprintBytes, DefaultSafetyMarginBytes), true
 }
