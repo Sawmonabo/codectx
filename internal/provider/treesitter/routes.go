@@ -3,6 +3,7 @@ package treesitter
 import (
 	"cmp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
@@ -423,12 +424,18 @@ func (s *routeScan) facts() []endpointFact {
 	return out
 }
 
-// text is the source bytes of a span.
+// text is the source bytes of a span the worker sent, or empty when the
+// span does not fit the pinned bytes or cuts a UTF-8 sequence: such a span
+// names no text, and a route is never read from it.
 func (s *routeScan) text(at wire.Span) string {
 	if at.End > uint32(len(s.b.src)) || at.Start > at.End {
 		return ""
 	}
-	return string(s.b.src[at.Start:at.End])
+	t := string(s.b.src[at.Start:at.End])
+	if !utf8.ValidString(t) {
+		return ""
+	}
+	return t
 }
 
 // site is the worker site at a call reference's callee token, or nil.
