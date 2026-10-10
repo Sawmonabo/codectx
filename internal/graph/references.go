@@ -815,7 +815,7 @@ func (e *Engine) heuristicReferences(ctx context.Context, reader GraphReader, no
 	}
 	repo := reader.Binding().RepositoryID
 	var found []referenceRelation
-	if err := e.callersOfSites(ctx, reader, dr, []model.NodeID{node}, map[model.NodeID]bool{},
+	if err := callersOfSites(ctx, reader, dr, []model.NodeID{node}, map[model.NodeID]bool{},
 		func(caller, start model.NodeID, via model.RelationID) {
 			found = append(found, referenceRelation{ID: model.NewRelationID(repo, caller, model.RelMayCall, start),
 				Kind: model.RelMayCall, From: caller, To: start, Via: via, Tier: referenceHeuristic})

@@ -163,8 +163,10 @@ Java and Rust, with parameters that take the call's arguments. Each is a
   reference, at `heuristic` precision.
 - `path`, only when the search proved no precise route exists, searches
   again with `may_call` admitted at the dearest relation cost, so the cheapest
-  route takes as many name-only hops as it needs and no more; it is marked
-  `possible`, each hop carries its call sites, and the notice counts the hops.
+  route takes as many name-only hops as it needs and no more. It is the same
+  disk-backed search, paged the same way, and lists every equal-cost route as
+  the precise search does; each route is marked `possible`, each hop carries
+  its call sites, and a notice per route counts its hops.
 - `impact` counts, per depth, the open sites naming an affected symbol
   (`open_sites_by_depth`) and does not list their callers as affected; an MCP
   request whose `relations` name `may_call` walks on through them, one depth

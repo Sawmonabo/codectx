@@ -196,9 +196,22 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	if err := w.run(ctx, req.From, req.To); err != nil {
 		return model.PathResult{}, err
 	}
+	// A name-only call is admitted only when the search proved there is no
+	// precise route: an exhausted search, not one a budget, the clock or the
+	// depth bound stopped, which owes a continuation or a truncation instead.
+	if !w.possible && !w.targetSettled && !w.resumable() && !w.depthPruned &&
+		slices.Contains(kinds, model.RelCalls) && declarationReader(e.reader) != nil {
+		if err := w.startPossible(); err != nil {
+			return model.PathResult{}, err
+		}
+		if err := w.run(ctx, req.From, req.To); err != nil {
+			return model.PathResult{}, err
+		}
+	}
 	res.VisitedCount = w.visited
 
 	var routes [][]model.Relation
+	var vias map[model.RelationID][]model.RelationID
 	if w.targetSettled {
 		// model.MaxReasonPathsPerEntry is still the wire bound PathResult's
 		// Validate enforces, so it floors the configured setting rather than
@@ -212,6 +225,9 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		}
 		if capped {
 			pathTruncate(&res.Meta, pathReasonRoutes)
+		}
+		if vias, err = w.hopVias(routes); err != nil {
+			return model.PathResult{}, err
 		}
 	}
 	// A page that ended on a budget rather than on the answer owes a
@@ -238,16 +254,10 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		pathTruncate(&res.Meta, pathReasonDepth)
 	}
 	if len(routes) == 0 {
-		// A name-only hop is offered only when the search proved there is no
-		// precise route: an exhausted search, not one a budget or the clock
-		// stopped, which owes a continuation instead.
-		if res.Meta.Truncated || res.Meta.NextCursor != "" || !slices.Contains(kinds, model.RelCalls) {
-			return res, nil
-		}
-		return e.possiblePath(ctx, res, req.From, req.To, direction, w.kindCodes, w.descent, maxDepth, w.maxVisited)
+		return res, nil
 	}
 
-	paths, err := e.hydratePaths(ctx, routes)
+	paths, err := e.hydratePaths(ctx, routes, vias)
 	if err != nil {
 		return model.PathResult{}, err
 	}
@@ -271,7 +281,11 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	res.Nodes = nodes
 	var onRoutes []model.Relation
 	for _, route := range routes {
-		onRoutes = append(onRoutes, route...)
+		for _, r := range route {
+			if r.Kind != model.RelMayCall {
+				onRoutes = append(onRoutes, r)
+			}
+		}
 	}
 	where, err := e.locate(ctx, ids, onRoutes)
 	if err != nil {
@@ -279,7 +293,69 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	}
 	res.Locations, res.Occurrences = where.locations, where.occurrences
 	res.Meta.Notices = append(res.Meta.Notices, where.notices...)
+	if w.possible {
+		if err := e.locateHops(ctx, &res, vias); err != nil {
+			return model.PathResult{}, err
+		}
+		res.Meta.Notices = append(res.Meta.Notices, possibleNotices(routes)...)
+	}
 	return res, nil
+}
+
+// locateHops lists each name-only step's call sites as the step's own
+// occurrences, in step order, within the answer's occurrence budget.
+func (e *Engine) locateHops(ctx context.Context, res *model.PathResult, vias map[model.RelationID][]model.RelationID) error {
+	loc, ok := e.reader.(SourceLocator)
+	if !ok {
+		return nil
+	}
+	hops := make([]model.RelationID, 0, len(vias))
+	for hop := range vias {
+		hops = append(hops, hop)
+	}
+	slices.Sort(hops)
+	for _, hop := range hops {
+		for _, v := range vias[hop] {
+			listed, total, err := e.relationSites(ctx, loc, v, occurrenceBudget-len(res.Occurrences))
+			if err != nil {
+				return err
+			}
+			for _, o := range listed {
+				o.RelationID = hop
+				res.Occurrences = append(res.Occurrences, o)
+			}
+			if int64(len(listed)) < total {
+				res.Meta.Notices = append(res.Meta.Notices, fmt.Sprintf(
+					"the possible route's call site relation %s has %d located occurrences; %d are listed", v, total, len(listed)))
+			}
+		}
+	}
+	return nil
+}
+
+// possibleNotices says, for each route the name-only search returned, how
+// many calls it takes that no analysis bound.
+func possibleNotices(routes [][]model.Relation) []string {
+	out := make([]string, 0, len(routes))
+	for i, route := range routes {
+		hops := 0
+		for _, r := range route {
+			if r.Kind == model.RelMayCall {
+				hops++
+			}
+		}
+		calls := "one call"
+		if hops > 1 {
+			calls = fmt.Sprintf("%d calls", hops)
+		}
+		which := "the route given"
+		if len(routes) > 1 {
+			which = fmt.Sprintf("route %d of %d", i+1, len(routes))
+		}
+		out = append(out, fmt.Sprintf("no precise route connects the two nodes; %s takes %s no analysis bound, "+
+			"matched by name only (`may_call`), and it may not run", which, calls))
+	}
+	return out
 }
 
 // pathBound resolves a request bound: zero means "the configured default", and
@@ -312,14 +388,26 @@ func pathTruncate(m *model.QueryMeta, reason string) {
 // hydratePaths attaches the evidence backing each route. Evidence is fetched for
 // every relation on every route in ONE batched call, not one call per edge, and
 // each route's evidence list carries the same bound as its relation list.
-func (e *Engine) hydratePaths(ctx context.Context, routes [][]model.Relation) ([]model.RelationPath, error) {
+//
+// A name-only step's evidence is that of the call site relations behind it
+// (vias), and a route that takes one is marked Possible.
+func (e *Engine) hydratePaths(ctx context.Context, routes [][]model.Relation,
+	vias map[model.RelationID][]model.RelationID) ([]model.RelationPath, error) {
 	var ids []model.RelationID
 	seen := map[model.RelationID]bool{}
+	backing := func(r model.Relation) []model.RelationID {
+		if r.Kind == model.RelMayCall {
+			return vias[r.ID]
+		}
+		return []model.RelationID{r.ID}
+	}
 	for _, route := range routes {
 		for _, r := range route {
-			if !seen[r.ID] {
-				seen[r.ID] = true
-				ids = append(ids, r.ID)
+			for _, id := range backing(r) {
+				if !seen[id] {
+					seen[id] = true
+					ids = append(ids, id)
+				}
 			}
 		}
 	}
@@ -333,11 +421,15 @@ func (e *Engine) hydratePaths(ctx context.Context, routes [][]model.Relation) ([
 		for _, r := range route {
 			p.Relations = append(p.Relations, r.ID)
 			p.CostUnits += Cost(r.Kind)
-			for _, ev := range byRelation[r.ID] {
-				if len(p.Evidence) == model.MaxRelationsPerPath {
-					break
+			if r.Kind == model.RelMayCall {
+				p.Possible = true
+			}
+			for _, id := range backing(r) {
+				for _, ev := range byRelation[id] {
+					if len(p.Evidence) < model.MaxRelationsPerPath {
+						p.Evidence = append(p.Evidence, ev)
+					}
 				}
-				p.Evidence = append(p.Evidence, ev)
 			}
 		}
 		paths = append(paths, p)
@@ -442,6 +534,14 @@ type pathWalk struct {
 	// spent. It is a position in the CURRENT batch's scan and is cleared when
 	// that batch is fully expanded.
 	expandAfter EdgePos
+	// scanDone and hopsAfter extend that position past the scan: the batch's
+	// stored lists are all read, and that many of its name-only steps are
+	// relaxed (nameOnly).
+	scanDone  bool
+	hopsAfter int64
+	// possible is the search that also takes name-only calls, run when the
+	// precise search proved no route exists (startPossible).
+	possible bool
 	// peakChunkBytes is the high-water mark of one chunk, the structural
 	// memory assertion a test reads: it must stay inside the frontier budget
 	// (plus the one group that budget is allowed to overshoot for) however
@@ -561,14 +661,15 @@ func (w *pathWalk) resumable() bool {
 }
 
 // loadProgress restores what the previous page left in the state file: the
-// expansion keyset position and the depth-pruned disclosure.
+// expansion position, the depth-pruned disclosure and the search's phase.
 func (w *pathWalk) loadProgress() error {
 	var after string
-	var pruned int
-	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_pruned FROM progress WHERE k = 0`,
-		nil, &after, &pruned); err != nil {
+	var pruned, scanDone, possible int
+	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_pruned, scan_done, hops_after, possible
+		FROM progress WHERE k = 0`, nil, &after, &pruned, &scanDone, &w.hopsAfter, &possible); err != nil {
 		return err
 	}
+	w.scanDone, w.possible = scanDone != 0, possible != 0
 	pos, err := decodeEdgePos(after)
 	if err != nil {
 		return err
@@ -581,12 +682,15 @@ func (w *pathWalk) loadProgress() error {
 // saveProgress writes it back. It is called on every edge page and at every
 // stop, so no page ever loses more than the batch page it was inside.
 func (w *pathWalk) saveProgress() error {
-	pruned := 0
-	if w.depthPruned {
-		pruned = 1
+	flag := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
 	}
-	return w.sc.exec(w.scCtx, `UPDATE progress SET expand_after = ?, depth_pruned = ? WHERE k = 0`,
-		encodeEdgePos(w.expandAfter), pruned)
+	return w.sc.exec(w.scCtx, `UPDATE progress SET expand_after = ?, depth_pruned = ?, scan_done = ?,
+		hops_after = ?, possible = ? WHERE k = 0`,
+		encodeEdgePos(w.expandAfter), flag(w.depthPruned), flag(w.scanDone), w.hopsAfter, flag(w.possible))
 }
 
 // markPending records the nodes settled here as owing an expansion.
@@ -789,7 +893,7 @@ func (w *pathWalk) drain(ctx context.Context) error {
 				return err
 			}
 		}
-		w.expandAfter = EdgePos{}
+		w.expandAfter, w.scanDone, w.hopsAfter = EdgePos{}, false, 0
 		if err := w.saveProgress(); err != nil {
 			return err
 		}
@@ -813,39 +917,84 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 		// would instead mean every kind.
 		return false, nil
 	}
-	var plain, dispatched []model.NodeID
-	for _, n := range batch {
-		if _, virtual := pathState(n); virtual {
-			dispatched = append(dispatched, n)
-		} else {
-			plain = append(plain, n)
+	if !w.scanDone {
+		stopped, err := w.scanBatch(ctx, batch, dists, depths)
+		if err != nil || stopped {
+			return stopped, err
+		}
+		// The batch's stored lists are read; the page that resumes it goes
+		// straight to its name-only steps.
+		w.scanDone = true
+		if err := w.saveProgress(); err != nil {
+			return false, err
 		}
 	}
-	if err := w.expandDispatched(ctx, dispatched, dists, depths); err != nil {
-		return false, err
+	if !w.possible {
+		return false, nil
 	}
-	refs, byRef, err := w.resolveBatch(ctx, plain)
+	return w.nameOnly(ctx, batch, dists, depths)
+}
+
+// scanBatch reads the stored lists of one pending batch in ONE resumable scan
+// and relaxes every entry it keeps, reporting whether the page ended first.
+// Under the descent the scan reads both lists: an outgoing entry of a
+// requested kind relaxes from the node's own state, an incoming `overrides`
+// entry from its dispatch state, and an entry neither state in the batch
+// owns is skipped uncharged. A long overrides list is therefore split across
+// pages by the same scan position as any other list.
+func (w *pathWalk) scanBatch(ctx context.Context, batch []model.NodeID,
+	dists map[model.NodeID]int64, depths map[model.NodeID]int) (bool, error) {
+	refs, plain, dispatch, err := w.resolveBatch(ctx, batch)
 	if err != nil {
 		return false, err
 	}
 	if len(refs) == 0 {
 		return false, nil
 	}
-	pend := make([]Edge, 0, adjacencyBatch)
+	direction, kinds := w.direction, w.kindCodes
+	if w.descent.active {
+		direction = model.DirectionBoth
+		if !slices.Contains(kinds, w.descent.overrides) {
+			kinds = append(slices.Clone(kinds), w.descent.overrides)
+		}
+	}
+	owner := func(e Edge) (model.NodeID, bool) {
+		if !w.descent.active {
+			n, ok := plain[e.Owner]
+			return n, ok
+		}
+		if e.Outgoing {
+			if !slices.Contains(w.kindCodes, e.Kind) {
+				return "", false
+			}
+			n, ok := plain[e.Owner]
+			return n, ok
+		}
+		if e.Kind != w.descent.overrides {
+			return "", false
+		}
+		n, ok := dispatch[e.Owner]
+		return n, ok
+	}
+	pend := make([]pathEntry, 0, adjacencyBatch)
 	stopped := false
 	var ferr error
 	flush := func() error {
 		if len(pend) == 0 {
 			return nil
 		}
-		if err := w.relax(ctx, pend, byRef, dists, depths); err != nil {
+		if err := w.relax(ctx, pend, dists, depths); err != nil {
 			return err
 		}
 		pend = pend[:0]
 		return nil
 	}
-	pos, err := w.reader.Neighbours(ctx, refs, w.direction, w.kindCodes, w.expandAfter,
+	pos, err := w.reader.Neighbours(ctx, refs, direction, kinds, w.expandAfter,
 		func(e Edge) error {
+			from, ok := owner(e)
+			if !ok {
+				return nil
+			}
 			// Both stops are checked BEFORE the entry is consumed, so the
 			// position the port reports for a stopped scan -- the entry it
 			// just delivered -- still names the first entry this page did NOT
@@ -871,7 +1020,7 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 			}
 			w.spent++
 			w.pageEdges++
-			pend = append(pend, e)
+			pend = append(pend, pathEntry{edge: e, from: from})
 			if len(pend) < adjacencyBatch {
 				return nil
 			}
@@ -911,32 +1060,50 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 	return stopped, w.saveProgress()
 }
 
-// resolveBatch maps the batch's canonical node ids onto the surrogates the
-// packed adjacency is keyed by, ASCENDING and duplicate-free as the port
-// requires, and returns the reverse map the relaxation reads owners through.
+// pathEntry is one kept entry of a batch's scan and the search state it
+// relaxes from.
+type pathEntry struct {
+	edge Edge
+	from model.NodeID
+}
+
+// resolveBatch maps the batch's states onto the surrogates the packed
+// adjacency is keyed by, ASCENDING and duplicate-free as the port requires,
+// and returns the reverse maps the scan reads owners through: a node's own
+// state, and its dispatch state when the batch holds that.
 //
 // A node the pinned generation does not publish resolves to zero and is
 // dropped: it has no packed list, and the search has nothing to expand for it.
 func (w *pathWalk) resolveBatch(ctx context.Context, batch []model.NodeID) ([]NodeRef,
-	map[NodeRef]model.NodeID, error) {
-	resolved, err := w.reader.Resolve(ctx, batch)
-	if err != nil {
-		return nil, nil, err
+	map[NodeRef]model.NodeID, map[NodeRef]model.NodeID, error) {
+	nodes := make([]model.NodeID, len(batch))
+	for i, n := range batch {
+		nodes[i], _ = pathState(n)
 	}
-	byRef := make(map[NodeRef]model.NodeID, len(resolved))
+	resolved, err := w.reader.Resolve(ctx, nodes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	plain := map[NodeRef]model.NodeID{}
+	dispatch := map[NodeRef]model.NodeID{}
 	refs := make([]NodeRef, 0, len(resolved))
 	for i, ref := range resolved {
 		if ref == 0 {
 			continue
 		}
-		if _, dup := byRef[ref]; dup {
-			continue
+		_, p := plain[ref]
+		_, d := dispatch[ref]
+		if !p && !d {
+			refs = append(refs, ref)
 		}
-		byRef[ref] = batch[i]
-		refs = append(refs, ref)
+		if _, isDispatch := pathState(batch[i]); isDispatch {
+			dispatch[ref] = batch[i]
+		} else {
+			plain[ref] = batch[i]
+		}
 	}
 	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
-	return refs, byRef, nil
+	return refs, plain, dispatch, nil
 }
 
 // relax turns one batch of packed entries into bucket rows. The canonical ids
@@ -945,17 +1112,18 @@ func (w *pathWalk) resolveBatch(ctx context.Context, batch []model.NodeID) ([]No
 // the settle order therefore still ties on the content-derived canonical node
 // id rather than on the rebuild-local surrogate the scan carries.
 //
-// Which endpoint the search came from is the entry's OWNER: the owner is the
-// node this batch settled, whichever direction its list was read in. It is
-// exact where guessing from the two endpoints is not: a self-loop, and an edge
-// whose endpoints are both settled in this batch, relax from the node whose
-// expansion actually delivered them.
-func (w *pathWalk) relax(ctx context.Context, pend []Edge, byRef map[NodeRef]model.NodeID,
+// Which state the search came from is the entry's owner state: the state of
+// the node this batch settled that kept the entry, whichever direction its
+// list was read in. It is exact where guessing from the two endpoints is not:
+// a self-loop, and an edge whose endpoints are both settled in this batch,
+// relax from the state whose expansion actually delivered them.
+func (w *pathWalk) relax(ctx context.Context, pend []pathEntry,
 	dists map[model.NodeID]int64, depths map[model.NodeID]int) error {
 	rels := make([]RelRef, len(pend))
 	tos := make([]NodeRef, len(pend))
-	for i, e := range pend {
-		rels[i], tos[i] = e.Rel, e.Neighbour
+	edges := make([]Edge, len(pend))
+	for i, p := range pend {
+		rels[i], tos[i], edges[i] = p.edge.Rel, p.edge.Neighbour, p.edge
 	}
 	relIDs, err := w.reader.RelationIDs(ctx, rels)
 	if err != nil {
@@ -965,17 +1133,12 @@ func (w *pathWalk) relax(ctx context.Context, pend []Edge, byRef map[NodeRef]mod
 	if err != nil {
 		return err
 	}
-	virtual, err := w.virtualCalls(ctx, pend, relIDs)
+	virtual, err := w.virtualCalls(ctx, edges, relIDs)
 	if err != nil {
 		return err
 	}
-	for i, e := range pend {
-		from, ok := byRef[e.Owner]
-		if !ok {
-			// The port delivered an entry for a node this batch is not
-			// expanding, which is nothing this search can relax.
-			continue
-		}
+	for i, e := range edges {
+		from := pend[i].from
 		to, rel := toIDs[i], relIDs[i]
 		if to == "" || rel == "" {
 			// An endpoint or a relation the pinned generation does not
@@ -1028,24 +1191,17 @@ func pathState(n model.NodeID) (model.NodeID, bool) {
 	return n, false
 }
 
-// virtualCalls is which of a relaxation batch's outgoing `calls` relations
-// have a virtual occurrence, in one batched read; nothing when the search
-// takes no downward step.
-func (w *pathWalk) virtualCalls(ctx context.Context, pend []Edge, relIDs []model.RelationID) (map[model.RelationID]bool, error) {
-	if !w.descent.active {
-		return map[model.RelationID]bool{}, nil
-	}
-	return virtualCalls(ctx, w.reader, pend, relIDs)
-}
-
-// virtualCalls is which of edges' outgoing `calls` relations, named by relIDs
-// in the same order, have a virtual occurrence, read in batches; nothing from
-// a reader that publishes no dispatch.
-func virtualCalls(ctx context.Context, r GraphReader, edges []Edge, relIDs []model.RelationID) (map[model.RelationID]bool, error) {
+// virtualCalls is which of a relaxation batch's outgoing `calls` relations,
+// named by relIDs in the same order, have a virtual occurrence, read in
+// batches; nothing when the search takes no downward step.
+func (w *pathWalk) virtualCalls(ctx context.Context, edges []Edge, relIDs []model.RelationID) (map[model.RelationID]bool, error) {
 	out := map[model.RelationID]bool{}
-	dr, _ := r.(DispatchReader)
-	calls, ok := r.Kinds().Code(model.RelCalls)
-	if dr == nil || !ok {
+	dr, _ := w.reader.(DispatchReader)
+	if !w.descent.active || dr == nil {
+		return out, nil
+	}
+	calls, ok := w.reader.Kinds().Code(model.RelCalls)
+	if !ok {
 		return out, nil
 	}
 	var ids []model.RelationID
@@ -1071,51 +1227,122 @@ func virtualCalls(ctx context.Context, r GraphReader, edges []Edge, relIDs []mod
 	return out, nil
 }
 
-// expandDispatched expands the dispatch states of a batch: each relaxes the
-// overrides of its method, one hop down, and nothing else -- the method's own
-// calls are its plain state's. The scan is read whole: an overrides list is
-// short, and its relaxations are idempotent rows, so a page that stops later
-// in the batch and repeats this costs nothing twice.
-func (w *pathWalk) expandDispatched(ctx context.Context, states []model.NodeID,
-	dists map[model.NodeID]int64, depths map[model.NodeID]int) error {
-	if len(states) == 0 || !w.descent.active {
-		return nil
+// nameOnly relaxes the batch's `may_call` steps once its stored lists are
+// read: from a node holding an open call site to each candidate of it,
+// against the edges from a candidate to each holder of a site naming it for
+// an incoming search, both for both. Each step costs the dearest relation
+// cost, is charged to the edge budget as one entry per call site relation
+// that makes it, and records those relations (`hopvia`) for the answer. The
+// steps come in a fixed order from the pinned generation, so the count of
+// those already relaxed (hopsAfter) is the position a page that stops on the
+// budget resumes from. A dispatch state takes none: its method's steps are
+// its own state's.
+func (w *pathWalk) nameOnly(ctx context.Context, batch []model.NodeID,
+	dists map[model.NodeID]int64, depths map[model.NodeID]int) (bool, error) {
+	dr := declarationReader(w.reader)
+	if dr == nil {
+		return false, nil
 	}
-	methods := make([]model.NodeID, len(states))
-	for i, n := range states {
-		methods[i], _ = pathState(n)
-	}
-	resolved, err := w.reader.Resolve(ctx, methods)
-	if err != nil {
-		return err
-	}
-	byRef := map[NodeRef]model.NodeID{}
-	var refs []NodeRef
-	for i, ref := range resolved {
-		if ref != 0 {
-			byRef[ref] = states[i]
-			refs = append(refs, ref)
+	var nodes []model.NodeID
+	for _, n := range batch {
+		if _, isDispatch := pathState(n); !isDispatch {
+			nodes = append(nodes, n)
 		}
 	}
-	if len(refs) == 0 {
-		return nil
+	if len(nodes) == 0 {
+		return false, nil
 	}
-	var pend []Edge
-	if _, err := w.reader.Neighbours(ctx, ascending(refs), model.DirectionIncoming, []KindCode{w.descent.overrides},
-		EdgePos{}, func(e Edge) error { pend = append(pend, e); return nil }); err != nil {
-		return err
+	nodes = sortedNodes(nodes)
+	repo := w.reader.Binding().RepositoryID
+	var seen int64
+	stopped := false
+	var ferr error
+	step := func(at, next, caller, callee model.NodeID, via model.RelationID) {
+		if stopped || ferr != nil {
+			return
+		}
+		if seen++; seen <= w.hopsAfter {
+			return
+		}
+		if w.maxEdges.Exceeded(w.pageEdges + 1) {
+			w.edgesHit, stopped = true, true
+			return
+		}
+		w.spent++
+		w.pageEdges++
+		w.hopsAfter = seen
+		hop := model.NewRelationID(repo, caller, model.RelMayCall, callee)
+		if ferr = w.sc.exec(w.scCtx,
+			`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
+			dists[at]+Cost(model.RelMayCall), string(next), string(hop), string(at), string(model.RelMayCall),
+			depths[at]+1); ferr != nil {
+			return
+		}
+		ferr = w.sc.exec(w.scCtx, `INSERT OR IGNORE INTO hopvia(rel, via) VALUES(?, ?)`, string(hop), string(via))
 	}
-	// Charged to the edge budget like every entry the search reads. The scan
-	// is not cut on it -- a repeat would charge it again -- so the page's
-	// next scan, which is resumable, is the one the budget stops.
-	w.spent += int64(len(pend))
-	w.pageEdges += int64(len(pend))
-	for start := 0; start < len(pend); start += adjacencyBatch {
-		if err := w.relax(ctx, pend[start:min(start+adjacencyBatch, len(pend))], byRef, dists, depths); err != nil {
+	if w.direction != model.DirectionIncoming {
+		if err := candidatesOfSites(ctx, w.reader, dr, nodes, map[model.NodeID]bool{},
+			func(c, k model.NodeID, via model.RelationID) { step(c, k, c, k, via) }); err != nil {
+			return false, err
+		}
+	}
+	if w.direction != model.DirectionOutgoing {
+		if err := callersOfSites(ctx, w.reader, dr, nodes, map[model.NodeID]bool{},
+			func(c, k model.NodeID, via model.RelationID) { step(k, c, c, k, via) }); err != nil {
+			return false, err
+		}
+	}
+	if ferr != nil {
+		return false, ferr
+	}
+	return stopped, w.saveProgress()
+}
+
+// hopVias is the call site relations behind each `may_call` step on routes.
+func (w *pathWalk) hopVias(routes [][]model.Relation) (map[model.RelationID][]model.RelationID, error) {
+	out := map[model.RelationID][]model.RelationID{}
+	for _, route := range routes {
+		for _, r := range route {
+			if r.Kind != model.RelMayCall {
+				continue
+			}
+			if _, done := out[r.ID]; done {
+				continue
+			}
+			var vias []model.RelationID
+			if err := w.sc.each(w.scCtx, `SELECT via FROM hopvia WHERE rel = ? ORDER BY via`, []any{string(r.ID)},
+				func(scan func(...any) error) error {
+					var via string
+					if err := scan(&via); err != nil {
+						return internalErr("path scratch read: " + err.Error())
+					}
+					vias = append(vias, model.RelationID(via))
+					return nil
+				}); err != nil {
+				return nil, err
+			}
+			out[r.ID] = vias
+		}
+	}
+	return out, nil
+}
+
+// startPossible turns an exhausted precise search into the search that also
+// takes name-only calls (ADR-0015 decision 3): the state is emptied and the
+// same walk runs again from the start with `may_call` steps admitted. The
+// phase is recorded in the state, so a continuation resumes it. The page's
+// work budgets and the search's cumulative counters carry on.
+func (w *pathWalk) startPossible() error {
+	for _, table := range []string{"settled", "parent", "bucket", "reach", "pending", "hopvia"} {
+		if err := w.sc.exec(w.scCtx, `DELETE FROM `+table); err != nil {
 			return err
 		}
 	}
-	return nil
+	w.possible, w.resumed = true, false
+	w.bucketCost, w.lastSettled = 0, ""
+	w.expandAfter, w.scanDone, w.hopsAfter = EdgePos{}, false, 0
+	w.depthPruned, w.targetSettled = false, false
+	return w.saveProgress()
 }
 
 // takePending reads the next batch of unexpanded nodes with the settled
@@ -1261,9 +1488,9 @@ func (e *Engine) scratchDir() string {
 // dispatch reaches its callee's dispatch state too, and a dispatch state
 // relaxes only the method's incoming `overrides` entries, each to the
 // override itself and to the override's own dispatch state, so a descent
-// goes on as deep as the overrides do. A node's own scan reads only its
-// outgoing entries of the requested kinds. It is inactive for every other
-// search.
+// goes on as deep as the overrides do. A node's own state relaxes only its
+// outgoing entries of the requested kinds (scanBatch). It is inactive for
+// every other search.
 type pathDescent struct {
 	active    bool
 	overrides KindCode
@@ -1278,370 +1505,4 @@ func pathDescentFor(r GraphReader, direction model.Direction, kinds []model.Rela
 		return pathDescent{}
 	}
 	return pathDescent{active: true, overrides: code}
-}
-
-// possiblePath answers a pair with no precise route (ADR-0015 decision 3) by
-// the cheapest route once name-only calls are admitted: one cost-ordered
-// search from `from` over the request's relation kinds -- with the forward
-// call walk's descent to overrides, as the precise search has -- that also
-// steps along `may_call`, from a node holding an open call site to each
-// candidate of it (against the edges for an incoming search, either way for
-// both). A `may_call` step costs the dearest relation cost there is, so the
-// search takes as many of them as the cheapest route needs and no more. The
-// route is marked Possible, carries every hop's call site occurrences, and the
-// answer counts its hops and says it may not run.
-//
-// The search is bounded by the request's depth bound and its visited budget;
-// one either bound stops is reported truncated, never as "no route".
-func (e *Engine) possiblePath(ctx context.Context, res model.PathResult, from, to model.NodeID,
-	direction model.Direction, codes []KindCode, descent pathDescent,
-	maxDepth, maxVisited config.Limit) (model.PathResult, error) {
-	dr := declarationReader(e.reader)
-	if dr == nil {
-		return res, nil
-	}
-	s := &possibleSearch{e: e, dr: dr, to: to, direction: direction, codes: codes, descent: descent,
-		maxDepth: maxDepth, maxVisited: maxVisited, tree: possibleTree{from: {}}}
-	found, err := s.run(ctx, from)
-	if err != nil {
-		return model.PathResult{}, err
-	}
-	switch {
-	case s.cut:
-		pathTruncate(&res.Meta, pathReasonVisited)
-	case s.pruned:
-		pathTruncate(&res.Meta, pathReasonDepth)
-	}
-	if !found {
-		return res, nil
-	}
-	route := s.tree.chain(to)
-	if len(route) > model.MaxRelationsPerPath {
-		pathTruncate(&res.Meta, pathReasonDepth)
-		return res, nil
-	}
-	var ids []model.RelationID
-	var legs []model.Relation
-	hops := 0
-	for _, step := range route {
-		if step.rel.Kind == model.RelMayCall {
-			hops++
-			ids = append(ids, step.via...)
-			continue
-		}
-		ids = append(ids, step.rel.ID)
-		legs = append(legs, step.rel)
-	}
-	evidence, err := e.adjacency.EvidenceFor(ctx, ids, model.MaxRelationsPerPath)
-	if err != nil {
-		return model.PathResult{}, err
-	}
-	p := model.RelationPath{CostUnits: s.tree[to].cost, Possible: true}
-	for _, step := range route {
-		p.Relations = append(p.Relations, step.rel.ID)
-		of := []model.RelationID{step.rel.ID}
-		if step.rel.Kind == model.RelMayCall {
-			of = step.via
-		}
-		for _, id := range of {
-			for _, ev := range evidence[id] {
-				if len(p.Evidence) < model.MaxRelationsPerPath {
-					p.Evidence = append(p.Evidence, ev)
-				}
-			}
-		}
-	}
-	res.Paths = []model.RelationPath{p}
-	nodes := []model.NodeID{from}
-	for _, step := range route {
-		nodes = append(nodes, step.rel.From, step.rel.To)
-	}
-	nodes = sortedNodes(nodes)
-	if res.Nodes, err = e.adjacency.NodesByID(ctx, nodes); err != nil {
-		return model.PathResult{}, err
-	}
-	where, err := e.locate(ctx, nodes, legs)
-	if err != nil {
-		return model.PathResult{}, err
-	}
-	res.Locations, res.Occurrences = where.locations, where.occurrences
-	res.Meta.Notices = append(res.Meta.Notices, where.notices...)
-	if loc, ok := e.reader.(SourceLocator); ok {
-		for _, step := range route {
-			if step.rel.Kind != model.RelMayCall {
-				continue
-			}
-			for _, v := range step.via {
-				listed, total, err := e.relationSites(ctx, loc, v, occurrenceBudget-len(res.Occurrences))
-				if err != nil {
-					return model.PathResult{}, err
-				}
-				for _, o := range listed {
-					o.RelationID = step.rel.ID
-					res.Occurrences = append(res.Occurrences, o)
-				}
-				if int64(len(listed)) < total {
-					res.Meta.Notices = append(res.Meta.Notices, fmt.Sprintf(
-						"the possible route's call site relation %s has %d located occurrences; %d are listed", v, total, len(listed)))
-				}
-			}
-		}
-	}
-	calls := "one call"
-	if hops > 1 {
-		calls = fmt.Sprintf("%d calls", hops)
-	}
-	res.Meta.Notices = append(res.Meta.Notices, fmt.Sprintf(
-		"no precise route connects the two nodes; the route given takes %s no analysis bound, matched by "+
-			"name only (`may_call`), and it may not run", calls))
-	return res, nil
-}
-
-// possibleStep is one state of the possible-route search: its cost and depth
-// from the start, the relation and state it was reached by, and for a
-// `may_call` step the call site relations that name it.
-type possibleStep struct {
-	cost  int64
-	depth int
-	rel   model.Relation
-	via   []model.RelationID
-	prev  model.NodeID
-}
-
-// possibleTree is the search's states, keyed as the precise search keys them:
-// a node, or a method's dispatch state (dispatchState).
-type possibleTree map[model.NodeID]possibleStep
-
-// chain is the steps from the start to n, in order, with every state read
-// back to its node.
-func (t possibleTree) chain(n model.NodeID) []possibleStep {
-	var out []possibleStep
-	for cur := t[n]; cur.prev != ""; cur = t[cur.prev] {
-		step := cur
-		step.rel.From, _ = pathState(step.rel.From)
-		step.rel.To, _ = pathState(step.rel.To)
-		out = append(out, step)
-	}
-	slices.Reverse(out)
-	return out
-}
-
-// possibleSearch is one possible-route search.
-type possibleSearch struct {
-	e          *Engine
-	dr         DeclarationReader
-	to         model.NodeID
-	direction  model.Direction
-	codes      []KindCode
-	descent    pathDescent
-	maxDepth   config.Limit
-	maxVisited config.Limit
-	tree       possibleTree
-	buckets    map[int64][]model.NodeID
-	settled    map[model.NodeID]bool
-	// cut is the visited budget stopping the search, pruned the depth bound
-	// leaving a state unexpanded.
-	cut, pruned bool
-}
-
-// run settles states cheapest first until the target settles, the frontier
-// empties, or the budget stops it; it reports whether the target settled.
-func (s *possibleSearch) run(ctx context.Context, from model.NodeID) (bool, error) {
-	s.buckets = map[int64][]model.NodeID{0: {from}}
-	s.settled = map[model.NodeID]bool{}
-	for len(s.buckets) > 0 {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		var cost int64 = -1
-		for c := range s.buckets {
-			if cost < 0 || c < cost {
-				cost = c
-			}
-		}
-		var batch []model.NodeID
-		for _, n := range sortedNodes(s.buckets[cost]) {
-			if !s.settled[n] && s.tree[n].cost == cost {
-				batch = append(batch, n)
-			}
-		}
-		delete(s.buckets, cost)
-		var expand []model.NodeID
-		for _, n := range batch {
-			if s.maxVisited.Exceeded(int64(len(s.settled) + 1)) {
-				s.cut = true
-				return false, nil
-			}
-			s.settled[n] = true
-			if n == s.to {
-				return true, nil
-			}
-			if atBound(s.maxDepth, s.tree[n].depth) {
-				s.pruned = true
-				continue
-			}
-			expand = append(expand, n)
-		}
-		if err := s.expand(ctx, expand); err != nil {
-			return false, err
-		}
-	}
-	return false, nil
-}
-
-// reach records state next reached from state at by rel, unless it is
-// settled or already reached at no greater cost.
-func (s *possibleSearch) reach(at, next model.NodeID, rel model.Relation, via []model.RelationID) {
-	c := s.tree[at].cost + Cost(rel.Kind)
-	if cur, seen := s.tree[next]; s.settled[next] || (seen && cur.cost <= c) {
-		return
-	}
-	s.tree[next] = possibleStep{cost: c, depth: s.tree[at].depth + 1, rel: rel, via: via, prev: at}
-	s.buckets[c] = append(s.buckets[c], next)
-}
-
-// expand steps out of one batch of states: a node along the request's
-// relations, the descent and the name-only calls, a dispatch state to its
-// method's overrides only.
-func (s *possibleSearch) expand(ctx context.Context, batch []model.NodeID) error {
-	var plain, dispatched []model.NodeID
-	for _, n := range batch {
-		if _, virtual := pathState(n); virtual {
-			dispatched = append(dispatched, n)
-		} else {
-			plain = append(plain, n)
-		}
-	}
-	if err := s.adjacent(ctx, plain, s.direction, s.codes, false); err != nil {
-		return err
-	}
-	if s.descent.active {
-		if err := s.adjacent(ctx, dispatched, model.DirectionIncoming, []KindCode{s.descent.overrides}, true); err != nil {
-			return err
-		}
-	}
-	return s.nameOnly(ctx, plain)
-}
-
-// adjacent relaxes the stored relations out of states as the precise search
-// does: a call that can dispatch also reaches its callee's dispatch state, and
-// an override a dispatch state reached also reaches its own.
-func (s *possibleSearch) adjacent(ctx context.Context, states []model.NodeID, direction model.Direction,
-	kinds []KindCode, fromDispatch bool) error {
-	if len(states) == 0 || len(kinds) == 0 {
-		return nil
-	}
-	r := s.e.reader
-	nodes := make([]model.NodeID, len(states))
-	for i, n := range states {
-		nodes[i], _ = pathState(n)
-	}
-	refs, err := r.Resolve(ctx, nodes)
-	if err != nil {
-		return err
-	}
-	owner := map[NodeRef]model.NodeID{}
-	var live []NodeRef
-	for i, ref := range refs {
-		if ref == 0 {
-			continue
-		}
-		owner[ref] = states[i]
-		live = append(live, ref)
-	}
-	if len(live) == 0 {
-		return nil
-	}
-	var edges []Edge
-	if _, err := r.Neighbours(ctx, ascending(live), direction, kinds, EdgePos{}, func(ed Edge) error {
-		edges = append(edges, ed)
-		return nil
-	}); err != nil {
-		return err
-	}
-	for start := 0; start < len(edges); start += model.MaxPageItems {
-		chunk := edges[start:min(start+model.MaxPageItems, len(edges))]
-		rels := make([]RelRef, len(chunk))
-		others := make([]NodeRef, len(chunk))
-		for i, ed := range chunk {
-			rels[i], others[i] = ed.Rel, ed.Neighbour
-		}
-		relIDs, err := r.RelationIDs(ctx, rels)
-		if err != nil {
-			return err
-		}
-		otherIDs, err := r.NodeIDs(ctx, others)
-		if err != nil {
-			return err
-		}
-		virtual := map[model.RelationID]bool{}
-		if s.descent.active {
-			if virtual, err = virtualCalls(ctx, r, chunk, relIDs); err != nil {
-				return err
-			}
-		}
-		for i, ed := range chunk {
-			kind, ok := r.Kinds().Kind(ed.Kind)
-			if !ok || relIDs[i] == "" || otherIDs[i] == "" {
-				continue
-			}
-			at, next := owner[ed.Owner], otherIDs[i]
-			here, _ := pathState(at)
-			rel := model.Relation{ID: relIDs[i], From: here, Kind: kind, To: next}
-			if !ed.Outgoing {
-				rel.From, rel.To = next, here
-			}
-			s.reach(at, next, rel, nil)
-			if virtual[relIDs[i]] || fromDispatch {
-				s.reach(at, dispatchState(next), rel, nil)
-			}
-		}
-	}
-	return nil
-}
-
-// nameOnly relaxes the `may_call` steps out of nodes: forward to each
-// candidate of an open call site a node holds, backward to each holder of an
-// open call site a node is a candidate of. A step names every call site
-// relation that makes it.
-func (s *possibleSearch) nameOnly(ctx context.Context, nodes []model.NodeID) error {
-	if len(nodes) == 0 {
-		return nil
-	}
-	nodes = sortedNodes(nodes)
-	type hop struct{ at, next, caller, callee model.NodeID }
-	vias := map[hop][]model.RelationID{}
-	var order []hop
-	note := func(h hop, via model.RelationID) {
-		if _, ok := vias[h]; !ok {
-			order = append(order, h)
-		}
-		if !slices.Contains(vias[h], via) {
-			vias[h] = append(vias[h], via)
-		}
-	}
-	if s.direction != model.DirectionIncoming {
-		if err := s.e.candidatesOfSites(ctx, s.e.reader, s.dr, nodes, map[model.NodeID]bool{},
-			func(c, k model.NodeID, via model.RelationID) {
-				note(hop{at: c, next: k, caller: c, callee: k}, via)
-			}); err != nil {
-			return err
-		}
-	}
-	if s.direction != model.DirectionOutgoing {
-		if err := s.e.callersOfSites(ctx, s.e.reader, s.dr, nodes, map[model.NodeID]bool{},
-			func(c, k model.NodeID, via model.RelationID) {
-				note(hop{at: k, next: c, caller: c, callee: k}, via)
-			}); err != nil {
-			return err
-		}
-	}
-	repo := s.e.reader.Binding().RepositoryID
-	for _, h := range order {
-		via := vias[h]
-		slices.Sort(via)
-		s.reach(h.at, h.next, model.Relation{ID: model.NewRelationID(repo, h.caller, model.RelMayCall, h.callee),
-			From: h.caller, Kind: model.RelMayCall, To: h.callee}, via)
-	}
-	return nil
 }

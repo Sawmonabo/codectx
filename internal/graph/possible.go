@@ -193,13 +193,13 @@ func (e *Engine) possibleRows(ctx context.Context, r GraphReader, mode tailMode,
 		}
 		switch mode {
 		case tailCallers:
-			if err := e.callersOfSites(ctx, r, dr, level, sites, func(caller, start model.NodeID, via model.RelationID) {
+			if err := callersOfSites(ctx, r, dr, level, sites, func(caller, start model.NodeID, via model.RelationID) {
 				reach(add(caller, start, via))
 			}); err != nil {
 				return possibleList{}, err
 			}
 		case tailCallees:
-			if err := e.candidatesOfSites(ctx, r, dr, level, sites, func(start, cand model.NodeID, via model.RelationID) {
+			if err := candidatesOfSites(ctx, r, dr, level, sites, func(start, cand model.NodeID, via model.RelationID) {
 				reach(add(start, cand, via))
 			}); err != nil {
 				return possibleList{}, err
@@ -222,7 +222,7 @@ func (e *Engine) possibleRows(ctx context.Context, r GraphReader, mode tailMode,
 
 // callersOfSites finds, for each node of level, the open call sites it is a
 // candidate of and each site's callers, in (start, site, caller) order.
-func (e *Engine) callersOfSites(ctx context.Context, r GraphReader, dr DeclarationReader, level []model.NodeID,
+func callersOfSites(ctx context.Context, r GraphReader, dr DeclarationReader, level []model.NodeID,
 	sites map[model.NodeID]bool, emit func(caller, start model.NodeID, via model.RelationID)) error {
 	decls, err := dr.Declared(ctx, level)
 	if err != nil {
@@ -278,7 +278,7 @@ func sitesNaming(ctx context.Context, dr DeclarationReader, n model.Node) ([]mod
 
 // candidatesOfSites finds, for each node of level, the open call sites it
 // calls and each site's ranked candidates, in (start, site, rank) order.
-func (e *Engine) candidatesOfSites(ctx context.Context, r GraphReader, dr DeclarationReader, level []model.NodeID,
+func candidatesOfSites(ctx context.Context, r GraphReader, dr DeclarationReader, level []model.NodeID,
 	sites map[model.NodeID]bool, emit func(start, cand model.NodeID, via model.RelationID)) error {
 	calls, err := storedList(ctx, r, level, model.DirectionOutgoing, model.RelCalls)
 	if err != nil {
