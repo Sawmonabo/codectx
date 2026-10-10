@@ -15,18 +15,22 @@ import (
 
 // resolvePython resolves the sites of a Python unit: direct binding through
 // imports and modules, a call of a class as its construction, flow-based type
-// inference (inferTypes), field-based resolution and class-hierarchy
-// analysis in method resolution order.
+// inference (inferTypes), field-based resolution of a receiver that recovered
+// nothing, and the method a receiver's class declares or inherits in method
+// resolution order.
 //
-// It reads the unit's tables once. Each site that stays inside its file (a
-// bare call of a name the file declares, a receiver whose type the file or
-// the inference recovered, a called value the inference traced) binds while
-// its table is in hand. A site that names a module (`mod.f()`, a name a
-// `from mod import f` introduced, which the worker spells as a TypeModule)
-// becomes a lookup that the unit's declarations answer through one ordered
-// merge: every declaration is indexed under each dotted module name its path
-// can be imported as, and both kinds of record are sorted together, so a
-// lookup meets the declarations of its key with nothing else resident.
+// It reads the unit's tables once to resolve. Each site that stays inside
+// its file (a bare call of a name the file declares, a receiver whose type
+// the file or the inference recovered, a called value the inference traced)
+// binds while its table is in hand. A site that names a module (`mod.f()`, a
+// name a `from mod import f` introduced, which the worker spells as a
+// TypeModule) and each import become lookups that the unit's declarations
+// and modules answer through one ordered merge: every declaration and every
+// file's module is indexed under each dotted module name its path can be
+// imported as, and both kinds of record are sorted together, so a lookup
+// meets the records of its key with nothing else resident. A second read
+// emits the argument flows of every site bound to a declaration of the unit,
+// which needs the site's arguments and what the merge bound.
 func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error {
 	h, err := buildHierarchy(ctx, u)
 	if err != nil {
@@ -44,16 +48,41 @@ func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error
 		return err
 	}
 	defer keys.Close()
-	err = u.Files(ctx, func(file int32, fv model.FileVersion, tab *Table) error {
+	hits, err := pagination.NewExternalSort(filepath.Join(u.dir, "python-hits"), 0,
+		encodeJSON[pyHit], decodeJSON[pyHit], comparePyHit)
+	if err != nil {
+		return err
+	}
+	defer hits.Close()
+	calls, err := pagination.NewExternalSort(filepath.Join(u.dir, "python-calls"), 0,
+		encodeJSON[pyCall], decodeJSON[pyCall], comparePyCall)
+	if err != nil {
+		return err
+	}
+	defer calls.Close()
+	calls.WithFold(keepFirst[pyCall])
+	call := func(b Binding, receiverFirst bool) error {
+		if err := emit(b); err != nil {
+			return err
+		}
+		return calls.Add(pyCall{Site: b.Site, Target: b.Target, First: receiverFirst})
+	}
+	err = u.Files(ctx, func(file int32, _ model.FileVersion, tab *Table) error {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
 			return err
 		}
 		if err := indexPythonDecls(file, tab, keys); err != nil {
 			return err
 		}
+		if err := addPythonImports(file, tab, keys); err != nil {
+			return err
+		}
+		r := pySite{ctx: ctx, h: h, t: t, fc: contextOf(file, tab), tab: tab, keys: keys, hits: hits, emit: emit, call: call}
 		for i := range tab.Sites {
-			site := Ref{File: file, Index: int32(i)}
-			if err := resolvePythonSite(ctx, h, t, site, tab, keys, emit); err != nil {
+			if err := r.resolve(Ref{File: file, Index: int32(i)}); err != nil {
 				return err
 			}
 		}
@@ -62,42 +91,58 @@ func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error
 	if err != nil {
 		return err
 	}
-	return joinPythonModules(ctx, u.dir, keys, emit)
+	if err := joinPythonModules(ctx, keys, hits, emit, call); err != nil {
+		return err
+	}
+	return pythonFlows(ctx, u, h, calls, emit)
 }
 
-// pyRecord is one record of the module merge: a declaration indexed under one
-// dotted module name its file can be imported as, or a site's lookup of a
-// name in a module. Records of one Key meet in the merge, declarations first.
+// pyRecord is one record of the module merge: a declaration, or a file's
+// module, indexed under one dotted module name its file can be imported as,
+// or a lookup of a name in a module, by a site or an import. Records of one
+// Key meet in the merge, declarations and modules first.
 type pyRecord struct {
 	// Key is the dotted module name and the qualified name inside it,
-	// joined by a NUL: "pkg.mod\x00Class.method".
+	// joined by a NUL: "pkg.mod\x00Class.method"; a module's own Key has
+	// nothing after the NUL.
 	Key string `json:"k"`
-	// Lookup marks a site's lookup; a declaration otherwise.
+	// Lookup marks a lookup; a declaration or a module otherwise.
 	Lookup bool `json:"l,omitempty"`
-	// Ref is the declaration, or the looking-up site.
+	// Ref is the declaration (Index -1 for a module), the looking-up site,
+	// or the looking-up import (an index into Table.Imports).
 	Ref Ref `json:"r"`
-	// Root is, for a declaration, the directory its module name is read
-	// from ("" for the repository root, else ending in "/"); for a lookup,
-	// the looking-up file's path.
+	// Root is, for a declaration or a module, the directory its module name
+	// is read from ("" for the repository root, else ending in "/"); for a
+	// lookup, the looking-up file's path.
 	Root string `json:"o,omitempty"`
-	// Class marks a declaration of a class.
-	Class bool `json:"c,omitempty"`
+	// Class marks a declaration of a class, and Unbound one of an instance
+	// method, which a call through its class passes the receiver as the
+	// first argument.
+	Class   bool `json:"c,omitempty"`
+	Unbound bool `json:"u,omitempty"`
 	// Init marks a lookup of a constructed class's `__init__`.
 	Init bool `json:"i,omitempty"`
 	// Exact marks a relative import's lookup, whose module is named from
 	// the repository root and answered by that root alone.
 	Exact bool `json:"x,omitempty"`
+	// Probe marks a site's lookup of the module it calls through itself,
+	// which says whether the module is the unit's.
+	Probe bool `json:"p,omitempty"`
+	// Import marks an import's lookup, of Rank: 0 the declaration the
+	// import names, 1 the submodule it names, 2 the module it imports from.
+	Import bool  `json:"m,omitempty"`
+	Rank   uint8 `json:"n,omitempty"`
 }
 
 func comparePyRecord(a, b pyRecord) int {
 	if c := strings.Compare(a.Key, b.Key); c != 0 {
 		return c
 	}
-	if a.Lookup != b.Lookup {
-		if !a.Lookup {
-			return -1
-		}
-		return 1
+	if c := cmpBool(a.Lookup, b.Lookup); c != 0 {
+		return c
+	}
+	if c := cmpBool(a.Import, b.Import); c != 0 {
+		return c
 	}
 	if c := compareRef(a.Ref, b.Ref); c != 0 {
 		return c
@@ -105,40 +150,77 @@ func comparePyRecord(a, b pyRecord) int {
 	if c := strings.Compare(a.Root, b.Root); c != 0 {
 		return c
 	}
-	if c := cmpBool(a.Class, b.Class); c != 0 {
-		return c
+	for _, c := range []int{cmpBool(a.Class, b.Class), cmpBool(a.Unbound, b.Unbound), cmpBool(a.Init, b.Init),
+		cmpBool(a.Exact, b.Exact), cmpBool(a.Probe, b.Probe), int(a.Rank) - int(b.Rank)} {
+		if c != 0 {
+			return c
+		}
 	}
-	if c := cmpBool(a.Init, b.Init); c != 0 {
-		return c
-	}
-	return cmpBool(a.Exact, b.Exact)
+	return 0
 }
 
-// pyHit is one declaration a module lookup met.
+// The groups of the module merge's hits.
+const (
+	hitSite   uint8 = 0 // a call site's
+	hitImport uint8 = 1 // an import's
+)
+
+// pyHit is one record a lookup met, or a site's sentinel.
 type pyHit struct {
-	Site   Ref  `json:"s"`
-	Target Ref  `json:"t"`
-	Init   bool `json:"i,omitempty"`
-	Class  bool `json:"c,omitempty"`
+	// Group and Site are the looking-up site or import.
+	Group  uint8 `json:"g,omitempty"`
+	Site   Ref   `json:"s"`
+	Target Ref   `json:"t"`
+	Init   bool  `json:"i,omitempty"`
+	Class  bool  `json:"c,omitempty"`
 	// Near reports that the declaration's module is read from a directory
 	// the looking-up file sits under, the import's own source root.
-	Near  bool `json:"n,omitempty"`
-	Exact bool `json:"x,omitempty"`
+	Near    bool  `json:"n,omitempty"`
+	Exact   bool  `json:"x,omitempty"`
+	Unbound bool  `json:"u,omitempty"`
+	Probe   bool  `json:"p,omitempty"`
+	Rank    uint8 `json:"k,omitempty"`
+	// Sentinel is the one record every site that looks a name up through a
+	// module has, so the site is settled when its lookups meet nothing.
+	Sentinel bool `json:"e,omitempty"`
 }
 
 func comparePyHit(a, b pyHit) int {
+	if a.Group != b.Group {
+		return int(a.Group) - int(b.Group)
+	}
 	if c := compareRef(a.Site, b.Site); c != 0 {
 		return c
 	}
 	if c := compareRef(a.Target, b.Target); c != 0 {
 		return c
 	}
-	for _, c := range []int{cmpBool(a.Init, b.Init), cmpBool(a.Class, b.Class), cmpBool(a.Near, b.Near), cmpBool(a.Exact, b.Exact)} {
+	for _, c := range []int{cmpBool(a.Init, b.Init), cmpBool(a.Class, b.Class), cmpBool(a.Near, b.Near), cmpBool(a.Exact, b.Exact),
+		cmpBool(a.Unbound, b.Unbound), cmpBool(a.Probe, b.Probe), int(a.Rank) - int(b.Rank), cmpBool(a.Sentinel, b.Sentinel)} {
 		if c != 0 {
 			return c
 		}
 	}
 	return 0
+}
+
+// pyCall is a call fact to a declaration of the unit, which the flow pass
+// reads: First says the site passes the target's receiver as its first
+// argument.
+type pyCall struct {
+	Site   Ref  `json:"s"`
+	Target Ref  `json:"t"`
+	First  bool `json:"f,omitempty"`
+}
+
+func comparePyCall(a, b pyCall) int {
+	if c := compareRef(a.Site, b.Site); c != 0 {
+		return c
+	}
+	if c := compareRef(a.Target, b.Target); c != 0 {
+		return c
+	}
+	return cmpBool(a.First, b.First)
 }
 
 func cmpBool(a, b bool) int {
@@ -191,16 +273,20 @@ func pythonModulePath(p string) []string {
 }
 
 // indexPythonDecls adds every declaration of tab under each module name its
-// file can be imported as, keyed by its qualified name: a module-level
-// function or class by its name, a method by "Class.method".
+// file can be imported as, keyed by its qualified name (a module-level
+// function or class by its name, a method by "Class.method"), and the file's
+// module under each such name with nothing after the NUL.
 func indexPythonDecls(file int32, tab *Table, keys *pagination.ExternalSort[pyRecord]) error {
 	return pythonModuleNames(tab.Path, func(name, root string) error {
+		if err := keys.Add(pyRecord{Key: name + "\x00", Ref: Ref{File: file, Index: -1}, Root: root}); err != nil {
+			return err
+		}
 		for i, d := range tab.Decls {
 			if d.Qualified == "" {
 				continue
 			}
 			rec := pyRecord{Key: name + "\x00" + d.Qualified, Ref: Ref{File: file, Index: int32(i)}, Root: root,
-				Class: d.Kind == model.NodeClass}
+				Class: d.Kind == model.NodeClass, Unbound: d.Kind == model.NodeMethod && !d.Static}
 			if err := keys.Add(rec); err != nil {
 				return err
 			}
@@ -209,56 +295,262 @@ func indexPythonDecls(file int32, tab *Table, keys *pagination.ExternalSort[pyRe
 	})
 }
 
-// resolvePythonSite binds one site of tab, the table of site.File: what the
-// file and the inference answer is emitted here, and a module lookup is added
-// to keys for the merge. Field-based resolution (a function written to the
-// field a member site calls through) answers a member site only when its
-// receiver's type bound nothing: a type that declares or inherits the method
-// decides the call, and one that does not leaves an instance attribute
-// (`self.cb = f; self.cb()`), which only the field can tell.
-func resolvePythonSite(ctx context.Context, h *hierarchy, t *types, site Ref, tab *Table,
-	keys *pagination.ExternalSort[pyRecord], emit func(Binding) error) error {
-	s := &tab.Sites[site.Index]
-	bound := false
-	bind := func(detail string) func(Ref) error {
-		return func(target Ref) error {
-			bound = true
-			return emit(Binding{Site: site, Target: target, Detail: detail})
+// addPythonImports adds the lookups of each import of tab, the table of the
+// member at ordinal file: `import a.b` and `from a import *` look up the
+// module they name; `from a import b` looks up the declaration b of module a
+// (Rank 0), else the submodule a.b (Rank 1), else the module a itself, which
+// the statement imports whatever b is (Rank 2). A relative module is named
+// from the repository root (absolutePythonModule) and answered by that root
+// alone; one that climbs above the root looks nothing up.
+func addPythonImports(file int32, tab *Table, keys *pagination.ExternalSort[pyRecord]) error {
+	for i, imp := range tab.Imports {
+		mod, exact := imp.Path, strings.HasPrefix(imp.Path, ".")
+		if exact {
+			if !pythonRelativeFits(tab.Path, mod) {
+				continue
+			}
+			mod = absolutePythonModule(tab.Path, mod)
 		}
+		ref := Ref{File: file, Index: int32(i)}
+		add := func(key string, rank uint8) error {
+			return keys.Add(pyRecord{Key: key, Lookup: true, Import: true, Rank: rank, Ref: ref, Root: tab.Path, Exact: exact})
+		}
+		if imp.Name == "" || imp.Name == ImportAll {
+			if mod == "" {
+				continue
+			}
+			if err := add(mod+"\x00", 2); err != nil {
+				return err
+			}
+			continue
+		}
+		member := imp.Original
+		if member == "" {
+			member = imp.Name
+		}
+		sub := member
+		if mod != "" {
+			sub = mod + "." + member
+			if err := add(mod+"\x00"+member, 0); err != nil {
+				return err
+			}
+			if err := add(mod+"\x00", 2); err != nil {
+				return err
+			}
+		}
+		if err := add(sub+"\x00", 1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pythonRelativeFits reports that the relative module rel, imported by the
+// file at importer, does not climb above the repository root.
+func pythonRelativeFits(importer, rel string) bool {
+	dots := len(rel) - len(strings.TrimLeft(rel, "."))
+	depth := 0
+	if dir := path.Dir(importer); dir != "." {
+		depth = strings.Count(dir, "/") + 1
+	}
+	return dots-1 <= depth
+}
+
+// pySite resolves the sites of one member's table.
+type pySite struct {
+	ctx  context.Context
+	h    *hierarchy
+	t    *types
+	fc   fileCtx
+	tab  *Table
+	keys *pagination.ExternalSort[pyRecord]
+	hits *pagination.ExternalSort[pyHit]
+	emit func(Binding) error
+	// call emits a FactCall to a declaration of the unit and records it for
+	// the flow pass, with whether the site passes the receiver first.
+	call func(b Binding, receiverFirst bool) error
+}
+
+// exactCall is a binder of the exact calls of site by detail.
+func (r *pySite) exactCall(site Ref, detail string) func(Ref) error {
+	return func(target Ref) error {
+		return r.call(Binding{Kind: FactCall, Site: site, Target: target, Detail: detail, Dispatch: model.DispatchExact}, false)
+	}
+}
+
+// resolve binds one site of r.tab: what the file and the inference answer
+// is emitted here, and a module lookup is added to the merge. A computed
+// site binds nothing. Field-based resolution (a function written to the
+// field a member site calls through) reaches a member site only when its
+// receiver recovered nothing (inference.addFieldWatches).
+func (r *pySite) resolve(site Ref) error {
+	tab := r.tab
+	s := &tab.Sites[site.Index]
+	if s.Computed {
+		return nil
 	}
 	if s.Receiver.Kind == wire.TypeModule {
 		// A name an import introduced: a module (`import a.b as m; m.f()`)
 		// or, on a bare site, the imported entity itself (`from a.b import
 		// f; f()`, spelled "a.b.f").
-		return lookupPython(site, tab.Path, s.Shape == wire.ShapeBare, s.Receiver.Name, s.Callee, keys)
+		return lookupPython(site, tab.Path, s.Shape == wire.ShapeBare, s.Receiver.Name, s.Callee, true, r.keys, r.hits)
 	}
 	switch s.Shape {
 	case wire.ShapeBare, wire.ShapeConstructor:
 		for _, c := range visibleCandidates(tab, s) {
-			if err := bind(DetailDirect)(Ref{File: site.File, Index: constructed(tab, c)}); err != nil {
+			if err := r.exactCall(site, DetailDirect)(Ref{File: site.File, Index: constructed(tab, c)}); err != nil {
 				return err
 			}
 		}
 	case wire.ShapeStatic:
 		// `mod.f()` through an import, or `mod.C.m()` through a class of a
 		// module, which calls the method C declares or inherits.
-		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, keys); err != nil {
+		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, false, r.keys, r.hits); err != nil {
 			return err
 		}
-		return h.types(ctx, site.File, s.Qualifier, func(typ Ref) error {
-			return h.declared(typ, s.Callee, entryRef(bind(DetailDirect)))
+		return r.h.types(r.ctx, site.File, s.Qualifier, func(typ Ref) error {
+			return r.class(site, s, typ, DetailDirect)
 		})
 	case wire.ShapeMember:
-		if err := resolvePythonReceiver(ctx, h, t, site, tab, s, bind); err != nil {
+		if err := r.receiver(site, s); err != nil {
 			return err
 		}
 	}
-	return t.functions(ctx, site, func(target Ref, detail string) error {
-		if detail == DetailField && s.Shape == wire.ShapeMember && bound {
+	return r.t.functions(r.ctx, site, func(target Ref, detail string) error {
+		return r.exactCall(site, detail)(target)
+	})
+}
+
+// receiver binds a member site by its receiver's types: a receiver the file
+// names as an instance (`self`, an annotation) by the method its class
+// declares or inherits in method resolution order, virtual; a class object
+// (`A.make()`, `cls.make()` of a classmethod's class written as a class) by
+// that method, exact; one the inference recovered (a parameter, another
+// call's result, a field) by flow, virtual for an instance a declaration
+// types and exact for a construction's result or a class object; and
+// `super()` by what follows the enclosing class in method resolution order,
+// exact. A receiver type outside the project, and a class of the unit that
+// reaches the method only through a supertype outside it, call the external
+// method (externalReceiver, types.outsideCall).
+func (r *pySite) receiver(site Ref, s *Site) error {
+	switch s.Receiver.Kind {
+	case wire.TypeNamed:
+		found := false
+		err := r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+			found = true
+			return r.instance(site, s, typ, DetailHierarchy)
+		})
+		if err != nil || found {
+			return err
+		}
+		_, err = externalReceiver(r.ctx, r.h, r.fc, site, s, []wire.Type{s.Receiver}, r.emit)
+		return err
+	case wire.TypeClass:
+		return r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+			return r.class(site, s, typ, DetailDirect)
+		})
+	case wire.TypeSuper:
+		return r.super(site, s)
+	case wire.TypeUnion:
+		if _, err := externalReceiver(r.ctx, r.h, r.fc, site, s, typeMembers(r.tab, s.Receiver), r.emit); err != nil {
+			return err
+		}
+	}
+	return r.t.seek(site, func(v recv) error {
+		if v.Role != roleReceiver {
 			return nil
 		}
-		return emit(Binding{Site: site, Target: target, Detail: detail})
+		switch v.X.Kind {
+		case valInstance:
+			return r.instance(site, s, v.X.Ref, DetailFlow)
+		case valObject, valExact:
+			return r.object(site, s, v.X.Ref, DetailFlow)
+		case valClass:
+			return r.class(site, s, v.X.Ref, DetailFlow)
+		}
+		return nil
 	})
+}
+
+// instance binds site s on an instance of typ that a subtype's instance may
+// stand for: the method typ declares or inherits, virtual when the language
+// lets an override run (hierarchy.overridable), else the external method.
+func (r *pySite) instance(site Ref, s *Site, typ Ref, detail string) error {
+	var found []entry
+	if err := r.h.declared(typ, s.Callee, func(e entry) error { found = append(found, e); return nil }); err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		_, err := r.t.outsideCall(r.h, r.fc.family, site, typ, s.Callee, r.emit)
+		return err
+	}
+	virtual, err := r.h.overridable(r.fc.family, typ, s.Callee, found)
+	if err != nil {
+		return err
+	}
+	d := model.DispatchExact
+	if virtual {
+		d = model.DispatchVirtual
+	}
+	for _, e := range found {
+		if err := r.call(Binding{Kind: FactCall, Site: site, Target: e.Ref, Detail: detail, Dispatch: d}, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// object binds site s on an instance of exactly typ: the method typ declares
+// or inherits, exact, else the external method.
+func (r *pySite) object(site Ref, s *Site, typ Ref, detail string) error {
+	found := false
+	err := r.h.declared(typ, s.Callee, func(e entry) error {
+		found = true
+		return r.exactCall(site, detail)(e.Ref)
+	})
+	if err != nil || found {
+		return err
+	}
+	_, err = r.t.outsideCall(r.h, r.fc.family, site, typ, s.Callee, r.emit)
+	return err
+}
+
+// class binds site s on the class object typ: the method typ declares or
+// inherits, exact, an instance method taking the site's first argument as
+// its receiver; else the external method.
+func (r *pySite) class(site Ref, s *Site, typ Ref, detail string) error {
+	found := false
+	err := r.h.declared(typ, s.Callee, func(e entry) error {
+		found = true
+		b := Binding{Kind: FactCall, Site: site, Target: e.Ref, Detail: detail, Dispatch: model.DispatchExact}
+		return r.call(b, e.Flags&flagStatic == 0)
+	})
+	if err != nil || found {
+		return err
+	}
+	_, err = r.t.outsideCall(r.h, r.fc.family, site, typ, s.Callee, r.emit)
+	return err
+}
+
+// super binds `super().m()` (resolvePythonSuper), exact; when no class of
+// the unit after the enclosing one declares m, the external method of the
+// enclosing class's supertypes outside the project.
+func (r *pySite) super(site Ref, s *Site) error {
+	found := false
+	bind := r.exactCall(site, DetailHierarchy)
+	err := resolvePythonSuper(r.ctx, r.h, site, r.tab, s, func(target Ref) error {
+		found = true
+		return bind(target)
+	})
+	if err != nil || found {
+		return err
+	}
+	class := enclosingClass(r.tab, s.Caller)
+	if class < 0 {
+		return nil
+	}
+	_, err = r.t.outsideCall(r.h, r.fc.family, site, Ref{File: site.File, Index: class}, s.Callee, r.emit)
+	return err
 }
 
 // visibleCandidates are the in-file candidates of bare site s that its name
@@ -298,81 +590,6 @@ func visibleCandidates(tab *Table, s *Site) []int32 {
 // entryRef adapts a binder of Refs to the hierarchy's entries.
 func entryRef(bind func(Ref) error) func(entry) error {
 	return func(e entry) error { return bind(e.Ref) }
-}
-
-// resolvePythonReceiver binds a member site by its receiver's types: a
-// receiver the file names as an instance (`self`, an annotation) by
-// class-hierarchy analysis in method resolution order (dispatchPython), a
-// class object (`A.make()`, `cls.make()` of a classmethod's class written
-// as a class) by the method that class declares or inherits alone, one the
-// inference recovered (a parameter, another call's result, a field) by flow,
-// and `super()` by what follows the enclosing class in method resolution
-// order.
-func resolvePythonReceiver(ctx context.Context, h *hierarchy, t *types, site Ref, tab *Table, s *Site,
-	bind func(string) func(Ref) error) error {
-	switch s.Receiver.Kind {
-	case wire.TypeNamed:
-		return h.types(ctx, site.File, s.Receiver.Name, func(typ Ref) error {
-			return dispatchPython(ctx, h, typ, s.Callee, bind(DetailHierarchy))
-		})
-	case wire.TypeClass:
-		return h.types(ctx, site.File, s.Receiver.Name, func(typ Ref) error {
-			return h.declared(typ, s.Callee, entryRef(bind(DetailDirect)))
-		})
-	case wire.TypeSuper:
-		return resolvePythonSuper(ctx, h, site, tab, s, bind(DetailHierarchy))
-	}
-	// The inference's receiver values: an instance dispatches, and a
-	// constructed instance (valObject) or a class object (valExact) calls
-	// its type's own or inherited method.
-	return t.seek(site, func(r recv) error {
-		if r.Role != roleReceiver {
-			return nil
-		}
-		switch r.X.Kind {
-		case valInstance:
-			return dispatchPython(ctx, h, r.X.Ref, s.Callee, bind(DetailFlow))
-		case valObject, valExact:
-			return h.declared(r.X.Ref, s.Callee, entryRef(bind(DetailFlow)))
-		}
-		return nil
-	})
-}
-
-// dispatchPython yields every method a call of method on an instance of the
-// Python class typ may run: for typ and each of its subtypes, the
-// declaration that type's method resolution order reaches first
-// (hierarchy.declared), each once. A method declared abstract is yielded
-// only when no type reaches one that is not.
-func dispatchPython(ctx context.Context, h *hierarchy, typ Ref, method string, yield func(Ref) error) error {
-	var concrete, abstract []Ref
-	seen := map[Ref]bool{}
-	err := pythonSubtypes(ctx, h, typ, func(sub Ref) error {
-		return h.declared(sub, method, func(e entry) error {
-			if seen[e.Ref] {
-				return nil
-			}
-			seen[e.Ref] = true
-			if e.Flags&flagAbstract != 0 {
-				abstract = append(abstract, e.Ref)
-			} else {
-				concrete = append(concrete, e.Ref)
-			}
-			return nil
-		})
-	})
-	if err != nil {
-		return err
-	}
-	if len(concrete) == 0 {
-		concrete = abstract
-	}
-	for _, m := range concrete {
-		if err := yield(m); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // pythonSubtypes yields typ and every class below it in the unit's
@@ -586,15 +803,26 @@ func constructed(tab *Table, c int32) int32 {
 // callee is its last component. Each lookup also asks for the `__init__` of
 // what it finds, which a construction binds instead of a class. A dotted name
 // can also end in a class (`from pkg import C; C.m()`), so its last component
-// is tried as one too.
-func lookupPython(site Ref, importer string, bare bool, module, callee string, keys *pagination.ExternalSort[pyRecord]) error {
+// is tried as one too. With probe, the site is bound through the module
+// alone: it gets a sentinel hit and the lookups of the modules it may name,
+// which say whether a module of that name is the unit's (settlePython).
+func lookupPython(site Ref, importer string, bare bool, module, callee string, probe bool,
+	keys *pagination.ExternalSort[pyRecord], hits *pagination.ExternalSort[pyHit]) error {
 	if module == "" {
 		return nil
 	}
 	exact := strings.HasPrefix(module, ".")
 	if exact {
+		if !pythonRelativeFits(importer, module) {
+			return nil
+		}
 		if module = absolutePythonModule(importer, module); module == "" {
 			return nil
+		}
+	}
+	if probe {
+		if err := hits.Add(pyHit{Site: site, Sentinel: true}); err != nil {
+			return err
 		}
 	}
 	add := func(mod, qualified string) error {
@@ -612,6 +840,12 @@ func lookupPython(site Ref, importer string, bare bool, module, callee string, k
 		}
 		return nil
 	}
+	known := func(mod string) error {
+		if !probe || mod == "" {
+			return nil
+		}
+		return keys.Add(pyRecord{Key: mod + "\x00", Lookup: true, Probe: true, Ref: site, Root: importer, Exact: exact})
+	}
 	mod, last := module, ""
 	if i := strings.LastIndexByte(module, '.'); i >= 0 {
 		mod, last = module[:i], module[i+1:]
@@ -620,12 +854,21 @@ func lookupPython(site Ref, importer string, bare bool, module, callee string, k
 		if last == "" {
 			return nil
 		}
+		if err := known(mod); err != nil {
+			return err
+		}
 		return add(mod, last)
+	}
+	if err := known(module); err != nil {
+		return err
 	}
 	if err := add(module, callee); err != nil {
 		return err
 	}
 	if last != "" {
+		if err := known(mod); err != nil {
+			return err
+		}
 		return add(mod, last+"."+callee)
 	}
 	return nil
@@ -651,18 +894,12 @@ func absolutePythonModule(importer, rel string) string {
 }
 
 // joinPythonModules merges the module index with the lookups. Each key's
-// declarations precede its lookups, and only one key's declarations are
-// held. The hits are sorted by site and settled per site: a declaration read
-// from the looking-up file's own source root is preferred over one read from
-// another, a relative import takes only the root's, and a class whose
-// `__init__` was found is constructed through it.
-func joinPythonModules(ctx context.Context, dir string, keys *pagination.ExternalSort[pyRecord], emit func(Binding) error) error {
-	hits, err := pagination.NewExternalSort(filepath.Join(dir, "python-hits"), 0,
-		encodeJSON[pyHit], decodeJSON[pyHit], comparePyHit)
-	if err != nil {
-		return err
-	}
-	defer hits.Close()
+// declarations and modules precede its lookups, and only one key's are
+// held. The hits, with each module-bound site's sentinel, are sorted by site
+// or import and settled per site (settlePython) and per import
+// (settlePythonImport).
+func joinPythonModules(ctx context.Context, keys *pagination.ExternalSort[pyRecord], hits *pagination.ExternalSort[pyHit],
+	emit func(Binding) error, call func(Binding, bool) error) error {
 	sorted, err := keys.Sorted()
 	if err != nil {
 		return err
@@ -681,12 +918,18 @@ func joinPythonModules(ctx context.Context, dir string, keys *pagination.Externa
 			decls = append(decls, r)
 			return nil
 		}
+		group := hitSite
+		if r.Import {
+			group = hitImport
+		}
 		for _, d := range decls {
 			near := strings.HasPrefix(r.Root, d.Root)
 			if r.Exact {
 				near = d.Root == ""
 			}
-			if err := hits.Add(pyHit{Site: r.Ref, Target: d.Ref, Init: r.Init, Class: d.Class, Near: near, Exact: r.Exact}); err != nil {
+			x := pyHit{Group: group, Site: r.Ref, Target: d.Ref, Init: r.Init, Class: d.Class, Near: near, Exact: r.Exact,
+				Unbound: d.Unbound, Probe: r.Probe, Rank: r.Rank}
+			if err := hits.Add(x); err != nil {
 				return err
 			}
 		}
@@ -701,9 +944,18 @@ func joinPythonModules(ctx context.Context, dir string, keys *pagination.Externa
 	}
 	defer settled.Close()
 	var group []pyHit
+	flush := func() error {
+		if len(group) == 0 {
+			return nil
+		}
+		if group[0].Group == hitImport {
+			return settlePythonImport(group, emit)
+		}
+		return settlePython(group, emit, call)
+	}
 	err = settled.Each(func(x pyHit) error {
-		if len(group) > 0 && group[0].Site != x.Site {
-			if err := settlePythonSite(group, emit); err != nil {
+		if len(group) > 0 && (group[0].Group != x.Group || group[0].Site != x.Site) {
+			if err := flush(); err != nil {
 				return err
 			}
 			group = group[:0]
@@ -714,13 +966,13 @@ func joinPythonModules(ctx context.Context, dir string, keys *pagination.Externa
 	if err != nil {
 		return err
 	}
-	return settlePythonSite(group, emit)
+	return flush()
 }
 
-// settlePythonSite emits one site's module hits: those read from the
-// looking-up file's source root when any is, else every hit of a non-relative
-// import; and of those, no class whose file supplied the class's `__init__`.
-func settlePythonSite(group []pyHit, emit func(Binding) error) error {
+// nearest is the hits a lookup keeps of group: those read from the
+// looking-up file's source root when any is, else every hit of a
+// non-relative import.
+func nearest(group []pyHit) []pyHit {
 	near := false
 	for _, x := range group {
 		near = near || x.Near
@@ -731,11 +983,63 @@ func settlePythonSite(group []pyHit, emit func(Binding) error) error {
 			kept = append(kept, x)
 		}
 	}
+	return kept
+}
+
+// settlePython emits one site's module hits (nearest), exact, and of those
+// no class whose file supplied the class's `__init__`; an instance method
+// reached through its class takes the site's first argument as its
+// receiver. A site bound through a module alone that meets nothing, through
+// a module no member file is, is a proven external call (FactExternalSite).
+func settlePython(group []pyHit, emit func(Binding) error, call func(Binding, bool) error) error {
+	sentinel, known := false, false
+	var found []pyHit
+	for _, x := range group {
+		switch {
+		case x.Sentinel:
+			sentinel = true
+		case x.Probe:
+			known = true
+		default:
+			found = append(found, x)
+		}
+	}
+	kept := nearest(found)
 	for _, x := range kept {
 		if x.Class && !x.Init && initFrom(kept, x.Target.File) {
 			continue
 		}
-		if err := emit(Binding{Site: x.Site, Target: x.Target, Detail: DetailDirect}); err != nil {
+		b := Binding{Kind: FactCall, Site: x.Site, Target: x.Target, Detail: DetailDirect, Dispatch: model.DispatchExact}
+		if err := call(b, x.Unbound && !x.Init); err != nil {
+			return err
+		}
+	}
+	if len(kept) == 0 && sentinel && !known {
+		return emit(Binding{Kind: FactExternalSite, Site: group[0].Site, Detail: DetailDirect})
+	}
+	return nil
+}
+
+// settlePythonImport emits one import's FactImport to each file its
+// nearest hits of the best rank are in: the file declaring the name it
+// imports, else the submodule's, else the module's it imports from.
+func settlePythonImport(group []pyHit, emit func(Binding) error) error {
+	kept := nearest(group)
+	if len(kept) == 0 {
+		return nil
+	}
+	best := kept[0].Rank
+	for _, x := range kept {
+		best = min(best, x.Rank)
+	}
+	var files []int32
+	for _, x := range kept {
+		if x.Rank != best || slices.Contains(files, x.Target.File) {
+			continue
+		}
+		files = append(files, x.Target.File)
+		b := Binding{Kind: FactImport, Site: x.Site, Target: Ref{File: x.Target.File, Index: -1}, Detail: DetailImport}
+		if err := emit(b); err != nil {
 			return err
 		}
 	}
@@ -750,4 +1054,37 @@ func initFrom(hits []pyHit, file int32) bool {
 		}
 	}
 	return false
+}
+
+// pythonFlows reads the tables a second time and emits the argument flows
+// of every call fact to a declaration of the unit (emitFlows), the sites
+// asked in ascending order against calls, sorted by site.
+func pythonFlows(ctx context.Context, u *unit, h *hierarchy, calls *pagination.ExternalSort[pyCall], emit func(Binding) error) error {
+	run, err := calls.Sorted()
+	if err != nil {
+		return err
+	}
+	defer run.Close()
+	if run.Len() == 0 {
+		return nil
+	}
+	at := newSeeker(run, func(c pyCall) Ref { return c.Site })
+	defer at.stop()
+	return u.Files(ctx, func(file int32, _ model.FileVersion, tab *Table) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for i := range tab.Sites {
+			s := &tab.Sites[i]
+			if len(s.Arguments) == 0 {
+				continue
+			}
+			site := Ref{File: file, Index: int32(i)}
+			err := at.each(site, func(c pyCall) error { return emitFlows(h, site, s, c.Target, c.First, emit) })
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

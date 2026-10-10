@@ -39,15 +39,21 @@ import (
 //   - a static site binds the method its qualifier's type declares or
 //     inherits, and through a module receiver the module's export;
 //   - a member site binds, for each instance its receiver holds, the method
-//     the instance's type declares or inherits (DetailFlow) and, unless the
-//     instance is a construction's result, every override in a subtype
-//     (hierarchy.dispatch, DetailHierarchy); through a `super`
-//     receiver or a class object the method the type declares or inherits,
-//     and through a module the module's export (DetailDirect); and, only when
-//     its receiver binds nothing once the inference settles, every function
-//     written to the field it calls (DetailField);
+//     the instance's type declares or inherits (DetailFlow), never a
+//     subtype's override: its dispatch is virtual for an instance a
+//     declaration or an annotation types, which an override can stand in
+//     for (hierarchy.overridable), and exact for a construction's result;
+//     through a `super` receiver or a class object the method the type
+//     declares or inherits, and through a module the module's export
+//     (DetailDirect), each exact; and, only when its receiver holds no
+//     value and names no type at all, every function written to the field
+//     it calls (DetailField);
 //   - an indirect site binds every function its called value holds
-//     (DetailFlow, or DetailField when the value is a field's).
+//     (DetailFlow, or DetailField when the value is a field's);
+//   - a computed site (Site.Computed) binds nothing.
+//
+// Every other binding is exact: a bare name's declaration, a construction's
+// constructor, a function value.
 //
 // A module's exports are its exported declarations, the names its own
 // `export` statements give them, and what it re-exports from other modules
@@ -71,6 +77,10 @@ type types struct {
 	// by site, which functions answers from.
 	recvRun *pagination.SortedRun[recv]
 	cursor  *seeker[recv]
+	calls   *seeker[binding]
+	// externals is each type declaration's supertypes outside the project
+	// (keyExternalSuper), which externalMember reads.
+	externals *index
 }
 
 // inferTypes runs the inference over the unit's tables.
@@ -100,12 +110,23 @@ func (t *types) functions(ctx context.Context, site Ref, yield func(target Ref, 
 	})
 }
 
-// bindings yields every binding the inference found, sorted by site and
-// target, each pair once with the technique that found it first in rank.
-func (t *types) bindings(yield func(Binding) error) error {
-	return t.bindingRun.Each(func(b binding) error {
-		return yield(Binding{Site: b.Site, Target: b.Target, Detail: rankDetail[b.Rank]})
-	})
+// callsAt yields the bindings the inference found for site, each target
+// once with the technique first in rank. Sites asked in ascending order are
+// answered by one forward pass.
+func (t *types) callsAt(site Ref, yield func(binding) error) error {
+	if t.calls == nil {
+		t.calls = newSeeker(t.bindingRun, func(b binding) Ref { return b.Site })
+	}
+	return t.calls.each(site, yield)
+}
+
+// call is b as the FactCall it states.
+func (b binding) call() Binding {
+	d := model.DispatchExact
+	if b.Virtual {
+		d = model.DispatchVirtual
+	}
+	return Binding{Kind: FactCall, Site: b.Site, Target: b.Target, Detail: rankDetail[b.Rank], Dispatch: d}
 }
 
 // seek yields the receiver values recorded for site, each once.
@@ -132,7 +153,11 @@ func (t *types) close() error {
 	if t.cursor != nil {
 		t.cursor.stop()
 	}
+	if t.calls != nil {
+		t.calls.stop()
+	}
 	t.bindingRun.Close()
+	t.externals.close()
 	return t.recvRun.Close()
 }
 
@@ -227,34 +252,35 @@ type recv struct {
 const (
 	rankDirect byte = iota
 	rankFlow
-	rankHierarchy
 	rankField
 )
 
-var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankHierarchy: DetailHierarchy, rankField: DetailField}
+var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankField: DetailField}
 
 // binding is one target found for a site. Flow reports that the site's
 // arguments and result connect to the target's parameters and returns (a
 // class bound for want of a constructor does not); Shift that the site's
 // first argument is the target's receiver (a Python instance method called
-// through its class), so argument i+1 is parameter i.
+// through its class), so argument i+1 is parameter i; Virtual that an
+// override of the target can run instead (the call's dispatch).
 type binding struct {
-	Site, Target Ref
-	Rank         byte
-	Flow, Shift  bool
+	Site, Target         Ref
+	Rank                 byte
+	Flow, Shift, Virtual bool
 }
 
 // lookup asks for the method Name the type Class declares, or else inherits
 // (hierarchy.declared: the nearest along each supertype path, Python's
 // method resolution order for a Python class). Unbound reports a Python call
 // through the class object, which passes an instance method its receiver as
-// the first argument.
+// the first argument; Virtual a receiver that may be an instance of a
+// subtype of Class, whose override the call then runs.
 type lookup struct {
-	Class   Ref
-	Name    string
-	Call    call
-	Rank    byte
-	Unbound bool
+	Class            Ref
+	Name             string
+	Call             call
+	Rank             byte
+	Unbound, Virtual bool
 }
 
 // exportReq asks for the export Name of the module Base for Call.
@@ -307,10 +333,15 @@ type inference struct {
 
 	// Field-based resolution of a member site waits for the fixed point:
 	// fieldWatches are the member sites' watches of the fields they call,
-	// and fielded reports that the watches of the sites their receivers
-	// bound nothing for have been added.
+	// and fielded reports that the watches of the sites whose receivers
+	// recovered nothing have been added. receivers are the member sites
+	// whose receiver names a type or a module, or held a value, until then.
 	fieldWatches *pagination.ExternalSort[watch]
+	receivers    *pagination.ExternalSort[Ref]
 	fielded      bool
+	// externals collects each type's supertypes outside the project, which
+	// the file scan reads from the tables' supertype rows.
+	externals *pagination.ExternalSort[entry]
 
 	open []interface{ Close() error }
 }
@@ -338,6 +369,14 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		return nil, err
 	}
 	in.fieldWatches.WithFold(keepFirst[watch])
+	if in.receivers, err = newSort(in, refCodec); err != nil {
+		return nil, err
+	}
+	in.receivers.WithFold(keepFirst[Ref])
+	if in.externals, err = newEntrySort(in.u.dir); err != nil {
+		return nil, err
+	}
+	in.keep(in.externals)
 	r, err := in.newRound()
 	if err != nil {
 		return nil, err
@@ -403,20 +442,30 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 	if err != nil {
 		return nil, err
 	}
+	externals, err := writeIndex(in.u.dir, in.externals)
+	if err != nil {
+		recvs.Close()
+		return nil, err
+	}
 	// The answer's runs belong to the types the inference returns.
 	in.open = slices.DeleteFunc(in.open, func(c interface{ Close() error }) bool { return c == in.bound })
-	return &types{bindingRun: in.bound, recvRun: recvs}, nil
+	return &types{bindingRun: in.bound, recvRun: recvs, externals: externals}, nil
 }
 
-// addFieldWatches adds the field watch of every member site that has no
-// binding once the values settle, and hands each the values its field
-// already holds. Until then a member site is bound only through its
-// receiver, so a site with no binding is one whose receiver's values, if
-// any reached it, declare or inherit no method of its name: an instance
-// attribute (`self.cb = f; self.cb()`) that only the field can tell.
+// addFieldWatches adds the field watch of every member site whose receiver
+// recovered nothing once the values settle, and hands each the values its
+// field already holds. A receiver that names a type or a module, or held
+// any value, decides the call through what it recovered: a type that
+// declares or inherits no method of the name, in the project, leaves the
+// site external or open (externalMember), never bound to a function some
+// other object's field of that name holds.
 func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	in.fielded = true
 	pending, err := sorted(in, in.fieldWatches)
+	if err != nil {
+		return err
+	}
+	recovered, err := sorted(in, in.receivers)
 	if err != nil {
 		return err
 	}
@@ -424,8 +473,8 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	if err != nil {
 		return err
 	}
-	err = join(pending, in.bound, func(w watch, b binding) int { return compareRef(w.Call.Site, b.Site) }, func(w watch, bs []binding) error {
-		if len(bs) > 0 {
+	err = join(pending, recovered, func(w watch, site Ref) int { return compareRef(w.Call.Site, site) }, func(w watch, rs []Ref) error {
+		if len(rs) > 0 {
 			return nil
 		}
 		return untyped.Add(w)
@@ -590,6 +639,9 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 			return err
 		}
 	}
+	if err := f.externalSupertypes(ctx); err != nil {
+		return err
+	}
 	for _, v := range t.Values {
 		if v.Field == "" {
 			continue
@@ -608,13 +660,59 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 	return nil
 }
 
+// externalSupertypes records each supertype row of the file whose supertype
+// is outside the project (hierarchy.externalName) under every type
+// declaration the row's subtype names (keyExternalSuper).
+func (f *fileScan) externalSupertypes(ctx context.Context) error {
+	if len(f.t.Supertypes) == 0 {
+		return nil
+	}
+	fc := contextOf(f.file, f.t)
+	for _, st := range f.t.Supertypes {
+		q, ok, err := f.in.h.externalName(ctx, fc, st.Super)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		err = f.in.h.types(ctx, f.file, st.Type, func(sub Ref) error {
+			return f.in.externals.Add(entry{Key: keyExternalSuper + refKey(sub), Aux: q})
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// keyExternalSuper + refKey(type): a supertype of the type outside the
+// project, its qualified name (hierarchy.externalName) in Aux.
+const keyExternalSuper = "xs\x00"
+
+// namesType reports a receiver term that names a type or a module itself,
+// whether or not the unit declares it: what it recovered decides the call.
+func (f *fileScan) namesType(ty wire.Type) bool {
+	return slices.ContainsFunc(f.members(ty), func(m wire.Type) bool {
+		switch m.Kind {
+		case wire.TypeNamed, wire.TypeClass, wire.TypeSuper, wire.TypeModule:
+			return true
+		}
+		return false
+	})
+}
+
 // site records one site: its arguments, the bindings and values its own
-// table decides, and the watches for the values that arrive later.
+// table decides, and the watches for the values that arrive later. A
+// computed site names nothing and is recorded by none of them.
 func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.ExternalSort[watch],
 	args *pagination.ExternalSort[argRec], i int32,
 ) error {
 	t, in := f.t, f.in
 	s := &t.Sites[i]
+	if s.Computed {
+		return nil
+	}
 	ref := Ref{File: f.file, Index: i}
 	c := call{Site: ref, Callee: s.Callee}
 	for j, a := range s.Args {
@@ -690,11 +788,16 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			return route(roleReceiver)
 		}
 	case wire.ShapeMember:
+		if f.namesType(s.Receiver) {
+			if err := in.receivers.Add(ref); err != nil {
+				return err
+			}
+		}
 		if err := route(roleReceiver); err != nil {
 			return err
 		}
 		// Field-based resolution waits until the values settle, and binds
-		// only when the receiver bound nothing (addFieldWatches).
+		// only when the receiver recovered nothing (addFieldWatches).
 		return in.fieldWatches.Add(watch{V: variable{Kind: varField, Name: s.Callee}, Role: roleField, Call: c})
 	case wire.ShapeIndirect:
 		role := roleCalled
@@ -732,14 +835,18 @@ func scoped(t *Table, caller int32, candidates []int32) []int32 {
 }
 
 // members is the types ty stands for: a union's members, else ty.
-func (f *fileScan) members(ty wire.Type) []wire.Type {
+func (f *fileScan) members(ty wire.Type) []wire.Type { return typeMembers(f.t, ty) }
+
+// typeMembers is the types ty, written in t, stands for: a union's members,
+// else ty.
+func typeMembers(t *Table, ty wire.Type) []wire.Type {
 	if ty.Kind != wire.TypeUnion {
 		return []wire.Type{ty}
 	}
-	if int(ty.Index) >= len(f.t.Unions) {
+	if int(ty.Index) >= len(t.Unions) {
 		return nil
 	}
-	return f.t.Unions[ty.Index]
+	return t.Unions[ty.Index]
 }
 
 // eval evaluates ty, written in the callable caller of the scanned file (-1
@@ -858,16 +965,16 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 		return err
 	}
 	c := v.Call
+	if v.Role == roleReceiver && !in.fielded {
+		if err := in.receivers.Add(c.Site); err != nil {
+			return err
+		}
+	}
 	switch v.Role {
 	case roleReceiver:
 		switch v.X.Kind {
 		case valInstance:
-			if err := r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow}); err != nil {
-				return err
-			}
-			return in.h.dispatch(ctx, v.X.Ref, c.Callee, func(m Ref) error {
-				return r.bindings.Add(binding{Site: c.Site, Target: m, Rank: rankHierarchy, Flow: true})
-			})
+			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow, Virtual: true})
 		case valObject:
 			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow})
 		case valExact:
@@ -998,18 +1105,47 @@ func importVar(base, name string) variable {
 }
 
 // resolveLookups answers each lookup by the method its type declares or
-// inherits (hierarchy.declared).
+// inherits (hierarchy.declared), virtual when the lookup's receiver may be a
+// subtype's instance and the language lets an override of what it found run
+// (hierarchy.overridable).
 func (in *inference) resolveLookups(r *round) error {
 	ls, err := sorted(in, r.lookups)
 	if err != nil {
 		return err
 	}
+	var found []entry
 	return ls.Each(func(l lookup) error {
-		return in.h.declared(l.Class, l.Name, func(e entry) error {
-			b := binding{Site: l.Call.Site, Target: e.Ref, Rank: l.Rank, Flow: true, Shift: l.Unbound && e.Flags&flagStatic == 0}
-			return r.bindings.Add(b)
-		})
+		found = found[:0]
+		if err := in.h.declared(l.Class, l.Name, func(e entry) error {
+			found = append(found, e)
+			return nil
+		}); err != nil {
+			return err
+		}
+		virtual := false
+		if l.Virtual && len(found) > 0 {
+			var err error
+			if virtual, err = in.h.overridable(in.family(), l.Class, l.Name, found); err != nil {
+				return err
+			}
+		}
+		for _, e := range found {
+			b := binding{Site: l.Call.Site, Target: e.Ref, Rank: l.Rank, Flow: true,
+				Shift: l.Unbound && e.Flags&flagStatic == 0, Virtual: virtual}
+			if err := r.bindings.Add(b); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+// family is the unit's language family as the hierarchy names it.
+func (in *inference) family() string {
+	if in.python {
+		return "python"
+	}
+	return "js"
 }
 
 // mergeBindings folds the round's bindings into every earlier one and
@@ -1184,6 +1320,111 @@ func (in *inference) propagate(r *round) (*pagination.SortedRun[fact], error) {
 	return d, nil
 }
 
+// ---- the facts beyond a binding ----
+
+// externalMember emits the external fact of member site, whose receiver
+// holds an instance or the class object of typ, a type of the unit, when typ
+// neither declares nor inherits method in the project (outsideCall). It
+// reports whether it emitted.
+func (t *types) externalMember(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
+	declares := false
+	if err := h.declared(typ, method, func(entry) error { declares = true; return nil }); err != nil || declares {
+		return false, err
+	}
+	return t.outsideCall(h, family, site, typ, method, emit)
+}
+
+// outsideCall emits the external fact of a call at site of method, which
+// the project's part of typ's supertype closure does not declare: with
+// exactly one supertype outside the project in the closure, a virtual
+// FactCall to that type's method of the name (externalMethod); with
+// several, a FactExternalSite, since which of them declares it is unknown.
+// A type with no supertype outside the project emits nothing. It reports
+// whether it emitted.
+func (t *types) outsideCall(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
+	var outside []string
+	seen := map[Ref]bool{typ: true}
+	queue := []Ref{typ}
+	for len(queue) > 0 {
+		x := queue[0]
+		queue = queue[1:]
+		err := t.externals.lookup(keyExternalSuper+refKey(x), func(e entry) error {
+			if !slices.Contains(outside, e.Aux) {
+				outside = append(outside, e.Aux)
+			}
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		err = h.links.lookup(keySuper+refKey(x), func(e entry) error {
+			if !seen[e.Ref] {
+				seen[e.Ref] = true
+				queue = append(queue, e.Ref)
+			}
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+	}
+	switch len(outside) {
+	case 0:
+		return false, nil
+	case 1:
+		return true, emit(Binding{Kind: FactCall, Site: site, Detail: DetailHierarchy, Dispatch: model.DispatchVirtual,
+			External: externalMethod(family, outside[0], method)})
+	}
+	return true, emit(Binding{Kind: FactExternalSite, Site: site, Detail: DetailHierarchy})
+}
+
+// externalReceiver emits the virtual FactCall of member site s, at site in
+// the file of fc, to the external method of each type its receiver names
+// that is outside the project (hierarchy.externalName). It reports whether
+// it emitted.
+func externalReceiver(ctx context.Context, h *hierarchy, fc fileCtx, site Ref, s *Site, members []wire.Type, emit func(Binding) error) (bool, error) {
+	emitted := false
+	for _, m := range members {
+		if m.Kind != wire.TypeNamed {
+			continue
+		}
+		q, ok, err := h.externalName(ctx, fc, m.Name)
+		if err != nil {
+			return emitted, err
+		}
+		if !ok {
+			continue
+		}
+		emitted = true
+		err = emit(Binding{Kind: FactCall, Site: site, Detail: DetailDirect, Dispatch: model.DispatchVirtual,
+			External: externalMethod(fc.family, q, s.Callee)})
+		if err != nil {
+			return emitted, err
+		}
+	}
+	return emitted, nil
+}
+
+// emitFlows emits a FactFlow for each argument of call site s, at site, and
+// the parameter of target it binds (argumentFlows over the target's
+// declared parameters, hierarchy.parameters); receiverFirst says the site
+// passes the target's receiver as its first argument.
+func emitFlows(h *hierarchy, site Ref, s *Site, target Ref, receiverFirst bool, emit func(Binding) error) error {
+	if len(s.Arguments) == 0 {
+		return nil
+	}
+	var params []paramInfo
+	if err := h.parameters(target, func(p paramInfo) error { params = append(params, p); return nil }); err != nil {
+		return err
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return argumentFlows(s, params, receiverFirst, func(arg, pos int32) error {
+		return emit(Binding{Kind: FactFlow, Site: site, Target: target, Detail: DetailArgument, Arg: arg, Param: pos})
+	})
+}
+
 // ---- language rules ----
 
 // ecmaScriptExtensions are the extensions an ECMAScript import may leave
@@ -1339,12 +1580,16 @@ func addAll[T any](s *pagination.ExternalSort[T], run *pagination.SortedRun[T]) 
 
 func keepFirst[T any](a, _ T) (T, error) { return a, nil }
 
-// bestBinding keeps the technique first in rank for one site and target.
+// bestBinding folds two bindings of one site and target: the technique
+// first in rank, and every connection and dispatch either found, so the
+// fold does not depend on the order the rounds found them in.
 func bestBinding(a, b binding) (binding, error) {
+	out := a
 	if b.Rank < a.Rank {
-		return b, nil
+		out = b
 	}
-	return a, nil
+	out.Flow, out.Shift, out.Virtual = a.Flow || b.Flow, a.Shift || b.Shift, a.Virtual || b.Virtual
+	return out, nil
 }
 
 // join is an ordered merge of a and b, both sorted by the key order
@@ -1597,9 +1842,10 @@ var bindingCodec = codec[binding]{
 		w.u8(b.Rank)
 		w.flag(b.Flow)
 		w.flag(b.Shift)
+		w.flag(b.Virtual)
 	},
 	get: func(r *rbuf) binding {
-		return binding{Site: r.ref(), Target: r.ref(), Rank: r.u8(), Flow: r.flag(), Shift: r.flag()}
+		return binding{Site: r.ref(), Target: r.ref(), Rank: r.u8(), Flow: r.flag(), Shift: r.flag(), Virtual: r.flag()}
 	},
 	cmp: func(a, b binding) int { return cmp.Or(compareRef(a.Site, b.Site), compareRef(a.Target, b.Target)) },
 }
@@ -1611,14 +1857,21 @@ var lookupCodec = codec[lookup]{
 		w.call(l.Call)
 		w.u8(l.Rank)
 		w.flag(l.Unbound)
+		w.flag(l.Virtual)
 	},
 	get: func(r *rbuf) lookup {
-		return lookup{Class: r.ref(), Name: r.str(), Call: r.call(), Rank: r.u8(), Unbound: r.flag()}
+		return lookup{Class: r.ref(), Name: r.str(), Call: r.call(), Rank: r.u8(), Unbound: r.flag(), Virtual: r.flag()}
 	},
 	cmp: func(a, b lookup) int {
 		return cmp.Or(compareRef(a.Class, b.Class), cmp.Compare(a.Name, b.Name), cmpCall(a.Call, b.Call),
-			cmp.Compare(a.Rank, b.Rank), cmpBool(a.Unbound, b.Unbound))
+			cmp.Compare(a.Rank, b.Rank), cmpBool(a.Unbound, b.Unbound), cmpBool(a.Virtual, b.Virtual))
 	},
+}
+
+var refCodec = codec[Ref]{
+	put: func(w *wbuf, x Ref) { w.ref(x) },
+	get: func(r *rbuf) Ref { return r.ref() },
+	cmp: compareRef,
 }
 
 var exportReqCodec = codec[exportReq]{
