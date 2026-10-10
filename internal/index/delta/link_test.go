@@ -231,3 +231,68 @@ func (f *fixture) attach(gen model.GenerationID, unit model.UnitID) {
 		f.t.Fatalf("AttachUnit: %v", err)
 	}
 }
+
+// TestFlowBodyEditRerunsNoOtherFile refreshes a JavaScript and a Python
+// unit after an edit that adds a call inside leaf's helper, which changes
+// leaf's sites and no interface entry and sends no value across its
+// boundary (helper is called with no argument and returns a constant), and
+// compares each refresh with a full build of the same tree (session.check).
+// The refresh re-derives leaf alone: the JavaScript refresh reads no other
+// file's table, and the Python refresh reads each other file's table once,
+// for the module index its import lookups meet, and resolves none of their
+// sites.
+//
+// Mutation: re-resolve the unit after any moved table -> the JavaScript
+// refresh reads main.js and pets.js, and the Python refresh reads main.py
+// and pets.py again for the inference's scan and the second pass of its
+// sites.
+func TestFlowBodyEditRerunsNoOtherFile(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		files        map[string]string
+		leaf, before string
+		after        string
+		others       []string
+		maxReads     int
+	}{
+		{
+			name: "javascript",
+			files: map[string]string{
+				"package.json": "{\n  \"name\": \"app\",\n  \"type\": \"module\"\n}\n",
+				"leaf.js":      "export function other() {\n  return 2;\n}\n\nexport function helper() {\n  return 1;\n}\n",
+				"pets.js":      "export class Dog {\n  speak() {\n    return \"woof\";\n  }\n}\n",
+				"main.js": "import { helper } from \"./leaf\";\nimport { Dog } from \"./pets\";\n\n" +
+					"export function main() {\n  helper();\n  new Dog().speak();\n}\n",
+			},
+			leaf: "leaf.js", before: "  return 1;\n", after: "  other();\n  return 1;\n",
+			others: []string{"main.js", "pets.js"}, maxReads: 0,
+		},
+		{
+			name: "python",
+			files: map[string]string{
+				"leaf.py": "def other():\n    return 2\n\n\ndef helper():\n    return 1\n",
+				"pets.py": "class Dog:\n    def speak(self):\n        return \"woof\"\n",
+				"main.py": "from leaf import helper\nfrom pets import Dog\n\n\ndef main():\n    helper()\n    Dog().speak()\n",
+			},
+			leaf: "leaf.py", before: "    return 1\n", after: "    other()\n    return 1\n",
+			others: []string{"main.py", "pets.py"}, maxReads: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := newSession(t)
+			files := c.files
+			s.check("base", s.advance(files))
+			files = edit{name: "body adding a call", replace: []sub{{c.leaf, c.before, c.after}}}.apply(t, files)
+			b := s.only(s.advance(files))
+			s.check("body adding a call", []linkBuild{b})
+			for _, p := range c.others {
+				if n := b.reads[p]; n > c.maxReads {
+					t.Errorf("the refresh read %s's table %d times, want at most %d: no value it reads moved", p, n, c.maxReads)
+				}
+			}
+			if b.reads[c.leaf] == 0 {
+				t.Errorf("the refresh never read %s's table, whose sites moved", c.leaf)
+			}
+		})
+	}
+}

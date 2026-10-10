@@ -15,7 +15,8 @@
 // (LinkOptions.Previous) keeps the predecessor's bindings unless a member's
 // table digest, the membership or a manifest field the linker reads moved;
 // then a static-family unit re-runs only the members whose recorded reads
-// changed (trace.go), and a flow-family unit resolves in full. It
+// changed (trace.go), and a flow-family unit re-derives only the members its
+// moved boundary values reach (refresh.go). It
 // republishes only the members whose facts changed (refresh.go), and the
 // build carries the rest over (docs/providers-link.md).
 //
@@ -35,7 +36,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"sync"
 
 	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -287,69 +287,14 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 
 // resolve is the unit's resolution by its family's: the static family's
 // re-runs only the members whose reads changed (resolveStatic); the flow
-// family's inference is a least fixed point over the whole unit, which a
-// removal cannot re-seed soundly without the provenance of every value, so
-// it resolves every site, and the refresh's fact diff keeps the
-// republication to the files whose facts changed.
-//
-// The flow family's path is three steps, each with one hand-off: the
-// resolver emits positional facts (canonical, folded by compareBinding into
-// one sorted run), identify names that run by identity, and the result is
-// the resolution's facts, with no groups, reads or address-taken functions.
-// A resolution that keeps part of its predecessor's facts replaces the first
-// step and hands identify the same sorted run.
+// family's re-derives only the region of members its boundary values reach
+// (resolveFlow).
 func resolve(ctx context.Context, u *unit, rf *refresh, fields []manifestField) (*resolution, error) {
 	switch u.family {
 	case FamilyJavaScript, FamilyPython:
-	default:
-		return resolveStatic(ctx, u, rf, fields)
+		return resolveFlow(ctx, u, rf)
 	}
-	sorted, err := newBindingSort(u.dir, compareBinding)
-	if err != nil {
-		return nil, err
-	}
-	defer sorted.Close()
-	sorted.WithFold(keepOne)
-	// A resolver may emit from any goroutine; the sort has one producer.
-	var mu sync.Mutex
-	emit := func(b Binding) error {
-		b, err := canonical(b)
-		if err != nil {
-			return err
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		return sorted.Add(b)
-	}
-	if err := resolverFor(u.family)(ctx, u, emit); err != nil {
-		return nil, err
-	}
-	run, err := sorted.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer run.Close()
-	res := &resolution{}
-	ok := false
-	defer func() {
-		if !ok {
-			res.close()
-		}
-	}()
-	if res.bindings, err = identify(ctx, u, run); err != nil {
-		return nil, err
-	}
-	if res.groups, err = emptyOf(newGroupSort(u.dir)); err != nil {
-		return nil, err
-	}
-	if res.reads, err = emptyOf(newReadSort(u.dir, compareRead)); err != nil {
-		return nil, err
-	}
-	if res.taken, err = emptyOf(newTakenSort(u.dir, compareTakenFrom)); err != nil {
-		return nil, err
-	}
-	ok = true
-	return res, nil
+	return resolveStatic(ctx, u, rf, fields)
 }
 
 // emptyOf is the empty run of a sort just opened.

@@ -34,9 +34,14 @@ import (
 //   - the index groups, by key (group), the recorded reads, by key (read),
 //     and the address-taken functions, by the member taking them (taken),
 //     each record a string of its encoded form: what a refresh of a
-//     static-family unit finds its re-runs from (trace.go), empty for a
-//     family whose resolution records no reads;
-//   - a byte, 1 when the static family's hierarchy follows (its module path
+//     static-family unit finds its re-runs from (trace.go), empty for the
+//     flow family;
+//   - the boundary contributions, by entry, value and contributing member
+//     (contribution), and the boundary entries read, by entry and reading
+//     member (flowRead), each a string of its encoded form: what a refresh
+//     of a flow-family unit finds its region from (refresh.go), empty for
+//     the static family;
+//   - a byte, 1 when the unit's hierarchy follows (its module path
 //     and root, its two indexes and its identity table, as they are on
 //     disk), else 0.
 //
@@ -45,7 +50,7 @@ import (
 
 // stateTag opens every stored resolution state, so a state of any other form
 // is refused before anything of it is read.
-const stateTag = "link.resolution.facts\n"
+const stateTag = "link.resolution.boundary\n"
 
 // details is every technique a fact can carry, in its stored order, which is
 // also the order of preference a fold of two equal facts keeps (better); the
@@ -171,64 +176,6 @@ func canonical(b Binding) (Binding, error) {
 	return b, nil
 }
 
-// compareBinding orders positional facts by file, entry table, entry, kind,
-// argument, target and external target: the key one fact has, which a fold
-// collapses (keepOne).
-func compareBinding(a, b Binding) int {
-	return cmp.Or(cmp.Compare(a.Site.File, b.Site.File), cmp.Compare(a.Kind.entry(), b.Kind.entry()),
-		cmp.Compare(a.Site.Index, b.Site.Index), cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Arg, b.Arg),
-		compareRef(a.Target, b.Target), cmp.Compare(a.Param, b.Param), cmp.Compare(a.External, b.External))
-}
-
-// compareTargetSite orders positional facts by target, then as
-// compareBinding.
-func compareTargetSite(a, b Binding) int {
-	return cmp.Or(compareRef(a.Target, b.Target), cmp.Compare(a.Param, b.Param), compareBinding(a, b))
-}
-
-// encodeBinding is a positional fact's record in a sorted run: its kind, its
-// entry, target, argument and parameter indices, its technique, dispatch and
-// reason bytes and its external key. A module target's index (-1) is stored
-// one up.
-func encodeBinding(b Binding) ([]byte, error) {
-	code, ok := detailCode(b.Detail)
-	dispatch, dok := codeOf(dispatches[:], b.Dispatch)
-	reason, rok := codeOf(reasons[:], b.Reason)
-	if !ok || !dok || !rok || b.Site.File < 0 || b.Site.Index < 0 || b.Target.File < 0 || b.Target.Index < -1 ||
-		b.Arg < 0 || b.Param < 0 {
-		return nil, internalErr("a fact on its way to identity is malformed")
-	}
-	out := []byte{byte(b.Kind)}
-	for _, v := range [...]int64{int64(b.Site.File), int64(b.Site.Index), int64(b.Target.File), int64(b.Target.Index) + 1,
-		int64(b.Arg), int64(b.Param)} {
-		out = binary.AppendUvarint(out, uint64(v))
-	}
-	out = append(out, code, dispatch, reason)
-	return appendString(out, b.External), nil
-}
-
-// decodeBinding reads one record encodeBinding wrote.
-func decodeBinding(raw []byte) (Binding, error) {
-	r := byteReader{b: raw}
-	b := Binding{Kind: Fact(r.byte())}
-	b.Site = Ref{File: r.index(), Index: r.index()}
-	b.Target = Ref{File: r.index(), Index: r.index() - 1}
-	b.Arg, b.Param = r.index(), r.index()
-	code, dispatch, reason := r.byte(), r.byte(), r.byte()
-	b.External = r.str()
-	if r.err != nil || len(r.b) != 0 || b.Kind > FactOverrides || int(code) >= len(details) ||
-		int(dispatch) >= len(dispatches) || int(reason) >= len(reasons) {
-		return Binding{}, errors.New("a fact on its way to identity is malformed")
-	}
-	b.Detail, b.Dispatch, b.Reason = details[code], dispatches[dispatch], reasons[reason]
-	return b, nil
-}
-
-// newBindingSort opens a sort of positional facts in dir by order.
-func newBindingSort(dir string, order func(a, b Binding) int) (*pagination.ExternalSort[Binding], error) {
-	return pagination.NewExternalSort(dir, 0, encodeBinding, decodeBinding, order)
-}
-
 // better reports whether technique a sorts before b in details, the one a
 // fold of two equal facts keeps, so the published technique does not depend
 // on the order a resolver emitted its repeats in.
@@ -256,17 +203,6 @@ func foldReason(a, b model.OpenSiteReason) model.OpenSiteReason {
 		return b
 	}
 	return a
-}
-
-// keepOne folds two positional emissions of one fact into one: the better
-// technique, the folded dispatch and reason.
-func keepOne(a, b Binding) (Binding, error) {
-	out := a
-	if better(b.Detail, a.Detail) {
-		out = b
-	}
-	out.Dispatch, out.Reason = foldDispatch(a.Dispatch, b.Dispatch), foldReason(a.Reason, b.Reason)
-	return out, nil
 }
 
 // idBinding is a fact named by identity: its entry by its file and its index
@@ -308,7 +244,8 @@ func compareTarget(a, b target) int {
 	return cmp.Or(cmp.Compare(a.File, b.File), cmp.Compare(a.Node, b.Node))
 }
 
-// keepOneID folds two facts of one key into one, as keepOne.
+// keepOneID folds two facts of one key into one: the better technique, the
+// folded dispatch and reason.
 func keepOneID(a, b idBinding) (idBinding, error) {
 	out := a
 	if better(b.Detail, a.Detail) {
@@ -585,6 +522,12 @@ func writeState(w io.Writer, fields []manifestField, records *pagination.SortedR
 		err = writeSection(bw, res.taken, encodeTaken)
 	}
 	if err == nil {
+		err = writeSection(bw, res.contributions, encodeWith(contributionCodec))
+	}
+	if err == nil {
+		err = writeSection(bw, res.flowReads, encodeWith(flowReadCodec))
+	}
+	if err == nil {
 		if res.h == nil {
 			err = bw.WriteByte(0)
 		} else if err = bw.WriteByte(1); err == nil {
@@ -731,6 +674,14 @@ func readState(r io.Reader, sink stateSink) error {
 	if err := readSection(s, "address-taken functions", decodeTaken, compareTakenFrom, true, sink.taken); err != nil {
 		return err
 	}
+	if err := readSection(s, "boundary contributions", decodeWith(contributionCodec, "a boundary contribution"),
+		contributionCodec.cmp, true, sink.contribution); err != nil {
+		return err
+	}
+	if err := readSection(s, "boundary reads", decodeWith(flowReadCodec, "a boundary read"), flowReadCodec.cmp, true,
+		sink.flowRead); err != nil {
+		return err
+	}
 	switch has, err := s.byte("its hierarchy mark"); {
 	case err != nil:
 		return err
@@ -755,6 +706,10 @@ type stateSink struct {
 	group   func(group) error
 	read    func(read) error
 	taken   func(taken) error
+	// contribution and flowRead receive the flow family's boundary
+	// contributions and reads (refresh.go).
+	contribution func(contribution) error
+	flowRead     func(flowRead) error
 	// hierarchy reads the stored hierarchy from the stream, when there is
 	// one.
 	hierarchy func(stateReader) error
@@ -765,13 +720,15 @@ type stateSink struct {
 // state it would refuse once it had begun publishing.
 func ValidateState(r io.Reader) error {
 	return readState(r, stateSink{
-		field:     func(manifestField) error { return nil },
-		record:    func(record) error { return nil },
-		binding:   func(idBinding) error { return nil },
-		group:     func(group) error { return nil },
-		read:      func(read) error { return nil },
-		taken:     func(taken) error { return nil },
-		hierarchy: skipHierarchy,
+		field:        func(manifestField) error { return nil },
+		record:       func(record) error { return nil },
+		binding:      func(idBinding) error { return nil },
+		group:        func(group) error { return nil },
+		read:         func(read) error { return nil },
+		taken:        func(taken) error { return nil },
+		contribution: func(contribution) error { return nil },
+		flowRead:     func(flowRead) error { return nil },
+		hierarchy:    skipHierarchy,
 	})
 }
 
@@ -811,6 +768,16 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 		return nil, err
 	}
 	defer takenSort.Close()
+	contributions, err := newSort0(dir, contributionCodec, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer contributions.Close()
+	flowReads, err := newSort0(dir, flowReadCodec, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer flowReads.Close()
 	p := &previous{}
 	defer func() {
 		if p.records == nil && p.h != nil {
@@ -823,6 +790,7 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 			return nil
 		},
 		record: records.Add, binding: bindings.Add, group: groups.Add, read: reads.Add, taken: takenSort.Add,
+		contribution: contributions.Add, flowRead: flowReads.Add,
 		hierarchy: func(s stateReader) error {
 			var err error
 			p.h, err = readHierarchy(dir, s)
@@ -851,6 +819,12 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 		return nil, err
 	}
 	if p.taken, err = takenSort.Sorted(); err != nil {
+		return nil, err
+	}
+	if p.contributions, err = contributions.Sorted(); err != nil {
+		return nil, err
+	}
+	if p.flowReads, err = flowReads.Sorted(); err != nil {
 		return nil, err
 	}
 	ok = true

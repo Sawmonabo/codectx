@@ -8,32 +8,53 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// resolveECMAScript resolves the sites of a JavaScript, TypeScript or TSX
+// resolveECMAScript resolves every site of a JavaScript, TypeScript or TSX
 // unit: direct binding through imports and scopes, flow-based type inference
-// (inferTypes) and field-based resolution. The inference binds every site as
-// part of its fixed point, since a site's targets decide what flows into
-// their parameters; one pass over the tables then emits, per member, what
-// the fixed point bound with each bound site's argument flows, the external
-// facts of the sites that reach outside the project, the hierarchy facts of
-// its declarations (hierarchy.hierarchyFacts), and what its imports resolve
-// to.
+// (inferTypes) and field-based resolution, over the unit's own hierarchy
+// (emitECMAScript).
 func resolveECMAScript(ctx context.Context, u *unit, emit func(Binding) error) error {
 	h, err := buildHierarchy(ctx, u)
 	if err != nil {
 		return err
 	}
 	defer h.close()
-	t, err := inferTypes(ctx, u, h)
+	t, err := inferTypes(ctx, u, h, nil, nil)
 	if err != nil {
 		return err
 	}
 	defer t.close()
+	return emitECMAScript(ctx, u, h, t, nil, emit)
+}
+
+// emitECMAScript emits the facts of the members only names (every member
+// when nil), whose sites the inference t bound as part of its fixed point,
+// since a site's targets decide what flows into their parameters: one pass
+// over their tables emits, per member, what the fixed point bound with each
+// bound site's argument flows, the external facts of the sites that reach
+// outside the project, the hierarchy facts of its declarations
+// (hierarchy.hierarchyFacts), and what its imports resolve to. An import
+// resolves against every member's module paths, which the hierarchy's file
+// contexts give without reading another member's table.
+func emitECMAScript(ctx context.Context, u *unit, h *hierarchy, t *types, only *pagination.SortedRun[int32],
+	emit func(Binding) error) error {
 	modules, err := newEntrySort(u.dir)
 	if err != nil {
 		return err
 	}
 	defer modules.Close()
-	err = u.Files(ctx, func(file int32, _ model.FileVersion, tab *Table) error {
+	var member int32 = -1
+	err = u.members(func(model.FileVersion) error {
+		member++
+		fc, found, err := h.fileContext(member)
+		if err != nil || !found {
+			return err
+		}
+		return addECMAScriptModule(member, fc.path, modules)
+	})
+	if err != nil {
+		return err
+	}
+	err = u.filesOf(ctx, only, func(file int32, _ model.FileVersion, tab *Table) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -144,18 +165,24 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 	return nil
 }
 
-// addECMAScriptImports adds the module records of the member at ordinal
-// file, whose table is tab, to modules: the file under each module path an
-// import may name it by (moduleBases, Tag 0), and each of its imports whose
-// specifier a member file can be under the module path it names
-// (moduleBase, Tag 1, Ref.Index the import's index in tab.Imports). A
-// package specifier names no member file and adds nothing.
-func addECMAScriptImports(file int32, tab *Table, modules *pagination.ExternalSort[entry]) error {
-	for _, base := range moduleBases(tab.Path, false) {
+// addECMAScriptModule adds the module records of the member at ordinal
+// file, whose path is p, to modules: the file under each module path an
+// import may name it by (moduleBases, Tag 0).
+func addECMAScriptModule(file int32, p string, modules *pagination.ExternalSort[entry]) error {
+	for _, base := range moduleBases(p, false) {
 		if err := modules.Add(entry{Key: base, Ref: Ref{File: file, Index: -1}}); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// addECMAScriptImports adds the import records of the member at ordinal
+// file, whose table is tab, to modules: each of its imports whose specifier
+// a member file can be under the module path it names (moduleBase, Tag 1,
+// Ref.Index the import's index in tab.Imports). A package specifier names
+// no member file and adds nothing.
+func addECMAScriptImports(file int32, tab *Table, modules *pagination.ExternalSort[entry]) error {
 	for i, imp := range tab.Imports {
 		base, ok := moduleBase(tab.Path, imp.Path, false)
 		if !ok {

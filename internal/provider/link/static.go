@@ -206,17 +206,20 @@ func decodeSigUse(raw []byte) (sigUse, error) {
 }
 
 // resolution is what one build's resolution leaves: the bindings by site;
-// and, for the static family, the index groups by key, the recorded reads by
-// key, the address-taken functions by the member taking them, and the
-// hierarchy, which a later build of the same layout reads instead of reading
-// every table. A family that records no reads has the three runs empty and
-// no hierarchy.
+// for the static family, the index groups by key, the recorded reads by
+// key and the address-taken functions by the member taking them, empty for
+// the flow family; for the flow family, the boundary contributions and the
+// boundary entries read, by entry (refresh.go), empty for the static
+// family; and the hierarchy, which a later build of the same layout reads
+// instead of reading every table.
 type resolution struct {
-	bindings *pagination.SortedRun[idBinding]
-	groups   *pagination.SortedRun[group]
-	reads    *pagination.SortedRun[read]
-	taken    *pagination.SortedRun[taken]
-	h        *hierarchy
+	bindings      *pagination.SortedRun[idBinding]
+	groups        *pagination.SortedRun[group]
+	reads         *pagination.SortedRun[read]
+	taken         *pagination.SortedRun[taken]
+	contributions *pagination.SortedRun[contribution]
+	flowReads     *pagination.SortedRun[flowRead]
+	h             *hierarchy
 }
 
 // close releases r. A run or hierarchy r shares with the predecessor's
@@ -227,6 +230,8 @@ func (r *resolution) close() {
 		r.groups.Close()
 		r.reads.Close()
 		r.taken.Close()
+		r.contributions.Close()
+		r.flowReads.Close()
 		if r.h != nil {
 			_ = r.h.close()
 		}
