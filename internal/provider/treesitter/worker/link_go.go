@@ -38,7 +38,7 @@ func newGoLinker() *goLinker { return &goLinker{} }
 func (k *goLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byte) {}
 
 func (k *goLinker) file(root Node, src []byte, out *wire.Link) {
-	x := &goLink{k: goLinkSyntaxOf(), src: src, out: out,
+	x := &goLink{k: goLinkSyntaxOf(), src: src, out: out, reads: k.reads(),
 		sites: map[uint32]uint32{}, imports: map[string]bool{}, funcs: map[string]goVar{},
 		types: map[string]map[string]goVar{}, consts: map[string]bool{},
 		tops: map[string]*goTop{}, index: map[string]int32{}}
@@ -81,6 +81,9 @@ type goLink struct {
 	k   *goLinkSyntax
 	src []byte
 	out *wire.Link
+	// reads resolves an identifier inside an argument to the variable it
+	// reads (readIndex).
+	reads *readIndex
 	// sites numbers each call site by its callee token's first byte, in
 	// the preorder both walks share.
 	sites map[uint32]uint32
@@ -1002,9 +1005,50 @@ func (x *goLink) site(call Node) {
 		}
 	}
 	if args := goChild(call, k.fArguments); !args.IsNull() {
-		goNamed(args, func(a Node) { s.Args = append(s.Args, goCopiedType(x.exprType(a))) })
+		goNamed(args, func(a Node) {
+			s.Args = append(s.Args, goCopiedType(x.exprType(a)))
+			s.Arguments = append(s.Arguments, x.argument(a))
+		})
 	}
 	x.out.Sites = append(x.out.Sites, s)
+}
+
+// argument is where one argument of a call is and the variables it reads:
+// a variadic argument `xs...` spreads the expression before its marker into
+// the remaining parameters.
+func (x *goLink) argument(a Node) wire.Argument {
+	var arg wire.Argument
+	if a.KindId() == x.k.variadicArgument {
+		arg.Spread = wire.SpreadPositional
+		a = firstNamed(a)
+	}
+	arg.At = goSpan(a)
+	arg.Reads = x.reads.argReads(a, x.readName, x.readSkip, nil)
+	return arg
+}
+
+// readName reports an identifier an argument reads as a value: any
+// identifier but the key of a keyed element that is a bare name, which in
+// `T{f: v}` names a struct field (the grammar cannot tell a map's variable
+// key from it, and the struct field is the form a bare name keys).
+func (x *goLink) readName(n Node) bool {
+	k := x.k
+	if n.KindId() != k.identifier {
+		return false
+	}
+	el := n.Parent()
+	if el.IsNull() || el.KindId() != k.literalElement {
+		return true
+	}
+	kv := el.Parent()
+	return kv.IsNull() || kv.KindId() != k.keyedElement || goChild(kv, k.fKey) != el
+}
+
+// readSkip reports a subtree whose identifiers an argument does not read: a
+// call's result, a conversion's included, and a function literal, whose
+// body runs when it is called.
+func (x *goLink) readSkip(n Node) bool {
+	return n.KindId() == x.k.callExpression || n.KindId() == x.k.funcLiteral
 }
 
 // passed sends the values a call's arguments pass, whatever its callee; the
@@ -1176,7 +1220,7 @@ type goLinkSyntax struct {
 	fieldDeclarationList, fieldDeclaration, typeSpec, varSpec, constSpec, importSpec, shortVarDeclaration,
 	assignmentStatement, returnStatement, sendStatement, rangeClause, receiveStatement, ifStatement,
 	forStatement, expressionSwitchStatement, typeSwitchStatement, selectStatement, expressionCase, typeCase,
-	defaultCase, communicationCase uint16
+	defaultCase, communicationCase, variadicArgument uint16
 
 	amp, star, define uint16
 
@@ -1215,6 +1259,7 @@ func goLinkSyntaxOf() *goLinkSyntax {
 		s.compositeLiteral, s.typeAssertionExpression = kind("composite_literal"), kind("type_assertion_expression")
 		s.literalValue, s.keyedElement, s.literalElement = kind("literal_value"), kind("keyed_element"), kind("literal_element")
 		s.funcLiteral, s.functionDeclaration, s.methodDeclaration = kind("func_literal"), kind("function_declaration"), kind("method_declaration")
+		s.variadicArgument = kind("variadic_argument")
 		s.methodElem, s.parameterList, s.parameterDeclaration = kind("method_elem"), kind("parameter_list"), kind("parameter_declaration")
 		s.variadicParameterDeclaration, s.functionType = kind("variadic_parameter_declaration"), kind("function_type")
 		s.pointerType, s.genericType, s.qualifiedType = kind("pointer_type"), kind("generic_type"), kind("qualified_type")
