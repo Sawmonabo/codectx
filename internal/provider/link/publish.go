@@ -594,7 +594,7 @@ func (f *filePublication) openSite(s *Site, caller Endpoint, reason model.OpenSi
 	if err != nil {
 		return internalErr("open site metadata: " + err.Error())
 	}
-	n, err := f.located(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path, NativeKey: native,
+	n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path, NativeKey: native,
 		Kind: kind, Language: f.t.Language, Name: nodeName(s.Callee, "call")}, s.Range, meta)
 	if err != nil {
 		return err
@@ -643,7 +643,7 @@ func (f *filePublication) dynamicImports() error {
 		if err != nil {
 			return err
 		}
-		n, err := f.located(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path,
+		n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path,
 			NativeKey: fitKey("openimport:" + path + ":" + byteSpan(d.Range)), Kind: model.NodeModule,
 			Language: f.t.Language, Name: "import"}, d.Range, meta)
 		if err != nil {
@@ -656,9 +656,9 @@ func (f *filePublication) dynamicImports() error {
 }
 
 // openImportMetadata is an open import site's metadata with fragments, the
-// path's literal parts in source order: every one, from the first, while the
-// node's metadata bound holds them and each is within a path's bound, and an
-// empty list, never a missing one, when none is.
+// path's literal parts in source order: every non-empty one, from the first,
+// while the node's metadata bound holds them and each is within a path's
+// bound, and an empty list, never a missing one, when none is.
 func openImportMetadata(fragments []string) ([]byte, error) {
 	m := model.OpenImportSiteMetadata{Resolution: model.ResolutionUnresolved, Reason: model.ReasonComputed,
 		Fragments: []string{}}
@@ -667,7 +667,10 @@ func openImportMetadata(fragments []string) ([]byte, error) {
 		return nil, internalErr("open import site metadata: " + err.Error())
 	}
 	for _, frag := range fragments {
-		if frag == "" || len(frag) > model.MaxPathBytes {
+		if frag == "" {
+			continue
+		}
+		if len(frag) > model.MaxPathBytes {
 			break
 		}
 		m.Fragments = append(m.Fragments, frag)
@@ -709,13 +712,13 @@ func (f *filePublication) hierarchy(d *Decl, group []idBinding) error {
 	return nil
 }
 
-// located mints c as a node of this file located at r, with metadata meta,
+// mint mints c as a node of this file located at r, with metadata meta,
 // publishes it once and returns its identity. It is keyed by its scope and
 // native key alone, so its identity is the site's and not its bytes'; it is
 // located in the file, so its fact shares the file's retention bucket: a
 // delta that republishes the file replaces it, and one that carries the file
 // carries it.
-func (f *filePublication) located(c model.NodeCandidate, r model.SourceRange, meta []byte) (model.NodeID, error) {
+func (f *filePublication) mint(c model.NodeCandidate, r model.SourceRange, meta []byte) (model.NodeID, error) {
 	res, err := f.p.req.Resolver.Resolve(f.p.ctx, c)
 	if err != nil {
 		return "", err
