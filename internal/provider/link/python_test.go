@@ -359,3 +359,57 @@ func TestResolvePythonGoldens(t *testing.T) {
 		})
 	}
 }
+
+// TestResolvePythonImports resolves each import of the case to the member
+// files it imports, derived twice from the source under the language
+// reference, the second time blind.
+//
+//	a/b/__init__.py: (empty)
+//	a/b/c.py: def f(): pass
+//	main.py: import a.b as c / from a.b import c
+//
+// `import a.b as c` binds c to the module a.b itself (The Python Language
+// Reference §7.11: "If the module name is followed by as, then the name
+// following as is bound directly to the imported module"),
+// whatever submodule or member of a.b is named c; `from a.b import c` binds
+// the submodule a.b.c, which a/b/__init__.py does not declare.
+//
+// Mutation: read an import whose Original is ImportAll as a from-import of
+// its name (addPythonImports) -> `import a.b as c` imports a/b/c.py.
+func TestResolvePythonImports(t *testing.T) {
+	tables := []*Table{
+		{Path: "a/b/__init__.py"},
+		{Path: "a/b/c.py", Decls: []Decl{pyFunc("f")}},
+		{Path: "main.py", Imports: []Import{
+			{Name: "c", Path: "a.b", Original: ImportAll, Scope: -1},
+			{Name: "c", Path: "a.b", Scope: -1},
+		}},
+	}
+	u := &unit{tables: pyTables(tables), dir: t.TempDir(),
+		members: func(yield func(model.FileVersion) error) error {
+			for i, tab := range tables {
+				tab.Language = "python"
+				if err := yield(model.FileVersion{ID: model.FileID("f" + strconv.Itoa(i)), Path: tab.Path, Language: "python"}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}}
+	var got []Binding
+	if err := resolvePython(context.Background(), u, func(b Binding) error {
+		if b.Kind == FactImport && !slices.Contains(got, b) {
+			got = append(got, b)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	slices.SortFunc(got, cmpBinding)
+	want := []Binding{
+		{Kind: FactImport, Site: Ref{2, 0}, Target: Ref{0, -1}, Detail: DetailImport},
+		{Kind: FactImport, Site: Ref{2, 1}, Target: Ref{1, -1}, Detail: DetailImport},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("imports\n got %v\nwant %v", got, want)
+	}
+}

@@ -296,8 +296,9 @@ func indexPythonDecls(file int32, tab *Table, keys *pagination.ExternalSort[pyRe
 }
 
 // addPythonImports adds the lookups of each import of tab, the table of the
-// member at ordinal file: `import a.b` and `from a import *` look up the
-// module they name; `from a import b` looks up the declaration b of module a
+// member at ordinal file: `import a.b`, `import a.b as c` (Original
+// ImportAll: the name is the module itself) and `from a import *` look up
+// the module they name; `from a import b` looks up the declaration b of module a
 // (Rank 0), else the submodule a.b (Rank 1), else the module a itself, which
 // the statement imports whatever b is (Rank 2). A relative module is named
 // from the repository root (absolutePythonModule) and answered by that root
@@ -315,7 +316,7 @@ func addPythonImports(file int32, tab *Table, keys *pagination.ExternalSort[pyRe
 		add := func(key string, rank uint8) error {
 			return keys.Add(pyRecord{Key: key, Lookup: true, Import: true, Rank: rank, Ref: ref, Root: tab.Path, Exact: exact})
 		}
-		if imp.Name == "" || imp.Name == ImportAll {
+		if imp.Name == "" || imp.Name == ImportAll || imp.Original == ImportAll {
 			if mod == "" {
 				continue
 			}
