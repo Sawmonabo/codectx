@@ -14,6 +14,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/reconcile"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -140,6 +141,11 @@ type declFact struct {
 	sig  string
 	doc  string
 	res  model.Resolution
+	// descriptor and disambiguator are the declaration's identity inputs
+	// (settleIdentities): its descriptor path, empty when its qualified name
+	// was cut, which leaves it a file-scoped identity, and what separates it
+	// from declarations sharing that path.
+	descriptor, disambiguator string
 	// truncated names the fields this declaration's storage ceilings cut.
 	truncated truncations
 
@@ -208,6 +214,7 @@ func (b *builder) build() error {
 	if err := b.validateDecls(); err != nil {
 		return err
 	}
+	b.settleIdentities()
 	if err := b.resolveModule(); err != nil {
 		return err
 	}
@@ -327,7 +334,7 @@ func (b *builder) resolveModule() error {
 	res, err := b.resolve(model.NodeCandidate{
 		ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: b.modKey,
 		Kind: model.NodeModule, Language: b.lang.Name, Name: path.Base(b.fv.Path), QualifiedName: b.fv.Path,
-		FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: b.fileRng,
+		FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: b.fileRng, Descriptor: b.moduleDescriptor(),
 	})
 	if err != nil {
 		return err
@@ -362,6 +369,7 @@ func (b *builder) resolveDecls() error {
 			ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: b.identityKey(d), Kind: d.kind, Language: b.lang.Name,
 			Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
 			FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: d.rng,
+			Descriptor: d.descriptor, Disambiguator: d.disambiguator,
 		})
 		if err != nil {
 			return err
@@ -439,6 +447,88 @@ func (b *builder) resolveDecls() error {
 		}
 	}
 	return nil
+}
+
+// settleIdentities sets each declaration's identity inputs (ADR-0014
+// decision 1). Its descriptor path is its qualified name along its ancestry
+// as the worker spells it; one cut to its storage ceiling is a prefix, not a
+// path, and leaves the declaration file-scoped, keyed by its range. Its
+// disambiguator is, in order, the parameter types as written where the
+// language overloads (the parameter list of the worker's Export.Signature),
+// the conditional branch enclosing it (wire.Decl.Branch), and whether a C or
+// C++ declaration is a prototype; the exact duplicates left are settled by
+// content (reconcile.SettleDuplicates). No part is a position, so neither a
+// body edit nor an inserted declaration moves another declaration's node.
+func (b *builder) settleIdentities() {
+	var params map[wire.Span]string
+	if overloads(b.lang.Name) && b.ex.link != nil {
+		params = make(map[wire.Span]string, len(b.ex.link.Exports))
+		for _, x := range b.ex.link.Exports {
+			if p, ok := parameterTypes(x.Signature); ok {
+				params[x.Name] = p
+			}
+		}
+	}
+	declared := make([]reconcile.Declared, len(b.decls))
+	for i := range b.decls {
+		d := &b.decls[i]
+		if _, cut := d.truncated["qualified_name"]; !cut {
+			d.descriptor = d.Qualified
+		}
+		prototype := d.Prototype && (b.lang.Name == "c" || b.lang.Name == "cpp")
+		d.disambiguator = reconcile.Disambiguator(params[wire.Span{Start: d.NameStart, End: d.NameEnd}], d.Branch, prototype)
+		declared[i] = reconcile.Declared{Kind: d.kind, Descriptor: d.descriptor, Disambiguator: d.disambiguator,
+			Start: uint64(d.Start), End: uint64(d.End), Content: reconcile.ContentDigest(b.src[d.Start:d.End])}
+	}
+	for i, dis := range reconcile.SettleDuplicates(declared) {
+		if b.decls[i].descriptor != "" {
+			b.decls[i].disambiguator = dis
+		}
+	}
+}
+
+// moduleDescriptor is the file module's descriptor path: the file's path, so
+// the module keeps one identity whatever its bytes, and an import another
+// file resolves to it survives every edit. A path over the descriptor bound
+// leaves the module keyed by its range.
+func (b *builder) moduleDescriptor() string {
+	if len(b.fv.Path) > model.MaxQualifiedNameBytes {
+		return ""
+	}
+	return b.fv.Path
+}
+
+// overloads reports a language whose declarations of one name in one scope
+// are told apart by their parameter types: Java's and C++'s overloads and
+// TypeScript's overload signatures.
+func overloads(language string) bool {
+	switch language {
+	case "java", "cpp", "typescript", "tsx":
+		return true
+	}
+	return false
+}
+
+// parameterTypes is the parameter list of an Export.Signature, its first
+// balanced parenthesized group ("(String,int)" of "(String,int)(void)"), and
+// false when the signature has none.
+func parameterTypes(sig string) (string, bool) {
+	if !strings.HasPrefix(sig, "(") {
+		return "", false
+	}
+	depth := 0
+	for i, r := range sig {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return sig[:i+1], true
+			}
+		}
+	}
+	return "", false
 }
 
 // identityKey is the native key the declaration's node is resolved under.

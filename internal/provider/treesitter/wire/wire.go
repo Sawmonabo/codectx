@@ -177,6 +177,14 @@ type Decl struct {
 	// Decorators are the declaration's decorators and annotations, in source
 	// order.
 	Decorators []Decorator `json:"decorators,omitempty"`
+	// Branch names the conditional branches between the declaration and its
+	// parent declaration (or the file), outermost first, each as the
+	// construct, its condition as written with whitespace collapsed, and the
+	// arm the declaration sits in: the two definitions of a name in the arms
+	// of one `if`, `try` or `#if` are two entities, told apart by this with
+	// no number (ADR-0014 decision 1). A Rust `#[cfg(...)]` attribute is a
+	// branch too. Empty when no conditional encloses the declaration.
+	Branch string `json:"branch,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

@@ -1429,9 +1429,17 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if sym.local {
 		qualified = ""
 	}
+	// A global symbol's descriptors are its descriptor path, the index's own
+	// disambiguator included, so its definition keeps one identity wherever
+	// an edit moves its bytes (ADR-0014 decision 1). A document-scoped local
+	// has none and is keyed by its range.
+	var descriptor string
+	if len(qualified) <= model.MaxQualifiedNameBytes {
+		descriptor = qualified
+	}
 	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: sym.scopeKey(ds.doc.path), NativeKey: sym.raw, Kind: sym.nodeKind(kind),
 		Language: ds.doc.language, Name: name, QualifiedName: qualified, Signature: sig,
-		FileID: ds.doc.file.ID, ContentHash: ds.doc.file.ContentHash, Range: rng}
+		FileID: ds.doc.file.ID, ContentHash: ds.doc.file.ContentHash, Range: rng, Descriptor: descriptor}
 	res, err := im.req.Resolver.Resolve(ctx, cand)
 	if err != nil {
 		return err

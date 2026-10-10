@@ -108,11 +108,18 @@ func (r *Resolver) Resolve(ctx context.Context, c model.NodeCandidate) (model.Re
 // already names it, with the match basis that key represents. It is a pure
 // function of the candidate.
 //
-//   - A located candidate (file and range) keys on the file's path identity,
-//     name, kind, language, qualified name and exact byte range:
-//     Section 9.4's "exact language/path/range/kind/qualified-name match".
-//     Two providers extracting the same declaration therefore mint the same
-//     node without either knowing about the other.
+//   - A declaration with a defining file and a descriptor path keys on the
+//     file's path identity, kind, language, descriptor path and
+//     disambiguator (ADR-0014): "exact package/qualified-name/signature/
+//     defining-file match", the signature being the disambiguator. Its byte
+//     range is an attribute of the node and of its evidence, never part of
+//     its key, so an edit that changes the declaration's length, or any
+//     declaration's before it, keeps its identity, and so does every
+//     relation another file publishes toward it.
+//   - A located candidate without a descriptor keys on the file's path
+//     identity, name, kind, language, qualified name and exact byte range:
+//     the file-scoped identity of a local, an anonymous function or a call
+//     site, which no other file names.
 //   - A candidate with a qualified name and a defining file but no range keys
 //     on scope, qualified name, kind, language, signature and file:
 //     "exact package/qualified-name/signature/defining-file match".
@@ -123,8 +130,14 @@ func (r *Resolver) Resolve(ctx context.Context, c model.NodeCandidate) (model.Re
 //     native key, provider and kind. It never merges with another provider's
 //     entity by short name (Section 9.4 forbids that), and the provider marks
 //     the node's metadata resolution=unresolved.
+//
+// Each case frames a distinct first component (the domain tag below), so
+// no key of one case can equal a key of another.
 func CanonicalKey(c model.NodeCandidate) (string, model.MatchBasis) {
 	switch {
+	case c.FileID != "" && c.Descriptor != "":
+		return model.CanonicalNodeKey(keyDescriptor+string(c.FileID), c.Descriptor, string(c.Kind), c.Language, c.Disambiguator),
+			model.MatchQualifiedSignature
 	case c.FileID != "" && c.Range != nil:
 		return model.CanonicalNodeKey(string(c.FileID), c.Name, string(c.Kind), c.Language, c.QualifiedName,
 			strconv.FormatUint(c.Range.Start.Byte, 10), strconv.FormatUint(c.Range.End.Byte, 10)), model.MatchSourceLocation
@@ -136,6 +149,12 @@ func CanonicalKey(c model.NodeCandidate) (string, model.MatchBasis) {
 		return model.CanonicalNodeKey(c.ScopeKey, c.NativeKey, c.ProviderID, string(c.Kind)), model.MatchUnresolved
 	}
 }
+
+// keyDescriptor prefixes the scope component of a descriptor-path key. A
+// FileID is lowercase hex and a scope key never begins with this tag, so a
+// descriptor key never frames the same first component as a range key or a
+// scoped key.
+const keyDescriptor = "descriptor:"
 
 func invalid(msg string) *model.Error {
 	return &model.Error{Code: model.CodeArgumentInvalid, Message: msg}
