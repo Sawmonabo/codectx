@@ -25,15 +25,17 @@ import (
 // digests alone would be reused with evidence about bytes that are gone. What
 // the digests decide is what the rebuild costs. Whenever the predecessor's
 // resolution state is readable, the applier hands it to Link with the stored
-// digests: Link classifies the members against it, finds the bindings again
+// digests: Link classifies the members against it, finds the facts again
 // only when a table digest, the membership or a manifest field the linker
-// reads moved, and republishes only the members whose facts changed; the
-// rest of the predecessor is carried over with those members, and the
-// predecessor's members that are gone, named replaced. A body edit that
-// keeps its table's digest republishes its own file and reads no other
-// table; one that moves it republishes its own file and the files whose
-// bindings or targeted declarations moved. Without a readable predecessor
-// state the unit is resolved and published in full and nothing is carried.
+// reads moved, and republishes only the members whose facts changed. Those
+// members and the predecessor's members that are gone are named replaced,
+// and so is the predecessor's index-level bucket (the external nodes, which
+// Link publishes again on every run); the rest of the predecessor is carried
+// over. A body edit that keeps its table's digest republishes its own file
+// and reads no other table; one that moves it republishes its own file and
+// the files whose facts or targeted nodes moved. Without a readable
+// predecessor state the unit is resolved and published in full and nothing
+// is carried.
 type linkApplier struct {
 	store   *sqlite.Store
 	p       *link.Provider
@@ -157,11 +159,14 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 		b.res.Delta = j.stats
 		if b.res.Filtered {
 			// The files Link named replaced were published again or are
-			// gone; everything else of the predecessor is carried. Nothing
-			// is index-level: every fact the linker publishes is located in
-			// a member.
+			// gone; everything else of the predecessor located in a member
+			// is carried. The index-level bucket is replaced: it holds only
+			// the external nodes, which no member locates and Link
+			// publishes on every run for every fact of the unit, carried or
+			// fresh, that targets one, so a node no fact targets any more is
+			// not carried without evidence.
 			var filesErr error
-			replaced := sqlite.Replaced{Files: func(yield func(model.FileID) bool) {
+			replaced := sqlite.Replaced{IndexLevel: true, Files: func(yield func(model.FileID) bool) {
 				filesErr = replacedFiles(replacedPath, yield)
 			}}
 			carried, err := w.CarryOver(ctx, req.Previous, replaced)

@@ -1,7 +1,10 @@
 // Package link is the package-scoped linking provider of ADR-0012 decision 9.
-// It publishes `calls` for every language with a lowering, from the link
-// tables the structural provider stores with each file's unit, and never
-// parses a file.
+// It publishes `calls`, `imports`, `data_flows_to`, `extends`, `implements`
+// and `overrides` for every language with a lowering, with an open-site node
+// for every call site and dynamic import it cannot bind and a node for every
+// external type and method its facts target (ADR-0015), from the link tables
+// the structural provider stores with each file's unit, and never parses a
+// file.
 //
 // A unit is one project of the repository, the scopes PlanUnits derives. Its
 // inputs are the project's member files, each recording the MemberDigest of
@@ -57,11 +60,13 @@ const (
 	ResolutionKind = "link.resolution"
 )
 
-// Capabilities are the capabilities the provider declares: `calls` alone.
-var Capabilities = []string{string(model.RelCalls)}
+// Capabilities are the capabilities the provider declares, one row of each
+// per unit.
+var Capabilities = []string{string(model.RelCalls), string(model.RelImports), string(model.RelDataFlowsTo),
+	string(model.RelExtends), string(model.RelImplements), string(model.RelOverrides)}
 
-// The evidence detail of a published `calls` occurrence names the technique
-// that bound the site.
+// The evidence detail of a published occurrence names the technique that
+// found its fact.
 const (
 	// DetailDirect: the callee names the declaration directly, by its
 	// package, module, import or scope.
@@ -91,11 +96,6 @@ const (
 	// DetailMethodSet: a Go `implements` or `overrides` of an interface the
 	// type satisfies by its method set, which the source never writes.
 	DetailMethodSet = "method_set"
-	// DetailAmbiguous is the `calls` edge to an ambiguous site's callee
-	// node, and DetailAmbiguousTarget each of its `may_refer_to` edges,
-	// spelled as the structural provider spells its own.
-	DetailAmbiguous       = "ambiguous"
-	DetailAmbiguousTarget = "ambiguous call target"
 )
 
 // LinkOptions is what the delta build hands one unit's link.
@@ -143,7 +143,7 @@ func New(tables Tables) *Provider { return &Provider{tables: tables} }
 
 // Descriptor is the provider's static identity: package-scoped, after the
 // structural provider whose tables it reads, and not required, since a
-// failed link degrades `calls` and nothing else.
+// failed link degrades the linker's relations and nothing else.
 func (p *Provider) Descriptor() model.ProviderDescriptor {
 	return model.ProviderDescriptor{ID: ProviderID, Version: Version, Capabilities: Capabilities,
 		DependsOn: []string{lang.ProviderID}, InvalidationScope: model.InvalidationPackage}
@@ -160,11 +160,11 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	return p.Link(ctx, req, sink, LinkOptions{})
 }
 
-// Link links one unit: it streams the members' tables, finds every site's
-// bindings (or keeps opts.Previous's), publishes `calls` (every fact, or with
-// opts.Previous only the facts of the members whose facts changed, named to
-// opts.Replaced with the members that are gone) and writes the resolution
-// state to opts.State.
+// Link links one unit: it streams the members' tables, finds every fact (or
+// keeps opts.Previous's), publishes them (every member's, or with
+// opts.Previous only those of the members whose facts changed, named to
+// opts.Replaced with the members that are gone, and every external node the
+// unit's facts target) and writes the resolution state to opts.State.
 func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts LinkOptions) (model.ProviderResult, error) {
 	failed := model.ProviderResult{RunID: req.Run, State: model.RunFailed}
 	if opts.Previous != nil && opts.Digests == nil {
@@ -247,6 +247,11 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		return failed, err
 	}
 	defer targets.Close()
+	externals, err := externalsOf(dir, bindings)
+	if err != nil {
+		return failed, err
+	}
+	defer externals.Close()
 	if rf.prev != nil {
 		if rf.resolve {
 			if err := rf.diff(bindings, targets); err != nil {
@@ -259,7 +264,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		defer pub.republished.Close()
 	}
 
-	records, err := pub.publish(bindings, targets)
+	records, err := pub.publish(bindings, targets, externals)
 	if err != nil {
 		failed.RecordsEmitted = pub.records
 		return failed, err
@@ -276,23 +281,29 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		}
 	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
-		Capabilities: []model.CapabilityState{pub.capability(records.Len())}}, nil
+		Capabilities: pub.capabilities(records.Len())}, nil
 }
 
 // resolve is the unit's resolution by its family's: the static family's
 // re-runs only the members whose reads changed (resolveStatic); the flow
 // family's inference is a least fixed point over the whole unit, which a
 // removal cannot re-seed soundly without the provenance of every value, so
-// it resolves every site and names each binding by identity, and the
-// refresh's binding diff keeps the republication to the files whose facts
-// changed.
+// it resolves every site, and the refresh's fact diff keeps the
+// republication to the files whose facts changed.
+//
+// The flow family's path is three steps, each with one hand-off: the
+// resolver emits positional facts (canonical, folded by compareBinding into
+// one sorted run), identify names that run by identity, and the result is
+// the resolution's facts, with no groups, reads or address-taken functions.
+// A resolution that keeps part of its predecessor's facts replaces the first
+// step and hands identify the same sorted run.
 func resolve(ctx context.Context, u *unit, rf *refresh, fields []manifestField) (*resolution, error) {
 	switch u.family {
 	case FamilyJavaScript, FamilyPython:
 	default:
 		return resolveStatic(ctx, u, rf, fields)
 	}
-	sorted, err := newBindingSort(u.dir, compareSiteTarget)
+	sorted, err := newBindingSort(u.dir, compareBinding)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +312,8 @@ func resolve(ctx context.Context, u *unit, rf *refresh, fields []manifestField) 
 	// A resolver may emit from any goroutine; the sort has one producer.
 	var mu sync.Mutex
 	emit := func(b Binding) error {
-		if _, err := encodeBinding(b); err != nil {
+		b, err := canonical(b)
+		if err != nil {
 			return err
 		}
 		mu.Lock()
@@ -348,24 +360,41 @@ func emptyOf[T any](s *pagination.ExternalSort[T], err error) (*pagination.Sorte
 	return s.Sorted()
 }
 
-// capability is the unit's `calls` row over its members: fresh when every
-// member's table was read whole and every site with a binding was published,
-// and partial, with what was left out counted, otherwise.
-func (p *publisher) capability(members int64) model.CapabilityState {
-	st := model.CapabilityState{ProviderID: ProviderID, Capability: string(model.RelCalls), Scope: p.req.Unit.ScopeKey,
-		State: model.CapabilityFresh}
-	if p.cov.untabled == 0 && p.cov.dropped == 0 && p.cov.unkeyed == 0 {
-		return st
+// capabilities are the unit's rows, one per declared capability: fresh
+// when every member's table was read whole, and partial, with what was left
+// out counted, otherwise. An open site is a fact the rows count, never
+// coverage they lack. The `calls` row always carries the site counts, and
+// the `imports` row the import counts, summed over the members' records.
+func (p *publisher) capabilities(members int64) []model.CapabilityState {
+	c := p.cov
+	out := make([]model.CapabilityState, 0, len(Capabilities))
+	for _, capability := range Capabilities {
+		st := model.CapabilityState{ProviderID: ProviderID, Capability: capability, Scope: p.req.Unit.ScopeKey,
+			State: model.CapabilityFresh}
+		switch model.RelationKind(capability) {
+		case model.RelCalls:
+			for _, d := range [...]struct {
+				key string
+				n   int64
+			}{{"sites", c.Sites}, {"bound_sites", c.Bound}, {"open_sites", c.Open}, {"computed_sites", c.Computed},
+				{"external_sites", c.External}} {
+				st = st.WithDetail(d.key, strconv.FormatInt(d.n, 10))
+			}
+		case model.RelImports:
+			st = st.WithDetail("resolved_imports", strconv.FormatInt(c.Imports, 10)).
+				WithDetail("open_import_sites", strconv.FormatInt(c.OpenImports, 10))
+		}
+		if c.untabled > 0 || c.dropped > 0 {
+			st.State, st.DiagnosticCode = model.CapabilityPartial, model.CodeCoverageIncomplete
+			if c.untabled > 0 {
+				st = st.WithDetail("members_without_table", strconv.FormatInt(c.untabled, 10))
+			}
+			if c.dropped > 0 {
+				st = st.WithDetail("dropped_table_entries", strconv.FormatInt(c.dropped, 10))
+			}
+			st = st.WithDetail("members", strconv.FormatInt(members, 10))
+		}
+		out = append(out, st)
 	}
-	st.State, st.DiagnosticCode = model.CapabilityPartial, model.CodeCoverageIncomplete
-	if p.cov.untabled > 0 {
-		st = st.WithDetail("members_without_table", strconv.FormatInt(p.cov.untabled, 10))
-	}
-	if p.cov.dropped > 0 {
-		st = st.WithDetail("dropped_table_entries", strconv.FormatInt(p.cov.dropped, 10))
-	}
-	if p.cov.unkeyed > 0 {
-		st = st.WithDetail("unkeyed_ambiguous_sites", strconv.FormatInt(p.cov.unkeyed, 10))
-	}
-	return st.WithDetail("members", strconv.FormatInt(members, 10))
+	return out
 }
