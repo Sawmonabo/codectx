@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/admission"
-	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -29,126 +28,122 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestLinkBodyEditRelinksNothing builds one Go linking unit over the real
-// structural provider, then rebuilds it after an edit inside the body of the
-// callee's file, and compares the rebuild with a full build of the edited
-// tree.
+// relinkBase is a Go module whose files call into a.go and into one of its
+// own packages: b.go calls Run and e.go calls Other, both in a.go; c.go calls
+// Twice in b.go; d.go calls Help through the module's own import path.
+var relinkBase = map[string]string{
+	"go.mod":    "module example.com/app\n\ngo 1.22\n\nrequire example.com/dep v1.0.0\n",
+	"a.go":      "package app\n\nfunc Run(x int) int { return x * 2 }\n\nfunc Other() int { return 1 }\n",
+	"b.go":      "package app\n\nfunc Twice(x int) int { return Run(x) + Run(x) }\n",
+	"c.go":      "package app\n\nfunc Thrice(x int) int { return Twice(x) + x }\n",
+	"e.go":      "package app\n\nfunc UseOther() int { return Other() }\n",
+	"d.go":      "package app\n\nimport \"example.com/app/util\"\n\nfunc Use() int { return util.Help() }\n",
+	"util/u.go": "package util\n\nfunc Help() int { return 1 }\n",
+}
+
+// TestLinkBodyEditRelinksNothing refreshes a Go linking unit after an edit
+// inside a function body, then after two go.mod edits, and compares each
+// refresh with a full build of the same tree (session.check).
 //
-// Failure mode: an edit that changes no link table is resolved again, or
-// republishes the facts of files whose facts did not move, or loses the facts
-// of the file it touched, or keeps a call of a declaration whose identity the
-// edit moved. b.go calls Run in a.go, c.go calls Twice in b.go, and only
-// a.go's body changes, with a length change, so Run's range, and with it Run's
-// node (a located identity is keyed on its exact range), moves. The rebuild
-// must hand Link the predecessor's resolution and read no table of c.go (a
-// resolver reads every member's table; republication needs a.go's, for Run's
-// occurrence, and b.go's, whose calls of Run name Run's new node), carry
-// c.go's facts over (Thrice and its call of Twice), and republish a.go's and
-// b.go's from the fresh tables: the unit then holds exactly what a full build
-// of the edited tree holds.
+// A body edit that lengthens Run republishes a.go alone: Run keeps its node
+// (a declaration is keyed by its descriptor path, not its range), so b.go's
+// carried calls still name it, and nothing of b.go, c.go, d.go, e.go or
+// util/u.go is republished or has its table read. A dependency version bump
+// changes no field the linker reads: nothing is republished and no table is
+// read. A module path change unbinds d.go's call of util.Help, which only
+// that site read: d.go is republished, and so is util/u.go, whose Help is
+// no longer a target, and every other file is carried.
 //
-// Mutations that fail it: resolve in full whatever opts.Previous holds (c.go's
-// table is read); publish every fact on the inheriting path (c.go's table is
-// read, nothing is carried); carry a.go's facts instead of republishing them
-// (the carry-over is refused, a.go's bytes having changed); republish only
-// the edited file (b.go's carried calls name Run's old node, and the unit
-// cannot seal). Its last step
-// renames the module in go.mod, which moves no table digest but decides which
-// imports are the project's own: the build must resolve. Mutation: compare a
-// tableless input by digest alone (go.mod counts unchanged, Filtered is set).
+// Mutations that fail it: republish every file with a site bound into the
+// edited file (b.go and e.go are short of their carried rows); key a
+// declaration on its range (Run's node moves, and b.go's carried call names
+// the old one); compare go.mod by its bytes (the version bump reruns and
+// reads tables); skip the reverse index for the module path (d.go's call
+// stays bound and differs from the full build); republish only the edited
+// file there (util/u.go keeps Help's occurrence).
 func TestLinkBodyEditRelinksNothing(t *testing.T) {
-	f := newFixture(t)
-	ts := f.structuralProvider()
-	tables := &countedTables{StoredTables: link.StoreTables(f.store), reads: map[string]int{}}
-	lp := link.New(tables)
-	a := delta.NewLink(f.store, lp, tables, limits, f.pool)
-	paths := []string{"go.mod", "a.go", "b.go", "c.go"}
-	const goMod = "module example.com/app\n\ngo 1.27\n"
-	const before = "package app\n\nfunc Run(x int) int { return x * 2 }\n"
-	const after = "package app\n\nfunc Run(x int) int { return x * 20 }\n"
-	const caller = "package app\n\nfunc Twice(x int) int { return Run(x) + Run(x) }\n"
-	const outer = "package app\n\nfunc Thrice(x int) int { return Twice(x) + x }\n"
+	s := newSession(t)
+	files := relinkBase
+	base := s.only(s.advance(files))
+	s.check("base", []linkBuild{base})
 
-	base := f.snapshot(map[string]string{"go.mod": goMod, "a.go": before, "b.go": caller, "c.go": outer})
-	baseGen := f.generation(base)
-	f.structural(ts, base, baseGen, "a.go")
-	callerUnit := f.structural(ts, base, baseGen, "b.go")
-	outerUnit := f.structural(ts, base, baseGen, "c.go")
-	prev := f.request(lp, build{tree: base, gen: baseGen, cfgHash: "config", scopeKey: goScope, paths: paths})
-	first, err := a.Apply(f.ctx, prev)
-	if err != nil {
-		t.Fatalf("first Apply: %v", err)
+	files = edit{name: "body", replace: []sub{{"a.go", "return x * 2 }", "return x * 20 }"}}}.apply(t, files)
+	body := s.only(s.advance(files))
+	s.check("body edit", []linkBuild{body})
+	s.wantRepublished("body edit", body, []string{"a.go"}, "b.go", "e.go", "c.go", "d.go", "util/u.go")
+	for _, p := range []string{"b.go", "c.go", "d.go", "e.go", "util/u.go"} {
+		if n := body.reads[p]; n != 0 {
+			t.Errorf("the body edit read %s's table %d times: no fact of it moved", p, n)
+		}
 	}
-	if !first.Full || first.FullReason != delta.FullNoPredecessor || first.Filtered {
-		t.Fatalf("the first build is %+v, want a full build with no predecessor", first)
+	if body.reads["a.go"] == 0 {
+		t.Error("the body edit never read a.go's table: Run's occurrence was not republished from the fresh table")
 	}
-	f.flush()
+	run := s.nodeNamed(base.unit, "Run")
+	if got := s.nodeNamed(body.unit, "Run"); got != run {
+		t.Errorf("Run is node %d after the body edit and %d before it: a body edit moved a declaration's identity", got, run)
+	}
+	if n := s.callsInto(body.unit, run); n == 0 {
+		t.Error("no carried call names Run's node after the body edit")
+	}
 
-	edited := f.snapshot(map[string]string{"go.mod": goMod, "a.go": after, "b.go": caller, "c.go": outer})
-	editedGen := f.generation(edited)
-	calleeUnit := f.structural(ts, edited, editedGen, "a.go")
-	f.attach(editedGen, callerUnit)
-	f.attach(editedGen, outerUnit)
-	refresh := f.request(lp, build{tree: edited, gen: editedGen, cfgHash: "config", scopeKey: goScope,
-		paths: paths, previous: prev.Build.Spec.ID})
-	tables.reset()
-	out, err := a.Apply(f.ctx, refresh)
-	if err != nil {
-		t.Fatalf("second Apply: %v", err)
+	files = edit{name: "bump", replace: []sub{{"go.mod", "v1.0.0", "v1.1.0"}}}.apply(t, files)
+	bump := s.only(s.advance(files))
+	s.check("version bump", []linkBuild{bump})
+	s.wantRepublished("version bump", bump, nil, "a.go", "b.go", "c.go", "d.go", "e.go", "util/u.go")
+	for p, n := range bump.reads {
+		if n != 0 {
+			t.Errorf("the version bump read %s's table %d times: it changes no field the linker reads", p, n)
+		}
 	}
-	if out.Full || !out.Filtered {
-		t.Fatalf("the rebuild is %+v, want the predecessor's resolution handed to Link: no table moved", out)
-	}
-	if want := (delta.Stats{Unchanged: int64(len(paths))}); out.Delta != want {
-		t.Errorf("Delta = %+v, want %+v: every member keeps its digest", out.Delta, want)
-	}
-	if n := tables.read("c.go"); n != 0 {
-		t.Errorf("the rebuild read c.go's table %d times: it resolved, or republished a file whose facts did not move", n)
-	}
-	if tables.read("a.go") == 0 {
-		t.Error("the rebuild never read a.go's table: Run's occurrence was not republished from the fresh table")
-	}
-	if tables.read("b.go") == 0 {
-		t.Error("the rebuild never read b.go's table: its calls of Run were not republished to Run's new node")
-	}
-	if out.Carried.Nodes == 0 || out.Carried.Relations == 0 || out.Carried.Evidence == 0 {
-		t.Errorf("Carried = %+v, want c.go's caller, its call of Twice and their evidence carried", out.Carried)
-	}
-	f.flush()
 
-	fullGen := f.generation(edited)
-	f.attach(fullGen, calleeUnit)
-	f.attach(fullGen, callerUnit)
-	f.attach(fullGen, outerUnit)
-	full := f.request(lp, build{tree: edited, gen: fullGen, cfgHash: "full", scopeKey: goScope, paths: paths})
-	if res, err := a.Apply(f.ctx, full); err != nil || !res.Full {
-		t.Fatalf("full build of the edited tree: %+v, %v", res, err)
-	}
-	f.flush()
-	db := f.raw()
-	var calls int
-	if err := db.QueryRow(`SELECT count(*) FROM relation_facts WHERE unit_id = ?`,
-		unitRowID(t, db, refresh.Build.Spec.ID)).Scan(&calls); err != nil {
-		t.Fatal(err)
-	}
-	if calls == 0 {
-		t.Fatal("the rebuilt unit holds no call: Twice's calls of Run are lost")
-	}
-	sameFacts(t, db, full.Build.Spec.ID, refresh.Build.Spec.ID)
+	files = edit{name: "module", replace: []sub{{"go.mod", "module example.com/app\n", "module example.com/renamed\n"}}}.apply(t, files)
+	moved := s.only(s.advance(files))
+	s.check("module path change", []linkBuild{moved})
+	s.wantRepublished("module path change", moved, []string{"d.go", "util/u.go"}, "a.go", "b.go", "c.go", "e.go")
+}
 
-	renamed := f.snapshot(map[string]string{"go.mod": "module example.com/renamed\n\ngo 1.27\n", "a.go": after, "b.go": caller, "c.go": outer})
-	renamedGen := f.generation(renamed)
-	f.attach(renamedGen, calleeUnit)
-	f.attach(renamedGen, callerUnit)
-	f.attach(renamedGen, outerUnit)
-	moved, err := a.Apply(f.ctx, f.request(lp, build{tree: renamed, gen: renamedGen, cfgHash: "config", scopeKey: goScope,
-		paths: paths, previous: refresh.Build.Spec.ID}))
-	if err != nil {
-		t.Fatalf("Apply after the module rename: %v", err)
+// TestLinkRenameRepublishesOnlyTheSitesThatNamedIt renames Run in a.go and
+// compares the refresh with a full build of the same tree. The rename
+// republishes a.go and b.go, whose sites named Run and are now unbound; e.go
+// calls Other in the same file and c.go calls Twice in b.go, and neither
+// named Run, so both are carried.
+//
+// Mutation that fails it: republish every file with a site bound into the
+// edited file (e.go is short of its carried rows); republish the caller's
+// callers (c.go is). Republishing a.go alone leaves b.go's carried calls of
+// Run, which the full build does not have.
+func TestLinkRenameRepublishesOnlyTheSitesThatNamedIt(t *testing.T) {
+	s := newSession(t)
+	files := relinkBase
+	s.check("base", s.advance(files))
+	files = edit{name: "rename", replace: []sub{{"a.go", "func Run(", "func Exec("}}}.apply(t, files)
+	renamed := s.only(s.advance(files))
+	s.check("rename", []linkBuild{renamed})
+	s.wantRepublished("rename", renamed, []string{"a.go", "b.go"}, "c.go", "e.go")
+}
+
+// nodeNamed is the node surrogate of the one node fact named name in unit.
+func (s *session) nodeNamed(unit model.UnitID, name string) int64 {
+	s.t.Helper()
+	var id int64
+	if err := s.db.QueryRow(`SELECT node_id FROM node_facts WHERE unit_id = ? AND name = ?`,
+		unitRowID(s.t, s.db, unit), name).Scan(&id); err != nil {
+		s.t.Fatalf("the node %s of unit %s: %v", name, unit, err)
 	}
-	if moved.Filtered || moved.Delta != (delta.Stats{Changed: 1, Unchanged: 3}) {
-		t.Errorf("after the module rename the build is %+v, want go.mod changed and the unit resolved", moved)
+	return id
+}
+
+// callsInto counts unit's calls relations whose target is node.
+func (s *session) callsInto(unit model.UnitID, node int64) int {
+	s.t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM relation_facts rf JOIN relation_ids r ON r.id = rf.relation_id
+		WHERE rf.unit_id = ? AND r.kind = ? AND r.to_node_id = ?`,
+		unitRowID(s.t, s.db, unit), string(model.RelCalls), node).Scan(&n); err != nil {
+		s.t.Fatal(err)
 	}
+	return n
 }
 
 // countedTables counts the tables read, by path; digests are not counted.
