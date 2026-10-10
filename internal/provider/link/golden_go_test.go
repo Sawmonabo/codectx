@@ -33,11 +33,11 @@ func useWrap(w Wrap) { w.Close() } // @uw
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"ub Close -> bclose Close",
-			"uc Close -> cclose Close",
-			"uw Close -> bclose Close",
+			"ub Close -> bclose Close exact",
+			"uc Close -> cclose Close exact",
+			"uw Close -> bclose Close exact",
 		},
-		fails: "an embedded field treated as a subtype dispatches `b.Close()` into Conn; dropping promotion leaves `w.Close()` unbound",
+		fails: "dropping promotion leaves `w.Close()` unbound; a concrete type's call marked virtual, as if an embedding type could override it",
 	},
 	{
 		name:   "interface-embedding",
@@ -45,9 +45,9 @@ func useWrap(w Wrap) { w.Close() } // @uw
 		files: map[string]string{
 			"p.go": `package p
 
-type R interface{ Read() }
+type R interface{ Read() } // @r
 
-type W interface{ Write() }
+type W interface{ Write() } // @w
 
 type RW interface {
 	R
@@ -77,12 +77,11 @@ func writer(w W) {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"b1 Write -> fwrite Write",
-			"b2 Read -> fread Read",
-			"w1 Write -> fwrite Write",
-			"w1 Write -> lwrite Write",
+			"b1 Write -> w Write virtual",
+			"b2 Read -> r Read virtual",
+			"w1 Write -> w Write virtual",
 		},
-		fails: "an interface not closed over its embedded interfaces lets Log satisfy RW, or lets nothing satisfy it",
+		fails: "a call through an interface published to each implementation binds File.Write and Log.Write; an interface not closed over its embedded interfaces leaves `rw.Write()` unbound",
 	},
 	{
 		name:   "module-import-paths",
@@ -119,7 +118,7 @@ func main() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"int Wrap -> own Wrap",
+			"int Wrap -> own Wrap exact",
 		},
 		fails: "an import bound by directory suffix binds github.com/pkg/errors and the standard log package to the module's own directories",
 	},
@@ -147,8 +146,8 @@ func run() int {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"call f -> tm M",
-			"call g -> other other",
+			"call f -> tm M exact",
+			"call g -> other other exact",
 		},
 		fails: "a method expression joined on the method's own signature binds `g(2)` to T.M and leaves `f(T{}, 1)` unbound",
 	},
@@ -181,9 +180,9 @@ func helper() {} // @otherhelper
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"boot NewServer -> new NewServer",
-			"boot Start -> start Start",
-			"h helper -> helper helper",
+			"boot NewServer -> new NewServer exact",
+			"boot Start -> start Start exact",
+			"h helper -> helper helper exact",
 		},
 		fails: "a call result receiver resolved to nothing leaves Start unbound; a bare call looked up outside the package binds other.helper",
 	},
@@ -193,7 +192,7 @@ func helper() {} // @otherhelper
 		files: map[string]string{
 			"p.go": `package p
 
-type Closer interface{ Close() }
+type Closer interface{ Close() } // @closer
 
 type Base struct{}
 
@@ -216,10 +215,10 @@ func viaIface(c Closer) { c.Close() } // @vi
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"vf Close -> stop stop",
-			"vi Close -> bclose Close",
+			"vf Close -> stop stop exact",
+			"vi Close -> closer Close virtual",
 		},
-		fails: "a promoted method not hidden by a shallower field lets T satisfy Closer and binds `t.Close()` to Base.Close",
+		fails: "a promoted method not hidden by a shallower field binds `t.Close()` to Base.Close; a call through Closer published to Base.Close instead of the method Closer declares",
 	},
 	{
 		name:   "field-and-method-at-one-depth",
@@ -252,7 +251,7 @@ func useY(y Y) { y.Run() } // @uy
 		// and a field at the shallowest depth), so the program never runs that call; both take that as no
 		// target.
 		want: []string{
-			"uy Run -> arun Run",
+			"uy Run -> arun Run exact",
 		},
 		fails: "a selector resolved at the shallowest depth despite a second name there binds `x.Run()` to A.Run",
 	},
@@ -309,9 +308,9 @@ func other(v ext.Server) {
 		// field reached through the embedded pointer is addressable, so the pointer-receiver method is called
 		// on its address ("Calls").
 		want: []string{
-			"u1 Load -> load Load",
-			"u2 Query -> query Query",
-			"u4 Get -> get Get",
+			"u1 Load -> load Load exact",
+			"u2 Query -> query Query exact",
+			"u4 Get -> get Get exact",
 		},
 		fails: "a member call through a field typed in another file, or through a promoted field of an embedded pointer, or through a chain of fields, left unbound; a field read on a receiver of unknown type bound by the field's name",
 	},
