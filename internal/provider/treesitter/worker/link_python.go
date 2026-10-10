@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
@@ -96,6 +97,13 @@ type pythonLinker struct {
 	// a TypeResult indexes sites.
 	sites  []wire.Site
 	values []wire.Value
+	// computed are the file's calls whose callee names nothing
+	// (Link.Computed), and dynamic its imports whose path is an expression
+	// (Link.DynamicImports), in the order function found them.
+	computed []wire.Site
+	dynamic  []wire.DynamicImport
+	// x holds the grammar kinds only the link tables read.
+	x *pyLinkSyntax
 	// returns are the types the def whose name token starts at the key
 	// returns, recovered from its return statements.
 	returns map[uint32]wire.Type
@@ -121,8 +129,10 @@ type pythonLinker struct {
 	// memo is each defining node's traced value; state 1 is in progress.
 	memo []pyMemo
 	// calls, assigns and rets are fn's own sites, assignments and return
-	// values; callAt maps a site's call span to its index in sites.
+	// values, others its calls whose callee names nothing; callAt maps a
+	// site's call span to its index in sites.
 	calls   []Node
+	others  []Node
 	assigns []Node
 	rets    []Node
 	callAt  map[flow.Span]uint32
@@ -315,6 +325,9 @@ func (k *pythonLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byt
 	if k.k == nil {
 		k.k = pySyntaxOf()
 	}
+	if k.x == nil {
+		k.x = pyLinkSyntaxOf()
+	}
 	k.g, k.src, k.fn = g, src, fn
 	defer k.release()
 	if !k.modulesRead {
@@ -344,6 +357,12 @@ func (k *pythonLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byt
 	}
 	for _, c := range k.calls {
 		k.sites = append(k.sites, k.site(c))
+		k.dynamicImport(c)
+	}
+	for _, c := range k.others {
+		s := wire.Site{Name: wireSpan(spanOf(c.ChildByFieldId(kn.fFunction))), Shape: wire.ShapeIndirect}
+		k.arguments(c, &s)
+		k.computed = append(k.computed, s)
 	}
 	for _, a := range k.assigns {
 		k.assignValues(a)
@@ -372,10 +391,11 @@ func (k *pythonLinker) release() {
 	clear(k.binds)
 	clear(k.callAt)
 	clear(k.calls)
+	clear(k.others)
 	clear(k.assigns)
 	clear(k.rets)
 	k.uses, k.defs, k.memo = k.uses[:0], k.defs[:0], k.memo[:0]
-	k.calls, k.assigns, k.rets = k.calls[:0], k.assigns[:0], k.rets[:0]
+	k.calls, k.others, k.assigns, k.rets = k.calls[:0], k.others[:0], k.assigns[:0], k.rets[:0]
 }
 
 // index builds the callable's variable names, reads and def-use pairs.
@@ -697,8 +717,11 @@ func (k *pythonLinker) visit(n Node) {
 	}
 	switch n.KindId() {
 	case kn.call:
-		if !k.calleeName(n).IsNull() {
+		switch {
+		case !k.calleeName(n).IsNull():
 			k.calls = append(k.calls, n)
+		case !n.ChildByFieldId(kn.fFunction).IsNull():
+			k.others = append(k.others, n)
 		}
 	case kn.assignment:
 		if p := n.Parent(); p.IsNull() || p.KindId() != kn.assignment {
@@ -866,14 +889,25 @@ func (k *pythonLinker) site(c Node) wire.Site {
 			s.Shape, s.Receiver = wire.ShapeMember, v.t
 		}
 	}
+	k.arguments(c, &s)
+	return s
+}
+
+// arguments fills s's Args and Arguments from call c's argument list, one
+// entry of each per argument: its type (unknown past the first splat or
+// keyword, which no position names), and where it is, the keyword it names,
+// its splat and the variables it reads.
+func (k *pythonLinker) arguments(c Node, s *wire.Site) {
+	kn := k.k
 	args := c.ChildByFieldId(kn.fArguments)
 	if args.IsNull() {
-		return s
+		return
 	}
 	if pythonLowering.isCallable(args) {
 		// `f(x for x in y)`: one generator argument.
 		s.Args = append(s.Args, wire.Type{})
-		return s
+		s.Arguments = append(s.Arguments, wire.Argument{At: wireSpan(spanOf(args)), Reads: k.argReads(args, nil)})
+		return
 	}
 	positional := true
 	for a := args.first(); !a.IsNull(); a = a.next() {
@@ -881,21 +915,84 @@ func (k *pythonLinker) site(c Node) wire.Site {
 			continue
 		}
 		var t wire.Type
+		arg := wire.Argument{}
+		e := a
 		switch a.KindId() {
-		case kn.listSplat, kn.dictionarySplat:
+		case kn.listSplat:
 			positional = false
+			e, arg.Spread = firstNamed(a), wire.SpreadPositional
+		case kn.dictionarySplat:
+			positional = false
+			e, arg.Spread = firstNamed(a), wire.SpreadKeyword
 		case kn.keywordArgument:
 			positional = false
-			k.passed(a.ChildByFieldId(kn.fValue))
+			e = a.ChildByFieldId(kn.fValue)
+			arg.Keyword = string(textOf(k.src, a.ChildByFieldId(kn.fName)))
+			k.passed(e)
 		default:
 			t = k.passed(a)
 			if !positional {
 				t = wire.Type{}
 			}
 		}
+		if e.IsNull() {
+			e = a
+		}
+		arg.At, arg.Reads = wireSpan(spanOf(e)), k.argReads(e, nil)
 		s.Args = append(s.Args, t)
+		s.Arguments = append(s.Arguments, arg)
 	}
-	return s
+}
+
+// argReads appends to dst the declaring identifiers of the named variables
+// expression e reads, each once: every identifier read as a value, resolved
+// by the file's read index. A call's result reads nothing; an attribute
+// reads its object, never its attribute name; of a nested callable only
+// what its creator evaluates is read: a lambda's default values, a
+// comprehension's first iterable.
+func (k *pythonLinker) argReads(e Node, dst []wire.Span) []wire.Span {
+	kn := k.k
+	switch {
+	case e.IsNull() || e.KindId() == kn.call:
+		return dst
+	case e.KindId() == kn.identifier:
+		if d, ok := k.reads().variable(e); ok && !slices.Contains(dst, d) {
+			dst = append(dst, d)
+		}
+		return dst
+	case e.KindId() == kn.attribute:
+		return k.argReads(e.ChildByFieldId(kn.fObject), dst)
+	case e.KindId() == kn.keywordArgument:
+		return k.argReads(e.ChildByFieldId(kn.fValue), dst)
+	case e.KindId() == kn.lambda:
+		ps := e.ChildByFieldId(kn.fParameters)
+		for p := ps.first(); !p.IsNull(); p = p.next() {
+			if id := p.KindId(); id == kn.defaultParameter || id == kn.typedDefaultParameter {
+				dst = k.argReads(p.ChildByFieldId(kn.fValue), dst)
+			}
+		}
+		return dst
+	case pythonLowering.isCallable(e):
+		for c := e.first(); !c.IsNull(); c = c.next() {
+			if c.KindId() != kn.forInClause {
+				continue
+			}
+			left := c.ChildByFieldId(kn.fLeft)
+			for x := c.first(); !x.IsNull(); x = x.next() {
+				if x.IsNamed() && !x.IsExtra() && x != left {
+					dst = k.argReads(x, dst)
+				}
+			}
+			return dst
+		}
+		return dst
+	}
+	for c := e.first(); !c.IsNull(); c = c.next() {
+		if c.IsNamed() && !c.IsExtra() {
+			dst = k.argReads(c, dst)
+		}
+	}
+	return dst
 }
 
 // passed is the type of argument a, recording a function passed as a value.
@@ -1222,6 +1319,8 @@ func (k *pythonLinker) file(root Node, src []byte, out *wire.Link) {
 	out.Sites = append(out.Sites, k.sites...)
 	out.Values = append(out.Values, k.values...)
 	out.Unions = append(out.Unions, k.unions...)
+	out.Computed = append(out.Computed, k.computed...)
+	out.DynamicImports = append(out.DynamicImports, k.dynamic...)
 }
 
 // export is def d's export.
@@ -1237,6 +1336,7 @@ func (k *pythonLinker) export(d Node) (wire.Export, bool) {
 		Receiver: class,
 		Static:   !method || k.decorated(d, "staticmethod") || k.decorated(d, "classmethod"),
 		Abstract: k.decorated(d, "abstractmethod"),
+		Override: method && k.override(d),
 	}
 	var types []string
 	typed := true
@@ -1354,4 +1454,240 @@ func compact(n Node, src []byte) string {
 	}
 	walk(n)
 	return b.String()
+}
+
+// override reports whether method d is marked as overriding a supertype's
+// (typing.override): a decorator `@override` whose name the module imports
+// from typing or typing_extensions, or `@typing.override` and
+// `@typing_extensions.override` written through the module (or a name the
+// module imports it as).
+func (k *pythonLinker) override(d Node) bool {
+	kn := k.k
+	p := d.Parent()
+	if p.IsNull() || p.KindId() != kn.decoratedDefinition {
+		return false
+	}
+	typing := func(module string) bool { return module == "typing" || module == "typing_extensions" }
+	for c := p.first(); !c.IsNull(); c = c.next() {
+		if c.KindId() != kn.decorator {
+			continue
+		}
+		switch e := firstNamed(c); {
+		case e.IsNull():
+		case e.KindId() == kn.identifier:
+			m := k.moduleNames[string(textOf(k.src, e))]
+			if m.o == pyImported && (m.t.Name == "typing.override" || m.t.Name == "typing_extensions.override") {
+				return true
+			}
+		case e.KindId() == kn.attribute:
+			obj, attr := e.ChildByFieldId(kn.fObject), lastNamed(e)
+			if obj.IsNull() || obj.KindId() != kn.identifier || attr.IsNull() || string(textOf(k.src, attr)) != "override" {
+				continue
+			}
+			name := string(textOf(k.src, obj))
+			m, bound := k.moduleNames[name]
+			if (bound && m.o == pyModule && typing(m.t.Name)) || (!bound && typing(name)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dynamicImport records call c, a site, as a dynamic import when it imports
+// a module whose name is an expression: `importlib.import_module(e)`,
+// `import_module(e)` imported from importlib, or the builtin
+// `__import__(e)`. The path is the first argument, positional or the
+// keyword `name`; its literal fragments are read from string literals,
+// their `+` concatenation, an f-string's literal parts and a `%` format's
+// literal parts, and a path that folds to one string is a constant.
+func (k *pythonLinker) dynamicImport(c Node) {
+	kn := k.k
+	f := c.ChildByFieldId(kn.fFunction)
+	switch f.KindId() {
+	case kn.identifier:
+		v, variable := k.nameOf(f)
+		builtin := string(textOf(k.src, f)) == "__import__" && v.o == pyUnknown && !variable
+		if !builtin && (v.o != pyImported || v.t.Name != "importlib.import_module") {
+			return
+		}
+	case kn.attribute:
+		attr := lastNamed(f)
+		if attr.IsNull() || string(textOf(k.src, attr)) != "import_module" {
+			return
+		}
+		if m := k.typeOf(f.ChildByFieldId(kn.fObject)); m.o != pyModule || m.t.Name != "importlib" {
+			return
+		}
+	default:
+		return
+	}
+	args := c.ChildByFieldId(kn.fArguments)
+	if args.IsNull() || pythonLowering.isCallable(args) {
+		return
+	}
+	var path Node
+	for a := args.first(); !a.IsNull(); a = a.next() {
+		if !a.IsNamed() || a.IsExtra() {
+			continue
+		}
+		switch a.KindId() {
+		case kn.keywordArgument:
+			if string(textOf(k.src, a.ChildByFieldId(kn.fName))) != "name" {
+				continue
+			}
+			path = a.ChildByFieldId(kn.fValue)
+		case kn.listSplat, kn.dictionarySplat:
+		default:
+			path = a
+		}
+		break
+	}
+	imp := wire.DynamicImport{At: wireSpan(spanOf(c)), Fragments: []string{}}
+	if !path.IsNull() {
+		imp.Fragments, imp.Constant = pyFragments(k.pieces(path, nil))
+	}
+	k.dynamic = append(k.dynamic, imp)
+}
+
+// pyPiece is one part of a path expression: a literal, or a hole where a
+// value the source does not spell goes.
+type pyPiece struct {
+	lit  string
+	hole bool
+}
+
+// pieces appends the parts of path expression e to dst.
+func (k *pythonLinker) pieces(e Node, dst []pyPiece) []pyPiece {
+	kn, x := k.k, k.x
+	e = pythonLowering.unparen(e)
+	switch {
+	case e.IsNull():
+		return append(dst, pyPiece{hole: true})
+	case e.KindId() == kn.stringLit:
+		for c := e.first(); !c.IsNull(); c = c.next() {
+			switch c.KindId() {
+			case x.stringContent:
+				dst = append(dst, pyPiece{lit: string(textOf(k.src, c))})
+			case x.interpolation:
+				dst = append(dst, pyPiece{hole: true})
+			}
+		}
+		return dst
+	case e.KindId() == x.concatenatedString:
+		for c := e.first(); !c.IsNull(); c = c.next() {
+			if c.KindId() == kn.stringLit {
+				dst = k.pieces(c, dst)
+			}
+		}
+		return dst
+	case e.KindId() == x.binaryOperator:
+		var op string
+		for c := e.first(); !c.IsNull(); c = c.next() {
+			if !c.IsNamed() && !c.IsExtra() {
+				op = string(textOf(k.src, c))
+				break
+			}
+		}
+		switch op {
+		case "+":
+			return k.pieces(e.ChildByFieldId(kn.fRight), k.pieces(e.ChildByFieldId(kn.fLeft), dst))
+		case "%":
+			left := pythonLowering.unparen(e.ChildByFieldId(kn.fLeft))
+			if left.IsNull() || (left.KindId() != kn.stringLit && left.KindId() != x.concatenatedString) {
+				break
+			}
+			for _, p := range k.pieces(left, nil) {
+				if p.hole {
+					dst = append(dst, p)
+					continue
+				}
+				dst = pyFormat(p.lit, dst)
+			}
+			return dst
+		}
+	}
+	return append(dst, pyPiece{hole: true})
+}
+
+// pyFormat appends the parts of literal s used as a `%` format: its text,
+// `%%` as one `%`, and a hole for every conversion specifier.
+func pyFormat(s string, dst []pyPiece) []pyPiece {
+	var lit strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '%' {
+			lit.WriteByte(s[i])
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '%' {
+			lit.WriteByte('%')
+			i++
+			continue
+		}
+		dst = append(dst, pyPiece{lit: lit.String()}, pyPiece{hole: true})
+		lit.Reset()
+		i++
+		if i < len(s) && s[i] == '(' {
+			for i < len(s) && s[i] != ')' {
+				i++
+			}
+			i++
+		}
+		for i < len(s) && strings.IndexByte("#0- +*.123456789hlL", s[i]) >= 0 {
+			i++
+		}
+		// i is the conversion character, which the loop steps past.
+	}
+	return append(dst, pyPiece{lit: lit.String()})
+}
+
+// pyFragments is a path's literal fragments, adjacent literals joined and
+// empty ones left out, and whether the path is one constant string.
+func pyFragments(ps []pyPiece) ([]string, bool) {
+	out := []string{}
+	constant := true
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, p := range ps {
+		if p.hole {
+			constant = false
+			flush()
+			continue
+		}
+		cur.WriteString(p.lit)
+	}
+	flush()
+	if constant {
+		return []string{strings.Join(out, "")}, true
+	}
+	return out, false
+}
+
+// pyLinkSyntax is the grammar kinds the link tables read that the lowering
+// does not.
+type pyLinkSyntax struct {
+	binaryOperator, concatenatedString, interpolation, stringContent uint16
+}
+
+var (
+	pyLinkSyntaxOnce  sync.Once
+	pyLinkSyntaxTable *pyLinkSyntax
+)
+
+// pyLinkSyntaxOf resolves the table once; a kind the grammar does not define
+// panics, as pySyntaxOf does.
+func pyLinkSyntaxOf() *pyLinkSyntax {
+	pyLinkSyntaxOnce.Do(func() {
+		const language = "python"
+		tl := mustGrammar(language)
+		kind := func(name string) uint16 { return mustKind(tl, language, name, true) }
+		pyLinkSyntaxTable = &pyLinkSyntax{binaryOperator: kind("binary_operator"), concatenatedString: kind("concatenated_string"),
+			interpolation: kind("interpolation"), stringContent: kind("string_content")}
+	})
+	return pyLinkSyntaxTable
 }
