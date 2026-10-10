@@ -65,10 +65,11 @@ func (r *staticFile) freeRust(caller int32, callee string, yield func(entry) err
 // path whose first component a `use` in caller's scope binds is read from
 // that use's path, from the module the use is written in (`u::f()` after
 // `use crate::util as u`), any other from caller's module (rustPath).
-func (r *staticFile) qualifiedRust(caller int32, q, name string, yield func(entry) error) error {
+// inUnit reports that the path names a module of the unit.
+func (r *staticFile) qualifiedRust(caller int32, q, name string, yield func(entry) error) (inUnit bool, err error) {
 	head, rest, ok := strings.Cut(q, "::")
 	scope := caller
-	err := r.h.importsAt(r.fc, head, func(p string, at int32) error {
+	err = r.h.importsAt(r.fc, head, func(p string, at int32) error {
 		if !rustSees(r.t.Decls, at, caller) {
 			return nil
 		}
@@ -79,9 +80,20 @@ func (r *staticFile) qualifiedRust(caller int32, q, name string, yield func(entr
 		return nil
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	return r.h.rustModuleDecls(keyFuncModule, r.fc, scope, q, name, yield)
+	crate, module := rustScope(r.fc, scope)
+	m, err := r.h.rustPath(crate, module, q)
+	if err != nil || m == "" {
+		return false, err
+	}
+	if err := r.h.decls.lookup(keyRustModule+m, func(entry) error {
+		inUnit = true
+		return nil
+	}); err != nil || !inUnit {
+		return false, err
+	}
+	return true, r.h.rustModuleDecls(keyFuncModule, r.fc, scope, q, name, yield)
 }
 
 // rustSees reports that a declaration or `use` written in scope (an index

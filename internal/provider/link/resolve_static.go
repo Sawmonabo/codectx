@@ -1,10 +1,12 @@
 package link
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
@@ -34,7 +36,40 @@ type returned struct {
 	name string
 }
 
-// site resolves site i and publishes its bindings; an indirect site with a
+// siteOut receives what the resolution of one site finds: each declaration
+// of the unit it calls, with the technique and the occurrence's dispatch,
+// and each proven external call, to the external method key names
+// (externalMethod), or, with key empty, to nothing a node names
+// (FactExternalSite). A nil external drops the external calls (a function
+// taken as a value names no call).
+type siteOut struct {
+	call     func(e entry, detail string, d model.Dispatch) error
+	external func(key string, d model.Dispatch) error
+}
+
+// ext reports an external call to out.
+func (out siteOut) ext(key string, d model.Dispatch) error {
+	if out.external == nil {
+		return nil
+	}
+	return out.external(key, d)
+}
+
+// with is out with every call of the unit reported through call.
+func (out siteOut) with(call func(e entry, detail string, d model.Dispatch) error) siteOut {
+	return siteOut{call: call, external: out.external}
+}
+
+// valueOut is the siteOut of a function taken as a value: each declaration
+// it denotes, and no external call.
+func valueOut(yield func(entry) error) siteOut {
+	return siteOut{call: func(e entry, _ string, _ model.Dispatch) error { return yield(e) }}
+}
+
+// site resolves site i and emits its facts: a FactCall per declaration it
+// calls, with the FactFlow of each argument into the parameter it binds
+// (argumentFlows), and a FactCall to an external method or a
+// FactExternalSite for a proven external call. An indirect site with a
 // declared function type also joins bySignature.
 //
 // A Java call of an abstract method binds that declaration only when no
@@ -44,64 +79,109 @@ func (r *staticFile) site(i int32, bySignature sigSink) error {
 	ref := Ref{File: r.file, Index: i}
 	s := &r.t.Sites[i]
 	joins := r.fc.language == "java" && s.Shape == wire.ShapeMember && s.Receiver.Kind == wire.TypeNamed
-	return r.resolve(i, bySignature, func(e entry, detail string) error {
-		if joins && e.Flags&flagAbstract != 0 && e.Sig != "" {
-			return bySignature(entry{Key: e.Sig, Tag: 2, Ref: ref, Aux: refKey(e.Ref), Sig: detail})
-		}
-		return r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail})
+	out := siteOut{
+		call: func(e entry, detail string, d model.Dispatch) error {
+			if joins && e.Flags&flagAbstract != 0 && e.Sig != "" {
+				return bySignature(entry{Key: e.Sig, Tag: 2, Ref: ref, Aux: refKey(e.Ref), Sig: detail})
+			}
+			if err := r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail, Dispatch: d}); err != nil {
+				return err
+			}
+			return r.flows(ref, s, e)
+		},
+		external: func(key string, d model.Dispatch) error {
+			if key == "" {
+				return r.emit(Binding{Kind: FactExternalSite, Site: ref})
+			}
+			return r.emit(Binding{Site: ref, External: key, Detail: DetailDirect, Dispatch: d})
+		},
+	}
+	return r.resolve(i, bySignature, out)
+}
+
+// flows emits the FactFlow of each argument of site s at ref into the
+// parameter of e, the declaration the site calls, it binds. A Go method
+// expression or a Rust path naming a method (`T.M(t, x)`, `T::m(&t, x)`)
+// passes the receiver as its first argument.
+func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
+	if len(s.Arguments) == 0 {
+		return nil
+	}
+	var params []paramInfo
+	if err := r.h.parameters(e.Ref, func(p paramInfo) error {
+		params = append(params, p)
+		return nil
+	}); err != nil {
+		return err
+	}
+	return argumentFlows(s, params, r.receiverFirst(s, e), func(arg, pos int32) error {
+		return r.emit(Binding{Kind: FactFlow, Site: ref, Target: e.Ref, Arg: arg, Param: pos, Detail: DetailArgument})
 	})
 }
 
-// resolve yields the declarations site i binds by its shape, with each
-// binding's detail, and records the types they return. Only a target a call
-// passing the site's arguments can call is yielded (fits). With
-// bySignature, an indirect site with a declared function type, and a Java
-// call of an abstract method, also join it.
-func (r *staticFile) resolve(i int32, bySignature sigSink, yield func(entry, string) error) error {
+// receiverFirst reports that site s passes the receiver of e, the method it
+// calls, as its first argument: a Go method expression or a Rust path
+// naming a method.
+func (r *staticFile) receiverFirst(s *Site, e entry) bool {
+	return s.Shape == wire.ShapeStatic && e.Flags&flagStatic == 0 && (r.fc.family == "go" || r.fc.family == "rust")
+}
+
+// resolve reports to out what site i binds by its shape, and records the
+// types its targets return. Only a target a call passing the site's
+// arguments can call is reported (fits). With bySignature, an indirect site
+// with a declared function type, and a Java call of an abstract method, also
+// join it.
+func (r *staticFile) resolve(i int32, bySignature sigSink, out siteOut) error {
 	s := &r.t.Sites[i]
 	_, known := r.returns[i]
 	if !known {
 		r.returns[i] = nil
 	}
 	var rets []returned
-	bind := func(detail string) func(entry) error {
-		return func(e entry) error {
-			if !r.fits(s, e) {
-				return nil
-			}
-			if !known && e.Returns != "" {
-				ret := returned{file: e.Ref.File, name: e.Returns}
-				if !slices.Contains(rets, ret) {
-					rets = append(rets, ret)
-				}
-			}
-			return yield(e, detail)
+	err := r.shape(i, s, bySignature, out.with(func(e entry, detail string, d model.Dispatch) error {
+		if !r.fits(s, e) {
+			return nil
 		}
-	}
-	err := r.shape(i, s, bySignature, bind)
+		if !known && e.Returns != "" {
+			ret := returned{file: e.Ref.File, name: e.Returns}
+			if !slices.Contains(rets, ret) {
+				rets = append(rets, ret)
+			}
+		}
+		return out.call(e, detail, d)
+	}))
 	if !known {
 		r.returns[i] = rets
 	}
 	return err
 }
 
+// exactly reports each declaration to out as an exact call of detail.
+func exactly(out siteOut, detail string) func(entry) error {
+	return func(e entry) error { return out.call(e, detail, model.DispatchExact) }
+}
+
 // shape resolves site s, at index i, by its shape.
-func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, bind func(string) func(entry) error) error {
+//
+// A call binds the one method its receiver's static type declares or
+// inherits (declared), `virtual` when an override of it can run
+// (dispatchOf), never the overrides themselves, which a query reaches
+// through `overrides`. A free function, a qualified or `super` call, a
+// constructor and a method of a constructed object are `exact`.
+func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, out siteOut) error {
 	switch s.Shape {
 	case wire.ShapeBare:
-		return r.bare(s.Caller, s.Callee, bind)
+		return r.bare(s.Caller, s.Callee, out)
 	case wire.ShapeStatic:
-		return r.qualified(s.Caller, s.Qualifier, s.Callee, bind(DetailDirect))
+		return r.qualified(s.Caller, s.Qualifier, s.Callee, out)
 	case wire.ShapeConstructor:
 		name := s.Qualifier
 		if name == "" {
 			name = s.Callee
 		}
-		return r.h.typesIn(r.ctx, r.fc, name, func(typ entry) error {
-			return r.h.methods(typ.Ref, lastComponent(typeName(name), r.fc.sep), bind(DetailDirect))
-		})
+		return r.construct(name, out)
 	case wire.ShapeMember:
-		err := r.member(s.Caller, s.Receiver, s.Callee, bind)
+		err := r.member(s.Caller, s.Receiver, s.Callee, out)
 		if err != nil || bySignature == nil || r.fc.language != "java" || s.Receiver.Kind != wire.TypeNamed {
 			return err
 		}
@@ -120,7 +200,7 @@ func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, bind func(stri
 		})
 	case wire.ShapeIndirect:
 		if s.Receiver.Kind == wire.TypeFunction {
-			if err := r.function(s.Caller, s.Receiver.Name, bind(DetailDirect)); err != nil {
+			if err := r.function(s.Caller, s.Receiver.Name, exactly(out, DetailDirect)); err != nil {
 				return err
 			}
 		}
@@ -142,59 +222,152 @@ func (r *staticFile) fits(s *Site, e entry) bool {
 		return true
 	}
 	n := len(s.Args)
-	if s.Shape == wire.ShapeStatic && e.Flags&flagStatic == 0 && (r.fc.family == "go" || r.fc.family == "rust") {
+	if r.receiverFirst(s, e) {
 		n--
 	}
 	return e.fits(n)
 }
 
-// dispatch binds the methods a call of method on a receiver of static type
-// typ reaches (dispatchEntries): DetailHierarchy when the call reaches into
-// typ's subtypes, DetailDirect when the language says it cannot.
-func (r *staticFile) dispatch(typ Ref, method string, bind func(string) func(entry) error) error {
-	return r.h.dispatchEntries(r.ctx, r.fc.family, typ, method, func(e entry, down bool) error {
-		if down {
-			return bind(DetailHierarchy)(e)
+// dispatchOf is the dispatch of a call of method on a receiver of static
+// type typ (iface when it is an interface or trait) that binds found, the
+// nearest declarations of it typ declares or inherits: `virtual` when an
+// override of them can run. A Rust call is virtual on a trait object or a
+// generic bounded by a trait (whose receiver names the trait) and exact on a
+// concrete type, which no impl overrides; every other family's rule is
+// overridable's.
+func (r *staticFile) dispatchOf(typ Ref, iface bool, method string, found []entry) (model.Dispatch, error) {
+	if r.fc.family == "rust" {
+		if iface {
+			return model.DispatchVirtual, nil
 		}
-		return bind(DetailDirect)(e)
+		return model.DispatchExact, nil
+	}
+	v, err := r.h.overridable(r.fc.family, typ, method, found)
+	if err != nil || !v {
+		return model.DispatchExact, err
+	}
+	return model.DispatchVirtual, nil
+}
+
+// onType reports to out the call of method on a receiver of static type
+// typ: the declarations typ declares or inherits, with their dispatch
+// (exact when the receiver is known to be exactly typ, a constructed
+// object), else the method of typ's one supertype outside the unit
+// (inherited).
+func (r *staticFile) onType(typ entry, method string, exact bool, out siteOut) error {
+	var found []entry
+	if err := r.h.declared(typ.Ref, method, func(e entry) error {
+		found = append(found, e)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		d := model.DispatchVirtual
+		if exact {
+			d = model.DispatchExact
+		}
+		return r.inherited(typ.Ref, method, d, out)
+	}
+	d := model.DispatchExact
+	if !exact {
+		var err error
+		if d, err = r.dispatchOf(typ.Ref, typ.Flags&flagInterface != 0, method, found); err != nil {
+			return err
+		}
+	}
+	for _, e := range found {
+		if err := out.call(e, DetailHierarchy, d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// inherited reports the call of method on typ, a type of the unit that
+// neither declares nor inherits it from the unit: with exactly one
+// supertype outside the unit (externalSupers), a call of that type's
+// external method; with several, a proven external call no node names;
+// with none, nothing.
+func (r *staticFile) inherited(typ Ref, method string, d model.Dispatch, out siteOut) error {
+	external, err := r.h.externalSupers(r.fc.family, typ, method)
+	if err != nil {
+		return err
+	}
+	switch len(external) {
+	case 0:
+		return nil
+	case 1:
+		return out.ext(externalMethod(r.fc.family, external[0].Aux, method), d)
+	}
+	return out.ext("", d)
+}
+
+// named reports the call of method on a receiver of the type written as
+// written in a file of fc: through each type of the unit it names (onType),
+// else, when it names a type outside the project, that type's external
+// method, `virtual`.
+func (r *staticFile) named(fc fileCtx, written, method string, exact bool, out siteOut) error {
+	found := false
+	err := r.h.typesIn(r.ctx, fc, written, func(typ entry) error {
+		found = true
+		return r.onType(typ, method, exact, out)
 	})
+	if err != nil || found {
+		return err
+	}
+	q, ok, err := r.h.externalName(r.ctx, fc, written)
+	if err != nil || !ok {
+		return err
+	}
+	d := model.DispatchVirtual
+	if exact {
+		d = model.DispatchExact
+	}
+	return out.ext(externalMethod(fc.family, q, method), d)
 }
 
 // bare resolves a call of a simple name: in Java, and in C++ inside a
-// class, by class-hierarchy analysis over the innermost enclosing type that
-// has a method of that name (JLS §15.12.1, [class.member.lookup]), walking
+// class, through the innermost enclosing type that has a method of that
+// name, declared or inherited (JLS §15.12.1, [class.member.lookup]), walking
 // out from an inner, local or anonymous class to the classes enclosing it
-// (an implicit `this` of the class that declares or inherits it); otherwise
-// the free functions the language's scope makes visible to the caller. In
-// C++ a member of an enclosing class is called without an object of it, so
-// only its static members are bound there.
-func (r *staticFile) bare(caller int32, callee string, bind func(string) func(entry) error) error {
+// (an implicit `this` of the class that declares or inherits it), with that
+// type's dispatch; otherwise the free functions the language's scope makes
+// visible to the caller, and in C and C++ first what an object-like macro of
+// the name stands for (aliasC). In C++ a member of an enclosing class is
+// called without an object of it, so only its static members are bound
+// there.
+func (r *staticFile) bare(caller int32, callee string, out siteOut) error {
 	if r.fc.language == "java" || r.fc.language == "cpp" {
 		found, outer := false, false
-		hit := func(detail string) func(entry) error {
-			return func(e entry) error {
-				found = true
-				if outer && r.fc.language == "cpp" && e.Flags&flagStatic == 0 {
-					return nil
-				}
-				return bind(detail)(e)
-			}
-		}
 		err := r.enclosingTypes(caller, func(types []Ref) (bool, error) {
 			for _, typ := range types {
-				// A level counts only when its type has the method as a
-				// member, declared or inherited: one it lacks is not
-				// reached through that type's subtypes.
+				// A level counts when its type has the method as a member,
+				// declared or inherited, even one it cannot call there.
+				var members []entry
 				member := false
-				err := r.h.declared(typ, callee, func(entry) error {
+				err := r.h.declared(typ, callee, func(e entry) error {
 					member = true
+					if !outer || r.fc.language != "cpp" || e.Flags&flagStatic != 0 {
+						members = append(members, e)
+					}
 					return nil
 				})
-				if err == nil && member {
-					err = r.dispatch(typ, callee, hit)
-				}
 				if err != nil {
 					return false, err
+				}
+				if !member {
+					continue
+				}
+				found = true
+				d, err := r.dispatchOf(typ, false, callee, members)
+				if err != nil {
+					return false, err
+				}
+				for _, e := range members {
+					if err := out.call(e, DetailHierarchy, d); err != nil {
+						return false, err
+					}
 				}
 			}
 			outer = true
@@ -204,34 +377,122 @@ func (r *staticFile) bare(caller int32, callee string, bind func(string) func(en
 			return err
 		}
 		if r.fc.language == "java" {
-			return r.staticImport(callee, bind(DetailDirect))
+			return r.staticImport(caller, callee, out)
 		}
 	}
-	return r.free(caller, callee, bind(DetailDirect))
+	if r.fc.family == "c" {
+		if aliased, err := r.aliasC(caller, callee, exactly(out, DetailDirect), nil); err != nil || aliased {
+			return err
+		}
+	}
+	found := false
+	err := r.free(caller, callee, func(e entry) error {
+		found = true
+		return out.call(e, DetailDirect, model.DispatchExact)
+	})
+	if err != nil || found || r.fc.language != "cpp" {
+		return err
+	}
+	// A C++ call of a type's name constructs it ([expr.type.conv]).
+	typed, err := r.isType(callee)
+	if err != nil || !typed {
+		return err
+	}
+	return r.construct(callee, out)
 }
 
-// staticImport yields the static methods named callee a Java file's static
-// imports bring into scope: `import static a.b.C.m;` names C's m, and
-// `import static a.b.C.*;` every member of C. A single-static import of the
-// name decides alone.
-func (r *staticFile) staticImport(callee string, yield func(entry) error) error {
+// isType reports that written names a type of the unit in the member.
+func (r *staticFile) isType(written string) (bool, error) {
+	typed := false
+	err := r.h.typesIn(r.ctx, r.fc, written, func(entry) error {
+		typed = true
+		return nil
+	})
+	return typed, err
+}
+
+// construct reports the construction of the type written as written: each
+// constructor of each type of the unit it names (the type's methods of its
+// own name), else the type itself, whose implicit constructor runs (JLS
+// §8.8.9, [class.default.ctor]), each exact. A type outside the project is a
+// proven external call no node names.
+func (r *staticFile) construct(written string, out siteOut) error {
+	ctor := lastComponent(typeName(written), r.fc.sep)
+	typed := false
+	err := r.h.typesIn(r.ctx, r.fc, written, func(typ entry) error {
+		typed = true
+		found := false
+		err := r.h.methods(typ.Ref, ctor, func(e entry) error {
+			found = true
+			return out.call(e, DetailDirect, model.DispatchExact)
+		})
+		if err != nil || found {
+			return err
+		}
+		return out.call(typ, DetailDirect, model.DispatchExact)
+	})
+	if err != nil || typed {
+		return err
+	}
+	if _, ok, err := r.h.externalName(r.ctx, r.fc, written); err != nil || !ok {
+		return err
+	}
+	return out.ext("", model.DispatchExact)
+}
+
+// constructed is the type site j constructs, as written: a `new` or a
+// constructor call (ShapeConstructor), or a C++ call of a type's name; ok is
+// false for any other site.
+func (r *staticFile) constructed(j int32) (string, bool, error) {
+	if j < 0 || int(j) >= len(r.t.Sites) {
+		return "", false, nil
+	}
+	s := &r.t.Sites[j]
+	switch {
+	case s.Shape == wire.ShapeConstructor:
+		return cmp.Or(s.Qualifier, s.Callee), true, nil
+	case s.Shape == wire.ShapeBare && r.fc.language == "cpp":
+		typed, err := r.isType(s.Callee)
+		return s.Callee, typed, err
+	}
+	return "", false, nil
+}
+
+// staticImport reports the static methods named callee a Java file's
+// static imports bring into scope: `import static a.b.C.m;` names C's m,
+// and `import static a.b.C.*;` every member of C. A single-static import of
+// the name decides alone, and one of a type outside the unit is a call of
+// its external method. Otherwise a call inside a class that inherits the
+// method from outside the unit calls it there (inherited).
+func (r *staticFile) staticImport(caller int32, callee string, out siteOut) error {
+	found := false
 	member := func(typePath, method string) error {
 		return r.h.decls.lookup(keyTypeQualified+r.fc.family+"\x00"+typePath, func(typ entry) error {
-			return r.h.declared(typ.Ref, method, yield)
+			found = true
+			return r.h.declared(typ.Ref, method, exactly(out, DetailDirect))
 		})
 	}
-	imported := false
+	var single []string
 	err := r.h.imports(r.fc, callee, func(p string) error {
-		imported = true
+		single = append(single, p)
 		if typePath, method, ok := cutLast(p, "."); ok {
 			return member(typePath, method)
 		}
 		return nil
 	})
-	if err != nil || imported {
+	if err != nil || found {
 		return err
 	}
-	return r.h.imports(r.fc, ImportAll, func(p string) error { return member(p, callee) })
+	if len(single) > 0 {
+		if typePath, method, ok := cutLast(single[0], "."); ok && len(single) == 1 {
+			return out.ext(externalMethod(r.fc.family, typePath, method), model.DispatchExact)
+		}
+		return nil
+	}
+	if err := r.h.imports(r.fc, ImportAll, func(p string) error { return member(p, callee) }); err != nil || found {
+		return err
+	}
+	return r.innermostTypes(caller, func(typ Ref) error { return r.inherited(typ, callee, model.DispatchVirtual, out) })
 }
 
 // free yields the free functions named callee visible to code in caller:
@@ -250,82 +511,152 @@ func (r *staticFile) free(caller int32, callee string, yield func(entry) error) 
 	return r.h.decls.lookup(keyFunc+r.fc.family+"\x00"+declScope(r.t, r.fc)+"\x00"+callee, yield)
 }
 
-// qualified resolves a call of name through qualifier q: a type's static
-// method or associated function (Rust's `Self` is the caller's impl type), a
-// package's function when q is a Go import (by the import's path), a
-// namespace's function (C++), or a Rust module's function (through the
-// `use` that binds q's first component, when one does).
-func (r *staticFile) qualified(caller int32, q, name string, yield func(entry) error) error {
-	found := false
-	hit := func(e entry) error {
-		found = true
-		return yield(e)
-	}
+// qualified resolves a call of name through qualifier q, each binding
+// exact: a type's static method or associated function (Rust's `Self` is the
+// caller's impl type), a package's function when q is a Go import (by the
+// import's path), a namespace's function (C++), or a Rust module's function
+// (through the `use` that binds q's first component, when one does).
+//
+// A qualifier that names nothing of the unit is a proven external call: a Go
+// import of a package outside the unit, a Java type outside the project (its
+// external method), a C++ namespace or type, or a Rust path, that names no
+// type or module of the unit. A type of the unit that neither declares nor
+// inherits name calls it on its one supertype outside the unit (inherited).
+func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error {
+	yield := exactly(out, DetailDirect)
 	if r.fc.language == "rust" && q == "Self" {
 		return r.innermostTypes(caller, func(typ Ref) error { return r.h.declared(typ, name, yield) })
 	}
 	if r.fc.family == "go" {
-		if imported, err := r.qualifiedGo(q, name, yield); err != nil || imported {
+		imported, inUnit, err := r.qualifiedGo(q, name, yield)
+		if err != nil || imported {
+			if err == nil && !inUnit {
+				err = out.ext("", model.DispatchExact)
+			}
 			return err
 		}
 	}
-	err := r.h.typesIn(r.ctx, r.fc, q, func(typ entry) error { return r.h.declared(typ.Ref, name, hit) })
-	if err != nil || found {
+	found, typed := false, false
+	err := r.h.typesIn(r.ctx, r.fc, q, func(typ entry) error {
+		typed = true
+		var members []entry
+		if err := r.h.declared(typ.Ref, name, func(e entry) error {
+			members = append(members, e)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(members) == 0 {
+			return r.inherited(typ.Ref, name, model.DispatchExact, out)
+		}
+		found = true
+		for _, e := range members {
+			if err := yield(e); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil || found || typed {
 		return err
 	}
 	switch r.fc.family {
 	case "c":
-		return r.qualifiedC(q, name, yield)
+		bound := false
+		if err := r.qualifiedC(q, name, func(e entry) error {
+			bound = true
+			return yield(e)
+		}); err != nil || bound {
+			return err
+		}
+		return out.ext("", model.DispatchExact)
 	case "rust":
-		return r.qualifiedRust(caller, q, name, yield)
+		inUnit, err := r.qualifiedRust(caller, q, name, yield)
+		if err != nil || inUnit {
+			return err
+		}
+		return out.ext("", model.DispatchExact)
+	case "java":
+		external, ok, err := r.h.externalName(r.ctx, r.fc, q)
+		if err != nil || !ok {
+			return err
+		}
+		return out.ext(externalMethod(r.fc.family, external, name), model.DispatchExact)
 	}
 	return nil
 }
 
-// member resolves a call of method on a receiver: by class-hierarchy
-// analysis over its declared type, or over the types the targets of the
-// call it is the result of return; along the enclosing class's supertypes
-// for `super`; as a qualified call through a module; or, for Go, over the
-// declared type of the field it reads (fieldGo).
-func (r *staticFile) member(caller int32, recv wire.Type, method string, bind func(string) func(entry) error) error {
+// member resolves a call of method on a receiver: over its declared type,
+// or over the types the targets of the call it is the result of return
+// (exact when that call constructs it); along the enclosing class's
+// supertypes for `super`, exact; as a qualified call through a module; or,
+// for Go and Java, over the declared type of the field it reads (fieldGo,
+// fieldJava).
+func (r *staticFile) member(caller int32, recv wire.Type, method string, out siteOut) error {
 	switch recv.Kind {
 	case wire.TypeNamed:
-		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error { return r.dispatch(typ.Ref, method, bind) })
+		return r.named(r.fc, recv.Name, method, false, out)
 	case wire.TypeResult:
-		return r.results(int32(recv.Index), method, func(typ Ref) error { return r.dispatch(typ, method, bind) })
+		// A constructed object is exactly the type it constructs.
+		if typ, ok, err := r.constructed(int32(recv.Index)); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			return r.named(r.fc, typ, method, true, out)
+		}
+		return r.results(int32(recv.Index), method, func(fc fileCtx, written string) error {
+			return r.named(fc, written, method, false, out)
+		})
 	case wire.TypeSuper:
 		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
-			return r.h.links.lookup(keySuper+refKey(typ.Ref), func(super entry) error {
-				return r.h.declared(super.Ref, method, bind(DetailDirect))
+			found := false
+			err := r.h.links.lookup(keySuper+refKey(typ.Ref), func(super entry) error {
+				return r.h.declared(super.Ref, method, func(e entry) error {
+					found = true
+					return out.call(e, DetailDirect, model.DispatchExact)
+				})
 			})
+			if err != nil || found {
+				return err
+			}
+			return r.inherited(typ.Ref, method, model.DispatchExact, out)
 		})
 	case wire.TypeModule:
-		return r.qualified(caller, recv.Name, method, bind(DetailDirect))
+		return r.qualified(caller, recv.Name, method, out)
+	case wire.TypeClass:
+		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
+			return r.onType(typ, method, true, out)
+		})
 	case wire.TypeField:
-		if r.fc.family == "go" {
-			return r.fieldGo(recv.Name, func(typ Ref) error { return r.dispatch(typ, method, bind) })
+		switch r.fc.family {
+		case "go":
+			return r.fieldGo(recv.Name, func(fc fileCtx, written string) error {
+				return r.named(fc, written, method, false, out)
+			})
+		case "java":
+			return r.fieldJava(recv.Name, method, out)
 		}
 	}
 	return nil
 }
 
-// results yields, each once, the types the targets of site j return that a
-// call of method on the result reaches, each read in the file of the target
-// that returns it: the static type of a call's result
-// (`NewServer().Start()`, a fluent chain, `Config::new().load()`). A Rust
-// result held in a smart pointer (`-> Rc<Foo>`) reaches the owned type,
-// except by a method the pointer answers itself (rustReceiver). A site not
-// yet resolved is resolved first, without publishing anything.
-func (r *staticFile) results(j int32, method string, yield func(Ref) error) error {
+// results calls each with the context of the file of each target of site j
+// and the type it returns, as that file writes it, each once: the static
+// type of a call's result (`NewServer().Start()`, a fluent chain,
+// `Config::new().load()`). A Rust result held in a smart pointer
+// (`-> Rc<Foo>`) reaches the owned type, except by a method the pointer
+// answers itself (rustReceiver). A site not yet resolved is resolved first,
+// without publishing anything.
+func (r *staticFile) results(j int32, method string, each func(fc fileCtx, written string) error) error {
 	if j < 0 || int(j) >= len(r.t.Sites) {
 		return nil
 	}
 	if _, ok := r.returns[j]; !ok {
-		if err := r.resolve(j, nil, func(entry, string) error { return nil }); err != nil {
+		noop := siteOut{call: func(entry, string, model.Dispatch) error { return nil }}
+		if err := r.resolve(j, nil, noop); err != nil {
 			return err
 		}
 	}
-	seen := map[Ref]bool{}
 	for _, ret := range r.returns[j] {
 		name := ret.name
 		if r.fc.family == "rust" {
@@ -334,14 +665,14 @@ func (r *staticFile) results(j int32, method string, yield func(Ref) error) erro
 				continue
 			}
 		}
-		err := r.h.types(r.ctx, ret.file, name, func(typ Ref) error {
-			if seen[typ] {
-				return nil
-			}
-			seen[typ] = true
-			return yield(typ)
-		})
+		fc, found, err := r.h.fileContext(ret.file)
 		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if err := each(fc, name); err != nil {
 			return err
 		}
 	}
@@ -349,7 +680,8 @@ func (r *staticFile) results(j int32, method string, yield func(Ref) error) erro
 }
 
 // function yields the declarations a function or method name taken as a
-// value in caller denotes: `f`, `pkg.F`, `T.M`, `T::m`, `&f`.
+// value in caller denotes: `f`, `pkg.F`, `T.M`, `T::m`, `&f`, and the
+// method `this`, `self` or `Self` declares or inherits (`this::m`).
 func (r *staticFile) function(caller int32, written string, yield func(entry) error) error {
 	name := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(written), "&*"))
 	sep := r.fc.sep
@@ -364,11 +696,9 @@ func (r *staticFile) function(caller int32, written string, yield func(entry) er
 		return r.free(caller, name, yield)
 	}
 	if q == "this" || q == "self" {
-		return r.innermostTypes(caller, func(typ Ref) error {
-			return r.h.dispatchEntries(r.ctx, r.fc.family, typ, last, func(e entry, _ bool) error { return yield(e) })
-		})
+		return r.innermostTypes(caller, func(typ Ref) error { return r.h.declared(typ, last, yield) })
 	}
-	return r.qualified(caller, q, last, yield)
+	return r.qualified(caller, q, last, valueOut(yield))
 }
 
 // enclosingTypes calls level with the types whose bodies enclose code in
@@ -429,4 +759,101 @@ func cutLast(s, sep string) (before, after string, ok bool) {
 func lastComponent(s, sep string) string {
 	_, last, _ := cutLast(s, sep)
 	return last
+}
+
+// fieldPath calls each with the type the field path fields, read from a
+// value of the type typ, holds, as the file declaring the last field writes
+// it, in that file's context: each step the field a selector of its name
+// denotes on the type the step before it holds (keyGoField: a Go type's own
+// or promoted, a Java class's own, else, in Java, the nearest along its
+// supertypes, JLS §8.3, else the class enclosing it in the member's file),
+// whose declared type is read in the file that declares the field. A field
+// with no declared type ends the path.
+func (r *staticFile) fieldPath(typ Ref, fields []string, each func(fc fileCtx, written string) error) error {
+	var found []entry
+	seen := map[Ref]bool{typ: true}
+	queue := []Ref{typ}
+	for len(queue) > 0 && len(found) == 0 {
+		t := queue[0]
+		queue = queue[1:]
+		if err := r.h.links.lookup(keyGoField+refKey(t)+fields[0], func(f entry) error {
+			found = append(found, f)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(found) > 0 || r.fc.family != "java" {
+			break
+		}
+		if err := r.h.links.lookup(keySuper+refKey(t), func(e entry) error {
+			if !seen[e.Ref] {
+				seen[e.Ref] = true
+				queue = append(queue, e.Ref)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	if len(found) == 0 && r.fc.family == "java" && typ.File == r.file && typ.Index >= 0 && int(typ.Index) < len(r.t.Decls) {
+		// A field read inside an inner class may be the enclosing class's
+		// (JLS §6.5.6.1, §8.1.3), named by the inner class it is read in.
+		for p := r.t.Decls[typ.Index].Parent; p >= 0 && int(p) < len(r.t.Decls); p = r.t.Decls[p].Parent {
+			if isType(r.t.Decls[p].Kind) {
+				return r.fieldPath(Ref{File: r.file, Index: p}, fields, each)
+			}
+		}
+	}
+	for _, f := range found {
+		if f.Sig == "" {
+			continue
+		}
+		if len(fields) == 1 {
+			fc, ok, err := r.h.fileContext(f.Ref.File)
+			if err != nil {
+				return err
+			}
+			if ok {
+				if err := each(fc, f.Sig); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		err := r.h.types(r.ctx, f.Ref.File, f.Sig, func(next Ref) error { return r.fieldPath(next, fields[1:], each) })
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fieldJava resolves a call of method on a Java field receiver written
+// "Owner.f1.f2…" (wire.TypeField), Owner as written, a qualified name when
+// written qualified: the longest leading part that names a type of the unit
+// is the owner, and the rest is read on it (fieldPath); the call binds on the
+// type the last field declares (named), of the unit or outside it. An owner
+// outside the project (`System.out`) makes it a proven external call no node
+// names.
+func (r *staticFile) fieldJava(written, method string, out siteOut) error {
+	parts := strings.Split(written, ".")
+	for k := len(parts) - 1; k >= 1; k-- {
+		found := false
+		err := r.h.typesIn(r.ctx, r.fc, strings.Join(parts[:k], "."), func(typ entry) error {
+			found = true
+			return r.fieldPath(typ.Ref, parts[k:], func(fc fileCtx, written string) error {
+				return r.named(fc, written, method, false, out)
+			})
+		})
+		if err != nil || found {
+			return err
+		}
+	}
+	if len(parts) < 2 {
+		return nil
+	}
+	if _, ok, err := r.h.externalName(r.ctx, r.fc, strings.Join(parts[:len(parts)-1], ".")); err != nil || !ok {
+		return err
+	}
+	return out.ext("", model.DispatchVirtual)
 }
