@@ -306,6 +306,14 @@ func keptLanguage(req wire.Request, h *lang.HeaderChoice) (lang.Language, error)
 	return l, nil
 }
 
+// detailExports names the export rule a Python module's exports followed when
+// it was not its `__all__`: exportsComputedAll, an `__all__` that is not
+// static, so every top-level name without a leading underscore is exported.
+const (
+	detailExports      = "exports"
+	exportsComputedAll = "underscore_rule: __all__ is not static"
+)
+
 // The capability details a header's parse discloses (lang.HeaderChoice): the
 // grammar it was parsed with first, the one kept and why, and, when the
 // fallback ran, the error bytes of each parse.
@@ -453,6 +461,12 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	}
 	if ex.done.LinkFailure != "" {
 		state = state.WithDetail(detailLinkFailure, ex.done.LinkFailure)
+	}
+	if ex.done.ComputedAll {
+		// The module's `__all__` is not static, so its exports follow the
+		// underscore rule; the row says so (ADR-0017 decision 2). It is the
+		// documented rule for such a module, not missing coverage.
+		state = state.WithDetail(detailExports, exportsComputedAll)
 	}
 	state, bounded := b.bounds(structure, state)
 	if ex.done.SyntaxErrors || ex.done.Truncated || bounded {

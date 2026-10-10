@@ -44,6 +44,8 @@ func referenceQueryHash(node model.NodeID, op model.ReferenceOperation) string {
 type referenceWalk struct {
 	direction model.Direction
 	kinds     []model.RelationKind
+	// family reads the references of the node's whole method family.
+	family bool
 }
 
 // referenceWalkFor maps a reference operation onto the canonical relation
@@ -51,7 +53,8 @@ type referenceWalk struct {
 //
 //   - references:      incoming `references` and `calls` -- every canonical
 //     edge that names this node as its target is a place the
-//     symbol is used.
+//     symbol is used -- of the node and of every method of its
+//     method family (methodFamily).
 //   - implements:      incoming `implements` -- the implementors of an
 //     interface, which is the direction that answers
 //     "who implements this", not "what does this implement".
@@ -66,13 +69,13 @@ func referenceWalkFor(op model.ReferenceOperation) (referenceWalk, error) {
 	switch op {
 	case model.ReferenceReferences:
 		return referenceWalk{model.DirectionIncoming,
-			[]model.RelationKind{model.RelReferences, model.RelCalls}}, nil
+			[]model.RelationKind{model.RelReferences, model.RelCalls}, true}, nil
 	case model.ReferenceImplements:
 		return referenceWalk{model.DirectionIncoming,
-			[]model.RelationKind{model.RelImplements}}, nil
+			[]model.RelationKind{model.RelImplements}, false}, nil
 	case model.ReferenceTypeDefinition:
 		return referenceWalk{model.DirectionOutgoing,
-			[]model.RelationKind{model.RelReferences}}, nil
+			[]model.RelationKind{model.RelReferences}, false}, nil
 	}
 	return referenceWalk{}, (&model.Error{Code: model.CodeArgumentInvalid,
 		Message: "reference operation is not a known reference operation"}).
@@ -483,6 +486,44 @@ type referenceRelation struct {
 	Kind model.RelationKind `json:"kind"`
 	From model.NodeID       `json:"from"`
 	To   model.NodeID       `json:"to"`
+	// Tier orders precise references before name-only ones, and Via is the
+	// stored call to an open site whose occurrences a name-only reference
+	// carries.
+	Tier int              `json:"tier,omitempty"`
+	Via  model.RelationID `json:"via,omitempty"`
+}
+
+// referenceHeuristic is the tier of a name-only reference; a precise one is
+// tier 0, so every precise reference is listed before every name-only one.
+const referenceHeuristic = 1
+
+// compareReferences is the list's order: tier, then canonical relation id,
+// then the site a name-only reference stands for.
+func compareReferences(a, b referenceRelation) int {
+	if c := cmp.Compare(a.Tier, b.Tier); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.ID, b.ID); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Via, b.Via)
+}
+
+// referencePrecision is an occurrence's precision: its evidence row's for a
+// precise reference, heuristic for a name-only one, which no analysis bound.
+func referencePrecision(r referenceRelation, stored model.Precision) model.Precision {
+	if r.Tier == referenceHeuristic {
+		return model.PrecisionHeuristic
+	}
+	return stored
+}
+
+// evidenceKey is the stored relation whose evidence an entry reports.
+func (r referenceRelation) evidenceKey() model.RelationID {
+	if r.Via != "" {
+		return r.Via
+	}
+	return r.ID
 }
 
 func encodeReferenceRelation(r referenceRelation) ([]byte, error) {
@@ -506,7 +547,7 @@ func decodeReferenceRelation(b []byte) (referenceRelation, error) {
 // when a run spills, so the charge is an estimate of the encoding it would
 // produce plus the struct and allocator overhead the buffer really pays.
 func sizeOfReferenceRelation(r referenceRelation) int64 {
-	return int64(len(r.ID)+len(r.Kind)+len(r.From)+len(r.To)) + 128
+	return int64(len(r.ID)+len(r.Kind)+len(r.From)+len(r.To)+len(r.Via)) + 136
 }
 
 // referenceHydrateBatch is how many relations are taken off the ordered list
@@ -546,7 +587,7 @@ func (b *referencePageBuilder) consume(ctx context.Context, batch []referenceRel
 	}
 	ids := make([]model.RelationID, 0, len(batch))
 	for _, r := range batch {
-		ids = append(ids, r.ID)
+		ids = append(ids, r.evidenceKey())
 	}
 	// pageLimit+1 per relation distinguishes "exactly a page of occurrences"
 	// from "more than a page", so the clipped flag is never raised for a
@@ -562,7 +603,7 @@ func (b *referencePageBuilder) consume(ctx context.Context, batch []referenceRel
 		return 0, err
 	}
 	for i, r := range batch {
-		occ := ev[r.ID]
+		occ := ev[r.evidenceKey()]
 		if len(occ) == 0 {
 			// A canonical relation with no evidence row contributes no
 			// occurrence and is not reported, because an occurrence IS an
@@ -604,7 +645,7 @@ func (b *referencePageBuilder) consume(ctx context.Context, batch []referenceRel
 				// resolving it would cost one file read per distinct file on a
 				// port that offers no batched file lookup, while FileID plus
 				// Range already locates the occurrence exactly.
-				Precision: row.Precision,
+				Precision: referencePrecision(r, row.Precision),
 				FileID:    row.FileID,
 				// Range and Bytes are the same interval from the two sides of
 				// persistence, and a hydrated evidence row carries the byte
@@ -660,7 +701,7 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	}
 	sorter, err := pagination.NewExternalSort(e.walkScratchDir(), 0,
 		encodeReferenceRelation, decodeReferenceRelation,
-		func(a, b referenceRelation) int { return cmp.Compare(a.ID, b.ID) })
+		compareReferences)
 	if err != nil {
 		return nil, err
 	}
@@ -670,6 +711,19 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	refs, err := reader.Resolve(ctx, []model.NodeID{node})
 	if err != nil {
 		return nil, err
+	}
+	// The references of a method are those of its whole method family: every
+	// method it overrides and every method overriding those, at any depth,
+	// both ways. References serve renaming and reading, and a rename of one
+	// override is a rename of the family (ADR-0015 decision 2).
+	owners := map[NodeRef]model.NodeID{}
+	if refs[0] != 0 {
+		owners[refs[0]] = node
+		if walk.family {
+			if refs, err = e.methodFamily(ctx, reader, refs[0], owners); err != nil {
+				return nil, err
+			}
+		}
 	}
 	codes, absent := kindCodesFor(reader, walk.kinds)
 	// A node this generation does not carry has no list, and an operation whose
@@ -709,12 +763,16 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 				// take the whole page down with it.
 				continue
 			}
-			r := referenceRelation{ID: relIDs[i], Kind: kind, From: node, To: nodeIDs[i]}
+			owner := owners[edge.Owner]
+			if owner == "" {
+				continue
+			}
+			r := referenceRelation{ID: relIDs[i], Kind: kind, From: owner, To: nodeIDs[i]}
 			if !edge.Outgoing {
 				// The entry is on the owner's INCOMING list, so the owner is
 				// the relation's to-node and the neighbour is where the
 				// reference is written.
-				r.From, r.To = nodeIDs[i], node
+				r.From, r.To = nodeIDs[i], owner
 			}
 			if err := sorter.Add(r); err != nil {
 				return err
@@ -737,7 +795,39 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	if err := flush(); err != nil {
 		return nil, err
 	}
+	if walk.family {
+		if err := e.heuristicReferences(ctx, reader, node, sorter.Add); err != nil {
+			return nil, err
+		}
+	}
 	return sorter.Sorted()
+}
+
+// heuristicReferences adds the name-only references of node after every
+// precise one (ADR-0015 decision 3): each caller of an open call site node is
+// a candidate of is a `may_call` reference, located at that site's
+// occurrences and reported at heuristic precision.
+func (e *Engine) heuristicReferences(ctx context.Context, reader GraphReader, node model.NodeID,
+	add func(referenceRelation) error) error {
+	dr := declarationReader(reader)
+	if dr == nil {
+		return nil
+	}
+	repo := reader.Binding().RepositoryID
+	var found []referenceRelation
+	if err := callersOfSites(ctx, reader, dr, []model.NodeID{node}, map[model.NodeID]bool{},
+		func(caller, start model.NodeID, via model.RelationID) {
+			found = append(found, referenceRelation{ID: model.NewRelationID(repo, caller, model.RelMayCall, start),
+				Kind: model.RelMayCall, From: caller, To: start, Via: via, Tier: referenceHeuristic})
+		}); err != nil {
+		return err
+	}
+	for _, r := range found {
+		if err := add(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // firstReferencePage computes the whole ordered list, serves its first page out
@@ -1015,4 +1105,51 @@ func (e *Engine) evidence(ctx context.Context, relations []model.RelationID,
 		out[rel] = rows
 	}
 	return out, nil
+}
+
+// methodFamily adds to owners every method connected to start by `overrides`,
+// up and down at any depth, and returns their surrogates ascending, start
+// included. One adjacency read per level of the family.
+func (e *Engine) methodFamily(ctx context.Context, reader GraphReader, start NodeRef,
+	owners map[NodeRef]model.NodeID) ([]NodeRef, error) {
+	code, ok := reader.Kinds().Code(model.RelOverrides)
+	if !ok {
+		return []NodeRef{start}, nil
+	}
+	level := []NodeRef{start}
+	var found []NodeRef
+	for len(level) > 0 {
+		var next []NodeRef
+		if _, err := reader.Neighbours(ctx, level, model.DirectionBoth, []KindCode{code}, EdgePos{}, func(edge Edge) error {
+			if _, seen := owners[edge.Neighbour]; seen {
+				return nil
+			}
+			owners[edge.Neighbour] = ""
+			next = append(next, edge.Neighbour)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		found = append(found, next...)
+		level = ascending(next)
+	}
+	if len(found) > 0 {
+		found = ascending(found)
+		for _, chunk := range impactChunkRefs(found) {
+			ids, err := reader.NodeIDs(ctx, chunk)
+			if err != nil {
+				return nil, err
+			}
+			for i, ref := range chunk {
+				owners[ref] = ids[i]
+			}
+		}
+	}
+	all := make([]NodeRef, 0, len(owners))
+	for ref, id := range owners {
+		if id != "" {
+			all = append(all, ref)
+		}
+	}
+	return ascending(all), nil
 }

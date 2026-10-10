@@ -65,6 +65,9 @@ type impactRecord struct {
 	Parent    model.NodeID       `json:"p,omitempty"`
 	Route     []model.RelationID `json:"rt,omitempty"`
 	Reasons   []string           `json:"rs,omitempty"`
+	// Possible is set on a record whose route takes a name-only `may_call`
+	// hop (expandOpenSites): its path may not run.
+	Possible bool `json:"po,omitempty"`
 }
 
 // scoreMicros is the frozen integer score: a cheaper, more direct route always

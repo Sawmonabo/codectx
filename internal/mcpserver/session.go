@@ -68,8 +68,9 @@ func (h *handlers) contextStatus(ctx context.Context, _ *mcp.CallToolRequest, in
 // contextNext answers codectx_context_next. METADATA ONLY: model.NextContextItem
 // names the next required file, its content hash and its byte offset, and
 // carries no content field at all — only codectx_read_source may return source
-// bytes. Nothing is projected away here because there is nothing to project
-// away; the guarantee is the answer type's.
+// bytes, and within a session it is the read that issues the receipt. Nothing
+// is projected away here because there is nothing to project away; the
+// guarantee is the answer type's.
 func (h *handlers) contextNext(ctx context.Context, _ *mcp.CallToolRequest, in model.SessionRequest) (*mcp.CallToolResult, result[model.NextContextItem], error) {
 	var zero result[model.NextContextItem]
 	if err := in.Validate(); err != nil {
@@ -112,24 +113,33 @@ func (h *handlers) contextInclude(ctx context.Context, _ *mcp.CallToolRequest, i
 	return nil, ok(h, status), nil
 }
 
-// readSource answers codectx_read_source. It is the ONLY handler that may
-// return source bytes and the only one bounded by
+// readSource answers codectx_read_source in both of its modes. It is the ONLY
+// handler that may return source bytes and the only one bounded by
 // resources.max_source_response_bytes rather than the metadata ceiling.
 //
-// The response is returned whole, receipt included: a receipt proves the bytes
-// were issued and is what codectx_context_acknowledge confirms, so dropping or
-// rewriting it would make coverage unprovable. It is never logged — a receipt
-// in a log line is a credential in a log line, and a second actor could replay
-// it against the session it was issued for.
+// With session_id it is the session read: the response is returned whole,
+// receipt included, because a receipt proves the bytes were issued and is what
+// codectx_context_acknowledge confirms, so dropping or rewriting it would make
+// coverage unprovable. It is never logged — a receipt in a log line is a
+// credential in a log line, and a second actor could replay it against the
+// session it was issued for.
+//
+// Without session_id it reads one node or one byte range of a pinned
+// generation and earns nothing: the answer carries no session block, no
+// receipt is issued and no coverage changes. It goes to the exploration
+// facade, which reaches no write transaction, so it neither commits a refresh
+// this server started early nor waits behind it; a session read goes to the
+// writing facade, which records the issued chunk. Both are bounded alike
+// below.
 //
 // The bound is checked here and not left to the request middleware because the
 // middleware's ceiling is resources.max_metadata_response_bytes, which this one
 // response type is exempt from. It bounds the chunk
 // content — the term the ceiling exists for — and not the serialized envelope:
-// the exact wire accounting is internal/coverage's, which sizes the chunk it
-// issues against this same key plus its envelope allowance. An over-budget body
-// therefore means the ContextService behind this interface mis-sized it, and
-// refusing is the honest answer.
+// the exact wire accounting is the facade's, which sizes every chunk it serves,
+// in either mode, against this same key plus its envelope allowance. An
+// over-budget body therefore means the ContextService behind this interface
+// mis-sized it, and refusing is the honest answer.
 //
 // An unconfigured key is CTX_INTERNAL naming it, never a resource-limit
 // refusal, matching internal/coverage's Limits check: a zero ceiling would
@@ -139,7 +149,11 @@ func (h *handlers) readSource(ctx context.Context, _ *mcp.CallToolRequest, in mo
 	if err := in.Validate(); err != nil {
 		return nil, zero, toolFailure(h.log, err)
 	}
-	res, err := h.context.Read(ctx, in)
+	read := h.context.Read
+	if !in.InSession() {
+		read = h.explore.Read
+	}
+	res, err := read(ctx, in)
 	if err != nil {
 		return nil, zero, toolFailure(h.log, err)
 	}

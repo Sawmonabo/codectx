@@ -379,9 +379,7 @@ func (u *unit) rng(start, end int) *model.SourceRange {
 // qualified name within this file: two manifests declaring the same name are
 // two packages.
 func (u *unit) defines(ctx context.Context, kind model.NodeKind, qualified, name, language string, rng *model.SourceRange, meta map[string]any) (model.Node, error) {
-	fv := u.e.File()
-	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: provider.ScopeWorkspace, NativeKey: string(kind) + ":" + qualified,
-		Kind: kind, Language: language, Name: name, QualifiedName: qualified, FileID: fv.ID, ContentHash: fv.ContentHash}
+	cand := u.definedCandidate(kind, qualified, name, language)
 	file, err := u.fileNode(ctx)
 	if err != nil {
 		return model.Node{}, err
@@ -395,6 +393,15 @@ func (u *unit) defines(ctx context.Context, kind model.NodeKind, qualified, name
 	}
 	u.e.Symbol(node, rng)
 	return node, nil
+}
+
+// definedCandidate is the identity of the node this manifest file defines.
+// Resolving it again in the same unit adds an evidence row to that node's
+// fact rather than a second node.
+func (u *unit) definedCandidate(kind model.NodeKind, qualified, name, language string) model.NodeCandidate {
+	fv := u.e.File()
+	return model.NodeCandidate{ProviderID: ID, ScopeKey: provider.ScopeWorkspace, NativeKey: string(kind) + ":" + qualified,
+		Kind: kind, Language: language, Name: name, QualifiedName: qualified, FileID: fv.ID, ContentHash: fv.ContentHash}
 }
 
 // dependency is a workspace-scoped structural identity: every manifest that

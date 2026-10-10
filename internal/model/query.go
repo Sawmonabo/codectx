@@ -329,7 +329,9 @@ func (t SearchTier) Valid() bool { return t.Rank() < len(searchTiers) }
 // the canonical entity or file chunk that was matched, the integer ranking
 // component with its retrieval tier, bounded reasons and the occurrence count
 // that deduplication folded away. It carries no source body — Section 19.3
-// reserves those for codectx_read_source.
+// reserves those for codectx_read_source, which reads a hit's node or file by
+// id within a context session or outside one, from the generation the hit's
+// binding names.
 type SearchHit struct {
 	NodeID          NodeID       `json:"node_id,omitempty"`
 	FileID          FileID       `json:"file_id"`
@@ -1093,12 +1095,12 @@ type PathRequest struct {
 	Direction  Direction `json:"direction,omitempty"`
 	MaxDepth   int       `json:"max_depth"`
 	MaxVisited int       `json:"max_visited"`
-	// Page carries the continuation of a path search whose earlier page spent
-	// its work budget or its deadline before the walk reached the target. The
-	// external-memory walk persists its own state, so a resumed page carries
-	// on settling cost buckets rather than restarting; Limit is unused here
-	// (a path answer is one route list, not a keyset page) and is validated
-	// only so a caller that sets it is told so rather than ignored.
+	// Page carries the continuation of a path search: of a walk whose earlier
+	// page spent its work budget or its deadline before reaching the target,
+	// which carries on settling cost buckets rather than restarting, and of
+	// the list of equal-cost routes, which goes on after the last route the
+	// page before listed. Limit is the routes one page lists (0 is the
+	// endpoint default).
 	Page PageRequest `json:"page"`
 }
 
@@ -1181,10 +1183,17 @@ func (p RelationPath) Validate() error {
 // the bounded routes themselves, and an exhausted traversal budget is reported
 // as truncation rather than "no path exists".
 type PathResult struct {
-	Meta         QueryMeta      `json:"meta"`
-	Paths        []RelationPath `json:"paths"`
-	Nodes        []Node         `json:"nodes"`
-	VisitedCount int64          `json:"visited_count"`
+	Meta  QueryMeta      `json:"meta"`
+	Paths []RelationPath `json:"paths"`
+	// RouteCount is how many equal-cost routes connect the pair, every page
+	// of them; Paths is one page of that list and Meta.NextCursor the next.
+	// RouteCountAtLeast marks it a lower bound: the deadline landed before
+	// the count finished, or it passed the largest integer. The last page
+	// of the list makes it exact.
+	RouteCount        int64  `json:"route_count"`
+	RouteCountAtLeast bool   `json:"route_count_at_least,omitempty"`
+	Nodes             []Node `json:"nodes"`
+	VisitedCount      int64  `json:"visited_count"`
 	// Locations and Occurrences are as on GraphResult: where the route's
 	// nodes are and every call site of its `calls` relations.
 	Locations   []NodeLocation       `json:"locations,omitempty"`
@@ -1196,7 +1205,10 @@ func (r PathResult) Validate() error {
 	if err := r.Meta.Validate(); err != nil {
 		return err
 	}
-	if err := boundCount("path_result.paths", len(r.Paths), MaxReasonPathsPerEntry); err != nil {
+	if err := boundPage("path_result.paths", len(r.Paths)); err != nil {
+		return err
+	}
+	if err := requireNonNegative("path_result.route_count", r.RouteCount); err != nil {
 		return err
 	}
 	for _, p := range r.Paths {

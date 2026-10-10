@@ -44,6 +44,12 @@ const (
 	// the level in heap -- the question the direction dedup rule asks of every
 	// delivered entry.
 	bitsetFrontierFile = "frontier.bits"
+	// bitsetBasedFile and bitsetRestedFile are a callers walk's dispatch
+	// sets (retainedWalk.based, rested), bitsetDispatchedFile a callees
+	// walk's (retainedWalk.dispatched).
+	bitsetBasedFile      = "based.bits"
+	bitsetRestedFile     = "rested.bits"
+	bitsetDispatchedFile = "dispatched.bits"
 	// bitsetManifestSuffix names a bit file's manifest. The count is maintained
 	// rather than recomputed because scanning the file for it would make an
 	// O(1) report cost O(nodes).
