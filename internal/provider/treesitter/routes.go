@@ -380,6 +380,10 @@ func (s *routeScan) emit(fw string, methods []string, r routeText, obj *routeObj
 
 // emitPrefixed is emit with the prefix already decided.
 func (s *routeScan) emitPrefixed(fw string, methods []string, r routeText, prefix string, resolved bool, at wire.Span, handlers []handler, receiver string) {
+	if r.route() == "" {
+		// An argument with no text names no route.
+		return
+	}
 	if len(methods) == 0 {
 		methods = []string{""}
 	}
@@ -685,14 +689,15 @@ func splitTop(text string) []string {
 }
 
 // literalMethods are the methods a list of method literals names, upper
-// case, and false when any element is not a literal: one endpoint with no
+// case, and false when any element is not a literal (or is longer than a
+// method's bound): one endpoint with no
 // method then stands for the route, since which methods it takes is not
 // written.
 func (s *routeScan) literalMethods(text string) ([]string, bool) {
 	var out []string
 	for _, e := range elements(text) {
 		v, ok := stringLiteral(s.b.lang.Name, e)
-		if !ok || v == "" {
+		if !ok || v == "" || len(v) > model.MaxIdentifierBytes {
 			return nil, false
 		}
 		out = append(out, strings.ToUpper(v))

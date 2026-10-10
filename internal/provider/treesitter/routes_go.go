@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
@@ -285,11 +286,14 @@ func goPattern(p string) (string, string, bool) {
 // goMethod is the method an argument names: a string literal, or net/http's
 // `http.MethodGet` and the other method constants.
 func (s *routeScan) goMethod(text string) (string, bool) {
-	if v, ok := stringLiteral("go", text); ok && v != "" {
+	if v, ok := stringLiteral("go", text); ok && v != "" && len(v) <= model.MaxIdentifierBytes {
 		return strings.ToUpper(v), true
 	}
 	q, name, ok := strings.Cut(text, ".")
 	if !ok || s.goImported(q) != fwNetHTTP || !strings.HasPrefix(name, "Method") || len(name) == len("Method") {
+		return "", false
+	}
+	if len(name) > model.MaxIdentifierBytes {
 		return "", false
 	}
 	return strings.ToUpper(name[len("Method"):]), true
