@@ -231,7 +231,8 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 	em := &emitter{w: out}
 	ex := &extraction{g: kept.g, l: kept.l, path: req.Path, src: src}
 	err := ex.run(kept.query, root, em)
-	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated, Header: header}
+	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated, Header: header,
+		ComputedAll: ex.all.present && ex.all.computed}
 	if err != nil {
 		kept.tree.Close()
 		return done, nil, err

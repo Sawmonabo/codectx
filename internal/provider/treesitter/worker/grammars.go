@@ -20,6 +20,7 @@ import (
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
 // grammar binds one pinned language to its compiled parser and the small set
@@ -42,6 +43,14 @@ type grammar struct {
 	// importNames derives the local names an import path introduces when the
 	// query captured none.
 	importNames func(path string) []string
+	// exported decides whether a top-level declaration is exported, for a
+	// language whose export rule is the file's, not the declaration's own
+	// syntax; it runs once containment is known, so it sees only top-level
+	// declarations.
+	exported func(e *extraction, d *decl) bool
+	// decorators lists a declaration's decorators, annotations or
+	// attributes in source order, for a language that has them.
+	decorators func(e *extraction, d *decl) []wire.Decorator
 	// blank is the name that declares nothing in the language, or empty
 	// when every name it extracts binds one. A declaration of it is not
 	// extracted, and neither is any declaration nested inside it.
@@ -61,6 +70,10 @@ type grammar struct {
 	// first use by importSyntax.
 	importsOnce sync.Once
 	imports     importSyntax
+	// deco is the grammar's decorator table, resolved on first use by
+	// decoSyntax.
+	decoOnce sync.Once
+	deco     decoSyntax
 	// kinds are the node kind ids the extraction and the hooks compare,
 	// resolved on first use by kindIDs.
 	kindsOnce sync.Once
@@ -77,14 +90,20 @@ type kindIDs struct {
 	identifier, funcLiteral             uint16
 	// Go: the type a type_spec declares, and a method receiver's type.
 	structType, interfaceType, typeIdentifier, parameterDeclaration uint16
-	// Python docstrings.
-	expressionStatement, str uint16
+	// Python docstrings and the `__main__` guard.
+	expressionStatement, str, comparisonOperator, stringStart uint16
 	// Java and Rust modifiers, Rust macros and attributes.
 	modifiers, visibilityModifier, macroDefinition, attributeItem uint16
-	// ECMAScript function values.
-	arrowFunction, functionExpression uint16
-	// C and C++ macros and declarator chains.
+	// ECMAScript function values and the bindings a function-valued
+	// property is stored under.
+	arrowFunction, functionExpression, pair, object, assignmentExpression uint16
+	// The bindings of a `require(...)` declarator.
+	variableDeclarator, objectPattern, shorthandPattern, objectAssignmentPattern uint16
+	pairPattern, assignmentPattern, propertyIdentifier                           uint16
+	// C and C++ macros and declarator chains, and what decides a C
+	// definition's linkage.
 	preprocDef, preprocFunctionDef, functionDeclarator, qualifiedIdentifier uint16
+	functionDefinition, storageClassSpecifier, initDeclarator               uint16
 	// errorKind is the kind of an ERROR node, the library's one error symbol,
 	// which its name lookup answers for "ERROR" in every grammar.
 	errorKind uint16
@@ -119,25 +138,40 @@ func (g *grammar) kindIDs() *kindIDs {
 			comments: kinds(g.comments...),
 			declaratorChain: kinds("pointer_declarator", "array_declarator", "init_declarator", "attributed_declarator",
 				"reference_declarator", "parenthesized_declarator"),
-			identifier:           id("identifier"),
-			funcLiteral:          id("func_literal"),
-			structType:           id("struct_type"),
-			interfaceType:        id("interface_type"),
-			typeIdentifier:       id("type_identifier"),
-			parameterDeclaration: id("parameter_declaration"),
-			expressionStatement:  id("expression_statement"),
-			str:                  id("string"),
-			modifiers:            id("modifiers"),
-			visibilityModifier:   id("visibility_modifier"),
-			macroDefinition:      id("macro_definition"),
-			attributeItem:        id("attribute_item"),
-			arrowFunction:        id("arrow_function"),
-			functionExpression:   id("function_expression"),
-			preprocDef:           id("preproc_def"),
-			preprocFunctionDef:   id("preproc_function_def"),
-			functionDeclarator:   id("function_declarator"),
-			qualifiedIdentifier:  id("qualified_identifier"),
-			errorKind:            id("ERROR"),
+			identifier:              id("identifier"),
+			funcLiteral:             id("func_literal"),
+			structType:              id("struct_type"),
+			interfaceType:           id("interface_type"),
+			typeIdentifier:          id("type_identifier"),
+			parameterDeclaration:    id("parameter_declaration"),
+			expressionStatement:     id("expression_statement"),
+			str:                     id("string"),
+			comparisonOperator:      id("comparison_operator"),
+			stringStart:             id("string_start"),
+			modifiers:               id("modifiers"),
+			visibilityModifier:      id("visibility_modifier"),
+			macroDefinition:         id("macro_definition"),
+			attributeItem:           id("attribute_item"),
+			arrowFunction:           id("arrow_function"),
+			functionExpression:      id("function_expression"),
+			pair:                    id("pair"),
+			variableDeclarator:      id("variable_declarator"),
+			objectPattern:           id("object_pattern"),
+			shorthandPattern:        id("shorthand_property_identifier_pattern"),
+			objectAssignmentPattern: id("object_assignment_pattern"),
+			pairPattern:             id("pair_pattern"),
+			assignmentPattern:       id("assignment_pattern"),
+			propertyIdentifier:      id("property_identifier"),
+			object:                  id("object"),
+			assignmentExpression:    id("assignment_expression"),
+			preprocDef:              id("preproc_def"),
+			preprocFunctionDef:      id("preproc_function_def"),
+			functionDeclarator:      id("function_declarator"),
+			qualifiedIdentifier:     id("qualified_identifier"),
+			functionDefinition:      id("function_definition"),
+			storageClassSpecifier:   id("storage_class_specifier"),
+			initDeclarator:          id("init_declarator"),
+			errorKind:               id("ERROR"),
 		}
 	})
 	return &g.kinds
@@ -148,7 +182,9 @@ func (g *grammar) kindIDs() *kindIDs {
 // C string on every call. A field the grammar does not define is 0, which
 // ChildByFieldId answers with no child, as a lookup by an unknown name does.
 type fieldIDs struct {
-	body, declarator, name, receiver, scope, typ uint16
+	body, declarator, name, receiver, scope, typ, condition uint16
+	// ECMAScript pairs and assignments.
+	key, value, left, right uint16
 }
 
 // fieldIDs is the field table of g, resolved once.
@@ -162,6 +198,11 @@ func (g *grammar) fieldIDs() *fieldIDs {
 			receiver:   tl.FieldIdForName("receiver"),
 			scope:      tl.FieldIdForName("scope"),
 			typ:        tl.FieldIdForName("type"),
+			condition:  tl.FieldIdForName("condition"),
+			key:        tl.FieldIdForName("key"),
+			value:      tl.FieldIdForName("value"),
+			left:       tl.FieldIdForName("left"),
+			right:      tl.FieldIdForName("right"),
 		}
 	})
 	return &g.fields
@@ -290,7 +331,7 @@ var grammars = map[string]*grammar{
 		isTest: func(d *decl, path string, _ []byte) bool {
 			return d.kind == "function" && strings.HasSuffix(path, "_test.go") && goTestName.MatchString(d.name)
 		},
-		importNames: func(p string) []string { return []string{lastSegment(p, "/")} },
+		importNames: func(p string) []string { return []string{goImportName(p)} },
 		// The Go specification, Blank identifier and Declarations and scope:
 		// the blank identifier "does not introduce a binding and thus is not
 		// declared", in a var, const, function, method, type or field
@@ -298,15 +339,17 @@ var grammars = map[string]*grammar{
 		blank:      "_",
 		flatFields: goFields,
 	},
-	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
-	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
-	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, flatFields: jsFields},
+	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
+	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
+	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
 	"python": {
-		language: tree_sitter_python.Language,
-		wrappers: []string{"decorated_definition"},
-		comments: []string{"comment"},
+		language:   tree_sitter_python.Language,
+		wrappers:   []string{"decorated_definition"},
+		comments:   []string{"comment"},
+		refine:     pyMainGuard,
+		decorators: pyDecorators,
 		docstring: func(d *decl) (uint, uint, bool) {
-			if d.body == nil {
+			if d.body == nil || d.kind == "endpoint" {
 				return 0, 0, false
 			}
 			k := d.ex.k
@@ -324,6 +367,7 @@ var grammars = map[string]*grammar{
 				d.kind == "class" && strings.HasPrefix(d.name, "Test")
 		},
 		importNames: func(p string) []string { return []string{firstSegment(p, ".")} },
+		exported:    pyExported,
 		flatFields:  pythonFields,
 	},
 	"java": {
@@ -338,6 +382,7 @@ var grammars = map[string]*grammar{
 		},
 		isTest:      func(d *decl, _ string, _ []byte) bool { return d.test },
 		importNames: func(p string) []string { return []string{lastSegment(p, ".")} },
+		decorators:  javaDecorators,
 		flatFields:  javaFields,
 	},
 	"rust": {
@@ -360,17 +405,21 @@ var grammars = map[string]*grammar{
 			return false
 		},
 		importNames: rustUseNames,
+		decorators:  rustDecorators,
 		// The Rust Reference, Constant items: a free constant may be unnamed
 		// by writing an underscore for its name, and such a constant is not
 		// nameable. No other item the extraction reads may be named `_`.
 		blank:      "_",
 		flatFields: rustFields,
 	},
-	"c":   {language: tree_sitter_c.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, flatFields: cFields},
-	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }, flatFields: cppFields},
+	"c":   {language: tree_sitter_c.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, decorators: cDecorators, flatFields: cFields},
+	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, decorators: cDecorators, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }, flatFields: cppFields},
 }
 
-var jsWrappers = []string{"export_statement", "lexical_declaration", "variable_declaration"}
+// jsWrappers are the statements a declaration's doc comment and export
+// marker attach to: an assignment's doc comment precedes its expression
+// statement.
+var jsWrappers = []string{"export_statement", "lexical_declaration", "variable_declaration", "expression_statement"}
 
 // jsRefine: a declaration is exported when it or a wrapper ancestor was an
 // export target. An export clause naming a top-level declaration is applied
@@ -396,6 +445,49 @@ func jsRefine(d *decl, _ []byte) {
 			break
 		}
 	}
+}
+
+// pyMainGuard keeps a module-level `if` the query captured as a `__main__`
+// guard only when its condition is exactly `__name__ == "__main__"`, in either
+// operand order: one comparison of two operands with the operator `==`, and
+// a string that is not a bytes literal. Anything else (`!=`, `is`, a chained
+// comparison, `b"__main__"`) is no guard and declares nothing.
+func pyMainGuard(d *decl, src []byte) {
+	if d.kind != "endpoint" {
+		return
+	}
+	k, f := d.ex.k, d.ex.f
+	cond := d.node.ChildByFieldId(f.condition)
+	if cond == nil || cond.KindId() != k.comparisonOperator || !pyEqualsGuard(cond, k, src) {
+		d.name = ""
+	}
+}
+
+// pyEqualsGuard reports a comparison of exactly two operands joined by one
+// `==`, whose string operand is not a bytes literal.
+func pyEqualsGuard(cond *ts.Node, k *kindIDs, src []byte) bool {
+	cur := cond.Walk()
+	defer cur.Close()
+	operands, operators := 0, 0
+	for ok := cur.GotoFirstChild(); ok; ok = cur.GotoNextSibling() {
+		n := cur.Node()
+		switch {
+		case n.IsExtra():
+		case n.IsNamed():
+			operands++
+			if n.KindId() == k.str {
+				if start := childOfKind(*n, k.stringStart); start == nil || strings.ContainsAny(start.Utf8Text(src), "bB") {
+					return false
+				}
+			}
+		default:
+			operators++
+			if n.Utf8Text(src) != "==" {
+				return false
+			}
+		}
+	}
+	return operands == 2 && operators == 1
 }
 
 var cWrappers = []string{"template_declaration", "declaration_list"}
@@ -462,6 +554,51 @@ func cRefine(d *decl, src []byte) {
 	if d.impl != "" && d.kind == "function" {
 		d.kind = "method"
 	}
+	if d.ex.l.Name == "c" {
+		d.exported = cExternal(d, src)
+	}
+}
+
+// cExternal reports a C definition with external linkage (C17 6.2.2), which
+// is what a C module exports: a function definition, or a file-scope object
+// definition, not declared `static`. A prototype and an `extern` object
+// declaration without an initializer define nothing, so they export nothing
+// here; the file that defines the name does. Linkage is not shared-library
+// visibility, which compiler flags and attribute macros decide.
+func cExternal(d *decl, src []byte) bool {
+	k := d.ex.k
+	switch {
+	case d.prototype || d.macro:
+		return false
+	case d.node.KindId() == k.functionDefinition:
+		static, _ := storageClass(d.node, k, src)
+		return !static
+	case d.kind == "variable":
+		static, extern := storageClass(d.node, k, src)
+		return !static && (!extern || d.declarator.KindId() == k.initDeclarator)
+	}
+	return false
+}
+
+// storageClass reports whether a C declaration or definition is declared
+// `static` or `extern`.
+func storageClass(n ts.Node, k *kindIDs, src []byte) (static, extern bool) {
+	if k.storageClassSpecifier == 0 {
+		return false, false
+	}
+	for i := range n.NamedChildCount() {
+		c := n.NamedChild(i)
+		if c == nil || c.KindId() != k.storageClassSpecifier {
+			continue
+		}
+		switch c.Utf8Text(src) {
+		case "static":
+			static = true
+		case "extern":
+			extern = true
+		}
+	}
+	return static, extern
 }
 
 // childOfKind is n's first named child of the kind id; id 0 never matches.
@@ -485,6 +622,40 @@ func lastSegment(s, sep string) string {
 		return s[i+len(sep):]
 	}
 	return s
+}
+
+// goImportName is the name a Go import binds when its spec names none. The
+// imported package's own clause decides it, which a reader of one file
+// cannot see, so it is the path's last element by the convention modules
+// follow: a major-version element is not the name (`github.com/go-chi/chi/v5`
+// binds chi), and neither is a gopkg.in version suffix (`gopkg.in/yaml.v3`
+// binds yaml).
+func goImportName(p string) string {
+	p = strings.Trim(p, "\"`")
+	elems := strings.Split(p, "/")
+	name := elems[len(elems)-1]
+	if len(elems) > 1 && isMajorVersion(name) {
+		name = elems[len(elems)-2]
+	}
+	if strings.HasPrefix(p, "gopkg.in/") {
+		if i := strings.LastIndex(name, ".v"); i > 0 && isMajorVersion(name[i+1:]) {
+			name = name[:i]
+		}
+	}
+	return name
+}
+
+// isMajorVersion reports a module major-version element: "v" and digits.
+func isMajorVersion(s string) bool {
+	if len(s) < 2 || s[0] != 'v' {
+		return false
+	}
+	for _, c := range s[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func firstSegment(s, sep string) string {

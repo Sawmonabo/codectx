@@ -260,6 +260,10 @@ type Done struct {
 	// a function whose own analysis failed is disclosed by its message
 	// instead (Function.Failed). It never fails the file's structural facts.
 	DependenceFailure string `json:"dependence_failure,omitempty"`
+	// ComputedAll reports a Python module whose `__all__` is bound or changed
+	// by a statement that is not one of the static forms, so its exports
+	// follow the underscore rule instead (ADR-0017 decision 2).
+	ComputedAll bool `json:"computed_all,omitempty"`
 	// LinkFailure is why the file's link pass sent no KindLink message
 	// although its dependence pass ran: a panic the worker recovered in the
 	// link tables' construction. It never fails the file's structural or
