@@ -30,9 +30,9 @@ export function run() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"r1 foo -> foo foo",
-			"r2 C -> cls C",
-			"r2 m -> m m",
+			"r1 foo -> foo foo exact",
+			"r2 C -> cls C exact",
+			"r2 m -> m m exact",
 		},
 		fails: "a default export not followed from the importer's local name leaves foo, C and m unbound",
 	},
@@ -61,10 +61,10 @@ export function run() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"r1 doWork -> work work",
-			"r2 other -> other other",
-			"rns work -> work work",
-			"r4 w -> work work",
+			"r1 doWork -> work work exact",
+			"r2 other -> other other exact",
+			"rns work -> work work exact",
+			"r4 w -> work work exact",
 		},
 		fails: "re-exports, `export *`, renamed exports and renamed imports not followed leave the four calls unbound or bound by local name",
 	},
@@ -88,8 +88,8 @@ function c() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"a1 helper -> ha helper",
-			"b1 helper -> hb helper",
+			"a1 helper -> ha helper exact",
+			"b1 helper -> hb helper exact",
 		},
 		fails: "a candidate kept by name alone, outside the caller's scope, binds each helper call to both inner helpers and c's to either",
 	},
@@ -110,8 +110,8 @@ run(tick); // @top
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"call cb -> tick tick",
-			"top run -> run run",
+			"call cb -> tick tick exact",
+			"top run -> run run exact",
 		},
 		fails: "a function value matched by name binds `cb()` to the method Clock.tick",
 	},
@@ -141,16 +141,16 @@ function blocks() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"n1 Square -> sq Square",
-			"n2 Circle -> ci Circle",
-			"a area -> sq area",
-			"a area -> ci area",
-			"n3 Repo -> repo Repo",
-			"sv save -> repo save",
-			"b1 Square -> sq Square",
-			"b1 area -> sq area",
-			"b2 Circle -> ci Circle",
-			"b2 area -> ci area",
+			"n1 Square -> sq Square exact",
+			"n2 Circle -> ci Circle exact",
+			"a area -> sq area exact set=2",
+			"a area -> ci area exact set=2",
+			"n3 Repo -> repo Repo exact",
+			"sv save -> repo save exact",
+			"b1 Square -> sq Square exact",
+			"b1 area -> sq area exact",
+			"b2 Circle -> ci Circle exact",
+			"b2 area -> ci area exact",
 		},
 		fails: "two reaching definitions merged to no type lose s.area(); field-based binding beside a known type binds the object literal's save; flat block scopes cross the two x",
 	},
@@ -172,8 +172,8 @@ function make() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"n Kid -> bc constructor",
-			"h hello -> bh hello",
+			"n Kid -> bc constructor exact",
+			"h hello -> bh hello exact",
 		},
 		fails: "a constructor not inherited by a derived class binds `new Kid(1)` to the class instead of Base's constructor",
 	},
@@ -213,10 +213,10 @@ export function run() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"c1 f -> mf f",
-			"c2 h -> zh h",
-			"c3 k -> yk k",
-			"c6 f -> mf f",
+			"c1 f -> mf f exact",
+			"c2 h -> zh h exact",
+			"c3 k -> yk k exact",
+			"c6 f -> mf f exact",
 		},
 		fails: "star exports read before own and named exports, `default` passed through `export *`, or a disagreeing pair resolved to either side gives f, h, g or default the wrong target",
 	},
@@ -240,8 +240,8 @@ export function run() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"c1 b -> a a",
-			"c3 b -> a a",
+			"c1 b -> a a exact",
+			"c3 b -> a a exact",
 		},
 		fails: "an `export {a as b}` that also exports the local name binds `ns.a()`",
 	},
@@ -262,12 +262,287 @@ function go() {
 `,
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
-		// the binding rules alone); the two agree on every binding.
+		// the binding rules alone); the two agree on every binding. `this` is a C or an instance of a
+		// subclass, which may redefine the field, so the call through it is virtual.
 		want: []string{
-			"r handler -> fh handler",
-			"n C -> cls C",
-			"g run -> run run",
+			"r handler -> fh handler virtual",
+			"n C -> cls C exact",
+			"g run -> run run exact",
 		},
 		fails: "a class field holding a function not recorded as a value of that field leaves `this.handler()` unbound",
+	},
+	{
+		name:   "value-flow-and-a-constructed-object",
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors), §13.3.5 (The new Operator: the object `new C()` returns has C.prototype as its prototype), §13.3.7 (The super Keyword: the home object's prototype's method), §15.7 (Class Definitions)",
+		files: map[string]string{
+			"src/animals.js": `class Animal {
+  sound() {}
+}
+class Dog extends Animal { // @dog
+  sound() {} // @ds
+}
+class Cat extends Animal { // @cat
+  sound() {} // @cs
+}
+class Puppy extends Dog {
+  sound() {
+    super.sound(); // @sup
+  }
+}
+function speak(a) { // @speak
+  a.sound(); // @s1
+}
+export function main() {
+  speak(new Dog()); // @m1
+  speak(new Cat()); // @m2
+  new Dog().sound(); // @m3
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding. `a` holds exactly a Dog and a Cat, so
+		// `a.sound()` calls each one's method, exact, two targets; `new Dog().sound()` is Dog's own, never
+		// Puppy's override; `super.sound()` in Puppy is Dog's.
+		want: []string{
+			"s1 sound -> ds sound exact set=2",
+			"s1 sound -> cs sound exact set=2",
+			"sup sound -> ds sound exact",
+			"m1 speak -> speak speak exact",
+			"m1 Dog -> dog Dog exact",
+			"m2 speak -> speak speak exact",
+			"m2 Cat -> cat Cat exact",
+			"m3 Dog -> dog Dog exact",
+			"m3 sound -> ds sound exact",
+		},
+		fails: "a construction's result dispatched into subclasses binds Puppy.sound from `new Dog().sound()`; a placeholder for the value set binds no method; dispatch read from the technique makes `super.sound()` or a flow-bound call virtual",
+	},
+	{
+		name:   "declared-types",
+		anchor: "TypeScript Language Specification §3.11 (Type relationships: assignment compatibility admits subclass instances), §4.15 (Property access); ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors), §13.3.5 (The new Operator)",
+		files: map[string]string{
+			"animals.ts": `class Animal {
+    sound(): void {} // @as
+}
+
+class Dog extends Animal { // @dog
+    sound(): void {} // @ds
+}
+
+class Cat extends Animal { // @cat
+    sound(): void {}
+}
+
+function speak(a: Animal): void { // @speak
+    a.sound(); // @s1
+}
+
+function direct(d: Dog): void { // @direct
+    d.sound(); // @s2
+}
+
+interface Speaker {
+    talk(): void; // @st
+}
+
+class Parrot implements Speaker { // @parrot
+    talk(): void {}
+}
+
+class Robot implements Speaker { // @robot
+    talk(): void {}
+}
+
+function chat(s: Speaker): void { // @chat
+    s.talk(); // @s3
+}
+
+function main(): void { // @main
+    speak(new Dog()); // @m1
+    speak(new Cat()); // @m2
+    direct(new Dog()); // @m3
+    chat(new Parrot()); // @m4
+    chat(new Robot()); // @m5
+}
+
+main(); // @top
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding. A receiver of a declared type calls the
+		// method that type declares, once, virtual: Animal's for `a`, Dog's for `d`, the interface's own
+		// signature for `s`; the overrides are reached at query time.
+		want: []string{
+			"s1 sound -> as sound virtual",
+			"s2 sound -> ds sound virtual",
+			"s3 talk -> st talk virtual",
+			"m1 speak -> speak speak exact",
+			"m1 Dog -> dog Dog exact",
+			"m2 speak -> speak speak exact",
+			"m2 Cat -> cat Cat exact",
+			"m3 direct -> direct direct exact",
+			"m3 Dog -> dog Dog exact",
+			"m4 chat -> chat chat exact",
+			"m4 Parrot -> parrot Parrot exact",
+			"m5 chat -> chat chat exact",
+			"m5 Robot -> robot Robot exact",
+			"top main -> main main exact",
+		},
+		fails: "a declared type published per override (the subtype walk) gives `a.sound()` three targets and `s.talk()` the two classes' methods; a declared type's call made exact loses the override",
+	},
+	{
+		name:   "super-under-declared-types",
+		anchor: "TypeScript Language Specification §4.9.2 (Super property access), §3.11; ECMA-262 (15th edition, 2024) §13.3.7 (The super Keyword), §13.3.5 (The new Operator)",
+		files: map[string]string{
+			"deep.ts": `class Animal {
+    sound(): void {} // @as
+}
+
+class Dog extends Animal { // @dog
+    sound(): void {} // @ds
+}
+
+class Puppy extends Dog { // @puppy
+    sound(): void {
+        super.sound(); // @sup
+    }
+}
+
+function speak(a: Animal): void { // @speak
+    a.sound(); // @s1
+}
+
+function walk(d: Dog): void { // @walk
+    d.sound(); // @s2
+}
+
+speak(new Puppy()); // @t1
+walk(new Puppy()); // @t2
+new Dog().sound(); // @t3
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding.
+		want: []string{
+			"sup sound -> ds sound exact",
+			"s1 sound -> as sound virtual",
+			"s2 sound -> ds sound virtual",
+			"t1 speak -> speak speak exact",
+			"t1 Puppy -> puppy Puppy exact",
+			"t2 walk -> walk walk exact",
+			"t2 Puppy -> puppy Puppy exact",
+			"t3 Dog -> dog Dog exact",
+			"t3 sound -> ds sound exact",
+		},
+		fails: "dispatch read from the technique makes `super.sound()` virtual; `new Dog().sound()` dispatched into Dog's subclasses binds Puppy.sound",
+	},
+	{
+		name:   "imports-between-files",
+		anchor: "ECMA-262 (15th edition, 2024) §16.2.2 (Imports), §16.2.1.7 (HostLoadImportedModule: a relative specifier names a file)",
+		files: map[string]string{
+			"src/a.js": `export function f() {} // @f
+`,
+			"src/main.js": `import { f } from './a.js';
+
+export function run() {
+  f(); // @r
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding and every import.
+		want: []string{
+			"r f -> f f exact",
+		},
+		facts: []string{
+			"src/main.js imports src/a.js",
+		},
+		fails: "an import published to the imported declaration's node, or to nothing, instead of the file of its module loses the `imports`",
+	},
+	{
+		name:   "spread-arguments",
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.8.1 (ArgumentListEvaluation: a SpreadElement expands into the remaining arguments), §15.1 (FunctionRestParameter collects them)",
+		files: map[string]string{
+			"src/sum.js": `function sum(first, ...rest) { // @sum
+  return first;
+}
+export function run(a, b, c) { // @run
+  sum(a, ...b); // @c1
+  sum(...c); // @c2
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding and every flow. A spread's elements fill
+		// the parameters from its position on, whose count the source does not say, so it binds the rest
+		// parameter that collects the excess.
+		want: []string{
+			"c1 sum -> sum sum exact",
+			"c2 sum -> sum sum exact",
+		},
+		facts: []string{
+			"run a flows sum first",
+			"run b flows sum rest",
+			"run c flows sum rest",
+		},
+		fails: "a spread matched by position flows c into first and b into nothing",
+	},
+	{
+		name:   "required-modules",
+		anchor: "Node.js Modules: CommonJS modules (`require(id)` loads the module id names; a relative id is a file); ECMA-262 (15th edition, 2024) §13.15 (an expression that does not fold names no module)",
+		files: map[string]string{
+			"src/load.js": `export function load(name) {
+  const a = require("./x/" + name);
+  const b = require("./x");
+  return [a, b];
+}
+`,
+			"src/x.js": `export const v = 1;
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every import. The first path is an expression whose only
+		// literal part is "./x/"; the second a constant naming src/x.js. Neither `require` call names a
+		// declaration of the unit.
+		want: []string{},
+		facts: []string{
+			"src/load.js imports open ./x/",
+			"src/load.js imports src/x.js",
+		},
+		fails: "every require treated as open loses the import of src/x.js; a computed path resolved by its fragment imports a file it may not name",
+	},
+	{
+		name:   "open-and-computed-sites",
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.6 (Function Calls), §13.3.2 (Property Accessors: a computed member), §9.4.2 (ResolveBinding: an unresolvable reference)",
+		files: map[string]string{
+			"src/open.js": `class Box { // @box
+  open() {} // @bo
+}
+export function run(obj, k, cb) {
+  obj[k](); // @comp
+  cb(); // @ind
+  obj.close(); // @mem
+  missing(); // @bare
+  new Box().open(); // @ok
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every site. Nothing reaches run's parameters and nothing
+		// declares missing: each of those calls is open for the reason its shape gives; the computed member's
+		// callee names nothing; the construction and its method are bound.
+		want: []string{
+			"ok Box -> box Box exact",
+			"ok open -> bo open exact",
+		},
+		sites: []string{
+			"comp obj[k] open computed value 0",
+			"ind cb open value_untracked value 0",
+			"mem close open receiver_untyped member 0",
+			"bare missing open global_unbound bare 0",
+		},
+		counts: map[string]string{
+			"sites": "6", "bound_sites": "2", "open_sites": "3", "computed_sites": "1", "external_sites": "0",
+		},
+		fails: "a computed callee counted as open, or a bound site counted open, breaks the counts; every open site given one reason misnames three",
 	},
 }
