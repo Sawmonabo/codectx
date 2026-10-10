@@ -36,3 +36,61 @@ func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 		t.Fatalf("a message with only exports decoded other entries: %+v", out)
 	}
 }
+
+// TestLinkFactsBeyondCallsRoundTrip carries every field the linker's facts
+// beyond calls read through one encode and decode: an export's override mark
+// and alias, an argument's reads, keyword and spread, a dynamic import's
+// fragments and constant flag, a parameter's marks, and a computed site with
+// its arguments. Each is written after fields that existed before it, so a
+// codec that skips or reorders one shifts every later byte.
+//
+// Mutation: AppendLink drops the alias, or DecodeLink reads a computed site's
+// arguments without their reads -> the decoded message differs (or is
+// refused as malformed).
+func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
+	in := Link{
+		Exports: []Export{
+			{Name: Span{Start: 1, End: 4}, Receiver: "C", Override: true},
+			{Name: Span{Start: 9, End: 12}, Alias: "log_impl"},
+		},
+		Sites: []Site{{Name: Span{Start: 20, End: 21}, Shape: ShapeBare, Args: []Type{{}, {Kind: TypeNamed, Name: "T"}},
+			Arguments: []Argument{
+				{At: Span{Start: 22, End: 23}, Reads: []Span{{Start: 2, End: 3}, {Start: 5, End: 6}}},
+				{At: Span{Start: 27, End: 29}, Keyword: "kw", Spread: SpreadKeyword},
+			}}},
+		Parameters: []Parameter{
+			{Callable: Span{Start: 1, End: 4}, Name: Span{Start: 5, End: 6}, Index: 1, Variadic: true},
+			{Callable: Span{Start: 1, End: 4}, Name: Span{Start: 7, End: 8}, Index: 2, Variadic: true, KeywordOnly: true},
+		},
+		DynamicImports: []DynamicImport{
+			{At: Span{Start: 30, End: 50}, Fragments: []string{"./x/", ".js"}},
+			{At: Span{Start: 51, End: 60}, Fragments: []string{"./m"}, Constant: true},
+			{At: Span{Start: 61, End: 70}, Fragments: []string{}},
+		},
+		Computed: []Site{{Name: Span{Start: 71, End: 77}, Shape: ShapeIndirect, Args: []Type{{}},
+			Arguments: []Argument{{At: Span{Start: 78, End: 80}, Spread: SpreadPositional, Reads: []Span{{Start: 5, End: 6}}}}}},
+	}
+	out, err := DecodeLink(AppendLink(nil, &in))
+	if err != nil {
+		t.Fatalf("DecodeLink refused the message: %v", err)
+	}
+	if !slices.Equal(out.Exports, in.Exports) || !slices.Equal(out.Parameters, in.Parameters) {
+		t.Fatalf("exports or parameters changed:\n got %+v %+v\nwant %+v %+v", out.Exports, out.Parameters, in.Exports, in.Parameters)
+	}
+	sameSites := func(a, b []Site) bool {
+		return slices.EqualFunc(a, b, func(x, y Site) bool {
+			return x.Name == y.Name && x.Shape == y.Shape && slices.Equal(x.Args, y.Args) &&
+				slices.EqualFunc(x.Arguments, y.Arguments, func(p, q Argument) bool {
+					return p.At == q.At && p.Keyword == q.Keyword && p.Spread == q.Spread && slices.Equal(p.Reads, q.Reads)
+				})
+		})
+	}
+	if !sameSites(out.Sites, in.Sites) || !sameSites(out.Computed, in.Computed) {
+		t.Fatalf("sites changed:\n got %+v %+v\nwant %+v %+v", out.Sites, out.Computed, in.Sites, in.Computed)
+	}
+	if !slices.EqualFunc(out.DynamicImports, in.DynamicImports, func(x, y DynamicImport) bool {
+		return x.At == y.At && x.Constant == y.Constant && slices.Equal(x.Fragments, y.Fragments)
+	}) {
+		t.Fatalf("dynamic imports changed:\n got %+v\nwant %+v", out.DynamicImports, in.DynamicImports)
+	}
+}

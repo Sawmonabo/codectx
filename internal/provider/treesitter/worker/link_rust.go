@@ -28,6 +28,7 @@ import (
 // only between two word tokens (`&mut Foo`), so a declaration's signature
 // and a function type's are equal exactly when they write the same types.
 type rustLinker struct {
+	linkReads
 	k   *rsLinkSyntax
 	src []byte
 	out *wire.Link
@@ -56,8 +57,13 @@ type rsField struct {
 	ptr bool
 }
 
-// rsOwner is one enclosing impl or trait: the name `Self` means.
-type rsOwner struct{ self string }
+// rsOwner is one enclosing impl or trait: the name `Self` means, and
+// whether it is an `impl Trait for Type` block, every method of which
+// implements the trait's.
+type rsOwner struct {
+	self      string
+	traitImpl bool
+}
 
 // rsLocal is one binding: its name, the type its value carries, whether it
 // is declared as a smart pointer owning a value of that type, and the
@@ -334,6 +340,7 @@ func (k *rustLinker) export(n Node) {
 	if k.member(n) {
 		x.Receiver = k.self()
 		inTrait = n.Parent().Parent().KindId() == s.traitItem
+		x.Override = !inTrait && len(k.owners) > 0 && k.owners[len(k.owners)-1].traitImpl
 	}
 	x.Abstract = inTrait && n.KindId() == s.functionSignatureItem
 	ps := n.ChildByFieldId(s.fParameters)
@@ -568,7 +575,7 @@ func (k *rustLinker) implItem(n Node) {
 			k.out.Supertypes = append(k.out.Supertypes, wire.Supertype{Type: self, Super: super})
 		}
 	}
-	k.owners = append(k.owners, rsOwner{self: self})
+	k.owners = append(k.owners, rsOwner{self: self, traitImpl: !k.kid(n, s.fTrait).IsNull()})
 	k.walk(n.ChildByFieldId(s.fBody))
 	k.owners = k.owners[:len(k.owners)-1]
 	k.generics = k.generics[:generics]
@@ -1017,6 +1024,8 @@ func (k *rustLinker) call(n Node) wire.Type {
 			t := k.value(a, "")
 			if !name.IsNull() {
 				site.Args = append(site.Args, t)
+				site.Arguments = append(site.Arguments, wire.Argument{At: wire.Span{Start: uint32(a.StartByte()), End: uint32(a.EndByte())},
+					Reads: k.reads().argReads(a, k.readName, k.readSkip, nil)})
 			}
 		}
 	}
@@ -1026,6 +1035,22 @@ func (k *rustLinker) call(n Node) wire.Type {
 	site.Name = wire.Span{Start: uint32(name.StartByte()), End: uint32(name.EndByte())}
 	k.out.Sites = append(k.out.Sites, site)
 	return wire.Type{Kind: wire.TypeResult, Index: uint32(len(k.out.Sites) - 1)}
+}
+
+// readName reports a name an argument reads: an identifier or `self`. A
+// segment of a scoped path (`a::b`) names an item; readSkip leaves it out.
+func (k *rustLinker) readName(n Node) bool {
+	return n.KindId() == k.k.identifier || n.KindId() == k.k.self
+}
+
+// readSkip reports a subtree whose names an argument does not read: a call's
+// or a macro's result, a closure, whose body runs later, and a scoped path.
+func (k *rustLinker) readSkip(n Node) bool {
+	switch n.KindId() {
+	case k.k.callExpression, k.k.macroInvocation, k.k.closureExpression, k.k.scopedIdentifier:
+		return true
+	}
+	return false
 }
 
 // structLiteral walks a struct expression, recording each function its
