@@ -51,7 +51,6 @@ const unlabelled = "unlabelled"
 // crash: the entry's parent directory is the only record of it that outlives
 // the process that queued it.
 var purposeByName = map[string]Purpose{
-	string(AnalyzerOutput):    AnalyzerOutput,
 	string(Materialization):   Materialization,
 	string(LeaseReclamation):  LeaseReclamation,
 	string(ScratchCollection): ScratchCollection,

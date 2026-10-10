@@ -87,10 +87,9 @@ func (c *Compiler) hydrateFiles(ctx context.Context, reader *sqlite.PinnedReader
 // lifetime in two places.
 //
 // caps is the pinned generation's capability report (PinnedReader.Capabilities,
-// query.go:498). It is the authoritative freshness source rather than
-// ImpactResult.Meta.Completeness, which the engine populates only for deferred
-// dependence (impact.go:41) and therefore under-reports stale, partial,
-// unavailable and failed providers; both are merged so neither is lost.
+// query.go:498). It is the authoritative freshness source; the impact answer's
+// ImpactResult.Meta.Completeness carries the adjacency's own report, and both
+// are merged so neither is lost.
 //
 // refScope is the reference expansion's own result: the production scopeResult
 // -- which is scalars only -- plus the candidate list this whole-set reference

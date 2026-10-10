@@ -1,8 +1,7 @@
 // Package plan derives, for one captured snapshot, exactly the units the
 // active providers will run, which sealed units of the previous generation may
-// be reused byte for byte, which refreshing semantic units may be carried
-// stale with their provenance distance, and which predecessor each rebuilt
-// unit imports its delta from (Sections 13.1, 13.3).
+// be reused byte for byte, and which predecessor each rebuilt unit imports its
+// delta from (Section 13.1).
 //
 // The planner runs no provider and writes nothing. It reads the snapshot
 // manifest once per pass and the previous generation's unit selection through
@@ -29,7 +28,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
@@ -47,9 +45,9 @@ const (
 	// unplannedNoInputs counts the semantic scopes refused because nothing in
 	// the pinned snapshot is a member of them, per provider.
 	unplannedNoInputs = "semantic_scope_without_inputs:"
-	// unplannedProjects counts the dependence projects the provider's own
-	// planner refused as units of their own, per family.
-	unplannedProjects = "dependence_projects_unplanned:"
+	// unplannedProjects counts the projects the linking provider's planner
+	// refused as units of their own, per family.
+	unplannedProjects = "link_projects_unplanned:"
 	// unplannedDuplicateFileNode counts the manifest units whose file node
 	// duplicates the filesystem unit's node for the same file identity. See
 	// the comment at duplicate().
@@ -95,19 +93,10 @@ type Unit struct {
 	// not a row a dependency read could refuse.
 	DependencyKeys []string
 	// Heavy marks a unit that must pass the Scheduler before it runs, and
-	// Admission is what it is admitted against in both dimensions: for a
-	// dependence unit the memory its Reservation weighs, for an external
-	// indexer's profile unit the memory and temporary disk its profile
-	// reserves. Reservation is the dependence unit's sizing -- heap caps and
-	// the rest -- which travels to the child; it is zero for every other unit.
-	Heavy       bool
-	Admission   admission.Reservation
-	Reservation dependence.Reservation
-	// Deferred marks a unit that does not block the base generation: under
-	// `providers.dependence.enabled = "auto"` the coordinator runs it as
-	// low-priority background work after base activation and publishes it
-	// through a later generation (Section 11.6).
-	Deferred bool
+	// Admission is what it is admitted against in both dimensions: the memory
+	// and temporary disk an external indexer's profile reserves.
+	Heavy     bool
+	Admission admission.Reservation
 }
 
 // Spec folds the unit's identity. analysisConfigHash is the coordinator's
@@ -125,26 +114,6 @@ func (u Unit) Spec(analysisConfigHash string) (model.UnitSpec, error) {
 		ScopeKey: u.ScopeKey, InputHash: h.Sum(), DependencyHash: model.DependencyHash(u.DependsOn, u.DependencyKeys...)}
 	spec.ID = model.NewUnitID(spec, analysisConfigHash)
 	return spec, nil
-}
-
-// Carried is one previous sealed unit of a refreshing semantic scope, with the
-// provenance distance Section 13.3 requires it to answer `stale` with. The
-// coordinator attaches it through sqlite.AttachCarried; it is never reported
-// fresh. Its scope's deferred unit is also in Plan.Units -- see Plan.Carry --
-// so the scope is counted once, by that unit (Plan.CountReused).
-//
-// It is also the row shape Inputs.CarriedPage reads back: a scope the previous
-// generation already carried is the same unit with the distance it had then,
-// which this generation's carry accumulates onto rather than restarting.
-type Carried struct {
-	Unit                 model.UnitID
-	ProviderID, ScopeKey string
-	// DistanceGenerations is how many activations separate the carried unit's
-	// snapshot from this one, and DistanceFiles how many member-file changes
-	// do, summed over those generations: a file edited in two of them counts
-	// once per generation, because each of those generations is one the unit
-	// did not see.
-	DistanceGenerations, DistanceFiles int
 }
 
 // Plan is one snapshot's complete unit plan.
@@ -168,14 +137,6 @@ type Plan struct {
 	// generation whose identity the fresh plan reproduces exactly. Those
 	// scopes have no entry in Units: there is nothing to run.
 	Reuse map[string]model.UnitID
-	// Carry are the stale predecessors of deferred semantic scopes, to attach
-	// through sqlite.AttachCarried. A carried scope's *deferred* unit is also
-	// in Units, because it runs later, in its own work generation (Section
-	// 11.6). The coordinator attaches the carried predecessor into
-	// this generation with sqlite.AttachCarried and must not attach the
-	// deferred unit here: generation_units holds one row per
-	// (generation, provider, scope).
-	Carry []Carried
 	// Previous maps Key(providerID, scopeKey) to the sealed predecessor a
 	// rebuilt semantic unit imports its delta from. A file-invalidated unit has
 	// no entry: it is rebuilt whole from one file, and there is no delta
@@ -187,16 +148,6 @@ type Plan struct {
 	// States is Selection.States plus every degradation the planner itself
 	// found, which is the complete capability picture before any unit runs.
 	States []model.CapabilityState
-	// HeavyScopes is every heavy scope this plan derived -- to run, to reuse
-	// or to carry -- in ascending order, and HeavyDerived reports that the
-	// provider that plans heavy units was active, so the list is that
-	// provider's complete scope set for this snapshot rather than an empty
-	// one because nothing was asked. The two together are what the run
-	// ledger's learned peaks are bounded by: a recorded scope the list does
-	// not name no longer exists in this repository. The list is bounded by
-	// the scope count, which the plan already holds in heap.
-	HeavyScopes  []string
-	HeavyDerived bool
 
 	// shared is the spilled, sorted membership of every whole-snapshot unit,
 	// which their Unit.Inputs sequences stream from.
@@ -211,9 +162,7 @@ type Plan struct {
 // CountReused calls add once for every scope Reuse holds, with its provider.
 // It is the one statement of how a plan's scopes are counted, which the run
 // row's planned total and every capability row's units_planned both follow:
-// each unit Units yields is one scope, each Reuse entry is one more, and a
-// Carry row is none, because its scope's deferred unit is already in Units.
-// Adding Carry as well counts every carried scope twice.
+// each unit Units yields is one scope, and each Reuse entry is one more.
 func (p Plan) CountReused(add func(providerID string)) {
 	for key := range p.Reuse {
 		if id, _, ok := strings.Cut(key, scopeSeparator); ok {
@@ -252,55 +201,9 @@ type Inputs struct {
 	// and the plan is about the pinned snapshot.
 	Selection provider.Selection
 	Store     *sqlite.Store
-	// PrevGen is the generation reuse, carry and delta predecessors are read
-	// from; zero means there is none and every unit is built.
+	// PrevGen is the generation reuse and delta predecessors are read from;
+	// zero means there is none and every unit is built.
 	PrevGen model.GenerationID
-	// CarriedPage is one keyset page of PrevGen's stale members, exactly
-	// sqlite.Store.CarriedUnits' shape: page in (provider, scope) order from
-	// the given cursor (two empty strings start from the beginning), at most
-	// limit rows, a short page being the last. Build pages until a short page
-	// arrives and folds the result by Key(providerID, scopeKey), so a unit
-	// carried across several generations accumulates its distance instead of
-	// reporting 1 forever.
-	//
-	// It is the page fetcher and not the folded lookup because completeness is
-	// then structural: a coordinator that called the listing once and folded
-	// one page would satisfy a lookup-shaped field with a partial map, and
-	// every scope past the first page would read as "never carried" -- a unit
-	// stale for ten generations reported stale for one. Build never chooses
-	// the response bound it pages with beyond asking for model.MaxPageItems,
-	// which is the cap the store applies anyway; a nil fetcher is refused
-	// whenever PrevGen is set.
-	CarriedPage func(ctx context.Context, afterProviderID, afterScopeKey string, limit int) ([]Carried, error)
-	// RecordedPeak is what this workspace has already measured one heavy
-	// scope to cost: the largest process-tree peak recorded for scopeKey, and
-	// where that scope has none and familyPrefix is not empty, the largest
-	// recorded for any scope whose key begins with familyPrefix. The second
-	// result is whether a measurement exists at all. It is a function field,
-	// in CarriedPage's style, so this package keeps no dependency on the run
-	// ledger's storage; the coordinator binds it to the ledger's indexed
-	// lookup for its own repository.
-	//
-	// It is asked once per heavy unit the plan derives and about that unit's
-	// key only, so its cost follows the heavy units this plan holds and never
-	// the size of the history.
-	//
-	// It is advisory in every direction. A nil lookup, a scope this workspace
-	// has never run and a family it has never measured all answer the same
-	// thing -- no observation -- and the reservation the family constants
-	// derive then stands exactly as it is. An unreadable ledger is the
-	// supplier's to report, and it answers no observation: an accounting file
-	// must not refuse a plan.
-	RecordedPeak func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool)
-	// Machine is the composition root's reading of the host, the one the
-	// admission allocation starts from before the ledger re-derives it
-	// before every admission. Every heavy unit's reservation, heap caps
-	// included, is sized against it, so every unit of one plan is sized from
-	// one reading. The planner never observes the machine itself: a reading
-	// of its own, taken while memory is momentarily free, would size caps
-	// from a moment the composition never saw. The zero value is a host that
-	// exposes no available memory.
-	Machine dependence.Machine
 	Config  config.Config
 	// TempDir is where the planner spills the sorted input run of whole-snapshot
 	// units. Empty takes the process temporary directory. The spill lives only
@@ -313,9 +216,6 @@ type Inputs struct {
 func Build(ctx context.Context, in Inputs) (Plan, error) {
 	if in.View == nil || in.Store == nil {
 		return Plan{}, invalid("the planner needs a snapshot view and the store")
-	}
-	if in.PrevGen != 0 && in.CarriedPage == nil {
-		return Plan{}, invalid("the planner needs the previous generation's carry distances; wire Inputs.CarriedPage to the paged sqlite.Store.CarriedUnits listing")
 	}
 	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
 		headerKey: headerKeyOf(in.View.Header()),
@@ -360,9 +260,6 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	b.allUnits = units
 	defer func() { _ = units.Close() }()
 	if err := b.classifyProviders(ctx); err != nil {
-		return Plan{}, err
-	}
-	if err := b.foldCarry(ctx); err != nil {
 		return Plan{}, err
 	}
 	if err := b.walk(ctx); err != nil {
@@ -426,11 +323,6 @@ type builder struct {
 	// providerOrder is each active provider's position in Selection.Active,
 	// which is the dependency order Plan.Units answers in.
 	providerOrder map[string]int
-	// prior is the complete fold of Inputs.CarriedPage by Key, empty when
-	// there is no previous generation. It holds one entry per stale scope of
-	// that generation -- unit-scoped like Plan.Reuse and Plan.Previous, never
-	// file-scoped.
-	prior map[string]Carried
 
 	byProvider map[string][]Unit
 	// overBound records one exemplar path per provider whose scope key does
@@ -439,10 +331,6 @@ type builder struct {
 	// noInputs records one exemplar scope key per provider whose semantic
 	// scope no snapshot file is a member of, for the degradation row.
 	noInputs map[string]string
-	// fsActive records whether the filesystem provider is active. Change
-	// attribution is derived from its per-file unit identity, which is the
-	// only content-exact comparison the planner has.
-	fsActive bool
 }
 
 // fileProvider is one active file-invalidated provider.
@@ -481,9 +369,6 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if d.ID == filesystem.ID {
-				b.fsActive = true
-			}
 			b.fileProviders = append(b.fileProviders, fileProvider{id: d.ID, version: version,
 				gate: gate, dependsOnFile: d.ID != filesystem.ID && slices.Contains(d.DependsOn, filesystem.ID)})
 			continue
@@ -491,11 +376,6 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 		scopes, unplanned, err := semanticScopes(ctx, p, det, b.in.View)
 		if err != nil {
 			return err
-		}
-		if d.ID == dependence.ProviderID {
-			// The provider whose units are heavy derived every scope it
-			// builds, which is what lets HeavyScopes be read as complete.
-			b.plan.HeavyDerived = true
 		}
 		for reason, n := range unplanned {
 			b.plan.Unplanned[reason] += n
@@ -523,7 +403,7 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 // that rebuilt every table would reuse the linking unit sealed over the old
 // ones. The registry orders the structural provider before the linking
 // provider that depends on it, so its version is already classified here.
-func (b *builder) linkKeys(family dependence.Family) ([]string, error) {
+func (b *builder) linkKeys(family link.Family) ([]string, error) {
 	i := slices.IndexFunc(b.fileProviders, func(fp fileProvider) bool { return fp.id == tslang.ProviderID })
 	if i < 0 {
 		return nil, internalErr("the linking provider is planned without the structural provider whose tables it reads")
@@ -532,44 +412,15 @@ func (b *builder) linkKeys(family dependence.Family) ([]string, error) {
 	// model.MaxIdentifierBytes: a prefix could push it past the bound
 	// UnitBuild.Validate holds every dependency key to.
 	keys := []string{b.fileProviders[i].version}
-	if family == dependence.FamilyC {
+	if family == link.FamilyC {
 		keys = append(keys, b.headerKey)
 	}
 	return keys, nil
 }
 
-// foldCarry reads the previous generation's carry distances once, before the
-// manifest walk. It pages Inputs.CarriedPage to the end -- a page shorter than
-// the limit is the last, the same keyset loop the snapshot view uses over the
-// manifest -- because a partial fold is indistinguishable from "this scope was
-// never carried": the scopes past the first page would each restart their
-// provenance distance at 1 and report a unit stale for ten generations as
-// stale for one.
-func (b *builder) foldCarry(ctx context.Context) error {
-	if b.in.PrevGen == 0 {
-		return nil
-	}
-	b.prior = map[string]Carried{}
-	afterProviderID, afterScopeKey := "", ""
-	for {
-		page, err := b.in.CarriedPage(ctx, afterProviderID, afterScopeKey, model.MaxPageItems)
-		if err != nil {
-			return err
-		}
-		for _, c := range page {
-			b.prior[Key(c.ProviderID, c.ScopeKey)] = c
-		}
-		if len(page) < model.MaxPageItems {
-			return nil
-		}
-		last := page[len(page)-1]
-		afterProviderID, afterScopeKey = last.ProviderID, last.ScopeKey
-	}
-}
-
-// walk is the one manifest pass that plans every file unit, folds every
-// semantic unit's inputs, and attributes each changed or removed file to the
-// semantic units that own it.
+// walk is the one manifest pass that plans every file unit and folds every
+// semantic unit's inputs. A deleted file is neither: a tombstone has no bytes
+// to index or declare.
 func (b *builder) walk(ctx context.Context) error {
 	shared := false
 	for _, list := range b.semantics {
@@ -581,31 +432,22 @@ func (b *builder) walk(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return model.Canceled(err)
 		}
-		deleted := fv.Status == model.FileDeleted
-		changed, removed, err := b.fileUnits(ctx, fv, deleted)
-		if err != nil {
+		if fv.Status == model.FileDeleted {
+			return nil
+		}
+		if err := b.fileUnits(ctx, fv); err != nil {
 			return err
 		}
 		in := model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable}
-		if shared && !deleted {
+		if shared {
 			if err := b.allInputs.Add(in); err != nil {
 				return err
 			}
 		}
-		// One membership test per file per semantic unit decides both the
-		// unit's declared inputs and the provenance distance of a carry, so
-		// the predicate is evaluated once.
 		for _, list := range b.semantics {
 			for _, s := range list {
-				if !s.contains(fv) {
-					continue
-				}
-				if !deleted && !s.allFiles {
+				if !s.allFiles && s.contains(fv) {
 					s.inputs = append(s.inputs, in)
-				}
-				if changed || removed {
-					s.changed++
-					s.removed = s.removed || removed
 				}
 			}
 		}
@@ -613,23 +455,11 @@ func (b *builder) walk(ctx context.Context) error {
 	})
 }
 
-// fileUnits plans every file-invalidated provider's unit for one snapshot file
-// and reports whether the file's bytes changed since the previous generation
-// and whether it is a tombstone the previous generation indexed.
-//
-// A deleted file gets no unit: a tombstone has no bytes. It is still looked up
-// in the previous generation, because a member file that existed then and is
-// gone now is exactly what Section 13.3 forbids carrying over.
-func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted bool) (changed, removed bool, err error) {
+// fileUnits plans every file-invalidated provider's unit for one live
+// snapshot file.
+func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion) error {
 	scopeKey := filesystem.ScopeKey(fv.Path)
 	if len(scopeKey) > model.MaxScopeKeyBytes {
-		if deleted {
-			// A tombstone was never going to be planned, so counting it as a
-			// refused scope would over-report the degradation. It is still a
-			// change for every scope that owns it, and never a removal: a key
-			// this long had no unit in the previous generation either.
-			return true, false, nil
-		}
 		// Refused, never truncated and never silently dropped: a truncated key
 		// is a colliding identity claim, and two deep paths sharing a long
 		// prefix would then have one another's facts. The refusal is counted
@@ -643,20 +473,14 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 				b.overBound[fp.id] = fv.Path
 			}
 		}
-		// Whether such a file's bytes changed cannot be established without a
-		// unit to compare, and a unit nothing indexes cannot be claimed
-		// unchanged: it counts as changed for every scope that owns it.
-		return true, false, nil
+		return nil
 	}
-	// Without the filesystem provider there is no content-exact comparison, so
-	// no file is claimed unchanged and no semantic scope is carried.
-	changed = !b.fsActive
 	// A header two grammars declare has the grammar the census decides, and
 	// every file unit of it carries that decision (headerKeyOf).
 	header := tslang.SharedHeader(fv.Path)
 	var fsUnit model.UnitID
 	for _, fp := range b.fileProviders {
-		if deleted || !fp.gate(fv) {
+		if !fp.gate(fv) {
 			continue
 		}
 		u := Unit{ProviderID: fp.id, ProviderVersion: fp.version, ScopeKey: scopeKey, InputCount: 1,
@@ -672,28 +496,23 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 			// identity, which would let it be reused against a file whose
 			// identity unit changed.
 			if fsUnit == "" {
-				return false, false, internalErr("provider " + fp.id +
+				return internalErr("provider " + fp.id +
 					" is planned before the filesystem unit it depends on")
 			}
 			u.DependsOn = []model.UnitID{fsUnit}
 		}
 		spec, err := u.Spec(b.cfgHash)
 		if err != nil {
-			return false, false, err
+			return err
 		}
 		// A file unit is rebuilt whole from one file; no delta applier exists
 		// for one, so its predecessor is not recorded.
 		reused, _, err := b.previous(ctx, fp.id, scopeKey, spec.ID)
 		if err != nil {
-			return false, false, err
+			return err
 		}
 		if fp.id == filesystem.ID {
 			fsUnit = spec.ID
-			// The filesystem unit folds this file's content hash and nothing
-			// else, so reusing it is the content-exact answer to "did this
-			// file change", and a path the previous generation never held is a
-			// change too.
-			changed = !reused
 			b.duplicate(fv)
 		}
 		if reused {
@@ -711,19 +530,10 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 		}
 		b.unitSeq++
 		if err := b.allUnits.Add(rec); err != nil {
-			return false, false, err
+			return err
 		}
 	}
-	if deleted {
-		// A tombstone the previous generation selected a filesystem unit for is
-		// a member that existed and no longer does.
-		prev, err := b.selected(ctx, filesystem.ID, scopeKey)
-		if err != nil {
-			return false, false, err
-		}
-		return true, prev != "", nil
-	}
-	return changed, false, nil
+	return nil
 }
 
 // duplicate counts the file identity that two units publish a node fact for:
@@ -747,7 +557,7 @@ func (b *builder) duplicate(fv model.FileVersion) {
 	}
 }
 
-// emit turns the semantic scopes into units, decides reuse, carry and delta
+// emit turns the semantic scopes into units, decides reuse and delta
 // predecessor for each, and orders the plan by the selection's dependency
 // order.
 func (b *builder) emit(ctx context.Context) error {
@@ -756,10 +566,6 @@ func (b *builder) emit(ctx context.Context) error {
 		return err
 	}
 	b.plan.shared = shared
-	gov := dependence.NewGovernor(b.in.Config.Providers.Dependence.UnitMemoryFloorBytes,
-		config.BaseFootprint(b.in.Config))
-	machine := b.in.Machine
-	deferDependence := b.in.Config.Providers.Dependence.Enabled == config.Auto
 
 	for _, p := range b.in.Selection.Active {
 		d := p.Descriptor()
@@ -791,20 +597,9 @@ func (b *builder) emit(ctx context.Context) error {
 			}
 			u := Unit{ProviderID: s.providerID, ProviderVersion: s.version, ScopeKey: s.scopeKey,
 				InputCount: count, Inputs: inputs, DependencyKeys: s.dependencyKeys}
-			if s.heavy {
-				u.Heavy = true
-				// The heap estimate is sized from the family's own source
-				// bytes, which is the figure research measured the per-family
-				// ratio against; the unit's declared inputs are a larger set
-				// (its manifests and lock files) and would inflate it.
-				u.Reservation = b.reserve(ctx, gov, s, machine)
-				u.Admission = admission.Reservation{MemoryBytes: u.Reservation.Bytes()}
-				u.Deferred = deferDependence
-				b.plan.HeavyScopes = append(b.plan.HeavyScopes, s.scopeKey)
-			} else if s.admit != (admission.Reservation{}) {
-				// An external indexer's profile run is a heavy child too. Its
-				// figures are the profile's own, so no governor sizes it and
-				// nothing about it is deferred: it is admitted on the one
+			if s.admit != (admission.Reservation{}) {
+				// An external indexer's profile run is a heavy child. Its
+				// figures are the profile's own: it is admitted on the one
 				// ledger beside every other heavy child, in both dimensions.
 				u.Heavy = true
 				u.Admission = s.admit
@@ -823,7 +618,6 @@ func (b *builder) emit(ctx context.Context) error {
 			}
 			if prev != "" {
 				b.plan.Previous[Key(s.providerID, s.scopeKey)] = prev
-				b.carry(s, prev, u.Deferred)
 			}
 			b.byProvider[d.ID] = append(b.byProvider[d.ID], u)
 		}
@@ -845,8 +639,6 @@ func (b *builder) emit(ctx context.Context) error {
 		}
 	}
 	b.plan.Units = unitSequence(files, slots)
-	slices.Sort(b.plan.HeavyScopes)
-	b.plan.HeavyScopes = slices.Compact(b.plan.HeavyScopes)
 	b.degradations()
 	return nil
 }
@@ -895,91 +687,6 @@ func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) fun
 		}
 		return flush(len(slots))
 	}
-}
-
-// reserve sizes one heavy unit's reservation: what the family constants derive
-// from the unit's own source bytes, raised to whatever this repository has
-// already been measured to need for this scope.
-//
-// The raise is a separate field and not a larger heap cap because the cap is
-// handed to the frontend, which grows into whatever it is given: raising it on
-// the evidence of a past peak would raise the next peak too. What the recorded
-// peak is evidence about is how much of the machine this unit takes while it
-// runs, which is what the unit is admitted against.
-//
-// Where no measurement exists the reservation is exactly what the constants
-// derived. ObservedPeakBytes is left at zero, which Reservation.Bytes reads as
-// "nothing to raise to" rather than as a reservation of zero; assigning an
-// unobserved peak unconditionally is the one mistake here that would collapse
-// every reservation in the product, which is why the raise is inside the
-// observation test.
-func (b *builder) reserve(ctx context.Context, gov dependence.Governor, s *semantic, m dependence.Machine) dependence.Reservation {
-	r := gov.Reserve(s.family, s.bytes, m)
-	if peak, observed := b.recordedPeak(ctx, s); observed {
-		r.ObservedPeakBytes = peak
-	}
-	return r
-}
-
-// recordedPeak is the largest process-tree peak this workspace's run ledger
-// holds for one heavy scope: the peak recorded for that scope key itself if it
-// has ever run here, and otherwise the largest peak recorded for any scope of
-// the same language, so a project indexed for the first time is still sized by
-// what its language has been measured to cost on this repository.
-//
-// The scope's own measurement wins over its language's even when it is the
-// smaller of the two: it is the one taken of this very work.
-//
-// The second result is whether a measurement exists, and it is the whole point
-// of the signature. No ledger, a store with no recorded run, a scope and a
-// language neither of which has ever been sampled, and a platform that samples
-// no process tree at all are every one of them "no observation", and every one
-// of them answers false -- never a peak of zero. A zero returned as observed
-// would be read as a reservation of zero for the work the plan is about.
-func (b *builder) recordedPeak(ctx context.Context, s *semantic) (int64, bool) {
-	if b.in.RecordedPeak == nil {
-		return 0, false
-	}
-	// A heavy unit with no language has no family whose history could stand
-	// in for this scope's own, so only its own key is asked about.
-	prefix := ""
-	if s.family != "" {
-		prefix = dependence.ScopeKeyPrefix(s.family)
-	}
-	return b.in.RecordedPeak(ctx, s.scopeKey, prefix)
-}
-
-// carry records the stale predecessor of a refreshing semantic scope with its
-// provenance distance (Section 13.3). A scope whose member file the previous
-// generation indexed and the snapshot no longer holds is not carried: the
-// carried unit's facts would be about source that is gone.
-//
-// Only scopes the current snapshot produced reach here, so a unit whose whole
-// scope disappeared -- a deleted module -- is never carried either.
-//
-// Only a deferred scope is carried, and that is a hard constraint rather than
-// a preference: generation_units is keyed (generation_id, provider_id,
-// scope_key), so one generation holds exactly one row per scope. A deferred
-// unit runs in a later work generation and publishes through a later
-// activation (Section 11.6), so this generation's row is free for its
-// predecessor. A unit that seals inside this generation occupies that row
-// itself, and carrying its predecessor beside it would be a primary-key
-// conflict, not a stale answer. Carrying such a scope after its unit *fails*
-// is a runtime decision this planner cannot make; Previous already names the
-// sealed predecessor the coordinator would attach.
-func (b *builder) carry(s *semantic, prev model.UnitID, deferred bool) {
-	if s.removed || !deferred {
-		return
-	}
-	c := Carried{Unit: prev, ProviderID: s.providerID, ScopeKey: s.scopeKey,
-		DistanceGenerations: 1, DistanceFiles: s.changed}
-	if prior, ok := b.prior[Key(s.providerID, s.scopeKey)]; ok {
-		// The predecessor was already stale in the previous generation, so its
-		// distance is measured from its own snapshot, not from that one.
-		c.DistanceGenerations += prior.DistanceGenerations
-		c.DistanceFiles += prior.DistanceFiles
-	}
-	b.plan.Carry = append(b.plan.Carry, c)
 }
 
 // degradations publishes one capability row per affected provider capability

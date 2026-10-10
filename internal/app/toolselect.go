@@ -7,10 +7,8 @@ import (
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/config"
-	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -18,17 +16,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// cpgKind is the lock's own word for the tool the dependence provider runs.
-// The selection below asks the inventory which entry that is rather than
-// naming the engine: the engine's name appears in the lock and in the one
-// package that runs it, never on a command surface.
-const cpgKind = "cpg"
-
-// SelectedTools is the lock entries one repository's own manifests and sources
-// select. It reads the mappings that already decide them -- the SCIP indexers'
-// triggers, the language servers' root markers, the dependence families'
-// project markers, and lang.Of/dependence.FamilyOf for the source check below
-// -- from the packages that own them. There is deliberately no table here: a
+// SelectedTools is the lock entries one repository's own manifests select,
+// with the runtimes they need. It reads the mappings that already decide them
+// -- the SCIP indexers' triggers and the language servers' root markers --
+// from the packages that own them. There is deliberately no table here: a
 // second copy of the mapping that decides what gets downloaded would drift
 // from the one that decides what runs.
 //
@@ -94,19 +85,6 @@ func SelectedTools(dir string) ([]string, error) {
 			markers[m] = true
 		}
 	}
-	// The dependence provider is the one provider a marker pass alone
-	// under-serves. Its C/C++ family declares no project marker at all, and the
-	// other families' units are found by walking for sources, so a directory
-	// carrying nothing but sources still runs the graph engine at index time.
-	// Marker-only selection therefore left a C or C++ repository without the
-	// engine or its runtime, and the user discovered that mid-index on the
-	// offline runner prefetching exists to serve. Either signal selects the
-	// engine: a project marker of any family, or a source file of any family.
-	for _, family := range dependence.Families {
-		for _, m := range dependence.ProjectMarkers(family) {
-			markers[m] = true
-		}
-	}
 
 	sig := newSignals(markers)
 	policy := cfg.TraversalPolicy()
@@ -116,7 +94,7 @@ func SelectedTools(dir string) ([]string, error) {
 	if err := sig.tracked(root, policy.MaxFiles); err != nil {
 		return nil, err
 	}
-	present, hasDependenceSource := sig.present, sig.source
+	present := sig.present
 
 	selected := make(map[string]bool, len(lock.Tools))
 	// A tool is selected by the first of its markers the repository holds;
@@ -136,28 +114,10 @@ func SelectedTools(dir string) ([]string, error) {
 	for _, def := range lsp.Definitions() {
 		add(def.Name, def.RootMarkers)
 	}
-	if cpg := cpgEntries(lock); len(cpg) > 0 {
-		wanted := hasDependenceSource
-		for _, family := range dependence.Families {
-			if wanted {
-				break
-			}
-			for _, marker := range dependence.ProjectMarkers(family) {
-				if present[marker] {
-					wanted = true
-					break
-				}
-			}
-		}
-		if wanted {
-			for _, name := range cpg {
-				selected[name] = true
-			}
-		}
-	}
 	// The runtimes come from the lock's own `runtime` field rather than from a
-	// second mapping: a Node-hosted indexer cannot run without node, and the
-	// point of prefetching is that nothing is fetched later.
+	// second mapping: a Node-hosted indexer cannot run without node, nor the
+	// Java indexer and language server without the Java runtime, and the point
+	// of prefetching is that nothing is fetched later.
 	runtimes := make([]string, 0, 2)
 	for name := range selected {
 		entry, ok := lock.Tools[name]
@@ -187,20 +147,18 @@ func SelectedTools(dir string) ([]string, error) {
 }
 
 // signals is the answer the two passes below build together: which of the
-// marker file names the repository holds anywhere its source reaches, and
-// whether it holds a source file of a language family the dependence provider
-// analyses. Both passes ask the same two questions of a path, through observe,
-// so neither can record a signal the other would have read differently.
+// marker file names the repository holds anywhere its source reaches. Both
+// passes ask the same question of a path, through observe, so neither can
+// record a signal the other would have read differently.
 //
 // Nothing repository-sized is retained: the set of marker names is fixed by
-// the packages that own them before the first pass begins, present is bounded
-// by that set, and the source question is one bit. Each pass ends as soon as
+// the packages that own them before the first pass begins, and present is
+// bounded by that set. Each pass ends as soon as
 // complete reports the answer decided -- that is the question being over, not
 // a bound on how much of the repository is read.
 type signals struct {
 	markers map[string]bool
 	present map[string]bool
-	source  bool
 }
 
 func newSignals(markers map[string]bool) *signals {
@@ -208,21 +166,16 @@ func newSignals(markers map[string]bool) *signals {
 }
 
 // observe records what one root-relative path contributes. Only its last
-// element is read: a marker is a file name, and a path's language is its
-// extension's.
+// element is read: a marker is a file name.
 func (s *signals) observe(rel string) {
-	base := path.Base(rel)
-	if s.markers[base] {
+	if base := path.Base(rel); s.markers[base] {
 		s.present[base] = true
-	}
-	if !s.source && dependence.FamilyOf(lang.Of(base)) != "" {
-		s.source = true
 	}
 }
 
 // complete reports that every signal is decided, so nothing a pass could still
 // see would change the answer.
-func (s *signals) complete() bool { return s.source && len(s.present) == len(s.markers) }
+func (s *signals) complete() bool { return len(s.present) == len(s.markers) }
 
 // walk is the first pass: every file the traversal policy admits.
 func (s *signals) walk(root workspace.Root, policy workspace.Policy) error {
@@ -249,7 +202,7 @@ func (s *signals) walk(root workspace.Root, policy workspace.Policy) error {
 // The capture's forced predicate is `tracked = 1 OR change IN ('added',
 // 'modified', 'deleted')`, and the index alone answers it for every path that
 // exists: a staged add is an index entry, a modification is of a tracked path,
-// and a deleted path is not in the worktree to carry a marker or a source. So
+// and a deleted path is not in the worktree to carry a marker. So
 // no second Git call is needed here, and there is no second definition of what
 // this repository tracks for this one to drift from.
 //
@@ -298,17 +251,3 @@ func (s *signals) tracked(root workspace.Root, maxFiles int64) error {
 // errSignalsComplete ends a selection pass once nothing it could still see
 // could change its answer.
 var errSignalsComplete = errors.New("every tool-selection signal is decided")
-
-// cpgEntries are the lock entries of the kind the dependence provider runs.
-// Asking the inventory which entry that is keeps the engine's name out of this
-// package: `--for-repo` needs to know that a Go or Java project needs the graph
-// engine, not which engine it is.
-func cpgEntries(lock toolchain.Lock) []string {
-	var out []string
-	for _, name := range lock.Names() {
-		if lock.Tools[name].Kind == cpgKind {
-			out = append(out, name)
-		}
-	}
-	return out
-}

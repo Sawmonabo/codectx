@@ -27,14 +27,6 @@ type MaterializeOptions struct {
 	// because an analyzer given a smaller tree with a list of what is missing
 	// can still answer, while one given an error cannot.
 	MaxBytes int64
-	// Include, when set, decides membership file by file: only versions it
-	// accepts are copied, and the ones it rejects cost neither a byte of the
-	// MaxBytes budget nor an inode. It is the selector for a subset whose
-	// shape is a predicate rather than a list, which model.FileSelection.Paths
-	// cannot express: that list is bounded at MaxFilterValues entries, far
-	// below the file count of one analysis unit. A nil Include copies every
-	// nondeleted file the selection yields.
-	Include func(model.FileVersion) bool
 }
 
 // Materialization is a private tree of copied snapshot files for an external
@@ -99,8 +91,8 @@ func (m *Materialization) Close() error {
 	return m.err
 }
 
-// Materialize copies the selected nondeleted files of view that opts.Include
-// accepts into a fresh private directory under opts.Dir, preserving the
+// Materialize copies the selected nondeleted files of view into a fresh
+// private directory under opts.Dir, preserving the
 // executable bit and the root-relative layout. Every byte passes through the view's verified reader.
 // Writes go through an os.Root over the new directory, so a manifest path can
 // neither escape it nor follow a link out of it. The tree is removed on any
@@ -156,9 +148,6 @@ func (m *Materialization) fill(ctx context.Context, view model.SnapshotView, sel
 			return model.Canceled(err)
 		}
 		if fv.Status == model.FileDeleted {
-			return nil
-		}
-		if opts.Include != nil && !opts.Include(fv) {
 			return nil
 		}
 		if opts.MaxBytes > 0 && total+fv.Size > opts.MaxBytes {

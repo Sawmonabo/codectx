@@ -9,7 +9,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
 
 // unit is one linking unit's member tables as the resolvers read them.
@@ -21,7 +20,7 @@ type unit struct {
 	// dir is the unit's private scratch directory, where a resolver's
 	// external sorts spill.
 	dir string
-	// root is the project's root-relative directory (dependence.Unit.Root),
+	// root is the project's root-relative directory (Unit.Root),
 	// the empty string the repository root, and content the pinned snapshot
 	// its manifests are read from (a Go module's go.mod, which decides which
 	// import paths are the project's own).
@@ -29,7 +28,7 @@ type unit struct {
 	content model.SnapshotView
 	// family is the unit's language family; a Rust unit reads its crates'
 	// names from their Cargo.toml (rustCrates).
-	family dependence.Family
+	family Family
 }
 
 // Files streams the unit's member tables in ascending FileID order, one
@@ -74,11 +73,11 @@ type Binding struct {
 type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
 
 // resolverFor is the resolution of decision 2 for a unit's language family.
-func resolverFor(f dependence.Family) resolver {
+func resolverFor(f Family) resolver {
 	switch f {
-	case dependence.FamilyJavaScript:
+	case FamilyJavaScript:
 		return resolveECMAScript
-	case dependence.FamilyPython:
+	case FamilyPython:
 		return resolvePython
 	}
 	return resolveStatic
@@ -89,7 +88,7 @@ func resolverFor(f dependence.Family) resolver {
 // files are inputs of the unit's closure but carry no table, so they are not
 // members.
 type members struct {
-	unit dependence.Unit
+	unit Unit
 	// run holds every live file of the family under the unit's root, sorted,
 	// and Each keeps those the unit owns; n is how many it keeps.
 	run *pagination.SortedRun[model.FileVersion]
@@ -118,7 +117,7 @@ func (m *members) Close() error { return m.run.Close() }
 // on; a scope the plan does not hold, or one that owns no member, is a
 // disagreement with the planner and fails rather than being guessed at.
 //
-// The manifest is read once (dependence.PlanUnit). It is served in path order
+// The manifest is read once (PlanUnit). It is served in path order
 // and a FileID is a digest, so the order is an external sort that spills into
 // dir rather than a list held in the heap.
 func planMembers(ctx context.Context, req provider.UnitRequest, dir string) (*members, error) {
@@ -134,7 +133,7 @@ func planMembers(ctx context.Context, req provider.UnitRequest, dir string) (*me
 		return nil, err
 	}
 	defer s.Close()
-	pu, ok, err := dependence.PlanUnit(ctx, req.Content, req.Unit.ScopeKey, s.Add)
+	pu, ok, err := PlanUnit(ctx, req.Content, req.Unit.ScopeKey, s.Add)
 	if err != nil {
 		return nil, err
 	}

@@ -2,12 +2,13 @@
 
 ## Status
 
-Accepted, 2026-09-16.
+Accepted, 2026-09-16. Superseded 2026-10-08 by [ADR-0012](ADR-0012-native-dependence-engine.md): the hosted
+dependence engine this record governs was deleted under its phase 6.
 
 ## Context
 
 The dependence provider runs an external analysis engine once per unit for the parse and
-once for the export, under a heap ceiling the provider chooses ([providers-dependence](../providers-dependence.md)).
+once for the export, under a heap ceiling the provider chooses.
 Until this decision the ceiling was the unit's estimate -- 512 bytes of heap per byte of JavaScript
 source, from the empirical research -- clamped to the machine's available memory minus two gigabytes.
 The first uncapped index of the 13,222-file reference repository showed what that means on a host
@@ -94,7 +95,7 @@ was the measurement for this family at this size.
 
    *Where the figure itself is missing*: a child reserves disk only where its expected bytes are a
    figure the product already states. The language servers state one (`DiskBudgetBytes` per
-   profile) and reserve it. The analysis engine does not: `providers.dependence.max_staged_rows`
+   profile) and reserve it. The analysis engine does not: its staged-row bound (a key deleted with the engine)
    bounds rows, is unlimited by default, and nothing anywhere records bytes per staged row. An
    engine unit is therefore admitted on memory alone, and that is said at the call site rather than
    papered over with a constant derived from source bytes — putting an underived number into the

@@ -46,8 +46,8 @@ before the problem happens is off when the problem happens.
 ### What a span is, and what it is not
 
 A run is a tree of **spans**, not a list of timers. One run at the root; under
-it one span per stage; under a stage one span per unit; under a subdivided
-unit one span per part. Each span carries its own wall time, processor time,
+it one span per stage; under a stage one span per unit; under a unit one
+span per step it takes. Each span carries its own wall time, processor time,
 peak resident memory, transferred bytes, what went in and what came out, and
 how it ended.
 
@@ -56,9 +56,8 @@ that worker parsed; an analyzer unit's span covers the unit. A span is a thing
 that costs seconds, and a span per file would make the account larger than
 what it accounts for.
 
-A run is one of three kinds. An `index` run is a `codectx index`, `refresh` or
-`watch` pass. A `deferred` run is one tick of the deferred publication that
-finishes work an earlier run left staged; each tick is its own run. An
+A run is one of two kinds. An `index` run is a `codectx index`, `refresh` or
+`watch` pass. An
 `overlay` run belongs to the process rather than to any generation, and holds
 the spans of things a process does outside a run -- today, starting a language
 server.
@@ -71,17 +70,14 @@ nothing and a run that failed included -- and deletes the runs before it. No
 count is involved. Retention keeps only the newest generation of each ref, so
 on a workspace indexed on one ref the run behind that generation is the oldest
 kept: each publication deletes the account of every earlier finished run, and
-a failed run survives until the next publication. Likewise, when a deferred
-publication extends an index run's generation on the same ref, that index
-run's account goes with the superseded generation unless an older retained
-ref's run precedes it, and the deferred run is the one behind the active store. A live run is never deleted,
+a failed run survives until the next publication. A live run is never deleted,
 and when no run names a generation the store still holds, nothing is deleted.
 Overlay runs are collected as soon as the process that opened them is gone.
 
 ### The stages a run records
 
 An index run opens these at its top level: `capture` (with `walk` beneath it),
-`plan`, `attach_reused`, `attach_carried`, `build`, `structural_parse` (the
+`plan`, `attach_reused`, `build`, `structural_parse` (the
 run's total for the parser pool), `coverage`, `activation`,
 `lexical_compaction`, `adjacency`, `lexical_build`, `retention`, `collection`
 and `reclaim`.
@@ -89,21 +85,9 @@ and `reclaim`.
 Under `build`, one span per planned unit, whose stage is the **provider's own
 id** -- `filesystem`, `treesitter`, `manifest` and the rest -- and whose scope
 is the unit's scope key. Beneath a unit span sit the steps that provider
-takes: `run` and `import` for a precisely indexed unit; `parse`, `export` and
-`import` for an analyzed one, with a `part` span per piece of a unit that was
-subdivided and that part's own steps beneath it; and `seal`, where the unit's
+takes: `run` and `import` for a precisely indexed unit, and `seal`, where the unit's
 facts become visible. Beneath the `structural_parse` total sits one span per
 parser worker, each carrying that worker's child process measurements.
-
-A `deferred` run records one unit span per unit it took off the background
-queue. When its publication fails, nothing requeues those units, and the run
-also records an `abandonment` marker: a top-level span, failed with the
-publication's code and message, whose scope is the active generation the run
-extended and whose `in` count is the units it abandoned. It is a marker, not a
-bracket, so its wall is the instant it was written. While that generation stays
-active, status in any process reads the run's units as `failed` with reason
-`publication_failed`, the publication's code and the run's `run_id`, never as
-still running. Retention keeps the run for as long as it keeps the generation.
 
 `server_start`, one per language server, sits under the process's `overlay`
 run rather than under an index run: a server is started lazily, by whatever
@@ -118,8 +102,7 @@ wall-sorted table while measuring nothing.
 
 ### How each stage ends
 
-`ok`, `failed`, `subdivided`, `reused` and `skipped` are endings the run
-reported. Three are not:
+`ok`, `failed` and `reused` are endings the run reported. Three are not:
 
 - `running` is a span that had not finished when the row was read.
 - `interrupted` is a span that was still open when its run ended -- a
@@ -145,7 +128,7 @@ ones it never got to.
 per-goroutine processor accounting. A stage that ran beside other work in this
 process therefore reports no processor time and says
 `unavailable (overlapped)` rather than a share of process-wide counters it
-does not own -- `capture`, `walk`, `plan`, `attach_reused`, `attach_carried`,
+does not own -- `capture`, `walk`, `plan`, `attach_reused`,
 `build`, `coverage`, `seal`, `activation`, `adjacency`, `lexical_build`,
 `lexical_compaction`, `retention`, `collection`, `reclaim`, the in-process
 `import` steps and every UNIT span all read this way. A unit span reads this way
@@ -153,8 +136,8 @@ even where the unit ran a child: it brackets the whole unit, of which the child
 is one step and this process's own work beside other units is the rest. A
 plausible wrong attribution is worse than an honest absence, because only the
 first one gets believed. `unavailable (unsampled)` is a different answer: the
-platform does not expose the counters at all. The steps that ran a child --
-`parse`, `export` and a `part`'s own -- carry real processor time, taken from
+platform does not expose the counters at all. The step that ran a child --
+a precisely indexed unit's `run` -- carries real processor time, taken from
 the child when it was reaped.
 
 **A child's transferred bytes are a sample, not a total.** They come from the
@@ -205,13 +188,13 @@ wall time with each one's share:
 
 ```
 stage       capture 6ms, ok, in 0, out 3
-run         ok in 21ms, 8 planned, 8 succeeded, 0 failed, 0 subdivided
+run         ok in 21ms, 8 planned, 8 succeeded, 0 failed
 stage       capture 6ms, 29% of the run, ok, in 0, out 3
 stage       activation 5ms, 24% of the run, ok, in 0, out 0
 ```
 
-The progressive lines are the run's own; a deferred tick and a `watch` pass
-print none, and under `--json` they go to stderr so that stdout carries the one
+The progressive lines are the run's own; a `watch` pass
+prints none, and under `--json` they go to stderr so that stdout carries the one
 envelope and nothing else. `--json` carries the same rows on the result
 itself, at `data.run` and `data.stages`, with `data.stages_omitted`. Because only
 top-level stages are printed, a unit that ended `unavailable` is not in this

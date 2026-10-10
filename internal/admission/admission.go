@@ -1,5 +1,5 @@
 // Package admission is this process's one reservation ledger: every heavy
-// child -- analysis engine runs, external indexers, language servers, parser
+// child -- external indexers' profile units, language servers, parser
 // workers -- is admitted against a single machine-derived allocation of MEMORY and one of
 // DISK, by the SUM of what they reserve in each (ADR-0010 decisions 5 and 6).
 //
@@ -12,11 +12,12 @@
 // the other needs. Two reservers each holding a running total bounded by the
 // same allocation is not one gate: it lets a process reserve a multiple of the
 // machine's memory and freeze the host, which is the failure this package
-// exists to make impossible. Nothing here observes the machine or derives the
-// allocations: the composition root derives both and hands the figures over,
-// and re-derives the memory figure from the kernel's before every admission
-// (RederiveBeforeEachAdmission, SetAllocation), so there is exactly one place
-// a second total could ever be introduced.
+// exists to make impossible. The ledger observes nothing and derives no
+// allocation: the composition root reads the machine (ObserveMachine,
+// Machine.SchedulingAllocation) and the disk, derives both and hands the
+// figures over, and re-derives the memory figure from the kernel's before
+// every admission (RederiveBeforeEachAdmission, SetAllocation), so there is
+// exactly one place a second total could ever be introduced.
 //
 // A holding's memory can move while it is held (Holding.Adjust): a parser
 // worker holds the base it reports for its lifetime, and a reported figure
@@ -27,7 +28,7 @@
 // does not fit blocks the waiters behind it rather than letting a small
 // reservation overtake it: the alternative starves a large unit for as long as
 // small ones keep arriving, and a unit that never runs is a capability that
-// never answers. A language server therefore queues behind an engine unit that
+// never answers. A language server therefore queues behind an indexer unit that
 // arrived first instead of opportunistically taking room from under it.
 //
 // The one thing a reserver may do before it waits is free room of its own: a
@@ -124,7 +125,7 @@ type waiter struct {
 // keep, has nothing to give a child, and every child that wants that
 // dimension then runs alone rather than being refused. An unobservable figure
 // is NOT zero and must not be passed as one; the composition root stands a
-// conservative figure in for it (dependence.Machine.SchedulingAllocation for
+// conservative figure in for it (Machine.SchedulingAllocation for
 // memory), because an admission gate with no bound is not a gate. Whether a
 // figure was observed is not the ledger's concern: it gates against the
 // figure either way, and the composition root tells the surfaces that
@@ -363,7 +364,7 @@ func (l *Ledger) remove(w *waiter) {
 			// pump stops at the first waiter that does not fit, so the head
 			// this one was blocking behind is granted only when something
 			// pumps. Without this the new head waits for an unrelated release
-			// -- a full engine parse away -- although it fits right now.
+			// -- a whole indexer run away -- although it fits right now.
 			l.pump()
 			return
 		}

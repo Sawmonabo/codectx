@@ -9,7 +9,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// The replaced-file set of a dependence unit is a merge join of the
+// The replaced-file set of a linking unit is a merge join of the
 // predecessor's declared inputs against this unit's own, streamed from both
 // ends and never held: a unit declares every source file of its project and
 // Section 6 forbids retaining that list in the heap.

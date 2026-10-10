@@ -51,8 +51,8 @@ func TestSealClipsEvidenceToTheConfiguredClip(t *testing.T) {
 		ev.ID = model.NewEvidenceID(ev)
 		fact.Evidence = append(fact.Evidence, ev)
 	}
-	if err := w.PutKeyedNodes(ctx, []model.NodeFact{fact}, [][]string{{model.H("fixture-fact-key", "key:clip")}}); err != nil {
-		t.Fatalf("PutKeyedNodes: %v", err)
+	if err := w.PutNodes(ctx, []model.NodeFact{fact}); err != nil {
+		t.Fatalf("PutNodes: %v", err)
 	}
 	if err := s.SealUnit(ctx, w); err != nil {
 		t.Fatalf("SealUnit: %v", err)

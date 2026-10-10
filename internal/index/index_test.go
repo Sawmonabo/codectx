@@ -4,8 +4,6 @@ package index
 // ten changed files, a new symbol and dependency, a delete and a rename, an
 // optional provider's failure, a required provider's failure, a concurrent
 // refresh, and a watcher overflow.
-// A ninth test covers the carry-distance paging the coordinator feeds the
-// planner.
 //
 // Failure modes these protect, all of which are silent:
 //   - a refresh that rebuilds units nothing changed, rewriting lexical bodies
@@ -17,9 +15,7 @@ package index
 //     or a required provider's failure publishing a generation anyway;
 //   - two concurrent refreshes publishing over one another's unseen pointer;
 //   - a watch overflow dropping the paths it collapsed, so the index reports
-//     coverage it does not have;
-//   - a carry fold that reads one page of the previous generation's stale
-//     members, reporting a unit stale for many generations as stale for one.
+//     coverage it does not have.
 
 import (
 	"bytes"
@@ -36,13 +32,11 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
-	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
@@ -106,21 +100,18 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	}
 	cfg := config.Defaults()
 	cfg.Storage.DataDir = f.dataDir
-	// The three optional providers are absent from the registry below, and
+	// The two optional providers are absent from the registry below, and
 	// the configuration says so: SCIP and LSP index through managed toolchain
-	// payloads and the dependence provider through a resolved analysis
-	// engine, none of which a test machine holds. providers(true) is the one
+	// payloads, which a test machine does not hold. providers(true) is the one
 	// exception — the SCIP provider over an index supplied in the tree, which
 	// needs no payload.
 	//
-	// Their delta appliers are therefore not driven through a coordinator
-	// here. internal/index/delta covers both against a real store, each
-	// refreshed unit held against a full import of the same tree: the
-	// dependence applier over a replaced, an added and a removed declared
-	// input, and the SCIP applier over a moved document.
+	// The SCIP delta applier is therefore not driven through a coordinator
+	// here. internal/index/delta covers it against a real store, the
+	// refreshed unit held against a full import of the same tree over a moved
+	// document.
 	cfg.Providers.SCIP.Enabled = config.Disabled
 	cfg.Providers.LSP.Enabled = config.Disabled
-	cfg.Providers.Dependence.Enabled = config.Disabled
 	f.cfg = cfg
 
 	cas, err := snapshot.OpenCAS(snapshot.CASDir(f.dataDir))
@@ -256,7 +247,6 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
 	}
-	f.t.Cleanup(func() { c.Close() })
 	return c
 }
 
@@ -546,45 +536,6 @@ func TestIncrementalScenario(t *testing.T) {
 		}
 	})
 
-	t.Run("a deferred publication outlives the activation that intervened while its units built", func(t *testing.T) {
-		// Failure mode: the background tick reads the active generation when
-		// it starts and the publication pins that id minutes later. An
-		// ordinary reconciliation in between supersedes it and retention
-		// deletes it, so the pin fails and the whole batch of sealed units is
-		// thrown away and collected -- under the shipped
-		// `providers.dependence.enabled = "auto"` default, every time.
-		gen, err := f.store.ActiveGeneration(ctx, f.c.repo)
-		if err != nil {
-			t.Fatalf("ActiveGeneration: %v", err)
-		}
-		pinned, err := f.store.PinGeneration(ctx, f.c.repo, gen, statusLeaseTTL)
-		if err != nil {
-			t.Fatalf("PinGeneration: %v", err)
-		}
-		snap := pinned.Binding().SnapshotID
-		pinned.Close()
-		sel, err := f.c.opts.Registry.Select(ctx, f.c.opts.Root, f.c.policy, f.c.enablement)
-		if err != nil {
-			t.Fatalf("Select: %v", err)
-		}
-		// The reconciliation the tick does not see. It activates over gen and
-		// retention collects it, exactly as the 30 s default interval does
-		// while a dependence unit runs.
-		if _, err := f.c.Refresh(ctx, nil); err != nil {
-			t.Fatalf("refresh: %v", err)
-		}
-		if _, err := f.store.PinGeneration(ctx, f.c.repo, gen, statusLeaseTTL); err == nil {
-			t.Fatal("the superseded generation still exists; this leg is not exercising the race")
-		}
-		// A publication with nothing to replace still pins and plans, which is
-		// the whole of the path that failed: it must reach "nothing to
-		// publish" over the generation that superseded gen, not
-		// CTX_ARGUMENT_INVALID over the one that is gone.
-		if _, _, err = f.c.late.publish(ctx, snap, sel, refNone, batch{}); err != nil {
-			t.Fatalf("the deferred publication pinned a stale generation: %v", err)
-		}
-	})
-
 	t.Run("an optional provider's failure degrades its capability only", func(t *testing.T) {
 		// A supplied index that is not a SCIP index at all: the optional
 		// provider plans its unit and cannot produce it.
@@ -641,7 +592,7 @@ func TestIncrementalScenario(t *testing.T) {
 			for _, i := range order {
 				agg.add(failures[i].scope, unitFailure{code: failures[i].code})
 			}
-			r.addFailures(scip.ID, "references", agg, 0)
+			r.addFailures(scip.ID, "references", agg)
 			states := r.finish(f.c.log)
 			for _, st := range states {
 				if st.ProviderID == scip.ID {
@@ -673,9 +624,8 @@ func TestIncrementalScenario(t *testing.T) {
 		// provider, capability, scope_key) with no state column, while the
 		// report keys its rows by state as well. A provider capability that
 		// reaches the publication with a sibling unit's fresh row folded to
-		// the workspace scope, a workspace-scoped partial degradation, a
-		// failed unit and a carried workspace scope publishes four rows under
-		// one primary key: the insert is rejected and `codectx index` exits on
+		// the workspace scope, a workspace-scoped partial degradation and a
+		// failed unit publishes three rows under one primary key: the insert is rejected and `codectx index` exits on
 		// a constraint error instead of publishing the degraded generation.
 		r := newCapabilityReport()
 		r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
@@ -683,8 +633,7 @@ func TestIncrementalScenario(t *testing.T) {
 		r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
 			Scope: provider.ScopeWorkspace, State: model.CapabilityPartial,
 			DiagnosticCode: model.CodeProviderOutputInvalid})
-		r.addCarried(scip.ID, "references", provider.ScopeWorkspace, 1, 2)
-		r.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout), 0)
+		r.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout))
 		states := r.finish(f.c.log)
 		var rows []model.CapabilityState
 		for _, s := range states {
@@ -785,249 +734,6 @@ func changedKey(key string, changed []string) bool {
 	return false
 }
 
-// TestCarryDistancesPageToTheEnd proves the coordinator feeds the planner the
-// whole stale membership of the previous generation, not its first page.
-//
-// Failure mode: a carry fold that stops at one page reports every scope past
-// it as never carried, so a unit stale for ten generations answers `stale` with
-// a provenance distance of one -- a freshness claim the source does not
-// support. The store caps a page at model.MaxPageItems and the planner ends its
-// fold on a short page, so a fixture with one more carried unit than that cap
-// is what makes the loop run at all.
-func TestCarryDistancesPageToTheEnd(t *testing.T) {
-	const carried = model.MaxPageItems + 1
-	f := newFixture(t, map[string]string{
-		"go.mod":     "module example.com/carry\n\ngo 1.27\n",
-		"pkg/one.go": goFile("pkg", "One", ""),
-	})
-	ctx := f.ctx
-	cold, err := f.c.Index(ctx, model.IndexRequest{})
-	if err != nil {
-		t.Fatalf("cold index: %v", err)
-	}
-	snap := cold.Binding.SnapshotID
-	fv, err := f.store.SnapshotFile(ctx, snap, model.NewFileID(f.c.repo, "pkg/one.go"))
-	if err != nil {
-		t.Fatalf("SnapshotFile: %v", err)
-	}
-	caps := []model.CapabilityState{{ProviderID: "dependence", Capability: "calls",
-		Scope: provider.ScopeWorkspace, State: model.CapabilityFresh}}
-
-	// A generation of sealed units, so there is something to carry.
-	sealed := make([]model.UnitID, 0, carried)
-	gen, err := f.store.BeginGeneration(ctx, f.c.repo, snap, f.c.cfgHash, "refs/heads/carry")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < carried; i++ {
-		u := plan.Unit{ProviderID: "dependence", ProviderVersion: "v1", ScopeKey: fmt.Sprintf("project:%04d", i),
-			InputCount: 1, Inputs: func(yield func(model.UnitInput) error) error {
-				return yield(model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable})
-			}}
-		spec, err := u.Spec(f.c.cfgHash)
-		if err != nil {
-			t.Fatal(err)
-		}
-		run, err := f.store.BeginProviderRun(ctx, gen, u.ProviderID, u.ProviderVersion)
-		if err != nil {
-			t.Fatal(err)
-		}
-		build := model.UnitBuild{Spec: spec, AnalysisConfigHash: f.c.cfgHash, OriginRunID: run,
-			SourceBinding: model.SourceBindingVerified}
-		w, err := f.store.BeginUnit(ctx, gen, build, u.Inputs)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := f.store.SealUnit(ctx, w); err != nil {
-			t.Fatal(err)
-		}
-		sealed = append(sealed, spec.ID)
-	}
-	if _, err := f.store.Activate(ctx, gen, cold.Binding.GenerationID, model.HealthFresh, caps, NormalizationVersion); err != nil {
-		t.Fatalf("Activate: %v", err)
-	}
-	// The generation that carries every one of them as stale.
-	stale, err := f.store.BeginGeneration(ctx, f.c.repo, snap, f.c.cfgHash, "refs/heads/carry")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, unit := range sealed {
-		if err := f.store.AttachCarried(ctx, stale, unit, sqlite.Carry{DistanceGenerations: 3, DistanceFiles: 7}); err != nil {
-			t.Fatalf("AttachCarried: %v", err)
-		}
-	}
-	if _, err := f.store.Activate(ctx, stale, gen, model.HealthDegraded, caps, NormalizationVersion); err != nil {
-		t.Fatalf("Activate: %v", err)
-	}
-
-	view, err := snapshot.OpenView(ctx, f.store, f.cas, snap)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sel, err := f.c.opts.Registry.Select(ctx, f.c.opts.Root, f.c.policy, f.c.enablement)
-	if err != nil {
-		t.Fatal(err)
-	}
-	page := f.c.carriedPage(stale)
-	var pages, rows int
-	counted := func(ctx context.Context, afterProviderID, afterScopeKey string, limit int) ([]plan.Carried, error) {
-		got, err := page(ctx, afterProviderID, afterScopeKey, limit)
-		pages++
-		rows += len(got)
-		for _, c := range got {
-			if c.DistanceGenerations != 3 || c.DistanceFiles != 7 {
-				t.Errorf("%s carried distance %d/%d, want 3/7", c.ScopeKey, c.DistanceGenerations, c.DistanceFiles)
-			}
-		}
-		return got, err
-	}
-	if _, err := plan.Build(ctx, plan.Inputs{View: view, Selection: sel, Store: f.store, PrevGen: stale,
-		CarriedPage: counted, Config: f.cfg}); err != nil {
-		t.Fatalf("plan.Build: %v", err)
-	}
-	if pages < 2 {
-		t.Fatalf("the carry fold read %d page(s); %d carried units cannot fit one page of %d",
-			pages, carried, model.MaxPageItems)
-	}
-	if rows != carried {
-		t.Fatalf("the carry fold saw %d of %d carried units", rows, carried)
-	}
-}
-
-// TestDeferredUnitsAreNotCoverage guards the false-readiness invariants of
-// Section 11.6 that only the `auto` configuration reaches: a deferred scope is
-// not coverage until the generation selects its planned unit, and the stale
-// predecessor carried for it is never that unit. Neither can be
-// driven end to end here: plan.Build marks a unit heavy -- and therefore
-// deferrable -- for the dependence provider alone, and that provider needs the
-// real analysis engine. So the coverage projection and the background queue are
-// exercised directly, which is where both defects lived.
-func TestDeferredUnitsAreNotCoverage(t *testing.T) {
-	f := newFixture(t, map[string]string{"pkg/a.go": goFile("pkg", "A", "")})
-	ctx := f.ctx
-	sel, err := f.c.opts.Registry.Select(ctx, f.c.opts.Root, f.c.policy, f.c.enablement)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(sel.Active) == 0 {
-		t.Fatal("detection selected no provider")
-	}
-	d := sel.Active[0].Descriptor()
-
-	// A generation whose only planned unit for this provider is deferred holds
-	// no member for it: the unit seals into a later publication.
-	g := &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
-		plan: plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})}}
-	if err := g.coverage(ctx); err != nil {
-		t.Fatalf("coverage: %v", err)
-	}
-	published := g.caps.finish(f.c.log)
-	for _, s := range published {
-		if s.ProviderID != d.ID {
-			continue
-		}
-		if s.State == model.CapabilityFresh {
-			t.Fatalf("%s/%s reported fresh coverage while its only unit is still deferred", s.ProviderID, s.Capability)
-		}
-		if s.Details["reason"] != "units_deferred" {
-			t.Fatalf("%s/%s deferred row has details %v", s.ProviderID, s.Capability, s.Details)
-		}
-	}
-
-	// The same unit, once the publication generation holds it, is coverage --
-	// and it is the generation's own unit rows that say so, not any record of
-	// what the background batch sealed.
-	//
-	// Mutation: restore the in-process mirror by making holdsFreshUnit answer
-	// from a batch-local set instead of Store.SelectedUnit; the sealed unit
-	// below is attached to the generation and to nothing else, so the
-	// capability comes back `unavailable: units_deferred` and this fails.
-	cold, err := f.c.Index(ctx, model.IndexRequest{})
-	if err != nil {
-		t.Fatalf("index: %v", err)
-	}
-	snap := cold.Binding.SnapshotID
-	fv, err := f.store.SnapshotFile(ctx, snap, model.NewFileID(f.c.repo, "pkg/a.go"))
-	if err != nil {
-		t.Fatalf("SnapshotFile: %v", err)
-	}
-	held := plan.Unit{ProviderID: d.ID, ProviderVersion: "v1", ScopeKey: "scope", Deferred: true,
-		InputCount: 1, Inputs: func(yield func(model.UnitInput) error) error {
-			return yield(model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable})
-		}}
-	spec, err := held.Spec(f.c.cfgHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pubGen, err := f.store.BeginGeneration(ctx, f.c.repo, snap, f.c.cfgHash, "refs/heads/deferred")
-	if err != nil {
-		t.Fatal(err)
-	}
-	run, err := f.store.BeginProviderRun(ctx, pubGen, held.ProviderID, held.ProviderVersion)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w, err := f.store.BeginUnit(ctx, pubGen, model.UnitBuild{Spec: spec, AnalysisConfigHash: f.c.cfgHash,
-		OriginRunID: run, SourceBinding: model.SourceBindingVerified}, held.Inputs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.store.SealUnit(ctx, w); err != nil {
-		t.Fatal(err)
-	}
-	g = &generation{c: f.c, gen: pubGen, caps: newCapabilityReport(), sel: sel,
-		plan: plan.Plan{Units: oneUnit(held)}}
-	if err := g.coverage(ctx); err != nil {
-		t.Fatalf("coverage: %v", err)
-	}
-	published = g.caps.finish(f.c.log)
-	for _, s := range published {
-		if s.ProviderID == d.ID && s.State != model.CapabilityFresh {
-			t.Fatalf("%s/%s reported %q after its deferred unit sealed into this generation",
-				s.ProviderID, s.Capability, s.State)
-		}
-	}
-
-	// The reverse direction: a generation whose member for the deferred scope
-	// is the STALE predecessor carried while the scope is rebuilt, beside a
-	// sibling scope of the same provider that did seal fresh. The carried
-	// member exists, but it is not the unit the plan derives, so the scope is
-	// still running and the sibling's fresh row must not speak for the
-	// capability.
-	//
-	// Mutation: make holdsFreshUnit answer true for any selected unit rather
-	// than for the planned spec; the carried member then counts as coverage,
-	// the sibling's fresh row is never demoted, and this fails.
-	rebuilt := held
-	rebuilt.ProviderVersion = "v2"
-	carriedGen, err := f.store.BeginGeneration(ctx, f.c.repo, snap, f.c.cfgHash, "refs/heads/carried")
-	if err != nil {
-		t.Fatal(err)
-	}
-	g = &generation{c: f.c, gen: carriedGen, caps: newCapabilityReport(), sel: sel,
-		plan: plan.Plan{Units: oneUnit(rebuilt), Carry: []plan.Carried{{Unit: spec.ID, ProviderID: d.ID,
-			ScopeKey: held.ScopeKey, DistanceGenerations: 1, DistanceFiles: 1}}}}
-	if err := g.attachCarried(ctx); err != nil {
-		t.Fatalf("attachCarried: %v", err)
-	}
-	if g.carried != 1 {
-		t.Fatalf("the stale predecessor was not carried into the generation (%d carried)", g.carried)
-	}
-	for _, capability := range d.Capabilities {
-		g.caps.add(model.CapabilityState{ProviderID: d.ID, Capability: capability, Scope: "sibling",
-			State: model.CapabilityFresh})
-	}
-	if err := g.coverage(ctx); err != nil {
-		t.Fatalf("coverage: %v", err)
-	}
-	for _, s := range g.caps.finish(f.c.log) {
-		if s.ProviderID == d.ID && s.State == model.CapabilityFresh {
-			t.Fatalf("%s/%s reported fresh while one of its scopes is answered by a carried stale "+
-				"predecessor whose rebuild is still running", s.ProviderID, s.Capability)
-		}
-	}
-}
-
 // A supplied index whose path resolves to nothing must still be recorded
 // against the published generation. An unresolved path plans no unit, so the
 // row is the only surviving evidence that tells it apart from a run that
@@ -1048,13 +754,6 @@ func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
 	if len(rows) != 1 || rows[0].Path != "missing.scip" || rows[0].Resolved {
 		t.Fatalf("supplied index record = %+v, want one unresolved missing.scip", rows)
 	}
-}
-
-// oneUnit is a hand-built plan.Plan's unit sequence. Plan.Units is a sequence
-// and not a slice because plan.Build streams it from a spilled run; a test
-// that assembles a plan by hand supplies the same shape over one unit.
-func oneUnit(u plan.Unit) func(yield func(plan.Unit) error) error {
-	return func(yield func(plan.Unit) error) error { return yield(u) }
 }
 
 // heldLock presents a lock the fixture already holds as the coordinator's
@@ -1437,7 +1136,6 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { c.Close() })
 
 	// Nothing has ever indexed this workspace, so no repository row exists yet.
 	// The watch must still be able to say it is here: the heartbeat is keyed by
@@ -1497,7 +1195,7 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 // TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce guards the
 // failure mode a report full of `unavailable` rows is: a provider the
 // operator turned off was planned for nothing and then reported once per
-// declared capability -- three providers off is eight rows -- which reads to a
+// declared capability -- two providers off is several rows -- which reads to a
 // person as eight failures and tells an agent it is holding a degraded index
 // rather than a configured one. What is off must be said once, in one field,
 // and nowhere else.
@@ -1508,18 +1206,10 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 // here too -- a filter that swallowed them would pass every other assertion.
 func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
 	f := newFixture(t, map[string]string{"go.mod": "module example.com/off\n\ngo 1.27\n", "a.go": "package a\n"})
-	// The fixture's configuration disables scip, lsp and dependence; this
-	// registry holds the scip provider, so selection is asked about a
-	// provider that is registered AND off.
+	// The fixture's configuration disables scip and lsp; this registry holds
+	// the scip provider, so selection is asked about a provider that is
+	// registered AND off.
 	c := f.coordinator(f.providers(true))
-	// What the composition root records for a provider it could not build --
-	// and it never even tries to build one the configuration disabled, which
-	// is the second way these rows reached the report.
-	for _, capability := range dependence.Capabilities {
-		c.opts.States = append(c.opts.States, model.CapabilityState{ProviderID: dependence.ProviderID,
-			Capability: capability, Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
-			DiagnosticCode: model.CodeProviderUnavailable})
-	}
 	res, err := c.Index(f.ctx, model.IndexRequest{})
 	if err != nil {
 		t.Fatalf("Index: %v", err)
@@ -1534,7 +1224,7 @@ func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
 	if err := st.Validate(); err != nil {
 		t.Fatalf("the status does not validate: %v", err)
 	}
-	off := []string{"scip", "lsp", "dependence"}
+	off := []string{"scip", "lsp"}
 	for _, surface := range []struct {
 		name     string
 		disabled []string

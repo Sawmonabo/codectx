@@ -32,10 +32,6 @@ var inPlaceFrees = map[string]string{
 	"internal/snapshot/lock.go (*WorkspaceLock).Close": "clears that same one-line record as the lock is " +
 		"given up, so a waiter arriving before the next holder is told nobody recorded themselves rather " +
 		"than handed the name of a process that has let go. Same bounded line, same nothing freed.",
-	"internal/provider/dependence/graphcsv/keys.go (*scratch).saveKeys": "creates the key set over the " +
-		"previous import's, which is the one of these that is unbounded: it is as large as that import's key set. " +
-		"The old set is emptied through paced.Shrink immediately above the create, so by the time the " +
-		"truncating open runs there is nothing left for it to free.",
 	"internal/index/delta/delta.go previousState": "creates the file a predecessor's delta state is " +
 		"streamed into, which a previous call may have left as large as that predecessor's unit. It is " +
 		"emptied through paced.Shrink immediately above the open.",

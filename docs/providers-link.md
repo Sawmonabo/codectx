@@ -87,11 +87,11 @@ A declaration the worker sent no type facts for is still a target by its name (`
 
 ## Units and inputs
 
-A unit is one project of the repository, the scope `dependence.PlanUnits` derives
-(`internal/provider/dependence/units.go:136`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
-`units.go:359`). The planner is reused rather than copied.
+A unit is one project of the repository, the scope `link.PlanUnits` derives
+(`internal/provider/link/projects.go:153`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
+`projects.go:341`). The planner is this provider's own.
 
-`Link` plans only its own unit, through `dependence.PlanUnit`, in one read of the manifest, and its members are the
+`Link` plans only its own unit, through `PlanUnit` (`projects.go:412`), in one read of the manifest, and its members are the
 candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as file versions in FileID order
 (`LinkOptions.Members`), so it keeps its members of them and sorts nothing.
 

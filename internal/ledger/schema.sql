@@ -10,7 +10,7 @@ CREATE TABLE ledger_meta (
 );
 CREATE TABLE runs (
     run_id BLOB PRIMARY KEY CHECK(length(run_id) = 32),
-    kind TEXT NOT NULL CHECK(kind IN ('index','deferred','overlay')),
+    kind TEXT NOT NULL CHECK(kind IN ('index','overlay')),
     repository_id BLOB NOT NULL CHECK(length(repository_id) = 32),
     -- The generation this run produced. Null until BeginGeneration returns,
     -- and for ever on a run that failed before it: a run has a ledger from its
@@ -40,13 +40,12 @@ CREATE TABLE runs (
     -- reader judges it interrupted from the elapsed stamp rather than from a
     -- finish time this product would have to invent.
     finished_at TEXT CHECK(finished_at IS NOT NULL OR outcome = 'running'),
-    outcome TEXT NOT NULL CHECK(outcome IN ('running','ok','failed','subdivided','reused','skipped','interrupted')),
+    outcome TEXT NOT NULL CHECK(outcome IN ('running','ok','failed','reused','interrupted')),
     file_count INTEGER NOT NULL CHECK(file_count >= 0),
     source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
     units_planned INTEGER NOT NULL CHECK(units_planned >= 0),
     units_succeeded INTEGER NOT NULL CHECK(units_succeeded >= 0),
     units_failed INTEGER NOT NULL CHECK(units_failed >= 0),
-    units_subdivided INTEGER NOT NULL CHECK(units_subdivided >= 0),
     -- Events the bounded bus refused because the collector was behind. A run
     -- never waits on its own accounting, so the loss is counted rather than
     -- prevented, and a reader that sees this above zero knows the span rows
@@ -100,24 +99,10 @@ CREATE TABLE spans (
     -- is one that reached no output because something it needed was absent,
     -- with diagnostic_code and failure_json naming which. A row left 'planned'
     -- when its run ends is swept to 'unavailable': it was never admitted.
-    outcome TEXT NOT NULL CHECK(outcome IN ('planned','running','ok','failed','subdivided','reused','skipped','interrupted','unavailable')),
+    outcome TEXT NOT NULL CHECK(outcome IN ('planned','running','ok','failed','reused','interrupted','unavailable')),
     diagnostic_code TEXT NOT NULL,
     failure_json TEXT NOT NULL
 );
--- The largest process-tree peak any span ever measured for one scope of one
--- repository: what the planner raises a heavy unit's reservation to. It is its
--- own table and not an aggregate over spans because a run is deleted once it
--- started before the oldest run whose generation the store still retains, and
--- a scope the retained runs did not touch would otherwise lose its measurement
--- with the runs that took it. A row exists only for a measurement above zero; a
--- scope nothing sampled has no row, never a row of zero. Rows leave only when
--- a plan that derived this repository's heavy scopes no longer names the key.
-CREATE TABLE scope_peaks (
-    repository_id BLOB NOT NULL CHECK(length(repository_id) = 32),
-    scope_key TEXT NOT NULL CHECK(length(scope_key) > 0),
-    peak_rss_bytes INTEGER NOT NULL CHECK(peak_rss_bytes > 0),
-    PRIMARY KEY (repository_id, scope_key)
-) WITHOUT ROWID;
 -- The learned need of one class of parsed file in one repository: the
 -- language, the grammar fingerprint the files were parsed under, the build of
 -- the worker that parsed them, and the file-size class. A new build learns

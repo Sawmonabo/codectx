@@ -4,13 +4,11 @@ import (
 	"context"
 	"runtime"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
 
 // inputAt is a distinct, deterministic snapshot input. File identities are
@@ -46,7 +44,7 @@ func digestOf(t *testing.T, each func(yield func(model.UnitInput) error) error) 
 
 // The planner's external merge must reproduce the in-heap sort BYTE FOR BYTE,
 // because the folded input digest it feeds is UnitSpec identity: an order that
-// differs by one pair invalidates every stored reuse and carry decision of
+// differs by one pair invalidates every stored reuse decision of
 // every prior generation. This holds the two digests against each other over
 // 50 000 inputs with a run buffer small enough to force ~50 spilled runs and a
 // real merge, which is the only way the merge path is exercised at all.
@@ -328,96 +326,6 @@ func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.
 	}
 }
 
-// A repository's second index must never reserve a heavy unit against less
-// than its first index watched that unit use: the reference runs recorded one
-// JavaScript unit peaking at 1.04x the figure it was admitted against, and
-// overrunning a reservation is the direction that freezes a host. The other
-// half of the same invariant is the one that would be catastrophic to get
-// wrong: a scope nobody ever measured, a workspace with no ledger at all and a
-// platform that samples no process tree are every one of them NO OBSERVATION,
-// and the reservation the family constants derived must then stand exactly as
-// it is. A missing measurement read as a peak of zero would collapse every
-// reservation in the product to the floor.
-//
-// Failure modes protected: (1) the second run of a repository under-reserves
-// what the first run measured and freezes the host; (2) an absent observation
-// is read as zero and every reservation collapses.
-func TestARecordedPeakOnlyEverRaisesAReservationAndAnAbsentOneChangesNothing(t *testing.T) {
-	const (
-		scope    = "pkg:javascript:app"
-		sibling  = "pkg:javascript:lib"
-		otherLan = "pkg:go:service"
-		// Far above what 1 MiB of JavaScript source derives, so a raise is
-		// unmistakable and the floor cannot account for it.
-		huge = int64(9) << 30
-	)
-	unit := func(key string) *semantic {
-		return &semantic{providerID: dependence.ProviderID, scopeKey: key, heavy: true,
-			family: dependence.FamilyJavaScript, bytes: 1 << 20}
-	}
-	gov := dependence.NewGovernor(0, 0)
-	// An unobserved machine, so no allocation bound can mask the raise.
-	machine := dependence.Machine{}
-	derived := gov.Reserve(dependence.FamilyJavaScript, 1<<20, machine).Bytes()
-	if derived <= 0 {
-		t.Fatalf("the family constants derive %d bytes for a heavy unit; the test cannot tell a raise from a collapse", derived)
-	}
-
-	for _, tc := range []struct {
-		name  string
-		peaks map[string]int64
-		unit  *semantic
-		want  int64
-	}{
-		{name: "the scope's own recorded peak raises the reservation to it",
-			peaks: map[string]int64{scope: huge}, unit: unit(scope), want: huge},
-		{name: "a scope with no history of its own is sized by its language's",
-			peaks: map[string]int64{scope: huge}, unit: unit(sibling), want: huge},
-		{name: "no ledger at all leaves the derived reservation standing",
-			peaks: nil, unit: unit(scope), want: derived},
-		{name: "a ledger with no peak for this scope or its language leaves it standing",
-			peaks: map[string]int64{otherLan: huge}, unit: unit(scope), want: derived},
-		{name: "a recorded peak below the derived figure never lowers it",
-			peaks: map[string]int64{scope: 1}, unit: unit(scope), want: derived},
-		{name: "the scope's own measurement wins over its language's larger one",
-			peaks: map[string]int64{sibling: huge, scope: huge / 2},
-			unit:  unit(scope), want: max(derived, huge/2)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			b := &builder{}
-			if tc.peaks != nil {
-				b.in.RecordedPeak = ledgerLike(tc.peaks)
-			}
-			got := b.reserve(context.Background(), gov, tc.unit, machine).Bytes()
-			if got != tc.want {
-				t.Fatalf("the unit is admitted against %d bytes, want %d (the family constants derive %d)",
-					got, tc.want, derived)
-			}
-			if got <= 0 {
-				t.Fatalf("the unit is admitted against %d bytes: an absent observation was read as zero", got)
-			}
-		})
-	}
-}
-
-// ledgerLike answers a lookup the way the run ledger's does: the scope's own
-// row, and where it has none and a family prefix is given, the largest row
-// whose key begins with it.
-func ledgerLike(peaks map[string]int64) func(ctx context.Context, scopeKey, familyPrefix string) (int64, bool) {
-	return func(_ context.Context, scopeKey, familyPrefix string) (int64, bool) {
-		if peak, ok := peaks[scopeKey]; ok {
-			return peak, true
-		}
-		largest, observed := int64(0), false
-		for key, peak := range peaks {
-			if familyPrefix != "" && strings.HasPrefix(key, familyPrefix) && peak > largest {
-				largest, observed = peak, true
-			}
-		}
-		return largest, observed
-	}
-}
-
 // A header's grammar is decided by the snapshot's census, so a header's file
 // units must be keyed by the census's first grammar. A census change that
 // moves that grammar must rebuild the unit, and one that keeps it must reuse
@@ -439,7 +347,7 @@ func TestAHeaderUnitIsKeyedByTheGrammarItReads(t *testing.T) {
 			fileProviders: []fileProvider{{id: providerID, version: "1", gate: func(model.FileVersion) bool { return true }}}}
 		fv := model.FileVersion{ID: model.NewFileID("repo", path), Path: path,
 			ContentHash: string(model.NewFileID("content", path))}
-		if _, _, err := b.fileUnits(context.Background(), fv, false); err != nil {
+		if err := b.fileUnits(context.Background(), fv); err != nil {
 			t.Fatalf("fileUnits(%s): %v", path, err)
 		}
 		run, err := sorter.Sorted()

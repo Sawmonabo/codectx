@@ -39,7 +39,7 @@ func TestRunsOmittedCountsEveryRunPastTheCeiling(t *testing.T) {
 	const extra = 5
 	g := &generation{caps: newCapabilityReport(), c: &Coordinator{log: slog.Default()}}
 	for i := range model.MaxRecordsPerResult + extra {
-		g.record(plan.Unit{ProviderID: "dependence"}, outcome{result: model.ProviderResult{RunID: model.ProviderRunID("run-" + strconv.Itoa(i)),
+		g.record(plan.Unit{ProviderID: "link"}, outcome{result: model.ProviderResult{RunID: model.ProviderRunID("run-" + strconv.Itoa(i)),
 			State: model.RunSucceeded}})
 	}
 	if len(g.runs) != model.MaxRecordsPerResult {
@@ -117,10 +117,10 @@ func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 			view.Run, res.Binding.GenerationID)
 	}
 	if view.Run.FileCount != res.FilesCaptured ||
-		view.Run.UnitsSucceeded != res.UnitsReused+res.UnitsBuilt+res.UnitsCarried {
+		view.Run.UnitsSucceeded != res.UnitsReused+res.UnitsBuilt {
 		t.Fatalf("the run row counts %d files and %d succeeded units; the result publishes %d files and %d",
 			view.Run.FileCount, view.Run.UnitsSucceeded, res.FilesCaptured,
-			res.UnitsReused+res.UnitsBuilt+res.UnitsCarried)
+			res.UnitsReused+res.UnitsBuilt)
 	}
 	// The stages activation opens for itself, spelled where they are opened:
 	// internal/storage/sqlite opens them under the activation span, so this
@@ -133,7 +133,7 @@ func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 		}
 	}
 	for _, want := range []string{stageCapture, stageWalk, stagePlan, stageAttachReused,
-		stageAttachCarried, stageBuild, stageCoverage, stageActivation, stageRetention,
+		stageBuild, stageCoverage, stageActivation, stageRetention,
 		"lexical_compaction", "adjacency", "lexical_build"} {
 		span, ok := stages[want]
 		if !ok {

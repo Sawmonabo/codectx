@@ -16,7 +16,7 @@ decides which units exist, opens each one in storage with its exact
 inputs and dependencies, and hands the provider a `UnitRequest`; the provider
 produces exactly that unit through the `Sink` and reports a `ProviderResult`.
 
-External tools (SCIP indexers, the dependence engine, language servers) run through
+External tools (SCIP indexers and language servers) run through
 `internal/process`. There is no second process abstraction and no plugin
 loader: providers are Go packages composed into one `Registry` by
 `internal/app`.
@@ -29,8 +29,8 @@ from the same worker walk that extracts the file
 package-scoped `link` provider's, at `static_analysis`, from the link tables
 the structural provider stores with each file's unit
 (`docs/providers-link.md`); the structural provider's own `calls` stay the
-in-file syntax tier. The `dependence` provider publishes no relation
-(`docs/providers-dependence.md`).
+in-file syntax tier. No provider has the id `dependence`, and none ever
+will (ADR-0012, decision 9).
 
 ```go
 type Provider interface {

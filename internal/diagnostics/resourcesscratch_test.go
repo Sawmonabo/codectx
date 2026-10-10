@@ -26,7 +26,7 @@ import (
 // must never err in.
 //
 // And freed_by_purpose is what keeps the small freed_bytes honest: it says the
-// freeing that did happen was an analyzer's output or a copied source tree,
+// freeing that did happen was, for example, a copied source tree,
 // never a working file the run will need again.
 //
 // The two freeing figures must be the same counter read two ways. Counted in
@@ -40,11 +40,8 @@ import (
 func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 	const each = 128 << 10
 	var held int64
-	// Two directories, and the import staging surface among them: it is the
-	// largest single file the product writes, and while it was pooled outside
-	// the arena the figure whose own comment says a partial sum "is the one
-	// thing this figure exists to rule out" did not count it at all.
-	for _, p := range []scratch.Purpose{scratch.SortRun, scratch.ImportStaging} {
+	// Two directories, each holding a different surface.
+	for _, p := range []scratch.Purpose{scratch.SortRun, scratch.LexicalStage} {
 		lease, f, err := scratch.For(t.TempDir()).TakeFile(p)
 		if err != nil {
 			t.Fatalf("take %s: %v", p, err)
@@ -56,13 +53,13 @@ func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 		held += each
 	}
 
-	// A foreign writer's output, which is removed rather than pooled.
+	// A copied source tree, which is removed rather than pooled.
 	out := t.TempDir()
-	if err := os.WriteFile(filepath.Join(out, "index"), make([]byte, 64<<10), 0o600); err != nil {
-		t.Fatalf("write output: %v", err)
+	if err := os.WriteFile(filepath.Join(out, "main.go"), make([]byte, 64<<10), 0o600); err != nil {
+		t.Fatalf("write tree: %v", err)
 	}
-	if err := paced.RemoveAllFor(paced.AnalyzerOutput, out); err != nil {
-		t.Fatalf("remove output: %v", err)
+	if err := paced.RemoveAllFor(paced.Materialization, out); err != nil {
+		t.Fatalf("remove tree: %v", err)
 	}
 
 	res, err := newTestService(t, Options{}).Resources(context.Background())
@@ -75,18 +72,18 @@ func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 	if got := int64(*res.ScratchBytes); got < held {
 		t.Fatalf("scratch_bytes is %d with %d bytes pooled under two directories: the block is summing one pool and understating what the run holds", got, held)
 	}
-	n, ok := res.FreedByPurpose[string(paced.AnalyzerOutput)]
+	n, ok := res.FreedByPurpose[string(paced.Materialization)]
 	if !ok {
-		t.Fatalf("freed_by_purpose does not account %s; a small freed_bytes with no breakdown cannot be told from a run that froze", paced.AnalyzerOutput)
+		t.Fatalf("freed_by_purpose does not account %s; a small freed_bytes with no breakdown cannot be told from a run that froze", paced.Materialization)
 	}
 	if n < 64<<10 {
-		t.Fatalf("freed_by_purpose accounts %d bytes of %s, want at least the %d removed", n, paced.AnalyzerOutput, 64<<10)
+		t.Fatalf("freed_by_purpose accounts %d bytes of %s, want at least the %d removed", n, paced.Materialization, 64<<10)
 	}
 	if res.FreedBytes == nil {
 		t.Fatal("the resources block reports no freed_bytes beside a breakdown of what was freed")
 	}
 	if got := uint64(*res.FreedBytes); got < n {
 		t.Fatalf("freed_bytes is %d while freed_by_purpose accounts %d for %s alone: the whole and its labelled part are not the same counter, so one of them is wrong",
-			got, n, paced.AnalyzerOutput)
+			got, n, paced.Materialization)
 	}
 }

@@ -3,7 +3,7 @@
 // tables the structural provider stores with each file's unit, and never
 // parses a file.
 //
-// A unit is one project of the repository, the scopes dependence.PlanUnits
+// A unit is one project of the repository, the scopes PlanUnits
 // derives. Its inputs are the project's member files, each recording the
 // MemberDigest of the table it linked (model.UnitInput.Digest). A build whose
 // every member digest equals its predecessor's resolves nothing: it inherits
@@ -33,7 +33,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -164,19 +163,19 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	// membership the planner already decided, so they are kept by family and
 	// liveness alone and the snapshot is not walked. Without them the unit
 	// plans its own members in one read of the manifest.
-	var pu dependence.Unit
+	var pu Unit
 	var each func(yield func(model.FileVersion) error) error
 	var count int64
 	if opts.Members != nil {
-		family, root, ok := dependence.ParseScopeKey(req.Unit.ScopeKey)
+		family, root, ok := ParseScopeKey(req.Unit.ScopeKey)
 		if !ok {
 			return failed, &model.Error{Code: model.CodeArgumentInvalid, Message: "the linking provider has no unit for this scope",
 				Details: map[string]string{"scope_key": req.Unit.ScopeKey}}
 		}
-		pu = dependence.Unit{ScopeKey: req.Unit.ScopeKey, Family: family, Root: root}
+		pu = Unit{ScopeKey: req.Unit.ScopeKey, Family: family, Root: root}
 		each = func(yield func(model.FileVersion) error) error {
 			return opts.Members(func(fv model.FileVersion) error {
-				if fv.Status == model.FileDeleted || dependence.FamilyOf(srclang.Of(fv.Path)) != family {
+				if fv.Status == model.FileDeleted || FamilyOf(srclang.Of(fv.Path)) != family {
 					return nil
 				}
 				return yield(fv)

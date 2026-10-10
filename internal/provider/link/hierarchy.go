@@ -16,7 +16,6 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/scratch"
@@ -330,7 +329,7 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	if err != nil {
 		return nil, err
 	}
-	if u.family == dependence.FamilyRust {
+	if u.family == FamilyRust {
 		if err := rustCrates(ctx, u, decls); err != nil {
 			return nil, err
 		}

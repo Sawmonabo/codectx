@@ -74,10 +74,9 @@ import (
 //go:embed fixture
 var fixtureFS embed.FS
 
-// runTimeout bounds one analyzer run. The slowest leg observed on Linux is the
-// engine parse of the Java fixture at ~5 s; the bound is two orders of
-// magnitude above that so a slow runner is never the failure, while a hung
-// child still fails its own run rather than the whole job's 60-minute budget.
+// runTimeout bounds one analyzer run far above what indexing the small fixture
+// takes, so a slow runner is never the failure, while a hung child still fails
+// its own run rather than the whole job's 60-minute budget.
 const runTimeout = 10 * time.Minute
 
 // check is one analyzer run against one part of the fixture.
@@ -91,9 +90,7 @@ type check struct {
 	// dir is the fixture subdirectory the tool runs in, which is the profile's
 	// input directory.
 	dir string
-	// documents are the paths the produced index must name. For the engine,
-	// which writes a binary graph rather than an index, this is empty and the
-	// output file's existence and size are the whole check.
+	// documents are the paths the produced index must name.
 	documents []string
 	// needs names a host program the tool shells out to. A runner that does not
 	// provide it fails this run: the profile genuinely needs that language's own
@@ -150,22 +147,6 @@ var indexChecks = []check{
 	},
 }
 
-// engineFrontends are the engine's own spellings for the parser of each
-// language family, matching internal/provider/dependence/graphengine. The engine
-// covers all nine languages through six frontends.
-var engineFrontends = []struct {
-	frontend  string
-	dir       string
-	languages []string
-}{
-	{"golang", "go", []string{"go"}},
-	{"jssrc", "ts", []string{"typescript", "tsx", "javascript"}},
-	{"pythonsrc", "py", []string{"python"}},
-	{"javasrc", "java", []string{"java"}},
-	{"c", "c", []string{"c", "cpp"}},
-	{"rust", "rust", []string{"rust"}},
-}
-
 // serverIdentity is the subset of managed language servers that answer an
 // identity invocation. jdtls speaks only LSP and is deliberately absent; see
 // the package comment.
@@ -184,8 +165,8 @@ type result struct {
 	// makes that honest absence, so it is neither a pass nor a failure -- but it
 	// contributes no language coverage, so another run has to cover the language
 	// or the job still fails. scip-clang on Windows is the case that exists
-	// today: the lock ships it for Linux and macOS only, and clangd and the
-	// graph engine carry C and C++ there.
+	// today: the lock ships it for Linux and macOS only, and clangd carries C
+	// and C++ there.
 	skipped bool
 	detail  string
 	elapsed time.Duration
@@ -252,7 +233,6 @@ func run(store, work string, keep bool) error {
 	for _, c := range indexChecks {
 		results = append(results, runIndexCheck(ctx, res, root, c))
 	}
-	results = append(results, runEngineChecks(ctx, res, root)...)
 	results = append(results, runServerChecks(ctx, res)...)
 
 	return summarize(results)
@@ -331,40 +311,17 @@ func runIndexCheck(ctx context.Context, res *toolchain.Resolver, root string, c 
 	return r
 }
 
-// runEngineChecks parses each language family of the fixture with the managed
-// graph engine, which is the dependence provider's backend.
-func runEngineChecks(ctx context.Context, res *toolchain.Resolver, root string) []result {
-	var out []result
-	tool, err := res.Resolve(ctx, "joern")
-	if err != nil {
-		return []result{{name: "joern", skipped: unsupportedHere(err), detail: "resolve: " + err.Error()}}
-	}
-	for _, fe := range engineFrontends {
-		r := result{name: "joern/" + fe.frontend, languages: fe.languages}
-		started := time.Now()
-		dir := filepath.Join(root, fe.dir)
-		graph := filepath.Join(root, fe.frontend+".cpg.bin")
-		// --max-num-def is the pinned per-method definition cap of the product's
-		// engine profile; the smoke uses the same one so it exercises the same
-		// code path in the frontend.
-		args := []string{"--language", fe.frontend, "--max-num-def", "40000", "--output", graph, dir}
-		if runOut, err := runTool(ctx, tool, args, root); err != nil {
-			r.detail = err.Error() + tail(runOut)
-		} else if info, err := os.Stat(graph); err != nil || info.Size() == 0 {
-			r.detail = "the parse produced no graph"
-		} else {
-			r.ok = true
-			r.detail = fmt.Sprintf("%d bytes of graph", info.Size())
-		}
-		r.elapsed = time.Since(started)
-		out = append(out, r)
-	}
-	return out
-}
-
 // runServerChecks starts each language server that answers an identity
-// invocation, which proves the payload executes on this platform.
+// invocation, which proves the payload executes on this platform. A server
+// that runs covers the languages the lock says it carries: that is the only
+// proof of C and C++ on a platform where the lock ships no C/C++ indexer, and
+// it reaches only as deep as the identity invocation the package comment
+// describes.
 func runServerChecks(ctx context.Context, res *toolchain.Resolver) []result {
+	languages := map[string][]string{}
+	for _, s := range res.Status(ctx) {
+		languages[s.Name] = s.Languages
+	}
 	names := make([]string, 0, len(serverIdentity))
 	for name := range serverIdentity {
 		names = append(names, name)
@@ -373,7 +330,7 @@ func runServerChecks(ctx context.Context, res *toolchain.Resolver) []result {
 
 	out := make([]result, 0, len(names))
 	for _, name := range names {
-		r := result{name: name}
+		r := result{name: name, languages: languages[name]}
 		started := time.Now()
 		tool, err := res.Resolve(ctx, name)
 		if err != nil {

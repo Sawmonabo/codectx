@@ -16,7 +16,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter"
@@ -228,7 +227,7 @@ int indirect() {
 }
 
 // TestCallsArriveForEveryGrammar runs the real structural provider over one
-// source per grammar, then the linking provider over the unit the dependence
+// source per grammar, then the linking provider over the unit the project
 // plan gives that source, and asserts what it published.
 //
 // Failure modes: `calls` missing for a language whose worker tables and
@@ -277,7 +276,7 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	h := providertest.New(t, files)
 	var sources []string
 	for p := range files {
-		if dependence.FamilyOf(srclang.Of(p)) != "" {
+		if link.FamilyOf(srclang.Of(p)) != "" {
 			sources = append(sources, p)
 		}
 	}
@@ -299,7 +298,7 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	// Sealing attached the structural units to the staging generation, which
 	// is where the linker reads their tables.
 	linker := link.New(link.StoreTables(h.Store))
-	plan, err := dependence.PlanUnits(ctx, h.View)
+	plan, err := link.PlanUnits(ctx, h.View)
 	if err != nil {
 		t.Fatalf("PlanUnits: %v", err)
 	}

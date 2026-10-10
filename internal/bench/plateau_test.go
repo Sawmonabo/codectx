@@ -244,7 +244,6 @@ func TestIncrementalReuse(t *testing.T) {
 	cfg.Storage.DataDir = dataDir
 	cfg.Providers.SCIP.Enabled = config.Disabled
 	cfg.Providers.LSP.Enabled = config.Disabled
-	cfg.Providers.Dependence.Enabled = config.Disabled
 
 	cas, err := snapshot.OpenCAS(snapshot.CASDir(dataDir))
 	if err != nil {
@@ -312,7 +311,6 @@ func TestIncrementalReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
 
 	started := time.Now()
 	cold, err := c.Index(ctx, model.IndexRequest{})

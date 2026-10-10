@@ -710,10 +710,11 @@ func ledgerFiles(t *testing.T, root string) []string {
 // cliRefreshedRecord matches the machine line `codectx watch --json` writes to
 // its stderr for each beat (internal/cli/index.go machineRefreshLine). It is
 // anchored to a whole line because the session's structured log shares that
-// stream, and it carries `carried` where the server's slog record does not,
-// which is exactly why the two legs cannot share one pattern.
+// stream. The server's record of a beat is a structured log line, prefixed
+// with its time and `msg=`, while this one is bare, which is why the two legs
+// cannot share one pattern.
 var cliRefreshedRecord = regexp.MustCompile(
-	`(?m)^refreshed generation=(\d+) health=\S+ reused=(\d+) built=(\d+) carried=\d+ invalidated=(\d+)$`)
+	`(?m)^refreshed generation=(\d+) health=\S+ reused=(\d+) built=(\d+) invalidated=(\d+)$`)
 
 // watchCommand starts `codectx watch --json` as a child process and hands back
 // its stderr -- where every beat is reported while the session runs -- and the

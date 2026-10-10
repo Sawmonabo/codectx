@@ -70,20 +70,16 @@ func (b *build) run(ctx context.Context) (Result, error) {
 // output is the storage side of a delta-built unit: provider.StoreUnit with
 // the carry-over and the delta state wedged in front of the seal.
 //
-// It embeds the concrete writer, not provider.UnitOutput: the batch sink
-// reaches its destination's keyed puts through a provider.DeltaSink type
-// assertion, and a wrapper that embedded the narrower interface would hide
-// them, so a keyed import would refuse to write at all.
+// It embeds the concrete writer, not provider.UnitOutput, because complete
+// takes the writer itself: the carry-over and the delta state are writer
+// methods the unit interface does not carry.
 type output struct {
 	*sqlite.UnitWriter
 	store    *sqlite.Store
 	complete func(ctx context.Context, w *sqlite.UnitWriter) error
 }
 
-var (
-	_ provider.UnitOutput = (*output)(nil)
-	_ provider.DeltaSink  = (*output)(nil)
-)
+var _ provider.UnitOutput = (*output)(nil)
 
 func (o *output) Seal(ctx context.Context) error {
 	if o.complete != nil {

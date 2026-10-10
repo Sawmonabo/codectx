@@ -366,12 +366,11 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	ctx := context.Background()
 	cfg := config.Defaults()
 	cfg.Storage.DataDir = dataDir
-	// The three optional providers are off for the same reason the budget rows
+	// The two optional providers are off for the same reason the budget rows
 	// turn them off: an "auto" provider that is unavailable on this host would
 	// make the figure a statement about the host.
 	cfg.Providers.SCIP.Enabled = config.Disabled
 	cfg.Providers.LSP.Enabled = config.Disabled
-	cfg.Providers.Dependence.Enabled = config.Disabled
 
 	cas, err := snapshot.OpenCAS(snapshot.CASDir(dataDir))
 	if err != nil {
@@ -451,7 +450,6 @@ func indexOnce(repo, dataDir string, record bool) (ledgerArmResult, error) {
 	if err != nil {
 		return ledgerArmResult{}, err
 	}
-	defer c.Close()
 
 	started := time.Now()
 	if _, err := c.Index(ctx, model.IndexRequest{}); err != nil {

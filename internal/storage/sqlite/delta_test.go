@@ -13,7 +13,7 @@ import (
 // TestCarryOverDrainsAStreamThatReadsTheStore hands CarryOver a replaced-file
 // stream that walks the predecessor's inputs through the store while the
 // carry-over's own ingestion call holds the group: the shape of the
-// dependence applier's merge join.
+// link applier's merge join.
 //
 // Requirement: a producer stream may read the store from inside the ingestion
 // call that drains it. Its reads run on the reader pool and see the last
@@ -70,7 +70,6 @@ func TestCarryOverDrainsAStreamThatReadsTheStore(t *testing.T) {
 			}
 		},
 		Scopes: slices.Values([]string{"file:" + a2.path}),
-		Keys:   slices.Values(keyList("key:node:" + a2.path)),
 	}
 	type outcome struct {
 		stats store.CarryOverStats

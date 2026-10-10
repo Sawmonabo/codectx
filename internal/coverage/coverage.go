@@ -316,7 +316,7 @@ const (
 var errNoSource = errors.New("no unserved required file remains")
 
 // typedErrf builds a typed model.Error without leaking source bytes,
-// receipt tokens or the dependence engine's name into the message. It is this
+// receipt tokens or an analyzer's product name into the message. It is this
 // package's only typed-error builder and constructs every error it raises.
 func typedErrf(code, format string, args ...any) *model.Error {
 	return &model.Error{Code: code, Message: fmt.Sprintf(format, args...)}

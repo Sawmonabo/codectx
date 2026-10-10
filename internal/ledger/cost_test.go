@@ -28,7 +28,7 @@ func BenchmarkSpanStartEnd(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, span := ledger.Start(ctx, "engine_unit", "scope")
+		_, span := ledger.Start(ctx, "unit", "scope")
 		span.AddIn(1)
 		span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	}
@@ -60,7 +60,7 @@ func BenchmarkCollectorRun(b *testing.B) {
 		ctx := run.Context(context.Background())
 		stageCtx, stage := ledger.Start(ctx, "structural_parse", "")
 		for unit := 0; unit < spansPerRun-1; unit++ {
-			_, span := ledger.StartProvider(stageCtx, "engine_unit", "scope", "structural")
+			_, span := ledger.StartProvider(stageCtx, "unit", "scope", "structural")
 			span.AddIn(1)
 			span.AddOut(2)
 			span.End(ledger.OutcomeOK, ledger.Measured{}, nil)

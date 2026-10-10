@@ -11,7 +11,7 @@
 
 **Architecture:** A Go application with immutable source snapshots, reusable immutable analysis units, generation-qualified canonical facts, SQLite/FTS5, bounded local analyzer workers, a query engine, a deterministic context compiler, and an actor-scoped source-coverage and workflow gate. CLI and MCP share typed application services.
 
-**Tech stack:** Go 1.27 language baseline with Go 1.27.1 as the initial exact toolchain pin; official MCP Go SDK v1.7.0 with MCP 2026-07-28; `modernc.org/sqlite` v1.58.0 as the initial driver pin; SQLite FTS5; official Tree-sitter Go bindings and pinned grammars; SCIP protobuf; local LSP; an optional local CPG engine; Git; `fsnotify`; Cobra; TOML; Go standard-library cryptography, logging, process, I/O, and testing packages. Go and MCP pins are supported by the published release records, not inferred from version numbers. [1](#ref-1) [2](#ref-2) [22](#ref-22)
+**Tech stack:** Go 1.27 language baseline with Go 1.27.1 as the initial exact toolchain pin; official MCP Go SDK v1.7.0 with MCP 2026-07-28; `modernc.org/sqlite` v1.58.0 as the initial driver pin; SQLite FTS5; official Tree-sitter Go bindings and pinned grammars; SCIP protobuf; local LSP; in-process control-flow, dependence and call-linking analysis; Git; `fsnotify`; Cobra; TOML; Go standard-library cryptography, logging, process, I/O, and testing packages. Go and MCP pins are supported by the published release records, not inferred from version numbers. [1](#ref-1) [2](#ref-2) [22](#ref-22)
 
 **Reading this revision:** All 33 design sections and all 21 implementation tasks are included. The product scope remains intact. Changes remove contradictory migration requirements, avoid whole-graph duplication, specify measurable aggregate resource budgets, close source/provenance/workflow gaps, and repair implementation dependencies. Performance figures are engineering acceptance targets, not measured claims. The supplied material is a specification, not an application repository; no claim of a bug-free executable is made.
 
@@ -56,7 +56,7 @@
    - [11.3 Tree-sitter Structural Provider](#113-tree-sitter-structural-provider)
    - [11.4 SCIP Import and Managed Indexers](#114-scip-import-and-managed-indexers)
    - [11.5 LSP Snapshot-Qualified Working-Tree Overlay](#115-lsp-snapshot-qualified-working-tree-overlay)
-   - [11.6 Dependence Provider](#116-dependence-provider)
+   - [11.6 Dependence Facts](#116-dependence-facts)
    - [11.7 Managed Analyzer Toolchain](#117-managed-analyzer-toolchain)
 - [12. Storage Architecture](#12-storage-architecture)
    - [12.1 SQLite Operating Model](#121-sqlite-operating-model)
@@ -124,7 +124,7 @@
    - [Task 8: Implement the Tree-sitter Structural Provider](#task-8-implement-the-tree-sitter-structural-provider)
    - [Task 9: Implement Streaming SCIP Import and Explicit Local Indexer Profiles](#task-9-implement-streaming-scip-import-and-explicit-local-indexer-profiles)
    - [Task 10: Implement the LSP Snapshot-Qualified Working-Tree Overlay](#task-10-implement-the-lsp-snapshot-qualified-working-tree-overlay)
-   - [Task 11: Implement the Dependence Provider over the Managed Graph Engine](#task-11-implement-the-dependence-provider-over-the-managed-graph-engine)
+   - [Task 11: Implement In-Process Dependence Facts and Call Linking](#task-11-implement-in-process-dependence-facts-and-call-linking)
    - [Task 12: Implement the Index Coordinator, Incremental Invalidation, Watch Mode, and Atomic Refresh](#task-12-implement-the-index-coordinator-incremental-invalidation-watch-mode-and-atomic-refresh)
    - [Task 13: Implement Exact, Symbol, Path, and Generation-Scoped FTS5 Search](#task-13-implement-exact-symbol-path-and-generation-scoped-fts5-search)
    - [Task 14: Implement Bounded Graph Traversal, Dependency Paths, and Impact Analysis](#task-14-implement-bounded-graph-traversal-dependency-paths-and-impact-analysis)
@@ -176,7 +176,7 @@ The platform is written in Go. Mature compiler and analysis systems are integrat
 - Tree-sitter supplies incremental syntax trees.
 - SCIP supplies compiler-derived definitions, references, occurrences, and relationships.
 - LSP supplies live working-tree semantics when a local language server is available.
-- A managed dependence engine supplies on-demand control-dependence, data-dependence and fallback call facts for all nine languages.
+- In-process dependence analysis supplies control-dependence, data-dependence, reads/writes and resolved cross-file call facts for all nine languages.
 
 All provider facts are normalized into a canonical, generation-qualified graph with source provenance. Sealed analysis units are reused without copying unchanged facts into each generation. Optional-provider failure degrades the affected capability; required-provider failure preserves the last usable generation. Native parser work is isolated from the serving process. These guarantees require the failure and resource checks specified below.
 
@@ -226,7 +226,7 @@ codectx context plan --task "Add retry semantics to PaymentService.Authorize" --
 codectx mcp serve --repo .
 ```
 
-without entering an API key or connecting to a hosted service. If only the bundled structural providers are available, the commands still work and report their precision. When the managed SCIP, LSP, or dependence engines are available, the same graph and query APIs become richer without changing the agent integration.
+without entering an API key or connecting to a hosted service. If only the bundled structural providers are available, the commands still work and report their precision. When the managed SCIP or LSP tools are available, the same graph and query APIs become richer without changing the agent integration.
 
 ---
 
@@ -259,7 +259,7 @@ The first generally usable release shall provide:
 - Structural facts for Go, JavaScript, TypeScript/TSX, Python, Java, Rust, C, and C++ through pinned Tree-sitter grammars.
 - Generic SCIP protobuf import plus configurable local SCIP indexer profiles.
 - Optional LSP live-overlay support over local subprocesses.
-- On-demand dependence analysis (control and data dependence) over a managed local engine.
+- In-process dependence analysis (control and data dependence, reads and writes) and cross-file call linking.
 - Common manifest extraction for `go.mod`, `package.json`, `pyproject.toml`, `Cargo.toml`, and `pom.xml`.
 - Markdown and plain-text documentation indexing.
 - A canonical graph with evidence and precision classes.
@@ -284,7 +284,7 @@ The installation is layered so absence of a heavyweight analyzer never makes the
 | Manifest/docs providers | packages, dependencies, configs, docs | Yes | No |
 | Local SCIP indexers | precise definitions/references/relationships | No; strongly recommended | No |
 | Local language servers | snapshot-qualified dirty-worktree semantic overlay | No | No |
-| Local dependence engine | fallback call facts, on demand | No | No |
+| In-process call linking | resolved cross-file call facts | No | No |
 | Local embedding plugin | conceptual retrieval enhancement | Outside core | No, if self-hosted |
 | Cloud AI or embedding provider | optional future plugin only | Never | Optional and non-core |
 
@@ -394,8 +394,8 @@ Go toolchain release facts are documented in [1](#ref-1) and [32](#ref-32). SQLi
        |                         |                         |
  Git/worktree capture      Provenance + aliases      Local bounded workers
                                                      /     |      \
-                                               Tree-sitter SCIP   dependence
-                                               child pool  local  local
+                                               Tree-sitter SCIP   link
+                                               child pool  local  in process
 
  LSP: on-demand, private snapshot-qualified query overlay through the same
  process runner; never an untracked mutation of canonical generation facts.
@@ -404,9 +404,9 @@ Go toolchain release facts are documented in [1](#ref-1) and [32](#ref-32). SQLi
 <a id="71-boundaries-and-ownership"></a>
 ### 7.1 Boundaries and Ownership
 
-`internal/model` contains data contracts and validation, with no dependency on services, providers, or storage. `internal/storage` owns SQL, unit publication, generation pinning, retention metadata, and transactions. Providers own their native formats and emit bounded canonical batches. `internal/process` owns child lifecycle for Git, parser workers, SCIP, LSP, and the dependence engine. `internal/source` owns byte/range/encoding conversion shared across source serving and adapters. CLI and MCP perform request translation and rendering only.
+`internal/model` contains data contracts and validation, with no dependency on services, providers, or storage. `internal/storage` owns SQL, unit publication, generation pinning, retention metadata, and transactions. Providers own their native formats and emit bounded canonical batches. `internal/process` owns child lifecycle for Git, parser workers, SCIP and LSP. `internal/source` owns byte/range/encoding conversion shared across source serving and adapters. CLI and MCP perform request translation and rendering only.
 
-No package outside a provider's implementation imports its Tree-sitter handles, SCIP protobuf, LSP wire structs, or dependence-engine IDs. There is no storage-to-provider import cycle: neutral provider descriptors and run metadata live in the model package. Application composition is concrete; consumers receive only the small service interfaces they actually use. Do not introduce `Graph(...) (any, error)` or an undefined `query` package.
+No package outside a provider's implementation imports its Tree-sitter handles, SCIP protobuf, LSP wire structs, or link tables. There is no storage-to-provider import cycle: neutral provider descriptors and run metadata live in the model package. Application composition is concrete; consumers receive only the small service interfaces they actually use. Do not introduce `Graph(...) (any, error)` or an undefined `query` package.
 
 <a id="72-process-model"></a>
 ### 7.2 Process Model
@@ -820,7 +820,7 @@ Batches are capped by **both records and retained bytes**, including strings, ev
 | manifest | filesystem | manifest/package and its dependency inputs | base index |
 | tree-sitter | filesystem | file-local extraction | base parser worker |
 | scip | filesystem, tree-sitter; manifest when profile needs it | declared package/workspace | managed optional index |
-| dependence | filesystem, tree-sitter; SCIP aliases when present | frontend-native project per language; workspace for C/C++ | managed optional index, on demand |
+| link | tree-sitter | project per language family; workspace for C/C++ | bundled, in process |
 | lsp | pinned files and available canonical structural facts | query workspace | optional query overlay, not `Provider.IndexUnit` |
 
 The LSP manager is a separate query adapter sharing the process runner, source conversion, and capability vocabulary; it is not forced into a nonexistent on-demand indexing enum. Optional provider absence is distinct from failure: a disabled/unconfigured optional provider is `unavailable` without making a healthy base generation falsely fail. An enabled requested capability that fails makes overall health `degraded` and preserves the precise missing scope.
@@ -873,29 +873,17 @@ LSP provides on-demand document/workspace symbols, definition, references, imple
 
 The LSP client owns Content-Length framing, initialize/initialized and shutdown/exit lifecycle, bounded outstanding requests, out-of-order responses, cancellation, document synchronization, and negotiated position encoding. LSP lifecycle is distinct from the MCP 2026 protocol. Treat server-initiated requests explicitly: return supported bounded read-only configuration, otherwise a protocol error; never perform `workspace/applyEdit`, run project commands, or follow external URIs. Validate returned ranges and locations against the materialization. [7](#ref-7)
 
-The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `ty`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP and the dependence provider. The complete advertised live-query feature set remains available as a labeled overlay.
+The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `ty`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP and the linking provider. The complete advertised live-query feature set remains available as a labeled overlay.
 
-<a id="116-dependence-provider"></a>
-### 11.6 Dependence Provider
+<a id="116-dependence-facts"></a>
+### 11.6 Dependence Facts
 
-The `dependence` provider supplies fallback call facts for the nine supported languages through a managed code-property-graph engine, until the native linking provider of ADR-0012 decision 9 publishes `calls`. Control dependence, data dependence, `reads` and `writes` are computed in process and published per file by the structural provider (`docs/providers-treesitter.md`, Dependence facts); this provider publishes none of them, and its descriptor lists `calls` alone. The engine is a Section 11.7 lock entry; its name appears in the repository, the lock, and the license inventory, never in a command, a config key, a provider id, an evidence detail, or a query result, so a future engine change is a backend swap and not a product change. Use the engine's built-in noninteractive tools and one exact tested argv per step, not product-owned analysis scripts or an exposed interpreter server:
+Dependence facts are computed in process, for all nine supported languages, by two providers (ADR-0012 decision 9). No external analyzer, runtime or tool lock entry is involved, and no provider has the id `dependence`: that id is never reused, so a store query can always tell that no hosted analysis published a row.
 
-```text
-parse:  <engine>-parse --language <frontend> <private unit materialization> --output <private cpg>
-export: <engine>-export <private cpg> --repr=all --format=neo4jcsv --out <private export>
-```
+- **The structural provider** (`internal/provider/treesitter`, `docs/providers-treesitter.md`, Dependence facts) publishes the four file-local families, `control_depends_on`, `data_flows_to`, `reads` and `writes`. Its parser worker lowers each callable to a control-flow graph and runs the flow core (`internal/provider/treesitter/flow`: post-dominators, control dependence, SSA def-use) in the same pass that extracts the file's structure, so the families are cached and reused with the file's own unit on a fingerprint match. A failure of the pass on a function degrades that file's four capabilities, is disclosed with the function's byte range, and never touches the file's structural facts. [8](#ref-8) [9](#ref-9)
+- **The linking provider** (`internal/provider/link`, `docs/providers-link.md`) publishes cross-file `calls`. It is package-scoped and never parses a file: it reads the link tables the structural provider stores with each file's unit and binds every call site by direct binding, class-hierarchy analysis, the address-taken cross-product, flow-based type inference and field-based resolution, as each language allows; a site with several candidates publishes an ambiguous callee and its `may_refer_to` candidates. Its units are the repository's projects, planned by `link.PlanUnits` (`internal/provider/link/projects.go`) from the snapshot's project markers: a Go module, a Maven or Gradle module, a `package.json`/`tsconfig.json` project, a Python package, a Cargo package, and one workspace unit for C and C++. A link unit is keyed on the digests of its files' export and call-site tables, so an edit inside a function body does not trigger a relink. [10](#ref-10) [27](#ref-27)
 
-One parse handles exactly one language, so the coordinator schedules one unit per (language, frontend-native project): a Go module, a Maven or Gradle module, a `package.json`/`tsconfig.json` project, a Python package with its environment, a Cargo package (which needs `cargo` on the engine's allowlisted PATH). C and C++ are one unit per repository with real include paths, because header resolution spans the whole tree. A call whose target lives in another unit keeps its edge and the callee's fully qualified name on an external stub; the reconciler aliases that stub to the real declaration from the other unit or from SCIP. The single `all` export already carries every edge family the provider imports (`CALL`, `CONTAINS`); no second export exists, and `--repr=pdg|cdg|ddg` is not implemented for CSV or GraphML in the pinned engine.
-
-The provider never delays base readiness. Nothing runs before the base generation is active, and nothing is installed when the workspace is opened: the backend construction resolves the analysis payload only if the store already holds it, keeps the payload's pinned identity otherwise, and the first unit that needs the engine fetches it at unit time. With `providers.dependence.enabled = "auto"` (the default), the coordinator then enqueues every dependence unit as low-priority background work under the resource governor; until a unit seals, its capability is `unavailable` with the reason `units_deferred` and the count of units still running, which every answer discloses. A one-shot building command is not exempt from that queue: `codectx index` and `codectx refresh` alike print their own generation as soon as it activates, then drain the deferred queue to empty, printing one line per publication, and exit. An interrupted run keeps that generation and every generation already published and reports the pending unit count; `providers.dependence.enabled = false` is the opt-out, and there is no flag that skips the drain while still planning the work. `true` blocks the index on the units; `false` disables the provider. A sealed dependence unit never mutates the active generation: the coordinator builds a new generation from the active generation's units plus the sealed unit, validates it, and activates it atomically through the same path a refresh uses (Section 13.1); seals landing in one scheduler tick coalesce into one generation, and the deferred row gives way to the unit's own rows exactly at activation. The parsed graph is cached per unit under the private data directory and reused across generations, so unchanged code pays nothing on refresh. The cache key is the complete semantic closure: the unit's source file hashes, its manifest and lock files (`go.mod`/`go.sum`, `package.json`/lockfile/`tsconfig.json`, `pyproject.toml`/`requirements*.txt`, `Cargo.toml`/`Cargo.lock`, `compile_commands.json` and include paths), the frontend argv including excludes and the definition cap, the engine payload digest, and the runtime payload digest. Any of these changing invalidates the unit.
-
-Memory is governed per process tree, not per Go heap, and never at the expense of results. The engine's frontend honors a heap cap through its environment and a cap is lossless: on every repository measured (239k-line Go, 443k- and 1.8M-line C, 81k-line TypeScript, 1.5M-line Java, 506k-line Python) a capped run produced the same facts as the default run or no graph at all. A heap cap is not a memory cap: resident memory above the cap is frontend-specific (Go/TypeScript/Java 0.1–0.5 GB, Python about 1.9 GB, C/C++ about 2.6 GB, plus a fixed ~0.8 GB helper for Rust), so the scheduler computes a reservation = heap cap + per-frontend allowance + helper allowance and uses it to order and co-schedule work, not to refuse it. There is no default memory ceiling: the heap cap is sized from the unit's byte count with headroom (a cap near the live set costs time instead of memory: 3.6× slower on the Java repository) up to the machine-derived allocation, which is free memory minus the base index's footprint minus a safety margin and never more than half of what the machine had available. Nothing rejects a unit for the memory it asks for: there is no ceiling and no setting that could be one, and the allocation only bounds the cap. On an out-of-memory exit the provider retries exactly once at the machine-derived allocation, and only when that allocation exceeds the failed cap; if the first attempt already had the maximum, it skips the retry (a doomed retry cost 100 s on the 1.05M-line Python tree) and reports `failed: memory` with the observed figures and the unit's estimated requirement. How many heavy analyzers run at once is decided by that one observation of the machine and by nothing else: the scheduler admits each while the summed reservations of everything already running plus this one fit the allocation, with no count beside the sum, and a unit whose reservation exceeds the whole allocation runs alone rather than never. The same allocation admits the external indexers and the language servers, so one process's children are weighed against one figure. The export step gets its own reservation (it scales with the graph, not the source: 2 GB of CSV for the 1.8M-line C repository) and the CSV is deleted after import. Engine failures are classified, never guessed: an out-of-memory exit is `failed: memory`; a deterministic pass crash (reproduced on a 137k-line Go module and a 324k-line TypeScript tree) is `failed: engine` with the failing pass name from stderr; a helper crash that the orchestrator hides behind a zero exit and a near-empty graph (reproduced on a 183k-line Rust workspace) is detected by the `Process exited with code` stderr line or a zero file count for a non-empty unit and is also `failed: engine`. Every result is validated for non-emptiness before it is admitted. Subdivision exists only as the last-resort recovery from a reproducible engine crash, never for memory. The full frontend-native unit always runs first. On a crash the provider reruns the same unit once with the frontend's allowlist of semantics-neutral options (a fixed per-frontend list maintained in the backend and verified in Task 22; today that list is empty for all six frontends, because every known option such as the Rust helper's `--no-sysroot` changes results) to prove the crash is reproducible and not transient. Only then does it split the unit along the next frontend-native boundary. A subdivided unit is never presented as equivalent: every capability it publishes carries `partial` with reason `subdivided`, the failed unit id, the backend failure (pass name and exception class), and the affected capabilities. The honesty test is per capability, measured in Section 8 of the round-3 research: control and data dependence survive splitting almost intact (99.7–99.9% of edges on the TypeScript corpus), so they are published `partial: subdivided`; engine `calls` from a subdivided TypeScript unit keep under half of their resolved targets, so they are published `partial: subdivided` and consumers are pointed at the syntax-plus-SCIP `calls` path, which never depended on the engine. If a subdivided run cannot produce an honest useful result for any capability, the unit fails with `failed: engine` instead. The engine's per-method definition cap is raised in the pinned argv to `--max-num-def 40000` (measured uncapped on a 1.05M-line Python tree: +23% parse time, +3% memory, zero skipped methods, every other fact count identical; see `docs/research/10-engine-empirical.md` Section 9a) and is part of the cache key; there is no second parse at a higher limit. A remaining skip warning is not a failure and degrades no capability: the skipped pass feeds only data dependence, which the structural provider publishes.
-
-Reads and writes are not published by this provider: the structural provider derives them from each callable's def-use analysis, at `static_analysis` precision (ADR-0012 decision 8). Provenance is never lost behind the neutral name: every evidence row's `provider_version` carries the adapter version and the engine payload digest, `Detection.ObservedVersion` reports the engine version and payload digest (never the engine name) to `status`, `doctor` and the ledger, and `docs/providers-dependence.md` maps digests to releases.
-
-The engine has no incremental mode (maintainer-confirmed) and no merge, append or per-file export, so a refreshed unit is a whole-unit parse and export; the storage step is a delta, never a rewrite. Facts are keyed by an id-independent semantic key (method full name, file, ordered ranges, fact label, the `ambiguous` operator and alternative identity of an ambiguous resolution's `may_refer_to` edge, and for relations the published identities of both endpoints, so an edge into an edited declaration is keyed as a changed fact), the fresh export is diffed against the stored unit on that key, and only changed rows are written; the Go frontend's nondeterministic package-initializer rows (`<clinit>`) are normalized before comparison so they do not appear as churn. Deriving the keys measured 1–5 s per unit against 17–65 s engine runs, and a one-line edit changes about one fact row in ten thousand. Stream CSV with field/record/depth caps enforced **before** a standard decoder can allocate an unbounded field. Use an on-disk native-ID map for arbitrary graph ordering; do not drop forward edges because a lookup window expired. Map only profile-owned labels; count and report unknown labels. External methods that carry a snapshot file location are declarations in another unit, not junk, and are kept. Verify actual overlays and exported labels against the pinned engine release; do not assume all releases require the same commands. [8](#ref-8) [9](#ref-9) [10](#ref-10) [27](#ref-27)
-
-A tool the lock does not provide for the current platform is unavailable with a typed platform reason; a timeout, malformed export, or unsupported unit is failed/partial with no unsealed facts admitted. The real pinned engine runs in the Task 22 CI matrix on every language before the docs call the provider supported. Remove materializations, graphs not selected for the cache, and exports on every termination path. Server mode is outside V1 and must not be introduced as a shortcut.
+Both providers record precision as the analysis that produced a fact (`static_analysis`, ADR-0012 decision 8), never as a toolchain name. Neither delays base readiness beyond its own units: the four file-local families seal with the structural unit, and `calls` seals with the link units in the same generation.
 Live-query routing is explicit: symbol/reference/call-hierarchy requests accept `semantic_source=canonical|lsp` (default canonical), a managed profile selector, and the required pinned file/range or symbol input. The CLI exposes `--semantic-source` on those commands; MCP uses the same typed field. `find_symbol` supports document/workspace symbol operations, and references supports implementation/type-definition operations. Query metadata contains a labeled overlay provider/version/input digest when LSP is used. Unsupported LSP methods return unavailable capability, not a silently substituted canonical answer. Context compilation always requests canonical mode.
 
 
@@ -904,9 +892,9 @@ Live-query routing is explicit: symbol/reference/call-hierarchy requests accept 
 
 A user installs codectx and every supported language works at its best available precision. The product owns every external analyzer and every runtime those analyzers need. Nothing is looked up on PATH, nothing is installed by the user, and nothing runs that the shipped binary did not pin. This is CodeQL's distribution model: one bundle with every extractor and its own runtime, plus on-demand fetch of pinned packs for the slim install. It is also mise's lockfile model: an exact version, a per-platform URL, and a SHA-256 per artifact, verified before anything executes. [37](#ref-37) [38](#ref-38) [39](#ref-39) [40](#ref-40)
 
-**Tool lock.** The binary embeds `internal/toolchain/tools.lock.json`. One entry per tool: `name`, `version`, `kind` (`indexer`, `server`, `cpg`, `runtime`), `license`, `upstream`, `runtime` (empty, `node` or `jdk`), `entry` (payload-relative executable, script or jar), `entry_sha256`, and a `platforms` map from `<os>_<arch>` to `{url, sha256, size}`. A platform absent from the map means the tool is unavailable there, reported as such, never a failure. The lock is data; the profile argv, triggers, and budgets are product code that names a lock entry.
+**Tool lock.** The binary embeds `internal/toolchain/tools.lock.json`. One entry per tool: `name`, `version`, `kind` (`indexer`, `server`, `runtime`), `license`, `upstream`, `runtime` (empty, `node` or `jdk`), `entry` (payload-relative executable, script or jar), `entry_sha256`, and a `platforms` map from `<os>_<arch>` to `{url, sha256, size}`. A platform absent from the map means the tool is unavailable there, reported as such, never a failure. The lock is data; the profile argv, triggers, and budgets are product code that names a lock entry.
 
-**Payloads.** Hosting is hybrid, and the rule is simple: a tool that ships a real upstream binary is fetched from upstream; a tool that does not is prebuilt and hosted by us. The engine, the JDK (Temurin), Node, `scip-go`, `scip-java`, `scip-clang`, `rust-analyzer`, `clangd` and `jdtls` are lock entries pointing at the upstream release asset URL (GitHub releases, `nodejs.org/dist`, Adoptium, `download.eclipse.org/jdtls`) with that file's SHA-256 and size, verified against the upstream-published digest where one exists and recorded as `upstream_digest`; the archive is used as upstream ships it (zip or tar.gz) and the entry path is the executable inside it. Only `gopls` (no upstream binaries; built per platform) and the four npm-based tools (`typescript-language-server` with `typescript`, `pyright`, `scip-typescript`, `scip-python`; prebuilt with `npm ci --omit=dev` so the user never needs npm) are published as `<name>-<version>-<os>-<arch>.tar.gz` assets of a `tools-v<n>` release of the codectx repository, about 50 MB in total. The release-time Go program `internal/tools/toollock` downloads every upstream distribution, verifies digests, builds the five hosted bundles, normalizes them, and writes the lock; `toollock -check` re-downloads and re-digests every URL in the lock, upstream and hosted. The runtime never runs `npm`, `pip`, `coursier`, `go install`, or any package manager, and the user needs neither Go nor Node installed: Node itself is a pinned upstream download. Digest pinning makes an upstream URL exactly as tamper-proof as a re-hosted one; re-hosting everything was rejected because it added ~15 GB of release assets and a fragile upload pipeline for no security gain. `tools.mirror` substitutes the host prefix per source so locked-down networks can serve every URL from an internal copy. The license of every redistributed bundle is recorded in the lock and in `THIRD_PARTY_LICENSES.md`. [41](#ref-41) [42](#ref-42) [46](#ref-46)
+**Payloads.** Hosting is hybrid, and the rule is simple: a tool that ships a real upstream binary is fetched from upstream; a tool that does not is prebuilt and hosted by us. The JDK (Temurin), Node, `scip-go`, `scip-java`, `scip-clang`, `rust-analyzer`, `clangd` and `jdtls` are lock entries pointing at the upstream release asset URL (GitHub releases, `nodejs.org/dist`, Adoptium, `download.eclipse.org/jdtls`) with that file's SHA-256 and size, verified against the upstream-published digest where one exists and recorded as `upstream_digest`; the archive is used as upstream ships it (zip or tar.gz) and the entry path is the executable inside it. Only `gopls` (no upstream binaries; built per platform) and the four npm-based tools (`typescript-language-server` with `typescript`, `pyright`, `scip-typescript`, `scip-python`; prebuilt with `npm ci --omit=dev` so the user never needs npm) are published as `<name>-<version>-<os>-<arch>.tar.gz` assets of a `tools-v<n>` release of the codectx repository, about 50 MB in total. The release-time Go program `internal/tools/toollock` downloads every upstream distribution, verifies digests, builds the five hosted bundles, normalizes them, and writes the lock; `toollock -check` re-downloads and re-digests every URL in the lock, upstream and hosted. The runtime never runs `npm`, `pip`, `coursier`, `go install`, or any package manager, and the user needs neither Go nor Node installed: Node itself is a pinned upstream download. Digest pinning makes an upstream URL exactly as tamper-proof as a re-hosted one; re-hosting everything was rejected because it added ~15 GB of release assets and a fragile upload pipeline for no security gain. `tools.mirror` substitutes the host prefix per source so locked-down networks can serve every URL from an internal copy. The license of every redistributed bundle is recorded in the lock and in `THIRD_PARTY_LICENSES.md`. [41](#ref-41) [42](#ref-42) [46](#ref-46)
 
 **Store.** Payloads live under `<data_dir>/tools/<name>/<version>/` with mode `0o700`. Install is atomic: fetch to `<data_dir>/tools/.staging/<random>/` with the byte cap, verify size and SHA-256 against the lock, extract with root confinement (reject absolute paths, `..`, symlinks whose target leaves the payload, hard links, devices, and more than the declared file count and bytes), fsync, then rename into place and write a `.complete` file carrying the payload digest. A cross-process file lock serializes installs of the same tool. A directory without `.complete` is invisible and swept. Versions not named by the current lock are removed by retention after a binary upgrade.
 
@@ -933,7 +921,6 @@ A user installs codectx and every supported language works at its best available
 | `ty` | server | python | — | upstream static binary | all six |
 | `clangd` | server | c, cpp | — | `clangd/clangd` release archives | as published upstream |
 | `jdtls` | server | java | jdk | `download.eclipse.org/jdtls/milestones` tarball | all six |
-| `joern` | cpg (backend of the `dependence` provider) | all nine languages; Rust requires `cargo` on the allowlisted PATH | jdk | `joernio/joern` per-platform `joern-cli` archives (astgen helpers bundled) | all six (upstream publishes linux amd64/arm64, macOS amd64/arm64, windows amd64/arm64) |
 
 **Lifecycle commands.** `codectx tools status` lists every lock entry with installed/available/unsupported/override state and the languages it unlocks; `tools prefetch [--all | --for-repo PATH]` installs ahead of time; `tools verify` rehashes the store; `tools gc` removes versions the current lock does not name. `doctor` includes the same report. None of these is required for ordinary use.
 
@@ -974,7 +961,7 @@ Initialize one current schema from embedded `schema.sql`. Store its version and 
 
 The physical model stores source manifests separately from reusable analysis units. `generation_units` selects one immutable unit per provider/scope. Node/relation identity dictionaries are not themselves visible facts; queries join through visible unit membership. Reusing a unit preserves evidence, aliases, and search documents. Numeric unit row IDs are compact internal join keys; exported UnitID is its 32-byte key encoded as hex. Provider run provenance outlives the creating generation when a retained unit still references it.
 
-The following is the complete DDL, kept byte-identical to `internal/storage/sqlite/schema.sql` (the embedded schema whose SHA-256 is the store fingerprint); it includes workflow/coverage state and the delta tables (`fact_keys`, `unit_delta_state`). Logical range, ownership, visibility, JSON shape, completeness, and state-transition checks that require joins are additionally enforced by the single store API at unit seal/publication or mutation. No provider gets a SQL handle.
+The following is the complete DDL, kept byte-identical to `internal/storage/sqlite/schema.sql` (the embedded schema whose SHA-256 is the store fingerprint); it includes workflow/coverage state and the delta table (`unit_delta_state`). Logical range, ownership, visibility, JSON shape, completeness, and state-transition checks that require joins are additionally enforced by the single store API at unit seal/publication or mutation. No provider gets a SQL handle.
 
 ```sql
 CREATE TABLE schema_meta (
@@ -991,7 +978,12 @@ CREATE TABLE blobs (
     hash BLOB PRIMARY KEY CHECK(length(hash) = 32),
     size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
     state TEXT NOT NULL CHECK(state IN ('ready','quarantined','trash')),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- When the Section 10.4 collector demoted this blob out of 'ready'. The
+    -- grace window before the second reachability check and the deletion is
+    -- measured from it, so a restore that flips the state back to 'ready'
+    -- clears it: a ready blob is never mid-grace.
+    trashed_at TEXT CHECK(trashed_at IS NULL OR state <> 'ready')
 );
 CREATE TABLE blob_blocks (
     blob_hash BLOB NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
@@ -1020,6 +1012,8 @@ CREATE TABLE snapshots (
     manifest_hash TEXT NOT NULL,
     file_count INTEGER NOT NULL CHECK(file_count >= 0),
     source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+    c_units INTEGER NOT NULL CHECK(c_units >= 0),
+    cpp_units INTEGER NOT NULL CHECK(cpp_units >= 0),
     capture_consistency TEXT NOT NULL CHECK(capture_consistency IN ('validated_capture','operator_frozen')),
     created_at TEXT NOT NULL,
     UNIQUE(repository_id, id)
@@ -1073,6 +1067,14 @@ CREATE TABLE provider_runs (
     status TEXT NOT NULL CHECK(status IN ('running','succeeded','partial','skipped','timed_out','failed','canceled')),
     counters_json TEXT NOT NULL DEFAULT '{}',
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    -- failure_json is the typed reason a run produced no unit: its scope key,
+    -- message and bounded details, including the tool output the capability
+    -- row and the log line both exclude. It is empty for every run that did
+    -- not fail. It lives on the run rather than on the unit because a failed
+    -- unit has no sealed row to carry it, and it is reachable for exactly as
+    -- long as the generation that failed is retained: deleting that
+    -- generation nulls generation_id, and the sweep then removes the run.
+    failure_json TEXT NOT NULL DEFAULT '',
     started_at TEXT NOT NULL,
     completed_at TEXT
 );
@@ -1106,27 +1108,14 @@ CREATE TABLE unit_dependencies (
     PRIMARY KEY(unit_id, dependency_id),
     CHECK(unit_id <> dependency_id)
 ) WITHOUT ROWID;
--- carried marks the Section 13.3 stale-with-distance member: the scope's
--- previous sealed unit, kept in the generation while its fresh rebuild is
--- still running. Such a unit's inputs differ from the generation's snapshot by
--- definition, so AttachCarried admits it where AttachUnit refuses, and the two
--- distance columns record how far behind it is (generations, and changed files
--- between its snapshot and this one). All three columns are folded into the
--- membership digest, and therefore into the AnalysisKey: without them a
--- generation carrying a stale unit would be byte-identical to one that rebuilt
--- it, and a stale answer would be indistinguishable from a fresh one.
 CREATE TABLE generation_units (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
     provider_id TEXT NOT NULL,
     scope_key TEXT NOT NULL,
     unit_id INTEGER NOT NULL,
-    carried INTEGER NOT NULL CHECK(carried IN (0,1)),
-    distance_generations INTEGER NOT NULL CHECK(distance_generations >= 0),
-    distance_files INTEGER NOT NULL CHECK(distance_files >= 0),
     PRIMARY KEY(generation_id, provider_id, scope_key),
     UNIQUE(generation_id, unit_id),
-    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key),
-    CHECK(carried = 1 OR (distance_generations = 0 AND distance_files = 0))
+    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key)
 ) WITHOUT ROWID;
 CREATE TABLE generation_capabilities (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
@@ -1135,19 +1124,31 @@ CREATE TABLE generation_capabilities (
     scope_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    -- remediation is what an operator can do about this row, in prose. It is a
+    -- column rather than an entry in details_json because details_json is the
+    -- provider's own bounded budget: a remediation charged to it could be the
+    -- entry a busy row drops.
+    remediation TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
+-- node_ids is the node identity dictionary (Section 12.2).
+-- id is a storage-internal surrogate: an INTEGER PRIMARY KEY is the b-tree key
+-- itself, so it costs zero payload bytes in the table and 1-4 varint bytes
+-- wherever it is referenced, against ~33 B for a 32-byte BLOB reference.
+-- The surrogate NEVER leaves the store: model.NodeID on the wire, in cursors
+-- and in every canonical hash is `canonical`, which is stored exactly once.
+-- repository_id is dropped: one store is one repository (schema.sql repositories).
 CREATE TABLE node_ids (
-    id BLOB PRIMARY KEY CHECK(length(id) = 32),
-    repository_id BLOB NOT NULL REFERENCES repositories(id),
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    canonical BLOB NOT NULL UNIQUE CHECK(length(canonical) = 32),
     kind TEXT NOT NULL,
-    canonical_key TEXT NOT NULL,
-    UNIQUE(repository_id, kind, canonical_key)
+    canonical_key BLOB NOT NULL CHECK(length(canonical_key) = 32),
+    UNIQUE(kind, canonical_key)
 );
 CREATE TABLE node_facts (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    node_id BLOB NOT NULL REFERENCES node_ids(id),
+    node_id INTEGER NOT NULL REFERENCES node_ids(id),
     language TEXT NOT NULL DEFAULT '',
     name TEXT NOT NULL,
     qualified_name TEXT NOT NULL DEFAULT '',
@@ -1162,46 +1163,39 @@ CREATE TABLE node_facts (
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte))
 ) WITHOUT ROWID;
+-- relation_ids mirrors node_ids: an INTEGER surrogate, the canonical 32-byte
+-- RelationID stored once in `canonical`, and the endpoints carried as node
+-- surrogates.
 CREATE TABLE relation_ids (
-    id BLOB PRIMARY KEY CHECK(length(id) = 32),
-    repository_id BLOB NOT NULL REFERENCES repositories(id),
-    from_node_id BLOB NOT NULL REFERENCES node_ids(id),
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    canonical BLOB NOT NULL UNIQUE CHECK(length(canonical) = 32),
+    from_node_id INTEGER NOT NULL REFERENCES node_ids(id),
     kind TEXT NOT NULL,
-    to_node_id BLOB NOT NULL REFERENCES node_ids(id),
-    UNIQUE(repository_id, from_node_id, kind, to_node_id)
+    to_node_id INTEGER NOT NULL REFERENCES node_ids(id),
+    UNIQUE(from_node_id, kind, to_node_id)
 );
 CREATE TABLE relation_facts (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    relation_id BLOB NOT NULL REFERENCES relation_ids(id),
+    relation_id INTEGER NOT NULL REFERENCES relation_ids(id),
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
--- fact_keys carries the producer's own id-independent delta keys for one fact
--- (Section 11.4). A fact is backed by every key that produced it, not by one:
--- a canonical edge is published once but is derived from N occurrences, each
--- with its own key, and a refresh re-emits the whole fact when any of them
--- changes. A carry-over therefore keeps a fact unless ANY of its keys is
--- replaced, which is the same condition the producer re-emits on, so the fresh
--- and carried sets partition exactly. A fact with no row here carries no key
--- and can only be replaced by its retention bucket.
-CREATE TABLE fact_keys (
-    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    node_id BLOB,
-    relation_id BLOB,
-    fact_key TEXT NOT NULL,
-    FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
-    FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
-    CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
-);
+-- evidence.id stays a PRIMARY KEY, refused by call site rather than by size.
+-- insertEvidence and copyEvidence upsert with ON CONFLICT(id) DO NOTHING,
+-- which SQLite only accepts against a PRIMARY KEY or UNIQUE index, and
+-- clipEvidence clips surplus evidence BY id value. The id is a pure function of the evidence
+-- fields (model.NewEvidenceID), so this uniqueness is a derived invariant, not
+-- an arbitrary surrogate, and the value reaches the wire as
+-- ReferenceOccurrence.evidence_id and FactReference.evidence_ids.
 CREATE TABLE evidence (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    node_id BLOB,
-    relation_id BLOB,
+    node_id INTEGER,
+    relation_id INTEGER,
     precision TEXT NOT NULL CHECK(precision IN ('compiler','language_server','static_analysis','syntax','heuristic')),
     file_id BLOB,
     start_byte INTEGER,
     end_byte INTEGER,
-    native_key TEXT NOT NULL DEFAULT '',
+    native_key_id INTEGER NOT NULL REFERENCES native_keys(id),
     detail TEXT NOT NULL DEFAULT '',
     content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
@@ -1220,19 +1214,59 @@ CREATE TABLE unit_delta_state (
     payload BLOB NOT NULL,
     PRIMARY KEY(unit_id, kind, part)
 ) WITHOUT ROWID;
+-- Intern dictionaries. A WITHOUT ROWID table re-stores its whole primary
+-- key inside every secondary index, so a wide PK is paid for once per index.
+-- Interning replaces the wide text columns with surrogates so that the PK, and
+-- therefore each index built over it, is a handful of varints.
+-- Measured on a control fixture store: 274 807 alias rows carry only 403 distinct
+-- scope keys (avg 34 B) and 216 385 distinct native keys (avg 52 B), each
+-- replicated three times (table + idx_alias_lookup + idx_alias_node); evidence
+-- adds 477 388 native-key copies drawn from the same 52 711-value vocabulary.
+-- The writer resolves these through a bounded LRU flushed with each batch
+-- (ids.go) -- never a whole-repository dictionary in heap.
+CREATE TABLE scope_keys (
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    key TEXT NOT NULL UNIQUE
+);
+-- native_keys is a HASH-KEYED dictionary (ADR-0003 SS2.3). `key TEXT UNIQUE`
+-- built an automatic index that cost more than the table it indexed -- 38.8 MB
+-- against 34.5 MB on a large Python repository, 47.1 against 41.2 on promptfoo -- because
+-- interning stored every distinct key twice: once as payload, once as the
+-- index key. Declaring the table WITHOUT ROWID PRIMARY KEY(key) does not fix
+-- it: both directions are needed (the writer resolves key->id, every reader
+-- id->key), so an id-keyed index survives, and a rowid-less table re-stores its
+-- whole primary key inside every secondary index, putting the full key back.
+-- Instead the id IS the key's digest -- the first 63 bits of SHA-256(key), zero
+-- clamped to 1 so that CHECK(id > 0) and the noRef sentinel both hold -- so the
+-- writer computes it without a lookup and one b-tree holds one copy of each
+-- key. Safety is DETECTION, not improbability: intern.go compares the stored
+-- key against the incoming one and probes the next id on disagreement, reusing
+-- the read-back the interner already performs, so two colliding keys can never
+-- merge into one id. scope_keys keeps its UNIQUE index: 403 distinct values on
+-- the control fixture is not an amplifier, and reconcile's scope lookup is by
+-- key.
+CREATE TABLE native_keys (
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    key TEXT NOT NULL
+);
+-- No `paths` intern table: the only high-multiplicity path column is
+-- search_units.path, and `path` is one of the columns search_fts indexes, fed
+-- from this column on every write. Interning it would put a surrogate id where
+-- the index expects text, so the path field would leave the full-text index.
+-- files.path is 818 rows / 114 KiB on that same fixture and is not an
+-- amplifier.
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    scope_key TEXT NOT NULL,
-    native_key TEXT NOT NULL,
-    node_id BLOB NOT NULL,
-    PRIMARY KEY(unit_id, scope_key, native_key, node_id),
-    FOREIGN KEY(node_id) REFERENCES node_ids(id)
+    scope_key_id INTEGER NOT NULL REFERENCES scope_keys(id),
+    native_key_id INTEGER NOT NULL REFERENCES native_keys(id),
+    node_id INTEGER NOT NULL REFERENCES node_ids(id),
+    PRIMARY KEY(unit_id, scope_key_id, native_key_id, node_id)
 ) WITHOUT ROWID;
 CREATE TABLE search_units (
     rowid INTEGER PRIMARY KEY,
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     search_key BLOB NOT NULL CHECK(length(search_key) = 32),
-    node_id BLOB,
+    node_id INTEGER,
     file_id BLOB NOT NULL,
     path TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -1241,15 +1275,52 @@ CREATE TABLE search_units (
     signature TEXT NOT NULL DEFAULT '',
     start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
     end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
-    body TEXT NOT NULL,
     token_count INTEGER NOT NULL CHECK(token_count >= 0),
+    -- The search_fts rowid holding this document's indexed text. It is the
+    -- DOCUMENT's identity, not the row's: a delta carry-over copies this
+    -- column forward with the rest of the row, so the carried unit points at
+    -- the posting the text was originally indexed into instead of re-deriving
+    -- a body the producer never published (a producer's Body is not the source
+    -- over [start_byte,end_byte) -- see internal/provider/treesitter/facts.go).
+    -- Sharing is confined to one carry chain: CarryOver refuses a predecessor
+    -- of another provider or scope key, and generation_units is keyed by
+    -- (generation_id, provider_id, scope_key), so at most one row of a chain
+    -- is visible in any generation and a doc_id still names one document
+    -- there. The posting is released like node_ids: deleteUnit removes it only
+    -- when no other unit's row still names it.
+    doc_id INTEGER NOT NULL CHECK(doc_id > 0),
+    -- The lexical segment this document's postings were folded into, or NULL
+    -- while the unit is still building. It is the DOCUMENT's segment, not the
+    -- row's: a carry-over copies it forward with doc_id, which is what makes a
+    -- carried unit own exactly the segments that hold at least one of its
+    -- carried documents rather than every segment its predecessor ever owned.
+    -- The reference is NO ACTION: a segment a document still names must not be
+    -- collectable. It is the SOURCE OF TRUTH for which segments a generation
+    -- reads and for which segments are garbage: a compaction re-points every
+    -- row of its inputs at the merged segment, so no row names an absorbed
+    -- segment afterwards and a retired unit that is attached again finds its
+    -- documents where its rows point.
+    segment_id INTEGER REFERENCES lexical_segments(id),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
 );
+-- The lexical tier stores no second copy of the source (ADR-0003 §2.1).
+-- search_units carries no `body` column and search_fts is CONTENTLESS, so the
+-- indexed body text exists only as index postings. That makes the postings
+-- irreplaceable rather than merely economical: no row of this database can
+-- reconstruct the text a document was indexed with, which is why a carry-over
+-- REUSES a carried document's posting through search_units.doc_id instead of
+-- rebuilding one. `contentless_delete=1` is
+-- what keeps DELETE and INSERT OR REPLACE available on unit invalidation
+-- (https://sqlite.org/fts5.html#contentless_tables, engine floor 3.43.0; the
+-- embedded engine is 3.53.4). Snippets and highlights are served from the
+-- content store through the verified range reader, over the file_id and byte
+-- range each row already carries -- never from this index. The index's rebuild
+-- source is therefore the content store, not the database (docs/storage.md).
 CREATE VIRTUAL TABLE search_fts USING fts5(
     name, qualified_name, signature, path, body,
-    content='search_units', content_rowid='rowid', tokenize='unicode61', detail='full'
+    content='', contentless_delete=1, tokenize='unicode61', detail='full'
 );
 CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'instance');
 CREATE TABLE context_manifests (
@@ -1269,7 +1340,7 @@ CREATE TABLE context_manifests (
 CREATE TABLE context_entries (
     manifest_id BLOB NOT NULL REFERENCES context_manifests(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-    node_id BLOB REFERENCES node_ids(id),
+    node_id INTEGER REFERENCES node_ids(id),
     file_id BLOB REFERENCES files(id),
     requirement TEXT NOT NULL CHECK(requirement IN ('required_full','required_symbol','recommended','optional')),
     score_micros INTEGER NOT NULL,
@@ -1402,6 +1473,12 @@ CREATE TABLE retention_leases (
     snapshot_id BLOB REFERENCES snapshots(id),
     owner_kind TEXT NOT NULL CHECK(owner_kind IN ('query','cursor','session','staging')),
     expires_at TEXT NOT NULL,
+    -- The owner this lease was taken for, so a lease can be found from its
+    -- owner and released when the owner ends. Lease identifiers otherwise flow
+    -- one way only, which is why a closed session's lease survived it and an
+    -- idempotent re-open minted a second one. It is NULL for an owner that has
+    -- no stable identity of its own, such as a staging lease.
+    owner_ref BLOB CHECK(owner_ref IS NULL OR length(owner_ref) = 32),
     CHECK(generation_id IS NOT NULL OR snapshot_id IS NOT NULL)
 );
 CREATE INDEX idx_generation_snapshot ON generations(snapshot_id);
@@ -1413,29 +1490,277 @@ CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
 CREATE INDEX idx_unit_dependencies_reverse ON unit_dependencies(dependency_id, unit_id);
 CREATE INDEX idx_nodes_name ON node_facts(name, unit_id, node_id);
 CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, unit_id, node_id);
-CREATE INDEX idx_nodes_file ON node_facts(file_id, start_byte, unit_id);
+-- idx_nodes_file is narrowed to the one column it probes. start_byte was a
+-- dead middle column: search.go keysets on coalesce(nf.start_byte, 0), which no
+-- plain column index can serve, and unit_id is already the leading column of
+-- the PRIMARY KEY suffix every index key carries. Re-audited on a rebuilt
+-- store: both consumers keep their plan, gc.go's file probe stays COVERING,
+-- and the index is 20.5% smaller.
+CREATE INDEX idx_nodes_file ON node_facts(file_id);
 CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
-CREATE INDEX idx_relations_from ON relation_ids(from_node_id, kind, to_node_id);
+-- No idx_relations_from: dropping the constant repository_id leaves
+-- relation_ids with UNIQUE(from_node_id, kind, to_node_id), whose autoindex is
+-- column-for-column what idx_relations_from would be. Its call sites (query.go:380,
+-- adjacency.go:194, gc.go:196) keep an identical access path. idx_relations_to
+-- stays: nothing else on relation_ids leads with to_node_id, and it is the
+-- reverse-traversal ("who calls X") path.
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
-CREATE UNIQUE INDEX idx_fact_keys ON fact_keys(unit_id, fact_key, coalesce(node_id, x''), coalesce(relation_id, x''));
-CREATE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id);
-CREATE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id);
 CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
-CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);
+CREATE INDEX idx_alias_lookup ON native_aliases(scope_key_id, native_key_id, unit_id);
 -- The identity sweep in unit deletion asks, per candidate node, whether any
 -- alias still points at it. Without this index that question is a full scan of
 -- native_aliases per node, which is quadratic in the size of the unit being
 -- deleted; the same holds for a manifest entry's node.
 CREATE INDEX idx_alias_node ON native_aliases(node_id, unit_id);
+-- The two native-key child columns, indexed so the dictionary can be swept.
+-- native_keys is the PARENT of both foreign keys below, and every connection
+-- runs with foreign_keys=ON, so SQLite must prove no child row survives before
+-- it may delete a dictionary row. Without an index on the child column that
+-- proof is a full scan of the child table PER DELETED ROW -- measured on a
+-- control fixture store (274 807 alias rows, 477 388 evidence rows), ~27 ms
+-- per deleted key, i.e. ~90 minutes to clear a full-vocabulary churn of
+-- ~201 k keys. That cost is charged to any DELETE on native_keys and cannot be
+-- rephrased away; it is also invisible to EXPLAIN QUERY PLAN, which reports
+-- only the collector's own probe. With these two indexes the foreign-key check
+-- and the collector's two NOT EXISTS probes are all index lookups, and the
+-- whole sweep finishes in one run.
+-- The trade-off, measured on the same store: the two indexes hold 6 799 360 B
+-- and 7 352 320 B, together 14 151 680 B = 2.24 % of a 632 266 752 B store,
+-- the second of them on the largest table there. That is the price of a
+-- dictionary that can be collected at all: without the sweep, native_keys plus
+-- its UNIQUE autoindex strands ~182 B per distinct key on every re-index,
+-- monotonically and with no bound (~73 MB per full-vocabulary churn), which
+-- overtakes the indexes' fixed share after the second rebuild.
+CREATE INDEX idx_alias_native ON native_aliases(native_key_id);
+CREATE INDEX idx_evidence_native ON evidence(native_key_id);
 CREATE INDEX idx_context_entries_node ON context_entries(node_id);
+-- The file arm of the same sweep: gc.go's files collection asks, per candidate
+-- file, whether any manifest entry still names it. context_entries carries
+-- node_id and file_id side by side and only node_id was indexed, so that arm
+-- was a full scan of context_entries per candidate file -- exactly the
+-- pathology idx_context_entries_node exists to prevent, on the sibling column.
+CREATE INDEX idx_context_entries_file ON context_entries(file_id);
 CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
+-- deleteUnit releases a posting only when no surviving unit's row still names
+-- it, and every read resolves a document by doc_id. Without this index both
+-- are a scan of search_units per probe.
+CREATE INDEX idx_search_doc ON search_units(doc_id);
+-- The segment arm of the same column. An activation walks the documents of
+-- each segment it is about to merge, re-points every row of the merged inputs
+-- and the collector asks, per candidate segment, whether any row still names
+-- it; all three are a scan of search_units per segment without this index, and
+-- carrying doc_id in it makes the walk index-only.
+CREATE INDEX idx_search_segment ON search_units(segment_id, doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
 CREATE INDEX idx_lease_expiry ON retention_leases(expires_at);
+-- One live lease per owner, enforced by the schema rather than by the caller
+-- remembering to look first: an idempotent re-open that acquires again is
+-- refused instead of pinning a generation twice. The partial index leaves
+-- owner-less leases unconstrained.
+CREATE UNIQUE INDEX idx_lease_owner ON retention_leases(owner_kind, owner_ref) WHERE owner_ref IS NOT NULL;
+-- The grace pass asks for the trashed blobs whose window has elapsed; without
+-- this index that question is a full scan of blobs on every collection pass.
+CREATE INDEX idx_blob_trash ON blobs(state, trashed_at);
+-- The supplied `--scip-index` paths one generation was built with, recorded
+-- whether or not the path resolved to anything. An unresolved path leaves no
+-- unit behind, so the absence of a unit is precisely the observation this table
+-- exists to preserve: without the row, "no index was supplied" and "the
+-- supplied path matched nothing" are indistinguishable after the fact, and the
+-- second silently ships a repository with no cross-file symbols. The path is
+-- root-relative by construction, so the row discloses no private absolute root.
+CREATE TABLE generation_supplied_indexes (
+    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    path TEXT NOT NULL CHECK(length(path) > 0),
+    resolved INTEGER NOT NULL CHECK(resolved IN (0, 1)),
+    PRIMARY KEY(generation_id, path)
+);
+-- The live watch heartbeats of one repository: one row per watching process,
+-- published where a second process can read them. Without these rows, a
+-- reporting process has no cross-process source for the pending-event count and
+-- no way to say whether a watch is running at all.
+--
+-- The key is the repository AND the writer's own session identity, because a
+-- workspace can be watched by more than one process at once -- a `codectx
+-- watch` in a terminal and an editor's server, say -- and one row per
+-- repository would have each one overwrite the other's claim, so whichever beat
+-- last would be the only watch anybody could see. `session_id` is minted once
+-- per watch, from the same random-identifier source every other operational id
+-- uses, and not the pid: an operating system reuses a pid, so a row keyed by
+-- one could be claimed by an unrelated process that inherited the number.
+--
+-- `expires_at` is written by the watcher itself, not derived by the reader from
+-- configuration: a reader whose `[index]` block differs from the watcher's --
+-- another checkout, another user, an edited file since the watch started --
+-- would otherwise compute a liveness window the writer never promised. The
+-- writer states its own deadline and refreshes it while it lives, so an expired
+-- row means the process that owned it stopped refreshing, which is the only
+-- signal of process death that works on every platform this product supports
+-- (a pid can be reused, and probing one is neither portable nor race-free). It
+-- is the same rule the run ledger states a run's liveness by, and a second rule
+-- for whether a process is still there would drift from it.
+--
+-- `beat_at` is when the writer last published this row, and is reported beside
+-- the watcher rather than judged: liveness is `expires_at` and nothing else.
+-- Deriving one from the other would be the reader recomputing the writer's
+-- window, which is exactly what `expires_at` exists to prevent.
+--
+-- `pending_events` and `last_pass_at` are nullable because absent and zero are
+-- different answers here as everywhere else: a watch driven only by periodic
+-- reconciliation has no notification queue to count, and a watch that has not
+-- completed a pass yet has no pass time -- neither is "0 pending" or "the epoch".
+--
+-- One row per watching process, replaced in place: this is liveness, not
+-- history. A row whose writer died is deleted by the next beat published for
+-- the repository, by the same elapsed-stamp rule a reader judges it by.
+CREATE TABLE watch_heartbeat (
+    repository_id BLOB NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 32),
+    writer_pid INTEGER NOT NULL CHECK(writer_pid > 0),
+    beat_at TEXT NOT NULL,
+    last_pass_at TEXT,
+    pending_events INTEGER CHECK(pending_events IS NULL OR pending_events >= 0),
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY(repository_id, session_id)
+);
+-- A sealed capsule's record lists (Section 17.3). context_capsules carries the
+-- capsule's identity and its per-list counts; the records themselves live here,
+-- one row each, so sealing a session that observed a repository-sized record
+-- set writes in bounded batches and reading one back is a keyset page rather
+-- than a single JSON blob that must be held whole.
+--
+-- The primary key IS the read order: a page is one (session_id, list) range
+-- scanned by ordinal, which is the list's canonical order, so no sort is
+-- needed and a continuation resumes at an ordinal instead of re-reading.
+-- row_key is the record's own cursor key, unique within a (session_id, list);
+-- the index on it turns a caller's cursor into the ordinal to resume from, and
+-- a cursor naming no row is refused rather than silently restarting the list.
+-- The rows are written inside the same transaction that inserts the capsule, so
+-- a capsule never exists without its records and the seal stays write-once.
+CREATE TABLE context_capsule_rows (
+    session_id BLOB NOT NULL REFERENCES context_capsules(session_id) ON DELETE CASCADE,
+    list TEXT NOT NULL CHECK(list IN ('scope','accepted_facts','rejected_facts','contradictions',
+        'unresolved','scope_review_ids','coverage','waivers')),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    row_key TEXT NOT NULL CHECK(length(row_key) > 0),
+    row_json TEXT NOT NULL,
+    PRIMARY KEY(session_id, list, ordinal)
+) WITHOUT ROWID;
+-- The coverage and waiver lists key their row on FileID alone, which this index
+-- would reject a second time. That state is unreachable: a session pins exactly
+-- one snapshot (read_sessions.id, snapshot_id is what session_files' foreign
+-- key names, and nothing updates snapshot_id), snapshot_files is keyed
+-- (snapshot_id, file_id), so one file has exactly one content hash inside one
+-- session -- and both session_files and coverage_waivers are keyed
+-- (session_id, file_id, content_hash). One file therefore yields at most one
+-- coverage row and at most one waiver per session.
+CREATE UNIQUE INDEX idx_capsule_row_key ON context_capsule_rows(session_id, list, row_key);
+
+-- The packed per-generation adjacency (ADR-0005 Decision 1). A generation's
+-- walk reads structure from here and from nowhere else: visibility is resolved
+-- once, at activation, instead of once per candidate edge per page, and the
+-- edge stream is scanned sequentially rather than descended as a b-tree.
+--
+-- It is derived from facts that are already sealed, so it is neither a fact nor
+-- an identity: no provider version and no analysis fingerprint of its own. It
+-- is dropped with the generation it belongs to.
+--
+-- generation_graph is written LAST, after every part, so its presence is the
+-- commit marker: a reader that finds the row is guaranteed every part behind it.
+CREATE TABLE generation_graph (
+    generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
+    max_node INTEGER NOT NULL CHECK(max_node >= 0),
+    max_relation INTEGER NOT NULL CHECK(max_relation >= 0),
+    node_count INTEGER NOT NULL CHECK(node_count >= 0),
+    edge_count INTEGER NOT NULL CHECK(edge_count >= 0),
+    kinds BLOB NOT NULL,
+    node_kinds BLOB NOT NULL
+);
+-- One chunk of one stream. The streams are the two directions' offset
+-- directories and edge streams plus the per-node and per-relation side arrays;
+-- `part` is 0-based and the parts of a stream concatenate to it, so a reader
+-- holds a bounded window of parts rather than a whole direction.
+CREATE TABLE generation_graph_parts (
+    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    stream TEXT NOT NULL CHECK(stream IN ('out.off','out.edges','in.off','in.edges',
+        'node.kind','node.container','node.bytes','rel.evidence')),
+    part INTEGER NOT NULL CHECK(part >= 0),
+    bytes BLOB NOT NULL,
+    PRIMARY KEY(generation_id, stream, part)
+) WITHOUT ROWID;
+
+-- generation_lexical is written LAST, after every generation_segments row, so
+-- its presence is the commit marker: a reader that finds the row is guaranteed
+-- the generation's whole segment set behind it. It also carries the
+-- generation's document statistics, which the scorer would otherwise recompute
+-- by probing every visible document (ADR-0007 Decision 1).
+CREATE TABLE generation_lexical (
+    generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
+    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
+    token_total INTEGER NOT NULL CHECK(token_total >= 0),
+    -- The generation's visible documents, one bit per document rowid. A
+    -- document an inherited segment still holds but whose unit left the
+    -- generation is hidden here; nothing is rewritten to hide it, and a reader
+    -- takes the bitmap as it stands instead of scanning the generation's
+    -- documents to rebuild it.
+    visible BLOB NOT NULL
+);
+
+-- A lexical segment is an immutable packed structure over a set of documents:
+-- the term directory, the term text it points into, the posting lists and the
+-- per-document attributes of the documents they name, each
+-- chunked into lexical_segment_parts. A segment is written once, by the seal of
+-- the unit whose documents it holds, and is never rewritten; an activation
+-- names segments, it does not rebuild them (ADR-0007 Decision 1).
+CREATE TABLE lexical_segments (
+    id INTEGER PRIMARY KEY,
+    term_count INTEGER NOT NULL CHECK(term_count >= 0),
+    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
+    bytes INTEGER NOT NULL CHECK(bytes >= 0)
+);
+
+-- One chunk of one segment stream. `term.dir` is the fixed-width term
+-- directory in term order -- term slice, document frequency and the slice of
+-- `post.list` holding that term's per-document (column, count) sequence --
+-- `term.text` the concatenated term bytes it points into, and `post.list` the
+-- posting lists themselves, whose documents ascend by rowid. `doc.dir` is the
+-- fixed-width document directory in ascending document rowid and `doc.attr`
+-- the attribute records it points into: every field a search candidate is
+-- served from, packed once per document, so a page of candidates is hydrated
+-- from these bytes instead of one document-row read each (ADR-0007 Decision 2). `part` is 0-based
+-- and the parts of a stream concatenate to it, so a reader holds a bounded
+-- window of parts rather than a whole vocabulary.
+CREATE TABLE lexical_segment_parts (
+    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE CASCADE,
+    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list','doc.dir','doc.attr')),
+    part INTEGER NOT NULL CHECK(part >= 0),
+    bytes BLOB NOT NULL,
+    PRIMARY KEY(segment_id, stream, part)
+) WITHOUT ROWID;
+
+-- The segment set of one generation, in read order. The set is DERIVED at
+-- activation from search_units.segment_id -- the distinct segments the live
+-- rows of the generation's member units point at -- and recorded here so a
+-- reader resolves it with one scan; nothing is rewritten to publish it, and a
+-- retained generation keeps its own rows when a later generation merges the
+-- same segments away. The reference is RESTRICT rather than CASCADE: a segment
+-- a generation still names must not be collectable while that row exists.
+CREATE TABLE generation_segments (
+    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE RESTRICT,
+    ord INTEGER NOT NULL CHECK(ord >= 0),
+    -- How many of the segment's documents this generation hides. Zero is the
+    -- common case and is what lets a document frequency answer from the term
+    -- directory; a segment with hidden documents is counted by walking the
+    -- term's posting list against the visible bitmap instead.
+    hidden INTEGER NOT NULL CHECK(hidden >= 0),
+    PRIMARY KEY(generation_id, ord)
+) WITHOUT ROWID;
+CREATE INDEX idx_generation_segments_segment ON generation_segments(segment_id, generation_id);
 ```
 
 Storage invariants beyond DDL:
@@ -1454,7 +1779,7 @@ Storage invariants beyond DDL:
 
 The indexing lock is held from snapshot capture through publication. Seal each bounded unit only after its source and references are validated. Required provider failure aborts the staging generation. An optional provider can contribute completed independent units only when it explicitly reports their coverage; a malformed unit is not partially admitted. A failure must not keep old facts whose input hashes no longer match.
 
-Before publication, calculate the AnalysisKey from the sorted membership rows — each selected unit key together with its `carried` marker and provenance distance (`distance_generations`, `distance_files`), so a generation carrying a stale unit never shares a key with an all-fresh generation of the same units (Section 13.3) — the source snapshot, complete capability report, normalization/schema/config fingerprints, and ranking-relevant inputs. Validate foreign keys and domain invariants, visible endpoints, mandatory provider coverage, source availability, and all required input bindings. Record a validation digest tied to that exact membership; the membership is frozen before the pointer transaction.
+Before publication, calculate the AnalysisKey from the sorted membership rows (each selected unit key), the source snapshot, complete capability report, normalization/schema/config fingerprints, and ranking-relevant inputs. Validate foreign keys and domain invariants, visible endpoints, mandatory provider coverage, source availability, and all required input bindings. Record a validation digest tied to that exact membership; the membership is frozen before the pointer transaction.
 
 ```sql
 BEGIN IMMEDIATE;
@@ -1480,7 +1805,7 @@ A shared FTS corpus contains documents from several immutable units and retained
 
 Obtain matching terms and occurrences from FTS/vocabulary using the same tokenizer, restrict documents through `generation_units`, and compute document frequency/length statistics for that membership. Use a tiny temporary FTS query-token table on a connection when tokenizer access requires it; do not reimplement Unicode tokenization. Stream per-query aggregates and rank with a bounded heap or disk-backed result spool. Cache only small scalar/term statistics keyed by AnalysisKey and the exact query with a byte cap. No second full corpus token index or graph-sized Go map is needed. Section 14 defines scoring and pagination.
 
-Retention keeps the results of the last `retain_refs` distinct refs (branches or commits) the user actually indexed, not the last N index snapshots: switching A → B → C → A must find A's SCIP and dependence units still on disk and reuse them without a run. Each activated generation records the ref it was built from; a ref's most recent generation is retained while the ref is among the last `retain_refs` worked on, and every unit any retained generation references is retained with it. Sealed but not yet activated units (a dependence unit still refreshing when the user switched away) are retained by the same rule through the generation they were produced for. There is no default size limit on this store; `[index] max_retained_bytes` is user-set only, `0` by default, and when set it evicts least-recently-used refs first and never the active one, exactly the user-set-only posture memory has. Generation removal deletes only membership and metadata after leases/session references are resolved. Units referenced by another retained generation or unit dependency remain. Remove unreachable units in reverse dependency order through the FTS-aware store procedure, then orphan identities and origin runs, then unreferenced source blobs using the GC grace protocol. Report disk categories separately; generation pruning does not justify unbounded retained completed sessions or query spools.
+Retention keeps the results of the last `retain_refs` distinct refs (branches or commits) the user actually indexed, not the last N index snapshots: switching A → B → C → A must find A's SCIP and link units still on disk and reuse them without a run. Each activated generation records the ref it was built from; a ref's most recent generation is retained while the ref is among the last `retain_refs` worked on, and every unit any retained generation references is retained with it. Sealed but not yet activated units (a link unit still refreshing when the user switched away) are retained by the same rule through the generation they were produced for. There is no default size limit on this store; `[index] max_retained_bytes` is user-set only, `0` by default, and when set it evicts least-recently-used refs first and never the active one, exactly the user-set-only posture memory has. Generation removal deletes only membership and metadata after leases/session references are resolved. Units referenced by another retained generation or unit dependency remain. Remove unreachable units in reverse dependency order through the FTS-aware store procedure, then orphan identities and origin runs, then unreferenced source blobs using the GC grace protocol. Report disk categories separately; generation pruning does not justify unbounded retained completed sessions or query spools.
 An alias may identify a node defined by a completed dependency rather than copying its attributes into the alias-owning unit; the seal validator requires that target to be visible through the unit/dependency closure. An idempotency-key collision with a different open-request hash fails rather than reusing a session. Snapshot header counts are computed/validated at seal, not rescanned on every status call. Query spools are bounded private files whose signed cursor header and durable lease bind their generation, expiry and immutable query; no second database catalog is introduced.
 
 
@@ -1508,7 +1833,7 @@ Default debounce is 250 ms and reconciliation interval is 30 seconds. Coalesce p
 <a id="133-capability-freshness"></a>
 ### 13.3 Capability Freshness
 
-Use `fresh`, `partial`, `stale`, `unavailable`, and `failed` per capability/scope, and `fresh`, `degraded`, or `failed` for generation health. Store precise reason codes separately from user-readable remediation. An optional disabled tool can be unavailable while the base generation is fresh. While a semantic unit is refreshing after an edit, its previous sealed unit is carried into the new generation and its capabilities answer as `stale` with a provenance distance (the number of generations, and the changed files, between the unit's snapshot and the active one) rather than as deferred; the carried unit is replaced by the fresh one at the next activation. A carried unit is never reported `fresh`, and a unit whose inputs no longer exist (deleted files) is not carried. An enabled requested provider that failed makes that capability failed and the active generation degraded if required base coverage still passes.
+Use `fresh`, `partial`, `stale`, `unavailable`, and `failed` per capability/scope, and `fresh`, `degraded`, or `failed` for generation health. Store precise reason codes separately from user-readable remediation. An optional disabled tool can be unavailable while the base generation is fresh. While a unit is refreshing after an edit, the active generation keeps answering from the units it already selected until the new generation is validated and activated. An enabled requested provider that failed makes that capability failed and the active generation degraded if required base coverage still passes.
 
 An active generation is coherent with its own snapshot even when the worktree is newer. Status distinguishes `snapshot_coherent`, `worktree_changed`, `refresh_pending`, `superseded`, and provider completeness. A valid historical query is not an assertion of current worktree freshness. No `fresh` status is inferred merely because an executable was found or a run emitted some rows.
 
@@ -2020,7 +2345,7 @@ max_retained_bytes = 0
 
 [resources]
 # How much runs at once is not here and is not settable. Heavy children -- an
-# analysis engine run, an external indexer, a language server -- are admitted
+# external indexer, a language server -- are admitted
 # while the sum of the memory they reserve fits the machine-derived allocation
 # (available memory less this process's own footprint and a safety margin, and
 # never more than half of what was available); one larger than the whole
@@ -2085,18 +2410,6 @@ stall_timeout = "5m"
 # waits on a gate of its own.
 max_outstanding_requests = 0
 idle_ttl = "60s"
-
-[providers.dependence]
-# auto = low-priority background units after the base index activates, queried units first;
-# true = block the index on them; false = off.
-enabled = "auto"
-timeout = "0s"                 # no wall-clock limit
-stall_timeout = "5m"           # hang detector, as for scip
-cache_bytes = 4294967296
-# The smallest heap cap a unit is given. There is no ceiling: nothing rejects a
-# unit for the memory it asks for, and the machine-derived allocation only
-# bounds the cap.
-unit_memory_floor_bytes = 805306368
 
 [context]
 default_phase = "sweep"
@@ -2212,7 +2525,7 @@ These are **proposed engineering acceptance budgets**, not observed results. The
 
 Reference workload: 1 million eligible source lines, 10,000 files, approximately 80 MiB source, all required languages represented, fixed generated source/graph seeds, representative manifests/tests/configuration/docs and a high-fanout case. Reference machine: 8 logical cores, 8 GiB RAM, local SSD, pinned OS/toolchain/build. Publish exact hardware, filesystem, cache state, grammar/provider versions, configuration, line/file/byte/node/edge counts and fixture hashes. Test real repositories as an additional signal, not a moving substitute for the fixed fixture.
 
-Base means parent process **plus all mandatory parser workers**, not only Go heap. Report managed SCIP/LSP/dependence engines individually and as a concurrently sampled full process-tree total when enabled. Optional analyzer memory is not hidden, but it is not dishonestly promised to fit the base parser budget.
+Base means parent process **plus all mandatory parser workers**, not only Go heap. Report managed SCIP indexers and LSP servers individually and as a concurrently sampled full process-tree total when enabled. Optional analyzer memory is not hidden, but it is not dishonestly promised to fit the base parser budget.
 
 <a id="232-initial-release-budgets"></a>
 ### 23.2 Initial Release Budgets
@@ -2297,7 +2610,7 @@ Ship the binary, bundled pinned grammars, LICENSE/NOTICE, documented default con
 
 The pin-everything rule of this specification governs what the **product executes** -- the analyzer payloads, runtimes and grammars the lock names, every one of which is digest-pinned and never resolved as `latest`. It does not govern which *release of codectx* a person chooses to install: `install.sh` therefore supports `latest` and defaults to it, alongside a pinned `--version`, because the installer's integrity comes from verifying the downloaded archive against that release's own `checksums.txt` before extraction, not from the operator having typed a version number.
 
-Profiles remain local base (bundled grammars), local precise (managed SCIP/LSP), and local deep (managed dependence engine). The slim archive fetches lock payloads on first use; the bundle archive carries the store pre-populated for its platform and never touches the network. Every redistributed tool and runtime has a recorded license and version in the lock and in `THIRD_PARTY_LICENSES.md` (Section 11.7). A future team server is outside V1. No supported profile requires a paid service or AI API key.
+Profiles remain local base (bundled grammars), local precise (managed SCIP/LSP); dependence facts and call linking are part of the local base and need no managed tool. The slim archive fetches lock payloads on first use; the bundle archive carries the store pre-populated for its platform and never touches the network. Every redistributed tool and runtime has a recorded license and version in the lock and in `THIRD_PARTY_LICENSES.md` (Section 11.7). A future team server is outside V1. No supported profile requires a paid service or AI API key.
 
 The data directory is workspace/installation-specific. Rebuild and pruning commands make destructive consequences explicit. An incompatible schema is not automatically migrated, and an existing user's session artifacts are not silently deleted by a new binary. Version mismatches fail clearly; greenfield development changes are in place, not a reason to add a compatibility system.
 Release SBOM generation uses the pinned selected SPDX or CycloneDX tooling, with native grammar assets included. [19](#ref-19) [20](#ref-20)
@@ -2317,7 +2630,7 @@ Tests exist to protect critical product behavior, not to maximize file count, mo
 |---|---|
 | Source identity and safety | One table/property fixture covering stable hashes, changing files, Git/worktree transformations, path escape, source ranges/encoding, CAS corruption and full retained reads. Prevents reading/writing the wrong bytes. |
 | Storage and incremental publication | One integration fixture covering reusable units, changed dependency invalidation, optional partial-output failure, atomic activation, FKs, query/session leases and GC races. Prevents stale/mixed facts or lost source. |
-| Provider boundary | Shared conformance fixture plus small native-format cases for each required grammar/SCIP/LSP/dependence profile. Covers malformed lengths, cancellation, source binding and process cleanup. Prevents false facts, OOM and hangs. |
+| Provider boundary | Shared conformance fixture plus small native-format cases for each required grammar/SCIP/LSP profile. Covers malformed lengths, cancellation, source binding and process cleanup. Prevents false facts, OOM and hangs. |
 | Search, graph and context | One deterministic fixture covering exact/lexical order, unrelated-generation ranking isolation, ambiguity, cycles/limits, required full files, scope gaps and budget/slicing boundaries. Prevents incomplete context presented as complete. |
 | Actor coverage and workflow | One state-machine fixture covering delivery receipts, duplicates, wrong actor/hash, empty/long/invalid-UTF8 files, scope changes, waiver behavior and guarded transitions. Prevents false full-read readiness. |
 | Product boundary | One end-to-end flow exercised by CLI and real MCP transport, sharing expected domain data. Covers offline/no-source-write behavior, JSON/protocol channels, version conflicts and cleanup. Prevents disconnected or incorrectly wired features. |
@@ -2342,7 +2655,7 @@ The same tests can satisfy multiple verification-matrix rows. Full source readin
 The release is acceptable only when demonstrated evidence supports every item:
 
 - Base indexing succeeds offline without optional analyzers and includes all required languages, files, symbols, scopes, imports/exports, structural calls/references, tests, manifests, dependencies, configuration, documents and source ranges.
-- SCIP enrichment preserves exact-source provenance and symbol identity; LSP offers all advertised supported live queries as a labeled snapshot-qualified overlay; the dependence provider contributes only export-supported deep facts.
+- SCIP enrichment preserves exact-source provenance and symbol identity; LSP offers all advertised supported live queries as a labeled snapshot-qualified overlay; the structural and linking providers publish dependence and resolved call facts from in-process analysis only.
 - Every retained source remains readable after worktree edits and Git history changes; unsafe paths, wrong hashes, invalid coordinates and unverified imports cannot become trusted facts.
 - Unit reuse avoids reprocessing unchanged source and correctly invalidates changed dependencies, including new/deleted files and provider/config changes. Failed units do not leak and generations publish atomically.
 - All queries remain pinned, paginated, explainable and deterministic; unrelated staging/retained generations do not change canonical lexical scores. Hard bounds and incomplete capability are always visible.
@@ -2412,8 +2725,8 @@ internal/provider/treesitter/      worker lifecycle, extraction, language regist
 internal/provider/treesitter/languages/  pinned grammar and query packs
 internal/provider/scip/            wire import, aliases, source binding, profiles
 internal/provider/lsp/             bounded client, manager, snapshot-qualified overlay
-internal/provider/dependence/      frontend-native units, graph cache, streaming CSV import and normalization
-internal/provider/dependence/graphengine/  pinned engine argv, stderr parsing, label map
+internal/provider/treesitter/flow/ control-flow graph, post-dominators, control dependence, SSA def-use
+internal/provider/link/            project planning, link tables, cross-file call binding
 internal/toolchain/                embedded tool lock, verified fetch, atomic store, resolver, runtime launchers
 internal/tools/toollock/           release-time lock and payload generator
 internal/reconcile/                deterministic canonical resolution and lineage
@@ -2432,7 +2745,7 @@ internal/e2e/                      shared critical workflow fixture
 internal/bench/                    one fixture generator and resource benchmark harness
 internal/tools/                    only thin Go automation actually needed by CI and release
 
-testdata/                          small polyglot, SCIP, LSP and dependence-export fixtures
+testdata/                          small polyglot, SCIP and LSP fixtures
 docs/                              architecture, providers, MCP, operations,
                                    configuration, performance, threat model
 .github/workflows/                 CI, offline and native-target release jobs
@@ -2455,7 +2768,7 @@ There is no `migrations/`, legacy provider path, duplicate graph/search cursor i
 | Syntax parsing | Official Tree-sitter Go binding and grammars | Mature syntax engine; own extraction queries and bounded worker lifecycle. |
 | Precise interchange | Official SCIP schema/bindings and protobuf primitives | Stream validated records, do not invent a competing symbol protocol. |
 | Live semantics | Small bounded LSP client/manager | Only required read-only methods and profiles, not an editor or generic command executor. |
-| Deep analysis | A managed CPG engine behind the neutral `dependence` provider | Integrate built-in exports; no copied CPG engine or product Scala code; engine swappable without a product-surface change. |
+| Deep analysis | In-process control-flow, dependence and call-linking analysis in the structural and linking providers | No external analyzer or runtime; each algorithm chosen against a named alternative (ADR-0012 decision 2); authored goldens per language. |
 | Analyzer distribution | Product-owned tool lock with re-hosted payloads and a stdlib fetch/verify/extract path | No package manager, npm, coursier or `go install` at runtime; runtimes (Node, JDK) are lock entries too. |
 | Database/FTS | SQLite through `modernc.org/sqlite`, FTS5 | Embedded indexed store; own generation membership/scoped ranking where required. |
 | Watch | `fsnotify` with reconciliation | Notifications are hints; avoid a bespoke filesystem watcher. |
@@ -2467,7 +2780,7 @@ There is no `migrations/`, legacy provider path, duplicate graph/search cursor i
 | Redis/Kafka/Postgres/Neo4j/distributed platform | Not included | No V1 need; unnecessary operational and memory overhead. |
 | CKB/Code Knowledge Backend | Do not adopt or copy implementation | Its source-available license imposes commercial-use conditions; retain the clean-room decision. This is not a judgment about its feature quality. |
 
-Do not add a generic plugin or retriever abstraction merely to leave a theoretical extension point. Existing provider interfaces are justified by concrete Tree-sitter/SCIP/dependence implementations, and the LSP query boundary has actual consumers. Recheck precise dependency and asset licenses when pinning them. OSI/copyleft/custom restrictions require explicit review rather than an invented assertion that all transitive components are permissive. [2](#ref-2) [4](#ref-4) [6](#ref-6) [13](#ref-13) [21](#ref-21)
+Do not add a generic plugin or retriever abstraction merely to leave a theoretical extension point. Existing provider interfaces are justified by concrete Tree-sitter/SCIP/link implementations, and the LSP query boundary has actual consumers. Recheck precise dependency and asset licenses when pinning them. OSI/copyleft/custom restrictions require explicit review rather than an invented assertion that all transitive components are permissive. [2](#ref-2) [4](#ref-4) [6](#ref-6) [13](#ref-13) [21](#ref-21)
 The original graph-ranked repository-map precedent is retained as background only; no third-party implementation is copied. [18](#ref-18)
 
 
@@ -2510,7 +2823,7 @@ Runtime provider dependency order is still enforced when source tasks are develo
 |---|---|---|
 | M0 Foundation | 1–6 | Pinned Go project, safe process/source boundaries, CAS, current SQLite schema and provider/unit runtime. |
 | M1 Base intelligence | 7–8, 12–14 | Offline full-language base index, genuinely incremental refresh, search/graph/impact. |
-| M2 Precise/deep capability | 9–11, 22 | Managed six-indexer SCIP, full supported LSP query overlay and version-verified dependence provider, every profile proven against its lock payload in CI. |
+| M2 Precise/deep capability | 9–11, 22 | Managed six-indexer SCIP, full supported LSP query overlay and in-process dependence and call linking, every profile proven against its lock payload in CI. |
 | M3 Context/workflow | 15–17 | Deterministic complete scope, bounded slices, actor receipts/review, strict gates and typed facade. |
 | M4 Product interfaces | 18–20 | CLI/MCP parity, diagnostic/retention/resource integration. |
 | M5 Release | 21 | Measured performance/capability parity, offline and six-target slim and bundle artifacts. |
@@ -2781,30 +3094,30 @@ git diff --check
 - [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
 
 
-<a id="task-11-implement-the-dependence-provider-over-the-managed-graph-engine"></a>
-### Task 11: Implement the Dependence Provider over the Managed Graph Engine
+<a id="task-11-implement-in-process-dependence-facts-and-call-linking"></a>
+### Task 11: Implement In-Process Dependence Facts and Call Linking
 
-**Deliverable:** A real version-pinned parse/export/import path providing evidence-supported control-dependence, data-dependence and fallback call facts per frontend-native unit, extraction-lazy and cached, with independent resource/failure and partial-analysis reporting, and no engine name on any product surface.
+**Deliverable:** The four file-local dependence families (`control_depends_on`, `data_flows_to`, `reads`, `writes`) published by the structural provider for all nine languages, and resolved cross-file `calls` published by the package-scoped linking provider, both computed in process per ADR-0012 and Section 11.6, with per-function failure disclosure and no external analyzer.
 
-**Files and ownership:** `internal/provider/dependence/` (provider, units, cache, CSV import, emit) with the engine adapter in `internal/provider/dependence/graphengine/`, small Neo4j CSV fixtures, `docs/providers-dependence.md`.
+**Files and ownership:** `internal/provider/treesitter/flow` and the per-language lowerings in `internal/provider/treesitter`, `internal/provider/link` (provider, project planner in `projects.go`, link tables, resolvers), their authored golden tables, `docs/providers-treesitter.md`, `docs/providers-link.md`.
 
-**Dependencies / consumes:** Task 6 runner/resolver; Task 4 private materialization; completed structural runtime dependencies from Tasks 7–8; Task 22 `toolchain.Resolver` for the engine and its JDK.
+**Dependencies / consumes:** Tasks 7–8 structural provider and parser worker; Task 6 provider contract; Task 12 package-scoped unit planning.
 
-**Produces / contract:** `dependence` Provider with `Descriptor().ID == "dependence"`, `ProviderVersion` = adapter version plus engine payload digest, `Detection.ObservedVersion` = engine version and payload digest; unit scope `pkg:<frontend-native project key>` per language (workspace scope only for C/C++); `Detection.Capabilities` naming `calls` alone (the four file-local dependence families are the structural provider's, ADR-0012 decision 9); `failed: memory` with observed peak bytes; evidence details `call` and `call speculated`.
+**Produces / contract:** the structural provider's descriptor lists the four families beside its structural capabilities; the `link` provider has `Descriptor().ID == "link"`, `DependsOn` the structural provider, package invalidation scope, and `Capabilities` naming `calls`; unit scope `pkg:<family>:<root>` per project and `workspace` for C/C++; evidence details naming the binding technique (`direct`, `hierarchy`, `address_taken`, `flow`, `field`, `ambiguous`). The id `dependence` is never registered (ADR-0012 decision 9).
 
-- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Install the pinned engine release on the development machine, run every argv below against the polyglot fixture in each of the nine languages, and record observed version, payload SHA-256 and raw output before deciding anything. Every subagent performs its own read.
-- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Use one export fixture with calls, unknown labels, forward IDs, an external method carrying a snapshot filename, malformed/oversized records and mismatched source paths. One process-fault case proves a failed export does not admit partial invalid facts. One stderr case proves a skipped-method warning is not a failure.
-- [ ] **Step 2: Implement the complete production path.** Resolve engine and JDK through the toolchain resolver; always pass `--language <frontend>` (`c`, `golang`, `pythonsrc`, `javasrc`, `jssrc`, `rust`) and `--max-num-def 40000`; one unit per frontend-native project (walk every `go.mod` yourself because the Go frontend ignores `go.work`; a Cargo workspace root is one unit; a `tsconfig`/`package.json` project is never split, because splitting loses more than half of resolved calls; a Python unit is a package), C/C++ whole-repository with include paths; subdivision only after a reproducible engine crash confirmed by one rerun with the frontend's (currently empty) semantics-neutral option allowlist, never for memory, published per capability as `partial: subdivided` with failed unit, backend failure and affected capabilities; single `--repr=all --format=neo4jcsv` export, no GraphML or DOT path; cache the parsed graph under the data directory keyed on the full semantic closure of Section 11.6 with retention; size the frontend heap cap from unit bytes up to the machine-derived allocation (free memory minus base footprint minus safety margin, bounded only by an explicit user limit), retry once on out-of-memory only when more memory is actually available, fail closed otherwise; classify out-of-memory, deterministic pass crash, and zero-exit helper crash (near-empty graph or `Process exited with code` on stderr) as distinct typed failures; capture stderr through the runner's bounded buffer and parse the skip warnings; cap CSV fields before decoder allocation, stream results, and use a disk mapping for native IDs; apply the export as a keyed delta against the stored unit (Section 11.6), normalizing Go `<clinit>` rows, and write only changed facts. Normalize only supported labels; keep external methods that carry a snapshot location and alias them by full name.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** `providers.dependence.enabled = auto|true|false` with `auto` default and the deferred capability row of Section 11.6; count unknown labels and missing capabilities; fail unsupported units rather than guess compatibility. No product-owned analysis script or interpreter server. Account the entire analyzer tree memory/temp/output as scheduler input (serialize heavy units by default; co-schedule only when the summed reservations fit), close processes, delete private inputs/exports and leave the base generation intact on optional failure. Record full process-tree metrics separately from base metrics. Docs name the engine only in `docs/providers-dependence.md` and `THIRD_PARTY_LICENSES.md`.
+- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Every subagent performs its own read.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Authored golden tables per language, each case citing its language-reference anchor and derived twice, the second blind: each table reproduces every case and emits nothing outside them. One case proves a panic in one function degrades only that file's four families.
+- [ ] **Step 2: Implement the complete production path.** Lower each callable to a control-flow graph in the worker; compute post-dominators, control dependence and SSA def-use; project them onto the four families; store each file's export and call-site tables with its unit; plan link units from project markers; bind call sites by the techniques of ADR-0012 decision 2; publish ambiguous sites with their candidates rather than guessing.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Capability rows for the four families and `calls` with their failure causes; per-function failure disclosure with byte ranges; the link provider reports disabled with the structural provider and has no configuration key of its own.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
-go test ./internal/provider/dependence/... ./internal/process -count=1
+go test ./internal/provider/treesitter/... ./internal/provider/link -count=1
 go vet ./...
 git diff --check
 ```
 
-- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, engine name on a product surface, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
+- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
 
 
 <a id="task-12-implement-the-index-coordinator-incremental-invalidation-watch-mode-and-atomic-refresh"></a>
@@ -3090,11 +3403,11 @@ because each row builds a real workspace and spawns real parser workers.
 <a id="task-22-implement-the-managed-analyzer-toolchain-lock-store-and-full-language-matrix"></a>
 ### Task 22: Implement the Managed Analyzer Toolchain, Lock, Store, and Full Language Matrix
 
-**Deliverable:** Every SCIP, LSP, and dependence profile runs from a lock-pinned, checksum-verified tool the product installs itself, with the six-indexer and six-server matrix of Section 11.7 and no user configuration. `config.Analyzer` and `[analyzers.<name>]` are deleted in place; the release-time lock generator and the CI real-tool matrix inputs exist.
+**Deliverable:** Every SCIP and LSP profile runs from a lock-pinned, checksum-verified tool the product installs itself, with the six-indexer and six-server matrix of Section 11.7 and no user configuration. `config.Analyzer` and `[analyzers.<name>]` are deleted in place; the release-time lock generator and the CI real-tool matrix inputs exist.
 
-**Files and ownership:** `internal/toolchain/` (lock schema and embedded `tools.lock.json`, store, fetcher, extractor, resolver, runtime launchers, typed errors), `internal/tools/toollock/` (release-time generator), rewritten profile files `internal/provider/scip/profile.go`, `internal/provider/lsp/profile.go`, `internal/provider/dependence/graphengine/profile.go`, new SCIP profiles for `scip-python`, `rust-analyzer scip`, and `scip-clang`, `internal/config/` removal of `Analyzer` and addition of `Tools`, `internal/cli/tools.go`, `.github/workflows/tools-matrix.yml`, `docs/toolchain.md`, provider docs, `THIRD_PARTY_LICENSES.md`. The integration owner wires `toolchain.Resolver` into `internal/app` composition alongside Task 12.
+**Files and ownership:** `internal/toolchain/` (lock schema and embedded `tools.lock.json`, store, fetcher, extractor, resolver, runtime launchers, typed errors), `internal/tools/toollock/` (release-time generator), rewritten profile files `internal/provider/scip/profile.go`, `internal/provider/lsp/profile.go`, new SCIP profiles for `scip-python`, `rust-analyzer scip`, and `scip-clang`, `internal/config/` removal of `Analyzer` and addition of `Tools`, `internal/cli/tools.go`, `.github/workflows/tools-matrix.yml`, `docs/toolchain.md`, provider docs, `THIRD_PARTY_LICENSES.md`. The integration owner wires `toolchain.Resolver` into `internal/app` composition alongside Task 12.
 
-**Dependencies / consumes:** Task 3 `config.Config`, `process.Runner`, and the confined opener; Task 6 `provider.Detection` (`Available`, `DiagnosticCode`, `ObservedVersion`); Tasks 9–11 profile call sites (`scip.runProfile`, `lsp.Trusted`/`Manager.Open`, `dependence/graphengine` tool resolution); `model.Error` codes; `lang.Of`.
+**Dependencies / consumes:** Task 3 `config.Config`, `process.Runner`, and the confined opener; Task 6 `provider.Detection` (`Available`, `DiagnosticCode`, `ObservedVersion`); Tasks 9–11 profile call sites (`scip.runProfile`, `lsp.Trusted`/`Manager.Open`); `model.Error` codes; `lang.Of`.
 
 **Produces / contract:**
 
@@ -3166,16 +3479,16 @@ type ToolOverride struct {
 }
 ```
 
-Profiles become product code: `scip.Profile{Kind profileKind; Tool toolchain.Tool}` with `profileKinds` extended to `scip-python` (triggers `pyproject.toml`, `setup.py`, `requirements.txt`, `setup.cfg`), `rust-analyzer` (trigger `Cargo.toml`, argv `scip ${input_dir} --output ${output_file}`), and `scip-clang` (trigger `compile_commands.json`, argv `--compdb-path ${input_dir}/compile_commands.json --index-output-path ${output_file}`); each profile carries its fixed argv, env allowlist, budgets, timeout, and network posture as Go values, verified against the real tool in this task. `lsp.Trusted(cfg, name)` becomes `lsp.Resolve(ctx, resolver, cfg, name)`; `dependence/graphengine` resolves its `Parse`/`Export` tools through `resolver.Resolve(ctx, "joern")` with `Parse`/`Export` tools from the `joern` entry under the `jdk` runtime. `provider.Detection.DiagnosticCode` carries the `CTX_TOOL_*` reason when a tool cannot be resolved, so `status`/`doctor` name the exact cause.
+Profiles become product code: `scip.Profile{Kind profileKind; Tool toolchain.Tool}` with `profileKinds` extended to `scip-python` (triggers `pyproject.toml`, `setup.py`, `requirements.txt`, `setup.cfg`), `rust-analyzer` (trigger `Cargo.toml`, argv `scip ${input_dir} --output ${output_file}`), and `scip-clang` (trigger `compile_commands.json`, argv `--compdb-path ${input_dir}/compile_commands.json --index-output-path ${output_file}`); each profile carries its fixed argv, env allowlist, budgets, timeout, and network posture as Go values, verified against the real tool in this task. `lsp.Trusted(cfg, name)` becomes `lsp.Resolve(ctx, resolver, cfg, name)`; `provider.Detection.DiagnosticCode` carries the `CTX_TOOL_*` reason when a tool cannot be resolved, so `status`/`doctor` name the exact cause.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Read all three profile files, their run/open paths, `config.Analyzer` and every consumer, `process.Runner`, the confined opener, and `snapshot` materialization in full. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum test set.** Four critical invariants, one table test each: a payload whose SHA-256 or size disagrees with the lock is neither extracted nor executed and leaves no store directory; an archive containing an absolute path, `..`, a symlink escaping the payload, a hard link, or more files/bytes than declared is rejected before any byte lands outside staging; `Offline: true` resolves a missing tool to `CTX_TOOL_OFFLINE` without a dial (use an `http.Transport` whose `DialContext` fails the test); a store directory without `.complete`, or whose `entry` hash disagrees with `entry_sha256`, is invisible and repaired by a fresh install. Serve fixtures from `httptest` with a two-file tarball built in the test; no real download in unit tests.
 - [ ] **Step 2: Implement the complete production path.** Embed the lock with `embed`; validate it at init (unique names, lowercase hex digests, positive sizes, runtime references that exist, entry paths that are relative and confined). Implement the fetcher as the single `net/http` owner with byte cap, timeout, same-host redirect limit, mirror substitution, and `HTTP_PROXY` support; stream to staging while hashing, never buffer a payload. Extract with the confined opener semantics of Section 21, preserving executable bits and applying `0o700` directories. Rename into place after fsync; write `.complete`. Serialize per-tool installs with a lock file. Resolve runtimes first and compose `ArgvPrefix`; hash the entry executable at every resolution. Delete `config.Analyzer`, `SortedAnalyzers`, `validateAnalyzers`, the `analyzers` fingerprint contribution and every consumer; add `config.Tools` with validation (absolute override paths, exact versions, required checksums, project configuration cannot set `[tools]`). Fold tool name, version and payload digest into `UnitSpec.ProviderVersion` and the LSP input digest so a tool change invalidates units. Rewrite the three profile files and add the three new SCIP profiles. Write `internal/tools/toollock` (download upstream, verify upstream digest, build-time `npm ci --omit=dev` and `go build` for `gopls`, normalize, tar.gz, compute digests, emit the lock and a license table). Publish the five hosted bundles (gopls and the four npm tools) as `tools-v1` release assets, point every other entry at its upstream asset with the upstream digest, and commit the generated lock.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Add `codectx tools status|prefetch|verify|gc [--json]` on the shared facade; extend `doctor` and `status` with the toolchain report; the `CTX_TOOL_*` codes map to exit 5 (provider unavailable) except `CTX_TOOL_OVERRIDE_INVALID`, which is exit 3. Add the `net/http` import check to CI (`go list -deps -f` over `./cmd/codectx` fails on any importer outside `internal/toolchain`). Add `.github/workflows/tools-matrix.yml`: for each lock entry on `ubuntu-latest`, `macos-latest`, and `windows-latest`, `codectx tools prefetch --all` then the provider smoke run against the polyglot fixture, which must exercise every advertised language through its real path (tree-sitter grammar, SCIP indexer where applicable, dependence frontend, normalization, storage, query): Go, TypeScript, TSX, JavaScript, Python, Java, C, C++ and Rust, with C++ and TSX included explicitly because the research rounds exercised only C and TypeScript; the callsite-join check includes non-ASCII TypeScript and Java fixtures so UTF-16 column conversion is tested; a profile whose smoke fails cannot be documented as supported. Update `docs/toolchain.md`, `docs/providers-scip.md`, `docs/providers-lsp.md`, `docs/providers-dependence.md`, `docs/configuration.md`, README quick start, `THIRD_PARTY_LICENSES.md` (Node, Temurin, jdtls EPL-2.0, clangd Apache-2.0 with LLVM exception, rust-analyzer MIT/Apache-2.0, scip-python MIT (vendors pyright), other scip-* Apache-2.0, pyright MIT, typescript-language-server Apache-2.0, TypeScript Apache-2.0, Joern Apache-2.0) and remove every "unverified against a real tool" label that the matrix now proves.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Add `codectx tools status|prefetch|verify|gc [--json]` on the shared facade; extend `doctor` and `status` with the toolchain report; the `CTX_TOOL_*` codes map to exit 5 (provider unavailable) except `CTX_TOOL_OVERRIDE_INVALID`, which is exit 3. Add the `net/http` import check to CI (`go list -deps -f` over `./cmd/codectx` fails on any importer outside `internal/toolchain`). Add `.github/workflows/tools-matrix.yml`: for each lock entry on `ubuntu-latest`, `macos-latest`, and `windows-latest`, `codectx tools prefetch --all` then the provider smoke run against the polyglot fixture, which must exercise every advertised language through its real path (tree-sitter grammar, SCIP indexer where applicable, dependence and call linking, normalization, storage, query): Go, TypeScript, TSX, JavaScript, Python, Java, C, C++ and Rust, with C++ and TSX included explicitly because the research rounds exercised only C and TypeScript; the callsite-join check includes non-ASCII TypeScript and Java fixtures so UTF-16 column conversion is tested; a profile whose smoke fails cannot be documented as supported. Update `docs/toolchain.md`, `docs/providers-scip.md`, `docs/providers-lsp.md`, `docs/configuration.md`, README quick start, `THIRD_PARTY_LICENSES.md` (Node, Temurin, jdtls EPL-2.0, clangd Apache-2.0 with LLVM exception, rust-analyzer MIT/Apache-2.0, scip-python MIT (vendors pyright), other scip-* Apache-2.0, pyright MIT, typescript-language-server Apache-2.0, TypeScript Apache-2.0) and remove every "unverified against a real tool" label that the matrix now proves.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
-go test ./internal/toolchain ./internal/config ./internal/provider/scip ./internal/provider/lsp ./internal/provider/dependence/... -count=1
+go test ./internal/toolchain ./internal/config ./internal/provider/scip ./internal/provider/lsp -count=1
 go run ./internal/tools/toollock -check   # lock digests match published tools-v1 assets
 go vet ./...
 git diff --check
@@ -3188,7 +3501,7 @@ git diff --check
 <a id="task-23-implement-early-cutoff-on-declaration-only-signature-digests"></a>
 ### Task 23: Implement Early Cutoff on Declaration-Only Signature Digests
 
-**Deliverable:** An edit confined to function bodies in one file re-runs only that file's own unit; the SCIP and dependence units of every module that merely depends on it are reused, proven per language by differential tests before that language is enabled.
+**Deliverable:** An edit confined to function bodies in one file re-runs only that file's own unit; the SCIP and link units of every module that merely depends on it are reused, proven per language by differential tests before that language is enabled.
 
 **Files and ownership:** `internal/provider/treesitter/signature/` (per-language declaration digest over the existing tree-sitter AST: exports, type declarations, function and method signatures, imports, constants that other files can observe; bodies excluded), `internal/model` (`unit_inputs.signature_hash` beside `content_hash`), `internal/storage/sqlite` (schema and reuse validation reading `signature_hash` for dependency inputs), `internal/index` (coordinator keys semantic units on own-file content hashes plus dependency-file signature hashes; a language without a proven digest keeps content-hash invalidation), docs.
 
@@ -3199,7 +3512,7 @@ git diff --check
 **Rulings applied:** research/13 R4 and research/14 §3 item 4. The digest is conservative: anything the language lets another file observe (Python module-level assignments, Go exported identifiers and struct fields, TypeScript exports and ambient declarations, Java public/protected members and annotations, Rust `pub` items and macros, C/C++ everything in headers) is in it. If a language's cross-file semantics cannot be bounded this way (C/C++ macros), that language is never enabled and the plan says so. Depends on Section 13.3's carried-over units so a rebinding of inputs is honest.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current tree-sitter, coordinator and storage files before editing.
-- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** The differential gate: for each language, a corpus of body-only edits and a corpus of declaration edits; a body-only edit must leave every dependent unit's SCIP and dependence facts identical to a full re-run (compared by the Task 9/11 delta keys), and every declaration edit must change the digest. One failure disables the language.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** The differential gate: for each language, a corpus of body-only edits and a corpus of declaration edits; a body-only edit must leave every dependent unit's SCIP and link facts identical to a full re-run (compared by the Task 9 delta keys and the link tables' digests), and every declaration edit must change the digest. One failure disables the language.
 - [ ] **Step 2: Implement the complete production path.** Digest, storage column, coordinator keying, reuse-reason logging, and the per-language enable flags; no language enabled without a passing gate recorded in the report.
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Status and doctor show which languages use signature cutoff; docs/indexing.md explains the two invalidation modes; a digest error falls back to content-hash invalidation for that unit and is counted.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review.
@@ -3221,7 +3534,7 @@ git diff --check
 
 **Files and ownership:** `internal/config` (`config.Limit` with `0` / `"unlimited"` as one value, `Exceeded`, `ValueOr`, `Min`; the validator loop that now rejects only negative values), `internal/graph` (per-page visited and edge work budgets, the spilling frontier and the server-side spooled resumable continuation), `internal/context` (budget and rank sites reading a bound through `config.Limit` instead of `> 0`), `internal/provider/*` (admission bounds that report a skip instead of failing a unit; progress-based stall detection in place of wall-clock unit timeouts), `internal/process` (the stall watchdog), `internal/search`, `internal/storage/sqlite`, `internal/index`, docs (`docs/configuration.md`, `docs/queries.md`, `docs/context-sessions.md`, `docs/adr/ADR-0001-scale-posture.md`, `docs/research/15-scale-posture.md`).
 
-**Dependencies / consumes:** Task 3 configuration, Task 14 bounded graph traversal and pagination, Task 15 context budgets, Task 11 dependence admission, Task 20 resource accounting.
+**Dependencies / consumes:** Task 3 configuration, Task 14 bounded graph traversal and pagination, Task 15 context budgets, Task 11 dependence facts and call linking, Task 20 resource accounting.
 
 **Produces / contract:** `config.Limit` as the single owner of the unlimited convention; fifteen configuration keys defaulting to unlimited; per-page `max_visited_nodes` and `max_graph_edges` with a continuation cursor and a page-end reason; `providers.*.stall_timeout` as a progress-based hang detector with failure reason `stalled`; a reported, never silent, breach of any user-set limit.
 
@@ -3270,7 +3583,7 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 | Exact-source SCIP | 11.4 | 9, 22 | Source-binding/position/local-symbol/occurrence fixtures, streamed memory check and real-tool smoke for all six indexers. |
 | Managed analyzer toolchain | 11.7, 20, 21, 24 | 22, 20, 21 | Digest/size mismatch never extracted or executed; confined extraction; offline never dials; atomic store; single `net/http` importer; per-platform CI matrix runs every lock entry. |
 | Full supported LSP overlay | 11.5 | 10, 22 | Actual protocol fake-server lifecycle and required-method table; private pinned input and cleanup. |
-| Dependence integration | 11.6 | 11, 22 | CSV fixture, real pinned engine run per language, no engine name on a product surface. |
+| Dependence facts and call linking | 11.6 | 7, 8, 11 | Authored golden tables per language, each derived twice, the second blind. |
 | Canonical node and relation provenance | 9, 11–12 | 2, 5–11 | Node facts, aliases and range-bearing relation evidence with scope/source identity; ambiguity retained. |
 | Stable generation-scoped lexical ranking | 12.4, 14 | 5, 13, 15 | Scores/hash unchanged by unrelated unit/generation insert/activation/pruning; near-tie platform checks. |
 | Bounded graph and pagination | 14 | 5, 13–14 | Cycle/fanout, edge/node/depth/work limits, signed cursor, lease and deterministic continuation. |
@@ -3351,19 +3664,19 @@ Pin exact dependency/grammar/profile revisions and checksums during implementati
    Capability-negotiated local LSP interface; pin the exact supported feature/profile revision during implementation.
 
 <a id="ref-8"></a>
-8. **Joern Code Property Graph documentation**  
-   <https://docs.joern.io/code-property-graph/>  
-   CPG concepts and explicit evidence mapping.
+8. **Ferrante, Ottenstein and Warren, The Program Dependence Graph and Its Use in Optimization, ACM TOPLAS 9(3), 1987**  
+   <https://doi.org/10.1145/24039.24041>  
+   Control dependence through post-dominance; the program dependence graph.
 
 <a id="ref-9"></a>
-9. **Joern complex query steps**  
-   <https://docs.joern.io/cpgql/complex-steps/>  
-   Call/dataflow interpretation, not a substitute for verified exported facts.
+9. **Cytron, Ferrante, Rosen, Wegman and Zadeck, Efficiently Computing Static Single Assignment Form and the Control Dependence Graph, ACM TOPLAS 13(4), 1991**  
+   <https://doi.org/10.1145/115372.115320>  
+   Dominance frontiers, SSA placement and def-use.
 
 <a id="ref-10"></a>
-10. **Joern graph export documentation**  
-   <https://docs.joern.io/export/>  
-   Built-in formats and version-sensitive noninteractive export.
+10. **Dean, Grove and Chambers, Optimization of Object-Oriented Programs Using Static Class Hierarchy Analysis, ECOOP 1995**  
+   <https://doi.org/10.1007/3-540-49538-X_5>  
+   Class-hierarchy analysis for call linking.
 
 <a id="ref-11"></a>
 11. **SQLite Write-Ahead Logging**  
@@ -3446,9 +3759,9 @@ Pin exact dependency/grammar/profile revisions and checksums during implementati
    Dependency risk report; inspect the selected pinned implementation and verify, do not claim an unverified fix.
 
 <a id="ref-27"></a>
-27. **Joern common issues**  
-   <https://docs.joern.io/common-issues/>  
-   Version-dependent dataflow overlay behavior.
+27. **Feldthaus, Schäfer, Sridharan, Dolby and Tip, Efficient Construction of Approximate Call Graphs for JavaScript IDE Services, ICSE 2013**  
+   <https://doi.org/10.1109/ICSE.2013.6606621>  
+   Field-based call-graph construction for the ECMAScript family.
 
 <a id="ref-28"></a>
 28. **SQLite PRAGMA reference**  

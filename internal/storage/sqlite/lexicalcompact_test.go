@@ -23,16 +23,13 @@ func tierFile(f *fixture, i int) fileFixture {
 func replacedFiles(files ...fileFixture) store.Replaced {
 	ids := make([]model.FileID, 0, len(files))
 	scopes := make([]string, 0, len(files))
-	keys := make([]string, 0, len(files))
 	for _, ff := range files {
 		ids = append(ids, ff.id)
 		scopes = append(scopes, "file:"+ff.path)
-		keys = append(keys, "key:node:"+ff.path)
 	}
 	return store.Replaced{
 		Files:  slices.Values(ids),
 		Scopes: slices.Values(scopes),
-		Keys:   slices.Values(keyList(keys...)),
 	}
 }
 

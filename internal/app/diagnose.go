@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -192,39 +191,6 @@ func (l runLedger) Run(ctx context.Context, runID string) (*model.RunRecord, []m
 	return runRecord(view)
 }
 
-// MarkedUnits reads the unit spans of the deferred runs that marked this
-// generation with the stage, for a status report in any process. A workspace
-// with no ledger answers none; one whose ledger cannot be read reports it, and
-// the report says so.
-func (l runLedger) MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
-	named int) ([]ledger.MarkedUnits, error) {
-	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
-	if err != nil || !recorded {
-		return nil, err
-	}
-	defer reader.Close()
-	return reader.MarkedUnits(ctx, repositoryID, generationID, stage, named)
-}
-
-// OpenPeaks opens the learned peaks for one plan. It is advisory and must
-// never refuse a plan: a workspace with no ledger answers a nil lookup, and one
-// whose ledger cannot be opened is logged and answers a nil lookup too, which
-// the plan reads as no observation for every scope. The coordinator closes the
-// reader it is handed. A literal nil is returned, never a nil *ledger.Reader,
-// so the interface compares nil.
-func (l runLedger) OpenPeaks(ctx context.Context) (index.PeakLookup, error) {
-	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
-	if err != nil {
-		slog.Warn("the learned peaks could not be read; heavy units are sized from the family estimates alone",
-			"component", "workspace", "error", err)
-		return nil, nil
-	}
-	if !recorded {
-		return nil, nil
-	}
-	return reader, nil
-}
-
 // runRecord is the one place a read run becomes the rows the model carries,
 // whichever question selected it.
 func runRecord(view ledger.RunView) (*model.RunRecord, []model.StageRecord, int64, error) {
@@ -242,7 +208,6 @@ func runRecord(view ledger.RunView) (*model.RunRecord, []model.StageRecord, int6
 		UnitsPlanned:        view.Run.UnitsPlanned,
 		UnitsSucceeded:      view.Run.UnitsSucceeded,
 		UnitsFailed:         view.Run.UnitsFailed,
-		UnitsSubdivided:     view.Run.UnitsSubdivided,
 		EventsDropped:       view.Run.EventsDropped,
 		ProcessPeakRSSBytes: view.Run.ProcessPeakRSSBytes,
 	}

@@ -271,7 +271,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		Scope:      "workspace",
 		State:      model.CapabilityFresh,
 	}, {
-		ProviderID:     "dependence",
+		ProviderID:     "link",
 		Capability:     "calls",
 		Scope:          "workspace",
 		State:          model.CapabilityUnavailable,
@@ -661,10 +661,9 @@ func TestGraphScenarios(t *testing.T) {
 			// entries carry no reason, or no incoming/outgoing discriminator, is
 			// an unexplained ranking a caller cannot act on -- and a cyclic graph
 			// (n-a -> n-b -> n-c -> n-a) that admits a node twice would double the
-			// same symbol and inflate its apparent impact. It also holds the
-			// deferred-dependence disclosure, which no completed real index can
-			// produce (the run drains the deferred queue), so this fixture is its
-			// only proof.
+			// same symbol and inflate its apparent impact. It also holds that the
+			// answer carries the generation's capability report unchanged,
+			// including a row that is unavailable.
 			name: "impact entries are explained, directed and deduplicated across a cycle",
 			run: func(t *testing.T, f *graphFixture) {
 				engine, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: fixtureLimits()})

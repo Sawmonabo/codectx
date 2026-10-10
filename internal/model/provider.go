@@ -368,20 +368,8 @@ type CapabilityState struct {
 	// busy row drops. It belongs to the same scope as DiagnosticCode and the
 	// exemplar `scope_key` -- a fold that keeps one row's code keeps that
 	// row's remediation with it and never joins two.
-	Remediation string `json:"remediation,omitempty"`
-	// UnitsRunning is how many scopes of this capability were still being
-	// built in the background when this row was published. It is an assertion
-	// about the generation, written into the generation's own row, which is
-	// what lets a SECOND process read it: the in-process deferred queue
-	// answers only for the process that is doing the work, so a `codectx
-	// status` in another terminal would otherwise report a capability as
-	// simply degraded while the work that completes it is still running.
-	//
-	// Every row of one provider capability carries the same figure, so a fold
-	// of two of them takes the greater and never the sum: adding them would
-	// count one running unit once per row it appears on.
-	UnitsRunning int               `json:"units_running,omitempty"`
-	Details      map[string]string `json:"details,omitempty"`
+	Remediation string            `json:"remediation,omitempty"`
+	Details     map[string]string `json:"details,omitempty"`
 }
 
 // WithDetail returns the state with one bounded diagnostic pair added, so a
@@ -454,9 +442,6 @@ func (c CapabilityState) Validate() error {
 	}
 	if err := boundField("capability_state.remediation", c.Remediation, MaxDetailBytes); err != nil {
 		return err
-	}
-	if c.UnitsRunning < 0 {
-		return invalid("capability_state.units_running is %d", c.UnitsRunning)
 	}
 	if err := boundCount("capability_state.details", len(c.Details), MaxCapabilityDetails); err != nil {
 		return err

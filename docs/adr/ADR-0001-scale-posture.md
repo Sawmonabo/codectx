@@ -2,6 +2,8 @@
 
 - **Status:** Accepted (decisions 1–7 implemented; decisions 8 and 9 accepted and scheduled)
 - **Date:** 2026-09-14
+- **Amended 2026-10-08:** the hosted dependence engine this record governs was deleted under
+  [ADR-0012](ADR-0012-native-dependence-engine.md) phase 6.
 - **Supersedes:** the dependence-tier direction of 2026-09-13 recorded in
   [`docs/research/00-synthesis.md` §8](../research/00-synthesis.md),
   which this record generalises from one provider to the whole product
@@ -552,8 +554,8 @@ where `301` is correct; mutation D (use the plain fold after the collapse) repor
 Run records: mutation E (drop the total counter) reports an omitted count of `-1000` instead of 5.
 
 **The primary-key fold.** The summing variant is applied **only after** scope collapse. Before the
-collapse, two rows on one primary key are two assertions about the same scope — a composition-time
-row meeting a stored one — and summing them would double-count. These details also feed a published
+collapse, two rows on one primary key are two assertions about the same scope — a planner degradation
+meeting a failed unit's row — and summing them would double-count. These details also feed a published
 binding key, so changing the fold on the ordinary path would move published identities. The plain
 fold is therefore left byte-identical and the summing fold is a separate function, with a mutation
 guarding the split.

@@ -293,12 +293,12 @@ func openCorpus(t *testing.T, ctx context.Context, repo string, languages []stri
 	if err := os.MkdirAll(userCfg, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// The three optional providers are switched off explicitly: an "auto"
+	// The two optional providers are switched off explicitly: an "auto"
 	// provider that happens to be unavailable on this host would make the
 	// fingerprint a statement about the host rather than about the corpus.
 	user := "[storage]\ndata_dir = \"" + filepath.Join(home, "data") + "\"\n" +
 		"[tools]\noffline = true\n" +
-		"[providers.scip]\nenabled = false\n[providers.lsp]\nenabled = false\n[providers.dependence]\nenabled = false\n"
+		"[providers.scip]\nenabled = false\n[providers.lsp]\nenabled = false\n"
 	if err := os.WriteFile(filepath.Join(userCfg, "config.toml"), []byte(user), 0o600); err != nil {
 		t.Fatal(err)
 	}

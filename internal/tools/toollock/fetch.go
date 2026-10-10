@@ -3,11 +3,8 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/sha512"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -18,8 +15,8 @@ import (
 )
 
 // maxDownloadBytes bounds every upstream read. The largest pinned distribution
-// (the dependence engine archive) is under 2 GiB; anything far above that is a
-// mirror serving something other than the pinned artifact.
+// (the Java runtime archive) is about two hundred megabytes; anything far above
+// that is a mirror serving something other than the pinned artifact.
 const maxDownloadBytes = 4 << 30
 
 var httpClient = &http.Client{Timeout: 30 * time.Minute}
@@ -102,34 +99,23 @@ func fetchText(ctx context.Context, url string) (string, error) {
 // spec means upstream publishes none; that is recorded honestly in the report
 // rather than papered over with a self-computed value called "verified".
 type digestSpec struct {
-	Algo  string // "sha256" or "sha512"
-	Hex   string // literal digest, when the pin carries one
+	Algo  string // "sha256"
 	URL   string // checksum file to fetch
 	Match string // artifact file name to select inside a multi-line manifest
-	B64   string // base64 digest (npm "integrity" form)
 }
 
 func (d digestSpec) empty() bool { return d.Algo == "" }
 
 // resolve returns the expected lowercase hex digest for the artifact.
 func (d digestSpec) resolve(ctx context.Context) (string, error) {
-	switch {
-	case d.Hex != "":
-		return strings.ToLower(d.Hex), nil
-	case d.B64 != "":
-		raw, err := base64.StdEncoding.DecodeString(d.B64)
-		if err != nil {
-			return "", err
-		}
-		return hex.EncodeToString(raw), nil
-	case d.URL != "":
-		body, err := fetchText(ctx, d.URL)
-		if err != nil {
-			return "", err
-		}
-		return parseChecksumFile(body, d.Match)
+	if d.URL == "" {
+		return "", fmt.Errorf("digest spec carries no value")
 	}
-	return "", fmt.Errorf("digest spec carries no value")
+	body, err := fetchText(ctx, d.URL)
+	if err != nil {
+		return "", err
+	}
+	return parseChecksumFile(body, d.Match)
 }
 
 func parseChecksumFile(body, match string) (string, error) {
@@ -155,8 +141,8 @@ func parseChecksumFile(body, match string) (string, error) {
 	return "", fmt.Errorf("no checksum line for %q", match)
 }
 
-// verifyUpstream streams path through the algorithm upstream published and
-// compares. A mismatch aborts the run: a payload we cannot tie to the upstream
+// verifyUpstream compares the SHA-256 of path, already computed as it was
+// downloaded, with the digest upstream published. A mismatch aborts the run: a payload we cannot tie to the upstream
 // artifact must never be re-hosted under the codectx release.
 func verifyUpstream(ctx context.Context, path string, spec digestSpec, sha256Hex string) (string, error) {
 	if spec.empty() {
@@ -166,32 +152,11 @@ func verifyUpstream(ctx context.Context, path string, spec digestSpec, sha256Hex
 	if err != nil {
 		return "", err
 	}
-	var got string
-	switch spec.Algo {
-	case "sha256":
-		got = sha256Hex
-	case "sha512":
-		got, err = hashFileWith(path, sha512.New())
-		if err != nil {
-			return "", err
-		}
-	default:
+	if spec.Algo != "sha256" {
 		return "", fmt.Errorf("unknown digest algorithm %q", spec.Algo)
 	}
-	if got != want {
-		return "", fmt.Errorf("upstream digest mismatch for %s: want %s, got %s", path, want, got)
+	if sha256Hex != want {
+		return "", fmt.Errorf("upstream digest mismatch for %s: want %s, got %s", path, want, sha256Hex)
 	}
 	return spec.Algo + ":" + want, nil
-}
-
-func hashFileWith(p string, h hash.Hash) (string, error) {
-	f, err := os.Open(p)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }

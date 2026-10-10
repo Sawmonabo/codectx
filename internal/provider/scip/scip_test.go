@@ -316,7 +316,7 @@ func TestCanonicalFixture(t *testing.T) {
 	}
 	wantRange(t, xa, files["pkg/a.go"], "x", 0)
 	// A ReadAccess occurrence is a `references` edge: `reads`/`writes` are the
-	// dependence provider's facts and this provider never publishes them.
+	// structural provider's facts and this provider never publishes them.
 	got.edge(t, foo.Node.ID, model.RelReferences, xa.Node.ID)
 
 	// Import and implementation relationships.

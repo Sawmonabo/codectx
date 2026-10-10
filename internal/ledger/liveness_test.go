@@ -183,7 +183,7 @@ func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
 	published.Finish(OutcomeOK)
 	// A tick that published nothing: it ended, and no generation will ever be
 	// attached to it. It started after the cutoff, so it stays.
-	barren, err := l.NewRun(KindDeferred, liveRepository)
+	barren, err := l.NewRun(KindIndex, liveRepository)
 	if err != nil {
 		t.Fatalf("new run: %v", err)
 	}
@@ -318,11 +318,7 @@ func TestARunsAccountOutlivesItsGeneration(t *testing.T) {
 	generations := []int64{1, 0, 3, 4, 0, 6}
 	ids := make([]string, 0, len(generations))
 	for i, gen := range generations {
-		kind := KindIndex
-		if gen == 0 && i > 2 {
-			kind = KindDeferred
-		}
-		run, err := l.NewRun(kind, liveRepository)
+		run, err := l.NewRun(KindIndex, liveRepository)
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}

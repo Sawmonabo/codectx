@@ -438,9 +438,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	if p.runner == nil {
 		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderUnavailable, Message: "scip profiles need the shared process runner"})
 	}
-	// The whole snapshot is the deliberate selection, not an omitted Include
-	// (snapshot.MaterializeOptions.Include exists and is not used here on
-	// purpose). A precise indexer resolves a symbol through the project's own
+	// The whole snapshot is the deliberate selection. A precise indexer resolves a symbol through the project's own
 	// dependency context -- the module graph, the package manifests, the
 	// installed distributions, the headers -- and the unit's scope is the
 	// workspace, so a copy narrowed to some subset of files would produce an

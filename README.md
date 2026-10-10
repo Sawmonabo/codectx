@@ -19,7 +19,7 @@ Node, no npm, no JDK and no language server of your own.
 Precise indexing of Go, Rust and Python additionally uses that language's own
 toolchain (`go`, `cargo`, `python3`/`pip3`) the way any build does, because the
 indexer loads the project model through it. Where one is absent that language
-falls back to the structural and dependence providers, which need nothing on the
+falls back to the structural and linking providers, which need nothing on the
 host; no other language depends on anything you install.
 
 ### Install the latest release
@@ -208,7 +208,7 @@ foreign token is refused with `CTX_CURSOR_INVALID` (exit 8) rather than answered
 from a different question.
 
 If only the bundled structural providers are available the commands still work
-and report their precision; SCIP, LSP or dependence-engine analysis enriches the
+and report their precision; SCIP indexing or LSP analysis enriches the
 same graph and query APIs without changing the agent integration. What that
 precision does and does not prove is set out in
 [docs/providers.md](docs/providers.md) and

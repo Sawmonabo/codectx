@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io/fs"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -33,7 +32,6 @@ type RunRow struct {
 	UnitsPlanned        int64
 	UnitsSucceeded      int64
 	UnitsFailed         int64
-	UnitsSubdivided     int64
 	EventsDropped       int64
 	ProcessPeakRSSBytes *uint64
 }
@@ -173,7 +171,7 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	// about the run it chose cannot disagree. The stamps are fixed-width UTC,
 	// which is why the clock compares as text.
 	const query = `SELECT run_id, kind, repository_id, generation_id, started_at, finished_at, outcome,
-		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
+		file_count, source_bytes, units_planned, units_succeeded, units_failed,
 		events_dropped, process_peak_rss_bytes, (` + liveRun + `) AS live
 		FROM runs WHERE repository_id = ?
 		ORDER BY live DESC, (generation_id IS NOT NULL AND generation_id = ?) DESC, started_at DESC
@@ -186,8 +184,8 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 // answer for a caller that knows which run it is asking about. A run reports
 // on itself through this and not through LatestRun, which answers with the
 // live run of the repository -- and a process can have a second run of its own
-// live, a deferred publication beside an index, which would then answer for
-// the run that asked.
+// live, an overlay beside an index, which would then answer for the run that
+// asked.
 //
 // It judges liveness, bounds its spans and reports what it omitted exactly as
 // LatestRun does; the two differ in which row they select and in nothing else.
@@ -197,7 +195,7 @@ func (r *Reader) Run(ctx context.Context, runID string) (RunView, bool, error) {
 		return RunView{}, false, err
 	}
 	const query = `SELECT run_id, kind, repository_id, generation_id, started_at, finished_at, outcome,
-		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
+		file_count, source_bytes, units_planned, units_succeeded, units_failed,
 		events_dropped, process_peak_rss_bytes, (` + liveRun + `) AS live
 		FROM runs WHERE run_id = ?`
 	now := time.Now()
@@ -219,7 +217,7 @@ func (r *Reader) read(ctx context.Context, now time.Time, row *sql.Row) (RunView
 	var peak sql.NullInt64
 	err := row.Scan(&raw, &kind, &rawRepo, &generation, &started, &finished, &outcome,
 		&view.Run.FileCount, &view.Run.SourceBytes, &view.Run.UnitsPlanned, &view.Run.UnitsSucceeded,
-		&view.Run.UnitsFailed, &view.Run.UnitsSubdivided, &view.Run.EventsDropped, &peak, &live)
+		&view.Run.UnitsFailed, &view.Run.EventsDropped, &peak, &live)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RunView{}, false, nil
 	}
@@ -436,138 +434,6 @@ func (r *Reader) LiveStage(ctx context.Context) (stage string, live bool, err er
 		return "", false, wrap("read the live run", err)
 	}
 	return stage, true, nil
-}
-
-// RecordedPeak is the largest process-tree peak this ledger holds for one
-// scope of a repository, and whether one is held at all. It is two indexed
-// reads of the high-water table and never a scan: the scope's own row by its
-// key, and only where that row is absent and familyPrefix is not empty, the
-// largest row whose key begins with familyPrefix -- a range over the same key,
-// bounded by that family's own scopes.
-//
-// The second result is the answer. A scope nothing ever sampled, a family
-// with no measured scope and a repository that has never run a heavy unit all
-// answer false with a zero the caller must not read: the table holds only
-// measurements above zero, so a zero here can only mean "no row", and a peak
-// of zero answered as observed would be a reservation of nothing.
-func (r *Reader) RecordedPeak(ctx context.Context, repositoryID, scopeKey, familyPrefix string) (int64, bool, error) {
-	repo, err := model.DecodeID(repositoryID)
-	if err != nil {
-		return 0, false, err
-	}
-	var peak int64
-	err = r.db.QueryRowContext(ctx, `SELECT peak_rss_bytes FROM scope_peaks
-		WHERE repository_id = ? AND scope_key = ?`, repo, scopeKey).Scan(&peak)
-	if err == nil {
-		return peak, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, wrap("read the scope's recorded peak", err)
-	}
-	if familyPrefix == "" {
-		return 0, false, nil
-	}
-	// The upper bound is the prefix with its last byte raised by one, which
-	// is the first key that no longer begins with it, so the range reads the
-	// family's rows off the primary key and nothing past them. A family
-	// prefix ends in its separator, so that byte is never the largest one.
-	upper := []byte(familyPrefix)
-	upper[len(upper)-1]++
-	err = r.db.QueryRowContext(ctx, `SELECT peak_rss_bytes FROM scope_peaks
-		WHERE repository_id = ? AND scope_key >= ? AND scope_key < ?
-		ORDER BY peak_rss_bytes DESC LIMIT 1`, repo, familyPrefix, string(upper)).Scan(&peak)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, wrap("read the family's recorded peak", err)
-	}
-	return peak, true, nil
-}
-
-// MarkedUnits is one provider's unit spans in the runs a marker names: how
-// many there are, and the first of them by scope key. A unit span is a
-// top-level span whose stage is its provider's id, which is how a run records
-// every unit it planned.
-type MarkedUnits struct {
-	Provider string
-	Units    int64
-	Named    []MarkedUnit
-}
-
-// MarkedUnit is one named unit and the marker that names its run: the run's
-// id and the marker's diagnostic code and failure text.
-type MarkedUnit struct {
-	ScopeKey       string
-	RunID          string
-	DiagnosticCode string
-	Failure        string
-}
-
-// MarkedUnits reads the unit spans of every deferred run of a repository that
-// holds a top-level span of this stage scoped to generationID in decimal --
-// the marker a run writes to say what it did to the units it planned over that
-// generation -- and that started no earlier than the run that produced the
-// generation. It answers per provider, in provider order, with the count and
-// the first named of them by scope key.
-//
-// The runs it reads are ones retention keeps for as long as the generation is
-// retained: a sweep deletes only runs that started before the oldest run
-// behind a retained generation, and every run read here started at or after
-// the run behind this one (SweepRuns). A generation whose producing run the
-// file no longer holds -- a ledger recreated after the store was built --
-// answers nothing, since no marker can be told apart from one about an
-// earlier generation of the same id.
-//
-// The markers are found through the runs index by repository and start, and
-// each run's spans through the run's own key, so the read covers the runs
-// since the generation's own and never the whole span table. The answer is
-// bounded by named per provider.
-func (r *Reader) MarkedUnits(ctx context.Context, repositoryID string, generationID int64, stage string,
-	named int) ([]MarkedUnits, error) {
-	repo, err := model.DecodeID(repositoryID)
-	if err != nil {
-		return nil, err
-	}
-	const query = `WITH base AS (
-			SELECT MIN(started_at) AS started FROM runs WHERE repository_id = ?1 AND generation_id = ?2
-		), marked AS (
-			SELECT m.run_id, m.diagnostic_code, m.failure_json
-			FROM base, runs r JOIN spans m ON m.run_id = r.run_id
-			WHERE r.repository_id = ?1 AND r.kind = 'deferred' AND r.started_at >= base.started
-			  AND m.parent_id IS NULL AND m.stage = ?3 AND m.scope_key = ?4
-		), units AS (
-			SELECT u.provider, u.scope_key, u.run_id, marked.diagnostic_code, marked.failure_json,
-				ROW_NUMBER() OVER (PARTITION BY u.provider ORDER BY u.scope_key, u.run_id) AS n,
-				COUNT(*) OVER (PARTITION BY u.provider) AS total
-			FROM marked JOIN spans u ON u.run_id = marked.run_id
-			WHERE u.parent_id IS NULL AND u.provider <> '' AND u.stage = u.provider
-		)
-		SELECT provider, total, scope_key, run_id, diagnostic_code, failure_json
-		FROM units WHERE n <= ?5 ORDER BY provider, n`
-	rows, err := r.db.QueryContext(ctx, query, repo, generationID, stage,
-		strconv.FormatInt(generationID, 10), named)
-	if err != nil {
-		return nil, wrap("read the marked units", err)
-	}
-	defer rows.Close()
-	var out []MarkedUnits
-	for rows.Next() {
-		var provider string
-		var total int64
-		var unit MarkedUnit
-		var runID []byte
-		if err := rows.Scan(&provider, &total, &unit.ScopeKey, &runID, &unit.DiagnosticCode, &unit.Failure); err != nil {
-			return nil, wrap("read the marked units", err)
-		}
-		unit.RunID = hex.EncodeToString(runID)
-		if len(out) == 0 || out[len(out)-1].Provider != provider {
-			out = append(out, MarkedUnits{Provider: provider, Units: total})
-		}
-		last := &out[len(out)-1]
-		last.Named = append(last.Named, unit)
-	}
-	return out, wrap("read the marked units", rows.Err())
 }
 
 // A NeedClass is one learned need model of a repository as a reader sees it:

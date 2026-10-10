@@ -3,6 +3,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,6 +19,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+
+	_ "modernc.org/sqlite"
 )
 
 // ---------------------------------------------------------------------------
@@ -119,8 +122,7 @@ func newSandbox(t *testing.T) *sandbox {
 		"[tools]\noffline = true\n" +
 		"[mcp]\nwatch = false\n" +
 		"[providers.scip]\nenabled = false\n" +
-		"[providers.lsp]\nenabled = false\n" +
-		"[providers.dependence]\nenabled = false\n"
+		"[providers.lsp]\nenabled = false\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -415,6 +417,7 @@ func TestE2ESearchParity(t *testing.T) {
 	if !indexEnv.OK || indexCode != 0 {
 		t.Fatalf("index failed (exit %d): %+v", indexCode, indexEnv.Error)
 	}
+	assertFamiliesWithoutTheRetiredProvider(t, s, data[model.IndexResult](t, indexEnv, indexCode))
 
 	const query = "TinyStore"
 	searchEnv, searchCode := s.run(t, "search", query)
@@ -443,6 +446,86 @@ func TestE2ESearchParity(t *testing.T) {
 	if cliPage.Meta.Binding.GenerationID != mcpPage.Meta.Binding.GenerationID {
 		t.Errorf("adapters answered from different generations: cli %d, mcp %d",
 			cliPage.Meta.Binding.GenerationID, mcpPage.Meta.Binding.GenerationID)
+	}
+}
+
+// retiredProviderID is the provider id of the retired hosted dependence engine.
+// It is never reused (ADR-0012 decision 9), so no row of any generation may
+// carry it.
+const retiredProviderID = "dependence"
+
+// assertFamiliesWithoutTheRetiredProvider is retirement condition 2 of
+// ADR-0012 over the multi-language fixture: every dependence family is still
+// published, by the provider that owns it now and at the state it had while
+// the engine was registered and disabled (this sandbox's configuration), and
+// no capability row, provider run, unit or generation member -- and so no node
+// or fact, which belong to a unit -- carries the retired provider id.
+//
+// Failure modes: a family loses its publisher with the engine and reads as
+// absent, or anything is registered, planned or reported under the retired
+// id. Mutations that fail it: drop the linking provider from the composition
+// (the `calls` row disappears), or register any provider under the id
+// "dependence" (the id assertions fire).
+func assertFamiliesWithoutTheRetiredProvider(t *testing.T, s *sandbox, res model.IndexResult) {
+	t.Helper()
+	families := []struct {
+		providerID string
+		capability model.RelationKind
+		state      model.CapabilityStateValue
+	}{
+		{"treesitter", model.RelControlDependsOn, model.CapabilityFresh},
+		{"treesitter", model.RelDataFlowsTo, model.CapabilityFresh},
+		{"treesitter", model.RelReads, model.CapabilityFresh},
+		{"treesitter", model.RelWrites, model.CapabilityFresh},
+		{"link", model.RelCalls, model.CapabilityFresh},
+	}
+	for _, f := range families {
+		var rows int
+		for _, row := range res.Completeness {
+			if row.ProviderID != f.providerID || row.Capability != string(f.capability) {
+				continue
+			}
+			rows++
+			if row.State != f.state {
+				t.Errorf("%s/%s is %q at scope %q, want %q", row.ProviderID, row.Capability, row.State, row.Scope, f.state)
+			}
+		}
+		if rows == 0 {
+			t.Errorf("no capability row publishes %s/%s", f.providerID, f.capability)
+		}
+	}
+	for _, row := range res.Completeness {
+		if row.ProviderID == retiredProviderID {
+			t.Errorf("a capability row carries the retired provider id: %+v", row)
+		}
+	}
+	for _, id := range res.ProvidersDisabled {
+		if id == retiredProviderID {
+			t.Errorf("the result names the retired provider among the disabled ones: %v", res.ProvidersDisabled)
+		}
+	}
+	var dbPath string
+	if err := filepath.WalkDir(filepath.Join(s.Home, "data"), func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "codectx.db" {
+			dbPath = path
+		}
+		return err
+	}); err != nil || dbPath == "" {
+		t.Fatalf("the sandbox holds no index database (walk error %v)", err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, table := range []string{"provider_runs", "units", "generation_units", "generation_capabilities"} {
+		var n int64
+		if err := db.QueryRow(`SELECT count(*) FROM `+table+` WHERE provider_id = ?`, retiredProviderID).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("%s holds %d rows under the retired provider id", table, n)
+		}
 	}
 }
 

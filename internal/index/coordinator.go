@@ -9,9 +9,8 @@
 //     snapshot (internal/index/plan);
 //  3. open a staging generation over the snapshot and the ref it was built
 //     from;
-//  4. attach the units the plan proved reusable, carry the stale predecessor
-//     of every refreshing deferred scope, and build the rest -- SCIP,
-//     dependence and linking through their delta appliers
+//  4. attach the units the plan proved reusable and build the rest -- SCIP
+//     and linking through their delta appliers
 //     (internal/index/delta), every other provider through provider.RunUnit;
 //  5. validate and activate with a compare-and-swap on the active pointer;
 //  6. retain by ref.
@@ -32,15 +31,14 @@ package index
 import (
 	"context"
 	"errors"
-	"github.com/Sawmonabo/codectx/internal/admission"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
@@ -48,7 +46,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
@@ -95,8 +92,7 @@ const (
 	// is not. Every watch beat is one, because a beat that blocked would stall
 	// the synchronous delivery of the batches behind it and the next beat
 	// repeats the work anyway; so is an agent's refresh, which is a tool call
-	// with somebody waiting on the answer, and so is every background hold the
-	// deferred sealer takes.
+	// with somebody waiting on the answer.
 	HoldNow HoldIntent = iota
 	// HoldPatiently is a build a person asked for and is waiting on. It waits
 	// for as long as whoever holds the workspace keeps getting somewhere,
@@ -125,7 +121,7 @@ type Locker interface {
 }
 
 // Options are the coordinator's dependencies. Every field except Lock,
-// Watcher, States, Logger and Now is required; the workspace lock is the
+// Watcher, Logger and Now is required; the workspace lock is the
 // caller's and is never closed here.
 type Options struct {
 	Root     workspace.Root
@@ -166,33 +162,16 @@ type Options struct {
 	// totals, one machine, and a process free to reserve twice what the host
 	// has.
 	Admission *admission.Ledger
-	// Machine is the composition root's one observation of the host: the
-	// reading Admission's allocation was derived from, handed over so the
-	// planner sizes every heavy unit's reservation and heap caps against the
-	// same reading. The coordinator never observes the machine itself. The
-	// zero value is a host that exposes no available memory.
-	Machine dependence.Machine
 	// RunLedgerReader reads back the rows this process's runs recorded: how a
-	// finished run states in its own result what it did, and what this
-	// workspace has already measured its heavy units to cost, which the plan
-	// raises a unit's reservation to. It may be nil, which is a coordinator
-	// whose results carry no run and whose heavy units are sized from the
-	// family estimates alone: a composition that records nothing has nothing
-	// to read back, which is no observation and never a measurement of zero.
+	// finished run states in its own result what it did. It may be nil, which
+	// is a coordinator whose results carry no run: a composition that records
+	// nothing has nothing to read back.
 	RunLedgerReader RunLedgerReader
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
 	// reported incomplete because that is what it is.
 	Watcher *watch.Watcher
-	// States are the composition-time capability rows of providers that could
-	// not be constructed at all -- an absent analyzer payload, a profile that
-	// did not resolve. They are folded into every capability report
-	// (IndexResult.Completeness, IndexStatus.Completeness) before the
-	// MaxCapabilityStates bound is applied, so a degradation the operator must
-	// see is never the row that truncation drops and never pushes the
-	// published list past its own contract.
-	States []model.CapabilityState
 	// SuppliedIndexes are the already-built indexes this run was handed --
 	// today the `--scip-index` path. The coordinator records each one against
 	// every generation it publishes, whether or not the path resolved, because
@@ -215,12 +194,6 @@ type SuppliedIndex struct {
 	Path       string
 	ProviderID string
 	ScopeKey   string
-}
-
-// Pending is the deferred work outstanding (Section 11.6): the units the
-// background queue holds or is building.
-type Pending struct {
-	Units int
 }
 
 // Coordinator owns one workspace's indexing. Index, Refresh and Status are
@@ -250,8 +223,6 @@ type Coordinator struct {
 	// the workspace lock the caller holds.
 	run sync.Mutex
 
-	// late owns the deferred dependence units of Section 11.6.
-	late *lateSealer
 	// watch is what this coordinator's own reconciliation loop knows about
 	// watch coverage; Status projects it.
 	watch watchState
@@ -303,7 +274,6 @@ func New(o Options) (*Coordinator, error) {
 		return nil, err
 	}
 	c.appliers = appliers
-	c.late = newLateSealer(c)
 	return c, nil
 }
 
@@ -324,20 +294,16 @@ func (c *Coordinator) newRun(kind ledger.Kind) *ledger.Run {
 // The stages a run records. They are the coordinator's own phases, named once
 // here so the ledger, the log line and every reader spell them identically.
 const (
-	stageCapture       = "capture"
-	stageWalk          = "walk"
-	stagePlan          = "plan"
-	stageAttachReused  = "attach_reused"
-	stageAttachCarried = "attach_carried"
-	stageBuild         = "build"
-	stageCoverage      = "coverage"
-	stageActivation    = "activation"
-	stageRetention     = "retention"
-	stageCollection    = "collection"
-	stageReclaim       = "reclaim"
-	// stageAbandonment is the marker a deferred run writes when its failed
-	// publication abandoned the units it popped (markAbandoned).
-	stageAbandonment = "abandonment"
+	stageCapture      = "capture"
+	stageWalk         = "walk"
+	stagePlan         = "plan"
+	stageAttachReused = "attach_reused"
+	stageBuild        = "build"
+	stageCoverage     = "coverage"
+	stageActivation   = "activation"
+	stageRetention    = "retention"
+	stageCollection   = "collection"
+	stageReclaim      = "reclaim"
 )
 
 // buildAppliers binds the delta appliers of the providers that can describe
@@ -356,13 +322,6 @@ func (c *Coordinator) buildAppliers() (map[string]delta.Applier, error) {
 			return nil, internalErr("the registered " + scip.ID + " provider cannot apply its own deltas")
 		}
 		out[scip.ID] = delta.NewSCIP(c.opts.Store, sp, c.limits, c.opts.Pool)
-	}
-	if p, ok := c.opts.Registry.Lookup(dependence.ProviderID); ok {
-		dp, ok := p.(*dependence.Provider)
-		if !ok {
-			return nil, internalErr("the registered " + dependence.ProviderID + " provider cannot apply its own deltas")
-		}
-		out[dependence.ProviderID] = delta.NewDependence(c.opts.Store, dp, c.limits, c.opts.Pool)
 	}
 	if p, ok := c.opts.Registry.Lookup(link.ProviderID); ok {
 		lp, ok := p.(*link.Provider)
@@ -429,18 +388,10 @@ func (c *Coordinator) hold(ctx context.Context, intent HoldIntent) (*snapshot.Wo
 // spelling in the process.
 func (c *Coordinator) Repository() model.RepositoryID { return c.repo }
 
-// Close stops the background deferred work. It does not release the workspace
-// lock, the store or the providers: those belong to the composition root,
-// which closes them in reverse after this returns.
-func (c *Coordinator) Close() error {
-	c.late.close()
-	return nil
-}
-
 // Index builds and publishes one generation over a fresh capture.
 //
 // Full plans every unit from scratch: no previous generation is consulted, so
-// nothing is reused or carried. Rebuild implies Full here; replacing the cache
+// nothing is reused. Rebuild implies Full here; replacing the cache
 // directory itself is the composition root's, because a coordinator that
 // deleted the store it was handed would be destroying state its caller still
 // owns.
@@ -771,26 +722,6 @@ func (c *Coordinator) ref(ctx context.Context) (string, error) {
 	return head, nil
 }
 
-// carriedPage adapts sqlite.Store.CarriedUnits to the planner's page fetcher.
-// The limit is passed through verbatim: the planner ends its fold on a page
-// shorter than the one it asked for, so capping it here would truncate the
-// fold silently and every scope past the first page would read as never
-// carried.
-func (c *Coordinator) carriedPage(gen model.GenerationID) func(context.Context, string, string, int) ([]plan.Carried, error) {
-	return func(ctx context.Context, afterProviderID, afterScopeKey string, limit int) ([]plan.Carried, error) {
-		page, err := c.opts.Store.CarriedUnits(ctx, gen, afterProviderID, afterScopeKey, limit)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]plan.Carried, 0, len(page))
-		for _, cu := range page {
-			out = append(out, plan.Carried{Unit: cu.Unit, ProviderID: cu.ProviderID, ScopeKey: cu.ScopeKey,
-				DistanceGenerations: cu.Carry.DistanceGenerations, DistanceFiles: cu.Carry.DistanceFiles})
-		}
-		return out, nil
-	}
-}
-
 // enablement is what Registry.Select asks about each provider. A provider the
 // configuration does not name is enabled, which is what a required base
 // provider is. The linking provider has no key of its own: it reads only what
@@ -802,8 +733,6 @@ func (c *Coordinator) enablement(providerID string) config.Enablement {
 	switch providerID {
 	case scip.ID:
 		return p.SCIP.Enabled
-	case dependence.ProviderID:
-		return p.Dependence.Enabled
 	case tslang.ProviderID, link.ProviderID:
 		if !p.TreeSitter.Enabled {
 			return config.Disabled
@@ -846,30 +775,6 @@ func disabledProviders(cfg config.Config) []string {
 	}
 	if p.LSP.Enabled == config.Disabled {
 		out = append(out, lspOverlayID)
-	}
-	if p.Dependence.Enabled == config.Disabled {
-		out = append(out, dependence.ProviderID)
-	}
-	return out
-}
-
-// composedStates are Options.States without the rows of a provider the
-// configuration disabled. The composition root records a capability row for a
-// provider it could not construct, and a provider that is off is one it does
-// not even try to construct; that row is the same misreading the selection no
-// longer produces, so it is dropped at the one place both capability reports
-// read those rows from.
-func enabledComposedStates(cfg config.Config, states []model.CapabilityState) []model.CapabilityState {
-	disabled := disabledProviders(cfg)
-	if len(disabled) == 0 {
-		return states
-	}
-	out := make([]model.CapabilityState, 0, len(states))
-	for _, st := range states {
-		if slices.Contains(disabled, st.ProviderID) {
-			continue
-		}
-		out = append(out, st)
 	}
 	return out
 }

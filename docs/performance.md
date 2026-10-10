@@ -31,7 +31,7 @@ Every measurement in Section 3 was taken on one host, in one configuration:
 | Build | release build, `go build -trimpath`; **uninstrumented** — no `-race`, no coverage instrumentation |
 | Cache state | cold workspace per row: a freshly generated corpus and a fresh data directory; the module cache and the managed tool store are warm and are never written during a row |
 | Managed toolchain | `[tools] offline = true` — every fetch is a typed refusal without opening a socket |
-| Providers enabled | Tree-sitter structural baseline only. The SCIP, LSP and dependence providers are **off** for every row |
+| Providers enabled | Tree-sitter structural baseline only. The SCIP and LSP providers are **off** for every row |
 | Grammar versions | the Tree-sitter grammar module set pinned in `THIRD_PARTY_LICENSES.md` and `docs/providers-treesitter.md` |
 
 **Uninstrumented release builds are the only valid source of latency and RSS

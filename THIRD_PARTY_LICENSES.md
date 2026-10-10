@@ -77,7 +77,6 @@ the two the bytes come from.
 | `ty` | 0.0.81 | MIT | upstream | https://github.com/astral-sh/ty |
 | `clangd` | 22.1.6 | Apache-2.0 WITH LLVM-exception | upstream | https://github.com/clangd/clangd |
 | `jdtls` (Eclipse JDT Language Server) | 1.61.0 | EPL-2.0 | upstream | https://download.eclipse.org/jdtls/milestones/1.61.0/ |
-| `joern` (backend of the `dependence` provider) | 4.0.627 | Apache-2.0 | upstream | https://github.com/joernio/joern |
 
 The npm payloads are produced with `npm ci --omit=dev --omit=optional
 --ignore-scripts`, so each carries its resolved production dependency tree and
