@@ -36,10 +36,11 @@ func TestMain(m *testing.M) {
 // linkCases is one source per grammar. Each holds one indirect site, a call
 // through a value that names no declaration (a function value, a function
 // pointer, a call through an interface parameter with one implementation),
-// and one ambiguous site, a call two or more declarations of the unit can
-// answer (a receiver whose type flows from two constructions, an interface
-// or base method with two overrides, a function pointer two address-taken
-// functions of its signature can hold).
+// and one several-target site: a receiver whose type flows from two
+// constructions (two `calls`, one per class's method, each with set size 2),
+// a call through an interface or base type (one `calls`, to the method the
+// type declares, virtual), or a function pointer two address-taken functions
+// of its signature can hold (two `calls`, exact, set size 2).
 var linkCases = []struct {
 	name string
 	// anchor is the language reference the indirect and ambiguous answers
@@ -48,9 +49,11 @@ var linkCases = []struct {
 	files  map[string]string
 	// indirect is the indirect site's caller and the declaration it reaches.
 	indirect [2]string
-	// ambiguous is the ambiguous site's caller and the name every candidate
-	// carries.
-	ambiguous [2]string
+	// several is the several-target site's caller and the name every target
+	// carries; targets how many `calls` it publishes, and dispatch theirs.
+	several  [2]string
+	targets  int
+	dispatch model.Dispatch
 }{
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
@@ -74,7 +77,7 @@ func indirect() int {
 	var f func(int) int = seven
 	return f(1)
 }
-`}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "Area"}},
+`}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "Area"}, targets: 1, dispatch: model.DispatchVirtual},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "java", anchor: `Java Language Specification §15.12.4.4 (Locate Method to Invoke), §9.8 (Functional Interfaces)`, files: map[string]string{"Calls.java": `interface Shape { int area(); }
@@ -86,7 +89,7 @@ class Calls {
   int ambiguous(Shape s) { return s.area(); }
   int indirect(Op op) { return op.run(1); }
 }
-`}, indirect: [2]string{"indirect", "run"}, ambiguous: [2]string{"ambiguous", "area"}},
+`}, indirect: [2]string{"indirect", "run"}, several: [2]string{"ambiguous", "area"}, targets: 1, dispatch: model.DispatchVirtual},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "javascript", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.js": `class Square { area() { return 4; } }
@@ -101,7 +104,7 @@ function indirect() {
   const f = seven;
   return f(1);
 }
-`}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+`}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "area"}, targets: 2, dispatch: model.DispatchExact},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "typescript", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.ts": `class Square { area(): number { return 4; } }
@@ -116,7 +119,7 @@ function indirect(): number {
   const f = seven;
   return f(1);
 }
-`}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+`}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "area"}, targets: 2, dispatch: model.DispatchExact},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "tsx", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.tsx": `class Square { area(): number { return 4; } }
@@ -131,7 +134,7 @@ function indirect(): number {
   const f = seven;
   return f(1);
 }
-`}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+`}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "area"}, targets: 2, dispatch: model.DispatchExact},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "python", anchor: `The Python Language Reference §6.3.4 (Calls), §3.3 (attribute lookup on a class)`, files: map[string]string{"calls.py": `class Square:
@@ -158,7 +161,7 @@ def ambiguous(flag):
 def indirect():
     f = seven
     return f(1)
-`}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+`}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "area"}, targets: 2, dispatch: model.DispatchExact},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "rust", anchor: `The Rust Reference, "Call expressions" (function pointer types), "Method-call expressions", "Trait objects"`, files: map[string]string{
@@ -191,7 +194,7 @@ pub fn indirect() -> i32 {
     let f: fn(i32) -> i32 = seven;
     f(1)
 }
-`}, indirect: [2]string{"indirect", "seven"}, ambiguous: [2]string{"ambiguous", "area"}},
+`}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "area"}, targets: 1, dispatch: model.DispatchVirtual},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "c", anchor: `ISO C §6.5.2.2 (Function calls through a pointer-to-function), §6.2.2 (Linkages of identifiers)`, files: map[string]string{"calls.c": `static int seven(int n) { return n + 7; }
@@ -208,7 +211,7 @@ int indirect(void) {
   long (*f)(long) = wide;
   return (int)f(1);
 }
-`}, indirect: [2]string{"indirect", "wide"}, ambiguous: [2]string{"ambiguous", ""}},
+`}, indirect: [2]string{"indirect", "wide"}, several: [2]string{"ambiguous", ""}, targets: 2, dispatch: model.DispatchExact},
 	// Derived twice from the source and the anchor, the second time blind (the source,
 	// the anchor and the binding rules alone); the two agree on both sites.
 	{name: "cpp", anchor: `ISO C++ [expr.call], [class.virtual]`, files: map[string]string{"calls.cpp": `struct Shape { virtual int area() = 0; };
@@ -223,7 +226,7 @@ int indirect() {
   long (*f)(long) = wide;
   return (int)f(1);
 }
-`}, indirect: [2]string{"indirect", "wide"}, ambiguous: [2]string{"ambiguous", "area"}},
+`}, indirect: [2]string{"indirect", "wide"}, several: [2]string{"ambiguous", "area"}, targets: 1, dispatch: model.DispatchVirtual},
 }
 
 // TestCallsArriveForEveryGrammar runs the real structural provider over one
@@ -231,28 +234,40 @@ int indirect() {
 // plan gives that source, and asserts what it published.
 //
 // Failure modes: `calls` missing for a language whose worker tables and
-// resolver both exist; an ambiguous site published as a guess (a direct edge
-// to one candidate) or with a candidate dropped; a relation published with
-// an endpoint the unit has no node fact for, which a generation refuses; a
-// `calls` row claiming fresh coverage it does not have.
+// resolver both exist; a call through a declared type published to every
+// override or to a stand-in node instead of the one method the type
+// declares; a several-target site published without its set size or with a
+// target dropped; a relation published with an endpoint the unit has no node
+// fact for, which a generation refuses; a capability row claiming fresh
+// coverage it does not have.
 //
-// Mutation: publish a site's first binding as a direct `calls` edge and skip
-// the rest (publish.go, filePublication.site) -> the ambiguous site has no
-// callee node with its candidate count, and every case fails. Second
-// mutation: skip the target occurrence nodes in joinTargets -> every case
-// fails the endpoint check.
-// Third mutation: publish a single binding into the ambiguous family (a
-// minted callee and one `may_refer_to`) -> no indirect site has its direct
-// `calls` edge, and every case fails.
+// Mutation: publish a site's first binding alone (publish.go) -> the
+// several-target sites of JavaScript, TypeScript, TSX, Python and C publish
+// one target. Second mutation: skip the target occurrence nodes -> every case
+// fails the endpoint check. Third mutation: walk a declared type's overrides
+// at publication -> the Go, Java, Rust and C++ sites publish two targets.
 func TestCallsArriveForEveryGrammar(t *testing.T) {
 	structural := newStructural(t)
 	for _, tc := range linkCases {
 		t.Run(tc.name, func(t *testing.T) {
 			l := linkSources(t, structural, tc.files)
-			if !l.out.reaches(tc.indirect[0], tc.indirect[1]) {
-				t.Errorf("the indirect site in %s is not bound to %s alone (%s)", tc.indirect[0], tc.indirect[1], tc.anchor)
+			if got := l.out.calls(tc.indirect[0], tc.indirect[1]); len(got) != 1 {
+				t.Errorf("the indirect site in %s publishes %d calls to %s, want one (%s)", tc.indirect[0], len(got), tc.indirect[1], tc.anchor)
 			}
-			checkAmbiguous(t, l.out, tc.ambiguous[0], tc.ambiguous[1])
+			got := l.out.calls(tc.several[0], tc.several[1])
+			if len(got) != tc.targets {
+				t.Fatalf("the several-target site in %s publishes %d calls, want %d (%s)", tc.several[0], len(got), tc.targets, tc.anchor)
+			}
+			for _, e := range got {
+				want := int64(0)
+				if tc.targets > 1 {
+					want = int64(tc.targets)
+				}
+				if e.Dispatch != tc.dispatch || e.SetSize != want {
+					t.Errorf("a call of the several-target site in %s carries dispatch %q set size %d, want %q %d",
+						tc.several[0], e.Dispatch, e.SetSize, tc.dispatch, want)
+				}
+			}
 		})
 	}
 }
@@ -262,6 +277,8 @@ type linked struct {
 	h     *providertest.Harness
 	files map[string]string
 	out   *capture
+	// calls is the unit's `calls` capability row.
+	calls model.CapabilityState
 }
 
 // linkSources runs the real structural provider over every source file of
@@ -332,7 +349,13 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	}
 	checkCapability(t, result, scope)
 	checkEndpoints(t, out)
-	return linked{h: h, files: files, out: out}
+	l := linked{h: h, files: files, out: out}
+	for _, c := range result.Capabilities {
+		if c.Capability == string(model.RelCalls) {
+			l.calls = c
+		}
+	}
+	return l
 }
 
 // newStructural is the structural provider with this binary as its worker.
@@ -365,22 +388,40 @@ func newStructural(t *testing.T) *treesitter.Provider {
 	return p
 }
 
-// checkCapability asserts the one `calls` row at the unit's scope is fresh:
-// every member of a clean source has its table whole.
+// checkCapability asserts every capability row the linking unit reports is
+// at the unit's scope and fresh (every member of a clean source has its
+// table whole; an open site is disclosed by the counts, never missing), and
+// that the `calls` row is among them with site counts that add up:
+// sites = bound + open + computed + external.
 func checkCapability(t *testing.T, r model.ProviderResult, scope string) {
 	t.Helper()
-	if len(r.Capabilities) != 1 {
-		t.Fatalf("the linking unit reported %d capability rows, want one", len(r.Capabilities))
+	var calls *model.CapabilityState
+	for i, c := range r.Capabilities {
+		if c.Scope != scope || c.State != model.CapabilityFresh {
+			t.Fatalf("the linking unit reported %s %s at %q, want fresh at %q (details %v)", c.Capability, c.State, c.Scope, scope, c.Details)
+		}
+		if c.Capability == string(model.RelCalls) {
+			calls = &r.Capabilities[i]
+		}
 	}
-	c := r.Capabilities[0]
-	if c.Capability != string(model.RelCalls) || c.Scope != scope || c.State != model.CapabilityFresh {
-		t.Fatalf("the linking unit reported %s %s at %q, want calls fresh at %q (details %v)", c.Capability, c.State, c.Scope, scope, c.Details)
+	if calls == nil {
+		t.Fatalf("the linking unit reported no calls row among %d rows", len(r.Capabilities))
+	}
+	count := func(k string) int64 {
+		v, err := strconv.ParseInt(calls.Details[k], 10, 64)
+		if err != nil {
+			t.Fatalf("the calls row has no count %s (details %v)", k, calls.Details)
+		}
+		return v
+	}
+	if sites, sum := count("sites"), count("bound_sites")+count("open_sites")+count("computed_sites")+count("external_sites"); sites != sum {
+		t.Fatalf("the calls row counts %d sites and %d bound, open, computed and external (details %v)", sites, sum, calls.Details)
 	}
 }
 
 // checkEndpoints asserts every relation's endpoints are nodes this unit
-// published: the occurrences of the structural nodes, and the ambiguous
-// callees it minted.
+// published: the occurrences of the structural nodes, the open sites and
+// external nodes it minted.
 func checkEndpoints(t *testing.T, out *capture) {
 	t.Helper()
 	if len(out.rels) == 0 {
@@ -392,55 +433,6 @@ func checkEndpoints(t *testing.T, out *capture) {
 				t.Fatalf("a %s relation names node %s, which the unit published no fact for", r.Relation.Kind, id)
 			}
 		}
-	}
-}
-
-// checkAmbiguous asserts the ambiguous site of caller publishes into the
-// ambiguous family: a `calls` edge to a callee node carrying the candidate
-// count, and one `may_refer_to` edge at the same site to each of that many
-// distinct candidates, every one named name (any name when name is empty).
-func checkAmbiguous(t *testing.T, out *capture, caller, name string) {
-	t.Helper()
-	found := false
-	for _, r := range out.rels {
-		from := out.nodes[r.Relation.From]
-		if r.Relation.Kind != model.RelCalls || from.Name != caller {
-			continue
-		}
-		for _, e := range r.Evidence {
-			if e.Detail != link.DetailAmbiguous {
-				continue
-			}
-			found = true
-			var meta struct {
-				Resolution string `json:"resolution"`
-				Candidates int    `json:"candidates"`
-			}
-			if err := json.Unmarshal(out.nodes[r.Relation.To].Metadata, &meta); err != nil || meta.Resolution != "ambiguous" || meta.Candidates < 2 {
-				t.Fatalf("the ambiguous callee of %s carries metadata %s, want resolution ambiguous with two or more candidates",
-					caller, out.nodes[r.Relation.To].Metadata)
-			}
-			candidates := map[model.NodeID]bool{}
-			for _, m := range out.rels {
-				if m.Relation.Kind != model.RelMayReferTo || m.Relation.From != r.Relation.From {
-					continue
-				}
-				for _, me := range m.Evidence {
-					if me.Detail == link.DetailAmbiguousTarget && me.NativeKey == e.NativeKey {
-						candidates[m.Relation.To] = true
-						if got := out.nodes[m.Relation.To].Name; name != "" && got != name {
-							t.Fatalf("a candidate of the ambiguous site in %s is %q, want %q", caller, got, name)
-						}
-					}
-				}
-			}
-			if len(candidates) != meta.Candidates {
-				t.Fatalf("the ambiguous site in %s counts %d candidates and publishes %d", caller, meta.Candidates, len(candidates))
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("%s has no ambiguous call site", caller)
 	}
 }
 
@@ -466,56 +458,82 @@ func (c *capture) PutRelations(ctx context.Context, facts []model.RelationFact) 
 	return c.UnitOutput.PutRelations(ctx, facts)
 }
 
-// reaches reports whether a site of caller is bound to the one declaration
-// named callee: a direct `calls` edge to it. A `may_refer_to` edge, or a
-// `calls` edge to an ambiguous callee, is one candidate among several and
-// never a binding the site makes alone.
-func (c *capture) reaches(caller, callee string) bool {
+// calls is the evidence of every `calls` occurrence from a declaration
+// named caller to a declaration named callee (any name when callee is
+// empty), never to an open site or an external node.
+func (c *capture) calls(caller, callee string) []model.Evidence {
+	var out []model.Evidence
 	for _, r := range c.rels {
-		if r.Relation.Kind != model.RelCalls || c.nodes[r.Relation.From].Name != caller || c.nodes[r.Relation.To].Name != callee {
+		to := c.nodes[r.Relation.To]
+		if r.Relation.Kind != model.RelCalls || c.nodes[r.Relation.From].Name != caller || len(to.Metadata) != 0 {
 			continue
 		}
-		for _, e := range r.Evidence {
-			if e.Detail != link.DetailAmbiguous {
-				return true
-			}
+		if callee != "" && to.Name != callee {
+			continue
 		}
+		out = append(out, r.Evidence...)
 	}
-	return false
+	return out
+}
+
+// nodeResolution reads a node's metadata `resolution`, empty for a
+// declaration.
+func nodeResolution(n model.Node) model.NameResolution {
+	var m struct {
+		Resolution model.NameResolution `json:"resolution"`
+	}
+	if len(n.Metadata) == 0 || json.Unmarshal(n.Metadata, &m) != nil {
+		return ""
+	}
+	return m.Resolution
 }
 
 // golden is one source-based case: files run through the real structural
-// provider and the linker, and the complete set of bindings the language
-// defines for its call sites.
+// provider and the linker, and the complete set of facts the language
+// defines for them.
 //
-// A binding is written "<site> <callee> -> <target> <name>": site is the label
-// of the line the call's callee token is on, callee that token as written,
-// target the label of the line the bound declaration's name is on, and name
-// that declaration's name. A line is labelled by a trailing comment `// @x`
-// or `# @x`. A line with no label is written "<path>:<line>", so a binding to
-// a declaration the case did not expect still shows where it went.
+// want is every `calls` occurrence to a declaration or an external method,
+// written "<site> <callee> -> <target> <name> <dispatch>", with " set=<n>"
+// appended when the site has n >= 2 targets: site is the label of the line
+// the call's callee token is on, callee that token as written, target the
+// label of the line the bound declaration's name is on and name that
+// declaration's name, or "external <qualified>" for an external method's
+// node; dispatch is the occurrence's `virtual` or `exact`. A line is labelled
+// by a trailing comment `// @x` or `# @x`; a line with no label is written
+// "<path>:<line>", so a binding to a declaration the case did not expect
+// still shows where it went.
 //
-// What the language defines, under decision 2's techniques and nothing
-// beyond them (no points-to, no reachability):
-//   - a call of something the case does not declare (a library function, a
-//     builtin, a type outside the case) binds nothing;
-//   - a call the language dispatches at run time binds the method its
-//     receiver's declared or inferred type selects and every override in a
-//     subtype the case declares; one it binds statically (static, private,
-//     `super`, non-virtual, qualified) binds the one declaration it selects;
-//   - a declaration without a body (abstract, interface, prototype) is bound
-//     only when the case has no body the call could run instead;
+// sites, when set, is every open-site node, written "<site> <callee> open
+// <reason> <shape> <arguments>"; facts, when set, every other relation:
+// "<from> imports <to>" (file paths; "<from> imports open <fragments>" for
+// an open import site, the fragments joined by "|"), "<label> <name>
+// extends|implements|overrides <label> <name>" (or "external <qualified>"),
+// "<label> <name> flows <label> <name>" for a `data_flows_to` from an
+// argument's variable to a parameter, each with " set=<n>" when it carries a
+// set size. counts, when set, are details the `calls` row must carry.
+//
+// What the language defines, under ADR-0015 and decision 2's techniques and
+// nothing beyond them (no points-to, no reachability):
+//   - a call on a receiver of a declared or annotated type calls the method
+//     that type declares or inherits, once, `virtual` unless the language
+//     says no override can run; its overrides are found at query time;
+//   - `super`, a qualified call, a constructed object, a final, static,
+//     private or non-virtual method and a function are `exact`;
+//   - a receiver whose classes are known only by value flow calls each
+//     class's method, each with the set size;
 //   - a call through a function value binds, in the static languages, every
 //     function whose value the case takes and whose type is the called
 //     value's declared type, and in JavaScript and Python the functions that
-//     reach the value through assignments, parameters, returns and fields;
+//     reach the value through assignments, parameters, returns and fields,
+//     each `exact` with the set size when there are several;
 //   - a construction binds the constructor that runs, its own or the one it
-//     inherits, and the class itself when none in its hierarchy is declared.
+//     inherits, and the class itself when none in its hierarchy is declared;
+//   - a call no analysis binds is an open site, and a call of something
+//     outside the project is external, named by no `calls` unless its
+//     receiver's type is an external type.
 //
-// One target is a direct `calls` edge; two or more are the ambiguous family,
-// a `calls` edge to a minted callee counting them and one `may_refer_to` per
-// target. Either way the published set must equal want exactly: a missing
-// binding is a lost edge, an extra one a wrong edge.
+// Each published set must equal its list exactly: a missing fact is a lost
+// edge, an extra one a wrong edge.
 type golden struct {
 	name string
 	// anchor is the language reference, by standard title and section, the
@@ -523,6 +541,9 @@ type golden struct {
 	anchor string
 	files  map[string]string
 	want   []string
+	sites  []string
+	facts  []string
+	counts map[string]string
 	// fails names the wrong answer the case catches and the change to the
 	// linker that would produce it.
 	fails string
@@ -535,11 +556,25 @@ func runGoldens(t *testing.T, cases []golden) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			l := linkSources(t, structural, c.files)
-			got := l.bindings(t)
-			want := slices.Clone(c.want)
-			slices.Sort(want)
-			if !slices.Equal(got, want) {
-				t.Fatalf("%s\ngot  %q\nwant %q\n(fails under: %s)", c.anchor, got, want, c.fails)
+			check := func(what string, got, want []string) {
+				t.Helper()
+				want = slices.Clone(want)
+				slices.Sort(want)
+				if !slices.Equal(got, want) {
+					t.Fatalf("%s: %s\ngot  %q\nwant %q\n(fails under: %s)", what, c.anchor, got, want, c.fails)
+				}
+			}
+			check("calls", l.bindings(t), c.want)
+			if c.sites != nil {
+				check("open sites", l.openSites(t), c.sites)
+			}
+			if c.facts != nil {
+				check("facts", l.facts(t), c.facts)
+			}
+			for k, v := range c.counts {
+				if got := l.calls.Details[k]; got != v {
+					t.Fatalf("the calls row's %s is %q, want %q (details %v; fails under: %s)", k, got, v, l.calls.Details, c.fails)
+				}
 			}
 		})
 	}
@@ -548,52 +583,110 @@ func runGoldens(t *testing.T, cases []golden) {
 // labelPattern is a line's trailing label comment.
 var labelPattern = regexp.MustCompile(`(?://|#)\s*@(\w+)\s*$`)
 
-// bindings is every (site, target) the unit published, in the golden
-// spelling, sorted. It checks the ambiguous family's shape on the way: a
-// site's ambiguous callee counts exactly the candidates published for it.
-func (l linked) bindings(t *testing.T) []string {
+// paths is each case file's path by its FileID.
+func (l linked) paths(t *testing.T) map[model.FileID]string {
 	t.Helper()
 	paths := map[model.FileID]string{}
 	for p := range l.files {
 		paths[l.h.File(t, p).ID] = p
 	}
+	return paths
+}
+
+// setSuffix is " set=<n>" for an occurrence carrying a set size.
+func setSuffix(e model.Evidence) string {
+	if e.SetSize == 0 {
+		return ""
+	}
+	return " set=" + strconv.FormatInt(e.SetSize, 10)
+}
+
+// endpoint spells a relation's endpoint: "external <qualified>" for an
+// external node, else "<label> <name>" (target).
+func (l linked) endpoint(paths map[model.FileID]string, n model.Node) string {
+	if nodeResolution(n) == model.ResolutionExternal {
+		return "external " + n.QualifiedName
+	}
+	return l.target(paths, n)
+}
+
+// bindings is every `calls` occurrence to a declaration or an external node,
+// in the golden spelling, sorted and each once.
+func (l linked) bindings(t *testing.T) []string {
+	t.Helper()
+	paths := l.paths(t)
 	var out []string
-	counted := map[string]int{}
-	candidates := map[string]map[model.NodeID]bool{}
 	for _, r := range l.out.rels {
+		if r.Relation.Kind != model.RelCalls {
+			continue
+		}
+		to := l.out.nodes[r.Relation.To]
+		if res := nodeResolution(to); res != "" && res != model.ResolutionExternal {
+			continue
+		}
 		for _, e := range r.Evidence {
-			switch {
-			case r.Relation.Kind == model.RelCalls && e.Detail == link.DetailAmbiguous:
-				var meta struct {
-					Candidates int `json:"candidates"`
-				}
-				if err := json.Unmarshal(l.out.nodes[r.Relation.To].Metadata, &meta); err != nil {
-					t.Fatalf("ambiguous callee metadata: %v", err)
-				}
-				counted[e.NativeKey] = meta.Candidates
-				continue
-			case r.Relation.Kind == model.RelMayReferTo && e.Detail == link.DetailAmbiguousTarget:
-				if candidates[e.NativeKey] == nil {
-					candidates[e.NativeKey] = map[model.NodeID]bool{}
-				}
-				candidates[e.NativeKey][r.Relation.To] = true
-			case r.Relation.Kind != model.RelCalls:
-				continue
-			}
-			b := l.site(t, e.NativeKey) + " -> " + l.target(paths, l.out.nodes[r.Relation.To])
+			b := l.site(t, e.NativeKey) + " -> " + l.endpoint(paths, to) + " " + string(e.Dispatch) + setSuffix(e)
 			if !slices.Contains(out, b) {
 				out = append(out, b)
 			}
 		}
 	}
-	for key, n := range counted {
-		if len(candidates[key]) != n || n < 2 {
-			t.Fatalf("the ambiguous site %s counts %d candidates and publishes %d", key, n, len(candidates[key]))
+	slices.Sort(out)
+	return out
+}
+
+// openSites is every open-site node, in the golden spelling, sorted.
+func (l linked) openSites(t *testing.T) []string {
+	t.Helper()
+	paths := l.paths(t)
+	var out []string
+	for _, n := range l.out.nodes {
+		var m model.OpenSiteMetadata
+		if nodeResolution(n) != model.ResolutionUnresolved || json.Unmarshal(n.Metadata, &m) != nil || !m.Shape.Valid() {
+			continue
+		}
+		if err := m.Validate(); err != nil {
+			t.Fatalf("open site %s: %v", n.ID, err)
+		}
+		path := paths[n.FileID]
+		label := path + ":?"
+		if n.Range != nil {
+			label = labelAt(path, l.files[path], int(n.Range.Start.Byte))
+		}
+		out = append(out, label+" "+n.Name+" open "+string(m.Reason)+" "+string(m.Shape)+" "+strconv.FormatInt(m.Arguments, 10))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// facts is every relation other than `calls`, in the golden spelling,
+// sorted and each once.
+func (l linked) facts(t *testing.T) []string {
+	t.Helper()
+	paths := l.paths(t)
+	var out []string
+	add := func(f string) {
+		if !slices.Contains(out, f) {
+			out = append(out, f)
 		}
 	}
-	for key := range candidates {
-		if _, ok := counted[key]; !ok {
-			t.Fatalf("the site %s publishes candidates without an ambiguous callee", key)
+	for _, r := range l.out.rels {
+		from, to := l.out.nodes[r.Relation.From], l.out.nodes[r.Relation.To]
+		for _, e := range r.Evidence {
+			switch r.Relation.Kind {
+			case model.RelCalls:
+			case model.RelImports:
+				var m model.OpenImportSiteMetadata
+				if nodeResolution(to) == model.ResolutionUnresolved && json.Unmarshal(to.Metadata, &m) == nil {
+					add(paths[from.FileID] + " imports open " + strings.Join(m.Fragments, "|"))
+					continue
+				}
+				add(paths[from.FileID] + " imports " + paths[to.FileID] + setSuffix(e))
+			case model.RelDataFlowsTo:
+				add(l.target(paths, from) + " flows " + l.target(paths, to) + setSuffix(e))
+			default:
+				add(l.endpoint(paths, from) + " " + string(r.Relation.Kind) + " " + l.endpoint(paths, to) + setSuffix(e))
+			}
 		}
 	}
 	slices.Sort(out)

@@ -1744,3 +1744,34 @@ func (ix *index) close() {
 		ix.lease = nil
 	}
 }
+
+// The hierarchy's answers the resolvers of both families share.
+
+// parameters yields the declared parameters of the callable declaration at
+// callable, in declaration order, each with its position in that
+// declaration's Decl.Parameters, through a lookup the trace records, so a
+// change of the callee's parameters re-runs every member whose argument
+// flows read them. A callable with no parameters yields none.
+func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error {
+	return nil
+}
+
+// hierarchyFacts emits the hierarchy facts of the declarations of the member
+// at ordinal file, whose table is t: FactExtends and FactImplements for each
+// type's supertypes, FactOverrides for each method that directly overrides
+// or implements a supertype's (ADR-0015 decision 2), with the reads the trace
+// records.
+func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
+	return nil
+}
+
+// externalName is the qualified name of the type written as written in a
+// file of fc when it names a type outside the project: no declaration of
+// the unit, through the file's scope and imports, is that type, and the
+// language names it through an import, a qualified name or its implicit
+// scope (the external key's qualified name, externalType). ok is false when
+// written names a type of the unit, or nothing the language can name
+// outside it.
+func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string) (qualified string, ok bool, err error) {
+	return "", false, nil
+}

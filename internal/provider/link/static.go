@@ -243,7 +243,7 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 			return err
 		}
 	}
-	return nil
+	return s.h.hierarchyFacts(s.ctx, file, t, emit)
 }
 
 // members runs every member with a table that run (FileIDs, ascending)

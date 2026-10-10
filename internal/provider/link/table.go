@@ -43,6 +43,10 @@ type Table struct {
 	Reexports []wire.Reexport `json:"reexports,omitempty"`
 	// Unions are the type sets a wire.Type of kind TypeUnion names.
 	Unions [][]wire.Type `json:"unions,omitempty"`
+	// DynamicImports are the file's imports whose path is an expression
+	// that does not fold to a constant (wire.DynamicImport); one that folds
+	// is an ordinary entry of Imports.
+	DynamicImports []DynamicImport `json:"dynamic_imports,omitempty"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the
@@ -70,6 +74,20 @@ type Import struct {
 	// Rust `use` inside an inline module or a block is that scope's alone,
 	// and its relative path (`super::*`) starts there.
 	Scope int32 `json:"scope"`
+	// Range is the import statement, directive or call, the range of the
+	// evidence of each `imports` it resolves to.
+	Range model.SourceRange `json:"range"`
+}
+
+// DynamicImport is one import whose path is an expression that does not
+// fold to a constant (`require("./x/" + name)`, `import(expr)`,
+// `importlib.import_module(expr)`, `__import__(expr)`, `#include MACRO`),
+// with the path's literal fragments in source order, none when it has none.
+// Caller is the declaration it is written in, -1 the module.
+type DynamicImport struct {
+	Caller    int32             `json:"caller"`
+	Range     model.SourceRange `json:"range"`
+	Fragments []string          `json:"fragments"`
 }
 
 // ImportAll is the Name of an import of every member of its Path: a Go dot
@@ -115,6 +133,33 @@ type Decl struct {
 	// function-like macro, which a call does.
 	Macro   bool      `json:"macro,omitempty"`
 	Returns wire.Type `json:"returns"`
+	// Override reports a method the language marks as overriding or
+	// implementing a supertype's (wire.Export.Override).
+	Override bool `json:"override,omitempty"`
+	// Alias is, for a C or C++ object-like macro whose replacement is one
+	// identifier, that identifier (wire.Export.Alias): a call of the macro's
+	// name calls what the identifier names where the macro is defined.
+	Alias string `json:"alias,omitempty"`
+	// Parameters are the callable's declared parameters, in declaration
+	// order (wire.Link.Parameters).
+	Parameters []Parameter `json:"parameters,omitempty"`
+}
+
+// Parameter is one declared parameter of a callable. Endpoint is the
+// parameter's variable node as the structural provider resolved it, keyed by
+// its callable's identity and its position (ADR-0014), so an argument's flow
+// into it survives an edit of the callee's body. Endpoint.Name is the
+// parameter's name as written, which a keyword argument names; Endpoint.Node
+// is empty when the structural provider minted no node for it (its
+// callable's analysis failed, or its key did not fit), and such a parameter
+// receives no flow.
+type Parameter struct {
+	Endpoint
+	// Index is the parameter's position: 0 an explicit receiver or self
+	// parameter, 1 the first declared parameter after it (wire.Parameter).
+	Index       uint32 `json:"index"`
+	Variadic    bool   `json:"variadic,omitempty"`
+	KeywordOnly bool   `json:"keyword_only,omitempty"`
 }
 
 // Visible reports that declaration cand can be named by a bare name in code
@@ -166,9 +211,28 @@ type Site struct {
 	// Args is its whole argument list (empty for a call of no argument);
 	// a site no wire.Site joined carries no argument facts.
 	Described bool `json:"described,omitempty"`
+	// Arguments has one entry per argument, in order, when the worker sent
+	// argument positions: Arguments[i] and Args[i] are the same argument.
+	Arguments []Argument `json:"arguments,omitempty"`
+	// Computed reports a call whose callee is an expression that names
+	// nothing (wire.Link.Computed): no call reference names it, Callee is
+	// the expression as written, and no analysis binds it.
+	Computed bool `json:"computed,omitempty"`
 	// Candidates are the declarations of this file the callee name can
 	// mean, the structural provider's own in-file targets.
 	Candidates []int32 `json:"candidates,omitempty"`
+}
+
+// Argument is one argument of a call site (wire.Argument): where it is,
+// the keyword it names, how it spreads, and the variable nodes of the named
+// variables it reads, each the structural provider's variable node, the
+// sources of its flow into the parameter it binds. A read whose variable has
+// no node is left out.
+type Argument struct {
+	Range   model.SourceRange `json:"range"`
+	Keyword string            `json:"keyword,omitempty"`
+	Spread  wire.Spread       `json:"spread,omitempty"`
+	Reads   []Endpoint        `json:"reads,omitempty"`
 }
 
 // Value is one value stored where a call can reach it without naming its

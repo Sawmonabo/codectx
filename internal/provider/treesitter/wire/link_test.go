@@ -15,10 +15,10 @@ import (
 // worker is retired as broken, the structural unit fails and the generation
 // fails with it.
 //
-// Mutation: count exports at 40 bytes instead of 39 in DecodeLink -> the
-// decode fails. After the exports' count, n minimal exports leave 39n bytes
-// plus 28 for the seven empty trailing lists' counts, and 40n exceeds that
-// once n is 29 or more, which is why the message carries more than that.
+// Mutation: count exports at 45 bytes instead of 44 in DecodeLink -> the
+// decode fails. After the exports' count, n minimal exports leave 44n bytes
+// plus 32 for the eight empty trailing lists' counts, and 45n exceeds that
+// once n is 33 or more, which is why the message carries more than that.
 func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 	var in Link
 	for i := range uint32(64) {

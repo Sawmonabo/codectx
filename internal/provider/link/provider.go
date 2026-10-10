@@ -78,6 +78,19 @@ const (
 	// DetailField: field-based resolution, a function written to the field
 	// the site calls through.
 	DetailField = "field"
+	// DetailImport: an `imports` from a file's module to the module of a
+	// file its import resolves to.
+	DetailImport = "import"
+	// DetailArgument: a `data_flows_to` from a variable an argument reads to
+	// the parameter the argument binds at a bound call site.
+	DetailArgument = "argument"
+	// DetailSupertype: an `extends`, `implements` or `overrides` the source
+	// declares: a written supertype, and a method of the same name and
+	// signature along the written supertypes.
+	DetailSupertype = "supertype"
+	// DetailMethodSet: a Go `implements` or `overrides` of an interface the
+	// type satisfies by its method set, which the source never writes.
+	DetailMethodSet = "method_set"
 	// DetailAmbiguous is the `calls` edge to an ambiguous site's callee
 	// node, and DetailAmbiguousTarget each of its `may_refer_to` edges,
 	// spelled as the structural provider spells its own.

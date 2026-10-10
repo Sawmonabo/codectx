@@ -35,9 +35,16 @@ type Link struct {
 	// callable. An argument at a bound call site flows to the parameter its
 	// position, keyword and spread match.
 	Parameters []Parameter
-	// DynamicImports are the file's imports whose path does not fold to a
-	// constant, each with the path's literal fragments.
+	// DynamicImports are the file's imports whose path is an expression:
+	// each with the path's literal fragments, or, when the expression folds
+	// to a constant, that path (DynamicImport.Constant).
 	DynamicImports []DynamicImport
+	// Computed are the file's calls whose callee is an expression that names
+	// nothing (`obj[k]()`, `f()()`, `(a || b)()`), which no call reference
+	// names: each a Site whose Name is the callee expression, Shape
+	// ShapeIndirect, with its Arguments. Only the ECMAScript family and
+	// Python send them.
+	Computed []Site
 }
 
 // Export describes one declaration of the file that a call may bind to, a
@@ -98,9 +105,21 @@ type Export struct {
 	Internal bool
 	// Returns is the type the callable returns: its declared result type,
 	// or the type the worker recovered from its return statements inside the
-	// file. TypeUnknown when neither says. For a Go struct field it is the
-	// field's declared type, reduced as a Go receiver is (`*T` is T).
+	// file. TypeUnknown when neither says. For a Go or Java field it is the
+	// field's declared type, reduced as a Go receiver is (`*T` is T) and, in
+	// Java, without its type arguments (`List<T>` is List).
 	Returns Type
+	// Override reports a method the language marks as overriding or
+	// implementing a supertype's: Java `@Override`, a C++ `override` or
+	// `final` virt-specifier, a TypeScript `override` modifier, a Python
+	// method decorated `typing.override` (`@override` imported from typing
+	// or typing_extensions, or written qualified), any method of a Rust
+	// `impl Trait for Type` block.
+	Override bool
+	// Alias is, for a C or C++ object-like macro whose replacement list is
+	// one identifier (`#define LOG log_impl`), that identifier; empty for
+	// every other declaration.
+	Alias string
 }
 
 // Supertype is one declared subtype relation of the file: Type extends,
@@ -162,6 +181,13 @@ type Argument struct {
 	// (`timeout` in `f(timeout=3)`); empty for a positional argument.
 	Keyword string
 	Spread  Spread
+	// Reads are the named variables the argument expression reads, each as
+	// the byte range of the identifier that declares it, spelled as
+	// Function.Vars spells a variable: a parameter or local of the calling
+	// callable or of a callable enclosing it. A literal, or an expression
+	// that reads no named variable, has none. They are the sources of the
+	// argument's flow into the parameter it binds.
+	Reads []Span
 }
 
 // Spread is how an argument expands into several parameters.
@@ -200,15 +226,19 @@ type Parameter struct {
 	KeywordOnly bool
 }
 
-// DynamicImport is one import whose path does not fold to a constant:
+// DynamicImport is one import whose path is an expression:
 // `require("./x/" + name)`, `import(expr)`, `importlib.import_module(expr)`,
-// `__import__(expr)`, `#include MACRO` with MACRO undefined in the file.
+// `__import__(expr)`, `#include MACRO`.
 type DynamicImport struct {
 	// At is the import expression or directive.
 	At Span
 	// Fragments are the path's literal parts, in source order; empty when
-	// the path has none.
+	// the path has none. When Constant, the one fragment is the whole path.
 	Fragments []string
+	// Constant reports a path that folds to a constant (`require("./x/" +
+	// "y")`, `import("./m")`, `#include NAME` with NAME defined in the file
+	// as a string or header name): an ordinary import of Fragments[0].
+	Constant bool
 }
 
 // Value is one value stored where a call can later reach it without naming
@@ -273,9 +303,11 @@ const (
 	// promoted, whose declared type (Export.Returns) types the value. A field
 	// of such a field is spelled "Owner.field.next", and so on, each step
 	// read on the type the step before it holds; Owner is two components
-	// when the first is an import (`pkg.T`). A bare name is a field of an
-	// unknown owner and types nothing. ECMAScript and
-	// Python send the bare field name.
+	// when the first is an import (`pkg.T`). Java spells a field read on a
+	// receiver of known type the same way ("Owner.field", Owner as written,
+	// a qualified name when written qualified); `this.f` is the enclosing
+	// class's field. A bare name is a field of an unknown owner and types
+	// nothing. ECMAScript and Python send the bare field name.
 	TypeField TypeKind = 6
 	// TypeFunction is the function or method Name, as written, taken as a
 	// value. Index is the receiver parameters the value takes ahead of the
@@ -307,17 +339,18 @@ type Type struct {
 //
 //	exports    n × (name start, end; receiver; signature; params; optional;
 //	                variadic, static, abstract, virtual, final, internal
-//	                flags; returns type)
+//	                flags; returns type; override flag; alias)
 //	supertypes n × (type; super)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
 //	                signature; args n × type; arguments n × (at start, end;
-//	                keyword; spread byte))
+//	                keyword; spread byte; reads n × (start, end)))
 //	values     n × (at start, end; field; type)
 //	reexports  n × (name; original; from)
 //	unions     n × (n × type)
 //	parameters n × (callable start, end; name start, end; index; variadic,
 //	                keyword-only flags)
-//	dynamic    n × (at start, end; fragments n × string)
+//	dynamic    n × (at start, end; fragments n × string; constant flag)
+//	computed   n × site, as in sites
 //	type       kind byte; name; index
 func AppendLink(dst []byte, l *Link) []byte {
 	e := encoder{b: dst}
@@ -335,6 +368,8 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.flag(x.Final)
 		e.flag(x.Internal)
 		e.typ(x.Returns)
+		e.flag(x.Override)
+		e.str(x.Alias)
 	}
 	e.u32(uint32(len(l.Supertypes)))
 	for _, s := range l.Supertypes {
@@ -342,22 +377,8 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.str(s.Super)
 	}
 	e.u32(uint32(len(l.Sites)))
-	for _, s := range l.Sites {
-		e.span(s.Name)
-		e.b = append(e.b, byte(s.Shape))
-		e.str(s.Qualifier)
-		e.typ(s.Receiver)
-		e.str(s.Signature)
-		e.u32(uint32(len(s.Args)))
-		for _, a := range s.Args {
-			e.typ(a)
-		}
-		e.u32(uint32(len(s.Arguments)))
-		for _, a := range s.Arguments {
-			e.span(a.At)
-			e.str(a.Keyword)
-			e.b = append(e.b, byte(a.Spread))
-		}
+	for i := range l.Sites {
+		e.site(&l.Sites[i])
 	}
 	e.u32(uint32(len(l.Values)))
 	for _, v := range l.Values {
@@ -393,8 +414,36 @@ func AppendLink(dst []byte, l *Link) []byte {
 		for _, f := range x.Fragments {
 			e.str(f)
 		}
+		e.flag(x.Constant)
+	}
+	e.u32(uint32(len(l.Computed)))
+	for i := range l.Computed {
+		e.site(&l.Computed[i])
 	}
 	return e.b
+}
+
+// site appends one site's encoding.
+func (e *encoder) site(s *Site) {
+	e.span(s.Name)
+	e.b = append(e.b, byte(s.Shape))
+	e.str(s.Qualifier)
+	e.typ(s.Receiver)
+	e.str(s.Signature)
+	e.u32(uint32(len(s.Args)))
+	for _, a := range s.Args {
+		e.typ(a)
+	}
+	e.u32(uint32(len(s.Arguments)))
+	for _, a := range s.Arguments {
+		e.span(a.At)
+		e.str(a.Keyword)
+		e.b = append(e.b, byte(a.Spread))
+		e.u32(uint32(len(a.Reads)))
+		for _, r := range a.Reads {
+			e.span(r)
+		}
+	}
 }
 
 // encoder appends the link encoding's primitives.
@@ -425,18 +474,19 @@ func DecodeLink(payload []byte) (Link, error) {
 	d := decoder{b: payload, malformed: ErrMalformedLink}
 	var l Link
 	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
-	// flags and a 9-byte type; a supertype two strings; a site 8 span, 1
-	// shape, 4 qualifier, 9 type, 4 signature, 4 args and 4 arguments; an
-	// argument 8 span, 4 keyword and 1 spread; a value 8 span, 4 field and 9
-	// type; a reexport three strings; a union its count; a parameter two 8
-	// spans, 4 index and 2 flags; a dynamic import 8 span and 4 fragments; a
-	// fragment its length.
-	l.Exports = make([]Export, 0, d.count(39))
+	// flags, a 9-byte type, 1 flag and 4 alias; a supertype two strings; a
+	// site 8 span, 1 shape, 4 qualifier, 9 type, 4 signature, 4 args and 4
+	// arguments; an argument 8 span, 4 keyword, 1 spread and 4 reads; a read
+	// 8 span; a value 8 span, 4 field and 9 type; a reexport three strings; a
+	// union its count; a parameter two 8 spans, 4 index and 2 flags; a
+	// dynamic import 8 span, 4 fragments and 1 flag; a fragment its length.
+	l.Exports = make([]Export, 0, d.count(44))
 	for range cap(l.Exports) {
 		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32(), Optional: d.u32()}
 		x.Variadic, x.Static, x.Abstract = d.flag(), d.flag(), d.flag()
 		x.Virtual, x.Final, x.Internal = d.flag(), d.flag(), d.flag()
 		x.Returns = d.typ()
+		x.Override, x.Alias = d.flag(), d.str()
 		l.Exports = append(l.Exports, x)
 	}
 	l.Supertypes = make([]Supertype, 0, d.count(8))
@@ -445,16 +495,7 @@ func DecodeLink(payload []byte) (Link, error) {
 	}
 	l.Sites = make([]Site, 0, d.count(34))
 	for range cap(l.Sites) {
-		s := Site{Name: d.span(), Shape: d.shape(), Qualifier: d.str(), Receiver: d.typ(), Signature: d.str()}
-		s.Args = make([]Type, 0, d.count(9))
-		for range cap(s.Args) {
-			s.Args = append(s.Args, d.typ())
-		}
-		s.Arguments = make([]Argument, 0, d.count(13))
-		for range cap(s.Arguments) {
-			s.Arguments = append(s.Arguments, Argument{At: d.span(), Keyword: d.str(), Spread: d.spread()})
-		}
-		l.Sites = append(l.Sites, s)
+		l.Sites = append(l.Sites, d.site())
 	}
 	l.Values = make([]Value, 0, d.count(21))
 	for range cap(l.Values) {
@@ -478,14 +519,19 @@ func DecodeLink(payload []byte) (Link, error) {
 		p.Variadic, p.KeywordOnly = d.flag(), d.flag()
 		l.Parameters = append(l.Parameters, p)
 	}
-	l.DynamicImports = make([]DynamicImport, 0, d.count(12))
+	l.DynamicImports = make([]DynamicImport, 0, d.count(13))
 	for range cap(l.DynamicImports) {
 		x := DynamicImport{At: d.span()}
 		x.Fragments = make([]string, 0, d.count(4))
 		for range cap(x.Fragments) {
 			x.Fragments = append(x.Fragments, d.str())
 		}
+		x.Constant = d.flag()
 		l.DynamicImports = append(l.DynamicImports, x)
+	}
+	l.Computed = make([]Site, 0, d.count(34))
+	for range cap(l.Computed) {
+		l.Computed = append(l.Computed, d.site())
 	}
 	if d.err == nil && len(d.b) != 0 {
 		d.fail(fmt.Sprintf("%d bytes past the message's end", len(d.b)))
@@ -497,6 +543,25 @@ func DecodeLink(payload []byte) (Link, error) {
 }
 
 func (d *decoder) span() Span { return Span{d.u32(), d.u32()} }
+
+// site decodes one site.
+func (d *decoder) site() Site {
+	s := Site{Name: d.span(), Shape: d.shape(), Qualifier: d.str(), Receiver: d.typ(), Signature: d.str()}
+	s.Args = make([]Type, 0, d.count(9))
+	for range cap(s.Args) {
+		s.Args = append(s.Args, d.typ())
+	}
+	s.Arguments = make([]Argument, 0, d.count(17))
+	for range cap(s.Arguments) {
+		a := Argument{At: d.span(), Keyword: d.str(), Spread: d.spread()}
+		a.Reads = make([]Span, 0, d.count(8))
+		for range cap(a.Reads) {
+			a.Reads = append(a.Reads, d.span())
+		}
+		s.Arguments = append(s.Arguments, a)
+	}
+	return s
+}
 
 func (d *decoder) str() string {
 	s := string(d.take(d.count(1)))

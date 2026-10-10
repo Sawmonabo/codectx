@@ -58,18 +58,78 @@ func compareRef(a, b Ref) int {
 	return cmp.Or(cmp.Compare(a.File, b.File), cmp.Compare(a.Index, b.Index))
 }
 
-// Binding is one declaration a resolver found a site may call.
+// Fact is what a Binding states. Every fact is about one entry of the
+// member Site.File names, and is published from that member's file: the
+// site's, the import's, or the declaration's.
+type Fact uint8
+
+const (
+	// FactCall: call site Site calls the declaration Target, or, when
+	// External is set, the external method it names (externalMethod).
+	// Dispatch is the occurrence's own: DispatchVirtual when the call can run
+	// an override of what it names, DispatchExact when it cannot (`super`, a
+	// qualified call, a constructed object, a final, static, private or
+	// non-virtual method, a function). A site with several call facts
+	// publishes one `calls` per distinct target, each with set_size the
+	// number of distinct targets.
+	FactCall Fact = 0
+	// FactExternalSite: call site Site is a proven external call that no
+	// edge names (an import, a module or a receiver type outside the
+	// project, without a method node to target), counted as external.
+	FactExternalSite Fact = 1
+	// FactOpenSite: call site Site is bound by nothing, for Reason. A site
+	// with no fact at all is open too, for the reason its shape gives
+	// (openReason); a resolver emits this fact only to say otherwise.
+	FactOpenSite Fact = 2
+	// FactImport: the import Site (an index into Table.Imports) resolves to
+	// the member file Target.File, whose module it imports (Target.Index is
+	// -1). An import that resolves to several files has one fact per file.
+	FactImport Fact = 3
+	// FactFlow: argument Arg of call site Site flows into parameter Param
+	// (an index into Target's Decl.Parameters) of the declaration Target the
+	// site is bound to (argumentFlows). Only a bound site has one.
+	FactFlow Fact = 4
+	// FactExtends: the type declaration Site has the declared supertype
+	// Target, or the external type External names (externalType).
+	FactExtends Fact = 5
+	// FactImplements: the type declaration Site implements the interface or
+	// trait Target or External: declared, or, in Go, satisfied by its method
+	// set.
+	FactImplements Fact = 6
+	// FactOverrides: the method declaration Site directly overrides or
+	// implements the method Target, or the external method External names.
+	FactOverrides Fact = 7
+)
+
+// Binding is one fact a resolver found. Site names the entry of a member's
+// table the fact is about (a call site, an import, a declaration, by Kind),
+// Target a declaration or a member's module of the unit, and External,
+// instead of Target, a type or method outside the project.
 type Binding struct {
+	Kind   Fact
 	Site   Ref
 	Target Ref
 	// Detail is the technique that found it: one of the Detail constants.
 	Detail string
+	// Dispatch is a FactCall's per-occurrence dispatch, empty for every
+	// other kind.
+	Dispatch model.Dispatch
+	// Arg and Param are a FactFlow's argument index at the site and
+	// parameter index in the target's Decl.Parameters.
+	Arg, Param int32
+	// External is the external type or method a FactCall, FactExtends,
+	// FactImplements or FactOverrides targets (externalType,
+	// externalMethod); Target is then unused.
+	External string
+	// Reason is a FactOpenSite's reason.
+	Reason model.OpenSiteReason
 }
 
-// A resolver resolves every site of one unit and emits each binding it finds,
+// A resolver resolves every site of one unit and emits each fact it finds,
 // in any order and with repeats; the core sorts them by site and target and
-// publishes one `calls` occurrence per site and target. A site no resolver
-// binds publishes nothing, and its structural call stands alone.
+// publishes one occurrence per fact. A call site with no call fact
+// publishes an open-site node and the caller's `calls` edge to it, unless a
+// FactExternalSite says it is a proven external call.
 type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
 
 // resolverFor is the flow family's resolution of decision 2 (resolve has
