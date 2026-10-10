@@ -1512,7 +1512,7 @@ func (k *javaScriptLinker) class(out *wire.Link, n Node) {
 				out.Supertypes = append(out.Supertypes, wire.Supertype{Type: name, Super: k.spell(v)})
 			}
 		case c.KindId() == x.implementsClause:
-			k.supertypeList(out, name, c)
+			k.supertypeList(out, name, c, true)
 		default:
 			// The javascript grammar's heritage is the extended expression.
 			out.Supertypes = append(out.Supertypes, wire.Supertype{Type: name, Super: k.spell(c)})
@@ -1525,16 +1525,19 @@ func (k *javaScriptLinker) supertypes(out *wire.Link, name, clause Node) {
 	if name.IsNull() || clause.IsNull() {
 		return
 	}
-	k.supertypeList(out, string(textOf(k.src, name)), clause)
+	k.supertypeList(out, string(textOf(k.src, name)), clause, false)
 }
 
 // supertypeList appends each type a heritage clause lists as a supertype of
-// name.
-func (k *javaScriptLinker) supertypeList(out *wire.Link, name string, clause Node) {
+// name, each marked an interface when iface says the clause is a class's
+// `implements` clause. An interface's `extends` clause may name a class
+// (an interface extending a class inherits its members), so it proves
+// nothing.
+func (k *javaScriptLinker) supertypeList(out *wire.Link, name string, clause Node, iface bool) {
 	for t := clause.first(); !t.IsNull(); t = t.next() {
 		if t.IsNamed() && !t.IsExtra() {
 			if super := k.namedType(t); super != "" {
-				out.Supertypes = append(out.Supertypes, wire.Supertype{Type: name, Super: super})
+				out.Supertypes = append(out.Supertypes, wire.Supertype{Type: name, Super: super, Interface: iface})
 			}
 		}
 	}

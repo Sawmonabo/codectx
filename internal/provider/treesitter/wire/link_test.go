@@ -39,20 +39,21 @@ func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 
 // TestLinkFactsBeyondCallsRoundTrip carries every field the linker's facts
 // beyond calls read through one encode and decode: an export's override mark
-// and alias, an argument's reads, keyword and spread, a dynamic import's
+// and alias, a supertype's interface mark, an argument's reads, keyword and spread, a dynamic import's
 // fragments and constant flag, a parameter's marks, and a computed site with
 // its arguments. Each is written after fields that existed before it, so a
 // codec that skips or reorders one shifts every later byte.
 //
-// Mutation: AppendLink drops the alias, or DecodeLink reads a computed site's
-// arguments without their reads -> the decoded message differs (or is
-// refused as malformed).
+// Mutation: AppendLink drops the alias or a supertype's interface mark, or
+// DecodeLink reads a computed site's arguments without their reads -> the
+// decoded message differs (or is refused as malformed).
 func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 	in := Link{
 		Exports: []Export{
 			{Name: Span{Start: 1, End: 4}, Receiver: "C", Override: true},
 			{Name: Span{Start: 9, End: 12}, Alias: "log_impl"},
 		},
+		Supertypes: []Supertype{{Type: "A", Super: "Thread"}, {Type: "A", Super: "Runnable", Interface: true}},
 		Sites: []Site{{Name: Span{Start: 20, End: 21}, Shape: ShapeBare, Args: []Type{{}, {Kind: TypeNamed, Name: "T"}},
 			Arguments: []Argument{
 				{At: Span{Start: 22, End: 23}, Reads: []Span{{Start: 2, End: 3}, {Start: 5, End: 6}}},
@@ -76,6 +77,9 @@ func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 	}
 	if !slices.Equal(out.Exports, in.Exports) || !slices.Equal(out.Parameters, in.Parameters) {
 		t.Fatalf("exports or parameters changed:\n got %+v %+v\nwant %+v %+v", out.Exports, out.Parameters, in.Exports, in.Parameters)
+	}
+	if !slices.Equal(out.Supertypes, in.Supertypes) {
+		t.Fatalf("supertypes changed:\n got %+v\nwant %+v", out.Supertypes, in.Supertypes)
 	}
 	sameSites := func(a, b []Site) bool {
 		return slices.EqualFunc(a, b, func(x, y Site) bool {

@@ -128,6 +128,10 @@ type Export struct {
 // and is never sent; the linker derives it from method sets.
 type Supertype struct {
 	Type, Super string
+	// Interface reports a Super the declaration proves an interface: a type
+	// a Java or TypeScript `implements` clause lists, or one a Java
+	// interface's `extends` clause lists (JLS §9.1.3).
+	Interface bool
 }
 
 // Reexport is one name the file's module exports under a name of its own or
@@ -284,7 +288,8 @@ type TypeKind byte
 const (
 	// TypeUnknown carries nothing: the worker recovered no type.
 	TypeUnknown TypeKind = 0
-	// TypeNamed is an instance of the type Name, as written.
+	// TypeNamed is an instance of the type Name, as written. Index is
+	// ExactObject when the value is an object of exactly that type, else 0.
 	TypeNamed TypeKind = 1
 	// TypeParam is the value of the enclosing callable's parameter Index,
 	// zero-based, whatever its callers pass.
@@ -324,6 +329,15 @@ const (
 	TypeUnion TypeKind = 9
 )
 
+// ExactObject is the Index of a TypeNamed value that is an object of
+// exactly the type Name: a C++ object declared by value (a local, a
+// parameter, a data member, a file-scope object or an array element),
+// neither a pointer nor a reference, whose dynamic type is its declared
+// type, so a virtual call on it runs that type's function ([class.virtual]:
+// the call is virtual only through a pointer or reference). Only the C++
+// worker sends it.
+const ExactObject uint32 = 1
+
 // Type is a value's type as the worker recovered it inside the file: a name
 // as written, or a reference the linker resolves across functions and files
 // (a parameter, another site's result, a field).
@@ -340,7 +354,7 @@ type Type struct {
 //	exports    n × (name start, end; receiver; signature; params; optional;
 //	                variadic, static, abstract, virtual, final, internal
 //	                flags; returns type; override flag; alias)
-//	supertypes n × (type; super)
+//	supertypes n × (type; super; interface flag)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
 //	                signature; args n × type; arguments n × (at start, end;
 //	                keyword; spread byte; reads n × (start, end)))
@@ -375,6 +389,7 @@ func AppendLink(dst []byte, l *Link) []byte {
 	for _, s := range l.Supertypes {
 		e.str(s.Type)
 		e.str(s.Super)
+		e.flag(s.Interface)
 	}
 	e.u32(uint32(len(l.Sites)))
 	for i := range l.Sites {
@@ -474,11 +489,11 @@ func DecodeLink(payload []byte) (Link, error) {
 	d := decoder{b: payload, malformed: ErrMalformedLink}
 	var l Link
 	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
-	// flags, a 9-byte type, 1 flag and 4 alias; a supertype two strings; a
-	// site 8 span, 1 shape, 4 qualifier, 9 type, 4 signature, 4 args and 4
-	// arguments; an argument 8 span, 4 keyword, 1 spread and 4 reads; a read
-	// 8 span; a value 8 span, 4 field and 9 type; a reexport three strings; a
-	// union its count; a parameter two 8 spans, 4 index and 2 flags; a
+	// flags, a 9-byte type, 1 flag and 4 alias; a supertype two strings and
+	// 1 flag; a site 8 span, 1 shape, 4 qualifier, 9 type, 4 signature, 4
+	// args and 4 arguments; an argument 8 span, 4 keyword, 1 spread and 4
+	// reads; a read 8 span; a value 8 span, 4 field and 9 type; a reexport
+	// three strings; a union its count; a parameter two 8 spans, 4 index and 2 flags; a
 	// dynamic import 8 span, 4 fragments and 1 flag; a fragment its length.
 	l.Exports = make([]Export, 0, d.count(44))
 	for range cap(l.Exports) {
@@ -489,9 +504,11 @@ func DecodeLink(payload []byte) (Link, error) {
 		x.Override, x.Alias = d.flag(), d.str()
 		l.Exports = append(l.Exports, x)
 	}
-	l.Supertypes = make([]Supertype, 0, d.count(8))
+	l.Supertypes = make([]Supertype, 0, d.count(9))
 	for range cap(l.Supertypes) {
-		l.Supertypes = append(l.Supertypes, Supertype{Type: d.str(), Super: d.str()})
+		x := Supertype{Type: d.str(), Super: d.str()}
+		x.Interface = d.flag()
+		l.Supertypes = append(l.Supertypes, x)
 	}
 	l.Sites = make([]Site, 0, d.count(34))
 	for range cap(l.Sites) {

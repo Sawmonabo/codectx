@@ -232,12 +232,12 @@ func (k *javaLinker) typeDecl(n Node) {
 	for c := n.first(); !c.IsNull(); c = c.next() {
 		switch c.KindId() {
 		case x.superclass:
-			k.supertypes(name, c)
+			k.supertypes(name, c, false)
 			super = k.erased(firstNamed(c))
 		case x.superInterfaces, x.extendsInterfaces:
 			for l := c.first(); !l.IsNull(); l = l.next() {
 				if l.KindId() == x.typeList {
-					k.supertypes(name, l)
+					k.supertypes(name, l, true)
 				}
 			}
 		}
@@ -266,8 +266,10 @@ func (k *javaLinker) constantBodies(body Node) bool {
 }
 
 // supertypes appends one supertype of the type name for every type listed
-// under list.
-func (k *javaLinker) supertypes(name string, list Node) {
+// under list, each marked an interface when iface says the list is a class's
+// `implements` clause or an interface's `extends` clause (JLS §8.1.5,
+// §9.1.3).
+func (k *javaLinker) supertypes(name string, list Node, iface bool) {
 	if name == "" {
 		return
 	}
@@ -276,7 +278,7 @@ func (k *javaLinker) supertypes(name string, list Node) {
 			continue
 		}
 		if s := k.erased(t); s != "" {
-			k.out.Supertypes = append(k.out.Supertypes, wire.Supertype{Type: name, Super: s})
+			k.out.Supertypes = append(k.out.Supertypes, wire.Supertype{Type: name, Super: s, Interface: iface})
 		}
 	}
 }

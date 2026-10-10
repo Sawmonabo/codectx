@@ -233,6 +233,38 @@ var staticGoldens = []golden{
 		fails: "a call through a function pointer bound to a stand-in, or to one of the two functions its type admits",
 	},
 	{
+		name:   "c-function-pointer-argument-flows",
+		anchor: "ISO/IEC 9899 (C) §6.5.2.2 (Function calls: a call through a pointer to function assigns each argument to the corresponding parameter of the function called), §6.3.2.1 (function designators), §6.5.16.1 (Simple assignment)",
+		files: map[string]string{
+			"pointers.c": `void g(int p) {} // @g
+void h(int q) {} // @h
+
+void run(int x) { // @run
+    void (*fp)(int) = g;
+    if (x > 0) {
+        fp = h;
+    }
+    fp(x); // @c1
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every fact. g and h are the only functions whose address
+		// is taken, both of fp's type, so `fp(x)` may call either and x reaches the parameter of each.
+		// Unprobed: the C worker's argument reads.
+		want: []string{
+			"c1 fp -> g g exact set=2",
+			"c1 fp -> h h exact set=2",
+		},
+		facts: []string{
+			"run x flows g p",
+			"run x flows h q",
+		},
+		// Mutation: emit flows only for direct calls (none from the address-taken cross-product) -> x
+		// reaches neither p nor q.
+		fails: "a call through a function pointer bound to its address-taken functions without the flow of its argument into their parameters",
+	},
+	{
 		name:   "java-external-override-and-call",
 		anchor: "Java Language Specification §8.1.4 (a class with no superclass extends Object), §9.6.4.4 (@Override), §4.3.2 (The Class Object), §15.12.4.4",
 		files: map[string]string{
@@ -272,6 +304,40 @@ class Use {
 		},
 		// Mutation: keep the hierarchy internal -> Dog.toString overrides nothing and `d.hashCode()` is open.
 		fails: "an override of a method outside the project dropped; an inherited method of java.lang.Object left open",
+	},
+	{
+		name:   "java-external-implements-and-extends",
+		anchor: "Java Language Specification §8.1.4 (Superclasses and Subclasses), §8.1.5 (Superinterfaces), §9.1.3 (Superinterfaces and Subinterfaces), §8.4.8.1 (Overriding by Instance Methods), §9.6.4.4 (@Override)",
+		files: map[string]string{
+			"Tasks.java": `class A implements Runnable { // @ta
+  @Override
+  public void run() {} // @arun
+}
+
+class B extends Thread { // @tb
+  @Override
+  public void run() {} // @brun
+}
+
+interface Task extends Runnable { // @ttask
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every fact. Runnable and Thread are java.lang's, outside
+		// the project: a class's `implements` clause names an interface, its `extends` clause a class, and an
+		// interface's `extends` clause an interface.
+		want: []string{},
+		facts: []string{
+			"ta A implements external java.lang.Runnable",
+			"arun run overrides external java.lang.Runnable.run",
+			"tb B extends external java.lang.Thread",
+			"brun run overrides external java.lang.Thread.run",
+			"ttask Task extends external java.lang.Runnable",
+		},
+		// Mutation: read every external supertype of a class as a class -> `A implements Runnable` is
+		// published as `A extends Runnable`.
+		fails: "a class's `implements` clause naming a type outside the project published as `extends` of an external class",
 	},
 	{
 		name:   "c-macro-aliases",
@@ -534,5 +600,68 @@ func TestExternalOverrideMeetsExternalCall(t *testing.T) {
 	}
 	if len(called) == 0 || len(overridden) == 0 || called[0] != overridden[0] {
 		t.Fatalf("the call of toString reaches %v and the override %v, want one external node", called, overridden)
+	}
+}
+
+// TestExternalSupertypeKinds checks the kind of each external type a
+// hierarchy relation names: an `implements` clause's type and a Java
+// interface's extended type are one interface node, an `extends` clause's
+// type of a class a class node, in Java and in TypeScript.
+//
+// Mutation: read every external supertype as a class (drop
+// wire.Supertype.Interface in the hierarchy) -> Runnable is a class node,
+// and A's Runnable and Task's Runnable are two nodes.
+func TestExternalSupertypeKinds(t *testing.T) {
+	cases := []struct {
+		golden string
+		from   []golden
+		// want is each external type's kind by qualified name.
+		want map[string]model.NodeKind
+	}{
+		{"java-external-implements-and-extends", staticGoldens,
+			map[string]model.NodeKind{"java.lang.Runnable": model.NodeInterface, "java.lang.Thread": model.NodeClass}},
+		{"typescript-external-implements-and-extends", ecmascriptGoldens,
+			map[string]model.NodeKind{"tasks.Runnable": model.NodeInterface, "threads.Thread": model.NodeClass}},
+	}
+	structural := newStructural(t)
+	for _, c := range cases {
+		t.Run(c.golden, func(t *testing.T) {
+			var files map[string]string
+			for _, g := range c.from {
+				if g.name == c.golden {
+					files = g.files
+				}
+			}
+			if files == nil {
+				t.Fatalf("no golden %s", c.golden)
+			}
+			l := linkSources(t, structural, files)
+			got := map[string][]model.NodeKind{}
+			ids := map[string]map[model.NodeID]bool{}
+			for _, r := range l.out.rels {
+				if r.Relation.Kind != model.RelExtends && r.Relation.Kind != model.RelImplements {
+					continue
+				}
+				to := l.out.nodes[r.Relation.To]
+				if nodeResolution(to) != model.ResolutionExternal {
+					continue
+				}
+				if ids[to.QualifiedName] == nil {
+					ids[to.QualifiedName] = map[model.NodeID]bool{}
+				}
+				if !ids[to.QualifiedName][to.ID] {
+					ids[to.QualifiedName][to.ID] = true
+					got[to.QualifiedName] = append(got[to.QualifiedName], to.Kind)
+				}
+			}
+			for q, kind := range c.want {
+				if len(got[q]) != 1 || got[q][0] != kind {
+					t.Fatalf("the external type %s is published as %v, want one %s node (all: %v)", q, got[q], kind, got)
+				}
+			}
+			if len(got) != len(c.want) {
+				t.Fatalf("external supertypes %v, want %v", got, c.want)
+			}
+		})
 	}
 }

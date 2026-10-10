@@ -1,71 +1,160 @@
 # The `link` provider
 
-`internal/provider/link` is the package-scoped linking provider of ADR-0012 decision 9. It publishes `calls` for
-the nine languages the structural provider lowers: C, C++, Go, Java, JavaScript, TypeScript, TSX, Python and Rust.
-It never parses a file. It reads the link tables the structural provider stored with each file's unit, binds every
-call site to the declarations it may call, and publishes each binding as a `calls` edge between the structural
-provider's own nodes.
+`internal/provider/link` is the package-scoped linking provider of ADR-0012 decision 9. It publishes `calls`,
+`imports`, `data_flows_to`, `extends`, `implements` and `overrides` for the nine languages the structural provider
+lowers: C, C++, Go, Java, JavaScript, TypeScript, TSX, Python and Rust. It never parses a file. It reads the link
+tables the structural provider stored with each file's unit, binds every call site to the declarations it may call,
+resolves imports to files, follows arguments into the parameters they bind, and reads the class hierarchy, and
+publishes each fact as an edge between the structural provider's own nodes.
 
 The structural provider still publishes its syntax-tier `calls` (docs/providers-treesitter.md, Unit scope and node
 identity): a call it resolves inside the file, and the callee reference node of every call it cannot. The linker
 publishes every binding it can justify, inside the file as well as across files: a site the structural provider bound
 in its file is bound again when the linker reaches the same declaration, and the two edges have one relation id (the
 caller, the kind and the target decide it), so the pair is one relation with both providers' evidence. A site the
-linker cannot bind publishes nothing here, and the structural call stands alone.
+linker cannot bind publishes an open-site node (Open sites, below).
 
 ## Descriptor
 
 ```
 ID                link
 Version           1
-Capabilities      calls
+Capabilities      calls, imports, data_flows_to, extends, implements, overrides
 DependsOn         treesitter
 InvalidationScope package
 Required          false
 ```
 
-`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:41-57`, and the descriptor is
-`Provider.Descriptor` (`provider.go:130-133`). The id is not `dependence`, which is never reused (decision 9). The
-provider is not required: a failed link degrades `calls` and nothing else. It runs when the structural provider is
+`ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go`, and the descriptor is
+`Provider.Descriptor`. The id is not `dependence`, which is never reused (decision 9). The provider is not required:
+a failed link degrades its six capabilities and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 
 ## What it publishes
 
 | Capability | Relation | From → to | Evidence detail |
 |---|---|---|---|
-| `calls` | `calls` | caller → each bound declaration | `direct`, `hierarchy`, `address_taken`, `flow`, `field` |
-| `calls` | `calls` | caller → ambiguous callee node | `ambiguous` |
-| `calls` | `may_refer_to` | caller → each candidate of an ambiguous site | `ambiguous call target` |
+| `calls` | `calls` | caller → each bound declaration, or an external method node | `direct`, `hierarchy`, `address_taken`, `flow`, `field` |
+| `calls` | `calls` | caller → the site's open-site node | none |
+| `imports` | `imports` | file module → each file module the import resolves to | `import` |
+| `imports` | `imports` | file module → the import's open-import-site node | none |
+| `data_flows_to` | `data_flows_to` | each variable an argument reads → the parameter it binds | `argument` |
+| `extends` | `extends` | type → a supertype of its own kind | `supertype` |
+| `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `method_set` |
+| `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
 
-The details are the `Detail*` constants (`provider.go:61-82`). Each one names the technique that bound the site:
+The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
 - `direct`: the callee names the declaration by its package, module, import or scope;
-- `hierarchy`: class-hierarchy analysis over the receiver's static type and its subtypes;
+- `hierarchy`: the method the receiver's static type declares or inherits, found by walking its supertypes;
 - `address_taken`: an indirect site joined to an address-taken function of the same signature;
 - `flow`: the receiver's type was recovered by flow-based type inference;
-- `field`: a function written to the field the site calls through.
+- `field`: a function written to the field the site calls through;
+- `import`: an import resolved to a file of the unit;
+- `argument`: an argument of a bound call site, matched to its parameter;
+- `supertype`: a supertype or an override the source writes;
+- `method_set`: a Go interface a type satisfies by its method set, which the source never writes.
 
-**Caller and target.** The caller is the declaration enclosing the site, or the file's module node when no
-declaration encloses it (`Site.Caller`, -1 for the module, `internal/provider/link/table.go:106-127`). A target is a
-declaration of any member file of the unit.
+**Caller and target.** The caller is the anonymous route handler a site is written in when the structural provider
+publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
+the site, else the file's module node (`Site.Caller`, -1 for the module, `internal/provider/link/table.go`). So a
+call inside `app.get("/x", (req, res) => helper())` is a call of the handler, as the structural provider's own
+`calls` are. A target is a declaration of any member file of the unit, a file's module, a parameter, or an external
+node.
 
-**Evidence.** Every fact is `static_analysis`. A site publishes one evidence row per edge, at the call expression's
+**Evidence.** Every fact is `static_analysis`. A call publishes one evidence row per edge, at the call expression's
 range (`Site.Range`). Its native key is the call-site key, spelled as the structural provider spells it:
 `callsite:<path>:<first byte>-<last byte>` of the callee token, one-based and inclusive (`Site.NameStart`,
-`Site.NameEnd`).
+`Site.NameEnd`). An `imports` edge is located at the import statement, a `data_flows_to` edge at the argument with
+the site's call-site key, and a hierarchy edge at the declaration that states it.
 
 **Endpoints are the structural nodes.** The linker mints no second identity for a declaration. Each table carries
-an `Endpoint` for each declaration and for the module (`table.go:71-78`): the node id, canonical key, kind, names
-and range the structural unit resolved. The linker publishes an occurrence of every endpoint an edge names, with its
-own evidence at the declaration's range. So the edge joins the structural node, and through it the cross-provider
-`decl:` key and the call-site key of docs/providers-treesitter.md.
+an `Endpoint` for each declaration, each parameter and the module (`table.go`): the node id, canonical key, kind,
+names and range the structural unit resolved. The linker publishes an occurrence of every endpoint an edge names,
+with its own evidence at the declaration's range. So the edge joins the structural node, and through it the
+cross-provider `decl:` key and the call-site key of docs/providers-treesitter.md.
 
-**Ambiguous sites.** A site bound to two or more declarations publishes into the ambiguous family the structural
-provider already uses. The linker mints a callee node in scope `file:<path>` with native key
-`link:<call-site key>`, located in the site's file at the site's range, and metadata `{"resolution":"ambiguous","candidates":n,"callee":"<name>"}`. It publishes a
-`calls` edge to that node and one `may_refer_to` edge per candidate. Nothing is capped: every candidate is published
-and counted in `candidates`, as in the structural provider's in-file family.
+**Several targets.** A site bound to two or more targets publishes one `calls` edge to each, and every one of them
+carries the same `set_size`, the number of targets, read as "1 of n" (ADR-0015 decision 1). That is a value-flow set
+with no declared receiver type (`speak(Dog())` and `speak(Cat())` reach `a.sound()` in `speak(a)` with two types),
+the address-taken join (a function pointer and every address-taken function of its signature), several functions
+written to one field, and a macro defined in several `#if` arms. An import matching several files (a quoted
+`#include` two headers end in) publishes one `imports` per file with `set_size` the same way. A site bound to one
+target carries no `set_size`. Nothing is capped: every target is published.
 
-A site bound to exactly one declaration publishes one `calls` edge to it.
+**Dispatch.** Every `calls` occurrence to a declaration or an external method carries `dispatch`: `virtual` when the
+call can run an override of its target, `exact` when it cannot. It is computed per occurrence, from the site, never
+from the technique that bound it: a `super` call, a qualified call (`a.Animal::sound()`, `Base.m(self)`), a call on a
+constructed object (`Dog().sound()`, `new C().m()`), a static, final, private or non-virtual method, a C++ call
+through a declaration that is not `virtual` or on an object declared by value (`Dog d; d.sound()`; a pointer or a
+reference stays `virtual`), and every function an address-taken or field set reaches are `exact`. A
+member call on a receiver with a declared static type publishes one `calls` to the method that type declares or
+inherits, even when it is abstract or an interface or trait method, and never one edge per override:
+`speak(a: Animal) { a.sound() }` with `Dog` and `Cat` overriding `sound` publishes `speak calls Animal.sound`,
+`virtual`, and nothing to `Dog.sound` or `Cat.sound`. The overrides a virtual call may run are the `overrides`
+edges into its target, which queries read.
+
+**Open sites.** Every site no fact binds publishes one open-site node and the caller's `calls` to it (ADR-0015
+decision 3). The node is in the file's scope `file:<path>`, keyed `open:` and the site's call-site key, or, for a
+computed callee, which has no callee token, `open:computed:<path>:<first byte>-<last byte>`; it is located at the
+site, named by the callee as written (`call` when there is none), of kind `method` for a member or static site and
+`function` otherwise, with metadata `{"resolution":"unresolved","reason":…,"shape":…,"arguments":n}`
+(`model.OpenSiteMetadata`). Its reason is the site's form:
+- `computed`: the callee is an expression that names nothing (`obj[k]()`);
+- `receiver_untyped`: a member or static call whose receiver has no recovered type;
+- `value_untracked`: a call through a value whose flow the analysis does not follow;
+- `global_unbound`: a bare name or a construction no visible scope declares.
+
+Its shape is `member`, `value`, `construct` or `bare`, and `arguments` is the number of arguments the site passes.
+The candidates of an open site are computed per query as `may_call`, never stored. A key longer than
+`model.MaxNativeKeyBytes` is replaced by its digest, so every open site has a node.
+
+**External nodes.** A supertype outside the project, and a method of one, get a node so a hierarchy edge into it has
+an endpoint and a call on a receiver of that type meets the override of that method at one node (ADR-0015 decision
+2, `internal/provider/link/external.go`). An external node has no file: it is minted in the scope `link:external`,
+keyed by the language family, the type's qualified name as the family resolves it (`hierarchy.externalName`) and, for
+a method, the method's name, with metadata `{"resolution":"external"}`. A call site does not know the parameter types
+an external method declares, so one node stands for all of a type's methods of one name. A Java `@Override` of
+`toString` and `o.toString()` on an `Object` receiver both target `java.lang.Object.toString`. Every run of every
+unit that names an external node republishes it with its own evidence, and the delta build replaces the index-level
+bucket that holds them (`Replaced{IndexLevel: true}`, `internal/index/delta/link.go`). A call proven to leave the
+project with no node to target (a call through a package outside the module, a method several external supertypes
+may supply) is counted external and publishes no edge.
+
+**Imports.** An import the linker resolves publishes `imports` from the file's module to the module of each file it
+names: a JavaScript, TypeScript or TSX specifier the module resolution reaches, a Python `import a.b` or
+`from a import b` (to the file that declares `b`, else the submodule `a.b`, else the module `a`), and a quoted C or C++ `#include` (the
+file beside the including one, and every member file whose path ends in the header's at a component boundary). An
+angled include, a package outside the unit, and an import naming no member file publish nothing.
+
+An import whose path does not fold to a constant publishes one open-import-site node and the module's `imports` to it
+(ADR-0015 decision 6): `require(expr)` and `import(expr)` in ECMAScript, `importlib.import_module(expr)` and
+`__import__(expr)` in Python, and `#include MACRO` with the macro undefined in the file. The node is in the file's
+scope, keyed `openimport:<path>:<first byte>-<last byte>`, named `import`, of kind `module`, with metadata
+`{"resolution":"unresolved","reason":"computed","fragments":[…]}`, the literal parts of the path in source order
+(`require("./x/" + name)` gives `["./x/"]`). The files whose paths match the fragments are computed per query as
+`may_import`. `require("./x")` folds and is an ordinary import.
+
+**Argument flows.** A bound call site publishes `data_flows_to` from each variable an argument reads to the parameter
+of the target the argument binds (ADR-0017), and an unbound site publishes none. Arguments are matched as the
+target's language binds them (`argumentFlows`, `internal/provider/link/args.go`): by position, then a keyword
+argument by its parameter's name, a spread or `*args` to the rest from its position, and the arguments past the last
+named parameter to a variadic one; a parameter an omitted default fills receives nothing. A call through a function value flows into
+every function the address-taken join binds it to. A receiver passed first (a
+Go method expression, a Rust path naming a method, Python `C.m(obj)`) binds the first parameter. A parameter with no
+node of its own receives no edge.
+
+**Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
+the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
+embedded interfaces), and `implements` to each other interface or trait it declares, or, in Go, satisfies by its
+method set. A Go struct's embedded types are promotion and no supertype. Each method publishes `overrides` to the
+method it directly overrides along each direct supertype, never a deeper one: in Java one of the same signature that
+is neither static, final nor private; in C++ a virtual one of the same signature; in Python the first along the
+method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name; in Go each
+method of an interface its type satisfies. A supertype outside the project is its external node. A method overrides
+an external one only where the language marks it (Java `@Override`, C++ `override` or `final`, TypeScript
+`override`, a Rust trait impl item, Python `typing.override`) and only when its type has exactly one supertype
+outside the project; an unmarked Python method with an external base publishes no `overrides`. Go publishes nothing
+toward a type outside the unit, whose method set no table holds.
 
 ## Endpoint identity per family
 
@@ -81,7 +170,7 @@ by its callable's identity and its position (`wire.Link.Parameters`), the file's
 anonymous functions and call-site nodes keep file-scoped identities that include their range. So a body edit, or a
 declaration inserted before another (an overload included), moves no endpoint, and an edge another file published
 toward it stays valid. What a call can bind to differs by family, and so does what the table's
-`Decl.Receiver` holds (`wire.Export`, `internal/provider/treesitter/wire/link.go:33-65`):
+`Decl.Receiver` holds (`wire.Export`, `internal/provider/treesitter/wire/link.go`):
 
 | Family | Targets | `Receiver` |
 |---|---|---|
@@ -97,10 +186,10 @@ A declaration the worker sent no type facts for is still a target by its name (`
 ## Units and inputs
 
 A unit is one project of the repository, the scope `link.PlanUnits` derives
-(`internal/provider/link/projects.go:153`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
-`projects.go:341`). The planner is this provider's own.
+(`internal/provider/link/projects.go`). A file belongs to the unit that owns it (`Unit.OwnsInput`,
+`projects.go`). The planner is this provider's own.
 
-`Link` plans only its own unit, through `PlanUnit` (`projects.go:412`), in one read of the manifest, and its members are the
+`Link` plans only its own unit, through `PlanUnit` (`projects.go`), in one read of the manifest, and its members are the
 candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as file versions in FileID order
 (`LinkOptions.Members`), so it keeps its members of them and sorts nothing.
 
@@ -108,15 +197,15 @@ The unit's inputs are its member files. The unit's identity is their content, as
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
 is its qualified name, so a unit reused on a match of anything less would serve evidence about bytes that are gone.
 Each input also records `model.UnitInput.Digest`, the member digest of the file's link table (`link.MemberDigest`,
-`internal/provider/link/tables.go:39-50`). The digest is outside the unit's identity: `UnitInputHasher` does not
+`internal/provider/link/tables.go`). The digest is outside the unit's identity: `UnitInputHasher` does not
 read it. It decides what a rebuild costs (Refresh, below).
 
 **The link tables.** For each file with a lowering, the worker sends one `KindLink` message (`wire.Link`). The
 structural provider joins it to the declarations and call references it validated, and stores the result as a
 `link.Table` with the file's structural unit, under `link.TableKind`, and the table's member digest beside it, under
-`link.DigestKind` (`storeTable`, `internal/provider/treesitter/link.go:266-287`). It stores both through
-`provider.StateSink` (`internal/provider/sink.go:240-249`), so they share the unit's lifetime. The linker reads a
-table back through `link.Tables`, and the delta build a digest alone through `link.Digests` (`tables.go:14-108`): the
+`link.DigestKind` (`storeTable`, `internal/provider/treesitter/link.go`). It stores both through
+`provider.StateSink` (`internal/provider/sink.go`), so they share the unit's lifetime. The linker reads a
+table back through `link.Tables`, and the delta build a digest alone through `link.Digests` (`tables.go`): the
 structural unit the generation selects for the file's scope, then that unit's state of the kind. A file with no
 lowering, or whose dependence or link pass failed, has neither.
 
@@ -136,6 +225,18 @@ Besides the joined declarations, sites and values, the table carries what the re
   `export { x } from`, `export * from`, `export * as ns from`;
 - `Unions`: the type sets a `TypeUnion` names, every type the worker recovered for a value that disagreeing reaching
   definitions or arms reach.
+- `Import.Range`: where the import is written, the location of its `imports` edges;
+- `DynamicImports`: each import whose path does not fold to a constant, with its range and its literal fragments;
+- `Decl.Parameters`: each parameter's node, position and its variadic and keyword-only marks, which argument flows
+  bind to;
+- `Decl.Override`: the language marks the method as overriding (`@Override`, `override`, `typing.override`, a trait
+  impl item);
+- `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
+  macro calls;
+- `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
+- `Site.Computed`: the callee is an expression that names nothing (`wire.Link.Computed`);
+- `Handlers` and `Site.Handler`: the anonymous route handlers the structural provider publishes as function nodes,
+  and the one a site is written in.
 
 **Two summaries.** Each table has an interface summary and a sites summary, each with its own digest
 (`Table.Interface`, `InterfaceDigest`, `SitesDigest`, `internal/provider/link/summary.go`). The interface is
@@ -150,8 +251,9 @@ call sites. Neither covers a byte range. The member digest folds both and the ta
 
 A linking unit stores its resolution state under `link.ResolutionKind` (`internal/provider/link/state.go`): the
 manifest fields the linker reads, one record per member (its content hash, member, interface and sites digests, and
-its coverage: whether it has a table, the entries dropped, the ambiguous sites without a key), and every binding by
-identity: a site by its file and its index in that file's table, a target by its file and its declaration node. A
+its coverage: whether it has a table, the entries dropped, and its site and import counts), and every fact by
+identity: a site by its file and its index in that file's table, a target by its file and its declaration, module or
+parameter node, or by its external key. A
 site's index is valid across builds because a member whose bytes did not change has the same table, and a member
 whose bytes changed re-resolves whole. For Go, Java, Rust, C and C++ the state also holds what the refresh re-runs
 from: a hash of each hierarchy index key's entries, the reverse index from every key a file's resolution read to that
@@ -196,8 +298,8 @@ nothing, and stores its state for the next.
 
 ## Resolution
 
-Each resolver reads the unit's tables one at a time, in FileID order (`unit.Files`, `unit.go:27-41`), and emits each
-`Binding` it finds (`unit.go:54-60`). The core sorts every binding by site and target in an external sort that
+Each resolver reads the unit's tables one at a time, in FileID order (`unit.Files`, `unit.go`), and emits each
+`Binding` it finds (`unit.go`). The core sorts every binding by site and target in an external sort that
 spills to disk, and publishes from the sorted stream. The type and declaration questions a resolver asks (which
 declarations a name, a package or a module holds; a type's supertypes, subtypes and members) are point lookups into
 sorted index files the hierarchy writes to scratch: a lookup reads from the 32 KiB block that holds its key to the
@@ -205,16 +307,21 @@ key's last entry, located by the first key of every block, which is the one part
 Nothing else the size of the project is held in memory. No binding is justified by the callee's name alone: each rests on a scope,
 an import, a type or a signature.
 
+A site none of these reach is not guessed at: it is an open site (What it publishes, Open sites), and the candidates
+a name alone would give are computed when a query asks (`may_call`), never stored as facts. So `x.run()` with an
+untyped `x` publishes one `calls` to its open-site node, reason `receiver_untyped`, and no edge to any `run` the unit
+declares.
+
 The members' language family picks the resolver:
 - **Java** (`resolveStatic`, `internal/provider/link/resolve_static.go`): class-hierarchy analysis. A static,
   constructor or `super` site binds directly, and a bare call a static import names binds the imported method. A
   bare call binds in the innermost enclosing class that has the method, declared or inherited, walking out from an
-  inner, local or anonymous class (JLS §15.12.1). A member site binds by its receiver's static type to the method
-  that type declares or inherits, and to every override in a subtype only when that method can be overridden: not
-  static and not `Final` (`hierarchy.dispatchEntries`, `hierarchy.overridable`). An anonymous class body is a
-  synthetic subtype of the type it instantiates (`hierarchy.anonymousType`), so a call on that type reaches its
-  methods and a call on another subtype does not. A call of an abstract method (a functional interface's) also
-  joins every method reference of that method's signature.
+  inner, local or anonymous class (JLS §15.12.1). A member site binds by its receiver's static type to the one
+  method that type declares or inherits, `virtual` when that method can be overridden (not static and not `Final`,
+  `hierarchy.overridable`) and `exact` otherwise. An anonymous class body is a synthetic subtype of the type it
+  instantiates (`anonymousType`), whose methods override that type's. A call of an abstract method (a functional
+  interface's) also joins every method reference of that method's signature. A receiver that is a field of a class,
+  in its own file or another, is typed by the field's declared type, inherited and enclosing-class fields included.
 - **Go, Rust, C, C++** (`resolveStatic`): direct binding and class-hierarchy analysis over interfaces and traits.
   Bare and static sites bind by the language's scoping: same package, import, `use`, namespace and
   using-directive, and a prototype yields to the definition it announces (`Decl.Prototype`). A Go import path names
@@ -229,11 +336,13 @@ The members' language family picks the resolver:
   owner's type, its own or promoted, read in the file that declares it, and a chain (`x.a.b.Load()`) step by
   step the same way (`fieldGo`). An
   indirect site joins every function taken as a value whose declared signature equals the site's
-  (`wire.Export.Signature`, `wire/link.go:42-49`); a Go method expression `T.M` taken as a value has the method's
+  (`wire.Export.Signature`, `wire/link.go`); a Go method expression `T.M` taken as a value has the method's
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
-  cross-product, with no reachability fixed point. A C++ call reaches into subtypes only from a member that is not
+  cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is not
   `Final` and that the receiver's type or a supertype declares `virtual` ([class.virtual]). In C++ a bare call inside
-  a class walks out to the enclosing classes' static members.
+  a class walks out to the enclosing classes' static members. A Go interface embedded from a package outside the
+  unit counts toward its embedder's method set by name. `#define NAME func` makes a call of `NAME` a call of `func`,
+  one per definition when `#if` arms define it differently, in the file and in the headers it includes.
 
 In every static family a site binds only a target its arguments fit: at least `Params - Optional` (one fewer for
 a `Variadic` one, whose last parameter may take none) and, unless `Variadic`, at most `Params` (`staticFile.fits`).
@@ -270,29 +379,33 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
   ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
   re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.
-  A renamed or default import reads the name it denotes. Member sites bind through receivers recovered by
-  flow-based type inference, then `hierarchy.dispatch`; a class object binds the method its class declares or
-  inherits, never an override. A class field holding a function is a member a call through the class binds. A
+  A renamed or default import reads the name it denotes. A member site binds, for each type flow-based type
+  inference recovered for its receiver, the method that type declares or inherits, never a subclass's override; a
+  class object binds the method its class declares or inherits. A class field holding a function is a member a call through the class binds. A
   construction binds the constructor the class declares or inherits, and a call on its result binds the method that
   class declares or inherits, never a subclass's override. Field-based resolution binds a member site to the
   functions written to the property it calls through, only when its receiver bound nothing once the inference
-  settled; a class's methods are written to no property, so they are reached only through a receiver's type. Class-hierarchy analysis applies where `extends` declares a subtype.
+  settled; a class's methods are written to no property, so they are reached only through a receiver's type. A
+  receiver that reaches the method only through a supertype outside the project calls that supertype's external
+  method, and the field-based fallback stays closed for it.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
   `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor
   a function nested in another function. A call of a class is its construction and binds its `__init__` when
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance
   receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type of a receiver two
-  disagreeing definitions reach included) dispatches in method resolution order: for its class and
-  each subclass, the first declaration of the method along that class's C3 linearisation (`hierarchy.pythonMRO`, over
-  the bases in the order each class lists them). A class object (`A.make()`, `mod.A.make()`) binds the method `A`
+  disagreeing definitions reach included) binds, for each of its types, the first declaration of the method along
+  that type's C3 linearisation (`hierarchy.pythonMRO`, over the bases in the order each class lists them), never a
+  subclass's override. A class object (`A.make()`, `mod.A.make()`) binds the method `A`
   declares or inherits alone, never a subclass's override. `super().m()` in class `B` binds, for `B` and each class
   below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached. Field-based
   resolution (a function written to the attribute; a method is written to no attribute, so it is reached only through
-  a receiver's type) answers an attribute call only when its receiver's type bound nothing.
+  a receiver's type) answers an attribute call only when its receiver's type bound nothing and reaches the method
+  through no supertype outside the project: `class L(list)` calling `self.append(1)` calls the external
+  `builtins.list.append`, never a function written to `append` elsewhere.
 
 **Flow-based type inference** (`inferTypes`, `internal/provider/link/infer.go`) starts from the types the worker
-recovered inside each function (`wire.Type`, `wire/link.go:136-169`):
+recovered inside each function (`wire.Type`, `wire/link.go`):
 - a `new C()` or an annotation is `TypeNamed`;
 - a parameter is `TypeParam`;
 - another call's result is `TypeResult`;
@@ -308,16 +421,21 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 ## Capability states
 
-The `calls` row is published at the unit's scope:
-- `fresh` when every member had a table, no table dropped an entry, and every bound site was published;
-- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:250-267`), when
-  a member has no table (`members_without_table`), a table's `Dropped` is non-zero (`dropped_table_entries`,
-  `table.go:49-53`; a callable whose analysis failed in the worker counts there, since its values and its sites'
-  recovered types are missing), or an ambiguous site's `link:` key would exceed `model.MaxNativeKeyBytes` and so has no callee
-  node to mint (`unkeyed_ambiguous_sites`). The row also counts the unit's `members`. A dropped entry is a worker
-  entry the structural provider could not join to a declaration or a call reference of the file, or whose range did
-  not fit the pinned bytes. None of these is fatal.
+The provider publishes one row of each of its six capabilities per unit, at the unit's scope:
+- `fresh` when every member had a table and no table dropped an entry;
+- `partial`, with `coverage_incomplete` (`publisher.capabilities`, `internal/provider/link/provider.go`), when a
+  member has no table (`members_without_table`) or a table's `Dropped` is non-zero (`dropped_table_entries`; a
+  callable whose analysis failed in the worker counts there, since its values and its sites' recovered types are
+  missing). The row then also counts the unit's `members`. A dropped entry is a worker entry the structural provider
+  could not join to a declaration or a call reference of the file, or whose range did not fit the pinned bytes. None
+  of these is fatal.
+
+The `calls` row always carries the unit's site counts, which add up: `sites` = `bound_sites` + `open_sites` +
+`computed_sites` + `external_sites`. A bound site has at least one target of the unit; an external site reached only
+external nodes or was proven to leave the project; a computed site has a callee that names nothing; every other site
+is open. The `imports` row carries `resolved_imports`, the imports resolved to at least one file, and
+`open_import_sites`.
 
 A file whose link pass failed in the worker is disclosed as `wire.Done.LinkFailure`
-(`internal/provider/treesitter/wire/wire.go:235-239`) on that file's structural capability rows. It stores no table,
+(`internal/provider/treesitter/wire/wire.go`) on that file's structural capability rows. It stores no table,
 so the linking unit that owns it is `partial`.

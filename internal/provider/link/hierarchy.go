@@ -717,7 +717,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
 			if ok {
 				var flags byte
-				if externalKind(fc.family, sub.Flags) == model.NodeInterface {
+				if st.Interface || externalKind(fc.family, sub.Flags) == model.NodeInterface {
 					flags = flagInterface
 				}
 				return links.Add(entry{Key: keyExternalSuper + refKey(sub.Ref), Ref: sub.Ref, Aux: external,
@@ -2009,8 +2009,9 @@ func (h *hierarchy) externalImported(fc fileCtx, p, original, local, rest string
 
 // externalKind is the kind of an external supertype of a type whose entry
 // carries flags, of family: an interface when the source proves it one (an
-// interface's or trait's supertype, a Rust impl's trait), a class
-// otherwise.
+// interface's or trait's supertype, a Rust impl's trait, or a supertype row
+// marked wire.Supertype.Interface, whose entry carries flagInterface), a
+// class otherwise.
 func externalKind(family string, flags byte) model.NodeKind {
 	if flags&flagInterface != 0 || family == "rust" {
 		return model.NodeInterface
