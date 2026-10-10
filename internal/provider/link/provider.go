@@ -1,7 +1,10 @@
 // Package link is the package-scoped linking provider of ADR-0012 decision 9.
-// It publishes `calls` for every language with a lowering, from the link
-// tables the structural provider stores with each file's unit, and never
-// parses a file.
+// It publishes `calls`, `imports`, `data_flows_to`, `extends`, `implements`
+// and `overrides` for every language with a lowering, with an open-site node
+// for every call site and dynamic import it cannot bind and a node for every
+// external type and method its facts target (ADR-0015), from the link tables
+// the structural provider stores with each file's unit, and never parses a
+// file.
 //
 // A unit is one project of the repository, the scopes PlanUnits derives. Its
 // inputs are the project's member files, each recording the MemberDigest of
