@@ -258,7 +258,11 @@ site's index is valid across builds because a member whose bytes did not change 
 whose bytes changed re-resolves whole. For Go, Java, Rust, C and C++ the state also holds what the refresh re-runs
 from: a hash of each hierarchy index key's entries, the reverse index from every key a file's resolution read to that
 file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
-identities their positions denote. Everything is a sorted run on disk; nothing the size of the unit is held in memory.
+identities their positions denote. For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
+identity table, what each member sends across its boundary (each callable's returned values, each argument into
+another member's parameter, each field write, with the stratum, before or after field-based resolution, it arrives
+at), and which boundary entries each member read. Everything is a sorted run on disk; nothing the size of the unit
+is held in memory.
 
 The delta build hands `Link` the predecessor's state whenever the predecessor stored one this build can read
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
@@ -280,10 +284,18 @@ What re-resolves:
   each other's results. When the layout holds (the same members, the same fields, and every member whose table moved
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
   and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
-- **Python, JavaScript, TypeScript, TSX**: any moved table resolves the unit in full. Their resolution is one least
-  fixed point of value flow and binding, and a least fixed point under removals cannot be resumed from its previous
-  result: a value that flowed around a cycle would keep supporting itself after its source is gone. The bindings are
-  then compared per site with the predecessor's.
+- **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
+  value flow and binding, which a refresh maintains by deleting and re-deriving (Gupta, Mumick and Subrahmanian,
+  "Maintaining Views Incrementally", 1993). When the layout holds, the refresh reuses the stored hierarchy and
+  re-derives a region of members: those whose table moved, with every member on a path between them in the stored
+  boundary graph, so a value cycling through untouched files is deleted and re-derived with them and cannot keep
+  supporting itself once its source is gone. The region starts from the stored contributions of the members outside
+  it, each at its stratum. The refresh then compares every boundary entry's values with the stored ones: when no
+  member outside the region reads a changed entry it stops, and otherwise the region grows by those readers and
+  every member they reach and is re-derived again. So a body edit that sends no other value re-runs its own file's
+  sites only. Members outside the final region keep their facts, contributions and reads. A refresh whose layout
+  does not hold (a member added, removed or renamed, or a moved table whose interface changed) resolves the unit in
+  full.
 
 What is republished (`refresh.diff`): the members whose bytes changed, the added members, the members whose bindings
 changed, and the members whose set of targeted declarations changed (a target's occurrence node is published in its
