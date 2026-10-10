@@ -1,6 +1,6 @@
 [info][OPAL] using 1 thread(s) for CPU bound tasks (can be changed by setting the system property org.opalj.threads.CPUBoundTasks; the number should be equal to the number of physical – not hyperthreaded – cores)[0m
 [info][OPAL] using at most 1 thread(s) for IO bound tasks (can be changed by setting the system property org.opalj.threads.IOBoundTasks; the number should be between 1 and 2 times the number of (hyperthreaded) cores)[0m
-[info][project configuration] the classPath is <probe>/fixtures/r2-java/i-classes[0m
+[info][project configuration] the classPath is <probe>/fixtures/round2-java/i-classes[0m
 Fri Oct 09 21:35:45 EDT 2026
 PTSs 27
 PTS entries 14

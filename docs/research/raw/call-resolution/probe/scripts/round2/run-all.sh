@@ -4,13 +4,13 @@
 # a .pth in the Jarvis venv pointing at third_party/jarvis/src/Jarvis/tool/Jarvis,
 # Soot 4.7.1 jar, Maven classpaths in scripts/round2/{wala,sootup,opal}/cp.txt,
 # probe classes compiled into $SC/{soot,wala,sootup}-probe-classes, Java fixtures compiled
-# with `javac --release 8` into fixtures/r2-java/<v>-classes.
+# with `javac --release 8` into fixtures/round2-java/<v>-classes.
 set -u
 PR=<probe>
 SC=${SC:?set SC to the directory holding the compiled probe classes}
 L="flock -w 560 $PR/heavy.lock timeout 240"
-FX=$PR/fixtures/r2-py
-FJ=$PR/fixtures/r2-java
+FX=$PR/fixtures/round2-py
+FJ=$PR/fixtures/round2-java
 O=$PR/out/round2
 cd "$O"
 

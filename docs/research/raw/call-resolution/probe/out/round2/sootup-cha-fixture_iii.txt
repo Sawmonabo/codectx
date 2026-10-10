@@ -1,4 +1,4 @@
-algo=cha entry=[<zoo.Main: void main(java.lang.String[])>] dir=<probe>/fixtures/r2-java/iii-classes
+algo=cha entry=[<zoo.Main: void main(java.lang.String[])>] dir=<probe>/fixtures/round2-java/iii-classes
 containsMethod(<zoo.Animal: void sound()>) = false (not a node in the call graph)
 callsTo(<zoo.Dog: void sound()>):
   Call:<zoo.Main: void main(java.lang.String[])> -> <zoo.Dog: void sound()> via virtualinvoke $stack3.<zoo.Dog: void sound()>(); declaredFromStmt=JVirtualInvokeExpr <zoo.Dog: void sound()>

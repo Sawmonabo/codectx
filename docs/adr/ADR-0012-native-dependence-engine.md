@@ -45,6 +45,11 @@ digests decide what a rebuild costs.
 Decisions 1, 2, 4, 5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
 but impact still excludes them (`internal/graph/cost.go:83-89`) and no program-dependence relation set joins them.
 
+**Amended 2026-10-09.** Decision 9's delta is replaced by
+[ADR-0014](ADR-0014-stable-identity-incremental-linking.md): identity keyed on the name path, two summaries per file,
+per-site traces and identity-keyed resolution. Its `calls` publication for several targets and for unbound sites is
+replaced by [ADR-0015](ADR-0015-open-call-sites-and-dispatch.md).
+
 **Amended 2026-10-08, phase 6 done.** By the owner's ruling, phase 6 is carried out in the change that records
 this amendment: the hosted engine, its package (the provider, its backend, its importer and its engine driver), its
 import path, its configuration, its tool lock entry and every consumer are deleted. The structural provider publishes
@@ -678,8 +683,10 @@ what it is, and the retirement gate's parity condition is what proves the label 
     input records it (`model.UnitInput.Digest`, a model addition). The rebuild reads one small digest per member and
     decodes no table to compare them. When membership and every digest hold, it resolves nothing. It inherits the
     predecessor's resolution and coverage, and republishes only the facts whose evidence lies in a file whose bytes
-    changed. Every other fact is carried over with those files named replaced. A table is read only when that
-    republication needs it: the edited file's, and the tables of the declarations its sites bind.
+    changed, and the facts of every file with a call bound into such a file, since a length-changing edit moves the
+    identities those calls target. Every other fact is carried over with those files named replaced. A table is read
+    only when that republication needs it: the republished files', and the tables of the declarations their sites
+    bind.
   - **Amended 2026-10-09:** identity no longer moves with bytes, and the delta reruns only the sites whose recorded
     reads changed: [ADR-0014](ADR-0014-stable-identity-incremental-linking.md). The single digest and positional
     resolution above are replaced by its two summaries, per-site traces and identity-keyed resolution.

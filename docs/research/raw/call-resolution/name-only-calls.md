@@ -16,7 +16,7 @@ and code-graph-rag are now read at source (why they were missing is at the top o
   wrong about code-review-graph's tiers; see its row.
 - §4.4, §4.6, §4.7, §4.9 and §5.9 cite the new findings as prior art. Their recommendations are unchanged.
 
-Revised Oct 9, 2026, third pass (9:05 PM to 9:45 PM): the four items the second pass left unconfirmed
+Revised Oct 9, 2026, third pass: the four items the second pass left unconfirmed
 were tested hands-on. Raw transcripts and outputs are under `probe/` (listed in
 `dispatch-calls.md` §8). What the pass changed:
 - rust-analyzer row: the `dyn Trait` and generic calls were run. They appear only under the trait method, so "who
@@ -31,8 +31,8 @@ were tested hands-on. Raw transcripts and outputs are under `probe/` (listed in
 - §1: one sentence corrected. The second pass said clangd alone returns possible callers through a base method;
   jdtls, gopls and tsserver do too, unmarked (`dispatch-calls.md` §2). The recommendation for name-only sites is
   unchanged. The multi-target question (§4.3, §5.1) is answered in `dispatch-calls.md`.
-- That change has since been merged (5ced710). The `publish.go:383-450` and `407-450` cited
-  below are `publish.go:564-628` there, unchanged in content.
+- The `publish.go:383-450` and `407-450` cited below, at c47c5c7, are `publish.go:564-628` at 5ced710,
+  unchanged in content.
 
 ## 1. Answer
 

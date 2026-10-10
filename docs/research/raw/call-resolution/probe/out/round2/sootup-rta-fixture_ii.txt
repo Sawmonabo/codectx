@@ -1,4 +1,4 @@
-algo=rta entry=[<zoo.Main: void speak(zoo.Animal)>] dir=<probe>/fixtures/r2-java/ii-classes
+algo=rta entry=[<zoo.Main: void speak(zoo.Animal)>] dir=<probe>/fixtures/round2-java/ii-classes
 containsMethod(<zoo.Animal: void sound()>) = false (not a node in the call graph)
 containsMethod(<zoo.Dog: void sound()>) = false (not a node in the call graph)
 containsMethod(<zoo.Cat: void sound()>) = false (not a node in the call graph)

@@ -33,8 +33,13 @@ republishes 5,000 files, and a body edit that adds one call relinks the whole pr
   2. **the enclosing branch** where a name is defined conditionally (an `if`/`else` arm, a preprocessor condition):
      both definitions of a name in two arms are distinct with no number [S3];
   3. **content matching** for exact duplicates at one level (a rebinding `def f` written twice): old and new are paired
-     by a hash of their content first [S4], and by order only among duplicates that both changed and moved.
-- Locals, parameters and anonymous functions keep file-scoped identities. No relation from another file names them.
+     by a hash of their content first [S4], then by order among the duplicates no hash matched.
+- A parameter is keyed by its declaration's identity and its position, so another file's argument flow into it
+  survives a body edit.
+- Locals, anonymous functions and call-site nodes keep file-scoped identities. No relation from another file names
+  them.
+- Every provider that builds a located declaration's candidate supplies these inputs: the structural provider, its
+  dependence pass and the precise index importer.
 - `renamed_from` and `moved_from` keep carrying lineage across renames and moves.
 
 **Alternatives.** Keeping the range in the key, and republishing every caller: correct, but every length-changing
@@ -102,12 +107,13 @@ inserted overload keeps every existing overload's identity.
 ## Consequences
 
 - Body edits cost one file, whatever the file's fan-in.
-- Every stored identity is stable across edits, so search documents, context sessions and graph answers keep valid
-  node IDs while code is edited.
+- Every declaration's and parameter's identity is stable across edits, so search documents, context sessions and
+  graph answers keep valid node IDs while code is edited.
 - The traces and reverse indexes take disk space proportional to the sites and the keys each reads; their size is
   measured in the scale proofs.
 - The structural provider must supply the descriptor path and the disambiguator for every declaration it emits.
-- ADR-0012 decision 9's caller widening is removed once identity no longer moves.
+- The republication of every calling file on a length-changing edit (Context) is removed once identity no longer
+  moves.
 
 ## Sources
 

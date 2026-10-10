@@ -1,4 +1,4 @@
-algo=cha all-reachable=false dir=<probe>/fixtures/r2-java/iii-classes
+algo=cha all-reachable=false dir=<probe>/fixtures/round2-java/iii-classes
 edgesInto(<zoo.Animal: void sound()>):
 edgesInto(<zoo.Dog: void sound()>):
   src=<zoo.Main: void main(java.lang.String[])> kind=VIRTUAL tgt=<zoo.Dog: void sound()> stmt=[virtualinvoke $r1.<zoo.Dog: void sound()>()] declaredTargetFromStmt=<zoo.Dog: void sound()>

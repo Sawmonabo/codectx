@@ -1,4 +1,4 @@
-algo=cha entry=[<zoo.Main: void main(java.lang.String[])>] dir=<probe>/fixtures/r2-java/i-classes
+algo=cha entry=[<zoo.Main: void main(java.lang.String[])>] dir=<probe>/fixtures/round2-java/i-classes
 callsTo(<zoo.Animal: void sound()>):
   Call:<zoo.Main: void speak(zoo.Animal)> -> <zoo.Animal: void sound()> via virtualinvoke l0.<zoo.Animal: void sound()>(); declaredFromStmt=JVirtualInvokeExpr <zoo.Animal: void sound()>
 callSourcesTo(<zoo.Animal: void sound()>) = [<zoo.Main: void speak(zoo.Animal)>]

@@ -1,9 +1,9 @@
 # Runs inside the Glean demo container. $1 = schema dir, $2 = JSON dir, $3 = db name
 set -u
 S="$1"; J="$2"; N="$3"
-G="glean --db-root /tmp/db --schema dir:$S"
+G="glean --db-root /glean-db --schema dir:$S"
 f() { grep -v -E '^[IW][0-9]{4} ' ; }
-mkdir -p /tmp/db
+mkdir -p /glean-db
 echo "## create"; $G create --repo $N/0 2>&1 | f
 echo "## write"; $G write --repo $N/0 $J/*.json 2>&1 | f
 echo "## derive"

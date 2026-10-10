@@ -30,7 +30,8 @@ the fixed in-file candidate cap removed. Not yet implemented. The survey and han
 |---|---|---|
 | One justified target | a direct, imported or scoped call; a call whose receiver has a declared type | `calls` to the target (for a declared type: the method that type declares or inherits) |
 | Several classes by value flow, no declared type | `def speak_u(a): a.sound()` with `Dog` and `Cat` objects flowing in | one `calls` per class's method, its evidence carrying the set size |
-| Name only | `obj.handle()` with no recovered type | an open-site node and `calls` to it; candidates at query time (decision 3) |
+| Several functions by signature or by field | `fp()` through a function pointer with two address-taken functions of its signature; `obj.run()` where two functions are written to a field `run` | one `calls` per function, its evidence carrying the set size, `dispatch: exact` |
+| Name only | `obj.handle()` with no recovered type; a call in a C++ template on a type that depends on a template parameter | an open-site node and `calls` to it; candidates at query time (decision 3) |
 | No name | `obj[k]()` | an open-site node, reason `computed`, counted, no candidates |
 | Proven external | a library call, a builtin receiver | the existing external placeholder, counted as external |
 
@@ -48,6 +49,16 @@ the same name is invisible to the index.
   trait it declares or, for Go, satisfies by method set) and `overrides` (method to the method it directly overrides
   or implements). A supertype outside the indexed project gets a structural node keyed by its qualified name, so the
   `overrides` edge has an endpoint and the walk does not stop at the project boundary.
+- **A relation and its occurrences.** One `calls` relation can hold several occurrences, a `super` call and a
+  virtual call into the same method. The relation counts as through-base when any occurrence is `virtual`, and a
+  through-base row lists only those occurrences.
+- **A method of an external supertype.** It gets a structural node keyed by the supertype's qualified name, the
+  method's name and its disambiguator (ADR-0014). It is the same node a call on a receiver of that external type
+  already targets, so the walk joins the two. A method overrides an external one when the language marks it: Java
+  `@Override`, C++ `override` or `final`, TypeScript `override`, a Rust trait `impl` item, Python `typing.override`,
+  or a Go method that satisfies an external interface's method set. An unmarked method of a class with an external
+  supertype publishes no `overrides` edge, and its callers answer says that calls through the external supertype are
+  found only for marked overrides.
 - **Callers of `m`.** Calls into `m`; then, for every method `b` that `m` overrides at any depth, the calls into `b`
   whose `dispatch` is `virtual`, each row marked "through `b`" with `b`'s override count. The answer counts `direct`
   and `through_base` apart and includes the `overrides` relations it used, so the route

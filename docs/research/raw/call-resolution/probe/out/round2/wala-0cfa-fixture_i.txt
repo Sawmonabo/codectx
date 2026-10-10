@@ -1,4 +1,4 @@
-algo=0cfa entrypoints=main dir=<probe>/fixtures/r2-java/i-classes
+algo=0cfa entrypoints=main dir=<probe>/fixtures/round2-java/i-classes
 node zoo.Main.speak(Lzoo/Animal;)V ctx=Everywhere
   site pc=1 invocationCode=VIRTUAL declaredTarget=zoo.Animal.sound()V getNumberOfTargets=2
     target zoo.Dog.sound()V

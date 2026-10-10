@@ -23,7 +23,7 @@ ast-grep-py unavailable; ast-grep language tier disabled
 2026-10-09 21:19:06.142 | INFO     | codebase_rag.services.protobuf_service:flush_all:303 - Flushing data to <probe>/out/cgr/trace-index-cgr-cpp...
 2026-10-09 21:19:06.142 | SUCCESS  | codebase_rag.services.protobuf_service:_write_layout:265 - Successfully flushed 10 unique nodes and 15 unique relationships to <probe>/out/cgr/trace-index-cgr-cpp
 2026-10-09 21:19:06.142 | INFO     | codebase_rag.graph_updater:_generate_semantic_embeddings:8206 - Semantic search dependencies not available, skipping embedding generation
-2026-10-09 21:19:06.143 | INFO     | codebase_rag.graph_updater:_publish_hash_cache:743 - Saved hash cache with 1 entries to /tmp/cgr-index-state-en7f_f_x/.cgr-hash-cache.json
+2026-10-09 21:19:06.143 | INFO     | codebase_rag.graph_updater:_publish_hash_cache:743 - Saved hash cache with 1 entries to <state-dir>/.cgr-hash-cache.json
 Provenance manifest written to <probe>/out/cgr/trace-index-cgr-cpp/manifest.json
 Indexing process completed successfully!
 recorded 26 relationship emits to <probe>/out/cgr/trace-cgr-cpp.jsonl

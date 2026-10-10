@@ -70,6 +70,11 @@ overrides the method (bug 160301); jdtls drops the flag.
 6. With no declared type and several classes flowing in, publish one `calls` per class's method, marked "1 of n", as
    the flow-based analyzers do (without the mark).
 
+**Not tested hands-on** (name-only-calls.md §6, dispatch-calls.md §3 and §8): a Hack indexer newer than the
+2023 build that was run; code-graph-rag's libclang C++ and jedi Python modes; Kythe's override-callers view, which
+its open-source table builder never fills; a live Sourcegraph instance; OPAL's incomplete-call-site report; and the
+cause of one empty direct Glean `DeclarationUses` query. Their rows rest on documentation and source.
+
 ## 3. Sources
 
 The complete source lists, with commits and line numbers, are §6 of name-only-calls.md and §7 of dispatch-calls.md.

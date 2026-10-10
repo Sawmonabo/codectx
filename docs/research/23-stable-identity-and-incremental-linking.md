@@ -39,7 +39,7 @@ is how mature indexers avoid both, completely.
   second `def f` at the same level replaces the first, and a name defined in both arms of an `if` is two definitions
   of one name. The enclosing branch distinguishes the second case without any number. For exact duplicates at one
   level, tree differencing matches old to new by a hash of identical subtrees first [10]; order is left only for
-  duplicates that both changed and moved.
+  the duplicates no hash matched.
 
 ## 3. An edit redoes only what read what changed
 
@@ -82,7 +82,8 @@ derived result [12], applied to inferred summaries.
 
 1. Key a declaration on file, kind, language, descriptor path and a disambiguator; keep ranges as attributes and
    evidence. Disambiguate by parameter types where the language overloads, by the enclosing branch where a name is
-   defined conditionally, and by content-hash matching for exact duplicates. Keep locals and lambdas file-scoped.
+   defined conditionally, and by content-hash matching for exact duplicates. Key parameters by their declaration and
+   position; keep locals and lambdas file-scoped.
 2. Split each file's link table into its interface (what other files read, inferred summaries included) and its own
    sites, each with its own digest; key the stored resolution by stable identity.
 3. Record a verifying trace per site and reverse indexes from each read key to its sites; on an edit, re-resolve the

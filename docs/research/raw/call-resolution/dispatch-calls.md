@@ -1,9 +1,9 @@
 # Calls through a base class: what "who calls Dog.sound?" should return
 
-Research and tests: Oct 9, 2026, 9:05 PM to 9:45 PM (America/New_York). Nothing in the codectx
-repository was changed. Every language-server result below comes from my own runs, with the raw JSON-RPC
-transcripts listed in §8. codectx was read at `main` 882da78 and at commit 5ced710, which carries the linker at cd16373 (the code first cited at `publish.go:383-450` is at `publish.go:564-628`
-there, unchanged).
+Research and tests: Oct 9, 2026. Nothing in the codectx repository was changed. Every language-server result
+below comes from my own runs, with the raw JSON-RPC transcripts listed in §8. codectx was read at `main` 882da78
+and at commit 5ced710, which carries the linker at cd16373; its several-target publication is
+`publish.go:564-628` there.
 
 The example used everywhere (each language has its own copy, §8):
 
@@ -32,8 +32,7 @@ caller of it. (It is a *reference* to the same method family, which matters for 
 through-base callers at query time: from `Dog.sound`, walk `overrides` up to every method it overrides, and collect
 the calls into those methods that can dispatch. The answer then holds two ordinary relations,
 `speak -calls-> Animal.sound` and `Dog.sound -overrides-> Animal.sound`, so the route is visible even in today's
-answer shape, which carries only `{id, from, kind, to}` per relation. This is option (c), which the
-owner ruled at 9:15 PM. The tests support it and add six refinements:
+answer shape, which carries only `{id, from, kind, to}` per relation. This is option (c). The tests support it and add six refinements:
 
 1. **Walk every level up.** With `Animal → Dog → Puppy`, `speak(a: Animal)` is a through-base caller of
    `Puppy.sound`. jdtls and CodeQL return it; clangd climbs one level only and misses it (§2.2).
@@ -323,12 +322,11 @@ Other runs:
   ("No errors!"); facts `out/hack/json/glean_symbol_info_chunk_*.json` (`hack.*.6` predicates, the schema of that
   2023 build, not of hhvm cad2158).
 - Soot, SootUp, WALA, OPAL, PyCG, Jarvis: `out/round2/` (40 files: `soot-*`, `sootup-*`, `wala-*`, `opal-*`, `pycg-*`,
-  `jarvis-*`); fixtures `fixtures/r2-py/fixture_{i,ii}.py` (i: with `speak(Dog())`, `speak(Cat())` and
-  `Dog().sound()`; ii: no call to `speak`) and `fixtures/r2-java/{i,ii,iii,iv}` (iii: abstract `Animal.sound`; iv:
+  `jarvis-*`); fixtures `fixtures/round2-py/fixture_{i,ii}.py` (i: with `speak(Dog())`, `speak(Cat())` and
+  `Dog().sound()`; ii: no call to `speak`) and `fixtures/round2-java/{i,ii,iii,iv}` (iii: abstract `Animal.sound`; iv:
   `Animal` an interface); scripts `scripts/round2/` (`run-all.sh` re-runs everything).
 
 Containers: Memgraph (`docker.io/memgraph/memgraph:3.3.0`) and the Glean demo image ran under rootless podman with
 names starting `dispatch-probe`; both containers and both images were removed afterwards
-(`podman ps -a --filter name=dispatch-probe` and `podman images` show none). Podman was used instead of Docker
-Desktop, whose engine was not running and is a heavier start on this host (`docker.exe version`: "failed to connect to the docker API at
-npipe:////./pipe/dockerDesktopLinuxEngine ... daemon is running").
+(`podman ps -a --filter name=dispatch-probe` and `podman images` show none). Podman was used because no
+Docker engine was running.
