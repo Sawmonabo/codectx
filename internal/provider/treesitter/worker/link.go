@@ -119,51 +119,67 @@ func spanText(s flow.Span) string {
 // shadowing included: a closure's graph names an enclosing callable's
 // variable by the identifier that declares it, the span Function.Vars
 // carries.
+//
+// A linker may look a name up between two callables, so the reads are kept
+// as sorted runs: each callable's reads are one run, and a run is merged
+// into the one before it while that one is at most twice its size, which
+// keeps the runs logarithmic in the file's reads and every read sorted a
+// logarithmic number of times.
 type readIndex struct {
 	src  []byte
-	uses []readUse
-	// sorted reports uses ordered by the declared spelling, then by the
-	// reading node's start ascending and its end descending; reach is, per
-	// entry, the greatest node end of its spelling's entries up to it.
-	sorted bool
-	reach  []uint32
+	runs []readRun
+}
+
+// readRun is a run of reads ordered by the declared spelling, then by the
+// reading node's start ascending and its end descending; reach is, per
+// entry, the greatest node end of its spelling's entries up to it.
+type readRun struct {
+	uses  []readUse
+	reach []uint32
 }
 
 // readUse is one node's read of one named variable: the node's span and the
 // variable's declaring identifier.
 type readUse struct{ node, decl flow.Span }
 
-// add records every named variable each node of g reads.
+// add records every named variable each node of g reads, as a new run.
 func (r *readIndex) add(g *flow.Graph, src []byte) {
-	r.src, r.sorted = src, false
+	r.src = src
+	var uses []readUse
 	for n := range int32(g.Len()) {
 		for _, v := range g.Uses(n) {
 			if d, named := g.Declared(v); named {
-				r.uses = append(r.uses, readUse{node: g.Span(n), decl: d})
+				uses = append(uses, readUse{node: g.Span(n), decl: d})
 			}
 		}
+	}
+	if len(uses) == 0 {
+		return
+	}
+	r.runs = append(r.runs, r.run(uses))
+	for k := len(r.runs); k >= 2 && len(r.runs[k-2].uses) <= 2*len(r.runs[k-1].uses); k = len(r.runs) {
+		merged := append(r.runs[k-2].uses, r.runs[k-1].uses...)
+		r.runs = append(r.runs[:k-2], r.run(merged))
 	}
 }
 
 func (r *readIndex) name(u readUse) []byte { return r.src[u.decl.Start:u.decl.End] }
 
-func (r *readIndex) sort() {
-	if r.sorted {
-		return
-	}
-	r.sorted = true
-	slices.SortFunc(r.uses, func(a, b readUse) int {
+// run sorts uses into a run and computes its reach.
+func (r *readIndex) run(uses []readUse) readRun {
+	slices.SortFunc(uses, func(a, b readUse) int {
 		return cmp.Or(bytes.Compare(r.name(a), r.name(b)), cmp.Compare(a.node.Start, b.node.Start),
 			cmp.Compare(b.node.End, a.node.End), cmp.Compare(a.decl.Start, b.decl.Start))
 	})
-	r.uses = slices.Compact(r.uses)
-	r.reach = slices.Grow(r.reach[:0], len(r.uses))[:len(r.uses)]
-	for i, u := range r.uses {
-		r.reach[i] = u.node.End
-		if i > 0 && r.reach[i-1] > u.node.End && bytes.Equal(r.name(r.uses[i-1]), r.name(u)) {
-			r.reach[i] = r.reach[i-1]
+	uses = slices.Compact(uses)
+	reach := make([]uint32, len(uses))
+	for i, u := range uses {
+		reach[i] = u.node.End
+		if i > 0 && reach[i-1] > u.node.End && bytes.Equal(r.name(uses[i-1]), r.name(u)) {
+			reach[i] = reach[i-1]
 		}
 	}
+	return readRun{uses: uses, reach: reach}
 }
 
 // variable is the declaring identifier of the named variable that the
@@ -171,21 +187,31 @@ func (r *readIndex) sort() {
 // spanning id reads. It reports false for an identifier no node reads as a
 // variable (a type, a module, a field, a name the lowering binds nothing to).
 func (r *readIndex) variable(id Node) (wire.Span, bool) {
-	if r.src == nil {
-		return wire.Span{}, false
-	}
-	r.sort()
-	text := textOf(r.src, id)
-	s := spanOf(id)
-	lo, _ := slices.BinarySearchFunc(r.uses, text, func(u readUse, t []byte) int { return bytes.Compare(r.name(u), t) })
-	hi := lo + sort.Search(len(r.uses)-lo, func(i int) bool { return bytes.Compare(r.name(r.uses[lo+i]), text) > 0 })
-	i, _ := slices.BinarySearchFunc(r.uses[lo:hi], s.Start+1, func(u readUse, x uint32) int { return cmp.Compare(u.node.Start, x) })
-	for i += lo - 1; i >= lo && r.reach[i] >= s.End; i-- {
-		if r.uses[i].node.End >= s.End {
-			return wireSpan(r.uses[i].decl), true
+	text, s := textOf(r.src, id), spanOf(id)
+	var best readUse
+	found := false
+	for _, run := range r.runs {
+		u, ok := r.innermost(run, text, s)
+		if ok && (!found || u.node.Start > best.node.Start || (u.node.Start == best.node.Start && u.node.End < best.node.End)) {
+			best, found = u, true
 		}
 	}
-	return wire.Span{}, false
+	return wireSpan(best.decl), found
+}
+
+// innermost is the read in run of a variable spelled text by the innermost
+// node spanning s.
+func (r *readIndex) innermost(run readRun, text []byte, s flow.Span) (readUse, bool) {
+	uses := run.uses
+	lo, _ := slices.BinarySearchFunc(uses, text, func(u readUse, t []byte) int { return bytes.Compare(r.name(u), t) })
+	hi := lo + sort.Search(len(uses)-lo, func(i int) bool { return bytes.Compare(r.name(uses[lo+i]), text) > 0 })
+	i, _ := slices.BinarySearchFunc(uses[lo:hi], s.Start+1, func(u readUse, x uint32) int { return cmp.Compare(u.node.Start, x) })
+	for i += lo - 1; i >= lo && run.reach[i] >= s.End; i-- {
+		if uses[i].node.End >= s.End {
+			return uses[i], true
+		}
+	}
+	return readUse{}, false
 }
 
 // argReads appends to dst the declaring identifiers of the named variables
