@@ -170,7 +170,8 @@ int main() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding. A by-value parameter, a local, a data
 		// member and an array element are objects of exactly their declared type, so their call runs that
-		// type's function; a pointer, a reference and `this` may denote a derived object.
+		// type's function; a pointer, a reference and `this` may denote a derived object. Unprobed: the
+		// worker's receiver type of a subscript (`pack[0]`) and of a data member read inside a method (`pet`).
 		want: []string{
 			"t1 sound -> dsound sound virtual",
 			"o1 sound -> dsound sound exact",

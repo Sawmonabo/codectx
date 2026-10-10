@@ -393,7 +393,7 @@ main(); // @top
 		name:   "typescript-external-implements-and-extends",
 		anchor: "TypeScript Language Specification §8.1.1 (Class Heritage Specification: the `extends` clause names the base class, the `implements` clause the interfaces the class implements); TypeScript 4.3 `override` modifier (a member that overrides a base class member); ECMA-262 (15th edition, 2024) §16.2.2 (Imports)",
 		files: map[string]string{
-			"tasks.ts": `import { Runnable } from "tasks";
+			"app.ts": `import { Runnable } from "tasks";
 import { Thread } from "threads";
 
 class A implements Runnable { // @ta
