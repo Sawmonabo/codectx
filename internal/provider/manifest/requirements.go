@@ -3,6 +3,7 @@ package manifest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"path"
@@ -34,11 +35,18 @@ import (
 //   - A constraint line pins a version without installing anything, so it is
 //     `configures` with `constraint: true`, never `depends_on`.
 //
-// Everything else is recorded in the node's `unresolved` metadata as written
-// and never interpreted: every other option line (`-e`, `--index-url`,
-// `--find-links`, ...), a requirement that is a bare URL, path or archive,
-// and an include that is a URL, absolute, outside the workspace, empty, or
-// names an environment variable. An include the snapshot does not hold is
+// Everything else is published as written and never interpreted: every other
+// option line (`-e`, `--index-url`, `--find-links`, ...), a requirement that
+// is a bare URL, path or archive, and an include that is a URL, absolute,
+// outside the workspace, empty, or names an environment variable. Each such
+// line is one evidence row on the configuration node, with the line's range
+// and a detail of `line` (the text), `reason` (for an include) and `via` (for
+// an included file, whose rows carry no range). One row per line, rather
+// than one list in node metadata, is what keeps every line: metadata is one
+// bounded payload per node, while a node's evidence is rows, paged on read
+// and bounded only by the per-fact evidence clip, which counts what it cuts.
+// A line over the evidence detail bound is shortened and counted under
+// `evidence_detail_bytes`. An include the snapshot does not hold is
 // still a `configures` fact and leaves the capability partial. A requirement
 // that names an environment variable (`${TOKEN}`) after its name is published
 // with `unresolved: environment`.
@@ -70,13 +78,23 @@ func (u *unit) requirements(ctx context.Context) error {
 			}
 		}
 	}
-	meta := map[string]any{}
-	if len(w.unresolved) > 0 {
-		meta["unresolved"] = w.unresolved
-	}
-	cfg, err := u.defines(ctx, model.NodeConfiguration, ecosystemPyPI+":requirements:"+rel, path.Base(rel), languagePython, nil, meta)
+	qualified, name := ecosystemPyPI+":requirements:"+rel, path.Base(rel)
+	cfg, err := u.defines(ctx, model.NodeConfiguration, qualified, name, languagePython, nil, nil)
 	if err != nil {
 		return err
+	}
+	cand, shortened := u.definedCandidate(model.NodeConfiguration, qualified, name, languagePython), 0
+	for _, l := range w.unresolved {
+		detail := filesystem.Detail("line", l.text, "reason", l.reason, "via", l.via)
+		if !detailKeeps(detail, "line", l.text) {
+			shortened++
+		}
+		if _, err := u.e.Node(ctx, cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: l.rng, Detail: detail}); err != nil {
+			return err
+		}
+	}
+	if shortened > 0 {
+		u.degraded(detailBytes, strconv.Itoa(shortened)+" lines over "+strconv.Itoa(model.MaxDetailBytes))
 	}
 	for i, inc := range w.includes {
 		if u.cut(BoundEntries, u.entries, int64(i+1)) {
@@ -125,7 +143,28 @@ type reqWalk struct {
 	visited    map[reqVisit]bool
 	deps       []reqDep
 	includes   []reqInclude
-	unresolved []map[string]string
+	unresolved []reqUnresolved
+}
+
+// reqUnresolved is one line the reader does not interpret, as written. reason
+// is set for an include line pip would act on; via and rng follow reqDep.
+type reqUnresolved struct {
+	text, reason, via string
+	rng               *model.SourceRange
+}
+
+// detailBytes is the capability detail key that counts the unresolved lines
+// whose text was shortened to fit the evidence detail bound.
+const detailBytes = "evidence_detail_bytes"
+
+// detailKeeps reports whether a rendered evidence detail still carries value
+// under key in full.
+func detailKeeps(detail, key, value string) bool {
+	var fields map[string]string
+	if err := json.Unmarshal([]byte(detail), &fields); err != nil {
+		return false
+	}
+	return fields[key] == value
 }
 
 // reqDep is one requirement or constraint line. via is the declaring file
@@ -168,7 +207,7 @@ func (w *reqWalk) line(file string, l reqLogical, constraint bool) (reqVisit, bo
 		case "-c", "--constraint":
 			return w.include(file, value, true, l.text, via, rng)
 		}
-		w.unresolve(l.text, via, "")
+		w.unresolve(l.text, via, "", rng)
 		return reqVisit{}, false
 	}
 	args, options := breakArgsOptions(l.text)
@@ -176,7 +215,7 @@ func (w *reqWalk) line(file string, l reqLogical, constraint bool) (reqVisit, bo
 	if !pep508Name(name) || !pep508Rest(spec) || archiveName(name) {
 		// A bare URL, path or archive installs what it names, which this
 		// static reader cannot know.
-		w.unresolve(l.text, via, "")
+		w.unresolve(l.text, via, "", rng)
 		return reqVisit{}, false
 	}
 	w.deps = append(w.deps, reqDep{name: name, spec: spec, options: options, via: via,
@@ -193,22 +232,22 @@ func (w *reqWalk) include(file, value string, constraint bool, text, via string,
 	}
 	switch {
 	case value == "":
-		w.unresolve(text, via, "malformed")
+		w.unresolve(text, via, "malformed", rng)
 		w.u.malformedEntry()
 		return reqVisit{}, false
 	case strings.Contains(value, "://"):
-		w.unresolve(text, via, "url")
+		w.unresolve(text, via, "url", rng)
 		return reqVisit{}, false
 	case strings.Contains(value, "${"):
-		w.unresolve(text, via, "environment")
+		w.unresolve(text, via, "environment", rng)
 		return reqVisit{}, false
 	case path.IsAbs(value) || (len(value) > 1 && value[1] == ':'):
-		w.unresolve(text, via, "absolute")
+		w.unresolve(text, via, "absolute", rng)
 		return reqVisit{}, false
 	}
 	target, ok := resolveRelative(path.Dir(file), value)
 	if !ok {
-		w.unresolve(text, via, "outside_workspace")
+		w.unresolve(text, via, "outside_workspace", rng)
 		return reqVisit{}, false
 	}
 	w.includes = append(w.includes, reqInclude{target: target, mode: mode, via: via, rng: rng})
@@ -216,20 +255,13 @@ func (w *reqWalk) include(file, value string, constraint bool, text, via string,
 }
 
 // unresolve records a line this reader does not interpret, with the file it
-// came from when that is an include and the reason when the line itself is
-// one pip would act on.
-func (w *reqWalk) unresolve(text, via, reason string) {
+// came from when that is an include, its range when it is the unit's own
+// file, and the reason when the line itself is one pip would act on.
+func (w *reqWalk) unresolve(text, via, reason string, rng *model.SourceRange) {
 	if w.u.cut(BoundEntries, w.u.entries, int64(len(w.unresolved)+1)) {
 		return
 	}
-	entry := map[string]string{"line": text}
-	if via != "" {
-		entry["via"] = via
-	}
-	if reason != "" {
-		entry["reason"] = reason
-	}
-	w.unresolved = append(w.unresolved, entry)
+	w.unresolved = append(w.unresolved, reqUnresolved{text: text, reason: reason, via: via, rng: rng})
 }
 
 // readIncluded reads an included file from the unit's snapshot under the
