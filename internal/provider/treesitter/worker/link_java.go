@@ -27,6 +27,16 @@ import (
 // has none. Arrays and primitive types carry no method a declaration of the
 // repository supplies and are sent as unknown. Signatures keep the types as
 // written (wire.Export.Signature).
+//
+// A field read is sent as the field it reads, TypeField "Owner.field"
+// (wire.TypeField): `this.f` is the enclosing type's field, a bare name a
+// field in scope is its declaring type's, `x.f` the field of x's type and
+// `T.f` the field of the type T as written; a field of such a field appends
+// its name. Each field, constant and enum constant whose type the file
+// declares is an Export whose Returns is that type, so the linker types the
+// read from the declaration, its own or a supertype's, in whichever file
+// declares it. A record component is no declaration the structural query
+// captures, so a read of one keeps its declared type.
 type javaLinker struct {
 	linkReads
 	k   *javaSyntax
@@ -57,6 +67,9 @@ type javaLinker struct {
 type javaBound struct {
 	typ   wire.Type
 	field bool
+	// owner is the type that declares a field sent as an Export, whose read
+	// is TypeField "owner.name"; empty for every other binding.
+	owner string
 }
 
 // javaFrame is one enclosing type body: name is the type `this` denotes,
@@ -287,20 +300,32 @@ func (k *javaLinker) members(body Node) {
 				if !k.x.child(d, k.x.fDimensions).IsNull() {
 					t = wire.Type{}
 				}
-				if name := d.ChildByFieldId(j.fName); !name.IsNull() {
-					k.bind(&k.vars, name, t, true)
-					k.bind(&k.fields, name, t, true)
+				if name := d.ChildByFieldId(j.fName); !name.IsNull() && name.KindId() == j.identifier {
+					k.memberField(name, t)
 				}
 			}
 		case j.enumConstant:
-			if name := c.ChildByFieldId(j.fName); !name.IsNull() {
-				t := k.thisType()
-				k.bind(&k.vars, name, t, true)
-				k.bind(&k.fields, name, t, true)
+			if name := c.ChildByFieldId(j.fName); !name.IsNull() && name.KindId() == j.identifier {
+				k.memberField(name, k.thisType())
 			}
 		case j.enumBodyDecls:
 			k.members(c)
 		}
+	}
+}
+
+// memberField binds a field, constant or enum constant name of type t that
+// the innermost type body declares, and appends its export when the file
+// declares t: the declaration a read of it is typed by.
+func (k *javaLinker) memberField(name Node, t wire.Type) {
+	var owner string
+	if f := len(k.frames) - 1; t.Kind == wire.TypeNamed && f >= 0 && k.frames[f].name != "" {
+		owner = k.frames[f].name
+		k.out.Exports = append(k.out.Exports, wire.Export{Name: javaSpan(name), Returns: t})
+	}
+	for _, s := range []*scope{&k.vars, &k.fields} {
+		k.bound = append(k.bound, javaBound{typ: t, field: true, owner: owner})
+		s.push(k.text(name), int32(len(k.bound)-1))
 	}
 }
 
@@ -343,6 +368,7 @@ func (k *javaLinker) callable(n Node) {
 			e.Final = k.hasModifier(mods, "final") || k.hasModifier(mods, "private") ||
 				len(k.frames) > 0 && k.frames[len(k.frames)-1].final
 			e.Abstract = n.ChildByFieldId(j.fBody).IsNull() && !k.hasModifier(mods, "native")
+			e.Override = k.overrides(mods)
 			if rt := x.child(n, x.fType); !rt.IsNull() && rt.KindId() != x.voidType {
 				k.typeText(&sig, rt)
 				k.typeText(&sig, x.child(n, x.fDimensions))
@@ -359,6 +385,21 @@ func (k *javaLinker) callable(n Node) {
 	k.params(ps, false)
 	k.children(n)
 	k.restore(m)
+}
+
+// overrides reports modifiers that annotate a method `@Override` or
+// `@java.lang.Override` (JLS §9.6.4.4).
+func (k *javaLinker) overrides(mods Node) bool {
+	j := k.k
+	for c := javaFirst(mods); !c.IsNull(); c = c.next() {
+		if c.KindId() != j.markerAnnotation && c.KindId() != j.annotation {
+			continue
+		}
+		if name := k.compact(c.ChildByFieldId(j.fName)); name == "Override" || name == "java.lang.Override" {
+			return true
+		}
+	}
+	return false
 }
 
 // parameters appends a Parameter for each named parameter of the list ps of
@@ -495,7 +536,8 @@ func (k *javaLinker) invocation(n Node) {
 	if name.IsNull() {
 		return
 	}
-	s := wire.Site{Name: javaSpan(name), Args: k.args(n.ChildByFieldId(j.fArguments))}
+	s := wire.Site{Name: javaSpan(name)}
+	s.Args, s.Arguments = k.args(n.ChildByFieldId(j.fArguments))
 	obj := n.ChildByFieldId(j.fObject)
 	switch {
 	case obj.IsNull():
@@ -600,7 +642,8 @@ func (k *javaLinker) creation(n Node) {
 	}
 	t := x.child(n, x.fType)
 	if name := k.createdName(t); !name.IsNull() {
-		s := wire.Site{Name: javaSpan(name), Shape: wire.ShapeConstructor, Args: k.args(n.ChildByFieldId(j.fArguments))}
+		s := wire.Site{Name: javaSpan(name), Shape: wire.ShapeConstructor}
+		s.Args, s.Arguments = k.args(n.ChildByFieldId(j.fArguments))
 		if name != t {
 			s.Qualifier = k.erased(t)
 		}
@@ -655,8 +698,9 @@ func (k *javaLinker) constructorCall(n Node) {
 	if q == "" {
 		return
 	}
-	k.addSite(n, wire.Site{Name: javaSpan(ctor), Shape: wire.ShapeConstructor, Qualifier: q,
-		Args: k.args(n.ChildByFieldId(k.k.fArguments))})
+	s := wire.Site{Name: javaSpan(ctor), Shape: wire.ShapeConstructor, Qualifier: q}
+	s.Args, s.Arguments = k.args(n.ChildByFieldId(k.k.fArguments))
+	k.addSite(n, s)
 }
 
 // enumConstant walks an enum constant's arguments, then its body, whose
@@ -865,7 +909,12 @@ func (k *javaLinker) exprType(n Node) wire.Type {
 			return k.exprType(e)
 		}
 	case j.identifier:
-		return k.boundType(&k.vars, n)
+		if i := k.vars.innermost(k.text(n)); i >= 0 {
+			if b := k.bound[k.vars.at(i).v]; b.owner != "" {
+				return wire.Type{Kind: wire.TypeField, Name: b.owner + "." + string(k.text(n))}
+			}
+			return k.bound[k.vars.at(i).v].typ
+		}
 	case j.this:
 		return k.thisType()
 	case j.objectCreation, j.cast:
@@ -881,25 +930,80 @@ func (k *javaLinker) exprType(n Node) wire.Type {
 		case f.KindId() == j.this:
 			// `Outer.this` is the enclosing instance of the type Outer.
 			return wire.Type{Kind: wire.TypeNamed, Name: k.compact(obj)}
-		case obj.KindId() == j.this && f.KindId() == j.identifier:
-			return k.boundType(&k.fields, f)
+		case f.KindId() != j.identifier:
+		case obj.KindId() == j.this:
+			// A record component the file declares keeps its declared type:
+			// no declaration of it carries the type.
+			if i := k.fields.innermost(k.text(f)); i >= 0 && k.bound[k.fields.at(i).v].owner == "" {
+				return k.bound[k.fields.at(i).v].typ
+			}
+			if t := k.thisType(); t.Name != "" {
+				return wire.Type{Kind: wire.TypeField, Name: t.Name + "." + string(k.text(f))}
+			}
+		default:
+			if q, ok := k.qualifier(obj); ok {
+				return wire.Type{Kind: wire.TypeField, Name: q + "." + string(k.text(f))}
+			}
+			switch t := k.exprType(obj); t.Kind {
+			case wire.TypeNamed:
+				return wire.Type{Kind: wire.TypeField, Name: t.Name + "." + string(k.text(f))}
+			case wire.TypeField:
+				if strings.Contains(t.Name, ".") {
+					return wire.Type{Kind: wire.TypeField, Name: t.Name + "." + string(k.text(f))}
+				}
+			}
 		}
 	}
 	return wire.Type{}
 }
 
-// args is the type of each argument in list, in order.
-func (k *javaLinker) args(list Node) []wire.Type {
+// args is the type and the argument of each argument in list, in order:
+// its expression and the variables it reads (readName, readSkip).
+func (k *javaLinker) args(list Node) ([]wire.Type, []wire.Argument) {
 	if list.IsNull() {
-		return nil
+		return nil, nil
 	}
-	var out []wire.Type
+	var types []wire.Type
+	var args []wire.Argument
 	for c := list.first(); !c.IsNull(); c = c.next() {
 		if c.IsNamed() && !c.IsExtra() {
-			out = append(out, k.exprType(c))
+			types = append(types, k.exprType(c))
+			args = append(args, wire.Argument{At: javaSpan(c), Reads: k.reads().argReads(c, k.readName, k.readSkip, nil)})
 		}
 	}
-	return out
+	return types, args
+}
+
+// readName reports an identifier an argument reads as a value: not the
+// field a field access names, nor the method a method reference names, nor
+// a segment of a qualified name.
+func (k *javaLinker) readName(n Node) bool {
+	j := k.k
+	if n.KindId() != j.identifier {
+		return false
+	}
+	switch p := n.Parent(); {
+	case p.IsNull():
+	case p.KindId() == j.fieldAccess:
+		return k.x.child(p, k.x.fField) != n
+	case p.KindId() == j.methodReference:
+		return firstNamed(p) == n
+	case p.KindId() == k.x.scopedIdentifier:
+		return false
+	}
+	return true
+}
+
+// readSkip reports a subtree whose identifiers an argument does not read: a
+// method invocation's or creation's result, a lambda, which reads its
+// captures only when it runs, and an anonymous class body.
+func (k *javaLinker) readSkip(n Node) bool {
+	j := k.k
+	switch n.KindId() {
+	case j.methodInvocation, j.objectCreation, j.lambda, j.classBody:
+		return true
+	}
+	return false
 }
 
 // addSite appends s, the site of the call node n.
