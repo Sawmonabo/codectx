@@ -97,13 +97,13 @@ func TestCaptureBuilderCarriesTheConfiguredRetryBudget(t *testing.T) {
 // with a measured wall: a stage whose span is never ended reads as running for
 // ever and its cost is simply missing from the breakdown.
 //
-// The three activation stages are asserted for a second reason: their span is
-// the only record of their duration, which no log line carries, so a missing
-// span here is the information going silently missing.
+// The activation's own stage is asserted for a second reason: its span is the
+// only record of its duration, which no log line carries, so a missing span
+// here is the information going silently missing.
 //
 // Mutation proof: delete the `walk.End(...)` call in generation.capture and the
-// walk stage reads as unfinished; or drop the lexical_build span's End in
-// buildLexical and that stage reads unfinished too.
+// walk stage reads as unfinished; or drop the adjacency span's End in
+// buildGraph and that stage reads unfinished too.
 func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
 	res, err := f.c.Index(f.ctx, model.IndexRequest{})
@@ -122,10 +122,10 @@ func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 			view.Run.FileCount, view.Run.UnitsSucceeded, res.FilesCaptured,
 			res.UnitsReused+res.UnitsBuilt)
 	}
-	// The stages activation opens for itself, spelled where they are opened:
+	// The stage activation opens for itself, spelled where it is opened:
 	// internal/storage/sqlite opens them under the activation span, so this
 	// package cannot name their constants.
-	inner := map[string]bool{"lexical_compaction": true, "adjacency": true, "lexical_build": true}
+	inner := map[string]bool{"adjacency": true}
 	stages := map[string]ledger.SpanRow{}
 	for _, span := range view.Spans {
 		if span.ParentSeq == nil || span.Stage == stageWalk || inner[span.Stage] {
@@ -134,7 +134,7 @@ func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 	}
 	for _, want := range []string{stageCapture, stageWalk, stagePlan, stageAttachReused,
 		stageBuild, stageCoverage, stageActivation, stageRetention,
-		"lexical_compaction", "adjacency", "lexical_build"} {
+		"adjacency"} {
 		span, ok := stages[want]
 		if !ok {
 			t.Errorf("the run recorded no %q stage", want)

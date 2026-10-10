@@ -32,7 +32,7 @@ const nativeKeyRowsPerDelete = 2
 
 // DeleteGeneration removes a failed or superseded generation's membership and
 // metadata, then collects units no retained generation or dependent unit
-// reaches, in reverse dependency order through the FTS-aware deletion
+// reaches, in reverse dependency order through the one unit deletion
 // procedure, then orphan identities and origin runs (Section 12.4). A live
 // lease or a retained session referencing the generation blocks deletion with
 // a retryable CTX_WORKSPACE_BUSY. The tail is the shared sweep; blob
@@ -72,12 +72,8 @@ func (s *Store) DeleteGeneration(ctx context.Context, gen model.GenerationID) er
 		if _, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("retention_leases", err)
 		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id); err != nil {
-			return wrap("generations", err)
-		}
-		// The generation's generation_segments rows have just cascaded away, so
-		// the segments only it named are collectable in this same transaction.
-		return collectUnreferencedSegments(ctx, tx)
+		_, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id)
+		return wrap("generations", err)
 	})
 	if err != nil {
 		return err
@@ -92,7 +88,9 @@ func (s *Store) DeleteGeneration(ctx context.Context, gen model.GenerationID) er
 // session names. snapshot limits the snapshot step to one row; nil considers
 // every snapshot, which only the indexing owner under its lock may do, since
 // a snapshot imported for a generation not yet begun is otherwise referenced
-// by nothing. Blob rows are left for the Section 10.4 grace protocol.
+// by nothing. Blob rows are left for the Section 10.4 grace protocol. Last, the
+// search documents the collected units released are deleted from the search
+// index under a commit of its own (commitSweepDeletes).
 func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error {
 	if err := s.collectUnreachableUnits(ctx); err != nil {
 		return err
@@ -103,10 +101,7 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 	if err := s.collectUnreferencedNativeKeys(ctx); err != nil {
 		return err
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
-		if err := collectUnreferencedSegments(ctx, tx); err != nil {
-			return err
-		}
+	err := s.write(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_runs WHERE generation_id IS NULL
 			AND NOT EXISTS (SELECT 1 FROM units u WHERE u.origin_run_id = provider_runs.id)`); err != nil {
 			return wrap("provider_runs", err)
@@ -136,6 +131,10 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 			AND NOT EXISTS (SELECT 1 FROM session_files s WHERE s.file_id = files.id)`)
 		return wrap("files", err)
 	})
+	if err != nil {
+		return err
+	}
+	return s.commitSweepDeletes(ctx)
 }
 
 // collectUnreachableUnits deletes, in bounded batches, every unit that no
@@ -284,15 +283,9 @@ func (s *Store) collectUnreferencedNativeKeys(ctx context.Context) error {
 
 // collectUnits repeatedly selects up to gcBatchUnits unit rows with query
 // (bound ?1 = arg, ?2 = batch size) and deletes them through deleteUnit, one
-// transaction per batch, until the query returns nothing.
-//
-// It touches no staging database. A lexical staging is a SLOT of the store's
-// scratch pool, not a file of the unit that staged into it: a crashed build's
-// slot is taken by the next unit that stages and emptied, and the pool itself
-// is inherited whole by the next process. There is no per-unit staging file to
-// collect, which is also what keeps collection away from the slot a live build
-// is writing -- several processes may share one data directory, and a live
-// build's staging would look exactly like a dead one's.
+// transaction per batch, until the query returns nothing. The search documents
+// the deleted units release are queued in the same transactions
+// (search_doc_deletes); the next library commit applies them.
 func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error {
 	for {
 		var deleted int
@@ -320,10 +313,7 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 				}
 			}
 			deleted = len(ids)
-			// The deleted units' search_units rows cascaded away with them, so
-			// the segments no row points at and no generation names go in the
-			// same transaction.
-			return collectUnreferencedSegments(ctx, tx)
+			return nil
 		})
 		if err != nil {
 			return err
@@ -334,30 +324,10 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 	}
 }
 
-// collectUnreferencedSegments deletes every lexical segment that no retained
-// generation names and that no document still points at. A segment survives
-// its generation only while some document lies in it -- the unit holding that
-// document may be attached to a new generation at any time, and it must find
-// its postings where its rows point -- and it survives its last document only
-// while a retained generation still reads it. The two tests together are what
-// makes a segment collectable, and they are what collects a segment a
-// compaction emptied: the merge re-points every row of its inputs, so an
-// absorbed segment is left named only by the generations that were published
-// before it, and it goes when the last of them does. Its parts cascade with it.
-//
-// It runs in the caller's transaction: a generation or a unit that goes away
-// and the segments that go away with it are one atomic change, so no reader
-// can pin a generation whose segments have already been reclaimed.
-func collectUnreferencedSegments(ctx context.Context, tx *sql.Tx) error {
-	_, err := tx.ExecContext(ctx, `DELETE FROM lexical_segments
-		WHERE NOT EXISTS (SELECT 1 FROM generation_segments gs WHERE gs.segment_id = lexical_segments.id)
-		AND NOT EXISTS (SELECT 1 FROM search_units su WHERE su.segment_id = lexical_segments.id)`)
-	return wrap("lexical_segments", err)
-}
-
-// deleteUnit is the one unit deletion procedure (Section 12.4). It deletes the
-// unit's FTS documents by rowid before the search_units rows go,
-// removes facts, then the identities only this unit referenced, then the unit.
+// deleteUnit is the one unit deletion procedure (Section 12.4). It queues the
+// unit's search documents for deletion from the search index before the
+// search_units rows go, removes facts, then the identities only this unit
+// referenced, then the unit.
 // Callers never `DELETE FROM units` directly. Membership rows are deliberately
 // not touched: every caller has already established the unit is unreachable,
 // and if one ever were not, the generation_units foreign key aborts the
@@ -374,16 +344,15 @@ func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM node_facts WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM native_aliases WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_relations SELECT relation_id FROM relation_facts WHERE unit_id = ?1`,
-		// search_fts is contentless with contentless_delete=1 (ADR-0003 §2.1),
-		// so a plain DELETE by rowid removes the document: no column values are
-		// read back and no body is stored to read. A posting is named by
-		// doc_id, and a delta carry-over shares one along a carry chain, so it
-		// is released only when no surviving unit still names it -- the same
-		// reference test node_ids and relation_ids get below. This runs before
-		// the search_units delete, so the survivor probe must exclude this
-		// unit's own rows explicitly. idx_search_doc serves both halves.
-		`DELETE FROM search_fts WHERE rowid IN (SELECT su.doc_id FROM search_units su WHERE su.unit_id = ?1
-			AND NOT EXISTS (SELECT 1 FROM search_units s2 WHERE s2.doc_id = su.doc_id AND s2.unit_id <> ?1))`,
+		// A search document is named by doc_id, and a delta carry-over shares
+		// one along a carry chain, so it is released only when no surviving
+		// unit still names it -- the same reference test node_ids and
+		// relation_ids get below. The library applies the queued delete at its
+		// next commit (searchindex.go). This runs before the search_units
+		// delete, so the survivor probe must exclude this unit's own rows
+		// explicitly. idx_search_doc serves the probe.
+		`INSERT INTO search_doc_deletes(doc_id) SELECT su.doc_id FROM search_units su WHERE su.unit_id = ?1
+			AND NOT EXISTS (SELECT 1 FROM search_units s2 WHERE s2.doc_id = su.doc_id AND s2.unit_id <> ?1)`,
 		`DELETE FROM search_units WHERE unit_id = ?1`,
 		`DELETE FROM evidence WHERE unit_id = ?1`,
 		`DELETE FROM native_aliases WHERE unit_id = ?1`,

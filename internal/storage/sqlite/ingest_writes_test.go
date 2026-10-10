@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -260,112 +259,29 @@ func TestIngestionGroupCommitsWhenTheCacheWouldSpill(t *testing.T) {
 	}
 }
 
-// TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion seals a
-// first index's worth of units -- one segment per unit, so the geometric
-// partitioning owes the generation a long cascade of merges -- and activates
-// it while sampling the log.
-//
-// Requirement: the group's commit decision fires only at the end of an
-// ingestion call, so a compaction cascade run inside the activation's own call
-// would have no commit point and nothing in the group's accounting would bound
-// its log; WALBoundBytes, which is stated as the largest log an ingestion group
-// leaves behind, would not be a bound on an activation. A first index of a
-// large repository owes thousands of merges. The merges therefore run as their
-// own ingestion calls before the activation, which commits between them, and
-// the activation itself only names the set they left.
-//
-// Mutation that fails it: run the merges inside the activation's call again
-// (drop compactBeforeActivation and compact from buildLexical) and the
-// activation commits once.
-func TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion(t *testing.T) {
-	const cacheKiB = 2048
-	path := t.TempDir() + "/activate.db"
-	f := newFixtureWithOptions(t, path, store.Options{WriterCacheKiB: cacheKiB})
-	gen := sealRepositoryInto(t, f, envInt(t, "CODECTX_INGEST_UNITS", 600), envInt(t, "CODECTX_INGEST_FACTS", 40), "", nil)
-	// The seals' own group is committed first, so what is counted below is the
-	// activation's alone.
-	if err := f.s.Flush(f.ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	before := f.s.Commits()
-	var peak int64
-	done := make(chan struct{})
-	sampled := make(chan struct{})
-	go func() {
-		defer close(sampled)
-		for {
-			if st, err := os.Stat(path + "-wal"); err == nil && st.Size() > peak {
-				peak = st.Size()
-			}
-			select {
-			case <-done:
-				return
-			case <-time.After(time.Millisecond):
-			}
-		}
-	}()
-	f.activate(gen, 0)
-	close(done)
-	<-sampled
-	commits := f.s.Commits() - before
-	t.Logf("activation commits=%d peak log=%d B bound=%d B over=%d B", commits, peak, f.s.WALBoundBytes(), peak-f.s.WALBoundBytes())
-	if commits < 2 {
-		t.Fatalf("the activation committed %d time(s): its compaction cascade never reached the group's commit decision, so nothing bounds its log", commits)
-	}
-	// The commit decision falls at the END of an ingestion call, so the frames
-	// of the merge that crosses the bound are already in the log when the group
-	// commits: a cascade run one merge per call peaks at the bound plus THAT
-	// ONE MERGE, never at the cascade. The bound asserted here is therefore the
-	// group bound plus one merge's frames, and nothing looser -- a bound that
-	// left room for a second merge would pass a cascade.
-	//
-	// Measured on this fixture, identically across repeated runs: 4 194 304 B
-	// bound, 4 202 432 B peak, an overshoot of 8 128 B, which is the two frames
-	// the crossing merge added. Eight frames is the assertion, four times what
-	// this fixture reaches and far below the 23.4 MiB the same fixture reaches
-	// when the cascade runs inside the activation's one call -- and that figure
-	// grows with the repository, which is what no bound would mean.
-	const walFrameBytes = 4096 + 24 // one page, plus the log frame's header
-	const mergeFrames = 8
-	if limit := f.s.WALBoundBytes() + mergeFrames*walFrameBytes; peak > limit {
-		t.Fatalf("the log reached %d B during the activation; the %d B group bound plus one merge's %d frames is %d B",
-			peak, f.s.WALBoundBytes(), mergeFrames, limit)
-	}
-}
-
-// TestAnActivationOvertakenByAnotherPaysNoMerges publishes one generation and
-// then asks the store to publish a second while still naming the first
+// TestAnActivationOvertakenByAnotherCommitsNothing publishes one generation
+// and then asks the store to publish a second while still naming the first
 // generation's predecessor as the pointer it saw -- the loser of an activation
 // race, deterministically.
 //
 // Requirement: the conditions an activation loses on are a pointer comparison
-// and a membership count, one row each, while the compaction cascade the
-// activation owes is thousands of merges, each its own committed and
-// unrollbackable ingestion. A loser that pays the cascade before reading the
-// row rebuilds a repository's segment set for an activation that was never
-// going to happen -- work no operator asked for, on the disk this group
-// commit exists to spare. The checks therefore run first.
+// and a membership count, one row each, while the search index commit the
+// activation owes is an fsync of every document the run added, and once made
+// it names the loser's generation as the index's payload. The checks
+// therefore run first, and the loser leaves the index's last commit as the
+// winner made it.
 //
-// What that spares is exactly this caller and no other: one that had already
-// been overtaken when it arrived. Two activations that start together both
-// pass the preflight and both pay the cascade, and the loser fails on the
-// re-check inside the activation transaction; sparing it as well would need a
-// lock held across the rebuild, which costs more than the merges it saves.
-//
-// Mutation that fails it: move the cascade back before the preflight (call
-// compactBeforeActivation first) and the loser's merges insert segments before
-// the version conflict is read.
-func TestAnActivationOvertakenByAnotherPaysNoMerges(t *testing.T) {
+// Mutation that fails it: move commitSearch before the preflight and the
+// loser's commit stamps the index with its own generation before the version
+// conflict is read.
+func TestAnActivationOvertakenByAnotherCommitsNothing(t *testing.T) {
 	f := newFixture(t, t.TempDir()+"/overtaken.db")
 	first := sealRepositoryInto(t, f, 40, 4, "", nil)
 	f.activate(first, 0)
 	second := sealRepositoryInto(t, f, 40, 4, " again", nil)
-	if err := f.s.Flush(f.ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	before, err := f.s.LexicalSegments(f.ctx)
-	if err != nil {
-		t.Fatalf("LexicalSegments: %v", err)
+	before, err := f.s.SearchCommitted()
+	if err != nil || before != strconv.FormatInt(int64(first), 10) {
+		t.Fatalf("the search index's last commit is %q (%v), want the first generation %d", before, err, first)
 	}
 	// Zero is the pointer this caller believes is published; the first
 	// generation is, so this activation has already been overtaken.
@@ -377,12 +293,11 @@ func TestAnActivationOvertakenByAnotherPaysNoMerges(t *testing.T) {
 	if !errors.As(err, &typed) || typed.Code != model.CodeVersionConflict {
 		t.Fatalf("the overtaken activation failed with %v; want a version conflict", err)
 	}
-	after, err := f.s.LexicalSegments(f.ctx)
+	after, err := f.s.SearchCommitted()
 	if err != nil {
-		t.Fatalf("LexicalSegments: %v", err)
+		t.Fatalf("SearchCommitted: %v", err)
 	}
 	if after != before {
-		t.Fatalf("the overtaken activation merged %d segment(s) before reading the pointer it lost on "+
-			"(segments %d -> %d)", after-before, before, after)
+		t.Fatalf("the overtaken activation committed the search index (payload %q -> %q) before reading the pointer it lost on", before, after)
 	}
 }

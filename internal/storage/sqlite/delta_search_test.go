@@ -9,104 +9,63 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // lexicalAnswer is everything a generation's lexical tier answers a query set
-// with, as text: the ordered document tuples a term matches and every input
-// BM25 scores them from. Scoring itself is a pure function of these (corpus
-// size, total length, per-term document frequency, per-document length and
-// per-term occurrence counts and offsets), and internal/search's rank order
-// breaks ties on path/start byte/node id/search key and never on the rowid, so
-// two generations with an identical answer here rank and score identically.
+// with, as text: each term's page in rank order, every result with its score,
+// occurrence count and identity, and the page's match count. Scores are exact
+// over the generation's visible documents and ties break on content, never on
+// a doc id, so two generations that hold the same visible documents answer
+// identically here, and a generation that sees one document more -- a hidden
+// document counted in N, df or the length average -- does not.
 func lexicalAnswer(t *testing.T, f *fixture, gen model.GenerationID, terms []string) string {
 	t.Helper()
 	r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
 	if err != nil {
 		t.Fatalf("PinGeneration(%d): %v", gen, err)
 	}
+	defer r.Close()
+	view, err := r.SearchView(f.ctx)
+	if err != nil {
+		t.Fatalf("SearchView(%d): %v", gen, err)
+	}
+	defer view.Close()
 	var b strings.Builder
-	docs, tokens, err := r.SearchStats(f.ctx)
-	if err != nil {
-		t.Fatalf("SearchStats: %v", err)
-	}
-	fmt.Fprintf(&b, "corpus documents=%d tokens=%d\n", docs, tokens)
-	dfs, err := r.DocumentFrequency(f.ctx, terms)
-	if err != nil {
-		t.Fatalf("DocumentFrequency: %v", err)
-	}
-	for i, term := range terms {
-		fmt.Fprintf(&b, "term %q df=%d\n", term, dfs[i])
-		ids, err := r.Match(f.ctx, `"`+term+`"`, 0, 100)
+	for _, term := range terms {
+		page, err := view.Search(f.ctx, textindex.Request{Query: term, Depth: 100})
 		if err != nil {
-			t.Fatalf("Match(%q): %v", term, err)
+			t.Fatalf("Search(%q): %v", term, err)
 		}
-		// Match pages by the document id, which a carried document keeps and a
-		// freshly indexed one mints; the ANSWER must not depend on either, so
-		// the tuples are compared in the rank tie-break order, not in id order.
-		// One posting session per term: the reader serves a term's whole
-		// instance list from a single held statement now, so the stream is
-		// drained once here and the per-document rows are picked out of it.
-		sess, err := r.OpenPostings(f.ctx)
-		if err != nil {
-			t.Fatalf("OpenPostings: %v", err)
+		fmt.Fprintf(&b, "term %q matches=%d exact=%v more=%v\n", term, page.Matches, page.MatchesExact, page.More)
+		for _, h := range page.Hits {
+			fmt.Fprintf(&b, "  %s %s %s %q [%d,%d) score=%d occurrences=%d key=%s\n",
+				h.Path, h.Name, h.QualifiedName, h.Signature, h.Bytes.Start, h.Bytes.End, h.ScoreMicros, h.Occurrences, h.SearchKey)
 		}
-		stream, err := sess.TermOccurrences(f.ctx, term)
-		if err != nil {
-			t.Fatalf("TermOccurrences(%q): %v", term, err)
-		}
-		var occ []store.TermOccurrence
-		for {
-			page, err := stream.Next(f.ctx, 100)
-			if err != nil {
-				t.Fatalf("TermOccurrences(%q) next: %v", term, err)
-			}
-			if page == nil {
-				break
-			}
-			occ = append(occ, page...)
-		}
-		if err := stream.Close(); err != nil {
-			t.Fatalf("stream close: %v", err)
-		}
-		if err := sess.Close(); err != nil {
-			t.Fatalf("session close: %v", err)
-		}
-		var lines []string
-		for _, id := range ids {
-			d, err := r.SearchUnit(f.ctx, id)
-			if err != nil {
-				t.Fatalf("SearchUnit(%d): %v", id, err)
-			}
-			var cols []string
-			for _, o := range occ {
-				if o.RowID != id {
-					continue
-				}
-				cols = append(cols, fmt.Sprintf("%s:%d@%v", o.Column, o.Count, o.Offsets))
-			}
-			lines = append(lines, fmt.Sprintf("  %s %s %s %q [%d,%d) len=%d key=%s %s",
-				d.Path, d.Name, d.QualifiedName, d.Signature, d.Bytes.Start, d.Bytes.End, d.TokenCount, d.ID, strings.Join(cols, " ")))
-		}
-		slices.Sort(lines)
-		b.WriteString(strings.Join(lines, "\n"))
-		b.WriteString("\n")
 	}
 	return b.String()
 }
 
-// TestDeltaCarriesTheTextItIndexed pins the one invariant a contentless index
-// cannot check for itself: a carried lexical document keeps the text it was
-// indexed with.
+// TestDeltaCarriesTheTextItIndexed pins two invariants of a delta carry-over.
 //
-// search_fts stores no body, and the body a producer published is NOT the
+// Visibility is per document: the delta unit carries b.go's document from its
+// predecessor and replaces a.go's, so its generation shows the carried document
+// and not the predecessor's a.go document, although the library holds both
+// under the predecessor's unit. Mutation: build the visible set from the units
+// that ADDED the documents instead of from the member rows' doc ids -- the
+// predecessor's a.go document (the only one holding zqxoriginal) then shows
+// in the delta generation and its statistics, and the delta answer differs from
+// the full index's.
+//
+// A carried document keeps the text it was indexed with. The database stores
+// no body, and the body a producer published is NOT the
 // source over the document's byte range -- treesitter publishes names,
 // signature and documentation over the whole declaration's extent, and the
 // filesystem provider publishes no body at all. So a carry-over that rebuilds
 // the index from the content store indexes text that was never any document's
 // body: the same tree answers differently depending on whether it was indexed
-// in full or refreshed, with no failing check anywhere, because every
-// integrity check a contentless index offers is internal to the index.
+// in full or refreshed, with no failing check anywhere.
 //
 // The fixture is what makes this provable: searchDoc's Body (docBody) shares
 // no token with the file's source, so re-derivation shows up as a changed hit
@@ -114,7 +73,7 @@ func lexicalAnswer(t *testing.T, f *fixture, gen model.GenerationID, terms []str
 func TestDeltaCarriesTheTextItIndexed(t *testing.T) {
 	dbPath := t.TempDir() + "/codectx.db"
 	f := newFixture(t, dbPath)
-	a1 := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
+	a1 := f.file("pkg/a.go", "package pkg\nfunc F() { zqxoriginal() }\n")
 	b := f.file("pkg/b.go", "package pkg\nfunc F() { F() }\n")
 	snap1 := f.snapshot("one", a1, b)
 	gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"), "main")
@@ -171,15 +130,21 @@ func TestDeltaCarriesTheTextItIndexed(t *testing.T) {
 	// zqxdocstring and zqxsignature appear only in a published body; package
 	// and pkg appear only in the source the byte range covers. A carry-over
 	// that re-derives the body loses the first pair and gains the second.
-	terms := []string{"zqxdocstring", "zqxsignature", "f", "package", "pkg"}
+	terms := []string{"zqxdocstring", "zqxsignature", "f", "package", "pkg", "zqxoriginal", "edited"}
 	full := lexicalAnswer(t, f, genFull, terms)
 	delta := lexicalAnswer(t, f, genDelta, terms)
 	if full != delta {
 		t.Errorf("a delta answers differently from a full index of the same tree.\nfull:\n%s\ndelta:\n%s", full, delta)
 	}
-	// Every read above resolves a document by doc_id, and the posting stream does
-	// not deduplicate, so a generation that saw one doc_id twice would
-	// double-count offsets and hydrate an arbitrary one of the rows. Two facts
+	if !strings.Contains(delta, "zqxoriginal\" matches=0") {
+		t.Errorf("the delta generation sees the replaced a.go document of its predecessor:\n%s", delta)
+	}
+	if first := lexicalAnswer(t, f, gen1, []string{"zqxoriginal"}); !strings.Contains(first, "matches=1") {
+		t.Fatalf("fixture no longer indexes the predecessor's a.go document under zqxoriginal:\n%s", first)
+	}
+	// A generation's visible set is a set of doc ids, so a generation that saw
+	// one doc_id through two member rows would serve whichever row's identity
+	// the library stored for it. Two facts
 	// in two files keep that from happening -- CarryOver refuses a predecessor
 	// of another provider or scope key, and generation_units is keyed by
 	// (generation_id, provider_id, scope_key) -- and it has to hold by
@@ -197,23 +162,22 @@ func TestDeltaCarriesTheTextItIndexed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if shared != 0 {
-		t.Errorf("%d document ids are visible twice in one generation; a shared posting must never reach two member units", shared)
+		t.Errorf("%d document ids are visible twice in one generation; a shared document must never reach two member units", shared)
 	}
 	if err := f.s.Check(f.ctx, true); err != nil {
 		t.Fatalf("deep integrity check after a delta: %v", err)
 	}
 
-	// Retiring the predecessor is where a shared posting is easiest to lose or
-	// to mistake for garbage: the unit whose insert minted it is gone, while
+	// Retiring the predecessor is where a shared document is easiest to lose or
+	// to mistake for garbage: the unit whose insert added it is gone, while
 	// the delta unit still names it. deleteUnit must keep it (it is released
-	// only when NO surviving unit names it), and the deep check's vocabulary
-	// scan must not read it as stale -- that scan walks doc_id, which the
-	// surviving row carries, and not the rowid the retired row had.
+	// only when NO surviving unit names it), while the predecessor's a.go
+	// document, which nothing names any more, is deleted from the index.
 	if err := f.s.DeleteGeneration(f.ctx, gen1); err != nil {
 		t.Fatalf("DeleteGeneration(gen1): %v", err)
 	}
 	if err := f.s.Check(f.ctx, true); err != nil {
-		t.Fatalf("deep integrity check after retiring the unit that minted the shared posting: %v", err)
+		t.Fatalf("deep integrity check after retiring the unit that added the shared document: %v", err)
 	}
 	if after := lexicalAnswer(t, f, genDelta, terms); after != delta {
 		t.Errorf("retiring the predecessor changed the delta generation's answer.\nbefore:\n%s\nafter:\n%s", delta, after)

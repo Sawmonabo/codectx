@@ -21,9 +21,8 @@ import (
 //
 // This asserts the structural fact rather than a duration: a process that has
 // opened a database can queue a removal under its directory. Opening the store
-// is the ONLY thing done here -- no unit is staged -- because the defect this
-// protects against is exactly that the registration used to depend on a lexical
-// staging having claimed the arena first, which a short run need never do.
+// is the ONLY thing done here -- no unit is written -- because the
+// registration must not depend on anything a short run need never do.
 //
 // Mutation that fails it: remove the `scratch.For` registration from Open.
 func TestOpenRegistersTheDatabaseDirectoryForPacedRemoval(t *testing.T) {

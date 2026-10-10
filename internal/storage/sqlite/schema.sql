@@ -123,6 +123,13 @@ CREATE TABLE units (
     origin_run_id BLOB NOT NULL REFERENCES provider_runs(id),
     state TEXT NOT NULL CHECK(state IN ('building','sealed','failed','quarantined')),
     source_binding TEXT NOT NULL CHECK(source_binding IN ('verified','unverified')),
+    -- The unit's pending mark: how many search documents it added to the
+    -- search index that are not yet known to be in a library commit. Its
+    -- batches add to it; the activation that publishes the unit, after the
+    -- library commit, clears it. Recover compares a nonzero mark with what the
+    -- library's last commit holds and fails a unit that differs, so a unit
+    -- whose documents a crash lost is rebuilt (ADR-0013 Decision 4).
+    search_pending INTEGER NOT NULL DEFAULT 0 CHECK(search_pending >= 0),
     UNIQUE(id, provider_id, scope_key)
 );
 CREATE TABLE unit_inputs (
@@ -285,12 +292,9 @@ CREATE TABLE native_keys (
     id INTEGER PRIMARY KEY CHECK(id > 0),
     key TEXT NOT NULL
 );
--- No `paths` intern table: the only high-multiplicity path column is
--- search_units.path, and `path` is one of the columns search_fts indexes, fed
--- from this column on every write. Interning it would put a surrogate id where
--- the index expects text, so the path field would leave the full-text index.
--- files.path is 818 rows / 114 KiB on that same fixture and is not an
--- amplifier.
+-- No `paths` intern table: files.path is 818 rows / 114 KiB on that same
+-- fixture and is not an amplifier, and a search document's path is stored in
+-- the search index, not here.
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key_id INTEGER NOT NULL REFERENCES scope_keys(id),
@@ -298,67 +302,55 @@ CREATE TABLE native_aliases (
     node_id INTEGER NOT NULL REFERENCES node_ids(id),
     PRIMARY KEY(unit_id, scope_key_id, native_key_id, node_id)
 ) WITHOUT ROWID;
+-- One row per search document of a unit: its identity, from search key to
+-- node, file and byte range. The indexed text -- path, kind, name, qualified
+-- name, signature and body -- lives only in the search index beside this
+-- database (ADR-0013), which stores what a search serves.
 CREATE TABLE search_units (
     rowid INTEGER PRIMARY KEY,
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     search_key BLOB NOT NULL CHECK(length(search_key) = 32),
     node_id INTEGER,
     file_id BLOB NOT NULL,
-    path TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    name TEXT NOT NULL DEFAULT '',
-    qualified_name TEXT NOT NULL DEFAULT '',
-    signature TEXT NOT NULL DEFAULT '',
     start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
     end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
-    token_count INTEGER NOT NULL CHECK(token_count >= 0),
-    -- The search_fts rowid holding this document's indexed text. It is the
-    -- DOCUMENT's identity, not the row's: a delta carry-over copies this
-    -- column forward with the rest of the row, so the carried unit points at
-    -- the posting the text was originally indexed into instead of re-deriving
-    -- a body the producer never published (a producer's Body is not the source
-    -- over [start_byte,end_byte) -- see internal/provider/treesitter/facts.go).
+    -- The search index document holding this row's text, allocated from
+    -- search_sequence when the row is written and never reused. It is the
+    -- DOCUMENT's identity, not the row's: a delta carry-over copies it forward
+    -- with the rest of the row, so the carried unit names the document its
+    -- text was indexed into instead of re-deriving a body the producer never
+    -- published (a producer's Body is not the source over
+    -- [start_byte,end_byte) -- see internal/provider/treesitter/facts.go).
     -- Sharing is confined to one carry chain: CarryOver refuses a predecessor
     -- of another provider or scope key, and generation_units is keyed by
     -- (generation_id, provider_id, scope_key), so at most one row of a chain
-    -- is visible in any generation and a doc_id still names one document
-    -- there. The posting is released like node_ids: deleteUnit removes it only
+    -- is visible in any generation and a doc_id names one document there. The
+    -- document is released like node_ids: deleteUnit queues its delete only
     -- when no other unit's row still names it.
     doc_id INTEGER NOT NULL CHECK(doc_id > 0),
-    -- The lexical segment this document's postings were folded into, or NULL
-    -- while the unit is still building. It is the DOCUMENT's segment, not the
-    -- row's: a carry-over copies it forward with doc_id, which is what makes a
-    -- carried unit own exactly the segments that hold at least one of its
-    -- carried documents rather than every segment its predecessor ever owned.
-    -- The reference is NO ACTION: a segment a document still names must not be
-    -- collectable. It is the SOURCE OF TRUTH for which segments a generation
-    -- reads and for which segments are garbage: a compaction re-points every
-    -- row of its inputs at the merged segment, so no row names an absorbed
-    -- segment afterwards and a retired unit that is attached again finds its
-    -- documents where its rows point.
-    segment_id INTEGER REFERENCES lexical_segments(id),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
 );
--- The lexical tier stores no second copy of the source (ADR-0003 §2.1).
--- search_units carries no `body` column and search_fts is CONTENTLESS, so the
--- indexed body text exists only as index postings. That makes the postings
--- irreplaceable rather than merely economical: no row of this database can
--- reconstruct the text a document was indexed with, which is why a carry-over
--- REUSES a carried document's posting through search_units.doc_id instead of
--- rebuilding one. `contentless_delete=1` is
--- what keeps DELETE and INSERT OR REPLACE available on unit invalidation
--- (https://sqlite.org/fts5.html#contentless_tables, engine floor 3.43.0; the
--- embedded engine is 3.53.4). Snippets and highlights are served from the
--- content store through the verified range reader, over the file_id and byte
--- range each row already carries -- never from this index. The index's rebuild
--- source is therefore the content store, not the database (docs/storage.md).
-CREATE VIRTUAL TABLE search_fts USING fts5(
-    name, qualified_name, signature, path, body,
-    content='', contentless_delete=1, tokenize='unicode61', detail='full'
+-- The next unallocated search document id. A batch of search documents takes
+-- its ids from here inside the transaction that writes their rows, so an id is
+-- durable exactly when its row is, and a crash that loses the rows also gives
+-- the ids back: Recover deletes every search index document at or past this
+-- value, which only a lost transaction can have added. Collection never
+-- lowers it, so a document id is never reused.
+CREATE TABLE search_sequence (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    next_doc_id INTEGER NOT NULL CHECK(next_doc_id > 0)
 );
-CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'instance');
+-- Search index documents that collection released and the search index has
+-- not yet deleted. deleteUnit queues them in the transaction that removes the
+-- rows naming them; the next library commit (an activation's, a collection
+-- sweep's or Recover's) applies them, and the rows it applied go in the
+-- SQLite transaction that follows it.
+CREATE TABLE search_doc_deletes (
+    rowid INTEGER PRIMARY KEY,
+    doc_id INTEGER NOT NULL CHECK(doc_id > 0)
+);
 CREATE TABLE context_manifests (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     generation_id INTEGER NOT NULL,
@@ -579,17 +571,13 @@ CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 -- was a full scan of context_entries per candidate file -- exactly the
 -- pathology idx_context_entries_node exists to prevent, on the sibling column.
 CREATE INDEX idx_context_entries_file ON context_entries(file_id);
-CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
--- deleteUnit releases a posting only when no surviving unit's row still names
--- it, and every read resolves a document by doc_id. Without this index both
--- are a scan of search_units per probe.
+-- An activation reads every member unit's doc ids to build the generation's
+-- visible set; carrying doc_id makes that walk index-only.
+CREATE INDEX idx_search_unit ON search_units(unit_id, doc_id);
+-- deleteUnit releases a document only when no surviving unit's row still
+-- names it, and Recover closes a failed unit over the units sharing its doc
+-- ids. Without this index both are a scan of search_units per probe.
 CREATE INDEX idx_search_doc ON search_units(doc_id);
--- The segment arm of the same column. An activation walks the documents of
--- each segment it is about to merge, re-points every row of the merged inputs
--- and the collector asks, per candidate segment, whether any row still names
--- it; all three are a scan of search_units per segment without this index, and
--- carrying doc_id in it makes the walk index-only.
-CREATE INDEX idx_search_segment ON search_units(segment_id, doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
@@ -729,71 +717,13 @@ CREATE TABLE generation_graph_parts (
     PRIMARY KEY(generation_id, stream, part)
 ) WITHOUT ROWID;
 
--- generation_lexical is written LAST, after every generation_segments row, so
--- its presence is the commit marker: a reader that finds the row is guaranteed
--- the generation's whole segment set behind it. It also carries the
--- generation's document statistics, which the scorer would otherwise recompute
--- by probing every visible document (ADR-0007 Decision 1).
-CREATE TABLE generation_lexical (
+-- One generation's visible search documents: a bitmap over doc ids (bit
+-- id%8 of byte id/8, least significant first) of every search_units.doc_id of
+-- its member units. A search opens the generation's view of the search index
+-- with it, so a document of a unit the generation does not select is never a
+-- candidate and never counts in a statistic. It is written in the activation
+-- transaction, after the search index commit that holds those documents.
+CREATE TABLE generation_search (
     generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
-    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
-    token_total INTEGER NOT NULL CHECK(token_total >= 0),
-    -- The generation's visible documents, one bit per document rowid. A
-    -- document an inherited segment still holds but whose unit left the
-    -- generation is hidden here; nothing is rewritten to hide it, and a reader
-    -- takes the bitmap as it stands instead of scanning the generation's
-    -- documents to rebuild it.
     visible BLOB NOT NULL
 );
-
--- A lexical segment is an immutable packed structure over a set of documents:
--- the term directory, the term text it points into, the posting lists and the
--- per-document attributes of the documents they name, each
--- chunked into lexical_segment_parts. A segment is written once, by the seal of
--- the unit whose documents it holds, and is never rewritten; an activation
--- names segments, it does not rebuild them (ADR-0007 Decision 1).
-CREATE TABLE lexical_segments (
-    id INTEGER PRIMARY KEY,
-    term_count INTEGER NOT NULL CHECK(term_count >= 0),
-    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
-    bytes INTEGER NOT NULL CHECK(bytes >= 0)
-);
-
--- One chunk of one segment stream. `term.dir` is the fixed-width term
--- directory in term order -- term slice, document frequency and the slice of
--- `post.list` holding that term's per-document (column, count) sequence --
--- `term.text` the concatenated term bytes it points into, and `post.list` the
--- posting lists themselves, whose documents ascend by rowid. `doc.dir` is the
--- fixed-width document directory in ascending document rowid and `doc.attr`
--- the attribute records it points into: every field a search candidate is
--- served from, packed once per document, so a page of candidates is hydrated
--- from these bytes instead of one document-row read each (ADR-0007 Decision 2). `part` is 0-based
--- and the parts of a stream concatenate to it, so a reader holds a bounded
--- window of parts rather than a whole vocabulary.
-CREATE TABLE lexical_segment_parts (
-    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE CASCADE,
-    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list','doc.dir','doc.attr')),
-    part INTEGER NOT NULL CHECK(part >= 0),
-    bytes BLOB NOT NULL,
-    PRIMARY KEY(segment_id, stream, part)
-) WITHOUT ROWID;
-
--- The segment set of one generation, in read order. The set is DERIVED at
--- activation from search_units.segment_id -- the distinct segments the live
--- rows of the generation's member units point at -- and recorded here so a
--- reader resolves it with one scan; nothing is rewritten to publish it, and a
--- retained generation keeps its own rows when a later generation merges the
--- same segments away. The reference is RESTRICT rather than CASCADE: a segment
--- a generation still names must not be collectable while that row exists.
-CREATE TABLE generation_segments (
-    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
-    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE RESTRICT,
-    ord INTEGER NOT NULL CHECK(ord >= 0),
-    -- How many of the segment's documents this generation hides. Zero is the
-    -- common case and is what lets a document frequency answer from the term
-    -- directory; a segment with hidden documents is counted by walking the
-    -- term's posting list against the visible bitmap instead.
-    hidden INTEGER NOT NULL CHECK(hidden >= 0),
-    PRIMARY KEY(generation_id, ord)
-) WITHOUT ROWID;
-CREATE INDEX idx_generation_segments_segment ON generation_segments(segment_id, generation_id);

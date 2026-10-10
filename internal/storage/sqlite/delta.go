@@ -20,15 +20,15 @@ import (
 // INSERT..SELECT per fact table and leaves all of that untouched.
 //
 // One thing is shared rather than copied, for the same reason node_ids is: a
-// lexical document's FTS posting. search_fts is contentless (ADR-0003 §2.1),
-// so the indexed text exists ONLY as postings -- no column of this database
-// holds it, and it cannot be re-derived from the source either, because a
-// producer's Body is not the file's bytes over [start_byte, end_byte)
-// (treesitter publishes names, signature and documentation; the filesystem
-// provider publishes none). A carried document therefore keeps the posting it
-// was indexed into, by copying search_units.doc_id along with the rest of the
-// row, and re-indexes nothing. deleteUnit releases a posting only when no
-// surviving unit's row still names it, exactly as it releases a node id.
+// search document of the search index. The indexed text exists ONLY there --
+// no column of this database holds it, and it cannot be re-derived from the
+// source either, because a producer's Body is not the file's bytes over
+// [start_byte, end_byte) (treesitter publishes names, signature and
+// documentation; the filesystem provider publishes none). A carried document
+// therefore keeps the document it was indexed into, by copying
+// search_units.doc_id along with the rest of the row, and re-indexes nothing.
+// deleteUnit releases a document only when no surviving unit's row still
+// names it, exactly as it releases a node id.
 //
 // A fact's retention bucket is the FileID on its evidence: evidence with a
 // FileID belongs to that path's bucket, evidence with none belongs to the
@@ -339,26 +339,21 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 	return w.copyEvidence(ctx, tx, prevRow, replaceIndexLevel, stats)
 }
 
-// copySearchUnits carries the lexical documents forward. doc_id travels with
-// the row, so each carried document keeps the posting its text was indexed
-// into and nothing is re-indexed: the copy is one bounded INSERT..SELECT that
-// reads and writes no text at all, and it chains through repeated deltas
-// because the column it copies is itself a copy. Re-deriving the body instead
-// -- from the content store over [start_byte, end_byte) -- would index source
-// text no producer ever published as a document body, silently changing every
-// carried document's lexical hits, BM25 length and snippets.
-//
-// segment_id travels with doc_id, so a carried document arrives already packed
-// and already naming the segment it lies in. That column is what makes the
-// carried documents part of the new generation's segment set without anything
-// being rewritten, and it is why a compaction re-points every row it absorbs:
-// a carry that copied an absorbed segment forward would name it beside the one
-// that holds the same documents.
+// copySearchUnits carries the search documents forward. doc_id travels with
+// the row, so each carried document keeps the search index document its text
+// was indexed into and nothing is re-indexed: the copy is one bounded
+// INSERT..SELECT that reads and writes no text at all, and it chains through
+// repeated deltas because the column it copies is itself a copy. Re-deriving
+// the body instead -- from the content store over [start_byte, end_byte) --
+// would index source text no producer ever published as a document body,
+// silently changing every carried document's lexical hits, BM25 length and
+// snippets. A carried document is visible in the new generation because its
+// doc id is in the generation's visible set (generation_search), and the
+// carried rows add nothing to the unit's pending mark: the library already
+// holds them under the unit that added them.
 func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow int64, stats *CarryOverStats) error {
-	res, err := tx.ExecContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind,
-		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id, segment_id)
-		SELECT ?3, su.search_key, su.node_id, su.file_id, su.path, su.kind,
-			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count, su.doc_id, su.segment_id
+	res, err := tx.ExecContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, start_byte, end_byte, doc_id)
+		SELECT ?3, su.search_key, su.node_id, su.file_id, su.start_byte, su.end_byte, su.doc_id
 		FROM search_units su WHERE su.unit_id = ?1
 			AND su.file_id NOT IN (SELECT file_id FROM cx_carry_files)
 			AND (su.node_id IS NULL OR EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = su.node_id))

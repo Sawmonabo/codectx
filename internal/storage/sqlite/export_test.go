@@ -3,9 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/binary"
-	"maps"
-	"slices"
+	"errors"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -15,17 +13,13 @@ import (
 // constants make unreachable on a fixture -- a list that straddles a part
 // boundary needs either a repository-sized fixture or a smaller part.
 
-// WithDerivedReaders is opts with each reader pool the test left unsized sized
-// as the product sizes it on this machine under the shipped configuration
-// (config.ReadConnections, config.PostingConnections), because Open refuses a
-// store opened without both counts.
+// WithDerivedReaders is opts with the short-read pool sized as the product
+// sizes it on this machine under the shipped configuration
+// (config.ReadConnections), because Open refuses a store opened without it.
 func WithDerivedReaders(opts Options) Options {
 	cfg := config.Defaults()
 	if opts.ReadConnections == 0 {
 		opts.ReadConnections = config.ReadConnections(cfg)
-	}
-	if opts.PostingConnections == 0 {
-		opts.PostingConnections = config.PostingConnections(cfg)
 	}
 	return opts
 }
@@ -43,31 +37,6 @@ func SetEdgePartBytes(n int) func() {
 // streams, exported so the query-plan test asserts the SQL that ships.
 func OutgoingEdgeQuery() string { return outgoingEdgeQuery() }
 func IncomingEdgeQuery() string { return incomingEdgeQuery() }
-
-// The scans the packed lexical structure streams, exported so the query-plan
-// test asserts the SQL that ships: the activation's one pass over its
-// documents, which resolves its segment set with them; a reader's walk of that
-// set; the seal's read of the attributes it packs once per document; and the
-// two the compaction adds -- the walk of the documents an input segment still
-// holds and the re-point of an absorbed segment's rows.
-func GenerationDocumentQuery() string { return generationDocumentQuery }
-func SegmentAttributeQuery() string   { return segmentAttributeQuery }
-func GenerationLexicalQuery() string  { return generationLexicalQuery }
-func SegmentDocumentQuery() string    { return segmentDocumentQuery }
-func RepointSegmentStatement() string { return repointSegmentStatement }
-
-// SetLexicalMergeRatio shrinks the geometric partitioning's ratio for one test
-// and returns a function that restores it. It is not a user setting: the ratio
-// decides how often already-packed bytes are rewritten, never what is stored or
-// answered. LexicalMergeRatio is the ratio that ships, so a test can drive a
-// merge on the real constant.
-func SetLexicalMergeRatio(r int) func() {
-	prev := lexMergeRatio
-	lexMergeRatio = r
-	return func() { lexMergeRatio = prev }
-}
-
-func LexicalMergeRatio() int { return lexMergeRatio }
 
 // EvidenceCountQuery is the build's third ordered scan.
 func EvidenceCountQuery() string { return evidenceCountQuery() }
@@ -111,101 +80,56 @@ func (s *Store) SetFreeBytes(fn func(dir string) (uint64, bool)) func() {
 	return func() { s.freeBytes = prev }
 }
 
-// SegmentPostingDocuments decodes the document rowids one segment's posting
-// lists actually carry, so a test can prove a document is GONE from the packed
-// bytes rather than merely hidden by a bitmap. It reassembles the segment's
-// term directory and posting stream, which is why it is a test hook: a
-// production read holds a bounded window of parts, never a whole stream.
-func SegmentPostingDocuments(db *sql.DB, segment int64) ([]int64, error) {
-	stream := func(name string) ([]byte, error) {
-		rows, err := db.Query(`SELECT bytes FROM lexical_segment_parts
-			WHERE segment_id = ? AND stream = ? ORDER BY part`, segment, name)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		var out []byte
-		for rows.Next() {
-			var b []byte
-			if err := rows.Scan(&b); err != nil {
-				return nil, err
-			}
-			out = append(out, b...)
-		}
-		return out, rows.Err()
-	}
-	dir, err := stream(streamTermDir)
-	if err != nil {
-		return nil, err
-	}
-	lists, err := stream(streamPostList)
-	if err != nil {
-		return nil, err
-	}
-	seen := map[int64]bool{}
-	for off := 0; off+termEntryBytes <= len(dir); off += termEntryBytes {
-		e := dir[off:]
-		listOff := int64(binary.LittleEndian.Uint64(e[termEntryListOff:]))
-		listLen := int64(binary.LittleEndian.Uint32(e[termEntryListLen:]))
-		if listOff+listLen > int64(len(lists)) {
-			return nil, corrupt("segment %d term at %d points past its posting stream", segment, off)
-		}
-		c := &postingCursor{raw: lists[listOff : listOff+listLen], segment: segment}
-		for {
-			live, err := c.next()
-			if err != nil {
-				return nil, err
-			}
-			if !live {
-				break
-			}
-			seen[c.doc] = true
-		}
-	}
-	return slices.Sorted(maps.Keys(seen)), nil
-}
-
-// SetLexPartBytes shrinks the lexical stream part size for one test and returns
-// a function that restores it. It is not a user setting: the part size bounds
-// how much of a stream is resident at once, never what is stored or answered.
-// A small value is what forces the stitch paths -- the reader's, which joins a
-// directory entry split across two parts, and the merge's, which joins a
-// posting list split across two -- that the shipped size reaches only on a
-// repository-sized fixture.
-func SetLexPartBytes(n int) func() {
-	prev := lexPartBytes
-	lexPartBytes = n
-	return func() { lexPartBytes = prev }
-}
-
 // Commits reports how many ingestion groups the store has committed, so a test
 // can prove a long cascade of writes reached the group's commit decision
 // between its steps rather than running as one unbounded transaction.
 func (s *Store) Commits() int64 { return s.commits.Load() }
 
-// LexicalSegments counts the packed segments the store holds. A merge inserts
-// one and leaves its inputs for the collector, so the count rises by one per
-// merge: it is how a test sees whether a compaction cascade ran. It reads the
-// writer's own view, because a merge sits in the open ingestion group until
-// the group's commit decision fires.
-func (s *Store) LexicalSegments(ctx context.Context) (int64, error) {
+// StopAfterSearchCommit makes every activation stop between its search
+// index commit and its SQLite transaction, as if the process died there, and
+// returns a function that restores the store's behaviour. The stopped
+// activation answers ErrStoppedAfterSearchCommit.
+func StopAfterSearchCommit() func() {
+	prev := afterSearchCommit
+	afterSearchCommit = func() error { return ErrStoppedAfterSearchCommit }
+	return func() { afterSearchCommit = prev }
+}
+
+// ErrStoppedAfterSearchCommit is the activation answer StopAfterSearchCommit
+// arranges.
+var ErrStoppedAfterSearchCommit = errors.New("stopped between the search index commit and the SQLite activation")
+
+// DiscardSearchAdds closes the search index writer without a commit, as a
+// process that died before its next library commit leaves it: every document
+// added since the last commit is gone from the library while the SQLite rows
+// naming them stay.
+func (s *Store) DiscardSearchAdds() error { return s.text.ReleaseWriter() }
+
+// SearchPending is a unit's pending mark, read from the writer's own view.
+func (s *Store) SearchPending(ctx context.Context, unit model.UnitID) (int64, error) {
+	key, err := idBlob("unit_id", string(unit))
+	if err != nil {
+		return 0, err
+	}
 	var n int64
-	err := s.readOwn(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `SELECT count(*) FROM lexical_segments`).Scan(&n)
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT search_pending FROM units WHERE unit_key = ?`, key).Scan(&n)
 	})
 	return n, err
 }
 
-// LexicalPartsLive is the bound on the parts a reader's lexical part cache
-// holds at once, exported so the test that proves the bound is over the whole
-// cache asserts against the constant rather than a copy of it.
-func LexicalPartsLive() int { return lexPartsLive }
+// PendingUnits counts the units still marked pending.
+func (s *Store) PendingUnits(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT count(*) FROM units WHERE search_pending > 0`).Scan(&n)
+	})
+	return n, err
+}
 
-// LexicalPartsPeak reports the most parts this session's lexical part cache
-// has held at once. A session that never opened one has held none.
-func (p *PostingSession) LexicalPartsPeak() int {
-	if p.lex == nil {
-		return 0
-	}
-	return p.lex.peak
+// SearchCommitted is the payload of the search index's last commit, empty when
+// it was never committed.
+func (s *Store) SearchCommitted() (string, error) {
+	payload, _, err := s.text.Committed()
+	return payload, err
 }

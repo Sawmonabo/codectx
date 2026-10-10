@@ -7,7 +7,6 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -45,6 +44,9 @@ func (s *Store) initSchema(ctx context.Context) error {
 		if tables == 0 {
 			if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
 				return wrap("create schema", err)
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO search_sequence(singleton, next_doc_id) VALUES(1, 1)`); err != nil {
+				return wrap("search_sequence", err)
 			}
 			_, err := tx.ExecContext(ctx, `INSERT INTO schema_meta(singleton, version, fingerprint) VALUES(1, ?, ?)`, schemaVersion, Fingerprint)
 			return wrap("schema_meta", err)
@@ -164,6 +166,11 @@ func (s *Store) Recover(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	// The search index is reconciled first, while the crashed run's staging
+	// is still as the crash left it (searchindex.go).
+	if err := s.reconcileSearch(ctx); err != nil {
+		return err
+	}
 	for _, id := range staging {
 		if err := s.Abort(ctx, model.GenerationID(id)); err != nil {
 			return err
@@ -187,23 +194,13 @@ func (s *Store) Recover(ctx context.Context, now time.Time) error {
 //     they do NOT walk a single page of content, and the caller must report the
 //     content walk as unverified rather than as passed.
 //   - deep (deep == true): everything shallow checks, then `quick_check`, the
-//     foreign key check and the full-text index walk -- the complete pass.
+//     foreign key check, that every search document id lies below the
+//     sequence that allocates them, and that the search index's last commit
+//     holds the active generation -- the complete pass.
 //
 // Both run on the reader pool (`s.read`), never `s.write`: an integrity walk
 // reads, and taking the writer for it serialised `doctor` against any running
-// indexer for the whole walk. The one exception is the FTS5 `integrity-check`
-// command, which is spelled as an INSERT and is therefore refused by the
-// readers' `query_only=ON`; it takes the writer for that statement alone, and
-// only under deep.
-//
-// search_fts is contentless (ADR-0003 §2.1), so its integrity-check proves the
-// index is internally consistent, not that it agrees with a stored copy of the
-// text -- there is no stored copy, and the text's own authority is the content
-// store, which verifies every block digest on read. Document membership is
-// still checked both ways: a posting is named by search_units.doc_id -- which a
-// delta carry-over shares along a carry chain, so several rows may name one --
-// and the vocabulary scan in checkContent reports any indexed document no row
-// names.
+// indexer for the whole walk.
 func (s *Store) Check(ctx context.Context, deep bool) error {
 	if err := s.checkHeader(ctx); err != nil {
 		return err
@@ -255,7 +252,7 @@ func (s *Store) checkHeader(ctx context.Context) error {
 }
 
 // checkContent is the O(database bytes) half: quick_check, the foreign key
-// check and the full-text index walk. Only --deep reaches it.
+// check and the search document checks. Only --deep reaches it.
 func (s *Store) checkContent(ctx context.Context) error {
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		var result string
@@ -272,34 +269,27 @@ func (s *Store) checkContent(ctx context.Context) error {
 		if violations != 0 {
 			return corrupt("%d foreign key violations", violations)
 		}
-		// integrity-check inspects only the index's own structures; it cannot
-		// report index entries no search_units row names. The vocabulary table
-		// enumerates every indexed instance, so a stale document shows up here.
-		// idx_search_doc serves the probe.
-		var stale int64
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.doc_id = v.doc)`).Scan(&stale); err != nil {
-			return wrap("search_vocab", err)
+		// A document id at or past the sequence was never allocated by a
+		// committed transaction; Recover removes such documents from the
+		// search index, and no row may name one. idx_search_doc serves it.
+		var unallocated int64
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_units
+			WHERE doc_id >= (SELECT next_doc_id FROM search_sequence WHERE singleton = 1)`).Scan(&unallocated); err != nil {
+			return wrap("search_units", err)
 		}
-		if stale != 0 {
-			return &model.Error{Code: model.CodeStorageCorrupt, Message: fmt.Sprintf("search index holds %d term instances for documents that no longer exist", stale),
-				Remediation: "rebuild the cache with index --rebuild"}
+		if unallocated != 0 {
+			return corrupt("%d search documents name a doc id the sequence never allocated", unallocated)
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	// FTS5's integrity-check is spelled as an INSERT into the virtual table, so
-	// the readers' query_only=ON refuses it. It is a read in every other sense
-	// and writes nothing; it is the only statement of this check that needs the
-	// writer, and it holds it only for its own duration.
-	return s.write(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(search_fts) VALUES('integrity-check')`); err != nil {
-			return &model.Error{Code: model.CodeStorageCorrupt, Message: "search index failed its internal integrity check: " + err.Error(),
-				Remediation: "rebuild the cache with index --rebuild"}
-		}
-		return nil
-	})
+	active, err := s.activeGenerationID(ctx)
+	if err != nil {
+		return err
+	}
+	return s.searchHolds(active)
 }
 
 // Stats is the storage accounting status and doctor report (Section 22):

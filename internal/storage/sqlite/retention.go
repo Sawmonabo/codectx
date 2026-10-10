@@ -67,7 +67,7 @@ func (p RetentionPolicy) overRetained(total int64) bool {
 // actually free; a unit another generation still selects reclaims nothing. The
 // size max_retained_bytes is measured against is a different question and
 // counts every unit a retained generation selects, shared or not (see
-// keepByRef). Both exclude FTS index overhead, page rounding and the content
+// keepByRef). Both exclude the search index's own files, page rounding and the content
 // blobs, which snapshots and the Section 10.4 grace protocol retain, not
 // generations. The figures are an accounting estimate for a warning, not a
 // page count.
@@ -348,9 +348,7 @@ func (s *Store) generationBytes(ctx context.Context, gen int64, exclusive bool) 
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(detail AS BLOB))), 0)
 			FROM evidence WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 FROM native_aliases WHERE unit_id IN (SELECT id FROM ex))
-	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(name AS BLOB)) + length(cast(qualified_name AS BLOB))
-			+ length(cast(signature AS BLOB)) + length(cast(path AS BLOB))), 0)
-			FROM search_units WHERE unit_id IN (SELECT id FROM ex))
+	  + (SELECT count(*) * ?2 FROM search_units WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(payload)), 0) FROM unit_delta_state WHERE unit_id IN (SELECT id FROM ex))`
 	cte := members
 	if exclusive {

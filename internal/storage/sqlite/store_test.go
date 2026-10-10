@@ -19,6 +19,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/retention"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	_ "modernc.org/sqlite"
 )
@@ -134,10 +135,6 @@ func (f *fixture) snapshot(tag string, files ...fileFixture) model.Snapshot {
 	return snap
 }
 
-// providerTokenCount is the deliberately wrong token count every fixture
-// document asserts; storage must compute its own from the indexed text.
-const providerTokenCount = 3
-
 // docBody is the indexed text a producer publishes for a declaration. It is
 // deliberately NOT the source over the document's byte range: treesitter
 // publishes names, signature and attached documentation and never the body
@@ -157,7 +154,7 @@ func docBody(ff fileFixture) string {
 func (f *fixture) searchDoc(ff fileFixture) model.SearchUnit {
 	return model.SearchUnit{ID: model.H("search-test", ff.path, ff.hash), NodeID: f.nodeID(ff), FileID: ff.id, Path: ff.path,
 		Kind: model.NodeFunction, Name: "F", QualifiedName: ff.path + ".F",
-		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: docBody(ff), TokenCount: providerTokenCount}
+		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: docBody(ff)}
 }
 
 // begin opens a file-scoped unit for ff inside gen without sealing it.
@@ -253,24 +250,24 @@ func (f *fixture) activate(gen, expected model.GenerationID) model.Binding {
 	return b
 }
 
-// flushed commits the store's open ingestion group, so a connection of the
-// test's own, or a reader-pool count, sees what the store has written so far.
-// packedDocuments hydrates documents the way a query does: from the pinned
-// generation's packed per-document attribute stream, through a posting session.
-func packedDocuments(t *testing.T, ctx context.Context, r *store.PinnedReader, ids []int64) []store.SearchDocument {
+// searchHits is the pinned generation's lexical page for query, deep enough
+// to hold every result a fixture can produce, best first.
+func searchHits(t *testing.T, ctx context.Context, r *store.PinnedReader, query string) []textindex.Hit {
 	t.Helper()
-	session, err := r.OpenPostings(ctx)
+	view, err := r.SearchView(ctx)
 	if err != nil {
-		t.Fatalf("OpenPostings: %v", err)
+		t.Fatalf("SearchView: %v", err)
 	}
-	defer session.Close()
-	docs, err := session.PackedDocuments(ctx, ids)
+	defer view.Close()
+	page, err := view.Search(ctx, textindex.Request{Query: query, Depth: 1000})
 	if err != nil {
-		t.Fatalf("PackedDocuments: %v", err)
+		t.Fatalf("Search(%q): %v", query, err)
 	}
-	return docs
+	return page.Hits
 }
 
+// flushed commits the store's open ingestion group, so a connection of the
+// test's own, or a reader-pool count, sees what the store has written so far.
 func flushed(t *testing.T, s *store.Store) {
 	t.Helper()
 	if err := s.Flush(context.Background()); err != nil {
@@ -286,21 +283,6 @@ func (f *fixture) stats() store.Stats {
 		f.t.Fatalf("Stats: %v", err)
 	}
 	return st
-}
-
-// indexedTokens counts the tokens storage's own tokenizer yields for every
-// column search_fts indexes, which is what token_count must equal.
-func (f *fixture) indexedTokens(doc model.SearchUnit) int64 {
-	f.t.Helper()
-	var n int64
-	for _, col := range []string{doc.Name, doc.QualifiedName, doc.Signature, doc.Path, doc.Body} {
-		terms, err := f.s.Tokenize(f.ctx, col)
-		if err != nil {
-			f.t.Fatalf("Tokenize: %v", err)
-		}
-		n += int64(len(terms))
-	}
-	return n
 }
 
 // capsuleSource is a model.CapsuleListSource over an in-memory record set. The
@@ -348,7 +330,7 @@ func wantCode(t *testing.T, err error, code string) {
 // Section 25.1 ("storage and incremental publication"). Each phase names the
 // silent failure it protects against: leaking unsealed facts, rewriting or
 // wrongly reusing units, a half-applied activation, lost provenance, a fact
-// bound to the wrong snapshot, an FTS index that disagrees with its content,
+// bound to the wrong snapshot, a search document outliving its collected unit,
 // GC collecting a pinned generation, and serving from a schema this binary
 // does not understand.
 func TestStorePublicationScenario(t *testing.T) {
@@ -560,7 +542,7 @@ func TestStorePublicationScenario(t *testing.T) {
 
 	// Phase: provenance retained. unitA still carries run1 as its origin even
 	// though gen1, which created it, is gone; unitB1 was unreachable and is
-	// collected together with its FTS rows; snap1 and c.go's file row, now
+	// collected together with its search documents; snap1 and c.go's file row, now
 	// referenced by nothing, are collected too.
 	if run, err := f.s.ProviderRun(ctx, run1); err != nil {
 		t.Fatalf("run1 provenance lost after deleting its generation: %v", err)
@@ -574,7 +556,7 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatal("unreachable unitB1 survived generation deletion")
 	}
 	if err := f.s.Check(ctx, true); err != nil {
-		t.Fatalf("FTS/database integrity after FTS-aware deletion: %v", err)
+		t.Fatalf("database and search index integrity after collection: %v", err)
 	}
 	afterGC := f.stats()
 	if afterGC.Snapshots != 1 || afterGC.Files != 3 {
@@ -587,29 +569,11 @@ func TestStorePublicationScenario(t *testing.T) {
 	if n, err := reader2.Node(ctx, f.nodeID(b2)); err != nil || n.UnitID != unitB2 {
 		t.Fatalf("active reader node = %+v %v, want gen2's unit %s", n, err, unitB2)
 	}
-	if ids, err := reader2.Match(ctx, `"changed"`, 0, 10); err != nil || len(ids) != 1 {
-		t.Fatalf("Match(changed) = %v %v, want exactly the gen2 b.go document", ids, err)
+	if hits := searchHits(t, ctx, reader2, "changed"); len(hits) != 1 || hits[0].Path != b2.path {
+		t.Fatalf("search(changed) = %+v, want exactly the gen2 b.go document", hits)
 	}
-	ids, err := reader2.Match(ctx, `"B"`, 0, 10)
-	if err != nil || len(ids) != 1 {
-		t.Fatalf("Match(B) = %v %v, want only the retained document; the deleted unit's FTS row must be gone", ids, err)
-	}
-	// Phase: length statistics agree with the index. token_count is computed
-	// by storage with the index tokenizer; the provider's value is ignored.
-	docB, err := reader2.SearchUnit(ctx, ids[0])
-	if err != nil {
-		t.Fatalf("SearchUnit: %v", err)
-	}
-	wantB := f.indexedTokens(f.searchDoc(b2))
-	if docB.TokenCount != wantB || docB.TokenCount == providerTokenCount {
-		t.Fatalf("stored token_count = %d, want %d indexed tokens (provider asserted %d)", docB.TokenCount, wantB, providerTokenCount)
-	}
-	docs, tokens, err := reader2.SearchStats(ctx)
-	if wantTokens := wantB + f.indexedTokens(f.searchDoc(a)); err != nil || docs != 2 || tokens != wantTokens {
-		t.Fatalf("SearchStats = %d docs %d tokens %v, want 2 docs %d tokens", docs, tokens, err, wantTokens)
-	}
-	if terms, err := f.s.Tokenize(ctx, "Foo_bar baz.Qux"); err != nil || len(terms) != 4 {
-		t.Fatalf("Tokenize = %v %v, want 4 unicode61 tokens", terms, err)
+	if hits := searchHits(t, ctx, reader2, "b"); len(hits) != 1 || hits[0].Path != b2.path {
+		t.Fatalf("search(b) = %+v, want only the retained b.go document; the collected unit's document must be gone", hits)
 	}
 
 	// Phase: manifests and sessions. A manifest must carry the generation's
@@ -952,13 +916,9 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("PinGeneration(gen2, stable): %v", err)
 	}
 	defer readerStable.Close()
-	dfBefore, err := readerStable.DocumentFrequency(ctx, []string{"changed"})
-	if err != nil {
-		t.Fatalf("DocumentFrequency: %v", err)
-	}
-	hitsBefore := packedDocuments(t, ctx, readerStable, ids)
-	if len(dfBefore) != 1 || dfBefore[0] != 1 || len(hitsBefore) != 1 {
-		t.Fatalf("gen2 lexical statistics = df %v over %d documents, want df 1 and the one b.go document containing \"changed\"", dfBefore, len(hitsBefore))
+	hitsBefore := searchHits(t, ctx, readerStable, "changed")
+	if len(hitsBefore) != 1 || hitsBefore[0].Path != b2.path || hitsBefore[0].ScoreMicros <= 0 {
+		t.Fatalf("gen2 search(changed) = %+v, want the one scored b.go document containing \"changed\"", hitsBefore)
 	}
 
 	if err := reader2.Close(); err != nil {
@@ -996,14 +956,13 @@ func TestStorePublicationScenario(t *testing.T) {
 	f.activate(genOwn, genFeature)
 	// genOwn's unit indexes b.go a second time under its own config, so the
 	// corpus now holds a second document containing "changed" that gen2 does
-	// not select. Its rowid is the probe the stability leg below uses.
+	// not select: a document the stability leg below must never count.
 	ownReader, err := f.s.PinGeneration(ctx, f.repo, genOwn, time.Minute)
 	if err != nil {
 		t.Fatalf("PinGeneration(genOwn): %v", err)
 	}
-	ownIDs, err := ownReader.Match(ctx, `"changed"`, 0, 10)
-	if err != nil || len(ownIDs) != 1 || ownIDs[0] == ids[0] {
-		t.Fatalf("genOwn Match(changed) = %v %v, want its own single document, not gen2's %d", ownIDs, err, ids[0])
+	if ownHits := searchHits(t, ctx, ownReader, "changed"); len(ownHits) != 1 {
+		t.Fatalf("genOwn search(changed) = %+v, want its own single document", ownHits)
 	}
 	// Released at once: a lease here would stop retention sweeping genOwn below.
 	if err := ownReader.Close(); err != nil {
@@ -1094,17 +1053,13 @@ func TestStorePublicationScenario(t *testing.T) {
 	}
 	// The other half of the ranking-stability leg: three generations have now
 	// staged and activated over gen2 and two have been swept, and genOwn's
-	// second "changed" document is live. gen2's df and document facts must be
-	// exactly what they were, and genOwn's rowid -- a real document of the
-	// same file, outside this generation -- must be omitted, not hydrated.
-	dfAfter, err := readerStable.DocumentFrequency(ctx, []string{"changed"})
-	if err != nil {
-		t.Fatalf("DocumentFrequency after publication and retention: %v", err)
-	}
-	hitsAfter := packedDocuments(t, ctx, readerStable, []int64{ids[0], ownIDs[0]})
-	if len(dfAfter) != 1 || dfAfter[0] != dfBefore[0] || len(hitsAfter) != 1 || hitsAfter[0] != hitsBefore[0] {
-		t.Fatalf("gen2 lexical statistics moved from df %v %+v to df %v %+v while later generations published and were swept; a score is not reproducible within its binding",
-			dfBefore, hitsBefore, dfAfter, hitsAfter)
+	// second "changed" document is live in the index. gen2's page -- its
+	// results and their scores -- must be exactly what it was: genOwn's
+	// document, a real document of the same file outside this generation,
+	// must count in no statistic and appear in no result.
+	if hitsAfter := searchHits(t, ctx, readerStable, "changed"); fmt.Sprintf("%+v", hitsAfter) != fmt.Sprintf("%+v", hitsBefore) {
+		t.Fatalf("gen2 search(changed) moved from %+v to %+v while later generations published and were swept; a score is not reproducible within its binding",
+			hitsBefore, hitsAfter)
 	}
 
 	// A limit nothing fits under: every ref but the active one is evicted, and
@@ -1396,8 +1351,10 @@ func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a
 }
 
 // factColumns are the identifying columns of each fact table, with every
-// unit-scoped column excluded: the row's own unit id, the rowid search_units
-// mints on insert and the evidence id, which folds the unit id by construction
+// unit-scoped column excluded: the row's own unit id, the rowid and doc id
+// search_units mints on insert (a carried row keeps its predecessor's doc id,
+// which TestDeltaCarriesTheTextItIndexed proves serves the same text) and the
+// evidence id, which folds the unit id by construction
 // (Section 9.3) and therefore cannot match across two units describing the
 // same occurrence.
 //
@@ -1411,7 +1368,7 @@ var factColumns = []struct{ table, cols string }{
 	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
 	{"relation_facts", "relation_id"},
 	{"native_aliases", "scope_key_id, native_key_id, node_id"},
-	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, token_count"},
+	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), start_byte, end_byte"},
 	{"evidence", "coalesce(node_id, 0), coalesce(relation_id, 0), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key_id, detail, content_hash_bound"},
 }
 
@@ -1537,16 +1494,6 @@ func TestDeltaImportInvariants(t *testing.T) {
 		}
 		defer raw.Close()
 		sameFacts(t, raw, unitRowID(t, raw, wFull.UnitID()), unitRowID(t, raw, wDelta.UnitID()))
-		// Carried search documents keep the rowids the FTS index was built
-		// against. SealUnit only counts documents, so an index entry pointing
-		// at the wrong row passes every other check and then answers a lexical
-		// query with another document's text. FTS5 with rank 1 compares the
-		// index against its external content table and errors when they
-		// disagree; without the argument it only checks the index internally
-		// and this mismatch passes.
-		if _, err := raw.Exec(`INSERT INTO search_fts(search_fts, rank) VALUES('integrity-check', 1)`); err != nil {
-			t.Fatalf("carried search documents left the FTS index disagreeing with its content: %v", err)
-		}
 	})
 
 	t.Run("a divergent repeated identity is refused", func(t *testing.T) {
