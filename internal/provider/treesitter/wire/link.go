@@ -288,7 +288,8 @@ type TypeKind byte
 const (
 	// TypeUnknown carries nothing: the worker recovered no type.
 	TypeUnknown TypeKind = 0
-	// TypeNamed is an instance of the type Name, as written.
+	// TypeNamed is an instance of the type Name, as written. Index is
+	// ExactObject when the value is an object of exactly that type, else 0.
 	TypeNamed TypeKind = 1
 	// TypeParam is the value of the enclosing callable's parameter Index,
 	// zero-based, whatever its callers pass.
@@ -327,6 +328,15 @@ const (
 	// disagreeing types reach.
 	TypeUnion TypeKind = 9
 )
+
+// ExactObject is the Index of a TypeNamed value that is an object of
+// exactly the type Name: a C++ object declared by value (a local, a
+// parameter, a data member, a file-scope object or an array element),
+// neither a pointer nor a reference, whose dynamic type is its declared
+// type, so a virtual call on it runs that type's function ([class.virtual]:
+// the call is virtual only through a pointer or reference). Only the C++
+// worker sends it.
+const ExactObject uint32 = 1
 
 // Type is a value's type as the worker recovered it inside the file: a name
 // as written, or a reference the linker resolves across functions and files

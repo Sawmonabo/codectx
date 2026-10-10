@@ -121,6 +121,74 @@ void use(B* b, A& a) {
 		fails: "a non-virtual call marked virtual; a qualified call marked virtual; a virtual call published to each override (B::g, D::g) instead of the member the static type names",
 	},
 	{
+		name:   "by-value-receivers",
+		anchor: "ISO/IEC 14882 (C++) [class.virtual] (a virtual call runs the final overrider in the dynamic type of the object), [intro.object] (an object declared of a class type, a member subobject and an array element have that type as their dynamic type), [expr.ref], [dcl.fct] (a parameter of array type is a pointer)",
+		files: map[string]string{
+			"receivers.cpp": `struct Animal { // @tanimal
+    virtual ~Animal() {}
+    virtual void sound() {} // @asound
+};
+
+struct Dog : Animal { // @tdog
+    void sound() override {} // @dsound
+    void bark() { // @fbark
+        this->sound(); // @t1
+    }
+};
+
+struct Owner { // @towner
+    Dog pet;
+    void call() { // @fcall
+        pet.sound(); // @o1
+    }
+};
+
+void byValue(Animal a) { // @fbyvalue
+    a.sound(); // @v1
+}
+
+void byPointer(Animal* p) { // @fbypointer
+    p->sound(); // @p1
+}
+
+void byReference(Animal& r) { // @fbyreference
+    r.sound(); // @r1
+}
+
+int main() {
+    Dog d;
+    d.sound(); // @l1
+    Dog pack[2];
+    pack[0].sound(); // @a1
+    byValue(d); // @m1
+    byPointer(&d); // @m2
+    byReference(d); // @m3
+    return 0;
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every binding. A by-value parameter, a local, a data
+		// member and an array element are objects of exactly their declared type, so their call runs that
+		// type's function; a pointer, a reference and `this` may denote a derived object.
+		want: []string{
+			"t1 sound -> dsound sound virtual",
+			"o1 sound -> dsound sound exact",
+			"v1 sound -> asound sound exact",
+			"p1 sound -> asound sound virtual",
+			"r1 sound -> asound sound virtual",
+			"l1 sound -> dsound sound exact",
+			"a1 sound -> dsound sound exact",
+			"m1 byValue -> fbyvalue byValue exact",
+			"m2 byPointer -> fbypointer byPointer exact",
+			"m3 byReference -> fbyreference byReference exact",
+		},
+		// Mutation: read every C++ receiver as virtual -> `a.sound()`, `d.sound()`, `pet.sound()` and
+		// `pack[0].sound()` carry virtual. Mutation: mark a pointer or reference receiver as an object ->
+		// `p->sound()`, `r.sound()` and `this->sound()` carry exact.
+		fails: "a call on an object declared by value marked virtual, or a call through a pointer, a reference or `this` marked exact",
+	},
+	{
 		name:   "arity-defaults-ellipsis",
 		anchor: "ISO/IEC 14882 (C++) [over.match.viable] (viable functions by parameter count, default arguments and ellipsis), [dcl.fct.default], [expr.call]",
 		files: map[string]string{

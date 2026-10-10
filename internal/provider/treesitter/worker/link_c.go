@@ -997,6 +997,11 @@ func (k *cLinker) fieldCall(site *wire.Site, fe Node, member bool) (ok bool) {
 	}
 	site.Name = wireSpan(spanOf(field))
 	recv := k.recover(fe.ChildByFieldId(s.fArgument))
+	if cKind(fe.ChildByFieldId(s.fOperator)) == s.arrow {
+		// `x->f()` reaches f through a pointer, or through the pointer an
+		// object's `operator->` returns.
+		recv = indirect(recv)
+	}
 	m, found := k.member(recv, textOf(k.src, field))
 	if member && s.cpp && (!found || m.fn) {
 		site.Shape, site.Receiver = wire.ShapeMember, recv
@@ -1166,7 +1171,7 @@ func (k *cLinker) recover(e Node) wire.Type {
 				}
 			}
 		}
-		return k.recover(a)
+		return indirect(k.recover(a))
 	case s.fieldExpression:
 		if f := lastNamed(e); cKind(f) == s.fieldIdentifier {
 			if m, ok := k.member(k.recover(e.ChildByFieldId(s.fArgument)), textOf(k.src, f)); ok && !m.fn {
@@ -1201,6 +1206,13 @@ func cNamed(name string) wire.Type {
 // instance of the named type below its pointers, references and arrays, the
 // type of an `auto` declarator's initializer, or nothing for a function
 // pointer, which has no named type.
+//
+// In C++ an instance is an ExactObject when the declarator declares an
+// object of the type itself, or an array of them, through no pointer or
+// reference: `Dog d`, a by-value parameter `Animal a`, a data member `Dog
+// m`, `Dog arr[2]`. A parameter's array declarator declares a pointer
+// ([dcl.fct]), and an `auto` declarator's type is its initializer's, whose
+// mark it keeps unless a pointer or reference declarator wraps it.
 func (k *cLinker) declType(d cDecl) wire.Type {
 	s := k.s
 	c := k.chain(d.decl)
@@ -1213,11 +1225,29 @@ func (k *cLinker) declType(d cDecl) wire.Type {
 	t := d.owner.ChildByFieldId(s.fType)
 	if cKind(t) == k.x.placeholderTypeSpecifier && k.x.placeholderTypeSpecifier != 0 {
 		if init := k.initializer(d.decl); !init.IsNull() {
-			return k.recover(init)
+			r := k.recover(init)
+			if r.Kind == wire.TypeNamed && c.indirect {
+				r.Index = 0
+			}
+			return r
 		}
 		return wire.Type{}
 	}
-	return cNamed(k.typeName(t))
+	r := cNamed(k.typeName(t))
+	if r.Kind == wire.TypeNamed && s.cpp && !c.indirect && !(c.array && k.parameter(d.owner)) {
+		r.Index = wire.ExactObject
+	}
+	return r
+}
+
+// indirect is t as a value reached through a pointer or reference: the
+// same type, never an ExactObject, since the object it denotes may be a
+// subobject of a derived class's object.
+func indirect(t wire.Type) wire.Type {
+	if t.Kind == wire.TypeNamed {
+		t.Index = 0
+	}
+	return t
 }
 
 // initializer is the value of an init declarator d, or null.
@@ -1500,6 +1530,9 @@ func (k *cLinker) returns(owner, top, fn Node) wire.Type {
 type cChain struct {
 	name, scope, fn Node
 	function        bool
+	// indirect reports a pointer or reference declarator on the way to the
+	// name, and array an array declarator.
+	indirect, array bool
 }
 
 // chain walks the declarator d to its name as the structural extraction
@@ -1513,9 +1546,12 @@ func (k *cLinker) chain(d Node) cChain {
 		case id == s.functionDeclarator || id == x.abstractFunctionDeclarator:
 			c.fn, c.function = d, true
 			d = d.ChildByFieldId(s.fDeclarator)
-		case id == s.pointerDeclarator || id == s.arrayDeclarator || id == s.abstractPointerDeclarator ||
-			id == s.abstractArrayDeclarator || id == s.referenceDeclarator && id != 0 || id == x.abstractReferenceDeclarator && id != 0:
-			c.function = false
+		case id == s.arrayDeclarator || id == s.abstractArrayDeclarator:
+			c.function, c.array = false, true
+			d = k.inner(d)
+		case id == s.pointerDeclarator || id == s.abstractPointerDeclarator ||
+			id == s.referenceDeclarator && id != 0 || id == x.abstractReferenceDeclarator && id != 0:
+			c.function, c.indirect = false, true
 			d = k.inner(d)
 		case id == s.initDeclarator || id == s.attributedDeclarator:
 			d = k.inner(d)

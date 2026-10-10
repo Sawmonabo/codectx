@@ -586,16 +586,17 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 	return nil
 }
 
-// member resolves a call of method on a receiver: over its declared type,
-// or over the types the targets of the call it is the result of return
-// (exact when that call constructs it); along the enclosing class's
+// member resolves a call of method on a receiver: over its declared type
+// (exact for a C++ object declared by value, wire.ExactObject), or over the
+// types the targets of the call it is the result of return (exact when that
+// call constructs it); along the enclosing class's
 // supertypes for `super`, exact; as a qualified call through a module; or,
 // for Go and Java, over the declared type of the field it reads (fieldGo,
 // fieldJava).
 func (r *staticFile) member(caller int32, recv wire.Type, method string, out siteOut) error {
 	switch recv.Kind {
 	case wire.TypeNamed:
-		return r.named(r.fc, recv.Name, method, false, out)
+		return r.named(r.fc, recv.Name, method, recv.Index == wire.ExactObject, out)
 	case wire.TypeResult:
 		// A constructed object is exactly the type it constructs.
 		if typ, ok, err := r.constructed(int32(recv.Index)); err != nil || ok {
