@@ -372,8 +372,11 @@ type budget struct {
 	pageVisited, pageEdges int64
 	// calls are a call walk's structured counts, cumulative and
 	// cursor-carried like visited and edges.
-	calls    model.GraphCounts
-	deadline time.Time
+	calls model.GraphCounts
+	// openSites are an impact walk's open call sites per depth (index 0 is
+	// depth 1), cumulative and cursor-carried like calls.
+	openSites []int64
+	deadline  time.Time
 	// now is the engine clock the deadline was measured on. A budget whose
 	// deadline comes from e.now() must be compared against e.now(): mixing in
 	// time.Now would make a test clock's deadline either unreachable or

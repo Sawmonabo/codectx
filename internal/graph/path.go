@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
 
@@ -239,7 +240,13 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		pathTruncate(&res.Meta, pathReasonDepth)
 	}
 	if len(routes) == 0 {
-		return res, nil
+		// A name-only hop is offered only when the search proved there is no
+		// precise route: an exhausted search, not one a budget or the clock
+		// stopped, which owes a continuation instead.
+		if res.Meta.Truncated || res.Meta.NextCursor != "" || !slices.Contains(kinds, model.RelCalls) {
+			return res, nil
+		}
+		return e.possiblePath(ctx, res, req.From, req.To, direction)
 	}
 
 	paths, err := e.hydratePaths(ctx, routes)
@@ -1155,4 +1162,89 @@ func (d pathDescent) keep(e Edge) bool {
 		return d.requested[e.Kind]
 	}
 	return e.Kind == d.overrides
+}
+
+// possiblePath answers a pair with no precise route by one name-only hop
+// (ADR-0015 decision 3): `from` calls an open site `to` is a candidate of --
+// the other way round for an incoming search, either for both. The route is
+// marked Possible, costs the highest relation cost there is, carries the
+// site's occurrences, and the answer says it may not run. Only a route of
+// that one hop is offered: a name-only hop between two precise legs is not
+// searched for.
+func (e *Engine) possiblePath(ctx context.Context, res model.PathResult, from, to model.NodeID,
+	direction model.Direction) (model.PathResult, error) {
+	dr := declarationReader(e.reader)
+	if dr == nil {
+		return res, nil
+	}
+	type hop struct{ caller, callee model.NodeID }
+	var hops []hop
+	switch direction {
+	case model.DirectionOutgoing:
+		hops = []hop{{from, to}}
+	case model.DirectionIncoming:
+		hops = []hop{{to, from}}
+	default:
+		hops = []hop{{from, to}, {to, from}}
+	}
+	repo := e.reader.Binding().RepositoryID
+	for _, h := range hops {
+		var via []model.RelationID
+		if err := e.callersOfSites(ctx, e.reader, dr, []model.NodeID{h.callee}, map[model.NodeID]bool{},
+			func(caller, _ model.NodeID, rel model.RelationID) {
+				if caller == h.caller {
+					via = append(via, rel)
+				}
+			}); err != nil {
+			return model.PathResult{}, err
+		}
+		if len(via) == 0 {
+			continue
+		}
+		rel := model.Relation{ID: model.NewRelationID(repo, h.caller, model.RelMayCall, h.callee),
+			From: h.caller, Kind: model.RelMayCall, To: h.callee}
+		evidence, err := e.adjacency.EvidenceFor(ctx, via, model.MaxRelationsPerPath)
+		if err != nil {
+			return model.PathResult{}, err
+		}
+		p := model.RelationPath{Relations: []model.RelationID{rel.ID}, CostUnits: Cost(model.RelMayCall), Possible: true}
+		for _, v := range via {
+			for _, ev := range evidence[v] {
+				if len(p.Evidence) < model.MaxRelationsPerPath {
+					p.Evidence = append(p.Evidence, ev)
+				}
+			}
+		}
+		res.Paths = []model.RelationPath{p}
+		ids := sortedNodes([]model.NodeID{from, to})
+		if res.Nodes, err = e.adjacency.NodesByID(ctx, ids); err != nil {
+			return model.PathResult{}, err
+		}
+		where, err := e.locate(ctx, ids, nil)
+		if err != nil {
+			return model.PathResult{}, err
+		}
+		res.Locations = where.locations
+		if loc, ok := e.reader.(SourceLocator); ok {
+			for _, v := range via {
+				listed, total, err := e.relationSites(ctx, loc, v, occurrenceBudget-len(res.Occurrences))
+				if err != nil {
+					return model.PathResult{}, err
+				}
+				for _, o := range listed {
+					o.RelationID = rel.ID
+					res.Occurrences = append(res.Occurrences, o)
+				}
+				if int64(len(listed)) < total {
+					res.Meta.Notices = append(res.Meta.Notices, fmt.Sprintf(
+						"the possible route's call site relation %s has %d located occurrences; %d are listed", v, total, len(listed)))
+				}
+			}
+		}
+		res.Meta.Notices = append(res.Meta.Notices,
+			"no precise route connects the two nodes; the route given is a call no analysis bound, matched by name "+
+				"only (`may_call`), and it may not run")
+		return res, nil
+	}
+	return res, nil
 }

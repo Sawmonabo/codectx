@@ -167,6 +167,16 @@ type traversalCursor struct {
 	// Calls are a call walk's structured counts, cumulative exactly as
 	// Visited and Edges are, so every page reports the answer's totals so far.
 	Calls model.GraphCounts `json:"calls,omitzero"`
+	// OpenSites are an impact walk's open call sites per depth, carried so
+	// every page of the answer reports the whole walk's counts.
+	OpenSites []int64 `json:"open_sites,omitempty"`
+	// Tail marks the continuation of a call or import walk's possible rows
+	// (possible.go): the walk is over, and TailAt possible rows of the
+	// answer's ordered list were served by the pages before. The list is a
+	// pure function of the pinned generation and the start nodes, so the next
+	// page recomputes it and seeks; nothing is retained.
+	Tail      bool      `json:"tail,omitempty"`
+	TailAt    int64     `json:"tail_at,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -225,6 +235,11 @@ func (c traversalCursor) validate() error {
 	if err := c.Calls.Validate(); err != nil {
 		return cursorInvalid("cursor call counts are negative")
 	}
+	for _, n := range c.OpenSites {
+		if n < 0 {
+			return cursorInvalid("cursor open-site counts are negative")
+		}
+	}
 	if err := c.validateLevel(); err != nil {
 		return err
 	}
@@ -274,6 +289,19 @@ func (c traversalCursor) validateLevel() error {
 // refused -- on a walk one, which is what keeps a tampered token from steering
 // a walk resume into a ranked spool or the reverse.
 func (c traversalCursor) validateRanked() error {
+	if c.TailAt < 0 || (!c.Tail && c.TailAt != 0) {
+		return cursorInvalid("cursor carries a possible-row position without a possible-row continuation")
+	}
+	if c.Tail {
+		// The possible rows follow a FINISHED walk: a token that also named a
+		// level, a retained walk, a list position or a ranking would resume
+		// two answers at once.
+		if c.Ranked || c.WalkDone || c.LevelState != "" || c.RetainID != "" || c.SpoolID != "" ||
+			c.LastNode != 0 || !c.LevelPos.IsZero() {
+			return cursorInvalid("a possible-row continuation carries a walk or ranking position")
+		}
+		return nil
+	}
 	if !c.Ranked {
 		if c.RankOffset != 0 || c.RankServed != 0 || c.RankTotal != 0 ||
 			c.PairOffset != 0 || c.PairServed != 0 || c.PairTotal != 0 {
@@ -553,6 +581,9 @@ type continuation struct {
 	// is what lets nextTraversalCursor mint a token for a walk with no
 	// frontier, which it otherwise refuses.
 	WalkDone bool
+	// Tail and TailAt continue a finished walk's possible rows.
+	Tail   bool
+	TailAt int64
 }
 
 // verifyContinuation is the half of a resume every paging endpoint shares: it
@@ -599,7 +630,7 @@ func (e *Engine) verifyContinuation(token, endpoint, queryHash string,
 	if c.GenerationID != binding.GenerationID || c.AnalysisKey != binding.AnalysisKey {
 		return traversalCursor{}, nil, cursorInvalid("cursor pins a generation that is no longer the one being read")
 	}
-	return c, &budget{visited: c.Visited, edges: c.Edges, calls: c.Calls,
+	return c, &budget{visited: c.Visited, edges: c.Edges, calls: c.Calls, openSites: c.OpenSites,
 		deadline: deadline, now: e.now}, nil
 }
 
@@ -766,7 +797,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// when the depth bound is reached (reported, not resumed) or when the
 	// request deadline passes; nothing here silently withholds a continuation
 	// from a walk that still has work.
-	resumesWalk := c.More || c.LastNode != 0 || c.WalkDone
+	resumesWalk := c.More || c.LastNode != 0 || c.WalkDone || c.Tail
 	if !resumesWalk {
 		// Nothing left to resume from: the answer is complete.
 		return "", nil
@@ -818,9 +849,12 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		LastNode:     c.LastNode,
 		Depth:        c.Depth,
 		WalkDone:     c.WalkDone,
+		Tail:         c.Tail,
+		TailAt:       c.TailAt,
 		Visited:      b.visited,
 		Edges:        b.edges,
 		Calls:        b.calls,
+		OpenSites:    b.openSites,
 		ExpiresAt:    e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
 	// The retained directory -- the frontier the walk committed level by level,

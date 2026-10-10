@@ -133,6 +133,43 @@ it. When a method marks no override and its class extends a type outside the
 indexed project, the callers answer says that calls through that type are found
 only for overrides the language marks.
 
+**Calls no analysis bound are listed by name, after every precise row.** When
+the linker cannot bind a call — `obj.handle()` with nothing known about `obj` —
+it publishes one open-site node for the call, located at it, named by the
+callee and carrying its shape (`bare`, `member`, `value`, `construct`) and
+argument count; the caller's `calls` edge goes to that node, and it replaces the
+structural `call:<name>` placeholder for the same site, so an open call is one
+row. Its candidates are computed per query, never stored: the declarations of
+the same name, of a kind the shape can call (methods for a member call,
+functions for a bare or value call, classes for a construction), in the same
+language family (C with C++, JavaScript with TypeScript), and, in C, C++, Go,
+Java and Rust, with parameters that take the call's arguments. Each is a
+`may_call` relation, marked `name_only`: it may not be what runs.
+
+- `callers` lists, after the precise callers, the callers of every open site
+  the symbol is a candidate of, and counts them as `may_call` beside
+  `open_sites`; with no caller at all, by analysis or by name, the notice
+  quotes the linker's site counts (sites, bound, open, computed, external)
+  rather than reporting a bare zero.
+- `callees` lists the open-site node and then its candidates, nearest first:
+  the same file, the same directory, a file the call's file imports or is
+  imported by, the same unit, then anywhere.
+- `refs` lists the callers of those open sites after every precise
+  reference, at `heuristic` precision.
+- `path` offers a route over one `may_call` hop, marked `possible` and costed
+  as the dearest relation, only when the search proved no precise route exists.
+- `impact` counts, per depth, the open sites naming an affected symbol
+  (`open_sites_by_depth`) and does not list their callers as affected.
+
+The possible rows are one hop from the start symbols; an MCP request whose
+`relations` name `may_call` walks on through them, to the callers of the
+callers' open sites and so on, up to its depth bound. A name declared thousands of times has an exact count
+and is paged, never cut. An import whose path does not fold to a constant
+(`require("./plugins/" + name)`) is an open import site with its literal
+fragments, and an outgoing `imports` answer lists, after the precise imports,
+every file whose path matches them as `may_import`, also by name only and not
+walked on unless a request's `relations` name `may_import`.
+
 **Endpoints.** `routes_to` (endpoint to handler) is not a call and is not in the
 `callers` or `callees` relation set, but a `callees` walk from an endpoint
 follows it to the handler first, then the handler's calls. `impact` walks it,

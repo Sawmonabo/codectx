@@ -1260,22 +1260,29 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		calls.note(owner, edge, rel, names.node(owner.Node))
 		return nil
 	}
-	state, err := expand(ctx, reader, req.Start, expandOptions{
-		Direction:     dir,
-		Kinds:         kinds,
-		MaxDepth:      maxDepth,
-		Budget:        b,
-		FrontierBytes: e.limits.FrontierBytes,
-		DeadlineStops: true,
-		Mints:         true,
-		Resume:        resume,
-		Retain:        retain,
-		Names:         names,
-		Dispatch:      mode,
-		Dispatches:    e.dispatchReader(),
-	}, visit)
-	if err != nil {
-		return model.GraphResult{}, err
+	// A continuation of the possible rows follows a finished walk: it walks
+	// nothing and serves the rows from where the page before it stopped.
+	tail := tailFor(dir, kinds)
+	inTail := resume != nil && resume.Cursor.Tail
+	var state walkState
+	if !inTail {
+		state, err = expand(ctx, reader, req.Start, expandOptions{
+			Direction:     dir,
+			Kinds:         kinds,
+			MaxDepth:      maxDepth,
+			Budget:        b,
+			FrontierBytes: e.limits.FrontierBytes,
+			DeadlineStops: true,
+			Mints:         true,
+			Resume:        resume,
+			Retain:        retain,
+			Names:         names,
+			Dispatch:      mode,
+			Dispatches:    e.dispatchReader(),
+		}, visit)
+		if err != nil {
+			return model.GraphResult{}, err
+		}
 	}
 
 	// Delivering a deadline-stopped page needs a live context: `ctx` is past
@@ -1314,11 +1321,70 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		return model.GraphResult{}, err
 	}
 	notices = append(notices, where.notices...)
+	// One row per open call site: the structural placeholder for a site the
+	// linker published an open site for is not a second callee.
+	var dropped map[model.RelationID]bool
+	if nodes, relations, dropped = dropPlaceholders(nodes, relations, &where); len(dropped) > 0 {
+		calls.drop(dropped)
+	}
 	marks, occurrences, err := e.marks(finish, calls, where.occurrences, &b.calls)
 	if err != nil {
 		return model.GraphResult{}, err
 	}
 	where.occurrences = occurrences
+
+	// The possible rows come after every precise row: on the page the walk
+	// finished on, in the room it left, and on the pages after it.
+	tailNext := int64(-1)
+	if tail != tailNone && !state.More && declarationReader(reader) != nil {
+		through := slices.Contains(kinds, tail.kind())
+		list, err := e.possibleRows(finish, reader, tail, req.Start, through, maxDepth.Int())
+		if err != nil {
+			return model.GraphResult{}, err
+		}
+		at := int64(0)
+		if inTail {
+			at = resume.Cursor.TailAt
+		}
+		page, err := e.servePossible(finish, reader, list, at, maxItems-len(relations), len(where.occurrences),
+			len(relations) > 0)
+		if err != nil {
+			return model.GraphResult{}, err
+		}
+		tailNext = page.next
+		relations = append(relations, page.relations...)
+		where.occurrences = append(where.occurrences, page.occurrences...)
+		marks = append(marks, page.marks...)
+		notices = append(notices, page.notices...)
+		if added := newNodes(page.nodes, nodes); len(added) > 0 {
+			more, err := e.adjacency.NodesByID(finish, added)
+			if err != nil {
+				return model.GraphResult{}, err
+			}
+			nodes = append(nodes, more...)
+			sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+			if loc, ok := reader.(SourceLocator); ok {
+				for _, chunk := range impactChunkNodes(added) {
+					got, err := loc.NodeLocations(finish, chunk)
+					if err != nil {
+						return model.GraphResult{}, err
+					}
+					where.locations = append(where.locations, got...)
+				}
+			}
+		}
+		if tail != tailImports {
+			b.calls.MayCall = int64(len(list.rows))
+			b.calls.OpenSites = list.sites
+		}
+		// The precise rows counted apart by the dispatch step, or, on a reader
+		// that takes none, every edge the walk admitted.
+		precise := b.calls.Direct + b.calls.ThroughBase
+		if mode == dispatchNone {
+			precise = b.edges
+		}
+		notices = appendNotice(notices, possibleNotice(tail, list, precise, caps))
+	}
 	if mode == dispatchCallers {
 		external, err := e.externalNotices(finish, req.Start)
 		if err != nil {
@@ -1347,6 +1413,22 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// carries the reason: it is part of the query hash the cursor is bound to,
 	// so a continuation minted for it could only resume a walk already past it.
 	var nextCursor string
+	if tailNext >= 0 {
+		// The walk is over and possible rows remain: the continuation names
+		// only where they resume.
+		nextCursor, err = e.nextTraversalCursor(finish, b, continuation{
+			Endpoint:  endpoint,
+			QueryHash: queryHash,
+			Tail:      true,
+			TailAt:    tailNext,
+		})
+		if err != nil {
+			return model.GraphResult{}, err
+		}
+		if reason == "" {
+			reason = reasonPageFull
+		}
+	}
 	if state.More && !state.DepthLimited {
 		// Nothing of the walk is materialized here. The frontier is already in
 		// the retained level file, committed as each level closed, and the
@@ -1391,13 +1473,28 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		Occurrences: where.occurrences,
 		Marks:       marks,
 	}
-	if mode != dispatchNone {
+	if mode != dispatchNone || (tail != tailNone && tail != tailImports) {
 		result.Counts = b.calls
 	}
 	if err := result.Validate(); err != nil {
 		return model.GraphResult{}, err
 	}
 	return result, nil
+}
+
+// newNodes lists the ids of want that have no node in have, ascending.
+func newNodes(want []model.NodeID, have []model.Node) []model.NodeID {
+	present := make(map[model.NodeID]bool, len(have))
+	for _, n := range have {
+		present[n.ID] = true
+	}
+	var out []model.NodeID
+	for _, id := range sortedNodes(want) {
+		if !present[id] {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // completeness is the ONE capability derivation every graph answer uses. It

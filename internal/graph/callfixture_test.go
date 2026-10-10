@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"testing"
 
@@ -32,11 +33,23 @@ type fixtureFact struct {
 }
 
 type fixtureDecl struct {
-	Name     string          `json:"name"`
-	Kind     model.NodeKind  `json:"kind"`
-	File     string          `json:"file"`
-	Bytes    [2]uint64       `json:"bytes"`
-	Metadata json.RawMessage `json:"metadata"`
+	// Key names the node in the scenario; it defaults to Name, and is set
+	// where several nodes share one name.
+	Key       string          `json:"key,omitempty"`
+	Name      string          `json:"name"`
+	Kind      model.NodeKind  `json:"kind"`
+	File      string          `json:"file"`
+	Bytes     [2]uint64       `json:"bytes"`
+	Metadata  json.RawMessage `json:"metadata"`
+	Language  string          `json:"language,omitempty"`
+	Signature string          `json:"signature,omitempty"`
+}
+
+func (d fixtureDecl) key() string {
+	if d.Key != "" {
+		return d.Key
+	}
+	return d.Name
 }
 
 type fixtureScenario struct {
@@ -56,6 +69,10 @@ type callFixture struct {
 	evidence  map[model.RelationID][]model.Evidence
 	byName    map[string]model.NodeID
 	relByEnds map[string]model.RelationID
+	// paths are the nodes' file paths, and caps the capability rows the
+	// scenario reports.
+	paths map[model.NodeID]string
+	caps  []model.CapabilityState
 }
 
 // loadCallFixture reads one scenario of testdata/dispatch.json.
@@ -75,6 +92,12 @@ func loadCallFixture(t *testing.T, scenario string) *callFixture {
 	if !ok {
 		t.Fatalf("dispatch fixture has no scenario %q", scenario)
 	}
+	return newCallFixture(scenario, sc)
+}
+
+// newCallFixture builds a scenario's two engine ports. Relations name their
+// ends by node key.
+func newCallFixture(scenario string, sc fixtureScenario) *callFixture {
 	f := &callFixture{
 		scenario: scenario,
 		binding: model.Binding{
@@ -88,13 +111,24 @@ func loadCallFixture(t *testing.T, scenario string) *callFixture {
 		evidence:  map[model.RelationID][]model.Evidence{},
 		byName:    map[string]model.NodeID{},
 		relByEnds: map[string]model.RelationID{},
+		paths:     map[model.NodeID]string{},
 	}
 	for _, d := range sc.Nodes {
-		id := f.nodeID(d.Name)
+		id := f.nodeID(d.key())
 		file := model.FileID(fixtureID(scenario + "/" + d.File))
-		f.nodes[id] = model.Node{ID: id, Kind: d.Kind, Name: d.Name, QualifiedName: d.Name,
-			Language: "python", FileID: file, Metadata: d.Metadata, SemanticSource: model.SemanticCanonical}
-		f.byName[d.Name] = id
+		language := d.Language
+		if language == "" {
+			language = "python"
+		}
+		qualified := d.key()
+		if d.Kind == model.NodeFile {
+			qualified = d.File
+		}
+		f.nodes[id] = model.Node{ID: id, Kind: d.Kind, Name: d.Name, QualifiedName: qualified,
+			Language: language, FileID: file, Signature: d.Signature, Metadata: d.Metadata,
+			SemanticSource: model.SemanticCanonical}
+		f.byName[d.key()] = id
+		f.paths[id] = d.File
 		if d.Bytes[1] > d.Bytes[0] {
 			f.located[id] = model.NodeLocation{NodeID: id, FileID: file, Path: d.File,
 				Bytes: model.ByteRange{Start: d.Bytes[0], End: d.Bytes[1]}}
@@ -149,6 +183,16 @@ func (f *callFixture) rel(t *testing.T, from string, kind model.RelationKind, to
 		t.Fatalf("scenario %s declares no relation %s %s %s", f.scenario, from, kind, to)
 	}
 	return id
+}
+
+// keyOf is the scenario key of a node id.
+func (f *callFixture) keyOf(id model.NodeID) string {
+	for k, v := range f.byName {
+		if v == id {
+			return k
+		}
+	}
+	return string(id)
 }
 
 // name is the readable name of a node id, for failure messages.
@@ -230,7 +274,7 @@ func (f *callFixture) EvidenceRows(ctx context.Context, relations []model.Relati
 }
 
 func (f *callFixture) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
-	return nil, ctx.Err()
+	return f.caps, ctx.Err()
 }
 
 func (f *callFixture) Binding() model.Binding { return f.binding }
@@ -303,4 +347,83 @@ func (g *locatedGraph) RelationDispatch(ctx context.Context, rels []model.Relati
 		}
 	}
 	return out, nil
+}
+
+var _ DeclarationReader = (*locatedGraph)(nil)
+
+func (g *locatedGraph) declaration(n model.Node) Declaration {
+	return Declaration{Node: n, Path: g.f.paths[n.ID], Unit: model.UnitID(fixtureID("unit/" + g.f.paths[n.ID]))}
+}
+
+func (g *locatedGraph) Declarations(ctx context.Context, name string, kinds []model.NodeKind, after model.NodeID,
+	limit int) ([]Declaration, model.NodeID, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	limit = fixtureEdgePageLimit(limit)
+	var all []model.Node
+	for _, n := range g.f.nodes {
+		if n.Name == name && n.ID > after && (len(kinds) == 0 || slices.Contains(kinds, n.Kind)) {
+			all = append(all, n)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	var next model.NodeID
+	if len(all) > limit {
+		all = all[:limit]
+		next = all[limit-1].ID
+	}
+	out := make([]Declaration, len(all))
+	for i, n := range all {
+		out[i] = g.declaration(n)
+	}
+	return out, next, nil
+}
+
+func (g *locatedGraph) Declared(ctx context.Context, ids []model.NodeID) ([]Declaration, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var out []Declaration
+	for _, id := range ids {
+		if n, ok := g.f.nodes[id]; ok {
+			out = append(out, g.declaration(n))
+		}
+	}
+	return out, nil
+}
+
+func (g *locatedGraph) SnapshotFiles(ctx context.Context, after model.FileID, limit int) ([]model.FileVersion,
+	model.FileID, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	seen := map[model.FileID]bool{}
+	var all []model.FileVersion
+	for id, n := range g.f.nodes {
+		if n.FileID != "" && n.FileID > after && !seen[n.FileID] {
+			seen[n.FileID] = true
+			all = append(all, model.FileVersion{ID: n.FileID, Path: g.f.paths[id], Status: model.FileTracked})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+	limit = fixtureEdgePageLimit(limit)
+	var next model.FileID
+	if len(all) > limit {
+		all = all[:limit]
+		next = all[limit-1].ID
+	}
+	return all, next, nil
+}
+
+func (g *locatedGraph) FileNodes(ctx context.Context, files []model.FileVersion) (map[model.FileID]model.NodeID, error) {
+	out := map[model.FileID]model.NodeID{}
+	for _, f := range files {
+		for _, n := range g.f.nodes {
+			if n.Kind == model.NodeFile && n.QualifiedName == f.Path {
+				out[f.ID] = n.ID
+			}
+		}
+	}
+	return out, ctx.Err()
 }

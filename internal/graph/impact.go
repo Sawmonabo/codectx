@@ -63,6 +63,8 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		// rather than repeating a single-shot total.
 		VisitedCount: b.visited,
 		EdgeCount:    b.edges,
+		// Whole-walk counts, carried by every continuation.
+		OpenSitesByDepth: b.openSites,
 	}
 	if err := result.Validate(); err != nil {
 		return model.ImpactResult{}, err
@@ -200,7 +202,17 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return answer, nil, nil, "", err
 		}
 		names := &levelNames{}
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry,
+		// Every affected node is also counted, per depth, by the open call
+		// sites it is a candidate of: possibly affected through a call no
+		// analysis bound, counted and not walked.
+		sites := newOpenSiteCounter(declarationReader(reader), b)
+		emit := func(rec impactRecord) error {
+			if err := sites.note(ctx, rec); err != nil {
+				return err
+			}
+			return retain.addEntry(rec)
+		}
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, emit,
 			names, kindNames(reader))
 		// Impact takes a call walk's dispatch step: a change to a method
 		// affects the callers of every method it overrides whose call may
@@ -264,6 +276,12 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return werr
 		}, retain.addPair, e.rollupProbe())
 		if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
+			return answer, nil, nil, "", err
+		}
+		// Counted before any continuation is minted, so the token carries
+		// this leg's last level too. The count reads the store and is
+		// delivery, not walking, so it runs past the deadline.
+		if err := sites.flush(context.WithoutCancel(ctx)); err != nil {
 			return answer, nil, nil, "", err
 		}
 	}

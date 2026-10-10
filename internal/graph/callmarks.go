@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -39,6 +40,14 @@ func (p *callPage) note(owner frontierState, edge Edge, rel model.Relation, owne
 	case rel.Kind == model.RelOverrides && p.mode == dispatchCallees && !edge.Outgoing:
 		p.mayDispatch = append(p.mayDispatch, rel.ID)
 	}
+}
+
+// drop forgets relations the page no longer serves.
+func (p *callPage) drop(ids map[model.RelationID]bool) {
+	if p == nil {
+		return
+	}
+	p.calls = slices.DeleteFunc(p.calls, func(id model.RelationID) bool { return ids[id] })
 }
 
 // marks turns the page's rows into the answer's marks and adds its counts to

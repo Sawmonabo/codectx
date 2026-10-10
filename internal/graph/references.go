@@ -486,6 +486,44 @@ type referenceRelation struct {
 	Kind model.RelationKind `json:"kind"`
 	From model.NodeID       `json:"from"`
 	To   model.NodeID       `json:"to"`
+	// Tier orders precise references before name-only ones, and Via is the
+	// stored call to an open site whose occurrences a name-only reference
+	// carries.
+	Tier int              `json:"tier,omitempty"`
+	Via  model.RelationID `json:"via,omitempty"`
+}
+
+// referenceHeuristic is the tier of a name-only reference; a precise one is
+// tier 0, so every precise reference is listed before every name-only one.
+const referenceHeuristic = 1
+
+// compareReferences is the list's order: tier, then canonical relation id,
+// then the site a name-only reference stands for.
+func compareReferences(a, b referenceRelation) int {
+	if c := cmp.Compare(a.Tier, b.Tier); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.ID, b.ID); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Via, b.Via)
+}
+
+// referencePrecision is an occurrence's precision: its evidence row's for a
+// precise reference, heuristic for a name-only one, which no analysis bound.
+func referencePrecision(r referenceRelation, stored model.Precision) model.Precision {
+	if r.Tier == referenceHeuristic {
+		return model.PrecisionHeuristic
+	}
+	return stored
+}
+
+// evidenceKey is the stored relation whose evidence an entry reports.
+func (r referenceRelation) evidenceKey() model.RelationID {
+	if r.Via != "" {
+		return r.Via
+	}
+	return r.ID
 }
 
 func encodeReferenceRelation(r referenceRelation) ([]byte, error) {
@@ -509,7 +547,7 @@ func decodeReferenceRelation(b []byte) (referenceRelation, error) {
 // when a run spills, so the charge is an estimate of the encoding it would
 // produce plus the struct and allocator overhead the buffer really pays.
 func sizeOfReferenceRelation(r referenceRelation) int64 {
-	return int64(len(r.ID)+len(r.Kind)+len(r.From)+len(r.To)) + 128
+	return int64(len(r.ID)+len(r.Kind)+len(r.From)+len(r.To)+len(r.Via)) + 136
 }
 
 // referenceHydrateBatch is how many relations are taken off the ordered list
@@ -549,7 +587,7 @@ func (b *referencePageBuilder) consume(ctx context.Context, batch []referenceRel
 	}
 	ids := make([]model.RelationID, 0, len(batch))
 	for _, r := range batch {
-		ids = append(ids, r.ID)
+		ids = append(ids, r.evidenceKey())
 	}
 	// pageLimit+1 per relation distinguishes "exactly a page of occurrences"
 	// from "more than a page", so the clipped flag is never raised for a
@@ -565,7 +603,7 @@ func (b *referencePageBuilder) consume(ctx context.Context, batch []referenceRel
 		return 0, err
 	}
 	for i, r := range batch {
-		occ := ev[r.ID]
+		occ := ev[r.evidenceKey()]
 		if len(occ) == 0 {
 			// A canonical relation with no evidence row contributes no
 			// occurrence and is not reported, because an occurrence IS an
@@ -607,7 +645,7 @@ func (b *referencePageBuilder) consume(ctx context.Context, batch []referenceRel
 				// resolving it would cost one file read per distinct file on a
 				// port that offers no batched file lookup, while FileID plus
 				// Range already locates the occurrence exactly.
-				Precision: row.Precision,
+				Precision: referencePrecision(r, row.Precision),
 				FileID:    row.FileID,
 				// Range and Bytes are the same interval from the two sides of
 				// persistence, and a hydrated evidence row carries the byte
@@ -663,7 +701,7 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	}
 	sorter, err := pagination.NewExternalSort(e.walkScratchDir(), 0,
 		encodeReferenceRelation, decodeReferenceRelation,
-		func(a, b referenceRelation) int { return cmp.Compare(a.ID, b.ID) })
+		compareReferences)
 	if err != nil {
 		return nil, err
 	}
@@ -757,7 +795,39 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	if err := flush(); err != nil {
 		return nil, err
 	}
+	if walk.family {
+		if err := e.heuristicReferences(ctx, reader, node, sorter.Add); err != nil {
+			return nil, err
+		}
+	}
 	return sorter.Sorted()
+}
+
+// heuristicReferences adds the name-only references of node after every
+// precise one (ADR-0015 decision 3): each caller of an open call site node is
+// a candidate of is a `may_call` reference, located at that site's
+// occurrences and reported at heuristic precision.
+func (e *Engine) heuristicReferences(ctx context.Context, reader GraphReader, node model.NodeID,
+	add func(referenceRelation) error) error {
+	dr := declarationReader(reader)
+	if dr == nil {
+		return nil
+	}
+	repo := reader.Binding().RepositoryID
+	var found []referenceRelation
+	if err := e.callersOfSites(ctx, reader, dr, []model.NodeID{node}, map[model.NodeID]bool{},
+		func(caller, start model.NodeID, via model.RelationID) {
+			found = append(found, referenceRelation{ID: model.NewRelationID(repo, caller, model.RelMayCall, start),
+				Kind: model.RelMayCall, From: caller, To: start, Via: via, Tier: referenceHeuristic})
+		}); err != nil {
+		return err
+	}
+	for _, r := range found {
+		if err := add(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // firstReferencePage computes the whole ordered list, serves its first page out

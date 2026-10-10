@@ -48,11 +48,13 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_callers", "Callers",
 		"Bounded inbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
 			"names others. Every node carries its range and every call its call-site ranges. Calls "+
-			"into a method this one overrides are listed as through that base: they may not run it.", h.callers)
+			"into a method this one overrides are listed as through that base: they may not run it. "+
+			"`may_call` rows follow every precise row and are matched by name only.", h.callers)
 	addTool(s, "codectx_callees", "Callees",
 		"Bounded outbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
 			"names others. Every node carries its range and every call its call-site ranges. The "+
-			"overrides a virtual call may dispatch to are listed and marked: they may not run.", h.callees)
+			"overrides a virtual call may dispatch to are listed and marked: they may not run. "+
+			"`may_call` rows follow every precise row and are matched by name only.", h.callees)
 	addTool(s, "codectx_dependency_path", "Dependency path",
 		"Bounded shortest dependency path between two resolved nodes. `direction` chooses "+
 			"which way edges are followed: \"outgoing\" (the default: what `from` depends on), "+

@@ -764,3 +764,104 @@ func (g *graphReader) RelationDispatch(ctx context.Context, rels []model.Relatio
 	}
 	return out, nil
 }
+
+var _ graph.DeclarationReader = (*graphReader)(nil)
+
+// Declarations pages the visible nodes named exactly name over the name
+// index, restricted to kinds, by node id; each carries its file's path and
+// its unit.
+//
+// Nodes limits fact ROWS and folds a node two units publish into one, so a
+// page can come back short with nodes still behind it. next is therefore the
+// last node of every non-empty page, and only an empty page ends the list:
+// one extra round trip per name, against an exact total.
+func (g *graphReader) Declarations(ctx context.Context, name string, kinds []model.NodeKind, after model.NodeID,
+	limit int) ([]graph.Declaration, model.NodeID, error) {
+	stored, err := g.r.Nodes(ctx, NodeFilter{Name: name, Kinds: kinds}, after, pageLimit(ctx, limit))
+	if err != nil {
+		return nil, "", err
+	}
+	out, err := g.declarations(ctx, stored)
+	if err != nil {
+		return nil, "", err
+	}
+	var next model.NodeID
+	if len(stored) > 0 {
+		next = stored[len(stored)-1].Node.ID
+	}
+	return out, next, nil
+}
+
+// Declared hydrates nodes with their file's path and their unit.
+func (g *graphReader) Declared(ctx context.Context, ids []model.NodeID) ([]graph.Declaration, error) {
+	var out []graph.Declaration
+	for start := 0; start < len(ids); start += model.MaxPageItems {
+		stored, err := g.r.NodesByID(ctx, ids[start:min(start+model.MaxPageItems, len(ids))])
+		if err != nil {
+			return nil, err
+		}
+		page, err := g.declarations(ctx, stored)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+	}
+	return out, nil
+}
+
+// declarations names the files of stored nodes in one batched read.
+func (g *graphReader) declarations(ctx context.Context, stored []StoredNode) ([]graph.Declaration, error) {
+	var files []model.FileID
+	seen := map[model.FileID]bool{}
+	for _, s := range stored {
+		if s.Node.FileID != "" && !seen[s.Node.FileID] {
+			seen[s.Node.FileID] = true
+			files = append(files, s.Node.FileID)
+		}
+	}
+	paths := make(map[model.FileID]string, len(files))
+	if len(files) > 0 {
+		versions, err := g.r.FilesByID(ctx, files)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range versions {
+			paths[v.ID] = v.Path
+		}
+	}
+	out := make([]graph.Declaration, 0, len(stored))
+	for _, s := range stored {
+		out = append(out, graph.Declaration{Node: s.Node, Path: paths[s.Node.FileID], Unit: s.UnitID})
+	}
+	return out, nil
+}
+
+// SnapshotFiles pages the pinned snapshot's manifest by file id.
+func (g *graphReader) SnapshotFiles(ctx context.Context, after model.FileID, limit int) ([]model.FileVersion, model.FileID, error) {
+	limit = pageLimit(ctx, limit)
+	page, err := g.r.Files(ctx, after, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	var next model.FileID
+	if len(page) >= limit {
+		next = page[len(page)-1].ID
+	}
+	return page, next, nil
+}
+
+// FileNodes finds each file's file node by its path, which is the file node's
+// qualified name.
+func (g *graphReader) FileNodes(ctx context.Context, files []model.FileVersion) (map[model.FileID]model.NodeID, error) {
+	out := make(map[model.FileID]model.NodeID, len(files))
+	for _, f := range files {
+		stored, err := g.r.Nodes(ctx, NodeFilter{QualifiedName: f.Path, Kinds: []model.NodeKind{model.NodeFile}}, "", 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(stored) == 1 {
+			out[f.ID] = stored[0].Node.ID
+		}
+	}
+	return out, nil
+}
