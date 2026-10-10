@@ -12,5 +12,12 @@
 (module (expression_statement (assignment left: (identifier) @name) @def.variable))
 (class_definition body: (block (expression_statement (assignment left: (identifier) @name) @def.field)))
 
+; Every statement that binds or changes `__all__`, which the export rule
+; reads: the static forms are an assignment, `+=`, `.extend`, `.append` and
+; `.remove`, each a statement of the module; anything else makes it computed.
+((assignment left: (identifier) @all.target) @all (#eq? @all.target "__all__"))
+((augmented_assignment left: (identifier) @all.target) @all (#eq? @all.target "__all__"))
+((call function: (attribute object: (identifier) @all.target attribute: (identifier) @all.method)) @all (#eq? @all.target "__all__"))
+
 (call function: (identifier) @call.name) @call
 (call function: (attribute object: (_) @call.qualifier attribute: (identifier) @call.name)) @call

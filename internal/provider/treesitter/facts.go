@@ -43,6 +43,9 @@ var declKinds = map[string]model.NodeKind{
 	"interface": model.NodeInterface, "struct": model.NodeStruct, "enum": model.NodeEnum,
 	"field": model.NodeField, "variable": model.NodeVariable, "constant": model.NodeConstant,
 	"test": model.NodeTest, "module": model.NodeModule, "namespace": model.NodeNamespace,
+	// An entry point the worker extracts as a declaration, a Python
+	// `__main__` guard, so the calls its body makes are made from it.
+	"endpoint": model.NodeEndpoint,
 }
 
 // family is a group of facts reported under its own capability rows, with
@@ -103,6 +106,9 @@ type builder struct {
 	// repeats an identity does not publish the same alias row twice.
 	aliasSeen map[model.NativeAlias]bool
 	search    []model.SearchUnit
+	// callees holds the callee reference node of each key a call or a route
+	// handler of this file minted (callee).
+	callees map[string]model.Resolution
 	// table is the file's link table once linkTable has joined it, nil when
 	// the worker sent none; storeTable hands it to the sink.
 	table *link.Table
@@ -207,6 +213,7 @@ func (b *builder) build() error {
 	b.aliasSeen = map[model.NativeAlias]bool{}
 	b.byName = map[string][]int{}
 	b.declKeys = map[string]bool{}
+	b.callees = map[string]model.Resolution{}
 	var err error
 	if b.fileRng, err = b.rangeOf(0, uint32(len(b.src))); err != nil {
 		return err
@@ -225,6 +232,9 @@ func (b *builder) build() error {
 		return err
 	}
 	if err := b.refs(); err != nil {
+		return err
+	}
+	if err := b.endpoints(); err != nil {
 		return err
 	}
 	if err := b.linkTable(); err != nil {
@@ -688,7 +698,6 @@ func (b *builder) imports() error {
 // the same bytes joins the syntactic callee to the compiler-resolved symbol
 // and the calls relation acquires a precise target.
 func (b *builder) refs() error {
-	callees := map[string]model.Resolution{}
 	for _, r := range b.ex.refs {
 		if r.Kind != "call" && r.Kind != "type" && r.Kind != "macro" {
 			return outputInvalid("reference kind " + bound(r.Kind, 32) + " is unknown")
@@ -738,54 +747,16 @@ func (b *builder) refs() error {
 			}
 			continue
 		}
-		var callee model.NodeID
-		if len(targets) == 1 {
-			// The one declaration of this file the name can mean. The callee
-			// node is that declaration, and the calls edge to a located
-			// declaration of this same file states that resolution
-			// structurally rather than as an attribute on a node that also
-			// describes the declaration itself.
-			callee = b.decls[targets[0]].res.Node.ID
-			b.putRelation(structure, from, model.RelCalls, callee, rng, r.Name, "")
-		} else {
-			// Nothing in this file is the single callee: the name is declared
-			// several times here, is qualified by an imported name, or is not
-			// declared here at all.
-			//
-			// A bare call keys its callee reference by the callee name, a
-			// qualified one by receiver and name; the two never collide
-			// because a callee name is a single identifier and a qualified
-			// key always carries the separating dot. A receiver the worker
-			// could not name within its bound leaves the qualifier empty, so
-			// the key is "call:." + name: a method of that name on a receiver
-			// this file does not name, which is what it is.
-			key := "call:" + r.Name
-			kind := model.NodeFunction
-			if r.Qualified {
-				key, kind = "call:"+r.Qualifier+"."+r.Name, model.NodeMethod
-			}
-			resolution, candidates := calleeResolution(r, targets)
-			res, ok := callees[key]
-			if !ok {
-				if b.maxCallees.Exceeded(int64(len(callees) + 1)) {
-					// Past the bound the call is counted, not minted: a file
-					// with more distinct cross-file callees than this is
-					// reported partial rather than allowed to publish an
-					// unbounded number of placeholder nodes and relations.
-					b.dropped[structure]++
-					continue
-				}
-				if res, err = b.resolve(model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key,
-					Kind: kind, Language: b.lang.Name, Name: r.Name}); err != nil {
-					return err
-				}
-				callees[key] = res
-				b.putNode(structure, res, rng, key, map[string]any{"resolution": resolution, "candidates": candidates, "callee": r.Name})
-			} else {
-				b.addEvidence(structure, res.Node.ID, rng, key)
-			}
-			callee = res.Node.ID
-			b.putRelation(structure, from, model.RelCalls, callee, rng, key, resolution)
+		targets = b.callTargets(r, targets)
+		callee, resolution, ok, err := b.callee(r, targets, rng)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		b.putRelation(structure, from, model.RelCalls, callee, rng, calleeKey(r, targets), resolution)
+		if len(targets) > 1 {
 			// Every in-file candidate the scope justifies is kept: how many
 			// declarations share a name is a property of the file, not a
 			// count to cut at.
@@ -805,6 +776,93 @@ func (b *builder) refs() error {
 		}
 	}
 	return nil
+}
+
+// callTargets narrows the declarations a call's name can mean to those its
+// scope justifies. A call of a member on a receiver value names no
+// declaration by scope: this provider types no receiver, so the methods of
+// this file that share the name are candidates by name alone. The linker
+// binds the call when it recovers the receiver's type and otherwise
+// publishes the site as open, its candidates computed per query (ADR-0015);
+// none is published here. A call qualified by a type or namespace path
+// (`T::f()`) names its scope and keeps its in-file candidates, as a bare call
+// does.
+func (b *builder) callTargets(r wire.Ref, targets []int) []int {
+	if len(targets) > 1 && r.Qualified && !pathCall(b.src, r.NameStart) {
+		return nil
+	}
+	return targets
+}
+
+// calleeKey is the native key of the node a reference names when it is not
+// one declaration of this file: a bare name keys its callee reference by the
+// name, a qualified one by receiver and name; the two never collide because
+// a callee name is a single identifier and a qualified key always carries
+// the separating dot. A receiver the worker could not name within its bound
+// leaves the qualifier empty, so the key is "call:." + name: a member of that
+// name on a receiver this file does not name, which is what it is. A
+// reference to one declaration of this file is keyed by its name.
+func calleeKey(r wire.Ref, targets []int) string {
+	switch {
+	case len(targets) == 1:
+		return r.Name
+	case r.Qualified:
+		return "call:" + r.Qualifier + "." + r.Name
+	}
+	return "call:" + r.Name
+}
+
+// callee is the node a call reference, or a handler a route names, stands
+// for, with the Section 9.3 resolution its relation carries and whether the
+// node exists. A name declared exactly once in this file names that
+// declaration, and the edge to a located declaration of this same file
+// states that resolution structurally rather than as an attribute on a node
+// that also describes the declaration itself. Every other name -- declared
+// several times here, qualified by an imported name, or not declared here --
+// names a provider-local callee reference node carrying the resolution and
+// candidates attributes, one per key, never a guess at another file's
+// symbol. Past a user-set tree_sitter.max_callee_references the node is not
+// minted: the reference is counted into dropped and reports false, so a file
+// with more distinct cross-file callees than the bound is partial rather than
+// allowed an unbounded number of placeholders.
+func (b *builder) callee(r wire.Ref, targets []int, rng *model.SourceRange) (model.NodeID, string, bool, error) {
+	if len(targets) == 1 {
+		return b.decls[targets[0]].res.Node.ID, "", true, nil
+	}
+	key := calleeKey(r, targets)
+	kind := model.NodeFunction
+	if r.Qualified {
+		kind = model.NodeMethod
+	}
+	resolution, candidates := calleeResolution(r, targets)
+	res, ok := b.callees[key]
+	if ok {
+		b.addEvidence(structure, res.Node.ID, rng, key)
+		return res.Node.ID, resolution, true, nil
+	}
+	if b.maxCallees.Exceeded(int64(len(b.callees) + 1)) {
+		b.dropped[structure]++
+		return "", "", false, nil
+	}
+	res, err := b.resolve(model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key,
+		Kind: kind, Language: b.lang.Name, Name: r.Name})
+	if err != nil {
+		return "", "", false, err
+	}
+	b.callees[key] = res
+	b.putNode(structure, res, rng, key, map[string]any{"resolution": resolution, "candidates": candidates, "callee": r.Name})
+	return res.Node.ID, resolution, true, nil
+}
+
+// pathCall reports a call qualified by a path, `T::f()` or `ns::f()`: the
+// callee token follows `::`. Every other qualified call names a member of a
+// receiver value (`x.f()`, `x->f()`, `self.f()`).
+func pathCall(src []byte, nameStart uint32) bool {
+	i := int(nameStart)
+	for i > 0 && (src[i-1] == ' ' || src[i-1] == '\t' || src[i-1] == '\n' || src[i-1] == '\r') {
+		i--
+	}
+	return i >= 2 && src[i-2] == ':' && src[i-1] == ':'
 }
 
 // calleeResolution is the Section 9.3 attribute pair for a call whose callee

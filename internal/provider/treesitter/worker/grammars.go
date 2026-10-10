@@ -42,6 +42,11 @@ type grammar struct {
 	// importNames derives the local names an import path introduces when the
 	// query captured none.
 	importNames func(path string) []string
+	// exported decides whether a top-level declaration is exported, for a
+	// language whose export rule is the file's, not the declaration's own
+	// syntax; it runs once containment is known, so it sees only top-level
+	// declarations.
+	exported func(e *extraction, d *decl) bool
 	// blank is the name that declares nothing in the language, or empty
 	// when every name it extracts binds one. A declaration of it is not
 	// extracted, and neither is any declaration nested inside it.
@@ -81,10 +86,13 @@ type kindIDs struct {
 	expressionStatement, str uint16
 	// Java and Rust modifiers, Rust macros and attributes.
 	modifiers, visibilityModifier, macroDefinition, attributeItem uint16
-	// ECMAScript function values.
-	arrowFunction, functionExpression uint16
-	// C and C++ macros and declarator chains.
+	// ECMAScript function values and the bindings a function-valued
+	// property is stored under.
+	arrowFunction, functionExpression, pair, object, assignmentExpression uint16
+	// C and C++ macros and declarator chains, and what decides a C
+	// definition's linkage.
 	preprocDef, preprocFunctionDef, functionDeclarator, qualifiedIdentifier uint16
+	functionDefinition, storageClassSpecifier, initDeclarator               uint16
 	// errorKind is the kind of an ERROR node, the library's one error symbol,
 	// which its name lookup answers for "ERROR" in every grammar.
 	errorKind uint16
@@ -119,25 +127,31 @@ func (g *grammar) kindIDs() *kindIDs {
 			comments: kinds(g.comments...),
 			declaratorChain: kinds("pointer_declarator", "array_declarator", "init_declarator", "attributed_declarator",
 				"reference_declarator", "parenthesized_declarator"),
-			identifier:           id("identifier"),
-			funcLiteral:          id("func_literal"),
-			structType:           id("struct_type"),
-			interfaceType:        id("interface_type"),
-			typeIdentifier:       id("type_identifier"),
-			parameterDeclaration: id("parameter_declaration"),
-			expressionStatement:  id("expression_statement"),
-			str:                  id("string"),
-			modifiers:            id("modifiers"),
-			visibilityModifier:   id("visibility_modifier"),
-			macroDefinition:      id("macro_definition"),
-			attributeItem:        id("attribute_item"),
-			arrowFunction:        id("arrow_function"),
-			functionExpression:   id("function_expression"),
-			preprocDef:           id("preproc_def"),
-			preprocFunctionDef:   id("preproc_function_def"),
-			functionDeclarator:   id("function_declarator"),
-			qualifiedIdentifier:  id("qualified_identifier"),
-			errorKind:            id("ERROR"),
+			identifier:            id("identifier"),
+			funcLiteral:           id("func_literal"),
+			structType:            id("struct_type"),
+			interfaceType:         id("interface_type"),
+			typeIdentifier:        id("type_identifier"),
+			parameterDeclaration:  id("parameter_declaration"),
+			expressionStatement:   id("expression_statement"),
+			str:                   id("string"),
+			modifiers:             id("modifiers"),
+			visibilityModifier:    id("visibility_modifier"),
+			macroDefinition:       id("macro_definition"),
+			attributeItem:         id("attribute_item"),
+			arrowFunction:         id("arrow_function"),
+			functionExpression:    id("function_expression"),
+			pair:                  id("pair"),
+			object:                id("object"),
+			assignmentExpression:  id("assignment_expression"),
+			preprocDef:            id("preproc_def"),
+			preprocFunctionDef:    id("preproc_function_def"),
+			functionDeclarator:    id("function_declarator"),
+			qualifiedIdentifier:   id("qualified_identifier"),
+			functionDefinition:    id("function_definition"),
+			storageClassSpecifier: id("storage_class_specifier"),
+			initDeclarator:        id("init_declarator"),
+			errorKind:             id("ERROR"),
 		}
 	})
 	return &g.kinds
@@ -149,6 +163,8 @@ func (g *grammar) kindIDs() *kindIDs {
 // ChildByFieldId answers with no child, as a lookup by an unknown name does.
 type fieldIDs struct {
 	body, declarator, name, receiver, scope, typ uint16
+	// ECMAScript pairs and assignments.
+	key, value, left, right uint16
 }
 
 // fieldIDs is the field table of g, resolved once.
@@ -162,6 +178,10 @@ func (g *grammar) fieldIDs() *fieldIDs {
 			receiver:   tl.FieldIdForName("receiver"),
 			scope:      tl.FieldIdForName("scope"),
 			typ:        tl.FieldIdForName("type"),
+			key:        tl.FieldIdForName("key"),
+			value:      tl.FieldIdForName("value"),
+			left:       tl.FieldIdForName("left"),
+			right:      tl.FieldIdForName("right"),
 		}
 	})
 	return &g.fields
@@ -324,6 +344,7 @@ var grammars = map[string]*grammar{
 				d.kind == "class" && strings.HasPrefix(d.name, "Test")
 		},
 		importNames: func(p string) []string { return []string{firstSegment(p, ".")} },
+		exported:    pyExported,
 		flatFields:  pythonFields,
 	},
 	"java": {
@@ -370,7 +391,10 @@ var grammars = map[string]*grammar{
 	"cpp": {language: tree_sitter_cpp.Language, wrappers: cWrappers, comments: []string{"comment"}, refine: cRefine, importNames: func(p string) []string { return []string{lastSegment(p, "::")} }, flatFields: cppFields},
 }
 
-var jsWrappers = []string{"export_statement", "lexical_declaration", "variable_declaration"}
+// jsWrappers are the statements a declaration's doc comment and export
+// marker attach to: an assignment's doc comment precedes its expression
+// statement.
+var jsWrappers = []string{"export_statement", "lexical_declaration", "variable_declaration", "expression_statement"}
 
 // jsRefine: a declaration is exported when it or a wrapper ancestor was an
 // export target. An export clause naming a top-level declaration is applied
@@ -462,6 +486,51 @@ func cRefine(d *decl, src []byte) {
 	if d.impl != "" && d.kind == "function" {
 		d.kind = "method"
 	}
+	if d.ex.l.Name == "c" {
+		d.exported = cExternal(d, src)
+	}
+}
+
+// cExternal reports a C definition with external linkage (C17 6.2.2), which
+// is what a C module exports: a function definition, or a file-scope object
+// definition, not declared `static`. A prototype and an `extern` object
+// declaration without an initializer define nothing, so they export nothing
+// here; the file that defines the name does. Linkage is not shared-library
+// visibility, which compiler flags and attribute macros decide.
+func cExternal(d *decl, src []byte) bool {
+	k := d.ex.k
+	switch {
+	case d.prototype || d.macro:
+		return false
+	case d.node.KindId() == k.functionDefinition:
+		static, _ := storageClass(d.node, k, src)
+		return !static
+	case d.kind == "variable":
+		static, extern := storageClass(d.node, k, src)
+		return !static && (!extern || d.declarator.KindId() == k.initDeclarator)
+	}
+	return false
+}
+
+// storageClass reports whether a C declaration or definition is declared
+// `static` or `extern`.
+func storageClass(n ts.Node, k *kindIDs, src []byte) (static, extern bool) {
+	if k.storageClassSpecifier == 0 {
+		return false, false
+	}
+	for i := range n.NamedChildCount() {
+		c := n.NamedChild(i)
+		if c == nil || c.KindId() != k.storageClassSpecifier {
+			continue
+		}
+		switch c.Utf8Text(src) {
+		case "static":
+			static = true
+		case "extern":
+			extern = true
+		}
+	}
+	return static, extern
 }
 
 // childOfKind is n's first named child of the kind id; id 0 never matches.
