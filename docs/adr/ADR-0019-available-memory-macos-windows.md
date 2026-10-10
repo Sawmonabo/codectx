@@ -97,7 +97,8 @@ as reservations on the ledger, and the allocation shrinks as the product's own c
 
 ### 4. One rule for a host that cannot be read
 
-`Allocation` takes only an observed reading; its unobserved branch is removed. `SchedulingAllocation` is the single
+The derivation (`derivedAllocation`, `internal/admission/machine.go`) takes a figure of available memory, not a
+reading, so it has no unobserved case at all. `SchedulingAllocation` is the single
 place an unobserved machine becomes the 8 GiB stand-in, and it is reported as unobserved, never as a measured figure.
 With decisions 1 and 2, the stand-in remains only for other platforms and for a failed reading.
 
@@ -117,7 +118,9 @@ to zero, and the existing rule that a child larger than the allocation runs alon
   16 KiB page multiplying correctly, and an overflow reported as unobserved; the Windows minimum on fake structures,
   with a zero or failed call unobserved.
 - **One stand-in rule:** a forced unobserved machine gives the 8 GiB stand-in, unobserved, and re-derivation keeps it;
-  no other caller can turn an unobserved reading into an allocation (mutation: restore `Allocation`'s 0 branch).
+  no other caller can turn an unobserved reading into an allocation: the derivation takes a figure, so the guarantee
+  is structural, and the test fails if `SchedulingAllocation` derives from an unobserved reading's bytes or reports
+  the stand-in as observed.
 - **Residency (macOS and Windows):** the readers report a resident set for the test process, and a child that
   touches N MiB lowers the allocation by much less than N.
 - **Job limit (Windows):** after asserting that its own reading exceeds 512 MiB, the test re-runs itself inside a job

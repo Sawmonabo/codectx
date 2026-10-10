@@ -58,23 +58,24 @@ func TestOwnChildGrowthDoesNotThrottleTheAllocation(t *testing.T) {
 	before := augmented()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
+	dir := t.TempDir()
+	exited := make(chan struct{})
 	go func() {
-		_, err := runner.Run(ctx, process.Spec{
+		defer close(exited)
+		_, _ = runner.Run(ctx, process.Spec{
 			Path:                   self,
 			Args:                   []string{"-test.run=^TestOwnChildGrowthDoesNotThrottleTheAllocation$", "-test.count=1"},
 			Env:                    []string{touchChildEnv + "=" + strconv.Itoa(n)},
-			Dir:                    t.TempDir(),
+			Dir:                    dir,
 			MaxStdoutBytes:         4096,
 			MaxStderrBytes:         4096,
 			Grace:                  time.Second,
 			MemoryReservationBytes: n,
 		})
-		done <- err
 	}()
 	defer func() {
 		cancel()
-		<-done
+		<-exited
 	}()
 
 	// The child's memory is visible once a sweep has read most of it; the
@@ -82,8 +83,8 @@ func TestOwnChildGrowthDoesNotThrottleTheAllocation(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Minute)
 	for runner.ReservedResidentBytes() < n/2 {
 		select {
-		case err := <-done:
-			t.Fatalf("the child exited before its memory was read: %v", err)
+		case <-exited:
+			t.Fatal("the child exited before its memory was read")
 		default:
 		}
 		if time.Now().After(deadline) {
