@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -164,7 +165,12 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	}()
 
 	codes, absent := kindCodesFor(e.reader, kinds)
+	descent := pathDescentFor(e.reader, direction, kinds, codes)
+	if descent.active {
+		codes = append(slices.Clone(codes), descent.overrides)
+	}
 	w := &pathWalk{
+		descent:     descent,
 		reader:      e.reader,
 		kinds:       kinds,
 		kindCodes:   codes,
@@ -436,6 +442,12 @@ type pathWalk struct {
 	// (plus the one group that budget is allowed to overshoot for) however
 	// large the graph is.
 	peakChunkBytes int64
+
+	// descent is the forward call walk's downward step: an outgoing search
+	// over `calls` also descends from a method to each method overriding
+	// it, at the cost of an `overrides` hop, because a virtual call into the
+	// method may run any of them (ADR-0015 decision 2).
+	descent pathDescent
 
 	depthPruned   bool
 	visitedHit    bool
@@ -816,8 +828,11 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 		pend = pend[:0]
 		return nil
 	}
-	pos, err := w.reader.Neighbours(ctx, refs, w.direction, w.kindCodes, w.expandAfter,
+	pos, err := w.reader.Neighbours(ctx, refs, w.descent.direction(w.direction), w.kindCodes, w.expandAfter,
 		func(e Edge) error {
+			if !w.descent.keep(e) {
+				return nil
+			}
 			// Both stops are checked BEFORE the entry is consumed, so the
 			// position the port reports for a stopped scan -- the entry it
 			// just delivered -- still names the first entry this page did NOT
@@ -1097,4 +1112,47 @@ func (e *Engine) scratchDir() string {
 		return ""
 	}
 	return e.spools.SortDir()
+}
+
+// pathDescent is an outgoing call search's downward step: the scan reads
+// both lists, keeps the outgoing entries of the requested kinds, and keeps an
+// incoming `overrides` entry, which relaxes from a method to an override of
+// it. It is inactive for every other search.
+type pathDescent struct {
+	active    bool
+	overrides KindCode
+	requested map[KindCode]bool
+}
+
+func pathDescentFor(r GraphReader, direction model.Direction, kinds []model.RelationKind,
+	codes []KindCode) pathDescent {
+	if direction != model.DirectionOutgoing || !slices.Contains(kinds, model.RelCalls) {
+		return pathDescent{}
+	}
+	code, ok := r.Kinds().Code(model.RelOverrides)
+	if !ok {
+		return pathDescent{}
+	}
+	d := pathDescent{active: true, overrides: code, requested: map[KindCode]bool{}}
+	for _, c := range codes {
+		d.requested[c] = true
+	}
+	return d
+}
+
+func (d pathDescent) direction(walk model.Direction) model.Direction {
+	if d.active {
+		return model.DirectionBoth
+	}
+	return walk
+}
+
+func (d pathDescent) keep(e Edge) bool {
+	if !d.active {
+		return true
+	}
+	if e.Outgoing {
+		return d.requested[e.Kind]
+	}
+	return e.Kind == d.overrides
 }

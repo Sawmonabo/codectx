@@ -162,8 +162,11 @@ type traversalCursor struct {
 	PairServed int64 `json:"pair_served,omitempty"`
 	PairTotal  int64 `json:"pair_total,omitempty"`
 	// Visited and Edges are CUMULATIVE across every page of this traversal.
-	Visited   int64     `json:"visited"`
-	Edges     int64     `json:"edges"`
+	Visited int64 `json:"visited"`
+	Edges   int64 `json:"edges"`
+	// Calls are a call walk's structured counts, cumulative exactly as
+	// Visited and Edges are, so every page reports the answer's totals so far.
+	Calls model.GraphCounts `json:"calls,omitzero"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -218,6 +221,9 @@ func (c traversalCursor) validate() error {
 	}
 	if c.Depth < 0 || c.Visited < 0 || c.Edges < 0 {
 		return cursorInvalid("cursor carries a negative depth or budget")
+	}
+	if err := c.Calls.Validate(); err != nil {
+		return cursorInvalid("cursor call counts are negative")
 	}
 	if err := c.validateLevel(); err != nil {
 		return err
@@ -593,7 +599,8 @@ func (e *Engine) verifyContinuation(token, endpoint, queryHash string,
 	if c.GenerationID != binding.GenerationID || c.AnalysisKey != binding.AnalysisKey {
 		return traversalCursor{}, nil, cursorInvalid("cursor pins a generation that is no longer the one being read")
 	}
-	return c, &budget{visited: c.Visited, edges: c.Edges, deadline: deadline, now: e.now}, nil
+	return c, &budget{visited: c.Visited, edges: c.Edges, calls: c.Calls,
+		deadline: deadline, now: e.now}, nil
 }
 
 // resumeTraversal verifies token for endpoint, binds it to the engine's pinned
@@ -813,6 +820,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		WalkDone:     c.WalkDone,
 		Visited:      b.visited,
 		Edges:        b.edges,
+		Calls:        b.calls,
 		ExpiresAt:    e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
 	// The retained directory -- the frontier the walk committed level by level,

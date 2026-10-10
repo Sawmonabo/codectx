@@ -286,3 +286,21 @@ func (g *locatedGraph) RelationOccurrences(ctx context.Context, rel model.Relati
 	}
 	return out, next, nil
 }
+
+var _ DispatchReader = (*locatedGraph)(nil)
+
+func (g *locatedGraph) RelationDispatch(ctx context.Context, rels []model.RelationID) ([]RelationDispatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]RelationDispatch, len(rels))
+	for i, id := range rels {
+		for _, ev := range g.f.evidence[id] {
+			if ev.Dispatch == model.DispatchVirtual {
+				out[i].Virtual = true
+			}
+			out[i].SetSize = max(out[i].SetSize, ev.SetSize)
+		}
+	}
+	return out, nil
+}

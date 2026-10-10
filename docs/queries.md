@@ -30,8 +30,8 @@ the wrong one is a wrong answer the caller cannot detect.
 | Command | Answers | Walks |
 |---|---|---|
 | `refs <name-or-id>` | the sealed reference occurrences of one node | incoming `references` and `calls` |
-| `callers <name-or-id>...` | who reaches these symbols | incoming `calls` |
-| `callees <name-or-id>...` | what these symbols reach | outgoing `calls` |
+| `callers <name-or-id>...` | who reaches these symbols | incoming `calls`, and the virtual calls into every method they override |
+| `callees <name-or-id>...` | what these symbols reach | outgoing `calls`, the overrides a virtual call may run, and an endpoint's `routes_to` |
 | `path <from> <to>` | the cheapest dependency routes between two nodes | the default relation allowlist |
 | `impact <name-or-id>...` | what a change to these symbols may affect, ranked | both directions over the impact allowlist |
 
@@ -85,6 +85,58 @@ index, not a clamped range, and still fails the query with
 `CTX_ARGUMENT_INVALID`; a cancelled query or an exhausted deadline still fails
 as itself rather than arriving as a complete answer with per-hit footnotes. Run
 `codectx doctor --deep` to verify the content store when hits carry this flag.
+
+## What a call answer carries
+
+**Where everything is.** A `callers`, `callees` or `path` answer carries a
+`locations` entry for every node it lists — the file, its path in the pinned
+snapshot and the node's byte range — and an `occurrences` entry for every call
+site behind every `calls` relation it lists, each with its file, byte range,
+`dispatch` (`virtual` when the call can run an override of its target, `exact`
+when it cannot) and, for a site bound to several targets, its `set_size`. One
+answer is enough to open a call hierarchy: no follow-up `symbol` or `refs` call
+is needed to place a caller or a call. A relation with more call sites than one
+answer holds lists its first sites and a notice gives the exact count. The
+MCP `codectx_callers` and `codectx_callees` tools walk `calls` when `relations`
+is empty, exactly as these commands do; a request that names relations walks
+those.
+
+**Calls through a base class are found at query time.** A call is stored once,
+against the method its receiver's declared type declares: in
+
+```python
+class Animal:
+    def sound(self): ...
+class Dog(Animal):
+    def sound(self): ...
+def speak(a: Animal): a.sound()
+def direct(d: Dog): d.sound()
+```
+
+`speak` calls `Animal.sound`. So `callers Dog.sound` lists `direct`, then climbs
+`overrides` to `Animal.sound` — at any depth, so a `Puppy.sound` under `Dog`
+reaches both — and lists `speak`, whose call is virtual, marked
+`through_base` with the base and how many methods override it. The
+`overrides` row it climbed is in the answer, the row lists only the call's
+virtual sites, and `counts` reports `direct` and `through_base` apart. A
+through-base row is a call that **may** run the method, never one that must:
+`super().sound()` and a qualified `Animal::sound()` are exact and never appear,
+and `callers Animal.sound` never lists `direct`, whose call can only run
+`Dog.sound`. `callees speak` lists `Animal.sound` and then every override of it,
+at any depth, marked `may_dispatch` and counted as `may_dispatch`. A site bound
+by value flow to several classes is marked `value_set` with its set size ("1
+of 2"). `path` and a forward `impact` take the same downward step; `impact` of
+a method lists the methods overriding it; `refs` of a method includes the
+references of every method in its override family, up and down. The step
+belongs to the command, not to `--relations`: a walk over `calls` alone takes
+it. When a method marks no override and its class extends a type outside the
+indexed project, the callers answer says that calls through that type are found
+only for overrides the language marks.
+
+**Endpoints.** `routes_to` (endpoint to handler) is not a call and is not in the
+`callers` or `callees` relation set, but a `callees` walk from an endpoint
+follows it to the handler first, then the handler's calls. `impact` walks it,
+so a changed handler marks the endpoints that route to it affected.
 
 ## Flags
 

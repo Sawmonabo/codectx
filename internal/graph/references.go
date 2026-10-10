@@ -44,6 +44,8 @@ func referenceQueryHash(node model.NodeID, op model.ReferenceOperation) string {
 type referenceWalk struct {
 	direction model.Direction
 	kinds     []model.RelationKind
+	// family reads the references of the node's whole method family.
+	family bool
 }
 
 // referenceWalkFor maps a reference operation onto the canonical relation
@@ -51,7 +53,8 @@ type referenceWalk struct {
 //
 //   - references:      incoming `references` and `calls` -- every canonical
 //     edge that names this node as its target is a place the
-//     symbol is used.
+//     symbol is used -- of the node and of every method of its
+//     method family (methodFamily).
 //   - implements:      incoming `implements` -- the implementors of an
 //     interface, which is the direction that answers
 //     "who implements this", not "what does this implement".
@@ -66,13 +69,13 @@ func referenceWalkFor(op model.ReferenceOperation) (referenceWalk, error) {
 	switch op {
 	case model.ReferenceReferences:
 		return referenceWalk{model.DirectionIncoming,
-			[]model.RelationKind{model.RelReferences, model.RelCalls}}, nil
+			[]model.RelationKind{model.RelReferences, model.RelCalls}, true}, nil
 	case model.ReferenceImplements:
 		return referenceWalk{model.DirectionIncoming,
-			[]model.RelationKind{model.RelImplements}}, nil
+			[]model.RelationKind{model.RelImplements}, false}, nil
 	case model.ReferenceTypeDefinition:
 		return referenceWalk{model.DirectionOutgoing,
-			[]model.RelationKind{model.RelReferences}}, nil
+			[]model.RelationKind{model.RelReferences}, false}, nil
 	}
 	return referenceWalk{}, (&model.Error{Code: model.CodeArgumentInvalid,
 		Message: "reference operation is not a known reference operation"}).
@@ -671,6 +674,19 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 	if err != nil {
 		return nil, err
 	}
+	// The references of a method are those of its whole method family: every
+	// method it overrides and every method overriding those, at any depth,
+	// both ways. References serve renaming and reading, and a rename of one
+	// override is a rename of the family (ADR-0015 decision 2).
+	owners := map[NodeRef]model.NodeID{}
+	if refs[0] != 0 {
+		owners[refs[0]] = node
+		if walk.family {
+			if refs, err = e.methodFamily(ctx, reader, refs[0], owners); err != nil {
+				return nil, err
+			}
+		}
+	}
 	codes, absent := kindCodesFor(reader, walk.kinds)
 	// A node this generation does not carry has no list, and an operation whose
 	// kinds this generation seals none of has no rows. Both are an EMPTY
@@ -709,12 +725,16 @@ func (e *Engine) referenceRelations(ctx context.Context, node model.NodeID,
 				// take the whole page down with it.
 				continue
 			}
-			r := referenceRelation{ID: relIDs[i], Kind: kind, From: node, To: nodeIDs[i]}
+			owner := owners[edge.Owner]
+			if owner == "" {
+				continue
+			}
+			r := referenceRelation{ID: relIDs[i], Kind: kind, From: owner, To: nodeIDs[i]}
 			if !edge.Outgoing {
 				// The entry is on the owner's INCOMING list, so the owner is
 				// the relation's to-node and the neighbour is where the
 				// reference is written.
-				r.From, r.To = nodeIDs[i], node
+				r.From, r.To = nodeIDs[i], owner
 			}
 			if err := sorter.Add(r); err != nil {
 				return err
@@ -1015,4 +1035,51 @@ func (e *Engine) evidence(ctx context.Context, relations []model.RelationID,
 		out[rel] = rows
 	}
 	return out, nil
+}
+
+// methodFamily adds to owners every method connected to start by `overrides`,
+// up and down at any depth, and returns their surrogates ascending, start
+// included. One adjacency read per level of the family.
+func (e *Engine) methodFamily(ctx context.Context, reader GraphReader, start NodeRef,
+	owners map[NodeRef]model.NodeID) ([]NodeRef, error) {
+	code, ok := reader.Kinds().Code(model.RelOverrides)
+	if !ok {
+		return []NodeRef{start}, nil
+	}
+	level := []NodeRef{start}
+	var found []NodeRef
+	for len(level) > 0 {
+		var next []NodeRef
+		if _, err := reader.Neighbours(ctx, level, model.DirectionBoth, []KindCode{code}, EdgePos{}, func(edge Edge) error {
+			if _, seen := owners[edge.Neighbour]; seen {
+				return nil
+			}
+			owners[edge.Neighbour] = ""
+			next = append(next, edge.Neighbour)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		found = append(found, next...)
+		level = ascending(next)
+	}
+	if len(found) > 0 {
+		found = ascending(found)
+		for _, chunk := range impactChunkRefs(found) {
+			ids, err := reader.NodeIDs(ctx, chunk)
+			if err != nil {
+				return nil, err
+			}
+			for i, ref := range chunk {
+				owners[ref] = ids[i]
+			}
+		}
+	}
+	all := make([]NodeRef, 0, len(owners))
+	for ref, id := range owners {
+		if id != "" {
+			all = append(all, ref)
+		}
+	}
+	return ascending(all), nil
 }

@@ -202,6 +202,17 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		names := &levelNames{}
 		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry,
 			names, kindNames(reader))
+		// Impact takes a call walk's dispatch step: a change to a method
+		// affects the callers of every method it overrides whose call may
+		// run it, and forward impact descends to the overrides a virtual
+		// call may run. The base a callers step climbs through is a route,
+		// not an affected entity.
+		mode := dispatchFor(req.Direction, kinds)
+		dispatches := e.dispatchReader()
+		if dispatches == nil {
+			mode = dispatchNone
+		}
+		acc.climbs = mode == dispatchCallers
 		// ONE streamed pass, TEED: the rollup's batching drives the walk, so
 		// every admitted edge reaches the entity record and the package pair as
 		// it is read and nothing is held between the edge that produced it and
@@ -235,7 +246,9 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				// The per-level canonical resolution the accumulator reads. One
 				// pointer, refilled by the walk before each level's edges are
 				// delivered, so a record is named without a round trip per edge.
-				Names: names,
+				Names:      names,
+				Dispatch:   mode,
+				Dispatches: dispatches,
 			}, func(fs frontierState, edge Edge) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never
@@ -906,6 +919,10 @@ type impactAccumulator struct {
 	// kinds names a relation kind from the generation's kind code, so a reason
 	// and a cost are read off the edge without a dictionary lookup per edge.
 	kinds []model.RelationKind
+	// climbs is set on a walk that takes the callers dispatch step: an
+	// `overrides` edge it climbs reaches a base method only as the route to
+	// that base's virtual callers, so the base is not listed as affected.
+	climbs bool
 }
 
 // newImpactAccumulator builds the visitor for one LEG of a walk. resume is the
@@ -994,6 +1011,9 @@ func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 		return nil
 	}
 	kind := a.kindOf(e.Kind)
+	if a.climbs && kind == model.RelOverrides && e.Outgoing {
+		return nil
+	}
 	direction := model.DirectionOutgoing
 	if !e.Outgoing {
 		direction = model.DirectionIncoming

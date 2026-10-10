@@ -707,6 +707,7 @@ func encodeFrontierState(fs frontierState) []byte {
 	buf = binary.AppendUvarint(buf, uint64(fs.Cost))
 	buf = binary.AppendUvarint(buf, uint64(fs.Node))
 	buf = binary.AppendUvarint(buf, uint64(fs.Via))
+	buf = append(buf, byte(fs.Step))
 	buf = binary.AppendUvarint(buf, uint64(len(fs.Route)))
 	for _, r := range fs.Route {
 		buf = binary.AppendUvarint(buf, uint64(r))
@@ -721,6 +722,7 @@ func decodeFrontierState(b []byte) (frontierState, error) {
 	fs.Cost = int64(d.uvarint())
 	fs.Node = NodeRef(d.uvarint())
 	fs.Via = RelRef(d.uvarint())
+	fs.Step = dispatchStep(d.byteAt())
 	n := d.uvarint()
 	if d.err != nil {
 		return frontierState{}, d.err
@@ -755,6 +757,7 @@ func admitState(r levelRecord, costs kindCosts) frontierState {
 		Node:  r.Edge.Neighbour,
 		Via:   r.Edge.Rel,
 		Route: appendRoute(r.Owner.Route, r.Edge.Rel),
+		Step:  r.Step,
 	}
 }
 

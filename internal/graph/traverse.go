@@ -148,7 +148,18 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 		return walkState{}, (&model.Error{Code: model.CodeInternal,
 			Message: "graph expansion requires a visitor"}).WithDetail("operation", "expand")
 	}
-	codes, costs, err := walkKinds(r, o.Kinds)
+	// A call walk takes the dispatch step (dispatch.go) when the reader can
+	// tell a virtual call from an exact one; its scan also reads the kinds the
+	// step walks.
+	mode := o.Dispatch
+	if o.Dispatches == nil {
+		mode = dispatchNone
+	}
+	scanKinds := o.Kinds
+	if mode != dispatchNone {
+		scanKinds = dispatchKinds(mode, o.Kinds)
+	}
+	codes, costs, err := walkKinds(r, scanKinds)
 	if errors.Is(err, errNoSuchKinds) {
 		// Every relation kind the request named is absent from this
 		// generation's dictionary, so the walk selects nothing. That is an
@@ -161,7 +172,7 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 		return walkState{}, err
 	}
 	w := &levelWalk{reader: r, o: o, codes: codes, costs: costs, visit: visit,
-		routes: newRouteNames(routeCacheEntries)}
+		routes: newRouteNames(routeCacheEntries), rule: newDispatchRule(r, mode, o.Kinds)}
 	st := walkState{Level: 1, LevelState: levelCollecting}
 	if o.Resume == nil {
 		if err := w.seed(ctx, seeds); err != nil {
@@ -209,6 +220,8 @@ type levelWalk struct {
 	codes  []KindCode
 	costs  kindCosts
 	visit  func(frontierState, Edge) error
+	// rule is the call walk's dispatch step, inactive for every other walk.
+	rule dispatchRule
 	// sorted is the level currently being served, held open across the pages of
 	// one request's serve so a page does not reopen and re-count it.
 	sorted *sortedLevel
@@ -418,6 +431,13 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 		if err := w.resolveIDs(ctx, pending); err != nil {
 			return err
 		}
+		if w.rule.active() {
+			kept, err := w.rule.settle(ctx, o.Dispatches, pending)
+			if err != nil {
+				return err
+			}
+			pending = kept
+		}
 		for _, rec := range pending {
 			if err := c.add(rec); err != nil {
 				return err
@@ -461,7 +481,7 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 			// the batched id read below can then drop the batch and resume the
 			// level exactly where that batch started.
 			full := false
-			at, err := w.reader.Neighbours(ctx, refs, o.Direction, w.codes, start, func(e Edge) error {
+			at, err := w.reader.Neighbours(ctx, refs, w.rule.direction(o.Direction), w.codes, start, func(e Edge) error {
 				if seen%edgeScanCheckEvery == 0 {
 					if err := checkWalk(ctx, o.Budget); err != nil {
 						if !deadlineStop(err, o) {
@@ -488,13 +508,20 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 				if err != nil || !keep {
 					return err
 				}
+				rec := levelRecord{Owner: owner, Edge: e}
+				if w.rule.active() {
+					var take bool
+					if take, rec.Step, rec.check = w.rule.entry(owner, e); !take {
+						return nil
+					}
+				}
 				if len(pending) >= levelResolveBatch {
 					// Stopped BEFORE this entry is taken, so the position the
 					// reader reports delivers it again.
 					full = true
 					return ErrStopScan
 				}
-				pending = append(pending, levelRecord{Owner: owner, Edge: e})
+				pending = append(pending, rec)
 				return nil
 			})
 			if err != nil {
@@ -1177,6 +1204,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// alone, with the cut disclosed when the answer is located.
 	_, locating := reader.(SourceLocator)
 	var sites int64
+	// A call walk takes the dispatch step and marks the rows it produced.
+	mode := dispatchFor(dir, kinds)
+	if e.dispatchReader() == nil {
+		mode = dispatchNone
+	}
+	calls := newCallPage(mode)
 	visit := func(owner frontierState, edge Edge) error {
 		// The visited and edge budgets are compared against THIS page's spend:
 		// they are work budgets that end a page, not ceilings that end a walk.
@@ -1224,6 +1257,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		relations = append(relations, rel)
 		endpoints[rel.From] = true
 		endpoints[rel.To] = true
+		calls.note(owner, edge, rel, names.node(owner.Node))
 		return nil
 	}
 	state, err := expand(ctx, reader, req.Start, expandOptions{
@@ -1237,6 +1271,8 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		Resume:        resume,
 		Retain:        retain,
 		Names:         names,
+		Dispatch:      mode,
+		Dispatches:    e.dispatchReader(),
 	}, visit)
 	if err != nil {
 		return model.GraphResult{}, err
@@ -1278,6 +1314,18 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		return model.GraphResult{}, err
 	}
 	notices = append(notices, where.notices...)
+	marks, occurrences, err := e.marks(finish, calls, where.occurrences, &b.calls)
+	if err != nil {
+		return model.GraphResult{}, err
+	}
+	where.occurrences = occurrences
+	if mode == dispatchCallers {
+		external, err := e.externalNotices(finish, req.Start)
+		if err != nil {
+			return model.GraphResult{}, err
+		}
+		notices = append(notices, external...)
+	}
 
 	reason := walkReason
 	// A page the clock ended is truncated for exactly that reason, and a
@@ -1341,6 +1389,10 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		MaxDepth:    maxDepth.Int(),
 		Locations:   where.locations,
 		Occurrences: where.occurrences,
+		Marks:       marks,
+	}
+	if mode != dispatchNone {
+		result.Counts = b.calls
 	}
 	if err := result.Validate(); err != nil {
 		return model.GraphResult{}, err

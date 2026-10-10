@@ -709,3 +709,58 @@ func (g *graphReader) RelationOccurrences(ctx context.Context, rel model.Relatio
 	}
 	return out, next, nil
 }
+
+var _ graph.DispatchReader = (*graphReader)(nil)
+
+// RelationDispatch summarizes each relation's visible evidence in one grouped
+// read per batch: whether any occurrence is a virtual call, and the largest
+// set size any occurrence carries. Results align with rels; a relation with
+// no visible evidence reads as the zero summary.
+func (g *graphReader) RelationDispatch(ctx context.Context, rels []model.RelationID) ([]graph.RelationDispatch, error) {
+	out := make([]graph.RelationDispatch, len(rels))
+	if len(rels) == 0 {
+		return out, nil
+	}
+	at := make(map[model.RelationID][]int, len(rels))
+	for i, id := range rels {
+		at[id] = append(at[id], i)
+	}
+	for start := 0; start < len(rels); start += graphBatch {
+		chunk := rels[start:min(start+graphBatch, len(rels))]
+		raw := make([]string, len(chunk))
+		for i, id := range chunk {
+			raw[i] = string(id)
+		}
+		values, err := batchBlobs("relation_id", raw)
+		if err != nil {
+			return nil, err
+		}
+		b := newBinder(g.r.gen)
+		list := b.markList(values)
+		query := `SELECT rl.canonical, max(CASE e.dispatch WHEN 'virtual' THEN 1 ELSE 0 END), max(e.set_size)
+			FROM evidence e JOIN relation_ids rl ON rl.id = e.relation_id
+			WHERE rl.canonical IN ` + list + memberOf("e") + ` GROUP BY rl.canonical`
+		err = g.r.s.read(ctx, func(tx *sql.Tx) error {
+			rows, err := tx.QueryContext(ctx, query, b.args...)
+			if err != nil {
+				return wrap("evidence", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id []byte
+				var virtual, setSize int64
+				if err := rows.Scan(&id, &virtual, &setSize); err != nil {
+					return wrap("evidence", err)
+				}
+				for _, i := range at[model.RelationID(idHex(id))] {
+					out[i] = graph.RelationDispatch{Virtual: virtual == 1, SetSize: setSize}
+				}
+			}
+			return wrap("evidence", rows.Err())
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
