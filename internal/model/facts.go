@@ -72,6 +72,19 @@ const (
 	RelRenamedFrom      RelationKind = "renamed_from"
 	RelMovedFrom        RelationKind = "moved_from"
 	RelMayReferTo       RelationKind = "may_refer_to"
+	// RelMayCall runs from a caller to a declaration whose name, call shape
+	// and language family fit one of the caller's open call sites (ADR-0015).
+	// Its precision is heuristic and its resolution name_only, or unique_name
+	// when exactly one compatible declaration exists. It is computed per query
+	// and never published as a fact.
+	RelMayCall RelationKind = "may_call"
+	// RelMayImport runs from a file to a file whose path matches the literal
+	// fragments of one of its open import sites. It is computed per query and
+	// never published as a fact.
+	RelMayImport RelationKind = "may_import"
+	// RelRoutesTo runs from an endpoint (a program entry point or a framework
+	// route) to the function that handles it.
+	RelRoutesTo RelationKind = "routes_to"
 )
 
 // Valid reports whether k is a known wire spelling.
@@ -80,11 +93,16 @@ func (k RelationKind) Valid() bool {
 	case RelContains, RelDefines, RelReferences, RelCalls, RelImports, RelExports,
 		RelImplements, RelExtends, RelOverrides, RelReads, RelWrites, RelDataFlowsTo,
 		RelControlDependsOn, RelTests, RelDependsOn, RelBuilds, RelGenerates,
-		RelDocuments, RelConfigures, RelOwns, RelRenamedFrom, RelMovedFrom, RelMayReferTo:
+		RelDocuments, RelConfigures, RelOwns, RelRenamedFrom, RelMovedFrom, RelMayReferTo,
+		RelMayCall, RelMayImport, RelRoutesTo:
 		return true
 	}
 	return false
 }
+
+// QueryTime reports a relation kind that answers compute per query from the
+// stored facts and that no provider ever publishes.
+func (k RelationKind) QueryTime() bool { return k == RelMayCall || k == RelMayImport }
 
 // Precision describes the origin of a fact, not calibrated confidence and not
 // guaranteed soundness (Section 9.3). Deterministic ranking weights derived
@@ -238,6 +256,40 @@ type Evidence struct {
 	Bytes     *ByteRange `json:"bytes,omitempty"`
 	NativeKey string     `json:"native_key,omitempty"`
 	Detail    string     `json:"detail,omitempty"`
+	// Dispatch is, for one occurrence of a call, whether the call can run an
+	// override of its target (DispatchVirtual) or cannot (DispatchExact: a
+	// `super` call, a qualified call, a call on a constructed object, a final,
+	// static or non-virtual method). It is computed per occurrence, so one
+	// relation can hold a virtual and an exact occurrence. It is empty for
+	// every evidence row that is not a call occurrence.
+	Dispatch Dispatch `json:"dispatch,omitempty"`
+	// SetSize is the number of targets the site this occurrence belongs to was
+	// bound to when the analysis bound it to several (one class's method per
+	// class a value flow reaches, one function per address-taken function of
+	// a signature, one file per file an include matches); each of those
+	// relations carries the same SetSize, read as "1 of n". It is 0 for a
+	// site bound to one target, and never 1.
+	SetSize int64 `json:"set_size,omitempty"`
+}
+
+// Dispatch is the per-occurrence dispatch field of call evidence.
+type Dispatch string
+
+const (
+	// DispatchVirtual is a call that can run an override of its target.
+	DispatchVirtual Dispatch = "virtual"
+	// DispatchExact is a call that runs exactly its target.
+	DispatchExact Dispatch = "exact"
+)
+
+// Valid reports whether d is a known wire spelling. The empty value, which
+// every non-call evidence row carries, is valid.
+func (d Dispatch) Valid() bool {
+	switch d {
+	case "", DispatchVirtual, DispatchExact:
+		return true
+	}
+	return false
 }
 
 // Validate enforces the evidence table constraints: the subject XOR, the
@@ -288,6 +340,21 @@ func (e Evidence) Validate() error {
 	}
 	if err := boundField("evidence.detail", e.Detail, MaxDetailBytes); err != nil {
 		return err
+	}
+	if !e.Dispatch.Valid() {
+		return invalid("evidence.dispatch %q is not a known dispatch", truncateForMessage(string(e.Dispatch)))
+	}
+	if e.Dispatch != "" && !hasRelation {
+		return invalid("evidence.dispatch is set on node evidence; only a call occurrence carries it")
+	}
+	if err := requireNonNegative("evidence.set_size", e.SetSize); err != nil {
+		return err
+	}
+	if e.SetSize == 1 {
+		return invalid("evidence.set_size is 1; a site bound to one target carries 0")
+	}
+	if e.SetSize != 0 && !hasRelation {
+		return invalid("evidence.set_size is set on node evidence; only a relation occurrence carries it")
 	}
 	// Identity is derived, not asserted. Every input to NewEvidenceID is a field
 	// of this struct, so a mismatch means the producer invented an ID; accepting
@@ -351,6 +418,19 @@ type NodeCandidate struct {
 	FileID        FileID       `json:"file_id,omitempty"`
 	ContentHash   string       `json:"content_hash,omitempty"`
 	Range         *SourceRange `json:"range,omitempty"`
+	// Descriptor is a located declaration's descriptor path: its qualified
+	// name along its ancestry, each enclosing module, type and function
+	// (ADR-0014). With the file, kind and language it keys the declaration's
+	// identity; the byte range never does. An external supertype's node
+	// carries the supertype's qualified name, an external method's node that
+	// name and the method's name. It is empty for a candidate whose identity
+	// is file-scoped (a local, an anonymous function, a call site).
+	Descriptor string `json:"descriptor,omitempty"`
+	// Disambiguator separates declarations that share a descriptor path: the
+	// parameter types as written where the language overloads, the enclosing
+	// branch where a name is defined conditionally, or the content match the
+	// resolver settles for an exact duplicate (ADR-0014).
+	Disambiguator string `json:"disambiguator,omitempty"`
 }
 
 // Validate enforces candidate shape before resolution work begins.
@@ -391,6 +471,15 @@ func (c NodeCandidate) Validate() error {
 	if err := validateLocatedRange("node_candidate.range", c.FileID, c.Range); err != nil {
 		return err
 	}
+	if err := boundField("node_candidate.descriptor", c.Descriptor, MaxQualifiedNameBytes); err != nil {
+		return err
+	}
+	if err := boundField("node_candidate.disambiguator", c.Disambiguator, MaxSignatureBytes); err != nil {
+		return err
+	}
+	if c.Disambiguator != "" && c.Descriptor == "" {
+		return invalid("node_candidate.disambiguator is set without a descriptor; it separates declarations that share one")
+	}
 	return nil
 }
 
@@ -423,12 +512,11 @@ func (r Resolution) Validate() error {
 	if err := requireField("resolution.canonical_key", r.CanonicalKey, MaxNativeKeyBytes); err != nil {
 		return err
 	}
-	// The ambiguous list carries no count bound. A native key aliased to more
-	// equally supported identities than MaxAmbiguousCandidates is a property of
-	// the repository, not an invalid resolution, and refusing it here made the
-	// resolver refuse the provider's whole output instead. The list is bounded
-	// by what the unit's sealed dependencies published: the resolver reads it
-	// from their alias table, which holds those rows and nothing else.
+	// The ambiguous list carries no count bound. How many equally supported
+	// identities a native key is aliased to is a property of the repository,
+	// not an invalid resolution. The list is bounded by what the unit's sealed
+	// dependencies published: the resolver reads it from their alias table,
+	// which holds those rows and nothing else.
 	for i, id := range r.Ambiguous {
 		if err := requireID(indexed("resolution.ambiguous", i), string(id)); err != nil {
 			return err
@@ -493,6 +581,9 @@ type RelationFact struct {
 func (f RelationFact) Validate() error {
 	if err := f.Relation.Validate(); err != nil {
 		return err
+	}
+	if f.Relation.Kind.QueryTime() {
+		return invalid("relation_fact %q is a %s relation, which answers compute per query and no provider publishes", f.Relation.ID, f.Relation.Kind)
 	}
 	if len(f.Evidence) == 0 {
 		return invalid("relation_fact %q has no evidence; every published relation is evidence backed", f.Relation.ID)
@@ -589,6 +680,288 @@ func (u SearchUnit) Validate() error {
 	}
 	if err := requireNonNegative("search_unit.token_count", u.TokenCount); err != nil {
 		return err
+	}
+	return nil
+}
+
+// Node metadata keys (Section 9.3). A node's Metadata is a JSON object; these
+// are the keys whose values this package defines.
+const (
+	// MetaResolution holds a NameResolution: how a name-resolved node, or a
+	// relation answers derive by name, was resolved.
+	MetaResolution = "resolution"
+	// MetaCandidates holds the number of candidates the resolution considered.
+	MetaCandidates = "candidates"
+	// MetaCallee holds the callee name of a call placeholder, as written.
+	MetaCallee = "callee"
+	// MetaReason, MetaShape and MetaArguments describe an open call site
+	// (OpenSiteMetadata); MetaReason and MetaFragments an open import site
+	// (OpenImportSiteMetadata).
+	MetaReason    = "reason"
+	MetaShape     = "shape"
+	MetaArguments = "arguments"
+	MetaFragments = "fragments"
+	// MetaFramework, MetaMethod, MetaRoute, MetaPath and MetaPrefix describe an
+	// endpoint (EndpointMetadata).
+	MetaFramework = "framework"
+	MetaMethod    = "method"
+	MetaRoute     = "route"
+	MetaPath      = "path"
+	MetaPrefix    = "prefix"
+	// MetaDecorators holds a declaration's decorators and annotations, in
+	// source order ([]Decorator).
+	MetaDecorators = "decorators"
+)
+
+// NameResolution is the `resolution` attribute of Section 9.3: the factual
+// basis a name was resolved on. No numeric confidence is published anywhere.
+type NameResolution string
+
+const (
+	ResolutionExact      NameResolution = "exact"
+	ResolutionImport     NameResolution = "import"
+	ResolutionSameModule NameResolution = "same_module"
+	// ResolutionUniqueName is a name-only candidate that is the one compatible
+	// declaration of its name in the generation.
+	ResolutionUniqueName NameResolution = "unique_name"
+	// ResolutionNameOnly is a name-only candidate among several compatible
+	// declarations of its name.
+	ResolutionNameOnly   NameResolution = "name_only"
+	ResolutionAmbiguous  NameResolution = "ambiguous"
+	ResolutionUnresolved NameResolution = "unresolved"
+	// ResolutionExternal is a structural node for a supertype outside the
+	// indexed project, or a method of one, so a hierarchy relation or a call
+	// on a receiver of that type has an endpoint. The node is keyed by its
+	// NodeCandidate.Descriptor (the supertype's qualified name; for a method,
+	// that name and the method's) and Disambiguator, so a call target and an
+	// `overrides` target of the same external method are one node.
+	ResolutionExternal NameResolution = "external"
+)
+
+// Valid reports whether r is a known wire spelling.
+func (r NameResolution) Valid() bool {
+	switch r {
+	case ResolutionExact, ResolutionImport, ResolutionSameModule, ResolutionUniqueName,
+		ResolutionNameOnly, ResolutionAmbiguous, ResolutionUnresolved, ResolutionExternal:
+		return true
+	}
+	return false
+}
+
+// OpenSiteReason is why the analysis bound no target to a call site.
+type OpenSiteReason string
+
+const (
+	// ReasonReceiverUntyped is a member call whose receiver has no recovered
+	// type.
+	ReasonReceiverUntyped OpenSiteReason = "receiver_untyped"
+	// ReasonValueUntracked is a call through a value whose flow the analysis
+	// does not follow.
+	ReasonValueUntracked OpenSiteReason = "value_untracked"
+	// ReasonGlobalUnbound is a bare name no visible scope declares.
+	ReasonGlobalUnbound OpenSiteReason = "global_unbound"
+	// ReasonComputed is a callee, or an import path, that does not fold to a
+	// name: `obj[k]()`, `require(expr)`. An open call site with this reason
+	// has no candidates.
+	ReasonComputed OpenSiteReason = "computed"
+)
+
+// Valid reports whether r is a known wire spelling.
+func (r OpenSiteReason) Valid() bool {
+	switch r {
+	case ReasonReceiverUntyped, ReasonValueUntracked, ReasonGlobalUnbound, ReasonComputed:
+		return true
+	}
+	return false
+}
+
+// CallShape is the form of a call site's callee expression, as candidates
+// for it are matched: methods and function-valued fields for a member site,
+// functions for a bare or value site, classes for a construction.
+type CallShape string
+
+const (
+	CallShapeBare      CallShape = "bare"
+	CallShapeMember    CallShape = "member"
+	CallShapeValue     CallShape = "value"
+	CallShapeConstruct CallShape = "construct"
+)
+
+// Valid reports whether c is a known wire spelling.
+func (c CallShape) Valid() bool {
+	switch c {
+	case CallShapeBare, CallShapeMember, CallShapeValue, CallShapeConstruct:
+		return true
+	}
+	return false
+}
+
+// OpenSiteMetadata is the metadata of an open-site node: one node per call
+// site no analysis bound, located at the site and named by the callee, with
+// the caller's `calls` edge to it (ADR-0015). Its candidates are computed per
+// query as `may_call`, never stored.
+type OpenSiteMetadata struct {
+	// Resolution is always ResolutionUnresolved.
+	Resolution NameResolution `json:"resolution"`
+	Reason     OpenSiteReason `json:"reason"`
+	Shape      CallShape      `json:"shape"`
+	// Arguments is the number of arguments the site passes.
+	Arguments int64 `json:"arguments"`
+}
+
+// Validate enforces the open-site metadata shape.
+func (m OpenSiteMetadata) Validate() error {
+	if m.Resolution != ResolutionUnresolved {
+		return invalid("open_site.resolution is %q; an open site is %q", truncateForMessage(string(m.Resolution)), ResolutionUnresolved)
+	}
+	if !m.Reason.Valid() {
+		return invalid("open_site.reason %q is not a known open-site reason", truncateForMessage(string(m.Reason)))
+	}
+	if !m.Shape.Valid() {
+		return invalid("open_site.shape %q is not a known call shape", truncateForMessage(string(m.Shape)))
+	}
+	if err := requireNonNegative("open_site.arguments", m.Arguments); err != nil {
+		return err
+	}
+	return nil
+}
+
+// OpenImportSiteMetadata is the metadata of an open import site: an import
+// whose path does not fold to a constant (`require("./x/" + name)`,
+// `import(expr)`, `importlib.import_module(expr)`, `#include MACRO` with the
+// macro undefined in the file). The files whose paths match its fragments are
+// computed per query as `may_import` (ADR-0015).
+type OpenImportSiteMetadata struct {
+	// Resolution is always ResolutionUnresolved.
+	Resolution NameResolution `json:"resolution"`
+	// Reason is always ReasonComputed.
+	Reason OpenSiteReason `json:"reason"`
+	// Fragments are the path's literal parts, in source order; empty when the
+	// path has none.
+	Fragments []string `json:"fragments"`
+}
+
+// Validate enforces the open-import-site metadata shape. The fragment list
+// has no count bound of its own: the node's metadata byte bound holds it.
+func (m OpenImportSiteMetadata) Validate() error {
+	if m.Resolution != ResolutionUnresolved {
+		return invalid("open_import_site.resolution is %q; an open import site is %q", truncateForMessage(string(m.Resolution)), ResolutionUnresolved)
+	}
+	if m.Reason != ReasonComputed {
+		return invalid("open_import_site.reason is %q; an open import site is %q", truncateForMessage(string(m.Reason)), ReasonComputed)
+	}
+	for i, f := range m.Fragments {
+		if err := requireField(indexed("open_import_site.fragments", i), f, MaxPathBytes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ExternalMetadata is the metadata of an external supertype or external
+// method node (ResolutionExternal).
+type ExternalMetadata struct {
+	// Resolution is always ResolutionExternal.
+	Resolution NameResolution `json:"resolution"`
+}
+
+// Validate enforces the external node's metadata shape.
+func (m ExternalMetadata) Validate() error {
+	if m.Resolution != ResolutionExternal {
+		return invalid("external.resolution is %q; an external node is %q", truncateForMessage(string(m.Resolution)), ResolutionExternal)
+	}
+	return nil
+}
+
+// PrefixState says whether every prefix an endpoint's route is mounted under
+// (a blueprint, an included router, a router mount, a class-level mapping)
+// resolved statically.
+type PrefixState string
+
+const (
+	PrefixResolved   PrefixState = "resolved"
+	PrefixUnresolved PrefixState = "unresolved"
+)
+
+// Valid reports whether p is a known wire spelling.
+func (p PrefixState) Valid() bool { return p == PrefixResolved || p == PrefixUnresolved }
+
+// EndpointMetadata is the metadata of an endpoint node, which `routes_to` its
+// handler. A framework route carries Framework, Method, Route and Prefix; a
+// program entry point (a `__main__` guard, a program `main`) carries none of
+// them. The full Path is published only when every prefix resolved; a URL is
+// never guessed.
+type EndpointMetadata struct {
+	Framework string `json:"framework,omitempty"`
+	// Method is the HTTP method as the route declares it, empty when the
+	// route accepts any.
+	Method string `json:"method,omitempty"`
+	// Route is the route as written at its declaration.
+	Route  string      `json:"route,omitempty"`
+	Path   string      `json:"path,omitempty"`
+	Prefix PrefixState `json:"prefix,omitempty"`
+}
+
+// Validate enforces the endpoint metadata shape: a route states its prefix,
+// and a path appears exactly when every prefix resolved.
+func (m EndpointMetadata) Validate() error {
+	if err := boundField("endpoint.framework", m.Framework, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := boundField("endpoint.method", m.Method, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := boundField("endpoint.route", m.Route, MaxPathBytes); err != nil {
+		return err
+	}
+	if err := boundField("endpoint.path", m.Path, MaxPathBytes); err != nil {
+		return err
+	}
+	if m.Prefix != "" && !m.Prefix.Valid() {
+		return invalid("endpoint.prefix %q is not a known prefix state", truncateForMessage(string(m.Prefix)))
+	}
+	if (m.Framework != "") != (m.Route != "") {
+		return invalid("endpoint names a framework without a route or a route without a framework")
+	}
+	if m.Route != "" && m.Prefix == "" {
+		return invalid("endpoint.route is set without a prefix state")
+	}
+	if m.Route == "" && (m.Method != "" || m.Prefix != "" || m.Path != "") {
+		return invalid("endpoint without a route carries a method, prefix or path")
+	}
+	if (m.Path != "") != (m.Prefix == PrefixResolved) {
+		return invalid("endpoint.path is published exactly when every prefix resolved")
+	}
+	return nil
+}
+
+// Decorator is one decorator or annotation on a declaration, as written: its
+// name (`app.route`, `Override`, `GetMapping`), its byte range and the byte
+// range of each argument, in order. Framework route tables read these; the
+// declaration's MetaDecorators value lists them in source order.
+type Decorator struct {
+	Name      string      `json:"name"`
+	Bytes     ByteRange   `json:"bytes"`
+	Arguments []ByteRange `json:"arguments,omitempty"`
+}
+
+// Validate enforces the decorator shape: every argument lies inside the
+// decorator.
+func (d Decorator) Validate() error {
+	if err := requireField("decorator.name", d.Name, MaxQualifiedNameBytes); err != nil {
+		return err
+	}
+	if err := d.Bytes.Validate("decorator.bytes"); err != nil {
+		return err
+	}
+	for i, a := range d.Arguments {
+		field := indexed("decorator.arguments", i)
+		if err := a.Validate(field); err != nil {
+			return err
+		}
+		if a.Start < d.Bytes.Start || a.End > d.Bytes.End {
+			return invalid("%s [%d,%d) lies outside the decorator [%d,%d)", field, a.Start, a.End, d.Bytes.Start, d.Bytes.End)
+		}
 	}
 	return nil
 }

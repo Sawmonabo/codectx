@@ -17,8 +17,8 @@ import (
 //
 // Mutation: count exports at 40 bytes instead of 39 in DecodeLink -> the
 // decode fails. After the exports' count, n minimal exports leave 39n bytes
-// plus 20 for the five empty trailing lists' counts, and 40n exceeds that
-// once n is 21 or more, which is why the message carries more than that.
+// plus 28 for the seven empty trailing lists' counts, and 40n exceeds that
+// once n is 29 or more, which is why the message carries more than that.
 func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 	var in Link
 	for i := range uint32(64) {

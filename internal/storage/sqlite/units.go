@@ -936,8 +936,8 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 // pure function of the occurrence's fields and ON CONFLICT(id) DO NOTHING is
 // what makes a republished occurrence idempotent.
 func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence, node nodeRef, rel relRef) error {
-	const insert = `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key_id, detail, content_hash_bound)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`
+	const insert = `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key_id, detail, dispatch, set_size, content_hash_bound)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`
 	stmt, cached, err := w.stmts.prepare(ctx, tx, insert)
 	if err != nil {
 		return err
@@ -962,7 +962,7 @@ func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []mode
 		}
 		start, end := rangeBytes(e.Range)
 		if _, err := stmt.ExecContext(ctx, idRaw, w.rowID, nullNode(node), nullRelation(rel), string(e.Precision), fileRaw, start, end,
-			int64(native), e.Detail, boolInt(e.ContentHash != "")); err != nil {
+			int64(native), e.Detail, string(e.Dispatch), e.SetSize, boolInt(e.ContentHash != "")); err != nil {
 			return err
 		}
 	}

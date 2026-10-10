@@ -56,9 +56,21 @@ func (k AcknowledgeKind) Valid() bool {
 	return k == AcknowledgeReceipt || k == AcknowledgeFile
 }
 
-// ReadChunkRequest asks for one bounded source chunk from the pinned snapshot.
-// ConfirmReceipts echoes previously issued tokens so the client avoids an extra
-// round trip; the final chunk still needs explicit confirmation.
+// ReadChunkRequest asks for one bounded source chunk from a pinned snapshot.
+// It has two modes, told apart by SessionID.
+//
+// A session read (SessionID set) reads FileID from the session's snapshot and
+// issues a receipt toward the session's coverage. ConfirmReceipts echoes
+// previously issued tokens so the client avoids an extra round trip; the
+// final chunk still needs explicit confirmation.
+//
+// A session-free read (SessionID empty) earns no receipt and no coverage. It
+// names exactly one selector: NodeID (that node's range in the generation
+// read), or FileID or Path (a byte range from Offset); or it carries the
+// Cursor of an earlier session-free answer and no selector, because the
+// cursor already holds the selector and the generation. GenerationID picks
+// the generation, zero meaning the active one. A Path is only hashed to a
+// file id and looked up in the snapshot's manifest, never opened.
 //
 // MaxBytes follows the PageRequest.Limit convention: zero means "the endpoint's
 // configured default", so the caller need not know the deployment's policy. A
@@ -66,25 +78,24 @@ func (k AcknowledgeKind) Valid() bool {
 // Section 16.2 forbids a chunk that can never make progress, and must not
 // exceed MaxRawChunkBytes.
 type ReadChunkRequest struct {
-	SessionID       SessionID `json:"session_id"`
-	ActorID         string    `json:"actor_id"`
-	FileID          FileID    `json:"file_id"`
-	Offset          uint64    `json:"offset"`
-	MaxBytes        uint32    `json:"max_bytes"`
-	ConfirmReceipts []string  `json:"confirm_receipts,omitempty"`
+	SessionID       SessionID    `json:"session_id,omitempty"`
+	ActorID         string       `json:"actor_id,omitempty"`
+	GenerationID    GenerationID `json:"generation_id,omitempty"`
+	NodeID          NodeID       `json:"node_id,omitempty"`
+	FileID          FileID       `json:"file_id,omitempty"`
+	Path            string       `json:"path,omitempty"`
+	Offset          uint64       `json:"offset,omitempty"`
+	MaxBytes        uint32       `json:"max_bytes,omitempty"`
+	Cursor          string       `json:"cursor,omitempty"`
+	ConfirmReceipts []string     `json:"confirm_receipts,omitempty"`
 }
 
-// Validate enforces the request shape and the Section 16.2 receipt batch cap.
+// InSession reports whether r is a session read.
+func (r ReadChunkRequest) InSession() bool { return r.SessionID != "" }
+
+// Validate enforces the request shape of its mode and the Section 16.2
+// receipt batch cap.
 func (r ReadChunkRequest) Validate() error {
-	if err := requireID("read_chunk.session_id", string(r.SessionID)); err != nil {
-		return err
-	}
-	if err := requireTrimmed("read_chunk.actor_id", r.ActorID, MaxIdentifierBytes); err != nil {
-		return err
-	}
-	if err := requireID("read_chunk.file_id", string(r.FileID)); err != nil {
-		return err
-	}
 	if err := boundSigned64("read_chunk.offset", r.Offset); err != nil {
 		return err
 	}
@@ -96,17 +107,103 @@ func (r ReadChunkRequest) Validate() error {
 			return invalid("read_chunk.max_bytes is %d, want at most %d", r.MaxBytes, MaxRawChunkBytes)
 		}
 	}
+	if r.InSession() {
+		return r.validateSession()
+	}
+	return r.validateSessionFree()
+}
+
+// validateSession checks a session read: the session pins the generation and
+// the snapshot, so only a file id selects what is read.
+func (r ReadChunkRequest) validateSession() error {
+	if err := requireID("read_chunk.session_id", string(r.SessionID)); err != nil {
+		return err
+	}
+	if err := requireTrimmed("read_chunk.actor_id", r.ActorID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireID("read_chunk.file_id", string(r.FileID)); err != nil {
+		return err
+	}
+	for _, f := range []struct {
+		field string
+		set   bool
+	}{
+		{"generation_id", r.GenerationID != 0},
+		{"node_id", r.NodeID != ""},
+		{"path", r.Path != ""},
+		{"cursor", r.Cursor != ""},
+	} {
+		if f.set {
+			return invalid("read_chunk names both session_id and %s; a session read selects its file by file_id in the session's snapshot", f.field)
+		}
+	}
 	if err := boundStrings("read_chunk.confirm_receipts", r.ConfirmReceipts, MaxReceiptsPerConfirmation, MaxTokenBytes); err != nil {
 		return err
 	}
 	return nil
 }
 
-// ReadChunkResponse carries the exact bytes plus the receipt that proves they
-// were issued. Only this response and its capsule export carry source bodies.
+// validateSessionFree checks a session-free read: exactly one selector, or a
+// cursor and none.
+func (r ReadChunkRequest) validateSessionFree() error {
+	if r.ActorID != "" {
+		return invalid("read_chunk.actor_id is set without a session_id; an actor reads within a session")
+	}
+	if len(r.ConfirmReceipts) != 0 {
+		return invalid("read_chunk.confirm_receipts is set without a session_id; receipts belong to a session")
+	}
+	if err := requireNonNegative("read_chunk.generation_id", int64(r.GenerationID)); err != nil {
+		return err
+	}
+	if err := optionalID("read_chunk.node_id", string(r.NodeID)); err != nil {
+		return err
+	}
+	if err := optionalID("read_chunk.file_id", string(r.FileID)); err != nil {
+		return err
+	}
+	if err := boundField("read_chunk.path", r.Path, MaxPathBytes); err != nil {
+		return err
+	}
+	if err := boundField("read_chunk.cursor", r.Cursor, MaxTokenBytes); err != nil {
+		return err
+	}
+	selectors := 0
+	for _, set := range []bool{r.NodeID != "", r.FileID != "", r.Path != ""} {
+		if set {
+			selectors++
+		}
+	}
+	if r.Cursor != "" {
+		if selectors != 0 || r.GenerationID != 0 || r.Offset != 0 {
+			return invalid("read_chunk names a cursor with a selector, generation_id or offset; a cursor already holds all three")
+		}
+		return nil
+	}
+	if selectors != 1 {
+		return invalid("read_chunk without a session_id names %d of node_id, file_id and path; it must name exactly one", selectors)
+	}
+	if r.NodeID != "" && r.Offset != 0 {
+		return invalid("read_chunk names node_id and offset; a node read starts at the node and continues by cursor")
+	}
+	return nil
+}
+
+// ReadChunkResponse carries the exact bytes of one chunk. Only this response
+// and its capsule export carry source bodies. Session is present exactly for
+// a session read: the receipt that proves the bytes were issued and the
+// session's coverage of the file before this chunk. A session-free read
+// carries no Session, so its absence is structural rather than an empty
+// receipt.
+//
+// NodeID is the node a session-free read by node was asked for. NextOffset
+// is where the next chunk of the same span starts; NextCursor continues a
+// session-free read of a span longer than one chunk, ending at the node's end
+// for a node read.
 type ReadChunkResponse struct {
 	Binding     Binding       `json:"binding"`
 	FileID      FileID        `json:"file_id"`
+	NodeID      NodeID        `json:"node_id,omitempty"`
 	ContentHash string        `json:"content_hash"`
 	ByteRange   ByteRange     `json:"byte_range"`
 	LineRange   SourceRange   `json:"line_range"`
@@ -114,8 +211,25 @@ type ReadChunkResponse struct {
 	Content     string        `json:"content"`
 	PartialLine bool          `json:"partial_line"`
 	NextOffset  *uint64       `json:"next_offset,omitempty"`
-	Receipt     string        `json:"receipt"`
-	Coverage    CoverageState `json:"coverage"`
+	NextCursor  string        `json:"next_cursor,omitempty"`
+	Session     *ReadSession  `json:"session,omitempty"`
+}
+
+// ReadSession is the session block of a session read's answer.
+type ReadSession struct {
+	Receipt  string        `json:"receipt"`
+	Coverage CoverageState `json:"coverage"`
+}
+
+// Validate enforces the session block's shape.
+func (s ReadSession) Validate() error {
+	if !s.Coverage.Valid() {
+		return invalid("read_chunk_response.session.coverage %q is not a known coverage state", truncateForMessage(string(s.Coverage)))
+	}
+	if err := requireField("read_chunk_response.session.receipt", s.Receipt, MaxTokenBytes); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Validate enforces the response shape. The byte range may be zero length: an
@@ -126,6 +240,9 @@ func (r ReadChunkResponse) Validate() error {
 		return err
 	}
 	if err := requireID("read_chunk_response.file_id", string(r.FileID)); err != nil {
+		return err
+	}
+	if err := optionalID("read_chunk_response.node_id", string(r.NodeID)); err != nil {
 		return err
 	}
 	if err := requireID("read_chunk_response.content_hash", r.ContentHash); err != nil {
@@ -146,14 +263,16 @@ func (r ReadChunkResponse) Validate() error {
 	if err := boundField("read_chunk_response.content", r.Content, MaxChunkContentBytes); err != nil {
 		return err
 	}
-	if !r.Coverage.Valid() {
-		return invalid("read_chunk_response.coverage %q is not a known coverage state", truncateForMessage(string(r.Coverage)))
-	}
-	if err := requireField("read_chunk_response.receipt", r.Receipt, MaxTokenBytes); err != nil {
-		return err
-	}
 	if r.NextOffset != nil {
 		if err := boundSigned64("read_chunk_response.next_offset", *r.NextOffset); err != nil {
+			return err
+		}
+	}
+	if err := boundField("read_chunk_response.next_cursor", r.NextCursor, MaxTokenBytes); err != nil {
+		return err
+	}
+	if r.Session != nil {
+		if err := r.Session.Validate(); err != nil {
 			return err
 		}
 	}

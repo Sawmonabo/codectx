@@ -670,16 +670,10 @@ func (b *builder) refs() error {
 			}
 			callee = res.Node.ID
 			b.putRelation(structure, from, model.RelCalls, callee, rng, key, resolution)
-			kept := min(len(targets), model.MaxAmbiguousCandidates)
-			if kept < len(targets) {
-				// The candidate list is cut to the model's ambiguity bound.
-				// Each candidate past it is a `may_refer_to` edge this file
-				// should have published and did not, so it is counted like
-				// every other loss and the file reports partial rather than
-				// claiming complete structural coverage.
-				b.dropped[structure] += len(targets) - kept
-			}
-			for _, t := range targets[:kept] {
+			// Every in-file candidate the scope justifies is kept: how many
+			// declarations share a name is a property of the file, not a
+			// count to cut at.
+			for _, t := range targets {
 				b.putRelation(structure, from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
 			}
 		}

@@ -13,10 +13,12 @@ import "github.com/Sawmonabo/codectx/internal/model"
 // stronger, more direct dependency": a call is the tightest coupling, a
 // containment edge the loosest.
 var relationCost = map[model.RelationKind]int64{
-	model.RelCalls:            1,
-	model.RelImplements:       1,
-	model.RelExtends:          1,
-	model.RelOverrides:        1,
+	model.RelCalls:      1,
+	model.RelImplements: 1,
+	model.RelExtends:    1,
+	model.RelOverrides:  1,
+	// An endpoint runs its handler: as tight a coupling as a call.
+	model.RelRoutesTo:         1,
 	model.RelImports:          2,
 	model.RelExports:          2,
 	model.RelDependsOn:        2,
@@ -44,6 +46,11 @@ var relationCost = map[model.RelationKind]int64{
 	model.RelRenamedFrom: 7,
 	model.RelMovedFrom:   7,
 	model.RelMayReferTo:  7,
+
+	// Name-only candidates, computed per query. A path admits them at the
+	// highest cost there is, so any precise route is cheaper (ADR-0015).
+	model.RelMayCall:   7,
+	model.RelMayImport: 7,
 }
 
 // unknownRelationCost is charged for a relation kind absent from the table. The

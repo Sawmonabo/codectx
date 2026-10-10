@@ -58,9 +58,9 @@ func TestHydrateMissingBlobFlagsOneHit(t *testing.T) {
 	start := uint64(strings.Index(goodBody, target))
 	goodSpan := model.ByteRange{Start: start, End: start + uint64(len(target))}
 	hits := []model.SearchHit{
-		{FileID: goodFile, Path: "pkg/good.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS},
-		{FileID: goneFile, Path: "pkg/gone.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS},
-		{FileID: goodFile, Path: "pkg/good.go", Kind: model.NodeFile, Tier: model.TierLexicalFTS},
+		{FileID: goodFile, Path: "pkg/good.go", Kind: model.NodeFunction, Tier: model.TierLexical},
+		{FileID: goneFile, Path: "pkg/gone.go", Kind: model.NodeFunction, Tier: model.TierLexical},
+		{FileID: goodFile, Path: "pkg/good.go", Kind: model.NodeFile, Tier: model.TierLexical},
 	}
 	spans := []model.ByteRange{goodSpan, {Start: 0, End: uint64(len(goneBody))}, {Start: 0, End: 0}}
 	if err := h.hydratePage(ctx, hits, spans); err != nil {
@@ -124,7 +124,7 @@ func TestHydrateFaultClassification(t *testing.T) {
 		cas)
 
 	// A span past the end of the file is a corrupt index, not a clamped range.
-	hits := []model.SearchHit{{FileID: file, Path: "pkg/a.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	hits := []model.SearchHit{{FileID: file, Path: "pkg/a.go", Kind: model.NodeFunction, Tier: model.TierLexical}}
 	err = h.hydratePage(ctx, hits, []model.ByteRange{{Start: 0, End: uint64(rec.Size) + 1}})
 	assertCode(t, "a document past the end of its file", err, model.CodeArgumentInvalid)
 	if hits[0].UnresolvedFields != nil {
@@ -134,7 +134,7 @@ func TestHydrateFaultClassification(t *testing.T) {
 	// Cancellation is never a per-hit footnote on an otherwise complete answer.
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	hits = []model.SearchHit{{FileID: file, Path: "pkg/a.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	hits = []model.SearchHit{{FileID: file, Path: "pkg/a.go", Kind: model.NodeFunction, Tier: model.TierLexical}}
 	err = h.hydratePage(canceled, hits, []model.ByteRange{{Start: 0, End: 0}})
 	assertCode(t, "a cancelled hydration", err, model.CodeCanceled)
 	if hits[0].UnresolvedFields != nil {

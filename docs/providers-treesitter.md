@@ -197,7 +197,7 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `imports` | file module → import target | every import/include/use |
 | `calls` | enclosing declaration (or file module) → declaration | a call whose name is declared exactly once in this file, respecting qualification (a `recv.name()` call names methods; a bare call names functions, tests, classes and structs); definitions preferred over prototypes |
 | `calls` | enclosing declaration (or file module) → callee reference | a call this file cannot resolve to exactly one of its declarations: ambiguous, import-qualified (`fmt.Println`, `str.ToUpper`, `path.join`, `std::move`) or not declared here. The callee is a provider-local node carrying `resolution`/`candidates`, never a guess |
-| `may_refer_to` | enclosing declaration → each candidate | a call whose name is declared more than once in this file (overloads, shadowing); bounded by `MaxAmbiguousCandidates`, alongside the `calls` edge to the ambiguous callee reference |
+| `may_refer_to` | enclosing declaration → each candidate | a call whose name is declared more than once in this file (overloads, shadowing); every candidate is kept, alongside the `calls` edge to the ambiguous callee reference |
 | `references` | enclosing declaration → type or macro declaration | a type reference to a class/struct/interface/enum declared in this file, or a Rust macro invocation of a `macro_rules!` declared in it; a name this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 

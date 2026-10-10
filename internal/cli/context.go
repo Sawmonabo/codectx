@@ -558,6 +558,12 @@ func emitContext[T any](cmd *cobra.Command, build model.BuildInfo, args []string
 // before any of it counts as delivered. The receipt is printed in full -- a
 // text-path reader who never sees it can never confirm anything.
 func writeChunkHeader(b *strings.Builder, resp model.ReadChunkResponse) {
+	// This command reads within a session, whose answer always carries the
+	// session block; the zero block is only a guard against a nil dereference.
+	var session model.ReadSession
+	if resp.Session != nil {
+		session = *resp.Session
+	}
 	fmt.Fprintf(b, "generation  %d\nsnapshot    %s\n", resp.Binding.GenerationID, resp.Binding.SnapshotID)
 	fmt.Fprintf(b, "file        %s\nhash        %s\n", resp.FileID, resp.ContentHash)
 	fmt.Fprintf(b, "bytes       [%d, %d) of the pinned source\n", resp.ByteRange.Start, resp.ByteRange.End)
@@ -570,13 +576,13 @@ func writeChunkHeader(b *strings.Builder, resp model.ReadChunkResponse) {
 	// The reported state is the coverage before this chunk: it was issued, not
 	// confirmed, so reporting it as served would be the claim this whole
 	// command exists to avoid making.
-	fmt.Fprintf(b, "coverage    %s (before this chunk; it is issued, not yet confirmed)\n", resp.Coverage)
+	fmt.Fprintf(b, "coverage    %s (before this chunk; it is issued, not yet confirmed)\n", session.Coverage)
 	if resp.NextOffset != nil {
 		fmt.Fprintf(b, "next        --%s %d\n", contextOffsetFlag, *resp.NextOffset)
 	} else {
 		b.WriteString("next        end of file\n")
 	}
-	fmt.Fprintf(b, "receipt     %s\n", resp.Receipt)
+	fmt.Fprintf(b, "receipt     %s\n", session.Receipt)
 	fmt.Fprintf(b, "            confirm it with --%s to earn coverage for these bytes\n", contextConfirmReceiptFlag)
 	b.WriteString("---\n")
 }

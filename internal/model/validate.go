@@ -65,7 +65,6 @@ const (
 	MaxReasonsPerEntry         = 8
 	MaxReasonPathsPerEntry     = 3  // Section 20.1 context.max_reason_paths_per_entry
 	MaxRelationsPerPath        = 64 // edges retained in one explanation path
-	MaxAmbiguousCandidates     = 16 // Section 9.4 bounded may_refer_to candidates
 	MaxCapabilityStates        = 256
 	MaxReceiptsPerConfirmation = 16 // Section 20.1 coverage.max_receipts_per_confirmation
 	// MaxRecordsPerResult bounds ONE PAGE of any list a result carries that is

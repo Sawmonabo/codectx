@@ -251,6 +251,12 @@ type SearchRequest struct {
 	Languages    []string     `json:"languages,omitempty"`
 	Paths        []string     `json:"paths,omitempty"`
 	Page         PageRequest  `json:"page"`
+	// MinScoreMicros is the in-process floor of a ranked lexical read: when
+	// positive, the lexical tier ends before its first hit scoring below it,
+	// and pages continue by cursor as usual; the exact tiers are unaffected.
+	// Zero reads every match. It is never on the wire: only an in-process
+	// caller that stops reading at a score threshold sets it.
+	MinScoreMicros int64 `json:"-"`
 }
 
 // Validate enforces the Section 14.1 rule that query text, filters and limits
@@ -273,6 +279,9 @@ func (r SearchRequest) Validate() error {
 	if err := boundStrings("search.paths", r.Paths, MaxFilterValues, MaxPathBytes); err != nil {
 		return err
 	}
+	if err := requireNonNegative("search.min_score_micros", r.MinScoreMicros); err != nil {
+		return err
+	}
 	if err := r.Page.ValidatePinned("search", r.GenerationID); err != nil {
 		return err
 	}
@@ -293,13 +302,13 @@ const (
 	TierExactQualifiedName  SearchTier = "exact_qualified_name"
 	TierQualifiedNamePrefix SearchTier = "qualified_name_prefix"
 	TierExactName           SearchTier = "exact_name"
-	TierLexicalFTS          SearchTier = "lexical_fts"
+	TierLexical             SearchTier = "lexical"
 )
 
 // searchTiers is the ranking order of Section 14.2.
 var searchTiers = [...]SearchTier{
 	TierExactPath, TierExactQualifiedName, TierQualifiedNamePrefix,
-	TierExactName, TierLexicalFTS,
+	TierExactName, TierLexical,
 }
 
 // Rank returns the tie-break ordinal, lower sorting first. An unknown tier ranks
@@ -657,6 +666,20 @@ type GraphResult struct {
 	VisitedCount int64      `json:"visited_count"`
 	EdgeCount    int64      `json:"edge_count"`
 	MaxDepth     int        `json:"max_depth"`
+	// Locations are where the answer's nodes are: one entry per node that has
+	// a stored range, so a caller needs no follow-up symbol lookup.
+	Locations []NodeLocation `json:"locations,omitempty"`
+	// Occurrences are the call sites of the answer's `calls` relations, every
+	// one, each with its own range: the incoming call's "from ranges" of a
+	// call hierarchy.
+	Occurrences []RelationOccurrence `json:"occurrences,omitempty"`
+	// Marks qualify relations of the answer that may not run as written:
+	// a call found through a base method, an override a call may dispatch
+	// to, one target of a several-target site, a name-only candidate. A
+	// relation with no mark is an exact fact.
+	Marks []GraphRowMark `json:"marks,omitempty"`
+	// Counts are the structured call counts of a callers or callees answer.
+	Counts GraphCounts `json:"counts,omitzero"`
 }
 
 // Validate enforces the traversal accounting contract.
@@ -690,6 +713,361 @@ func (r GraphResult) Validate() error {
 		return err
 	}
 	if err := requireNonNegative("graph_result.max_depth", int64(r.MaxDepth)); err != nil {
+		return err
+	}
+	if err := validateLocations("graph_result", r.Locations, r.Occurrences); err != nil {
+		return err
+	}
+	if err := boundPage("graph_result.marks", len(r.Marks)); err != nil {
+		return err
+	}
+	for _, m := range r.Marks {
+		if err := m.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := r.Counts.Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// NodeLocation is where one node of a graph answer is: its whole range and
+// its name token's range, both as stored byte intervals (a call hierarchy
+// item's range and selection range).
+type NodeLocation struct {
+	NodeID NodeID    `json:"node_id"`
+	FileID FileID    `json:"file_id"`
+	Path   string    `json:"path,omitempty"`
+	Bytes  ByteRange `json:"bytes"`
+	// NameBytes is the name token's range, absent when the node stores none.
+	NameBytes *ByteRange `json:"name_bytes,omitempty"`
+}
+
+// Validate enforces the location shape: the name lies inside the node.
+func (l NodeLocation) Validate() error {
+	if err := requireID("node_location.node_id", string(l.NodeID)); err != nil {
+		return err
+	}
+	if err := requireID("node_location.file_id", string(l.FileID)); err != nil {
+		return err
+	}
+	if err := boundField("node_location.path", l.Path, MaxPathBytes); err != nil {
+		return err
+	}
+	if err := l.Bytes.Validate("node_location.bytes"); err != nil {
+		return err
+	}
+	if l.NameBytes != nil {
+		if err := l.NameBytes.Validate("node_location.name_bytes"); err != nil {
+			return err
+		}
+		if l.NameBytes.Start < l.Bytes.Start || l.NameBytes.End > l.Bytes.End {
+			return invalid("node_location.name_bytes lies outside the node's bytes")
+		}
+	}
+	return nil
+}
+
+// RelationOccurrence is one evidence-backed occurrence of a relation in a
+// graph answer: the call site of a `calls` relation, with the occurrence's own
+// dispatch and set size.
+type RelationOccurrence struct {
+	RelationID RelationID `json:"relation_id"`
+	EvidenceID EvidenceID `json:"evidence_id"`
+	FileID     FileID     `json:"file_id"`
+	Bytes      ByteRange  `json:"bytes"`
+	Dispatch   Dispatch   `json:"dispatch,omitempty"`
+	SetSize    int64      `json:"set_size,omitempty"`
+}
+
+// Validate enforces the occurrence shape.
+func (o RelationOccurrence) Validate() error {
+	if err := requireID("relation_occurrence.relation_id", string(o.RelationID)); err != nil {
+		return err
+	}
+	if err := requireID("relation_occurrence.evidence_id", string(o.EvidenceID)); err != nil {
+		return err
+	}
+	if err := requireID("relation_occurrence.file_id", string(o.FileID)); err != nil {
+		return err
+	}
+	if err := o.Bytes.Validate("relation_occurrence.bytes"); err != nil {
+		return err
+	}
+	if !o.Dispatch.Valid() {
+		return invalid("relation_occurrence.dispatch %q is not a known dispatch", truncateForMessage(string(o.Dispatch)))
+	}
+	if err := requireNonNegative("relation_occurrence.set_size", o.SetSize); err != nil {
+		return err
+	}
+	if o.SetSize == 1 {
+		return invalid("relation_occurrence.set_size is 1; a site bound to one target carries 0")
+	}
+	return nil
+}
+
+// validateLocations checks the location and occurrence pages a graph or path
+// answer carries.
+func validateLocations(field string, locations []NodeLocation, occurrences []RelationOccurrence) error {
+	if err := boundPage(field+".locations", len(locations)); err != nil {
+		return err
+	}
+	for _, l := range locations {
+		if err := l.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := boundPage(field+".occurrences", len(occurrences)); err != nil {
+		return err
+	}
+	for _, o := range occurrences {
+		if err := o.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MarkKind is how a marked relation of a graph answer may run.
+type MarkKind string
+
+const (
+	// MarkThroughBase is a call into a method the answer's method overrides,
+	// at any depth, that may dispatch to it: listed under the override's
+	// callers "through" the base method, never as a direct call.
+	MarkThroughBase MarkKind = "through_base"
+	// MarkMayDispatch is an override of a callee that a virtual call into the
+	// callee may run instead.
+	MarkMayDispatch MarkKind = "may_dispatch"
+	// MarkValueSet is one target of a site bound to several, shown "1 of n".
+	MarkValueSet MarkKind = "value_set"
+	// MarkNameOnly is a `may_call` candidate: same name and shape, no analysis
+	// bound it.
+	MarkNameOnly MarkKind = "name_only"
+)
+
+// Valid reports whether k is a known wire spelling.
+func (k MarkKind) Valid() bool {
+	switch k {
+	case MarkThroughBase, MarkMayDispatch, MarkValueSet, MarkNameOnly:
+		return true
+	}
+	return false
+}
+
+// GraphRowMark qualifies one relation of a graph answer, keyed by its
+// relation ID. Every mark is a possibility, never a certainty, so Possible is
+// always true.
+type GraphRowMark struct {
+	RelationID RelationID `json:"relation_id"`
+	Kind       MarkKind   `json:"kind"`
+	// Base is the overridden method a through_base relation calls, and
+	// BaseOverrides how many methods override it.
+	Base          NodeID `json:"base,omitempty"`
+	BaseOverrides int64  `json:"base_overrides,omitempty"`
+	// SetSize is n of a value_set mark's "1 of n".
+	SetSize  int64 `json:"set_size,omitempty"`
+	Possible bool  `json:"possible"`
+	// Occurrences are the relation's occurrences the mark applies to. A
+	// through_base relation lists only its virtual occurrences: a `super` or
+	// qualified call into the base method never runs the override.
+	Occurrences []EvidenceID `json:"occurrences,omitempty"`
+}
+
+// Validate enforces the mark shape: each kind carries exactly its own fields.
+func (m GraphRowMark) Validate() error {
+	if err := requireID("graph_row_mark.relation_id", string(m.RelationID)); err != nil {
+		return err
+	}
+	if !m.Kind.Valid() {
+		return invalid("graph_row_mark.kind %q is not a known mark kind", truncateForMessage(string(m.Kind)))
+	}
+	if !m.Possible {
+		return invalid("graph_row_mark %q is not marked possible; every mark is a possibility", m.RelationID)
+	}
+	if err := optionalID("graph_row_mark.base", string(m.Base)); err != nil {
+		return err
+	}
+	if err := requireNonNegative("graph_row_mark.base_overrides", m.BaseOverrides); err != nil {
+		return err
+	}
+	if err := requireNonNegative("graph_row_mark.set_size", m.SetSize); err != nil {
+		return err
+	}
+	if (m.Kind == MarkThroughBase) != (m.Base != "") {
+		return invalid("graph_row_mark.base is set exactly on a %s mark", MarkThroughBase)
+	}
+	if m.Kind == MarkThroughBase && m.BaseOverrides < 1 {
+		return invalid("graph_row_mark.base_overrides is %d; a base reached through an override has at least one", m.BaseOverrides)
+	}
+	if m.Kind != MarkThroughBase && m.BaseOverrides != 0 {
+		return invalid("graph_row_mark.base_overrides is set on a %s mark", m.Kind)
+	}
+	if (m.Kind == MarkValueSet) != (m.SetSize != 0) {
+		return invalid("graph_row_mark.set_size is set exactly on a %s mark", MarkValueSet)
+	}
+	if m.Kind == MarkValueSet && m.SetSize < 2 {
+		return invalid("graph_row_mark.set_size is %d; a several-target site has at least 2", m.SetSize)
+	}
+	if err := boundPage("graph_row_mark.occurrences", len(m.Occurrences)); err != nil {
+		return err
+	}
+	for i, id := range m.Occurrences {
+		if err := requireID(indexed("graph_row_mark.occurrences", i), string(id)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GraphCounts are a call answer's exact counts, kept apart so a caller can
+// tell precise callers from possible ones: Direct relations, ThroughBase
+// calls into an overridden method, MayDispatch overrides a callee may run,
+// MayCall name-only candidates, and the OpenSites no analysis bound.
+type GraphCounts struct {
+	Direct      int64 `json:"direct"`
+	ThroughBase int64 `json:"through_base"`
+	MayDispatch int64 `json:"may_dispatch"`
+	MayCall     int64 `json:"may_call"`
+	OpenSites   int64 `json:"open_sites"`
+}
+
+// Validate enforces nonnegative counts.
+func (c GraphCounts) Validate() error {
+	for _, f := range []struct {
+		field string
+		value int64
+	}{
+		{"graph_counts.direct", c.Direct},
+		{"graph_counts.through_base", c.ThroughBase},
+		{"graph_counts.may_dispatch", c.MayDispatch},
+		{"graph_counts.may_call", c.MayCall},
+		{"graph_counts.open_sites", c.OpenSites},
+	} {
+		if err := requireNonNegative(f.field, f.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CandidateCloseness is the closeness step a name-only candidate was found
+// at, in ranking order (ADR-0015): the site's own file, its directory or
+// package, a module its file imports or that imports the candidate's file,
+// its unit, then anywhere else.
+type CandidateCloseness string
+
+const (
+	ClosenessSameFile      CandidateCloseness = "same_file"
+	ClosenessSameDirectory CandidateCloseness = "same_directory"
+	ClosenessImported      CandidateCloseness = "imported"
+	ClosenessSameUnit      CandidateCloseness = "same_unit"
+	ClosenessElsewhere     CandidateCloseness = "elsewhere"
+)
+
+// Valid reports whether c is a known wire spelling.
+func (c CandidateCloseness) Valid() bool {
+	switch c {
+	case ClosenessSameFile, ClosenessSameDirectory, ClosenessImported, ClosenessSameUnit, ClosenessElsewhere:
+		return true
+	}
+	return false
+}
+
+// CandidateRequest asks for the name-only candidates of one open call site,
+// named by its open-site node, or of a direct lookup by Name, Shape,
+// Arguments and Language when no site node is at hand. Exactly one form is
+// given.
+type CandidateRequest struct {
+	GenerationID GenerationID `json:"generation_id,omitempty"`
+	Site         NodeID       `json:"site,omitempty"`
+	Name         string       `json:"name,omitempty"`
+	Shape        CallShape    `json:"shape,omitempty"`
+	Arguments    int64        `json:"arguments,omitempty"`
+	Language     string       `json:"language,omitempty"`
+	Page         PageRequest  `json:"page"`
+}
+
+// Validate enforces exactly one request form.
+func (r CandidateRequest) Validate() error {
+	if err := optionalID("candidates.site", string(r.Site)); err != nil {
+		return err
+	}
+	if err := boundField("candidates.name", r.Name, MaxNameBytes); err != nil {
+		return err
+	}
+	if r.Shape != "" && !r.Shape.Valid() {
+		return invalid("candidates.shape %q is not a known call shape", truncateForMessage(string(r.Shape)))
+	}
+	if err := requireNonNegative("candidates.arguments", r.Arguments); err != nil {
+		return err
+	}
+	if err := boundField("candidates.language", r.Language, MaxLanguageBytes); err != nil {
+		return err
+	}
+	direct := r.Name != "" || r.Shape != "" || r.Arguments != 0 || r.Language != ""
+	switch {
+	case r.Site != "" && direct:
+		return invalid("candidates names both a site and a direct lookup; give one")
+	case r.Site == "" && (r.Name == "" || r.Shape == "" || r.Language == ""):
+		return invalid("candidates names no site, and a direct lookup needs a name, a shape and a language")
+	}
+	if err := r.Page.ValidatePinned("candidates", r.GenerationID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Candidate is one name-only candidate.
+type Candidate struct {
+	NodeID NodeID `json:"node_id"`
+	// Resolution is ResolutionUniqueName when the candidate is the one
+	// compatible declaration of its name, else ResolutionNameOnly.
+	Resolution NameResolution     `json:"resolution"`
+	Closeness  CandidateCloseness `json:"closeness"`
+}
+
+// Validate enforces the candidate shape.
+func (c Candidate) Validate() error {
+	if err := requireID("candidate.node_id", string(c.NodeID)); err != nil {
+		return err
+	}
+	if c.Resolution != ResolutionNameOnly && c.Resolution != ResolutionUniqueName {
+		return invalid("candidate.resolution is %q; a name-only candidate is %q or %q",
+			truncateForMessage(string(c.Resolution)), ResolutionNameOnly, ResolutionUniqueName)
+	}
+	if !c.Closeness.Valid() {
+		return invalid("candidate.closeness %q is not a known closeness step", truncateForMessage(string(c.Closeness)))
+	}
+	return nil
+}
+
+// CandidatePage is one ranked page of a site's candidates. Total is the exact
+// number of candidates, never cut at a count; Cursor continues the ranking.
+type CandidatePage struct {
+	Total      int64       `json:"total"`
+	Candidates []Candidate `json:"candidates"`
+	Cursor     string      `json:"cursor,omitempty"`
+}
+
+// Validate enforces the page shape.
+func (p CandidatePage) Validate() error {
+	if err := requireNonNegative("candidate_page.total", p.Total); err != nil {
+		return err
+	}
+	if err := boundCount("candidate_page.candidates", len(p.Candidates), MaxPageItems); err != nil {
+		return err
+	}
+	if int64(len(p.Candidates)) > p.Total {
+		return invalid("candidate_page carries %d candidates of a total of %d", len(p.Candidates), p.Total)
+	}
+	for _, c := range p.Candidates {
+		if err := c.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := boundField("candidate_page.cursor", p.Cursor, MaxTokenBytes); err != nil {
 		return err
 	}
 	return nil
@@ -766,6 +1144,9 @@ type RelationPath struct {
 	Relations []RelationID `json:"relations"`
 	Evidence  []EvidenceID `json:"evidence,omitempty"`
 	CostUnits int64        `json:"cost_units"`
+	// Possible is set on a route that uses a name-only `may_call` hop: it may
+	// not run, and is offered only when no precise route exists.
+	Possible bool `json:"possible,omitempty"`
 }
 
 // Validate enforces the path bound and its nonnegative deterministic integer
@@ -804,6 +1185,10 @@ type PathResult struct {
 	Paths        []RelationPath `json:"paths"`
 	Nodes        []Node         `json:"nodes"`
 	VisitedCount int64          `json:"visited_count"`
+	// Locations and Occurrences are as on GraphResult: where the route's
+	// nodes are and every call site of its `calls` relations.
+	Locations   []NodeLocation       `json:"locations,omitempty"`
+	Occurrences []RelationOccurrence `json:"occurrences,omitempty"`
 }
 
 // Validate enforces the result shape.
@@ -828,6 +1213,9 @@ func (r PathResult) Validate() error {
 		}
 	}
 	if err := requireNonNegative("path_result.visited_count", r.VisitedCount); err != nil {
+		return err
+	}
+	if err := validateLocations("path_result", r.Locations, r.Occurrences); err != nil {
 		return err
 	}
 	return nil

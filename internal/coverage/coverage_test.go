@@ -1025,16 +1025,16 @@ var scenarios = []scenario{
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if resp.Receipt == "" || resp.Coverage == model.CoverageFullServed {
+		if resp.Session.Receipt == "" || resp.Session.Coverage == model.CoverageFullServed {
 			t.Fatalf("read of the empty file reports coverage %q with receipt %q; "+
-				"an issued chunk is not coverage until it is confirmed", resp.Coverage, resp.Receipt)
+				"an issued chunk is not coverage until it is confirmed", resp.Session.Coverage, resp.Session.Receipt)
 		}
 
 		// 2. Acknowledge it. It reports no status of its own; what
 		// it changes is the stored coverage, which is what this asserts.
 		if err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionA, ActorID: actorA,
-			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
+			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Session.Receipt},
 		}); err != nil {
 			t.Fatalf("acknowledge: %v", err)
 		}
@@ -1271,7 +1271,7 @@ var scenarios = []scenario{
 		var typedErr *model.Error
 		if err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionB, ActorID: actorB,
-			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
+			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Session.Receipt},
 		}); !errors.As(err, &typedErr) || typedErr.Code != model.CodeCursorInvalid {
 			t.Fatalf("session %s / actor %s spent a receipt issued to %s / %s: %v",
 				sessionB, actorB, sessionA, actorA, err)
@@ -1308,7 +1308,7 @@ var scenarios = []scenario{
 		}
 		if err := svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionA, ActorID: actorA,
-			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
+			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Session.Receipt},
 		}); err != nil {
 			t.Fatalf("acknowledge the receipt: %v", err)
 		}

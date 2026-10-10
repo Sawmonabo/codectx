@@ -721,12 +721,12 @@ func runScenario(t *testing.T, a adapter, actor string, s seed) walk {
 		})
 		// Printing a chunk is not delivery: the coverage reported beside it is
 		// the coverage BEFORE it, and only the confirmation below earns any.
-		if chunk.Coverage == model.CoverageFullServed {
+		if chunk.Session.Coverage == model.CoverageFullServed {
 			t.Errorf("%s: file %s reported full coverage from the read itself, before its receipt was confirmed",
 				a.kind(), f.FileID)
 		}
 		a.acknowledge(t, model.AcknowledgeRequest{SessionID: plan.SessionID, ActorID: actor,
-			Kind: model.AcknowledgeReceipt, Receipts: []string{chunk.Receipt}})
+			Kind: model.AcknowledgeReceipt, Receipts: []string{chunk.Session.Receipt}})
 		// The file review is the second, separate assertion: it is refused
 		// unless the file is already fully served, which the confirmation above
 		// has just made true.
@@ -1607,7 +1607,7 @@ func openRetainedSession(t *testing.T, s *sandbox) (model.SessionRequest, model.
 		chunk := a.read(t, model.ReadChunkRequest{SessionID: plan.SessionID,
 			ActorID: retainActor, FileID: f.FileID})
 		if bytes.HasPrefix([]byte(chunk.Content), []byte("package store")) {
-			return session, chunk, chunk.Receipt
+			return session, chunk, chunk.Session.Receipt
 		}
 	}
 	t.Fatalf("the retained session pins no required file holding %s", mutatedFile)

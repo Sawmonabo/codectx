@@ -150,7 +150,7 @@ const matchPageSize = model.MaxPageItems
 // trailing-document trim below can never empty a page.
 const occurrencePageSize = model.MaxPageItems
 
-// lexicalTier scores the lexical_fts tier over one pinned generation. It holds
+// lexicalTier scores the lexical tier over one pinned generation. It holds
 // no generation state: the pinned reader is passed per request and the only
 // retained memory is the byte-capped statistics cache. Safe for concurrent use.
 type lexicalTier struct {

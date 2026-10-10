@@ -75,6 +75,11 @@ type ImpactResult struct {
 	Packages     []PackageEdge `json:"packages,omitempty"`
 	VisitedCount int64         `json:"visited_count"`
 	EdgeCount    int64         `json:"edge_count"`
+	// OpenSitesByDepth counts, at each depth (index 0 is depth 1, the depth an
+	// entry's Depth names), the open call sites whose candidates name a node
+	// of the frontier: possibly affected, counted and not expanded unless the
+	// request names `may_call`.
+	OpenSitesByDepth []int64 `json:"open_sites_by_depth,omitempty"`
 }
 
 // Validate enforces the result shape and its traversal accounting.
@@ -103,6 +108,13 @@ func (r ImpactResult) Validate() error {
 	}
 	if err := requireNonNegative("impact_result.edge_count", r.EdgeCount); err != nil {
 		return err
+	}
+	// One count per depth the walk reached: bounded by the walk, not by a
+	// page width.
+	for i, n := range r.OpenSitesByDepth {
+		if err := requireNonNegative(indexed("impact_result.open_sites_by_depth", i), n); err != nil {
+			return err
+		}
 	}
 	return nil
 }

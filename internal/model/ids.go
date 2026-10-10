@@ -87,7 +87,8 @@ func NewRelationID(repo RepositoryID, from NodeID, kind RelationKind, to NodeID)
 }
 
 // NewEvidenceID derives evidence identity from semantic unit identity, subject,
-// precision, native key, source hash/range and bounded detail (Section 9.3).
+// precision, native key, source hash/range, bounded detail, and a call
+// occurrence's dispatch and set size (Section 9.3).
 // It excludes OriginRunID and every timestamp, so a reused unit keeps its
 // original evidence rows and a rerun over unchanged input is a no-op.
 //
@@ -112,6 +113,8 @@ func NewEvidenceID(e Evidence) EvidenceID {
 	h.AddString(start)
 	h.AddString(end)
 	h.AddString(e.Detail)
+	h.AddString(string(e.Dispatch))
+	h.AddString(strconv.FormatInt(e.SetSize, 10))
 	return EvidenceID(h.Sum())
 }
 

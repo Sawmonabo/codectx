@@ -361,8 +361,8 @@ func connectWith(t *testing.T, s *mcp.Server, c *mcp.Client, wantClean bool) *mc
 // wire contract of a tool in a diff that never mentions this package. That is
 // exactly the silent change a snapshot exists to catch.
 //
-// codectx_refresh_index takes no arguments, so it
-// require none.
+// codectx_refresh_index takes no arguments, and codectx_read_source has two
+// modes whose fields its Validate checks, so they require none.
 var toolSchemas = map[string][]string{
 	"codectx_index_status":        {"resources"},
 	"codectx_refresh_index":       nil,
@@ -380,7 +380,7 @@ var toolSchemas = map[string][]string{
 	"codectx_context_next":        {"session_id", "actor_id"},
 	"codectx_context_entries":     {"session_id", "actor_id", "view", "page"},
 	"codectx_context_include":     {"session_id", "actor_id", "seeds", "expected_version"},
-	"codectx_read_source":         {"session_id", "actor_id", "file_id", "offset", "max_bytes"},
+	"codectx_read_source":         nil,
 	"codectx_context_acknowledge": {"session_id", "actor_id", "kind"},
 	"codectx_context_waive":       {"session_id", "actor_id", "file_id", "reason"},
 	"codectx_context_record":      {"session_id", "actor_id", "expected_scope_version", "kind", "note"},
@@ -883,7 +883,7 @@ var scenarios = []scenario{
 				ByteRange: model.ByteRange{End: uint64(len(source))},
 				Encoding:  model.EncodingUTF8,
 				Content:   source,
-				Receipt:   receipt,
+				Session:   &model.ReadSession{Receipt: receipt, Coverage: model.CoverageUnserved},
 			}, nil
 		}
 		return scenario{
@@ -909,8 +909,8 @@ var scenarios = []scenario{
 				}
 				var got result[model.ReadChunkResponse]
 				decode(t, res, &got)
-				if got.Data.Receipt != receipt {
-					t.Errorf("receipt = %q, want the issued receipt %q echoed verbatim", got.Data.Receipt, receipt)
+				if got.Data.Session.Receipt != receipt {
+					t.Errorf("receipt = %q, want the issued receipt %q echoed verbatim", got.Data.Session.Receipt, receipt)
 				}
 				if got.Data.Content != source {
 					t.Errorf("content = %q, want the issued chunk %q", got.Data.Content, source)
@@ -967,7 +967,7 @@ var scenarios = []scenario{
 			name: "context_next returns metadata only, no source bytes",
 			facade: func(f *fakeServices) {
 				f.readFn = func(_ context.Context, r model.ReadChunkRequest) (model.ReadChunkResponse, error) {
-					return model.ReadChunkResponse{FileID: r.FileID, Encoding: model.EncodingUTF8, Content: source, Receipt: "receipt"}, nil
+					return model.ReadChunkResponse{FileID: r.FileID, Encoding: model.EncodingUTF8, Content: source, Session: &model.ReadSession{Receipt: "receipt", Coverage: model.CoverageUnserved}}, nil
 				}
 				f.nextFn = func(context.Context, model.SessionRequest) (model.NextContextItem, error) {
 					return model.NextContextItem{

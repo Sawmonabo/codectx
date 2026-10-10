@@ -538,7 +538,7 @@ func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation
 	var out []StoredEvidence
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT e.id, u.unit_key, u.provider_id, u.provider_version, u.origin_run_id, en.canonical, er.canonical, e.precision,
-			e.file_id, ui.content_hash, e.start_byte, e.end_byte, nk.key, e.detail FROM evidence e`+r.visible("e")+
+			e.file_id, ui.content_hash, e.start_byte, e.end_byte, nk.key, e.detail, e.dispatch, e.set_size FROM evidence e`+r.visible("e")+
 			`JOIN native_keys nk ON nk.id = e.native_key_id
 			LEFT JOIN node_ids en ON en.id = e.node_id LEFT JOIN relation_ids er ON er.id = e.relation_id
 			LEFT JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id WHERE `+subject+` ORDER BY e.id LIMIT ?`, args...)
@@ -551,7 +551,8 @@ func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation
 			var id, unitKey, run, nodeID, relID, fileID, contentHash []byte
 			var start, end sql.NullInt64
 			if err := rows.Scan(&id, &unitKey, &se.Evidence.ProviderID, &se.Evidence.ProviderVersion, &run, &nodeID, &relID, &se.Evidence.Precision,
-				&fileID, &contentHash, &start, &end, &se.Evidence.NativeKey, &se.Evidence.Detail); err != nil {
+				&fileID, &contentHash, &start, &end, &se.Evidence.NativeKey, &se.Evidence.Detail,
+				&se.Evidence.Dispatch, &se.Evidence.SetSize); err != nil {
 				return wrap("evidence", err)
 			}
 			se.Evidence.ID, se.Evidence.UnitID, se.Evidence.OriginRunID = model.EvidenceID(idHex(id)), model.UnitID(idHex(unitKey)), model.ProviderRunID(idHex(run))

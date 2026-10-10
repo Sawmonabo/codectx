@@ -832,7 +832,7 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 		if !filter.keep(d.Path) || !matchesKinds(d.Kind, req.Kinds) {
 			return nil
 		}
-		r := ranked{Tier: model.TierLexicalFTS, ScoreMicros: h.ScoreMicros, Path: d.Path,
+		r := ranked{Tier: model.TierLexical, ScoreMicros: h.ScoreMicros, Path: d.Path,
 			StartByte: d.Bytes.Start, NodeID: d.NodeID, SearchKey: d.ID, RowID: d.RowID,
 			// One per lexical DOCUMENT, so several documents of one node
 			// fold to that many occurrences. The matched term
@@ -842,7 +842,7 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 		bytes := d.Bytes
 		return c.add(r, hitFacts{span: &bytes, hit: model.SearchHit{NodeID: d.NodeID, FileID: d.FileID,
 			Path: d.Path, Kind: d.Kind, Name: d.Name, QualifiedName: d.QualifiedName, Signature: d.Signature}},
-			reasonFor(model.TierLexicalFTS))
+			reasonFor(model.TierLexical))
 	})
 }
 

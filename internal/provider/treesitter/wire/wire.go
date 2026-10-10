@@ -174,6 +174,19 @@ type Decl struct {
 	// Impl names the Rust impl target or C++ qualifier a method was defined
 	// under when its containing type is not a declaration in this file.
 	Impl string `json:"impl,omitempty"`
+	// Decorators are the declaration's decorators and annotations, in source
+	// order.
+	Decorators []Decorator `json:"decorators,omitempty"`
+}
+
+// Decorator is one decorator or annotation on a declaration: its name as
+// written (`app.route`, `Override`), the byte offsets of the whole decorator
+// and of each argument, in order.
+type Decorator struct {
+	Name      string `json:"name"`
+	Start     uint32 `json:"start"`
+	End       uint32 `json:"end"`
+	Arguments []Span `json:"arguments,omitempty"`
 }
 
 // Import is one import/include/use statement.

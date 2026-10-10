@@ -171,10 +171,10 @@ const evidenceBatchColumns = `e.id AS id, u.unit_key AS unit_key, u.provider_id 
 	u.provider_version AS provider_version, u.origin_run_id AS origin_run_id, NULL AS node_id,
 	rl.canonical AS relation_id, e.precision AS precision, e.file_id AS file_id,
 	ui.content_hash AS content_hash, e.start_byte AS start_byte, e.end_byte AS end_byte,
-	nk.key AS native_key, e.detail AS detail`
+	nk.key AS native_key, e.detail AS detail, e.dispatch AS dispatch, e.set_size AS set_size`
 
 const evidenceBatchOuterColumns = `id, unit_key, provider_id, provider_version, origin_run_id, node_id,
-	relation_id, precision, file_id, content_hash, start_byte, end_byte, native_key, detail`
+	relation_id, precision, file_id, content_hash, start_byte, end_byte, native_key, detail, dispatch, set_size`
 
 // EvidenceBatch returns the visible evidence backing each relation in one round
 // trip, at most perRelation rows per relation in evidence-id order. The per-
@@ -244,7 +244,8 @@ func scanBatchedEvidence(rows *sql.Rows) (StoredEvidence, model.RelationID, erro
 	var id, unitKey, run, nodeID, relID, fileID, contentHash []byte
 	var start, end sql.NullInt64
 	if err := rows.Scan(&id, &unitKey, &se.Evidence.ProviderID, &se.Evidence.ProviderVersion, &run, &nodeID, &relID,
-		&se.Evidence.Precision, &fileID, &contentHash, &start, &end, &se.Evidence.NativeKey, &se.Evidence.Detail); err != nil {
+		&se.Evidence.Precision, &fileID, &contentHash, &start, &end, &se.Evidence.NativeKey, &se.Evidence.Detail,
+		&se.Evidence.Dispatch, &se.Evidence.SetSize); err != nil {
 		return se, "", wrap("evidence", err)
 	}
 	se.Evidence.ID, se.Evidence.UnitID, se.Evidence.OriginRunID = model.EvidenceID(idHex(id)), model.UnitID(idHex(unitKey)), model.ProviderRunID(idHex(run))
