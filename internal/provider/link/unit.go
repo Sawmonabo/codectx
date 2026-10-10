@@ -105,6 +105,15 @@ const (
 // table the fact is about (a call site, an import, a declaration, by Kind),
 // Target a declaration or a member's module of the unit, and External,
 // instead of Target, a type or method outside the project.
+//
+// A resolver resolves every site of one unit and emits each fact it finds,
+// in any order and with repeats; the core keeps one fact per kind, entry,
+// argument and target (the best technique of its repeats, canonical),
+// names each by identity and publishes one occurrence per fact. A call site
+// with no call fact publishes an open-site node and the caller's `calls` edge
+// to it, unless a FactExternalSite says it is a proven external call. A
+// FactFlow into a parameter the structural provider minted no node for is
+// not a fact and is dropped.
 type Binding struct {
 	Kind   Fact
 	Site   Ref
@@ -123,25 +132,6 @@ type Binding struct {
 	External string
 	// Reason is a FactOpenSite's reason.
 	Reason model.OpenSiteReason
-}
-
-// A resolver resolves every site of one unit and emits each fact it finds,
-// in any order and with repeats; the core keeps one fact per kind, entry,
-// argument and target (the best technique of its repeats, canonical),
-// names each by identity and publishes one occurrence per fact. A call site
-// with no call fact publishes an open-site node and the caller's `calls` edge
-// to it, unless a FactExternalSite says it is a proven external call. A
-// FactFlow into a parameter the structural provider minted no node for is
-// not a fact and is dropped.
-type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
-
-// resolverFor is the flow family's resolution of decision 2 (resolve has
-// the static family's).
-func resolverFor(f Family) resolver {
-	if f == FamilyPython {
-		return resolvePython
-	}
-	return resolveECMAScript
 }
 
 // members is a unit's member files in ascending FileID order: each live

@@ -898,14 +898,3 @@ func pull[T any](run *pagination.SortedRun[T]) (func() (T, bool, error), func())
 func notMember(what string, file model.FileID) error {
 	return internalErr("a binding's " + what + " is in file " + string(file) + ", which is not a member of the unit")
 }
-
-// untabledRef is a binding naming a member with no table, which no resolver
-// can have read and no state of an equal digest can hold.
-func untabledRef(what string, r Ref) error {
-	return internalErr("a binding's " + what + " names member " + strconv.Itoa(int(r.File)) + ", which has no link table")
-}
-
-// outOfTable is a binding naming an entry past its member's table.
-func outOfTable(what string, r Ref, path string) error {
-	return internalErr("a binding's " + what + " names entry " + strconv.Itoa(int(r.Index)) + " past the link table of " + path)
-}
