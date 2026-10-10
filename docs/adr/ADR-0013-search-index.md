@@ -323,7 +323,10 @@ The tokenizer reproduces today's rules:
 - diacritics are removed.
 
 Every library tokenizer with a silent length cut is avoided. The library's default analyzer drops tokens of 40 bytes or
-more.
+more. One cut remains below the tokenizer: the library's postings writer does not index a single token longer than
+65 530 bytes. Our tokenizer still counts such a token in the document's length, so the length is exact, but a query
+for it cannot match. No identifier or word of source text reaches that size; the bound is the indexer's, and is stated
+here so that no record claims there is none.
 
 **The code-aware form is adopted.** This form emits the whole identifier, and also its camelCase and snake_case parts at
 the same position. For example, `NewController` is indexed as `newcontroller`, `new` and `controller`. Under the
