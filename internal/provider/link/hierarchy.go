@@ -151,8 +151,26 @@ const (
 	keyMethod = "m\x00"
 	// keySub + refKey(type): a declared or satisfied direct subtype.
 	keySub = "d\x00"
-	// keySuper + refKey(type): a declared or satisfied direct supertype.
+	// keySuper + refKey(type): a declared or satisfied direct supertype,
+	// flagInterface in Flags when it is an interface or trait.
 	keySuper = "p\x00"
+	// keyExternalSuper + refKey(type): a supertype outside the unit, its
+	// qualified name in Aux (externalName), flagInterface in Flags when the
+	// source proves it an interface or trait (externalKind). A type of any
+	// family but Go has those its own declaration and its impls write; a Go
+	// type has every external type it embeds, directly or through an
+	// embedded type of the unit (satisfy), flagInterface when the embedding
+	// type is an interface.
+	keyExternalSuper = "px\x00"
+	// keyParam + refKey(callable): one declared parameter of the callable
+	// (Decl.Parameters), its position in Aux (basePosition), its name in
+	// Sig, its Parameter.Index in MinArgs and its marks in Flags
+	// (paramVariadic, paramKeywordOnly).
+	keyParam = "pa\x00"
+	// keyMacro + name: a C or C++ object-like macro of that name whose
+	// replacement is one identifier (Decl.Alias), its file's path in Aux and
+	// the identifier in Sig.
+	keyMacro = "ma\x00"
 )
 
 // The flags of an entry.
@@ -163,6 +181,15 @@ const (
 	flagVirtual
 	flagFinal
 	flagInternal
+	// flagInterface marks a type declaration of kind interface (a Rust
+	// trait included), and a supertype entry naming one.
+	flagInterface
+)
+
+// The marks of a parameter entry (keyParam).
+const (
+	paramVariadic byte = 1 << iota
+	paramKeywordOnly
 )
 
 // typeKinds are the declaration kinds a type name denotes; a Rust trait is
@@ -476,6 +503,14 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		ref := Ref{File: file, Index: int32(i)}
+		if err := addParameters(s, ref, d); err != nil {
+			return err
+		}
+		if fc.family == "c" && d.Alias != "" {
+			if err := s.Add(entry{Key: keyMacro + d.Name, Ref: ref, Aux: t.Path, Sig: d.Alias}); err != nil {
+				return err
+			}
+		}
 		ns := ""
 		if fc.family == "c" {
 			ns = namespaceOf(d, fc.sep)
@@ -529,10 +564,24 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 	return nil
 }
 
-// declEntry is the entry of declaration d at ref, with what a lookup
-// filters and answers on without reading d's table: its signature, its
-// flags, the argument counts a call of it may pass (wire.Export.Params) and
-// the type it returns when the worker named one.
+// addParameters adds the declared parameters of the declaration d at ref
+// (keyParam), in declaration order.
+func addParameters(s *pagination.ExternalSort[entry], ref Ref, d *Decl) error {
+	for pos, p := range d.Parameters {
+		e := entry{Key: keyParam + refKey(ref), Ref: ref, Aux: basePosition(pos), Sig: p.Name, MinArgs: p.Index}
+		if p.Variadic {
+			e.Flags |= paramVariadic
+		}
+		if p.KeywordOnly {
+			e.Flags |= paramKeywordOnly
+		}
+		if err := s.Add(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // internalEntry is declEntry for a C or C++ function with internal linkage,
 // carrying its namespace and file in Aux.
 func internalEntry(ref Ref, d *Decl, aux string) entry {
@@ -541,6 +590,10 @@ func internalEntry(ref Ref, d *Decl, aux string) entry {
 	return e
 }
 
+// declEntry is the entry of declaration d at ref, with what a lookup
+// filters and answers on without reading d's table: its signature, its
+// flags, the argument counts a call of it may pass (wire.Export.Params) and
+// the type it returns when the worker named one.
 func declEntry(ref Ref, d *Decl) entry {
 	e := entry{Ref: ref, Sig: d.Signature, Flags: flagsOf(d)}
 	if d.Described && callable(d) {
@@ -580,22 +633,42 @@ func flagsOf(d *Decl) byte {
 	if d.Internal {
 		f |= flagInternal
 	}
+	if d.Kind == model.NodeInterface {
+		f |= flagInterface
+	}
 	return f
 }
 
-// addLinks adds t's methods under the types that declare them and its
-// declared supertypes in both directions. A Go table's methods and embedded
-// types also go to methodSets, and its embeddings are promotion, not
-// subtyping (goEmbeddings).
+// addLinks adds t's methods under the types that declare them, a Java
+// type's fields under it (keyGoField), and its declared supertypes in both
+// directions, those outside the unit under keyExternalSuper. A Go table's
+// methods and embedded types also go to methodSets, and its embeddings are
+// promotion, not subtyping (goEmbeddings).
 func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.ExternalSort[entry], file int32, t *Table) error {
 	fc := contextOf(file, t)
 	for i := range t.Decls {
 		d := &t.Decls[i]
+		if fc.family == "java" && d.Kind == model.NodeField && d.Parent >= 0 && isType(t.Decls[d.Parent].Kind) {
+			f := entry{Key: keyGoField + refKey(Ref{File: file, Index: d.Parent}) + d.Name, Ref: Ref{File: file, Index: int32(i)}}
+			if d.Returns.Kind == wire.TypeNamed {
+				f.Sig = d.Returns.Name
+			}
+			if err := links.Add(f); err != nil {
+				return err
+			}
+			continue
+		}
 		if !callable(d) {
 			continue
 		}
 		ref := Ref{File: file, Index: int32(i)}
 		e := declEntry(ref, d)
+		// A method an interface declares without an export (a Go method
+		// specification, a pure member the worker described nothing of) has
+		// no body a call could run but an implementation's.
+		if p := d.Parent; !d.Described && p >= 0 && t.Decls[p].Kind == model.NodeInterface {
+			e.Flags |= flagAbstract
+		}
 		add := func(typ Ref) error {
 			e.Key = keyMethod + refKey(typ) + d.Name
 			if err := links.Add(e); err != nil {
@@ -627,10 +700,35 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		return h.goEmbeddings(ctx, methodSets, fc, t)
 	}
 	for i, st := range t.Supertypes {
-		err := h.typesIn(ctx, fc, st.Type, func(sub entry) error {
-			return h.typesIn(ctx, fc, st.Super, func(super entry) error {
-				return addBase(links, sub.Ref, super.Ref, i)
-			})
+		var supers []entry
+		err := h.typesIn(ctx, fc, st.Super, func(super entry) error {
+			supers = append(supers, super)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		external, ok := "", false
+		if len(supers) == 0 {
+			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil || !ok {
+				return err
+			}
+		}
+		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
+			if ok {
+				var flags byte
+				if externalKind(fc.family, sub.Flags) == model.NodeInterface {
+					flags = flagInterface
+				}
+				return links.Add(entry{Key: keyExternalSuper + refKey(sub.Ref), Ref: sub.Ref, Aux: external,
+					Sig: basePosition(i), Flags: flags})
+			}
+			for _, super := range supers {
+				if err := addBase(links, sub.Ref, super.Ref, i, super.Flags&flagInterface); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 		if err != nil {
 			return err
@@ -641,23 +739,24 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 
 // addSubtype records that sub is a direct subtype of super by a relation no
 // declaration of sub lists in an order (Go's method-set satisfaction).
-func addSubtype(links *pagination.ExternalSort[entry], sub, super Ref) error {
-	return addBase(links, sub, super, -1)
+func addSubtype(links *pagination.ExternalSort[entry], sub, super Ref, flags byte) error {
+	return addBase(links, sub, super, -1, flags)
 }
 
 // addBase records that sub is a direct subtype of super, which sub's file
 // lists as its supertype row pos (-1 for none). A class's rows are listed in
 // the order its declaration names its bases, so the keySuper entry carries
 // pos (basePosition) and a lookup can read the bases as written, which
-// Python's method resolution order is computed from.
-func addBase(links *pagination.ExternalSort[entry], sub, super Ref, pos int) error {
+// Python's method resolution order is computed from. flags is
+// flagInterface when super is an interface or trait.
+func addBase(links *pagination.ExternalSort[entry], sub, super Ref, pos int, flags byte) error {
 	if sub == super {
 		return nil
 	}
 	if err := links.Add(entry{Key: keySub + refKey(super), Ref: sub}); err != nil {
 		return err
 	}
-	e := entry{Key: keySuper + refKey(sub), Ref: super}
+	e := entry{Key: keySuper + refKey(sub), Ref: super, Flags: flags}
 	if pos >= 0 {
 		e.Aux = basePosition(pos)
 	}
@@ -677,19 +776,32 @@ func refOf(k string) Ref {
 // types yields the type declarations a type name as written in a table of
 // the member file may denote, each once.
 func (h *hierarchy) types(ctx context.Context, file int32, name string, yield func(Ref) error) error {
-	var fc fileCtx
-	found := false
-	err := h.decls.lookup(keyFile+refKey(Ref{File: file}), func(e entry) error {
+	return h.typeEntries(ctx, file, name, func(e entry) error { return yield(e.Ref) })
+}
+
+// typeEntries is types yielding each type's entry, whose Flags say whether
+// it is an interface.
+func (h *hierarchy) typeEntries(ctx context.Context, file int32, name string, yield func(entry) error) error {
+	fc, found, err := h.fileContext(file)
+	if err != nil || !found {
+		return err
+	}
+	return h.typesIn(ctx, fc, name, yield)
+}
+
+// fileContext is the context of the member file at ordinal file as the
+// index holds it (keyFile), without its imports and declarations, which a
+// lookup through the context reads from the index instead; found is false
+// for a member without a table.
+func (h *hierarchy) fileContext(file int32) (fc fileCtx, found bool, err error) {
+	err = h.decls.lookup(keyFile+refKey(Ref{File: file}), func(e entry) error {
 		language, p, _ := strings.Cut(e.Aux, "\x00")
 		fc = fileCtx{file: file, language: language, family: familyOf(language), sep: separatorOf(language), path: p,
 			scopes: strings.Split(e.Sig, "\n")}
 		found = true
 		return nil
 	})
-	if err != nil || !found {
-		return err
-	}
-	return h.typesIn(ctx, fc, name, func(e entry) error { return yield(e.Ref) })
+	return fc, found, err
 }
 
 // typesIn yields the type declarations name, as written in a file of
@@ -1327,21 +1439,13 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 }
 
 // dispatch yields every method declaration a call of method on a receiver
-// whose static type is the declaration typ may reach: the method typ
-// declares or inherits, and every override in a subtype of typ, each once.
-// A declaration without a body is yielded only when no declaration with one
-// is reachable, since a call runs a body.
+// whose static type is the declaration typ may run: the method typ declares
+// or inherits, and every override in a subtype of typ, each once. A
+// declaration without a body is yielded only when no declaration with one is
+// reachable, since a call runs a body. Value-flow inference reads it for a
+// receiver known only by its declared type; a static-family call binds the
+// one method typ declares or inherits (declared) instead.
 func (h *hierarchy) dispatch(ctx context.Context, typ Ref, method string, yield func(Ref) error) error {
-	return h.dispatchEntries(ctx, "", typ, method, func(e entry, _ bool) error { return yield(e.Ref) })
-}
-
-// dispatchEntries is dispatch for a call written in a file of family, which
-// reaches the overrides in typ's subtypes only when the nearest declarations
-// can be overridden (overridable); down reports, with each entry, that it
-// did. The family "" overrides by name alone.
-func (h *hierarchy) dispatchEntries(ctx context.Context, family string, typ Ref, method string,
-	yield func(e entry, down bool) error,
-) error {
 	var concrete, abstract []entry
 	collect := func(e entry) error {
 		if e.Flags&flagAbstract != 0 {
@@ -1354,13 +1458,9 @@ func (h *hierarchy) dispatchEntries(ctx context.Context, family string, typ Ref,
 	if err := h.declared(typ, method, collect); err != nil {
 		return err
 	}
-	down, err := h.overridable(family, typ, method, slices.Concat(concrete, abstract))
-	if err != nil {
-		return err
-	}
 	seen := map[Ref]bool{typ: true}
 	queue := []Ref{typ}
-	for down && len(queue) > 0 {
+	for len(queue) > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1388,16 +1488,17 @@ func (h *hierarchy) dispatchEntries(ctx context.Context, family string, typ Ref,
 			continue
 		}
 		yielded[e.Ref] = true
-		if err := yield(e, down); err != nil {
+		if err := yield(e.Ref); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// overridable reports that a call of method on typ reaches the overrides
-// in typ's subtypes, given found, the nearest declarations of it typ
-// declares or inherits, by the rule of the call's family:
+// overridable reports that a call of method on a receiver of static type
+// typ can run an override of what it names (DispatchVirtual), given found,
+// the nearest declarations of it typ declares or inherits, by the rule of
+// the call's family:
 //   - Java: one of them is an instance method that is not Final (JLS
 //     §8.4.8): a static method hides and a final or private one, or one of a
 //     final class, has no override;
@@ -1407,10 +1508,11 @@ func (h *hierarchy) dispatchEntries(ctx context.Context, family string, typ Ref,
 //     member the static type names;
 //   - Go: one of them is an interface's method; a concrete type's method is
 //     promoted into the types embedding it, never overridden;
-//   - every other family: always.
+//   - every other family: always (a Rust call reads its receiver's kind
+//     instead, staticFile.dispatchOf).
 //
 // When the unit declares none (typ inherits the method from outside the
-// unit, whose rules are unknown), the call reaches every override.
+// unit, whose rules are unknown), an override can run.
 func (h *hierarchy) overridable(family string, typ Ref, method string, found []entry) (bool, error) {
 	if len(found) == 0 {
 		return true, nil
@@ -1753,16 +1855,13 @@ func (ix *index) close() {
 // change of the callee's parameters re-runs every member whose argument
 // flows read them. A callable with no parameters yields none.
 func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error {
-	return nil
-}
-
-// hierarchyFacts emits the hierarchy facts of the declarations of the member
-// at ordinal file, whose table is t: FactExtends and FactImplements for each
-// type's supertypes, FactOverrides for each method that directly overrides
-// or implements a supertype's (ADR-0015 decision 2), with the reads the trace
-// records.
-func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
-	return nil
+	return h.decls.lookup(keyParam+refKey(callable), func(e entry) error {
+		if len(e.Aux) != 8 {
+			return errMalformedEntry
+		}
+		return yield(paramInfo{Pos: int32(binary.BigEndian.Uint64([]byte(e.Aux))), Name: e.Sig, Index: e.MinArgs,
+			Variadic: e.Flags&paramVariadic != 0, KeywordOnly: e.Flags&paramKeywordOnly != 0})
+	})
 }
 
 // externalName is the qualified name of the type written as written in a
@@ -1772,6 +1871,502 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 // scope (the external key's qualified name, externalType). ok is false when
 // written names a type of the unit, or nothing the language can name
 // outside it.
+//
+// A qualified name whose first component an import binds is read with that
+// component replaced by what the import denotes; a simple name an import
+// binds is what the import denotes. Otherwise, by family:
+//   - Java: a qualified name as written; a simple name is java.lang's (JLS
+//     §7.3), unless an on-demand import may supply it;
+//   - Go: a qualified name only through its import (a package outside the
+//     unit's module); a simple name only when it is predeclared (`error`),
+//     since any other is a type parameter or a dot import's;
+//   - Python: a qualified name as written; a simple name is a builtin's
+//     (`builtins.list`), unless a star import may supply it;
+//   - ECMAScript: as written, a global (`Error`);
+//   - Rust: a qualified name as written unless it starts in the crate
+//     (`crate`, `self`, `super`, a crate of the unit); a simple name as
+//     written (the prelude's), unless a glob of a path outside the crate may
+//     supply it;
+//   - C and C++: a qualified name as written; a simple name only through a
+//     using-declaration, since any other may be a template parameter.
+//
+// Every read goes through the indexes, so a member's trace records it.
 func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string) (qualified string, ok bool, err error) {
+	name := typeName(written)
+	if name == "" {
+		return "", false, nil
+	}
+	inUnit := false
+	if err := h.typesIn(ctx, fc, name, func(entry) error {
+		inUnit = true
+		return nil
+	}); err != nil || inUnit {
+		return "", false, err
+	}
+	type imported struct{ path, original string }
+	var imps []imported
+	collect := func(local string) error {
+		imps = imps[:0]
+		return h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+local, func(e entry) error {
+			imps = append(imps, imported{path: e.Aux, original: e.Sig})
+			return nil
+		})
+	}
+	if head, rest, isQualified := strings.Cut(name, fc.sep); isQualified {
+		if err := collect(head); err != nil {
+			return "", false, err
+		}
+		if len(imps) > 1 {
+			return "", false, nil
+		}
+		if len(imps) == 1 {
+			return h.externalImported(fc, imps[0].path, imps[0].original, head, rest)
+		}
+		switch fc.family {
+		case "go":
+			return "", false, nil
+		case "rust":
+			if head == "crate" || head == "self" || head == "super" || head == "" {
+				return "", false, nil
+			}
+			crate := false
+			if err := h.decls.lookup(keyRustCrate+head, func(entry) error {
+				crate = true
+				return nil
+			}); err != nil || crate {
+				return "", false, err
+			}
+		}
+		return name, true, nil
+	}
+	if err := collect(name); err != nil {
+		return "", false, err
+	}
+	if len(imps) > 1 {
+		return "", false, nil
+	}
+	if len(imps) == 1 {
+		return h.externalImported(fc, imps[0].path, imps[0].original, name, "")
+	}
+	switch fc.family {
+	case "go":
+		if goUniverseTypes[name] {
+			return name, true, nil
+		}
+		return "", false, nil
+	case "c":
+		return "", false, nil
+	case "js":
+		return name, true, nil
+	}
+	// A name an import of every member of a path outside the unit may
+	// supply is not known to be the implicit scope's.
+	open := false
+	err = h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+ImportAll, func(e entry) error {
+		if fc.family != "rust" || !rustInCrate(e.Aux) {
+			open = true
+		}
+		return nil
+	})
+	if err != nil || open {
+		return "", false, err
+	}
+	switch fc.family {
+	case "java":
+		return "java.lang." + name, true, nil
+	case "python":
+		return "builtins." + name, true, nil
+	}
+	return name, true, nil
+}
+
+// goUniverseTypes are Go's predeclared interface types ("Predeclared
+// identifiers"), the only types outside every package a method call can be
+// made on.
+var goUniverseTypes = map[string]bool{"error": true, "any": true, "comparable": true}
+
+// rustInCrate reports a Rust path that starts in the current crate.
+func rustInCrate(p string) bool {
+	head, _, _ := strings.Cut(p, "::")
+	return head == "crate" || head == "self" || head == "super"
+}
+
+// externalImported is externalName of a name whose first component local an
+// import of fc's file binds to path p (Import.Path), denoting original in p's
+// module when the import renames it (Import.Original), followed by rest
+// (empty for a simple name).
+func (h *hierarchy) externalImported(fc fileCtx, p, original, local, rest string) (string, bool, error) {
+	join := func(parts ...string) string {
+		var kept []string
+		for _, part := range parts {
+			if part != "" {
+				kept = append(kept, part)
+			}
+		}
+		return strings.Join(kept, fc.sep)
+	}
+	switch fc.family {
+	case "go":
+		inUnit := false
+		if err := h.goPackages(p, func(string) error {
+			inUnit = true
+			return nil
+		}); err != nil || inUnit || rest == "" {
+			return "", false, err
+		}
+		return p + "." + rest, true, nil
+	case "python":
+		if strings.HasPrefix(p, ".") {
+			return "", false, nil
+		}
+		switch {
+		case rest == "":
+			// `from m import C [as D]`.
+			return join(p, cmp.Or(original, local)), true, nil
+		case original == "" && (p == local || strings.HasPrefix(p, local+".")):
+			// `import a.b`, binding a: the name is written in full.
+			return join(local, rest), true, nil
+		case original != "":
+			return join(p, original, rest), true, nil
+		}
+		// `import m as local`.
+		return join(p, rest), true, nil
+	case "js":
+		if strings.HasPrefix(p, ".") || strings.HasPrefix(p, "/") {
+			return "", false, nil
+		}
+		switch original {
+		case "*":
+			if rest == "" {
+				return "", false, nil
+			}
+			return join(p, rest), true, nil
+		case "":
+			return join(p, local, rest), true, nil
+		}
+		return join(p, original, rest), true, nil
+	case "rust":
+		if rustInCrate(p) {
+			return "", false, nil
+		}
+		return join(p, rest), true, nil
+	case "java", "c":
+		if fc.family == "c" && strings.HasPrefix(p, "<") || p == "" {
+			return "", false, nil
+		}
+		return join(p, rest), true, nil
+	}
 	return "", false, nil
+}
+
+// externalKind is the kind of an external supertype of a type whose entry
+// carries flags, of family: an interface when the source proves it one (an
+// interface's or trait's supertype, a Rust impl's trait), a class
+// otherwise.
+func externalKind(family string, flags byte) model.NodeKind {
+	if flags&flagInterface != 0 || family == "rust" {
+		return model.NodeInterface
+	}
+	return model.NodeClass
+}
+
+// externalSupers is every supertype outside the unit of the type typ of
+// family that may declare method, each once (keyExternalSuper): those of typ
+// and of each supertype of the unit along its supertypes, and for Java
+// java.lang.Object when none of them is a class and method is one of
+// Object's (JLS §8.1.4: a class with no superclass of the unit that names
+// one outside it extends Object, and an interface has Object's public
+// members, §9.2). A Go type's are those it embeds, directly or by promotion.
+func (h *hierarchy) externalSupers(family string, typ Ref, method string) ([]entry, error) {
+	var out []entry
+	add := func(e entry) error {
+		if !slices.ContainsFunc(out, func(o entry) bool { return o.Aux == e.Aux }) {
+			out = append(out, e)
+		}
+		return nil
+	}
+	seen := map[Ref]bool{typ: true}
+	queue := []Ref{typ}
+	for len(queue) > 0 {
+		t := queue[0]
+		queue = queue[1:]
+		if err := h.links.lookup(keyExternalSuper+refKey(t), add); err != nil {
+			return nil, err
+		}
+		if family == "go" {
+			break
+		}
+		err := h.links.lookup(keySuper+refKey(t), func(e entry) error {
+			if !seen[e.Ref] {
+				seen[e.Ref] = true
+				queue = append(queue, e.Ref)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if family == "java" && javaObjectMethods[method] && !slices.ContainsFunc(out, func(e entry) bool { return e.Flags&flagInterface == 0 }) {
+		out = append(out, entry{Aux: "java.lang.Object"})
+	}
+	return out, nil
+}
+
+// javaObjectMethods are the methods java.lang.Object declares (JLS §4.3.2).
+var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize": true, "getClass": true,
+	"hashCode": true, "notify": true, "notifyAll": true, "toString": true, "wait": true}
+
+// hierarchyFacts emits the hierarchy facts of the declarations of the member
+// at ordinal file, whose table is t: FactExtends and FactImplements for each
+// type's supertypes, FactOverrides for each method that directly overrides
+// or implements a supertype's (ADR-0015 decision 2), with the reads the trace
+// records.
+//
+// A type extends each declared supertype that is a class, or that is an
+// interface when it is one itself (a Java or TypeScript interface's
+// extended interfaces, a Rust supertrait, a Go interface's embedded
+// interfaces), and implements each other interface or trait it declares, or
+// that a Go type satisfies by its method set (DetailMethodSet). A Go struct's
+// embedded types are promotion and no supertype. A supertype outside the
+// unit is its external type node (externalType).
+//
+// A method overrides, along each of its type's direct supertypes, the
+// nearest method of its name that it can override: in Java one that is
+// neither static, final nor private, of the same signature; in C++ a virtual
+// one of the same signature; in Python the first along the method
+// resolution order; in Rust a trait's, by a method of the trait's impl
+// (Decl.Override); in ECMAScript one of the same name; in Go each method of
+// an interface its type satisfies. A method that overrides none of the
+// unit's and that the language marks as overriding (Decl.Override) overrides
+// the method of its name of the one supertype outside the unit its type has
+// (externalSupers), none when it has several. Go publishes nothing toward a
+// type outside the unit, whose method set no table holds.
+func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
+	fc := contextOf(file, t)
+	for i := range t.Decls {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d := &t.Decls[i]
+		ref := Ref{File: file, Index: int32(i)}
+		var err error
+		switch {
+		case isType(d.Kind) && fc.family == "go":
+			err = h.goSupertypeFacts(ctx, fc, t, ref, d, emit)
+		case isType(d.Kind):
+			err = h.supertypeFacts(fc, ref, d, emit)
+		case isCallable(d.Kind):
+			err = h.overrideFacts(ctx, fc, t, ref, d, emit)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// supertypeFacts emits the supertype facts of the type d at ref of a family
+// but Go: its declared supertypes of the unit (keySuper) and outside it
+// (keyExternalSuper), wherever the unit declares them (a Rust impl in another
+// file).
+func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Binding) error) error {
+	relation := func(super byte) Fact {
+		if super&flagInterface != 0 && d.Kind != model.NodeInterface {
+			return FactImplements
+		}
+		return FactExtends
+	}
+	err := h.links.lookup(keySuper+refKey(ref), func(e entry) error {
+		return emit(Binding{Kind: relation(e.Flags), Site: ref, Target: e.Ref, Detail: DetailSupertype})
+	})
+	if err != nil {
+		return err
+	}
+	return h.links.lookup(keyExternalSuper+refKey(ref), func(e entry) error {
+		return emit(Binding{Kind: relation(e.Flags), Site: ref, Detail: DetailSupertype,
+			External: externalType(fc.family, externalKind(fc.family, e.Flags), e.Aux)})
+	})
+}
+
+// goSupertypeFacts emits the supertype facts of the Go type d at ref: an
+// interface extends each interface it embeds, of the unit or outside it, and
+// a type that is no interface implements each interface its method set
+// satisfies.
+func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+	if d.Kind != model.NodeInterface {
+		return h.links.lookup(keySuper+refKey(ref), func(e entry) error {
+			if e.Aux != "" {
+				return nil
+			}
+			return emit(Binding{Kind: FactImplements, Site: ref, Target: e.Ref, Detail: DetailMethodSet})
+		})
+	}
+	for _, st := range t.Supertypes {
+		sub := false
+		if err := h.typesIn(ctx, fc, st.Type, func(e entry) error {
+			sub = sub || e.Ref == ref
+			return nil
+		}); err != nil {
+			return err
+		}
+		if !sub {
+			continue
+		}
+		found := false
+		err := h.typesIn(ctx, fc, st.Super, func(e entry) error {
+			found = true
+			if e.Ref == ref || e.Flags&flagInterface == 0 {
+				return nil
+			}
+			return emit(Binding{Kind: FactExtends, Site: ref, Target: e.Ref, Detail: DetailSupertype})
+		})
+		if err != nil || found {
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		q, ok, err := h.externalName(ctx, fc, st.Super)
+		if err != nil {
+			return err
+		}
+		if ok {
+			err := emit(Binding{Kind: FactExtends, Site: ref, Detail: DetailSupertype,
+				External: externalType(fc.family, model.NodeInterface, q)})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// owners yields the types the method d of t, in context fc, is declared on:
+// its enclosing type, a Java anonymous class body's synthetic type, or the
+// types its receiver names.
+func (h *hierarchy) owners(ctx context.Context, fc fileCtx, t *Table, d *Decl, yield func(Ref) error) error {
+	if p := d.Parent; p >= 0 && int(p) < len(t.Decls) && isType(t.Decls[p].Kind) && !anonymousReceiver(fc, d) {
+		return yield(Ref{File: fc.file, Index: p})
+	}
+	if anonymousReceiver(fc, d) {
+		ref, _ := anonymousType(fc.file, d.Receiver)
+		return yield(ref)
+	}
+	if d.Receiver == "" {
+		return nil
+	}
+	return h.typesIn(ctx, fc, d.Receiver, func(e entry) error { return yield(e.Ref) })
+}
+
+// overrideFacts emits what the method d at ref directly overrides
+// (hierarchyFacts).
+func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+	switch {
+	case d.Static && (fc.family == "java" || fc.family == "c"):
+		// A static method hides; it overrides nothing.
+		return nil
+	case fc.family == "rust" && !d.Override:
+		// Only an item of a trait's impl implements the trait's.
+		return nil
+	case fc.family == "go" && d.Parent >= 0 && int(d.Parent) < len(t.Decls) && t.Decls[d.Parent].Kind == model.NodeInterface:
+		// An interface's method specification implements nothing.
+		return nil
+	}
+	sig := declEntry(ref, d).Sig
+	return h.owners(ctx, fc, t, d, func(owner Ref) error {
+		var targets []Ref
+		add := func(e entry) {
+			if e.Ref != ref && !slices.Contains(targets, e.Ref) {
+				targets = append(targets, e.Ref)
+			}
+		}
+		detail := DetailSupertype
+		switch fc.family {
+		case "go":
+			detail = DetailMethodSet
+			err := h.links.lookup(keySuper+refKey(owner), func(iface entry) error {
+				if iface.Aux != "" || iface.Ref == owner {
+					return nil
+				}
+				return h.methods(iface.Ref, d.Name, func(e entry) error {
+					add(e)
+					return nil
+				})
+			})
+			if err != nil {
+				return err
+			}
+		default:
+			order, err := h.pythonMRO(owner)
+			if err != nil {
+				return err
+			}
+			if order != nil {
+				for _, base := range order[1:] {
+					if err := h.methods(base, d.Name, func(e entry) error {
+						add(e)
+						return nil
+					}); err != nil || len(targets) > 0 {
+						if err != nil {
+							return err
+						}
+						break
+					}
+				}
+				break
+			}
+			err = h.links.lookup(keySuper+refKey(owner), func(super entry) error {
+				if fc.family == "c" {
+					// [class.virtual]: only a virtual member is overridden.
+					if v, err := h.virtual(super.Ref, d.Name); err != nil || !v {
+						return err
+					}
+				}
+				return h.declared(super.Ref, d.Name, func(e entry) error {
+					if overrides(fc.family, sig, e) {
+						add(e)
+					}
+					return nil
+				})
+			})
+			if err != nil {
+				return err
+			}
+		}
+		for _, target := range targets {
+			if err := emit(Binding{Kind: FactOverrides, Site: ref, Target: target, Detail: detail}); err != nil {
+				return err
+			}
+		}
+		if len(targets) > 0 || !d.Override || fc.family == "go" {
+			return nil
+		}
+		external, err := h.externalSupers(fc.family, owner, d.Name)
+		if err != nil || len(external) != 1 {
+			return err
+		}
+		return emit(Binding{Kind: FactOverrides, Site: ref, Detail: DetailSupertype,
+			External: externalMethod(fc.family, external[0].Aux, d.Name)})
+	})
+}
+
+// overrides reports that a method of signature sig, of family, can override
+// the supertype's method e of its name: in Java one that is neither static
+// nor final nor private (JLS §8.4.8.1), and in Java and C++ one of the same
+// signature when both are spelled.
+func overrides(family, sig string, e entry) bool {
+	switch family {
+	case "java":
+		if e.Flags&(flagStatic|flagFinal) != 0 {
+			return false
+		}
+	case "c":
+		if e.Flags&flagStatic != 0 {
+			return false
+		}
+	default:
+		return true
+	}
+	return sig == "" || e.Sig == "" || sig == e.Sig
 }

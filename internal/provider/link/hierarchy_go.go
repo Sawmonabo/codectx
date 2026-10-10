@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"path"
+	"slices"
 	"strings"
 
 	"golang.org/x/mod/modfile"
@@ -36,6 +37,9 @@ const (
 	goFieldRecord
 	// goEmbedRecord is a type the type embeds, in Ref.
 	goEmbedRecord
+	// goExternalRecord is a type outside the unit the type embeds, its
+	// qualified name (externalName) in Aux.
+	goExternalRecord
 )
 
 // addGoMethod records that typ itself declares the method e (keyed under
@@ -82,18 +86,42 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 		}
 	}
 	for _, st := range t.Supertypes {
-		err := h.typesIn(ctx, fc, st.Type, func(sub entry) error {
-			return h.typesIn(ctx, fc, st.Super, func(super entry) error {
-				if sub.Ref == super.Ref {
-					return nil
-				}
-				field := entry{Key: refKey(sub.Ref), Tag: goFieldRecord, Aux: lastComponent(typeName(st.Super), "."),
-					Ref: sub.Ref, Sig: st.Super}
-				if err := methodSets.Add(field); err != nil {
+		var supers []Ref
+		err := h.typesIn(ctx, fc, st.Super, func(super entry) error {
+			supers = append(supers, super.Ref)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		external, ok := "", false
+		if len(supers) == 0 {
+			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil || !ok {
+				return err
+			}
+		}
+		if len(supers) == 0 && !ok {
+			continue
+		}
+		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
+			if slices.Contains(supers, sub.Ref) {
+				return nil
+			}
+			// The embedded field, named by its type's unqualified name.
+			field := entry{Key: refKey(sub.Ref), Tag: goFieldRecord, Aux: lastComponent(typeName(st.Super), "."),
+				Ref: sub.Ref, Sig: st.Super}
+			if err := methodSets.Add(field); err != nil {
+				return err
+			}
+			if ok {
+				return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goExternalRecord, Aux: external})
+			}
+			for _, super := range supers {
+				if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: super}); err != nil {
 					return err
 				}
-				return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: super.Ref})
-			})
+			}
+			return nil
 		})
 		if err != nil {
 			return err
@@ -110,9 +138,12 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 // promote (goSelectors); each promoted method is added to links under the
 // type, so a call on the type, or on an interface it satisfies, reaches the
 // promoted declaration. Each field a selector on the type reaches, its own
-// or promoted, is added under keyGoField. A type satisfies an interface when its method set
-// includes every method of the interface's, by name and signature
-// ("Interface types", "Method sets"). sets holds, under each
+// or promoted, is added under keyGoField, and each type outside the unit it
+// embeds under keyExternalSuper. A type satisfies an interface when its
+// method set includes every method of the interface's, by name and
+// signature ("Interface types", "Method sets"), and, since the method set of
+// a type outside the unit is in no table, when it embeds every such type the
+// interface embeds (goExternalKey). sets holds, under each
 // name-and-signature key, the interfaces whose method sets have it (tag 0)
 // before the types whose method sets have it (tag 1). Each interface's
 // method keys are sorted under its own refKey, ahead of its pairs with types
@@ -172,6 +203,20 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 			tag = 0
 		}
 		return goSelectors(ix, typ, tag == 0, func(name string, m entry, promoted bool) error {
+			if m.Tag == goExternalRecord {
+				// An external embedded type is part of the method set the
+				// satisfaction counts: an interface embedding it is
+				// satisfied only by a type that embeds it too.
+				var flags byte
+				if tag == 0 {
+					flags = flagInterface
+				}
+				err := links.Add(entry{Key: keyExternalSuper + refKey(typ), Ref: typ, Aux: m.Aux, Flags: flags})
+				if err != nil {
+					return err
+				}
+				return sets.Add(entry{Key: goExternalKey + m.Aux, Tag: tag, Ref: typ})
+			}
 			if m.Tag == goFieldRecord {
 				return links.Add(entry{Key: keyGoField + refKey(typ) + name, Ref: m.Ref, Sig: m.Sig})
 			}
@@ -190,17 +235,25 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 	return pairSatisfied(dir, links, sets)
 }
 
+// goExternalKey prefixes the satisfaction key (satisfy's sets) of a type
+// outside the unit that a Go type embeds: no method's name and signature
+// starts with it.
+const goExternalKey = "\x01"
+
 // goSelectors yields the methods and fields a selector on the Go type typ
 // denotes ("Selectors", "Method sets"), each a record of its declaring type
 // (Tag says which): every method and field typ declares, then, depth by
 // depth through its embedded types, each of a name no shallower depth
-// declares. At one depth a name a struct reaches along two or more embedding
+// declares. It also yields, with an empty name, every type outside the unit
+// typ embeds, directly or through its embedded types (goExternalRecord),
+// each once. At one depth a name a struct reaches along two or more embedding
 // paths denotes nothing, and hides the name at every deeper depth; an
 // interface's method set is the union of its embedded interfaces' and admits
 // a name from several of them. An interface embeds only interfaces. Only
 // typ's own walk is held.
 func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry, promoted bool) error) error {
 	have := map[string]bool{}
+	external := map[string]bool{}
 	// level counts the embedding paths reaching each type at the current
 	// depth, two meaning two or more.
 	level := map[Ref]int{}
@@ -209,6 +262,9 @@ func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry
 		case goMethodRecord, goFieldRecord:
 			have[e.Aux] = true
 			return yield(e.Aux, e, false)
+		case goExternalRecord:
+			external[e.Aux] = true
+			return yield("", e, false)
 		case goEmbedRecord:
 			level[e.Ref] = min(level[e.Ref]+1, 2)
 		}
@@ -245,6 +301,9 @@ func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry
 					r.paths = min(r.paths+paths, 2)
 				case e.Tag == goEmbedRecord && !visited[e.Ref]:
 					next[e.Ref] = min(next[e.Ref]+paths, 2)
+				case e.Tag == goExternalRecord && !external[e.Aux]:
+					external[e.Aux] = true
+					return yield("", e, true)
 				}
 				return nil
 			})
@@ -337,7 +396,7 @@ func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry]) erro
 		if n++; pair[:8] != iface || n != want {
 			return nil
 		}
-		return addSubtype(links, refOf(pair[8:]), refOf(pair[:8]))
+		return addSubtype(links, refOf(pair[8:]), refOf(pair[:8]), flagInterface)
 	})
 }
 
