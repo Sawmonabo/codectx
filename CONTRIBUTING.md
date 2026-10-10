@@ -16,6 +16,17 @@ Tree-sitter's official bindings are native code, so a build needs a working C
 toolchain. Release builds must not claim `CGO_ENABLED=0` portability — SQLite's
 CGo-free driver does not remove Tree-sitter's native requirement.
 
+The search index is a Rust crate in `internal/search/textindex`, linked into
+the binary as a static library. Its toolchain is pinned in
+`internal/search/textindex/rust-toolchain.toml` and its crate tree in
+`Cargo.lock` beside it; do not change either without updating
+[docs/toolchain.md](docs/toolchain.md#building-the-binary-the-search-indexs-crate).
+Build the library before anything that links a binary, test binaries included:
+
+```sh
+go generate ./internal/search/textindex   # cargo build --release --locked
+```
+
 Every dependency is pinned to an exact version. No `latest`, and nothing is
 downloaded at runtime that the embedded tool lock does not name with a URL and a
 SHA-256.
@@ -45,6 +56,7 @@ build.
 
 ```sh
 go mod tidy && go mod verify
+go generate ./internal/search/textindex
 gofmt -l .            # must print nothing
 go vet ./...
 git diff --check

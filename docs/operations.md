@@ -35,7 +35,7 @@ reported `unverified` until you pass `--deep`:
 
 | Check | What `--deep` verifies |
 |---|---|
-| `storage_integrity` | `quick_check`, the foreign key check and the full-text index walk |
+| `storage_integrity` | `quick_check` and the foreign key check |
 | `storage_accounting` | the generation, unit, blob, lease and session row counts. The database and write-ahead-log **sizes are still reported without `--deep`**, and so is the warning that the log is past its high-water mark -- that is a file stat, and it is the cheapest real finding this command has. |
 
 A third, `source_retention`, is a bounded sample either way -- four objects
@@ -59,7 +59,7 @@ The parser smoke checks are also `--deep` only.
 - **Workspace and data-directory permissions** — that the data directory exists,
   is user-private and is writable.
 - **Free space** — measured against `resources.min_free_disk_bytes`.
-- **Database schema, full-text index and write-ahead log** — including a
+- **Database schema and write-ahead log** — including a
   write-ahead log larger than the store's ingestion group bound, which means it
   has not been checkpointed since the last run.
 - **The active generation pointer** — whether this repository has one at all.
@@ -199,14 +199,14 @@ Two consequences an operator sees:
   `index` in any process. Pass the printed cursor back to take the next page.
 * A continuation that names state whose deadline has passed, or a generation
   collected in the meantime, is answered `CTX_CURSOR_INVALID`: re-run from the
-  first page. A `search`, `refs` or `impact` answer paged this way is reachable
-  for one `storage.query_cursor_ttl` from its first page, because the spool it
-  reads carries the expiry the page that wrote it stamped and no lease renews
-  it. A walk and a `path` search re-stamp their state on every page, so their
-  deadline advances with the walk.
-* `doctor --deep` is in the recording row, not the answering one: the search
-  index's own integrity check is spelled as an insert into the index, so a deep
-  report needs the writer. It still takes no workspace lock.
+  first page. A `refs` or `impact` answer paged this way is reachable for one
+  `storage.query_cursor_ttl` from its first page, because the spool it reads
+  carries the expiry the page that wrote it stamped and no lease renews it. A
+  walk and a `path` search re-stamp their state on every page, so their deadline
+  advances with the walk. A `search` keeps no state between pages at all: its
+  cursor carries its own position.
+* `doctor --deep` is in the recording row, not the answering one: it opens the
+  store as the writer. It still takes no workspace lock.
 
 ### The one process that is both
 
@@ -532,26 +532,36 @@ they cite a generation that no longer exists.
 
 ## The search index on disk
 
-The lexical tier's index is a directory of its own under the workspace's data
-directory, beside the database ([storage](storage.md#the-search-index)). One
-index holds the search documents of every retained unit; a generation is the
-set of units it makes visible, so the directory does not grow a copy per
-snapshot. Its segments merge in the background, and a unit's documents leave
-it when collection frees the unit.
+The lexical tier's index is a directory beside the database, named after it
+with `.search` appended ([storage](storage.md#the-search-index)). One index
+holds the search documents of every retained unit; a generation is the set of
+documents it makes visible, so the directory does not grow a copy per
+snapshot. Its segments merge in the background, each segment has a block
+summary file (`.cxsum`) beside it, and a document leaves the index when
+collection removes the last row that names it.
+
+Only the process that indexes holds the index's writer, and it gives the
+writer back after each activation, so a later `index`, `refresh` or `gc` in
+another process can take it. The writer's memory is admitted through the same
+ledger as every other stage's.
 
 The index commits before the database activates a generation, with that
 generation's id as its commit payload, so a generation the database has
-activated is always in the index. A crash between the two leaves an index commit
-the database never activated; on the next start, reconciliation deletes the
-documents of units no generation references and re-plans any unit whose
-documents never reached a commit, as it does any unsealed unit. There is
-nothing to run by hand.
+activated is always in the index. A crash between the two leaves an index
+commit the database never activated. The next start of a writing process
+reconciles them: it applies the queued document deletes, deletes the
+documents the lost transaction had numbered, fails every unit whose documents
+the index does not fully hold so the next run re-plans it like any unsealed
+unit, and commits. There is nothing to run by hand.
 
 Like everything else in the data directory, the index is not a source of
-truth. A damaged index directory is recovered the way the store is: remove the
-data directory and re-index ([Rebuilding a workspace](#rebuilding-a-workspace)).
-Removing the index directory alone is not a supported repair, because the
-database's activated generations assume the documents it holds.
+truth. A search that answers `CTX_STORAGE_CORRUPT` with a re-index remediation
+has found the index directory missing, or older than the database's active
+generation: it was removed or replaced. That and a damaged index directory are
+recovered the way the store is: remove the data directory and re-index
+([Rebuilding a workspace](#rebuilding-a-workspace)). Removing the index
+directory alone is not a supported repair, because the database's activated
+generations assume the documents it holds.
 
 ## What a run cost, while it is still running
 

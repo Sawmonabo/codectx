@@ -1264,12 +1264,9 @@ CREATE TABLE native_keys (
     id INTEGER PRIMARY KEY CHECK(id > 0),
     key TEXT NOT NULL
 );
--- No `paths` intern table: the only high-multiplicity path column is
--- search_units.path, and `path` is one of the columns search_fts indexes, fed
--- from this column on every write. Interning it would put a surrogate id where
--- the index expects text, so the path field would leave the full-text index.
--- files.path is 818 rows / 114 KiB on that same fixture and is not an
--- amplifier.
+-- No `paths` intern table: a search document's path lives in the search
+-- index (Section 12.4), not in search_units, and files.path is 818 rows /
+-- 114 KiB on that same fixture and is not an amplifier.
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key_id INTEGER NOT NULL REFERENCES scope_keys(id),
@@ -1285,18 +1282,37 @@ CREATE TABLE search_units (
     file_id BLOB NOT NULL,
     start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
     end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
+    -- The document's identity in the search index. It is allocated from a
+    -- persisted monotonic sequence inside the transaction that writes the row,
+    -- is never reused, and survives collection. A delta carry-over copies it
+    -- with the row, so several units' rows may name one document; a
+    -- generation's visible set is the doc ids of its member units' rows.
+    doc_id INTEGER NOT NULL CHECK(doc_id > 0),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
 );
--- A search document's text, columns, kind, path and token count live in the
+-- A search document's text, columns, kind, path and token counts live in the
 -- search index (Section 12.4); this row is only its identity, from search key
--- to node, with the file and byte range a hit's source window is read from. The per-unit totals are what make N and the total
--- token count of a generation exact sums over its visible units.
-CREATE TABLE search_unit_totals (
-    unit_id INTEGER PRIMARY KEY REFERENCES units(id) ON DELETE CASCADE,
-    document_count INTEGER NOT NULL CHECK(document_count >= 0),
-    token_count INTEGER NOT NULL CHECK(token_count >= 0)
+-- to node, with the file and byte range a hit's source window is read from.
+-- SQLite keeps no per-unit totals: the index counts a generation's statistics
+-- over its alive set. Per unit, `units.search_pending` holds the count of
+-- documents the unit added until the activation that commits them; the
+-- start-up reconcile compares that count with the index's (Section 12.2
+-- invariants).
+-- The next unallocated document id, taken inside the transaction that writes
+-- the rows, so an id is durable exactly when its row is; never lowered, so an
+-- id is never reused.
+CREATE TABLE search_sequence (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    next_doc_id INTEGER NOT NULL CHECK(next_doc_id > 0)
+);
+-- Document ids collection released that the next search-index commit deletes.
+-- A row is queued only when no surviving search_units row names the id, and is
+-- removed by the SQLite transaction that follows the commit applying it.
+CREATE TABLE search_doc_deletes (
+    rowid INTEGER PRIMARY KEY,
+    doc_id INTEGER NOT NULL CHECK(doc_id > 0)
 );
 CREATE TABLE context_manifests (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
@@ -1518,17 +1534,15 @@ CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 -- was a full scan of context_entries per candidate file -- exactly the
 -- pathology idx_context_entries_node exists to prevent, on the sibling column.
 CREATE INDEX idx_context_entries_file ON context_entries(file_id);
-CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
--- deleteUnit releases a posting only when no surviving unit's row still names
--- it, and every read resolves a document by doc_id. Without this index both
--- are a scan of search_units per probe.
+-- An activation reads its member units' doc ids into the visible bitmap and
+-- collection reads a deleted unit's; both are a scan of search_units per unit
+-- without this index, and carrying doc_id in it makes the read index-only.
+CREATE INDEX idx_search_unit ON search_units(unit_id, doc_id);
+-- Collection queues a document's delete only when no surviving unit's row
+-- still names its doc id, and the reconcile finds the units whose rows name a
+-- failed unit's doc ids. Without this index both are a scan of search_units
+-- per probe.
 CREATE INDEX idx_search_doc ON search_units(doc_id);
--- The segment arm of the same column. An activation walks the documents of
--- each segment it is about to merge, re-points every row of the merged inputs
--- and the collector asks, per candidate segment, whether any row still names
--- it; all three are a scan of search_units per segment without this index, and
--- carrying doc_id in it makes the walk index-only.
-CREATE INDEX idx_search_segment ON search_units(segment_id, doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
@@ -1668,74 +1682,16 @@ CREATE TABLE generation_graph_parts (
     PRIMARY KEY(generation_id, stream, part)
 ) WITHOUT ROWID;
 
--- generation_lexical is written LAST, after every generation_segments row, so
--- its presence is the commit marker: a reader that finds the row is guaranteed
--- the generation's whole segment set behind it. It also carries the
--- generation's document statistics, which the scorer would otherwise recompute
--- by probing every visible document (ADR-0007 Decision 1).
-CREATE TABLE generation_lexical (
+-- The generation's visible search documents: a bitmap over doc ids, bit
+-- id mod 8 of byte id/8, least significant bit first, with a bit set for every
+-- search_units.doc_id of the generation's member units. It is computed in the
+-- activation transaction, after the search index committed with this
+-- generation's id as its payload, and a view of the generation turns it into
+-- each index segment's alive set (Section 12.4).
+CREATE TABLE generation_search (
     generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
-    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
-    token_total INTEGER NOT NULL CHECK(token_total >= 0),
-    -- The generation's visible documents, one bit per document rowid. A
-    -- document an inherited segment still holds but whose unit left the
-    -- generation is hidden here; nothing is rewritten to hide it, and a reader
-    -- takes the bitmap as it stands instead of scanning the generation's
-    -- documents to rebuild it.
     visible BLOB NOT NULL
 );
-
--- A lexical segment is an immutable packed structure over a set of documents:
--- the term directory, the term text it points into, the posting lists and the
--- per-document attributes of the documents they name, each
--- chunked into lexical_segment_parts. A segment is written once, by the seal of
--- the unit whose documents it holds, and is never rewritten; an activation
--- names segments, it does not rebuild them (ADR-0007 Decision 1).
-CREATE TABLE lexical_segments (
-    id INTEGER PRIMARY KEY,
-    term_count INTEGER NOT NULL CHECK(term_count >= 0),
-    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
-    bytes INTEGER NOT NULL CHECK(bytes >= 0)
-);
-
--- One chunk of one segment stream. `term.dir` is the fixed-width term
--- directory in term order -- term slice, document frequency and the slice of
--- `post.list` holding that term's per-document (column, count) sequence --
--- `term.text` the concatenated term bytes it points into, and `post.list` the
--- posting lists themselves, whose documents ascend by rowid. `doc.dir` is the
--- fixed-width document directory in ascending document rowid and `doc.attr`
--- the attribute records it points into: every field a search candidate is
--- served from, packed once per document, so a page of candidates is hydrated
--- from these bytes instead of one document-row read each (ADR-0007 Decision 2). `part` is 0-based
--- and the parts of a stream concatenate to it, so a reader holds a bounded
--- window of parts rather than a whole vocabulary.
-CREATE TABLE lexical_segment_parts (
-    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE CASCADE,
-    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list','doc.dir','doc.attr')),
-    part INTEGER NOT NULL CHECK(part >= 0),
-    bytes BLOB NOT NULL,
-    PRIMARY KEY(segment_id, stream, part)
-) WITHOUT ROWID;
-
--- The segment set of one generation, in read order. The set is DERIVED at
--- activation from search_units.segment_id -- the distinct segments the live
--- rows of the generation's member units point at -- and recorded here so a
--- reader resolves it with one scan; nothing is rewritten to publish it, and a
--- retained generation keeps its own rows when a later generation merges the
--- same segments away. The reference is RESTRICT rather than CASCADE: a segment
--- a generation still names must not be collectable while that row exists.
-CREATE TABLE generation_segments (
-    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
-    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE RESTRICT,
-    ord INTEGER NOT NULL CHECK(ord >= 0),
-    -- How many of the segment's documents this generation hides. Zero is the
-    -- common case and is what lets a document frequency answer from the term
-    -- directory; a segment with hidden documents is counted by walking the
-    -- term's posting list against the visible bitmap instead.
-    hidden INTEGER NOT NULL CHECK(hidden >= 0),
-    PRIMARY KEY(generation_id, ord)
-) WITHOUT ROWID;
-CREATE INDEX idx_generation_segments_segment ON generation_segments(segment_id, generation_id);
 ```
 
 Storage invariants beyond DDL:
@@ -1746,8 +1702,8 @@ Storage invariants beyond DDL:
 - `node_facts` and `relation_facts` have supporting evidence before seal. Native aliases remain scoped. `unit_dependencies` is acyclic and references sealed dependencies.
 - Session history, context entries, observation references, leases, and capsule scope must belong to the session/manifest's generation and snapshot. Exact actor identity is checked by the application on every session operation.
 - Immutable unit tables are never updated after seal. Source manifests, sealed manifests, and capsules are also immutable. Current session pointers and versioned workflow state are explicitly mutable.
-- A unit's search documents are added to the search index once, when the unit is first built, and deleted from it (by term on the `unit` field) only when collection frees the unit. Unit/GC deletion uses the store's deletion procedure, not raw `DELETE units`; the procedure deletes the unit's documents from the search index as well as its rows.
-- The search index commits first, with the generation's id as its commit payload, and SQLite activates the generation after that, so a generation SQLite has activated is always committed in the search index. On start, reconciliation deletes the documents of units no SQLite generation references and re-plans any unit whose documents never reached a commit, like any other unsealed unit. Normal unit sealing validates that the unit emitted the exact expected document keys; nothing rebuilds the whole index for a small refresh.
+- A unit's search documents are added to the search index once, when the unit is first built, each under the `doc_id` its `search_units` row carries. A document is deleted from the index when collection removes the last row that names its doc id: unit/GC deletion uses the store's deletion procedure, not raw `DELETE units`, and the procedure queues the released doc ids in `search_doc_deletes`, which the next search-index commit applies.
+- The search index commits first, with the generation's id in decimal as its commit payload, and the SQLite activation transaction follows, writing `generation_search`, clearing the member units' pending marks and removing the applied delete rows; so a generation SQLite has activated is always committed in the search index. On start, a writing store reconciles: it applies the queued deletes, deletes every index document whose doc id is at or past the sequence's next unallocated id, fails every pending unit whose document count the index does not match (with every unit whose rows name one of its doc ids) so it is re-planned like any other unsealed unit, then commits with the active generation as the payload and releases the writer. A payload older than the active generation means the index directory was lost or replaced, and every search then answers `CTX_STORAGE_CORRUPT` with a re-index remediation. Normal unit sealing validates that the unit emitted the exact expected document keys; nothing rebuilds the whole index for a small refresh.
 
 <a id="123-generation-activation-and-failure-isolation"></a>
 ### 12.3 Generation Activation and Failure Isolation
@@ -1776,9 +1732,9 @@ An active-generation lookup and its retention lease are acquired consistently un
 <a id="124-search-isolation-storage-growth-and-cleanup"></a>
 ### 12.4 Search Isolation, Storage Growth, and Cleanup
 
-The lexical index is one embedded search index, linked into the binary, that holds the search documents of every retained unit: compressed postings with frequencies and positions in immutable segments read through memory maps, a dictionary per column, and fast (columnar) fields for `unit`, `kind`, the path and `token_count`. The index keeps only its latest commit, so a snapshot is not an index directory: a generation is a **visibility set** of units over the one index. The set comes from SQLite's list of the generation's units, is resolved once per term ordinal of the `unit` fast field, and is expanded per segment into a bitset over document ids. Hidden documents are never candidates, and they never count in the document count N, in the total token count or in document frequency, so another generation's documents cannot change a pinned result. Canonical lexical ranking therefore uses **generation-scoped BM25F statistics**, exact for the generation being searched: N and the total token count are sums of per-unit totals held in SQLite, and df is counted over visible postings. The route that applies the set (the segment's alive set, a query wrapper or the collector) is **pending**: it is chosen by its time on the reference export at 10% and 50% of units hidden, and all three routes give identical pages. [12](#ref-12)
+The lexical index is one embedded search index, linked into the binary, that holds the search documents of every retained unit in a directory beside the database (`<database>.search`) that the store owns, creates, recovers and removes: compressed postings with frequencies and positions in immutable segments read through memory maps, a dictionary per column, and fast (columnar) fields for `doc_id`, `unit`, `kind`, the path, the other served fields and the five per-column token counts. The index keeps only its latest commit, so a snapshot is not an index directory: a generation is a **visible set of documents** over the one index, a bitmap over doc ids of every `search_units.doc_id` of its member units, stored in `generation_search`. Visibility is per document because a delta carry-over keeps only part of its predecessor's documents (it drops those of replaced files and dead nodes), so a set of visible units would show documents the carrying unit dropped. A view of the generation turns the bitmap into each segment's alive set from the `doc_id` column, once per (generation, segment), cached with the searcher within the query memory budget. Hidden documents are never candidates, and they never count in the document count N, in the length sums or in document frequency, so another generation's documents cannot change a pinned result. Canonical lexical ranking therefore uses **generation-scoped BM25F statistics**, exact for the generation being searched: the index counts N and the length sums over the alive set once per (generation, searcher), and df per query term over alive postings; SQLite keeps no per-unit totals. [12](#ref-12)
 
-Each document is tokenized once, when its unit is added. The tokenizer forms tokens from letters, numbers and private-use characters, treats everything else as a separator, folds case and removes diacritics, and has no silent length cut. Whether a **code-aware form** replaces it is **pending**: that form emits the whole identifier and also its camelCase and snake_case parts at the same position, and it is adopted if it lifts the subword set, holds the name set within 0.01 MRR@10 and does not lower the doc set. The writer's thread count and memory budget, the merge threads and the search executor are derived from the admission's measured need like every other worker, with no fixed constant. The index commits once per generation activation, never once per unit, and its background merges replace any merge at activation. Section 14 defines scoring and pagination.
+Each document is tokenized once, when its unit is added. The tokenizer forms tokens from letters, numbers and private-use characters, treats everything else as a separator, folds case and removes diacritics, and has no silent length cut; it is **code-aware**: a token with two or more camelCase parts is indexed whole and also as each part at the same position (snake_case needs nothing more, `_` separates). A document's length is its token count over all five columns, parts included, counted at add time and stored per column. The writer is opened by the first change and released after each activation's commit so another process can write; its threads, merge threads and search threads are the machine's CPU count, its memory the library's per-thread floor times its threads admitted through the admission ledger, and the number of searches at once the machine's query slots, with no fixed constant. The index commits once per generation activation, never once per unit, and its background merges replace any merge at activation; each segment's block summary is built at the commit or merge that makes it searchable. Section 14 defines scoring and pagination.
 
 Retention keeps the results of the last `retain_refs` distinct refs (branches or commits) the user actually indexed, not the last N index snapshots: switching A → B → C → A must find A's SCIP and link units still on disk and reuse them without a run. Each activated generation records the ref it was built from; a ref's most recent generation is retained while the ref is among the last `retain_refs` worked on, and every unit any retained generation references is retained with it. Sealed but not yet activated units (a link unit still refreshing when the user switched away) are retained by the same rule through the generation they were produced for. There is no default size limit on this store; `[index] max_retained_bytes` is user-set only, `0` by default, and when set it evicts least-recently-used refs first and never the active one, exactly the user-set-only posture memory has. Generation removal deletes only membership and metadata after leases/session references are resolved. Units referenced by another retained generation or unit dependency remain. Remove unreachable units in reverse dependency order through the store's deletion procedure, which also deletes their documents from the search index, then orphan identities and origin runs, then unreferenced source blobs using the GC grace protocol. Report disk categories separately; generation pruning does not justify unbounded retained completed sessions or graph query spools.
 An alias may identify a node defined by a completed dependency rather than copying its attributes into the alias-owning unit; the seal validator requires that target to be visible through the unit/dependency closure. An idempotency-key collision with a different open-request hash fails rather than reusing a session. Snapshot header counts are computed/validated at seal, not rescanned on every status call. Graph query spools are bounded private files whose signed cursor header and durable lease bind their generation, expiry and immutable query; no second database catalog is introduced.

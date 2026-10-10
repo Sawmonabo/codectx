@@ -248,7 +248,7 @@ definition's canonical key is its file and byte range, so an unchanged
 document's definitions must be re-derived here or a reference from a changed
 document to a symbol defined in an unchanged one would mint a second, unlocated
 identity instead of naming the stored node. The delta therefore buys the
-storage, FTS and reconcile cost of the unchanged documents — which is where
+storage, search-index and reconcile cost of the unchanged documents — which is where
 almost all of the import cost lives — and not their position-conversion cost.
 
 **Removal is set-based.** A deleted source file yields no `Document` at all, not

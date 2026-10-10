@@ -472,22 +472,53 @@ linked through cgo into the one codectx binary
 ([ADR-0013](adr/ADR-0013-search-index.md), decision 1). The binary already needs
 cgo for its parser grammars, and every release leg already builds on a runner of
 its own target, so the crate adds a compiler to each leg rather than a new kind
-of leg:
+of leg.
 
-- **A pinned Rust toolchain on every native leg.** Every release and CI leg
-  installs one exact Rust toolchain version, pinned the way the Go toolchain is,
-  and builds the crate for that leg's own target. The release never builds with
-  a toolchain it did not pin.
+**Where it lives.** The crate is `internal/search/textindex/`, beside the Go
+package of the same name that calls it:
+
+| File | What it fixes |
+|---|---|
+| `Cargo.toml` | the crate, built as a static library, its exact dependency versions and the release profile |
+| `Cargo.lock` | every crate in the tree, with its version and checksum |
+| `rust-toolchain.toml` | the one Rust toolchain version the crate builds with, and the components it needs |
+| `.cargo/config.toml` | the target directory, `_build/`, which Go's `./...` patterns skip |
+
+**The build is two steps.**
+
+```sh
+go generate ./internal/search/textindex   # cargo build --release --locked
+go build -trimpath -o ./bin/codectx ./cmd/codectx
+```
+
+The first leaves `_build/release/libcodectx_textindex.a`; the second links it
+through cgo. `go vet` and `go build` of a package that does not link a binary
+need no archive. A test binary of a package that reaches the index, and every
+binary, does.
+
+**Reproducible bytes.** `--locked` refuses a build whose lock would change, and
+Cargo verifies every crate it fetches against the checksum `Cargo.lock`
+records, so the same commit builds from the same sources. The release profile
+makes those sources build to the same archive bytes: one codegen unit, no
+incremental compilation, no debug information, unwinding panics (every export
+catches a panic, which needs them), and the generate step maps the home
+directory, where Cargo keeps the crate sources, out of every embedded path
+(`--remap-path-prefix=$HOME=~`), so the archive names no build host. Two clean builds of one commit produce archives with the same
+SHA-256.
+
+**What a release or CI leg needs.**
+
+- **The pinned Rust toolchain**, the version `rust-toolchain.toml` names,
+  installed for that leg's own target. The release never builds with a
+  toolchain it did not pin.
 - **Windows uses the GNU targets.** Go's cgo links through the MinGW toolchain,
   so the crate is built for `x86_64-pc-windows-gnu` on amd64 and for
   `aarch64-pc-windows-gnullvm` on arm64, never for the MSVC targets.
-- **The crate tree is locked and vendored.** `Cargo.lock` pins every crate the
-  library depends on, and the tree is vendored in the repository, so a release
-  build fetches nothing from a registry and the same commit builds the same
-  bytes.
-- **Nothing reaches the user.** The crate is linked into the binary, so the
-  user installs no Rust toolchain and no library; codectx is still one
-  executable.
+- **The crates `Cargo.lock` names**, fetched from the registry or present in
+  the leg's Cargo cache, and the `go generate` step before `go build`.
+
+**Nothing reaches the user.** The crate is linked into the binary, so the user
+installs no Rust toolchain and no library; codectx is still one executable.
 
 ## Licenses
 
@@ -495,6 +526,7 @@ Every pinned payload's license is recorded in the lock entry and in
 `THIRD_PARTY_LICENSES.md`. No pinned tool requires a paid service, a network
 service at query time, or an AI API key.
 
-The search index's crate tree is part of the same inventory: every crate in
-`Cargo.lock`, the library itself included, is recorded in
-`THIRD_PARTY_LICENSES.md` with its version and license.
+The search index's crate tree is part of the same inventory: every crate the
+archive links (the normal dependencies `Cargo.lock` resolves, the library
+itself included) is recorded in `THIRD_PARTY_LICENSES.md` with its version and
+license.

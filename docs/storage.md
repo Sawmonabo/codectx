@@ -107,24 +107,31 @@ attached documentation over the whole declaration's extent, and the filesystem
 provider publishes no body — so rebuilding a document from the file would index
 text that was never any document's body and silently change that document's
 hits, BM25F length and snippets on every delta. The carry-over copies the
-documents' identity rows and the unit's document and token totals, and the
-documents themselves stay in the search index exactly as they were added. The
-whole carry-over reads and writes no text.
+identity rows of the documents it keeps, each with its `doc_id`, and drops those
+of replaced files and of nodes that no longer exist; the documents themselves
+stay in the search index exactly as they were added, and the new generation's
+visible set names the kept doc ids. The whole carry-over reads and writes no
+text.
 
 ## The search index
 
 The lexical tier's postings live in an embedded search library, built in this
 repository as a static library and linked into the one binary
-([ADR-0013](adr/ADR-0013-search-index.md)). Its index is a directory of its own
-under the data directory: compressed postings with frequencies and positions,
-immutable segments read through memory maps, a dictionary per column, and fast
-(columnar) fields for `unit`, `kind`, the path and `token_count`. SQLite keeps
+([ADR-0013](adr/ADR-0013-search-index.md)). Its index is a directory beside the
+database, `<database>.search`, owned by the store: the store opens it after the
+database, closes it after the database's last user, and removes it wherever it
+removes the database. The index holds compressed postings with frequencies and
+positions, immutable segments read through memory maps, a dictionary per
+column, and fast (columnar) fields: `doc_id`, `unit`, `kind`, the path and the
+other fields a hit serves, and the five per-column token counts. SQLite keeps
 what is not postings:
 
 - each search document's identity row in `search_units`, from search key to
-  node, file and byte range;
-- each unit's document count and total token count, so a generation's N and
-  total token length are sums over its visible units;
+  node, file, byte range and `doc_id`;
+- the doc-id sequence, each unit's pending mark until its documents are
+  committed, and `search_doc_deletes`, the documents collection released that
+  the next library commit deletes;
+- `generation_search`, each generation's visible bitmap;
 - everything that is not search: files, symbols, relations, evidence, snapshots
   and units.
 
@@ -136,36 +143,61 @@ carries. Generic results still carry no body (Section 14.2).
 
 **One index holds every retained unit.** The library keeps only its latest
 commit, so a snapshot is not an index directory. A unit's documents are added
-once, when the unit is first built, carrying the unit's content-keyed digest in
-the `unit` field. A generation is a **visibility set** over the one index: its
-member units, read from SQLite, resolved once per term ordinal of the `unit`
-fast field and expanded per segment into a bitset over document ids. Hidden
-documents are never candidates, and they never count in N, in the total token
-count or in a term's document frequency, so a generation ranks exactly like an
-index of only its visible documents. Which route applies that bitset — each
-segment's alive set, a query wrapper, or the collector — is **pending**: it is
-chosen by its time at 10% and 50% of units hidden on the reference export, and
-all three give identical pages.
+once, when the unit is first built. Each carries a `doc_id`, allocated from a
+monotonic sequence inside the transaction that writes its row and never reused,
+and the adding unit's content-keyed digest in `unit`. A generation's visible set
+is a bitmap over doc ids (bit id mod 8 of byte id/8, least significant bit
+first) of every `search_units.doc_id` of its member units, computed in the
+activation transaction. A view of the generation turns it into each segment's
+alive set, read from the `doc_id` column once per (generation, segment) and
+cached with the searcher. Hidden documents are never candidates, and they never
+count in N, in the length sums or in a term's document frequency, which the
+library counts over the alive set, so a generation ranks exactly like an index
+of only its visible documents. Visibility is per document rather than per unit
+because a delta carry-over keeps only part of its predecessor's documents: a
+set of visible units would show the documents the carrying unit dropped.
 
-**Writing and committing.** The library's multi-threaded writer takes its
-thread count and memory budget from the admission's measured need, like every
-other worker; its merge threads and the search executor are governed the same
-way, and none of them has a fixed constant. A unit's documents are added in one
-call, and the index commits **once per generation activation**, never once per
-unit: a commit costs one fsync, and a commit per unit would cost minutes on a
-large repository. Units added between commits are invisible until their
-generation activates. The library merges its segments in the background, so an
-activation never touches postings.
+**Writing and committing.** The library's multi-threaded writer is opened by
+the first call that changes the index and stays open across a run. Its threads,
+its merge threads and the search threads are the machine's CPU count, and its
+memory is the library's per-thread floor times its threads, admitted through the
+admission ledger before it opens and given back when it closes. A unit's
+documents are added in one call after its rows are written, and the index
+commits **once per generation activation**, never once per unit: a commit costs
+one fsync, and a commit per unit would cost minutes on a large repository.
+Documents added between commits are invisible until their generation activates.
+The writer is released after each activation's commit, and after the commit
+that ends a collection sweep run outside an activation, so another process can
+write; a release waits for running merges. The library merges its segments in
+the background, so an activation never touches postings. After each commit and
+each merge, every segment that lacks a block summary gets one
+([queries](queries.md#how-search-serves-a-page)).
 
 **Crash order and recovery.** The library commits first, with the generation's
-id as its payload, and SQLite activates the generation after that. A
-generation SQLite has activated is therefore always committed in the index. On
-start, reconciliation deletes the documents of units that no SQLite generation
-references and re-plans any unit whose documents never reached a commit, like
-any other unsealed unit. A unit's documents are deleted only when collection
-frees the unit, by term on the `unit` field. Nothing in the index directory is
-a source of truth: an index lost with its data directory is rebuilt by
-re-indexing, as the rest of the directory is.
+id in decimal as its payload, and applies the queued document deletes in that
+commit. The SQLite activation transaction follows: it stores the visible
+bitmap, clears the member units' pending marks and removes the applied delete
+rows. A generation SQLite has activated is therefore always committed in the
+index. On start, `Store.Recover` in a store that writes reconciles the two:
+
+1. it applies the queued document deletes;
+2. it deletes every document whose doc id is at or past the sequence's next
+   unallocated id, which a lost SQLite transaction allocated;
+3. for every unit still marked pending, it compares the index's count of the
+   unit's documents with the unit's own; on a mismatch it fails the unit,
+   together with every unit whose rows name one of its doc ids, and those units
+   are re-planned like any other unsealed unit;
+4. it commits, with the active generation as the payload, and releases the
+   writer.
+
+A document leaves the index when collection deletes the last `search_units`
+row that names its doc id. A commit payload naming a generation older than the
+active one means the index directory was lost or replaced; the store still
+opens, and every search answers `CTX_STORAGE_CORRUPT` with a re-index
+remediation, as it does on a read-only open of a database whose index directory
+is missing. Nothing in the index directory is a source of truth: an index lost
+with its data directory is rebuilt by re-indexing, as the rest of the directory
+is.
 
 ## Discarding a unit: two costs, two paths
 
