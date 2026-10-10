@@ -27,7 +27,12 @@ import (
 //   - the manifest fields (manifestFields): key and value, strings;
 //   - the member records, by FileID (record);
 //   - the bindings, by site then target (idBinding): site file, site index,
-//     target file, target node and the technique as one byte.
+//     target file, target node and the technique as one byte;
+//   - the index groups, by key (group), the recorded reads, by key (read),
+//     and the address-taken functions, by the member taking them (taken),
+//     each record a string of its encoded form: what a refresh of a
+//     static-family unit finds its re-runs from (trace.go), empty for a
+//     family whose resolution records no reads.
 //
 // A string is its length (an unsigned varint) and its bytes. A state that is
 // short, long, out of order or malformed is corrupt storage.
@@ -339,8 +344,8 @@ func (r *byteReader) count() int64 {
 	return int64(n)
 }
 
-// writeState stores fields, records (by FileID) and bindings (by site) to w.
-func writeState(w io.Writer, fields []manifestField, records *pagination.SortedRun[record], bindings *pagination.SortedRun[idBinding]) error {
+// writeState stores fields, records (by FileID) and res to w.
+func writeState(w io.Writer, fields []manifestField, records *pagination.SortedRun[record], res *resolution) error {
 	bw := bufio.NewWriter(w)
 	out := binary.AppendUvarint([]byte(stateTag), uint64(len(fields)))
 	for _, f := range fields {
@@ -357,10 +362,10 @@ func writeState(w io.Writer, fields []manifestField, records *pagination.SortedR
 		})
 	}
 	if err == nil {
-		_, err = bw.Write(binary.AppendUvarint(nil, uint64(bindings.Len())))
+		_, err = bw.Write(binary.AppendUvarint(nil, uint64(res.bindings.Len())))
 	}
 	if err == nil {
-		err = bindings.Each(func(b idBinding) error {
+		err = res.bindings.Each(func(b idBinding) error {
 			rec, err := encodeIDBinding(b)
 			if err == nil {
 				_, err = bw.Write(rec)
@@ -369,10 +374,63 @@ func writeState(w io.Writer, fields []manifestField, records *pagination.SortedR
 		})
 	}
 	if err == nil {
+		err = writeSection(bw, res.groups, encodeGroup)
+	}
+	if err == nil {
+		err = writeSection(bw, res.reads, encodeRead)
+	}
+	if err == nil {
+		err = writeSection(bw, res.taken, encodeTaken)
+	}
+	if err == nil {
 		err = bw.Flush()
 	}
 	if err != nil {
 		return internalErr("link resolution state: " + err.Error())
+	}
+	return nil
+}
+
+// writeSection writes run's count, then each record's encoded form as a
+// string.
+func writeSection[T any](bw *bufio.Writer, run *pagination.SortedRun[T], encode func(T) ([]byte, error)) error {
+	if _, err := bw.Write(binary.AppendUvarint(nil, uint64(run.Len()))); err != nil {
+		return err
+	}
+	return run.Each(func(v T) error {
+		rec, err := encode(v)
+		if err == nil {
+			_, err = bw.Write(appendString(nil, string(rec)))
+		}
+		return err
+	})
+}
+
+// readSection reads one section writeSection wrote, refusing records out of
+// order (or, with strict, repeated).
+func readSection[T any](s stateReader, what string, decode func([]byte) (T, error), compare func(a, b T) int,
+	strict bool, add func(T) error) error {
+	n, err := s.uvarint("its " + what + " count")
+	if err != nil {
+		return err
+	}
+	var last T
+	for i := uint64(0); i < n; i++ {
+		raw, err := s.str("a record of its " + what)
+		if err != nil {
+			return err
+		}
+		v, err := decode([]byte(raw))
+		if err != nil {
+			return stateCorrupt(err.Error())
+		}
+		if c := compare(last, v); i > 0 && (c > 0 || strict && c == 0) {
+			return stateCorrupt("its " + what + " are out of order")
+		}
+		last = v
+		if err := add(v); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -421,7 +479,8 @@ func (s stateReader) byte(what string) (byte, error) {
 // readState streams a stored state's sections to field, rec and bind, each
 // in its stored order, and refuses a state that is short, long, out of
 // order or malformed.
-func readState(r io.Reader, field func(manifestField) error, rec func(record) error, bind func(idBinding) error) error {
+func readState(r io.Reader, sink stateSink) error {
+	field, rec, bind := sink.field, sink.record, sink.binding
 	s := stateReader{br: bufio.NewReader(r)}
 	tag := make([]byte, len(stateTag))
 	if _, err := io.ReadFull(s.br, tag); err != nil || string(tag) != stateTag {
@@ -530,27 +589,52 @@ func readState(r io.Reader, field func(manifestField) error, rec func(record) er
 			return err
 		}
 	}
+	if err := readSection(s, "index groups", decodeGroup, compareGroup, true, sink.group); err != nil {
+		return err
+	}
+	if err := readSection(s, "recorded reads", decodeRead, compareRead, true, sink.read); err != nil {
+		return err
+	}
+	if err := readSection(s, "address-taken functions", decodeTaken, compareTakenFrom, true, sink.taken); err != nil {
+		return err
+	}
 	if _, err := s.br.ReadByte(); err != io.EOF {
-		return stateCorrupt("it holds more than its " + strconv.FormatUint(n, 10) + " bindings")
+		return stateCorrupt("it holds more than its sections")
 	}
 	return nil
+}
+
+// stateSink receives a stored state's sections, each in its stored order.
+type stateSink struct {
+	field   func(manifestField) error
+	record  func(record) error
+	binding func(idBinding) error
+	group   func(group) error
+	read    func(read) error
+	taken   func(taken) error
 }
 
 // ValidateState reads a stored resolution state through and reports whether
 // it is well formed, so a build can resolve in full instead of handing Link a
 // state it would refuse once it had begun publishing.
 func ValidateState(r io.Reader) error {
-	discard := func(manifestField) error { return nil }
-	return readState(r, discard, func(record) error { return nil }, func(idBinding) error { return nil })
+	return readState(r, stateSink{
+		field:   func(manifestField) error { return nil },
+		record:  func(record) error { return nil },
+		binding: func(idBinding) error { return nil },
+		group:   func(group) error { return nil },
+		read:    func(read) error { return nil },
+		taken:   func(taken) error { return nil },
+	})
 }
 
 // previous is a predecessor's state as one build reads it: its manifest
-// fields, and its records and bindings spilled to sorted runs in the unit's
-// scratch directory.
+// fields, and its records and resolution spilled to sorted runs in the
+// unit's scratch directory.
 type previous struct {
-	fields   []manifestField
-	records  *pagination.SortedRun[record]
-	bindings *pagination.SortedRun[idBinding]
+	fields  []manifestField
+	records *pagination.SortedRun[record]
+	resolution
 }
 
 // loadState reads a stored state into dir.
@@ -565,28 +649,61 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 		return nil, err
 	}
 	defer bindings.Close()
-	p := &previous{}
-	err = readState(r, func(f manifestField) error {
-		p.fields = append(p.fields, f)
-		return nil
-	}, records.Add, bindings.Add)
+	groups, err := newGroupSort(dir)
 	if err != nil {
 		return nil, err
 	}
+	defer groups.Close()
+	reads, err := newReadSort(dir, compareRead)
+	if err != nil {
+		return nil, err
+	}
+	defer reads.Close()
+	takenSort, err := newTakenSort(dir, compareTakenFrom)
+	if err != nil {
+		return nil, err
+	}
+	defer takenSort.Close()
+	p := &previous{}
+	err = readState(r, stateSink{
+		field: func(f manifestField) error {
+			p.fields = append(p.fields, f)
+			return nil
+		},
+		record: records.Add, binding: bindings.Add, group: groups.Add, read: reads.Add, taken: takenSort.Add,
+	})
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			p.close()
+		}
+	}()
 	if p.records, err = records.Sorted(); err != nil {
 		return nil, err
 	}
 	if p.bindings, err = bindings.Sorted(); err != nil {
-		p.records.Close()
 		return nil, err
 	}
+	if p.groups, err = groups.Sorted(); err != nil {
+		return nil, err
+	}
+	if p.reads, err = reads.Sorted(); err != nil {
+		return nil, err
+	}
+	if p.taken, err = takenSort.Sorted(); err != nil {
+		return nil, err
+	}
+	ok = true
 	return p, nil
 }
 
 func (p *previous) close() {
 	if p != nil {
 		p.records.Close()
-		p.bindings.Close()
+		p.resolution.close()
 	}
 }
 

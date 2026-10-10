@@ -72,15 +72,13 @@ type Binding struct {
 // binds publishes nothing, and its structural call stands alone.
 type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
 
-// resolverFor is the resolution of decision 2 for a unit's language family.
+// resolverFor is the flow family's resolution of decision 2 (resolve has
+// the static family's).
 func resolverFor(f Family) resolver {
-	switch f {
-	case FamilyJavaScript:
-		return resolveECMAScript
-	case FamilyPython:
+	if f == FamilyPython {
 		return resolvePython
 	}
-	return resolveStatic
+	return resolveECMAScript
 }
 
 // members is a unit's member files in ascending FileID order: each live

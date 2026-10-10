@@ -24,8 +24,12 @@ import (
 // as they are, named by identity, and a body edit that leaves its table's
 // digest costs the republication of its own file and nothing else.
 //
-// When the bindings are found again, they are diffed against the
-// predecessor's: a file whose sites' bindings changed is republished, and so
+// When the bindings are found again, a Go, Java, Rust, C or C++ unit
+// re-runs only the members whose table moved, that are new, or whose
+// recorded reads changed (static.go, trace.go), and keeps every other
+// member's bindings; a Python or ECMAScript unit resolves every site, its
+// inference being one fixed point over the unit. The bindings are then
+// diffed against the predecessor's: a file whose sites' bindings changed is republished, and so
 // is a file the set of whose targeted declarations changed, since a target's
 // occurrence is published in its own file and a carried relation into a
 // newly targeted declaration needs it there. Every other file's facts are
@@ -76,6 +80,31 @@ type refresh struct {
 	// and those of the predecessor's members that are gone: every file the
 	// carry-over names replaced.
 	changed *pagination.ExternalSort[model.FileID]
+	// moved collects the members whose table digest moved or that are new
+	// with a table, whose own sites resolve again whatever they read; gone
+	// the predecessor's members that are no longer members.
+	moved, gone *pagination.ExternalSort[model.FileID]
+}
+
+// open makes rf's sorts in its unit's directory.
+func (rf *refresh) open() error {
+	var err error
+	if rf.changed, err = newFileIDSort(rf.u.dir); err != nil {
+		return err
+	}
+	if rf.moved, err = newFileIDSort(rf.u.dir); err != nil {
+		return err
+	}
+	rf.gone, err = newFileIDSort(rf.u.dir)
+	return err
+}
+
+func (rf *refresh) close() {
+	for _, s := range []*pagination.ExternalSort[model.FileID]{rf.changed, rf.moved, rf.gone} {
+		if s != nil {
+			s.Close()
+		}
+	}
 }
 
 func newFileIDSort(dir string) (*pagination.ExternalSort[model.FileID], error) {
@@ -105,6 +134,9 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		if err := rf.changed.Add(old.File); err != nil {
 			return err
 		}
+		if err := rf.gone.Add(old.File); err != nil {
+			return err
+		}
 		old, ok, err = next()
 		return err
 	}
@@ -121,6 +153,11 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		if ok && old.File == fv.ID {
 			if old.Digest != digest {
 				rf.resolve = true
+				if digest != "" {
+					if err := rf.moved.Add(fv.ID); err != nil {
+						return err
+					}
+				}
 			}
 			// A member whose table moved is republished even with its bytes
 			// unchanged: its occurrences are published from its table.
@@ -134,6 +171,9 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		}
 		if digest != "" {
 			rf.resolve = true
+			if err := rf.moved.Add(fv.ID); err != nil {
+				return err
+			}
 		}
 		return rf.changed.Add(fv.ID)
 	})
@@ -164,8 +204,8 @@ func (rf *refresh) diff(fresh *pagination.SortedRun[idBinding], targets *paginat
 // diffGroups merges a and b, both sorted with key ascending, and calls changed
 // once for each key whose run of entries differs between them: an entry in
 // one only, or an entry that is not the same as the other's at its place.
-func diffGroups[T any](a, b *pagination.SortedRun[T], key func(T) model.FileID, same func(x, y T) bool,
-	changed func(model.FileID) error) error {
+func diffGroups[T any, K cmp.Ordered](a, b *pagination.SortedRun[T], key func(T) K, same func(x, y T) bool,
+	changed func(K) error) error {
 	na, sa := pull(a)
 	defer sa()
 	nb, sb := pull(b)
@@ -179,7 +219,7 @@ func diffGroups[T any](a, b *pagination.SortedRun[T], key func(T) model.FileID, 
 		return err
 	}
 	for xok || yok {
-		var k model.FileID
+		var k K
 		switch {
 		case !yok || xok && key(x) < key(y):
 			k = key(x)

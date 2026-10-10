@@ -386,6 +386,11 @@ func goModulePath(ctx context.Context, u *unit) (string, error) {
 // continues with, and any other path the module's vendor directory's copy.
 // A unit with no module path binds no import path.
 func (h *hierarchy) goPackages(importPath string, yield func(string) error) error {
+	if h.note != nil {
+		if err := h.note(traceManifest + fieldGoModule); err != nil {
+			return err
+		}
+	}
 	if h.goModule == "" {
 		return nil
 	}

@@ -10,7 +10,9 @@
 // declaration node, whose identity a body edit or an inserted declaration
 // does not move (ADR-0014). A build against its predecessor's state
 // (LinkOptions.Previous) keeps the predecessor's bindings unless a member's
-// table digest, the membership or a manifest field the linker reads moved,
+// table digest, the membership or a manifest field the linker reads moved;
+// then a static-family unit re-runs only the members whose recorded reads
+// changed (trace.go), and a flow-family unit resolves in full. It
 // republishes only the members whose facts changed (refresh.go), and the
 // build carries the rest over (docs/providers-link.md).
 //
@@ -34,8 +36,8 @@ import (
 
 	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -88,8 +90,9 @@ type LinkOptions struct {
 	// Previous streams the predecessor's resolution state, which the build
 	// validates first (ValidateState): Link refuses a corrupt one. With it,
 	// Link classifies the members against the predecessor's records, finds
-	// the bindings again only when a member's table digest, the membership
-	// or a manifest field the linker reads moved, publishes only the facts
+	// bindings again only when a member's table digest, the membership or a
+	// manifest field the linker reads moved, and then, for the static
+	// family, only those of the members whose reads moved; it publishes only the facts
 	// of the members whose facts changed, and names those and the members
 	// that are gone to Replaced: the build carries the predecessor's other
 	// facts over. Nil resolves and publishes in full.
@@ -205,25 +208,27 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 			return failed, err
 		}
 		defer rf.prev.close()
-		if rf.changed, err = newFileIDSort(dir); err != nil {
+		if err := rf.open(); err != nil {
+			rf.close()
 			return failed, err
 		}
-		defer rf.changed.Close()
+		defer rf.close()
 		if err := rf.classify(ctx, opts.Digests, fields); err != nil {
 			return failed, err
 		}
 		pub.prev = rf.prev.records
 	}
 
-	var bindings *pagination.SortedRun[idBinding]
+	res := &resolution{}
 	if rf.resolve {
-		if bindings, err = p.resolve(ctx, u); err != nil {
+		if res, err = resolve(ctx, u, rf, fields); err != nil {
 			return failed, err
 		}
-		defer bindings.Close()
+		defer res.close()
 	} else {
-		bindings = rf.prev.bindings
+		res = &rf.prev.resolution
 	}
+	bindings := res.bindings
 	targets, err := targetsOf(dir, bindings)
 	if err != nil {
 		return failed, err
@@ -248,7 +253,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	defer records.Close()
 	if opts.State != nil {
-		if err := writeState(opts.State, fields, records, bindings); err != nil {
+		if err := writeState(opts.State, fields, records, res); err != nil {
 			return failed, err
 		}
 	}
@@ -261,9 +266,19 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		Capabilities: []model.CapabilityState{pub.capability(records.Len())}}, nil
 }
 
-// resolve finds every binding of the unit by its family's resolution and
-// names each by identity.
-func (p *Provider) resolve(ctx context.Context, u *unit) (*pagination.SortedRun[idBinding], error) {
+// resolve is the unit's resolution by its family's: the static family's
+// re-runs only the members whose reads changed (resolveStatic); the flow
+// family's inference is a least fixed point over the whole unit, which a
+// removal cannot re-seed soundly without the provenance of every value, so
+// it resolves every site and names each binding by identity, and the
+// refresh's binding diff keeps the republication to the files whose facts
+// changed.
+func resolve(ctx context.Context, u *unit, rf *refresh, fields []manifestField) (*resolution, error) {
+	switch u.family {
+	case FamilyJavaScript, FamilyPython:
+	default:
+		return resolveStatic(ctx, u, rf, fields)
+	}
 	sorted, err := newBindingSort(u.dir, compareSiteTarget)
 	if err != nil {
 		return nil, err
@@ -288,7 +303,36 @@ func (p *Provider) resolve(ctx context.Context, u *unit) (*pagination.SortedRun[
 		return nil, err
 	}
 	defer run.Close()
-	return identify(ctx, u, run)
+	res := &resolution{}
+	ok := false
+	defer func() {
+		if !ok {
+			res.close()
+		}
+	}()
+	if res.bindings, err = identify(ctx, u, run); err != nil {
+		return nil, err
+	}
+	if res.groups, err = emptyOf(newGroupSort(u.dir)); err != nil {
+		return nil, err
+	}
+	if res.reads, err = emptyOf(newReadSort(u.dir, compareRead)); err != nil {
+		return nil, err
+	}
+	if res.taken, err = emptyOf(newTakenSort(u.dir, compareTakenFrom)); err != nil {
+		return nil, err
+	}
+	ok = true
+	return res, nil
+}
+
+// emptyOf is the empty run of a sort just opened.
+func emptyOf[T any](s *pagination.ExternalSort[T], err error) (*pagination.SortedRun[T], error) {
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	return s.Sorted()
 }
 
 // capability is the unit's `calls` row over its members: fresh when every
