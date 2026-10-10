@@ -3,13 +3,16 @@
 // tables the structural provider stores with each file's unit, and never
 // parses a file.
 //
-// A unit is one project of the repository, the scopes PlanUnits
-// derives. Its inputs are the project's member files, each recording the
-// MemberDigest of the table it linked (model.UnitInput.Digest). A build whose
-// every member digest equals its predecessor's resolves nothing: it inherits
-// the predecessor's resolution, republishes only the facts of the members
-// whose content changed, and the build carries the rest over
-// (docs/providers-link.md).
+// A unit is one project of the repository, the scopes PlanUnits derives. Its
+// inputs are the project's member files, each recording the MemberDigest of
+// the table it linked (model.UnitInput.Digest). Its resolution state names
+// every site by its file and table index and every target by its file and
+// declaration node, whose identity a body edit or an inserted declaration
+// does not move (ADR-0014). A build against its predecessor's state
+// (LinkOptions.Previous) keeps the predecessor's bindings unless a member's
+// table digest, the membership or a manifest field the linker reads moved,
+// republishes only the members whose facts changed (refresh.go), and the
+// build carries the rest over (docs/providers-link.md).
 //
 // Resolution is decision 2's, per language family: class-hierarchy analysis
 // for Java; direct binding, the signature-keyed address-taken × indirect-site
@@ -31,6 +34,7 @@ import (
 
 	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
@@ -47,8 +51,7 @@ const (
 	// Table under.
 	TableKind = "link.tables"
 	// ResolutionKind is the delta-state kind a linking unit stores its
-	// resolution under, which a later build whose member tables all keep
-	// their digests re-emits instead of resolving.
+	// resolution state under, which a later build of the unit starts from.
 	ResolutionKind = "link.resolution"
 )
 
@@ -82,23 +85,22 @@ const (
 
 // LinkOptions is what the delta build hands one unit's link.
 type LinkOptions struct {
-	// Previous streams the predecessor's resolution state when every member
-	// keeps its predecessor's MemberDigest; nil resolves in full. The build
-	// validates it first (ValidateState): Link refuses a corrupt one.
+	// Previous streams the predecessor's resolution state, which the build
+	// validates first (ValidateState): Link refuses a corrupt one. With it,
+	// Link classifies the members against the predecessor's records, finds
+	// the bindings again only when a member's table digest, the membership
+	// or a manifest field the linker reads moved, publishes only the facts
+	// of the members whose facts changed, and names those and the members
+	// that are gone to Replaced: the build carries the predecessor's other
+	// facts over. Nil resolves and publishes in full.
 	Previous io.Reader
-	// Edited, with Previous, streams the FileIDs of the members whose content
-	// changed since the predecessor, in ascending order; it may name files
-	// that are not members and must yield the same IDs on every walk. Link
-	// then publishes only the facts whose evidence lies in a republished
-	// member, an edited one or one with a site bound to a declaration of an
-	// edited one, whose identity moves with that file's bytes, and takes the
-	// coverage from Previous: the build carries the predecessor's other
-	// facts over. Nil publishes every fact.
-	Edited func(yield func(model.FileID) error) error
-	// Replaced, with Edited, receives once the facts are published every
-	// file whose facts Link republished, and every file Edited names, in
-	// ascending order: the files the build names replaced when it carries
-	// the predecessor's facts over. Nil reports none.
+	// Digests, required with Previous, reads each member's stored
+	// MemberDigest, which classifies it without reading its table.
+	Digests Digests
+	// Replaced, with Previous, receives once the facts are published every
+	// file whose predecessor's facts the build must not carry over, in
+	// ascending order: the members Link republished and the predecessor's
+	// members that are gone. Nil reports none.
 	Replaced func(model.FileID) error
 	// Members, when set, streams the unit's inputs as file versions in
 	// ascending FileID order, the members among them and possibly other
@@ -142,14 +144,15 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	return p.Link(ctx, req, sink, LinkOptions{})
 }
 
-// Link links one unit: it streams the members' tables, resolves every site
-// (or inherits opts.Previous), publishes `calls` (every fact, or with
-// opts.Edited only the republished members', named to opts.Replaced) and
-// writes the resolution state to opts.State.
+// Link links one unit: it streams the members' tables, finds every site's
+// bindings (or keeps opts.Previous's), publishes `calls` (every fact, or with
+// opts.Previous only the facts of the members whose facts changed, named to
+// opts.Replaced with the members that are gone) and writes the resolution
+// state to opts.State.
 func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts LinkOptions) (model.ProviderResult, error) {
 	failed := model.ProviderResult{RunID: req.Run, State: model.RunFailed}
-	if opts.Edited != nil && opts.Previous == nil {
-		return failed, internalErr("a link that publishes only the edited members needs the predecessor's resolution")
+	if opts.Previous != nil && opts.Digests == nil {
+		return failed, internalErr("a link against its predecessor's state needs the members' stored digests")
 	}
 	// The unit's sorted runs spill into a directory of its own, removed
 	// through the pace when the link ends.
@@ -165,7 +168,6 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	// plans its own members in one read of the manifest.
 	var pu Unit
 	var each func(yield func(model.FileVersion) error) error
-	var count int64
 	if opts.Members != nil {
 		family, root, ok := ParseScopeKey(req.Unit.ScopeKey)
 		if !ok {
@@ -181,23 +183,90 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 				return yield(fv)
 			})
 		}
-		if err := each(func(model.FileVersion) error { count++; return nil }); err != nil {
-			return failed, err
-		}
 	} else {
 		members, err := planMembers(ctx, req, dir)
 		if err != nil {
 			return failed, err
 		}
 		defer members.Close()
-		pu, each, count = members.unit, members.Each, members.Len()
+		pu, each = members.unit, members.Each
 	}
 	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir, root: pu.Root, content: req.Content,
 		family: pu.Family, members: each}
-
-	sorted, err := newBindingSort(dir, compareSiteTarget)
+	fields, err := manifestFields(ctx, u)
 	if err != nil {
 		return failed, err
+	}
+
+	rf := &refresh{u: u, resolve: true}
+	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u}
+	if opts.Previous != nil {
+		if rf.prev, err = loadState(opts.Previous, dir); err != nil {
+			return failed, err
+		}
+		defer rf.prev.close()
+		if rf.changed, err = newFileIDSort(dir); err != nil {
+			return failed, err
+		}
+		defer rf.changed.Close()
+		if err := rf.classify(ctx, opts.Digests, fields); err != nil {
+			return failed, err
+		}
+		pub.prev = rf.prev.records
+	}
+
+	var bindings *pagination.SortedRun[idBinding]
+	if rf.resolve {
+		if bindings, err = p.resolve(ctx, u); err != nil {
+			return failed, err
+		}
+		defer bindings.Close()
+	} else {
+		bindings = rf.prev.bindings
+	}
+	targets, err := targetsOf(dir, bindings)
+	if err != nil {
+		return failed, err
+	}
+	defer targets.Close()
+	if rf.prev != nil {
+		if rf.resolve {
+			if err := rf.diff(bindings, targets); err != nil {
+				return failed, err
+			}
+		}
+		if pub.republished, err = rf.changed.Sorted(); err != nil {
+			return failed, err
+		}
+		defer pub.republished.Close()
+	}
+
+	records, err := pub.publish(bindings, targets)
+	if err != nil {
+		failed.RecordsEmitted = pub.records
+		return failed, err
+	}
+	defer records.Close()
+	if opts.State != nil {
+		if err := writeState(opts.State, fields, records, bindings); err != nil {
+			return failed, err
+		}
+	}
+	if pub.republished != nil && opts.Replaced != nil {
+		if err := pub.republished.Each(opts.Replaced); err != nil {
+			return failed, err
+		}
+	}
+	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
+		Capabilities: []model.CapabilityState{pub.capability(records.Len())}}, nil
+}
+
+// resolve finds every binding of the unit by its family's resolution and
+// names each by identity.
+func (p *Provider) resolve(ctx context.Context, u *unit) (*pagination.SortedRun[idBinding], error) {
+	sorted, err := newBindingSort(u.dir, compareSiteTarget)
+	if err != nil {
+		return nil, err
 	}
 	defer sorted.Close()
 	sorted.WithFold(keepOne)
@@ -211,45 +280,24 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		defer mu.Unlock()
 		return sorted.Add(b)
 	}
-	var inherited coverage
-	if opts.Previous != nil {
-		inherited, err = readState(opts.Previous, emit)
-	} else {
-		err = resolverFor(pu.Family)(ctx, u, emit)
+	if err := resolverFor(u.family)(ctx, u, emit); err != nil {
+		return nil, err
 	}
+	run, err := sorted.Sorted()
 	if err != nil {
-		return failed, err
+		return nil, err
 	}
-	bindings, err := sorted.Sorted()
-	if err != nil {
-		return failed, err
-	}
-	defer bindings.Close()
-
-	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: count, edited: opts.Edited, replaced: opts.Replaced}
-	if opts.Edited != nil {
-		pub.cov = inherited
-	}
-	if err := pub.publish(bindings); err != nil {
-		failed.RecordsEmitted = pub.records
-		return failed, err
-	}
-	if opts.State != nil {
-		if err := writeState(opts.State, bindings, pub.cov); err != nil {
-			return failed, err
-		}
-	}
-	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
-		Capabilities: []model.CapabilityState{pub.capability()}}, nil
+	defer run.Close()
+	return identify(ctx, u, run)
 }
 
-// capability is the unit's `calls` row: fresh when every member's table was
-// read whole and every site with a binding was published, and partial, with
-// what was left out counted, otherwise.
-func (p *publisher) capability() model.CapabilityState {
+// capability is the unit's `calls` row over its members: fresh when every
+// member's table was read whole and every site with a binding was published,
+// and partial, with what was left out counted, otherwise.
+func (p *publisher) capability(members int64) model.CapabilityState {
 	st := model.CapabilityState{ProviderID: ProviderID, Capability: string(model.RelCalls), Scope: p.req.Unit.ScopeKey,
 		State: model.CapabilityFresh}
-	if p.cov.untabled == 0 && p.cov.dropped == 0 && p.unkeyed == 0 {
+	if p.cov.untabled == 0 && p.cov.dropped == 0 && p.cov.unkeyed == 0 {
 		return st
 	}
 	st.State, st.DiagnosticCode = model.CapabilityPartial, model.CodeCoverageIncomplete
@@ -259,8 +307,8 @@ func (p *publisher) capability() model.CapabilityState {
 	if p.cov.dropped > 0 {
 		st = st.WithDetail("dropped_table_entries", strconv.FormatInt(p.cov.dropped, 10))
 	}
-	if p.unkeyed > 0 {
-		st = st.WithDetail("unkeyed_ambiguous_sites", strconv.FormatInt(p.unkeyed, 10))
+	if p.cov.unkeyed > 0 {
+		st = st.WithDetail("unkeyed_ambiguous_sites", strconv.FormatInt(p.cov.unkeyed, 10))
 	}
-	return st.WithDetail("members", strconv.FormatInt(p.members, 10))
+	return st.WithDetail("members", strconv.FormatInt(members, 10))
 }

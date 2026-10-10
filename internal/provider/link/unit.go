@@ -105,9 +105,6 @@ func (m *members) Each(yield func(model.FileVersion) error) error {
 	})
 }
 
-// Len is the member count.
-func (m *members) Len() int64 { return m.n }
-
 // Close releases the sorted run.
 func (m *members) Close() error { return m.run.Close() }
 
@@ -162,9 +159,11 @@ func planMembers(ctx context.Context, req provider.UnitRequest, dir string) (*me
 	return m, nil
 }
 
-// coverage is what the unit's tables leave out: members with no table, whose
-// sites the linker cannot see, and the worker entries their parent dropped.
+// coverage is what the unit's facts leave out: members with no table, whose
+// sites the linker cannot see, the worker entries their parent dropped, and
+// the ambiguous sites whose call-site key does not fit a native key.
 type coverage struct {
 	untabled int64
 	dropped  int64
+	unkeyed  int64
 }

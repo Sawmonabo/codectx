@@ -342,14 +342,24 @@ func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry]) erro
 }
 
 // readGoModule reads the module path of the go.mod at the unit's project
-// root, which decides which import paths name the unit's own packages. A
-// unit with no go.mod there has no module path.
+// root (goModulePath), which decides which import paths name the unit's own
+// packages.
 func (h *hierarchy) readGoModule(ctx context.Context, u *unit) error {
 	h.goRoot = path.Join(".", u.root)
+	var err error
+	h.goModule, err = goModulePath(ctx, u)
+	return err
+}
+
+// goModulePath is the module path the go.mod at the unit's project root
+// declares, empty when there is none. It is the only field of a go.mod the
+// linker reads: a requirement or a version bump decides nothing it does.
+func goModulePath(ctx context.Context, u *unit) (string, error) {
 	if u.content == nil {
-		return nil
+		return "", nil
 	}
-	return u.content.EachFile(ctx, model.FileSelection{Paths: []string{path.Join(u.root, "go.mod")}}, func(fv model.FileVersion) error {
+	var module string
+	err := u.content.EachFile(ctx, model.FileSelection{Paths: []string{path.Join(u.root, "go.mod")}}, func(fv model.FileVersion) error {
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
@@ -362,9 +372,10 @@ func (h *hierarchy) readGoModule(ctx context.Context, u *unit) error {
 		if err != nil {
 			return err
 		}
-		h.goModule = modfile.ModulePath(data)
+		module = modfile.ModulePath(data)
 		return nil
 	})
+	return module, err
 }
 
 // goPackages yields the scope (directory and package) of every Go package

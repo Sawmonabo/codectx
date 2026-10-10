@@ -200,12 +200,20 @@ func (h *hierarchy) rustPath(crate string, module []string, q string) (string, e
 }
 
 // rustCrates adds, for each Cargo.toml of the unit, the crate its library
-// is, under the name other crates `use` it by (keyRustCrate): `[lib] name`,
-// else `[package] name` with `-` written `_` (the Cargo Book's "Cargo
-// Targets"), its root the `[lib] path`, else src/lib.rs. A manifest without
-// a package (a virtual workspace) names no crate; neither does one that
-// does not parse, which Cargo itself refuses.
+// is, under the name other crates `use` it by (keyRustCrate, eachRustCrate).
 func rustCrates(ctx context.Context, u *unit, s *pagination.ExternalSort[entry]) error {
+	return eachRustCrate(ctx, u, func(name, root string) error {
+		return s.Add(entry{Key: keyRustCrate + name, Aux: root})
+	})
+}
+
+// eachRustCrate yields, for each Cargo.toml of the unit, its library's crate
+// name and root module (rustModuleKey): `[lib] name`, else `[package] name`
+// with `-` written `_` (the Cargo Book's "Cargo Targets"), its root the `[lib]
+// path`, else src/lib.rs. A manifest without a package (a virtual workspace)
+// names no crate; neither does one that does not parse, which Cargo itself
+// refuses. These are the only fields of a Cargo.toml the linker reads.
+func eachRustCrate(ctx context.Context, u *unit, yield func(name, root string) error) error {
 	if u.content == nil {
 		return nil
 	}
@@ -243,7 +251,7 @@ func rustCrates(ctx context.Context, u *unit, s *pagination.ExternalSort[entry])
 			return nil
 		}
 		lib := cmp.Or(doc.Lib.Path, "src/lib.rs")
-		return s.Add(entry{Key: keyRustCrate + name, Aux: rustModuleKey(rustFile(path.Join(path.Dir(fv.Path), lib)))})
+		return yield(name, rustModuleKey(rustFile(path.Join(path.Dir(fv.Path), lib))))
 	})
 }
 
