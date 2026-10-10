@@ -221,6 +221,9 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `may_refer_to` | enclosing declaration → each candidate | a bare or path-qualified call whose name is declared more than once in this file (overloads, shadowing); every candidate is kept, uncapped, alongside the `calls` edge to the ambiguous callee reference. A call of a member on a receiver value publishes none (the callee reference table above) |
 | `references` | enclosing declaration → type or macro declaration | a type reference to a class/struct/interface/enum declared in this file, or a Rust macro invocation of a `macro_rules!` declared in it; a name this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
+| `defines` | file module → endpoint | every program entry point and framework route the file declares (a `__main__` guard is a declaration and is defined like one) |
+| `routes_to` | endpoint → handler | the entry function or route handler: a declaration of this file, the callee reference a call of the handler's name would name (with the call-site alias on its token), the file's module for a script, or a route handler literal |
+| `defines` / `contains` | file module or innermost enclosing declaration → route handler literal | a function literal a route registers in place, published as an anonymous `function` node keyed by its range |
 
 **Function-valued properties.** In JavaScript, TypeScript and TSX a function or
 arrow function stored under a name is a function declaration named by that
@@ -256,6 +259,91 @@ declared `static`; a tentative definition (`int x;`) is one, a prototype and an
 nothing. This is linkage, not shared-library visibility, which compiler flags
 (`-fvisibility`) and attribute macros decide and a syntactic reader does not
 evaluate. C++ publishes no `exports`.
+
+**Decorator facts.** Every declaration publishes its decorators, annotations
+and attributes under the `decorators` metadata key, in source order, each as
+`{name, bytes, arguments}`: the name as written with whitespace folded
+(`app.route`, `org.junit.Test`, `tokio::main`, `gnu::cold`), the decorator's
+byte range, and each argument's, a keyword argument or element-value pair
+including its key. Python reads the decorators of a decorated definition; Java
+the annotations in a declaration's modifiers (not type-use annotations); JavaScript
+and TypeScript the decorators of a class (and of an export statement wrapping
+it), of a method and of a field, not of a parameter or a class expression; Rust
+the outer attributes preceding an item, arguments split at the token tree's
+top-level commas, the value of `#[name = value]` as its one argument; C and C++
+each attribute of a `[[...]]` or `__attribute__((...))` on the declaration or its
+declarator (not `__declspec` or `alignas`). Go has no such construct. The range of
+every decorator and argument is validated against the pinned bytes like any
+other offset. Decorators past the metadata bound, or with a name over the
+qualified-name bound, are counted and the file reports partial; any other
+metadata a node cannot fit is counted the same way, never dropped in silence.
+
+**Endpoints.** An `endpoint` node is a program entry point or a framework
+route (ADR-0017 decision 8). Its identity is its file, its kind and its
+descriptor, never its range: the method and the route as written (`GET /users`,
+or `/users` when the route names no method), or the entry point's form
+(`__main__`, `main`, `script`). Two endpoints that share a descriptor are told
+apart by what they are (a Java `main`'s class, the receiver as written of a route
+registered on two routers), and exact duplicates left after that by content, as
+declarations are. Each is defined by the file's module, carries one `routes_to`
+per handler and one search document (name the descriptor; body the framework,
+method, route and path), so the search kind filter `endpoint` finds it. A route
+endpoint's metadata is `framework`, `method`, `route` and `prefix`, and `path` only
+when `prefix` is `resolved`; an entry point carries none. An endpoint whose route
+or path is over its bound, or whose key is over the native-key bound, is not
+published and is counted, so the file reports partial.
+
+**Program entry points.** Each is an `endpoint` node that
+`routes_to` its entry:
+
+| Entry point | Descriptor | Routes to |
+|---|---|---|
+| a module-level Python `if __name__ == "__main__":` (`==`, either operand order) | `__main__` | each function its block calls directly; the guard is a declaration, so its block's calls are made from it and a function defined in it is contained by it |
+| Go `func main` in `package main` | `main` | the function |
+| every Java `main` of JLS SE 25 §12.1.4, per class: `static` or instance, one `String[]`/`String...` parameter or none, not `private`, `void`; a class of the file that inherits one from a superclass of the same file (a superclass in another file is not visible here) | `main`, disambiguated by the class's qualified name | the method |
+| a top-level Rust `fn main`; a file-scope C or C++ `main` definition that is not `static` | `main` | the function |
+| a file starting with `#!` (not Rust's `#![`) | `script` | the file's module |
+
+**Framework routes.** The provider reads routes from decorators, annotations
+and registration calls, only in a file that imports the framework (Python
+`flask`, `fastapi`, `django.urls` or `django.conf.urls`; JavaScript and
+TypeScript `express`; Go `net/http`, `github.com/gorilla/mux`,
+`github.com/go-chi/chi`, `github.com/gin-gonic/gin`, `github.com/labstack/echo`;
+Java `org.springframework.web.bind.annotation`). Each method and route is one
+endpoint with `routes_to` its handler. A receiver is known by the call that built
+it (the link table's site result type).
+
+| Framework | Routes and method | Handler | Prefix resolves through |
+|---|---|---|---|
+| Flask | `@x.route(rule, methods=[…])` (no `methods`: `GET`, Flask's default), `@x.get`/`post`/`put`/`delete`/`patch` | the decorated function | `Flask()` is a root; a `Blueprint(url_prefix=…)` through exactly one `register_blueprint(bp, url_prefix=…)` in the file, whose prefix overrides the blueprint's own |
+| FastAPI | `@x.get` … `@x.trace`, `@x.api_route(path, methods=…)` (default `GET`) | the decorated function | `FastAPI()` is a root; an `APIRouter(prefix=…)` through exactly one `include_router(r, prefix=…)`, whose prefix adds to the router's own; `mount(path, app)` |
+| Django | `path`, `re_path`, `url` imported from Django; no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never: the including urlconf is chosen by settings, so every Django route is `unresolved` |
+| Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()` through exactly one `use([path,] router)` |
+| Spring | `@GetMapping` … `@PatchMapping`, `@RequestMapping(method = RequestMethod.X)` (none: no method); `value`, `path` or positional, arrays | the annotated method | the class-level `@RequestMapping` literal is the only prefix, none means no prefix; several or a non-literal one leave the class's routes `unresolved` |
+| Go `net/http` | `http.Handle`/`HandleFunc` on the default mux, a `ServeMux`'s `Handle`/`HandleFunc`; a Go 1.22 pattern `"GET /x"` gives the method and the route `/x` | the second argument | the default mux is a root; `NewServeMux()` when the file serves it once (`ListenAndServe[TLS]`, `Serve[TLS]`) or another router handles it once |
+| gorilla/mux | `Handle`/`HandleFunc`, methods from `.Methods(…)` on the registration | the second argument | `NewRouter()` served or handled once; `PathPrefix(p).Subrouter()` a child |
+| chi | `Get` … `Trace`, `Handle`/`HandleFunc` (any method), `Method`/`MethodFunc(m, p, h)` | the second argument (third for `Method`) | `NewRouter()`/`NewMux()` served once or `Mount(p, r)` once; routes inside a `Route` or `Group` closure are on a parameter and stay `unresolved` |
+| gin | `GET` … `OPTIONS`, `Any`, `Handle(m, p, …)` | the last argument | `gin.New()`/`gin.Default()` are roots; `Group(p)` a child |
+| echo | `GET` … `TRACE`, `Any`, `Add(m, p, h)` | the second argument (third for `Add`) | `echo.New()` is a root; `Group(p)` a child |
+
+Method constants (`http.MethodGet`, `RequestMethod.GET`) count as literal
+methods; methods not written as literals give one endpoint with no method. The
+route is always the route as written: a string literal's text, or the
+expression as written when it is not one, which is then `unresolved`. `prefix`
+is `resolved`, with the full `path`, only when every prefix between the route and
+an application root is a literal in the same file; anything else is `unresolved`
+with no `path`, never a guessed URL. An application object or router mounted
+from another file is not visible to a per-file provider. A route registered by a
+call is read from the call's argument positions in the link table, never from
+the source text, so a file whose link pass did not run publishes no
+call-registered route; a route on a receiver the file does not build is read only
+when the route is a string literal. A handler written as anything other than a
+name, a dotted name or a function literal (a wrapper call such as
+`http.HandlerFunc(f)`) gives the endpoint no `routes_to`. Not read: Flask
+`add_url_rule`, FastAPI `add_api_route` and websocket routes, Express array routes
+and `const { Router } = require("express")`, gorilla `PathPrefix(…).Handler(…)`,
+mounts through `http.Server{Handler: …}` or `StripPrefix`, echo `Match`, a
+class-level `@RequestMapping(method = …)`, a qualified Django `urls.path(…)`.
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped
@@ -761,6 +849,7 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@export` + `@export.name` | an export wrapper or export list entry |
 | `@def.test` + `@test.name` | a test declaration by call form (`it`, `test`, `describe`) |
 | `@name.scope` | the object a function-valued member assignment stores into (`a` of `a.b = () => …`), which comes ahead of the name in the declaration's qualified name |
+| `@def.endpoint` + `@guard.name` | a module-level Python `if` whose condition compares `__name__` (`@guard.name`) with the string `__main__` (`@name`); the worker checks the operator and keeps only `==` |
 | `@all` + `@all.target` + `@all.method` | a Python statement that binds or changes `__all__` (an assignment, an augmented assignment, a call of one of its methods), which the export rule reads |
 
 Per-language hooks in `worker/grammars.go` refine kinds (Go `type_spec`
@@ -807,6 +896,22 @@ All MIT:
 
 ## Tests
 
+- `internal/provider/treesitter/extraction_facts_test.go`: function-valued
+  properties are declarations with their stored path; Python (`__all__`, static
+  and computed) and C (external linkage) exports; a name defined twenty times
+  keeps all twenty candidates and a member call publishes none.
+- `internal/provider/treesitter/entry_points_test.go`: decorators with their
+  argument ranges; the `__main__` guard, Go `main`, the Java `main` forms and a
+  shebang script as endpoints.
+- `internal/provider/treesitter/routes_test.go`: one case per framework (route,
+  method, prefix, path, handler); a decorator that is not a route publishes
+  nothing; an unregistered blueprint or an `APIRouter` included elsewhere is
+  `unresolved` with no path. The call-registered cases (Express, Go, Django)
+  need the link table's argument positions.
+- `internal/bench/routes_walk_test.go` `TestEndpointsAreSeedsOfACalleeWalk`
+  (skipped under `-short`): through the product's composition, the kind filter
+  `endpoint` returns exactly the routes and a walk from them over `routes_to` and
+  `calls` reaches every function the handlers call.
 - `internal/provider/treesitter/treesitter_test.go` `TestLanguageFixtures`:
   one fixture per grammar (nested declaration, non-ASCII range) through
   `providertest.Conform`, then a captured run asserting every located node's
