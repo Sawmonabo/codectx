@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -31,10 +32,12 @@ import (
 // moved table keeps its interface (layout), it also keeps the predecessor's
 // hierarchy and reads only the tables of the members that re-run; a Python or ECMAScript unit resolves every site, its
 // inference being one fixed point over the unit. The bindings are then
-// diffed against the predecessor's: a file whose sites' bindings changed is republished, and so
-// is a file the set of whose targeted declarations changed, since a target's
-// occurrence is published in its own file and a carried relation into a
-// newly targeted declaration needs it there. Every other file's facts are
+// diffed against the predecessor's: a file whose facts of any kind changed is
+// republished, and so is a file the set of whose targeted declarations,
+// modules or parameters changed, since a target's occurrence is published in
+// its own file and a carried relation into a newly targeted node needs it
+// there. A record's counts are a function of its file's table and facts, so
+// a carried file's record holds the counts a fresh read would. Every other file's facts are
 // carried, a re-run that changes nothing about a file stopping there.
 
 // The keys of the manifest fields.
@@ -222,9 +225,13 @@ func (rf *refresh) sameInterface(ctx context.Context, fv model.FileVersion, old 
 	return nil
 }
 
-// diff adds to changed every file whose sites' bindings differ between the
-// predecessor's bindings and fresh, both by site, and every file whose set
-// of targeted declarations differs between old and targets.
+// diff adds to changed every file whose facts differ between the
+// predecessor's and fresh, both by entry: a fact of any kind added, removed
+// or changed in its technique, dispatch or reason; and every file whose set
+// of targeted nodes (declarations, modules, parameters) differs between the
+// predecessor's facts and targets, since a target's occurrence is published
+// from its own file. An external target is no file's: its node is published
+// on every run.
 func (rf *refresh) diff(fresh *pagination.SortedRun[idBinding], targets *pagination.SortedRun[target]) error {
 	err := diffGroups(rf.prev.bindings, fresh, func(b idBinding) model.FileID { return b.SiteFile },
 		func(a, b idBinding) bool { return a == b }, rf.changed.Add)
@@ -294,49 +301,69 @@ func diffGroups[T any, K cmp.Ordered](a, b *pagination.SortedRun[T], key func(T)
 	return nil
 }
 
-// halfBinding is a positional binding whose target is already named by
-// identity, on its way to its site's.
+// halfBinding is a positional fact whose target is already named by
+// identity, on its way to its entry's file: Site is its positional entry and
+// ID the fact with every field but SiteFile set.
 type halfBinding struct {
-	Site       Ref
-	TargetFile model.FileID
-	Target     model.NodeID
-	Detail     string
+	Site Ref
+	ID   idBinding
 }
 
 func encodeHalf(h halfBinding) ([]byte, error) {
-	code, ok := detailCode(h.Detail)
-	if !ok || h.Site.File < 0 || h.Site.Index < 0 {
-		return nil, internalErr("a binding on its way to identity is malformed")
+	if h.Site.File < 0 || h.Site.Index < 0 {
+		return nil, internalErr("a fact on its way to identity is malformed")
+	}
+	rest, err := encodeIDBinding(h.ID)
+	if err != nil {
+		return nil, err
 	}
 	out := binary.AppendUvarint(binary.AppendUvarint(nil, uint64(h.Site.File)), uint64(h.Site.Index))
-	out = appendString(out, string(h.TargetFile))
-	out = appendString(out, string(h.Target))
-	return append(out, code), nil
+	return append(out, rest...), nil
 }
 
 func decodeHalf(raw []byte) (halfBinding, error) {
 	r := byteReader{b: raw}
-	h := halfBinding{Site: Ref{File: r.index(), Index: r.index()}, TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str())}
-	code := r.byte()
-	if r.err != nil || len(r.b) != 0 || int(code) >= len(details) {
-		return halfBinding{}, errors.New("a binding on its way to identity is malformed")
+	site := Ref{File: r.index(), Index: r.index()}
+	if r.err != nil {
+		return halfBinding{}, errors.New("a fact on its way to identity is malformed")
 	}
-	h.Detail = details[code]
-	return h, nil
+	id, err := decodeIDBinding(r.b)
+	if err != nil {
+		return halfBinding{}, err
+	}
+	return halfBinding{Site: site, ID: id}, nil
 }
 
-// identify names run's positional bindings by identity, by two ordered
-// merges with the members: the bindings by target, whose table gives the
-// target's node, then by site, whose member gives its file. A table is read
-// only for a member some binding targets, and is held only while its
-// targets are named.
+// identify names run's positional facts (canonical, by compareBinding) by
+// identity, by two ordered merges with the members: the facts with a target
+// of the unit by target, whose table gives the target's node (a
+// declaration's, the module's for a FactImport, the parameter's for a
+// FactFlow), then every fact by entry, whose member gives its file. A table
+// is read only for a member some fact targets, and is held only while its
+// targets are named. A FactFlow into a parameter with no node is dropped.
+//
+// It is the flow family's hand-off from its resolver's positional facts to
+// the facts publication and the state read (resolve): any resolution of the
+// family that yields a sorted run of positional facts plugs in here.
 func identify(ctx context.Context, u *unit, run *pagination.SortedRun[Binding]) (*pagination.SortedRun[idBinding], error) {
 	byTarget, err := newBindingSort(u.dir, compareTargetSite)
 	if err != nil {
 		return nil, err
 	}
 	defer byTarget.Close()
-	if err := run.Each(byTarget.Add); err != nil {
+	halves, err := pagination.NewExternalSort(u.dir, 0, encodeHalf, decodeHalf,
+		func(a, b halfBinding) int { return cmp.Or(compareRef(a.Site, b.Site), compareIDSite(a.ID, b.ID)) })
+	if err != nil {
+		return nil, err
+	}
+	defer halves.Close()
+	err = run.Each(func(b Binding) error {
+		if b.External == "" && b.Kind.hasTarget() {
+			return byTarget.Add(b)
+		}
+		return halves.Add(halfBinding{Site: b.Site, ID: unnamed("", b)})
+	})
+	if err != nil {
 		return nil, err
 	}
 	targets, err := byTarget.Sorted()
@@ -344,14 +371,6 @@ func identify(ctx context.Context, u *unit, run *pagination.SortedRun[Binding]) 
 		return nil, err
 	}
 	defer targets.Close()
-	halves, err := pagination.NewExternalSort(u.dir, 0, encodeHalf, decodeHalf,
-		func(a, b halfBinding) int {
-			return cmp.Or(compareRef(a.Site, b.Site), cmp.Compare(a.TargetFile, b.TargetFile), cmp.Compare(a.Target, b.Target))
-		})
-	if err != nil {
-		return nil, err
-	}
-	defer halves.Close()
 	next, stop := pull(targets)
 	cur, ok, err := next()
 	if err != nil {
@@ -372,12 +391,16 @@ func identify(ctx context.Context, u *unit, run *pagination.SortedRun[Binding]) 
 			return untabledRef("target", cur.Target)
 		}
 		for ok && cur.Target.File == file {
-			if cur.Target.Index >= int32(len(t.Decls)) {
-				return outOfTable("target", cur.Target, fv.Path)
-			}
-			err := halves.Add(halfBinding{Site: cur.Site, TargetFile: fv.ID, Target: t.Decls[cur.Target.Index].Node, Detail: cur.Detail})
+			node, err := tableTarget(t, cur, fv.Path)
 			if err != nil {
 				return err
+			}
+			if node != "" {
+				h := halfBinding{Site: cur.Site, ID: unnamed("", cur)}
+				h.ID.TargetFile, h.ID.Target = fv.ID, node
+				if err := halves.Add(h); err != nil {
+					return err
+				}
 			}
 			if cur, ok, err = next(); err != nil {
 				return err
@@ -412,8 +435,9 @@ func identify(ctx context.Context, u *unit, run *pagination.SortedRun[Binding]) 
 	err = u.members(func(fv model.FileVersion) error {
 		file++
 		for more && h.Site.File == file {
-			err := out.Add(idBinding{SiteFile: fv.ID, Site: h.Site.Index, TargetFile: h.TargetFile, Target: h.Target, Detail: h.Detail})
-			if err != nil {
+			id := h.ID
+			id.SiteFile = fv.ID
+			if err := out.Add(id); err != nil {
 				return err
 			}
 			if h, more, err = nextSite(); err != nil {
@@ -429,4 +453,25 @@ func identify(ctx context.Context, u *unit, run *pagination.SortedRun[Binding]) 
 		return nil, untabledRef("site", h.Site)
 	}
 	return out.Sorted()
+}
+
+// tableTarget is the node of b's target in t, its member's table: the
+// declaration's, the module's for a FactImport, the parameter's for a
+// FactFlow, which is empty when the structural provider minted none.
+func tableTarget(t *Table, b Binding, path string) (model.NodeID, error) {
+	if b.Kind == FactImport {
+		return t.Module.Node, nil
+	}
+	if b.Target.Index >= int32(len(t.Decls)) {
+		return "", outOfTable("target", b.Target, path)
+	}
+	d := &t.Decls[b.Target.Index]
+	if b.Kind != FactFlow {
+		return d.Node, nil
+	}
+	if b.Param >= int32(len(d.Parameters)) {
+		return "", internalErr("a fact names parameter " + strconv.Itoa(int(b.Param)) + " past the parameters of " +
+			string(d.Node) + " in " + path)
+	}
+	return d.Parameters[b.Param].Node, nil
 }

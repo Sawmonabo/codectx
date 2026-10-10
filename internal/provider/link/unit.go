@@ -126,10 +126,13 @@ type Binding struct {
 }
 
 // A resolver resolves every site of one unit and emits each fact it finds,
-// in any order and with repeats; the core sorts them by site and target and
-// publishes one occurrence per fact. A call site with no call fact
-// publishes an open-site node and the caller's `calls` edge to it, unless a
-// FactExternalSite says it is a proven external call.
+// in any order and with repeats; the core keeps one fact per kind, entry,
+// argument and target (the best technique of its repeats, canonical),
+// names each by identity and publishes one occurrence per fact. A call site
+// with no call fact publishes an open-site node and the caller's `calls` edge
+// to it, unless a FactExternalSite says it is a proven external call. A
+// FactFlow into a parameter the structural provider minted no node for is
+// not a fact and is dropped.
 type resolver func(ctx context.Context, u *unit, emit func(Binding) error) error
 
 // resolverFor is the flow family's resolution of decision 2 (resolve has
@@ -217,11 +220,11 @@ func planMembers(ctx context.Context, req provider.UnitRequest, dir string) (*me
 	return m, nil
 }
 
-// coverage is what the unit's facts leave out: members with no table, whose
-// sites the linker cannot see, the worker entries their parent dropped, and
-// the ambiguous sites whose call-site key does not fit a native key.
+// coverage is the unit's counts and what its facts leave out, summed over
+// its members' records: members with no table, whose entries the linker
+// cannot see, and the worker entries their parent dropped.
 type coverage struct {
 	untabled int64
 	dropped  int64
-	unkeyed  int64
+	counts
 }
