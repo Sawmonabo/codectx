@@ -91,6 +91,22 @@ func (b *builder) linkTable() error {
 		}
 		byName[s.Name] = i
 	}
+	// A call in a route handler written as a function literal is made from
+	// the handler's node, as the structural provider's own call is
+	// (literalAround).
+	handler := map[model.NodeID]int32{}
+	for _, l := range b.literals {
+		if _, ok := handler[l.id]; !ok {
+			t.Handlers = append(t.Handlers, l.ep)
+			handler[l.id] = int32(len(t.Handlers))
+		}
+	}
+	handlerOf := func(r wire.Ref) int32 {
+		if id, ok := b.literalAround(r); ok {
+			return handler[id]
+		}
+		return 0
+	}
 	t.Sites = make([]link.Site, 0, len(b.ex.refs))
 	joined := make([]int, 0, len(b.ex.refs))
 	for _, r := range b.ex.refs {
@@ -106,6 +122,7 @@ func (b *builder) linkTable() error {
 		if r.Qualified {
 			s.Shape = wire.ShapeMember
 		}
+		s.Handler = handlerOf(r)
 		for _, c := range b.targets(r) {
 			s.Candidates = append(s.Candidates, int32(c))
 		}
@@ -183,6 +200,7 @@ func (b *builder) linkTable() error {
 		s := link.Site{Caller: b.enclosing(byStart, ws.Name), Range: *rng, NameStart: ws.Name.Start, NameEnd: ws.Name.End,
 			Callee: bound(string(b.src[ws.Name.Start:ws.Name.End]), model.MaxNameBytes), Shape: wire.ShapeIndirect,
 			Described: true, Computed: true}
+		s.Handler = handlerOf(wire.Ref{Start: ws.Name.Start, End: ws.Name.End, Scope: int(s.Caller)})
 		s.Args, s.Arguments = b.linkArgs(ws, typ, &t.Dropped)
 		t.Sites = append(t.Sites, s)
 	}

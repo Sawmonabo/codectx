@@ -43,6 +43,10 @@ type Table struct {
 	Reexports []wire.Reexport `json:"reexports,omitempty"`
 	// Unions are the type sets a wire.Type of kind TypeUnion names.
 	Unions [][]wire.Type `json:"unions,omitempty"`
+	// Handlers are the route handlers written as function literals that the
+	// structural provider publishes as function nodes of their own: a call in
+	// a handler's body is made from it (Site.Handler).
+	Handlers []Endpoint `json:"handlers,omitempty"`
 	// DynamicImports are the file's imports whose path is an expression
 	// that does not fold to a constant (wire.DynamicImport); one that folds
 	// is an ordinary entry of Imports.
@@ -218,6 +222,12 @@ type Site struct {
 	// nothing (wire.Link.Computed): no call reference names it, Callee is
 	// the expression as written, and no analysis binds it.
 	Computed bool `json:"computed,omitempty"`
+	// Handler, when not 0, is one more than the index in Table.Handlers of
+	// the route handler literal the call is made from: the site's `calls`
+	// are published from that handler's node, as the structural provider's
+	// are, while Caller stays the declaration whose scope the call's names
+	// are read in.
+	Handler int32 `json:"handler,omitempty"`
 	// Candidates are the declarations of this file the callee name can
 	// mean, the structural provider's own in-file targets.
 	Candidates []int32 `json:"candidates,omitempty"`
