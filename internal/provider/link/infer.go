@@ -394,15 +394,13 @@ type inference struct {
 	// input values the first stratum must not see, added when it settles.
 	returnsIn *pagination.SortedRun[contribution]
 	late      *pagination.ExternalSort[fact]
-	// early and earlyBound are the facts and bindings at the end of the
-	// first stratum. constants collects the contributions whose value is a
+	// early is the facts at the end of the first stratum. constants collects the contributions whose value is a
 	// constant, pending those whose value a variable holds, and readLog
 	// the boundary entries read.
-	early      *pagination.SortedRun[fact]
-	earlyBound *pagination.SortedRun[binding]
-	constants  *pagination.ExternalSort[contribution]
-	pending    *pagination.ExternalSort[pendingFlow]
-	readLog    *pagination.ExternalSort[flowRead]
+	early     *pagination.SortedRun[fact]
+	constants *pagination.ExternalSort[contribution]
+	pending   *pagination.ExternalSort[pendingFlow]
+	readLog   *pagination.ExternalSort[flowRead]
 	// shapes is the argument shape of every scanned site that has one, by
 	// site, and shapeAt reads it in site order.
 	shapes  *pagination.SortedRun[siteShape]
@@ -509,7 +507,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		// What the round superseded is released now, so the spill holds the
 		// current relations, the first stratum's and nothing of other
 		// rounds.
-		in.release(mark, prev, in.facts, in.delta, in.edges, in.bound, in.watches, in.early, in.earlyBound)
+		in.release(mark, prev, in.facts, in.delta, in.edges, in.bound, in.watches, in.early)
 		if delta.Len() == 0 && in.fielded {
 			break
 		}
@@ -521,7 +519,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 			// The values have settled: the member sites whose receivers
 			// bound no method now read the functions written to the fields
 			// they call, and the fixed point continues from there.
-			in.early, in.earlyBound = in.facts, in.bound
+			in.early = in.facts
 			if err := in.addFieldWatches(ctx, r); err != nil {
 				return nil, err
 			}

@@ -245,9 +245,7 @@ func (f *fixture) attach(gen model.GenerationID, unit model.UnitID) {
 // Mutation: re-resolve the unit after any moved table -> the JavaScript
 // refresh reads main.js and pets.js, and the Python refresh reads main.py
 // and pets.py again for the inference's scan and the second pass of its
-// sites. Mutation: re-derive the forward closure of the edited file instead
-// of stopping where its boundary values come out equal -> main reads
-// helper's returns and is re-derived, reading its table.
+// sites.
 func TestFlowBodyEditRerunsNoOtherFile(t *testing.T) {
 	for _, c := range []struct {
 		name         string

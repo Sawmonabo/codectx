@@ -22,7 +22,8 @@ import (
 // that changes the binding of a call in another file (Python, JavaScript,
 // TypeScript, TSX); the argument of a value cycle through two untouched
 // files changed (`hop_a(Dog())` becomes `hop_a(Cat())`, the Dog passed on
-// from ring_a to ring_b to ring_c and back); a call removed; a field write
+// from ring_a to ring_b to ring_c and back), then removed (`hop_a(None)`);
+// a call removed; a field write
 // moved to another file; a body edit of a
 // function another file passes arguments to, which must keep its parameters'
 // identities; a file added, deleted and renamed; and for Go a dependency
@@ -40,9 +41,11 @@ import (
 // change leaves the importer's call bound to the package it no longer
 // imports); republish only the edited file after a rename or a deletion (the
 // carried calls of the old name keep their bindings); re-derive only the
-// edited file from the values the others stored (the Dog that cycled
-// through ring_b and ring_c back into ring_a keeps ring_b's call bound to
-// Dog.speak, and the full build binds Cat.speak alone).
+// edited file from the values the others stored, growing only by readers of
+// changed values (when the cycle's origin is removed, the Cat that cycled
+// through ring_b and ring_c back into ring_a still comes out of ring_a, so
+// nothing reads a changed value and ring_b's call keeps Cat.speak, which the
+// full build does not bind).
 func TestIncrementalLinkEqualsFullBuild(t *testing.T) {
 	for _, sc := range differentialScripts {
 		t.Run(sc.name, func(t *testing.T) {
@@ -85,13 +88,15 @@ func renamed(files map[string]string, from, to string) map[string]string {
 // values are stored when an edit arrives depends on the edits before it.
 //
 // Mutation: re-derive only the edited file's sites from every other file's
-// stored values (no closure over the cycle through it) -> after the value
-// cycle edit, ring_b's speak call keeps Dog.speak, which ring_a no longer
-// passes and the full build does not bind. Mutation: leave the second
+// stored values, growing only by readers of changed values (no closure over
+// the cycle through it) -> after the cycle's origin is removed, ring_a
+// still sends the Cat that ring_c stored back into it, nothing changed is
+// read, and ring_b's speak call keeps Cat.speak, which the full build does
+// not bind. Mutation: leave the second
 // stratum's inputs in the first -> a field-based call whose receiver binds
 // in the full build also binds through the field.
 func TestIncrementalFlowLinkEqualsFullBuildInAnotherOrder(t *testing.T) {
-	order := []string{"value cycle through untouched files", "changed returned value", "removed call",
+	order := []string{"value cycle through untouched files", "value cycle's origin removed", "changed returned value", "removed call",
 		"body edit keeps the parameters", "moved field write", "body adding a call", "file added", "new declaration",
 		"rename", "body only", "file deleted", "file renamed"}
 	for _, sc := range []script{pythonScript, javascriptScript, typescriptScript, tsxScript} {
@@ -277,6 +282,7 @@ def hop_c(v):
 		{name: "one arm of the conditional redefinition", replace: []sub{{"factory.py", "return 2\n", "return 2 + 20\n"}}},
 		{name: "changed returned value", replace: []sub{{"factory.py", "return Dog()", "return Cat()"}}},
 		{name: "value cycle through untouched files", replace: []sub{{"ring_a.py", "hop_a(Dog())", "hop_a(Cat())"}}},
+		{name: "value cycle's origin removed", replace: []sub{{"ring_a.py", "hop_a(Cat())", "hop_a(None)"}}},
 		{name: "removed call", replace: []sub{{"main.py", "    run(1)\n", ""}}},
 		{name: "moved field write", replace: []sub{{"ui.py", "self.handler = on_click", "self.handler = None"}},
 			write: map[string]string{"widgets.py": "from ui import on_click\n\n\ndef wire(b):\n    b.handler = on_click\n"}},
@@ -357,6 +363,7 @@ export function feed(`},
 		{name: "one arm of the conditional redefinition", replace: []sub{{factory, "return 2;", "return 2 + 20;"}}},
 		{name: "changed returned value", replace: []sub{{factory, "return new Dog();", "return new Cat();"}}},
 		{name: "value cycle through untouched files", replace: []sub{{"ring_a" + ext, "hopA(new Dog())", "hopA(new Cat())"}}},
+		{name: "value cycle's origin removed", replace: []sub{{"ring_a" + ext, "hopA(new Cat())", "hopA(null)"}}},
 		{name: "removed call", replace: []sub{{main, "  run(1);\n", ""}}},
 		{name: "moved field write", replace: []sub{{ui, "this.handler = onClick;", "this.handler = null;"}},
 			write: map[string]string{"widgets" + ext: "import { onClick } from \"./ui\";\n\nexport function wire(b) {\n  b.handler = onClick;\n}\n"}},
