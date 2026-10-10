@@ -456,6 +456,47 @@ func (x *goLink) export(n, name Node, receiver string, static, abstract bool) {
 		}
 	}
 	x.out.Exports = append(x.out.Exports, e)
+	x.parameters(n, name)
+}
+
+// parameters appends a Parameter for each name the callable n, named name,
+// declares a parameter by, as the lowering declares its variables: the
+// receiver's at 0, then one per name of each parameter declaration in order
+// from 1. A declaration without names takes one position and a `_` takes its
+// own; neither declares a variable, so neither is sent. Named results are
+// no parameters.
+func (x *goLink) parameters(n, name Node) {
+	k := x.k
+	callable := goSpan(name)
+	add := func(id Node, index uint32, variadic bool) {
+		if x.text(id) != "_" {
+			x.out.Parameters = append(x.out.Parameters,
+				wire.Parameter{Callable: callable, Name: goSpan(id), Index: index, Variadic: variadic})
+		}
+	}
+	if r := n.ChildByFieldId(k.fReceiver); !r.IsNull() {
+		goNamed(r, func(p Node) { x.eachName(p, func(id Node) { add(id, 0, false) }) })
+	}
+	ps := n.ChildByFieldId(k.fParameters)
+	if ps.IsNull() {
+		return
+	}
+	var index uint32
+	goNamed(ps, func(p Node) {
+		variadic := p.KindId() == k.variadicParameterDeclaration
+		if !variadic && p.KindId() != k.parameterDeclaration {
+			return
+		}
+		names := 0
+		x.eachName(p, func(id Node) {
+			names++
+			index++
+			add(id, index, variadic)
+		})
+		if names == 0 {
+			index++
+		}
+	})
 }
 
 // walk is the second walk: it keeps the block scopes and emits the tables.

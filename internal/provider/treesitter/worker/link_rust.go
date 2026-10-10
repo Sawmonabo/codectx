@@ -371,6 +371,43 @@ func (k *rustLinker) export(n Node) {
 		}
 	}
 	k.out.Exports = append(k.out.Exports, x)
+	k.parameters(x.Name, ps)
+}
+
+// parameters appends a Parameter for each parameter of the list ps of the
+// callable named callable that one name declares, at the token the lowering
+// declares its variable by: the self parameter's `self` at 0, then each
+// parameter Params counts, from 1. A pattern of several names, an anonymous
+// parameter and a `...` take their positions and are not sent.
+func (k *rustLinker) parameters(callable wire.Span, ps Node) {
+	s := k.k
+	if ps.IsNull() {
+		return
+	}
+	add := func(name Node, index uint32) {
+		k.out.Parameters = append(k.out.Parameters, wire.Parameter{Callable: callable,
+			Name: wire.Span{Start: uint32(name.StartByte()), End: uint32(name.EndByte())}, Index: index})
+	}
+	var index uint32
+	for p := ps.first(); !p.IsNull(); p = p.next() {
+		switch {
+		case p.KindId() == s.selfParameter:
+			if self := kindChild(p, s.self); !self.IsNull() {
+				add(self, 0)
+			}
+		case k.isSelf(p):
+			add(p.ChildByFieldId(s.fPattern), 0)
+		case p.KindId() == s.variadicParameter:
+			index++
+		case !k.paramType(p).IsNull():
+			index++
+			if p.KindId() == s.parameter {
+				if pat := p.ChildByFieldId(s.fPattern); !pat.IsNull() && pat.KindId() == s.identifier {
+					add(pat, index)
+				}
+			}
+		}
+	}
 }
 
 // isSelf reports a method's self parameter: `self`, `&mut self`, or

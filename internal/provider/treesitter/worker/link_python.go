@@ -1207,6 +1207,7 @@ func (k *pythonLinker) file(root Node, src []byte, out *wire.Link) {
 			case kn.functionDefinition:
 				if x, ok := k.export(c); ok {
 					out.Exports = append(out.Exports, x)
+					k.parameters(c, x.Name, out)
 				}
 				inner = prefix + string(textOf(src, c.ChildByFieldId(kn.fName))) + "."
 			case kn.classDefinition:
@@ -1270,6 +1271,29 @@ func (k *pythonLinker) export(d Node) (wire.Export, bool) {
 		x.Returns = k.returns[uint32(name.StartByte())]
 	}
 	return x, true
+}
+
+// parameters appends a Parameter for each parameter def d, whose export is
+// named callable, declares by a name, as the lowering declares its
+// variables: the receiver (`self`, `cls`) at 0, then every other parameter
+// in order from 1, `*args`, keyword-only parameters and `**kwargs`
+// included. A pattern parameter takes its position and is not sent, since
+// no one name declares it.
+func (k *pythonLinker) parameters(d Node, callable wire.Span, out *wire.Link) {
+	var index uint32
+	k.eachParam(d, func(p pyParam) {
+		at := uint32(0)
+		if !p.receiver {
+			index++
+			at = index
+		}
+		if p.name.IsNull() || p.name.KindId() != k.k.identifier {
+			return
+		}
+		out.Parameters = append(out.Parameters, wire.Parameter{Callable: callable, Name: wireSpan(spanOf(p.name)), Index: at,
+			Variadic:    p.splat || p.keywords,
+			KeywordOnly: p.keywords || !p.receiver && !p.splat && p.index < 0})
+	})
 }
 
 // supertypes appends class c's declared bases: each positional base, a

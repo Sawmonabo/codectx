@@ -353,10 +353,40 @@ func (k *javaLinker) callable(n Node) {
 		sig.WriteByte(')')
 		e.Signature = sig.String()
 		k.out.Exports = append(k.out.Exports, e)
+		k.parameters(e.Name, ps)
 	}
 	k.params(ps, false)
 	k.children(n)
 	k.restore(m)
+}
+
+// parameters appends a Parameter for each named parameter of the list ps of
+// the callable named callable, at the name the lowering declares its
+// variable by. A receiver parameter (`Foo this`) is the receiver at 0 and
+// declares no name, so it is never sent; the formal and variable-arity
+// parameters are numbered from 1.
+func (k *javaLinker) parameters(callable wire.Span, ps Node) {
+	j, x := k.k, k.x
+	var index uint32
+	for p := javaFirst(ps); !p.IsNull(); p = p.next() {
+		var name Node
+		switch p.KindId() {
+		case j.formalParameter:
+			name = p.ChildByFieldId(j.fName)
+		case j.spreadParameter:
+			if d := x.kid(p, j.variableDeclarator); !d.IsNull() {
+				name = d.ChildByFieldId(j.fName)
+			}
+		default:
+			continue
+		}
+		index++
+		if name.IsNull() || name.KindId() != j.identifier {
+			continue
+		}
+		k.out.Parameters = append(k.out.Parameters, wire.Parameter{Callable: callable, Name: javaSpan(name), Index: index,
+			Variadic: p.KindId() == j.spreadParameter})
+	}
 }
 
 // lambda appends a lambda written to a field as a value, then walks it with

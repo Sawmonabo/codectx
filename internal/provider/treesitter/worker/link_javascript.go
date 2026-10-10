@@ -1245,6 +1245,56 @@ func (k *javaScriptLinker) export(out *wire.Link, name, fn Node, receiver string
 	out.Exports = append(out.Exports, wire.Export{Name: wireSpan(spanOf(name)), Receiver: receiver,
 		Signature: k.signature(fn), Params: params, Variadic: variadic, Static: static, Abstract: abstract,
 		Returns: k.returnType(fn)})
+	k.parameters(out, wireSpan(spanOf(name)), fn)
+}
+
+// parameters appends a Parameter for each parameter of fn, the callable
+// named callable, that one name declares, at the identifier the lowering
+// declares its variable by, numbered from 1 as params counts them: a
+// TypeScript `this` parameter is no position, and a destructuring pattern
+// takes its position and is not sent. A rest parameter is Variadic.
+func (k *javaScriptLinker) parameters(out *wire.Link, callable wire.Span, fn Node) {
+	kk := k.k
+	add := func(name Node, index uint32, variadic bool) {
+		out.Parameters = append(out.Parameters, wire.Parameter{Callable: callable, Name: wireSpan(spanOf(name)),
+			Index: index, Variadic: variadic})
+	}
+	if fn.KindId() == k.x.arrowFunction {
+		if p := fn.ChildByFieldId(kk.fParameter); !p.IsNull() {
+			if p.KindId() == kk.identifier {
+				add(p, 1, false)
+			}
+			return
+		}
+	}
+	ps := fn.ChildByFieldId(kk.fParameters)
+	if ps.IsNull() {
+		return
+	}
+	var index uint32
+	for p := ps.first(); !p.IsNull(); p = p.next() {
+		if !p.IsNamed() || p.IsExtra() || k.thisParam(p) {
+			continue
+		}
+		index++
+		name, rest := p, false
+		if id := name.KindId(); id == kk.requiredParameter || id == kk.optionalParameter {
+			if pat := name.ChildByFieldId(kk.fPattern); !pat.IsNull() {
+				name = pat
+			} else {
+				name = name.ChildByFieldId(kk.fName)
+			}
+		}
+		switch jsKindOf(name) {
+		case kk.assignmentPattern:
+			name = name.ChildByFieldId(kk.fLeft)
+		case kk.restPattern:
+			name, rest = firstNamed(name), true
+		}
+		if jsKindOf(name) == kk.identifier {
+			add(name, index, rest)
+		}
+	}
 }
 
 // class appends a class's Export, its constructor's parameters and the
