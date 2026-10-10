@@ -395,8 +395,7 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				fmt.Fprintf(b, "direction   %s\nwalked      %d visited, %d %s, depth %d\n",
 					result.Direction, result.VisitedCount, result.EdgeCount,
 					plural(int(result.EdgeCount), "edge", "edges"), result.MaxDepth)
-				writeNodeTable(b, result.Nodes)
-				writeRelationTable(b, result.Relations)
+				writeCallAnswer(b, result)
 			})
 		},
 	}
@@ -735,6 +734,89 @@ func writeRelationTable(b *strings.Builder, relations []model.Relation) {
 	for _, r := range relations {
 		fmt.Fprintf(b, "  %s  %-18s %s -> %s\n", r.ID, clip(string(r.Kind), 18), r.From, r.To)
 	}
+}
+
+// writeCallAnswer renders a callers or callees answer as a call hierarchy:
+// each node with where it is, each relation with how it may run -- through a
+// base method, an override a call may dispatch to, one of n targets, a call
+// matched by name only -- and the byte ranges of its call sites, then the
+// structured counts. Byte ranges are printed as bytes: the answer carries no
+// line numbers, and a byte offset is never presented as one.
+func writeCallAnswer(b *strings.Builder, result model.GraphResult) {
+	where := map[model.NodeID]model.NodeLocation{}
+	for _, l := range result.Locations {
+		where[l.NodeID] = l
+	}
+	if len(result.Nodes) == 0 {
+		b.WriteString("nodes       none\n")
+	} else {
+		fmt.Fprintf(b, "nodes       %d\n", len(result.Nodes))
+		for _, n := range result.Nodes {
+			name := n.QualifiedName
+			if name == "" {
+				name = n.Name
+			}
+			at := ""
+			if l, ok := where[n.ID]; ok {
+				at = fmt.Sprintf("  %s bytes %d-%d", l.Path, l.Bytes.Start, l.Bytes.End)
+			}
+			fmt.Fprintf(b, "  %s  %-12s %s%s\n", n.ID, clip(string(n.Kind), 12), clip(name, 80), at)
+		}
+	}
+	marks := map[model.RelationID][]model.GraphRowMark{}
+	for _, m := range result.Marks {
+		marks[m.RelationID] = append(marks[m.RelationID], m)
+	}
+	sites := map[model.RelationID][]model.RelationOccurrence{}
+	for _, o := range result.Occurrences {
+		sites[o.RelationID] = append(sites[o.RelationID], o)
+	}
+	paths := map[model.FileID]string{}
+	for _, l := range result.Locations {
+		paths[l.FileID] = l.Path
+	}
+	if len(result.Relations) == 0 {
+		b.WriteString("relations   none\n")
+	} else {
+		fmt.Fprintf(b, "relations   %d\n", len(result.Relations))
+		for _, r := range result.Relations {
+			fmt.Fprintf(b, "  %s  %-18s %s -> %s\n", r.ID, clip(string(r.Kind), 18), r.From, r.To)
+			for _, m := range marks[r.ID] {
+				fmt.Fprintf(b, "      %s\n", markText(m))
+			}
+			for _, o := range sites[r.ID] {
+				file := paths[o.FileID]
+				if file == "" {
+					file = string(o.FileID)
+				}
+				dispatch := ""
+				if o.Dispatch != "" {
+					dispatch = " " + string(o.Dispatch)
+				}
+				fmt.Fprintf(b, "      site %s bytes %d-%d%s\n", file, o.Bytes.Start, o.Bytes.End, dispatch)
+			}
+		}
+	}
+	c := result.Counts
+	if c != (model.GraphCounts{}) {
+		fmt.Fprintf(b, "counts      direct %d, through base %d, may dispatch %d, may call %d, open sites %d\n",
+			c.Direct, c.ThroughBase, c.MayDispatch, c.MayCall, c.OpenSites)
+	}
+}
+
+// markText says in words how a marked relation may run.
+func markText(m model.GraphRowMark) string {
+	switch m.Kind {
+	case model.MarkThroughBase:
+		return fmt.Sprintf("through base %s (overridden %d times): may not run this method", m.Base, m.BaseOverrides)
+	case model.MarkMayDispatch:
+		return "may dispatch to this override: it may not run"
+	case model.MarkValueSet:
+		return fmt.Sprintf("1 of %d targets bound at the site", m.SetSize)
+	case model.MarkNameOnly:
+		return "matched by name only: no analysis bound this call, and it may not run"
+	}
+	return string(m.Kind)
 }
 
 // writeOccurrences renders a reference page, keeping the Section 9.2
