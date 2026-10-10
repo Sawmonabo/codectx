@@ -38,6 +38,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/residency"
 	"github.com/Sawmonabo/codectx/internal/retention"
 	"github.com/Sawmonabo/codectx/internal/search"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -680,6 +681,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// because it builds nothing, and it still records the reading session
 		// it was opened for.
 		LazyWriter: o.indexing() && !o.locksAtOpen(),
+		TextIndex:  s.textIndexOptions(),
 	}); err != nil {
 		return nil, err
 	}
@@ -698,6 +700,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			MaxJSONBytes:       cfg.Context.MaxManifestBytes.Value(),
 			Synchronous:        cfg.Storage.Synchronous,
 			ReadOnly:           true,
+			TextIndex:          s.textIndexOptions(),
 		}); err != nil {
 			return nil, err
 		}
@@ -1098,6 +1101,37 @@ func dataDirNotWritable(dir string, cause error) error {
 		Remediation: "Make that directory writable, or set storage.data_dir to a path this user may write."}
 }
 
+// textIndexOptions sizes the store's search index from this process's machine
+// and resources: the writer, its merges and one query's segment search each run
+// on every core this process may use, the number of searches running at once is
+// the query slot count, and the cached visibility sets share the query memory
+// budget. The writer's memory is the library's per-thread floor for those
+// threads, and it is admitted through the composition's admission ledger before
+// the writer opens.
+//
+// The ledger is created after the store opens and recovers, so Reserve reads
+// the field when the writer opens rather than when the store does. The index
+// writer opens lazily, on its first mutation; the one that can come before the
+// ledger exists is recovery's reconcile, which runs alone before any other
+// admitted work and so reserves nothing.
+func (s *stack) textIndexOptions() textindex.Options {
+	cpus := config.CPUs()
+	return textindex.Options{
+		WriterThreads:     cpus,
+		WriterMemoryBytes: textindex.WriterMemoryFloor(cpus),
+		MergeThreads:      cpus,
+		SearchThreads:     cpus,
+		QuerySlots:        config.QuerySlots(),
+		ViewCacheBytes:    s.cfg.Resources.QueryMemoryBytes,
+		Reserve: func(ctx context.Context, bytes int64) (func(), error) {
+			if s.admission == nil {
+				return func() {}, nil
+			}
+			return s.admission.Reserve(ctx, bytes, nil)
+		},
+	}
+}
+
 // openQueries builds the query services that need the repository identity,
 // which only the coordinator derives. It is called by open once the coordinator
 // exists rather than from openStack, because the alternative -- re-deriving the
@@ -1109,7 +1143,6 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 		Store:     s.store,
 		Repo:      repo,
 		Signer:    s.signer,
-		Spools:    s.spools,
 		Leases:    s.leases,
 		Content:   s.cas,
 		Resources: s.cfg.Resources,
@@ -1126,12 +1159,11 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 		// The same service over the reader handle. A generation pinned through
 		// it takes no retention lease, so a search served this way reaches no
 		// write transaction; it still pages in full, because a continuation
-		// carries its own recorded expiry rather than a lease row.
+		// carries its whole position in the token rather than a lease row.
 		read, err := search.New(search.Options{
 			Store:     s.queryStore,
 			Repo:      repo,
 			Signer:    s.signer,
-			Spools:    s.spools,
 			Leases:    s.leases,
 			Content:   s.cas,
 			Resources: s.cfg.Resources,

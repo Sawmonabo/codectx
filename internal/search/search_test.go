@@ -5,12 +5,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math"
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,6 +16,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	_ "modernc.org/sqlite"
@@ -26,11 +24,10 @@ import (
 
 // The Section 14 ranking fixture. Three small lexical documents in one
 // activated generation are the smallest corpus that can separate the exact
-// tiers from lexical BM25, exercise an indexed prefix range, carry a Unicode
-// identifier and a literal-punctuation body through the FTS encoder, and fold
-// two occurrences of one node into one hit. Every leg asserts against
-// this one corpus so a ranking change cannot be hidden behind a private
-// fixture.
+// tiers from the lexical tier, exercise an indexed prefix range, carry a
+// Unicode identifier and a literal-punctuation body through the query parser,
+// and fold two documents of one node into one hit. The scenario's legs assert
+// against this one corpus; a leg that needs another shape builds its own.
 const (
 	fixtureProviderID      = "treesitter"
 	fixtureProviderVersion = "1.0.0"
@@ -38,7 +35,7 @@ const (
 )
 
 // doc describes one fixture document: its file, its node identity and the
-// indexed text BM25 scores. Occurrences > 1 publishes that many search
+// indexed text the lexical tier scores. Occurrences > 1 publishes that many search
 // documents for the same node, which is what the deduplication leg folds.
 type doc struct {
 	path          string
@@ -80,14 +77,25 @@ type fixture struct {
 	hashes  map[string]string
 }
 
-// newFixture builds and activates the corpus once per scenario, so a corpus
-// that no longer publishes is a failure here rather than in a later leg.
-func newFixture(t *testing.T) *fixture {
+// storeOptions opens a fixture store, read-write or read-only, with its search
+// index sized for one test: one thread of each kind and one query slot.
+func storeOptions(readOnly bool) sqlite.Options {
+	return sqlite.Options{ReadOnly: readOnly, ReadConnections: config.ReadConnections(config.Defaults()),
+		TextIndex: textindex.Options{WriterThreads: 1, WriterMemoryBytes: textindex.WriterMemoryFloor(1),
+			MergeThreads: 1, SearchThreads: 1, QuerySlots: 1, ViewCacheBytes: 1 << 20}}
+}
+
+// newFixture builds and activates the ranking corpus.
+func newFixture(t *testing.T) *fixture { return newFixtureOf(t, fixtureDocs) }
+
+// newFixtureOf builds and activates one corpus, one document set per file, so a
+// corpus that no longer publishes is a failure here rather than in a later leg.
+func newFixtureOf(t *testing.T, docs []doc) *fixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "codectx.db")
-	st, err := sqlite.Open(ctx, dbPath, sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+	st, err := sqlite.Open(ctx, dbPath, storeOptions(false))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -106,10 +114,10 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("OpenCAS: %v", err)
 	}
-	hashes := make(map[string]string, len(fixtureDocs))
+	hashes := make(map[string]string, len(docs))
 	f.hashes = hashes
-	files := make([]model.FileVersion, 0, len(fixtureDocs))
-	for _, d := range fixtureDocs {
+	files := make([]model.FileVersion, 0, len(docs))
+	for _, d := range docs {
 		rec, err := cas.Put(ctx, strings.NewReader(d.body))
 		if err != nil {
 			t.Fatalf("CAS.Put(%s): %v", d.path, err)
@@ -159,7 +167,7 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("BeginProviderRun: %v", err)
 	}
-	for _, d := range fixtureDocs {
+	for _, d := range docs {
 		f.publish(f.gen, run, d, hashes[d.path])
 	}
 	f.binding, err = st.Activate(ctx, f.gen, 0, model.HealthFresh,
@@ -173,11 +181,7 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("OpenSigner: %v", err)
 	}
-	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, st)
-	if err != nil {
-		t.Fatalf("NewSpools: %v", err)
-	}
-	f.opts = Options{Store: st, Repo: f.repo, Signer: signer, Spools: spools,
+	f.opts = Options{Store: st, Repo: f.repo, Signer: signer,
 		Leases: pagination.NewLeases(st, pagination.DefaultCursorTTL), Content: cas,
 		Resources: config.Defaults().Resources, CursorTTL: pagination.DefaultCursorTTL,
 		Now: func() time.Time { return time.Now().UTC() }}
@@ -256,30 +260,19 @@ type leg struct {
 }
 
 // TestSearchRankingScenario is the package's single scenario: one corpus, one
-// activated generation, every leg. It guards determinism of
-// the Section 14.2 ranking -- a silent reordering or score drift would serve
-// different context for identical inputs.
+// activated generation, every leg that only reads it.
 func TestSearchRankingScenario(t *testing.T) {
 	legs := []leg{
-		{"rank/less_orders_the_full_tie_break_chain", legLessChain},
-		{"rank/quantization_is_the_only_float_boundary", legQuantization},
-		{"rank/dedup_folds_occurrences_and_keeps_the_lowest_tier", legDedupFolds},
-		{"rank/dedup_falls_back_to_path_and_start_byte", legDedupFileKey},
-		{"rank/the_ranked_set_keeps_every_distinct_hit", legRankedSetLossless},
-		{"rank/the_answer_does_not_depend_on_the_order_candidates_arrive", legFoldOrderIndependent},
-		{"rank/the_ranked_set_is_bounded_by_its_run_budget", legRankedSetIsBoundedByItsRunBudget},
-		{"cursor/a_streamed_continuation_walk_reproduces_the_whole_answer", legStreamedWalkParity},
-		{"rank/reasons_stay_within_their_bounds", legReasonBounds},
 		{"rank/range_hydration_reads_a_bounded_window", legRangeHydration},
-		{"cursor/query_hash_binds_the_query_and_its_filters", legQueryHash},
+		{"cursor/query_hash_binds_the_query_its_filters_and_its_scoring", legQueryHash},
 		{"cursor/tampered_expired_and_foreign_cursors_are_rejected", legCursorRejections},
 		{"cursor/resolve_pages_by_a_bounded_keyset", legResolveKeyset},
+		{"cursor/search_positions_round_trip_and_refuse_foreign_keys", legSearchPositionKeys},
+		{"cursor/a_minimum_score_change_refuses_the_cursor", legMinScoreRefusesTheCursor},
 		{"scenario/search_serves_the_section_14_2_order", legEndToEndRanking},
 		{"exact/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
 		{"exact/exact_tiers_hold_one_read_page", legExactTiersHoldOnePage},
 		{"exact/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
-		{"cursor/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
-		{"page/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"page/a_writerless_search_pages_in_full", legWriterlessSearchPagesInFull},
 		{"page/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
 		{"resolve/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
@@ -297,337 +290,15 @@ func TestSearchRankingScenario(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Ranking and cursor legs.
-//
-// The legs below guard two invariants. Ranking determinism:
-// identical inputs must produce byte-identical ordering and byte-identical
-// ScoreMicros on every release target, which is why every assertion here is an
-// exact int64 and never "a is before b". Cursor integrity: a continuation must
-// name the generation, query and endpoint it was minted for, or the caller
-// silently reads page 2 of a different question.
+// Cursor legs. A continuation must name the generation, query, filters and
+// scoring it was minted for, or the caller silently reads page 2 of a
+// different question.
 // ---------------------------------------------------------------------------
 
-// rankedOf builds a candidate with the sort tuple spelled out, so a leg that
-// isolates one tie-break key differs from its partner in exactly that key.
-func rankedOf(tier model.SearchTier, score int64, path string, start uint64, node model.NodeID, key string) ranked {
-	return ranked{Tier: tier, ScoreMicros: score, Path: path, StartByte: start,
-		NodeID: node, SearchKey: key, Occurrences: 1}
-}
-
-// scoredOf wraps a sort tuple as the record the served order compares, with
-// the served facts a real candidate carries.
-func scoredOf(r ranked, kind model.NodeKind, name string, end uint64) scored {
-	return scored{ranked: r, Folded: r.ScoreMicros, Span: &model.ByteRange{Start: r.StartByte, End: end},
-		Hit: model.SearchHit{NodeID: r.NodeID, Path: r.Path, Kind: kind, Name: name}}
-}
-
-// legLessChain proves the full Section 14.2 chain, one key at a time. A
-// dropped or reordered key would silently reorder results for identical
-// inputs, which is the determinism guarantee Section 14.2 sells. The keys
-// after start byte are the content keys that make the order independent of
-// WHERE the tree was indexed: end byte, kind, name, qualified name and
-// signature all precede the root-dependent NodeID and SearchKey.
-func legLessChain(t *testing.T, _ *fixture) {
-	baseR := rankedOf(model.TierExactName, 100, "b", 10, "n2", "k2")
-	base := scoredOf(baseR, model.NodeFunction, "m2", 20)
-	cases := []struct {
-		key   string
-		lower scored
-	}{
-		{"tier", scoredOf(rankedOf(model.TierExactPath, 0, "b", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
-		{"score", scoredOf(rankedOf(model.TierExactName, 101, "b", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
-		{"path", scoredOf(rankedOf(model.TierExactName, 100, "a", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
-		{"start_byte", scoredOf(rankedOf(model.TierExactName, 100, "b", 9, "n2", "k2"), model.NodeFunction, "m2", 20)},
-		{"end_byte", scoredOf(baseR, model.NodeFunction, "m2", 19)},
-		{"kind", scoredOf(baseR, model.NodeDocument, "m2", 20)},
-		{"name", scoredOf(baseR, model.NodeFunction, "m1", 20)},
-		{"qualified_name", withQName(scoredOf(baseR, model.NodeFunction, "m2", 20), "q1")},
-		{"signature", withSignature(scoredOf(baseR, model.NodeFunction, "m2", 20), "s1")},
-		{"node_id", scoredOf(rankedOf(model.TierExactName, 100, "b", 10, "n1", "k2"), model.NodeFunction, "m2", 20)},
-		{"search_key", scoredOf(rankedOf(model.TierExactName, 100, "b", 10, "n2", "k1"), model.NodeFunction, "m2", 20)},
-	}
-	// The base carries a qualified name and a signature so the two cases that
-	// isolate those keys have something to sort below.
-	base = withSignature(withQName(base, "q2"), "s2")
-	for i := range cases {
-		if cases[i].key != "qualified_name" && cases[i].key != "signature" {
-			cases[i].lower = withSignature(withQName(cases[i].lower, "q2"), "s2")
-		}
-		if cases[i].key == "qualified_name" {
-			cases[i].lower = withSignature(cases[i].lower, "s2")
-		}
-		if cases[i].key == "signature" {
-			cases[i].lower = withQName(cases[i].lower, "q2")
-		}
-	}
-	for _, c := range cases {
-		if cmpScored(c.lower, base) >= 0 {
-			t.Errorf("%s: want the %s-lower candidate to sort first", c.key, c.key)
-		}
-		if cmpScored(base, c.lower) <= 0 {
-			t.Errorf("%s: the order is not antisymmetric", c.key)
-		}
-	}
-	// A tier with a worse score still outranks a better-scoring later tier:
-	// tier is the FIRST key, not a tiebreak after score.
-	exact := scoredOf(rankedOf(model.TierExactQualifiedName, 0, "z", 99, "n9", "k9"), model.NodeFunction, "m9", 100)
-	lexical := scoredOf(rankedOf(model.TierLexical, 9_999_999, "a", 0, "n0", "k0"), model.NodeFunction, "m0", 1)
-	if cmpScored(exact, lexical) >= 0 {
-		t.Error("a zero-scored exact hit must outrank a high-scoring lexical hit")
-	}
-	if cmpScored(base, base) != 0 {
-		t.Error("the order must be reflexive-equal on one record")
-	}
-	// A candidate with no span sorts below one that has one, and the order
-	// stays total either way.
-	noSpan := scoredOf(baseR, model.NodeFunction, "m2", 20)
-	noSpan.Span = nil
-	if cmpScored(noSpan, base) >= 0 {
-		t.Error("a candidate without a span must sort before one that has an end byte")
-	}
-}
-
-// withQName and withSignature set the served fields the tail of the order
-// compares, which scoredOf leaves empty.
-func withQName(s scored, q string) scored     { s.Hit.QualifiedName = q; return s }
-func withSignature(s scored, v string) scored { s.Hit.Signature = v; return s }
-
-// legFoldOrderIndependent is the fold-order invariant in one package:
-// the served answer must be a pure function of the candidates, never of the
-// order they arrive in. A delta re-index walks the lexical tier in a different
-// search_units.doc_id order than a fresh index of the same tree does -- a
-// delta carries doc ids forward, a fresh index assigns them anew -- so any
-// arrival-ordered choice makes the two indexes of one tree answer differently.
-//
-// The shape is the general one: several candidates share a deduplication key
-// while differing in name, range and score, and one group spans two tiers --
-// the case where folding the ACCUMULATED score makes the survivor
-// arrival-ordered.
-//
-// Mutation: restore `keep.Hit, keep.Span = a.Hit, a.Span` in fold, or compare
-// Folded instead of ScoreMicros in it, and this fails.
-func legFoldOrderIndependent(t *testing.T, _ *fixture) {
-	// Three candidates sharing one document node as their deduplication key,
-	// plus a two-tier group: an exact-name hit and a lexical hit of one node.
-	group := []scored{
-		scoredOf(rankedOf(model.TierLexical, 900, "docs/skill.md", 0, "n-doc", "k-h1"), model.NodeDocument, "Skill: Reverse-Proxy Config Hunt", 34),
-		scoredOf(rankedOf(model.TierLexical, 700, "docs/skill.md", 5474, "n-doc", "k-h2"), model.NodeDocument, "1. Map the config surface", 5504),
-		scoredOf(rankedOf(model.TierLexical, 900, "docs/skill.md", 5771, "n-doc", "k-h3"), model.NodeDocument, "2. Config failure patterns", 5802),
-		scoredOf(rankedOf(model.TierExactName, 0, "pkg/cfg.go", 12, "n-fn", "k-fn-x"), model.NodeFunction, "Config", 40),
-		scoredOf(rankedOf(model.TierLexical, 5000, "pkg/cfg.go", 12, "n-fn", "k-fn-y"), model.NodeFunction, "Config", 40),
-		scoredOf(rankedOf(model.TierLexical, 100, "pkg/other.go", 3, "n-o", "k-o"), model.NodeFunction, "configure", 20),
-	}
-	// Every permutation of six candidates is 720 orders. These five are chosen
-	// so that EVERY member of each deduplication group leads its group in at
-	// least one of them: an order that always offers the eventual survivor
-	// first would pass even with the arrival-ordered fold restored.
-	orders := [][]int{{0, 1, 2, 3, 4, 5}, {5, 4, 3, 2, 1, 0}, {2, 0, 4, 1, 5, 3}, {1, 3, 5, 0, 2, 4}, {4, 5, 0, 2, 3, 1}}
-	var want []string
-	for _, order := range orders {
-		c := collectorFor(t)
-		for _, i := range order {
-			v := group[i]
-			if err := c.add(v.ranked, hitFacts{hit: v.Hit, span: v.Span}, "matched the "+string(v.Tier)+" tier"); err != nil {
-				t.Fatalf("order %v: adding a candidate: %v", order, err)
-			}
-		}
-		var got []string
-		for _, r := range resultsOf(t, c) {
-			got = append(got, fmt.Sprintf("%s|%d|%s|%s|%d|%v", r.Tier, r.ScoreMicros, r.Hit.Path, r.Hit.Name, r.Occurrences, r.Reasons))
-		}
-		if want == nil {
-			want = got
-			if len(want) != 3 {
-				t.Fatalf("the three deduplication keys folded to %d results: %v", len(want), want)
-			}
-			continue
-		}
-		if !slices.Equal(got, want) {
-			t.Fatalf("arrival order %v served\n  %v\nbut the first order served\n  %v", order, got, want)
-		}
-	}
-	// The two-tier group ranks first -- it keeps the LOWER tier rank -- and it
-	// is served at the higher score, carrying the reasons of both sides in a
-	// fixed order.
-	if want[0] != "exact_name|5000|pkg/cfg.go|Config|2|[matched the exact_name tier matched the lexical tier]" {
-		t.Errorf("the two-tier group served %q, want the exact tier at the lexical score", want[0])
-	}
-	// The survivor of the Markdown group is decided by content, not by which
-	// heading arrived first: highest score, then the earliest start byte.
-	if want[1] != "lexical|900|docs/skill.md|Skill: Reverse-Proxy Config Hunt|3|[matched the lexical tier]" {
-		t.Errorf("the Markdown group served %q, want the highest-scoring, earliest heading", want[1])
-	}
-}
-
-// legQuantization proves the one float boundary. Ranking compares int64 only;
-// a drifting or truncating quantizer would make two releases disagree on the
-// order of two hits whose scores differ in the seventh decimal.
-func legQuantization(t *testing.T, _ *fixture) {
-	cases := []struct {
-		score float64
-		want  int64
-	}{
-		{0, 0},
-		{1, 1_000_000},
-		{0.0000005, 1},   // rounds half away from zero, never truncates to 0
-		{0.00000049, 0},  // and the value just below it does not
-		{-0.0000005, -1}, // symmetric, so a negative idf cannot round to +0
-		{2.7182818284, 2_718_282},
-	}
-	for _, c := range cases {
-		if got := quantizeScore(c.score); got != c.want {
-			t.Errorf("quantizeScore(%v) = %d, want %d", c.score, got, c.want)
-		}
-	}
-	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		if got := quantizeScore(bad); got != 0 {
-			t.Errorf("quantizeScore(%v) = %d, want 0: a non-finite score must not become an arbitrary ranking value", bad, got)
-		}
-	}
-}
-
-// legDedupFolds proves deduplication: one entity, one hit, the
-// lowest tier seen, the lexical score kept, occurrences summed. Folding after
-// paging (or not at all) would serve one node twice inside one page and
-// understate its occurrence count.
-func legDedupFolds(t *testing.T, _ *fixture) {
-	c := collectorFor(t)
-	add(t, c, rankedOf(model.TierLexical, 4_200_000, "pkg/alpha.go", 0, "node-a", "doc-a1"), "lexical match")
-	add(t, c, rankedOf(model.TierExactName, 0, "pkg/alpha.go", 0, "node-a", "doc-a2"), "exact_name match")
-	add(t, c, rankedOf(model.TierLexical, 1_000_000, "pkg/beta.go", 0, "node-b", "doc-b1"), "lexical match")
-	got := resultsOf(t, c)
-	if len(got) != 2 {
-		t.Fatalf("results = %d hits, want 2 after deduplication", len(got))
-	}
-	a := got[0]
-	if a.NodeID != "node-a" {
-		t.Fatalf("first hit is %q, want node-a", a.NodeID)
-	}
-	if a.Tier != model.TierExactName {
-		t.Errorf("folded tier = %q, want %q: the survivor keeps the lowest tier rank seen", a.Tier, model.TierExactName)
-	}
-	if a.ScoreMicros != 4_200_000 {
-		t.Errorf("folded ScoreMicros = %d, want 4200000: an exact hit that also matched lexically keeps that score", a.ScoreMicros)
-	}
-	if a.Occurrences != 2 {
-		t.Errorf("folded Occurrences = %d, want 2", a.Occurrences)
-	}
-	if a.SearchKey != "doc-a2" {
-		t.Errorf("folded SearchKey = %q, want doc-a2: the survivor is the candidate that sorts first", a.SearchKey)
-	}
-	if len(a.Reasons) != 2 {
-		t.Errorf("folded Reasons = %v, want both sides' reasons", a.Reasons)
-	}
-	if got[1].ScoreMicros != 1_000_000 || got[1].Occurrences != 1 {
-		t.Errorf("second hit = %+v, want the untouched beta candidate", got[1].ranked)
-	}
-}
-
-// legDedupFileKey proves the fallback key. A file chunk carries no node id, so
-// keying only on NodeID would fold every bodiless chunk of every file into one
-// hit.
-func legDedupFileKey(t *testing.T, _ *fixture) {
-	c := collectorFor(t)
-	add(t, c, rankedOf(model.TierLexical, 3, "pkg/alpha.go", 0, "", "doc-1"))
-	add(t, c, rankedOf(model.TierLexical, 5, "pkg/alpha.go", 0, "", "doc-2"))
-	add(t, c, rankedOf(model.TierLexical, 7, "pkg/alpha.go", 64, "", "doc-3"))
-	add(t, c, rankedOf(model.TierLexical, 9, "pkg/beta.go", 0, "", "doc-4"))
-	got := resultsOf(t, c)
-	if len(got) != 3 {
-		t.Fatalf("results = %d hits, want 3: (path,start) separates chunks, and folds only the pair that shares one", len(got))
-	}
-	want := []int64{9, 7, 5}
-	for i, w := range want {
-		if got[i].ScoreMicros != w {
-			t.Errorf("hit %d ScoreMicros = %d, want %d", i, got[i].ScoreMicros, w)
-		}
-	}
-	if got[2].Occurrences != 2 {
-		t.Errorf("the two documents at pkg/alpha.go:0 folded to Occurrences = %d, want 2", got[2].Occurrences)
-	}
-}
-
-// legRankedSetLossless proves the ranked set is lossless: the former bound of
-// 10*model.MaxPageItems distinct results refused every new key past 2000 and
-// discarded the tail of the corpus. 5000 distinct candidates, offered in an
-// order unrelated to their rank, must ALL survive, in exactly the order an
-// in-memory oracle sorted by the Section 14.2 chain produces, and the answer
-// must not claim to be truncated.
-//
-// Mutation: restore the refusal in collector.add and this fails on the count.
-func legRankedSetLossless(t *testing.T, _ *fixture) {
-	const distinct = 5000
-	oracle := make([]ranked, 0, distinct)
-	c := collectorFor(t)
-	// A stride coprime with distinct offers the candidates in an order that
-	// shares no prefix with the ranked order, so a collector that silently
-	// kept only a prefix of what it was offered cannot pass.
-	for i := range distinct {
-		n := (i * 2237) % distinct
-		r := rankedOf(model.TierLexical, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
-			model.NodeID("n"+strconv.Itoa(n)), "k"+strconv.Itoa(n))
-		oracle = append(oracle, r)
-		add(t, c, r, "lexical")
-	}
-	if truncated, reason := c.truncation(); truncated {
-		t.Fatalf("a %d-result answer reported itself truncated: %s", distinct, reason)
-	}
-	got := resultsOf(t, c)
-	if len(got) != distinct {
-		t.Fatalf("results = %d, want every one of the %d distinct hits", len(got), distinct)
-	}
-	sort.Slice(oracle, func(i, j int) bool {
-		return cmpScored(scored{ranked: oracle[i]}, scored{ranked: oracle[j]}) < 0
-	})
-	for i := range oracle {
-		if got[i].ranked != oracle[i] {
-			t.Fatalf("hit %d = %+v, want %+v (rank order differs from the oracle)", i, got[i].ranked, oracle[i])
-		}
-	}
-	// A repeat of a key still folds rather than entering twice, at any size.
-	again := collectorFor(t)
-	for i := range distinct {
-		n := (i * 2237) % distinct
-		add(t, again, rankedOf(model.TierLexical, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
-			model.NodeID("n"+strconv.Itoa(n)), "k"+strconv.Itoa(n)), "lexical")
-	}
-	add(t, again, oracle[0], "exact")
-	if got := resultsOf(t, again); len(got) != distinct {
-		t.Fatalf("a repeated key grew the set to %d, want %d", len(got), distinct)
-	}
-}
-
-// legReasonBounds proves the Section 14.3 explanation bounds survive folding.
-// A folded hit with nine reasons, or one reason of a megabyte, fails
-// model.SearchHit.Validate and takes the whole page down.
-func legReasonBounds(t *testing.T, _ *fixture) {
-	c := collectorFor(t)
-	long := strings.Repeat("x", model.MaxReasonBytes+64)
-	for i := range model.MaxReasonsPerEntry + 4 {
-		add(t, c, rankedOf(model.TierLexical, 1, "p", 0, "n", "k"), "reason "+strconv.Itoa(i), long, "reason 0")
-	}
-	got := resultsOf(t, c)[0]
-	if len(got.Reasons) != model.MaxReasonsPerEntry {
-		t.Fatalf("Reasons = %d entries, want the bound %d", len(got.Reasons), model.MaxReasonsPerEntry)
-	}
-	for i, r := range got.Reasons {
-		if len(r) > model.MaxReasonBytes {
-			t.Errorf("reason %d is %d bytes, over the %d-byte bound", i, len(r), model.MaxReasonBytes)
-		}
-	}
-	if n := len(slices.Compact(slices.Clone(got.Reasons))); n != len(got.Reasons) {
-		t.Errorf("Reasons repeats an entry: %v", got.Reasons)
-	}
-	hit := model.SearchHit{FileID: model.NewFileID("r", "p"), Path: "p", Kind: model.NodeFunction,
-		Tier: model.TierLexical, Reasons: got.Reasons}
-	if err := hit.Validate(); err != nil {
-		t.Errorf("a folded hit does not validate: %v", err)
-	}
-}
-
-// legQueryHash proves the cursor's query binding. A hash that ignored a filter
-// would let a cursor minted for one filter set resume against another, serving
-// page 2 of a different question under the same token.
+// legQueryHash proves the cursor's query binding. A hash that ignored a filter,
+// the minimum score or the length rule would let a cursor minted for one answer
+// resume against another, serving page 2 of a different question under the
+// same token.
 func legQueryHash(t *testing.T, _ *fixture) {
 	base := model.SearchRequest{Query: "handle request",
 		Kinds:     []model.NodeKind{model.NodeFunction, model.NodeClass},
@@ -635,11 +306,11 @@ func legQueryHash(t *testing.T, _ *fixture) {
 	reordered := model.SearchRequest{Query: " handle   request ",
 		Kinds:     []model.NodeKind{model.NodeClass, model.NodeFunction},
 		Languages: []string{"rust", "go"}, Paths: []string{"cmd/", "pkg/"}}
-	h := searchQueryHash(base)
+	h := searchQueryHash(base, textindex.LengthTotal)
 	if !model.ValidHexID(h) {
 		t.Fatalf("query hash %q is not a well-formed id; Cursor.Validate rejects it", h)
 	}
-	if got := searchQueryHash(reordered); got != h {
+	if got := searchQueryHash(reordered, textindex.LengthTotal); got != h {
 		t.Error("filter order or interior whitespace changed the query hash; one query must have one cursor identity")
 	}
 	changed := []struct {
@@ -652,18 +323,26 @@ func legQueryHash(t *testing.T, _ *fixture) {
 		{"paths", model.SearchRequest{Query: base.Query, Kinds: base.Kinds, Languages: base.Languages, Paths: []string{"pkg/"}}},
 	}
 	for _, c := range changed {
-		if searchQueryHash(c.req) == h {
+		if searchQueryHash(c.req, textindex.LengthTotal) == h {
 			t.Errorf("changing %s did not change the query hash", c.name)
 		}
 	}
+	floored := base
+	floored.MinScoreMicros = 1
+	if searchQueryHash(floored, textindex.LengthTotal) == h {
+		t.Error("changing the minimum score did not change the query hash")
+	}
+	if searchQueryHash(base, textindex.LengthWeighted) == h {
+		t.Error("changing the length rule did not change the query hash")
+	}
 	// A filter group is separated, so "a\x00b" and "ab" are different queries.
 	split := model.SearchRequest{Query: base.Query, Kinds: base.Kinds, Languages: base.Languages, Paths: []string{"pk", "g/cmd/"}}
-	if searchQueryHash(split) == searchQueryHash(model.SearchRequest{Query: base.Query, Kinds: base.Kinds,
-		Languages: base.Languages, Paths: []string{"pkg/cmd/"}}) {
+	if searchQueryHash(split, textindex.LengthTotal) == searchQueryHash(model.SearchRequest{Query: base.Query, Kinds: base.Kinds,
+		Languages: base.Languages, Paths: []string{"pkg/cmd/"}}, textindex.LengthTotal) {
 		t.Error("filter values are concatenated without a separator")
 	}
 	// The two endpoints never collide on one preimage.
-	if symbolQueryHash(model.SymbolRequest{Query: base.Query}) == searchQueryHash(model.SearchRequest{Query: base.Query}) {
+	if symbolQueryHash(model.SymbolRequest{Query: base.Query}) == searchQueryHash(model.SearchRequest{Query: base.Query}, textindex.LengthTotal) {
 		t.Error("the search and symbol endpoints hash one query to one value")
 	}
 }
@@ -674,7 +353,7 @@ func legQueryHash(t *testing.T, _ *fixture) {
 func legCursorRejections(t *testing.T, f *fixture) {
 	signer := f.opts.Signer
 	now := time.Now().UTC()
-	qh := searchQueryHash(model.SearchRequest{Query: "handle"})
+	qh := searchQueryHash(model.SearchRequest{Query: "handle"}, textindex.LengthTotal)
 	c := newCursor(endpointSearch, f.binding, model.H("lease", "1"), qh, now.Add(15*time.Minute))
 	token, err := signer.EncodeCursor(c)
 	if err != nil {
@@ -729,7 +408,7 @@ func legCursorRejections(t *testing.T, f *fixture) {
 	other.AnalysisKey = model.AnalysisKey(model.H("other-analysis"))
 	assertCode(t, "reanalyzed", verifyCursor(back, other, qh), model.CodeCursorInvalid)
 	assertCode(t, "requeried", verifyCursor(back, f.binding,
-		searchQueryHash(model.SearchRequest{Query: "handle", Languages: []string{"go"}})), model.CodeCursorInvalid)
+		searchQueryHash(model.SearchRequest{Query: "handle", Languages: []string{"go"}}, textindex.LengthTotal)), model.CodeCursorInvalid)
 }
 
 // legResolveKeyset proves the Resolve continuation fits its bound and round
@@ -989,13 +668,18 @@ func assertCode(t *testing.T, what string, err error, want string) {
 	}
 }
 
-// legEndToEndRanking is the end-to-end retrieval leg: the whole Section 14.2
-// order over the real corpus, through the real service, exact and lexical
-// retrieval together.
+// legEndToEndRanking is the end-to-end retrieval leg: the Section 14.2 order
+// over the real corpus, through the real service and the real search index,
+// exact and lexical retrieval together.
 //
-// It asserts exact int64 ScoreMicros for the exact tiers -- they are fixed at
-// 0 for a document that did not also match lexically, and a non-zero
-// value there would mean tier ordering had quietly become score ordering.
+// The exact tiers are not ranked: every exact hit scores 0 and is one
+// occurrence, and it sorts above every lexical hit. A lexical result whose node
+// an exact tier served is not served again, so the node the query names
+// exactly appears once, at its exact tier. The two documents of one node fold
+// into one lexical result counting both.
+//
+// Mutation: serve the lexical sequence without the exact fold (drop the
+// servedExactly test in lexicalPhase) and the alpha node is served twice.
 func legEndToEndRanking(t *testing.T, f *fixture) {
 	s := newService(t, f.opts)
 	page, err := s.Search(f.ctx, model.SearchRequest{Query: "pkg.Alpha.Handle", Page: model.PageRequest{Limit: 10}})
@@ -1006,65 +690,61 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 		t.Fatal("the exact qualified name matched nothing")
 	}
 	top := page.Items[0]
-	if top.Tier != model.TierExactQualifiedName {
-		t.Errorf("top tier = %q, want %q", top.Tier, model.TierExactQualifiedName)
+	if top.Tier != model.TierExactQualifiedName || top.NodeID != f.nodes["pkg/alpha.go"] {
+		t.Fatalf("top hit is %q at tier %q, want the alpha node at %q", top.NodeID, top.Tier, model.TierExactQualifiedName)
 	}
-	if top.NodeID != f.nodes["pkg/alpha.go"] {
-		t.Errorf("top hit is %q, want the alpha node", top.NodeID)
-	}
-	if top.OccurrenceCount != 2 {
-		t.Errorf("OccurrenceCount = %d, want 2: the two documents of one node fold to one hit", top.OccurrenceCount)
+	if top.ScoreMicros != 0 || top.OccurrenceCount != 1 {
+		t.Errorf("the exact hit scores %d with %d occurrences, want 0 and 1: the exact tiers are not ranked",
+			top.ScoreMicros, top.OccurrenceCount)
 	}
 	if top.Range == nil {
 		t.Error("the served hit carries no source range")
 	}
-	// The BM25F constants themselves. Section 9 requires exact int64
-	// ScoreMicros, not orderings: with only an ordering assertion, bm25K1,
-	// bm25B and every columnWeight entry can be changed to any other value and
-	// the suite stays green, so the scoring formula would be unprotected. Two
-	// scores are pinned because they load different parts of it: the top hit
-	// folds a name-column match into an exact-tier candidate, and the second
-	// is a pure body/qualified-name lexical hit. Recompute these deliberately
-	// -- a changed value here is a changed ranking for every caller.
-	//
-	// The other half of Section 9's ranking claim, that a lower-scoring exact
-	// hit still outranks a higher-scoring lexical one, is legLessChain's
-	// (:327); asserting it again here would be a duplicate.
-	const (
-		wantTopMicros     int64 = 2_197_205
-		wantLexicalMicros int64 = 554_547
-	)
-	if top.ScoreMicros != wantTopMicros {
-		t.Errorf("the alpha hit scores %d, want the BM25F value %d", top.ScoreMicros, wantTopMicros)
-	}
-	lexicalHit := false
-	for _, hit := range page.Items {
-		if hit.NodeID != f.nodes["pkg/beta.go"] {
-			continue
-		}
-		lexicalHit = true
-		if hit.Tier != model.TierLexical || hit.ScoreMicros != wantLexicalMicros {
-			t.Errorf("the beta hit is tier %q at %d, want %q at the BM25F value %d",
-				hit.Tier, hit.ScoreMicros, model.TierLexical, wantLexicalMicros)
-		}
-	}
-	if !lexicalHit {
-		t.Error("the query returned no lexical hit to score")
-	}
+	alpha, lexical := 0, 0
 	for i, hit := range page.Items {
-		// The exact and prefix tiers score zero unless the document also
-		// matched lexically, keeping that score, which is exactly what
-		// the top hit here does: its node's two lexical documents fold into
-		// the exact candidate. The exemption is read off the hit's own
-		// reasons, with the production spelling, so it can only apply to a
-		// hit the lexical tier really contributed to.
-		lexical := hit.Tier == model.TierLexical || slices.Contains(hit.Reasons, reasonFor(model.TierLexical))
-		if !lexical && hit.ScoreMicros != 0 {
+		if hit.NodeID == f.nodes["pkg/alpha.go"] {
+			alpha++
+		}
+		if hit.Tier == model.TierLexical {
+			lexical++
+			if hit.ScoreMicros <= 0 {
+				t.Errorf("lexical hit %d scores %d, want a positive score", i, hit.ScoreMicros)
+			}
+		} else if hit.ScoreMicros != 0 {
 			t.Errorf("hit %d is tier %q with ScoreMicros = %d, want 0", i, hit.Tier, hit.ScoreMicros)
 		}
 		if i > 0 && page.Items[i-1].Tier.Rank() > hit.Tier.Rank() {
 			t.Errorf("hit %d (%q) sorts after a later tier", i, hit.Tier)
 		}
+		if i > 0 && hit.Tier == model.TierLexical && page.Items[i-1].Tier == model.TierLexical &&
+			page.Items[i-1].ScoreMicros < hit.ScoreMicros {
+			t.Errorf("lexical hit %d scores %d above its predecessor's %d", i, hit.ScoreMicros, page.Items[i-1].ScoreMicros)
+		}
+	}
+	if alpha != 1 {
+		t.Errorf("the alpha node was served %d times, want once, at its exact tier", alpha)
+	}
+	if lexical == 0 {
+		t.Error("the query returned no lexical hit: the beta and café documents match its terms")
+	}
+
+	// Two documents of one node fold into one lexical result counting both.
+	handle, err := s.Search(f.ctx, model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 10}})
+	if err != nil {
+		t.Fatalf("Search(handle): %v", err)
+	}
+	folded := 0
+	for _, hit := range handle.Items {
+		if hit.NodeID == f.nodes["pkg/alpha.go"] {
+			folded++
+			if hit.Tier != model.TierLexical || hit.OccurrenceCount != 2 {
+				t.Errorf("the alpha node is served at %q with %d occurrences, want lexical with its 2 documents",
+					hit.Tier, hit.OccurrenceCount)
+			}
+		}
+	}
+	if folded != 1 {
+		t.Errorf("the alpha node's two documents were served as %d results, want one", folded)
 	}
 
 	// The prefix tier serves both pkg.Beta* and pkg.Alpha* documents through
@@ -1073,12 +753,18 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 	if err != nil {
 		t.Fatalf("Search(prefix): %v", err)
 	}
-	if len(prefix.Items) < 3 {
-		t.Errorf("the prefix query returned %d hits, want every fixture document", len(prefix.Items))
+	prefixed := 0
+	for _, hit := range prefix.Items {
+		if hit.Tier == model.TierQualifiedNamePrefix {
+			prefixed++
+		}
+	}
+	if prefixed != len(fixtureDocs) {
+		t.Errorf("the prefix query served %d prefix-tier hits, want every fixture node", prefixed)
 	}
 
-	// A Unicode identifier and a literal-punctuation query both survive the
-	// FTS encoder rather than being rejected as malformed MATCH syntax.
+	// A Unicode identifier and a literal-punctuation query are text to the
+	// lexical tier, never syntax.
 	for _, q := range []string{"café", "foo(bar)"} {
 		got, err := s.Search(f.ctx, model.SearchRequest{Query: q, Page: model.PageRequest{Limit: 10}})
 		if err != nil {
@@ -1088,6 +774,55 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 			t.Errorf("Search(%q) matched nothing", q)
 		}
 	}
+}
+
+// legSearchPositionKeys proves a continuation's position survives its token
+// and that a key this endpoint did not write is refused rather than read as a
+// restarted answer. A Resolve key, a spool cursor's empty key and a negative
+// count are all CTX_CURSOR_INVALID.
+func legSearchPositionKeys(t *testing.T, f *fixture) {
+	for _, want := range []searchPosition{
+		{phase: phaseExact, rank: model.TierExactName.Rank(), node: f.nodes["pkg/alpha.go"]},
+		{phase: phaseLexical, served: 412},
+	} {
+		key := want.lastKey()
+		if len(key) > 1024 {
+			t.Fatalf("the position key is %d bytes, over the Cursor.LastKey bound", len(key))
+		}
+		got, err := parseSearchPosition(key)
+		if err != nil || got != want {
+			t.Fatalf("parseSearchPosition(%q) = %+v, %v; want %+v", key, got, err, want)
+		}
+	}
+	node := string(f.nodes["pkg/alpha.go"])
+	for _, bad := range []string{"", "l", "l\x00-1", "l\x00x", "x\x004\x00" + node, "x\x00-1\x00" + node,
+		"x\x001\x00not-an-id", resolveKey(model.TierExactName, node)} {
+		_, err := parseSearchPosition(bad)
+		assertCode(t, "key "+strconv.Quote(bad), err, model.CodeCursorInvalid)
+	}
+}
+
+// legMinScoreRefusesTheCursor proves a continuation minted under one minimum
+// score is refused under another: the floor decides which lexical results
+// exist, so the count a lexical position carries would name a different place.
+//
+// Mutation: leave MinScoreMicros out of searchQueryHash and the floored
+// continuation is served.
+func legMinScoreRefusesTheCursor(t *testing.T, f *fixture) {
+	s := newService(t, f.opts)
+	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
+	first, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("Search(page 1): %v", err)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a one-hit page over two matching nodes minted no continuation")
+	}
+	floored := req
+	floored.MinScoreMicros = 1
+	floored.Page.Cursor = first.Meta.NextCursor
+	_, err = s.Search(f.ctx, floored)
+	assertCode(t, "a continuation under another minimum score", err, model.CodeCursorInvalid)
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,11 +891,6 @@ func (s *stubExact) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int)
 	return nil, nil
 }
 
-// testTruncationReason is an arbitrary answer-level truncation reason used to
-// prove a spool meta record round-trips it; the reason's text is not the
-// invariant under test.
-const testTruncationReason = "a traversal budget was exhausted"
-
 // legPathTierLossless proves the exact_path tier drops nothing: it walks the
 // whole keyset and emits every kept candidate, with the read page size bounding
 // only one round trip. Serving five of eight candidates -- or answering
@@ -1186,7 +916,7 @@ func legPathTierLossless(t *testing.T, _ *fixture) {
 	collect := func(kinds []model.NodeKind) []exactHit {
 		t.Helper()
 		var out []exactHit
-		if _, err := pathCandidates(context.Background(), stub, stub.path, kinds, page,
+		if err := pathCandidates(context.Background(), stub, stub.path, stub.file, kinds, page,
 			func(h exactHit) error { out = append(out, h); return nil }); err != nil {
 			t.Fatalf("pathCandidates: %v", err)
 		}
@@ -1325,7 +1055,7 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 		stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "pkg/wide.go"}
 		var held uint64
 		count := 0
-		if err := exactCandidates(context.Background(), stub, "Widget", nil, 1000,
+		if err := exactCandidates(context.Background(), stub, "Widget", nil, 1000, allExactTiers,
 			func(exactHit) error {
 				count++
 				if count == n {
@@ -1372,7 +1102,7 @@ func legExactPathTierOwnsItsFile(t *testing.T, _ *fixture) {
 	// The query resolves as a path AND matches the symbol tiers' filters.
 	stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "Widget"}
 	byTier := map[model.SearchTier]int{}
-	if err := exactCandidates(context.Background(), stub, stub.path, nil, 100,
+	if err := exactCandidates(context.Background(), stub, stub.path, nil, 100, allExactTiers,
 		func(h exactHit) error { byTier[h.Tier]++; return nil }); err != nil {
 		t.Fatalf("exactCandidates: %v", err)
 	}
@@ -1386,60 +1116,21 @@ func legExactPathTierOwnsItsFile(t *testing.T, _ *fixture) {
 	}
 }
 
-// legSpoolExhaustionEndsThePage proves the class-D refusal is gone: when the
-// shared spool byte budget cannot hold the tail of an answer, the hits already
-// in hand are still served. Before, spoolNext's error propagated out of Search
-// and page 1 failed because the page after it could not be written.
-//
-// The budget is set to one byte, so Create's header alone exhausts it and no
-// continuation can be minted for a corpus that certainly has one.
-//
-// Mutation: restore `return empty, err` in the spoolNext branch and Search
-// fails here instead of answering.
-func legSpoolExhaustionEndsThePage(t *testing.T, f *fixture) {
-	full, err := pagination.NewSpools(filepath.Join(t.TempDir(), "spools"), 1, f.store)
-	if err != nil {
-		t.Fatalf("NewSpools: %v", err)
-	}
-	opts := f.opts
-	opts.Spools = full
-	s := newService(t, opts)
-	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
-	page, err := s.Search(f.ctx, req)
-	if err != nil {
-		t.Fatalf("a full spool failed page 1 instead of ending it: %v", err)
-	}
-	if len(page.Items) != 1 {
-		t.Fatalf("page 1 served %d hits, want the 1 it had in hand", len(page.Items))
-	}
-	if page.Meta.NextCursor != "" {
-		t.Error("an answer whose tail could not be spooled still minted a continuation")
-	}
-	if !page.Meta.Truncated {
-		t.Fatal("an answer that dropped its tail did not report itself truncated")
-	}
-	if !strings.Contains(page.Meta.TruncationReason, "spool") {
-		t.Errorf("truncation reason = %q, want the dropped tail named", page.Meta.TruncationReason)
-	}
-}
-
 // legWriterlessSearchPagesInFull proves that a search answered by a process
 // that opened the store read-only -- which is how `codectx search` answers
 // while another process is indexing -- pages through its WHOLE answer, across
 // separate calls, and reaches the same hits the unpaged answer holds.
 //
-// Failure mode: such a process serves page one and mints no continuation, so a
-// person searching during an index silently sees a prefix of the ranking with
-// no way to reach the rest. The spool a continuation needs is a filesystem
-// write, which this process can make; only the retention lease is a database
-// write, and the entry is bound to the cursor's own expiry instead.
+// Failure mode: such a process cannot record a retention lease, and a search
+// that required one would serve page one and stop, so a person searching
+// during an index silently sees a prefix of the ranking with no way to reach
+// the rest. The continuation carries its whole position in the token, so it
+// needs no lease: the read of the call that presents it retains the generation.
 //
-// Mutation: drop the spool write -- make rawWriter.start return before
-// spools.Create, leaving w.spool nil -- and the continuation the first page
-// hands back names nothing, so page two fails instead of serving the tail.
+// Mutation: drop the reader.Continuable() branch in keysetNext so the lease is
+// always acquired, and the read-only store refuses page one's continuation.
 func legWriterlessSearchPagesInFull(t *testing.T, f *fixture) {
-	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true,
-		ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+	ro, err := sqlite.Open(f.ctx, f.dbPath, storeOptions(true))
 	if err != nil {
 		t.Fatalf("read-only Open: %v", err)
 	}
@@ -1461,8 +1152,7 @@ func legWriterlessSearchPagesInFull(t *testing.T, f *fixture) {
 	}
 	seen := len(first.Items)
 	// The SECOND call is the point: the token was minted with no lease row, and
-	// the process that presents it back reads the spool by the expiry its
-	// header carries.
+	// the process that presents it back resumes from the position it carries.
 	req.Page.Cursor = first.Meta.NextCursor
 	second, err := s.Search(f.ctx, req)
 	if err != nil {
@@ -1493,71 +1183,6 @@ func legWriterlessSearchPagesInFull(t *testing.T, f *fixture) {
 	}
 }
 
-// legContinuationTruncation proves that Service.Search's continuation branch
-// reports the answer-level truncation the FIRST page computed. A continuation
-// reads its hits from the spool and has nothing of its own to recompute
-// truncation from, so a page that dropped the metadata would present the tail
-// of an admittedly incomplete answer as complete.
-//
-// The spool round-trip itself is legSpooledPage's; what is asserted here is
-// only what comes out of Service.Search. The truncated continuation is minted
-// rather than produced by a first page because neither answer-level bound --
-// 200 exact candidates, 512 term offsets -- is reachable on a three-document
-// corpus.
-func legContinuationTruncation(t *testing.T, f *fixture) {
-	s := newService(t, f.opts)
-	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
-	first, err := s.Search(f.ctx, req)
-	if err != nil {
-		t.Fatalf("Search(page 1): %v", err)
-	}
-	if first.Meta.NextCursor == "" {
-		t.Fatal("a bounded page over three matching documents minted no continuation")
-	}
-	if first.Meta.Truncated {
-		t.Fatalf("the control page reports truncation (%q); the assertion below would be vacuous", first.Meta.TruncationReason)
-	}
-	continued := req
-	continued.Page.Cursor = first.Meta.NextCursor
-	second, err := s.Search(f.ctx, continued)
-	if err != nil {
-		t.Fatalf("Search(page 2): %v", err)
-	}
-	if len(second.Items) == 0 || second.Items[0].NodeID == first.Items[0].NodeID {
-		t.Fatalf("page 2 served %d items starting at the page-1 hit; the continuation did not advance", len(second.Items))
-	}
-	if second.Meta.Truncated {
-		t.Error("a continuation of a complete answer reports truncation")
-	}
-
-	// The answer-level truncation rides INSIDE the signed continuation, so a
-	// truncated walk is minted by re-signing a live one -- over a fresh first
-	// page, whose spool the assertion below is the only reader of -- rather
-	// than by a fixture that cannot reach either answer-level bound.
-	fresh, err := s.Search(f.ctx, req)
-	if err != nil {
-		t.Fatalf("Search(fresh page 1): %v", err)
-	}
-	c, err := s.resumeSearch(fresh.Meta.NextCursor, searchQueryHash(req), time.Now().UTC())
-	if err != nil {
-		t.Fatalf("resumeSearch: %v", err)
-	}
-	c.Truncated, c.TruncationReason = true, testTruncationReason
-	token, err := s.signSearchCursor(c)
-	if err != nil {
-		t.Fatalf("signSearchCursor: %v", err)
-	}
-	continued.Page.Cursor = token
-	page, err := s.Search(f.ctx, continued)
-	if err != nil {
-		t.Fatalf("Search(truncated continuation): %v", err)
-	}
-	if !page.Meta.Truncated || page.Meta.TruncationReason != testTruncationReason {
-		t.Fatalf("the continuation reports (%t, %q), want the first page's (true, %q)",
-			page.Meta.Truncated, page.Meta.TruncationReason, testTruncationReason)
-	}
-}
-
 // legSymbolByCanonicalID proves the canonical-id tier of `codectx symbol`. The
 // command's Long text promises a canonical node ID resolves, and the name tiers
 // index names: without this tier a query spelled as an id falls through them
@@ -1578,136 +1203,20 @@ func legSymbolByCanonicalID(t *testing.T, f *fixture) {
 	}
 }
 
-// collectorFor opens a ranking collector whose external sort spills under the
-// test's own directory. The run budget is the floor, so these legs exercise
-// the spilling path rather than the buffer-only one.
-func collectorFor(t *testing.T) *collector {
-	t.Helper()
-	c, err := newCollector(t.TempDir(), 0)
-	if err != nil {
-		t.Fatalf("opening a collector: %v", err)
-	}
-	t.Cleanup(func() { c.Close() })
-	return c
-}
-
-// add offers one candidate with no servable facts, which the ranking legs do
-// not read.
-func add(t *testing.T, c *collector, r ranked, reasons ...string) {
-	t.Helper()
-	if err := c.add(r, hitFacts{}, reasons...); err != nil {
-		t.Fatalf("adding a candidate: %v", err)
-	}
-}
-
-// resultsOf drains the ordered run into a slice so a leg can index it. The
-// production path streams it instead; nothing outside a test holds it whole.
-func resultsOf(t *testing.T, c *collector) []scored {
-	t.Helper()
-	run, err := c.deduped()
-	if err != nil {
-		t.Fatalf("ordering the candidate set: %v", err)
-	}
-	t.Cleanup(func() { run.Close() })
-	out, err := rankOrder(t, run)
-	if err != nil {
-		t.Fatalf("reading the ordered set: %v", err)
-	}
-	return out
-}
-
-// rankOrder is the WHOLE answer in served order: the deduplicated candidates
-// promoted and passed through the same external sort under cmpScored that a
-// continuation runs over the raw candidate spool. It is the reference the
-// bounded heap's first page is compared against.
-func rankOrder(t *testing.T, run *pagination.SortedRun[scored]) ([]scored, error) {
-	t.Helper()
-	sorter, err := newScoredSort(t.TempDir(), 0, cmpScored)
-	if err != nil {
-		return nil, err
-	}
-	defer sorter.Close()
-	if err := run.Each(func(v scored) error {
-		v.ScoreMicros = v.Folded
-		return sorter.Add(v)
-	}); err != nil {
-		return nil, err
-	}
-	sorted, err := sorter.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer sorted.Close()
-	var out []scored
-	err = sorted.Each(func(v scored) error { out = append(out, v); return nil })
-	return out, err
-}
-
-// legRankedSetIsBoundedByItsRunBudget proves the ranked set is sized by the
-// query memory admission and not by the number of matches. A one-character
-// qualified_name_prefix range-scans a corpus-sized slice of node_ids and every
-// match enters this set; at 200 000 matches a map-plus-slice collector would
-// hold 200 000 entries plus 200 000 servable hits.
-//
-// The assertion is the sort's live-record high-water mark, which is
-// deterministic and input-independent: it must be IDENTICAL at 20 000 and at
-// 200 000 candidates and within the envelope the run budget and the merge
-// fan-in define.
-//
-// Mutation: drop the byte budget so a run is unbounded (WithRunBytes's sizeOf
-// nil-guard, or a runBytes larger than the input) and the high-water mark
-// becomes the match count at both sizes.
-func legRankedSetIsBoundedByItsRunBudget(t *testing.T, f *fixture) {
-	peakAt := func(n int) int {
-		c := collectorFor(t)
-		for i := range n {
-			// A stride coprime with n offers the candidates in an order that
-			// shares no prefix with either sort order, so every run spills a
-			// scattered key range and the merge is a real one.
-			k := (i * 2237) % n
-			add(t, c, rankedOf(model.TierLexical, int64(k), "pkg/f"+strconv.Itoa(k%97)+".go", uint64(k),
-				model.NodeID("n"+strconv.Itoa(k)), "k"+strconv.Itoa(k)), "lexical")
-		}
-		got := resultsOf(t, c)
-		if len(got) != n {
-			t.Fatalf("%d candidates ranked to %d results, want all of them", n, len(got))
-		}
-		return c.peakLiveRecords()
-	}
-	small, large := peakAt(20_000), peakAt(200_000)
-	// A ten-fold input must not move the high-water mark at all beyond the
-	// merge fan-in: the run budget is a BYTE budget, so the record count one
-	// run holds varies by a few with the length of the keys that happen to
-	// fill it, but it cannot track the input.
-	if large > small+pagination.MaxSortFanIn {
-		t.Fatalf("live record high-water was %d at 20000 candidates and %d at 200000; the working set must not grow with the match count",
-			small, large)
-	}
-	// The envelope: one run buffer of the floored budget, whose records this
-	// leg makes about 300 bytes each, plus one record per open run in the
-	// merge. A generous ceiling still fails instantly on an unbounded run.
-	const envelope = 4096
-	if large > envelope {
-		t.Fatalf("live record high-water was %d at 200000 candidates, over the %d-record envelope", large, envelope)
-	}
-
-}
-
 // legDeadlineEndsThePage is the deadline rule for search: resources.query_timeout ends
-// a PAGE, not an answer. On a real repository this endpoint answered
-// CTX_QUERY_DEADLINE with no page and no cursor, so the widest queries -- the
-// only ones that ever reach the deadline -- were unanswerable rather than
-// partially answered.
+// a PAGE, not an answer. Answering CTX_QUERY_DEADLINE with no page would leave
+// the widest queries -- the only ones that ever reach the deadline --
+// unanswerable rather than partially answered.
 //
-// The ranking phase runs under a budget that has already expired here, so
-// every tier stops at its first read; what the collector holds is served as a
-// page that says it is truncated and why. Nothing else in the answer may
+// The candidate search runs under a budget that has already expired here, so
+// every tier stops at its first read; what was found is served as a page that
+// says it is truncated and why. Nothing else in the answer may
 // degrade: the binding, the completeness report and the page's own validation
 // are the same as any other answer's.
 //
-// Mutation: return the tier error from Service.rank instead of converting a
-// deadline into a truncated page (drop the isQueryDeadline arms) and this leg
-// fails with CTX_QUERY_DEADLINE where it wants a page.
+// Mutation: return the error from collect instead of converting a deadline into
+// a truncated page (drop the deadline arm of ended) and this leg fails with a
+// typed deadline or cancel error where it wants a page.
 func legDeadlineEndsThePage(t *testing.T, f *fixture) {
 	opts := f.opts
 	opts.Resources.QueryTimeout = config.Duration(time.Nanosecond)
@@ -1726,11 +1235,11 @@ func legDeadlineEndsThePage(t *testing.T, f *fixture) {
 		t.Fatalf("the deadline page is bound to generation %d, want %d",
 			got.Meta.Binding.GenerationID, f.binding.GenerationID)
 	}
-	// Whatever was ranked before the deadline is served, and a page that
-	// leaves hits unserved carries the continuation to reach them.
-	if len(got.Items) > 0 && len(got.Items) < len(fixtureDocs) && got.Meta.NextCursor == "" {
-		t.Fatalf("a deadline page served %d of at most %d hits with no continuation",
-			len(got.Items), len(fixtureDocs))
+	// What was found before the deadline is served, and a page the deadline
+	// ended carries no continuation: its hits are not a prefix of the answer's
+	// order, so no position after them names the rest of it.
+	if got.Meta.NextCursor != "" {
+		t.Fatal("a page the deadline ended minted a continuation")
 	}
 	if err := got.Validate(); err != nil {
 		t.Fatalf("the deadline page does not validate: %v", err)
@@ -1826,114 +1335,6 @@ func legPageClampIsReported(t *testing.T, f *fixture) {
 		t.Fatalf("a request that named no page bound carries notices %v, want none", plain.Meta.Notices)
 	}
 }
-
-// legStreamedWalkParity proves a paged walk is the same answer, in the same
-// order, as the unpaginated one. The tail is never materialised: every
-// candidate is laid into the raw spool as it passes, the first continuation
-// sorts that spool and writes the ordered remainder skipping the records page
-// one already served, and every later page seeks to its own byte offset. A
-// record that was skipped, repeated or reordered -- an off-by-one in that skip
-// against the served count, or a codec that did not round trip -- would show
-// up here and nowhere else.
-//
-// It asserts the WHOLE hit, field for field: Reasons, Kind, Name,
-// QualifiedName and Signature survive the spool round trip or they are lost
-// for every page but the first, and Range must come back identical although
-// the continuation -- not the first page -- is what hydrates it.
-//
-// The corpus walk runs the whole continuation path on a small answer; the
-// second half drives the page heap over a candidate set whose ties span the
-// page boundary, which is the arm a small corpus can never reach.
-func legStreamedWalkParity(t *testing.T, f *fixture) {
-	s := newService(t, f.opts)
-	whole, err := s.Search(f.ctx, model.SearchRequest{Query: "handle"})
-	if err != nil {
-		t.Fatalf("Search(one page): %v", err)
-	}
-	if len(whole.Items) < 2 {
-		t.Fatalf("the corpus answers %d hits; the walk below needs at least 2", len(whole.Items))
-	}
-	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
-	var walked []model.SearchHit
-	for page := 0; ; page++ {
-		if page > len(whole.Items) {
-			t.Fatalf("the continuation walk did not end after %d pages", page)
-		}
-		got, err := s.Search(f.ctx, req)
-		if err != nil {
-			t.Fatalf("Search(page %d): %v", page+1, err)
-		}
-		walked = append(walked, got.Items...)
-		if got.Meta.NextCursor == "" {
-			break
-		}
-		req.Page.Cursor = got.Meta.NextCursor
-	}
-	if len(walked) != len(whole.Items) {
-		t.Fatalf("the walk served %d hits, want the %d the whole answer holds", len(walked), len(whole.Items))
-	}
-	if !reflect.DeepEqual(walked, whole.Items) {
-		for i := range whole.Items {
-			if !reflect.DeepEqual(walked[i], whole.Items[i]) {
-				t.Fatalf("walked hit %d = %+v, want %+v: a spooled hit must survive the round trip whole",
-					i, walked[i], whole.Items[i])
-			}
-		}
-		t.Fatalf("the walked answer differs from the whole one")
-	}
-
-	// The wide arm, on a candidate set whose TIES SPAN THE PAGE BOUNDARY: every
-	// candidate shares one tier, one score and one path, so the first page is
-	// decided entirely by the tie-break keys after them. The heap's page must
-	// be the fully sorted answer's first page, record for record.
-	//
-	// Mutation: drop any key of cmpScored's tie-break chain and the two
-	// disagree at the boundary, because the heap evicts a different entry than
-	// the sort keeps.
-	c := collectorFor(t)
-	const wide, page = model.MaxPageItems*2 + model.MaxPageItems/4, 7
-	for i := range wide {
-		k := (i * 2237) % wide
-		r := rankedOf(model.TierLexical, 1_000_000, "pkg/w.go", uint64(k%3),
-			model.NodeID("w"+strconv.Itoa(k)), "wk"+strconv.Itoa(k))
-		facts := hitFacts{hit: model.SearchHit{NodeID: r.NodeID, FileID: f.files["pkg/handler.go"],
-			Path: r.Path, Kind: model.NodeFunction, Name: "w" + strconv.Itoa(k%5),
-			QualifiedName: "pkg.W" + strconv.Itoa(k%5), Signature: "func w" + strconv.Itoa(k%5) + "() error"}}
-		if err := c.add(r, facts, "matched the lexical tier"); err != nil {
-			t.Fatalf("adding a wide candidate: %v", err)
-		}
-	}
-	run, err := c.deduped()
-	if err != nil {
-		t.Fatalf("deduplicating the wide set: %v", err)
-	}
-	defer run.Close()
-	want, err := rankOrder(t, run)
-	if err != nil {
-		t.Fatalf("ordering the wide set: %v", err)
-	}
-	h := &pageHeap{limit: page}
-	if err := run.Each(func(v scored) error {
-		v.ScoreMicros = v.Folded
-		h.offer(v)
-		return nil
-	}); err != nil {
-		t.Fatalf("feeding the heap: %v", err)
-	}
-	if got := h.page(); !reflect.DeepEqual(got, want[:page]) {
-		for i := range got {
-			if !reflect.DeepEqual(got[i], want[i]) {
-				t.Fatalf("the heap's hit %d is %+v, the sorted run's is %+v: one comparator, two answers",
-					i, got[i], want[i])
-			}
-		}
-		t.Fatalf("the heap served %d hits and the sorted run's first page holds %d", len(got), page)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// The tokenizer fix legs.
-// ---------------------------------------------------------------------------
 
 // stubFileReader answers File for any id by SYNTHESIZING the version, so a walk
 // over 200 000 distinct files costs the stub nothing: a pre-built map of them
@@ -2051,7 +1452,7 @@ func newTwoOffsetFixture(t *testing.T, loserStart, winnerStart uint64) *twoOffse
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	st, err := sqlite.Open(ctx, filepath.Join(dir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+	st, err := sqlite.Open(ctx, filepath.Join(dir, "codectx.db"), storeOptions(false))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -2144,12 +1545,8 @@ func newTwoOffsetFixture(t *testing.T, loserStart, winnerStart uint64) *twoOffse
 	if err != nil {
 		t.Fatalf("OpenSigner: %v", err)
 	}
-	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, st)
-	if err != nil {
-		t.Fatalf("NewSpools: %v", err)
-	}
 	return &twoOffsetFixture{ctx: ctx, path: path, opts: Options{Store: st, Repo: repo, Signer: signer,
-		Spools: spools, Leases: pagination.NewLeases(st, pagination.DefaultCursorTTL), Content: cas,
+		Leases: pagination.NewLeases(st, pagination.DefaultCursorTTL), Content: cas,
 		Resources: config.Defaults().Resources, CursorTTL: pagination.DefaultCursorTTL,
 		Now: func() time.Time { return time.Now().UTC() }}}
 }
@@ -2281,9 +1678,9 @@ func (f *fixture) unitOf(d doc) model.UnitID {
 // process that opened the store read-only -- the composition that answers while
 // another process is indexing.
 //
-// Unlike search's, this continuation writes nothing: it carries its whole
-// position in the token and retains no spool, so the only thing it ever needed
-// a lease for was to retain the generation it names. The read snapshot of the
+// The continuation writes nothing: it carries its whole position in the token,
+// so the only thing it ever needed a lease for was to retain the generation it
+// names. The read snapshot of the
 // call that presents it does that, and a generation collected in between is
 // answered in the cursor's family. Requiring the lease anyway made an answer
 // larger than one page unreachable for the whole length of an index -- a
@@ -2293,8 +1690,7 @@ func (f *fixture) unitOf(d doc) model.UnitID {
 // Mutation: drop the reader.Continuable() branch in keysetNext so the lease is
 // always acquired. The leg then fails with the read-only store's refusal.
 func legWriterlessSymbolPagesInFull(t *testing.T, f *fixture) {
-	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true,
-		ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+	ro, err := sqlite.Open(f.ctx, f.dbPath, storeOptions(true))
 	if err != nil {
 		t.Fatalf("read-only Open: %v", err)
 	}
@@ -2335,5 +1731,151 @@ func legWriterlessSymbolPagesInFull(t *testing.T, f *fixture) {
 	}
 	if seen != len(all.Items) {
 		t.Fatalf("paging a writerless symbol query reached %d nodes, want the %d the one-shot answer has", seen, len(all.Items))
+	}
+}
+
+// identifierDocs is a code corpus for the identifier and paging tests: one
+// identifier whose camelCase parts include a word no other text of the corpus
+// spells on its own, decoys that share some of its parts, and two qualified
+// names one query names exactly and by prefix.
+var identifierDocs = []doc{
+	{path: "pkg/pod.go", name: "Pod", qualifiedName: "pkg.Pod",
+		signature: "type Pod struct", body: "type Pod struct { Spec PodSpec }", occurrences: 1},
+	{path: "pkg/podctl.go", name: "PodController", qualifiedName: "pkg.PodController",
+		signature: "type PodController struct", body: "type PodController struct { queue WorkQueue }", occurrences: 1},
+	{path: "pkg/newpod.go", name: "NewPodController", qualifiedName: "pkg.NewPodController",
+		signature: "func NewPodController() *PodController",
+		body:      "func NewPodController() *PodController { return &PodController{} }", occurrences: 1},
+	{path: "pkg/manager.go", name: "NewNodeManager", qualifiedName: "pkg.NewNodeManager",
+		signature: "func NewNodeManager() *NodeManager", body: "func NewNodeManager() *NodeManager { return nil }", occurrences: 1},
+	{path: "pkg/loop.go", name: "ControlLoop", qualifiedName: "pkg.ControlLoop",
+		signature: "func ControlLoop()", body: "func ControlLoop() { for { tick() } }", occurrences: 1},
+	{path: "pkg/run.go", name: "RunCtl", qualifiedName: "pkg.RunCtl",
+		signature: "func RunCtl() error", body: "func RunCtl() error { return run() }", occurrences: 1},
+}
+
+// TestMidIdentifierWordFindsTheIdentifier proves the code-aware tokenizer
+// reaches the search page: the word `controller` appears in this corpus only
+// inside identifiers (NewPodController, PodController), so the query finds the
+// identifier on page 1 only because each camelCase part is indexed at the
+// identifier's position. It also proves the exact tiers keep their place ahead
+// of that: a query that names one qualified name exactly and prefixes another
+// serves those two first, at their tiers, and every node once.
+//
+// Mutation: index only the whole identifier (no camelCase parts at its
+// position) and `controller` finds nothing.
+func TestMidIdentifierWordFindsTheIdentifier(t *testing.T) {
+	f := newFixtureOf(t, identifierDocs)
+	s := newService(t, f.opts)
+	page, err := s.Search(f.ctx, model.SearchRequest{Query: "controller"})
+	if err != nil {
+		t.Fatalf("Search(controller): %v", err)
+	}
+	found := false
+	for _, hit := range page.Items {
+		if hit.NodeID == f.nodes["pkg/newpod.go"] {
+			found = true
+			if hit.Tier != model.TierLexical || hit.ScoreMicros <= 0 {
+				t.Errorf("NewPodController is served at %q scoring %d, want a scored lexical hit", hit.Tier, hit.ScoreMicros)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("the mid-identifier word `controller` did not find NewPodController on page 1 (%d hits)", len(page.Items))
+	}
+
+	tiers, err := s.Search(f.ctx, model.SearchRequest{Query: "pkg.Pod"})
+	if err != nil {
+		t.Fatalf("Search(pkg.Pod): %v", err)
+	}
+	if len(tiers.Items) < 3 {
+		t.Fatalf("pkg.Pod served %d hits, want the two exact-tier hits and lexical hits after them", len(tiers.Items))
+	}
+	if h := tiers.Items[0]; h.Tier != model.TierExactQualifiedName || h.NodeID != f.nodes["pkg/pod.go"] {
+		t.Errorf("hit 0 is %q at %q, want Pod at %q", h.Name, h.Tier, model.TierExactQualifiedName)
+	}
+	if h := tiers.Items[1]; h.Tier != model.TierQualifiedNamePrefix || h.NodeID != f.nodes["pkg/podctl.go"] {
+		t.Errorf("hit 1 is %q at %q, want PodController at %q", h.Name, h.Tier, model.TierQualifiedNamePrefix)
+	}
+	seen := map[model.NodeID]int{}
+	for i, h := range tiers.Items {
+		seen[h.NodeID]++
+		if i >= 2 && h.Tier != model.TierLexical {
+			t.Errorf("hit %d is at %q, want every hit after the two exact ones lexical", i, h.Tier)
+		}
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("node %s was served %d times, want once", id, n)
+		}
+	}
+}
+
+// TestSearchPagingWalksTheWholeAnswerOnce proves a paged walk is the deep
+// page: walking every page by cursor -- one hit at a time, and in pages that
+// end inside the exact tiers and inside the lexical tier -- serves each result
+// once and in the order one page of the whole answer serves it. The query's
+// answer crosses from the exact tiers into the lexical tier, where the results
+// the exact tiers served are dropped from the lexical sequence. A filter change
+// refuses the cursor.
+//
+// Mutation: slice the lexical page without the exact fold and the exact hits
+// reappear in the lexical sequence, served twice.
+func TestSearchPagingWalksTheWholeAnswerOnce(t *testing.T) {
+	f := newFixtureOf(t, identifierDocs)
+	s := newService(t, f.opts)
+	const query = "pkg.Pod"
+	whole, err := s.Search(f.ctx, model.SearchRequest{Query: query})
+	if err != nil {
+		t.Fatalf("Search(one page): %v", err)
+	}
+	if whole.Meta.NextCursor != "" {
+		t.Fatal("the whole answer does not fit one page; the walk below compares against it")
+	}
+	if len(whole.Items) != len(identifierDocs) {
+		t.Fatalf("the whole answer holds %d hits, want each of the %d nodes once", len(whole.Items), len(identifierDocs))
+	}
+	for _, limit := range []int{1, 3} {
+		req := model.SearchRequest{Query: query, Page: model.PageRequest{Limit: limit}}
+		var walked []model.SearchHit
+		for page := 0; ; page++ {
+			if page > len(whole.Items) {
+				t.Fatalf("limit %d: the walk did not end after %d pages", limit, page)
+			}
+			got, err := s.Search(f.ctx, req)
+			if err != nil {
+				t.Fatalf("limit %d: Search(page %d): %v", limit, page+1, err)
+			}
+			walked = append(walked, got.Items...)
+			if got.Meta.NextCursor == "" {
+				break
+			}
+			if len(got.Items) != limit {
+				t.Fatalf("limit %d: page %d served %d hits and a continuation", limit, page+1, len(got.Items))
+			}
+			req.Page.Cursor = got.Meta.NextCursor
+		}
+		if !reflect.DeepEqual(walked, whole.Items) {
+			for i := range min(len(walked), len(whole.Items)) {
+				if !reflect.DeepEqual(walked[i], whole.Items[i]) {
+					t.Fatalf("limit %d: walked hit %d = %+v, want %+v", limit, i, walked[i], whole.Items[i])
+				}
+			}
+			t.Fatalf("limit %d: the walk served %d hits, the whole answer %d", limit, len(walked), len(whole.Items))
+		}
+	}
+
+	first, err := s.Search(f.ctx, model.SearchRequest{Query: query, Page: model.PageRequest{Limit: 1}})
+	if err != nil {
+		t.Fatalf("Search(page 1): %v", err)
+	}
+	for _, changed := range []model.SearchRequest{
+		{Query: query, Kinds: []model.NodeKind{model.NodeFunction}},
+		{Query: query, Paths: []string{"pkg"}},
+		{Query: "pkg.Po"},
+	} {
+		changed.Page = model.PageRequest{Limit: 1, Cursor: first.Meta.NextCursor}
+		_, err := s.Search(f.ctx, changed)
+		assertCode(t, "a continuation under a changed request", err, model.CodeCursorInvalid)
 	}
 }
