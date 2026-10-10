@@ -224,7 +224,9 @@ const sourceEnvelopeBytes = 4096
 // maxRawForWire is the single chunk-size arithmetic in this package. Section
 // 16.2 requires the raw size to be reduced *before* bytes are emitted, so the
 // slicer and the serializer must agree; recomputing any part of this elsewhere
-// is a defect.
+// in this package is a defect. A read outside a session is served by the
+// application facade, which sizes its chunk by the same rule
+// (internal/app's sourceChunkBytes), so a chunk is the same size in both modes.
 //
 // The result is the largest raw byte count that satisfies all four bounds:
 //

@@ -329,7 +329,9 @@ func (t SearchTier) Valid() bool { return t.Rank() < len(searchTiers) }
 // the canonical entity or file chunk that was matched, the integer ranking
 // component with its retrieval tier, bounded reasons and the occurrence count
 // that deduplication folded away. It carries no source body — Section 19.3
-// reserves those for codectx_read_source.
+// reserves those for codectx_read_source, which reads a hit's node or file by
+// id within a context session or outside one, from the generation the hit's
+// binding names.
 type SearchHit struct {
 	NodeID          NodeID       `json:"node_id,omitempty"`
 	FileID          FileID       `json:"file_id"`

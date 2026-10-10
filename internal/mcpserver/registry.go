@@ -72,7 +72,10 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_context_include", "Include seeds",
 		"Widen a session's scope with additional seeds.", h.contextInclude)
 	addTool(s, "codectx_read_source", "Read source",
-		"The only tool that returns source bytes: one bounded chunk with a receipt.", h.readSource)
+		"The only tool that returns source bytes. With session_id, one bounded chunk of a session's "+
+			"file and its receipt. Without it, a node's range by node_id, or a byte range by file_id or "+
+			"path, from generation_id or the active generation, paged by next_cursor to the node's or "+
+			"file's end; such a read earns no coverage.", h.readSource)
 
 	// --- review gate and capsule ------------------------------------------
 	addTool(s, "codectx_context_acknowledge", "Acknowledge",

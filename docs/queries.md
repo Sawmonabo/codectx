@@ -536,3 +536,64 @@ one of them: either precedence silently ignores something the operator typed.
 A workspace that cannot be opened fails the command. It is not answered with an
 empty page, because an empty map and an unopenable workspace are different
 facts and rendering one as the other is the single thing a map must never say.
+
+## Reading source — `codectx source`
+
+```sh
+codectx source <node-id | file-id | path> [--offset N] [--max-bytes N] [--generation N] [--json]
+```
+
+`codectx source` prints the indexed bytes of one node or one file, outside any
+context session. It is the command-line half of `codectx_read_source` without a
+`session_id`, and it reads exactly what that tool reads.
+
+- **A node id** prints the node's range as the pinned generation holds it. A
+  node keeps its id across generations while its range moves, so the range read
+  is always the asked generation's: pass the `--generation` of the answer that
+  named the node, and the bytes match that answer's ranges exactly. A node the
+  generation does not hold — deleted, or only a language-server overlay row,
+  which is never a canonical fact — is refused as **not in this generation**
+  (`CTX_ARGUMENT_INVALID`). A node whose stored range or content hash disagrees
+  with the generation's manifest is `CTX_SOURCE_INTEGRITY`, a damaged index
+  rather than a wrong argument.
+- **A file id or a path** prints the file from `--offset` (default 0) to its
+  end. A node is printed from its own start and takes no `--offset`.
+- **An argument of 64 lowercase hex characters is an id**: it is read as a node
+  id, and as a file id when the generation holds no such node. With `--offset`
+  it can only be a file id.
+- **A path** is the root-relative path the index stores. It is only turned into
+  a file id and looked up in the generation's manifest; nothing is opened on it.
+  A path the snapshot does not hold — one that climbs out of the tree with
+  `../`, an ignored file, a symbolic link the capture skipped, anything under
+  the data directory — is refused as not in this generation. The bytes come
+  from the content store, never from the working tree, so an edit made since the
+  index ran does not show.
+
+Without `--generation` the active generation is read. The whole span is
+printed: the command reads it in chunks of `--max-bytes` raw bytes (0, the
+default, is the configured `coverage.chunk_bytes`; a value above
+`coverage.max_chunk_bytes` is clamped to it) and holds one chunk at a time.
+Every chunk after the first is asked for by the signed continuation the previous
+chunk carried, so the span comes from the generation the first chunk was read
+from, and that continuation holds a retention lease, so a retention pass between
+two chunks cannot collect that generation. Because the lease is a write, this
+command opens the workspace the way the context commands do: during another
+process's indexing write it waits for that write to commit.
+
+Text output is the span's bytes and nothing else — a chunk that is not valid
+UTF-8 is decoded back to its bytes — so `codectx source <id> > out` reproduces
+them exactly, CRLF line endings and a missing final newline included. `--json`
+writes one envelope per chunk, in order. Each carries the generation `binding`,
+`file_id`, `node_id` for a node read, `content_hash`, the `byte_range` and
+`line_range` of that chunk, `encoding` (`utf8`, or `base64` where the bytes are
+not valid UTF-8), `content`, `partial_line`, and `next_offset` and
+`next_cursor` while the span continues. No envelope carries a `session` block:
+a read outside a session issues no receipt and earns no coverage.
+
+Through the tool, `codectx_read_source` without `session_id` takes exactly one
+of `node_id`, `file_id` or `path`, plus `offset` for a file, `max_bytes` for the
+chunk size and `generation_id`; or, to continue, `cursor` alone (with
+`max_bytes` if wanted). A node that fits one chunk — nearly every symbol — comes
+back whole in one call; a longer span pages with `next_cursor` to the node's or
+the file's end. The source response bound, `resources.max_source_response_bytes`,
+applies exactly as it does to a session read.

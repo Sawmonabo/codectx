@@ -107,7 +107,7 @@ func (h *handlers) search(ctx context.Context, _ *mcp.CallToolRequest, in model.
 // The overlay label the facade puts in QueryMeta.Overlay is likewise returned
 // verbatim, so an ephemeral dirty-worktree answer stays distinguishable from a
 // sealed fact. model.Node carries no file content: only codectx_read_source
-// returns source bytes.
+// returns source bytes, and it reads a node by its id outside any session.
 func (h *handlers) findSymbol(ctx context.Context, _ *mcp.CallToolRequest, in model.SymbolRequest) (*mcp.CallToolResult, result[model.Page[model.Node]], error) {
 	var zero result[model.Page[model.Node]]
 	if err := in.Validate(); err != nil {

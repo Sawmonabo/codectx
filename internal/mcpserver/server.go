@@ -20,11 +20,12 @@ import (
 //
 // It names no analysis engine: which engine produced a fact is an internal
 // detail and never part of the wire vocabulary.
-const serverInstructions = `codectx serves one workspace over stdio. Open a context session with ` +
-	`codectx_context_plan, read the required files through codectx_read_source (the only tool that ` +
-	`returns source bytes), acknowledge or waive each one, then close under the session's expected ` +
-	`version. Every answer is a bounded page pinned to one index generation; failures are typed ` +
-	`CTX_* tool errors, not protocol errors.`
+const serverInstructions = `codectx serves one workspace over stdio. codectx_read_source is the only ` +
+	`tool that returns source bytes: without a session it reads a node or a byte range of one generation ` +
+	`and earns no coverage. For a coverage-gated task, open a context session with codectx_context_plan, ` +
+	`read the required files through codectx_read_source with its session_id, acknowledge or waive each ` +
+	`one, then close under the session's expected version. Every answer is a bounded page pinned to one ` +
+	`index generation; failures are typed CTX_* tool errors, not protocol errors.`
 
 const serverDescription = "Bounded, generation-pinned code context and review-gate tools for one workspace."
 
