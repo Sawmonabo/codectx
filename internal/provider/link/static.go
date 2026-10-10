@@ -106,23 +106,31 @@ func decodeSigUse(raw []byte) (sigUse, error) {
 	return u, nil
 }
 
-// resolution is what one build's resolution leaves, each a sorted run: the
-// bindings by site; and, for the static family, the index groups by key, the
-// recorded reads by key and the address-taken functions by the member taking
-// them. A family that records no reads has the last three empty.
+// resolution is what one build's resolution leaves: the bindings by site;
+// and, for the static family, the index groups by key, the recorded reads by
+// key, the address-taken functions by the member taking them, and the
+// hierarchy, which a later build of the same layout reads instead of reading
+// every table. A family that records no reads has the three runs empty and
+// no hierarchy.
 type resolution struct {
 	bindings *pagination.SortedRun[idBinding]
 	groups   *pagination.SortedRun[group]
 	reads    *pagination.SortedRun[read]
 	taken    *pagination.SortedRun[taken]
+	h        *hierarchy
 }
 
+// close releases r. A run or hierarchy r shares with the predecessor's
+// state is released by whichever closes first; both closes are idempotent.
 func (r *resolution) close() {
 	if r != nil {
 		r.bindings.Close()
 		r.groups.Close()
 		r.reads.Close()
 		r.taken.Close()
+		if r.h != nil {
+			_ = r.h.close()
+		}
 	}
 }
 
@@ -238,8 +246,9 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 	return nil
 }
 
-// members runs every member the cursor run (FileIDs, ascending) names, or
-// every member when run is nil.
+// members runs every member with a table that run (FileIDs, ascending)
+// names, or every member with a table when run is nil, reading only those
+// members' tables.
 func (s *staticRun) members(run *pagination.SortedRun[model.FileID]) error {
 	has := func(model.FileID) (bool, error) { return true, nil }
 	if run != nil {
@@ -250,11 +259,17 @@ func (s *staticRun) members(run *pagination.SortedRun[model.FileID]) error {
 		defer c.stop()
 		has = c.has
 	}
-	return s.u.Files(s.ctx, func(file int32, fv model.FileVersion, t *Table) error {
+	var file int32 = -1
+	return s.u.members(func(fv model.FileVersion) error {
+		file++
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
 		ok, err := has(fv.ID)
+		if err != nil || !ok {
+			return err
+		}
+		t, ok, err := s.u.tables.Table(s.ctx, s.u.gen, fv)
 		if err != nil || !ok {
 			return err
 		}
@@ -314,28 +329,13 @@ func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun
 // resolveStatic is a static-family unit's resolution: of every member on a
 // full build, else of the members rf finds must re-run, with every other
 // member's taken from rf.prev.
+//
+// A refresh whose layout is the predecessor's (refresh.layout) has the
+// predecessor's hierarchy and groups exactly, since the hierarchy is a
+// function of the members' interfaces and the manifest fields alone: it
+// reads them from the state and reads no table but those of the members that
+// re-run. Any other build builds the hierarchy from every table.
 func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestField) (*resolution, error) {
-	h, err := buildHierarchy(ctx, u)
-	if err != nil {
-		return nil, err
-	}
-	defer h.close()
-	groups, err := newGroupSort(u.dir)
-	if err != nil {
-		return nil, err
-	}
-	defer groups.Close()
-	if err := h.ids.groups(h.decls, traceDecls, groups); err != nil {
-		return nil, err
-	}
-	if err := h.ids.groups(h.links, traceLinks, groups); err != nil {
-		return nil, err
-	}
-	for _, f := range fields {
-		if err := groups.Add(group{Key: keyHash(traceManifest + f.Key), Hash: model.H(groupDomain, f.Value)}); err != nil {
-			return nil, err
-		}
-	}
 	res := &resolution{}
 	ok := false
 	defer func() {
@@ -343,15 +343,25 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 			res.close()
 		}
 	}()
-	if res.groups, err = groups.Sorted(); err != nil {
-		return nil, err
+	if rf.prev != nil && rf.layout && rf.prev.h != nil {
+		res.h, res.groups = rf.prev.h, rf.prev.groups
+	} else {
+		var err error
+		if res.h, err = buildHierarchy(ctx, u); err != nil {
+			return nil, err
+		}
+		if res.groups, err = indexGroups(u.dir, res.h, fields); err != nil {
+			return nil, err
+		}
 	}
+	h := res.h
 	s := &staticRun{ctx: ctx, u: u, h: h}
 	defer s.close()
 	if err := s.open(); err != nil {
 		return nil, err
 	}
 	var gone *pagination.SortedRun[model.FileID]
+	var err error
 	if rf.prev == nil {
 		if err := s.members(nil); err != nil {
 			return nil, err
@@ -367,6 +377,27 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 	}
 	ok = true
 	return res, nil
+}
+
+// indexGroups is every group h's indexes hold, with one per manifest field.
+func indexGroups(dir string, h *hierarchy, fields []manifestField) (*pagination.SortedRun[group], error) {
+	groups, err := newGroupSort(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer groups.Close()
+	if err := h.ids.groups(h.decls, traceDecls, groups); err != nil {
+		return nil, err
+	}
+	if err := h.ids.groups(h.links, traceLinks, groups); err != nil {
+		return nil, err
+	}
+	for _, f := range fields {
+		if err := groups.Add(group{Key: keyHash(traceManifest + f.Key), Hash: model.H(groupDomain, f.Value)}); err != nil {
+			return nil, err
+		}
+	}
+	return groups.Sorted()
 }
 
 // finish completes res from what s ran and, on a refresh, from prev's

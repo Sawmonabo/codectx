@@ -1458,6 +1458,9 @@ func (h *hierarchy) virtual(typ Ref, method string) (bool, error) {
 
 // close releases what the hierarchy spilled.
 func (h *hierarchy) close() error {
+	if h == nil {
+		return nil
+	}
 	h.decls.close()
 	h.links.close()
 	h.ids.close()

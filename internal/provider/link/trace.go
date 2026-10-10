@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -218,11 +219,12 @@ func (ids *idTable) scope(r Ref) (string, error) {
 }
 
 func (ids *idTable) close() {
-	if ids == nil {
+	if ids == nil || ids.memberLease == nil {
 		return
 	}
 	ids.memberLease.Release()
 	ids.nodeLse.Release()
+	ids.memberLease, ids.nodeLse = nil, nil
 }
 
 // refPrefixes are the index keys that carry a refKey right after their
@@ -314,4 +316,211 @@ func (ids *idTable) groups(ix *index, prefix string, out *pagination.ExternalSor
 		err = flush()
 	}
 	return err
+}
+
+// The hierarchy as the state keeps it, for a later build whose layout is the
+// same (refresh.layout): its module path and root, its two indexes and its
+// identity table, each written as it is on disk.
+
+// writeTo writes h to w.
+func (h *hierarchy) writeTo(w *bufio.Writer) error {
+	if _, err := w.Write(appendString(appendString(nil, h.goModule), h.goRoot)); err != nil {
+		return err
+	}
+	if err := h.decls.writeTo(w); err != nil {
+		return err
+	}
+	if err := h.links.writeTo(w); err != nil {
+		return err
+	}
+	return h.ids.writeTo(w)
+}
+
+// readHierarchy reads a hierarchy writeTo wrote into files of dir's arena.
+func readHierarchy(dir string, s stateReader) (*hierarchy, error) {
+	h := &hierarchy{}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = h.close()
+		}
+	}()
+	var err error
+	if h.goModule, err = s.str("its hierarchy's module path"); err != nil {
+		return nil, err
+	}
+	if h.goRoot, err = s.str("its hierarchy's module root"); err != nil {
+		return nil, err
+	}
+	if h.decls, err = readIndex(dir, s); err != nil {
+		return nil, err
+	}
+	if h.links, err = readIndex(dir, s); err != nil {
+		return nil, err
+	}
+	if h.ids, err = readIDTable(dir, s); err != nil {
+		return nil, err
+	}
+	ok = true
+	return h, nil
+}
+
+// writeTo writes the index's length, then its records as they are on disk.
+func (ix *index) writeTo(w *bufio.Writer) error {
+	if _, err := w.Write(binary.AppendUvarint(nil, uint64(ix.size))); err != nil {
+		return err
+	}
+	_, err := io.Copy(w, io.NewSectionReader(ix.f, 0, ix.size))
+	return err
+}
+
+// readIndex reads an index writeTo wrote into a file of dir's arena, locating
+// its blocks as writeIndex does.
+func readIndex(dir string, s stateReader) (*index, error) {
+	size, err := s.uvarint("a hierarchy index")
+	if err != nil {
+		return nil, err
+	}
+	lease, f, err := scratch.For(dir).TakeFile(scratch.SortRun)
+	if err != nil {
+		return nil, err
+	}
+	ix := &index{lease: lease, f: f}
+	w := bufio.NewWriter(f)
+	block := int64(-indexBlockBytes)
+	var buf []byte
+	for uint64(ix.size) < size {
+		n, err := binary.ReadUvarint(s.br)
+		if err != nil || n > size {
+			ix.close()
+			return nil, stateCorrupt("a hierarchy index is short")
+		}
+		buf = append(buf[:0], make([]byte, n)...)
+		if _, err := io.ReadFull(s.br, buf); err != nil {
+			ix.close()
+			return nil, stateCorrupt("a hierarchy index is short")
+		}
+		e, err := decodeEntry(buf)
+		if err != nil {
+			ix.close()
+			return nil, stateCorrupt("a hierarchy index entry is malformed")
+		}
+		if ix.size-block >= indexBlockBytes {
+			block = ix.size
+			ix.first = append(ix.first, e.Key)
+			ix.off = append(ix.off, ix.size)
+		}
+		head := binary.AppendUvarint(nil, n)
+		if _, err := w.Write(head); err == nil {
+			_, err = w.Write(buf)
+		}
+		if err != nil {
+			ix.close()
+			return nil, internalErr("hierarchy index: " + err.Error())
+		}
+		ix.size += int64(len(head)) + int64(n)
+	}
+	if uint64(ix.size) != size {
+		ix.close()
+		return nil, stateCorrupt("a hierarchy index overruns its length")
+	}
+	if err := w.Flush(); err != nil {
+		ix.close()
+		return nil, internalErr("hierarchy index: " + err.Error())
+	}
+	return ix, nil
+}
+
+// writeTo writes the table's member and declaration counts, then its two
+// files.
+func (ids *idTable) writeTo(w *bufio.Writer) error {
+	out := binary.AppendUvarint(binary.AppendUvarint(nil, uint64(ids.count)), uint64(ids.decls))
+	if _, err := w.Write(out); err != nil {
+		return err
+	}
+	if _, err := io.Copy(w, io.NewSectionReader(ids.members, 0, ids.count*idRecord)); err != nil {
+		return err
+	}
+	_, err := io.Copy(w, io.NewSectionReader(ids.nodes, 0, ids.decls*model.IDHexLen))
+	return err
+}
+
+// readIDTable reads a table writeTo wrote into files of dir's arena.
+func readIDTable(dir string, s stateReader) (*idTable, error) {
+	count, err := s.uvarint("its identity table")
+	if err != nil {
+		return nil, err
+	}
+	decls, err := s.uvarint("its identity table")
+	if err != nil {
+		return nil, err
+	}
+	if count > 1<<31 || decls > 1<<62/model.IDHexLen {
+		return nil, stateCorrupt("its identity table's counts are malformed")
+	}
+	ids, err := newIDTable(dir)
+	if err != nil {
+		return nil, err
+	}
+	ids.count, ids.decls = int64(count), int64(decls)
+	for _, part := range []struct {
+		w *bufio.Writer
+		n int64
+	}{{ids.mw, ids.count * idRecord}, {ids.nw, ids.decls * model.IDHexLen}} {
+		if n, err := io.CopyN(part.w, s.br, part.n); err != nil || n != part.n {
+			ids.close()
+			return nil, stateCorrupt("its identity table is short")
+		}
+	}
+	if err := ids.finish(); err != nil {
+		ids.close()
+		return nil, internalErr("link identity table: " + err.Error())
+	}
+	return ids, nil
+}
+
+// skipHierarchy reads a hierarchy writeTo wrote through, checking its form,
+// and keeps nothing of it.
+func skipHierarchy(s stateReader) error {
+	for _, what := range []string{"its hierarchy's module path", "its hierarchy's module root"} {
+		if _, err := s.str(what); err != nil {
+			return err
+		}
+	}
+	for range 2 {
+		size, err := s.uvarint("a hierarchy index")
+		if err != nil {
+			return err
+		}
+		var read uint64
+		for read < size {
+			raw, err := s.str("a hierarchy index entry")
+			if err != nil {
+				return err
+			}
+			if _, err := decodeEntry([]byte(raw)); err != nil {
+				return stateCorrupt("a hierarchy index entry is malformed")
+			}
+			read += uint64(len(binary.AppendUvarint(nil, uint64(len(raw))))) + uint64(len(raw))
+		}
+		if read != size {
+			return stateCorrupt("a hierarchy index overruns its length")
+		}
+	}
+	count, err := s.uvarint("its identity table")
+	if err != nil {
+		return err
+	}
+	decls, err := s.uvarint("its identity table")
+	if err != nil {
+		return err
+	}
+	if count > 1<<31 || decls > 1<<62/model.IDHexLen {
+		return stateCorrupt("its identity table's counts are malformed")
+	}
+	n := int64(count)*idRecord + int64(decls)*model.IDHexLen
+	if m, err := io.CopyN(io.Discard, s.br, n); err != nil || m != n {
+		return stateCorrupt("its identity table is short")
+	}
+	return nil
 }

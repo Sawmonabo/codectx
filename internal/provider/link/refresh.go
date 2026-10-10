@@ -27,7 +27,9 @@ import (
 // When the bindings are found again, a Go, Java, Rust, C or C++ unit
 // re-runs only the members whose table moved, that are new, or whose
 // recorded reads changed (static.go, trace.go), and keeps every other
-// member's bindings; a Python or ECMAScript unit resolves every site, its
+// member's bindings; when the membership and manifest fields hold and every
+// moved table keeps its interface (layout), it also keeps the predecessor's
+// hierarchy and reads only the tables of the members that re-run; a Python or ECMAScript unit resolves every site, its
 // inference being one fixed point over the unit. The bindings are then
 // diffed against the predecessor's: a file whose sites' bindings changed is republished, and so
 // is a file the set of whose targeted declarations changed, since a target's
@@ -76,6 +78,12 @@ type refresh struct {
 	prev *previous
 	// resolve reports that the bindings are found again.
 	resolve bool
+	// layout reports that the unit's hierarchy is its predecessor's: the
+	// same members, the same manifest fields, and every member whose table
+	// moved keeps its interface (InterfaceDigest), which is all a hierarchy
+	// is built from. Only the members whose sites moved then re-run, and no
+	// other table is read.
+	layout bool
 	// changed collects, folded, the FileIDs whose facts are republished
 	// and those of the predecessor's members that are gone: every file the
 	// carry-over names replaced.
@@ -121,6 +129,7 @@ func newFileIDSort(dir string) (*pagination.ExternalSort[model.FileID], error) {
 // each member's stored MemberDigest, empty for a member without a table.
 func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manifestField) error {
 	rf.resolve = !slices.Equal(fields, rf.prev.fields)
+	rf.layout = !rf.resolve
 	next, stop := pull(rf.prev.records)
 	defer stop()
 	old, ok, err := next()
@@ -128,6 +137,7 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		return err
 	}
 	gone := func() error {
+		rf.layout = false
 		if old.Digest != "" {
 			rf.resolve = true
 		}
@@ -153,8 +163,13 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		if ok && old.File == fv.ID {
 			if old.Digest != digest {
 				rf.resolve = true
-				if digest != "" {
+				if digest == "" {
+					rf.layout = false
+				} else {
 					if err := rf.moved.Add(fv.ID); err != nil {
+						return err
+					}
+					if err := rf.sameInterface(ctx, fv, old); err != nil {
 						return err
 					}
 				}
@@ -169,6 +184,7 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 			old, ok, err = next()
 			return err
 		}
+		rf.layout = false
 		if digest != "" {
 			rf.resolve = true
 			if err := rf.moved.Add(fv.ID); err != nil {
@@ -181,6 +197,29 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		err = gone()
 	}
 	return err
+}
+
+// sameInterface clears rf.layout unless fv's fresh table keeps the interface
+// old records. It reads the table only while the layout still holds: a
+// member whose table moved re-runs and reads it anyway.
+func (rf *refresh) sameInterface(ctx context.Context, fv model.FileVersion, old record) error {
+	if !rf.layout {
+		return nil
+	}
+	t, ok, err := rf.u.tables.Table(ctx, rf.u.gen, fv)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		rf.layout = false
+		return nil
+	}
+	iface, err := t.InterfaceDigest()
+	if err != nil {
+		return err
+	}
+	rf.layout = iface == old.Interface
+	return nil
 }
 
 // diff adds to changed every file whose sites' bindings differ between the

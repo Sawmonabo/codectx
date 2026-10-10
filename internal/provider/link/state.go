@@ -32,7 +32,10 @@ import (
 //     and the address-taken functions, by the member taking them (taken),
 //     each record a string of its encoded form: what a refresh of a
 //     static-family unit finds its re-runs from (trace.go), empty for a
-//     family whose resolution records no reads.
+//     family whose resolution records no reads;
+//   - a byte, 1 when the static family's hierarchy follows (its module path
+//     and root, its two indexes and its identity table, as they are on
+//     disk), else 0.
 //
 // A string is its length (an unsigned varint) and its bytes. A state that is
 // short, long, out of order or malformed is corrupt storage.
@@ -383,6 +386,13 @@ func writeState(w io.Writer, fields []manifestField, records *pagination.SortedR
 		err = writeSection(bw, res.taken, encodeTaken)
 	}
 	if err == nil {
+		if res.h == nil {
+			err = bw.WriteByte(0)
+		} else if err = bw.WriteByte(1); err == nil {
+			err = res.h.writeTo(bw)
+		}
+	}
+	if err == nil {
 		err = bw.Flush()
 	}
 	if err != nil {
@@ -598,6 +608,16 @@ func readState(r io.Reader, sink stateSink) error {
 	if err := readSection(s, "address-taken functions", decodeTaken, compareTakenFrom, true, sink.taken); err != nil {
 		return err
 	}
+	switch has, err := s.byte("its hierarchy mark"); {
+	case err != nil:
+		return err
+	case has == 1:
+		if err := sink.hierarchy(s); err != nil {
+			return err
+		}
+	case has != 0:
+		return stateCorrupt("its hierarchy mark is malformed")
+	}
 	if _, err := s.br.ReadByte(); err != io.EOF {
 		return stateCorrupt("it holds more than its sections")
 	}
@@ -612,6 +632,9 @@ type stateSink struct {
 	group   func(group) error
 	read    func(read) error
 	taken   func(taken) error
+	// hierarchy reads the stored hierarchy from the stream, when there is
+	// one.
+	hierarchy func(stateReader) error
 }
 
 // ValidateState reads a stored resolution state through and reports whether
@@ -619,12 +642,13 @@ type stateSink struct {
 // state it would refuse once it had begun publishing.
 func ValidateState(r io.Reader) error {
 	return readState(r, stateSink{
-		field:   func(manifestField) error { return nil },
-		record:  func(record) error { return nil },
-		binding: func(idBinding) error { return nil },
-		group:   func(group) error { return nil },
-		read:    func(read) error { return nil },
-		taken:   func(taken) error { return nil },
+		field:     func(manifestField) error { return nil },
+		record:    func(record) error { return nil },
+		binding:   func(idBinding) error { return nil },
+		group:     func(group) error { return nil },
+		read:      func(read) error { return nil },
+		taken:     func(taken) error { return nil },
+		hierarchy: skipHierarchy,
 	})
 }
 
@@ -665,12 +689,22 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 	}
 	defer takenSort.Close()
 	p := &previous{}
+	defer func() {
+		if p.records == nil && p.h != nil {
+			_ = p.h.close()
+		}
+	}()
 	err = readState(r, stateSink{
 		field: func(f manifestField) error {
 			p.fields = append(p.fields, f)
 			return nil
 		},
 		record: records.Add, binding: bindings.Add, group: groups.Add, read: reads.Add, taken: takenSort.Add,
+		hierarchy: func(s stateReader) error {
+			var err error
+			p.h, err = readHierarchy(dir, s)
+			return err
+		},
 	})
 	if err != nil {
 		return nil, err
