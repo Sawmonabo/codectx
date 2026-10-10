@@ -368,9 +368,15 @@ func (b *builder) linkImports() ([]link.Import, error) {
 		if len(names) == 0 {
 			out = append(out, link.Import{Path: imp.Path, Scope: scope, Range: *rng})
 		}
+		// A Python `import a.b as c` binds c to the module a.b itself, which
+		// `from a.b import c` never does: its name denotes the whole module.
+		wholeModule := b.lang.Name == "python" && strings.HasPrefix(strings.TrimSpace(text), "import")
 		for i, n := range names {
 			li := link.Import{Name: n, Path: imp.Path, Scope: scope, Range: *rng}
-			if len(imp.Originals) == len(names) {
+			switch {
+			case wholeModule && n != link.ImportAll:
+				li.Original = "*"
+			case len(imp.Originals) == len(names):
 				li.Original = imp.Originals[i]
 			}
 			out = append(out, li)

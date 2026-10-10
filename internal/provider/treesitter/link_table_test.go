@@ -168,3 +168,24 @@ func TestAnEditBeforeACallableKeepsItsParameterNodes(t *testing.T) {
 		}
 	}
 }
+
+// TestAPythonModuleAliasDenotesTheWholeModule tells the two Python imports
+// that bind one name to one path apart: `import a.b as c` binds c to the
+// module a.b itself, `from a.b import d` binds d to the member d of a.b.
+//
+// Mutation: leave Original empty on the aliased plain import -> its entry
+// equals a from-import's, and the linker resolves `import a.b as c` to a
+// declaration or submodule named c.
+func TestAPythonModuleAliasDenotesTheWholeModule(t *testing.T) {
+	_, tab := indexedTable(t, newProvider(t), "m.py", "import a.b as c\nfrom a.b import d\n")
+	got := map[string]string{}
+	for _, imp := range tab.Imports {
+		got[imp.Name] = imp.Path + " " + imp.Original
+	}
+	if got["c"] != "a.b *" {
+		t.Errorf("import a.b as c is %q, want the whole module a.b (%q)", got["c"], "a.b *")
+	}
+	if got["d"] != "a.b " {
+		t.Errorf("from a.b import d is %q, want the member d of a.b (%q)", got["d"], "a.b ")
+	}
+}

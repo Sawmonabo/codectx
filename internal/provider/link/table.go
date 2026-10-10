@@ -72,7 +72,8 @@ type Import struct {
 	Path string `json:"path"`
 	// Original is the name Name denotes in Path's module as written, when
 	// the import renames it (wire.Import.Originals): `a` for `import { a as
-	// b }`, "default" for a default import, "*" for a namespace import.
+	// b }`, "default" for a default import, "*" for a namespace import and
+	// for a Python `import a.b as c`, whose name is the module Path itself.
 	Original string `json:"original,omitempty"`
 	// Scope is the declaration the import is written in, -1 the module: a
 	// Rust `use` inside an inline module or a block is that scope's alone,
