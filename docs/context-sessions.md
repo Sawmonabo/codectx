@@ -125,6 +125,17 @@ never confirms its own receipt — there is no service call after the bytes are
 written, so a failed write fails the command with nothing confirmed, and a
 successful write is still not treated as delivery on its own.
 
+## Reading outside a session earns no coverage
+
+Source can also be read without a session: `codectx source` and
+`codectx_read_source` without a `session_id` read a node's range or a file's
+bytes from one pinned generation (see [queries](queries.md#reading-source--codectx-source)).
+Those bytes come from the same content store by the same chunk rules, but the
+read names no actor and no session, so it issues no receipt, writes no issued
+chunk and changes no session's coverage. Bytes read that way never count toward
+`full_served`: a file a session requires is still unserved for that session's
+actor until it is read and confirmed within the session.
+
 ## Acknowledge: the only thing that creates coverage
 
 ```sh

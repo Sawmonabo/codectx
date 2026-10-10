@@ -638,3 +638,230 @@ func (g *graphReader) EvidenceFor(ctx context.Context, relations []model.Relatio
 func (g *graphReader) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	return g.r.Capabilities(ctx)
 }
+
+var _ graph.SourceLocator = (*graphReader)(nil)
+
+// NodeLocations reads where each node is: the stored byte interval of its
+// preferred visible fact, its file and that file's path in the pinned
+// snapshot. A node with no stored range, or one the generation does not
+// publish, is omitted. No name-token range is stored for a node, so none is
+// returned.
+func (g *graphReader) NodeLocations(ctx context.Context, ids []model.NodeID) ([]model.NodeLocation, error) {
+	var out []model.NodeLocation
+	for start := 0; start < len(ids); start += model.MaxPageItems {
+		chunk := ids[start:min(start+model.MaxPageItems, len(ids))]
+		stored, err := g.r.NodesByID(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		var files []model.FileID
+		seen := map[model.FileID]bool{}
+		for _, s := range stored {
+			if s.Bytes == nil || s.Node.FileID == "" || seen[s.Node.FileID] {
+				continue
+			}
+			seen[s.Node.FileID] = true
+			files = append(files, s.Node.FileID)
+		}
+		paths := make(map[model.FileID]string, len(files))
+		if len(files) > 0 {
+			versions, err := g.r.FilesByID(ctx, files)
+			if err != nil {
+				return nil, err
+			}
+			for _, v := range versions {
+				paths[v.ID] = v.Path
+			}
+		}
+		for _, s := range stored {
+			if s.Bytes == nil || s.Node.FileID == "" {
+				continue
+			}
+			out = append(out, model.NodeLocation{NodeID: s.Node.ID, FileID: s.Node.FileID,
+				Path: paths[s.Node.FileID], Bytes: *s.Bytes})
+		}
+	}
+	return out, nil
+}
+
+// RelationOccurrences reads one keyset page of a relation's visible evidence
+// and returns the located rows with their dispatch and set size. next is the
+// last row's id when the page was full, so a page whose rows are all
+// unlocated still advances.
+func (g *graphReader) RelationOccurrences(ctx context.Context, rel model.RelationID, after model.EvidenceID,
+	limit int) ([]model.RelationOccurrence, model.EvidenceID, error) {
+	rows, err := g.r.Evidence(ctx, "", rel, after, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]model.RelationOccurrence, 0, len(rows))
+	for _, row := range rows {
+		if row.Bytes == nil || row.Evidence.FileID == "" {
+			continue
+		}
+		out = append(out, model.RelationOccurrence{RelationID: rel, EvidenceID: row.Evidence.ID,
+			FileID: row.Evidence.FileID, Bytes: *row.Bytes, Dispatch: row.Evidence.Dispatch,
+			SetSize: row.Evidence.SetSize})
+	}
+	var next model.EvidenceID
+	if len(rows) > 0 && len(rows) >= pageLimit(ctx, limit) {
+		next = rows[len(rows)-1].Evidence.ID
+	}
+	return out, next, nil
+}
+
+var _ graph.DispatchReader = (*graphReader)(nil)
+
+// RelationDispatch summarizes each relation's visible evidence in one grouped
+// read per batch: whether any occurrence is a virtual call, and the largest
+// set size any occurrence carries. Results align with rels; a relation with
+// no visible evidence reads as the zero summary.
+func (g *graphReader) RelationDispatch(ctx context.Context, rels []model.RelationID) ([]graph.RelationDispatch, error) {
+	out := make([]graph.RelationDispatch, len(rels))
+	if len(rels) == 0 {
+		return out, nil
+	}
+	at := make(map[model.RelationID][]int, len(rels))
+	for i, id := range rels {
+		at[id] = append(at[id], i)
+	}
+	for start := 0; start < len(rels); start += graphBatch {
+		chunk := rels[start:min(start+graphBatch, len(rels))]
+		raw := make([]string, len(chunk))
+		for i, id := range chunk {
+			raw[i] = string(id)
+		}
+		values, err := batchBlobs("relation_id", raw)
+		if err != nil {
+			return nil, err
+		}
+		b := newBinder(g.r.gen)
+		list := b.markList(values)
+		query := `SELECT rl.canonical, max(CASE e.dispatch WHEN 'virtual' THEN 1 ELSE 0 END), max(e.set_size)
+			FROM evidence e JOIN relation_ids rl ON rl.id = e.relation_id
+			WHERE rl.canonical IN ` + list + memberOf("e") + ` GROUP BY rl.canonical`
+		err = g.r.s.read(ctx, func(tx *sql.Tx) error {
+			rows, err := tx.QueryContext(ctx, query, b.args...)
+			if err != nil {
+				return wrap("evidence", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id []byte
+				var virtual, setSize int64
+				if err := rows.Scan(&id, &virtual, &setSize); err != nil {
+					return wrap("evidence", err)
+				}
+				for _, i := range at[model.RelationID(idHex(id))] {
+					out[i] = graph.RelationDispatch{Virtual: virtual == 1, SetSize: setSize}
+				}
+			}
+			return wrap("evidence", rows.Err())
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+var _ graph.DeclarationReader = (*graphReader)(nil)
+
+// Declarations pages the visible nodes named exactly name over the name
+// index, restricted to kinds, by node id; each carries its file's path and
+// its unit.
+//
+// Nodes limits fact ROWS and folds a node two units publish into one, so a
+// page can come back short with nodes still behind it. next is therefore the
+// last node of every non-empty page, and only an empty page ends the list:
+// one extra round trip per name, against an exact total.
+func (g *graphReader) Declarations(ctx context.Context, name string, kinds []model.NodeKind, after model.NodeID,
+	limit int) ([]graph.Declaration, model.NodeID, error) {
+	stored, err := g.r.Nodes(ctx, NodeFilter{Name: name, Kinds: kinds}, after, pageLimit(ctx, limit))
+	if err != nil {
+		return nil, "", err
+	}
+	out, err := g.declarations(ctx, stored)
+	if err != nil {
+		return nil, "", err
+	}
+	var next model.NodeID
+	if len(stored) > 0 {
+		next = stored[len(stored)-1].Node.ID
+	}
+	return out, next, nil
+}
+
+// Declared hydrates nodes with their file's path and their unit.
+func (g *graphReader) Declared(ctx context.Context, ids []model.NodeID) ([]graph.Declaration, error) {
+	var out []graph.Declaration
+	for start := 0; start < len(ids); start += model.MaxPageItems {
+		stored, err := g.r.NodesByID(ctx, ids[start:min(start+model.MaxPageItems, len(ids))])
+		if err != nil {
+			return nil, err
+		}
+		page, err := g.declarations(ctx, stored)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+	}
+	return out, nil
+}
+
+// declarations names the files of stored nodes in one batched read.
+func (g *graphReader) declarations(ctx context.Context, stored []StoredNode) ([]graph.Declaration, error) {
+	var files []model.FileID
+	seen := map[model.FileID]bool{}
+	for _, s := range stored {
+		if s.Node.FileID != "" && !seen[s.Node.FileID] {
+			seen[s.Node.FileID] = true
+			files = append(files, s.Node.FileID)
+		}
+	}
+	paths := make(map[model.FileID]string, len(files))
+	if len(files) > 0 {
+		versions, err := g.r.FilesByID(ctx, files)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range versions {
+			paths[v.ID] = v.Path
+		}
+	}
+	out := make([]graph.Declaration, 0, len(stored))
+	for _, s := range stored {
+		out = append(out, graph.Declaration{Node: s.Node, Path: paths[s.Node.FileID], Unit: s.UnitID})
+	}
+	return out, nil
+}
+
+// SnapshotFiles pages the pinned snapshot's manifest by file id.
+func (g *graphReader) SnapshotFiles(ctx context.Context, after model.FileID, limit int) ([]model.FileVersion, model.FileID, error) {
+	limit = pageLimit(ctx, limit)
+	page, err := g.r.Files(ctx, after, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	var next model.FileID
+	if len(page) >= limit {
+		next = page[len(page)-1].ID
+	}
+	return page, next, nil
+}
+
+// FileNodes finds each file's file node by its path, which is the file node's
+// qualified name.
+func (g *graphReader) FileNodes(ctx context.Context, files []model.FileVersion) (map[model.FileID]model.NodeID, error) {
+	out := make(map[model.FileID]model.NodeID, len(files))
+	for _, f := range files {
+		stored, err := g.r.Nodes(ctx, NodeFilter{QualifiedName: f.Path, Kinds: []model.NodeKind{model.NodeFile}}, "", 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(stored) == 1 {
+			out[f.ID] = stored[0].Node.ID
+		}
+	}
+	return out, nil
+}

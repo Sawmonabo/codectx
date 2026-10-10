@@ -221,10 +221,18 @@ type receiptPayload struct {
 // resources.max_source_response_bytes, which Section 16.2 forbids.
 const sourceEnvelopeBytes = 4096
 
-// maxRawForWire is the single chunk-size arithmetic in this package. Section
+// RawChunkBytes is the raw size of one source chunk read at offset under these
+// limits: maxRawForWire, for a reader outside this package.
+func (l Limits) RawChunkBytes(requested uint32, offset uint64) (uint32, error) {
+	return maxRawForWire(requested, offset, l)
+}
+
+// maxRawForWire is the single chunk-size arithmetic of a source read. Section
 // 16.2 requires the raw size to be reduced *before* bytes are emitted, so the
 // slicer and the serializer must agree; recomputing any part of this elsewhere
-// is a defect.
+// is a defect. A read outside a session is served by the application facade,
+// which sizes its chunk through RawChunkBytes, so a chunk is the same size in
+// both modes.
 //
 // The result is the largest raw byte count that satisfies all four bounds:
 //

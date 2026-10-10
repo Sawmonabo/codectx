@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -27,9 +28,9 @@ import (
 type seedSet struct {
 	// sink is where every admitted candidate goes AS IT IS FOUND.
 	// The candidate set is the repository-sized half of discovery -- the
-	// lexical tier and the changed-file step both page to exhaustion -- so it
-	// is never accumulated here; a producer pushes and the expansion's sorts
-	// hold it. Excluded below stays a slice because it is bounded by the
+	// lexical tier reads down to its stop (ADR-0016 decision 3) and the
+	// changed-file step pages to exhaustion -- so it is never accumulated
+	// here; a producer pushes and the expansion's sorts hold it. Excluded below stays a slice because it is bounded by the
 	// REQUEST and by the step count: one row per unresolved token of a task
 	// clipped to model.MaxTaskBytes, and one per step that stopped at a bound.
 	sink seedSink
@@ -38,6 +39,8 @@ type seedSet struct {
 	// stays what it has always been: every candidate, then every exclusion.
 	Excluded   []candidate
 	Unresolved bool
+	// Stop is how the lexical read ended (ADR-0016 decision 3).
+	Stop seedStop
 	// cutStages names the Section 15.2 steps already reported as having stopped
 	// at the context.max_seeds bound, so one bound that stops several later steps is named
 	// once per step rather than once per skipped identity. The key is the STEP,
@@ -154,15 +157,16 @@ func seedsFull(limit config.Limit, n int) bool {
 //
 // What bounds the seed set with context.max_seeds unlimited: steps 0-4 mine the
 // task text, which boundTask clips to model.MaxTaskBytes before any scanning,
-// so they are bounded by the REQUEST. Steps 5 and 6 read the repository, and
-// they read ALL of it that matches -- every lexical page, every changed row --
-// because a discovery step that stops at a page boundary makes the plan depend
-// on where that boundary fell, and a bound borrowed from the count of
-// candidates an unrelated step resolved drops seeds nothing ever names. What
-// keeps those two steps from dominating the plan is the RANKING (originLexical
-// and originChangedFile score last) and the Section 15.4 byte budget, which
-// names every candidate it drops in the excluded-with-reason projection. The
-// only count bound over them is context.max_seeds: unlimited by default, and
+// so they are bounded by the REQUEST. Steps 5 and 6 read the repository. Step
+// 6 reads every changed row. Step 5 reads the task text's matches in score
+// order and stops at the first unread match below which nothing can rank
+// above the files the plan packs (ADR-0016 decision 3): the stop is decided by
+// the matches' scores and the resolved budget, never by where a page boundary
+// falls, and the manifest names the score it stopped at. A round that closes
+// the previous round's kept files then reads every match inside them
+// (keptFileSeeds), at most the plan's file budget of files. Neither step is
+// bounded by the count of candidates an unrelated step resolved. The only
+// count bound over them is context.max_seeds: unlimited by default, and
 // disclosed as a cut when an operator sets one and it stops a step.
 //
 // Every repository read here is one page at a time, so the READ working set is
@@ -176,7 +180,7 @@ func seedsFull(limit config.Limit, n int) bool {
 // manifest across two generations (Section 15.1). reader is that same pinned
 // reader, so a path token is checked against visible facts only.
 func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
-	req model.ContextRequest, sink seedSink,
+	req model.ContextRequest, b resolvedBudget, round roundInputs, sink seedSink,
 ) (seedSet, error) {
 	if sink == nil {
 		return seedSet{}, argumentInvalid("seed discovery requires an open seed sink")
@@ -217,7 +221,13 @@ func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader
 		}
 	}
 
-	if err := c.freeTermSeeds(ctx, gen, task, tokens, &out); err != nil {
+	if err := c.freeTermSeeds(ctx, reader, gen, task, tokens, b, round, &out); err != nil {
+		return seedSet{}, err
+	}
+	// The kept-file read follows the main read it is relative to: it needs
+	// that read's stop, and its matches must arrive after the main read's so a
+	// duplicate folds onto the earlier seed (ADR-0016 decision 5).
+	if err := c.keptFileSeeds(ctx, reader, gen, task, round, &out); err != nil {
 		return seedSet{}, err
 	}
 	if err := c.changedFileSeeds(ctx, reader, &out); err != nil {
@@ -247,6 +257,8 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 				Status:      fv.Status,
 				SizeBytes:   fv.Size,
 				Reasons:     []string{boundReason(fmt.Sprintf("the task names the path %q", fv.Path))},
+				RootWeight:  namedRootWeight(tok.Origin),
+				Named:       true,
 			}); err != nil {
 				return false, err
 			}
@@ -280,11 +292,15 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 }
 
 // freeTermSeeds runs Section 15.2 steps 4 and 5 over the prose the earlier
-// steps did not claim: each remaining term goes to Search.Resolve for an exact
-// declaration, then the task text goes to Search.Search once for lexical hits.
-// A word that answers nothing is prose, not a failed identity, so it leaves no
+// steps did not claim: each remaining identifier-shaped term goes to
+// Search.Resolve for an exact declaration, then the task text goes to
+// Search.Search for lexical hits, read down to the stop (ADR-0016 decision 3)
+// against the resolved budget b and the round's extra witness count. A word
+// that answers nothing is prose, not a failed identity, so it leaves no
 // exclusion and does not make the scope incomplete.
-func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, task string, claimed []seedToken, out *seedSet) error {
+func (c *Compiler) freeTermSeeds(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID, task string,
+	claimed []seedToken, b resolvedBudget, round roundInputs, out *seedSet,
+) error {
 	limit := c.cfg.Context.MaxSeeds
 	taken := make(map[string]bool, len(claimed))
 	for _, tok := range claimed {
@@ -314,18 +330,30 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 		return nil
 	}
 
-	// The lexical tier is PAGED TO EXHAUSTION on its own keyset cursor. It is
-	// the weakest discovery step, but "weakest" bounds a candidate's SCORE, not
-	// how much of the repository the step is allowed to look at: reading one
-	// page made the plan depend on where a page boundary happened to fall, and
-	// a task whose matches run past the first page silently lost the rest. The
-	// only bound on how many of them are admitted is context.max_seeds, which
-	// is the operator's, is unlimited by default, and is reported when it cuts.
+	// The lexical tier is read in score order on its own keyset cursor, page
+	// by page, until the stop (ADR-0016 decision 3): once F+1 distinct witness
+	// files (F the plan's file budget, plus the round's extra) hold a read
+	// match, the next match is read only while lexicalTau of its contribution
+	// reaches the contribution at which the last of those witnesses appeared.
+	// The first match below that is examined -- on the next page if the page
+	// ran out -- and not admitted, and no unread match can then lend anything
+	// a rank key above the packed files. The decision depends on scores alone,
+	// so matches of equal score are read together whatever the page size, and
+	// the plan does not depend on where a page boundary falls. c.fullRead reads
+	// every match instead. The only count bound on admissions is
+	// context.max_seeds, which is the operator's, is unlimited by default, and
+	// is reported when it cuts.
+	stop := newLexicalStop(c.fullRead, b, round)
+	defer func() { out.Stop = stop.stop }()
 	cursor := ""
 	for {
 		// A continuation names the cursor ALONE: the cursor already pins the
 		// generation it was minted against -- the same gen this compile pinned
 		// -- and naming both is refused as a contradiction.
+		//
+		// MinScoreMicros is deliberately left unset: the floor is learned while
+		// reading, and a cursor binds the floor it was minted under, so the
+		// stop is applied here on the keyset cursor rather than by the search.
 		read := model.SearchRequest{
 			Query: clipUTF8(task, model.MaxQueryTextBytes),
 			Page:  model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
@@ -345,14 +373,26 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 			}
 			return contextErr(ctx, err)
 		}
+		if err := stop.loadPage(ctx, reader, page.Items); err != nil {
+			return err
+		}
 		for _, hit := range page.Items {
+			weight, ok, err := stop.admit(hit)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
 			cnd := candidate{
 				NodeID:      hit.NodeID,
 				FileID:      hit.FileID,
 				Path:        hit.Path,
 				Requirement: model.RequirementRecommended,
 				Origin:      originLexical,
-				Reasons:     []string{boundReason(fmt.Sprintf("the task text matches %q lexically", hit.Path))},
+				Reasons: []string{boundReason(fmt.Sprintf("the task text matches %q lexically (tier %s, score %d)",
+					hit.Path, hit.Tier, hit.ScoreMicros))},
+				RootWeight: weight,
 			}
 			if hit.Range != nil {
 				cnd.StartByte = int64(hit.Range.Start.Byte)
@@ -529,7 +569,8 @@ func (c *Compiler) pageLimitNotice() string {
 
 // nodeCandidate builds the seed candidate for one resolved declaration. A
 // declaration the task named is required in full: Section 15.2 makes every
-// selected implementation file required, and no later pass may demote it.
+// selected implementation file required, and no later pass may demote it. It
+// is a named root of its origin's weight (ADR-0016 decision 1).
 func nodeCandidate(n model.Node, origin originKind, reason string) candidate {
 	c := candidate{
 		NodeID:      n.ID,
@@ -537,11 +578,24 @@ func nodeCandidate(n model.Node, origin originKind, reason string) candidate {
 		Requirement: model.RequirementFull,
 		Origin:      origin,
 		Reasons:     []string{boundReason(reason)},
+		RootWeight:  namedRootWeight(origin),
+		Named:       true,
 	}
 	if n.Range != nil {
 		c.StartByte = int64(n.Range.Start.Byte)
 	}
 	return c
+}
+
+// namedRootWeight is the root weight of a seed the task or the caller named
+// (ADR-0016 decision 1): an explicit seed at the full seed contribution, and
+// any of the four exact steps at the exact contribution. Every origin that
+// reaches it is one of those five.
+func namedRootWeight(origin originKind) int64 {
+	if origin == originExplicitSeed {
+		return seedContribution
+	}
+	return exactContribution
 }
 
 // add pushes a candidate to the sink in discovery order.
@@ -651,21 +705,45 @@ func splitWords(task string) []string {
 	return out
 }
 
-// freeTerms is the Section 15.2 step 4/5 input: the plain words of the task,
-// which are mined for declarations and lexical hits. One-character words carry
-// no identity, so they are not queried.
+// freeTerms is the Section 15.2 step 4 input: the words of the task that are
+// shaped like identifiers, each of which goes to exact resolution. A plain
+// word is prose and is not resolved, and a one-rune word carries no identity.
+// Every word still reaches step 5, whose query is the whole task text.
 func freeTerms(task string, limit config.Limit) []string {
 	words := splitWords(task)
 	out := make([]string, 0, len(words))
 	seen := map[string]bool{}
 	for _, w := range words {
-		if len(w) < 2 || seen[w] || seedsFull(limit, len(out)) {
+		if utf8.RuneCountInString(w) < 2 || !identifierShaped(w) || seen[w] || seedsFull(limit, len(out)) {
 			continue
 		}
 		seen[w] = true
 		out = append(out, w)
 	}
 	return out
+}
+
+// identifierShaped reports whether a free word reads as a code identifier
+// rather than prose: it holds an underscore, or a digit without being all
+// digits, or an upper-case letter after its first rune. "fix", "the", "Fix"
+// and "login" are prose; "parseURL", "max_files", "utf8" and "HTTP" are
+// identifiers. No word list is consulted.
+func identifierShaped(w string) bool {
+	digits, allDigits := false, true
+	for i, r := range w {
+		switch {
+		case r == '_':
+			return true
+		case unicode.IsDigit(r):
+			digits = true
+		default:
+			allDigits = false
+			if i > 0 && unicode.IsUpper(r) {
+				return true
+			}
+		}
+	}
+	return digits && !allDigits
 }
 
 // looksLikePath reports whether a token reads as a repository path: it has a

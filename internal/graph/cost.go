@@ -86,10 +86,11 @@ func DefaultRelations() []model.RelationKind {
 
 // ImpactRelations is the allowlist an impact query expands over, in the
 // priority order impact ranking assumes: the kinds that most strongly imply a
-// consumer must change come first.
+// consumer must change come first. `routes_to` is in it so a changed handler
+// marks the endpoints that route to it affected.
 func ImpactRelations() []model.RelationKind {
 	return []model.RelationKind{
-		model.RelImplements, model.RelOverrides, model.RelCalls, model.RelReads,
+		model.RelImplements, model.RelOverrides, model.RelCalls, model.RelRoutesTo, model.RelReads,
 		model.RelWrites, model.RelTests, model.RelConfigures, model.RelDocuments,
 		model.RelDependsOn, model.RelImports,
 	}

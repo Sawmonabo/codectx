@@ -34,16 +34,13 @@ func addQueryFlags(cmd *cobra.Command, cursored bool) {
 }
 
 // addLimitFlag declares --limit, for the commands whose request has a page.
-// `path` has none: its routes are bounded by the reason-path cap.
 func addLimitFlag(cmd *cobra.Command) {
 	cmd.Flags().Int(queryLimitFlag, 0, "items in one page"+zeroBoundHelp)
 }
 
 // addCursorFlag declares --cursor, for the commands that actually MINT a
 // continuation token. It is separate from addLimitFlag because a command can
-// bound its page without being resumable, and `path` is the reverse: it is
-// resumable but takes no --limit, because a route set is bounded by the
-// reason-path cap rather than paged.
+// bound its page without being resumable.
 func addCursorFlag(cmd *cobra.Command) {
 	// The repeat-every-flag clause is the first half of the help because it is
 	// the refusal an operator actually hits: the request's direction, relation
@@ -69,10 +66,9 @@ func addCursorFlag(cmd *cobra.Command) {
 // with --limit but no --cursor simply builds a page request with no cursor.
 func pageRequest(cmd *cobra.Command) (model.PageRequest, error) {
 	// Both reads are Lookup-guarded, because the two flags are declared
-	// independently: `path` declares --cursor and no --limit (a route set is
-	// bounded by the reason-path cap, not paged), and reading a flag the
-	// command never registered is a cobra error that kills the invocation
-	// before it reaches the workspace. A missing --limit leaves Limit zero,
+	// independently (a command can be paged without being resumable), and
+	// reading a flag the command never registered is a cobra error that kills
+	// the invocation before it reaches the workspace. A missing --limit leaves Limit zero,
 	// which is "take the configured page bound".
 	var limit int
 	if cmd.Flags().Lookup(queryLimitFlag) != nil {

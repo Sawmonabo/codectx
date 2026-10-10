@@ -171,7 +171,7 @@ never of the kinds.
 | `composer.json` | `encoding/json`; ranges from the same token walk | `package` `composer:<name>` lowercased (an unnamed root project is identified by its path), metadata `version`, `type`; PHP code is not parsed | `require` → `runtime`, `require-dev` → `dev`; the platform entries (`php` and its variants, `hhvm`, `ext-*`, `lib-*`, `composer`, `composer-plugin-api`, `composer-runtime-api`) are dependencies with `platform: true` |
 | `Cargo.toml` | BurntSushi/toml; ranges from a bounded line scan | `package` (or `configuration` for a virtual workspace manifest); a `[package]` field written `{ workspace = true }` is listed in `inherited` and not resolved | `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` and their `[target.*]` forms → `runtime`/`dev`/`build`; `optional = true` → `optional`; `{ workspace = true }` → `inherited: workspace`, requirement unresolved; `[workspace.dependencies]` → `depends_on` with `declared: workspace` |
 | `pyproject.toml` | BurntSushi/toml; per-requirement ranges are the quoted string inside the located array | `package`; `dynamic` fields are metadata and never invented | PEP 621 `dependencies` → `runtime`; `optional-dependencies` → `optional` with `extra`; PEP 735 `dependency-groups` → `dev` with `group`; `build-system.requires` → `build`; Poetry tables → `runtime`/`dev` |
-| requirements file | line reader of the subset below | `configuration` `pypi:requirements:<path>`; lines this reader does not interpret are listed in `unresolved` | requirement lines → `depends_on` kind `runtime`; constraint lines → `configures` with `constraint: true`; each `-r`/`-c` → `configures` the included file with `include: requirement`/`constraint` |
+| requirements file | line reader of the subset below | `configuration` `pypi:requirements:<path>`; each line this reader does not interpret is one evidence row on that node with its `line` text | requirement lines → `depends_on` kind `runtime`; constraint lines → `configures` with `constraint: true`; each `-r`/`-c` → `configures` the included file with `include: requirement`/`constraint` |
 | `pom.xml` | streaming `encoding/xml` tokens with depth (32), element (200k) and text (4 KiB) bounds | `package` `maven:group:artifact`; a missing `groupId`/`version` is taken from `<parent>` and listed in `inherited`; `<properties>` are metadata | `<dependency>` scope `compile`/`runtime` → `runtime`, `test` → `test`, `provided`/`system`/`import` → `build`, `<optional>true` → `optional`; `<parent>` → `depends_on` kind `build`, `role: parent`; `<dependencyManagement>` → `configures` with `managed`; `<modules>` → `builds` the module directory; `${property}` references stay literal with `unresolved: property`; only the direct children of a `<dependency>`/`<parent>` set its coordinates, so a `<exclusions><exclusion><groupId>` describes the exclusion and is not indexed |
 | Markdown (and ADRs) | bounded line scanner | the `document` node (idempotent with the filesystem fact), and one `section` node per ATX heading | each heading → a `section` node the document `contains`, named by the heading text and qualified `<path>#<trail>` (the enclosing heading path, joined ` > `), located at the heading line, with its own name-only search document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
 
@@ -233,14 +233,24 @@ format:
   as requirements and once at most as constraints, so an include cycle ends.
 - A constraint pins a version and installs nothing, so a constraint line is
   `configures` with `constraint: true`, never `depends_on`.
-- Everything else is listed in the node's `unresolved` metadata as written
-  (`line`, with `via` for an included file and a `reason` for an include),
-  never interpreted: every other option line (`-e`, `--index-url`,
-  `--find-links`, ...), a requirement that is a bare URL, path or archive,
-  and an include that is a URL (`reason: url`), absolute (`absolute`),
-  outside the workspace (`outside_workspace`) or names an environment
-  variable (`environment`). A requirement that names an environment variable
-  after its name is published with `unresolved: environment`.
+- Everything else is published as written, never interpreted: every other
+  option line (`-e`, `--index-url`, `--find-links`, ...), a requirement that
+  is a bare URL, path or archive, and an include that is a URL
+  (`reason: url`), absolute (`absolute`), outside the workspace
+  (`outside_workspace`) or names an environment variable (`environment`).
+  Each such line is one evidence row on the file's `configuration` node, at
+  precision `syntax`, whose detail is `line` (the text), `reason` (for an
+  include) and `via` (for a line of an included file). A line of the unit's
+  own file carries its range; a line of an included file carries none, like
+  that file's requirements. The node has no metadata list of these lines: a
+  node's metadata is one payload bounded at 8 KiB, past which it is replaced
+  by `{"truncated":true}`, while its evidence is rows read a page at a time,
+  so a file with thousands of option lines keeps every one. A line longer
+  than the evidence detail bound (1 KiB) is shortened, and the capability
+  counts such lines under `evidence_detail_bytes`; two identical lines of
+  the same included file, having no range to tell them apart, are one row.
+  A requirement that names an environment variable after its name is
+  published with `unresolved: environment`.
 - An include the snapshot does not hold, or an `-r`/`-c` with no path
   (`reason: malformed`), leaves the capability `partial` with
   `CTX_ARGUMENT_INVALID`; an included file over
@@ -263,6 +273,7 @@ scope:
 | a list was cut at a user-set `providers.manifest.max_dependencies` or `providers.manifest.max_entries`, or the parse at a user-set `providers.manifest.max_toml_lines` or `providers.manifest.max_xml_elements` (all four unlimited by default, so this outcome cannot arise from the shipped configuration); the capability names the key and the count that crossed it | `partial` | `CTX_RESOURCE_LIMIT` |
 | one entry was unusable (a dependency without a name, a path outside the workspace, a requirements include the snapshot does not hold) | `partial` | `CTX_ARGUMENT_INVALID` |
 | a file a requirements file includes is over `workspace.max_parse_file_bytes`; the capability names `max_parse_file_bytes` | `partial` | `CTX_RESOURCE_LIMIT` |
+| an uninterpreted requirements line was shortened to the evidence detail bound; the capability names `evidence_detail_bytes` with the count of such lines | `partial` | `CTX_RESOURCE_LIMIT` |
 | the file does not parse as its format | `failed` | `CTX_ARGUMENT_INVALID` |
 | size over `workspace.max_parse_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |
 

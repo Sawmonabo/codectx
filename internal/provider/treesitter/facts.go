@@ -43,6 +43,9 @@ var declKinds = map[string]model.NodeKind{
 	"interface": model.NodeInterface, "struct": model.NodeStruct, "enum": model.NodeEnum,
 	"field": model.NodeField, "variable": model.NodeVariable, "constant": model.NodeConstant,
 	"test": model.NodeTest, "module": model.NodeModule, "namespace": model.NodeNamespace,
+	// An entry point the worker extracts as a declaration, a Python
+	// `__main__` guard, so the calls its body makes are made from it.
+	"endpoint": model.NodeEndpoint,
 }
 
 // family is a group of facts reported under its own capability rows, with
@@ -103,6 +106,15 @@ type builder struct {
 	// repeats an identity does not publish the same alias row twice.
 	aliasSeen map[model.NativeAlias]bool
 	search    []model.SearchUnit
+	// endpointFacts are the file's endpoints, found before the call
+	// references are published (endpoints.go); literals are the route
+	// handlers written as function literals among them, by start, each with
+	// its node.
+	endpointFacts []endpointFact
+	literals      []literalNode
+	// callees holds the callee reference node of each key a call or a route
+	// handler of this file minted (callee).
+	callees map[string]model.Resolution
 	// table is the file's link table once linkTable has joined it, nil when
 	// the worker sent none; storeTable hands it to the sink.
 	table *link.Table
@@ -148,6 +160,12 @@ type declFact struct {
 	descriptor, disambiguator string
 	// truncated names the fields this declaration's storage ceilings cut.
 	truncated truncations
+	// decorators are the declaration's decorators and annotations as they
+	// are published under model.MetaDecorators, in source order: every one
+	// the worker sent whose name fits its bound, each range validated
+	// against the pinned bytes. The worker's own list stays on Decl, every
+	// range of it validated too, for the route table.
+	decorators []model.Decorator
 
 	// body is the search document's text: the attached documentation and the
 	// signature, composed and bounded once at extraction so a cut is recorded
@@ -207,6 +225,7 @@ func (b *builder) build() error {
 	b.aliasSeen = map[model.NativeAlias]bool{}
 	b.byName = map[string][]int{}
 	b.declKeys = map[string]bool{}
+	b.callees = map[string]model.Resolution{}
 	var err error
 	if b.fileRng, err = b.rangeOf(0, uint32(len(b.src))); err != nil {
 		return err
@@ -224,7 +243,17 @@ func (b *builder) build() error {
 	if err := b.imports(); err != nil {
 		return err
 	}
+	// The endpoints are found before the call references are published:
+	// a route handler written as a function literal is a node, and the calls
+	// its body makes are made from it.
+	b.endpointFacts = append(b.entryPoints(), b.routeTable()...)
+	if err := b.handlerLiterals(); err != nil {
+		return err
+	}
 	if err := b.refs(); err != nil {
+		return err
+	}
+	if err := b.endpoints(); err != nil {
 		return err
 	}
 	if err := b.linkTable(); err != nil {
@@ -318,6 +347,9 @@ func (b *builder) validateDecls() error {
 		// signature each at their own ceiling compose to more than one body
 		// holds, so this bound really does cut and must disclose it.
 		f.body = f.truncated.cut("body", searchBody(f.doc, f.sig), maxDocBytes)
+		if err := b.validateDecorators(&f); err != nil {
+			return err
+		}
 		b.decls = append(b.decls, f)
 		b.byName[f.Name] = append(b.byName[f.Name], i)
 		name := wire.Span{Start: d.NameStart, End: d.NameEnd}
@@ -326,6 +358,70 @@ func (b *builder) validateDecls() error {
 		}
 	}
 	return nil
+}
+
+// validateDecorators checks every decorator the worker sent for d against the
+// pinned bytes, as every other worker offset is: the decorator's range and
+// each argument's go through rangeOf, and each argument lies inside its
+// decorator (model.Decorator.Validate). A decorator need not lie inside its
+// declaration: a Python decorator and a Rust attribute precede the
+// definition they apply to. A name the source spells longer than the bound
+// is valid source this provider cannot store: that one decorator is left
+// out of the published list and counted, so the file reports partial.
+func (b *builder) validateDecorators(d *declFact) error {
+	for _, w := range d.Decorators {
+		if w.Name == "" || !utf8.ValidString(w.Name) {
+			return outputInvalid("decorator name is empty or not UTF-8")
+		}
+		if _, err := b.rangeOf(w.Start, w.End); err != nil {
+			return err
+		}
+		m := model.Decorator{Name: w.Name, Bytes: model.ByteRange{Start: uint64(w.Start), End: uint64(w.End)}}
+		for _, a := range w.Arguments {
+			if _, err := b.rangeOf(a.Start, a.End); err != nil {
+				return err
+			}
+			m.Arguments = append(m.Arguments, model.ByteRange{Start: uint64(a.Start), End: uint64(a.End)})
+		}
+		if len(w.Name) > model.MaxQualifiedNameBytes {
+			b.dropped[structure]++
+			continue
+		}
+		if err := m.Validate(); err != nil {
+			return outputInvalid(err.Error())
+		}
+		d.decorators = append(d.decorators, m)
+	}
+	return nil
+}
+
+// fitDecorators sets meta's decorators to the longest prefix of decorators,
+// in source order, whose metadata still fits model.MaxMetadataBytes, and
+// returns how many that is. The serialized size grows with every decorator
+// added, so the longest fitting prefix is found by bisection.
+func fitDecorators(meta map[string]any, decorators []model.Decorator) int {
+	fits := func(n int) bool {
+		if n == 0 {
+			delete(meta, model.MetaDecorators)
+		} else {
+			meta[model.MetaDecorators] = decorators[:n]
+		}
+		raw, err := json.Marshal(meta)
+		return err == nil && len(raw) <= model.MaxMetadataBytes
+	}
+	if fits(len(decorators)) {
+		return len(decorators)
+	}
+	lo, hi := 0, len(decorators)
+	for hi-lo > 1 {
+		if mid := (lo + hi) / 2; fits(mid) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	fits(lo)
+	return lo
 }
 
 // resolveModule mints the file's module node: the container every top-level
@@ -393,6 +489,12 @@ func (b *builder) resolveDecls() error {
 			// answer built from it says which stored values were cut and how
 			// long they were. Distinct from result truncation by name.
 			meta["truncated_fields"] = d.truncated
+		}
+		if _, seen := b.nodeAt[res.Node.ID]; !seen && len(d.decorators) > 0 {
+			// Only the first occurrence's metadata is published, so only its
+			// decorators are fitted to the bound; the ones past it are
+			// counted, never dropped in silence.
+			b.dropped[structure] += len(d.decorators) - fitDecorators(meta, d.decorators)
 		}
 		first := b.putNode(structure, res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)
@@ -677,8 +779,9 @@ func (b *builder) imports() error {
 }
 
 // refs publishes call sites and type references. Resolution is file-local
-// (Section 11.1 precision syntax): a call to a name declared exactly once in
-// this file names that declaration; every other call names a provider-local
+// (Section 11.1 precision syntax): a bare or path-qualified call to a name
+// declared exactly once in this file names that declaration; every other
+// call, a call of a member on a receiver value included, names a provider-local
 // callee reference node carrying the Section 9.3 resolution and candidates
 // attributes, never a guess at another file's symbol, and a name declared
 // several times here is additionally retained as may_refer_to edges.
@@ -688,7 +791,6 @@ func (b *builder) imports() error {
 // the same bytes joins the syntactic callee to the compiler-resolved symbol
 // and the calls relation acquires a precise target.
 func (b *builder) refs() error {
-	callees := map[string]model.Resolution{}
 	for _, r := range b.ex.refs {
 		if r.Kind != "call" && r.Kind != "type" && r.Kind != "macro" {
 			return outputInvalid("reference kind " + bound(r.Kind, 32) + " is unknown")
@@ -727,6 +829,9 @@ func (b *builder) refs() error {
 		if r.Scope >= 0 {
 			from = b.decls[r.Scope].res.Node.ID
 		}
+		if id, ok := b.literalAround(r); ok {
+			from = id
+		}
 		targets := b.targets(r)
 		if r.Kind == "type" || r.Kind == "macro" {
 			// A type or macro reference to a name this file does not declare
@@ -738,54 +843,16 @@ func (b *builder) refs() error {
 			}
 			continue
 		}
-		var callee model.NodeID
-		if len(targets) == 1 {
-			// The one declaration of this file the name can mean. The callee
-			// node is that declaration, and the calls edge to a located
-			// declaration of this same file states that resolution
-			// structurally rather than as an attribute on a node that also
-			// describes the declaration itself.
-			callee = b.decls[targets[0]].res.Node.ID
-			b.putRelation(structure, from, model.RelCalls, callee, rng, r.Name, "")
-		} else {
-			// Nothing in this file is the single callee: the name is declared
-			// several times here, is qualified by an imported name, or is not
-			// declared here at all.
-			//
-			// A bare call keys its callee reference by the callee name, a
-			// qualified one by receiver and name; the two never collide
-			// because a callee name is a single identifier and a qualified
-			// key always carries the separating dot. A receiver the worker
-			// could not name within its bound leaves the qualifier empty, so
-			// the key is "call:." + name: a method of that name on a receiver
-			// this file does not name, which is what it is.
-			key := "call:" + r.Name
-			kind := model.NodeFunction
-			if r.Qualified {
-				key, kind = "call:"+r.Qualifier+"."+r.Name, model.NodeMethod
-			}
-			resolution, candidates := calleeResolution(r, targets)
-			res, ok := callees[key]
-			if !ok {
-				if b.maxCallees.Exceeded(int64(len(callees) + 1)) {
-					// Past the bound the call is counted, not minted: a file
-					// with more distinct cross-file callees than this is
-					// reported partial rather than allowed to publish an
-					// unbounded number of placeholder nodes and relations.
-					b.dropped[structure]++
-					continue
-				}
-				if res, err = b.resolve(model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key,
-					Kind: kind, Language: b.lang.Name, Name: r.Name}); err != nil {
-					return err
-				}
-				callees[key] = res
-				b.putNode(structure, res, rng, key, map[string]any{"resolution": resolution, "candidates": candidates, "callee": r.Name})
-			} else {
-				b.addEvidence(structure, res.Node.ID, rng, key)
-			}
-			callee = res.Node.ID
-			b.putRelation(structure, from, model.RelCalls, callee, rng, key, resolution)
+		targets = b.callTargets(r, targets)
+		callee, resolution, ok, err := b.callee(r, targets, rng)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		b.putRelation(structure, from, model.RelCalls, callee, rng, calleeKey(r, targets), resolution)
+		if len(targets) > 1 {
 			// Every in-file candidate the scope justifies is kept: how many
 			// declarations share a name is a property of the file, not a
 			// count to cut at.
@@ -805,6 +872,95 @@ func (b *builder) refs() error {
 		}
 	}
 	return nil
+}
+
+// callTargets narrows the declarations a call's name can mean to those its
+// scope justifies. A call of a member on a receiver value names no
+// declaration by scope, however many methods of this file share the name,
+// one included: this provider types no receiver, so a method of that name is
+// a candidate by name alone, and a name never binds a call (ADR-0015
+// decision 1). The linker binds the call when it recovers the receiver's
+// type and otherwise publishes the site as open, its candidates computed per
+// query; nothing is published here. A call qualified by a type or namespace
+// path (`T::f()`) names its scope and keeps its in-file candidates, as a bare
+// call does.
+func (b *builder) callTargets(r wire.Ref, targets []int) []int {
+	if r.Qualified && !pathCall(b.src, r.NameStart) {
+		return nil
+	}
+	return targets
+}
+
+// calleeKey is the native key of the node a reference names when it is not
+// one declaration of this file: a bare name keys its callee reference by the
+// name, a qualified one by receiver and name; the two never collide because
+// a callee name is a single identifier and a qualified key always carries
+// the separating dot. A receiver the worker could not name within its bound
+// leaves the qualifier empty, so the key is "call:." + name: a member of that
+// name on a receiver this file does not name, which is what it is. A
+// reference to one declaration of this file is keyed by its name.
+func calleeKey(r wire.Ref, targets []int) string {
+	switch {
+	case len(targets) == 1:
+		return r.Name
+	case r.Qualified:
+		return "call:" + r.Qualifier + "." + r.Name
+	}
+	return "call:" + r.Name
+}
+
+// callee is the node a call reference, or a handler a route names, stands
+// for, with the Section 9.3 resolution its relation carries and whether the
+// node exists. A name declared exactly once in this file names that
+// declaration when callTargets keeps it, and the edge to a located
+// declaration of this same file states that resolution structurally rather
+// than as an attribute on a node that also describes the declaration itself.
+// Every other name -- declared several times here, a member of a receiver
+// value, qualified by an imported name, or not declared here -- names a
+// provider-local callee reference node carrying the resolution and
+// candidates attributes, one per key, never a guess at another file's
+// symbol. Past a user-set tree_sitter.max_callee_references the node is not
+// minted: the reference is counted into dropped and reports false, so a file
+// with more distinct cross-file callees than the bound is partial rather than
+// allowed an unbounded number of placeholders.
+func (b *builder) callee(r wire.Ref, targets []int, rng *model.SourceRange) (model.NodeID, string, bool, error) {
+	if len(targets) == 1 {
+		return b.decls[targets[0]].res.Node.ID, "", true, nil
+	}
+	key := calleeKey(r, targets)
+	kind := model.NodeFunction
+	if r.Qualified {
+		kind = model.NodeMethod
+	}
+	resolution, candidates := calleeResolution(r, targets)
+	res, ok := b.callees[key]
+	if ok {
+		b.addEvidence(structure, res.Node.ID, rng, key)
+		return res.Node.ID, resolution, true, nil
+	}
+	if b.maxCallees.Exceeded(int64(len(b.callees) + 1)) {
+		b.dropped[structure]++
+		return "", "", false, nil
+	}
+	res, err := b.resolve(model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key,
+		Kind: kind, Language: b.lang.Name, Name: r.Name})
+	if err != nil {
+		return "", "", false, err
+	}
+	b.callees[key] = res
+	b.putNode(structure, res, rng, key, map[string]any{"resolution": resolution, "candidates": candidates, "callee": r.Name})
+	return res.Node.ID, resolution, true, nil
+}
+
+// pathCall reports a call qualified by a path, `T::f()` or `ns::f()`: the
+// callee token follows `::`. Every other qualified call names a member of a
+// receiver value (`x.f()`, `x->f()`, `self.f()`).
+func pathCall(src []byte, nameStart uint32) bool {
+	i := int(nameStart)
+	for i > 0 && (src[i-1] == ' ' || src[i-1] == '\t' || src[i-1] == '\n' || src[i-1] == '\r') {
+		i--
+	}
+	return i >= 2 && src[i-2] == ':' && src[i-1] == ':'
 }
 
 // calleeResolution is the Section 9.3 attribute pair for a call whose callee
@@ -944,6 +1100,10 @@ func (b *builder) putNode(fam family, res model.Resolution, rng *model.SourceRan
 	if len(meta) > 0 {
 		if raw, err := json.Marshal(meta); err == nil && len(raw) <= model.MaxMetadataBytes {
 			node.Metadata = raw
+		} else {
+			// Metadata that does not fit its bound is not published, and
+			// the loss is counted so the file reports partial.
+			b.dropped[fam]++
 		}
 	}
 	b.nodes = append(b.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey,

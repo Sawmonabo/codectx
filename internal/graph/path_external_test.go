@@ -123,7 +123,6 @@ func pathProofLimits() Limits {
 	l := fixtureLimits()
 	// Every scale bound unlimited: these rows isolate the walk's own behaviour.
 	l.MaxDepth, l.MaxVisited, l.MaxEdges = 0, 0, 0
-	l.MaxReasonPaths = 8
 	l.QueryTimeout = time.Minute
 	return l
 }
@@ -872,11 +871,10 @@ func TestPathTieBreakSettlesOnCanonicalIdNotSurrogate(t *testing.T) {
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 	relations := append([]model.Relation(nil), f.relations...)
 
-	// ONE reported route, not three. The fixture's two routes are equal-cost
-	// and the default reason-path bound reports BOTH, which breaks no tie at
-	// all: the answer would be the same whatever the settle order did.
+	// ONE route per page, not the whole list. The fixture's two routes are
+	// equal-cost and a full page reports BOTH, which breaks no tie at all:
+	// the answer would be the same whatever the settle order did.
 	limits := fixtureLimits()
-	limits.MaxReasonPaths = 1
 
 	route := func(order MemoryGraphOrder) []model.RelationID {
 		t.Helper()
@@ -887,7 +885,7 @@ func TestPathTieBreakSettlesOnCanonicalIdNotSurrogate(t *testing.T) {
 		}
 		res, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
 			From: fixtureNodeID("n-a"), To: fixtureNodeID("n-z"),
-			Relations: []model.RelationKind{model.RelCalls}})
+			Relations: []model.RelationKind{model.RelCalls}, Page: model.PageRequest{Limit: 1}})
 		if err != nil {
 			t.Fatalf("ShortestPath: %v", err)
 		}
@@ -993,5 +991,59 @@ func TestAPathSearchReusesOneSurfaceAndFreesNothing(t *testing.T) {
 		if n < was {
 			t.Fatalf("pooled surface %s shrank from %d to %d bytes: it was emptied rather than reused", path, was, n)
 		}
+	}
+}
+
+// TestEveryEqualCostRouteIsPagedAndCounted pins the route list: five
+// equal-cost routes from s to t, two per page, are all reachable by
+// continuation, in relation order, each listed once, and every page reports
+// the exact count of five.
+//
+// Mutation caught: dropping a route from the list (the fourth never comes,
+// and the pages concatenate to four routes against a count of five); a cap
+// on the list (the third page never comes).
+func TestEveryEqualCostRouteIsPagedAndCounted(t *testing.T) {
+	var edges [][3]string
+	for i := range 5 {
+		mid := fmt.Sprintf("m%d", i)
+		edges = append(edges, [3]string{"s", mid, string(model.RelCalls)}, [3]string{mid, "t", string(model.RelCalls)})
+	}
+	g := newPathGraph(edges)
+	kinds := []model.RelationKind{model.RelCalls}
+	_, want := referenceRoutes(g, g.node("s"), g.node("t"), kinds)
+	if len(want) != 5 {
+		t.Fatalf("the reference found %d routes; the proof needs five", len(want))
+	}
+	dir := t.TempDir()
+	e := pathPagingEngine(t, g, g.reader(), dir, newFixtureLeases(), 0)
+	req := model.PathRequest{From: g.node("s"), To: g.node("t"), Relations: kinds, Page: model.PageRequest{Limit: 2}}
+	var got []string
+	pages := 0
+	for {
+		res, err := e.ShortestPath(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", pages, err)
+		}
+		pages++
+		if res.RouteCount != 5 || res.RouteCountAtLeast {
+			t.Fatalf("page %d counts %d routes (at least %v), want exactly 5", pages, res.RouteCount, res.RouteCountAtLeast)
+		}
+		if res.Meta.Truncated {
+			t.Fatalf("page %d is truncated (%q); a paged list is not cut", pages, res.Meta.TruncationReason)
+		}
+		got = append(got, routeSequences(res)...)
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		if pages == 10 {
+			t.Fatalf("the list did not end in 10 pages")
+		}
+		req.Page.Cursor = res.Meta.NextCursor
+	}
+	if pages != 3 {
+		t.Errorf("five routes two per page took %d pages, want 3", pages)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("the pages listed %v; the reference says %v", got, want)
 	}
 }
