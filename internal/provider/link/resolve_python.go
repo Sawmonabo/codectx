@@ -322,8 +322,9 @@ func resolvePythonReceiver(ctx context.Context, h *hierarchy, t *types, site Ref
 	case wire.TypeSuper:
 		return resolvePythonSuper(ctx, h, site, tab, s, bind(DetailHierarchy))
 	}
-	// The inference's receiver values: an instance dispatches, a class
-	// object (valExact) calls its own or inherited method.
+	// The inference's receiver values: an instance dispatches, and a
+	// constructed instance (valObject) or a class object (valExact) calls
+	// its type's own or inherited method.
 	return t.seek(site, func(r recv) error {
 		if r.Role != roleReceiver {
 			return nil
@@ -331,7 +332,7 @@ func resolvePythonReceiver(ctx context.Context, h *hierarchy, t *types, site Ref
 		switch r.X.Kind {
 		case valInstance:
 			return dispatchPython(ctx, h, r.X.Ref, s.Callee, bind(DetailFlow))
-		case valExact:
+		case valObject, valExact:
 			return h.declared(r.X.Ref, s.Callee, entryRef(bind(DetailFlow)))
 		}
 		return nil

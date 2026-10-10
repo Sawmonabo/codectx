@@ -35,16 +35,17 @@ import (
 //   - a constructor site (`new C()`) constructs every type its callee names;
 //   - a construction binds the constructor the class declares or inherits
 //     (`constructor`, Python's `__init__`), otherwise the class itself, and
-//     its result holds an instance of the class;
+//     its result holds an instance of exactly that class;
 //   - a static site binds the method its qualifier's type declares or
 //     inherits, and through a module receiver the module's export;
 //   - a member site binds, for each instance its receiver holds, the method
-//     the instance's type declares or inherits (DetailFlow) and every override
-//     in a subtype (hierarchy.dispatch, DetailHierarchy); through a `super`
+//     the instance's type declares or inherits (DetailFlow) and, unless the
+//     instance is a construction's result, every override in a subtype
+//     (hierarchy.dispatch, DetailHierarchy); through a `super`
 //     receiver or a class object the method the type declares or inherits,
 //     and through a module the module's export (DetailDirect); and, only when
-//     no value reaches its receiver once the inference settles, every
-//     function written to the field it calls (DetailField);
+//     its receiver binds nothing once the inference settles, every function
+//     written to the field it calls (DetailField);
 //   - an indirect site binds every function its called value holds
 //     (DetailFlow, or DetailField when the value is a field's).
 //
@@ -165,6 +166,10 @@ const (
 	// binds what the type declares or inherits, and in Python calls an
 	// instance method unbound, its first argument the instance.
 	valClass byte = 5
+	// valObject is an instance of exactly the type declaration Ref, what a
+	// construction of it returns: a call on it binds what the type declares
+	// or inherits, and no subtype's override.
+	valObject byte = 6
 )
 
 // value is one abstract value.
@@ -302,10 +307,9 @@ type inference struct {
 
 	// Field-based resolution of a member site waits for the fixed point:
 	// fieldWatches are the member sites' watches of the fields they call,
-	// typed the sites some value reached as a receiver, and fielded that
-	// the watches of the sites no value reached have been added.
+	// and fielded reports that the watches of the sites their receivers
+	// bound nothing for have been added.
 	fieldWatches *pagination.ExternalSort[watch]
-	typed        *pagination.ExternalSort[call]
 	fielded      bool
 
 	open []interface{ Close() error }
@@ -334,10 +338,6 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		return nil, err
 	}
 	in.fieldWatches.WithFold(keepFirst[watch])
-	if in.typed, err = newSort(in, callCodec); err != nil {
-		return nil, err
-	}
-	in.typed.WithFold(keepFirst[call])
 	r, err := in.newRound()
 	if err != nil {
 		return nil, err
@@ -376,8 +376,8 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 			return nil, err
 		}
 		if delta.Len() == 0 {
-			// The values have settled: the member sites no value reached
-			// as a receiver now read the functions written to the fields
+			// The values have settled: the member sites whose receivers
+			// bound no method now read the functions written to the fields
 			// they call, and the fixed point continues from there.
 			if err := in.addFieldWatches(ctx, r); err != nil {
 				return nil, err
@@ -408,15 +408,15 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 	return &types{bindingRun: in.bound, recvRun: recvs}, nil
 }
 
-// addFieldWatches adds the field watch of every member site no value
-// reached as a receiver, and hands each the values its field already holds.
+// addFieldWatches adds the field watch of every member site that has no
+// binding once the values settle, and hands each the values its field
+// already holds. Until then a member site is bound only through its
+// receiver, so a site with no binding is one whose receiver's values, if
+// any reached it, declare or inherit no method of its name: an instance
+// attribute (`self.cb = f; self.cb()`) that only the field can tell.
 func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	in.fielded = true
 	pending, err := sorted(in, in.fieldWatches)
-	if err != nil {
-		return err
-	}
-	typed, err := sorted(in, in.typed)
 	if err != nil {
 		return err
 	}
@@ -424,8 +424,8 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	if err != nil {
 		return err
 	}
-	err = join(pending, typed, func(w watch, c call) int { return cmpCall(w.Call, c) }, func(w watch, cs []call) error {
-		if len(cs) > 0 {
+	err = join(pending, in.bound, func(w watch, b binding) int { return compareRef(w.Call.Site, b.Site) }, func(w watch, bs []binding) error {
+		if len(bs) > 0 {
 			return nil
 		}
 		return untyped.Add(w)
@@ -694,7 +694,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			return err
 		}
 		// Field-based resolution waits until the values settle, and binds
-		// only when none reached the receiver (addFieldWatches).
+		// only when the receiver bound nothing (addFieldWatches).
 		return in.fieldWatches.Add(watch{V: variable{Kind: varField, Name: s.Callee}, Role: roleField, Call: c})
 	case wire.ShapeIndirect:
 		role := roleCalled
@@ -858,11 +858,6 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 		return err
 	}
 	c := v.Call
-	if v.Role == roleReceiver && !in.fielded {
-		if err := in.typed.Add(c); err != nil {
-			return err
-		}
-	}
 	switch v.Role {
 	case roleReceiver:
 		switch v.X.Kind {
@@ -873,6 +868,8 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 			return in.h.dispatch(ctx, v.X.Ref, c.Callee, func(m Ref) error {
 				return r.bindings.Add(binding{Site: c.Site, Target: m, Rank: rankHierarchy, Flow: true})
 			})
+		case valObject:
+			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow})
 		case valExact:
 			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankDirect})
 		case valClass:
@@ -942,7 +939,7 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 	// its superclass's; Python looks `__init__` up the bases), and one
 	// that inherits none either is bound as the class itself.
 	err = cons.Each(func(c construct) error {
-		if err := r.facts.Add(fact{V: variable{Kind: varResult, File: c.Call.Site.File, Index: c.Call.Site.Index}, X: value{Kind: valInstance, Ref: c.Class}}); err != nil {
+		if err := r.facts.Add(fact{V: variable{Kind: varResult, File: c.Call.Site.File, Index: c.Call.Site.Index}, X: value{Kind: valObject, Ref: c.Class}}); err != nil {
 			return err
 		}
 		found := false
@@ -1583,12 +1580,6 @@ var watchByCall = codec[watch]{put: watchCodec.put, get: watchCodec.get,
 	cmp: func(a, b watch) int {
 		return cmp.Or(cmpCall(a.Call, b.Call), cmpVar(a.V, b.V), cmp.Compare(a.Role, b.Role))
 	},
-}
-
-var callCodec = codec[call]{
-	put: func(w *wbuf, c call) { w.call(c) },
-	get: func(r *rbuf) call { return r.call() },
-	cmp: cmpCall,
 }
 
 var recvCodec = codec[recv]{

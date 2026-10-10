@@ -72,9 +72,10 @@ import (
 // ShapeMember otherwise, with the object's type as Receiver.
 //
 // Values: every function written to an attribute or to a name in a class
-// body, every def a class body declares (a method is the class's attribute
-// of its name, which field-based resolution reads), and every function
-// passed or assigned as a value.
+// body, and every function passed or assigned as a value. A def a class body
+// declares is written to no attribute a value is read from, so it is no
+// Value: a call reaches a method through its receiver's type, never through
+// its name alone.
 type pythonLinker struct {
 	k *pySyntax
 	// moduleNames are the names the module's own code binds, read once on
@@ -1207,14 +1208,7 @@ func (k *pythonLinker) file(root Node, src []byte, out *wire.Link) {
 				if x, ok := k.export(c); ok {
 					out.Exports = append(out.Exports, x)
 				}
-				name := c.ChildByFieldId(kn.fName)
-				if _, method := k.enclosingClass(c); method && !name.IsNull() && !k.property(c) {
-					// A method is its class's attribute of its name.
-					m := string(textOf(src, name))
-					k.values = append(k.values, wire.Value{At: wireSpan(spanOf(name)), Field: m,
-						Type: wire.Type{Kind: wire.TypeFunction, Name: prefix + m}})
-				}
-				inner = prefix + string(textOf(src, name)) + "."
+				inner = prefix + string(textOf(src, c.ChildByFieldId(kn.fName))) + "."
 			case kn.classDefinition:
 				k.supertypes(c, out)
 				inner = prefix + string(textOf(src, c.ChildByFieldId(kn.fName))) + "."
