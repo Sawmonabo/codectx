@@ -221,6 +221,9 @@ type capture struct {
 	nodes     map[model.NodeID]model.Node
 	relations []model.RelationFact
 	search    []model.SearchUnit
+	// nodeEvidence is every node evidence row, in the order it reached
+	// storage.
+	nodeEvidence map[model.NodeID][]model.Evidence
 }
 
 type captureOutput struct {
@@ -232,8 +235,10 @@ func (o *captureOutput) PutNodes(ctx context.Context, facts []model.NodeFact) er
 	o.c.mu.Lock()
 	if o.c.nodes == nil {
 		o.c.nodes = map[model.NodeID]model.Node{}
+		o.c.nodeEvidence = map[model.NodeID][]model.Evidence{}
 	}
 	for _, f := range facts {
+		o.c.nodeEvidence[f.Node.ID] = append(o.c.nodeEvidence[f.Node.ID], f.Evidence...)
 		// The located fact (the file's own unit) wins over a referencing one.
 		if have, ok := o.c.nodes[f.Node.ID]; !ok || (have.FileID == "" && f.Node.FileID != "") {
 			o.c.nodes[f.Node.ID] = f.Node
@@ -804,27 +809,95 @@ func TestRequirementsIncludeCycleYieldsExactlyItsPackages(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("requirements facts differ:\n--- got\n%s\n--- want\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	var meta struct {
-		Unresolved []map[string]string `json:"unresolved"`
-	}
-	for _, n := range cap.nodes {
-		if n.Kind == model.NodeConfiguration {
-			if err := json.Unmarshal(n.Metadata, &meta); err != nil {
-				t.Fatalf("configuration metadata %s: %v", n.Metadata, err)
-			}
-		}
-	}
-	var lines []string
-	for _, u := range meta.Unresolved {
-		lines = append(lines, u["line"])
-	}
-	wantLines := []string{"--index-url https://pypi.example/simple", "-e ./local-pkg", "./vendor/thing-1.0.tar.gz"}
-	if !slices.Equal(lines, wantLines) {
+	wantLines := []string{"line=--index-url https://pypi.example/simple ranged", "line=-e ./local-pkg ranged", "line=./vendor/thing-1.0.tar.gz ranged"}
+	if lines := unresolvedLines(t, cap); !slices.Equal(lines, wantLines) {
 		t.Fatalf("unresolved lines = %q, want %q", lines, wantLines)
 	}
 	if cs := states[manifest.ID+" "+manifest.CapabilityManifests+" "+filesystem.ScopeKey("requirements.txt")]; cs.State != model.CapabilityFresh {
 		t.Fatalf("a fully read requirements file published %s/%s, want fresh", cs.State, cs.DiagnosticCode)
 	}
+}
+
+// TestRequirementsKeepsEveryUnresolvedLine pins that a requirements file
+// with more uninterpreted option lines than one node's metadata can hold
+// (model.MaxMetadataBytes) still publishes every line, each as its own
+// evidence row on the configuration node carrying its text and range.
+// Mutation caught: storing the lines as one node-metadata list, which
+// filesystem.Metadata replaces with {"truncated":true} once it passes the
+// bound, so every line is lost.
+func TestRequirementsKeepsEveryUnresolvedLine(t *testing.T) {
+	const n = 400
+	var req strings.Builder
+	var want []string
+	encoded := 0
+	for i := range n {
+		line := fmt.Sprintf("--find-links https://mirror.example/simple/%04d", i)
+		fmt.Fprintf(&req, "%s\n", line)
+		want = append(want, "line="+line+" ranged")
+		encoded += len(`{"line":""},`) + len(line)
+	}
+	if encoded <= model.MaxMetadataBytes {
+		t.Fatalf("the fixture's lines encode to %d bytes, which fits the %d-byte metadata bound; it does not exercise the bound", encoded, model.MaxMetadataBytes)
+	}
+	req.WriteString("requests>=2\n")
+	files := map[string]string{"requirements.txt": req.String()}
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &capture{}
+	states := map[string]model.CapabilityState{}
+	runUnit(t, providertest.New(t, files), mf, "requirements.txt", cap, states)
+	if got := unresolvedLines(t, cap); !slices.Equal(got, want) {
+		t.Fatalf("published %d unresolved line records, want %d, one per line with its text and range", len(got), len(want))
+	}
+	for _, node := range cap.nodes {
+		if node.Kind == model.NodeConfiguration && len(node.Metadata) > 0 {
+			t.Fatalf("configuration metadata = %s, want none: the lines are records, not a metadata list", node.Metadata)
+		}
+	}
+	if cs := states[manifest.ID+" "+manifest.CapabilityManifests+" "+filesystem.ScopeKey("requirements.txt")]; cs.State != model.CapabilityFresh {
+		t.Fatalf("a fully published requirements file reported %s/%s, want fresh", cs.State, cs.DiagnosticCode)
+	}
+}
+
+// unresolvedLines renders, in publication order, every evidence row of a
+// configuration node that records an uninterpreted line, as its sorted
+// detail pairs followed by "ranged" when the row has a range.
+func unresolvedLines(t *testing.T, cap *capture) []string {
+	t.Helper()
+	ids := make([]model.NodeID, 0, len(cap.nodes))
+	for id, node := range cap.nodes {
+		if node.Kind == model.NodeConfiguration {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	var out []string
+	for _, id := range ids {
+		for _, ev := range cap.nodeEvidence[id] {
+			if ev.Detail == "" {
+				continue
+			}
+			var detail map[string]string
+			if err := json.Unmarshal([]byte(ev.Detail), &detail); err != nil {
+				t.Fatalf("evidence detail %q: %v", ev.Detail, err)
+			}
+			if _, ok := detail["line"]; !ok {
+				continue
+			}
+			var pairs []string
+			for _, k := range sortedMapKeys(detail) {
+				pairs = append(pairs, k+"="+detail[k])
+			}
+			line := strings.Join(pairs, " ")
+			if ev.Range != nil {
+				line += " ranged"
+			}
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 // TestComposerRequireAndRequireDev guards composer.json's two link tables.
