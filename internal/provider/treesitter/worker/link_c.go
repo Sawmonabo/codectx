@@ -977,10 +977,21 @@ func (k *cLinker) call(n Node) {
 // or `x->f()`, or, dereferenced, `(*x->f)()`: an indirect call through the
 // data member f, typed by its declaration when the receiver's record
 // declares it, or, when member allows it, a C++ call of the member function
-// f on the receiver. ok is false when fe names no field.
+// f on the receiver, or, qualified, `x.Base::f()`, the static call of the
+// member function Base declares. ok is false when fe names no field.
 func (k *cLinker) fieldCall(site *wire.Site, fe Node, member bool) (ok bool) {
 	s := k.s
 	field := lastNamed(fe)
+	if member && s.cpp && cKind(field) == s.qualifiedIdentifier {
+		// `a.Base::f()` names the member function Base declares and never
+		// dispatches: the call `Base::f()` names, on a.
+		name, scope := field.ChildByFieldId(s.fName), firstNamed(field)
+		if cKind(name) != s.identifier || scope == name {
+			return false
+		}
+		site.Name, site.Shape, site.Qualifier = wireSpan(spanOf(name)), wire.ShapeStatic, k.typeName(scope)
+		return true
+	}
 	if cKind(field) != s.fieldIdentifier {
 		return false
 	}
