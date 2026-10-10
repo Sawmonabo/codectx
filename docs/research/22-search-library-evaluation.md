@@ -57,9 +57,10 @@ ways (`harness/03-query-modes.md`):
    round trip per posting, a full sort spooled to disk before page 1, and statistics recomputed per query.
 7. **Rule audit** (§5): the scoring rules hold. The "no top-k cap" rule for ranked lists is dropped by the owner's
    ruling of Oct 8, 2026: a ranked search serves its best results. The code-aware tokenizer is adopted by the owner's
-   ruling of Oct 9, 2026. Two choices stay pending: the document length weighted per column, which helps name and
-   subword and costs doc (§2.4), until the quality benchmark; and the visibility route, because the three routes ran
-   within noise of each other on kubernetes, so speed does not choose among them (§2.6).
+   ruling of Oct 9, 2026. One choice stays pending: the document length weighted per column, which helps name and
+   subword and costs doc (§2.4), until the quality benchmark. The visibility route is the alive set: the three routes
+   ran within noise of each other on kubernetes (§2.6), and the alive set is the library's own mechanism for documents
+   a searcher must not see (ADR-0013, decision 3).
 
 ## 1. Question and method
 
@@ -333,7 +334,7 @@ On kubernetes (`runs/05-variants.md`, 30 queries, seed 7; no visible-only refere
 | 50% | 18.6–22.5 ms | 96.8–103.6 ms | 2 893.7 / 2 895.7 ms | 1/30 |
 
 - The routes are within noise of each other in every mode, so the kubernetes time that was to choose the route
-  (ADR-0013, decision 3) does not separate them, and the route stays open (§9).
+  (ADR-0013, decision 3) does not separate them; the alive set is chosen by design (§9).
 - Building the hidden set costs 10–22 ms per searcher on 546 613 documents, more than a warm library query, so it must be
   cached per searcher generation.
 - `product` ignores the query-wrapper route (it always hides in its own collector), so only two routes ran for it.
@@ -517,7 +518,7 @@ ADR-0013 does not settle it and no run here decides it. Decisions are ADR-0013's
 | RT5 | memory-map advice | not decided | kubernetes: four advice modes within noise (17.2–18.1 against 16.0 ms), same pages |
 | RT6 | space usage | measurement only | disk attribution in `features/04-directories-storage.md` |
 | RT7 | snippets | a new feature, opt-in (decision 7) | no body is shown today |
-| — | custom alive set per segment | one of the three visibility routes; the route is open (decision 3) | hidden documents never become candidates; on kubernetes within noise of the other two (§2.6) |
+| — | custom alive set per segment | the visibility route (decision 3) | hidden documents never become candidates; on kubernetes within noise of the other two (§2.6) |
 | — | memory-mapped, immutable segments | used (decision 1) | — |
 
 ## 5. The rule audit
@@ -609,12 +610,12 @@ the owner's ruling of Oct 9, 2026 (§5, rule 8).
 
 ## 9. Pending, and not measured
 
-Two choices are pending:
+One choice is pending, and one was settled by design:
 
 | Choice | What was measured | Decided by |
 |---|---|---|
 | the document length weighted per column (decision 2, rule 7) | name and subword gain, doc loses (§2.4) | the quality benchmark, by the owner's ruling of Oct 9, 2026 |
-| the visibility route: alive set, query wrapper or collector (decision 3, rule 6) | the three ran within noise of each other at 0%, 10% and 50% hidden (§2.6) | not by speed; no other measured ground separates them |
+| the visibility route: alive set, query wrapper or collector (decision 3, rule 6) | the three ran within noise of each other at 0%, 10% and 50% hidden (§2.6) | settled: the alive set, the library's own mechanism, its set cached per generation and segment (ADR-0013) |
 
 These kubernetes measurements never ran (`runs/05-variants.md`, `runs/07-delta.md`, owner ruling of Oct 8, 2026):
 
