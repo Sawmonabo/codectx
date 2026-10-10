@@ -5,12 +5,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -1046,13 +1044,6 @@ const readSourceEndpoint = "read_source"
 // old token resume a span it no longer describes.
 const readSourceQueryHashDomain = "codectx.app.read_source.v1"
 
-// sourceEnvelopeBytes is the headroom a source answer reserves for everything
-// that is not the encoded chunk: the JSON envelope, the binding, both ranges,
-// the field names and the continuation token. It is the reservation the
-// coverage service makes for a session read, so the two modes size a chunk
-// against resources.max_source_response_bytes identically.
-const sourceEnvelopeBytes = 4096
-
 // spanKind is what a read outside a session names: one node, or one file.
 type spanKind string
 
@@ -1208,7 +1199,9 @@ func (s *Services) readOutside(ctx context.Context, req model.ReadChunkRequest) 
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
-	raw, err := sourceChunkBytes(req.MaxBytes, span.at, st.cfg)
+	// The coverage service's own sizer, so a chunk is the same size in and
+	// outside a session.
+	raw, err := coverageLimits(st.cfg).RawChunkBytes(req.MaxBytes, span.at)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
@@ -1402,42 +1395,6 @@ func (s *Services) readSourceCursor(ctx context.Context, leases *pagination.Leas
 		return "", err
 	}
 	return token, nil
-}
-
-// sourceChunkBytes is the raw size of one chunk of a read outside a session:
-// the largest byte count that satisfies the request (zero meaning
-// coverage.chunk_bytes), the policy ceiling (coverage.max_chunk_bytes and
-// model.MaxRawChunkBytes, the span one content-store read admits), the wire
-// budget (the worst-case base64 encoding 4*((raw+2)/3) plus
-// sourceEnvelopeBytes within resources.max_source_response_bytes), and the
-// signed 64-bit byte range a position is stored in. It is the arithmetic the
-// coverage service applies to a session read, so a chunk is the same size in
-// both modes. A misconfigured bound is CTX_INTERNAL: it is a wiring defect,
-// not something the caller can correct.
-func sourceChunkBytes(requested uint32, offset uint64, cfg config.Config) (uint32, error) {
-	chunk, ceiling, wireBound := cfg.Coverage.ChunkBytes, cfg.Coverage.MaxChunkBytes, cfg.Resources.MaxSourceResponseBytes
-	if chunk <= 0 || ceiling <= 0 || wireBound <= 0 {
-		return 0, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
-			"source read limits are not configured: chunk_bytes=%d max_chunk_bytes=%d max_source_response_bytes=%d",
-			chunk, ceiling, wireBound)}
-	}
-	raw := int64(requested)
-	if raw <= 0 {
-		raw = chunk
-	}
-	raw = min(raw, ceiling, model.MaxRawChunkBytes)
-	budget := wireBound - sourceEnvelopeBytes
-	if budget <= 0 {
-		return 0, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
-			"max_source_response_bytes %d leaves no room for the %d-byte response envelope", wireBound, sourceEnvelopeBytes)}
-	}
-	raw = min(raw, 3*(budget/4))
-	if offset > uint64(math.MaxInt64) {
-		return 0, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
-			"read offset %d is past the storable byte range", offset)}
-	}
-	raw = max(min(raw, math.MaxInt64-int64(offset)), 0)
-	return uint32(raw), nil
 }
 
 // argumentInvalid reports whether err is the store's refusal of an id the
