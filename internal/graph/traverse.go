@@ -1170,6 +1170,13 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	for _, s := range req.Start {
 		endpoints[s] = true
 	}
+	// sites is how many located occurrences the page's call and route
+	// relations carry. The answer lists every one of them, so the page ends
+	// before a relation whose sites would cross the answer's occurrence list;
+	// only a relation that outnumbers a whole answer on its own is served
+	// alone, with the cut disclosed when the answer is located.
+	_, locating := reader.(SourceLocator)
+	var sites int64
 	visit := func(owner frontierState, edge Edge) error {
 		// The visited and edge budgets are compared against THIS page's spend:
 		// they are work budgets that end a page, not ceilings that end a walk.
@@ -1200,6 +1207,19 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			// an id would publish a fact nothing backs. The edge is still
 			// COUNTED: the walk read it.
 			return nil
+		}
+		if locating && occurrenceKind(rel.Kind) {
+			counts, err := reader.EvidenceCounts(ctx, []RelRef{edge.Rel})
+			if err != nil {
+				return err
+			}
+			if len(counts) == 1 {
+				if sites+counts[0] > occurrenceBudget && len(relations) > 0 {
+					walkReason = reasonPageFull
+					return errStopExpansion
+				}
+				sites += counts[0]
+			}
 		}
 		relations = append(relations, rel)
 		endpoints[rel.From] = true
@@ -1253,6 +1273,11 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	if err != nil {
 		return model.GraphResult{}, err
 	}
+	where, err := e.locate(finish, ids, relations)
+	if err != nil {
+		return model.GraphResult{}, err
+	}
+	notices = append(notices, where.notices...)
 
 	reason := walkReason
 	// A page the clock ended is truncated for exactly that reason, and a
@@ -1313,7 +1338,9 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		// MaxDepth echoes the effective depth bound the walk ran under, so a
 		// caller can tell a shallow answer caused by a tightened bound from one
 		// caused by the graph simply ending.
-		MaxDepth: maxDepth.Int(),
+		MaxDepth:    maxDepth.Int(),
+		Locations:   where.locations,
+		Occurrences: where.occurrences,
 	}
 	if err := result.Validate(); err != nil {
 		return model.GraphResult{}, err

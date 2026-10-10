@@ -46,9 +46,11 @@ func register(s *mcp.Server, h *handlers) {
 
 	// --- traversal -------------------------------------------------------
 	addTool(s, "codectx_callers", "Callers",
-		"Bounded inbound call neighborhood of one or more nodes.", h.callers)
+		"Bounded inbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
+			"names others. Every node carries its range and every call its call-site ranges.", h.callers)
 	addTool(s, "codectx_callees", "Callees",
-		"Bounded outbound call neighborhood of one or more nodes.", h.callees)
+		"Bounded outbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
+			"names others. Every node carries its range and every call its call-site ranges.", h.callees)
 	addTool(s, "codectx_dependency_path", "Dependency path",
 		"Bounded shortest dependency path between two resolved nodes. `direction` chooses "+
 			"which way edges are followed: \"outgoing\" (the default: what `from` depends on), "+

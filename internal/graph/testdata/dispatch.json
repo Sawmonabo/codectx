@@ -1,0 +1,549 @@
+{
+ "scenarios": {
+  "three_levels_cpp": {
+   "nodes": [
+    {
+     "bytes": [
+      53,
+      68
+     ],
+     "file": "deep.cpp",
+     "kind": "method",
+     "name": "Animal.sound"
+    },
+    {
+     "bytes": [
+      99,
+      123
+     ],
+     "file": "deep.cpp",
+     "kind": "method",
+     "name": "Dog.sound"
+    },
+    {
+     "bytes": [
+      153,
+      177
+     ],
+     "file": "deep.cpp",
+     "kind": "method",
+     "name": "Puppy.sound"
+    },
+    {
+     "bytes": [
+      182,
+      222
+     ],
+     "file": "deep.cpp",
+     "kind": "function",
+     "name": "speak"
+    },
+    {
+     "bytes": [
+      224,
+      260
+     ],
+     "file": "deep.cpp",
+     "kind": "function",
+     "name": "walk"
+    },
+    {
+     "bytes": [
+      262,
+      310
+     ],
+     "file": "deep.cpp",
+     "kind": "function",
+     "name": "exact"
+    }
+   ],
+   "relations": [
+    {
+     "from": "Dog.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        112,
+        120
+       ]
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "Puppy.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        166,
+        174
+       ]
+      }
+     ],
+     "to": "Dog.sound"
+    },
+    {
+     "from": "speak",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        210,
+        219
+       ],
+       "dispatch": "virtual"
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "walk",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        248,
+        257
+       ],
+       "dispatch": "virtual"
+      }
+     ],
+     "to": "Dog.sound"
+    },
+    {
+     "from": "exact",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        290,
+        307
+       ],
+       "dispatch": "exact"
+      }
+     ],
+     "to": "Animal.sound"
+    }
+   ],
+   "source": {
+    "deep.cpp": "struct Animal {\n    virtual ~Animal() {}\n    virtual void sound() {}\n};\n\nstruct Dog : Animal {\n    void sound() override {}\n};\n\nstruct Puppy : Dog {\n    void sound() override {}\n};\n\nvoid speak(Animal& a) {\n    a.sound();\n}\n\nvoid walk(Dog& d) {\n    d.sound();\n}\n\nvoid exact(Animal& a) {\n    a.Animal::sound();\n}\n"
+   }
+  },
+  "three_levels_py": {
+   "nodes": [
+    {
+     "bytes": [
+      18,
+      46
+     ],
+     "file": "deep.py",
+     "kind": "method",
+     "name": "Animal.sound"
+    },
+    {
+     "bytes": [
+      72,
+      100
+     ],
+     "file": "deep.py",
+     "kind": "method",
+     "name": "Dog.sound"
+    },
+    {
+     "bytes": [
+      125,
+      165
+     ],
+     "file": "deep.py",
+     "kind": "method",
+     "name": "Puppy.sound"
+    },
+    {
+     "bytes": [
+      168,
+      203
+     ],
+     "file": "deep.py",
+     "kind": "function",
+     "name": "speak"
+    },
+    {
+     "bytes": [
+      206,
+      237
+     ],
+     "file": "deep.py",
+     "kind": "function",
+     "name": "walk"
+    }
+   ],
+   "relations": [
+    {
+     "from": "Dog.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        76,
+        81
+       ]
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "Puppy.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        129,
+        134
+       ]
+      }
+     ],
+     "to": "Dog.sound"
+    },
+    {
+     "from": "Puppy.sound",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        150,
+        165
+       ],
+       "dispatch": "exact"
+      }
+     ],
+     "to": "Dog.sound"
+    },
+    {
+     "from": "speak",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        194,
+        203
+       ],
+       "dispatch": "virtual"
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "walk",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        228,
+        237
+       ],
+       "dispatch": "virtual"
+      }
+     ],
+     "to": "Dog.sound"
+    }
+   ],
+   "source": {
+    "deep.py": "class Animal:\n    def sound(self):\n        ...\n\n\nclass Dog(Animal):\n    def sound(self):\n        ...\n\n\nclass Puppy(Dog):\n    def sound(self):\n        super().sound()\n\n\ndef speak(a: Animal):\n    a.sound()\n\n\ndef walk(d: Dog):\n    d.sound()\n\n\nspeak(Puppy())\nwalk(Puppy())\n"
+   }
+  },
+  "two_subclasses": {
+   "nodes": [
+    {
+     "bytes": [
+      0,
+      46
+     ],
+     "file": "animals.py",
+     "kind": "class",
+     "name": "Animal"
+    },
+    {
+     "bytes": [
+      49,
+      100
+     ],
+     "file": "animals.py",
+     "kind": "class",
+     "name": "Dog"
+    },
+    {
+     "bytes": [
+      103,
+      154
+     ],
+     "file": "animals.py",
+     "kind": "class",
+     "name": "Cat"
+    },
+    {
+     "bytes": [
+      18,
+      46
+     ],
+     "file": "animals.py",
+     "kind": "method",
+     "name": "Animal.sound"
+    },
+    {
+     "bytes": [
+      72,
+      100
+     ],
+     "file": "animals.py",
+     "kind": "method",
+     "name": "Dog.sound"
+    },
+    {
+     "bytes": [
+      126,
+      154
+     ],
+     "file": "animals.py",
+     "kind": "method",
+     "name": "Cat.sound"
+    },
+    {
+     "bytes": [
+      157,
+      192
+     ],
+     "file": "animals.py",
+     "kind": "function",
+     "name": "speak"
+    },
+    {
+     "bytes": [
+      195,
+      228
+     ],
+     "file": "animals.py",
+     "kind": "function",
+     "name": "direct"
+    }
+   ],
+   "relations": [
+    {
+     "from": "Dog",
+     "kind": "extends",
+     "occurrences": [
+      {
+       "bytes": [
+        59,
+        65
+       ]
+      }
+     ],
+     "to": "Animal"
+    },
+    {
+     "from": "Cat",
+     "kind": "extends",
+     "occurrences": [
+      {
+       "bytes": [
+        113,
+        119
+       ]
+      }
+     ],
+     "to": "Animal"
+    },
+    {
+     "from": "Dog.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        76,
+        81
+       ]
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "Cat.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        130,
+        135
+       ]
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "speak",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        183,
+        192
+       ],
+       "dispatch": "virtual"
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "direct",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        219,
+        228
+       ],
+       "dispatch": "virtual"
+      }
+     ],
+     "to": "Dog.sound"
+    }
+   ],
+   "source": {
+    "animals.py": "class Animal:\n    def sound(self):\n        ...\n\n\nclass Dog(Animal):\n    def sound(self):\n        ...\n\n\nclass Cat(Animal):\n    def sound(self):\n        ...\n\n\ndef speak(a: Animal):\n    a.sound()\n\n\ndef direct(d: Dog):\n    d.sound()\n"
+   }
+  },
+  "value_set": {
+   "nodes": [
+    {
+     "bytes": [
+      18,
+      46
+     ],
+     "file": "untyped.py",
+     "kind": "method",
+     "name": "Animal.sound"
+    },
+    {
+     "bytes": [
+      72,
+      100
+     ],
+     "file": "untyped.py",
+     "kind": "method",
+     "name": "Dog.sound"
+    },
+    {
+     "bytes": [
+      126,
+      154
+     ],
+     "file": "untyped.py",
+     "kind": "method",
+     "name": "Cat.sound"
+    },
+    {
+     "bytes": [
+      157,
+      186
+     ],
+     "file": "untyped.py",
+     "kind": "function",
+     "name": "speak_u"
+    },
+    {
+     "bytes": [
+      189,
+      243
+     ],
+     "file": "untyped.py",
+     "kind": "function",
+     "name": "both"
+    }
+   ],
+   "relations": [
+    {
+     "from": "Dog.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        76,
+        81
+       ]
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "Cat.sound",
+     "kind": "overrides",
+     "occurrences": [
+      {
+       "bytes": [
+        130,
+        135
+       ]
+      }
+     ],
+     "to": "Animal.sound"
+    },
+    {
+     "from": "speak_u",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        177,
+        186
+       ],
+       "dispatch": "exact",
+       "set_size": 2
+      }
+     ],
+     "to": "Dog.sound"
+    },
+    {
+     "from": "speak_u",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        177,
+        186
+       ],
+       "dispatch": "exact",
+       "set_size": 2
+      }
+     ],
+     "to": "Cat.sound"
+    },
+    {
+     "from": "both",
+     "kind": "calls",
+     "occurrences": [
+      {
+       "bytes": [
+        214,
+        229
+       ],
+       "dispatch": "exact"
+      },
+      {
+       "bytes": [
+        234,
+        243
+       ],
+       "dispatch": "virtual"
+      }
+     ],
+     "to": "Animal.sound"
+    }
+   ],
+   "source": {
+    "untyped.py": "class Animal:\n    def sound(self):\n        ...\n\n\nclass Dog(Animal):\n    def sound(self):\n        ...\n\n\nclass Cat(Animal):\n    def sound(self):\n        ...\n\n\ndef speak_u(a):\n    a.sound()\n\n\ndef both(a: Animal):\n    Animal.sound(a)\n    a.sound()\n\n\nspeak_u(Dog())\nspeak_u(Cat())\n"
+   }
+  }
+ }
+}

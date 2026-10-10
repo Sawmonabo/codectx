@@ -258,6 +258,16 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		return model.PathResult{}, err
 	}
 	res.Nodes = nodes
+	var onRoutes []model.Relation
+	for _, route := range routes {
+		onRoutes = append(onRoutes, route...)
+	}
+	where, err := e.locate(ctx, ids, onRoutes)
+	if err != nil {
+		return model.PathResult{}, err
+	}
+	res.Locations, res.Occurrences = where.locations, where.occurrences
+	res.Meta.Notices = append(res.Meta.Notices, where.notices...)
 	return res, nil
 }
 

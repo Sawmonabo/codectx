@@ -108,15 +108,21 @@ func (h *handlers) callees(ctx context.Context, _ *mcp.CallToolRequest, in graph
 
 // graph is the one body behind both traversal tools: they differ only in the
 // direction they fix, so writing it twice would be the drift Section 5.1 forbids.
+// An empty relation list is the call hierarchy both tools are named for:
+// `calls` alone, the allowlist the CLI's callers and callees commands pin.
 // Every bound is passed through verbatim — a zero means "the configured
 // default", never unlimited (Section 20.1), and resolving it is the engine's
 // job, not this package's.
 func (h *handlers) graph(ctx context.Context, in graphInput, direction model.Direction) (*mcp.CallToolResult, result[model.GraphResult], error) {
 	var zero result[model.GraphResult]
+	relations := in.Relations
+	if len(relations) == 0 {
+		relations = []model.RelationKind{model.RelCalls}
+	}
 	req := model.GraphRequest{
 		GenerationID: in.GenerationID,
 		Start:        in.Start,
-		Relations:    in.Relations,
+		Relations:    relations,
 		Direction:    direction,
 		MaxDepth:     in.MaxDepth,
 		MaxVisited:   in.MaxVisited,
