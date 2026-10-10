@@ -465,24 +465,50 @@ func (b *builder) settleIdentities() {
 		params = make(map[wire.Span]string, len(b.ex.link.Exports))
 		for _, x := range b.ex.link.Exports {
 			if p, ok := parameterTypes(x.Signature); ok {
-				params[x.Name] = p
+				// The count keeps two overloads apart whose parameters
+				// declare no types (an untyped TypeScript overload spells
+				// each parameter empty).
+				params[x.Name] = p + "/" + strconv.FormatUint(uint64(x.Params), 10)
 			}
 		}
 	}
-	declared := make([]reconcile.Declared, len(b.decls))
+	// A declaration's identity includes its parent's disambiguator, so the
+	// members of two conditionally defined parents (a class defined in both
+	// arms of an `if`, two cfg-gated modules) are as distinct as their
+	// parents. Parents precede their children, so the declarations are
+	// settled depth by depth, each depth reading its parents' settled parts.
+	depth := make([]int, len(b.decls))
+	deepest := 0
 	for i := range b.decls {
-		d := &b.decls[i]
-		if _, cut := d.truncated["qualified_name"]; !cut {
-			d.descriptor = d.Qualified
+		if p := b.decls[i].Parent; p >= 0 {
+			depth[i] = depth[p] + 1
+			deepest = max(deepest, depth[i])
 		}
-		prototype := d.Prototype && (b.lang.Name == "c" || b.lang.Name == "cpp")
-		d.disambiguator = reconcile.Disambiguator(params[wire.Span{Start: d.NameStart, End: d.NameEnd}], d.Branch, prototype)
-		declared[i] = reconcile.Declared{Kind: d.kind, Descriptor: d.descriptor, Disambiguator: d.disambiguator,
-			Start: uint64(d.Start), End: uint64(d.End), Content: reconcile.ContentDigest(b.src[d.Start:d.End])}
 	}
-	for i, dis := range reconcile.SettleDuplicates(declared) {
-		if b.decls[i].descriptor != "" {
-			b.decls[i].disambiguator = dis
+	for level := 0; level <= deepest; level++ {
+		var at []int
+		var declared []reconcile.Declared
+		for i := range b.decls {
+			if depth[i] != level {
+				continue
+			}
+			d := &b.decls[i]
+			if _, cut := d.truncated["qualified_name"]; !cut {
+				d.descriptor = d.Qualified
+			}
+			prototype := d.Prototype && (b.lang.Name == "c" || b.lang.Name == "cpp")
+			d.disambiguator = reconcile.Disambiguator(params[wire.Span{Start: d.NameStart, End: d.NameEnd}], d.Branch, prototype)
+			if d.Parent >= 0 {
+				d.disambiguator = reconcile.Within(b.decls[d.Parent].disambiguator, d.disambiguator)
+			}
+			at = append(at, i)
+			declared = append(declared, reconcile.Declared{Kind: d.kind, Descriptor: d.descriptor, Disambiguator: d.disambiguator,
+				Start: uint64(d.Start), End: uint64(d.End), Content: reconcile.ContentDigest(b.src[d.Start:d.End])})
+		}
+		for j, dis := range reconcile.SettleDuplicates(declared) {
+			if d := &b.decls[at[j]]; d.descriptor != "" {
+				d.disambiguator = dis
+			}
 		}
 	}
 }

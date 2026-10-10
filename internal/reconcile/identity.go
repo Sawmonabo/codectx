@@ -39,6 +39,17 @@ func Disambiguator(params, branch string, prototype bool) string {
 	return bounded(strings.Join(parts, "\x00"))
 }
 
+// Within is the disambiguator of a declaration nested in a parent whose
+// settled disambiguator is parent: the parent's, then its own, so the members
+// of two parents that share a descriptor path (a class defined in both arms of
+// an `if`) are as distinct as the parents. A parent with none adds nothing.
+func Within(parent, own string) string {
+	if parent == "" {
+		return own
+	}
+	return bounded(join("within="+parent, own))
+}
+
 // Declared is one declaration of a file as SettleDuplicates reads it.
 type Declared struct {
 	Kind          model.NodeKind
