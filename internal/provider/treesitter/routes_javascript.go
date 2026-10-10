@@ -1,0 +1,165 @@
+package treesitter
+
+import (
+	"slices"
+	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+)
+
+// expressVerbs are the Express routing methods of an application, a router
+// and a `route(path)`: each names its HTTP method except `all`, which takes
+// any.
+var expressVerbs = []string{"get", "post", "put", "delete", "patch", "options", "head", "all"}
+
+// express reads the file's Express routes: `express()` is an application
+// root, `express.Router()` (or an imported `Router()`) a router that
+// resolves when this file mounts it once with `use`.
+func (s *routeScan) express() {
+	if !s.frameworks[fwExpress] {
+		return
+	}
+	s.calls(func(r *wire.Ref, site *wire.Site, i int) {
+		switch s.jsTarget(site, i) {
+		case "express":
+			s.objs[i] = &routeObj{fw: fwExpress, root: true, ownKnown: true}
+		case "express.Router":
+			s.objs[i] = &routeObj{fw: fwExpress, ownKnown: true}
+		}
+	})
+	s.calls(func(r *wire.Ref, site *wire.Site, _ int) {
+		if r.Qualified && r.Name == "use" {
+			s.expressMount(site)
+		}
+	})
+	s.calls(s.expressRoute)
+}
+
+// jsTarget is what an ECMAScript site calls, through the module it was
+// imported from: "express" for `express()`, "express.Router" for
+// `express.Router()` or `Router()` imported from it; empty when the callee
+// is not an imported name.
+func (s *routeScan) jsTarget(site *wire.Site, i int) string {
+	if site.Receiver.Kind != wire.TypeModule {
+		return ""
+	}
+	// A named import is "module#name", a default import "module#default",
+	// a namespace import or a require the module alone.
+	name := site.Receiver.Name
+	if m, export, ok := strings.Cut(name, "#"); ok {
+		name = m
+		if export != "default" {
+			name += "." + export
+		}
+	}
+	switch site.Shape {
+	case wire.ShapeBare, wire.ShapeIndirect:
+		return name
+	case wire.ShapeStatic, wire.ShapeMember:
+		return name + "." + s.callee(i)
+	}
+	return ""
+}
+
+// expressMount records `parent.use([path,] ..., router)`: each argument that
+// is an object this file builds is mounted at the path, the root when the
+// call names none.
+func (s *routeScan) expressMount(site *wire.Site) {
+	parent := s.objOf(site.Receiver)
+	s.attachArgs(site, func(o *routeObj, at int) (routeAttach, bool) {
+		if at == 0 {
+			return routeAttach{parent: parent, known: true}, true
+		}
+		args := s.siteArgs(site)
+		if len(args) == 0 {
+			return routeAttach{parent: parent}, true
+		}
+		v, ok := stringLiteral(s.b.lang.Name, args[0].text)
+		return routeAttach{parent: parent, prefix: v, known: ok}, true
+	})
+}
+
+// expressRoute reads one call as an Express route: `x.get(path, ...,
+// handler)` and the other verbs, `x.use(path, ..., handler)`, and
+// `x.route(path).get(..., handler)` chains. The handler is the last
+// argument; the ones before it are middleware. A receiver this file does not
+// build is read only with a literal route, so a same-named method of an
+// unrelated object is not read as a route.
+func (s *routeScan) expressRoute(r *wire.Ref, site *wire.Site, i int) {
+	if !r.Qualified || !(slices.Contains(expressVerbs, r.Name) || r.Name == "use") {
+		return
+	}
+	args := positional(s.siteArgs(site))
+	if len(args) == 0 {
+		return
+	}
+	var methods []string
+	if r.Name != "all" && r.Name != "use" {
+		methods = []string{strings.ToUpper(r.Name)}
+	}
+	if chain := s.routeChain(s.resultSite(site.Receiver), len(s.link.Sites)); chain >= 0 && r.Name != "use" {
+		chained := &s.link.Sites[chain]
+		cargs := positional(s.siteArgs(chained))
+		if len(cargs) == 0 {
+			return
+		}
+		ref := s.siteRef(chain)
+		obj := s.objOf(chained.Receiver)
+		route := s.routeOf(cargs[0])
+		if obj == nil && !route.literal {
+			return
+		}
+		s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(args[len(args)-1]), refQualifier(ref))
+		return
+	}
+	if len(args) < 2 {
+		return
+	}
+	obj := s.objOf(site.Receiver)
+	route := s.routeOf(args[0])
+	last := args[len(args)-1]
+	if r.Name == "use" {
+		// `use` mounts a router or an application when it passes one, and
+		// otherwise registers middleware at a path: an endpoint only when the
+		// path is a literal and the handler is not an imported module.
+		if !route.literal || s.objOf(argType(site, len(args)-1)) != nil || argType(site, len(args)-1).Kind == wire.TypeModule {
+			return
+		}
+		if _, imported := s.imports[last.text]; imported {
+			return
+		}
+	}
+	if obj == nil && !route.literal {
+		return
+	}
+	s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(last), r.Qualifier)
+}
+
+// routeChain is the `route(path)` site a chain of Express verbs hangs from,
+// `x.route(path)` in `x.route(path).get(h).post(h)`, or -1. budget bounds
+// the walk by the file's sites.
+func (s *routeScan) routeChain(i, budget int) int {
+	for ; i >= 0 && budget > 0; budget-- {
+		r := s.siteRef(i)
+		if r == nil || !r.Qualified {
+			return -1
+		}
+		switch {
+		case r.Name == "route":
+			return i
+		case slices.Contains(expressVerbs, r.Name):
+			i = s.resultSite(s.link.Sites[i].Receiver)
+		default:
+			return -1
+		}
+	}
+	return -1
+}
+
+// refQualifier is a call reference's receiver as written, empty for none.
+func refQualifier(r *wire.Ref) string {
+	if r == nil {
+		return ""
+	}
+	return r.Qualifier
+}
