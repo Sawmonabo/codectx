@@ -179,20 +179,7 @@ func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, out siteOut) e
 		if name == "" {
 			name = s.Callee
 		}
-		ctor := lastComponent(typeName(name), r.fc.sep)
-		found := false
-		err := r.h.typesIn(r.ctx, r.fc, name, func(typ entry) error {
-			found = true
-			return r.h.methods(typ.Ref, ctor, exactly(out, DetailDirect))
-		})
-		if err != nil || found {
-			return err
-		}
-		q, ok, err := r.h.externalName(r.ctx, r.fc, name)
-		if err != nil || !ok {
-			return err
-		}
-		return out.ext(externalMethod(r.fc.family, q, ctor), model.DispatchExact)
+		return r.construct(name, out)
 	case wire.ShapeMember:
 		err := r.member(s.Caller, s.Receiver, s.Callee, out)
 		if err != nil || bySignature == nil || r.fc.language != "java" || s.Receiver.Kind != wire.TypeNamed {
@@ -407,9 +394,50 @@ func (r *staticFile) bare(caller int32, callee string, out siteOut) error {
 		return err
 	}
 	// A C++ call of a type's name constructs it ([expr.type.conv]).
-	return r.h.typesIn(r.ctx, r.fc, callee, func(typ entry) error {
-		return r.h.methods(typ.Ref, lastComponent(typeName(callee), r.fc.sep), exactly(out, DetailDirect))
+	typed, err := r.isType(callee)
+	if err != nil || !typed {
+		return err
+	}
+	return r.construct(callee, out)
+}
+
+// isType reports that written names a type of the unit in the member.
+func (r *staticFile) isType(written string) (bool, error) {
+	typed := false
+	err := r.h.typesIn(r.ctx, r.fc, written, func(entry) error {
+		typed = true
+		return nil
 	})
+	return typed, err
+}
+
+// construct reports the construction of the type written as written: each
+// constructor of each type of the unit it names (the type's methods of its
+// own name), else the type itself, whose implicit constructor runs (JLS
+// §8.8.9, [class.default.ctor]), each exact. A type outside the project is a
+// proven external call no node names.
+func (r *staticFile) construct(written string, out siteOut) error {
+	ctor := lastComponent(typeName(written), r.fc.sep)
+	typed := false
+	err := r.h.typesIn(r.ctx, r.fc, written, func(typ entry) error {
+		typed = true
+		found := false
+		err := r.h.methods(typ.Ref, ctor, func(e entry) error {
+			found = true
+			return out.call(e, DetailDirect, model.DispatchExact)
+		})
+		if err != nil || found {
+			return err
+		}
+		return out.call(typ, DetailDirect, model.DispatchExact)
+	})
+	if err != nil || typed {
+		return err
+	}
+	if _, ok, err := r.h.externalName(r.ctx, r.fc, written); err != nil || !ok {
+		return err
+	}
+	return out.ext("", model.DispatchExact)
 }
 
 // constructed is the type site j constructs, as written: a `new` or a
@@ -424,11 +452,7 @@ func (r *staticFile) constructed(j int32) (string, bool, error) {
 	case s.Shape == wire.ShapeConstructor:
 		return cmp.Or(s.Qualifier, s.Callee), true, nil
 	case s.Shape == wire.ShapeBare && r.fc.language == "cpp":
-		typed := false
-		err := r.h.typesIn(r.ctx, r.fc, s.Callee, func(entry) error {
-			typed = true
-			return nil
-		})
+		typed, err := r.isType(s.Callee)
 		return s.Callee, typed, err
 	}
 	return "", false, nil
