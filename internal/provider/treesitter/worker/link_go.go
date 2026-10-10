@@ -29,7 +29,7 @@ import (
 // method with its receiver as the first parameter ("Method expressions"):
 // its TypeFunction carries Index 1, the receiver parameters it takes ahead
 // of the method's own, and every other function value Index 0.
-type goLinker struct{}
+type goLinker struct{ linkReads }
 
 func newGoLinker() *goLinker { return &goLinker{} }
 

@@ -77,6 +77,7 @@ import (
 // Value: a call reaches a method through its receiver's type, never through
 // its name alone.
 type pythonLinker struct {
+	linkReads
 	k *pySyntax
 	// moduleNames are the names the module's own code binds, read once on
 	// the first callable: what a nested callable's free name refers to.

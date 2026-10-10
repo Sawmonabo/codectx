@@ -28,6 +28,7 @@ import (
 // only between two word tokens (`&mut Foo`), so a declaration's signature
 // and a function type's are equal exactly when they write the same types.
 type rustLinker struct {
+	linkReads
 	k   *rsLinkSyntax
 	src []byte
 	out *wire.Link

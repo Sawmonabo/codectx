@@ -73,6 +73,7 @@ import (
 // it captures. Inside a method, a name no local declares is looked up among
 // its class's members when the class is declared in the file.
 type cLinker struct {
+	linkReads
 	language string
 	s        *cSyntax
 	x        *cLinkSyntax

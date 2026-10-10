@@ -103,6 +103,7 @@ import (
 // exported declaration, `export { a }` and `export { a as b }`, `export { x }
 // from "./m"`, `export * from "./m"` and `export * as ns from "./m"`.
 type javaScriptLinker struct {
+	linkReads
 	language string
 	// k and x are the grammar's kind tables and l its lowering, resolved on
 	// the first call (ready); src is the file's bytes.

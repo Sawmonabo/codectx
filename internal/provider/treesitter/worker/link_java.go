@@ -28,6 +28,7 @@ import (
 // repository supplies and are sent as unknown. Signatures keep the types as
 // written (wire.Export.Signature).
 type javaLinker struct {
+	linkReads
 	k   *javaSyntax
 	x   *javaLinkSyntax
 	src []byte
