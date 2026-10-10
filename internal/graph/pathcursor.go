@@ -60,8 +60,17 @@ type pathCursor struct {
 	// Visited and Edges are CUMULATIVE across every page of this search: the
 	// per-page budgets are refilled on each page, and these are what the answer
 	// discloses as the work the whole search has spent.
-	Visited   int64     `json:"visited"`
-	Edges     int64     `json:"edges"`
+	Visited int64 `json:"visited"`
+	Edges   int64 `json:"edges"`
+	// Routes marks a continuation of the equal-cost route list rather than
+	// of the search: After is the position the next page starts after (the
+	// enumeration keys of the last route subtree finished), Listed the routes
+	// listed so far, and Count and AtLeast the routes' count.
+	Routes    bool      `json:"routes,omitempty"`
+	After     []string  `json:"after,omitempty"`
+	Listed    int64     `json:"listed,omitempty"`
+	Count     int64     `json:"count,omitempty"`
+	AtLeast   bool      `json:"at_least,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -96,8 +105,16 @@ func (c pathCursor) validate() error {
 	if len(c.LastNode) > model.MaxIdentifierBytes {
 		return cursorInvalid("cursor resume position exceeds its bound")
 	}
-	if c.BucketCost < 0 || c.Visited < 0 || c.Edges < 0 {
+	if c.BucketCost < 0 || c.Visited < 0 || c.Edges < 0 || c.Listed < 0 || c.Count < 0 {
 		return cursorInvalid("cursor carries a negative position or budget")
+	}
+	if len(c.After) > model.MaxRelationsPerPath || (!c.Routes && (len(c.After) > 0 || c.Listed > 0)) {
+		return cursorInvalid("cursor route position exceeds its bound")
+	}
+	for _, k := range c.After {
+		if len(k) > 2*model.MaxIdentifierBytes+1 {
+			return cursorInvalid("cursor route position exceeds its bound")
+		}
 	}
 	if c.ExpiresAt.IsZero() {
 		return cursorInvalid("cursor has no expiry")
@@ -263,6 +280,11 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 		LastNode:     w.lastSettled,
 		Visited:      w.visited,
 		Edges:        w.spent,
+		Routes:       w.routing,
+		After:        w.routeAfter,
+		Listed:       w.routesListed,
+		Count:        w.routeCount,
+		AtLeast:      w.routeCountAtLeast,
 		ExpiresAt:    e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
 	// The page's writes are committed and the directory handed over BEFORE the

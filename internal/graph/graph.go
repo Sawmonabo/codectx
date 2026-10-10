@@ -99,6 +99,10 @@ type Options struct {
 // walk resumes on the next page. The cumulative counts are still carried by the
 // cursor and reported, so a caller sees the total the walk has spent.
 //
+// MaxReasonPaths is context.max_reason_paths_per_entry: whether an impact
+// entry carries the route that admitted it. It does not bound a path answer,
+// which lists every equal-cost route a page at a time.
+//
 // MaxPageItems, CursorTTL and FrontierBytes stay strictly positive: a page with
 // no item ceiling is a wire-security bound (class B), not a scale bound, and a
 // frontier with no byte ceiling has no heap bound at all. QueryTimeout does

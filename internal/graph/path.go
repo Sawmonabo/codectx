@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -29,6 +30,7 @@ const (
 	pathReasonEdges    = "the edge budget was exhausted before the path search completed"
 	pathReasonDepth    = "the max-depth bound stopped the path search; the routes returned are the cheapest within that depth"
 	pathReasonRoutes   = "the route-enumeration budget was exhausted before every equal-cost route was collected"
+	pathReasonRouteEnd = "more equal-cost routes remain and this workspace offers no continuation to list them"
 )
 
 // ShortestPath runs an EXTERNAL-MEMORY nonnegative integer-cost Dijkstra over
@@ -193,14 +195,24 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		// the counters nor doubles them.
 		w.visited, w.spent = resume.Cursor.Visited, resume.Cursor.Edges
 		w.bucketCost, w.lastSettled = resume.Cursor.BucketCost, resume.Cursor.LastNode
+		w.routing = resume.Cursor.Routes
+		w.routeAfter, w.routesListed = resume.Cursor.After, resume.Cursor.Listed
+		w.routeCount, w.routeCountAtLeast = resume.Cursor.Count, resume.Cursor.AtLeast
 	}
-	if err := w.run(ctx, req.From, req.To); err != nil {
+	if w.routing {
+		// A continuation of the route list: the search is finished and its
+		// shortest-path graph is in the state; only the list goes on.
+		if err := w.loadProgress(); err != nil {
+			return model.PathResult{}, err
+		}
+		w.targetSettled = true
+	} else if err := w.run(ctx, req.From, req.To); err != nil {
 		return model.PathResult{}, err
 	}
 	// A name-only call is admitted only when the search proved there is no
 	// precise route: an exhausted search, not one a budget, the clock or the
 	// depth bound stopped, which owes a continuation or a truncation instead.
-	if !w.possible && !w.targetSettled && !w.resumable() && !w.depthPruned &&
+	if !w.routing && !w.possible && !w.targetSettled && !w.resumable() && !w.depthPruned &&
 		slices.Contains(kinds, model.RelCalls) && declarationReader(e.reader) != nil {
 		if err := w.startPossible(); err != nil {
 			return model.PathResult{}, err
@@ -214,21 +226,53 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	var routes [][]model.Relation
 	var vias map[model.RelationID][]model.RelationID
 	if w.targetSettled {
-		// model.MaxReasonPathsPerEntry is still the wire bound PathResult's
-		// Validate enforces, so it floors the configured setting rather than
-		// being floored by it; an unlimited setting yields the wire bound, not
-		// zero routes. A cut is reported as pathReasonRoutes below.
-		want := e.limits.ReasonPaths().Min(config.Limit(model.MaxReasonPathsPerEntry))
-		var capped bool
-		routes, capped, err = w.routes(req.From, req.To, want.Int())
+		if !w.routing {
+			// The page that settles the target counts its equal-cost routes
+			// once, over the shortest-path graph, without listing them.
+			if err := w.markReach(req.To); err != nil {
+				return model.PathResult{}, err
+			}
+			if w.routeCount, w.routeCountAtLeast, err = w.countRoutes(ctx, req.From, req.To); err != nil {
+				return model.PathResult{}, err
+			}
+			w.routing = true
+		}
+		// Every equal-cost route is listed, a page at a time: the request's
+		// page limit (the endpoint default when zero), and never more nodes
+		// than a page carries. The list resumes after the last route a page
+		// finished, so no route is held past the page that lists it.
+		limit := req.Page.Limit
+		if limit <= 0 {
+			limit = model.MaxPageItems
+		}
+		page, err := w.routePage(req.From, req.To, limit)
 		if err != nil {
 			return model.PathResult{}, err
 		}
-		if capped {
+		routes = page.routes
+		w.routesListed += int64(len(routes))
+		if page.capped {
 			pathTruncate(&res.Meta, pathReasonRoutes)
 		}
+		if !page.more && w.routeCountAtLeast {
+			// The last page: every route is listed, so the count is exact.
+			w.routeCount, w.routeCountAtLeast = w.routesListed, false
+		}
+		if w.routeCountAtLeast {
+			w.routeCount = max(w.routeCount, w.routesListed)
+		}
+		res.RouteCount, res.RouteCountAtLeast = w.routeCount, w.routeCountAtLeast
 		if vias, err = w.hopVias(routes); err != nil {
 			return model.PathResult{}, err
+		}
+		if page.more {
+			w.routeAfter = page.after
+			if res.Meta.NextCursor, err = e.nextPathCursor(ctx, sc, queryHash, w); err != nil {
+				return model.PathResult{}, err
+			}
+			if res.Meta.NextCursor == "" {
+				pathTruncate(&res.Meta, pathReasonRouteEnd)
+			}
 		}
 	}
 	// A page that ended on a budget rather than on the answer owes a
@@ -542,6 +586,16 @@ type pathWalk struct {
 	// possible is the search that also takes name-only calls, run when the
 	// precise search proved no route exists (startPossible).
 	possible bool
+	// routing is a search that settled its target and is listing its
+	// equal-cost routes: routeAfter is the position after the last route
+	// subtree a page finished (routePage), routesListed the routes every page
+	// so far listed, and routeCount the count of them all (countRoutes), a
+	// lower bound while routeCountAtLeast.
+	routing           bool
+	routeAfter        []string
+	routesListed      int64
+	routeCount        int64
+	routeCountAtLeast bool
 	// peakChunkBytes is the high-water mark of one chunk, the structural
 	// memory assertion a test reads: it must stay inside the frontier budget
 	// (plus the one group that budget is allowed to overshoot for) however
@@ -1598,67 +1652,254 @@ func (w *pathWalk) admitted(n model.NodeID) ([]model.Relation, error) {
 	return out, err
 }
 
-// routes enumerates up to want equal-cost shortest routes out of the on-disk
-// shortest-path DAG, in the frozen order: cost ascending (every route here
-// shares the settled cost of the target) then the RelationID sequence compared
-// lexicographically. A preorder walk that visits each node's edges in
-// RelationID order emits the sequences in exactly that order. The second
-// return reports that the enumeration budget ran out before the DAG was
-// exhausted.
-func (w *pathWalk) routes(from, to model.NodeID, want int) ([][]model.Relation, bool, error) {
-	if want <= 0 {
-		return nil, false, nil
+// routeStep is one edge of the shortest-path graph out of a state, keyed for
+// the enumeration by (relation, state): one relation reaches a method and its
+// dispatch state both.
+type routeStep struct {
+	rel  model.Relation
+	node model.NodeID
+}
+
+func (r routeStep) key() string { return string(r.rel.ID) + "\x00" + string(r.node) }
+
+// routeEdges is the page of edges out of state n that lie on a shortest route
+// to the target, in (relation, state) order from key at (inclusive), at most
+// limit of them. The page is materialized before the caller recurses: the
+// scratch holds ONE connection, and a nested query under an open row set
+// would wait on it forever.
+func (w *pathWalk) routeEdges(n model.NodeID, at string, limit int) ([]routeStep, error) {
+	rel, node, _ := strings.Cut(at, "\x00")
+	var out []routeStep
+	err := w.sc.each(w.scCtx, `SELECT p.node, p.rel, p.kind FROM parent p
+		WHERE p.frm = ? AND (p.rel, p.node) >= (?, ?) AND EXISTS(SELECT 1 FROM reach r WHERE r.node = p.node)
+		ORDER BY p.rel, p.node LIMIT ?`, []any{string(n), rel, node, limit},
+		func(scan func(...any) error) error {
+			var to, id, kind string
+			if err := scan(&to, &id, &kind); err != nil {
+				return internalErr("path scratch read: " + err.Error())
+			}
+			out = append(out, routeStep{node: model.NodeID(to), rel: model.Relation{ID: model.RelationID(id),
+				From: n, To: model.NodeID(to), Kind: model.RelationKind(kind)}})
+			return nil
+		})
+	return out, err
+}
+
+// routeLen is the longest route the enumeration lists: the depth bound and
+// the relations one path carries.
+func (w *pathWalk) routeLen() int {
+	if w.maxDepth.Exceeded(int64(model.MaxRelationsPerPath)) {
+		return w.maxDepth.Int()
 	}
-	if err := w.markReach(to); err != nil {
-		return nil, false, err
-	}
-	var out [][]model.Relation
-	var cur []model.Relation
+	return model.MaxRelationsPerPath
+}
+
+// routePageResult is one page of the route list.
+type routePageResult struct {
+	routes [][]model.Relation
+	// more is that routes remain after this page; after is the position the
+	// next page starts after.
+	more  bool
+	after []string
+	// capped is the enumeration's per-page step budget ending the page.
+	capped bool
+}
+
+// routePage lists the next page of equal-cost shortest routes out of the
+// on-disk shortest-path graph, in the frozen order: the (relation, state)
+// sequence compared lexicographically, which a preorder walk visiting each
+// state's edges in that order emits. It starts after w.routeAfter: the
+// prefix of the last route subtree a page finished, so a subtree is never
+// listed twice and a resumed page descends straight to where the last one
+// stopped. A page takes at most limit routes and at most a page of nodes, and
+// at most pathEnumerationSteps edges of the graph: a dense graph's dead-end
+// prefixes (the depth bound) cost steps, and a page that spends them ends
+// with a continuation rather than a shorter list.
+func (w *pathWalk) routePage(from, to model.NodeID, limit int) (routePageResult, error) {
+	var out routePageResult
+	after := w.routeAfter
+	maxLen := w.routeLen()
+	nodes := map[model.NodeID]bool{from: true}
+	var cur []routeStep
+	done := slices.Clone(after) // the prefix of the last finished subtree
 	steps := 0
-	capped := false
-	var walk func(n model.NodeID) error
-	walk = func(n model.NodeID) error {
-		if len(out) == want || capped {
-			return nil
+	stop := false
+	take := func() bool {
+		if len(out.routes) == limit {
+			return false
 		}
+		route := make([]model.Relation, len(cur))
+		added := 0
+		for i, st := range cur {
+			r := st.rel
+			r.From, _ = pathState(r.From)
+			r.To, _ = pathState(r.To)
+			route[i] = r
+			if !nodes[r.To] {
+				added++
+			}
+		}
+		if len(out.routes) > 0 && len(nodes)+added > model.MaxPageItems {
+			return false
+		}
+		for _, r := range route {
+			nodes[r.To] = true
+		}
+		out.routes = append(out.routes, route)
+		return true
+	}
+	var walk func(n model.NodeID, constrained bool) error
+	walk = func(n model.NodeID, constrained bool) error {
 		if n == to {
-			route := make([]model.Relation, len(cur))
-			for i, r := range cur {
-				r.From, _ = pathState(r.From)
-				r.To, _ = pathState(r.To)
-				route[i] = r
+			if !take() {
+				stop, out.more = true, true
 			}
-			out = append(out, route)
 			return nil
 		}
-		if atBound(w.maxDepth, len(cur)) || len(cur) >= model.MaxRelationsPerPath {
+		if len(cur) >= maxLen {
 			return nil
 		}
-		edges, err := w.admitted(n)
-		if err != nil {
-			return err
+		depth := len(cur)
+		at := ""
+		if constrained {
+			at = after[depth]
 		}
-		for _, r := range edges {
-			if steps++; steps > pathEnumerationSteps {
-				capped = true
-				return nil
-			}
-			cur = append(cur, r)
-			err := walk(r.To)
-			cur = cur[:len(cur)-1]
+		for {
+			edges, err := w.routeEdges(n, at, adjacencyBatch)
 			if err != nil {
 				return err
 			}
-			if len(out) == want || capped {
+			for _, st := range edges {
+				key := st.key()
+				within := constrained && key == after[depth]
+				if within && depth == len(after)-1 {
+					continue // that subtree was finished by an earlier page
+				}
+				if steps++; steps > pathEnumerationSteps {
+					stop, out.more, out.capped = true, true, true
+					return nil
+				}
+				cur = append(cur, st)
+				err := walk(st.node, within)
+				cur = cur[:len(cur)-1]
+				if err != nil {
+					return err
+				}
+				if stop {
+					return nil
+				}
+				done = append(slices.Clone(keysOf(cur)), key)
+			}
+			if len(edges) < adjacencyBatch {
 				return nil
 			}
+			at = edges[len(edges)-1].key() + "\x00"
+			constrained = false
 		}
-		return nil
 	}
-	if err := walk(from); err != nil {
-		return nil, false, err
+	if err := walk(from, len(after) > 0); err != nil {
+		return routePageResult{}, err
 	}
-	return out, capped, nil
+	out.after = done
+	return out, nil
+}
+
+// keysOf is the enumeration keys of a route prefix.
+func keysOf(steps []routeStep) []string {
+	out := make([]string, len(steps))
+	for i, st := range steps {
+		out[i] = st.key()
+	}
+	return out
+}
+
+// countRoutes counts the equal-cost shortest routes the enumeration lists,
+// without listing them: dynamic programming over the shortest-path graph in
+// settle order, where every parent is strictly cheaper than its child, the
+// routes reaching a state at each length being the sum over its parents'
+// routes one shorter, up to the longest route listed. The partial counts live
+// in the state (pathcount), a page of states at a time. A count past the
+// largest integer, or a deadline that lands first, is reported as a lower
+// bound (atLeast), which the last page of the list makes exact.
+func (w *pathWalk) countRoutes(ctx context.Context, from, to model.NodeID) (int64, bool, error) {
+	if err := w.sc.exec(w.scCtx, `DELETE FROM pathcount`); err != nil {
+		return 0, false, err
+	}
+	if err := w.sc.exec(w.scCtx, `INSERT INTO pathcount(node, len, n) VALUES(?, 0, 1)`, string(from)); err != nil {
+		return 0, false, err
+	}
+	maxLen := w.routeLen()
+	saturated := false
+	var lastDist int64 = -1
+	lastNode := ""
+	for {
+		if stop, err := w.checkDeadline(ctx); stop || err != nil {
+			return 0, true, err
+		}
+		type state struct {
+			node string
+			dist int64
+		}
+		var page []state
+		if err := w.sc.each(w.scCtx, `SELECT s.node, s.dist FROM settled s JOIN reach r ON r.node = s.node
+			WHERE (s.dist, s.node) > (?, ?) AND s.node != ? ORDER BY s.dist, s.node LIMIT ?`,
+			[]any{lastDist, lastNode, string(from), adjacencyBatch},
+			func(scan func(...any) error) error {
+				var st state
+				if err := scan(&st.node, &st.dist); err != nil {
+					return internalErr("path scratch read: " + err.Error())
+				}
+				page = append(page, st)
+				return nil
+			}); err != nil {
+			return 0, false, err
+		}
+		for _, st := range page {
+			sums := map[int64]int64{}
+			if err := w.sc.each(w.scCtx, `SELECT c.len + 1, c.n FROM parent p JOIN pathcount c ON c.node = p.frm
+				WHERE p.node = ? AND c.len + 1 <= ?`, []any{st.node, maxLen},
+				func(scan func(...any) error) error {
+					var l, n int64
+					if err := scan(&l, &n); err != nil {
+						return internalErr("path scratch read: " + err.Error())
+					}
+					if sums[l] > math.MaxInt64-n {
+						sums[l], saturated = math.MaxInt64, true
+					} else {
+						sums[l] += n
+					}
+					return nil
+				}); err != nil {
+				return 0, false, err
+			}
+			for l, n := range sums {
+				if err := w.sc.exec(w.scCtx, `INSERT INTO pathcount(node, len, n) VALUES(?, ?, ?)`, st.node, l, n); err != nil {
+					return 0, false, err
+				}
+			}
+		}
+		if len(page) < adjacencyBatch {
+			break
+		}
+		lastDist, lastNode = page[len(page)-1].dist, page[len(page)-1].node
+	}
+	var total int64
+	if err := w.sc.each(w.scCtx, `SELECT n FROM pathcount WHERE node = ?`, []any{string(to)},
+		func(scan func(...any) error) error {
+			var n int64
+			if err := scan(&n); err != nil {
+				return internalErr("path scratch read: " + err.Error())
+			}
+			if total > math.MaxInt64-n {
+				total, saturated = math.MaxInt64, true
+			} else {
+				total += n
+			}
+			return nil
+		}); err != nil {
+		return 0, false, err
+	}
+	return total, saturated, nil
 }
 
 // scratchDir is the directory whose scratch pool a path search takes its state

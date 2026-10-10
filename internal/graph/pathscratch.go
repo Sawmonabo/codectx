@@ -119,6 +119,7 @@ DROP TABLE IF EXISTS reach;
 DROP TABLE IF EXISTS pending;
 DROP TABLE IF EXISTS progress;
 DROP TABLE IF EXISTS hopvia;
+DROP TABLE IF EXISTS pathcount;
 `
 
 const pathScratchSchema = `
@@ -131,6 +132,7 @@ CREATE TABLE bucket(cost INTEGER NOT NULL, node TEXT NOT NULL, rel TEXT NOT NULL
 CREATE TABLE reach(node TEXT PRIMARY KEY) WITHOUT ROWID;
 CREATE TABLE pending(node TEXT PRIMARY KEY) WITHOUT ROWID;
 CREATE TABLE hopvia(rel TEXT NOT NULL, via TEXT NOT NULL, PRIMARY KEY(rel, via)) WITHOUT ROWID;
+CREATE TABLE pathcount(node TEXT NOT NULL, len INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY(node, len)) WITHOUT ROWID;
 CREATE TABLE progress(k INTEGER PRIMARY KEY, expand_after TEXT NOT NULL, depth_pruned INTEGER NOT NULL,
 	scan_done INTEGER NOT NULL, hop_pos TEXT NOT NULL, possible INTEGER NOT NULL);
 INSERT INTO progress(k, expand_after, depth_pruned, scan_done, hop_pos, possible) VALUES(0, '', 0, 0, '', 0);
@@ -154,7 +156,8 @@ INSERT INTO progress(k, expand_after, depth_pruned, scan_done, hop_pos, possible
 // steps are, the depth-pruned flag, which is an answer-level
 // disclosure that must survive the page that discovered it, and whether the
 // search is the one that takes name-only calls. hopvia holds the call site
-// relations behind each name-only step.
+// relations behind each name-only step, and pathcount the
+// routes reaching each state by length, which counts the equal-cost routes.
 
 // openPathScratch opens the search's database on a surface of the store's
 // scratch pool under parent, emptied of whatever the search before it left

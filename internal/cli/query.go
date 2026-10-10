@@ -478,6 +478,14 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			}
 			return emitQuery(cmd, build, args, result, result.Meta, func(b *strings.Builder) {
 				fmt.Fprintf(b, "walked      %d visited\n", result.VisitedCount)
+				if result.RouteCount > 0 {
+					atLeast := ""
+					if result.RouteCountAtLeast {
+						atLeast = "at least "
+					}
+					fmt.Fprintf(b, "routes      %s%d equal-cost, this page lists %d\n", atLeast, result.RouteCount,
+						len(result.Paths))
+				}
 				writePaths(b, result.Paths)
 				writeNodeTable(b, result.Nodes)
 			})
@@ -489,6 +497,9 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 	addQueryFlags(cmd, true)
 	addTraversalFlags(cmd, false, false)
 	addPathDirectionFlag(cmd)
+	// The equal-cost routes are a list, paged like any other: --limit is the
+	// routes one page lists.
+	addLimitFlag(cmd)
 	// A path search IS resumable now: a page that spends its deadline or its
 	// visited budget keeps its state and prints the token that continues it.
 	addCursorFlag(cmd)

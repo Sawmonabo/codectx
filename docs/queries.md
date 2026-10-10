@@ -193,8 +193,8 @@ so a changed handler marks the endpoints that route to it affected.
 | `--repo` | all | Workspace root to answer from. |
 | `--generation` | all | Answer from this generation instead of the active one. It is not combinable with `--cursor`: a cursor already pins its generation. |
 | `--timeout` | all | Deadline for this invocation, and the only thing that bounds one: `resources.query_timeout` is a default and not a ceiling, and it is unlimited, so a command you do not bound answers in full. Every command honours that — `search`, `symbol`, the graph walks, `context plan`, the coverage and workflow commands, and the MCP tools alike. A value here **sets** the deadline for the call — above a configured `resources.query_timeout` as readily as below it. What a call does when it expires depends on whether there is anything to resume past. `search`, `symbol`, the graph walks and `context plan` accumulate work across pages or passes, so a bounded call ends with a continuation cursor and the next call carries on from it. The coverage commands (`coverage read`, `coverage next`, `coverage ack`, `coverage session`, `coverage status`) and the workflow commands (`workflow advance`, `workflow close`, `workflow include`, `workflow status`) answer one bounded read or apply one mutation, so there is no partial state for a cursor to name: an expiry there is reported as `CTX_QUERY_DEADLINE`, naming `resources.query_timeout` / `--timeout` as the setting to move. Zero asks for no deadline of its own and leaves the configured value in charge. |
-| `--limit` | all but `path` | Items in one page. A route set is bounded by the reason-path cap rather than paged, so `path` declares no `--limit`. |
-| `--cursor` | all | Continue a previous page — on `path`, continue the same search. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
+| `--limit` | all | Items in one page; on `path`, the equal-cost routes one page lists. |
+| `--cursor` | all | Continue a previous page — on `path`, continue the same search, or the list of its equal-cost routes. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
@@ -354,9 +354,12 @@ what was admitted, in the one global order — and never a continuation of the
 walk past `N`. The default, `0`, sets no bound: the walk runs to exhaustion and
 its pages concatenate to the whole answer.
 
-`path` is the third shape, and it is neither of those. It declares no `--limit`
-because a route set is bounded by the reason-path cap rather than paged into
-items, but the **search** behind it is paged: `--visited` is a per-page work
+`path` is the third shape, and it is neither of those. Its answer is the list
+of every equal-cost route, paged by `--limit` with `next` and counted whole in
+`route_count` (counted over the shortest-path graph, not by listing; "at least"
+when the deadline lands first, and exact on the last page). The routes are
+listed in relation order from the search's kept state, a page at a time, never
+held all at once. The **search** behind it is paged too: `--visited` is a per-page work
 budget there, and a page that spends it ends with `next` rather than an answer.
 Following that cursor resumes the same search from the state it kept, so the
 routes it finally reports are the ones an unbounded search would report. The
@@ -463,7 +466,7 @@ where the workspace is composed, and handed to it.
 | `context.max_graph_depth` | Default and ceiling for `--depth`. Unlimited by default. |
 | `context.max_visited_nodes` | Default and ceiling for `--visited`. Unlimited by default. |
 | `context.max_graph_edges` | Default and ceiling for `--edges`. Unlimited by default. |
-| `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. |
+| `context.max_reason_paths_per_entry` | Explanation routes a context entry stores. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. It does not bound `path`, which lists every equal-cost route. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Unlimited by default, so an unbounded walk answers in full. |
 | traversal slots (half this machine's cores, at least one) | Process-wide gate on concurrent graph queries; it is derived from the machine and is not a setting. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |

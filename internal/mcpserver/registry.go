@@ -60,7 +60,8 @@ func register(s *mcp.Server, h *handlers) {
 			"which way edges are followed: \"outgoing\" (the default: what `from` depends on), "+
 			"\"incoming\" (what depends on it) or \"both\" (either way). A node that is only ever "+
 			"called has no outgoing route to its callers, so a pair connected against the edge "+
-			"direction reports no path until `direction` is incoming or both.", h.dependencyPath)
+			"direction reports no path until `direction` is incoming or both. Every equal-cost "+
+			"route is listed, a page at a time by next_cursor, and `route_count` counts them all.", h.dependencyPath)
 	addTool(s, "codectx_impact", "Impact",
 		"Affected scope and required package boundaries, with completeness.", h.impact)
 
