@@ -1,0 +1,6 @@
+free -g available 28G
+=== tqrels seed 7
+tqrels <bench>/docs.jsonl <dir> 20261008: name/doc/subword byte-identical to <bench>/qual; ident copied
+free -g available 28G
+=== ours qual-ident tbquery <bench>/store <bench>/qual/queries-ident.txt 1
+rc=0

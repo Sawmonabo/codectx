@@ -50,6 +50,10 @@ pub struct IndexConfig {
     /// One extra text field `all` holding the five columns as five values (the
     /// stock library's nearest thing to BM25F: one field, one length, one df).
     pub combined: bool,
+    /// Exact per-column token counts as u64 fast fields (product::LEN_NAMES), with
+    /// the index's own tokenizer (the code tokenizer on a code index, else
+    /// unicode61), for product's `--dl weighted`.
+    pub column_lengths: bool,
     /// none | lz4 | zstd:<level>
     pub docstore: String,
     pub blocksize: usize,
@@ -71,6 +75,7 @@ impl Default for IndexConfig {
             name_ngram: false,
             field_counts: false,
             combined: false,
+            column_lengths: false,
             docstore: "lz4".into(),
             blocksize: 16384,
         }
@@ -122,7 +127,7 @@ impl IndexConfig {
                     _ => return Err("--schema is full or lean".into()),
                 },
                 f @ ("--lean-numeric" | "--lean-strings" | "--kind-fast-only" | "--path-facet" | "--kind-code"
-                | "--parts-fields" | "--name-ngram" | "--field-counts" | "--combined") => {
+                | "--parts-fields" | "--name-ngram" | "--field-counts" | "--combined" | "--column-lengths") => {
                     match f {
                         "--lean-numeric" => c.lean_numeric = true,
                         "--lean-strings" => c.lean_strings = true,
@@ -132,6 +137,7 @@ impl IndexConfig {
                         "--parts-fields" => c.parts_fields = true,
                         "--name-ngram" => c.name_ngram = true,
                         "--combined" => c.combined = true,
+                        "--column-lengths" => c.column_lengths = true,
                         _ => c.field_counts = true,
                     }
                     args.remove(i);
@@ -179,6 +185,7 @@ impl IndexConfig {
             (self.name_ngram, "ngram"),
             (self.field_counts, "counts"),
             (self.combined, "combined"),
+            (self.column_lengths, "collen"),
         ] {
             if on {
                 p.push(name.into());
@@ -283,6 +290,11 @@ pub fn build_schema(c: &IndexConfig) -> Schema {
             b.add_u64_field(n, num(false, false));
         }
     }
+    if c.column_lengths {
+        for n in crate::product::LEN_NAMES {
+            b.add_u64_field(n, num(false, false));
+        }
+    }
     if c.combined {
         b.add_text_field("all", text(c.text_tokenizer(), IndexRecordOption::WithFreqsAndPositions));
     }
@@ -384,6 +396,20 @@ pub fn to_doc(d: &Doc, f: &Fields) -> tantivy::TantivyDocument {
     if let Some(cs) = f.counts {
         for (i, c) in d.columns().iter().enumerate() {
             t.add_u64(cs[i], unicode61::count(c));
+        }
+    }
+    if let Some(ls) = f.lens {
+        // The index's own tokenizer: a code index counts stacked parts, as its
+        // postings (and token_count_code) do.
+        for (i, c) in d.columns().iter().enumerate() {
+            let n = if f.token_count_code.is_some() {
+                let mut n = 0u64;
+                unicode61::for_each_code_token(c, |_, _, _, _, _| n += 1);
+                n
+            } else {
+                unicode61::count(c)
+            };
+            t.add_u64(ls[i], n);
         }
     }
     if let Some(a) = f.all {

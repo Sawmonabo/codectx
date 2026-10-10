@@ -13,10 +13,13 @@ audited on its merits, not for the library to be judged against the rules.
 that folder. Its [README](raw/search-library/README.md) lists what was published, what was not and why, and how host
 paths were replaced.
 
-- `runs/` — the kubernetes runs: `00` export, `01` our index, `02` the library's index, `03` search speed (with
-  `03-pooled-latency.txt` and `03-first-page.txt` derived from the per-run lines), `04` quality, and the raw logs.
+- `runs/` — the kubernetes runs. Round 1: `00` export, `01` our index, `02` the library's index, `03` search speed
+  (with `03-pooled-latency.txt` and `03-first-page.txt` derived from the per-run lines), `04` quality, and the raw
+  logs. Round 2: `05` every variant, with the three runs on our scoring (the code-aware tokenizer, our pruned
+  collector, the weighted length), `06` the rule audit, `07` the delta routes, and their logs and scripts in
+  `r2-logs/`.
 - `ours/` — how our arm reproduces production's write and query paths (`01`–`07`), and its source.
-- `harness/` — the library arm: a summary (`00`), notes `01`–`12`, and its source.
+- `harness/` — the library arm: a summary (`00`), notes `01`–`13`, and its source.
 - `features/` (`01`–`09`) and `features-matrix/` (`00`, `10`–`18`) — every library feature, read from its source.
 - `web/` — eight literature and engine questions (`01`–`08`) and their summary (`00`).
 
@@ -33,23 +36,30 @@ ways (`harness/03-query-modes.md`):
 1. **The library's index is 44 times faster to build and about half the size.** 9.0 s against 400.7 s, 48.8 s of
    CPU against 593.7 s, 0.85 GB peak against 2.45 GB, 337–387 MB against about 641 MB live (`runs/01-ours-index.md`, `runs/02-library-index.md`).
    Activation, 165.4 s today, disappears: the library merges in the background.
-2. **Our exact rules inside the library are 12 times faster than today; the library's pruned top 200 is about 3 000
-   times faster.** 30 queries, warm, first page of 200: 47.4 s today, 4.04 s for `product`, 129 ms for
-   `library-all`, 16 ms for `library` (`runs/03-search-speed.txt`). `product` scores every match; a pruned collector
-   for our formula is the design (decision 5) and its kubernetes run is being measured (§9).
+2. **Our exact rules inside the library are 12 times faster than today, and 160 times with our pruned collector;
+   the library's pruned top 200 is about 3 000 times faster.** 30 queries, warm, first page of 200: 47.4 s today,
+   4.04 s for `product`, 129 ms for `library-all`, 16 ms for `library` (`runs/03-search-speed.txt`). `product` scores
+   every match. Our formula's pruned collector (decision 5) returns the same pages as `product` on 3 030 of 3 030
+   queries and answers the 30 in 296 ms, against 4 653 ms for `product` in the same run (15.7×), and in 185 ms on 4
+   search threads (`runs/05-variants.md`, owner run 2).
 3. **`product` returns today's answers.** Folded hit counts equal today's served counts on 30 of 30 queries, and the
    first page is identical on 22 of 30. The other 8 differ only because our arm records an unfolded, document-level
    page (`runs/03-first-page.txt`).
 4. **The library's own scoring cannot be adopted.** On the doc set it collapses from 0.68 to 0.02 MRR@10, because it
    gives every column its own document frequency (§3). It wins the name and subword sets, which our scoring can get
    back through the tokenizer, not through per-column scoring (§2.4).
-5. **The code-aware tokenizer is the largest quality lever measured.** Under the library's scoring it lifts subword
-   MRR@10 from 0.60 to 0.70 and Recall@200 from 0.22 to 0.66. Under our scoring it is being measured (§9).
+5. **The code-aware tokenizer is the largest quality lever measured, and it is always on.** Under the library's
+   scoring it lifts subword MRR@10 from 0.60 to 0.70 and Recall@200 from 0.22 to 0.66. Under our scoring it lifts
+   subword MRR@10 from 0.379 to 0.500 and Recall@200 from 0.214 to 0.630, and ends all 13 zero-hit queries, at a cost of
+   0.023 MRR@10 on name and 0.009 on doc (`runs/05-variants.md`, owner run 1). By the owner's ruling of Oct 9, 2026, camelCase and
+   snake_case splitting is always on: the whole identifier is kept and its parts are added at its position.
 6. **Today's slowness is structural, not single-threading** (§3): two indexes over the same text, a SQLite page
    round trip per posting, a full sort spooled to disk before page 1, and statistics recomputed per query.
 7. **Rule audit** (§5): the scoring rules hold. The "no top-k cap" rule for ranked lists is dropped by the owner's
-   ruling of Oct 8, 2026: a ranked search serves its best results. Three choices stay pending on named results: the
-   code-aware tokenizer, the weighted document length and the visibility route.
+   ruling of Oct 8, 2026: a ranked search serves its best results. The code-aware tokenizer is adopted by the owner's
+   ruling of Oct 9, 2026. Two choices stay pending: the document length weighted per column, which helps name and
+   subword and costs doc (§2.4), until the quality benchmark; and the visibility route, because the three routes ran
+   within noise of each other on kubernetes, so speed does not choose among them (§2.6).
 
 ## 1. Question and method
 
@@ -59,7 +69,7 @@ ways (`harness/03-query-modes.md`):
 - **Producer:** the real `codectx index` at `16dfef6`, with the scip, lsp and dependence providers turned off by a
   bench-only user configuration. A nil-guarded observer inside the store's own write path captures each search
   document after the store accepts it, with the store's own `token_count` (`ours/01-export-path.md`).
-- **Run:** Oct 8, 5:24 PM to 5:44 PM; 19 min 25 s; peak 2.89 GB.
+- **Run:** Oct 8; 19 min 25 s; peak 2.89 GB.
 - **Documents:** 546 613 (filesystem 37 080, tree-sitter 509 533) in 49 280 units, 437 001 distinct terms. 1 285 of
   those units carry no document, so the library arm, which only needs units with documents, sees 47 995.
 - **Completeness check:** with the 15 459 manifest documents the export leaves out, the total is 562 072, exactly
@@ -149,6 +159,12 @@ Variants are threads, writer memory budget, commit cadence and tokenizer. "end" 
 - **Commit cadence.** A commit costs about 20 ms of fsync, so 47 995 commits cost 954 s. On the fixture a per-unit
   commit cost about 18 ms at 1 thread and 66 ms at 16, because every thread flushes (`harness/04-commit-cadence.md`).
 - **The code-aware tokenizer** costs 33 MB (+9%) of disk, mostly positions (`features/04-directories-storage.md`).
+- **Round 2's 37 index variants** (`runs/05-variants.md`, one build each) put a number on every writer, merge,
+  schema and storage feature in §4. Same-layout builds vary from 13 to 20 s, so a wall difference under about 30% is
+  noise. With a commit every 1 000 units (48 commits, 20.4 s), turning merges off leaves 768 segments and makes
+  library search 7× slower (130.7 against 18.0 ms over the 30 queries); `log:min=16` or 8 merge threads cut the build
+  by 35–38% with 18–19 segments and no measurable search cost. A commit every 100 units costs 77.2 s (480 commits,
+  about 0.12 s each).
 
 ### 2.2 Search speed by band (`runs/03-search-speed.txt`, `runs/ours-query.log`, `runs/tquery-speed.log`)
 
@@ -223,9 +239,15 @@ Median over all 150 warm runs (30 queries × 5).
 - **Deep pages.** The library's pruned top-k answered pages 1, 2, 3, 5 and 10 in 15.9, 16.2, 16.5, 16.4 and 18.3 ms
   for the 30 queries: about 0.5 ms a page whatever the page number.
 - **Search threads.** 16 threads cut the library modes by 26% (`library`, 16.0 to 11.8 ms) and 20% (`library-all`,
-  129.3 to 103.7 ms) over 30 queries. `product` ran on one thread in this run; per-segment threads for our collector
-  are proven to give identical output on the fixture (`harness/12-product-topk.md`) and their kubernetes timing is
-  being measured (§9).
+  129.3 to 103.7 ms) over 30 queries. On the 2-segment index, 4 threads cut our pruned collector by 37.5% (296 to
+  185 ms, median query 10.12 to 6.23 ms) and exhaustive `product` by 4.5% (4 653 to 4 443 ms), with pages identical
+  to one thread on 30 of 30 (`runs/05-variants.md`, owner run 2). On the 11-segment index, 8 threads cut `library`
+  by 14% and `library-all` by 6%, and 2 threads made `library` 128% slower: the gain depends on the segment count
+  and is not monotonic.
+- **Filter routes on kubernetes** (`runs/05-variants.md`, library mode, 30 queries): for the folder filter, a facet
+  (19.0 ms) and a term range (28–30 ms) beat a regular expression (116.1 ms) with identical pages; for the kind
+  filter, a u64 filter collector is the fastest correct route (27.1 against 38.0 ms). The byte-column filter
+  collector returns 0 hits on every kind-filtered query, as on the fixture (C5).
 
 ### 2.4 Quality (`runs/04-quality.txt`)
 
@@ -235,6 +257,9 @@ MRR@10 / Success@10, Recall@200 in brackets where it matters. "Δ" is MRR@10 aga
 |---|---|---|---|---|---|---|
 | **today** | 0.833 / 95.0% | — | 0.684 / 86.5% | — | 0.379 / 64.9% (0.213) | — |
 | `product` (our scoring in the library) | 0.833 / 95.0% | 0.000 | 0.684 / 86.5% | +0.000 | 0.379 / 64.9% (0.214) | 0.000 |
+| `product`, code-aware tokenizer | 0.810 / 93.2% | −0.023 | 0.676 / 85.9% | −0.009 | 0.500 / 86.7% (0.630) | +0.121 |
+| `product`, weighted length | 0.857 / 96.7% | +0.024 | 0.670 / 86.3% | −0.014 | 0.435 / 70.5% (0.214) | +0.055 |
+| `product`, code-aware tokenizer and weighted length | 0.856 / 96.8% | +0.023 | 0.648 / 84.9% | −0.037 | 0.559 / 91.0% (0.644) | +0.179 |
 | `library` (per-column scoring) | 0.901 / 99.1% | +0.068 | 0.024 / 9.3% | −0.661 | 0.602 / 75.7% (0.218) | +0.223 |
 | `library`, code-aware tokenizer | 0.909 / 99.1% | +0.075 | 0.046 / 12.1% | −0.639 | 0.703 / 92.8% (0.661) | +0.324 |
 | `library-all` | 0.907 / 99.1% | +0.074 | 0.023 / 9.1% | −0.661 | 0.602 / 75.9% (0.218) | +0.223 |
@@ -242,10 +267,23 @@ MRR@10 / Success@10, Recall@200 in brackets where it matters. "Δ" is MRR@10 aga
 
 - `product` equals today to the fourth decimal on every set. Its subword Recall@200 differs in the fourth place
   (0.2139 against 0.2130), consistent with its counting folded results, not documents.
-- The code-aware tokenizer ends subword's 13 zero-hit queries.
+- The code-aware tokenizer ends subword's 13 zero-hit queries, under both scorings.
 - The library's per-column scoring wins name and subword. That gain is set against its collapse on doc (§3). The
-  code-aware tokenizer gives most of the subword gain without the per-column model; under our scoring it is being
-  measured (§9).
+  code-aware tokenizer gives part of the subword gain without the per-column model: under our scoring, +0.121
+  MRR@10 and Recall@200 from 0.214 to 0.630. It costs name 0.023 MRR@10 (Recall@200 0.946 to 0.920), because
+  camelCase parts make name queries match 5.6 times as many documents (mean hits 9 096 to 50 583), and doc 0.009
+  (owner run 1).
+- **Weighted length** (owner run 3, `harness/13-weighted-length.md`): the document length is Σ weight(c) · len(c)
+  over the five columns with the BM25F weights 5/5/2/2/1, from five exact per-column token counts stored as fast
+  fields (index 355 MB against 353.5 MB). It helps name (+0.024) and subword (+0.055) and costs doc (−0.014); with
+  the code-aware tokenizer it is the best arm on name and subword and costs doc 0.037. It never changes which
+  documents match. Its `--dl total` controls reproduce the earlier pages on 1 000 of 1 000 queries of every set.
+  The cost on doc comes from a long name or qualified name, weighted 5, making the whole document look long; a
+  weighting less steep than the frequency weights is the next arm to measure (`runs/06-rule-audit.md`, item 7).
+- **Other tokenizers and analyzers on kubernetes** (library scoring, `runs/05-variants.md`): stemming loses 0.126
+  subword MRR@10; the library's default analyzer drops 9 name queries to zero hits (it removes tokens of 40 bytes
+  or more); parts indexed in their own columns reach subword Recall@200 0.566, and name n-grams 0.514, against 0.661
+  for the code-aware tokenizer.
 
 ### 2.5 Top-k exactness (`harness/08-topk-check.md`, `harness/12-product-topk.md`, `runs/tquery-speed.log`)
 
@@ -256,12 +294,20 @@ MRR@10 / Success@10, Recall@200 in brackets where it matters. "Δ" is MRR@10 aga
 | the same, 1 000 name-set queries | kubernetes, 11 segments | equal on 1 000 of 1 000; 0 misses |
 | the same, 812 queries | fixture: 1, 2, 3 (after a delta) and 6 segments, 1 and 4 threads | equal on 812 of 812 every time; 0 misses; same-document scores up to 2 ulp apart between the two f32 paths |
 | our formula's pruned collector (block-max bounds over our BM25F), pages 1–3 | fixture: 1, 6 and 3 (after a delta) segments, unicode61 and code-aware indexes, 1 and 4 threads | identical to exhaustive scoring on 2 436 of 2 436 query-page pairs every time |
-| the same, kubernetes | — | being measured (§9) |
+| the same, kubernetes, page 1 | kubernetes, 2 segments, 1 thread (and 4 threads on the 30) | identical to exhaustive `product` on 3 030 of 3 030 queries (the 30 and the three quality sets of 1 000) |
+| the library's pruned top 200 for other query shapes (`runs/05-variants.md`) | kubernetes, 2 and 11 segments | disjunction-max, minimum-should-match and fuzzy: 30 of 30, 0 misses. Flat and parser shapes: misses on 2 of 30 (11 segments) and 45 of 1 000 name queries, every one a document 1–2 ulp above the page's lowest score, a tie settled by f32 summation order, not a lost document |
 
 The library's pruned page differs from `library-all`'s only in how ties are broken (document address against `id`).
 On the fixture our pruned collector was about 2× faster than exhaustive `product` on page 1 (1.07 against 2.05 ms),
-although its bound skipped only about 2% of blocks there: the gain is the threshold keeping documents out of the fold.
-The fixture's vocabulary is synthetic and flat; the real skip rate needs kubernetes.
+although its bound skipped only about 2% of blocks there, because the fixture's vocabulary is flat.
+
+On kubernetes (`runs/05-variants.md`, owner run 2; per query in `runs/r2-logs/topk-per-query.md`) it skipped 67.7%
+of blocks over the 30 queries and answered them in 296 ms against 4 653 ms for `product` (15.7×), up to 100× on the
+most frequent terms (`vendor` 876.6 to 8.7 ms, 94.6% of blocks skipped). It is slower than `product` on one query
+only, the phrase `"admission controller"` (5.6 to 7.4 ms); the five rare terms, where no block is skipped, still gain
+23–36%. On the quality sets, summed: doc 85.5 to 14.7 s, subword 36.5 to 9.0 s, name 35.2 to 4.8 s (most names are
+rare, so the median name query gains only 14%; the frequent names dominate the sum). Its cost is a block-max side
+file of 75.5 MB for the 2-segment index (4 814 741 blocks), built in 1.46 s and rebuilt after every commit or merge.
 
 ### 2.6 Visibility smoke (`harness/11-hide-units.md`)
 
@@ -275,8 +321,44 @@ only the visible documents. Fixture: 6 segments, 18 queries.
 | 50% | 234 / 2 356 | 18/18 equal | equal | 3/18 equal | 0.09–0.20 ms |
 
 The library's pages differ because its statistics still count hidden documents. The three routes (a query wrapper,
-a collector, a custom alive set per segment) ran within noise on the fixture; their kubernetes timing at 10% and 50%
-decides the route (§9). A soft delta through hiding equalled the hard delete on 19 of 19 queries.
+a collector, a custom alive set per segment) ran within noise on the fixture. A soft delta through hiding equalled
+the hard delete on 19 of 19 queries.
+
+On kubernetes (`runs/05-variants.md`, 30 queries, seed 7; no visible-only reference index was built there):
+
+| Hidden | `library`, three routes, warm sum | `library-all`, three routes | `product`, collector / alive set | Pages identical to the unhidden index (0% is the correctness check) |
+|---|---|---|---|---|
+| 0% | 15.1–16.1 ms | 145.2–155.0 ms | 4 851.1 / 4 650.0 ms | 30/30 on every route and mode |
+| 10% | 16.1–22.2 ms | 146.1–151.3 ms | 4 063.1 / 4 246.5 ms | 4/30 |
+| 50% | 18.6–22.5 ms | 96.8–103.6 ms | 2 893.7 / 2 895.7 ms | 1/30 |
+
+- The routes are within noise of each other in every mode, so the kubernetes time that was to choose the route
+  (ADR-0013, decision 3) does not separate them, and the route stays open (§9).
+- Building the hidden set costs 10–22 ms per searcher on 546 613 documents, more than a warm library query, so it must be
+  cached per searcher generation.
+- `product` ignores the query-wrapper route (it always hides in its own collector), so only two routes ran for it.
+
+### 2.7 Delta routes (`runs/07-delta.md`, `runs/r2-logs/c-audit.log`)
+
+The unit with the most documents (9 460, a generated Windows constants file under `vendor/`) is deleted and re-added
+with its first body changed, on its own copy of the 2-segment index, single runs:
+
+| Route | Put + commit | Afterwards: segments / deleted documents |
+|---|---|---|
+| delete by the `unit` term | 276.8 ms | 3 / 9 460 |
+| the same, then a forced merge | 265.9 ms, then 12 372 ms of merge | 1 / 0 |
+| delete by `id`, 9 460 times | 392.9 ms | 3 / 9 460 |
+| delete by a term query on `unit` | 318.1 ms | 3 / 9 460 |
+| soft: nothing deleted, the old documents hidden | 299.2 ms | 3 / 0 |
+| delete by the `unit` term, merge policy merging a segment once 20% of it is deleted | 334.2 ms | 3 / 9 460 (no merge triggered) |
+
+- Every route costs about 0.27–0.39 s, dominated by the commit. Single runs: the two runs of the same route differ
+  by 11 ms. Delete by `id`, one call per document, is the slowest; delete by the `unit` term (decision 3), one call
+  per unit, is among the fastest.
+- The library's statistics count the 9 460 deleted documents until a merge removes them; the forced merge that does
+  so costs 12.4 s on this corpus. Exact statistics over visible documents (rule 1) never depend on merges.
+- Unmeasured: our engine's delta on the same unit, so no like-for-like delta comparison exists; the drift comparison
+  (pages after the delta against a fresh index, before and after a merge); and the soft delta's pages (§9).
 
 ## 3. Why today's tier is slow, and why per-column scoring collapses on the doc set
 
@@ -317,6 +399,10 @@ What the variants showed on the fixture (520 doc queries; `harness/10-variants.m
 - the union df alone keeps MRR@10 at 0.000 but lifts Recall@200 to 1.000: per-column sums with large boosts still
   favour a one-word identifier match.
 
+Kubernetes agrees (`runs/05-variants.md`): BM25 over one combined column reproduces our ranking (name 0.831, doc
+0.683, subword 0.381, against 0.833, 0.684 and 0.379) for 104 MB more disk; equal boosts 1/1/1/1/1 lift the
+per-column sum's doc MRR@10 only to 0.265, and union document frequencies only to 0.034.
+
 The literature agrees: BM25F's one saturation over weighted frequencies is the model built for this case, and the
 combined-field queries of two major engines exist for it (`web/01-field-combination.md`).
 
@@ -332,30 +418,30 @@ ADR-0013 does not settle it and no run here decides it. Decisions are ADR-0013's
 | I1 | indexing threads | used, derived from the admission's measured need (decision 4) | 9.0 s at 16 threads, 18.1 s at 1 |
 | I2 | writer memory budget | used, derived the same way (decision 4) | 0.49–1.36 GB peak across budgets |
 | I3 | merge threads | used, governed with the other workers (decision 4) | merges must not freeze the host |
-| I4 | merge-policy knobs | the default policy, merging in the background (decision 4) | no measured need to tune; segment count costs 5–10% (§2.3) |
-| I5 | no merges, then one final merge | not used | its purposes (one segment, add-ordered ids) are met by content-keyed ties and our own pruning |
+| I4 | merge-policy knobs | the default policy, merging in the background (decision 4) | segment count costs 5–10% (§2.3); kubernetes, a commit every 1 000 units: `log:min=16` cut the build 35% at no measurable search cost, no merging made search 7× slower (§2.1) |
+| I5 | no merges, then one final merge | not used | its purposes (one segment, add-ordered ids) are met by content-keyed ties and our own pruning; kubernetes: 29.7 s against 20.4 s |
 | I6 | commit | used, one per generation activation (decision 4) | a commit per unit cost 954 s |
 | I7 | commit payload | used: the generation's id (decision 4) | crash order and reconciliation |
-| I8 | one operation batch per unit | not used | fixture: 9.5 s against 8.6 s, no gain |
+| I8 | one operation batch per unit | not used | fixture: 9.5 s against 8.6 s; kubernetes: 12.9 s against 20.4 s, a single run beside merge variants of 12.6–13.2 s |
 | I9 | delete by term | used, on the `unit` field (decision 3) | units are freed whole |
 | I10 | delete by query | not used | delete by term covers every case |
 | I11 | single-segment writer | not used | a hidden API; one-shot builds only |
-| I12 | build in RAM, then persist | not used | identical bytes; holds the index in memory |
+| I12 | build in RAM, then persist | not used | identical bytes; holds the index in memory (kubernetes peak 2.03 GB against 1.26 GB) |
 | I13 | index sorting | not available | removed upstream in 0.24 |
 
 ### Settings and fields
 
 | # | Feature | In the design | Why |
 |---|---|---|---|
-| F1, F2 | document-store compressor and block size | not decided | fixture only: store 233 KB (default) against 140 KB (zstd 3) |
-| F3 | document-store cache | not decided | fixture: misses fall from 9 618 to 42 with the default cache |
-| F4 | nothing stored, values from fast fields | not decided | the library stores what it serves (decision 8); fast-field id reads cost about 6 µs each against the cached store |
-| F5 | field norms off | not decided | our scoring never reads them; the library's scoring needs them |
+| F1, F2 | document-store compressor and block size | not decided | kubernetes: store 52.0 MB (default) against 33.0 MB (zstd 3) and 30.7 MB (zstd 3, 64 KB blocks); search within noise |
+| F3 | document-store cache | not decided | fixture: misses fall from 9 618 to 42 with the default cache; kubernetes: no cache doubles library latency (31.9 against 16.0 ms) |
+| F4 | nothing stored, values from fast fields | not decided | the library stores what it serves (decision 8); kubernetes: 50 MB saved, library latency doubled (34.7 against 16.0 ms) |
+| F5 | field norms off | not decided | our scoring never reads them; the library's scoring needs them (off: name −0.034, subword −0.103 MRR@10); text-only norms change nothing and take 4.4 MB off the norms |
 | F6 | frequencies and positions | used on the five text columns (decisions 2 and 8) | positions serve phrases in place of the full-text table |
 | F7 | indexed, fast and stored flags | used: `kind`, path, `unit` and `token_count` are fast (decision 7) | filters and statistics inside the collector |
 | F8 | value coercion | not used | values are typed at export |
 | F9 | fast-field codecs | automatic | no knob |
-| F10 | sstable term dictionary | not decided | fixture: 180 KB against 394 KB, same answers |
+| F10 | sstable term dictionary | not decided | kubernetes: term dictionary 121.4 to 60.5 MB (disk −17%); library latency 2.5×, `product` +29% with identical pages |
 
 ### Tokenizers
 
@@ -364,12 +450,12 @@ ADR-0013 does not settle it and no run here decides it. Decisions are ADR-0013's
 | T1 | custom tokenizer | used: today's rules (decision 6) | the only way to keep today's terms |
 | T2 | stock simple, whitespace and raw tokenizers | not used | their terms differ from today's |
 | T3 | regular-expression tokenizer | not used | no measured need |
-| T4 | n-grams | not used | fixture identifier recall 0.64 against 0.29, at a disk cost; the code-aware form is the candidate |
+| T4 | n-grams | not used | kubernetes, library scoring: subword Recall@200 0.514 against 0.661 for the code-aware form |
 | T5 | lower-casing and ASCII folding filters | not used | our tokenizer folds case and removes diacritics itself |
-| T6 | long-token removal | avoided (decision 6) | the default analyzer silently drops tokens of 40 bytes or more |
-| T7 | stemming and stop words | not used | they change which documents match |
+| T6 | long-token removal | avoided (decision 6) | the default analyzer silently drops tokens of 40 bytes or more: 9 name queries without a hit on kubernetes |
+| T7 | stemming and stop words | not used | they change which documents match; stemming loses 0.126 subword MRR@10 |
 | T8 | compound-word splitting | not used | needs a dictionary; identifiers are open vocabulary |
-| T9 | camelCase and snake_case parts at the whole token's position | pending (decision 6) | the largest quality lever (§2.4); decided under our scoring (§9) |
+| T9 | camelCase and snake_case parts at the whole token's position | used, always on, the whole identifier kept (owner's ruling of Oct 9, 2026; decision 6) | the largest quality lever: under our scoring subword +0.121 MRR@10, name −0.023, doc −0.009 (§2.4); 33 MB (+9.4%) of disk |
 | T10 | pre-tokenized text | not used | each document is tokenized once, in the library |
 | T11 | the indexer's 65 530-byte token limit | never reached | our tokenizer cuts at 32 768 bytes first |
 
@@ -384,7 +470,7 @@ ADR-0013 does not settle it and no run here decides it. Decisions are ADR-0013's
 | Q5 | phrase query and slop | phrases from positions; no slop | slop is new semantics no rule asks for |
 | Q6 | phrase-prefix query | a new feature, opt-in, with an explicit limit (decision 7) | it caps silently at 50 expansions |
 | Q7 | regular-expression query | a new feature, opt-in (decision 7) | the folder filter uses an ordinal range instead |
-| Q8 | fuzzy query | a new feature, opt-in (decision 7) | new semantics |
+| Q8 | fuzzy query | a new feature, opt-in (decision 7) | new semantics: at distance 1 it changes the hits of 22 of 30 queries and is 4.5× slower |
 | Q9 | range query | not used as a query | the folder filter is an ordinal range inside the collector |
 | Q10 | exists query | not used | no codectx query needs it |
 | Q11, Q14 | disjunction-max query | not used | under the pruned collector this release sums the disjuncts; the fix is merged upstream, not released |
@@ -414,51 +500,53 @@ ADR-0013 does not settle it and no run here decides it. Decisions are ADR-0013's
 | C2 | order by a fast field | not used | no query needs it |
 | C3 | ties on document address | not used | addresses change with threads and merges |
 | C4 | tuple sort keys | not used | still f32 |
-| C5 | filter collector | not used | filters run inside our collector; the byte-column variant silently drops every document on a string fast field |
-| C6 | count | not used | the match count comes from our collector, exact or marked as a lower bound (decision 5) |
+| C5 | filter collector | not used | filters run inside our collector; the byte-column variant silently drops every document on a string fast field, on kubernetes too |
+| C6 | count | not used | the match count comes from our collector, exact or marked as a lower bound (decision 5); the library counts all 30 queries in 5.4 ms |
 | C7 | custom collector | used (decision 2) | it carries our formula, statistics, fold and comparator |
-| C8 | facet and histogram collectors | a new feature, opt-in (decision 7) | per-folder counts |
-| C9 | aggregations | a new feature, opt-in, with explicit limits (decision 7) | the terms aggregation returns 10 buckets by default |
+| C8 | facet and histogram collectors | a new feature, opt-in (decision 7) | per-folder counts; 111.5 ms for the 30 queries |
+| C9 | aggregations | a new feature, opt-in, with explicit limits (decision 7) | the terms aggregation returns 10 buckets by default; per-kind counts 21.1–26.5 ms for the 30 queries |
 
 ### Search runtime and storage
 
 | # | Feature | In the design | Why |
 |---|---|---|---|
-| RT1 | multi-threaded search executor | used, governed like every worker (decision 4) | identical output; timing for our collector being measured |
-| RT2 | warmers | not decided | fixture only |
+| RT1 | multi-threaded search executor | used, governed like every worker (decision 4) | identical output; 4 threads cut our pruned collector 37.5% (§2.3) |
+| RT2 | warmers | not decided | kubernetes: statistics move to open (2.10 against 0.35 ms) and the cold query is not faster |
 | RT3 | reload policy | not decided | the product opens a generation's view (decision 1) |
 | RT4 | searcher reuse | used | a held searcher is a consistent view |
-| RT5 | memory-map advice | not decided | fixture: 18/18 equal answers, open 0.14–0.20 ms |
+| RT5 | memory-map advice | not decided | kubernetes: four advice modes within noise (17.2–18.1 against 16.0 ms), same pages |
 | RT6 | space usage | measurement only | disk attribution in `features/04-directories-storage.md` |
 | RT7 | snippets | a new feature, opt-in (decision 7) | no body is shown today |
-| — | custom alive set per segment | used for visibility (decision 3) | hidden documents never become candidates |
+| — | custom alive set per segment | one of the three visibility routes; the route is open (decision 3) | hidden documents never become candidates; on kubernetes within noise of the other two (§2.6) |
 | — | memory-mapped, immutable segments | used (decision 1) | — |
 
 ## 5. The rule audit
 
 Each of codectx's search rules, what it buys, what it costs, and its verdict. Rule numbers are those of
-`web/00-summary.md`. The rule-audit runs (`runs/06-rule-audit.md`) are being measured and will add their figures
-to this table.
+`web/00-summary.md`. The kubernetes rule-audit figures are in `runs/06-rule-audit.md`, whose items are numbered
+by topic, not by these rules.
 
 | Rule | What it buys | What it costs | Verdict |
 |---|---|---|---|
-| 1. exact df over the union of columns, visible documents only | the doc set (0.68 against 0.02); a delta equals a fresh index | a df pass per query term, from columns | **keep** (decisions 2 and 3) |
-| 2. a delta equals a fresh index | identical answers whatever the build history | exact statistics over visible documents | **keep** (decision 3) |
-| 3. no top-k cap on ranked results | every match reachable | scoring every match on every page: 4.04 s for 30 queries against milliseconds pruned | **drop**, by the owner's ruling of Oct 8, 2026. The no-default-limit rule covers the data an index produces (files, units, facts, rows, exact lookups), not ranked lists. A ranked search serves its best results through an exact block-max top-k (decision 5); the exact tier keeps returning every match |
+| 1. exact df over the union of columns, visible documents only | the doc set (0.68 against 0.02); a delta equals a fresh index; statistics that never wait for a merge (a forced merge of one delta costs 12.4 s, §2.7) | a df pass per query term, from columns | **keep** (decisions 2 and 3) |
+| 2. a delta equals a fresh index | identical answers whatever the build history | exact statistics over visible documents | **keep** (decision 3); its kubernetes check is unmeasured (§9) |
+| 3. no top-k cap on ranked results | every match reachable | scoring every match on every page: 4 653 ms for 30 queries against 296 ms for our exact pruned collector, whose pages are identical on 3 030 of 3 030 queries | **drop**, by the owner's ruling of Oct 8, 2026. The no-default-limit rule covers the data an index produces (files, units, facts, rows, exact lookups), not ranked lists. A ranked search serves its best results through an exact block-max top-k (decision 5); the exact tier keeps returning every match |
 | 4. content-only, deterministic ties | pages and cursors repeat across builds, threads and merges | a content tie key read per page | **keep** (decision 2) |
 | 5. retained snapshots | branch switching, pinned reads, reattached hidden units | one index holds every retained unit | **keep** (decision 3) |
-| 6. hidden units never count | a generation ranks like an index of its own units (18/18 on the fixture) | a visibility set per searcher, 0.08–0.2 ms | **keep** (decision 3); the route is **pending** its kubernetes time |
-| 7. f64 BM25F, one saturation, weights 5/5/2/2/1, length = `token_count` | the doc set; exact lengths; a 1e-6 grid f32 cannot hold | our own collector and pinned logarithm | **keep** (decision 2); **pending**: the document length weighted per column, adopted if it raises MRR@10 on two of the three sets and lowers it on none |
-| 8. today's tokenizer rules (letters, numbers, private use; case folded; diacritics removed) | today's terms and phrases | camelCase parts do not match | **keep** the rules (decision 6), and never a silent length cut; **pending**: the code-aware form, adopted if it lifts subword, holds name within 0.01 MRR@10 and does not lower doc, under our scoring |
+| 6. hidden units never count | a generation ranks like an index of its own units (18/18 on the fixture) | a visibility set per searcher: 0.08–0.2 ms on the fixture, 10–22 ms on kubernetes, so it is cached per searcher generation | **keep** (decision 3). The route is open: the three ran within noise on kubernetes (§2.6) |
+| 7. f64 BM25F, one saturation, weights 5/5/2/2/1, length = `token_count` | the doc set; exact lengths; a 1e-6 grid f32 cannot hold | our own collector and pinned logarithm | **keep** (decision 2). **Pending**, until the quality benchmark: the document length weighted per column. Measured: name +0.024, subword +0.055, doc −0.014 MRR@10; with the code-aware tokenizer name +0.023, subword +0.179, doc −0.037 against today (§2.4). It lowers doc, so it does not meet the criterion set before the run (raise two sets, lower none) |
+| 8. today's tokenizer rules (letters, numbers, private use; case folded; diacritics removed) | today's terms and phrases | camelCase parts do not match | **keep** the rules (decision 6), and never a silent length cut. **Change**, by the owner's ruling of Oct 9, 2026: camelCase and snake_case splitting is always on, the whole identifier kept and its parts added at its position. Under our scoring: subword +0.121 MRR@10, Recall@200 0.214 to 0.630, zero-hit queries 13 to 0; name −0.023; doc −0.009 (§2.4). That misses the criterion set before the run (name within 0.01, doc not lowered); the ruling rests on the subword gain, about five times the name loss, and on the literature, where the whole identifier plus its parts is the best measured form (`web/06-code-tokenization.md`) |
 | 9. tiers first, then lexical score | exact lookups before ranked text | — | **keep** (unchanged) |
 | 10. keyset-cursor paging over one content-keyed total order | repeatable paging that survives merges | — | **keep**; page n is collected as the top 200·n (decision 5) |
-| 11. scores quantized to 1e-6 | order independent of summation order | one rounding per score | **keep** (decision 2) |
+| 11. scores quantized to 1e-6 | order independent of summation order: our pages are identical on 2 and 11 segments of the same documents (30 of 30), where f32 with `id` ties serves different pages for 376, 799 and 572 of the 1 000 name, doc and subword queries | one rounding per score | **keep** (decision 2), for reproducible pages; ranking quality alone would not require it (library MRR@10 moves at most 0.0015 across layouts) |
 | new: one commit per generation activation | 954 s of fsync avoided | units are invisible until their generation activates | **adopt** (decision 4) |
 
 On the evidence (`web/00-summary.md`), rules 1, 2, 4, 5, 10 and 11 rest on identity and repeatability more than on
 measured ranking quality: no source measures the quality effect of counting deleted documents, f32 against f64, or
-exact against quantized lengths. Rule 7's length and rule 8 are the two the literature challenges, which is why both
-are pending a measurement rather than settled by argument.
+exact against quantized lengths. Rule 7's length and rule 8 are the two the literature challenges, and both were
+measured on kubernetes: rule 8's code-aware form is adopted by ruling, and rule 7's weighted length stays pending
+until the quality benchmark. Our scoring with one-byte lengths in place of exact ones has no harness route and was
+not measured.
 
 ## 6. Engines: the landscape and the embedding evidence (`web/07-engine-landscape.md`)
 
@@ -496,35 +584,49 @@ under our own scoring.
   boundary rather than mid-character; extra fast fields counted in its disk; its library modes count raw documents,
   not folded results, and read every phrase position where ours stops at 512.
 - **Cold means a fresh process on a warm page cache.** No cold-disk figure was measured.
-- **A shared host.** The host's load and free memory were sampled every 5 s (`runs/host-load.tsv`); warm runs vary.
+- **A shared host.** The host's load and free memory were sampled every 5 s in round 1 (`runs/host-load.tsv`) and
+  every 30 s in round 2 (`runs/r2-logs/host-load-r2.tsv`, 1-minute load 2.3 to 11.3 on 16 cores); warm runs vary.
+- **Single runs in round 2.** Every round-2 variant was built and queried once. Library indexes that hold the same
+  documents in the same layout span about ±15% in speed, so a library speed difference under about 20% is noise,
+  and a build-wall difference under about 30%. A different document layout alone changes the library's tie order
+  (5 of 30 identical pages against the baseline), so its pages are compared as sets and by top-10 overlap
+  (`runs/05-variants.md`).
 - **First-page comparison.** Our arm records an unfolded, document-level page, `product` a folded one. All 8
   differing first pages are fold differences: 3 rare queries differ at position 3 or 5, where our page lists a second
   document of an already-listed result, and 5 at positions 117–172 (`runs/03-first-page.txt`).
-- **Fixture-only evidence.** The visibility routes, our pruned collector, our collector's threads and most variants
-  were proven on a 4 800-document synthetic fixture. Its vocabulary is flat, so its timings show that a variant runs,
-  not which is fast.
+- **Fixture-only evidence.** A visible-only reference index (the exactness check for hiding), the soft delta's
+  pages and the weighted length's exactness check ran only on the 4 800-document synthetic fixture. Its vocabulary
+  is flat, so its timings show that a variant runs, not which is fast; every timing in §2 is from kubernetes.
 
 ## 8. Settled by this record
 
 ADR-0013 decisions 1 to 5 and 7 to 9 rest on §2–§6: the library's index, our ranking in a custom collector, one
 index with a visibility set per generation, one commit per activation with the library committed first, a ranked
 page as an exact top-k, filters from fast fields, and the removal of the full-text table, the packed segments, the
-activation merge and the ranked-set spool.
+activation merge and the ranked-set spool. Decision 5 holds on the real corpus: our pruned collector returns the
+exhaustive pages on 3 030 of 3 030 queries (§2.5). The tokenizer (decision 6) is the code-aware form, always on, by
+the owner's ruling of Oct 9, 2026 (§5, rule 8).
 
-## 9. Still being measured
+## 9. Pending, and not measured
 
-On the same kubernetes export, running as of Oct 8, 2026 at 9:48 PM. Records land in `runs/05-variants.md`,
-`runs/06-rule-audit.md` and `runs/07-delta.md`.
+Two choices are pending:
 
-| Measurement | Decides | Rule |
+| Choice | What was measured | Decided by |
 |---|---|---|
-| our formula's pruned collector: exactness on all 30 queries and every quality query, and its speed | confirms decision 5 on the real corpus | — |
-| our collector with per-segment search threads | the thread share the governor grants (decision 4) | — |
-| our scoring with the code-aware tokenizer, on all three sets | decision 6 | adopted if it lifts subword, holds name within 0.01 MRR@10 and does not lower doc |
-| our scoring with the document length weighted per column | decision 2 | adopted if it raises MRR@10 on two of the three sets and lowers it on none |
-| the three visibility routes at 10% and 50% hidden | decision 3 | the fastest; all give identical pages |
-| deltas: our delta against delete and re-add, and statistics before and after a merge | decision 9's test 5 on the real corpus | a delta's pages equal a fresh index's |
-| the rule-audit runs | re-measure §5 | — |
+| the document length weighted per column (decision 2, rule 7) | name and subword gain, doc loses (§2.4) | the quality benchmark, by the owner's ruling of Oct 9, 2026 |
+| the visibility route: alive set, query wrapper or collector (decision 3, rule 6) | the three ran within noise of each other at 0%, 10% and 50% hidden (§2.6) | not by speed; no other measured ground separates them |
+
+These kubernetes measurements never ran (`runs/05-variants.md`, `runs/07-delta.md`, owner ruling of Oct 8, 2026):
+
+| Measurement | What exists instead | Would check |
+|---|---|---|
+| our engine's delta on the same unit, against the library's delete and re-add | the library's delta routes alone (§2.7) | a like-for-like delta cost |
+| the drift comparison: pages after a delta against a fresh index, before and after a forced merge | the fresh post-delta index was built (every token count matched) but not queried; the fixture's 19 of 19 | rule 2 and decision 9's test 5 on the real corpus |
+| the soft delta's pages against the hard delete | the fixture's 19 of 19 (§2.6) | a delta through hiding |
+| a visible-only reference index | the fixture's exact match (§2.6) | hiding's exactness on the real corpus |
+| our scoring with one-byte lengths in place of exact ones | no harness route | rule 7's exact length |
+| the doc-collapse explanation on kubernetes | the fixture's (`harness/09-doc-collapse.md`) | §3's mechanism on the real corpus |
+| `product` speed with the code-aware tokenizer, and a noise rerun of the baselines | the code-aware index's quality runs and size | the code-aware tokenizer's query cost |
 
 After integration, the kubernetes measurement is repeated on the integrated binary and recorded here (decision 9).
 

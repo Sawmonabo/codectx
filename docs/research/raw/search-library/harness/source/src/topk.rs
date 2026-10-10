@@ -66,7 +66,7 @@ pub fn file_name(seg: SegmentId, dl: &str) -> String {
 /// Builds a segment's side structure: a merge of the five columns' sorted term
 /// dictionaries, so each token is visited once with all its columns.
 pub fn build(seg: &SegmentReader, f: &Fields, dl: &str) -> Result<SegBlocks> {
-    let dlc = seg.fast_fields().u64(dl)?;
+    let dlc = crate::product::DlCol::open(seg, dl)?;
     let invs = f.text.iter().map(|fl| seg.inverted_index(*fl)).collect::<tantivy::Result<Vec<_>>>()?;
     let mut streams = Vec::new();
     for inv in &invs {
@@ -106,7 +106,7 @@ pub fn build(seg: &SegmentReader, f: &Fields, dl: &str) -> Result<SegBlocks> {
             }
             tb.df += 1;
             let b = d >> BLOCK_BITS;
-            let l = dlc.first(d).unwrap_or(0).min(u32::MAX as u64) as u32;
+            let l = dlc.get(d).min(u32::MAX as u64) as u32;
             match tb.blocks.last_mut() {
                 Some(e) if e[0] == b => {
                     e[1] = e[1].max(wtf);
@@ -365,7 +365,7 @@ impl Collector for TopkCollector {
                     let (mut w, mut l) = (0f64, i64::MAX);
                     while j < list.len() && (list[j].0 >> BLOCK_BITS) as usize == b {
                         w = w.max(list[j].1);
-                        l = l.min(cols.dl.first(list[j].0).unwrap_or(0) as i64);
+                        l = l.min(cols.dl.get(list[j].0) as i64);
                         j += 1;
                     }
                     ub[b] += idf[i] * bm25_saturation(w, l, avgdl);
@@ -424,7 +424,7 @@ impl Collector for TopkCollector {
                     continue;
                 }
                 out.docs_scored += 1;
-                let dl = cols.dl.first(d).unwrap_or(0) as i64;
+                let dl = cols.dl.get(d) as i64;
                 let mut score = 0f64;
                 for i in 0..self.terms.len() {
                     let w = wtf[i * BLOCK as usize + off];

@@ -52,6 +52,10 @@
 //!   --warm-stats          (product) a Warmer computes the corpus statistics per searcher
 //!                         generation at reader open, so the cold query does not
 //!   --time-open           the cold child's open (+ warm) time to <arm>-<phase>-open.jsonl
+//!   --dl total|weighted   (product modes) document length: the total token count
+//!                         (default), or Σ weight(c) × len(c) over the five columns from
+//!                         `tindex --column-lengths`'s exact counts; avgdl follows over
+//!                         visible documents. product-topk needs `tblock --dl weighted`.
 //!   --search-threads N    the searcher's multi-threaded executor, segments in parallel
 //!                         (every mode; product modes merge under our comparator, so the
 //!                         answer is the single-threaded one)
@@ -94,7 +98,7 @@ use tbench::{anyhow_lite::Result, append_result, parse_query, parse_query_with, 
 /// Options that take a value, and the ones that do not.
 const VALUED: &[&str] = &[
     "--kind", "--path-prefix", "--search-threads", "--phase", "--page", "--explain", "--explain-qrels", "--shape", "--weights",
-    "--slop", "--kind-filter", "--path-filter", "--collect", "--stats", "--id-source", "--doc-cache", "--madvise",
+    "--slop", "--dl", "--kind-filter", "--path-filter", "--collect", "--stats", "--id-source", "--doc-cache", "--madvise",
     "--hide-units", "--hide-seed", "--hide", "--hide-via", "--count-via", "--docset-via", "--agg", "--facets",
 ];
 const FLAGS: [&str; 2] = ["--warm-stats", "--time-open"];
@@ -113,6 +117,8 @@ struct Opts {
     q: QueryOpts,
     collect: String,
     stats: String,
+    /// --dl weighted (product modes): Σ weight(c) × len(c) as the document length.
+    dl_weighted: bool,
     id_fast: Option<bool>,
     doc_cache: Option<usize>,
     madvise: Option<String>,
@@ -182,6 +188,7 @@ impl Opts {
                     o.q.weights = w.try_into().map_err(|_| "--weights takes five values a/b/c/d/e")?;
                 }
                 "--slop" => o.q.slop = v.parse()?,
+                "--dl" => o.dl_weighted = one_of(k, v, &["total", "weighted"])? == "weighted",
                 "--kind-filter" => {
                     o.q.kind_via = match v.as_str() {
                         "terms" => KindVia::Terms,
@@ -242,7 +249,9 @@ impl Opts {
         while i < self.raw.len() {
             let k = &self.raw[i];
             let n = if FLAGS.contains(&k.as_str()) { 1 } else { 2 };
-            if !OWN_FIELD.contains(&k.as_str()) {
+            // `--dl total` is the default: it leaves the line and the phase as they were.
+            let default_dl = k == "--dl" && self.raw.get(i + 1).map(String::as_str) == Some("total");
+            if !OWN_FIELD.contains(&k.as_str()) && !default_dl {
                 out.extend(self.raw[i..(i + n).min(self.raw.len())].iter().cloned());
             }
             i += n;
@@ -339,7 +348,7 @@ fn open(dir: &str, mode: &str, o: &Opts) -> Result<Ctx> {
         index.set_multithread_executor(n)?;
     }
     let an = Analyzer::for_index(&index, &f);
-    let warmer = o.warm_stats.then(|| Arc::new(StatsWarmer(Mutex::new(HashMap::new()), dl_of(mode, &f))));
+    let warmer = o.warm_stats.then(|| Arc::new(StatsWarmer(Mutex::new(HashMap::new()), dl_of(mode, &f, o))));
     let mut rb = index.reader_builder().reload_policy(ReloadPolicy::Manual);
     if let Some(n) = o.doc_cache {
         rb = rb.doc_store_cache_num_blocks(n);
@@ -377,7 +386,7 @@ fn open(dir: &str, mode: &str, o: &Opts) -> Result<Ctx> {
     let id_cols = s.segment_readers().iter().map(|r| r.fast_fields().str("id")).collect::<tantivy::Result<Vec<_>>>()?;
     // product-topk reads its side files at open, timed with the open (--time-open).
     let t2 = Instant::now();
-    let blocks = if mode == "product-topk" { Some(tbench::topk::load(path, s.segment_readers(), dl_of(mode, &f))?) } else { None };
+    let blocks = if mode == "product-topk" { Some(tbench::topk::load(path, s.segment_readers(), dl_of(mode, &f, o))?) } else { None };
     let open_ms = open_ms + t2.elapsed().as_secs_f64() * 1e3;
     Ok(Ctx { mode: mode.into(), o: o.clone(), index, f, s, an, _reader: reader, warmer, hide, hide_build_ms, readers, live, blocks, id_fast, id_cols, open_ms })
 }
@@ -508,8 +517,8 @@ impl Ctx {
             *w.0.lock().unwrap().get(&self.s.generation().generation_id()).ok_or("the warmer has not seen this searcher")?
         } else {
             match &self.readers {
-                Some(rs) => corpus_stats_of(rs, None, dl_of(&self.mode, &self.f))?,
-                None => corpus_stats_of(self.s.segment_readers(), self.hide.as_deref(), dl_of(&self.mode, &self.f))?,
+                Some(rs) => corpus_stats_of(rs, None, dl_of(&self.mode, &self.f, &self.o))?,
+                None => corpus_stats_of(self.s.segment_readers(), self.hide.as_deref(), dl_of(&self.mode, &self.f, &self.o))?,
             }
         };
         Ok(*cache.insert(st))
@@ -547,7 +556,7 @@ impl Ctx {
             }
             "product-topk" => {
                 let st = self.product_stats(stats)?;
-                let dl = dl_of(&self.mode, &self.f);
+                let dl = dl_of(&self.mode, &self.f, &self.o);
                 let terms = if dl == tbench::product::DL_CODE { parse_query_with(text, true) } else { parse_query(text) };
                 let blocks = self.blocks.clone().ok_or("product-topk needs the block-max files (tblock)")?;
                 let hide = if self.readers.is_some() { None } else { self.hide.clone() };
@@ -573,7 +582,7 @@ impl Ctx {
                 let block = self.mode == "product-block";
                 let c = ProductCollector {
                     terms: if self.mode == "product-code" { parse_query_with(text, true) } else { parse_query(text) },
-                    dl: dl_of(&self.mode, &self.f),
+                    dl: dl_of(&self.mode, &self.f, &self.o),
                     page_no: self.o.page_no.unwrap_or(1),
                     fields: self.f,
                     stats: st,
@@ -790,7 +799,11 @@ const MODES: [&str; 11] = [
 
 /// The document-length column a mode reads on an index: product-code reads the
 /// code tokenizer's count; product-topk follows the index (code or unicode61).
-fn dl_of(mode: &str, f: &Fields) -> &'static str {
+/// `--dl weighted` replaces it by Σ weight × column length (product::DL_WEIGHTED).
+fn dl_of(mode: &str, f: &Fields, o: &Opts) -> &'static str {
+    if o.dl_weighted {
+        return tbench::product::DL_WEIGHTED;
+    }
     let code = mode == "product-code" || (mode == "product-topk" && f.token_count_code.is_some());
     if code { tbench::product::DL_CODE } else { tbench::product::DL }
 }
@@ -824,6 +837,9 @@ fn check(mode: &str, o: &Opts, cx: &Ctx) -> Result<()> {
         }
     } else if product && crate_tokenizer(cx) != tbench::TOKENIZER {
         return Err("product mode reproduces our engine and needs a unicode61 index".into());
+    }
+    if o.dl_weighted && (!product || cx.f.lens.is_none()) {
+        return Err("--dl weighted applies to the product modes on an index built with --column-lengths".into());
     }
     if mode == "library-combined" && !matches!(o.q.shape, Shape::Combined | Shape::CombinedFields(_)) {
         return Err("library-combined takes --shape combined or combined+fields[:W]".into());

@@ -1,5 +1,8 @@
 //! tcheck <docs.jsonl> <index dir> <queries.txt> [--kind K]... [--path-prefix P]... [--code]
 //!
+//! --dl weighted checks the weighted document length (Σ weight × column length,
+//! from the reference's own per-column counts) against product mode reading the
+//! --column-lengths fields.
 //! --topk also checks product-topk's page (topk.rs; `tblock` first) against the
 //! same reference, and --search-threads N runs both through the executor.
 //! --code checks product-code instead: the reference tokenizes with the code
@@ -32,6 +35,11 @@ fn main() -> Result<()> {
     let code = a.iter().any(|x| x == "--code");
     let topk = a.iter().any(|x| x == "--topk");
     a.retain(|x| x != "--code" && x != "--topk");
+    let mut weighted = false;
+    if let Some(i) = a.iter().position(|x| x == "--dl") {
+        weighted = a.get(i + 1).map(String::as_str) == Some("weighted");
+        a.drain(i..i + 2);
+    }
     let mut threads = None;
     if let Some(i) = a.iter().position(|x| x == "--search-threads") {
         threads = Some(a.get(i + 1).ok_or("--search-threads needs N")?.parse::<usize>()?);
@@ -62,7 +70,9 @@ fn main() -> Result<()> {
             })
             .collect::<Vec<HashMap<String, Vec<u32>>>>();
         let mut d = d;
-        if code {
+        if weighted {
+            d.token_count = cols.iter().zip(WEIGHTS).map(|(m, w)| w as i64 * m.values().map(|p| p.len() as i64).sum::<i64>()).sum();
+        } else if code {
             d.token_count = cols.iter().map(|m| m.values().map(|p| p.len() as i64).sum::<i64>()).sum();
         }
         all.push(Tok { doc: d, cols });
@@ -80,7 +90,13 @@ fn main() -> Result<()> {
     if tbench::index_tokenizer(&index, &fields) != want_tok {
         return Err(format!("this check needs a {want_tok} index").into());
     }
-    let dl = if code { tbench::product::DL_CODE } else { tbench::product::DL };
+    let dl = if weighted {
+        tbench::product::DL_WEIGHTED
+    } else if code {
+        tbench::product::DL_CODE
+    } else {
+        tbench::product::DL
+    };
     let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
     let s: tantivy::Searcher = reader.searcher();
     let st = corpus_stats_of(s.segment_readers(), None, dl)?;

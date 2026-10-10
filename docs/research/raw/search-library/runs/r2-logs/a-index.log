@@ -1,0 +1,378 @@
+free -g available 28G
+=== tindex t2-large-end args: 2 large end
+tindex index-t2-large-end: 546613 docs, 47995 units, 1 commits, 2 segments, add 4726.9 ms, final 5081.1 ms, total 9808.2 ms, cpu 22187.6 ms, peak rss 1030139904 B, disk 339869933 B, token_count mismatches 0
+rc=0 du=339869933
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:09.85
+	Maximum resident set size (kbytes): 1005996
+settled tantivy-index-t2-large-end-add.jsonl
+settled tantivy-index-t2-large-end-final.jsonl
+settled tantivy-index-t2-large-end.jsonl
+tspace t2-large-end rc=0
+free -g available 28G
+=== tindex t4-large-end args: 4 large end
+tindex index-t4-large-end: 546613 docs, 47995 units, 1 commits, 4 segments, add 2651.8 ms, final 2710.8 ms, total 5362.9 ms, cpu 22479.7 ms, peak rss 996036608 B, disk 357368970 B, token_count mismatches 0
+rc=0 du=357368970
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:05.37
+	Maximum resident set size (kbytes): 972692
+settled tantivy-index-t4-large-end-add.jsonl
+settled tantivy-index-t4-large-end-final.jsonl
+settled tantivy-index-t4-large-end.jsonl
+tspace t4-large-end rc=0
+free -g available 27G
+=== tindex t8-large-end args: 8 large end
+tindex index-t8-large-end: 546613 docs, 47995 units, 1 commits, 1 segments, add 3443.8 ms, final 13939.7 ms, total 17383.7 ms, cpu 43451.0 ms, peak rss 1146081280 B, disk 336888780 B, token_count mismatches 0
+rc=0 du=336888780
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:17.39
+	Maximum resident set size (kbytes): 1119220
+settled tantivy-index-t8-large-end-add.jsonl
+settled tantivy-index-t8-large-end-final.jsonl
+settled tantivy-index-t8-large-end.jsonl
+tspace t8-large-end rc=0
+free -g available 28G
+=== tindex t16-256-end args: 16 256 end
+tindex index-t16-256-end: 546613 docs, 47995 units, 1 commits, 13 segments, add 4166.8 ms, final 6903.6 ms, total 11072.2 ms, cpu 59867.5 ms, peak rss 571269120 B, disk 342331926 B, token_count mismatches 0
+rc=0 du=342331926
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:11.09
+	Maximum resident set size (kbytes): 557880
+settled tantivy-index-t16-256-end-add.jsonl
+settled tantivy-index-t16-256-end-final.jsonl
+settled tantivy-index-t16-256-end.jsonl
+tspace t16-256-end rc=0
+free -g available 28G
+=== tindex t16-1024-end args: 16 1024 end
+tindex index-t16-1024-end: 546613 docs, 47995 units, 1 commits, 5 segments, add 5350.2 ms, final 7331.5 ms, total 12682.1 ms, cpu 55645.1 ms, peak rss 1205547008 B, disk 354362826 B, token_count mismatches 0
+rc=0 du=354362826
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.69
+	Maximum resident set size (kbytes): 1177292
+settled tantivy-index-t16-1024-end-add.jsonl
+settled tantivy-index-t16-1024-end-final.jsonl
+settled tantivy-index-t16-1024-end.jsonl
+tspace t16-1024-end rc=0
+free -g available 28G
+=== tindex e1000-log-min4 args: 16 default every:1000 --merge-policy log:min=4
+tindex index-t16-default-every1000-mplogmin4: 546613 docs, 47995 units, 48 commits, 6 segments, add 14035.2 ms, final 8557.0 ms, total 22593.6 ms, cpu 87878.7 ms, peak rss 861818880 B, disk 347723757 B, token_count mismatches 0
+rc=0 du=347723757
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:22.63
+	Maximum resident set size (kbytes): 841620
+settled tantivy-index-t16-default-every1000-mplogmin4-add.jsonl
+settled tantivy-index-t16-default-every1000-mplogmin4-final.jsonl
+settled tantivy-index-t16-default-every1000-mplogmin4.jsonl
+tspace e1000-log-min4 rc=0
+free -g available 28G
+=== tindex e1000-log-min16 args: 16 default every:1000 --merge-policy log:min=16
+tindex index-t16-default-every1000-mplogmin16: 546613 docs, 47995 units, 48 commits, 18 segments, add 12435.8 ms, final 750.5 ms, total 13187.4 ms, cpu 57873.0 ms, peak rss 907988992 B, disk 345498087 B, token_count mismatches 0
+rc=0 du=345498087
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.21
+	Maximum resident set size (kbytes): 886708
+settled tantivy-index-t16-default-every1000-mplogmin16-add.jsonl
+settled tantivy-index-t16-default-every1000-mplogmin16-final.jsonl
+settled tantivy-index-t16-default-every1000-mplogmin16.jsonl
+tspace e1000-log-min16 rc=0
+free -g available 28G
+=== tindex e1000-none args: 16 default every:1000 --merge-policy none
+tindex index-t16-default-every1000-mpnone: 546613 docs, 47995 units, 48 commits, 768 segments, add 12129.2 ms, final 161.8 ms, total 12300.1 ms, cpu 38487.0 ms, peak rss 789737472 B, disk 405374882 B, token_count mismatches 0
+rc=0 du=405374882
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.33
+	Maximum resident set size (kbytes): 771228
+settled tantivy-index-t16-default-every1000-mpnone-add.jsonl
+settled tantivy-index-t16-default-every1000-mpnone-final.jsonl
+settled tantivy-index-t16-default-every1000-mpnone.jsonl
+tspace e1000-none rc=0
+free -g available 28G
+=== tindex e1000-nonefinal args: 16 default every:1000 --merge-policy none+final
+tindex index-t16-default-every1000-mpnonefinal: 546613 docs, 47995 units, 48 commits, 1 segments, add 12810.1 ms, final 16867.2 ms, total 29682.3 ms, cpu 53852.0 ms, peak rss 1082236928 B, disk 333602910 B, token_count mismatches 0
+rc=0 du=333602910
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:29.72
+	Maximum resident set size (kbytes): 1056872
+settled tantivy-index-t16-default-every1000-mpnonefinal-add.jsonl
+settled tantivy-index-t16-default-every1000-mpnonefinal-final.jsonl
+settled tantivy-index-t16-default-every1000-mpnonefinal.jsonl
+tspace e1000-nonefinal rc=0
+free -g available 28G
+=== tindex e1000-mt1 args: 16 default every:1000 --merge-threads 1
+tindex index-t16-default-every1000-mt1: 546613 docs, 47995 units, 48 commits, 19 segments, add 11978.6 ms, final 17234.5 ms, total 29215.3 ms, cpu 59957.1 ms, peak rss 846372864 B, disk 350602841 B, token_count mismatches 0
+rc=0 du=350602841
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:29.24
+	Maximum resident set size (kbytes): 826536
+settled tantivy-index-t16-default-every1000-mt1-add.jsonl
+settled tantivy-index-t16-default-every1000-mt1-final.jsonl
+settled tantivy-index-t16-default-every1000-mt1.jsonl
+tspace e1000-mt1 rc=0
+free -g available 28G
+=== tindex e1000-mt8 args: 16 default every:1000 --merge-threads 8
+tindex index-t16-default-every1000-mt8: 546613 docs, 47995 units, 48 commits, 19 segments, add 11982.2 ms, final 637.1 ms, total 12620.4 ms, cpu 65220.9 ms, peak rss 885096448 B, disk 350828341 B, token_count mismatches 0
+rc=0 du=350828341
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.65
+	Maximum resident set size (kbytes): 864352
+settled tantivy-index-t16-default-every1000-mt8-add.jsonl
+settled tantivy-index-t16-default-every1000-mt8-final.jsonl
+settled tantivy-index-t16-default-every1000-mt8.jsonl
+tspace e1000-mt8 rc=0
+free -g available 28G
+=== tindex e1000-batchunit args: 16 default every:1000 --batch unit
+tindex index-t16-default-every1000-batchunit: 546613 docs, 47995 units, 48 commits, 17 segments, add 11843.8 ms, final 1046.4 ms, total 12891.1 ms, cpu 54195.8 ms, peak rss 880254976 B, disk 340767601 B, token_count mismatches 0
+rc=0 du=340767601
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.91
+	Maximum resident set size (kbytes): 859624
+settled tantivy-index-t16-default-every1000-batchunit-add.jsonl
+settled tantivy-index-t16-default-every1000-batchunit-final.jsonl
+settled tantivy-index-t16-default-every1000-batchunit.jsonl
+tspace e1000-batchunit rc=0
+free -g available 28G
+=== tindex t16-default-every100 args: 16 default every:100
+tindex index-t16-default-every100: 546613 docs, 47995 units, 480 commits, 15 segments, add 76706.1 ms, final 518.9 ms, total 77225.6 ms, cpu 130588.8 ms, peak rss 752910336 B, disk 342530332 B, token_count mismatches 0
+rc=0 du=342530332
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:17.26
+	Maximum resident set size (kbytes): 735264
+settled tantivy-index-t16-default-every100-add.jsonl
+settled tantivy-index-t16-default-every100-final.jsonl
+settled tantivy-index-t16-default-every100.jsonl
+tspace t16-default-every100 rc=0
+free -g available 28G
+=== tindex t1-large-end-single args: 1 large end --single-segment
+tindex index-t1-large-end-single: 546613 docs, 47995 units, 1 commits, 1 segments, add 10146.6 ms, final 9458.2 ms, total 19604.9 ms, cpu 19748.2 ms, peak rss 832016384 B, disk 323947693 B, token_count mismatches 0
+rc=0 du=323947693
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:19.62
+	Maximum resident set size (kbytes): 812516
+settled tantivy-index-t1-large-end-single-add.jsonl
+settled tantivy-index-t1-large-end-single-final.jsonl
+settled tantivy-index-t1-large-end-single.jsonl
+tspace t1-large-end-single rc=0
+free -g available 28G
+=== tindex t16-large-end-ram args: 16 large end --ram-then-persist
+tindex index-t16-large-end-ram: 546613 docs, 47995 units, 1 commits, 2 segments, add 4002.3 ms, final 9321.5 ms, total 13875.0 ms, cpu 57369.1 ms, peak rss 2026594304 B, disk 353749550 B, token_count mismatches 0
+rc=0 du=353749550
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.95
+	Maximum resident set size (kbytes): 1979096
+settled tantivy-index-t16-large-end-ram-add.jsonl
+settled tantivy-index-t16-large-end-ram-final.jsonl
+settled tantivy-index-t16-large-end-ram-persist.jsonl
+settled tantivy-index-t16-large-end-ram.jsonl
+tspace t16-large-end-ram rc=0
+free -g available 28G
+=== tindex ds-none args: 16 large end --docstore none
+tindex index-t16-large-end-none: 546613 docs, 47995 units, 1 commits, 2 segments, add 4160.8 ms, final 8406.4 ms, total 12567.4 ms, cpu 55048.4 ms, peak rss 1254289408 B, disk 433444069 B, token_count mismatches 0
+rc=0 du=433444069
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.58
+	Maximum resident set size (kbytes): 1224892
+settled tantivy-index-t16-large-end-none-add.jsonl
+settled tantivy-index-t16-large-end-none-final.jsonl
+settled tantivy-index-t16-large-end-none.jsonl
+tspace ds-none rc=0
+free -g available 28G
+=== tindex ds-zstd3 args: 16 large end --docstore zstd:3
+tindex index-t16-large-end-zstd3: 546613 docs, 47995 units, 1 commits, 2 segments, add 4725.6 ms, final 8120.5 ms, total 12846.5 ms, cpu 57028.1 ms, peak rss 1269538816 B, disk 334578051 B, token_count mismatches 0
+rc=0 du=334578051
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.86
+	Maximum resident set size (kbytes): 1239784
+settled tantivy-index-t16-large-end-zstd3-add.jsonl
+settled tantivy-index-t16-large-end-zstd3-final.jsonl
+settled tantivy-index-t16-large-end-zstd3.jsonl
+tspace ds-zstd3 rc=0
+free -g available 28G
+=== tindex ds-zstd9 args: 16 large end --docstore zstd:9
+tindex index-t16-large-end-zstd9: 546613 docs, 47995 units, 1 commits, 2 segments, add 4744.6 ms, final 8750.2 ms, total 13495.1 ms, cpu 60866.5 ms, peak rss 1275314176 B, disk 333684630 B, token_count mismatches 0
+rc=0 du=333684630
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.51
+	Maximum resident set size (kbytes): 1245424
+settled tantivy-index-t16-large-end-zstd9-add.jsonl
+settled tantivy-index-t16-large-end-zstd9-final.jsonl
+settled tantivy-index-t16-large-end-zstd9.jsonl
+tspace ds-zstd9 rc=0
+free -g available 28G
+=== tindex ds-zstd3-bs64k args: 16 large end --docstore zstd:3 --blocksize 65536
+tindex index-t16-large-end-zstd3-bs65536: 546613 docs, 47995 units, 1 commits, 2 segments, add 4690.3 ms, final 8654.8 ms, total 13345.4 ms, cpu 57517.4 ms, peak rss 1266737152 B, disk 332248837 B, token_count mismatches 0
+rc=0 du=332248837
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.35
+	Maximum resident set size (kbytes): 1237048
+settled tantivy-index-t16-large-end-zstd3-bs65536-add.jsonl
+settled tantivy-index-t16-large-end-zstd3-bs65536-final.jsonl
+settled tantivy-index-t16-large-end-zstd3-bs65536.jsonl
+tspace ds-zstd3-bs64k rc=0
+free -g available 28G
+=== tindex ds-zstd3-bs256k args: 16 large end --docstore zstd:3 --blocksize 262144
+tindex index-t16-large-end-zstd3-bs262144: 546613 docs, 47995 units, 1 commits, 2 segments, add 4612.4 ms, final 8484.4 ms, total 13097.1 ms, cpu 57886.2 ms, peak rss 1285865472 B, disk 333823558 B, token_count mismatches 0
+rc=0 du=333823558
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.11
+	Maximum resident set size (kbytes): 1255728
+settled tantivy-index-t16-large-end-zstd3-bs262144-add.jsonl
+settled tantivy-index-t16-large-end-zstd3-bs262144-final.jsonl
+settled tantivy-index-t16-large-end-zstd3-bs262144.jsonl
+tspace ds-zstd3-bs256k rc=0
+free -g available 28G
+=== tindex store-none args: 16 large end --store none
+tindex index-t16-large-end-nostore: 546613 docs, 47995 units, 1 commits, 2 segments, add 4371.2 ms, final 8447.5 ms, total 12819.0 ms, cpu 55253.0 ms, peak rss 1256071168 B, disk 303739341 B, token_count mismatches 0
+rc=0 du=303739341
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.83
+	Maximum resident set size (kbytes): 1226632
+settled tantivy-index-t16-large-end-nostore-add.jsonl
+settled tantivy-index-t16-large-end-nostore-final.jsonl
+settled tantivy-index-t16-large-end-nostore.jsonl
+tspace store-none rc=0
+free -g available 28G
+=== tindex lean args: 16 large end --schema lean
+tindex index-t16-large-end-nostore-fntextonly-leannum-leanstr: 546613 docs, 47995 units, 1 commits, 2 segments, add 4603.7 ms, final 5347.3 ms, total 9951.3 ms, cpu 42732.7 ms, peak rss 973545472 B, disk 228215315 B, token_count mismatches 0
+rc=0 du=228215315
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:09.96
+	Maximum resident set size (kbytes): 950728
+settled tantivy-index-t16-large-end-nostore-fntextonly-leannum-leanstr-add.jsonl
+settled tantivy-index-t16-large-end-nostore-fntextonly-leannum-leanstr-final.jsonl
+settled tantivy-index-t16-large-end-nostore-fntextonly-leannum-leanstr.jsonl
+tspace lean rc=0
+free -g available 28G
+=== tindex fn-textonly args: 16 large end --fieldnorms text-only
+tindex index-t16-large-end-fntextonly: 546613 docs, 47995 units, 1 commits, 2 segments, add 4648.2 ms, final 8481.2 ms, total 13129.7 ms, cpu 56455.0 ms, peak rss 1253122048 B, disk 348930356 B, token_count mismatches 0
+rc=0 du=348930356
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.14
+	Maximum resident set size (kbytes): 1223752
+settled tantivy-index-t16-large-end-fntextonly-add.jsonl
+settled tantivy-index-t16-large-end-fntextonly-final.jsonl
+settled tantivy-index-t16-large-end-fntextonly.jsonl
+tspace fn-textonly rc=0
+free -g available 28G
+=== tindex fn-none args: 16 large end --fieldnorms none
+tindex index-t16-large-end-fnnone: 546613 docs, 47995 units, 1 commits, 2 segments, add 4433.4 ms, final 8259.5 ms, total 12693.2 ms, cpu 56208.9 ms, peak rss 1250189312 B, disk 346285689 B, token_count mismatches 0
+rc=0 du=346285689
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.70
+	Maximum resident set size (kbytes): 1220888
+settled tantivy-index-t16-large-end-fnnone-add.jsonl
+settled tantivy-index-t16-large-end-fnnone-final.jsonl
+settled tantivy-index-t16-large-end-fnnone.jsonl
+tspace fn-none rc=0
+free -g available 28G
+=== tindex body-freqs args: 16 large end --body-record freqs
+tindex index-t16-large-end-bodyfreqs: 546613 docs, 47995 units, 1 commits, 2 segments, add 4640.9 ms, final 8186.2 ms, total 12827.5 ms, cpu 56864.6 ms, peak rss 1168510976 B, disk 300842181 B, token_count mismatches 0
+rc=0 du=300842181
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.84
+	Maximum resident set size (kbytes): 1141124
+settled tantivy-index-t16-large-end-bodyfreqs-add.jsonl
+settled tantivy-index-t16-large-end-bodyfreqs-final.jsonl
+settled tantivy-index-t16-large-end-bodyfreqs.jsonl
+tspace body-freqs rc=0
+free -g available 28G
+=== tindex kind-fast args: 16 large end --kind-fast-only
+tindex index-t16-large-end-kindfast: 546613 docs, 47995 units, 1 commits, 2 segments, add 4685.8 ms, final 8327.8 ms, total 13014.0 ms, cpu 58404.7 ms, peak rss 1262637056 B, disk 350983704 B, token_count mismatches 0
+rc=0 du=350983704
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.02
+	Maximum resident set size (kbytes): 1233044
+settled tantivy-index-t16-large-end-kindfast-add.jsonl
+settled tantivy-index-t16-large-end-kindfast-final.jsonl
+settled tantivy-index-t16-large-end-kindfast.jsonl
+tspace kind-fast rc=0
+free -g available 28G
+=== tindex kindcode-facet args: 16 large end --kind-code --path-facet
+tindex index-t16-large-end-facet-kindcode: 546613 docs, 47995 units, 1 commits, 2 segments, add 6440.3 ms, final 8416.5 ms, total 14857.2 ms, cpu 63392.4 ms, peak rss 1330499584 B, disk 364223344 B, token_count mismatches 0
+rc=0 du=364223344
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:14.87
+	Maximum resident set size (kbytes): 1299316
+settled tantivy-index-t16-large-end-facet-kindcode-add.jsonl
+settled tantivy-index-t16-large-end-facet-kindcode-final.jsonl
+settled tantivy-index-t16-large-end-facet-kindcode.jsonl
+tspace kindcode-facet rc=0
+free -g available 28G
+=== tindex sstable args: 16 large end
+tindex index-t16-large-end: 546613 docs, 47995 units, 1 commits, 2 segments, add 4315.3 ms, final 3458.6 ms, total 7774.2 ms, cpu 36246.3 ms, peak rss 1206329344 B, disk 292651938 B, token_count mismatches 0
+rc=0 du=292651938
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:07.78
+	Maximum resident set size (kbytes): 1178056
+settled tantivy-index-t16-large-end-add-sstable.jsonl
+settled tantivy-index-t16-large-end-final-sstable.jsonl
+settled tantivy-index-t16-large-end-sstable.jsonl
+tspace sstable rc=0
+free -g available 28G
+=== tindex tok-default args: 16 large end --tokenizer default
+tindex index-t16-large-end-default: 546613 docs, 47995 units, 1 commits, 2 segments, add 4497.5 ms, final 8326.1 ms, total 12823.9 ms, cpu 53625.4 ms, peak rss 1237417984 B, disk 350239836 B, token_count mismatches 0
+rc=0 du=350239836
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.84
+	Maximum resident set size (kbytes): 1208416
+settled tantivy-index-t16-large-end-default-add.jsonl
+settled tantivy-index-t16-large-end-default-final.jsonl
+settled tantivy-index-t16-large-end-default.jsonl
+tspace tok-default rc=0
+free -g available 28G
+=== tindex tok-simple args: 16 large end --tokenizer simple
+tindex index-t16-large-end-simple: 546613 docs, 47995 units, 1 commits, 2 segments, add 4265.2 ms, final 8596.3 ms, total 12861.8 ms, cpu 53698.7 ms, peak rss 1245442048 B, disk 353351831 B, token_count mismatches 0
+rc=0 du=353351831
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.88
+	Maximum resident set size (kbytes): 1216252
+settled tantivy-index-t16-large-end-simple-add.jsonl
+settled tantivy-index-t16-large-end-simple-final.jsonl
+settled tantivy-index-t16-large-end-simple.jsonl
+tspace tok-simple rc=0
+free -g available 28G
+=== tindex tok-enstem args: 16 large end --tokenizer en_stem
+tindex index-t16-large-end-enstem: 546613 docs, 47995 units, 1 commits, 2 segments, add 4568.0 ms, final 7808.7 ms, total 12377.1 ms, cpu 62745.4 ms, peak rss 1231523840 B, disk 347550583 B, token_count mismatches 0
+rc=0 du=347550583
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:12.39
+	Maximum resident set size (kbytes): 1202660
+settled tantivy-index-t16-large-end-enstem-add.jsonl
+settled tantivy-index-t16-large-end-enstem-final.jsonl
+settled tantivy-index-t16-large-end-enstem.jsonl
+tspace tok-enstem rc=0
+free -g available 28G
+=== tindex tok-pretok args: 16 large end --tokenizer pretokenized
+tindex index-t16-large-end-pretokenized: 546613 docs, 47995 units, 1 commits, 2 segments, add 11953.3 ms, final 8234.8 ms, total 20188.6 ms, cpu 69539.2 ms, peak rss 1263923200 B, disk 353577847 B, token_count mismatches 0
+rc=0 du=353577847
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:20.20
+	Maximum resident set size (kbytes): 1234300
+settled tantivy-index-t16-large-end-pretokenized-add.jsonl
+settled tantivy-index-t16-large-end-pretokenized-final.jsonl
+settled tantivy-index-t16-large-end-pretokenized.jsonl
+tspace tok-pretok rc=0
+free -g available 28G
+=== tindex parts args: 16 large end --parts-fields
+tindex index-t16-large-end-parts: 546613 docs, 47995 units, 1 commits, 2 segments, add 5749.3 ms, final 8768.8 ms, total 14518.5 ms, cpu 59849.9 ms, peak rss 1293254656 B, disk 360776355 B, token_count mismatches 0
+rc=0 du=360776355
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:14.54
+	Maximum resident set size (kbytes): 1262944
+settled tantivy-index-t16-large-end-parts-add.jsonl
+settled tantivy-index-t16-large-end-parts-final.jsonl
+settled tantivy-index-t16-large-end-parts.jsonl
+tspace parts rc=0
+free -g available 28G
+=== tindex ngram args: 16 large end --name-ngram
+tindex index-t16-large-end-ngram: 546613 docs, 47995 units, 1 commits, 2 segments, add 5273.6 ms, final 8362.3 ms, total 13636.2 ms, cpu 57933.9 ms, peak rss 1297174528 B, disk 364511176 B, token_count mismatches 0
+rc=0 du=364511176
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.64
+	Maximum resident set size (kbytes): 1266772
+settled tantivy-index-t16-large-end-ngram-add.jsonl
+settled tantivy-index-t16-large-end-ngram-final.jsonl
+settled tantivy-index-t16-large-end-ngram.jsonl
+tspace ngram rc=0
+free -g available 28G
+=== tindex counts args: 16 large end --field-counts
+tindex index-t16-large-end-counts: 546613 docs, 47995 units, 1 commits, 2 segments, add 6915.0 ms, final 8661.7 ms, total 15577.1 ms, cpu 60302.1 ms, peak rss 1270927360 B, disk 355391908 B, token_count mismatches 0
+rc=0 du=355391908
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:15.58
+	Maximum resident set size (kbytes): 1241140
+settled tantivy-index-t16-large-end-counts-add.jsonl
+settled tantivy-index-t16-large-end-counts-final.jsonl
+settled tantivy-index-t16-large-end-counts.jsonl
+tspace counts rc=0
+free -g available 28G
+=== tindex combined args: 16 large end --combined
+tindex index-t16-large-end-combined: 546613 docs, 47995 units, 1 commits, 2 segments, add 6398.3 ms, final 9547.1 ms, total 15945.8 ms, cpu 74514.8 ms, peak rss 1561829376 B, disk 457274257 B, token_count mismatches 0
+rc=0 du=457274257
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:15.99
+	Maximum resident set size (kbytes): 1525224
+settled tantivy-index-t16-large-end-combined-add.jsonl
+settled tantivy-index-t16-large-end-combined-final.jsonl
+settled tantivy-index-t16-large-end-combined.jsonl
+tspace combined rc=0
+free -g available 28G
+=== tindex code-combined args: 16 large end --tokenizer code --combined
+tindex index-t16-large-end-code-combined: 546613 docs, 47995 units, 1 commits, 2 segments, add 11868.6 ms, final 10050.9 ms, total 21919.9 ms, cpu 93005.4 ms, peak rss 1683705856 B, disk 518335044 B, token_count mismatches 0
+rc=0 du=518335044
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:21.93
+	Maximum resident set size (kbytes): 1644244
+settled tantivy-index-t16-large-end-code-combined-add.jsonl
+settled tantivy-index-t16-large-end-code-combined-final.jsonl
+settled tantivy-index-t16-large-end-code-combined.jsonl
+tspace code-combined rc=0
+tspace t16-large-end rc=0
+tspace t1-default-end rc=0
+tspace t16-default-end rc=0
+tspace t16-default-every1000 rc=0
+tspace t16-large-end-code rc=0
+tspace t1-default-unit rc=0
+ALLDONE

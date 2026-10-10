@@ -1,0 +1,56 @@
+{"cold_ms":142.866,"hits":2,"kinds":null,"open_ms":2.187,"page_without_range":0,"path_prefixes":null,"query":"APICallToPerfData","served_hits":2,"served_page":2,"warm_ms":[95.222]}
+{"cold_ms":3180.754,"hits":74265,"kinds":null,"open_ms":1.992,"page_without_range":0,"path_prefixes":null,"query":"api","served_hits":71419,"served_page":200,"warm_ms":[2943.613]}
+{"cold_ms":6691.957,"hits":148279,"kinds":null,"open_ms":1.498,"page_without_range":0,"path_prefixes":null,"query":"api call to perf data","served_hits":144326,"served_page":200,"warm_ms":[5644.456]}
+{"cold_ms":1197.199,"hits":0,"kinds":null,"open_ms":1.522,"page_without_range":0,"path_prefixes":null,"query":"\"api call to perf data\"","served_hits":0,"served_page":0,"warm_ms":[13.472]}
+{"cold_ms":133.468,"hits":2,"kinds":null,"open_ms":1.533,"page_without_range":0,"path_prefixes":null,"query":"APIResourcesHumanReadableFlags","served_hits":2,"served_page":2,"warm_ms":[83.288]}
+{"cold_ms":457.215,"hits":1223,"kinds":null,"open_ms":1.491,"page_without_range":0,"path_prefixes":null,"query":"human","served_hits":903,"served_page":200,"warm_ms":[401.515]}
+{"cold_ms":3972.655,"hits":83490,"kinds":null,"open_ms":1.551,"page_without_range":0,"path_prefixes":null,"query":"api resources human readable flags","served_hits":80251,"served_page":200,"warm_ms":[3833.894]}
+{"cold_ms":562.168,"hits":0,"kinds":null,"open_ms":1.477,"page_without_range":0,"path_prefixes":null,"query":"\"api resources human readable flags\"","served_hits":0,"served_page":0,"warm_ms":[14.447]}
+{"cold_ms":143.138,"hits":2,"kinds":null,"open_ms":1.841,"page_without_range":0,"path_prefixes":null,"query":"APIResourcesNewNamePrintFlags","served_hits":2,"served_page":2,"warm_ms":[86.383]}
+{"cold_ms":422.847,"hits":955,"kinds":null,"open_ms":2.32,"page_without_range":0,"path_prefixes":null,"query":"print","served_hits":847,"served_page":200,"warm_ms":[391.359]}
+{"cold_ms":5819.034,"hits":126735,"kinds":null,"open_ms":1.492,"page_without_range":0,"path_prefixes":null,"query":"api resources new name print flags","served_hits":122764,"served_page":200,"warm_ms":[5469.205]}
+{"cold_ms":1144.796,"hits":0,"kinds":null,"open_ms":1.532,"page_without_range":0,"path_prefixes":null,"query":"\"api resources new name print flags\"","served_hits":0,"served_page":0,"warm_ms":[4.249]}
+{"cold_ms":123.636,"hits":2,"kinds":null,"open_ms":1.508,"page_without_range":0,"path_prefixes":null,"query":"AbsIdx","served_hits":2,"served_page":2,"warm_ms":[70.472]}
+{"cold_ms":335.64,"hits":490,"kinds":null,"open_ms":1.505,"page_without_range":0,"path_prefixes":null,"query":"idx","served_hits":468,"served_page":200,"warm_ms":[286.966]}
+{"cold_ms":484.784,"hits":672,"kinds":null,"open_ms":1.473,"page_without_range":0,"path_prefixes":null,"query":"abs idx","served_hits":634,"served_page":200,"warm_ms":[399.523]}
+{"cold_ms":12.605,"hits":0,"kinds":null,"open_ms":1.91,"page_without_range":0,"path_prefixes":null,"query":"\"abs idx\"","served_hits":0,"served_page":0,"warm_ms":[3.05]}
+{"cold_ms":138.717,"hits":2,"kinds":null,"open_ms":1.433,"page_without_range":0,"path_prefixes":null,"query":"AbsolutePluginPath","served_hits":2,"served_page":2,"warm_ms":[97.187]}
+{"cold_ms":423.276,"hits":704,"kinds":null,"open_ms":1.478,"page_without_range":0,"path_prefixes":null,"query":"absolute","served_hits":614,"served_page":200,"warm_ms":[397.665]}
+{"cold_ms":2027.637,"hits":28356,"kinds":null,"open_ms":1.503,"page_without_range":0,"path_prefixes":null,"query":"absolute plugin path","served_hits":25920,"served_page":200,"warm_ms":[1932.855]}
+{"cold_ms":161.124,"hits":0,"kinds":null,"open_ms":1.564,"page_without_range":0,"path_prefixes":null,"query":"\"absolute plugin path\"","served_hits":0,"served_page":0,"warm_ms":[3.554]}
+{"cold_ms":125.523,"hits":5,"kinds":null,"open_ms":1.432,"page_without_range":0,"path_prefixes":null,"query":"GenerateReadFileCmd","served_hits":5,"served_page":5,"warm_ms":[75.29]}
+{"cold_ms":1300.5,"hits":25866,"kinds":null,"open_ms":1.806,"page_without_range":0,"path_prefixes":null,"query":"cmd","served_hits":25683,"served_page":200,"warm_ms":[1295.667]}
+{"cold_ms":3066.156,"hits":52518,"kinds":null,"open_ms":1.757,"page_without_range":0,"path_prefixes":null,"query":"generate read file cmd","served_hits":50422,"served_page":200,"warm_ms":[2870.105]}
+{"cold_ms":182.374,"hits":0,"kinds":null,"open_ms":1.604,"page_without_range":0,"path_prefixes":null,"query":"\"generate read file cmd\"","served_hits":0,"served_page":0,"warm_ms":[6.069]}
+{"cold_ms":149.103,"hits":5,"kinds":null,"open_ms":1.482,"page_without_range":0,"path_prefixes":null,"query":"GenerateSelfSignedCertKeyWithFixtures","served_hits":4,"served_page":4,"warm_ms":[86.075]}
+{"cold_ms":287.497,"hits":459,"kinds":null,"open_ms":1.502,"page_without_range":0,"path_prefixes":null,"query":"fixtures","served_hits":445,"served_page":200,"warm_ms":[261.585]}
+{"cold_ms":3878.596,"hits":57300,"kinds":null,"open_ms":1.5,"page_without_range":0,"path_prefixes":null,"query":"generate self signed cert key with fixtures","served_hits":53810,"served_page":200,"warm_ms":[3653.793]}
+{"cold_ms":217.884,"hits":0,"kinds":null,"open_ms":1.508,"page_without_range":0,"path_prefixes":null,"query":"\"generate self signed cert key with fixtures\"","served_hits":0,"served_page":0,"warm_ms":[6.083]}
+{"cold_ms":138.282,"hits":5,"kinds":null,"open_ms":1.689,"page_without_range":0,"path_prefixes":null,"query":"GenerateSnapshotClassSpec","served_hits":4,"served_page":4,"warm_ms":[85.025]}
+{"cold_ms":522.57,"hits":2263,"kinds":null,"open_ms":1.527,"page_without_range":0,"path_prefixes":null,"query":"snapshot","served_hits":1473,"served_page":200,"warm_ms":[466.118]}
+{"cold_ms":2122.668,"hits":24387,"kinds":null,"open_ms":2.103,"page_without_range":0,"path_prefixes":null,"query":"generate snapshot class spec","served_hits":21576,"served_page":200,"warm_ms":[2002.62]}
+{"cold_ms":117.026,"hits":0,"kinds":null,"open_ms":1.549,"page_without_range":0,"path_prefixes":null,"query":"\"generate snapshot class spec\"","served_hits":0,"served_page":0,"warm_ms":[2.956]}
+{"cold_ms":136.26,"hits":5,"kinds":null,"open_ms":1.623,"page_without_range":0,"path_prefixes":null,"query":"GenerationsBySlice","served_hits":5,"served_page":5,"warm_ms":[88.771]}
+{"cold_ms":801.646,"hits":4197,"kinds":null,"open_ms":1.887,"page_without_range":0,"path_prefixes":null,"query":"slice","served_hits":3980,"served_page":200,"warm_ms":[761.727]}
+{"cold_ms":3045.877,"hits":44982,"kinds":null,"open_ms":1.467,"page_without_range":0,"path_prefixes":null,"query":"generations by slice","served_hits":42280,"served_page":200,"warm_ms":[2901.377]}
+{"cold_ms":211.398,"hits":0,"kinds":null,"open_ms":1.546,"page_without_range":0,"path_prefixes":null,"query":"\"generations by slice\"","served_hits":0,"served_page":0,"warm_ms":[2.153]}
+{"cold_ms":138.749,"hits":5,"kinds":null,"open_ms":1.503,"page_without_range":0,"path_prefixes":null,"query":"Get2NodesThatCanRunPod","served_hits":4,"served_page":4,"warm_ms":[91.007]}
+{"cold_ms":1630.1,"hits":24462,"kinds":null,"open_ms":1.486,"page_without_range":0,"path_prefixes":null,"query":"pod","served_hits":22841,"served_page":200,"warm_ms":[1628.232]}
+{"cold_ms":4037.306,"hits":70183,"kinds":null,"open_ms":1.612,"page_without_range":0,"path_prefixes":null,"query":"get2 nodes that can run pod","served_hits":67003,"served_page":200,"warm_ms":[3805.722]}
+{"cold_ms":25.503,"hits":0,"kinds":null,"open_ms":1.556,"page_without_range":0,"path_prefixes":null,"query":"\"get2 nodes that can run pod\"","served_hits":0,"served_page":0,"warm_ms":[3.023]}
+{"cold_ms":810.012,"hits":14479,"kinds":null,"open_ms":1.603,"page_without_range":0,"path_prefixes":null,"query":"OpenAPI","served_hits":12940,"served_page":200,"warm_ms":[762.731]}
+{"cold_ms":3476.338,"hits":75931,"kinds":null,"open_ms":1.537,"page_without_range":0,"path_prefixes":null,"query":"open api","served_hits":72985,"served_page":200,"warm_ms":[3422.123]}
+{"cold_ms":662.577,"hits":43,"kinds":null,"open_ms":1.955,"page_without_range":0,"path_prefixes":null,"query":"\"open api\"","served_hits":41,"served_page":41,"warm_ms":[355.607]}
+{"cold_ms":771.483,"hits":14479,"kinds":null,"open_ms":1.783,"page_without_range":0,"path_prefixes":null,"query":"openAPI","served_hits":12940,"served_page":200,"warm_ms":[776.671]}
+{"cold_ms":891.9,"hits":14563,"kinds":null,"open_ms":1.693,"page_without_range":0,"path_prefixes":null,"query":"OmitEmpty","served_hits":14452,"served_page":200,"warm_ms":[813.328]}
+{"cold_ms":314.39,"hits":217,"kinds":null,"open_ms":1.609,"page_without_range":0,"path_prefixes":null,"query":"omit","served_hits":203,"served_page":200,"warm_ms":[284.196]}
+{"cold_ms":1318.344,"hits":9753,"kinds":null,"open_ms":1.943,"page_without_range":0,"path_prefixes":null,"query":"omit empty","served_hits":7875,"served_page":200,"warm_ms":[1221.234]}
+{"cold_ms":105.37,"hits":2,"kinds":null,"open_ms":1.601,"page_without_range":0,"path_prefixes":null,"query":"\"omit empty\"","served_hits":2,"served_page":2,"warm_ms":[62.75]}
+{"cold_ms":459.341,"hits":15199,"kinds":null,"open_ms":3.812,"page_without_range":0,"path_prefixes":null,"query":"FreeBSD","served_hits":15178,"served_page":200,"warm_ms":[425.403]}
+{"cold_ms":533.168,"hits":1593,"kinds":null,"open_ms":2.208,"page_without_range":0,"path_prefixes":null,"query":"free","served_hits":1490,"served_page":200,"warm_ms":[473.169]}
+{"cold_ms":755.69,"hits":2708,"kinds":null,"open_ms":1.571,"page_without_range":0,"path_prefixes":null,"query":"free bsd","served_hits":2597,"served_page":200,"warm_ms":[641.788]}
+{"cold_ms":21.864,"hits":0,"kinds":null,"open_ms":1.885,"page_without_range":0,"path_prefixes":null,"query":"\"free bsd\"","served_hits":0,"served_page":0,"warm_ms":[2.538]}
+{"cold_ms":1792.162,"hits":40115,"kinds":null,"open_ms":1.668,"page_without_range":0,"path_prefixes":null,"query":"APIServer","served_hits":39009,"served_page":200,"warm_ms":[1760.781]}
+{"cold_ms":1519.448,"hits":21049,"kinds":null,"open_ms":1.676,"page_without_range":0,"path_prefixes":null,"query":"server","served_hits":19210,"served_page":200,"warm_ms":[1459.388]}
+{"cold_ms":3640.659,"hits":87877,"kinds":null,"open_ms":1.973,"page_without_range":0,"path_prefixes":null,"query":"api server","served_hits":84870,"served_page":200,"warm_ms":[3703.081]}
+{"cold_ms":1504.424,"hits":2136,"kinds":null,"open_ms":1.589,"page_without_range":0,"path_prefixes":null,"query":"\"api server\"","served_hits":1746,"served_page":200,"warm_ms":[916.59]}

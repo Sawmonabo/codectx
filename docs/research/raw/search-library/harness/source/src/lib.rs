@@ -110,6 +110,8 @@ pub struct Fields {
     pub counts: Option<[Field; 5]>,
     /// `--combined`: the five columns as values of one text field.
     pub all: Option<Field>,
+    /// `--column-lengths`: each column's exact token count (product::LEN_NAMES).
+    pub lens: Option<[Field; 5]>,
     /// `--tokenizer code`: the code tokenizer's token count (product-code's length).
     pub token_count_code: Option<Field>,
     /// `--tokenizer pretokenized`: documents carry unicode61 tokens directly.
@@ -123,6 +125,7 @@ impl Fields {
     pub fn from_schema(s: &Schema, pretokenized: bool) -> anyhow_lite::Result<Fields> {
         let g = |n: &str| s.get_field(n).map_err(|e| format!("schema has no field {n}: {e}"));
         let o = |n: &str| s.get_field(n).ok();
+        let lens = product::LEN_NAMES.iter().map(|n| o(n)).collect::<Option<Vec<_>>>().map(|v| [v[0], v[1], v[2], v[3], v[4]]);
         let counts = COUNT_NAMES.iter().map(|n| o(n)).collect::<Option<Vec<_>>>().map(|v| [v[0], v[1], v[2], v[3], v[4]]);
         Ok(Fields {
             text: [g(TEXT_NAMES[0])?, g(TEXT_NAMES[1])?, g(TEXT_NAMES[2])?, g(TEXT_NAMES[3])?, g(TEXT_NAMES[4])?],
@@ -130,7 +133,7 @@ impl Fields {
             qn_s: g("qn_s")?, sig_s: g("sig_s")?, unit: g("unit")?, token_count: g("token_count")?,
             start: g("start")?, end: g("end")?,
             path_facet: o("path_facet"), kind_code: o("kind_code"), name_parts: o("name_parts"), qn_parts: o("qn_parts"),
-            name_ngram: o("name_ngram"), counts, all: o("all"), token_count_code: o(product::DL_CODE), pretokenized,
+            name_ngram: o("name_ngram"), counts, lens, all: o("all"), token_count_code: o(product::DL_CODE), pretokenized,
         })
     }
 }

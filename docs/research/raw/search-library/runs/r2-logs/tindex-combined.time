@@ -1,0 +1,23 @@
+	Command being timed: "systemd-run --user --scope -q -p MemoryMax=12G <bench>/rust/target-next/release/tindex <bench>/docs.jsonl <bench>/idx/combined 16 large end --combined"
+	User time (seconds): 66.27
+	System time (seconds): 8.24
+	Percent of CPU this job got: 465%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:15.99
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1525224
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 52
+	Minor (reclaiming a frame) page faults: 418719
+	Voluntary context switches: 765205
+	Involuntary context switches: 15027
+	Swaps: 0
+	File system inputs: 29744
+	File system outputs: 1887584
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

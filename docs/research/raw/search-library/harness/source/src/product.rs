@@ -51,19 +51,45 @@ pub fn corpus_stats(searcher: &Searcher) -> tantivy::Result<CorpusStats> {
 pub const DL: &str = "token_count";
 /// product-code's document length: the code tokenizer's token count (stacked parts included).
 pub const DL_CODE: &str = "token_count_code";
+/// `--dl weighted`: Σ weight(c) × len(c) over the five columns (5/5/2/2/1), from
+/// the exact per-column counts `tindex --column-lengths` stores (LEN_NAMES).
+pub const DL_WEIGHTED: &str = "weighted";
+pub const LEN_NAMES: [&str; 5] = ["len_name", "len_qualified_name", "len_signature", "len_path", "len_body"];
+
+/// A segment's document-length reader: one column, or the weighted sum of five.
+pub enum DlCol {
+    One(Column<u64>),
+    Weighted(Vec<Column<u64>>),
+}
+
+impl DlCol {
+    pub fn open(seg: &SegmentReader, dl: &str) -> tantivy::Result<DlCol> {
+        let ff = seg.fast_fields();
+        if dl != DL_WEIGHTED {
+            return Ok(DlCol::One(ff.u64(dl)?));
+        }
+        Ok(DlCol::Weighted(LEN_NAMES.iter().map(|n| ff.u64(n)).collect::<tantivy::Result<Vec<_>>>()?))
+    }
+    pub fn get(&self, d: DocId) -> u64 {
+        match self {
+            DlCol::One(c) => c.first(d).unwrap_or(0),
+            DlCol::Weighted(cs) => cs.iter().zip(WEIGHTS).map(|(c, w)| w as u64 * c.first(d).unwrap_or(0)).sum(),
+        }
+    }
+}
 
 /// N and the token total over the live documents of `segs` that `hide` leaves
 /// visible (our statistics count visible documents only); `dl` names the length column.
 pub fn corpus_stats_of(segs: &[SegmentReader], hide: Option<&HideSet>, dl: &str) -> tantivy::Result<CorpusStats> {
     let mut s = CorpusStats { docs: 0, tokens: 0 };
     for seg in segs {
-        let dl = seg.fast_fields().u64(dl)?;
+        let dl = DlCol::open(seg, dl)?;
         let alive = seg.alive_bitset();
         let vis = hide.and_then(|h| h.segment(seg.segment_id()));
         for d in 0..seg.max_doc() {
             if alive.map_or(true, |a| a.is_alive(d)) && vis.as_ref().map_or(true, |v| v[d as usize]) {
                 s.docs += 1;
-                s.tokens += dl.first(d).unwrap_or(0) as i64;
+                s.tokens += dl.get(d) as i64;
             }
         }
     }
@@ -141,7 +167,7 @@ pub struct SegFruit {
 /// The columns the fold reads in one segment: length, span, rank columns
 /// (path, kind, name, qualified_name, signature, node_id, id) and the filter.
 pub struct SegCols {
-    pub dl: Column<u64>,
+    pub dl: DlCol,
     start: Column<u64>,
     end: Column<u64>,
     strs: Vec<RankCol>,
@@ -153,7 +179,7 @@ impl SegCols {
         let ff = seg.fast_fields();
         let strs = STR_COLS.iter().map(|n| RankCol::open(seg, n)).collect::<tantivy::Result<Vec<_>>>()?;
         let keep = SegFilter::build(filter, &strs[C_KIND], &strs[C_PATH])?;
-        Ok(SegCols { dl: ff.u64(dl)?, start: ff.u64("start")?, end: ff.u64("end")?, strs, keep })
+        Ok(SegCols { dl: DlCol::open(seg, dl)?, start: ff.u64("start")?, end: ff.u64("end")?, strs, keep })
     }
     /// The filter's verdict on a document.
     pub fn keep(&self, d: DocId) -> bool {
@@ -467,7 +493,7 @@ impl Collector for ProductCollector {
             let mut touched = Vec::new();
             for (i, list) in f.per_term.iter().enumerate() {
                 for &(d, wtf) in list {
-                    let dl = f.cols.dl.first(d).unwrap_or(0) as i64;
+                    let dl = f.cols.dl.get(d) as i64;
                     if !hit[d as usize] {
                         hit[d as usize] = true;
                         touched.push(d);

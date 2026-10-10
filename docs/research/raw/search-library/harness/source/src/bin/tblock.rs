@@ -1,10 +1,10 @@
-//! tblock <index dir>
+//! tblock <index dir> [--dl weighted]
 //!
 //! Writes product-topk's side structure (topk.rs): one file per searchable
 //! segment, `tb-blockmax-<segment uuid>-<dl>.bin`, beside the index. The length
 //! column is token_count, or token_count_code on a `--tokenizer code` index.
 //! Segments are immutable, so a file stays valid until a merge replaces its
-//! segment; run tblock again after any commit or merge. Prints per segment the
+//! segment (`--dl weighted`: the weighted column-length sum); run tblock again after any commit or merge. Prints per segment the
 //! time, the tokens and blocks stored, and the bytes; then the totals as JSON.
 use std::time::Instant;
 use tantivy::ReloadPolicy;
@@ -14,7 +14,14 @@ fn main() -> Result<()> {
     let a: Vec<String> = std::env::args().collect();
     let dir = std::path::Path::new(a.get(1).ok_or("usage: tblock <index dir>")?);
     let (index, f) = open_index(dir, None)?;
-    let dl = if f.token_count_code.is_some() { product::DL_CODE } else { product::DL };
+    let weighted = a.iter().any(|x| x == "--dl") && a.iter().any(|x| x == "weighted");
+    let dl = if weighted {
+        product::DL_WEIGHTED
+    } else if f.token_count_code.is_some() {
+        product::DL_CODE
+    } else {
+        product::DL
+    };
     let s = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?.searcher();
     let t0 = Instant::now();
     let (mut bytes, mut terms, mut blocks) = (0u64, 0u64, 0u64);
