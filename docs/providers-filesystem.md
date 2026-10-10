@@ -4,7 +4,7 @@
 base providers of Section 11.2. Together they publish every repository,
 directory, file, document, package, module, dependency, configuration and
 build-target node of the base index, the `contains`, `defines`,
-`depends_on`, `builds`, `configures` and `documents` relations between them,
+`depends_on`, `builds`, `configures`, `documents` and `references` relations between them,
 and the lexical search documents every other search feature builds on. Both
 follow the provider contract of [providers.md](providers.md): facts flow only
 through the sink, identities come only from the resolver, bytes come only
@@ -21,14 +21,18 @@ A unit is one file for both providers. The coordinator plans:
 
 The unit's `InputHash` is the digest of that one file version, so an
 unchanged file reuses its sealed unit with zero work, and a change to one
-file invalidates exactly two units. `filesystem.PathFromScope` recovers the
+file invalidates exactly two units. A requirements file is the one manifest
+that reads other files: its `-r` and `-c` includes are read from the same
+snapshot view, but they are not inputs of its unit, so an edit to an included
+file alone does not rebuild the unit that includes it. `filesystem.PathFromScope` recovers the
 path inside `IndexUnit`; a scope that is not a normalized file scope is a
 coordinator error.
 
 Both providers are `Required` and always detect as available. `manifest`
 detection additionally reports the well-known root manifests it finds
-(`go.mod`, `go.work`, `package.json`, `Cargo.toml`, `pyproject.toml`,
-`pom.xml`) through `Root.Lstat`; nothing is walked.
+(`go.mod`, `go.work`, `package.json`, `composer.json`, `Cargo.toml`,
+`pyproject.toml`, `requirements.txt`, `pom.xml`) through `Root.Lstat`;
+nothing is walked.
 
 ## Identities and aliases
 
@@ -164,8 +168,10 @@ never of the kinds.
 | `go.mod` | `x/mod/modfile.Parse` (strict: a repository go.mod is a main module, and lax parsing drops `replace`/`exclude`) | `module` with `go`/`toolchain` metadata | `require` → `depends_on` kind `runtime` with `indirect`; `replace` → `configures` with `replace` target; `exclude` → `configures` with `exclude` |
 | `go.work` | `modfile.ParseWork` | `configuration` | `use` → `configures` the directory (the repository for `use .`); `replace` as above |
 | `package.json` | `encoding/json`; ranges from one token walk | `package`, metadata `version`, `private`, `workspaces` (globs unexpanded), `scripts` (never executed) | `dependencies`/`devDependencies`/`peerDependencies`/`optionalDependencies` → kinds `runtime`/`dev`/`peer`/`optional` |
+| `composer.json` | `encoding/json`; ranges from the same token walk | `package` `composer:<name>` lowercased (an unnamed root project is identified by its path), metadata `version`, `type`; PHP code is not parsed | `require` → `runtime`, `require-dev` → `dev`; the platform entries (`php` and its variants, `hhvm`, `ext-*`, `lib-*`, `composer`, `composer-plugin-api`, `composer-runtime-api`) are dependencies with `platform: true` |
 | `Cargo.toml` | BurntSushi/toml; ranges from a bounded line scan | `package` (or `configuration` for a virtual workspace manifest); a `[package]` field written `{ workspace = true }` is listed in `inherited` and not resolved | `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` and their `[target.*]` forms → `runtime`/`dev`/`build`; `optional = true` → `optional`; `{ workspace = true }` → `inherited: workspace`, requirement unresolved; `[workspace.dependencies]` → `depends_on` with `declared: workspace` |
 | `pyproject.toml` | BurntSushi/toml; per-requirement ranges are the quoted string inside the located array | `package`; `dynamic` fields are metadata and never invented | PEP 621 `dependencies` → `runtime`; `optional-dependencies` → `optional` with `extra`; PEP 735 `dependency-groups` → `dev` with `group`; `build-system.requires` → `build`; Poetry tables → `runtime`/`dev` |
+| requirements file | line reader of the subset below | `configuration` `pypi:requirements:<path>`; lines this reader does not interpret are listed in `unresolved` | requirement lines → `depends_on` kind `runtime`; constraint lines → `configures` with `constraint: true`; each `-r`/`-c` → `references` the included file with `include: requirement`/`constraint` |
 | `pom.xml` | streaming `encoding/xml` tokens with depth (32), element (200k) and text (4 KiB) bounds | `package` `maven:group:artifact`; a missing `groupId`/`version` is taken from `<parent>` and listed in `inherited`; `<properties>` are metadata | `<dependency>` scope `compile`/`runtime` → `runtime`, `test` → `test`, `provided`/`system`/`import` → `build`, `<optional>true` → `optional`; `<parent>` → `depends_on` kind `build`, `role: parent`; `<dependencyManagement>` → `configures` with `managed`; `<modules>` → `builds` the module directory; `${property}` references stay literal with `unresolved: property`; only the direct children of a `<dependency>`/`<parent>` set its coordinates, so a `<exclusions><exclusion><groupId>` describes the exclusion and is not indexed |
 | Markdown (and ADRs) | bounded line scanner | the `document` node (idempotent with the filesystem fact), and one `section` node per ATX heading | each heading → a `section` node the document `contains`, named by the heading text and qualified `<path>#<trail>` (the enclosing heading path, joined ` > `), located at the heading line, with its own name-only search document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
 
@@ -199,6 +205,48 @@ their exact byte ranges and only the facts past it carry evidence without a
 range. The documented degradation is evidence without a range, never a
 guessed one.
 
+### Requirements files
+
+A requirements file is a `.txt` or `.in` file whose name contains
+`requirements` (`requirements.txt`, `requirements-dev.txt`,
+`dev-requirements.in`), or any `.txt` or `.in` file directly inside a
+directory named `requirements`. pip accepts any name; a file outside this
+set is read only when a recognized one includes it. Lock files of any
+ecosystem are not read. The supported subset of pip's requirements file
+format:
+
+- A line ending in `\` continues on the next line; a comment line ends a
+  continuation.
+- `#` at the start of a line, or after whitespace, starts a comment to the
+  end of the line.
+- A requirement line is a PEP 508 requirement. The name, PEP 503 normalized,
+  is the dependency's identity; its extras, version specifiers, direct
+  reference and environment markers are the `requirement` as written.
+  Markers are carried, never evaluated.
+- Per-requirement options after the requirement (`--hash`,
+  `--config-settings`) are carried verbatim as `options`.
+- `-r`/`--requirement` includes a requirements file and `-c`/`--constraint`
+  a constraints file, resolved relative to the directory of the file that
+  names it. The included file's lines are published on the including file's
+  node with `via` naming the file that declares them and without a range,
+  since evidence ranges are in the unit's own file. Each file is read once
+  as requirements and once at most as constraints, so an include cycle ends.
+- A constraint pins a version and installs nothing, so a constraint line is
+  `configures` with `constraint: true`, never `depends_on`.
+- Everything else is listed in the node's `unresolved` metadata as written
+  (`line`, with `via` for an included file and a `reason` for an include),
+  never interpreted: every other option line (`-e`, `--index-url`,
+  `--find-links`, ...), a requirement that is a bare URL, path or archive,
+  and an include that is a URL (`reason: url`), absolute (`absolute`),
+  outside the workspace (`outside_workspace`) or names an environment
+  variable (`environment`). A requirement that names an environment variable
+  after its name is published with `unresolved: environment`.
+- An include the snapshot does not hold, or an `-r`/`-c` with no path
+  (`reason: malformed`), leaves the capability `partial` with
+  `CTX_ARGUMENT_INVALID`; an included file over
+  `workspace.max_parse_file_bytes` leaves it `partial` with
+  `CTX_RESOURCE_LIMIT` and the detail `max_parse_file_bytes`.
+
 Every fact carries evidence at precision `syntax` with the exact byte range
 of the declaring line, element or token when the parser exposes one;
 otherwise the evidence binds to the file without a range rather than
@@ -213,7 +261,8 @@ scope:
 |---|---|---|
 | parsed | `fresh` | |
 | a list was cut at a user-set `providers.manifest.max_dependencies` or `providers.manifest.max_entries`, or the parse at a user-set `providers.manifest.max_toml_lines` or `providers.manifest.max_xml_elements` (all four unlimited by default, so this outcome cannot arise from the shipped configuration); the capability names the key and the count that crossed it | `partial` | `CTX_RESOURCE_LIMIT` |
-| one entry was unusable (a dependency without a name, a path outside the workspace) | `partial` | `CTX_ARGUMENT_INVALID` |
+| one entry was unusable (a dependency without a name, a path outside the workspace, a requirements include the snapshot does not hold) | `partial` | `CTX_ARGUMENT_INVALID` |
+| a file a requirements file includes is over `workspace.max_parse_file_bytes`; the capability names `max_parse_file_bytes` | `partial` | `CTX_RESOURCE_LIMIT` |
 | the file does not parse as its format | `failed` | `CTX_ARGUMENT_INVALID` |
 | size over `workspace.max_parse_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |
 
