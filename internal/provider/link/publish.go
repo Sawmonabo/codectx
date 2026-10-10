@@ -1,7 +1,9 @@
 package link
 
 import (
+	"cmp"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"iter"
@@ -34,11 +36,17 @@ import (
 // identity it names.
 //
 // A unit that inherits its predecessor's resolution (publisher.edited set)
-// republishes only the facts whose evidence lies in an edited member: the
-// occurrences of the edited members' declarations and the facts of their
-// sites. Its predecessor's other facts are carried over by the delta build,
-// and a table is read only when what is republished needs it: an edited
-// member's, and an untouched member's that a republished site targets.
+// republishes only the facts whose evidence lies in a republished member:
+// the occurrences of its declarations and the facts of its sites. The
+// republished members are the edited ones and every member with a site bound
+// to a declaration of an edited member (dependents): a declaration's identity
+// is minted from its file and its exact range (reconcile.CanonicalKey), so an
+// edit that moves a declaration's range gives it a new node, and a call of it
+// recorded in an untouched file must name the new one. Its predecessor's
+// other facts are carried over by the delta build, which names the
+// republished members replaced (publisher.replaced), and a table is read only
+// when what is republished needs it: a republished member's, and an untouched
+// member's that a republished site targets.
 
 // occurrence is a structural node a published edge names, with the file it
 // is declared in.
@@ -98,10 +106,15 @@ type publisher struct {
 	u    *unit
 	// edited, when set, streams the FileIDs of the members whose content
 	// changed since the predecessor whose resolution the unit inherits, in
-	// ascending order (it may name files that are not members): only their
-	// facts are published, and cov is the predecessor's. Nil publishes every
-	// fact and takes cov from the tables.
+	// ascending order (it may name files that are not members); publish
+	// widens it to the republished members, the edited ones and their
+	// dependents. Only their facts are published, and cov is the
+	// predecessor's. Nil publishes every fact and takes cov from the tables.
 	edited func(yield func(model.FileID) error) error
+	// replaced, when set with edited, receives once publication is done
+	// every FileID the widened edited stream names, in ascending order: the
+	// files whose facts the delta build must not carry over.
+	replaced func(model.FileID) error
 	// members is the unit's member count, from which the members with no
 	// table are counted.
 	members int64
@@ -113,8 +126,28 @@ type publisher struct {
 }
 
 // publish runs the three merges over run, the unit's folded bindings in site
-// order.
+// order, after widening edited to the republished members.
 func (p *publisher) publish(run *pagination.SortedRun[Binding]) error {
+	if p.edited != nil {
+		dependents, err := p.dependents(run)
+		if err != nil {
+			return err
+		}
+		defer dependents.Close()
+		edited := p.edited
+		p.edited = func(yield func(model.FileID) error) error { return unionIDs(edited, dependents, yield) }
+	}
+	if err := p.publishFacts(run); err != nil {
+		return err
+	}
+	if p.edited != nil && p.replaced != nil {
+		return p.edited(p.replaced)
+	}
+	return nil
+}
+
+// publishFacts runs the three merges over run.
+func (p *publisher) publishFacts(run *pagination.SortedRun[Binding]) error {
 	byTarget, err := pagination.NewExternalSort(p.u.dir, 0, encodeMarked, decodeMarked,
 		func(a, b marked) int { return compareTargetSite(a.Binding, b.Binding) })
 	if err != nil {
@@ -150,6 +183,150 @@ func (p *publisher) publish(run *pagination.SortedRun[Binding]) error {
 	}
 	defer sites.Close()
 	return p.publishSites(sites)
+}
+
+// dependents is the FileIDs, ascending and each once, of the members with a
+// site bound to a declaration of an edited member. It reads
+// no table: the bindings, sorted by target, are merged with the members to
+// find the sites' members, and those, sorted, are merged with the members
+// again to name them.
+func (p *publisher) dependents(run *pagination.SortedRun[Binding]) (*pagination.SortedRun[model.FileID], error) {
+	byTarget, err := newBindingSort(p.u.dir, compareTargetSite)
+	if err != nil {
+		return nil, err
+	}
+	defer byTarget.Close()
+	if err := run.Each(byTarget.Add); err != nil {
+		return nil, err
+	}
+	targets, err := byTarget.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer targets.Close()
+	ordinals, err := pagination.NewExternalSort(p.u.dir, 0, encodeOrdinal, decodeOrdinal, cmp.Compare[int32])
+	if err != nil {
+		return nil, err
+	}
+	defer ordinals.Close()
+	ordinals.WithFold(func(a, _ int32) (int32, error) { return a, nil })
+	edited, stopEdited := p.editedCursor()
+	defer stopEdited()
+	next, stop := pull(targets)
+	defer stop()
+	cur, ok, err := next()
+	if err != nil {
+		return nil, err
+	}
+	var file int32 = -1
+	err = p.u.members(func(fv model.FileVersion) error {
+		file++
+		if !ok || cur.Target.File != file {
+			return nil
+		}
+		e, err := edited(fv.ID)
+		if err != nil {
+			return err
+		}
+		for ok && cur.Target.File == file {
+			if e {
+				if err := ordinals.Add(cur.Site.File); err != nil {
+					return err
+				}
+			}
+			if cur, ok, err = next(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return nil, untabledRef("target", cur.Target)
+	}
+	sites, err := ordinals.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer sites.Close()
+	ids, err := pagination.NewExternalSort(p.u.dir, 0,
+		func(id model.FileID) ([]byte, error) { return []byte(id), nil },
+		func(b []byte) (model.FileID, error) { return model.FileID(b), nil }, cmp.Compare[model.FileID])
+	if err != nil {
+		return nil, err
+	}
+	defer ids.Close()
+	nextSite, stopSites := pull(sites)
+	defer stopSites()
+	site, more, err := nextSite()
+	if err != nil {
+		return nil, err
+	}
+	file = -1
+	err = p.u.members(func(fv model.FileVersion) error {
+		file++
+		if !more || site != file {
+			return nil
+		}
+		if err := ids.Add(fv.ID); err != nil {
+			return err
+		}
+		site, more, err = nextSite()
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if more {
+		return nil, untabledRef("site", Ref{File: site})
+	}
+	return ids.Sorted()
+}
+
+// unionIDs yields, in ascending order and each once, the FileIDs of edited
+// and of more, both ascending.
+func unionIDs(edited func(yield func(model.FileID) error) error, more *pagination.SortedRun[model.FileID],
+	yield func(model.FileID) error) error {
+	next, stop := pull(more)
+	defer stop()
+	cur, ok, err := next()
+	if err != nil {
+		return err
+	}
+	err = edited(func(id model.FileID) error {
+		for ok && cur < id {
+			if err := yield(cur); err != nil {
+				return err
+			}
+			if cur, ok, err = next(); err != nil {
+				return err
+			}
+		}
+		if ok && cur == id {
+			if cur, ok, err = next(); err != nil {
+				return err
+			}
+		}
+		return yield(id)
+	})
+	for err == nil && ok {
+		if err = yield(cur); err == nil {
+			cur, ok, err = next()
+		}
+	}
+	return err
+}
+
+func encodeOrdinal(v int32) ([]byte, error) { return binary.AppendUvarint(nil, uint64(v)), nil }
+
+func decodeOrdinal(raw []byte) (int32, error) {
+	n, w := binary.Uvarint(raw)
+	if w != len(raw) || n > 1<<31-1 {
+		return 0, errors.New("a member ordinal is malformed")
+	}
+	return int32(n), nil
 }
 
 // markSites is the first merge. It reads no table.

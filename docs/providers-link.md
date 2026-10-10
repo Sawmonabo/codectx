@@ -25,7 +25,7 @@ Required          false
 ```
 
 `ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go:41-57`, and the descriptor is
-`Provider.Descriptor` (`provider.go:123-126`). The id is not `dependence`, which is never reused (decision 9). The
+`Provider.Descriptor` (`provider.go:130-133`). The id is not `dependence`, which is never reused (decision 9). The
 provider is not required: a failed link degrades `calls` and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 
@@ -140,16 +140,22 @@ The delta build reads each member's digest, one small read per member and no tab
 its predecessor's in FileID order, as one merge join against the predecessor unit's stored inputs
 (`internal/index/delta/link.go`). An input with no table (a manifest such as `go.mod`, or a member whose link pass failed) is compared by its bytes, because a resolver may read it: a Go module path decides which imports are the project's own. When membership, every digest and every tableless input are equal, it hands `Link` the predecessor's
 resolution state (`LinkOptions.Previous`, stored under `link.ResolutionKind`) and the stream of members whose bytes
-changed (`LinkOptions.Edited`, `provider.go:84-110`). The state names each site and target by position (`Ref`,
+changed (`LinkOptions.Edited`, `provider.go:84-117`). The state names each site and target by position (`Ref`,
 `internal/provider/link/unit.go`) and holds the unit's coverage, so the linker resolves nothing. It republishes only
-the facts whose evidence lies in an edited member: the occurrences of its declarations that an edge names, and its
-sites' `calls`, `may_refer_to` and ambiguous callee nodes. Every other fact of the predecessor is carried over
-(`sqlite.CarryOver`) with the edited members named in `Replaced.Files`.
+the facts whose evidence lies in a republished member: the occurrences of its declarations that an edge names, and
+its sites' `calls`, `may_refer_to` and ambiguous callee nodes. The republished members are the edited ones and every
+member with a site bound to a declaration of an edited one (`publisher.dependents`, `publish.go`): a declaration's
+node is keyed on its file and its exact range (`reconcile.CanonicalKey`), so a body edit that changes the body's
+length gives the enclosing declaration a new node, and its callers' `calls` must name the new one. Every other fact
+of the predecessor is carried over (`sqlite.CarryOver`) with the republished members, which `Link` hands back
+through `LinkOptions.Replaced`, named in `Replaced.Files`.
 
-A table is read only when what is republished needs it: an edited member's, and an untouched member's when a
-republished site binds one of its declarations. An untouched member whose path is long enough that an ambiguous
-site's `link:` key could exceed `model.MaxNativeKeyBytes` is also walked, to count `unkeyed_ambiguous_sites`, and
-publishes nothing. So an edit inside a function body resolves nothing and republishes one file's facts.
+A table is read only when what is republished needs it: a republished member's, and an untouched member's when a
+republished site binds one of its declarations. Finding the dependents reads no table: the bindings, sorted by
+target, are merged with the members. An untouched member whose path is long enough that an ambiguous site's
+`link:` key could exceed `model.MaxNativeKeyBytes` is also walked, to count `unkeyed_ambiguous_sites`, and publishes
+nothing. So an edit inside a function body resolves nothing and republishes the edited file's facts and those of
+the files that call into it.
 
 A predecessor that stored no state, or a state the build cannot read (`link.ValidateState`), resolves in full,
 with `Result.FullReason` `no_previous_state` or `unreadable_previous_state`. Any other build resolves in full,
@@ -271,7 +277,7 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 The `calls` row is published at the unit's scope:
 - `fresh` when every member had a table, no table dropped an entry, and every bound site was published;
-- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:243-260`), when
+- `partial`, with `coverage_incomplete` (`publisher.capability`, `internal/provider/link/provider.go:250-267`), when
   a member has no table (`members_without_table`), a table's `Dropped` is non-zero (`dropped_table_entries`,
   `table.go:49-53`; a callable whose analysis failed in the worker counts there, since its values and its sites'
   recovered types are missing), or an ambiguous site's `link:` key would exceed `model.MaxNativeKeyBytes` and so has no callee

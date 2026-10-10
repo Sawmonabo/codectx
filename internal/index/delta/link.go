@@ -26,10 +26,12 @@ import (
 // the digests decide is what the rebuild costs. When the unit has its
 // predecessor's members, each with its predecessor's digest, it hands Link the
 // predecessor's resolution and the stream of members whose content changed:
-// Link resolves nothing and republishes only those members' facts, and the
-// rest of the predecessor is carried over with those members named replaced.
-// That is the path an edit inside a function body takes: it republishes the
-// edited file's facts and reads only the tables that republication needs.
+// Link resolves nothing and republishes only the facts of those members and
+// of the members whose sites bind their declarations (an edit that moves a
+// declaration's range moves its identity), and the rest of the predecessor is
+// carried over with the members Link republished named replaced. That is the
+// path an edit inside a function body takes: it republishes the edited file's
+// facts and its callers', and reads only the tables that republication needs.
 // Any other build resolves in full, publishes every fact and carries nothing.
 type linkApplier struct {
 	store   *sqlite.Store
@@ -74,6 +76,10 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 		b.res.Full, b.res.FullReason = true, FullNoPredecessor
 	}
 	statePath := filepath.Join(dir, "resolution")
+	// replacedPath holds, one per line in ascending order, the FileIDs whose
+	// facts the inheriting path republished (LinkOptions.Replaced), which the
+	// carry-over names replaced.
+	replacedPath := filepath.Join(dir, "replaced")
 	// edited streams the files the predecessor declared that this unit does
 	// not declare with the same bytes, in ascending FileID order, from the
 	// merge join of the two units' stored inputs, walked afresh each time so
@@ -113,6 +119,20 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 			}
 		}
 		b.res.Filtered = opts.Previous != nil
+		var replacedOut *os.File
+		var replacedW *bufio.Writer
+		if b.res.Filtered {
+			f, err := os.OpenFile(replacedPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if err != nil {
+				return model.ProviderResult{}, internal("link replaced files: " + err.Error())
+			}
+			replacedOut = f
+			replacedW = bufio.NewWriter(paced.NewWriter(replacedOut))
+			opts.Replaced = func(id model.FileID) error {
+				_, err := replacedW.WriteString(string(id) + "\n")
+				return err
+			}
+		}
 		// The state file is new in this build's fresh directory, so the open
 		// creates it and has nothing to free.
 		out, err := os.OpenFile(statePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -128,23 +148,27 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 		if closeErr := out.Close(); err == nil && closeErr != nil {
 			err = internal("link resolution state: " + closeErr.Error())
 		}
+		if replacedOut != nil {
+			if flushErr := replacedW.Flush(); err == nil && flushErr != nil {
+				err = internal("link replaced files: " + flushErr.Error())
+			}
+			if closeErr := replacedOut.Close(); err == nil && closeErr != nil {
+				err = internal("link replaced files: " + closeErr.Error())
+			}
+		}
 		return res, err
 	}
 
 	b.complete = func(ctx context.Context, w *sqlite.UnitWriter) error {
 		b.res.Delta = j.stats
 		if b.res.Filtered {
-			// The edited members' facts were republished; everything else of
-			// the predecessor is carried. Nothing is index-level: every fact
-			// the linker publishes is located in a member.
+			// The republished members' facts were published again;
+			// everything else of the predecessor is carried. Nothing is
+			// index-level: every fact the linker publishes is located in a
+			// member.
 			var filesErr error
 			replaced := sqlite.Replaced{Files: func(yield func(model.FileID) bool) {
-				filesErr = edited(func(f model.FileID) error {
-					if !yield(f) {
-						return errStopInputs
-					}
-					return nil
-				})
+				filesErr = replacedFiles(replacedPath, yield)
 			}}
 			carried, err := w.CarryOver(ctx, req.Previous, replaced)
 			if filesErr != nil {
@@ -294,4 +318,24 @@ func (j *digestJoin) finish() error {
 // predecessor's digest.
 func (j *digestJoin) same() bool {
 	return j.complete && j.stats.Changed == 0 && j.stats.Removed == 0
+}
+
+// replacedFiles yields the FileIDs the file at path lists, one per line, until
+// yield stops.
+func replacedFiles(path string, yield func(model.FileID) bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return internal("link replaced files: " + err.Error())
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if !yield(model.FileID(sc.Text())) {
+			return nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return internal("link replaced files: " + err.Error())
+	}
+	return nil
 }

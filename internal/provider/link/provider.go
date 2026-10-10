@@ -90,10 +90,17 @@ type LinkOptions struct {
 	// Edited, with Previous, streams the FileIDs of the members whose content
 	// changed since the predecessor, in ascending order; it may name files
 	// that are not members and must yield the same IDs on every walk. Link
-	// then publishes only the facts whose evidence lies in an edited member
-	// and takes the coverage from Previous: the build carries the
-	// predecessor's other facts over. Nil publishes every fact.
+	// then publishes only the facts whose evidence lies in a republished
+	// member, an edited one or one with a site bound to a declaration of an
+	// edited one, whose identity moves with that file's bytes, and takes the
+	// coverage from Previous: the build carries the predecessor's other
+	// facts over. Nil publishes every fact.
 	Edited func(yield func(model.FileID) error) error
+	// Replaced, with Edited, receives once the facts are published every
+	// file whose facts Link republished, and every file Edited names, in
+	// ascending order: the files the build names replaced when it carries
+	// the predecessor's facts over. Nil reports none.
+	Replaced func(model.FileID) error
 	// Members, when set, streams the unit's inputs as file versions in
 	// ascending FileID order, the members among them and possibly other
 	// inputs (a manifest); Link keeps the unit's members of them and does
@@ -138,8 +145,8 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 
 // Link links one unit: it streams the members' tables, resolves every site
 // (or inherits opts.Previous), publishes `calls` (every fact, or with
-// opts.Edited only the edited members') and writes the resolution state to
-// opts.State.
+// opts.Edited only the republished members', named to opts.Replaced) and
+// writes the resolution state to opts.State.
 func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts LinkOptions) (model.ProviderResult, error) {
 	failed := model.ProviderResult{RunID: req.Run, State: model.RunFailed}
 	if opts.Edited != nil && opts.Previous == nil {
@@ -220,7 +227,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	defer bindings.Close()
 
-	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: count, edited: opts.Edited}
+	pub := &publisher{ctx: ctx, req: req, sink: sink, u: u, members: count, edited: opts.Edited, replaced: opts.Replaced}
 	if opts.Edited != nil {
 		pub.cov = inherited
 	}
