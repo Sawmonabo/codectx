@@ -45,7 +45,7 @@ def run(c: C):
 			"r2 m -> am m",
 			"r2 m -> em m",
 		},
-		fails: "every base walked at the first level that has the method binds B.m beside A.m",
+		fails: "every base walked at the first level that has the method binds B.m beside A.m; a construction's result dispatched into subclasses binds E.m from `C().m()`",
 	},
 	{
 		name:   "super-and-class-objects",
@@ -298,6 +298,6 @@ def run():
 			"r1 Y -> yc Y",
 			"cp ping -> yp ping",
 		},
-		fails: "arguments sent to every same-named method rather than the one the method resolution order reaches bind A.m's `y.ping()`",
+		fails: "arguments sent to every same-named method rather than the one the method resolution order reaches bind A.m's `y.ping()`, and so does a class-body def sent as a field value of its name, which field-based resolution reads for the untyped `y`",
 	},
 }
