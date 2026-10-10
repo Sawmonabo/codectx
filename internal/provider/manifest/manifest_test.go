@@ -768,8 +768,8 @@ func sortedMapKeys(m map[string]string) []string {
 // requirements file with markers, extras, comments, a continuation, a
 // per-requirement hash, a constraints file and an `-r` include that includes
 // the file back must publish exactly its packages and end. Mutation caught:
-// following includes without the visited guard never returns from the unit,
-// and dropping the comment rule publishes the comment text as a requirement.
+// following includes without the visited guard never returns from the unit
+// (the walk grows until the test's time or memory runs out), and dropping the comment rule publishes the comment text as a requirement.
 func TestRequirementsIncludeCycleYieldsExactlyItsPackages(t *testing.T) {
 	files := map[string]string{
 		"requirements.txt": "# pinned for production\n" +
@@ -793,13 +793,13 @@ func TestRequirementsIncludeCycleYieldsExactlyItsPackages(t *testing.T) {
 	got := relationLines(t, cap, model.NodeConfiguration)
 	want := []string{
 		"configures dependency pypi:urllib3 constraint=true kind=runtime requirement=<2 via=constraints.txt",
+		"configures file constraints.txt include=constraint ranged",
+		"configures file dev/requirements-dev.txt include=requirement ranged",
+		"configures file requirements.txt include=requirement via=dev/requirements-dev.txt",
 		"depends_on dependency pypi:django kind=runtime options=--hash=sha256:abc requirement===4.2 ranged",
 		"depends_on dependency pypi:pytest kind=runtime requirement=>=7 via=dev/requirements-dev.txt",
 		`depends_on dependency pypi:requests kind=runtime requirement=[security]>=2.31 ; python_version >= "3.8" ranged`,
 		`depends_on dependency pypi:typing-extensions kind=runtime requirement=; python_version < "3.11" via=dev/requirements-dev.txt`,
-		"references file constraints.txt include=constraint ranged",
-		"references file dev/requirements-dev.txt include=requirement ranged",
-		"references file requirements.txt include=requirement via=dev/requirements-dev.txt",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("requirements facts differ:\n--- got\n%s\n--- want\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))

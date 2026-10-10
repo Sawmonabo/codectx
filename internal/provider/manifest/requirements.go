@@ -39,7 +39,7 @@ import (
 // `--find-links`, ...), a requirement that is a bare URL, path or archive,
 // and an include that is a URL, absolute, outside the workspace, empty, or
 // names an environment variable. An include the snapshot does not hold is
-// still a `references` fact and leaves the capability partial. A requirement
+// still a `configures` fact and leaves the capability partial. A requirement
 // that names an environment variable (`${TOKEN}`) after its name is published
 // with `unresolved: environment`.
 func (u *unit) requirements(ctx context.Context) error {
@@ -47,6 +47,9 @@ func (u *unit) requirements(ctx context.Context) error {
 	w := &reqWalk{u: u, root: rel, visited: map[reqVisit]bool{{rel, false}: true}}
 	queue := []reqVisit{{rel, false}}
 	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		next := queue[0]
 		queue = queue[1:]
 		data := u.data
@@ -83,7 +86,7 @@ func (u *unit) requirements(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := u.e.Relation(cfg.ID, model.RelReferences, target.ID, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: inc.rng,
+		if err := u.e.Relation(cfg.ID, model.RelConfigures, target.ID, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: inc.rng,
 			Detail: filesystem.Detail("include", inc.mode, "via", inc.via)}); err != nil {
 			return err
 		}
