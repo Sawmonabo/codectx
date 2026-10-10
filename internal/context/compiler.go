@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -306,22 +307,44 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// that boundary's carry and answers a continuation cursor instead of a
 	// plan. A deadline is therefore never a lost compile, whichever pass it
 	// lands behind.
+	//
+	// The passes run in rounds (ADR-0016 decisions 4 and 5): after each
+	// round's P-H, nextRound decides from that pack whether the plan is done or
+	// another round runs with new inputs, and P-I runs once, on the final
+	// round. A resumed call re-enters the recorded round at the recorded pass
+	// and continues the loop from there. A round rebuilds the pipeline from
+	// P-A with fresh sorts in the same sort area, and the area's deferred
+	// release removes every round's runs: a compile's temporary disk is the
+	// sum of its rounds' runs, each round's no larger than a one-round compile
+	// of the same inputs. No halt lands between two rounds -- a round that has
+	// not started has no carry to checkpoint -- so the next round's P-A is the
+	// first place the stop is asked again.
 	st := &compileState{pass: passIngest}
 	if resumed != nil {
 		if err := c.restoreAt(sorts, resumed, st); err != nil {
 			return CompileResult{}, err
 		}
 	}
-	if err := c.runPasses(ctx, reader, gen, req, sorts, resolved, st,
-		func(int) bool { return paging && c.deadlineReached(ctx) }); err != nil {
-		return CompileResult{}, err
-	}
-	if st.halted {
-		token, cerr := c.checkpointAt(ctx, binding, requestHash, st)
-		if cerr != nil {
-			return CompileResult{}, cerr
+	for {
+		if err := c.runPasses(ctx, reader, gen, req, sorts, resolved, st,
+			func(int) bool { return paging && c.deadlineReached(ctx) }); err != nil {
+			return CompileResult{}, err
 		}
-		return CompileResult{Truncated: true, TruncationReason: truncationDeadline, NextCursor: token}, nil
+		if st.halted {
+			token, cerr := c.checkpointAt(ctx, binding, requestHash, st)
+			if cerr != nil {
+				return CompileResult{}, cerr
+			}
+			return CompileResult{Truncated: true, TruncationReason: truncationDeadline, NextCursor: token}, nil
+		}
+		next, done, err := nextRound(ctx, st)
+		if err != nil {
+			return CompileResult{}, err
+		}
+		if done {
+			break
+		}
+		st.beginRound(next)
 	}
 	scoped, scopeComplete := st.scope, st.scopeComplete
 
@@ -424,8 +447,8 @@ type compileState struct {
 	// ingest is P-A's live sink, and is set ONLY while the walk is halted
 	// mid-pass: a deadline that fires between two of graph.Impact's pages ends
 	// P-A here, and this is the carry the passIngest boundary checkpoints (its
-	// four pre-fold sorts, the walk's cursor, the root list and the arrival
-	// counter). Every other boundary leaves it nil, because the pass that
+	// pre-fold sorts, the closure's reached set among them, the walk's cursor,
+	// the walk groups and the arrival counter). Every other boundary leaves it nil, because the pass that
 	// produced it has finished.
 	ingest *seedIngest
 
@@ -444,6 +467,81 @@ type compileState struct {
 	// scalars.
 	round  int
 	inputs roundInputs
+	// history is every earlier round's inputs, in round order: a next round
+	// whose inputs repeat any of them would loop, so nextRound refuses it.
+	// Each entry is bounded by the resolved budget and there is one per round.
+	history []roundInputs
+}
+
+// nextRound decides, after a round's P-H, whether the plan is done or which
+// inputs the next round runs with (ADR-0016 decisions 4 and 5):
+//
+//   - a read that met every match is done;
+//   - a round with no kept files whose pack kept some runs a closure round
+//     over them, with the same witness count;
+//   - otherwise the pack's certificate is checked. Failing, the next round
+//     needs one more witness per witness file the pack dropped as oversized,
+//     and closes this pack's kept files; failing with none dropped is an
+//     internal error, never another round. Holding over the same kept files
+//     the round closed is done; holding over different ones closes those.
+//
+// A pack that kept nothing in a round with no kept files has nothing to close,
+// so it goes to the certificate directly.
+//
+// Two outcomes leave the stop unconfirmed, and both end the rounds with this
+// round's plan and its scope marked incomplete (ADR-0016 decision 6), the
+// reason recorded on the stop for the manifest notice: a certificate that fails
+// with no witness file dropped as oversized, which a deeper read cannot repair,
+// and a next round whose inputs repeat this round's or an earlier one's, which
+// would loop. P-I follows this decision in the same call with no boundary
+// between them, so the reason needs no checkpoint of its own.
+func nextRound(ctx context.Context, st *compileState) (roundInputs, bool, error) {
+	stop := st.scope.Stop
+	if !stop.Stopped {
+		return roundInputs{}, true, nil
+	}
+	out, err := readPackOutcome(ctx, st.measured, st.packed, stop.Witnesses)
+	if err != nil {
+		return roundInputs{}, false, contextErr(ctx, err)
+	}
+	next := roundInputs{Extra: st.inputs.Extra, Kept: out.Kept}
+	switch {
+	case len(st.inputs.Kept) == 0 && len(out.Kept) > 0:
+		// The closure round: next already closes this pack's kept files.
+	case !out.certified(stop.Tau):
+		if out.OversizedWitnesses == 0 {
+			st.unconfirmed("the packed files are not bound by the file budget above the stop and no witness file was dropped as oversized, so reading further cannot confirm it")
+			return roundInputs{}, true, nil
+		}
+		next.Extra += out.OversizedWitnesses
+	case slices.Equal(out.Kept, st.inputs.Kept):
+		return roundInputs{}, true, nil
+	}
+	same := func(r roundInputs) bool { return r.Extra == next.Extra && slices.Equal(r.Kept, next.Kept) }
+	if same(st.inputs) || slices.ContainsFunc(st.history, same) {
+		st.unconfirmed(fmt.Sprintf("closing the packed files changed which files are packed, and the next round would repeat an earlier one (%d extra witness file(s), %d kept file(s))",
+			next.Extra, len(next.Kept)))
+		return roundInputs{}, true, nil
+	}
+	return next, false, nil
+}
+
+// unconfirmed ends the rounds on a stop the pack could not confirm: the scope
+// is incomplete, and the stop carries why for the manifest notice.
+func (st *compileState) unconfirmed(why string) {
+	st.scope.Stop.Unconfirmed = why
+	st.scopeComplete = false
+}
+
+// beginRound starts the next round at P-A. Every pass clears the carry slots
+// it was the last reader of, so the slots P-I would have read are the only
+// ones left to clear; P-A rebuilds the scope verdict.
+func (st *compileState) beginRound(next roundInputs) {
+	st.history = append(st.history, st.inputs)
+	st.round++
+	st.inputs = next
+	st.pass = passIngest
+	st.measured, st.packed = nil, nil
 }
 
 // roundInputs is what one round of the compile takes from the round before it.
@@ -481,6 +579,10 @@ type seedStop struct {
 	// Witnesses are the distinct witness files the stop counted, in the order
 	// the read met them: files whose encoded source fits one slice.
 	Witnesses []model.FileID `json:"witnesses,omitempty"`
+	// Unconfirmed is why the packed plan could not confirm the stop
+	// (nextRound), empty when it did or when the read met every match. A plan
+	// that carries it has an incomplete scope.
+	Unconfirmed string `json:"unconfirmed,omitempty"`
 }
 
 // compileStage is one pass of the pipeline: the index a checkpoint behind it
@@ -610,6 +712,16 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 			ingest.scope.ScopeComplete = false
 		}
 		ingest.scope.Stop = seeds.Stop
+		if ingest.closure = keptClosureOf(st.inputs, seeds.Stop); ingest.closure != nil {
+			if ingest.closure.reached, err = newIDSort(sorts, "closure-reached"); err != nil {
+				return err
+			}
+		}
+	}
+	// The closure's reader and query are this call's, on every leg: a
+	// continuation carries neither.
+	if cl := ingest.closure; cl != nil {
+		cl.reader, cl.query = reader, clipUTF8(boundTask(req.Task), model.MaxQueryTextBytes)
 	}
 	// Re-read on every leg of the walk, resumed or not: dropping caps on the
 	// continuation would move Completeness, and with it ScopeComplete and the
@@ -630,7 +742,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 	}
 	if halted {
 		// The walk stopped between two pages. The sink itself is the carry --
-		// its four pre-fold sorts, its arrival counter, its root list and the
+		// its pre-fold sorts, its arrival counter, its walk groups and the
 		// walk's cursor -- and the scalars are copied out here because
 		// checkpointAt reads them from st: the tail below never ran, so
 		// nothing else would have set them.
@@ -919,6 +1031,9 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []strin
 			"so no unread match can rank above the packed files. Every match and walk entry inside the packed files is included. "+
 			"Explanations list routes from the %d matches read.",
 			st.NextScore, st.Read, st.FileBudget, st.Read)
+		if st.Unconfirmed != "" {
+			add("The read's stop could not be confirmed after packing: %s; the scope is marked incomplete.", st.Unconfirmed)
+		}
 	}
 	if n := scoped.Candidates; n > 0 {
 		add("%d name-only call candidate(s) of open call sites were admitted as possible context after every precise entry; none is required scope",

@@ -119,9 +119,13 @@ type checkpointScalars struct {
 	Candidates            int64    `json:"candidates,omitempty"`
 	CandidatesUnavailable string   `json:"candidates_unavailable,omitempty"`
 	// Round and Inputs are the compile's round and that round's inputs, both
-	// bounded by the resolved budget.
-	Round  int         `json:"round,omitempty"`
-	Inputs roundInputs `json:"inputs,omitempty"`
+	// bounded by the resolved budget, and History every earlier round's
+	// inputs, one entry per round. A boundary behind P-H needs nothing more:
+	// the round decision reads the verdict and group streams that boundary
+	// already carries (readPackOutcome).
+	Round   int           `json:"round,omitempty"`
+	Inputs  roundInputs   `json:"inputs,omitempty"`
+	History []roundInputs `json:"history,omitempty"`
 }
 
 // checkpointFile is state.json's name inside the state directory. It does not
@@ -361,6 +365,10 @@ const (
 	streamSeedCand   = "seed-cand"
 	streamSeedPath   = "seed-path"
 	streamSeedHop    = "seed-hop"
+	// streamSeedReached is the closure's reached set: the kept-file nodes the
+	// round's walks reached so far, PRE-fold. A round that runs no closure has
+	// none and checkpoints it as no files.
+	streamSeedReached = "seed-reached"
 
 	streamCands     = "cands"
 	streamHydrated  = "hydrated"
@@ -395,11 +403,12 @@ const (
 func passStreams(pass int) []string {
 	switch pass {
 	case passIngest:
-		// P-A halted INSIDE itself, between two pages of the graph walk: the
-		// carry is the sink's four PRE-fold sorts, none of them folded and none
-		// of them merged. seedSort is deliberately absent -- foldSeeds consumed
-		// it and nothing after it reads it, or `stages`, or `resolved`.
-		return []string{streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop}
+		// P-A halted INSIDE itself, between two pages of the graph walk or
+		// before its closure walk: the carry is the sink's PRE-fold sorts, none
+		// of them folded and none of them merged. seedSort is deliberately
+		// absent -- foldSeeds consumed it and nothing after it reads it, or
+		// `stages`, or `resolved`.
+		return []string{streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReached}
 	case passHydrate:
 		return []string{streamCands, streamRoutes, streamHops}
 	case passAttributes:
@@ -452,7 +461,7 @@ func cpSort[T any](dir, name string, sorter *pagination.ExternalSort[T]) ([]chec
 	return checkpointSort(dir, name, sorter)
 }
 
-// checkpointIngest persists one of P-A's four pre-fold sorts. They live on the
+// checkpointIngest persists one of P-A's pre-fold sorts. They live on the
 // halted seed sink rather than on st, because they are one pass's working set
 // and not a finished stream any later pass reads.
 func (st *compileState) checkpointIngest(dir, name string) ([]checkpointRun, error) {
@@ -466,6 +475,13 @@ func (st *compileState) checkpointIngest(dir, name string) ([]checkpointRun, err
 		return cpSort(dir, name, st.ingest.candSort)
 	case streamSeedPath:
 		return cpSort(dir, name, st.ingest.pathSort)
+	case streamSeedReached:
+		if st.ingest.closure == nil {
+			// The round runs no closure, so it has no reached set; the restore
+			// of the same round builds none and reads no files.
+			return nil, nil
+		}
+		return cpSort(dir, name, st.ingest.closure.reached)
 	default:
 		return cpSort(dir, name, st.ingest.hopSort)
 	}
@@ -478,7 +494,7 @@ func (st *compileState) checkpointIngest(dir, name string) ([]checkpointRun, err
 // checkpointSort.
 func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]checkpointRun, error) {
 	switch name {
-	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop:
+	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReached:
 		return st.checkpointIngest(dir, name)
 	case streamCands:
 		return cpRun(dir, name, runBytes, st.cands, lessCandSeq, sizeOfCand)
@@ -554,17 +570,18 @@ func (st *compileState) measuredRun(name string) *pagination.SortedRun[candRec] 
 func (st *compileState) restoreStream(s *compileSorts, dir, name string, files []checkpointRun) error {
 	var err error
 	switch name {
-	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop:
+	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReached:
 		if st.ingest == nil {
 			return missingStream(name)
 		}
 	}
 	switch name {
 	case streamSeedEntity:
-		// The seed/entity union fold, restored PRE-fold with the exact fold it
-		// was built with: without foldMinSeq a boundary the walk reaches twice
-		// stops collapsing onto its earliest arrival, and the continuation
-		// serves duplicates the uninterrupted walk never had.
+		// The seed survivors and the name-only candidates the walk pages
+		// pushed, restored PRE-fold with the exact fold they were built with:
+		// without foldMinSeq a candidate two open sites name, or one a seed
+		// already holds, stops collapsing onto its earliest arrival, and the
+		// continuation serves records the uninterrupted compile folded away.
 		var sorter *pagination.ExternalSort[candRec]
 		sorter, err = restoreSort(s, dir, name, files, lessEntityID, sizeOfCand)
 		if err == nil {
@@ -576,6 +593,21 @@ func (st *compileState) restoreStream(s *compileSorts, dir, name string, files [
 		st.ingest.pathSort, err = restoreSort(s, dir, name, files, lessPathSeq, sizeOfPath)
 	case streamSeedHop:
 		st.ingest.hopSort, err = restoreSort(s, dir, name, files, lessHopSeq, sizeOfHop)
+	case streamSeedReached:
+		cl := st.ingest.closure
+		if cl == nil {
+			// The checkpoint's own round inputs and stop say this round runs
+			// no closure, so a reached set here belongs to some other state.
+			if len(files) > 0 {
+				return cursorExpired("the continuation state carries a closure this round does not run")
+			}
+			return nil
+		}
+		var sorter *pagination.ExternalSort[idRec]
+		sorter, err = restoreSort(s, dir, name, files, lessID, sizeOfID)
+		if err == nil {
+			cl.reached = sorter.WithFold(foldSameID)
+		}
 	case streamCands:
 		st.cands, err = restoreRun(s, dir, name, files, lessCandSeq, sizeOfCand)
 	case streamHydrated:
@@ -722,6 +754,7 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 		CandidatesUnavailable: st.scope.CandidatesUnavailable,
 		Round:                 st.round,
 		Inputs:                st.inputs,
+		History:               st.history,
 	}
 	if st.ingest != nil {
 		scalars.WalkCursor = st.ingest.cursor
@@ -762,7 +795,7 @@ func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) 
 		return cursorExpired("the continuation state was written at a boundary this build does not resume")
 	}
 	if r.State.Pass == passIngest {
-		// The sink the four pre-fold sorts restore INTO. It is opened before
+		// The sink the pre-fold sorts restore INTO. It is opened before
 		// the loop, empty of sorts, because restoreStream fills them one name
 		// at a time; seedSort, stages and resolved stay zero, which is exactly
 		// what the resumed walk reads of them.
@@ -780,7 +813,7 @@ func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) 
 	st.pass = r.State.Pass
 	st.scope = scalarScope(r.State.Scalars)
 	st.scopeComplete = r.State.Scalars.ScopeComplete
-	st.round, st.inputs = r.State.Scalars.Round, r.State.Scalars.Inputs
+	st.round, st.inputs, st.history = r.State.Scalars.Round, r.State.Scalars.Inputs, r.State.Scalars.History
 	return nil
 }
 
@@ -804,6 +837,9 @@ func (c *Compiler) resumedIngest(s *compileSorts, sc checkpointScalars) *seedIng
 		stalls:  sc.Stalls,
 		started: true,
 		scope:   scalarScope(sc),
+		// The same rule that built the closure on the interrupted leg, over
+		// the same scalars; its reached set is restored as a stream.
+		closure: keptClosureOf(sc.Inputs, sc.Stop),
 	}
 }
 

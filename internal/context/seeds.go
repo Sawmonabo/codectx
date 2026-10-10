@@ -162,7 +162,9 @@ func seedsFull(limit config.Limit, n int) bool {
 // order and stops at the first unread match below which nothing can rank
 // above the files the plan packs (ADR-0016 decision 3): the stop is decided by
 // the matches' scores and the resolved budget, never by where a page boundary
-// falls, and the manifest names the score it stopped at. Neither step is
+// falls, and the manifest names the score it stopped at. A round that closes
+// the previous round's kept files then reads every match inside them
+// (keptFileSeeds), at most the plan's file budget of files. Neither step is
 // bounded by the count of candidates an unrelated step resolved. The only
 // count bound over them is context.max_seeds: unlimited by default, and
 // disclosed as a cut when an operator sets one and it stops a step.
@@ -220,6 +222,12 @@ func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader
 	}
 
 	if err := c.freeTermSeeds(ctx, reader, gen, task, tokens, b, round, &out); err != nil {
+		return seedSet{}, err
+	}
+	// The kept-file read follows the main read it is relative to: it needs
+	// that read's stop, and its matches must arrive after the main read's so a
+	// duplicate folds onto the earlier seed (ADR-0016 decision 5).
+	if err := c.keptFileSeeds(ctx, reader, gen, task, round, &out); err != nil {
 		return seedSet{}, err
 	}
 	if err := c.changedFileSeeds(ctx, reader, &out); err != nil {

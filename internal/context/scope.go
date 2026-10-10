@@ -342,6 +342,11 @@ type seedIngest struct {
 	// request arrived with, so a bound kept only in a local would restart at
 	// zero on every continuation and never fire.
 	stalls int
+	// closure is the round's kept-file closure (closure.go), nil in a round
+	// that runs none. The walk loop marks the kept-file nodes it reaches on
+	// it, and the closure walk runs from the ones it did not reach after the
+	// last group.
+	closure *keptClosure
 }
 
 // newSeedIngest opens the sort area's seed-side sorts and returns the sink the
@@ -516,7 +521,7 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 		if err := in.entitySort.Add(r); err != nil {
 			return err
 		}
-		if r.NodeID == "" {
+		if r.NodeID == "" || keptFileSeed(r, in.scope.Stop) {
 			return nil
 		}
 		if !width.Exceeded(int64(len(start)) + 1) {
@@ -776,7 +781,13 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 	cfg := in.cfg
 	s := in.sorts
 	out := &ingested{}
+	// finish runs the kept-file closure first (ADR-0016 decision 5): after the
+	// round's last walk group, on every path that ends the pass, so its
+	// entries and its disclosures are on the spool and the verdict below.
 	finish := func() (*ingested, bool, error) {
+		if err := c.closeKeptFiles(ctx, in, eng, gen); err != nil {
+			return nil, false, err
+		}
 		out.Scope = in.scope
 		done, err := finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort)
 		return done, false, err
@@ -887,9 +898,12 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 				next = cursor
 			}
 			// more is whether THIS walk has a page left; a halt may also land
-			// after a walk's last page when a later group is still unwalked.
+			// after a walk's last page when a later group is still unwalked,
+			// or when the round's closure walk is still to run -- the one
+			// place the closure can halt, since it does not halt inside
+			// itself (closeKeptFiles).
 			more := next != "" || stalled
-			halt := stop != nil && stop() && (more || in.walkAt+1 < len(in.walks))
+			halt := stop != nil && stop() && (more || in.walkAt+1 < len(in.walks) || in.closure != nil)
 			// A page whose truncation is the DEADLINE'S OWN does not narrow the
 			// scope when this call halts on it with the walk to continue: the
 			// continuation is what answers that truncation, and narrowing would
@@ -924,6 +938,9 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
 			for j := range impact.Entries {
 				if err := in.admitEntry(impact.Entries[j], group); err != nil {
+					return nil, false, err
+				}
+				if err := in.markReached(impact.Entries[j]); err != nil {
 					return nil, false, err
 				}
 			}
