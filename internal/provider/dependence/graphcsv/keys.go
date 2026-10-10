@@ -263,8 +263,9 @@ func (l *keyLines) close() {
 
 // saveKeys writes the import's key set: the magic line and every distinct
 // fact key in ascending order, streamed from one pass of the engine's sort
-// over the identity and occurrence tables, so the set is never materialized
-// in the heap or in a table of its own.
+// over the identity table, so the set is never materialized in the heap or in
+// a table of its own. Only node facts are keyed; the import stages no
+// relation.
 func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 	if err := s.commit(ctx); err != nil {
 		return KeySet{}, err
@@ -283,9 +284,7 @@ func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 	if _, err := w.WriteString(keySetMagic + "\n"); err != nil {
 		return KeySet{}, internalErr("import keys: %v", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT key FROM ident WHERE key <> ''
-		UNION SELECT key FROM occ WHERE key <> ''
-		UNION SELECT key FROM occ_sorted WHERE key <> '' ORDER BY 1`)
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT key FROM ident WHERE key <> '' ORDER BY 1`)
 	if err != nil {
 		return KeySet{}, internalErr("import keys: %v", err)
 	}
@@ -310,28 +309,11 @@ func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 	return KeySet{path: path, count: n}, nil
 }
 
-// markDelta records every fresh key the previous run did not publish. A delta
-// import emits only the relations one of whose keys is recorded; the removed
-// count is what storage must delete. Diff visits the keys in ascending
-// order, so the table is appended to.
-func (s *scratch) markDelta(ctx context.Context, fresh, prev KeySet) (Delta, error) {
+// measureDelta is the fresh key set against the previous run's: the counts
+// the report carries out, removed being what storage must delete.
+func measureDelta(fresh, prev KeySet) (Delta, error) {
 	if prev.Empty() {
 		return Delta{Changed: fresh.Count()}, nil
 	}
-	if err := s.run(ctx, "delta", `CREATE TABLE changed(key TEXT PRIMARY KEY) WITHOUT ROWID`); err != nil {
-		return Delta{}, err
-	}
-	delta, err := fresh.Diff(prev, func(key string, removed bool) error {
-		if removed {
-			return nil
-		}
-		return s.exec(ctx, `INSERT OR IGNORE INTO changed(key) VALUES(?)`, key)
-	})
-	if err != nil {
-		return Delta{}, err
-	}
-	if err := s.commit(ctx); err != nil {
-		return Delta{}, err
-	}
-	return delta, nil
+	return fresh.Diff(prev, nil)
 }

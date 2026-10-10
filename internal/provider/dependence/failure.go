@@ -8,14 +8,11 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// CapabilityCalls is the one capability this provider publishes, in the
-// product's relation vocabulary (Section 9.2), never the engine's edge name.
-// Control dependence, data flow, reads and writes are the structural
+// Capabilities is the descriptor's capability list: empty, because this
+// provider publishes no relation. `calls` is the linking provider's, and
+// control dependence, data flow, reads and writes are the structural
 // provider's, published per file.
-const CapabilityCalls = "calls"
-
-// Capabilities is the descriptor's capability list in its published order.
-var Capabilities = []string{CapabilityCalls}
+var Capabilities = []string{}
 
 // CapabilityUnsupportedLabels is the pseudo-capability under which a unit
 // reports export rows the importer recognised as real but did not map. It is

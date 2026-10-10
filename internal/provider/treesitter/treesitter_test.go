@@ -17,6 +17,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
 )
@@ -138,10 +139,10 @@ func TestLanguageFixtures(t *testing.T) {
 				t.Fatalf("fixture %s carries no non-ASCII range", fx.file)
 			}
 			files := map[string]string{fx.file: string(src)}
-			providertest.Conform(t, p, files, treesitter.ScopePrefix+fx.file, []string{fx.file})
+			providertest.Conform(t, p, files, lang.ScopePrefix+fx.file, []string{fx.file})
 
 			h := providertest.New(t, files)
-			u := h.Plan(t, p, treesitter.ScopePrefix+fx.file, []string{fx.file})
+			u := h.Plan(t, p, lang.ScopePrefix+fx.file, []string{fx.file})
 			cap := &capture{UnitOutput: h.Begin(t, u, []string{fx.file})}
 			result, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool)
 			if err != nil {
@@ -253,7 +254,7 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 	t.Helper()
 	files := map[string]string{file: src}
 	h := providertest.New(t, files)
-	u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+	u := h.Plan(t, p, lang.ScopePrefix+file, []string{file})
 	cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
 	result, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool)
 	if err != nil {
@@ -272,7 +273,7 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 			vars[n.Node.Name], precision[n.Node.Name] = n.Node.ID, n.Evidence[0].Precision
 			key := "decl:" + n.Node.Name + "@" + file + ":"
 			if !slices.ContainsFunc(cap.aliases, func(a model.NativeAlias) bool {
-				return a.NodeID == n.Node.ID && a.ScopeKey == treesitter.ScopePrefix+file && strings.HasPrefix(a.NativeKey, key)
+				return a.NodeID == n.Node.ID && a.ScopeKey == lang.ScopePrefix+file && strings.HasPrefix(a.NativeKey, key)
 			}) {
 				t.Fatalf("%s: variable %s carries no declaration-key alias %s...", file, n.Node.Name, key)
 			}
@@ -337,7 +338,7 @@ func TestAnEmptyFileIndexes(t *testing.T) {
 	for _, file := range []string{"__init__.py", "empty.js", "empty.ts", "empty.tsx"} {
 		t.Run(file, func(t *testing.T) {
 			h := providertest.New(t, map[string]string{file: ""})
-			u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+			u := h.Plan(t, p, lang.ScopePrefix+file, []string{file})
 			result, err := provider.RunUnit(context.Background(), p, u.Request, h.Begin(t, u, []string{file}), providertest.Limits, h.Pool)
 			if err != nil {
 				t.Fatalf("RunUnit(%s): %v", file, err)
@@ -356,6 +357,18 @@ type capture struct {
 	aliases  []model.NativeAlias
 	evidence []model.Evidence
 	search   []model.SearchUnit
+}
+
+// PutState forwards the file's stored link table to the unit output. The
+// capture embeds provider.UnitOutput, which does not carry PutState, so
+// without it the batch sink finds no state destination and the provider's
+// refusal to seal a unit without its link table fails every run here.
+func (c *capture) PutState(ctx context.Context, kind string, payload []byte) error {
+	s, ok := c.UnitOutput.(provider.StateSink)
+	if !ok {
+		return &model.Error{Code: model.CodeInternal, Message: "the captured unit output does not store provider state"}
+	}
+	return s.PutState(ctx, kind, payload)
 }
 
 func (c *capture) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
@@ -395,7 +408,7 @@ func TestOneIdentityOneNodeAndBlankNamesDeclareNothing(t *testing.T) {
 		t.Helper()
 		files := map[string]string{file: src}
 		h := providertest.New(t, files)
-		u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+		u := h.Plan(t, p, lang.ScopePrefix+file, []string{file})
 		cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
 		result, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool)
 		if err != nil {
@@ -520,7 +533,7 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 		if !strings.HasPrefix(a.NativeKey, "callsite:") {
 			continue
 		}
-		if a.ScopeKey != treesitter.ScopePrefix+file || !strings.HasPrefix(a.NativeKey, prefix) {
+		if a.ScopeKey != lang.ScopePrefix+file || !strings.HasPrefix(a.NativeKey, prefix) {
 			t.Fatalf("call-site alias %q is published in scope %q, not the file's own", a.NativeKey, a.ScopeKey)
 		}
 		if seen[a.NativeKey] {
@@ -547,7 +560,7 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 	// Determinism: a second independent unit over the same bytes must publish
 	// the identical keys naming the identical identities.
 	h := providertest.New(t, files)
-	u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+	u := h.Plan(t, p, lang.ScopePrefix+file, []string{file})
 	again := &capture{UnitOutput: h.Begin(t, u, []string{file})}
 	if _, err := provider.RunUnit(context.Background(), p, u.Request, again, providertest.Limits, h.Pool); err != nil {
 		t.Fatalf("second RunUnit: %v", err)
@@ -670,7 +683,7 @@ func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
 	}
 	files := map[string]string{file: string(src)}
 	h := providertest.New(t, files)
-	u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+	u := h.Plan(t, p, lang.ScopePrefix+file, []string{file})
 	cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
 	if _, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool); err != nil {
 		t.Fatalf("RunUnit: %v", err)
@@ -749,7 +762,7 @@ func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
 	// worker, under one total for the stage.
 	units := newSingleWorkerProvider(t)
 	h := providertest.New(t, map[string]string{"sample.go": string(src)})
-	u := h.Plan(t, units, treesitter.ScopePrefix+"sample.go", []string{"sample.go"})
+	u := h.Plan(t, units, lang.ScopePrefix+"sample.go", []string{"sample.go"})
 	cap := &capture{UnitOutput: h.Begin(t, u, []string{"sample.go"})}
 	if _, err := provider.RunUnit(ctx, units, u.Request, cap, providertest.Limits, h.Pool); err != nil {
 		t.Fatalf("RunUnit: %v", err)

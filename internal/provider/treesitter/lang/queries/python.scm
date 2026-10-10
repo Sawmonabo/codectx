@@ -1,9 +1,10 @@
 ; Python structural query pack.
 
-(import_statement name: (dotted_name) @import.path) @import
-(import_statement name: (aliased_import name: (dotted_name) @import.path alias: (identifier) @import.name)) @import
+; `import a, b as c` imports each module on its own: each clause is one import.
+(import_statement name: (dotted_name) @import.path @import)
+(import_statement name: (aliased_import name: (dotted_name) @import.path alias: (identifier) @import.name) @import)
 (import_from_statement module_name: (_) @import.path name: (dotted_name) @import.name) @import
-(import_from_statement module_name: (_) @import.path name: (aliased_import alias: (identifier) @import.name)) @import
+(import_from_statement module_name: (_) @import.path name: (aliased_import name: (dotted_name) @import.original alias: (identifier) @import.name)) @import
 (import_from_statement module_name: (_) @import.path (wildcard_import)) @import
 
 (function_definition name: (identifier) @name body: (block) @body) @def.function

@@ -242,7 +242,7 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 		done.DependenceFailure = ferr.Error()
 		return done, nil, nil
 	}
-	done.DependenceFailure, err = w.dependence(out, flat, kept.l.Name, src)
+	done.DependenceFailure, done.LinkFailure, err = w.dependence(out, flat, kept.l.Name, src)
 	return done, nil, err
 }
 

@@ -29,9 +29,20 @@ withdrawn:
 The gate actually used is the authored goldens, each table derived twice, blind, from the source text and the
 language reference, plus one test pass, one review and one fix round over the integrated change. The four file-local
 families move to the structural provider for every language at once, so decision 9's graduation set is not built.
-The engine's importer stops publishing those four families for every language in the same change, and the engine
-runs for `calls` only until the linking provider of decision 9 publishes them; it is then deleted. Decisions 1, 2, 4,
-5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
+The engine's importer stops publishing those four families for every language in the same change.
+
+The same ruling withdraws the engine-run gates of phases 4 and 5:
+- the in-repo-resolved band against the engine;
+- the pinned-corpus diffs.
+
+`calls` moves to the linking provider of decision 9 for all nine languages at once, under the same gate: authored
+goldens, each derived twice, the second derivation blind, plus one test pass, one review and one fix round. The
+engine's importer publishes no relation from that change on, and the engine is then deleted. The two call-resolution
+targets of the measurements section, ≥ 95% on a configured typed repository and ≥ 85% on an unconfigured or
+dynamic-language one, are not gates of phases 4 and 5. They are measured in the proofs after the engine's deletion.
+Decision 9's `calls` keying is amended in place: the linking unit is keyed on its files' content, and the table
+digests decide what a rebuild costs.
+Decisions 1, 2, 4, 5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
 but impact still excludes them (`internal/graph/cost.go:83-89`) and no program-dependence relation set joins them.
 
 ## Context
@@ -468,8 +479,15 @@ minute later, after the product has reported done.
 **Amended 2026-10-08.** The band conditions of phases 1, 2 and 3 below are withdrawn (Status): no engine run gates
 them. Phases 1 to 3 close together, for all nine languages, when the authored golden tables, derived twice, pass
 and the integrated change has had its one test pass, review and fix round. Phase 3's zero-rows condition is met by
-construction: the engine's importer no longer publishes the four families. The text below is the plan as accepted
-on 2026-09-26; the phase table marks what the amendment changes.
+construction: the engine's importer no longer publishes the four families.
+
+Phases 4 and 5 are amended by the same ruling. Their engine-run conditions, the in-repo-resolved band and the
+pinned-corpus diffs, are withdrawn. They close together, for all nine languages, when the linker's authored goldens,
+each derived twice, pass and the integrated change has had its one test pass, review and fix round. The two
+call-resolution targets are not gates of either phase; they are measured in the proofs after the engine's deletion.
+The engine's importer publishes no relation once the linking provider publishes `calls`.
+
+The text below is the plan as accepted on 2026-09-26; the phase table marks what the amendment changes.
 
 Every gate is stated per **repository class**, never per repository. A class is claimed only on at least two instances
 from different language families, and **every** instance must pass, not the average. Two classes cannot be claimed yet,
@@ -516,11 +534,14 @@ output or the first table.
 | **1 — Go and Rust publish, the calibration gate** (withdrawn) | `control_depends_on` and `data_flows_to` for Go and Rust, published by the structural provider (decision 9) | the same two families for the other seven languages; `reads`/`writes` and `calls` everywhere | per family, the symmetric difference against the engine is **≤ the band measured first from two engine runs on the same units**, per class. Rust's gate is its authored goldens, because the engine has no Rust test corpus and emits no try-operator control dependence. Second required output: **differential-test cost per language**, the number nobody has, from which every later phase is priced |
 | **2 — ECMAScript family, and the shared write algebra** (withdrawn) | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate per class (Rust's by its authored goldens, since no engine band exists for it), **and** on every instance of the class the native pass completes with a lower wall *and* a lower tree-summed peak than the engine on the same units, on the same 250 ms sampler |
 | **3 — Python, Java, C/C++ dependence** (withdrawn) | all four dependence families for all nine advertised languages | **resolved `calls` only**, where no precise profile applies | the per-family band gate per language and class; Java control and data dependence are diffed against the engine like any other language, and only Java `calls` is authored. **And** a store query over a fresh index returns **zero** dependence-provider rows of the four dependence kinds at the active generation, which is what licenses deleting the import path |
-| **4 — static call linking, the four frontends with no type recovery** | resolved `calls` for C/C++, Go, Rust **and Java**, by the package-scoped linker of decision 9 | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora of each class. Rust's gate is its authored goldens. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
-| **5 — type recovery, the two frontends that have it** | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise |
+| **4 and 5, as amended 2026-10-08 — `calls` for every language at once** | resolved `calls` for all nine advertised languages, published by the package-scoped linking provider of decision 9: class-hierarchy analysis for Java; direct binding, the signature-keyed address-taken × indirect-site cross-product and class-hierarchy analysis for Go, Rust, C and C++; flow-based type inference, field-based resolution and class-hierarchy analysis for the ECMAScript family and Python | **nothing**; the engine's importer publishes no relation | the linker's authored goldens, each derived twice, the second blind, reproduce every case, and the integrated change has had one test pass, one review and one fix round. No engine run gates it: there is no in-repo-resolved band and no pinned-corpus diff. The two call-resolution targets are not gates here; they are measured in the proofs after the engine's deletion. The rows for phases 4 and 5 below are withdrawn |
+| **4 — static call linking, the four frontends with no type recovery** (withdrawn) | resolved `calls` for C/C++, Go, Rust **and Java**, by the package-scoped linker of decision 9 | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora of each class. Rust's gate is its authored goldens. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
+| **5 — type recovery, the two frontends that have it** (withdrawn) | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise |
 | **6 — the retirement gate** | nothing is ported; the engine, its backend package and its import path are deleted | **nothing** | the five conditions below, simultaneously |
 
-**The retirement gate — all five at once.**
+**The retirement gate — all five at once.** **Amended 2026-10-08.** Conditions 1 and 3 are not gates of the
+deletion: condition 1's engine band is withdrawn with the band itself (decision 7), and the targets of condition 3 are
+measured in the proofs after the engine's deletion, against the same denominator and by the same sample method.
 
 1. **Parity.** For each of the nine advertised languages and each of the five published families, the native key set
    is within the per-family band measured from two engine runs on that language's pinned units, on every instance of
@@ -624,9 +645,22 @@ what it is, and the retirement gate's parity condition is what proves the label 
   file's structural facts.
   The structural provider is Required, and a failed unit fails the generation
   (`internal/index/generation.go:1392-1394`).
-- **`calls`.** A new package-scoped linking provider publishes `calls`. It is keyed on per-file digests of each file's
-  export table and call-site table, so an edit inside a function body does not trigger a relink. Unit inputs are files
-  today (`internal/index/delta/delta.go:56-72`), so this is a model addition.
+- **`calls`.** A new package-scoped linking provider publishes `calls`. As accepted, it was to be keyed on per-file
+  digests of each file's export table and call-site table, so that an edit inside a function body would not trigger a
+  relink. **Amended 2026-10-08:** the unit is keyed on its member files' content, like every unit (`Request.Inputs`,
+  `internal/index/delta/delta.go:63-80`), and the digests decide what a rebuild costs.
+  - *Why not the digests.* The published facts bind their evidence to each file's bytes and ranges
+    (`model.NewEvidenceID`), and units are reused only on a full fingerprint match. A unit keyed on the digests would
+    be reused after a body edit with evidence about bytes that are gone.
+  - *What a body edit costs.* Each structural unit stores its table's member digest beside the table, and each linking
+    input records it (`model.UnitInput.Digest`, a model addition). The rebuild reads one small digest per member and
+    decodes no table to compare them. When membership and every digest hold, it resolves nothing. It inherits the
+    predecessor's resolution and coverage, and republishes only the facts whose evidence lies in a file whose bytes
+    changed. Every other fact is carried over with those files named replaced. A table is read only when that
+    republication needs it: the edited file's, and the tables of the declarations its sites bind.
+  - *What it does not save.* The edited file's own facts are republished. The rebuild also walks the unit's inputs
+    without reading a table: to compare the digests, and to name the changed files to each publication pass and to the
+    carry-over.
 - **Per-file reindexing.** The four file-local families reuse structural file units on a fingerprint match.
 - **The `dependence` id is never reused.** That keeps two conditions measurable: phase 3's zero dependence-provider rows
   and retirement condition 2.

@@ -137,7 +137,7 @@ var ErrMalformedFunction = errors.New("wire: malformed function message")
 // Byte ranges are not checked against any source here: the parent validates
 // them against the pinned bytes.
 func DecodeFunction(payload []byte) (Function, error) {
-	d := decoder{b: payload}
+	d := decoder{b: payload, malformed: ErrMalformedFunction}
 	var f Function
 	f.Span = Span{d.u32(), d.u32()}
 	switch d.u8() {
@@ -168,16 +168,17 @@ func DecodeFunction(payload []byte) (Function, error) {
 	return f, nil
 }
 
-// decoder reads a function payload front to back; the first failure sticks
-// and every later read answers zero.
+// decoder reads a binary payload front to back; the first failure sticks,
+// wrapped in malformed, and every later read answers zero.
 type decoder struct {
-	b   []byte
-	err error
+	b         []byte
+	err       error
+	malformed error
 }
 
 func (d *decoder) fail(msg string) {
 	if d.err == nil {
-		d.err = fmt.Errorf("%w: %s", ErrMalformedFunction, msg)
+		d.err = fmt.Errorf("%w: %s", d.malformed, msg)
 	}
 	d.b = nil
 }

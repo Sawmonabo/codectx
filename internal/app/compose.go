@@ -31,6 +31,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/graphengine"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
@@ -929,7 +930,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 
-	providers := []provider.Provider{fs, mf, s.ts, sp}
+	// The linking provider reads the link tables the structural provider
+	// stores with each file's unit, from this store, and publishes `calls`.
+	providers := []provider.Provider{fs, mf, s.ts, sp, link.New(link.StoreTables(s.store))}
 	if dp := s.openDependence(ctx, shared); dp != nil {
 		providers = append(providers, dp)
 	}

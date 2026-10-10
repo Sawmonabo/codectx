@@ -41,21 +41,33 @@ type depLists struct {
 	seenN, seenV []int32
 	// stack is the walk's stack of nodes.
 	stack []int32
+	// linker builds the file's link tables beside the pass, link holds them
+	// and linkFailure is why they were abandoned (link.go).
+	linker      linker
+	link        wire.Link
+	linkFailure string
 }
 
 // dependence runs the file's dependence pass over flat, the kept parse's flat
 // array in language, after the structural facts were sent: one KindFunction
-// message per callable, in preorder. A failure outside every function (no
-// lowering, or a panic in the lowering's resolution or the callable walk)
-// sends no message and is returned as the reason Done discloses; the callables
-// are collected before the first is lowered, so no message precedes such a
-// failure. The error is a write failure, which ends the loop.
-func (w *state) dependence(out io.Writer, flat *Flat, language string, src []byte) (failure string, err error) {
+// message per callable, in preorder, then the file's KindLink message. A
+// failure outside every function (no lowering, or a panic in the lowering's
+// resolution or the callable walk) sends no message and is returned as the
+// reason Done discloses; the callables are collected before the first is
+// lowered, so no message precedes such a failure. A failure of the link
+// pass alone sends no link message and is returned as linkFailure. The error
+// is a write failure, which ends the loop.
+func (w *state) dependence(out io.Writer, flat *Flat, language string, src []byte) (failure, linkFailure string, err error) {
 	l, failure := w.walk(flat, language)
 	if failure != "" {
-		return failure, nil
+		return failure, "", nil
 	}
-	return "", w.functions(out, l, src)
+	w.dep.linker, _ = newLinker(language)
+	if err := w.functions(out, l, src); err != nil {
+		return "", "", err
+	}
+	linkFailure, err = w.link(out, flat.Root(), src)
+	return "", linkFailure, err
 }
 
 // walk resolves language's lowering and collects flat's callables, recovering
@@ -120,6 +132,7 @@ func (w *state) analyse(l *Lowering, fn Node, src []byte) (cause string, failed 
 	cd := flow.ControlDependence(g, pd, &w.arena)
 	du := flow.DefUse(g, &w.arena)
 	w.dep.msg = wire.AppendFunction(w.dep.msg[:0], w.dep.project(g, cd, du, spanOf(fn)))
+	w.linkFunction(fn, g, du, src)
 	return "", false
 }
 

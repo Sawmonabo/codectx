@@ -199,7 +199,7 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `calls` | enclosing declaration (or file module) → declaration | a call whose name is declared exactly once in this file, respecting qualification (a `recv.name()` call names methods; a bare call names functions, tests, classes and structs); definitions preferred over prototypes |
 | `calls` | enclosing declaration (or file module) → callee reference | a call this file cannot resolve to exactly one of its declarations: ambiguous, import-qualified (`fmt.Println`, `str.ToUpper`, `path.join`, `std::move`) or not declared here. The callee is a provider-local node carrying `resolution`/`candidates`, never a guess |
 | `may_refer_to` | enclosing declaration → each candidate | a call whose name is declared more than once in this file (overloads, shadowing); bounded by `MaxAmbiguousCandidates`, alongside the `calls` edge to the ambiguous callee reference |
-| `references` | enclosing declaration → type declaration | a type reference to a class/struct/interface/enum declared in this file; a type this file does not declare gets no placeholder |
+| `references` | enclosing declaration → type or macro declaration | a type reference to a class/struct/interface/enum declared in this file, or a Rust macro invocation of a `macro_rules!` declared in it; a name this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
@@ -362,6 +362,49 @@ reports one row per capability under its own scope:
 
 None of these fails the unit or changes the structure row.
 
+### Link tables
+
+The same walk builds each file's link tables for the linking provider (docs/providers-link.md), which publishes the
+cross-file `calls`. The worker's `linker` (`internal/provider/treesitter/worker/link.go`) is made per file for the
+file's language, is called once per analysed callable while its flow graph and def-use chains are valid, and then
+once for the file. Each language family fills its own `worker/link_<family>.go`. The tables are a `wire.Link`:
+- **exports**: the declarations a call may bind to, each keyed by its declaration's name token, with its receiver,
+  signature, parameter count, variadic, static and abstract flags, and returned type;
+- **supertypes**: every declared subtype relation of the file (extends, implements, embeds, `impl Trait for Type`);
+- **sites**: every call reference, keyed by its callee token, with its callee shape (bare, member, static, indirect,
+  constructor), qualifier, and the types the worker recovered inside the file for its receiver and arguments;
+- **values**: every function taken as a value and every value written to a field or property.
+
+Names and types are spelled as the source writes them, and `Export.Signature` and `Site.Signature` follow one
+normalisation rule, so equal strings join an indirect site to an address-taken function. The worker resolves nothing
+outside the file.
+
+For Rust (`worker/link_rust.go`), a method's `self` parameter is its receiver, not one of `Params`, and a foreign
+function's `...` is one of `Params` with `Variadic` set. A method's `Signature` spells its self parameter first, as
+the type it declares (`&self` of `Foo` is `&Foo`), because a Rust method is a value only through its path, `Foo::m`,
+whose function type takes the receiver first. A binding's or field's declared type loses the references and the
+standard smart pointer around it (`&Box<dyn Handler>`, `Rc<T>`, `Arc<T>`, `Pin<P>`), as a method call's
+auto-dereference does, so the receiver names the owned type; an impl's self type and a trait bound keep theirs, and a
+declared result keeps its pointer (`Rc<Foo>`), which the linker removes for every method but the pointer's own (the
+lists in `lang/rust.go`). A call of a method the pointer itself answers through a standard trait (`clone`, `as_ref`,
+`fmt`, …) on a binding or field declared as a pointer carries no receiver type. A macro invocation is not a call: the
+query pack captures it as a `macro` reference (`lang/queries/rust.scm`), which names only a `macro_rules!` of the file
+and is never a link site, and a bare call never names a Rust macro.
+
+The parent joins the tables to the declarations and call references it validated: every call reference becomes a
+site of the stored `link.Table` (`internal/provider/link/table.go`), with its shape from the joined wire site or,
+when none joins, from the reference itself, and with the declarations of this file its callee name can mean as its
+candidates. Each declaration and the module carry the node identity the unit resolved, so the linker publishes these
+nodes rather than minting its own. The table also carries the file's package clause, one `link.Import` per name the
+file's import records introduce (a Rust use tree split per leaf, an import of every member of a path named
+`link.ImportAll`, each with the name it denotes in the imported module), each declaration's prototype flag, and the
+worker's re-exports and type unions (`internal/provider/treesitter/link.go`, `linkTable` and `linkImports`). A wire
+entry that does not join, or whose range does not fit the pinned bytes, is dropped and counted in `Table.Dropped`,
+never fatal, and so is each callable whose analysis failed in the worker, whose values and recovered site types the
+table therefore lacks. The table is stored with the file's unit under `link.TableKind`
+through `provider.StateSink`, and the provider refuses to run on a sink that cannot store it. A file with a link
+failure stores no table and discloses `link_failure` on its structural capability rows.
+
 ### Reuse
 
 The four families are facts of the structural file unit, so a file whose fingerprint matches its sealed unit reuses
@@ -509,7 +552,8 @@ worker → parent   Decl* Import* Ref*                           facts, one reco
                   Decl{id, parent, kind, name, qualified, start, end, name_start, name_end, sig_end, doc_start, doc_end, ...}
                   Ref{kind, start, end, name_start, name_end, name, scope, qualified?, qualifier?, qualifier_is_import?}
 worker → parent   Function*                                    KindFunction, one per callable, binary
-worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, memory}
+worker → parent   Link?                                        KindLink, once when the dependence pass ran, binary
+worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, link_failure?, memory}
               or  Error{code, message}                         per-file failure; worker stays healthy
 ```
 
@@ -537,6 +581,14 @@ allocates and refuses an index past the list it names
 file's dependence pass failed outside every function, so no function message
 was sent; it never touches the file's structural facts. What the parent
 publishes from these is stated under Dependence facts.
+
+A `Link` message (`KindLink`, `wire.AppendLink` and `wire.DecodeLink` in
+`internal/provider/treesitter/wire/link.go`) is binary too: the file's link
+tables, sent once after its function messages and before `KindDone` whenever
+the dependence pass ran. `Done.LinkFailure` is set when a panic in the link
+tables' construction was recovered; no link message is then sent, and the
+file's structural and dependence facts are unaffected. What the parent stores
+from it is stated under Link tables.
 
 Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single
@@ -643,7 +695,7 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
 | `@bind.names` + `@bind.values` | the name list and the value list of a Go short variable declaration whose values hold a function literal, each captured once per statement under `@def.function`; the worker pairs the i-th name with the i-th value and declares each identifier bound to a function literal, so `x, f := 1, func() {}` declares f alone. The value list must hold a function literal for the pattern to match, so a plain `x := v` is never walked |
 | `@import.clause` | an ECMAScript import clause, captured once per statement; the worker walks its default, namespace and named bindings in source order. No pattern captures each entry of a list and then a later sibling of that list: the matcher would keep one partial match per entry open until the sibling, which is quadratic in the entry count |
-| `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`) |
+| `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`). A Rust macro invocation is not one: it is `@ref.macro` + `@ref.macro.name`, a reference to the macro |
 | `@ref.type` | a type reference |
 | `@package` | the package/module clause |
 | `@export` + `@export.name` | an export wrapper or export list entry |

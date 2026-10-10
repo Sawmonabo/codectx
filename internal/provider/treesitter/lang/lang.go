@@ -25,9 +25,14 @@ const BindingModule = "github.com/tree-sitter/go-tree-sitter@v0.25.0"
 // ProviderID is the descriptor identity of the structural provider.
 const ProviderID = "treesitter"
 
+// ScopePrefix is the unit scope the structural provider indexes: one file, as
+// "file:"+path. The coordinator plans one unit per supported file, and the
+// linking provider finds a file's link tables under the same scope.
+const ScopePrefix = "file:"
+
 // extractionVersion changes whenever the worker's extraction logic changes
 // the facts it emits for the same source and query pack.
-const extractionVersion = "4"
+const extractionVersion = "6"
 
 //go:embed queries/*.scm
 var queryFS embed.FS

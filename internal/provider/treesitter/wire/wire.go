@@ -40,7 +40,7 @@ const (
 	// Fact messages, one record each, then KindDone or KindError. A
 	// file's answer is every KindDecl, KindImport and KindRef message, then
 	// one KindFunction message per callable in the lowering's preorder, then
-	// KindDone.
+	// one KindLink message when the dependence pass ran, then KindDone.
 	KindDecl   Kind = 4
 	KindImport Kind = 5
 	KindRef    Kind = 6
@@ -49,6 +49,9 @@ const (
 	// KindFunction carries one callable's dependence facts in the binary
 	// encoding of AppendFunction, never JSON.
 	KindFunction Kind = 9
+	// KindLink carries the file's link tables in the binary encoding of
+	// AppendLink, never JSON.
+	KindLink Kind = 10
 )
 
 // ChunkBytes is the transport unit, not a limit on anything carried: the
@@ -180,11 +183,18 @@ type Import struct {
 	Path  string `json:"path"`
 	// Names are the local names the statement introduces, when known.
 	Names []string `json:"names,omitempty"`
+	// Originals is nil, or holds for each of Names the name it denotes in
+	// the imported module as written, empty where the local name is that
+	// name: `a` for `b` in `import { a as b }`, "default" for a default
+	// import, "*" for a namespace import, `A` for `B` in
+	// `from m import A as B`.
+	Originals []string `json:"originals,omitempty"`
 }
 
 // Ref is one reference occurrence: a call site or a type reference.
 type Ref struct {
-	// Kind is "call" or "type".
+	// Kind is "call", "type" or "macro" (a Rust macro invocation, which
+	// names a macro and calls nothing).
 	Kind string `json:"kind"`
 	// Start and End bound the whole reference expression: the call
 	// expression for a call, the identifier itself for a type reference.
@@ -229,6 +239,11 @@ type Done struct {
 	// a function whose own analysis failed is disclosed by its message
 	// instead (Function.Failed). It never fails the file's structural facts.
 	DependenceFailure string `json:"dependence_failure,omitempty"`
+	// LinkFailure is why the file's link pass sent no KindLink message
+	// although its dependence pass ran: a panic the worker recovered in the
+	// link tables' construction. It never fails the file's structural or
+	// dependence facts.
+	LinkFailure string `json:"link_failure,omitempty"`
 	// Memory is the worker's reading of itself at the end of this file.
 	Memory Memory `json:"memory"`
 }

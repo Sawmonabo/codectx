@@ -106,6 +106,17 @@ func (r *Recorder) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) 
 	return r.UnitOutput.PutSearchUnits(ctx, docs)
 }
 
+// PutState forwards a provider's stored artifact. The Recorder embeds the
+// UnitOutput interface, which does not carry it, so without this a provider
+// that stores state would be refused by the sink (provider.StateSink).
+func (r *Recorder) PutState(ctx context.Context, kind string, payload []byte) error {
+	s, ok := r.UnitOutput.(provider.StateSink)
+	if !ok {
+		return &model.Error{Code: model.CodeInternal, Message: "the recorded unit output does not store provider state"}
+	}
+	return s.PutState(ctx, kind, payload)
+}
+
 // Identities is the sorted set of identities persisted, the value two
 // source-equivalent runs must agree on.
 func (r *Recorder) Identities() []string {
@@ -191,6 +202,7 @@ func Conform(t *testing.T, p provider.Provider, files map[string]string, scopeKe
 // batch flush the harness triggers after every call.
 type flushable interface {
 	provider.DeltaSink
+	provider.StateSink
 	Flush(context.Context) error
 }
 
@@ -239,6 +251,10 @@ func (f flushing) PutAliases(ctx context.Context, aliases []model.NativeAlias) e
 
 func (f flushing) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
 	return f.then(ctx, f.sink.PutSearchUnits(ctx, docs))
+}
+
+func (f flushing) PutState(ctx context.Context, kind string, payload []byte) error {
+	return f.then(ctx, f.sink.PutState(ctx, kind, payload))
 }
 
 func (f flushing) then(ctx context.Context, err error) error {

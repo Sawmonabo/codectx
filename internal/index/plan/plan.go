@@ -31,6 +31,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -501,10 +502,40 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 		}
 		for i := range scopes {
 			scopes[i].version = version
+			if d.ID == link.ProviderID {
+				keys, err := b.linkKeys(scopes[i].family)
+				if err != nil {
+					return err
+				}
+				scopes[i].dependencyKeys = keys
+			}
 			b.semantics[d.ID] = append(b.semantics[d.ID], &scopes[i])
 		}
 	}
 	return nil
+}
+
+// linkKeys are the synthetic dependency keys of a linking unit. The unit reads
+// the tables its members' structural units stored, not the members' bytes, so
+// what decides those tables beyond the bytes is part of its identity: the
+// structural provider's version, and for a C or C++ project the grammar the
+// census gives a shared header (headerKeyOf). Without them a structural change
+// that rebuilt every table would reuse the linking unit sealed over the old
+// ones. The registry orders the structural provider before the linking
+// provider that depends on it, so its version is already classified here.
+func (b *builder) linkKeys(family dependence.Family) ([]string, error) {
+	i := slices.IndexFunc(b.fileProviders, func(fp fileProvider) bool { return fp.id == tslang.ProviderID })
+	if i < 0 {
+		return nil, internalErr("the linking provider is planned without the structural provider whose tables it reads")
+	}
+	// The folded version alone, which foldVersion already bounds to
+	// model.MaxIdentifierBytes: a prefix could push it past the bound
+	// UnitBuild.Validate holds every dependency key to.
+	keys := []string{b.fileProviders[i].version}
+	if family == dependence.FamilyC {
+		keys = append(keys, b.headerKey)
+	}
+	return keys, nil
 }
 
 // foldCarry reads the previous generation's carry distances once, before the
@@ -759,7 +790,7 @@ func (b *builder) emit(ctx context.Context) error {
 				continue
 			}
 			u := Unit{ProviderID: s.providerID, ProviderVersion: s.version, ScopeKey: s.scopeKey,
-				InputCount: count, Inputs: inputs}
+				InputCount: count, Inputs: inputs, DependencyKeys: s.dependencyKeys}
 			if s.heavy {
 				u.Heavy = true
 				// The heap estimate is sized from the family's own source
