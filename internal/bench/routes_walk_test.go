@@ -13,11 +13,11 @@ import (
 // TestEndpointsAreSeedsOfACalleeWalk indexes a repository whose one module
 // declares two Flask routes and no `__main__` guard, through the product's
 // own composition. The endpoint kind filter returns exactly the two routes,
-// and a walk outward from both of them over routes_to and calls reaches
-// every function either handler calls. The relations are passed explicitly:
-// whether routes_to belongs to the default relation set is decided
-// elsewhere. Mutations caught: publishing no routes_to (the walk reaches no
-// handler), publishing an endpoint for the module (a third hit), and a kind
+// and a callees walk from both of them, which names `calls` alone, reaches
+// every function either handler calls: the walk follows `routes_to` out of
+// an endpoint by default. Mutations caught: publishing no routes_to, or a
+// callees walk that does not follow it from an endpoint (the walk reaches no
+// handler); publishing an endpoint for the module (a third hit); a kind
 // filter that lets other kinds through.
 func TestEndpointsAreSeedsOfACalleeWalk(t *testing.T) {
 	if testing.Short() {
@@ -74,7 +74,9 @@ def items():
 		t.Fatalf("endpoint hits = %v, want %v", names, want)
 	}
 
-	res, err := svc.Graph(ctx, model.GraphRequest{Start: seeds, Relations: []model.RelationKind{model.RelRoutesTo, model.RelCalls},
+	// A callees walk names `calls` alone; the walk itself follows `routes_to`
+	// out of an endpoint seed to the handler before its calls.
+	res, err := svc.Graph(ctx, model.GraphRequest{Start: seeds, Relations: []model.RelationKind{model.RelCalls},
 		Direction: model.DirectionOutgoing, MaxDepth: 4})
 	if err != nil {
 		t.Fatalf("graph: %v", err)

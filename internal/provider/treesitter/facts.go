@@ -106,6 +106,12 @@ type builder struct {
 	// repeats an identity does not publish the same alias row twice.
 	aliasSeen map[model.NativeAlias]bool
 	search    []model.SearchUnit
+	// endpointFacts are the file's endpoints, found before the call
+	// references are published (endpoints.go); literals are the route
+	// handlers written as function literals among them, by start, each with
+	// its node.
+	endpointFacts []endpointFact
+	literals      []literalNode
 	// callees holds the callee reference node of each key a call or a route
 	// handler of this file minted (callee).
 	callees map[string]model.Resolution
@@ -235,6 +241,13 @@ func (b *builder) build() error {
 		return err
 	}
 	if err := b.imports(); err != nil {
+		return err
+	}
+	// The endpoints are found before the call references are published:
+	// a route handler written as a function literal is a node, and the calls
+	// its body makes are made from it.
+	b.endpointFacts = append(b.entryPoints(), b.routeTable()...)
+	if err := b.handlerLiterals(); err != nil {
 		return err
 	}
 	if err := b.refs(); err != nil {
@@ -815,6 +828,9 @@ func (b *builder) refs() error {
 		if r.Scope >= 0 {
 			from = b.decls[r.Scope].res.Node.ID
 		}
+		if id, ok := b.literalAround(r); ok {
+			from = id
+		}
 		targets := b.targets(r)
 		if r.Kind == "type" || r.Kind == "macro" {
 			// A type or macro reference to a name this file does not declare
@@ -859,15 +875,16 @@ func (b *builder) refs() error {
 
 // callTargets narrows the declarations a call's name can mean to those its
 // scope justifies. A call of a member on a receiver value names no
-// declaration by scope: this provider types no receiver, so the methods of
-// this file that share the name are candidates by name alone. The linker
-// binds the call when it recovers the receiver's type and otherwise
-// publishes the site as open, its candidates computed per query (ADR-0015);
-// none is published here. A call qualified by a type or namespace path
-// (`T::f()`) names its scope and keeps its in-file candidates, as a bare call
-// does.
+// declaration by scope, however many methods of this file share the name,
+// one included: this provider types no receiver, so a method of that name is
+// a candidate by name alone, and a name never binds a call (ADR-0015
+// decision 1). The linker binds the call when it recovers the receiver's
+// type and otherwise publishes the site as open, its candidates computed per
+// query; nothing is published here. A call qualified by a type or namespace
+// path (`T::f()`) names its scope and keeps its in-file candidates, as a bare
+// call does.
 func (b *builder) callTargets(r wire.Ref, targets []int) []int {
-	if len(targets) > 1 && r.Qualified && !pathCall(b.src, r.NameStart) {
+	if r.Qualified && !pathCall(b.src, r.NameStart) {
 		return nil
 	}
 	return targets

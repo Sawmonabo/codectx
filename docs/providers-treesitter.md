@@ -138,7 +138,7 @@ attribute pair and no number that could be read as a confidence:
 |---|---|---|
 | `ambiguous` | number of candidates (≥ 2) | a bare or path-qualified (`T::f()`) call of a name declared more than once in this file (overloads, shadowing, two methods of one name); the candidates are also retained as `may_refer_to` edges, every one of them, with no count to cut at |
 | `import` | 0 | the qualifier is a name an import of this file introduced (`fmt.Println`, `str.ToUpper`), so the callee comes through that import and is known not to be here |
-| `unresolved` | 0 | nothing in this file declares the name — a builtin, a conversion, a cross-file callee — or the call is of a member on a receiver value (`x.m()`, `self.m()`) and the file declares the name more than once: this provider types no receiver, so the methods sharing the name are candidates by name alone, and none is published; the linker binds the call when it recovers the receiver's type and otherwise publishes it as an open site with reason `receiver_untyped`, whose candidates are computed per query (ADR-0015) |
+| `unresolved` | 0 | nothing in this file declares the name — a builtin, a conversion, a cross-file callee — or the call is of a member on a receiver value (`x.m()`, `self.m()`), however many methods of the file have the name, one included: this provider types no receiver, so a method sharing the name is a candidate by name alone, a name never binds a call, and none is published; the linker binds the call when it recovers the receiver's type and otherwise publishes it as an open site with reason `receiver_untyped`, whose candidates are computed per query (ADR-0015) |
 
 `exact` never appears: it requires a compiler binding this provider does not
 have. `same_module` and `unique_name` never appear either: a call that does
@@ -216,14 +216,14 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `contains` | outer declaration → nested declaration | nested declaration (parent is the innermost containing declaration; a Rust `impl` block or C++ qualifier contributes to the qualified name and makes the function a method but is not itself a node) |
 | `exports` | file module → declaration | Go exported identifier, Rust `pub`, Java `public`, JS/TS `export` (including `export { x }` lists), TS `export default`; Python: the names of a static `__all__` when the module has one, otherwise every top-level name without a leading underscore; C: every definition with external linkage (below) |
 | `imports` | file module → import target | every import/include/use |
-| `calls` | enclosing declaration (or file module) → declaration | a call whose name is declared exactly once in this file, respecting qualification (a `recv.name()` call names methods; a bare call names functions, tests, classes and structs); definitions preferred over prototypes |
+| `calls` | enclosing declaration (or file module, or route handler literal) → declaration | a bare or path-qualified call whose name is declared exactly once in this file (a `T::name()` call names methods; a bare call names functions, tests, classes and structs); definitions preferred over prototypes. A call of a member on a receiver value (`recv.name()`) never binds here |
 | `calls` | enclosing declaration (or file module) → callee reference | a call this file cannot resolve to exactly one of its declarations: ambiguous, import-qualified (`fmt.Println`, `str.ToUpper`, `path.join`, `std::move`) or not declared here. The callee is a provider-local node carrying `resolution`/`candidates`, never a guess |
 | `may_refer_to` | enclosing declaration → each candidate | a bare or path-qualified call whose name is declared more than once in this file (overloads, shadowing); every candidate is kept, uncapped, alongside the `calls` edge to the ambiguous callee reference. A call of a member on a receiver value publishes none (the callee reference table above) |
 | `references` | enclosing declaration → type or macro declaration | a type reference to a class/struct/interface/enum declared in this file, or a Rust macro invocation of a `macro_rules!` declared in it; a name this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 | `defines` | file module → endpoint | every program entry point and framework route the file declares (a `__main__` guard is a declaration and is defined like one) |
 | `routes_to` | endpoint → handler | the entry function or route handler: a declaration of this file, the callee reference a call of the handler's name would name (with the call-site alias on its token), the file's module for a script, or a route handler literal |
-| `defines` / `contains` | file module or innermost enclosing declaration → route handler literal | a function literal a route registers in place, published as an anonymous `function` node keyed by its range |
+| `defines` / `contains` | file module or innermost enclosing declaration → route handler literal | a function literal a route registers in place, published as an anonymous `function` node keyed by its range; the calls in its body are made from it, so a walk from the endpoint reaches what the handler calls |
 
 **Function-valued properties.** In JavaScript, TypeScript and TSX a function or
 arrow function stored under a name is a function declaration named by that
@@ -248,9 +248,12 @@ or tuple of string literals (annotated or not), `+=` of one, `.extend` of one,
 and `.append` or `.remove` of one string literal; they apply in source order.
 Otherwise, a module with no `__all__` or whose `__all__` is computed (any
 other value, a statement under a conditional or a loop, another method)
-exports every top-level declaration whose name has no leading underscore. A
-name `__all__` lists that the module does not declare (an imported name) is
-exported by the module that declares it, not here.
+exports every top-level declaration whose name has no leading underscore, and
+a computed `__all__` is disclosed on the file's `structure` row by the detail
+`exports` = `underscore_rule: __all__ is not static` (the row's state is
+unchanged). A name `__all__` lists that the module does not declare (an
+imported name) is exported by the module that declares it, not here. A
+declaration inside a `__main__` guard is not exported.
 
 **C exports.** A C file exports each definition with external linkage
 (C17 6.2.2): a function definition and a file-scope object definition, not
@@ -298,7 +301,7 @@ published and is counted, so the file reports partial.
 
 | Entry point | Descriptor | Routes to |
 |---|---|---|
-| a module-level Python `if __name__ == "__main__":` (`==`, either operand order) | `__main__` | each function its block calls directly; the guard is a declaration, so its block's calls are made from it and a function defined in it is contained by it |
+| a module-level Python `if __name__ == "__main__":` (`==`, either operand order) | `__main__` | each function its block calls directly; the guard is a declaration, so its block's calls are made from it. It is a scope but no container: a function defined in it is a declaration of the module under its own name, told apart from one outside the guard by the branch it sits in (its disambiguator), and is not exported |
 | Go `func main` in `package main` | `main` | the function |
 | every Java `main` of JLS SE 25 §12.1.4, per class: `static` or instance, one `String[]`/`String...` parameter or none, not `private`, `void`; a class of the file that inherits one from a superclass of the same file (a superclass in another file is not visible here) | `main`, disambiguated by the class's qualified name | the method |
 | a top-level Rust `fn main`; a file-scope C or C++ `main` definition that is not `static` | `main` | the function |
@@ -369,7 +372,7 @@ given under Dependence facts, Capabilities. The `structure` row's states:
 
 | State | DiagnosticCode | Meaning |
 |---|---|---|
-| `fresh` | – | parsed without syntax errors, every record within bounds |
+| `fresh` | – | parsed without syntax errors, every record within bounds (a Python module whose `__all__` is computed carries the `exports` detail under Python exports, in any state) |
 | `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, the query exceeded its match limit, evidence past the per-fact bound was cut (counted under the `evidence_clipped` detail), the file reached a user-set `providers.tree_sitter.max_callee_references` bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
 | `unavailable` | `CTX_RESOURCE_LIMIT` | file larger than a user-set `workspace.max_parse_file_bytes`, or longer than the parser's 32-bit offsets address (`wire.MaxSourceOffset`); not streamed |
 | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` | not valid UTF-8, or no pinned grammar for the file |
@@ -701,7 +704,7 @@ worker → parent   Decl* Import* Ref*                           facts, one reco
                   Ref{kind, start, end, name_start, name_end, name, scope, qualified?, qualifier?, qualifier_is_import?}
 worker → parent   Function*                                    KindFunction, one per callable, binary
 worker → parent   Link?                                        KindLink, once when the dependence pass ran, binary
-worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, link_failure?, memory}
+worker → parent   Done{package, syntax_errors, truncated, header?, dependence_failure?, link_failure?, computed_all?, memory}
               or  Error{code, message}                         per-file failure; worker stays healthy
 ```
 
@@ -840,8 +843,9 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 |---|---|
 | `@def.<kind>` | a declaration of `<kind>` (function, method, class, interface, struct, enum, field, variable, constant, module, namespace, test); its `@name` (or `@declarator` for C) names it, `@body` marks where the signature ends |
 | `@scope` + `@scope.name` | a non-declaration container that contributes to qualified names and turns functions into methods (Rust `impl`) |
-| `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
+| `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces; a Go import without an alias binds its path's last element, skipping a major-version element (`…/chi/v5` binds `chi`) and a `gopkg.in` `.vN` suffix (`gopkg.in/yaml.v3` binds `yaml`) |
 | `@bind.names` + `@bind.values` | the name list and the value list of a Go short variable declaration whose values hold a function literal, each captured once per statement under `@def.function`; the worker pairs the i-th name with the i-th value and declares each identifier bound to a function literal, so `x, f := 1, func() {}` declares f alone. The value list must hold a function literal for the pattern to match, so a plain `x := v` is never walked |
+| `@import.fn` | the `require` callee of a CommonJS `require("y")` import; when the call is a variable's value the worker binds that variable's names: `const x = require("y")` binds `x` to the whole module, `const { a, b: c, d = 1 } = require("y")` binds `a`, `c` (to `b`) and `d` |
 | `@import.clause` | an ECMAScript import clause, captured once per statement; the worker walks its default, namespace and named bindings in source order. No pattern captures each entry of a list and then a later sibling of that list: the matcher would keep one partial match per entry open until the sibling, which is quadratic in the entry count |
 | `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`). A Rust macro invocation is not one: it is `@ref.macro` + `@ref.macro.name`, a reference to the macro |
 | `@ref.type` | a type reference |

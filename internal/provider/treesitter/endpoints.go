@@ -1,7 +1,9 @@
 package treesitter
 
 import (
+	"cmp"
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -74,7 +76,7 @@ func fnHandler(at wire.Span) handler { return handler{decl: -1, fn: &at} }
 // does not fit its bound is not published and is counted, so the file
 // reports partial.
 func (b *builder) endpoints() error {
-	facts := append(b.entryPoints(), b.routeTable()...)
+	facts := b.endpointFacts
 	if len(facts) == 0 {
 		return nil
 	}
@@ -217,7 +219,14 @@ func (b *builder) handlerNode(h handler, descriptor string, at *model.SourceRang
 	case h.ref != nil:
 		return b.handlerRef(*h.ref)
 	case h.fn != nil:
-		return b.handlerLiteral(*h.fn, descriptor)
+		i, ok := slices.BinarySearchFunc(b.literals, *h.fn, func(l literalNode, at wire.Span) int {
+			return cmp.Or(cmp.Compare(l.at.Start, at.Start), cmp.Compare(at.End, l.at.End))
+		})
+		if !ok {
+			// Its node was not minted: a bound kept it out, and counted it.
+			return "", false, nil
+		}
+		return b.literals[i].id, true, nil
 	}
 	return "", false, nil
 }
@@ -245,6 +254,66 @@ func (b *builder) handlerRef(r wire.Ref) (model.NodeID, bool, error) {
 		b.dropped[structure]++
 	}
 	return id, true, nil
+}
+
+// literalNode is a route handler written as a function literal, and its node.
+type literalNode struct {
+	at wire.Span
+	id model.NodeID
+}
+
+// handlerLiterals mints the node of every route handler written as a
+// function literal, once per literal, before the call references are
+// published, so the calls in its body are made from it (literalAround). They
+// are kept by start, outer before inner.
+func (b *builder) handlerLiterals() error {
+	seen := map[wire.Span]bool{}
+	for i := range b.endpointFacts {
+		f := &b.endpointFacts[i]
+		for _, h := range f.handlers {
+			if h.fn == nil || seen[*h.fn] {
+				continue
+			}
+			seen[*h.fn] = true
+			if h.fn.End > uint32(len(b.src)) || h.fn.Start > h.fn.End {
+				return outputInvalid("a route handler's range does not fit the pinned bytes")
+			}
+			id, ok, err := b.handlerLiteral(*h.fn, f.descriptor)
+			if err != nil {
+				return err
+			}
+			if ok {
+				b.literals = append(b.literals, literalNode{at: *h.fn, id: id})
+			}
+		}
+	}
+	slices.SortFunc(b.literals, func(x, y literalNode) int {
+		return cmp.Or(cmp.Compare(x.at.Start, y.at.Start), cmp.Compare(y.at.End, x.at.End))
+	})
+	return nil
+}
+
+// literalAround is the node of the innermost route handler literal whose
+// body holds the reference r, when that literal is nested inside r's
+// enclosing declaration (or r has none): the call is made from the handler,
+// as a call in a nested declaration is made from it. A declaration nested
+// inside the literal stays the reference's scope.
+func (b *builder) literalAround(r wire.Ref) (model.NodeID, bool) {
+	n, _ := slices.BinarySearchFunc(b.literals, r.Start+1, func(l literalNode, start uint32) int { return cmp.Compare(l.at.Start, start) })
+	for k := n - 1; k >= 0; k-- {
+		l := b.literals[k]
+		if l.at.Start > r.Start || r.End > l.at.End || l.at == (wire.Span{Start: r.Start, End: r.End}) {
+			continue
+		}
+		if r.Scope >= 0 {
+			if d := &b.decls[r.Scope]; l.at.Start < d.Start || l.at.End > d.End {
+				// The reference's own declaration is inside the literal.
+				return "", false
+			}
+		}
+		return l.id, true
+	}
+	return "", false
 }
 
 // handlerLiteral publishes a function literal an endpoint registers in

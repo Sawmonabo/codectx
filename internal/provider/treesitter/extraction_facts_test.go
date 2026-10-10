@@ -19,6 +19,14 @@ import (
 // fact it published.
 func extracted(t *testing.T, p *treesitter.Provider, file, src string) *capture {
 	t.Helper()
+	c, _ := extractedRun(t, p, file, src)
+	return c
+}
+
+// extractedRun is extracted with the run's result, whose capability rows it
+// reports.
+func extractedRun(t *testing.T, p *treesitter.Provider, file, src string) (*capture, model.ProviderResult) {
+	t.Helper()
 	h := providertest.New(t, map[string]string{file: src})
 	u := h.Plan(t, p, lang.ScopePrefix+file, []string{file})
 	c := &capture{UnitOutput: h.Begin(t, u, []string{file})}
@@ -29,7 +37,19 @@ func extracted(t *testing.T, p *treesitter.Provider, file, src string) *capture 
 	if result.State != model.RunSucceeded {
 		t.Fatalf("run state for %s = %s, want succeeded", file, result.State)
 	}
-	return c
+	return c, result
+}
+
+// structureRow is the run's structure capability row.
+func structureRow(t *testing.T, result model.ProviderResult) model.CapabilityState {
+	t.Helper()
+	for _, row := range result.Capabilities {
+		if row.Capability == "structure" {
+			return row
+		}
+	}
+	t.Fatal("no structure capability row")
+	return model.CapabilityState{}
 }
 
 // node is the one published node of kind named name, failing on none or
@@ -280,5 +300,236 @@ def use(x):
 		if m := metadata(t, n.Node); m["callee"] == "m" && m["resolution"] != "unresolved" {
 			t.Errorf("the callee reference of x.m says %v, want unresolved", m)
 		}
+	}
+}
+
+// TestAComputedAllIsDisclosedOnTheStructureRow asserts that a Python module
+// whose `__all__` is computed says so on its structure capability row, while
+// one with a static `__all__` and one with none say nothing, and none of them
+// is partial for it: the underscore rule is the documented rule for such a
+// module, not missing coverage.
+//
+// Mutation it catches: never send the computed bit (no detail on the
+// computed module's row); send it for any `__all__` (a detail on the static
+// one's).
+func TestAComputedAllIsDisclosedOnTheStructureRow(t *testing.T) {
+	p := newProvider(t)
+	for _, tc := range []struct {
+		file, src string
+		disclosed bool
+	}{
+		{"computed.py", "__all__ = sorted(globals())\n\ndef f(): pass\n", true},
+		{"static.py", "__all__ = [\"f\"]\n\ndef f(): pass\n", false},
+		{"none.py", "def f(): pass\n", false},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			_, result := extractedRun(t, p, tc.file, tc.src)
+			row := structureRow(t, result)
+			_, got := row.Details["exports"]
+			if got != tc.disclosed {
+				t.Errorf("structure row details %v, want the exports detail %v", row.Details, tc.disclosed)
+			}
+			if row.State != model.CapabilityFresh {
+				t.Errorf("structure row is %s, want fresh", row.State)
+			}
+		})
+	}
+}
+
+// TestAMemberCallWithOneInFileMethodBindsNothingHere asserts that a call of a
+// member on a receiver value binds no in-file declaration even when exactly
+// one method of the file has the name: a name never binds a call (ADR-0015
+// decision 1), so the call names a callee reference that says it is
+// unresolved, which the linker binds or opens.
+//
+// Mutation it catches: bind when exactly one in-file method has the name
+// (use calls A.only).
+func TestAMemberCallWithOneInFileMethodBindsNothingHere(t *testing.T) {
+	p := newProvider(t)
+	c := extracted(t, p, "one.py", `class A:
+    def only(self): pass
+
+def use(x):
+    x.only()
+`)
+	use := c.node(t, model.NodeFunction, "use")
+	var method model.Node
+	for _, n := range c.all(model.NodeMethod, "only") {
+		if n.Range != nil {
+			method = n
+		}
+	}
+	if method.ID == "" {
+		t.Fatal("no declaration of the method only")
+	}
+	for _, r := range c.rels {
+		if r.Relation.Kind == model.RelCalls && r.Relation.From == use.ID && r.Relation.To == method.ID {
+			t.Fatal("x.only() binds the one in-file method only")
+		}
+	}
+	var found bool
+	for _, n := range c.nodes {
+		if m := metadata(t, n.Node); m["callee"] == "only" {
+			found = true
+			if m["resolution"] != "unresolved" {
+				t.Errorf("the callee reference of x.only says %v, want unresolved", m)
+			}
+		}
+	}
+	if !found {
+		t.Error("x.only() names no callee reference")
+	}
+}
+
+// TestCallsInAnInlineHandlerAreMadeFromIt registers a route whose handler is
+// an arrow function written in place and asserts the endpoint routes to that
+// function's node and the calls in its body are made from it, so a walk from
+// the endpoint reaches what the handler calls; the module, where the route is
+// registered, makes no call to helper. The route is registered by a call, so
+// it needs the worker's call-argument positions (wire.Site.Arguments).
+//
+// Mutation it catches: attribute the calls inside the handler to the
+// enclosing declaration (the module calls helper and the handler calls
+// nothing).
+func TestCallsInAnInlineHandlerAreMadeFromIt(t *testing.T) {
+	p := newProvider(t)
+	c := extracted(t, p, "inline.js", `const express = require("express");
+const app = express();
+
+function helper() { return 1; }
+
+app.get("/inline", (req, res) => { helper(); });
+`)
+	ep := c.node(t, model.NodeEndpoint, "GET /inline")
+	handlers := c.targets(model.RelRoutesTo, ep.ID)
+	if len(handlers) != 1 || handlers[0] != "GET /inline" {
+		t.Fatalf("the endpoint routes to %v, want its handler literal", handlers)
+	}
+	var literal model.Node
+	for _, r := range c.rels {
+		if r.Relation.Kind == model.RelRoutesTo && r.Relation.From == ep.ID {
+			literal, _ = c.byID(r.Relation.To)
+		}
+	}
+	if literal.Kind != model.NodeFunction {
+		t.Fatalf("the handler is a %s, want a function", literal.Kind)
+	}
+	if got := c.targets(model.RelCalls, literal.ID); !slices.Equal(got, []string{"helper"}) {
+		t.Errorf("the handler calls %v, want [helper]", got)
+	}
+	if got := c.targets(model.RelCalls, c.moduleNode(t, "inline.js").ID); slices.Contains(got, "helper") {
+		t.Errorf("the module calls %v; the handler's call of helper is the handler's", got)
+	}
+}
+
+// TestAFunctionInAMainGuardKeepsItsName asserts that a function defined inside
+// a `__main__` guard is a declaration of the module named by its own name,
+// told apart from a top-level function of the same name by the branch it sits
+// in, not by a `__main__` prefix, and that it is not exported; the guard routes
+// to it when it calls it.
+//
+// Mutations it catches: qualify it under the guard (`__main__.f`); export it
+// by the underscore rule; drop the branch from its identity (the two f's are
+// one node).
+func TestAFunctionInAMainGuardKeepsItsName(t *testing.T) {
+	p := newProvider(t)
+	c := extracted(t, p, "guarded.py", `def f():
+    return 1
+
+if __name__ == "__main__":
+    def f():
+        return 2
+    f()
+`)
+	fs := c.all(model.NodeFunction, "f")
+	var located []model.Node
+	for _, n := range fs {
+		if n.Range != nil {
+			located = append(located, n)
+		}
+	}
+	if len(located) != 2 || located[0].ID == located[1].ID {
+		t.Fatalf("%d located f nodes %v, want two distinct", len(located), located)
+	}
+	mod := c.moduleNode(t, "guarded.py")
+	defined := c.targets(model.RelDefines, mod.ID)
+	n := 0
+	for _, name := range defined {
+		if name == "f" {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("the module defines %v, want both f", defined)
+	}
+	for _, f := range located {
+		if f.QualifiedName != "f" {
+			t.Errorf("f is qualified %q, want f", f.QualifiedName)
+		}
+	}
+	if got := c.targets(model.RelExports, mod.ID); !slices.Equal(got, []string{"f"}) {
+		t.Errorf("exports %v, want only the top-level f", got)
+	}
+	guard := c.node(t, model.NodeEndpoint, "__main__")
+	if got := c.targets(model.RelRoutesTo, guard.ID); !slices.Contains(got, "f") {
+		t.Errorf("the guard routes to %v, want f", got)
+	}
+}
+
+// TestImportsBindTheirConventionalNames asserts the local names two import
+// forms bind, through the receiver of a call: a Go import whose path ends in
+// a major version (`.../chi/v5`) or a gopkg.in version suffix (`yaml.v3`)
+// binds the package's name, so `chi.NewRouter()` and `yaml.Marshal()` are
+// calls through an import; and a `require(...)` bound to a name or
+// destructured binds those names, so `x.go()` and `c.run()` are too.
+//
+// Mutations it catches: take the path's last element as the Go name (`v5`,
+// `yaml.v3`); bind no name for a `require` declarator, or ignore a
+// destructured pair's local name.
+func TestImportsBindTheirConventionalNames(t *testing.T) {
+	p := newProvider(t)
+	for _, tc := range []struct {
+		file, src string
+		callees   []string
+	}{
+		{"main.go", `package main
+
+import (
+	"github.com/go-chi/chi/v5"
+	"gopkg.in/yaml.v3"
+)
+
+func main() {
+	chi.NewRouter()
+	yaml.Marshal(nil)
+}
+`, []string{"NewRouter", "Marshal"}},
+		{"req.js", `const x = require("y");
+const { a, b: c } = require("z");
+
+function f() {
+	x.go();
+	a.run();
+	c.run();
+}
+`, []string{"go", "run"}},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			c := extracted(t, p, tc.file, tc.src)
+			for _, name := range tc.callees {
+				var seen bool
+				for _, n := range c.nodes {
+					if m := metadata(t, n.Node); m["callee"] == name {
+						seen = true
+						if m["resolution"] != "import" {
+							t.Errorf("%s: the callee reference %s says %v, want import", tc.file, n.Node.Name, m)
+						}
+					}
+				}
+				if !seen {
+					t.Errorf("%s: no callee reference for %s", tc.file, name)
+				}
+			}
+		})
 	}
 }

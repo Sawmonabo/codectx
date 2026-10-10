@@ -97,6 +97,9 @@ type kindIDs struct {
 	// ECMAScript function values and the bindings a function-valued
 	// property is stored under.
 	arrowFunction, functionExpression, pair, object, assignmentExpression uint16
+	// The bindings of a `require(...)` declarator.
+	variableDeclarator, objectPattern, shorthandPattern, objectAssignmentPattern uint16
+	pairPattern, assignmentPattern, propertyIdentifier                           uint16
 	// C and C++ macros and declarator chains, and what decides a C
 	// definition's linkage.
 	preprocDef, preprocFunctionDef, functionDeclarator, qualifiedIdentifier uint16
@@ -135,33 +138,40 @@ func (g *grammar) kindIDs() *kindIDs {
 			comments: kinds(g.comments...),
 			declaratorChain: kinds("pointer_declarator", "array_declarator", "init_declarator", "attributed_declarator",
 				"reference_declarator", "parenthesized_declarator"),
-			identifier:            id("identifier"),
-			funcLiteral:           id("func_literal"),
-			structType:            id("struct_type"),
-			interfaceType:         id("interface_type"),
-			typeIdentifier:        id("type_identifier"),
-			parameterDeclaration:  id("parameter_declaration"),
-			expressionStatement:   id("expression_statement"),
-			str:                   id("string"),
-			comparisonOperator:    id("comparison_operator"),
-			stringStart:           id("string_start"),
-			modifiers:             id("modifiers"),
-			visibilityModifier:    id("visibility_modifier"),
-			macroDefinition:       id("macro_definition"),
-			attributeItem:         id("attribute_item"),
-			arrowFunction:         id("arrow_function"),
-			functionExpression:    id("function_expression"),
-			pair:                  id("pair"),
-			object:                id("object"),
-			assignmentExpression:  id("assignment_expression"),
-			preprocDef:            id("preproc_def"),
-			preprocFunctionDef:    id("preproc_function_def"),
-			functionDeclarator:    id("function_declarator"),
-			qualifiedIdentifier:   id("qualified_identifier"),
-			functionDefinition:    id("function_definition"),
-			storageClassSpecifier: id("storage_class_specifier"),
-			initDeclarator:        id("init_declarator"),
-			errorKind:             id("ERROR"),
+			identifier:              id("identifier"),
+			funcLiteral:             id("func_literal"),
+			structType:              id("struct_type"),
+			interfaceType:           id("interface_type"),
+			typeIdentifier:          id("type_identifier"),
+			parameterDeclaration:    id("parameter_declaration"),
+			expressionStatement:     id("expression_statement"),
+			str:                     id("string"),
+			comparisonOperator:      id("comparison_operator"),
+			stringStart:             id("string_start"),
+			modifiers:               id("modifiers"),
+			visibilityModifier:      id("visibility_modifier"),
+			macroDefinition:         id("macro_definition"),
+			attributeItem:           id("attribute_item"),
+			arrowFunction:           id("arrow_function"),
+			functionExpression:      id("function_expression"),
+			pair:                    id("pair"),
+			variableDeclarator:      id("variable_declarator"),
+			objectPattern:           id("object_pattern"),
+			shorthandPattern:        id("shorthand_property_identifier_pattern"),
+			objectAssignmentPattern: id("object_assignment_pattern"),
+			pairPattern:             id("pair_pattern"),
+			assignmentPattern:       id("assignment_pattern"),
+			propertyIdentifier:      id("property_identifier"),
+			object:                  id("object"),
+			assignmentExpression:    id("assignment_expression"),
+			preprocDef:              id("preproc_def"),
+			preprocFunctionDef:      id("preproc_function_def"),
+			functionDeclarator:      id("function_declarator"),
+			qualifiedIdentifier:     id("qualified_identifier"),
+			functionDefinition:      id("function_definition"),
+			storageClassSpecifier:   id("storage_class_specifier"),
+			initDeclarator:          id("init_declarator"),
+			errorKind:               id("ERROR"),
 		}
 	})
 	return &g.kinds
@@ -321,7 +331,7 @@ var grammars = map[string]*grammar{
 		isTest: func(d *decl, path string, _ []byte) bool {
 			return d.kind == "function" && strings.HasSuffix(path, "_test.go") && goTestName.MatchString(d.name)
 		},
-		importNames: func(p string) []string { return []string{lastSegment(p, "/")} },
+		importNames: func(p string) []string { return []string{goImportName(p)} },
 		// The Go specification, Blank identifier and Declarations and scope:
 		// the blank identifier "does not introduce a binding and thus is not
 		// declared", in a var, const, function, method, type or field
@@ -612,6 +622,40 @@ func lastSegment(s, sep string) string {
 		return s[i+len(sep):]
 	}
 	return s
+}
+
+// goImportName is the name a Go import binds when its spec names none. The
+// imported package's own clause decides it, which a reader of one file
+// cannot see, so it is the path's last element by the convention modules
+// follow: a major-version element is not the name (`github.com/go-chi/chi/v5`
+// binds chi), and neither is a gopkg.in version suffix (`gopkg.in/yaml.v3`
+// binds yaml).
+func goImportName(p string) string {
+	p = strings.Trim(p, "\"`")
+	elems := strings.Split(p, "/")
+	name := elems[len(elems)-1]
+	if len(elems) > 1 && isMajorVersion(name) {
+		name = elems[len(elems)-2]
+	}
+	if strings.HasPrefix(p, "gopkg.in/") {
+		if i := strings.LastIndex(name, ".v"); i > 0 && isMajorVersion(name[i+1:]) {
+			name = name[:i]
+		}
+	}
+	return name
+}
+
+// isMajorVersion reports a module major-version element: "v" and digits.
+func isMajorVersion(s string) bool {
+	if len(s) < 2 || s[0] != 'v' {
+		return false
+	}
+	for _, c := range s[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func firstSegment(s, sep string) string {
