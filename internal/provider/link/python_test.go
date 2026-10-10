@@ -61,9 +61,9 @@ func pyMethod(q string, class int32) Decl { return pyDecl(model.NodeMethod, q, c
 //     fail);
 //   - field: a function stored on an attribute is not what the attribute's
 //     call through an untyped receiver binds (skip types.functions →
-//     "field-based" fails), or is bound beside a receiver that recovered a
-//     class (open the gate for it → "field-based beside a recovered
-//     receiver" fails);
+//     "field-based" fails), or through `self` of a class that declares no
+//     such method (close the gate for every recovered receiver →
+//     "field-based on self" fails);
 //   - no name-only join: a bare call of a name the file neither declares nor
 //     imports binds a same-named function elsewhere (index lookups by callee
 //     alone → "no import" fails);
@@ -199,17 +199,18 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// def on_click(): pass
 			// class Button: def __init__(self): self.handler = on_click
 			//               def press(self): self.handler()
-			name: "field-based beside a recovered receiver",
+			name: "field-based on self",
 			// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
-			// the binding rules alone); the two agree: `self` is a Button, which declares and inherits no
-			// handler in the project, and field-based resolution reads only a receiver that recovered
-			// nothing, so the call binds nothing.
+			// the binding rules alone); the two agree on every binding: `self` is a Button, which declares and
+			// inherits no handler and has no supertype outside the project, so the instance attribute the
+			// field holds decides the call.
 			anchor: "The Python Language Reference §3.3 (instance attribute lookup before the class), §6.3.1 (Attribute references)",
 			tables: []*Table{{Path: "ui.py",
 				Decls:  []Decl{pyFunc("on_click"), pyClass("Button"), pyMethod("Button.__init__", 1), pyMethod("Button.press", 1)},
 				Values: []Value{{Caller: 2, Field: "handler", Type: wire.Type{Kind: wire.TypeFunction, Name: "on_click"}}},
 				Sites: []Site{{Caller: 3, Callee: "handler", Shape: wire.ShapeMember,
 					Receiver: wire.Type{Kind: wire.TypeNamed, Name: "Button"}}}}},
+			want: []want{{Site: Ref{0, 0}, Target: Ref{0, 0}, Detail: DetailField, Dispatch: model.DispatchExact}},
 		},
 		{
 			// def on_click(): pass

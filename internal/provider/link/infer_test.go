@@ -220,11 +220,12 @@ class Circle extends Shape {}`,
 		mutation: "walking the declared type's subtypes binds Square.area to `this.area()`; " +
 			"a `super` receiver read as an instance makes its call virtual",
 	}, {
-		name: "field-based resolution beside a recovered receiver",
+		name: "field-based resolution for a class that declares nothing",
 		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
-		// the binding rules alone); the two agree on every binding: Box declares no close, so the call
-		// through a constructed Box binds nothing, whatever another object's close field holds.
-		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors: a property is looked up on the object and its prototype chain), §13.3.5 (The new Operator)",
+		// the binding rules alone); the two agree on every binding: Box declares no close and has no
+		// supertype outside the project, so only a property written on the instance can supply the call,
+		// and the field that close is written to decides it.
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors: a property is looked up on the object and its prototype chain), §13.15.2 (Assignment to a property), §13.3.5 (The new Operator)",
 		source: `function shut() {}
 class Box {}
 const door = {};
@@ -238,8 +239,8 @@ export function run() { new Box().close(); }`,
 				{Caller: 3, Callee: "close", Shape: wire.ShapeMember, Receiver: result(0)},
 			},
 			[]Value{{Caller: -1, Field: "close", Type: wire.Type{Kind: wire.TypeFunction, Name: "shut"}}})},
-		want:     []Binding{b(0, 0, 0, 1, DetailDirect, exact)},
-		mutation: "the field-based gate opened for a receiver that recovered a value binds `new Box().close()` to shut",
+		want:     []Binding{b(0, 0, 0, 1, DetailDirect, exact), b(0, 1, 0, 0, DetailField, exact)},
+		mutation: "the field-based gate closed for every receiver that recovered a value leaves `new Box().close()` unbound",
 	}, {
 		name: "computed callee",
 		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and

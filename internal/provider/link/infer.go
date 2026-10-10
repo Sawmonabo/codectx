@@ -88,6 +88,8 @@ func inferTypes(ctx context.Context, u *unit, h *hierarchy) (*types, error) {
 	in := &inference{u: u, h: h}
 	t, err := in.run(ctx)
 	in.closeAll()
+	// Set only when the run failed after the scan.
+	in.externalIx.close()
 	return t, err
 }
 
@@ -333,15 +335,18 @@ type inference struct {
 
 	// Field-based resolution of a member site waits for the fixed point:
 	// fieldWatches are the member sites' watches of the fields they call,
-	// and fielded reports that the watches of the sites whose receivers
-	// recovered nothing have been added. receivers are the member sites
-	// whose receiver names a type or a module, or held a value, until then.
+	// and fielded reports that the watches of the sites the field may
+	// decide have been added. receivers are the values each member site's
+	// receiver held until then, and a value of kind 0 for a receiver that
+	// names a module, or a type the unit does not declare.
 	fieldWatches *pagination.ExternalSort[watch]
-	receivers    *pagination.ExternalSort[Ref]
+	receivers    *pagination.ExternalSort[recv]
 	fielded      bool
 	// externals collects each type's supertypes outside the project, which
-	// the file scan reads from the tables' supertype rows.
-	externals *pagination.ExternalSort[entry]
+	// the file scan reads from the tables' supertype rows, and externalIx
+	// is them once the scan is done.
+	externals  *pagination.ExternalSort[entry]
+	externalIx *index
 
 	open []interface{ Close() error }
 }
@@ -369,10 +374,10 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		return nil, err
 	}
 	in.fieldWatches.WithFold(keepFirst[watch])
-	if in.receivers, err = newSort(in, refCodec); err != nil {
+	if in.receivers, err = newSort(in, recvCodec); err != nil {
 		return nil, err
 	}
-	in.receivers.WithFold(keepFirst[Ref])
+	in.receivers.WithFold(keepFirst[recv])
 	if in.externals, err = newEntrySort(in.u.dir); err != nil {
 		return nil, err
 	}
@@ -382,6 +387,9 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		return nil, err
 	}
 	if err := in.scan(ctx, r); err != nil {
+		return nil, err
+	}
+	if in.externalIx, err = writeIndex(in.u.dir, in.externals); err != nil {
 		return nil, err
 	}
 	if in.facts, err = emptyRun(in, factCodec); err != nil {
@@ -442,22 +450,22 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 	if err != nil {
 		return nil, err
 	}
-	externals, err := writeIndex(in.u.dir, in.externals)
-	if err != nil {
-		recvs.Close()
-		return nil, err
-	}
 	// The answer's runs belong to the types the inference returns.
 	in.open = slices.DeleteFunc(in.open, func(c interface{ Close() error }) bool { return c == in.bound })
+	externals := in.externalIx
+	in.externalIx = nil
 	return &types{bindingRun: in.bound, recvRun: recvs, externals: externals}, nil
 }
 
-// addFieldWatches adds the field watch of every member site whose receiver
-// recovered nothing once the values settle, and hands each the values its
-// field already holds. A receiver that names a type or a module, or held
-// any value, decides the call through what it recovered: a type that
-// declares or inherits no method of the name, in the project, leaves the
-// site external or open (externalMember), never bound to a function some
+// addFieldWatches adds the field watch of every member site the field may
+// decide once the values settle, and hands each the values its field
+// already holds: a site whose receiver recovered nothing, or recovered only
+// classes of the unit that neither declare nor inherit a method of the name
+// and have no supertype outside the project (an instance attribute,
+// `self.cb = f; self.cb()`, which only the field can tell). A receiver that
+// names a module or a type outside the unit, or holds a class that declares
+// the method or may inherit it from outside the project, decides the call
+// through what it recovered (externalMember), never through a function some
 // other object's field of that name holds.
 func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	in.fielded = true
@@ -473,9 +481,12 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	if err != nil {
 		return err
 	}
-	err = join(pending, recovered, func(w watch, site Ref) int { return compareRef(w.Call.Site, site) }, func(w watch, rs []Ref) error {
-		if len(rs) > 0 {
-			return nil
+	err = join(pending, recovered, func(w watch, v recv) int { return compareRef(w.Call.Site, v.Call.Site) }, func(w watch, vs []recv) error {
+		for _, v := range vs {
+			open, err := in.fieldDecides(v.X, w.Call.Callee)
+			if err != nil || !open {
+				return err
+			}
 		}
 		return untyped.Add(w)
 	})
@@ -499,6 +510,24 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	}
 	in.watches, err = unionRuns(in, watchCodec, in.watches, added)
 	return err
+}
+
+// fieldDecides reports that a receiver holding x leaves a call of method to
+// the field it calls through: x is a class of the unit, as an instance or a
+// class object, that neither declares nor inherits method and has no
+// supertype outside the project.
+func (in *inference) fieldDecides(x value, method string) (bool, error) {
+	switch x.Kind {
+	case valInstance, valObject, valExact, valClass:
+	default:
+		return false, nil
+	}
+	declares := false
+	if err := in.h.declared(x.Ref, method, func(entry) error { declares = true; return nil }); err != nil || declares {
+		return false, err
+	}
+	outside, err := outsideSupertypes(in.h, in.externalIx, x.Ref)
+	return len(outside) == 0, err
 }
 
 // release closes every relation opened since mark except live, which stays
@@ -690,16 +719,31 @@ func (f *fileScan) externalSupertypes(ctx context.Context) error {
 // project, its qualified name (hierarchy.externalName) in Aux.
 const keyExternalSuper = "xs\x00"
 
-// namesType reports a receiver term that names a type or a module itself,
-// whether or not the unit declares it: what it recovered decides the call.
-func (f *fileScan) namesType(ty wire.Type) bool {
-	return slices.ContainsFunc(f.members(ty), func(m wire.Type) bool {
+// namesOutside reports a receiver term that names a module, or a type or a
+// supertype no declaration of the unit is: what it names decides the call,
+// never the field it calls through.
+func (f *fileScan) namesOutside(ctx context.Context, ty wire.Type) (bool, error) {
+	for _, m := range f.members(ty) {
+		found := false
 		switch m.Kind {
-		case wire.TypeNamed, wire.TypeClass, wire.TypeSuper, wire.TypeModule:
-			return true
+		case wire.TypeModule:
+			return true, nil
+		case wire.TypeNamed, wire.TypeClass:
+			if err := f.in.h.types(ctx, f.file, m.Name, func(Ref) error { found = true; return nil }); err != nil {
+				return false, err
+			}
+		case wire.TypeSuper:
+			if err := f.eval(ctx, -1, m, func(operand) error { found = true; return nil }); err != nil {
+				return false, err
+			}
+		default:
+			continue
 		}
-		return false
-	})
+		if !found {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // site records one site: its arguments, the bindings and values its own
@@ -788,8 +832,12 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			return route(roleReceiver)
 		}
 	case wire.ShapeMember:
-		if f.namesType(s.Receiver) {
-			if err := in.receivers.Add(ref); err != nil {
+		outside, err := f.namesOutside(ctx, s.Receiver)
+		if err != nil {
+			return err
+		}
+		if outside {
+			if err := in.receivers.Add(recv{Call: c, Role: roleReceiver}); err != nil {
 				return err
 			}
 		}
@@ -966,7 +1014,7 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 	}
 	c := v.Call
 	if v.Role == roleReceiver && !in.fielded {
-		if err := in.receivers.Add(c.Site); err != nil {
+		if err := in.receivers.Add(v); err != nil {
 			return err
 		}
 	}
@@ -1342,31 +1390,9 @@ func (t *types) externalMember(h *hierarchy, family string, site, typ Ref, metho
 // A type with no supertype outside the project emits nothing. It reports
 // whether it emitted.
 func (t *types) outsideCall(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
-	var outside []string
-	seen := map[Ref]bool{typ: true}
-	queue := []Ref{typ}
-	for len(queue) > 0 {
-		x := queue[0]
-		queue = queue[1:]
-		err := t.externals.lookup(keyExternalSuper+refKey(x), func(e entry) error {
-			if !slices.Contains(outside, e.Aux) {
-				outside = append(outside, e.Aux)
-			}
-			return nil
-		})
-		if err != nil {
-			return false, err
-		}
-		err = h.links.lookup(keySuper+refKey(x), func(e entry) error {
-			if !seen[e.Ref] {
-				seen[e.Ref] = true
-				queue = append(queue, e.Ref)
-			}
-			return nil
-		})
-		if err != nil {
-			return false, err
-		}
+	outside, err := outsideSupertypes(h, t.externals, typ)
+	if err != nil {
+		return false, err
 	}
 	switch len(outside) {
 	case 0:
@@ -1376,6 +1402,39 @@ func (t *types) outsideCall(h *hierarchy, family string, site, typ Ref, method s
 			External: externalMethod(family, outside[0], method)})
 	}
 	return true, emit(Binding{Kind: FactExternalSite, Site: site, Detail: DetailHierarchy})
+}
+
+// outsideSupertypes is the qualified names of the supertypes outside the
+// project in typ's supertype closure, typ's own included, each once, read
+// from externals (keyExternalSuper).
+func outsideSupertypes(h *hierarchy, externals *index, typ Ref) ([]string, error) {
+	var outside []string
+	seen := map[Ref]bool{typ: true}
+	queue := []Ref{typ}
+	for len(queue) > 0 {
+		x := queue[0]
+		queue = queue[1:]
+		err := externals.lookup(keyExternalSuper+refKey(x), func(e entry) error {
+			if !slices.Contains(outside, e.Aux) {
+				outside = append(outside, e.Aux)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		err = h.links.lookup(keySuper+refKey(x), func(e entry) error {
+			if !seen[e.Ref] {
+				seen[e.Ref] = true
+				queue = append(queue, e.Ref)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return outside, nil
 }
 
 // externalReceiver emits the virtual FactCall of member site s, at site in
@@ -1866,12 +1925,6 @@ var lookupCodec = codec[lookup]{
 		return cmp.Or(compareRef(a.Class, b.Class), cmp.Compare(a.Name, b.Name), cmpCall(a.Call, b.Call),
 			cmp.Compare(a.Rank, b.Rank), cmpBool(a.Unbound, b.Unbound), cmpBool(a.Virtual, b.Virtual))
 	},
-}
-
-var refCodec = codec[Ref]{
-	put: func(w *wbuf, x Ref) { w.ref(x) },
-	get: func(r *rbuf) Ref { return r.ref() },
-	cmp: compareRef,
 }
 
 var exportReqCodec = codec[exportReq]{
