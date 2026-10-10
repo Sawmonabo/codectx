@@ -2,10 +2,10 @@
 
 ## Status
 
-Accepted, 2026-10-08, by the owner after the measurement below. Two choices inside the decisions wait on
-measurements that are running on the same export, and each names the result that decides it:
-- whether the code-aware tokenizer replaces the plain one (decision 6);
-- whether document length is weighted per column (decision 2).
+Accepted, 2026-10-08, by the owner after the measurement below. Amended 2026-10-09 by the owner's ruling: the
+code-aware tokenizer form is adopted (decision 6), and the visibility route is the alive set (decision 3). One choice
+waits on the quality benchmark over real task questions, and names the result that decides it: whether document
+length is weighted per column (decision 2).
 
 This record replaces [ADR-0007](ADR-0007-lexical-first-page.md) in full. It replaces the lexical half of
 [ADR-0003](ADR-0003-storage-tier2.md) and amends [ADR-0001](ADR-0001-scale-posture.md) §2.4: a ranked search serves its
@@ -148,8 +148,10 @@ both sides. A shared test vector proves equality.
 
 **Pending, document length weighted per column.** The BM25F paper uses Σ weight(c)·length(c) as the document length,
 and so does the major engine that implements it. Ours uses the unweighted total. This is a departure, not a measured
-loss. The weighted form is adopted if it raises MRR@10 on two of the three sets and lowers it on none. Otherwise the
-unweighted total stays.
+loss. Both forms are built: every column's token count is a fast field, and each block summary stores the minimum
+document length under both forms, so the choice is made per query and early stopping stays exact under either. The
+quality benchmark over real task questions decides it, and the chosen form then becomes a constant. Until then the
+choice is a fixed internal switch, never a user setting.
 
 ## Decision 3: one index holds every retained unit; a generation is a visibility set
 
@@ -179,8 +181,11 @@ statistics still count hidden documents.
   share segments across indexes.
 - *A directory that never deletes, plus saved commit metadata.* It works against the library's design.
 
-**Pending: the visibility route** (alive set, query wrapper or collector). It is chosen by its kubernetes time at 10%
-and 50% hidden. All three routes give identical pages.
+**The visibility route is the alive set.** On kubernetes (546 613 documents, 30 queries, 0%, 10% and 50% of units
+hidden) the alive set, a query wrapper and the collector gave identical pages and times within noise of each other.
+The alive set is the library's own mechanism for documents a searcher must not see, so the collector and the block
+bounds never meet a hidden document. Building one generation's set costs 10–22 ms per searcher, more than a warm
+query, so it is built once per (generation, segment) and cached with the searcher.
 
 ## Decision 4: writing, committing and recovering
 
@@ -209,8 +214,8 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   cannot enter the top k. It changes the work, never the results: the top k equal exhaustive scoring's top k. The
   library's own pruning returned pages equal to exhaustive scoring, with 0 misses, on 2- and 11-segment indexes, at
   about 0.5 ms a page whatever the page number. Our formula's pruned collector returned pages 1 to 3 identical to
-  exhaustive scoring on 2 436 of 2 436 query-page pairs on a fixture, at 1 and 4 search threads; its kubernetes run is
-  next. The library's pruned disjunction-max query is wrong in this release
+  exhaustive scoring on 2 436 of 2 436 query-page pairs on a fixture, at 1 and 4 search threads, and on kubernetes
+  3 030 of 3 030 pages over four query sets, 15.7 times faster summed on the 30 speed queries (4 653 ms to 296 ms). The library's pruned disjunction-max query is wrong in this release
   (the fix is merged upstream but not released), so pruning is built for our formula and never borrowed from the
   library's queries.
 - **Match count.** The count is exact when every match was visited, and otherwise a lower bound marked as one. That is
@@ -222,6 +227,14 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   lower bound, like the match count. Exact-tier results come first and a lexical document folds into the exact-tier
   result with its key.
 - **No spool.** The ranked set is never sorted to disk. ADR-0001 §2.4 is amended to this rule.
+- **Block summaries.** Each segment has one summary: per block, the maximum weighted term frequency and the minimum
+  document length under both length forms. A summary is built for every new segment at commit and at merge, in the
+  same step that makes the segment visible; a segment without a current summary is scored exhaustively, so a stale
+  summary is never read.
+- **Bounds.** Ties at the k-th score are bounded by the heap and the content tie key, never collected in an unbounded
+  list; block metadata is read from the summary files per block, never held per segment in the heap. The number of
+  queries searching at once, the writer's memory budget and its merge and search threads are admitted by measured
+  need, like every other stage.
 
 The exact tier (path and symbol lookup) is not ranked and keeps returning every match.
 
@@ -240,11 +253,12 @@ The tokenizer reproduces today's rules:
 Every library tokenizer with a silent length cut is avoided. The library's default analyzer drops tokens of 40 bytes or
 more.
 
-**Pending: the code-aware form.** This form emits the whole identifier, and also its camelCase and snake_case parts at
+**The code-aware form is adopted.** This form emits the whole identifier, and also its camelCase and snake_case parts at
 the same position. For example, `NewController` is indexed as `newcontroller`, `new` and `controller`. Under the
 library's scoring it lifted the subword set from 0.60 to 0.70 MRR@10 (Recall@200 0.22 to 0.66), and it held the
-other two sets. Under our scoring it is being measured now. It is adopted if it lifts subword, holds name within 0.01
-MRR@10 and does not lower doc. The literature supports the whole-plus-parts form. On Go, it raised NDCG@10 from 0.309
+other two sets. Under our scoring on kubernetes it lifted subword from 0.379 to 0.500 MRR@10 (Recall@200 0.214 to 0.630, zero-hit
+queries 13 to 0), and cost name 0.023 and doc 0.009. The owner adopted it on that measurement: partial-name search is
+the gap the product most needs closed, and whole identifiers keep their exact and prefix tiers ahead of it. The literature supports the whole-plus-parts form. On Go, it raised NDCG@10 from 0.309
 to 0.563 in one 2026 preprint, while parts alone scored 0.469.
 
 ## Decision 7: filters and new query features come from fast fields
