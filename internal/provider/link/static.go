@@ -3,7 +3,9 @@ package link
 import (
 	"cmp"
 	"context"
+	"encoding/binary"
 	"errors"
+	"slices"
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -33,11 +35,17 @@ import (
 // address-taken functions of a signature. Every other member keeps its
 // predecessor's bindings, reads and address-taken functions.
 
-// taken is one function a member takes as a value, under its signature.
+// taken is one function a member takes as a value, under its signature,
+// with what a call through the value passes its arguments into: Params, the
+// function's declared parameters (encodeParams), and ReceiverFirst when the
+// value takes the method's receiver as its first argument (a Go method
+// expression `T.M`, a Rust path `T::m` to a method with a self parameter).
 type taken struct {
-	Sig    string
-	From   model.FileID
-	Target target
+	Sig           string
+	From          model.FileID
+	Target        target
+	Params        string
+	ReceiverFirst bool
 }
 
 func compareTakenFrom(a, b taken) int {
@@ -50,16 +58,101 @@ func compareTakenSig(a, b taken) int {
 
 func encodeTaken(t taken) ([]byte, error) {
 	out := appendString(appendString(nil, t.Sig), string(t.From))
-	return appendString(appendString(out, string(t.Target.File)), string(t.Target.Node)), nil
+	out = appendString(appendString(out, string(t.Target.File)), string(t.Target.Node))
+	flag := byte(0)
+	if t.ReceiverFirst {
+		flag = 1
+	}
+	return append(appendString(out, t.Params), flag), nil
 }
 
 func decodeTaken(raw []byte) (taken, error) {
 	b := byteReader{b: raw}
-	t := taken{Sig: b.str(), From: model.FileID(b.str()), Target: target{File: model.FileID(b.str()), Node: model.NodeID(b.str())}}
-	if b.err != nil || len(b.b) != 0 {
+	t := taken{Sig: b.str(), From: model.FileID(b.str()), Target: target{File: model.FileID(b.str()), Node: model.NodeID(b.str())},
+		Params: b.str()}
+	flag := b.byte()
+	if b.err != nil || len(b.b) != 0 || flag > 1 {
 		return taken{}, errors.New("an address-taken function is malformed")
 	}
+	if _, err := decodeParams(t.Params); err != nil {
+		return taken{}, err
+	}
+	t.ReceiverFirst = flag == 1
 	return t, nil
+}
+
+// boundParam is one declared parameter of a callable a fact names by
+// identity: what argumentFlows matches an argument against, and the
+// parameter's node (empty when the structural provider minted none).
+type boundParam struct {
+	paramInfo
+	Node model.NodeID
+}
+
+// encodeParams spells params, in order, as one string: each parameter's
+// position, index, marks, name and node.
+func encodeParams(params []boundParam) string {
+	var out []byte
+	for _, p := range params {
+		marks := byte(0)
+		if p.Variadic {
+			marks |= 1
+		}
+		if p.KeywordOnly {
+			marks |= 2
+		}
+		out = binary.AppendUvarint(binary.AppendUvarint(out, uint64(p.Pos)), uint64(p.Index))
+		out = appendString(appendString(append(out, marks), p.Name), string(p.Node))
+	}
+	return string(out)
+}
+
+// decodeParams reads what encodeParams wrote.
+func decodeParams(s string) ([]boundParam, error) {
+	b := byteReader{b: []byte(s)}
+	var out []boundParam
+	for len(b.b) > 0 && b.err == nil {
+		pos, index := b.index(), b.uvarint()
+		marks := b.byte()
+		p := boundParam{paramInfo: paramInfo{Pos: pos, Index: uint32(index), Variadic: marks&1 != 0, KeywordOnly: marks&2 != 0,
+			Name: b.str()}, Node: model.NodeID(b.str())}
+		if index > 1<<32-1 || marks > 3 {
+			b.fail()
+		}
+		out = append(out, p)
+	}
+	if b.err != nil {
+		return nil, errors.New("a callable's parameters are malformed")
+	}
+	return out, nil
+}
+
+// argumentShapes spells the arguments of a site as one string: each
+// argument's keyword and spread, which argumentFlows matches parameters by.
+func argumentShapes(args []Argument) string {
+	var out []byte
+	for _, a := range args {
+		out = append(appendString(out, a.Keyword), byte(a.Spread))
+	}
+	return string(out)
+}
+
+// shapedSite is a site with the arguments argumentShapes spelled, each with
+// its keyword and spread alone.
+func shapedSite(s string) (Site, error) {
+	b := byteReader{b: []byte(s)}
+	var site Site
+	for len(b.b) > 0 && b.err == nil {
+		a := Argument{Keyword: b.str(), Spread: wire.Spread(b.byte())}
+		if a.Spread > wire.SpreadKeyword {
+			b.fail()
+		}
+		site.Arguments = append(site.Arguments, a)
+	}
+	if b.err != nil {
+		return Site{}, errors.New("a signature join's arguments are malformed")
+	}
+	return site, nil
 }
 
 func newTakenSort(dir string, order func(a, b taken) int) (*pagination.ExternalSort[taken], error) {
@@ -73,11 +166,15 @@ func newTakenSort(dir string, order func(a, b taken) int) (*pagination.ExternalS
 // sigUse is a site that joins the address-taken functions of Sig: an
 // indirect site, which binds each of them, exact, or a Java call of an
 // abstract method, which binds the method (Site's target and detail),
-// virtual, when there is none. Site is the call fact the join completes.
+// virtual, when there is none. Site is the call fact the join completes;
+// Args are the site's arguments (argumentShapes), and Params, for a Java
+// call of an abstract method, the method's parameters (encodeParams).
 type sigUse struct {
 	Sig      string
 	Abstract bool
 	Site     idBinding
+	Args     string
+	Params   string
 }
 
 func encodeSigUse(u sigUse) ([]byte, error) {
@@ -89,12 +186,13 @@ func encodeSigUse(u sigUse) ([]byte, error) {
 	if u.Abstract {
 		flag = 1
 	}
-	return append(appendString(nil, u.Sig), append([]byte{flag}, b...)...), nil
+	out := appendString(appendString(appendString(nil, u.Sig), u.Args), u.Params)
+	return append(out, append([]byte{flag}, b...)...), nil
 }
 
 func decodeSigUse(raw []byte) (sigUse, error) {
 	r := byteReader{b: raw}
-	u := sigUse{Sig: r.str()}
+	u := sigUse{Sig: r.str(), Args: r.str(), Params: r.str()}
 	flag := r.byte()
 	if r.err != nil || flag > 1 {
 		return sigUse{}, errors.New("a signature join is malformed")
@@ -199,33 +297,53 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 		}
 		return s.bindings.Add(id)
 	}
+	// take records the function at ref, taken as a value of signature sig,
+	// with its parameters; receiverFirst is true for a Go method
+	// expression, and a Rust path to a method takes its self parameter
+	// first.
+	take := func(sig string, ref Ref, receiverFirst bool) error {
+		to, err := s.h.ids.node(ref)
+		if err != nil {
+			return err
+		}
+		params, err := s.boundParams(ref)
+		if err != nil {
+			return err
+		}
+		if familyOf(t.Language) == "rust" {
+			receiverFirst = slices.ContainsFunc(params, func(p boundParam) bool { return p.Index == 0 })
+		}
+		return s.taken.Add(taken{Sig: sig, From: fv.ID, Target: to, Params: encodeParams(params), ReceiverFirst: receiverFirst})
+	}
 	signature := func(e entry) error {
-		switch e.Tag {
-		case 0:
-			to, err := s.h.ids.node(e.Ref)
-			if err != nil {
-				return err
-			}
-			return s.taken.Add(taken{Sig: e.Key, From: fv.ID, Target: to})
-		case 1:
-			if err := note(signatureKey(e.Key)); err != nil {
-				return err
-			}
-			return s.uses.Add(sigUse{Sig: e.Key, Site: idBinding{Kind: FactCall, SiteFile: fv.ID, Site: e.Ref.Index,
-				Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
+		if e.Tag == 0 {
+			return internalErr("a resolver joined a function taken as a value as a site")
 		}
 		if err := note(signatureKey(e.Key)); err != nil {
 			return err
 		}
-		to, err := s.h.ids.node(refOf(e.Aux))
+		if e.Ref.Index < 0 || int(e.Ref.Index) >= len(t.Sites) {
+			return internalErr("a resolver joined site " + strconv.Itoa(int(e.Ref.Index)) + " past its member's table")
+		}
+		args := argumentShapes(t.Sites[e.Ref.Index].Arguments)
+		if e.Tag == 1 {
+			return s.uses.Add(sigUse{Sig: e.Key, Args: args, Site: idBinding{Kind: FactCall, SiteFile: fv.ID, Site: e.Ref.Index,
+				Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
+		}
+		method := refOf(e.Aux)
+		to, err := s.h.ids.node(method)
 		if err != nil {
 			return err
 		}
 		if _, ok := detailCode(e.Sig); !ok {
 			return internalErr("a resolver joined an abstract method with the unknown technique " + strconv.Quote(e.Sig))
 		}
-		return s.uses.Add(sigUse{Sig: e.Key, Abstract: true, Site: idBinding{Kind: FactCall, SiteFile: fv.ID,
-			Site: e.Ref.Index, TargetFile: to.File, Target: to.Node, Detail: e.Sig, Dispatch: model.DispatchVirtual}})
+		params, err := s.boundParams(method)
+		if err != nil {
+			return err
+		}
+		return s.uses.Add(sigUse{Sig: e.Key, Abstract: true, Args: args, Params: encodeParams(params), Site: idBinding{Kind: FactCall,
+			SiteFile: fv.ID, Site: e.Ref.Index, TargetFile: to.File, Target: to.Node, Detail: e.Sig, Dispatch: model.DispatchVirtual}})
 	}
 	r := staticFile{h: s.h, ctx: s.ctx, file: file, t: t, fc: contextOf(file, t), emit: emit, returns: map[int32][]returned{}}
 	for i := range t.Sites {
@@ -242,11 +360,11 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 			if e.Sig == "" {
 				return nil
 			}
-			sig := e.Sig
-			if r.fc.family == "go" && v.Type.Index > 0 {
+			sig, expression := e.Sig, r.fc.family == "go" && v.Type.Index > 0
+			if expression {
 				sig = goMethodExpression(v.Type.Name, sig)
 			}
-			return signature(entry{Key: sig, Ref: e.Ref})
+			return take(sig, e.Ref, expression)
 		})
 		if err != nil {
 			return err
@@ -256,6 +374,22 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 		return err
 	}
 	return s.h.hierarchyFacts(s.ctx, file, t, emit)
+}
+
+// boundParams is the declared parameters of the callable at ref, in
+// declaration order, each with its node, read through the hierarchy so the
+// member running records the read.
+func (s *staticRun) boundParams(ref Ref) ([]boundParam, error) {
+	var out []boundParam
+	err := s.h.parameters(ref, func(p paramInfo) error {
+		to, err := s.h.ids.param(ref, p.Pos)
+		if err != nil {
+			return err
+		}
+		out = append(out, boundParam{paramInfo: p, Node: to.Node})
+		return nil
+	})
+	return out, err
 }
 
 // members runs every member with a table that run (FileIDs, ascending)
@@ -293,8 +427,10 @@ func (s *staticRun) members(run *pagination.SortedRun[model.FileID]) error {
 // address-taken functions of its signature in taken (by signature), into
 // out: an indirect site to every one of them, each a call fact of dispatch
 // exact (the function the value holds is the one that runs), a Java call of
-// an abstract method to that method, virtual, only when there is none. Only
-// one signature's functions are held at a time.
+// an abstract method to that method, virtual, only when there is none. Each
+// bound target also gets the FactFlow of each of the site's arguments into
+// the parameter of the target it binds (argumentFlows), as a direct call's
+// target does. Only one signature's functions are held at a time.
 func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun[sigUse], out *pagination.ExternalSort[idBinding]) error {
 	next, stop := pull(taken)
 	defer stop()
@@ -302,8 +438,13 @@ func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun
 	if err != nil {
 		return err
 	}
+	type function struct {
+		target        target
+		params        []boundParam
+		receiverFirst bool
+	}
 	sig := ""
-	var functions []target
+	var functions []function
 	have := false
 	return uses.Each(func(u sigUse) error {
 		if !have || u.Sig != sig {
@@ -314,28 +455,68 @@ func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun
 				}
 			}
 			for ok && cur.Sig == sig {
-				if n := len(functions); n == 0 || functions[n-1] != cur.Target {
-					functions = append(functions, cur.Target)
+				if n := len(functions); n == 0 || functions[n-1].target != cur.Target {
+					params, err := decodeParams(cur.Params)
+					if err != nil {
+						return err
+					}
+					functions = append(functions, function{target: cur.Target, params: params, receiverFirst: cur.ReceiverFirst})
 				}
 				if cur, ok, err = next(); err != nil {
 					return err
 				}
 			}
 		}
+		site, err := shapedSite(u.Args)
+		if err != nil {
+			return err
+		}
 		if u.Abstract {
 			if len(functions) > 0 {
 				return nil
 			}
-			return out.Add(u.Site)
+			params, err := decodeParams(u.Params)
+			if err != nil {
+				return err
+			}
+			if err := out.Add(u.Site); err != nil {
+				return err
+			}
+			return joinFlows(&site, u.Site, u.Site.TargetFile, params, false, out)
 		}
 		for _, f := range functions {
 			b := u.Site
-			b.TargetFile, b.Target = f.File, f.Node
+			b.TargetFile, b.Target = f.target.File, f.target.Node
 			if err := out.Add(b); err != nil {
+				return err
+			}
+			if err := joinFlows(&site, u.Site, f.target.File, f.params, f.receiverFirst, out); err != nil {
 				return err
 			}
 		}
 		return nil
+	})
+}
+
+// joinFlows adds to out the FactFlow of each argument of site, the call
+// fact call completes by a join, into the parameter it binds among params,
+// the declared parameters of the bound target in file: one per pair whose
+// parameter has a node.
+func joinFlows(site *Site, call idBinding, file model.FileID, params []boundParam, receiverFirst bool, out *pagination.ExternalSort[idBinding]) error {
+	if len(site.Arguments) == 0 || len(params) == 0 {
+		return nil
+	}
+	info := make([]paramInfo, len(params))
+	node := make(map[int32]model.NodeID, len(params))
+	for i, p := range params {
+		info[i], node[p.Pos] = p.paramInfo, p.Node
+	}
+	return argumentFlows(site, info, receiverFirst, func(arg, pos int32) error {
+		if node[pos] == "" {
+			return nil
+		}
+		return out.Add(idBinding{Kind: FactFlow, SiteFile: call.SiteFile, Site: call.Site, Arg: arg, TargetFile: file,
+			Target: node[pos], Detail: DetailArgument})
 	})
 }
 

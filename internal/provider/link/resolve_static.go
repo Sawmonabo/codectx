@@ -10,10 +10,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// sigSink receives what a site or value joins the cross-product with
-// (staticRun.signature): an address-taken function (tag 0), an indirect site
-// (tag 1) or a Java call of an abstract method (tag 2, the method's Ref in
-// Aux, the detail in Sig), each under its declared signature in Key.
+// sigSink receives what a site joins the cross-product with (the signature
+// sink of staticRun.member): an indirect site (tag 1) or a Java call of an
+// abstract method (tag 2, the method's Ref in Aux, the detail in Sig), each
+// under its declared signature in Key and the site's Ref in Ref.
 type sigSink func(entry) error
 
 // staticFile resolves the sites and values of one member table.

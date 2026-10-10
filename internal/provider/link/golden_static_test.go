@@ -233,6 +233,38 @@ var staticGoldens = []golden{
 		fails: "a call through a function pointer bound to a stand-in, or to one of the two functions its type admits",
 	},
 	{
+		name:   "c-function-pointer-argument-flows",
+		anchor: "ISO/IEC 9899 (C) §6.5.2.2 (Function calls: a call through a pointer to function assigns each argument to the corresponding parameter of the function called), §6.3.2.1 (function designators), §6.5.16.1 (Simple assignment)",
+		files: map[string]string{
+			"pointers.c": `void g(int p) {} // @g
+void h(int q) {} // @h
+
+void run(int x) { // @run
+    void (*fp)(int) = g;
+    if (x > 0) {
+        fp = h;
+    }
+    fp(x); // @c1
+}
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every fact. g and h are the only functions whose address
+		// is taken, both of fp's type, so `fp(x)` may call either and x reaches the parameter of each.
+		// Unprobed: the C worker's argument reads.
+		want: []string{
+			"c1 fp -> g g exact set=2",
+			"c1 fp -> h h exact set=2",
+		},
+		facts: []string{
+			"run x flows g p",
+			"run x flows h q",
+		},
+		// Mutation: emit flows only for direct calls (none from the address-taken cross-product) -> x
+		// reaches neither p nor q.
+		fails: "a call through a function pointer bound to its address-taken functions without the flow of its argument into their parameters",
+	},
+	{
 		name:   "java-external-override-and-call",
 		anchor: "Java Language Specification §8.1.4 (a class with no superclass extends Object), §9.6.4.4 (@Override), §4.3.2 (The Class Object), §15.12.4.4",
 		files: map[string]string{
