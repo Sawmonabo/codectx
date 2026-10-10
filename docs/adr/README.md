@@ -29,3 +29,4 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | [ADR-0014](ADR-0014-stable-identity-incremental-linking.md) | A declaration's identity is its name path, and an edit relinks only what read what changed | Accepted, 2026-10-09 |
 | [ADR-0015](ADR-0015-open-call-sites-and-dispatch.md) | Unbound calls are open sites with name candidates, and calls through a base class are found at query time | Accepted, 2026-10-09 |
 | [ADR-0016](ADR-0016-seed-budget.md) | The context planner reads lexical matches until no unread match can change what it packs | Accepted, 2026-10-09 |
+| [ADR-0017](ADR-0017-extraction-and-linking-coverage.md) | Eight facts a client derives from source are published by the index, each in a stated exact form | Accepted, 2026-10-09 |
