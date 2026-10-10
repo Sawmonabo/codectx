@@ -377,6 +377,7 @@ var refPrefixes = []struct {
 	file   bool
 }{
 	{keyFile, true}, {keyImport, true}, {keyMethod, false}, {keySub, false}, {keySuper, false}, {keyGoField, false},
+	{keyExternalSuper, false}, {keyParam, false},
 }
 
 // traceKey is the read of key in the index scope names (scopeDecls,

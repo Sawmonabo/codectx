@@ -46,11 +46,11 @@ pub fn g() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"r1 f -> af f",
-			"r2 f -> bf f",
-			"rootcall h -> ah h",
-			"g1 h -> ah h",
-			"g2 f -> af f",
+			"r1 f -> af f exact",
+			"r2 f -> bf f exact",
+			"rootcall h -> ah h exact",
+			"g1 h -> ah h exact",
+			"g2 f -> af f exact",
 		},
 		fails: "a module path collapsed to its last component binds util::f to both util files; crate, self and super left unresolved lose their calls",
 	},
@@ -66,7 +66,7 @@ edition = "2021"
 			"src/lib.rs": `use std::rc::Rc;
 
 pub trait Handler {
-    fn handle(&self);
+    fn handle(&self); // @hspec
 }
 
 pub struct A;
@@ -93,11 +93,10 @@ pub fn one(a: Rc<A>) {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"all handle -> ah handle",
-			"all handle -> bh handle",
-			"one handle -> ah handle",
+			"all handle -> hspec handle virtual",
+			"one handle -> ah handle exact",
 		},
-		fails: "a Box or Rc receiver read as the type `Box` or `Rc` leaves both calls unbound",
+		fails: "a Box or Rc receiver read as the type `Box` or `Rc` leaves both calls unbound; a trait object's call published to each impl instead of the trait's method; a concrete receiver's call marked virtual",
 	},
 	{
 		name:   "macros-and-call-forms",
@@ -134,11 +133,11 @@ pub fn run(s: S) -> i32 {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"call bail -> fbail bail",
-			"chain new -> new new",
-			"chain start -> start start",
-			"f1 m -> m m",
-			"f2 m -> m m",
+			"call bail -> fbail bail exact",
+			"chain new -> new new exact",
+			"chain start -> start start exact",
+			"f1 m -> m m exact",
+			"f2 m -> m m exact",
 		},
 		fails: "a macro invocation taken as a call of the same-named function binds `bail!()`; an argument count that excludes the receiver of `S::m(&s, 1)` drops it",
 	},
@@ -176,10 +175,10 @@ pub fn run() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"g1 h -> mh h",
-			"k1 h -> mh h",
-			"r1 h -> top h",
-			"r2 g -> mg g",
+			"g1 h -> mh h exact",
+			"k1 h -> mh h exact",
+			"r1 h -> top h exact",
+			"r2 g -> mg g exact",
 		},
 		fails: "a bare name looked up at the file's top level from inside `mod m`, or `super` read from the file, binds the crate root's h",
 	},
@@ -210,7 +209,7 @@ mod tests {
 		// the binding rules alone); the two agree on every binding. The tests module exists only under
 		// `#[cfg(test)]`; both read the call as the test build defines it.
 		want: []string{
-			"t1 h -> ah h",
+			"t1 h -> ah h exact",
 		},
 		fails: "a glob `use super::*` not followed leaves `h()` in the tests module unbound",
 	},
@@ -251,8 +250,8 @@ pub fn run() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"r1 f -> qf f",
-			"r2 f -> af f",
+			"r1 f -> qf f exact",
+			"r2 f -> af f exact",
 		},
 		fails: "a first path segment that names another crate of the workspace, read as a module of this crate, binds app's f or nothing",
 	},
@@ -295,12 +294,12 @@ pub fn run(foo: Foo) -> i32 {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"c1 make -> mk make",
-			"c2 clone -> fclone clone",
-			"c3 g -> fm m",
-			"c3 g -> other other",
-			"c4 h -> fm m",
-			"c4 h -> other other",
+			"c1 make -> mk make exact",
+			"c2 clone -> fclone clone exact",
+			"c3 g -> fm m exact set=2",
+			"c3 g -> other other exact set=2",
+			"c4 h -> fm m exact set=2",
+			"c4 h -> other other exact set=2",
 		},
 		fails: "a pointer result unwrapped before its own methods binds `make().clone()` to Foo::clone; a method path spelled without its self parameter misses the fn(&Foo, i32) sites",
 	},

@@ -2020,6 +2020,11 @@ func (h *hierarchy) externalImported(fc fileCtx, p, original, local, rest string
 			return "", false, nil
 		}
 		switch {
+		case original == "*" && rest == "":
+			// `import m as local` binds a module, never a type.
+			return "", false, nil
+		case original == "*":
+			return join(p, rest), true, nil
 		case rest == "":
 			// `from m import C [as D]`.
 			return join(p, cmp.Or(original, local)), true, nil
@@ -2029,8 +2034,8 @@ func (h *hierarchy) externalImported(fc fileCtx, p, original, local, rest string
 		case original != "":
 			return join(p, original, rest), true, nil
 		}
-		// `import m as local`.
-		return join(p, rest), true, nil
+		// `from m import sub`, a submodule: its names are m.sub's.
+		return join(p, local, rest), true, nil
 	case "js":
 		if strings.HasPrefix(p, ".") || strings.HasPrefix(p, "/") {
 			return "", false, nil
@@ -2071,32 +2076,49 @@ func externalKind(family string, flags byte) model.NodeKind {
 }
 
 // externalSupers is every supertype outside the unit of the type typ of
-// family that may declare method, each once (keyExternalSuper): those of typ
-// and of each supertype of the unit along its supertypes, and for Java
-// java.lang.Object when none of them is a class and method is one of
+// family that may declare method, each once (externalSupertypes), and for
+// Java java.lang.Object when none of them is a class and method is one of
 // Object's (JLS §8.1.4: a class with no superclass of the unit that names
 // one outside it extends Object, and an interface has Object's public
 // members, §9.2). A Go type's are those it embeds, directly or by promotion.
 func (h *hierarchy) externalSupers(family string, typ Ref, method string) ([]entry, error) {
 	var out []entry
-	add := func(e entry) error {
-		if !slices.ContainsFunc(out, func(o entry) bool { return o.Aux == e.Aux }) {
-			out = append(out, e)
-		}
+	err := h.externalSupertypes(typ, family != "go", func(e entry) error {
+		out = append(out, e)
 		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	if family == "java" && javaObjectMethods[method] && !slices.ContainsFunc(out, func(e entry) bool { return e.Flags&flagInterface == 0 }) {
+		out = append(out, entry{Aux: "java.lang.Object"})
+	}
+	return out, nil
+}
+
+// externalSupertypes yields each supertype outside the unit (keyExternalSuper)
+// of typ and, when along, of each of its supertypes of the unit, breadth
+// first, each qualified name once: its entry's Aux is the qualified name
+// (externalName) and its Flags hold flagInterface when the source proves it
+// an interface or trait.
+func (h *hierarchy) externalSupertypes(typ Ref, along bool, yield func(entry) error) error {
+	names := map[string]bool{}
 	seen := map[Ref]bool{typ: true}
 	queue := []Ref{typ}
 	for len(queue) > 0 {
 		t := queue[0]
 		queue = queue[1:]
-		if err := h.links.lookup(keyExternalSuper+refKey(t), add); err != nil {
-			return nil, err
+		err := h.links.lookup(keyExternalSuper+refKey(t), func(e entry) error {
+			if names[e.Aux] {
+				return nil
+			}
+			names[e.Aux] = true
+			return yield(e)
+		})
+		if err != nil || !along {
+			return err
 		}
-		if family == "go" {
-			break
-		}
-		err := h.links.lookup(keySuper+refKey(t), func(e entry) error {
+		err = h.links.lookup(keySuper+refKey(t), func(e entry) error {
 			if !seen[e.Ref] {
 				seen[e.Ref] = true
 				queue = append(queue, e.Ref)
@@ -2104,13 +2126,10 @@ func (h *hierarchy) externalSupers(family string, typ Ref, method string) ([]ent
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-	if family == "java" && javaObjectMethods[method] && !slices.ContainsFunc(out, func(e entry) bool { return e.Flags&flagInterface == 0 }) {
-		out = append(out, entry{Aux: "java.lang.Object"})
-	}
-	return out, nil
+	return nil
 }
 
 // javaObjectMethods are the methods java.lang.Object declares (JLS §4.3.2).

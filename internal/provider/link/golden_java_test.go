@@ -28,12 +28,11 @@ class Use {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"stwice area -> sarea area",
-			"stwice area -> qarea area",
-			"qarea area -> sarea area",
-			"go area -> qarea area",
+			"stwice area -> sarea area virtual",
+			"qarea area -> sarea area exact",
+			"go area -> qarea area virtual",
 		},
-		fails: "a member call that skips the subtype's override, or a `super.m()` call dispatched like an instance call, loses Sq.area or binds it to its own super call",
+		fails: "a call through a declared type published to each override binds `area()` in Shape.twice to Sq.area; a `super.m()` call read as an instance call binds Sq.area to itself or carries virtual",
 	},
 	{
 		name:   "static-private-overriding",
@@ -70,17 +69,15 @@ class Use {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"r1 of -> aof of",
-			"r2 helper -> ahelp helper",
-			"rthis helper -> ahelp helper",
-			"r4 m -> am m",
-			"r4 m -> bm m",
-			"g1 of -> aof of",
-			"g2 of -> bof of",
-			"g3 m -> am m",
-			"g3 m -> bm m",
+			"r1 of -> aof of exact",
+			"r2 helper -> ahelp helper exact",
+			"rthis helper -> ahelp helper exact",
+			"r4 m -> am m virtual",
+			"g1 of -> aof of exact",
+			"g2 of -> bof of exact",
+			"g3 m -> am m virtual",
 		},
-		fails: "dispatching a static or private method into subtypes binds B.of and B.helper; dropping dispatch for an instance method loses B.m",
+		fails: "a static or private method marked virtual, as if B.of or B.helper could override it; an instance method marked exact; a call through A published to B's override",
 	},
 	{
 		name:   "arity-and-varargs",
@@ -109,12 +106,12 @@ class Use {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"n1 Log -> c1 Log",
-			"n0 Log -> c0 Log",
-			"s1 w -> w1 w",
-			"s2 w -> w2 w",
-			"s3 v -> v v",
-			"s4 v -> v v",
+			"n1 Log -> c1 Log exact",
+			"n0 Log -> c0 Log exact",
+			"s1 w -> w1 w virtual",
+			"s2 w -> w2 w virtual",
+			"s3 v -> v v virtual",
+			"s4 v -> v v virtual",
 		},
 		fails: "a constructor or method family not filtered by argument count makes every overload a candidate; a variable-arity method dropped by the count loses both v calls",
 	},
@@ -149,12 +146,11 @@ class App {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"mk Handler -> hctor Handler",
-			"g1 handle -> real handle",
-			"g2 handle -> real handle",
-			"g2 handle -> anon handle",
+			"mk Handler -> hctor Handler exact",
+			"g1 handle -> real handle virtual",
+			"g2 handle -> habs handle virtual",
 		},
-		fails: "an anonymous class body registered as the instantiated type's own methods binds `r.handle()` to it, or drops it from `h.handle()`",
+		fails: "an anonymous class body registered as the instantiated type's own methods binds `r.handle()` to it; a call through Handler published to each override instead of the abstract method no method reference of its signature implements",
 	},
 	{
 		name:   "enclosing-class",
@@ -182,8 +178,8 @@ class App {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"in ping -> ping ping",
-			"an ping -> ping ping",
+			"in ping -> ping ping virtual",
+			"an ping -> ping ping virtual",
 		},
 		fails: "a bare call in an inner or anonymous class that never walks out to the enclosing class leaves both ping calls unbound",
 	},
@@ -209,7 +205,7 @@ class MathOps {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"call apply -> twice twice",
+			"call apply -> twice twice exact",
 		},
 		fails: "a functional-interface call that binds the abstract method beside the referenced one, or that ignores method references, gives the wrong set",
 	},
@@ -245,9 +241,10 @@ class Runner {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"r1 waitFor -> wait waitFor",
+			"m1 waitFor -> external java.lang.Process.waitFor virtual",
+			"r1 waitFor -> wait waitFor virtual",
 		},
-		fails: "a simple type name looked up unit-wide without the import binds `p.waitFor()` in Main, whose Process is java.lang's",
+		fails: "a simple type name looked up unit-wide without the import binds `p.waitFor()` in Main, whose Process is java.lang's; a type outside the project named other than java.lang's leaves it without its external method",
 	},
 	{
 		name:   "fluent-chain",
@@ -269,9 +266,9 @@ class Use {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"go create -> create create",
-			"go name -> name name",
-			"go build -> build build",
+			"go create -> create create exact",
+			"go name -> name name virtual",
+			"go build -> build build virtual",
 		},
 		fails: "a receiver that is another call's result resolved to nothing leaves name and build unbound",
 	},

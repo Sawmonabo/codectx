@@ -36,9 +36,9 @@ void b(void) {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"a1 usage -> ausage usage",
-			"a2 add -> add add",
-			"b1 usage -> busage usage",
+			"a1 usage -> ausage usage exact",
+			"a2 add -> add add exact",
+			"b1 usage -> busage usage exact",
 		},
 		fails: "a static function looked up across the unit makes each usage call ambiguous; a prototype not yielding to its definition binds the header",
 	},
@@ -66,12 +66,12 @@ int run(struct S *s, struct S o) {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"p1 cb -> inc inc",
-			"p1 cb -> dec dec",
-			"p2 cb -> inc inc",
-			"p2 cb -> dec dec",
-			"p3 cb -> inc inc",
-			"p3 cb -> dec dec",
+			"p1 cb -> inc inc exact set=2",
+			"p1 cb -> dec dec exact set=2",
+			"p2 cb -> inc inc exact set=2",
+			"p2 cb -> dec dec exact set=2",
+			"p3 cb -> inc inc exact set=2",
+			"p3 cb -> dec dec exact set=2",
 		},
 		fails: "a call through a dereferenced field pointer not captured, or not joined on the field's declared type, leaves the calls unbound",
 	},
@@ -111,17 +111,14 @@ void use(B* b, A& a) {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"h1 f -> af f",
-			"h2 g -> ag g",
-			"h2 g -> bg g",
-			"h2 g -> dg g",
-			"k1 g -> ag g",
-			"u1 g -> bg g",
-			"u1 g -> dg g",
-			"u2 f -> bf f",
-			"u3 f -> af f",
+			"h1 f -> af f exact",
+			"h2 g -> ag g virtual",
+			"k1 g -> ag g exact",
+			"u1 g -> bg g virtual",
+			"u2 f -> bf f exact",
+			"u3 f -> af f exact",
 		},
-		fails: "dispatching a non-virtual call into subtypes binds B::f and D::f; a qualified call dispatched binds the overrides; an implicitly virtual override not dispatched loses D::g",
+		fails: "a non-virtual call marked virtual; a qualified call marked virtual; a virtual call published to each override (B::g, D::g) instead of the member the static type names",
 	},
 	{
 		name:   "arity-defaults-ellipsis",
@@ -144,11 +141,11 @@ int main() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"c1 put -> p1 put",
-			"c2 put -> p1 put",
-			"c3 put -> p3 put",
-			"c4 dot -> dv dot",
-			"c5 dot -> dv dot",
+			"c1 put -> p1 put exact",
+			"c2 put -> p1 put exact",
+			"c3 put -> p3 put exact",
+			"c4 dot -> dv dot exact",
+			"c5 dot -> dv dot exact",
 		},
 		fails: "an overload family not filtered by argument count, default arguments and ellipsis makes every put call ambiguous",
 	},
@@ -174,9 +171,9 @@ int fc() { return helper(); } // @fc
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"fa helper -> ah helper",
-			"fb helper -> bh helper",
-			"fc helper -> cproto helper",
+			"fa helper -> ah helper exact",
+			"fb helper -> bh helper exact",
+			"fc helper -> cproto helper exact",
 		},
 		fails: "an internal-linkage function bound from another file makes each helper call ambiguous and binds c.cpp's external call to them",
 	},
@@ -198,7 +195,7 @@ int go() { return cfun(); } // @go
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"go cfun -> def cfun",
+			"go cfun -> def cfun exact",
 		},
 		fails: "a braceless linkage-specification prototype not captured, or bound instead of its definition, leaves the call on the header",
 	},
@@ -232,8 +229,8 @@ void fb() {
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
 		want: []string{
-			"fa run -> arun run",
-			"fb run -> brun run",
+			"fa run -> arun run exact",
+			"fb run -> brun run exact",
 		},
 		fails: "two unnamed-namespace types of one name merged across files bind each `i.run()` to both",
 	},
