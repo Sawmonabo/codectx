@@ -353,38 +353,50 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, reader *sqlite.PinnedReade
 	stop := newLexicalStop(c.fullRead, b, round)
 	defer func() { out.Stop = stop.stop }()
 	read := model.SearchRequest{Query: clipUTF8(task, model.MaxQueryTextBytes)}
+	// admitStep is what each step's hits go through. Its own failures are kept
+	// apart from the search's, so only a bound the search met is read as a
+	// capability reduction below; a failure of the stop or the sink fails the
+	// compile as it is.
+	var stepErr error
+	admitStep := func(hits []model.SearchHit) error {
+		if err := stop.loadPage(ctx, reader, hits); err != nil {
+			return err
+		}
+		for _, hit := range hits {
+			weight, ok, err := stop.admit(hit)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errStopReached
+			}
+			cnd := candidate{
+				NodeID:      hit.NodeID,
+				FileID:      hit.FileID,
+				Path:        hit.Path,
+				Requirement: model.RequirementRecommended,
+				Origin:      originLexical,
+				Reasons: []string{boundReason(fmt.Sprintf("the task text matches %q lexically (tier %s, score %d)",
+					hit.Path, hit.Tier, hit.ScoreMicros))},
+				RootWeight: weight,
+			}
+			if hit.Range != nil {
+				cnd.StartByte = int64(hit.Range.Start.Byte)
+			}
+			if err := add(out, cnd); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	end, err := c.search.ReadAnswer(ctx, reader, read, c.pageLimit(), lexicalReadBytes(c.cfg),
 		func(hits []model.SearchHit) (bool, error) {
-			if err := stop.loadPage(ctx, reader, hits); err != nil {
-				return false, err
-			}
-			for _, hit := range hits {
-				weight, ok, err := stop.admit(hit)
-				if err != nil {
-					return false, err
-				}
-				if !ok {
-					return false, nil
-				}
-				cnd := candidate{
-					NodeID:      hit.NodeID,
-					FileID:      hit.FileID,
-					Path:        hit.Path,
-					Requirement: model.RequirementRecommended,
-					Origin:      originLexical,
-					Reasons: []string{boundReason(fmt.Sprintf("the task text matches %q lexically (tier %s, score %d)",
-						hit.Path, hit.Tier, hit.ScoreMicros))},
-					RootWeight: weight,
-				}
-				if hit.Range != nil {
-					cnd.StartByte = int64(hit.Range.Start.Byte)
-				}
-				if err := add(out, cnd); err != nil {
-					return false, err
-				}
-			}
-			return true, nil
+			stepErr = admitStep(hits)
+			return stepErr == nil, nil
 		})
+	if stepErr != nil && !errors.Is(stepErr, errStopReached) {
+		return stepErr
+	}
 	if err != nil {
 		// A bound the lexical tier could not serve within is a capability
 		// reduction, not a failed compile: the weakest discovery step stops
@@ -404,6 +416,10 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, reader *sqlite.PinnedReade
 	}
 	return nil
 }
+
+// errStopReached ends a step of the lexical read at the stop. It never leaves
+// freeTermSeeds.
+var errStopReached = errors.New("the lexical read reached its stop")
 
 // lexicalReadBytes is the bytes one step of the lexical read may hold: the
 // query memory admission (resources.query_memory_bytes) less the share the
