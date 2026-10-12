@@ -623,13 +623,15 @@ func runCLI(tb testing.TB, f *budgetFixture, home string, args ...string) {
 	}
 }
 
-// lexicalShape is the identity of the stored lexical bodies: how many search
-// units exist, the highest rowid ever allocated, and the token and byte totals.
+// lexicalShape is the identity of the stored search documents: how many search
+// units exist, the highest rowid and search document id ever allocated, and the
+// source extent they cover.
 //
 // It is deliberately not a row count. internal/index's incremental scenario
-// already asserts the FTS document count, and a delete-and-reinsert rewrite
-// preserves that count exactly while allocating fresh rowids -- which is the
-// rewrite the no-change row has to be able to see.
+// already asserts the document count, and a delete-and-reinsert rewrite
+// preserves that count exactly while allocating fresh rowids and document ids
+// (a document id is never reused) -- which is the rewrite the no-change row has
+// to be able to see.
 func lexicalShape(tb testing.TB, dataDir string) string {
 	tb.Helper()
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "codectx.db")+"?mode=ro")
@@ -637,17 +639,17 @@ func lexicalShape(tb testing.TB, dataDir string) string {
 		tb.Fatalf("open the store read-only: %v", err)
 	}
 	defer db.Close()
-	var units, maxRowID, tokens, bytes int64
+	var units, maxRowID, maxDocID, bytes int64
 	// The documents keep no stored body (ADR-0003 §2.1), so the source extent
 	// they cover stands in for its bytes: a delete-and-reinsert rewrite moves
 	// the rowids, which is what this shape exists to see, and a reparse that
 	// re-cut the documents would move the extent.
-	row := db.QueryRow(`SELECT count(*), coalesce(max(rowid), 0), coalesce(sum(token_count), 0),
+	row := db.QueryRow(`SELECT count(*), coalesce(max(rowid), 0), coalesce(max(doc_id), 0),
 		coalesce(sum(end_byte - start_byte), 0) FROM search_units`)
-	if err := row.Scan(&units, &maxRowID, &tokens, &bytes); err != nil {
-		tb.Fatalf("read the lexical tables: %v", err)
+	if err := row.Scan(&units, &maxRowID, &maxDocID, &bytes); err != nil {
+		tb.Fatalf("read the search units: %v", err)
 	}
-	return fmt.Sprintf("units=%d max_rowid=%d tokens=%d body_bytes=%d", units, maxRowID, tokens, bytes)
+	return fmt.Sprintf("units=%d max_rowid=%d max_doc_id=%d body_bytes=%d", units, maxRowID, maxDocID, bytes)
 }
 
 // touchFiles rewrites n generated Go files with a changed body, so a refresh
