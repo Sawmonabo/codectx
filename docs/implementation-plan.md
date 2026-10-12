@@ -1104,6 +1104,13 @@ CREATE TABLE units (
     origin_run_id BLOB NOT NULL REFERENCES provider_runs(id),
     state TEXT NOT NULL CHECK(state IN ('building','sealed','failed','quarantined')),
     source_binding TEXT NOT NULL CHECK(source_binding IN ('verified','unverified')),
+    -- The unit's pending mark: how many search documents it added to the
+    -- search index that are not yet known to be in a library commit. Its
+    -- batches add to it; the activation that publishes the unit, after the
+    -- library commit, clears it. Recover compares a nonzero mark with what the
+    -- library's last commit holds and fails a unit that differs, so a unit
+    -- whose documents a crash lost is rebuilt (ADR-0013 Decision 4).
+    search_pending INTEGER NOT NULL DEFAULT 0 CHECK(search_pending >= 0),
     UNIQUE(id, provider_id, scope_key)
 );
 CREATE TABLE unit_inputs (
@@ -1147,6 +1154,23 @@ CREATE TABLE generation_capabilities (
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
+-- unit_capabilities is what one sealed unit reported about its own scope: the
+-- capability rows of its provider result, written in the transaction that
+-- seals it. A generation that reuses the unit folds these into its report
+-- exactly as it folds the rows of a unit it builds, so a reused unit's counts
+-- and degradations are never missing from a generation it is a member of.
+-- One row per capability the unit reported; the key refuses a second.
+CREATE TABLE unit_capabilities (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    diagnostic_code TEXT NOT NULL DEFAULT '',
+    remediation TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(unit_id, provider_id, capability, scope_key)
+) WITHOUT ROWID;
 -- node_ids is the node identity dictionary (Section 12.2).
 -- id is a storage-internal surrogate: an INTEGER PRIMARY KEY is the b-tree key
 -- itself, so it costs zero payload bytes in the table and 1-4 varint bytes
@@ -1171,12 +1195,19 @@ CREATE TABLE node_facts (
     file_id BLOB,
     start_byte INTEGER,
     end_byte INTEGER,
+    -- The declaration's name token, inside [start_byte, end_byte); NULL for a
+    -- node with no name token of its own.
+    name_start_byte INTEGER,
+    name_end_byte INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
-           AND start_byte >= 0 AND end_byte >= start_byte))
+           AND start_byte >= 0 AND end_byte >= start_byte)),
+    CHECK((name_start_byte IS NULL AND name_end_byte IS NULL)
+       OR (start_byte IS NOT NULL AND name_start_byte IS NOT NULL AND name_end_byte IS NOT NULL
+           AND name_start_byte >= start_byte AND name_end_byte >= name_start_byte AND name_end_byte <= end_byte))
 ) WITHOUT ROWID;
 -- relation_ids mirrors node_ids: an INTEGER surrogate, the canonical 32-byte
 -- RelationID stored once in `canonical`, and the endpoints carried as node
@@ -1212,6 +1243,8 @@ CREATE TABLE evidence (
     end_byte INTEGER,
     native_key_id INTEGER NOT NULL REFERENCES native_keys(id),
     detail TEXT NOT NULL DEFAULT '',
+    dispatch TEXT NOT NULL DEFAULT '' CHECK(dispatch IN ('', 'virtual', 'exact')),
+    set_size INTEGER NOT NULL DEFAULT 0 CHECK(set_size = 0 OR set_size >= 2),
     content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
@@ -1264,9 +1297,9 @@ CREATE TABLE native_keys (
     id INTEGER PRIMARY KEY CHECK(id > 0),
     key TEXT NOT NULL
 );
--- No `paths` intern table: a search document's path lives in the search
--- index (Section 12.4), not in search_units, and files.path is 818 rows /
--- 114 KiB on that same fixture and is not an amplifier.
+-- No `paths` intern table: files.path is 818 rows / 114 KiB on that same
+-- fixture and is not an amplifier, and a search document's path is stored in
+-- the search index, not here.
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key_id INTEGER NOT NULL REFERENCES scope_keys(id),
@@ -1274,6 +1307,10 @@ CREATE TABLE native_aliases (
     node_id INTEGER NOT NULL REFERENCES node_ids(id),
     PRIMARY KEY(unit_id, scope_key_id, native_key_id, node_id)
 ) WITHOUT ROWID;
+-- One row per search document of a unit: its identity, from search key to
+-- node, file and byte range. The indexed text -- path, kind, name, qualified
+-- name, signature and body -- lives only in the search index beside this
+-- database (ADR-0013), which stores what a search serves.
 CREATE TABLE search_units (
     rowid INTEGER PRIMARY KEY,
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
@@ -1282,34 +1319,39 @@ CREATE TABLE search_units (
     file_id BLOB NOT NULL,
     start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
     end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
-    -- The document's identity in the search index. It is allocated from a
-    -- persisted monotonic sequence inside the transaction that writes the row,
-    -- is never reused, and survives collection. A delta carry-over copies it
-    -- with the row, so several units' rows may name one document; a
-    -- generation's visible set is the doc ids of its member units' rows.
+    -- The search index document holding this row's text, allocated from
+    -- search_sequence when the row is written and never reused. It is the
+    -- DOCUMENT's identity, not the row's: a delta carry-over copies it forward
+    -- with the rest of the row, so the carried unit names the document its
+    -- text was indexed into instead of re-deriving a body the producer never
+    -- published (a producer's Body is not the source over
+    -- [start_byte,end_byte) -- see internal/provider/treesitter/facts.go).
+    -- Sharing is confined to one carry chain: CarryOver refuses a predecessor
+    -- of another provider or scope key, and generation_units is keyed by
+    -- (generation_id, provider_id, scope_key), so at most one row of a chain
+    -- is visible in any generation and a doc_id names one document there. The
+    -- document is released like node_ids: deleteUnit queues its delete only
+    -- when no other unit's row still names it.
     doc_id INTEGER NOT NULL CHECK(doc_id > 0),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
 );
--- A search document's text, columns, kind, path and token counts live in the
--- search index (Section 12.4); this row is only its identity, from search key
--- to node, with the file and byte range a hit's source window is read from.
--- SQLite keeps no per-unit totals: the index counts a generation's statistics
--- over its alive set. Per unit, `units.search_pending` holds the count of
--- documents the unit added until the activation that commits them; the
--- start-up reconcile compares that count with the index's (Section 12.2
--- invariants).
--- The next unallocated document id, taken inside the transaction that writes
--- the rows, so an id is durable exactly when its row is; never lowered, so an
--- id is never reused.
+-- The next unallocated search document id. A batch of search documents takes
+-- its ids from here inside the transaction that writes their rows, so an id is
+-- durable exactly when its row is, and a crash that loses the rows also gives
+-- the ids back: Recover deletes every search index document at or past this
+-- value, which only a lost transaction can have added. Collection never
+-- lowers it, so a document id is never reused.
 CREATE TABLE search_sequence (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_doc_id INTEGER NOT NULL CHECK(next_doc_id > 0)
 );
--- Document ids collection released that the next search-index commit deletes.
--- A row is queued only when no surviving search_units row names the id, and is
--- removed by the SQLite transaction that follows the commit applying it.
+-- Search index documents that collection released and the search index has
+-- not yet deleted. deleteUnit queues them in the transaction that removes the
+-- rows naming them; the next library commit (an activation's, a collection
+-- sweep's or Recover's) applies them, and the rows it applied go in the
+-- SQLite transaction that follows it.
 CREATE TABLE search_doc_deletes (
     rowid INTEGER PRIMARY KEY,
     doc_id INTEGER NOT NULL CHECK(doc_id > 0)
@@ -1534,14 +1576,12 @@ CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 -- was a full scan of context_entries per candidate file -- exactly the
 -- pathology idx_context_entries_node exists to prevent, on the sibling column.
 CREATE INDEX idx_context_entries_file ON context_entries(file_id);
--- An activation reads its member units' doc ids into the visible bitmap and
--- collection reads a deleted unit's; both are a scan of search_units per unit
--- without this index, and carrying doc_id in it makes the read index-only.
+-- An activation reads every member unit's doc ids to build the generation's
+-- visible set; carrying doc_id makes that walk index-only.
 CREATE INDEX idx_search_unit ON search_units(unit_id, doc_id);
--- Collection queues a document's delete only when no surviving unit's row
--- still names its doc id, and the reconcile finds the units whose rows name a
--- failed unit's doc ids. Without this index both are a scan of search_units
--- per probe.
+-- deleteUnit releases a document only when no surviving unit's row still
+-- names it, and Recover closes a failed unit over the units sharing its doc
+-- ids. Without this index both are a scan of search_units per probe.
 CREATE INDEX idx_search_doc ON search_units(doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
@@ -1682,12 +1722,12 @@ CREATE TABLE generation_graph_parts (
     PRIMARY KEY(generation_id, stream, part)
 ) WITHOUT ROWID;
 
--- The generation's visible search documents: a bitmap over doc ids, bit
--- id mod 8 of byte id/8, least significant bit first, with a bit set for every
--- search_units.doc_id of the generation's member units. It is computed in the
--- activation transaction, after the search index committed with this
--- generation's id as its payload, and a view of the generation turns it into
--- each index segment's alive set (Section 12.4).
+-- One generation's visible search documents: a bitmap over doc ids (bit
+-- id%8 of byte id/8, least significant first) of every search_units.doc_id of
+-- its member units. A search opens the generation's view of the search index
+-- with it, so a document of a unit the generation does not select is never a
+-- candidate and never counts in a statistic. It is written in the activation
+-- transaction, after the search index commit that holds those documents.
 CREATE TABLE generation_search (
     generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
     visible BLOB NOT NULL
