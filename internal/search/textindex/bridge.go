@@ -378,6 +378,8 @@ func statusErr(what string, status C.int32_t, errBuf *C.cx_buf) error {
 		return &model.Error{Code: model.CodeDiskFull, Message: text}
 	case C.CX_CANCELED:
 		return &model.Error{Code: model.CodeCanceled, Message: text}
+	case C.CX_NO_POSITION:
+		return ErrUnknownPosition
 	default:
 		return &model.Error{Code: model.CodeInternal, Message: text}
 	}

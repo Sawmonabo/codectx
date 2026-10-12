@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -268,7 +269,6 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"cursor/tampered_expired_and_foreign_cursors_are_rejected", legCursorRejections},
 		{"cursor/resolve_pages_by_a_bounded_keyset", legResolveKeyset},
 		{"cursor/search_positions_round_trip_and_refuse_foreign_keys", legSearchPositionKeys},
-		{"cursor/a_minimum_score_change_refuses_the_cursor", legMinScoreRefusesTheCursor},
 		{"scenario/search_serves_the_section_14_2_order", legEndToEndRanking},
 		{"exact/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
 		{"exact/exact_tiers_hold_one_read_page", legExactTiersHoldOnePage},
@@ -295,9 +295,9 @@ func TestSearchRankingScenario(t *testing.T) {
 // different question.
 // ---------------------------------------------------------------------------
 
-// legQueryHash proves the cursor's query binding. A hash that ignored a filter,
-// the minimum score or the length rule would let a cursor minted for one answer
-// resume against another, serving page 2 of a different question under the
+// legQueryHash proves the cursor's query binding. A hash that ignored a filter
+// or the length rule would let a cursor minted for one answer resume against
+// another, serving page 2 of a different question under the
 // same token.
 func legQueryHash(t *testing.T, _ *fixture) {
 	base := model.SearchRequest{Query: "handle request",
@@ -326,11 +326,6 @@ func legQueryHash(t *testing.T, _ *fixture) {
 		if searchQueryHash(c.req, textindex.LengthTotal) == h {
 			t.Errorf("changing %s did not change the query hash", c.name)
 		}
-	}
-	floored := base
-	floored.MinScoreMicros = 1
-	if searchQueryHash(floored, textindex.LengthTotal) == h {
-		t.Error("changing the minimum score did not change the query hash")
 	}
 	if searchQueryHash(base, textindex.LengthWeighted) == h {
 		t.Error("changing the length rule did not change the query hash")
@@ -679,7 +674,7 @@ func assertCode(t *testing.T, what string, err error, want string) {
 // into one lexical result counting both.
 //
 // Mutation: serve the lexical sequence without the exact fold (drop the
-// servedExactly test in lexicalPhase) and the alpha node is served twice.
+// exact fold (exactFold.served) in lexicalPhase) and the alpha node is served twice.
 func legEndToEndRanking(t *testing.T, f *fixture) {
 	s := newService(t, f.opts)
 	page, err := s.Search(f.ctx, model.SearchRequest{Query: "pkg.Alpha.Handle", Page: model.PageRequest{Limit: 10}})
@@ -778,51 +773,31 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 
 // legSearchPositionKeys proves a continuation's position survives its token
 // and that a key this endpoint did not write is refused rather than read as a
-// restarted answer. A Resolve key, a spool cursor's empty key and a negative
-// count are all CTX_CURSOR_INVALID.
+// restarted answer. A Resolve key, a spool cursor's empty key, a negative score
+// and a second spelling of one lexical position are all CTX_CURSOR_INVALID.
 func legSearchPositionKeys(t *testing.T, f *fixture) {
 	for _, want := range []searchPosition{
 		{phase: phaseExact, rank: model.TierExactName.Rank(), node: f.nodes["pkg/alpha.go"]},
-		{phase: phaseLexical, served: 412},
+		{phase: phaseLexical},
+		{phase: phaseLexical, after: &textindex.Position{ScoreMicros: 4_120_000, DocID: 77}},
+		{phase: phaseLexical, after: &textindex.Position{ScoreMicros: math.MaxInt64, DocID: math.MaxUint64}},
 	} {
 		key := want.lastKey()
 		if len(key) > 1024 {
 			t.Fatalf("the position key is %d bytes, over the Cursor.LastKey bound", len(key))
 		}
 		got, err := parseSearchPosition(key)
-		if err != nil || got != want {
+		if err != nil || !reflect.DeepEqual(got, want) {
 			t.Fatalf("parseSearchPosition(%q) = %+v, %v; want %+v", key, got, err, want)
 		}
 	}
 	node := string(f.nodes["pkg/alpha.go"])
-	for _, bad := range []string{"", "l", "l\x00-1", "l\x00x", "x\x004\x00" + node, "x\x00-1\x00" + node,
-		"x\x001\x00not-an-id", resolveKey(model.TierExactName, node)} {
+	for _, bad := range []string{"", "l", "l\x00-1\x007", "l\x00x\x007", "l\x0012", "l\x0012\x00", "l\x00012\x007",
+		"l\x00+12\x007", "l\x0012\x0007", "l\x0012\x00-7", "l\x0012\x007\x00", "x\x004\x00" + node,
+		"x\x00-1\x00" + node, "x\x001\x00not-an-id", resolveKey(model.TierExactName, node)} {
 		_, err := parseSearchPosition(bad)
 		assertCode(t, "key "+strconv.Quote(bad), err, model.CodeCursorInvalid)
 	}
-}
-
-// legMinScoreRefusesTheCursor proves a continuation minted under one minimum
-// score is refused under another: the floor decides which lexical results
-// exist, so the count a lexical position carries would name a different place.
-//
-// Mutation: leave MinScoreMicros out of searchQueryHash and the floored
-// continuation is served.
-func legMinScoreRefusesTheCursor(t *testing.T, f *fixture) {
-	s := newService(t, f.opts)
-	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
-	first, err := s.Search(f.ctx, req)
-	if err != nil {
-		t.Fatalf("Search(page 1): %v", err)
-	}
-	if first.Meta.NextCursor == "" {
-		t.Fatal("a one-hit page over two matching nodes minted no continuation")
-	}
-	floored := req
-	floored.MinScoreMicros = 1
-	floored.Page.Cursor = first.Meta.NextCursor
-	_, err = s.Search(f.ctx, floored)
-	assertCode(t, "a continuation under another minimum score", err, model.CodeCursorInvalid)
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +924,7 @@ type stubWideExact struct {
 
 func (s *stubWideExact) node(i int) sqlite.StoredNode {
 	return sqlite.StoredNode{
-		Node: model.Node{ID: model.NodeID(fmt.Sprintf("n%08d", i)), Kind: model.NodeFunction,
+		Node: model.Node{ID: model.NodeID(fmt.Sprintf("%0*x", model.IDHexLen, i)), Kind: model.NodeFunction,
 			Name: "Widget", QualifiedName: "Widget.m" + strconv.Itoa(i), FileID: s.file},
 		Bytes: &model.ByteRange{Start: uint64(i), End: uint64(i) + 1},
 	}
@@ -1012,15 +987,15 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 		}
 	}
 	// The keyset resumes at the successor of `after`, which the fixed-width
-	// id encodes; rescanning from zero on every page would make the leg's cost
-	// quadratic in a corpus it walks 200 000 nodes of.
+	// hex id encodes; rescanning from zero on every page would make the leg's
+	// cost quadratic in a corpus it walks 200 000 nodes of.
 	first := 0
 	if after != "" {
-		i, err := strconv.Atoi(strings.TrimPrefix(string(after), "n"))
+		i, err := strconv.ParseUint(string(after), 16, 64)
 		if err != nil {
 			return nil, err
 		}
-		first = i + 1
+		first = int(i) + 1
 	}
 	var out []sqlite.StoredNode
 	for i := first; i < s.n; i++ {
@@ -1037,11 +1012,12 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 }
 
 // legExactTiersHoldOnePage proves the exact tiers carry no candidate-sized heap
-// structure: the `seen` set that decided the cross-tier "most specific tier
-// wins" rule held one model.NodeID per distinct candidate, so a wide
-// qualified_name_prefix scan cost heap proportional to the match count. The
-// rule is now two predicates over the candidate in hand, and the working set is
-// one read page however many candidates the tier yields.
+// structure: a `seen` set deciding the cross-tier "most specific tier wins"
+// rule would hold one model.NodeID per distinct candidate, so a wide
+// qualified_name_prefix scan would cost heap proportional to the match count.
+// The rule is decided over the candidate in hand and the earlier tiers' own
+// keysets (tierRule), and the working set is one read page per tier however
+// many candidates the tier yields.
 //
 // The heap is sampled at the LAST candidate, while anything the walk accumulated
 // is still reachable; the answer itself is counted and discarded, so what the
@@ -1055,7 +1031,7 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 		stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "pkg/wide.go"}
 		var held uint64
 		count := 0
-		if err := exactCandidates(context.Background(), stub, "Widget", nil, 1000, allExactTiers,
+		if err := exactCandidates(context.Background(), stub, "Widget", nil, hitFilter{}, 1000, allExactTiers,
 			func(exactHit) error {
 				count++
 				if count == n {
@@ -1071,8 +1047,8 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 		return count, held
 	}
 	// Correctness first: every node matches both the prefix tier and the
-	// exact_name tier, and each must be emitted ONCE -- supersededByLowerTier
-	// suppresses the duplicate, with no candidate-sized seen set.
+	// exact_name tier, and each must be emitted ONCE -- tierRule assigns each
+	// node its one tier, with no candidate-sized seen set.
 	small, smallHeap := walk(20_000)
 	if small != 20_000 {
 		t.Fatalf("a 20000-declaration prefix tier emitted %d candidates, want each exactly once", small)
@@ -1090,19 +1066,19 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 	t.Logf("exact-tier live set: 20000 candidates %d bytes, 200000 candidates %d bytes", smallHeap, largeHeap)
 }
 
-// legExactPathTierOwnsItsFile proves the predicate that replaced the tier-0
-// half of the removed `seen` set: when the query is BOTH a path and a symbol
-// name, every declaration of that file is emitted once, by the exact_path tier
-// that outranks the symbol tiers, and the symbol tiers do not emit it again.
+// legExactPathTierOwnsItsFile proves the tier-0 half of tierRule: when the
+// query is BOTH a path and a symbol name, every declaration of that file is
+// emitted once, by the exact_path tier that outranks the symbol tiers, and the
+// symbol tiers do not emit it again.
 //
-// Mutation: drop the `n.Node.FileID == pathFile` clause from exactCandidates
-// and the prefix tier re-emits all 500, doubling the count.
+// Mutation: drop the pathFile block from tierRule.earlier and the prefix tier
+// re-emits all 500, doubling the count.
 func legExactPathTierOwnsItsFile(t *testing.T, _ *fixture) {
 	const n = 500
 	// The query resolves as a path AND matches the symbol tiers' filters.
 	stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "Widget"}
 	byTier := map[model.SearchTier]int{}
-	if err := exactCandidates(context.Background(), stub, stub.path, nil, 100, allExactTiers,
+	if err := exactCandidates(context.Background(), stub, stub.path, nil, hitFilter{}, 100, allExactTiers,
 		func(h exactHit) error { byTier[h.Tier]++; return nil }); err != nil {
 		t.Fatalf("exactCandidates: %v", err)
 	}

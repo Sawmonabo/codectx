@@ -92,9 +92,10 @@ type Request struct {
 	PathPrefixes []string
 	// Depth is how many folded results the page holds at most, best first.
 	Depth int
-	// MinScoreMicros, when positive, drops every result scoring below it.
-	MinScoreMicros int64
-	LengthRule     LengthRule
+	// After, when set, resumes the ranking after a result already served: the
+	// page holds only the results that sort strictly after it.
+	After      *Position
+	LengthRule LengthRule
 	// MaxTerms refuses a query with more terms; zero is unlimited.
 	MaxTerms int64
 	// IgnoreSummaries scores every block, as a segment with no summary is
@@ -102,9 +103,26 @@ type Request struct {
 	IgnoreSummaries bool
 }
 
+// Position is a place in a view's ranking: a served result, named by its score
+// and the doc id of the document it is. The library reads the rest of the
+// result's sort key back from that document, so a position is a few bytes
+// whatever the result's strings. It is meaningful only for the view, query,
+// filters and length rule its result was served under.
+type Position struct {
+	ScoreMicros int64
+	DocID       uint64
+}
+
 // Hit is one folded result: the best-scoring document of its result key (the
 // node, or the file and start byte of a document with no node).
+//
+// Results are ranked by score descending, then by the content key: path,
+// start byte, end byte, kind, name, qualified name, signature, node id and
+// search key. The order is total.
 type Hit struct {
+	// DocID is the document the result is; with ScoreMicros it is the
+	// result's Position.
+	DocID         uint64
 	SearchKey     string
 	NodeID        model.NodeID
 	FileID        model.FileID
@@ -158,3 +176,10 @@ func (e *TooManyTerms) Error() string { return ErrTooManyTerms.Error() }
 
 // Unwrap lets errors.Is match ErrTooManyTerms.
 func (e *TooManyTerms) Unwrap() error { return ErrTooManyTerms }
+
+// ErrUnknownPosition is what errors.Is matches when a request's After names no
+// document of the view: a position served by another view, or none at all.
+var ErrUnknownPosition = errors.New("the resume position names no document of this view")
+
+// At answers the hit's Position.
+func (h Hit) At() Position { return Position{ScoreMicros: h.ScoreMicros, DocID: h.DocID} }

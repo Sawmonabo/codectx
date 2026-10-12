@@ -30,6 +30,7 @@ extern "C" {
 #define CX_DISK_FULL 5       /* the filesystem refused a write for lack of space */
 #define CX_INTERNAL 6        /* any other failure, a caught panic included */
 #define CX_TOO_MANY_TERMS 7  /* *err holds the query's term count in decimal */
+#define CX_NO_POSITION 8     /* a request's resume position names no document of the view */
 
 /* A byte buffer owned by the library. */
 typedef struct {
@@ -105,15 +106,23 @@ int32_t cx_view_open(cx_index *x, uint64_t generation, const uint8_t *visible, s
 void cx_view_close(cx_view *v);
 
 /*
- * Answers one page. Request layout:
+ * Answers one page: the best `depth` folded results, by score descending and
+ * then the content key (path, start byte, end byte, kind, name, qualified name,
+ * signature, node id, search key), after the resume position when one is given.
+ * Request layout:
  *   string query
  *   uvarint kinds,    kinds x string
  *   uvarint prefixes, prefixes x string   (cleaned root-relative path prefixes)
  *   uvarint depth                         (folded results wanted, >= 1)
- *   varint  min_score_micros              (0: no floor)
  *   u8      length_rule                   (0: total, 1: weighted per column)
  *   uvarint max_terms                     (0: unlimited)
- *   u8      flags                         (bit 0: ignore every block summary)
+ *   u8      flags                         (bit 0: ignore every block summary;
+ *                                          bit 1: a resume position follows)
+ *   [varint score_micros, uvarint doc_id] (with bit 1: the score and doc_id of
+ *                                          a result a page of this view served;
+ *                                          the page holds only results whose
+ *                                          best document sorts strictly after
+ *                                          that document)
  * Page layout:
  *   uvarint terms
  *   u8      more          (1: more results exist past depth)
@@ -123,7 +132,7 @@ void cx_view_close(cx_view *v);
  *   u8      matches_exact (1: every match was visited)
  *   uvarint segments, uvarint segments_without_summary,
  *   uvarint blocks_total, uvarint blocks_scored, uvarint docs_scored
- *   uvarint hits, hits x { string search_key, string node_id, string file_id,
+ *   uvarint hits, hits x { uvarint doc_id, string search_key, string node_id, string file_id,
  *                          string path, string kind, string name,
  *                          string qualified_name, string signature,
  *                          uvarint start_byte, uvarint end_byte,

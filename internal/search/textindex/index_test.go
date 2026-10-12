@@ -475,3 +475,82 @@ func TestPanicInsideAnExportReturnsAnError(t *testing.T) {
 		}
 	}
 }
+
+// TestResumedPagesEqualTheDeepReadsSuffix compares every resumed page with the
+// suffix of one deep read: for positions drawn at random and at the edges of
+// tied-score runs, Search(After: p, Depth: d) holds exactly the d results the
+// deep read ranks after p, with More exactly when more follow, under both
+// length rules, with and without a kind filter, over several segments with
+// hidden units, where about four in five documents share a node with others
+// (so a node's best document can sit before the position while another of its
+// documents scores after it). Each resumed page is also compared with the same
+// request scored exhaustively (IgnoreSummaries). A position whose document the
+// view does not hold is refused as ErrUnknownPosition.
+//
+// Mutation caught: a position compared by score alone (a tied run split across
+// two pages loses or repeats its members at the edge).
+// Mutation caught: a position applied per document rather than per folded
+// result (a node served before the position comes back through a lower-scoring
+// document of it).
+func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
+	c := genCorpus(4, 5000, 100)
+	dir := t.TempDir()
+	c.build(t, dir, 15, nil)
+	x := openReadOnly(t, dir, 2)
+	v, err := x.OpenView(1, c.visible(hiddenEvery(4)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	rng := rand.New(rand.NewPCG(4, 4))
+	ties := 0
+	for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
+		for _, kinds := range [][]model.NodeKind{nil, {model.NodeFunction, model.NodeFile}} {
+			for _, q := range engineQueries {
+				deep := search(t, v, Request{Query: q, Kinds: kinds, Depth: 1 << 20, LengthRule: rule})
+				if deep.More || len(deep.Hits) < 2 {
+					t.Fatalf("query %q: the deep read holds %d hits (more %v); the test needs the whole ranking",
+						q, len(deep.Hits), deep.More)
+				}
+				var at []int
+				for i := 0; i+1 < len(deep.Hits) && len(at) < 6; i++ {
+					if deep.Hits[i].ScoreMicros == deep.Hits[i+1].ScoreMicros {
+						at = append(at, i)
+						ties++
+					}
+				}
+				at = append(at, 0, len(deep.Hits)-1)
+				for range 8 {
+					at = append(at, rng.IntN(len(deep.Hits)))
+				}
+				for _, i := range at {
+					p := deep.Hits[i].At()
+					for _, d := range []int{1, 7, 60} {
+						end := min(i+1+d, len(deep.Hits))
+						want := Page{Hits: deep.Hits[i+1 : end], More: end < len(deep.Hits)}
+						r := Request{Query: q, Kinds: kinds, Depth: d, LengthRule: rule, After: &p}
+						got := search(t, v, r)
+						if err := samePage(got, want); err != nil {
+							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d: %v", rule, kinds, q, i, d, err)
+						}
+						r.IgnoreSummaries = true
+						if err := samePage(search(t, v, r), want); err != nil {
+							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d, exhaustive: %v",
+								rule, kinds, q, i, d, err)
+						}
+					}
+				}
+			}
+		}
+	}
+	if ties == 0 {
+		t.Fatal("no tied scores in the fixture: the test proves nothing about ties at a page edge")
+	}
+
+	// A hidden document is not a position of this view.
+	hidden := c.docs[c.units[0]][0].DocID
+	_, err = v.Search(context.Background(), Request{Query: "hot", Depth: 5, After: &Position{ScoreMicros: 1, DocID: hidden}})
+	if !errors.Is(err, ErrUnknownPosition) {
+		t.Fatalf("a position naming a hidden document returned %v, want ErrUnknownPosition", err)
+	}
+}

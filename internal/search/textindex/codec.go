@@ -61,14 +61,18 @@ func encodeRequest(r Request) []byte {
 		b = putString(b, p)
 	}
 	b = putUvarint(b, uint64(r.Depth))
-	b = putVarint(b, r.MinScoreMicros)
 	b = append(b, byte(r.LengthRule))
 	b = putUvarint(b, uint64(max(r.MaxTerms, 0)))
 	var flags byte
 	if r.IgnoreSummaries {
 		flags |= 1
 	}
-	return append(b, flags)
+	if r.After == nil {
+		return append(b, flags)
+	}
+	b = append(b, flags|2)
+	b = putVarint(b, r.After.ScoreMicros)
+	return putUvarint(b, r.After.DocID)
 }
 
 // reader decodes a library buffer. Errors latch: after the first short read
@@ -169,6 +173,7 @@ func decodePage(b []byte) (Page, error) {
 	p.Hits = make([]Hit, 0, n)
 	for i := uint64(0); i < n && !r.bad; i++ {
 		var h Hit
+		h.DocID = r.uvarint()
 		h.SearchKey = r.string()
 		h.NodeID = model.NodeID(r.string())
 		h.FileID = model.FileID(r.string())

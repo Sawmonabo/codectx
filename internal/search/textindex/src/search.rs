@@ -3,24 +3,43 @@
 //! depth+1 folded results per segment found by block-max pruning, folded
 //! across segments under the content-only comparator.
 //!
+//! Order. A result is a fold group (a node, or a file and start byte) ranked by
+//! its best document under `cmp_hits`: score descending, then the content key.
+//! The key ends in the node id and the search key, so two documents tie on it
+//! only when they are one group's, and the order of results is total.
+//!
+//! Resume. A request may name a position `after`: the score and the document of
+//! a result already served. The page is then the results whose best document
+//! sorts strictly after that document's key, which is the suffix of the deep
+//! read past it. A document at or before the position is never a candidate, and
+//! it marks its group as served: a group whose best document lies at or before
+//! the position was served there, whatever its other documents score.
+//!
 //! Exactness. A block is skipped only when its quantized upper bound (with a
-//! margin over the floating sums) is strictly below the score of the
-//! (depth+1)-th entry of a full heap, so nothing skipped could enter the top
-//! depth+1 or raise a result's score. An entity's best document in a segment
-//! is its best in that segment, and a result that depth+1 others beat in one
-//! segment is beaten by them globally, so the union of the segments' heaps
-//! holds the exact global top depth+1. `more` is then whether a (depth+1)-th
-//! folded result exists.
+//! margin over the floating sums) is strictly below the score of the worst
+//! entry of a full heap. The heap holds documents after the position only, so
+//! that score is at most the position's, and a skipped block holds no document
+//! at or before the position: every group the position marks is marked. Within
+//! a segment the heap ends holding the cap best candidate groups, each at its
+//! best document, so every candidate group the segment saw that sorts at or
+//! before the heap's worst entry is in it. A segment that turned a group away
+//! or skipped a block (truncated) therefore answers exactly up to its worst
+//! entry, and the union of the segments answers exactly up to the least worst
+//! entry of the truncated ones (the cut). Groups another segment marked are
+//! removed, and when fewer than depth+1 results remain above the cut, which
+//! only marked groups holding heap places can cause, the segments are scored
+//! again with twice the heap. `more` is then whether a (depth+1)-th folded
+//! result exists.
 //!
 //! Counts. `matches` counts the matching visible documents that pass the
-//! filters and the score floor; it is exact when no block was skipped. A
+//! filters; it is exact when no block was skipped. A
 //! hit's occurrence count is exact when no block was skipped and, in every
 //! segment whose heap ever turned a document away, the hit's entry was
 //! admitted before the first turn-away and never left (so it saw every one
 //! of its documents); otherwise it is a lower bound.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -30,8 +49,8 @@ use tantivy::schema::IndexRecordOption;
 use tantivy::{DocId, DocSet, InvertedIndexReader, SegmentReader, Term, TERMINATED};
 
 use crate::codec::{put_str, put_uvarint, put_varint, Reader};
-use crate::error::{Error, Result, CX_CANCELED, CX_TOO_MANY_TERMS};
-use crate::schema::{Fields, S_KIND, S_NODE, S_PATH, STRS};
+use crate::error::{Error, Result, CX_CANCELED, CX_NO_POSITION, CX_TOO_MANY_TERMS};
+use crate::schema::{Fields, END, START, S_KIND, S_NODE, S_PATH, STRS};
 use crate::score::{idf, quantize, safe_bound, saturation, WEIGHTS};
 use crate::summary::{Lengths, Summary, BLOCK, BLOCK_BITS, UNBOUNDED_WTF};
 use crate::tokenizer::{parse_query, QueryTerm};
@@ -63,10 +82,11 @@ struct Request {
     kinds: Vec<String>,
     prefixes: Vec<String>,
     depth: usize,
-    min_score: i64,
     rule: Rule,
     max_terms: u64,
     ignore_summaries: bool,
+    /// The resume position: a served result's score and its document's id.
+    after: Option<(i64, u64)>,
 }
 
 fn decode(buf: &[u8]) -> Result<Request> {
@@ -87,7 +107,6 @@ fn decode(buf: &[u8]) -> Result<Request> {
         return Err(Error::invalid("a search depth must be at least 1"));
     }
     let depth = usize::try_from(depth).map_err(|_| Error::invalid("a search depth overflows"))?;
-    let min_score = r.varint()?;
     let rule = match r.byte()? {
         0 => Rule::Total,
         1 => Rule::Weighted,
@@ -95,8 +114,12 @@ fn decode(buf: &[u8]) -> Result<Request> {
     };
     let max_terms = r.uvarint()?;
     let flags = r.byte()?;
+    if flags & !3 != 0 {
+        return Err(Error::invalid(format!("unknown request flags {flags}")));
+    }
+    let after = if flags & 2 != 0 { Some((r.varint()?, r.uvarint()?)) } else { None };
     r.finish()?;
-    Ok(Request { query, kinds, prefixes, depth, min_score, rule, max_terms, ignore_summaries: flags & 1 != 0 })
+    Ok(Request { query, kinds, prefixes, depth, rule, max_terms, ignore_summaries: flags & 1 != 0, after })
 }
 
 /// Answers one page (the cx_view_search layouts).
@@ -142,62 +165,205 @@ pub fn search(view: &View, req: &[u8], cancel: Cancel) -> Result<Vec<u8>> {
     }
     let idfs: Vec<f64> = df.iter().map(|&d| idf(view.docs, d)).collect();
 
-    let scored_any = AtomicBool::new(false);
-    let ctx = Ctx {
-        fields: &fields,
-        terms: &terms,
-        idf: &idfs,
-        avgdl,
-        rule: req.rule,
-        cap: req.depth.saturating_add(1),
-        min_score: req.min_score,
-        kinds: &req.kinds,
-        prefixes: &req.prefixes,
-        ignore_summaries: req.ignore_summaries,
-        cancel,
-        scored_any: &scored_any,
+    let after = match req.after {
+        Some((micros, doc)) => Some(read_after(view, &fields, micros, doc)?),
+        None => None,
     };
-    let jobs: Vec<_> = segs.iter().copied().zip(phase_a).collect();
-    let fruits = view.index.executor.map(|((seg, sv), a)| Ok(score_segment(&ctx, seg, sv, a)), jobs.into_iter())?;
-    let fruits = fruits.into_iter().collect::<Result<Vec<_>>>()?;
-    let canceled = fruits.iter().any(|f| f.canceled);
-    if canceled && !scored_any.load(AtomicOrdering::Relaxed) {
-        return Err(Error::new(CX_CANCELED, "the search was canceled before any block was scored"));
-    }
 
-    // Fold across segments.
-    let skipped = fruits.iter().any(|f| f.skipped) || canceled;
-    let dropping = fruits.iter().filter(|f| f.dropped).count() as u32;
-    let mut global: HashMap<GlobalKey, (Hit, u64, u32)> = HashMap::new();
-    for f in fruits {
-        page.matches += f.matches;
-        page.blocks_total += f.blocks_total;
-        page.blocks_scored += f.blocks_scored;
-        page.docs_scored += f.docs_scored;
-        for (hit, count, complete) in f.hits {
-            let seen = u32::from(f.dropped && complete);
-            match global.get_mut(&hit.key()) {
-                Some(e) => {
-                    if cmp_hits(&hit, &e.0) == Ordering::Less {
-                        e.0 = hit;
+    let scored_any = AtomicBool::new(false);
+    let mut cap = req.depth.saturating_add(1);
+    let (mut blocks_scored, mut docs_scored) = (0u64, 0u64);
+    loop {
+        let ctx = Ctx {
+            fields: &fields,
+            terms: &terms,
+            idf: &idfs,
+            avgdl,
+            rule: req.rule,
+            cap,
+            kinds: &req.kinds,
+            prefixes: &req.prefixes,
+            ignore_summaries: req.ignore_summaries,
+            after: after.as_ref(),
+            cancel,
+            scored_any: &scored_any,
+        };
+        let jobs: Vec<_> = segs.iter().copied().zip(phase_a.iter()).collect();
+        let fruits = view.index.executor.map(|((seg, sv), a)| Ok(score_segment(&ctx, seg, sv, a)), jobs.into_iter())?;
+        let fruits = fruits.into_iter().collect::<Result<Vec<_>>>()?;
+        let canceled = fruits.iter().any(|f| f.canceled);
+        if canceled && !scored_any.load(AtomicOrdering::Relaxed) {
+            return Err(Error::new(CX_CANCELED, "the search was canceled before any block was scored"));
+        }
+
+        // Fold across segments.
+        let skipped = fruits.iter().any(|f| f.skipped) || canceled;
+        let dropping = fruits.iter().filter(|f| f.dropped).count() as u32;
+        let cut: Option<Hit> =
+            fruits.iter().filter_map(|f| f.boundary.as_ref()).min_by(|x, y| cmp_hits(x, y)).cloned();
+        let mut marked: Vec<(&[RankCol], &HashSet<Entity>)> = Vec::new();
+        let mut global: HashMap<GlobalKey, (Hit, u64, u32)> = HashMap::new();
+        page.matches = 0;
+        page.blocks_total = 0;
+        for f in &fruits {
+            page.matches += f.matches;
+            page.blocks_total += f.blocks_total;
+            blocks_scored += f.blocks_scored;
+            docs_scored += f.docs_scored;
+            if !f.marked.is_empty() {
+                marked.push((&f.ranks, &f.marked));
+            }
+        }
+        for f in fruits.iter() {
+            for (hit, count, complete) in &f.hits {
+                let seen = u32::from(f.dropped && *complete);
+                match global.get_mut(&hit.key()) {
+                    Some(e) => {
+                        if cmp_hits(hit, &e.0) == Ordering::Less {
+                            e.0 = hit.clone();
+                        }
+                        e.1 += count;
+                        e.2 += seen;
                     }
-                    e.1 += count;
-                    e.2 += seen;
-                }
-                None => {
-                    global.insert(hit.key(), (hit, count, seen));
+                    None => {
+                        global.insert(hit.key(), (hit.clone(), *count, seen));
+                    }
                 }
             }
         }
+        let mut all: Vec<(Hit, u64, u32)> = Vec::with_capacity(global.len());
+        for e in global.into_values() {
+            if let Some(c) = &cut {
+                if cmp_hits(&e.0, c) == Ordering::Greater {
+                    continue;
+                }
+            }
+            let mut served = false;
+            for (ranks, set) in &marked {
+                if local_entity(ranks, &e.0)?.is_some_and(|k| set.contains(&k)) {
+                    served = true;
+                    break;
+                }
+            }
+            if !served {
+                all.push(e);
+            }
+        }
+        if all.len() <= req.depth && cut.is_some() && !canceled {
+            // Marked groups held heap places: fewer than depth+1 results are
+            // known exactly, and more may exist past the cut.
+            cap = cap.saturating_mul(2);
+            continue;
+        }
+        all.sort_by(|a, b| cmp_hits(&a.0, &b.0));
+        page.more = all.len() > req.depth;
+        all.truncate(req.depth);
+        page.canceled = canceled;
+        page.matches_exact = !skipped;
+        page.blocks_scored = blocks_scored;
+        page.docs_scored = docs_scored;
+        page.hits = all.into_iter().map(|(h, n, seen)| (h, n, !skipped && seen == dropping)).collect();
+        return Ok(page.encode(terms.len()));
     }
-    let mut all: Vec<(Hit, u64, u32)> = global.into_values().collect();
-    all.sort_by(|a, b| cmp_hits(&a.0, &b.0));
-    page.more = all.len() > req.depth;
-    all.truncate(req.depth);
-    page.canceled = canceled;
-    page.matches_exact = !skipped;
-    page.hits = all.into_iter().map(|(h, n, seen)| (h, n, !skipped && seen == dropping)).collect();
-    Ok(page.encode(terms.len()))
+}
+
+/// The position a request resumes after, read back from its document: the
+/// full comparator key of the result last served. The document is found by its
+/// id among the view's alive documents; an id the view does not hold is
+/// CX_NO_POSITION.
+struct After {
+    micros: i64,
+    /// The string columns in STRS order.
+    strs: Vec<Vec<u8>>,
+    start: u64,
+    end: u64,
+}
+
+fn read_after(view: &View, fields: &Fields, micros: i64, doc_id: u64) -> Result<After> {
+    let term = Term::from_field_u64(fields.doc_id, doc_id);
+    for (seg, sv) in view.searcher.segment_readers().iter().zip(&view.segs) {
+        let inv = seg.inverted_index(fields.doc_id)?;
+        let Some(mut p) = inv.read_postings(&term, IndexRecordOption::Basic)? else { continue };
+        let mut d = p.doc();
+        while d != TERMINATED {
+            if sv.alive.alive(d) {
+                let mut strs = Vec::with_capacity(STRS.len());
+                for name in STRS {
+                    let rc = RankCol::open(seg, name)?;
+                    let mut b = Vec::new();
+                    if let (Some(c), Some(o)) = (&rc.col, rc.ord(d)) {
+                        if !c.ord_to_bytes(o, &mut b)? {
+                            return Err(Error::corrupt("a string column's dictionary is missing an ordinal"));
+                        }
+                    }
+                    strs.push(b);
+                }
+                let ff = seg.fast_fields();
+                let start = ff.u64(START)?.first(d).unwrap_or(0);
+                let end = ff.u64(END)?.first(d).unwrap_or(0);
+                return Ok(After { micros, strs, start, end });
+            }
+            d = p.advance();
+        }
+    }
+    Err(Error::new(CX_NO_POSITION, "the resume position names no document of this view"))
+}
+
+/// The position in one segment's ordinals. Each string is coded against the
+/// segment's sorted dictionary as twice the rank of its value when the segment
+/// holds the value, else as the odd number between the ranks around it, so a
+/// document's string, coded as twice its rank, compares with it exactly as the
+/// strings compare.
+struct SegAfter {
+    micros: i64,
+    strs: [u64; 7],
+    start: u64,
+    end: u64,
+}
+
+impl SegAfter {
+    fn new(a: &After, ranks: &[RankCol]) -> Result<SegAfter> {
+        let mut strs = [0u64; 7];
+        for (i, v) in strs.iter_mut().enumerate() {
+            *v = rank_code(&ranks[i], &a.strs[i])?;
+        }
+        Ok(SegAfter { micros: a.micros, strs, start: a.start, end: a.end })
+    }
+
+    /// Whether a document sorts at or before the position.
+    fn holds(&self, k: &OrdKey) -> bool {
+        let doc = (Reverse(k.micros.0), 2 * k.path, k.start, k.end, 2 * k.kind, 2 * k.name, 2 * k.qn, 2 * k.sig, 2 * k.node, 2 * k.search_key);
+        let s = &self.strs;
+        let pos = (Reverse(self.micros), s[0], self.start, self.end, s[1], s[2], s[3], s[4], s[5], s[6]);
+        doc <= pos
+    }
+}
+
+/// A string's code in one segment (SegAfter): RankCol ranks the empty string 0
+/// and every value of the dictionary above it in byte order.
+fn rank_code(rc: &RankCol, v: &[u8]) -> Result<u64> {
+    if v.is_empty() {
+        return Ok(0);
+    }
+    let Some(c) = &rc.col else { return Ok(1) };
+    let g = first_ord_ge(c, v)?;
+    let mut b = Vec::new();
+    let present = g < c.num_terms() as u64 && c.ord_to_bytes(g, &mut b)? && b == v;
+    let rank = g + rc.shift;
+    Ok(if present { 2 * rank } else { 2 * rank - 1 })
+}
+
+/// A fold group inside one segment: the node's rank, else the file's path rank
+/// and the start byte.
+type Entity = (u8, u64, u64);
+
+/// A resolved result's group in another segment's ranks, or None when that
+/// segment holds no document of it.
+fn local_entity(ranks: &[RankCol], h: &Hit) -> Result<Option<Entity>> {
+    let (rc, key) = if h.node.is_empty() { (&ranks[S_PATH], &h.path) } else { (&ranks[S_NODE], &h.node) };
+    let Some(c) = &rc.col else { return Ok(None) };
+    let Some(o) = c.dictionary().term_ord(key.as_bytes())? else { return Ok(None) };
+    Ok(Some(if h.node.is_empty() { (1, o + rc.shift, h.start) } else { (0, o + rc.shift, 0) }))
 }
 
 #[derive(Default)]
@@ -227,6 +393,7 @@ impl Page {
         }
         put_uvarint(&mut b, self.hits.len() as u64);
         for (h, n, exact) in &self.hits {
+            put_uvarint(&mut b, h.doc_id);
             for s in [&h.search_key, &h.node, &h.file, &h.path, &h.kind, &h.name, &h.qn, &h.sig] {
                 put_str(&mut b, s);
             }
@@ -241,7 +408,11 @@ impl Page {
 }
 
 /// A resolved result.
+#[derive(Clone)]
 struct Hit {
+    /// The doc id of the document the result is, which a later page names as
+    /// its resume position.
+    doc_id: u64,
     micros: i64,
     path: String,
     start: u64,
@@ -416,16 +587,23 @@ struct Ctx<'a> {
     avgdl: f64,
     rule: Rule,
     cap: usize,
-    min_score: i64,
     kinds: &'a [String],
     prefixes: &'a [String],
     ignore_summaries: bool,
+    after: Option<&'a After>,
     cancel: Cancel,
     scored_any: &'a AtomicBool,
 }
 
 struct SegFruit {
     hits: Vec<(Hit, u64, bool)>,
+    /// The heap's worst entry when the segment is truncated: it turned a group
+    /// away or skipped a block, so it answers exactly only up to this entry.
+    boundary: Option<Hit>,
+    /// The groups with a document at or before the resume position, in this
+    /// segment's ranks, which `ranks` resolves another segment's results into.
+    marked: HashSet<Entity>,
+    ranks: Vec<RankCol>,
     dropped: bool,
     skipped: bool,
     canceled: bool,
@@ -627,12 +805,15 @@ impl Cursor {
     }
 }
 
-fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: SegA) -> Result<SegFruit> {
+fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: &SegA) -> Result<SegFruit> {
     let f = ctx.fields;
     let nt = ctx.terms.len();
     let max_doc = seg.max_doc();
     let mut out = SegFruit {
         hits: Vec::new(),
+        boundary: None,
+        marked: HashSet::new(),
+        ranks: Vec::new(),
         dropped: false,
         skipped: false,
         canceled: false,
@@ -646,7 +827,9 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: SegA) -> Resul
     }
     let ranks = STRS.iter().map(|n| RankCol::open(seg, n)).collect::<Result<Vec<_>>>()?;
     let filter = SegFilter::build(ctx.kinds, ctx.prefixes, &ranks[S_KIND], &ranks[S_PATH])?;
+    let after = ctx.after.map(|a| SegAfter::new(a, &ranks)).transpose()?;
     let ff = seg.fast_fields();
+    let ids: Column<u64> = ff.u64(crate::schema::DOC_ID)?;
     let start_col: Column<u64> = ff.u64(crate::schema::START)?;
     let end_col: Column<u64> = ff.u64(crate::schema::END)?;
     let lens = Lengths::open(seg)?;
@@ -678,7 +861,7 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: SegA) -> Resul
     // The visit order: by bound when the segment has a usable summary, else
     // every block holding a posting in doc order.
     let summary: Option<&Summary> = if ctx.ignore_summaries { None } else { sv.summary.as_deref() };
-    let ordered: Option<Vec<(u32, f64)>> = summary.map(|s| bounds(ctx, s, &a, &dl_of));
+    let ordered: Option<Vec<(u32, f64)>> = summary.map(|s| bounds(ctx, s, a, &dl_of));
     if let Some(o) = &ordered {
         out.blocks_total = o.len() as u64;
     }
@@ -692,10 +875,6 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: SegA) -> Resul
             Some(o) => {
                 let Some(&(b, ub)) = o.get(next) else { break };
                 let bound = safe_bound(ub);
-                if ctx.min_score > 0 && bound < ctx.min_score {
-                    // This block and every later one hold no document at the floor.
-                    break;
-                }
                 if heap.worst().is_some_and(|w| bound < w) {
                     out.skipped = true;
                     break;
@@ -766,11 +945,8 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: SegA) -> Resul
                 }
             }
             let micros = quantize(score);
-            if ctx.min_score > 0 && micros < ctx.min_score {
-                continue;
-            }
             out.matches += 1;
-            heap.offer(OrdKey {
+            let k = OrdKey {
                 micros: Reverse(micros),
                 path: ranks[0].rank(d),
                 start: start_col.first(d).unwrap_or(0),
@@ -782,11 +958,34 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: SegA) -> Resul
                 node: ranks[S_NODE].rank(d),
                 search_key: ranks[6].rank(d),
                 doc: d,
-            });
+            };
+            if let Some(p) = &after {
+                // A document at or before the position is no candidate, and
+                // its group was served there: none of the group's documents is.
+                if p.holds(&k) {
+                    out.marked.insert(k.entity());
+                    continue;
+                }
+                if out.marked.contains(&k.entity()) {
+                    continue;
+                }
+            }
+            heap.offer(k);
         }
     }
     out.dropped = heap.dropped;
-    out.hits = resolve(&ranks, heap)?;
+    let truncated = heap.dropped || out.skipped;
+    let mut hits = resolve(&ranks, &ids, heap)?;
+    if truncated {
+        out.boundary = hits.iter().map(|h| &h.0).max_by(|x, y| cmp_hits(x, y)).cloned();
+    }
+    // A group marked after it took a heap place keeps that place until here;
+    // the boundary above counts it, and the result is dropped now.
+    hits.retain(|h| !out.marked.contains(&h.3));
+    out.hits = hits.into_iter().map(|(h, n, complete, _)| (h, n, complete)).collect();
+    if !out.marked.is_empty() {
+        out.ranks = ranks;
+    }
     Ok(out)
 }
 
@@ -837,8 +1036,9 @@ fn bounds(ctx: &Ctx, s: &Summary, a: &SegA, dl_of: &impl Fn(DocId) -> u64) -> Ve
     blocks
 }
 
-/// The heap's entries with their strings, one sorted dictionary pass per column.
-fn resolve(ranks: &[RankCol], heap: Heap) -> Result<Vec<(Hit, u64, bool)>> {
+/// The heap's entries with their strings, one sorted dictionary pass per column,
+/// each with its group in the segment's ranks.
+fn resolve(ranks: &[RankCol], ids: &Column<u64>, heap: Heap) -> Result<Vec<(Hit, u64, bool, Entity)>> {
     let entries: Vec<Slot> = heap.slots.into_values().collect();
     let mut strings: Vec<Vec<String>> = vec![vec![String::new(); entries.len()]; STRS.len()];
     for (k, rc) in ranks.iter().enumerate() {
@@ -870,6 +1070,7 @@ fn resolve(ranks: &[RankCol], heap: Heap) -> Result<Vec<(Hit, u64, bool)>> {
         .map(|(i, s)| {
             let mut take = |k: usize| std::mem::take(&mut strings[k][i]);
             let hit = Hit {
+                doc_id: ids.first(s.key.doc).unwrap_or(0),
                 micros: s.key.micros.0,
                 path: take(0),
                 start: s.key.start,
@@ -882,7 +1083,7 @@ fn resolve(ranks: &[RankCol], heap: Heap) -> Result<Vec<(Hit, u64, bool)>> {
                 search_key: take(6),
                 file: take(7),
             };
-            (hit, s.count, s.complete)
+            (hit, s.count, s.complete, s.key.entity())
         })
         .collect())
 }
