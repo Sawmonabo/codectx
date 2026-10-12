@@ -364,8 +364,8 @@ cloud or AI credential fields in core.
 | `default_max_files` | `200` | project (lower only) | Default file budget; must fit `workspace.max_files`. |
 | `max_slices` | `16` | user | Most slices in one manifest. |
 | `max_graph_depth` | `0` (unlimited) | user | Graph expansion depth. |
-| `max_visited_nodes` | `0` (unlimited) | user | Nodes **one page** of an expansion may visit. A per-page work budget, not a ceiling on the walk. |
-| `max_graph_edges` | `0` (unlimited) | user | Relations **one page** of an expansion may admit. A per-page work budget, not a ceiling on the walk. |
+| `max_visited_nodes` | `0` (unlimited) | user | Nodes **one page** of an expansion may visit. A per-page work budget on the paged traversals; on `impact` and the context compiler's scope walk, a bound on the whole walk (below). |
+| `max_graph_edges` | `0` (unlimited) | user | Relations **one page** of an expansion may admit. A per-page work budget on the paged traversals; on `impact` and the context compiler's scope walk, a bound on the whole walk (below). |
 | `max_reason_paths_per_entry` | `0` (unlimited) | user | Explanation paths stored per entry. |
 | `max_manifest_bytes` | `0` (unlimited) | user | Largest manifest. Unlimited by default; a compile is never refused for the size of its plan. |
 | `max_capsule_bytes` | `0` (unlimited) | user | Largest capsule, by bytes. Unlimited by default. It is not the only thing that bounds a capsule — the two record-count keys below bound it too, and both are unlimited by default as well. |
@@ -418,6 +418,13 @@ result. A query deadline reached during either ends the page rather than the
 answer: the request comes back with `query deadline reached` and a cursor that
 carries the walk or the ranking on, so an unfinished `impact` is never served as
 a complete one. `docs/queries.md` states the same contract from the query side.
+
+The context compiler's scope walk spends them the same way `impact` does, as
+bounds on the whole walk: it walks every root of a compile round in **one**
+walk, so `max_visited_nodes` counts every distinct node that walk reaches and
+`max_graph_edges` every relation it reads, whichever root's route reached them,
+and spending either ends the walk, narrows the scope (`scope_complete=false`)
+and is reported.
 
 `max_graph_edges` is read in one more place: the context compiler's scan that
 resolves the **kind** of every relation a selection's explanation routes name.
