@@ -114,18 +114,19 @@ func inferTypes(ctx context.Context, u *unit, h *hierarchy, only *pagination.Sor
 
 // functions yields the function declarations the called value of site may
 // hold: a function value that flowed to it, or one written to the field it
-// calls through, each once with the technique that found it. Sites asked in
+// calls through, each once with the technique that found it and whether the
+// call passes the method's receiver first (valUnbound). Sites asked in
 // ascending order are answered by one forward pass.
-func (t *types) functions(ctx context.Context, site Ref, yield func(target Ref, detail string) error) error {
+func (t *types) functions(ctx context.Context, site Ref, yield func(target Ref, detail string, receiverFirst bool) error) error {
 	return t.seek(site, func(r recv) error {
-		if r.X.Kind != valFunction {
+		if r.X.Kind != valFunction && r.X.Kind != valUnbound {
 			return nil
 		}
 		switch r.Role {
 		case roleCalled:
-			return yield(r.X.Ref, DetailFlow)
+			return yield(r.X.Ref, DetailFlow, r.X.Kind == valUnbound)
 		case roleField:
-			return yield(r.X.Ref, DetailField)
+			return yield(r.X.Ref, DetailField, r.X.Kind == valUnbound)
 		}
 		return nil
 	})
@@ -222,6 +223,10 @@ const (
 	// construction of it returns: a call on it binds what the type declares
 	// or inherits, and no subtype's override.
 	valObject byte = 6
+	// valUnbound is the instance method declaration Ref taken as a value
+	// through its class object (Python `C.m`): a call of it passes the
+	// receiver as its first argument.
+	valUnbound byte = 7
 )
 
 // value is one abstract value.
@@ -288,7 +293,8 @@ var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, ran
 // arguments and result connect to the target's parameters and returns (a
 // class bound for want of a constructor does not); Shift that the site's
 // first argument is the target's receiver (a Python instance method called
-// through its class), so argument i+1 is parameter i; Virtual that an
+// through its class, or taken as a value through it), so argument i+1 is
+// parameter i; Virtual that an
 // override of the target can run instead (the call's dispatch).
 type binding struct {
 	Site, Target         Ref
@@ -1196,17 +1202,26 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 			return yield(operand{X: value{Kind: valModule, Path: base}})
 		}
 	case wire.TypeFunction:
-		return f.function(ctx, caller, ty.Name, constant(valFunction))
+		// A method taken through its class object takes its receiver first
+		// (wire.TypeFunction's Index), unless it is a static or class method.
+		return f.function(ctx, caller, ty.Name, func(r Ref, static bool) error {
+			kind := valFunction
+			if ty.Index > 0 && f.python && !static {
+				kind = valUnbound
+			}
+			return yield(operand{X: value{Kind: kind, Ref: r}})
+		})
 	}
 	return nil
 }
 
 // function yields the callable declarations the function value written as
-// name in caller denotes. A bare name is read as a call's bare callee is
-// (scoped), so it never denotes a method. A member name `C.m` or `o.m` is
-// the method m that the class or object C declares in the file; failing
-// one, the method m the type C names declares or inherits.
-func (f *fileScan) function(ctx context.Context, caller int32, name string, yield func(Ref) error) error {
+// name in caller denotes, each with whether it is static (called without a
+// receiver). A bare name is read as a call's bare callee is (scoped), so it
+// never denotes a method. A member name `C.m` or `o.m` is the method m that
+// the class or object C declares in the file; failing one, the method m the
+// type C names declares or inherits.
+func (f *fileScan) function(ctx context.Context, caller int32, name string, yield func(r Ref, static bool) error) error {
 	t := f.t
 	if f.callables == nil {
 		f.callables = make(map[string][]int32)
@@ -1219,7 +1234,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 	holder, member, dotted := cutLast(name, ".")
 	if !dotted {
 		for _, i := range scoped(t, caller, f.callables[name]) {
-			if err := yield(Ref{File: f.file, Index: i}); err != nil {
+			if err := yield(Ref{File: f.file, Index: i}, t.Decls[i].Static); err != nil {
 				return err
 			}
 		}
@@ -1232,7 +1247,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 			continue
 		}
 		found = true
-		if err := yield(Ref{File: f.file, Index: i}); err != nil {
+		if err := yield(Ref{File: f.file, Index: i}, t.Decls[i].Static); err != nil {
 			return err
 		}
 	}
@@ -1240,7 +1255,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 		return nil
 	}
 	return f.in.h.types(ctx, f.file, holder, func(typ Ref) error {
-		return f.in.h.declared(typ, member, func(e entry) error { return yield(e.Ref) })
+		return f.in.h.declared(typ, member, func(e entry) error { return yield(e.Ref, e.Flags&flagStatic != 0) })
 	})
 }
 
@@ -1275,12 +1290,12 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 			// Calling a Python class object constructs an instance.
 			return r.constructs.Add(construct{Class: v.X.Ref, Ctor: "__init__", Call: c})
 		}
-		if v.X.Kind == valFunction {
+		if v.X.Kind == valFunction || v.X.Kind == valUnbound {
 			rank := rankFlow
 			if v.Role == roleField {
 				rank = rankField
 			}
-			return r.bindings.Add(binding{Site: c.Site, Target: v.X.Ref, Rank: rank, Flow: true})
+			return r.bindings.Add(binding{Site: c.Site, Target: v.X.Ref, Rank: rank, Flow: true, Shift: v.X.Kind == valUnbound})
 		}
 	case roleConstruct:
 		if v.X.Kind == valInstance {

@@ -35,11 +35,14 @@ import (
 //   - a call that is a site: TypeResult of that site (the linker decides
 //     whether it constructs a class);
 //   - `x.f` read as a value: a method value when x is a class of the file,
-//     or an instance of one (self included), whose body declares a def f
-//     that is no property: TypeFunction of that def's qualified name (`C.f`
-//     for a top-level class C), the name the declaration table carries;
-//     otherwise TypeField f; `super()` as a receiver: TypeSuper of the
-//     enclosing class;
+//     or an instance of one (self included, or a construction `C()`), whose
+//     body declares a def f that is no property: TypeFunction of that def's
+//     qualified name (`C.f` for a top-level class C), the name the
+//     declaration table carries, with Index 1 when x is the class object
+//     itself (the method taken unbound, which a call passes its receiver
+//     first unless it is a static or class method) and 0 for an instance
+//     (bound to it); otherwise TypeField f; `super()` as a receiver:
+//     TypeSuper of the enclosing class;
 //   - a name `import a.b` binds (a) or `import a.b as c` binds (c): the
 //     module (TypeModule "a" or "a.b"); a name `from m import f as g` binds:
 //     TypeModule "m.f", the imported name spelled through its module so an
@@ -314,7 +317,7 @@ func (v pyVal) asValue() wire.Type {
 	case pyValue, pyModule, pyImported:
 		return v.t
 	case pyFunction:
-		return wire.Type{Kind: wire.TypeFunction, Name: v.t.Name}
+		return wire.Type{Kind: wire.TypeFunction, Name: v.t.Name, Index: v.t.Index}
 	case pyClass:
 		return wire.Type{Kind: wire.TypeClass, Name: v.t.Name}
 	}
@@ -1024,6 +1027,19 @@ func (k *pythonLinker) receiver(obj Node) pyVal {
 	return k.typeOf(obj)
 }
 
+// constructed is the class whose construction e is, `C()` of a class C of
+// the file, or "".
+func (k *pythonLinker) constructed(e Node) string {
+	e = pythonLowering.unparen(e)
+	if e.IsNull() || e.KindId() != k.k.call {
+		return ""
+	}
+	if c := k.typeOf(e.ChildByFieldId(k.k.fFunction)); c.o == pyClass {
+		return c.t.Name
+	}
+	return ""
+}
+
 // classOf is the name of the class nearest around n, or "".
 func (k *pythonLinker) classOf(n Node) string {
 	for p := n.Parent(); !p.IsNull(); p = p.Parent() {
@@ -1055,13 +1071,23 @@ func (k *pythonLinker) typeOf(e Node) pyVal {
 			return pyVal{}
 		}
 		name := string(textOf(k.src, f))
-		o := k.typeOf(e.ChildByFieldId(kn.fObject))
+		obj := e.ChildByFieldId(kn.fObject)
+		o := k.typeOf(obj)
+		if c := k.constructed(obj); c != "" {
+			o = pyVal{o: pyValue, t: wire.Type{Kind: wire.TypeNamed, Name: c}}
+		}
 		switch {
 		case o.o == pyModule || o.o == pyImported:
 			return pyVal{o: o.o, t: wire.Type{Kind: wire.TypeModule, Name: o.t.Name + "." + name}}
 		case o.o == pyClass || (o.o == pyValue && o.t.Kind == wire.TypeNamed):
 			if m := k.method(o.t.Name, name); m != "" {
-				return pyVal{o: pyFunction, t: wire.Type{Name: m}}
+				v := pyVal{o: pyFunction, t: wire.Type{Name: m}}
+				if o.o == pyClass {
+					// Taken through the class object, the method is not
+					// bound: its call passes the receiver first.
+					v.t.Index = 1
+				}
+				return v
 			}
 		}
 		return pyVal{o: pyValue, t: wire.Type{Kind: wire.TypeField, Name: name}}

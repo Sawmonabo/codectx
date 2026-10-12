@@ -319,7 +319,10 @@ const (
 	// TypeFunction is the function or method Name, as written, taken as a
 	// value. Index is the receiver parameters the value takes ahead of the
 	// callable's own: 1 for a Go method expression `T.M` (spelled "*T.M"
-	// for `(*T).M`), else 0.
+	// for `(*T).M`) and for a Python method taken through its class object
+	// (`C.m`, whose call passes the receiver first unless the method is a
+	// static or class method, which the linker reads from its declaration),
+	// else 0.
 	TypeFunction TypeKind = 7
 	// TypeClass is the type Name itself as a value, not an instance of it: a
 	// class object (`A.make()` in Python, `C.m()` in ECMAScript). A call on
