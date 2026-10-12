@@ -123,10 +123,17 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 	}{t.Path, t.Language, t.Package, Endpoint{Node: t.Module.Node, Kind: t.Module.Kind, Name: t.Module.Name,
 		Qualified: t.Module.Qualified}, t.Unions})
 	for i, imp := range t.Imports {
+		imp.Range = model.SourceRange{}
 		add(EntryImport, imp.Name+"\x00"+imp.Path, i, imp)
 	}
 	for i, d := range t.Decls {
 		d.Range, d.CanonicalKey = model.SourceRange{}, ""
+		if len(d.Parameters) > 0 {
+			d.Parameters = slices.Clone(d.Parameters)
+			for j := range d.Parameters {
+				d.Parameters[j].Range, d.Parameters[j].CanonicalKey = model.SourceRange{}, ""
+			}
+		}
 		add(EntryDeclaration, string(d.Node), i, d)
 	}
 	for i, st := range t.Supertypes {
@@ -172,13 +179,22 @@ func (t *Table) InterfaceDigest() (string, error) {
 
 // SitesDigest is the digest of t's sites summary: every call site in order,
 // with its caller, callee, shape, qualifier, receiver, signature, arguments
-// and in-file candidates, and the unions their types name, but no byte range
-// or callee offset. A body edit that adds, removes or rewrites a call changes
-// it; one that only moves code does not.
+// (their types, keywords and spreads) and in-file candidates, and the unions
+// their types name, but no byte range, callee offset or argument read: the
+// variables an argument reads are file-scoped nodes keyed by their ranges,
+// published only from the site's own file, which a content change
+// republishes. A body edit that adds, removes or rewrites a call changes it;
+// one that only moves code does not.
 func (t *Table) SitesDigest() (string, error) {
 	sites := make([]Site, len(t.Sites))
 	for i, s := range t.Sites {
 		s.Range, s.NameStart, s.NameEnd = model.SourceRange{}, 0, 0
+		if len(s.Arguments) > 0 {
+			s.Arguments = slices.Clone(s.Arguments)
+			for j := range s.Arguments {
+				s.Arguments[j].Range, s.Arguments[j].Reads = model.SourceRange{}, nil
+			}
+		}
 		sites[i] = s
 	}
 	b, err := json.Marshal(struct {

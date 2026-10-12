@@ -32,6 +32,13 @@ import (
 //     unnamed namespace) and whether a C++ member is virtual or final as its
 //     declaration says. A class, struct, union or enum definition in an
 //     unnamed namespace is exported too, with Internal alone.
+//     A C++ member function with an `override` or `final` virt-specifier
+//     is marked Override. An object-like macro whose replacement list is one
+//     identifier (`#define LOG log_impl`) is exported with that identifier
+//     as its Alias.
+//   - Parameters: each named parameter of an exported function or
+//     function-like macro, numbered from 1 (a C++ `this` is implicit), and a
+//     `...`, Variadic, at its own token.
 //   - Supertypes: each base of a C++ class, struct or union.
 //   - Sites: every call the structural queries capture, keyed by its callee
 //     token: `f()` (bare, or indirect when f is a local, a parameter, a
@@ -42,7 +49,15 @@ import (
 //     function), `(*x->f)()` and `(*x.f)()` (indirect through the data
 //     member f) and `tbl[i]()` (always indirect, typed by the element type
 //     tbl declares). A call is listed after the calls inside it, so the call an
-//     argument or a receiver is the result of has the lower index.
+//     argument or a receiver is the result of has the lower index. Each
+//     argument carries its expression and the variables it reads
+//     (readName, readSkip).
+//   - DynamicImports: every `#include NAME` whose path is a macro name: a
+//     constant one when every object-like definition of NAME before the
+//     directive replaces it with the same string literal or header name,
+//     spelled as the structural import record spells a literal include's
+//     path (`"a.h"` is a.h, `<a.h>` keeps its brackets), otherwise an open one
+//     with no fragments.
 //   - Values: every function taken as a value: `&f` and `&C::m`, and a name
 //     in a position that stores or passes its value (an argument, an
 //     initializer, a member's default value, the right side of `=`, a
@@ -73,6 +88,7 @@ import (
 // it captures. Inside a method, a name no local declares is looked up among
 // its class's members when the class is declared in the file.
 type cLinker struct {
+	linkReads
 	language string
 	s        *cSyntax
 	x        *cLinkSyntax
@@ -93,6 +109,10 @@ type cLinker struct {
 	// has internal linkage, a later one without the specifier included
 	// (ISO C 6.2.2p5, [dcl.stc]).
 	statics map[string]bool
+	// defines holds, by macro name, the include path each object-like
+	// definition of the file replaces the name with (cDefine), in source
+	// order.
+	defines map[string][]cDefine
 
 	// names and locals are the scope chain of the walk, one local per
 	// binding; base is where the innermost callable's bindings begin.
@@ -108,6 +128,14 @@ type cLinker struct {
 	// sites maps a call expression to its index in out.Sites.
 	sites map[uintptr]uint32
 	buf   []byte
+}
+
+// cDefine is one object-like macro definition: where it starts and the
+// include path its replacement list is, empty when it is no string literal
+// or header name.
+type cDefine struct {
+	start uint32
+	path  string
 }
 
 // cDecl is one declarator and the declaration that owns its specifiers: a
@@ -135,10 +163,11 @@ func newCLinker(language string) *cLinker { return &cLinker{language: language} 
 func (k *cLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byte) {}
 
 func (k *cLinker) file(root Node, src []byte, out *wire.Link) {
-	*k = cLinker{language: k.language, s: cSyntaxOf(k.language), x: cLinkSyntaxOf(k.language), src: src, out: out,
-		functions: map[string]bool{}, objects: map[string]cDecl{}, others: map[string]bool{},
+	*k = cLinker{linkReads: k.linkReads, language: k.language, s: cSyntaxOf(k.language), x: cLinkSyntaxOf(k.language),
+		src: src, out: out, functions: map[string]bool{}, objects: map[string]cDecl{}, others: map[string]bool{},
 		typedefs: map[string]cDecl{}, records: map[string]Node{}, namespaces: map[string]bool{},
-		members: map[Node]map[string]cMember{}, statics: map[string]bool{}, sites: map[uintptr]uint32{}}
+		members: map[Node]map[string]cMember{}, statics: map[string]bool{}, sites: map[uintptr]uint32{},
+		defines: map[string][]cDefine{}}
 	k.declare(root)
 	k.classes = k.classes[:0]
 	k.walk(root)
@@ -211,6 +240,10 @@ func (k *cLinker) declare(n Node) {
 	case id == x.enumerator || id == x.preprocDef:
 		if name := n.ChildByFieldId(s.fName); !name.IsNull() {
 			k.others[k.text(name)] = true
+			if id == x.preprocDef {
+				path, _ := k.replacement(n)
+				k.defines[k.text(name)] = append(k.defines[k.text(name)], cDefine{start: uint32(n.StartByte()), path: path})
+			}
 		}
 	}
 	k.declareChildren(n)
@@ -375,6 +408,10 @@ func (k *cLinker) walk(n Node) {
 	case id == x.preprocFunctionDef:
 		k.macro(n)
 		return
+	case id == x.preprocDef:
+		k.alias(n)
+	case id == x.preprocInclude:
+		k.include(n)
 	case id == s.callExpression:
 		k.children(n)
 		k.call(n)
@@ -520,6 +557,7 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 	e.Abstract = k.pure(owner, d)
 	if receiver != "" && s.cpp {
 		e.Virtual, e.Final = k.virtual(owner, c.fn, receiver)
+		e.Override = k.overrides(c.fn)
 	} else if key, ok := k.linkageKey(owner, c); ok && len(k.classes) == 0 {
 		_, unnamed := k.enclosingNamespaces(owner)
 		e.Internal = unnamed || k.statics[key]
@@ -532,8 +570,9 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 // parameters appends a Parameter for each named parameter of the list ps of
 // the function named callable, at the identifier the lowering declares its
 // variable by, numbered from 1 in the positions params (cArity) counts: a
-// `...` or an unnamed parameter takes its position and is not sent, and a
-// `(void)` list, whose count is 0, has none.
+// `...` is sent Variadic at its own token, which declares no variable, an
+// unnamed parameter takes its position and is not sent, and a `(void)`
+// list, whose count is 0, has none.
 func (k *cLinker) parameters(callable wire.Span, ps Node, params uint32) {
 	s, x := k.s, k.x
 	if params == 0 {
@@ -548,11 +587,13 @@ func (k *cLinker) parameters(callable wire.Span, ps Node, params uint32) {
 			continue
 		}
 		index++
+		if ellipsis {
+			k.out.Parameters = append(k.out.Parameters, wire.Parameter{Callable: callable, Name: wireSpan(spanOf(c)),
+				Index: index, Variadic: true})
+			continue
+		}
 		name := c
 		if !knr {
-			if ellipsis {
-				continue
-			}
 			name = k.chain(c.ChildByFieldId(s.fDeclarator)).name
 		}
 		if name.IsNull() || name.KindId() != s.identifier {
@@ -650,7 +691,8 @@ func (k *cLinker) pure(owner, d Node) bool {
 }
 
 // macro appends the Export of a function-like macro: its parameter count,
-// each named parameter as a Parameter numbered from 1,
+// each named parameter as a Parameter numbered from 1 and a `...` as a
+// Variadic one,
 // and no types. Every parameter is optional: an argument of a macro
 // invocation may be empty (`G()` passes G one empty argument, ISO C
 // 6.10.3p4), and an empty argument is no expression of the call's argument
@@ -670,10 +712,138 @@ func (k *cLinker) macro(n Node) {
 		case p.KindId() == k.x.ellipsis && !p.IsNamed():
 			e.Params++
 			e.Variadic = true
+			k.out.Parameters = append(k.out.Parameters, wire.Parameter{Callable: e.Name, Name: wireSpan(spanOf(p)),
+				Index: e.Params, Variadic: true})
 		}
 	}
 	e.Optional = e.Params
 	k.out.Exports = append(k.out.Exports, e)
+}
+
+// alias appends the Export of the object-like macro n when its replacement
+// list is exactly one identifier: a call of the macro's name calls what that
+// identifier names.
+func (k *cLinker) alias(n Node) {
+	name := n.ChildByFieldId(k.s.fName)
+	if name.IsNull() {
+		return
+	}
+	if _, ident := k.replacement(n); ident != "" {
+		k.out.Exports = append(k.out.Exports, wire.Export{Name: wireSpan(spanOf(name)), Alias: ident})
+	}
+}
+
+// replacement reads the replacement list of the object-like macro n, its
+// comments and surrounding whitespace removed: the include path it is when
+// it is one string literal (without its quotes) or one header name (with
+// its brackets), and the identifier it is when it is exactly one.
+func (k *cLinker) replacement(n Node) (path, ident string) {
+	v := n.ChildByFieldId(k.s.fValue)
+	if v.IsNull() {
+		return "", ""
+	}
+	text := strings.TrimSpace(string(textOf(k.src, v)))
+	switch {
+	case strings.HasPrefix(text, `"`):
+		end := strings.IndexByte(text[1:], '"')
+		if end < 0 || strings.ContainsRune(text[1:end+1], '\\') || cUncommented(text[end+2:]) != "" {
+			return "", ""
+		}
+		return text[1 : end+1], ""
+	case strings.HasPrefix(text, "<"):
+		end := strings.IndexByte(text, '>')
+		if end < 0 || cUncommented(text[end+1:]) != "" {
+			return "", ""
+		}
+		return text[:end+1], ""
+	}
+	text = cUncommented(text)
+	if text == "" {
+		return "", ""
+	}
+	for i, r := range text {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return "", ""
+		}
+	}
+	return "", text
+}
+
+// cUncommented is text with a trailing comment and whitespace removed: what
+// is left of a replacement list's tail outside its first token.
+func cUncommented(text string) string {
+	for _, open := range []string{"//", "/*"} {
+		if i := strings.Index(text, open); i >= 0 {
+			if open == "/*" && !strings.HasSuffix(strings.TrimSpace(text[i:]), "*/") {
+				continue
+			}
+			text = text[:i]
+		}
+	}
+	return strings.TrimSpace(text)
+}
+
+// include appends the DynamicImport of the directive n when its path is a
+// macro name: constant when every object-like definition of the name before
+// the directive replaces it with one and the same include path, and open,
+// with no fragments, otherwise.
+func (k *cLinker) include(n Node) {
+	p := n.ChildByFieldId(k.x.fPath)
+	if cKind(p) != k.s.identifier {
+		return
+	}
+	imp := wire.DynamicImport{At: wireSpan(spanOf(n))}
+	path, defined := "", false
+	for _, d := range k.defines[k.text(p)] {
+		if d.start >= uint32(n.StartByte()) {
+			break
+		}
+		if d.path == "" || defined && d.path != path {
+			path, defined = "", true
+			break
+		}
+		path, defined = d.path, true
+	}
+	if path != "" {
+		imp.Fragments, imp.Constant = []string{path}, true
+	}
+	k.out.DynamicImports = append(k.out.DynamicImports, imp)
+}
+
+// overrides reports whether the function declarator fn carries an
+// `override` or `final` virt-specifier: the member says it overrides a
+// base's virtual member ([class.virtual]).
+func (k *cLinker) overrides(fn Node) bool {
+	for c := cFirst(fn); !c.IsNull(); c = c.next() {
+		if c.KindId() == k.x.virtualSpecifier && c.IsNamed() && k.x.virtualSpecifier != 0 {
+			if t := string(textOf(k.src, c)); t == "override" || t == "final" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// readName reports an identifier an argument reads by name: a plain
+// identifier, which the read index resolves to a variable or to nothing.
+// A field name is a field_identifier and a type name a type_identifier, so
+// neither is one.
+func (k *cLinker) readName(n Node) bool { return n.KindId() == k.s.identifier }
+
+// readSkip reports a subtree whose identifiers an argument does not read:
+// a call, whose result the argument is, a C++ construction by `new`, a
+// lambda, whose body runs later, and a qualified or template name, which
+// names a namespace member or a function, never a local.
+func (k *cLinker) readSkip(n Node) bool {
+	switch id, s := n.KindId(), k.s; {
+	case id == s.callExpression:
+		return true
+	case !s.cpp:
+		return false
+	case id == s.newExpression || id == s.lambdaExpression || id == s.qualifiedIdentifier || id == s.templateFunction:
+		return true
+	}
+	return false
 }
 
 // storage reports whether the declaration owner has the storage class
@@ -794,6 +964,7 @@ func (k *cLinker) call(n Node) {
 			for a := c.first(); !a.IsNull(); a = a.next() {
 				if a.IsNamed() && !a.IsExtra() {
 					site.Args = append(site.Args, k.recover(a))
+					site.Arguments = append(site.Arguments, wire.Argument{At: wireSpan(spanOf(a)), Reads: k.reads().argReads(a, k.readName, k.readSkip, nil)})
 				}
 			}
 		}
@@ -806,15 +977,31 @@ func (k *cLinker) call(n Node) {
 // or `x->f()`, or, dereferenced, `(*x->f)()`: an indirect call through the
 // data member f, typed by its declaration when the receiver's record
 // declares it, or, when member allows it, a C++ call of the member function
-// f on the receiver. ok is false when fe names no field.
+// f on the receiver, or, qualified, `x.Base::f()`, the static call of the
+// member function Base declares. ok is false when fe names no field.
 func (k *cLinker) fieldCall(site *wire.Site, fe Node, member bool) (ok bool) {
 	s := k.s
 	field := lastNamed(fe)
+	if member && s.cpp && cKind(field) == s.qualifiedIdentifier {
+		// `a.Base::f()` names the member function Base declares and never
+		// dispatches: the call `Base::f()` names, on a.
+		name, scope := field.ChildByFieldId(s.fName), firstNamed(field)
+		if cKind(name) != s.identifier || scope == name {
+			return false
+		}
+		site.Name, site.Shape, site.Qualifier = wireSpan(spanOf(name)), wire.ShapeStatic, k.typeName(scope)
+		return true
+	}
 	if cKind(field) != s.fieldIdentifier {
 		return false
 	}
 	site.Name = wireSpan(spanOf(field))
 	recv := k.recover(fe.ChildByFieldId(s.fArgument))
+	if cKind(fe.ChildByFieldId(s.fOperator)) == s.arrow {
+		// `x->f()` reaches f through a pointer, or through the pointer an
+		// object's `operator->` returns.
+		recv = indirect(recv)
+	}
 	m, found := k.member(recv, textOf(k.src, field))
 	if member && s.cpp && (!found || m.fn) {
 		site.Shape, site.Receiver = wire.ShapeMember, recv
@@ -984,7 +1171,7 @@ func (k *cLinker) recover(e Node) wire.Type {
 				}
 			}
 		}
-		return k.recover(a)
+		return indirect(k.recover(a))
 	case s.fieldExpression:
 		if f := lastNamed(e); cKind(f) == s.fieldIdentifier {
 			if m, ok := k.member(k.recover(e.ChildByFieldId(s.fArgument)), textOf(k.src, f)); ok && !m.fn {
@@ -1019,6 +1206,13 @@ func cNamed(name string) wire.Type {
 // instance of the named type below its pointers, references and arrays, the
 // type of an `auto` declarator's initializer, or nothing for a function
 // pointer, which has no named type.
+//
+// In C++ an instance is an ExactObject when the declarator declares an
+// object of the type itself, or an array of them, through no pointer or
+// reference: `Dog d`, a by-value parameter `Animal a`, a data member `Dog
+// m`, `Dog arr[2]`. A parameter's array declarator declares a pointer
+// ([dcl.fct]), and an `auto` declarator's type is its initializer's, whose
+// mark it keeps unless a pointer or reference declarator wraps it.
 func (k *cLinker) declType(d cDecl) wire.Type {
 	s := k.s
 	c := k.chain(d.decl)
@@ -1031,11 +1225,29 @@ func (k *cLinker) declType(d cDecl) wire.Type {
 	t := d.owner.ChildByFieldId(s.fType)
 	if cKind(t) == k.x.placeholderTypeSpecifier && k.x.placeholderTypeSpecifier != 0 {
 		if init := k.initializer(d.decl); !init.IsNull() {
-			return k.recover(init)
+			r := k.recover(init)
+			if r.Kind == wire.TypeNamed && c.indirect {
+				r.Index = 0
+			}
+			return r
 		}
 		return wire.Type{}
 	}
-	return cNamed(k.typeName(t))
+	r := cNamed(k.typeName(t))
+	if r.Kind == wire.TypeNamed && s.cpp && !c.indirect && !(c.array && k.parameter(d.owner)) {
+		r.Index = wire.ExactObject
+	}
+	return r
+}
+
+// indirect is t as a value reached through a pointer or reference: the
+// same type, never an ExactObject, since the object it denotes may be a
+// subobject of a derived class's object.
+func indirect(t wire.Type) wire.Type {
+	if t.Kind == wire.TypeNamed {
+		t.Index = 0
+	}
+	return t
 }
 
 // initializer is the value of an init declarator d, or null.
@@ -1318,6 +1530,9 @@ func (k *cLinker) returns(owner, top, fn Node) wire.Type {
 type cChain struct {
 	name, scope, fn Node
 	function        bool
+	// indirect reports a pointer or reference declarator on the way to the
+	// name, and array an array declarator.
+	indirect, array bool
 }
 
 // chain walks the declarator d to its name as the structural extraction
@@ -1331,9 +1546,12 @@ func (k *cLinker) chain(d Node) cChain {
 		case id == s.functionDeclarator || id == x.abstractFunctionDeclarator:
 			c.fn, c.function = d, true
 			d = d.ChildByFieldId(s.fDeclarator)
-		case id == s.pointerDeclarator || id == s.arrayDeclarator || id == s.abstractPointerDeclarator ||
-			id == s.abstractArrayDeclarator || id == s.referenceDeclarator && id != 0 || id == x.abstractReferenceDeclarator && id != 0:
-			c.function = false
+		case id == s.arrayDeclarator || id == s.abstractArrayDeclarator:
+			c.function, c.array = false, true
+			d = k.inner(d)
+		case id == s.pointerDeclarator || id == s.abstractPointerDeclarator ||
+			id == s.referenceDeclarator && id != 0 || id == x.abstractReferenceDeclarator && id != 0:
+			c.function, c.indirect = false, true
 			d = k.inner(d)
 		case id == s.initDeclarator || id == s.attributedDeclarator:
 			d = k.inner(d)
@@ -1444,7 +1662,11 @@ type cLinkSyntax struct {
 	translationUnit, functionDefinition, fieldDeclaration, fieldDeclarationList, typeDefinition,
 	structSpecifier, unionSpecifier, enumerator, preprocFunctionDef, preprocDef, parameterDeclaration,
 	variadicParameter, argumentList, fieldDesignator, abstractFunctionDeclarator, paren, ellipsis,
-	linkageSpecification, declarationList uint16
+	linkageSpecification, declarationList, preprocInclude uint16
+	// fPath is the field of an include directive's path, read from the
+	// grammar directly: the grammar table holds cRefine, so this table may
+	// not consult it (cLinkSyntaxIn).
+	fPath uint16
 
 	// C++ only.
 	classSpecifier, baseClassClause, templateType, trailingReturnType, placeholderTypeSpecifier,
@@ -1521,10 +1743,15 @@ func resolveCLinkSyntax(language string, tl *ts.Language) *cLinkSyntax {
 		ellipsis:                   mustKind(tl, language, "...", false),
 		linkageSpecification:       kind("linkage_specification"),
 		declarationList:            kind("declaration_list"),
+		preprocInclude:             kind("preproc_include"),
+		fPath:                      tl.FieldIdForName("path"),
 		declaration:                kind("declaration"),
 		object:                     make([]bool, tl.NodeKindCount()),
 		conditional:                make([]bool, tl.NodeKindCount()),
 		clause:                     make([]bool, tl.NodeKindCount()),
+	}
+	if x.fPath == 0 {
+		panic("worker: the " + language + " grammar has no field path")
 	}
 	x.object[kind("pointer_declarator")], x.object[kind("array_declarator")] = true, true
 	for _, name := range []string{"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef"} {

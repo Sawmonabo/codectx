@@ -1,6 +1,7 @@
 package link
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"testing"
@@ -55,22 +56,24 @@ func js(path string, decls []Decl, sites []Site, values []Value, supers ...wire.
 		Decls: decls, Sites: sites, Values: values, Supertypes: supers}
 }
 
-// TestInferGoldens protects the ECMAScript resolver's answer for each
+// TestInferGoldens protects the ECMAScript resolver's call facts for each
 // technique: a site bound to a declaration the source does not call, or a
 // call the source makes left unbound, publishes a wrong `calls` edge or
-// loses one. Every case's expected bindings were derived twice from its
-// source and the technique definitions, once independently of the
-// implementation. The last case reads the class hierarchy's type lookup and
-// dispatch (hierarchy.types, hierarchy.dispatch) for names written in the
-// source; the others bind through the tables' own candidates, members,
-// exports and fields.
+// loses one, and a call with the wrong dispatch says an override can or
+// cannot run where the language says otherwise. Every case's expected
+// bindings were derived twice from its source and the technique
+// definitions, once independently of the implementation. The last case
+// reads the class hierarchy's type lookup (hierarchy.types) for names
+// written in the source; the others bind through the tables' own
+// candidates, members, exports and fields.
 func TestInferGoldens(t *testing.T) {
 	named := func(n string) wire.Type { return wire.Type{Kind: wire.TypeNamed, Name: n} }
 	result := func(i uint32) wire.Type { return wire.Type{Kind: wire.TypeResult, Index: i} }
 	param := func(i uint32) wire.Type { return wire.Type{Kind: wire.TypeParam, Index: i} }
-	b := func(sf, si, tf, ti int32, detail string) Binding {
-		return Binding{Site: Ref{File: sf, Index: si}, Target: Ref{File: tf, Index: ti}, Detail: detail}
+	b := func(sf, si, tf, ti int32, detail string, d model.Dispatch) Binding {
+		return Binding{Site: Ref{File: sf, Index: si}, Target: Ref{File: tf, Index: ti}, Detail: detail, Dispatch: d}
 	}
+	exact, virtual := model.DispatchExact, model.DispatchVirtual
 	cases := []struct {
 		name string
 		// anchor is the language reference, by standard title and section,
@@ -100,8 +103,9 @@ class Car {
 			},
 			[]Value{{Caller: 3, Field: "engine", Type: result(0)}})},
 		// Engine declares no constructor, so `new Engine()` binds the class;
-		// the instance written to `engine` reaches the read in drive.
-		want:     []Binding{b(0, 0, 0, 0, DetailDirect), b(0, 1, 0, 1, DetailFlow)},
+		// the constructed instance written to `engine` reaches the read in
+		// drive, exactly an Engine.
+		want:     []Binding{b(0, 0, 0, 0, DetailDirect, exact), b(0, 1, 0, 1, DetailFlow, exact)},
 		mutation: "a field write that adds no edge into the field's variable leaves `this.engine.start()` unbound",
 	}, {
 		name: "parameter flow across an import",
@@ -126,7 +130,7 @@ export function run(task) { task.exec(); }`,
 				[]Decl{exported(decl(model.NodeFunction, "run", -1))},
 				[]Site{{Caller: 0, Callee: "exec", Shape: wire.ShapeMember, Receiver: param(0)}}, nil),
 		},
-		want:     []Binding{b(0, 0, 1, 0, DetailDirect), b(0, 1, 0, 0, DetailDirect), b(1, 0, 0, 1, DetailFlow)},
+		want:     []Binding{b(0, 0, 1, 0, DetailDirect, exact), b(0, 1, 0, 0, DetailDirect, exact), b(1, 0, 0, 1, DetailFlow, exact)},
 		mutation: "connecting an argument to a parameter of the caller instead of the callee leaves `task.exec()` unbound",
 	}, {
 		name: "return flow",
@@ -144,7 +148,7 @@ function use() { const l = make(); l.write(); }`,
 				{Caller: 3, Callee: "make", Shape: wire.ShapeBare, Candidates: []int32{2}},
 				{Caller: 3, Callee: "write", Shape: wire.ShapeMember, Receiver: result(1)},
 			}, nil)},
-		want:     []Binding{b(0, 0, 0, 0, DetailDirect), b(0, 1, 0, 2, DetailDirect), b(0, 2, 0, 1, DetailFlow)},
+		want:     []Binding{b(0, 0, 0, 0, DetailDirect, exact), b(0, 1, 0, 2, DetailDirect, exact), b(0, 2, 0, 1, DetailFlow, exact)},
 		mutation: "dropping a bound target's returns from the site's result leaves `l.write()` unbound",
 	}, {
 		name: "field-based resolution",
@@ -162,7 +166,7 @@ export function fire(h) { h.click(); }`,
 				exported(decl(model.NodeFunction, "fire", -1))},
 			[]Site{{Caller: 2, Callee: "click", Shape: wire.ShapeMember, Receiver: param(0)}},
 			[]Value{{Caller: -1, Field: "click", Type: wire.Type{Kind: wire.TypeFunction, Name: "onClick"}}})},
-		want:     []Binding{b(0, 0, 0, 0, DetailField)},
+		want:     []Binding{b(0, 0, 0, 0, DetailField, exact)},
 		mutation: "a member site that watches only its receiver, not the field it calls, leaves `h.click()` unbound",
 	}, {
 		name: "an imported function written to a field",
@@ -188,10 +192,10 @@ export function save() {}`,
 		},
 		// The value is the declaration h.js exports as onSave; the local
 		// name `save` an import renamed it to names nothing in h.js.
-		want:     []Binding{b(0, 0, 1, 0, DetailField)},
+		want:     []Binding{b(0, 0, 1, 0, DetailField, exact)},
 		mutation: "evaluating `./h.js#onSave` as a module path leaves `x.save()` unbound; looking up the local name binds h.js save",
 	}, {
-		name: "class-hierarchy analysis and super",
+		name: "declared type and super",
 		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
 		// the binding rules alone); the two agree on every binding.
 		anchor: "ECMA-262 (15th edition, 2024) §15.7 (Class Definitions: extends), §13.3.7 (The super Keyword)",
@@ -209,16 +213,54 @@ class Circle extends Shape {}`,
 				{Caller: 4, Callee: "area", Shape: wire.ShapeMember, Receiver: wire.Type{Kind: wire.TypeSuper, Name: "Square"}},
 			}, nil,
 			wire.Supertype{Type: "Square", Super: "Shape"}, wire.Supertype{Type: "Circle", Super: "Shape"})},
-		// `this` may be a Square, whose override the call then reaches;
-		// `super.area()` is the superclass's method alone.
-		want:     []Binding{b(0, 0, 0, 1, DetailFlow), b(0, 0, 0, 4, DetailHierarchy), b(0, 1, 0, 1, DetailDirect)},
-		mutation: "a `super` receiver dispatched like an instance binds Square.area to its own super call",
+		// `this` is a Shape or a subclass's instance: the call binds the
+		// method Shape declares, virtual, and Square's override is found at
+		// query time; `super.area()` is the superclass's method, exact.
+		want: []Binding{b(0, 0, 0, 1, DetailFlow, virtual), b(0, 1, 0, 1, DetailDirect, exact)},
+		mutation: "walking the declared type's subtypes binds Square.area to `this.area()`; " +
+			"a `super` receiver read as an instance makes its call virtual",
+	}, {
+		name: "field-based resolution for a class that declares nothing",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree on every binding: Box declares no close and has no
+		// supertype outside the project, so only a property written on the instance can supply the call,
+		// and the field that close is written to decides it.
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors: a property is looked up on the object and its prototype chain), §13.15.2 (Assignment to a property), §13.3.5 (The new Operator)",
+		source: `function shut() {}
+class Box {}
+const door = {};
+door.close = shut;
+export function run() { new Box().close(); }`,
+		tables: []*Table{js("src/a.js",
+			[]Decl{decl(model.NodeFunction, "shut", -1), decl(model.NodeClass, "Box", -1),
+				decl(model.NodeConstant, "door", -1), exported(decl(model.NodeFunction, "run", -1))},
+			[]Site{
+				{Caller: 3, Callee: "Box", Shape: wire.ShapeConstructor, Candidates: []int32{1}},
+				{Caller: 3, Callee: "close", Shape: wire.ShapeMember, Receiver: result(0)},
+			},
+			[]Value{{Caller: -1, Field: "close", Type: wire.Type{Kind: wire.TypeFunction, Name: "shut"}}})},
+		want:     []Binding{b(0, 0, 0, 1, DetailDirect, exact), b(0, 1, 0, 0, DetailField, exact)},
+		mutation: "the field-based gate closed for every receiver that recovered a value leaves `new Box().close()` unbound",
+	}, {
+		name: "computed callee",
+		// Derived twice from the source and the anchor, the second time blind (the source, the anchor and
+		// the binding rules alone); the two agree: a computed member's callee names nothing.
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors: `obj[expr]` evaluates expr to a property key at run time)",
+		source: `function go() {}
+export function run(obj, k) { obj[k](); }`,
+		tables: []*Table{js("src/a.js",
+			[]Decl{decl(model.NodeFunction, "go", -1), exported(decl(model.NodeFunction, "run", -1))},
+			[]Site{{Caller: 1, Callee: "obj[k]", Shape: wire.ShapeIndirect, Computed: true,
+				Receiver: wire.Type{Kind: wire.TypeFunction, Name: "go"}}}, nil)},
+		mutation: "a computed site recorded like an indirect one binds the value its table names",
 	}}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var got []Binding
 			if err := resolveECMAScript(context.Background(), goldenUnit(t, c.tables...), func(b Binding) error {
-				got = append(got, b)
+				if b.Kind == FactCall || b.Kind == FactExternalSite {
+					got = append(got, b)
+				}
 				return nil
 			}); err != nil {
 				t.Fatal(err)
@@ -235,5 +277,11 @@ func cmpBinding(a, b Binding) int {
 	if c := compareRef(a.Site, b.Site); c != 0 {
 		return c
 	}
-	return compareRef(a.Target, b.Target)
+	if c := cmp.Compare(a.Kind, b.Kind); c != 0 {
+		return c
+	}
+	if c := compareRef(a.Target, b.Target); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.External, b.External)
 }

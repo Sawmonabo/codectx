@@ -184,3 +184,99 @@ func addInternal(s *pagination.ExternalSort[entry], t *Table, d *Decl, e entry) 
 	}
 	return nil
 }
+
+// aliasC yields what a call of name in caller binds through the C or C++
+// object-like macros of that name whose replacement is one identifier
+// (Decl.Alias) and that the caller's file sees: its own, and those of a
+// header it includes (includes). The preprocessor replaces the name before
+// the call is parsed, so a visible macro decides alone (aliased), and the
+// call binds what each definition's identifier names in the caller, as a
+// bare call of it would, one binding per definition (a macro defined in
+// several `#if` arms binds each arm's). seen holds the macro names already
+// replaced along the expansion, which the preprocessor never replaces again
+// ([cpp.rescan]).
+func (r *staticFile) aliasC(caller int32, name string, yield func(entry) error, seen map[string]bool) (aliased bool, err error) {
+	var replacements []string
+	err = r.h.decls.lookup(keyMacro+name, func(e entry) error {
+		if e.Ref.File == r.file || r.includes(e.Aux) {
+			aliased = true
+			if !slices.Contains(replacements, e.Sig) {
+				replacements = append(replacements, e.Sig)
+			}
+		}
+		return nil
+	})
+	if err != nil || !aliased {
+		return aliased, err
+	}
+	if seen == nil {
+		seen = map[string]bool{}
+	}
+	seen[name] = true
+	for _, id := range replacements {
+		if seen[id] {
+			continue
+		}
+		again, err := r.aliasC(caller, id, yield, seen)
+		if err != nil {
+			return true, err
+		}
+		if !again {
+			if err := r.free(caller, id, yield); err != nil {
+				return true, err
+			}
+		}
+	}
+	return true, nil
+}
+
+// includeFacts emits a FactImport for each quoted `#include` of a C or C++
+// member to every member file it may name, as the include lookup reads it
+// (includes): the file beside the including one, and every file whose path
+// ends in the header's at a component boundary, each once. An angled
+// include names a header an include directory supplies, which the unit
+// does not decide, and one that names no member file publishes nothing.
+func (r *staticFile) includeFacts() error {
+	if r.fc.family != "c" {
+		return nil
+	}
+	for i, imp := range r.t.Imports {
+		if imp.Name != "" || strings.HasPrefix(imp.Path, "<") || imp.Path == "" {
+			continue
+		}
+		h := path.Clean(imp.Path)
+		var files []int32
+		add := func(file int32) {
+			if file != r.file && !slices.Contains(files, file) {
+				files = append(files, file)
+			}
+		}
+		beside := path.Join(path.Dir(r.fc.path), h)
+		err := r.h.decls.lookup(keyPath+beside, func(e entry) error {
+			fc, ok, err := r.h.fileContext(e.Ref.File)
+			if err == nil && ok && fc.path == beside {
+				add(e.Ref.File)
+			}
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(h, "../") {
+			if err := r.h.decls.lookup(keyPath+h, func(e entry) error {
+				add(e.Ref.File)
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		for _, file := range files {
+			err := r.emit(Binding{Kind: FactImport, Site: Ref{File: r.file, Index: int32(i)}, Target: Ref{File: file, Index: -1},
+				Detail: DetailImport})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

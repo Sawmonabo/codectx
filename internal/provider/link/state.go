@@ -13,27 +13,35 @@ import (
 )
 
 // The resolution state is what a unit's next build starts from: the manifest
-// fields its resolution read, one record per member, and every binding, each
-// named by identity. A site is its file and its index in that file's table,
-// which is valid wherever the state is read: a member whose table digest
-// held has the same sites at the same indices, and a member whose digest
-// moved is resolved again. A target is its file and its declaration's node
-// identity, which a body edit or an inserted declaration does not move
-// (reconcile.CanonicalKey), so a binding into an edited file survives the
-// edit and nothing has to be renumbered.
+// fields its resolution read, one record per member, and every fact, each
+// named by identity. A fact's entry is its file and its index in that file's
+// table (a site, an import or a declaration, by kind), which is valid
+// wherever the state is read: a member whose table digest held has the same
+// entries at the same indices, and a member whose digest moved is resolved
+// again. A target is its file and its node identity (a declaration's, a
+// file's module's or a parameter's), which a body edit or an inserted
+// declaration does not move (reconcile.CanonicalKey), so a fact into an
+// edited file survives the edit and nothing has to be renumbered; an
+// external target is its external key (externalType, externalMethod).
 //
-// The stored form is stateTag, then three sections, each its count and its
+// The stored form is stateTag, then these sections, each its count and its
 // entries in ascending order:
 //   - the manifest fields (manifestFields): key and value, strings;
-//   - the member records, by FileID (record);
-//   - the bindings, by site then target (idBinding): site file, site index,
-//     target file, target node and the technique as one byte;
+//   - the member records, by FileID (record), each a string of its encoded
+//     form;
+//   - the facts, by entry then target (idBinding), each a string of its
+//     encoded form;
 //   - the index groups, by key (group), the recorded reads, by key (read),
 //     and the address-taken functions, by the member taking them (taken),
 //     each record a string of its encoded form: what a refresh of a
-//     static-family unit finds its re-runs from (trace.go), empty for a
-//     family whose resolution records no reads;
-//   - a byte, 1 when the static family's hierarchy follows (its module path
+//     static-family unit finds its re-runs from (trace.go), empty for the
+//     flow family;
+//   - the boundary contributions, by entry, value and contributing member
+//     (contribution), and the boundary entries read, by entry and reading
+//     member (flowRead), each a string of its encoded form: what a refresh
+//     of a flow-family unit finds its region from (refresh.go), empty for
+//     the static family;
+//   - a byte, 1 when the unit's hierarchy follows (its module path
 //     and root, its two indexes and its identity table, as they are on
 //     disk), else 0.
 //
@@ -42,12 +50,16 @@ import (
 
 // stateTag opens every stored resolution state, so a state of any other form
 // is refused before anything of it is read.
-const stateTag = "link.resolution.identity\n"
+const stateTag = "link.resolution.boundary\n"
 
-// details is every technique a binding can carry, in its stored order.
-var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField}
+// details is every technique a fact can carry, in its stored order, which is
+// also the order of preference a fold of two equal facts keeps (better); the
+// empty technique, a fact no technique is named for (an open or external
+// site), is last.
+var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
+	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, ""}
 
-// detailCode is the stored byte of a binding's technique.
+// detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {
 	for i, v := range details {
 		if v == d {
@@ -57,82 +69,161 @@ func detailCode(d string) (byte, bool) {
 	return 0, false
 }
 
-// compareSiteTarget orders positional bindings by site, then target.
-func compareSiteTarget(a, b Binding) int {
-	return cmp.Or(compareRef(a.Site, b.Site), compareRef(a.Target, b.Target))
-}
+// dispatches and reasons are the stored bytes of a call fact's dispatch and
+// an open site's reason; the empty value is 0.
+var (
+	dispatches = [...]model.Dispatch{"", model.DispatchVirtual, model.DispatchExact}
+	reasons    = [...]model.OpenSiteReason{"", model.ReasonReceiverUntyped, model.ReasonValueUntracked,
+		model.ReasonGlobalUnbound, model.ReasonComputed}
+)
 
-// compareTargetSite orders positional bindings by target, then site.
-func compareTargetSite(a, b Binding) int {
-	return cmp.Or(compareRef(a.Target, b.Target), compareRef(a.Site, b.Site))
-}
-
-// encodeBinding is a positional binding's record in a sorted run.
-func encodeBinding(b Binding) ([]byte, error) {
-	code, ok := detailCode(b.Detail)
-	if !ok {
-		return nil, internalErr("a resolver bound a site with the unknown technique " + strconv.Quote(b.Detail))
-	}
-	if b.Site.File < 0 || b.Site.Index < 0 || b.Target.File < 0 || b.Target.Index < 0 {
-		return nil, internalErr("a resolver bound a site through a negative member or table index")
-	}
-	out := make([]byte, 0, 4*binary.MaxVarintLen32+1)
-	for _, v := range [...]int32{b.Site.File, b.Site.Index, b.Target.File, b.Target.Index} {
-		out = binary.AppendUvarint(out, uint64(v))
-	}
-	return append(out, code), nil
-}
-
-// decodeBinding reads one record encodeBinding wrote.
-func decodeBinding(raw []byte) (Binding, error) {
-	var v [4]int32
-	for i := range v {
-		n, w := binary.Uvarint(raw)
-		if w <= 0 || n > 1<<31-1 {
-			return Binding{}, errors.New("a binding index is malformed")
+func codeOf[T comparable](values []T, v T) (byte, bool) {
+	for i, x := range values {
+		if x == v {
+			return byte(i), true
 		}
-		v[i], raw = int32(n), raw[w:]
 	}
-	if len(raw) != 1 || int(raw[0]) >= len(details) {
-		return Binding{}, errors.New("a binding technique is malformed")
-	}
-	return Binding{Site: Ref{File: v[0], Index: v[1]}, Target: Ref{File: v[2], Index: v[3]}, Detail: details[raw[0]]}, nil
+	return 0, false
 }
 
-// newBindingSort opens a sort of positional bindings in dir by order.
-func newBindingSort(dir string, order func(a, b Binding) int) (*pagination.ExternalSort[Binding], error) {
-	return pagination.NewExternalSort(dir, 0, encodeBinding, decodeBinding, order)
+// entry is the table a fact of kind k indexes with its Site: 0 a call site
+// (Table.Sites), 1 an import (Table.Imports), 2 a declaration (Table.Decls).
+// Facts sort by file, then entry table, then entry, so one file's facts
+// about one site, import or declaration are adjacent.
+func (k Fact) entry() int {
+	switch k {
+	case FactImport:
+		return 1
+	case FactExtends, FactImplements, FactOverrides:
+		return 2
+	}
+	return 0
+}
+
+// hasTarget reports whether a fact of kind k names a target of the unit when
+// it names no external one.
+func (k Fact) hasTarget() bool {
+	switch k {
+	case FactExternalSite, FactOpenSite:
+		return false
+	}
+	return true
+}
+
+// external reports whether a fact of kind k may name an external target.
+func (k Fact) external() bool {
+	switch k {
+	case FactCall, FactExtends, FactImplements, FactOverrides:
+		return true
+	}
+	return false
+}
+
+// canonical is b checked against what its kind states and with every field
+// its kind does not use zeroed, so two emissions of one fact compare equal
+// and fold whatever a resolver left in the unused fields. A fact whose
+// fields contradict its kind is a resolver defect.
+func canonical(b Binding) (Binding, error) {
+	bad := func(what string) (Binding, error) {
+		return Binding{}, internalErr("a resolver emitted a fact of kind " + strconv.Itoa(int(b.Kind)) + " " + what)
+	}
+	if b.Kind > FactOverrides {
+		return bad("that is not a kind of fact")
+	}
+	if _, ok := detailCode(b.Detail); !ok {
+		return bad("with the unknown technique " + strconv.Quote(b.Detail))
+	}
+	if b.Site.File < 0 || b.Site.Index < 0 {
+		return bad("about a negative member or table index")
+	}
+	if b.Kind == FactCall {
+		if b.Dispatch == "" || !b.Dispatch.Valid() {
+			return bad("with no dispatch or an unknown one")
+		}
+	} else {
+		b.Dispatch = ""
+	}
+	if b.Kind == FactOpenSite {
+		if !b.Reason.Valid() {
+			return bad("with no open-site reason or an unknown one")
+		}
+	} else {
+		b.Reason = ""
+	}
+	if b.Kind != FactFlow {
+		b.Arg, b.Param = 0, 0
+	} else if b.Arg < 0 || b.Param < 0 {
+		return bad("with a negative argument or parameter index")
+	}
+	switch {
+	case b.External != "":
+		if !b.Kind.external() {
+			return bad("naming an external target")
+		}
+		if _, ok := externalCandidate(b.External); !ok {
+			return bad("naming a malformed external key")
+		}
+		b.Target = Ref{}
+	case !b.Kind.hasTarget():
+		b.Target = Ref{}
+	case b.Kind == FactImport:
+		if b.Target.File < 0 || b.Target.Index != -1 {
+			return bad("naming no member's module")
+		}
+	case b.Target.File < 0 || b.Target.Index < 0:
+		return bad("naming a negative member or table index")
+	}
+	return b, nil
 }
 
 // better reports whether technique a sorts before b in details, the one a
-// fold of two bindings of one site and target keeps, so the published
-// technique does not depend on the order a resolver emitted its repeats in.
+// fold of two equal facts keeps, so the published technique does not depend
+// on the order a resolver emitted its repeats in.
 func better(a, b string) bool {
 	ca, _ := detailCode(a)
 	cb, _ := detailCode(b)
 	return ca < cb
 }
 
-// keepOne folds two positional bindings of one site and target into one.
-func keepOne(a, b Binding) (Binding, error) {
-	if better(b.Detail, a.Detail) {
-		return b, nil
+// foldDispatch is the dispatch of two emissions of one call fact: virtual
+// when either can run an override.
+func foldDispatch(a, b model.Dispatch) model.Dispatch {
+	if a == model.DispatchVirtual || b == model.DispatchVirtual {
+		return model.DispatchVirtual
 	}
-	return a, nil
+	return cmp.Or(a, b)
 }
 
-// idBinding is a binding named by identity: the site by its file and its
-// index in that file's table, the target by its file and its declaration's
-// node.
+// foldReason is the reason of two emissions of one open-site fact: the one
+// that sorts first in reasons, so the fold does not depend on their order.
+func foldReason(a, b model.OpenSiteReason) model.OpenSiteReason {
+	ca, _ := codeOf(reasons[:], a)
+	cb, _ := codeOf(reasons[:], b)
+	if a == "" || b != "" && cb < ca {
+		return b
+	}
+	return a
+}
+
+// idBinding is a fact named by identity: its entry by its file and its index
+// in that file's table (Site, by Kind's entry table), and its target by its
+// file and node (a declaration's, a member's module's, a parameter's) or by
+// its external key. A fact with no target (an open or external site) has all
+// three empty.
 type idBinding struct {
+	Kind       Fact
 	SiteFile   model.FileID
 	Site       int32
+	Arg        int32
 	TargetFile model.FileID
 	Target     model.NodeID
+	External   string
 	Detail     string
+	Dispatch   model.Dispatch
+	Reason     model.OpenSiteReason
 }
 
-// target is a declaration a binding targets.
+// target is a node of the unit a fact targets, with its file.
 type target struct {
 	File model.FileID
 	Node model.NodeID
@@ -140,23 +231,28 @@ type target struct {
 
 func (b idBinding) target() target { return target{File: b.TargetFile, Node: b.Target} }
 
-// compareIDSite orders bindings by site, then target: the stored order, and
-// the order a file's sites are published in.
+// compareIDSite orders facts by file, entry table, entry, kind, argument and
+// target: the stored order, the order a file's facts are published in, and
+// the key one fact has, which a fold collapses (keepOneID).
 func compareIDSite(a, b idBinding) int {
-	return cmp.Or(cmp.Compare(a.SiteFile, b.SiteFile), cmp.Compare(a.Site, b.Site),
-		cmp.Compare(a.TargetFile, b.TargetFile), cmp.Compare(a.Target, b.Target))
+	return cmp.Or(cmp.Compare(a.SiteFile, b.SiteFile), cmp.Compare(a.Kind.entry(), b.Kind.entry()),
+		cmp.Compare(a.Site, b.Site), cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Arg, b.Arg),
+		cmp.Compare(a.TargetFile, b.TargetFile), cmp.Compare(a.Target, b.Target), cmp.Compare(a.External, b.External))
 }
 
 func compareTarget(a, b target) int {
 	return cmp.Or(cmp.Compare(a.File, b.File), cmp.Compare(a.Node, b.Node))
 }
 
-// keepOneID folds two bindings of one site and target into one, as keepOne.
+// keepOneID folds two facts of one key into one: the better technique, the
+// folded dispatch and reason.
 func keepOneID(a, b idBinding) (idBinding, error) {
+	out := a
 	if better(b.Detail, a.Detail) {
-		return b, nil
+		out = b
 	}
-	return a, nil
+	out.Dispatch, out.Reason = foldDispatch(a.Dispatch, b.Dispatch), foldReason(a.Reason, b.Reason)
+	return out, nil
 }
 
 func appendString(out []byte, s string) []byte {
@@ -165,27 +261,29 @@ func appendString(out []byte, s string) []byte {
 
 func encodeIDBinding(b idBinding) ([]byte, error) {
 	code, ok := detailCode(b.Detail)
-	if !ok {
-		return nil, internalErr("a binding carries the unknown technique " + strconv.Quote(b.Detail))
+	dispatch, dok := codeOf(dispatches[:], b.Dispatch)
+	reason, rok := codeOf(reasons[:], b.Reason)
+	if !ok || !dok || !rok || b.Kind > FactOverrides || b.Site < 0 || b.Arg < 0 {
+		return nil, internalErr("a fact named by identity is malformed")
 	}
-	if b.Site < 0 {
-		return nil, internalErr("a binding names a negative site index")
-	}
-	out := appendString(nil, string(b.SiteFile))
-	out = binary.AppendUvarint(out, uint64(b.Site))
+	out := appendString([]byte{byte(b.Kind)}, string(b.SiteFile))
+	out = binary.AppendUvarint(binary.AppendUvarint(out, uint64(b.Site)), uint64(b.Arg))
 	out = appendString(out, string(b.TargetFile))
 	out = appendString(out, string(b.Target))
-	return append(out, code), nil
+	out = appendString(out, b.External)
+	return append(out, code, dispatch, reason), nil
 }
 
 func decodeIDBinding(raw []byte) (idBinding, error) {
 	r := byteReader{b: raw}
-	b := idBinding{SiteFile: model.FileID(r.str()), Site: r.index(), TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str())}
-	code := r.byte()
-	if r.err != nil || len(r.b) != 0 || int(code) >= len(details) {
-		return idBinding{}, errors.New("a binding is malformed")
+	b := idBinding{Kind: Fact(r.byte()), SiteFile: model.FileID(r.str()), Site: r.index(), Arg: r.index(),
+		TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str()), External: r.str()}
+	code, dispatch, reason := r.byte(), r.byte(), r.byte()
+	if r.err != nil || len(r.b) != 0 || b.Kind > FactOverrides || int(code) >= len(details) ||
+		int(dispatch) >= len(dispatches) || int(reason) >= len(reasons) {
+		return idBinding{}, errors.New("a fact is malformed")
 	}
-	b.Detail = details[code]
+	b.Detail, b.Dispatch, b.Reason = details[code], dispatches[dispatch], reasons[reason]
 	return b, nil
 }
 
@@ -205,13 +303,14 @@ func decodeTarget(raw []byte) (target, error) {
 	r := byteReader{b: raw}
 	t := target{File: model.FileID(r.str()), Node: model.NodeID(r.str())}
 	if r.err != nil || len(r.b) != 0 {
-		return target{}, errors.New("a binding target is malformed")
+		return target{}, errors.New("a fact's target is malformed")
 	}
 	return t, nil
 }
 
-// targetsOf is the declarations run's bindings target, ascending and each
-// once.
+// targetsOf is the nodes of the unit run's facts target, ascending and each
+// once: declarations, members' modules and parameters. An external target is
+// none of them (externalsOf).
 func targetsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.SortedRun[target], error) {
 	s, err := pagination.NewExternalSort(dir, 0, encodeTarget, decodeTarget, compareTarget)
 	if err != nil {
@@ -219,16 +318,62 @@ func targetsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.So
 	}
 	defer s.Close()
 	s.WithFold(func(a, _ target) (target, error) { return a, nil })
-	if err := run.Each(func(b idBinding) error { return s.Add(b.target()) }); err != nil {
+	err = run.Each(func(b idBinding) error {
+		if b.Target == "" {
+			return nil
+		}
+		return s.Add(b.target())
+	})
+	if err != nil {
 		return nil, err
 	}
 	return s.Sorted()
 }
 
+// externalsOf is the external keys run's facts target, ascending and each
+// once.
+func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.SortedRun[string], error) {
+	s, err := newKeySort(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	err = run.Each(func(b idBinding) error {
+		if b.External == "" {
+			return nil
+		}
+		return s.Add(b.External)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.Sorted()
+}
+
+// counts are one member's share of the counts its unit's capability rows
+// carry, so a row sums them over the records without reading a carried
+// member's table: its call sites, those bound to a declaration of the unit,
+// those open (Computed ones excluded), the computed ones, those external;
+// its imports resolved to a member and its open import sites.
+type counts struct {
+	Sites, Bound, Open, Computed, External int64
+	Imports, OpenImports                   int64
+}
+
+func (c *counts) add(o counts) {
+	c.Sites += o.Sites
+	c.Bound += o.Bound
+	c.Open += o.Open
+	c.Computed += o.Computed
+	c.External += o.External
+	c.Imports += o.Imports
+	c.OpenImports += o.OpenImports
+}
+
 // record is what the state keeps of one member: its content, its table's
-// digests (empty when it has no table) and its share of the unit's
-// coverage. A build that does not read the member's table takes all of it
-// from here.
+// digests (empty when it has no table), its table's Dropped count and its
+// counts. A build that does not read the member's table takes all of it from
+// here.
 type record struct {
 	File model.FileID
 	// Content is the content hash the member had.
@@ -237,9 +382,8 @@ type record struct {
 	// summaries' digests.
 	Digest, Interface, Sites string
 	Tabled                   bool
-	// Dropped is the table's Dropped count, and Unkeyed the member's
-	// ambiguous sites whose call-site key does not fit a native key.
-	Dropped, Unkeyed int64
+	Dropped                  int64
+	Counts                   counts
 }
 
 func encodeRecord(r record) ([]byte, error) {
@@ -252,18 +396,24 @@ func encodeRecord(r record) ([]byte, error) {
 		tabled = 1
 	}
 	out = append(out, tabled)
-	if r.Dropped < 0 || r.Unkeyed < 0 {
-		return nil, internalErr("a member record holds a negative count")
+	c := r.Counts
+	for _, n := range [...]int64{r.Dropped, c.Sites, c.Bound, c.Open, c.Computed, c.External, c.Imports, c.OpenImports} {
+		if n < 0 {
+			return nil, internalErr("a member record holds a negative count")
+		}
+		out = binary.AppendUvarint(out, uint64(n))
 	}
-	out = binary.AppendUvarint(out, uint64(r.Dropped))
-	return binary.AppendUvarint(out, uint64(r.Unkeyed)), nil
+	return out, nil
 }
 
 func decodeRecord(raw []byte) (record, error) {
 	r := byteReader{b: raw}
 	rec := record{File: model.FileID(r.str()), Content: r.str(), Digest: r.str(), Interface: r.str(), Sites: r.str()}
 	tabled := r.byte()
-	rec.Dropped, rec.Unkeyed = r.count(), r.count()
+	c := &rec.Counts
+	for _, p := range [...]*int64{&rec.Dropped, &c.Sites, &c.Bound, &c.Open, &c.Computed, &c.External, &c.Imports, &c.OpenImports} {
+		*p = r.count()
+	}
 	if r.err != nil || len(r.b) != 0 || tabled > 1 {
 		return record{}, errors.New("a member record is malformed")
 	}
@@ -271,9 +421,10 @@ func decodeRecord(raw []byte) (record, error) {
 	return rec, nil
 }
 
+func compareRecord(a, b record) int { return cmp.Compare(a.File, b.File) }
+
 func newRecordSort(dir string) (*pagination.ExternalSort[record], error) {
-	return pagination.NewExternalSort(dir, 0, encodeRecord, decodeRecord,
-		func(a, b record) int { return cmp.Compare(a.File, b.File) })
+	return pagination.NewExternalSort(dir, 0, encodeRecord, decodeRecord, compareRecord)
 }
 
 // manifestField is one field of a manifest the unit's resolution reads
@@ -354,27 +505,12 @@ func writeState(w io.Writer, fields []manifestField, records *pagination.SortedR
 	for _, f := range fields {
 		out = appendString(appendString(out, f.Key), f.Value)
 	}
-	_, err := bw.Write(binary.AppendUvarint(out, uint64(records.Len())))
+	_, err := bw.Write(out)
 	if err == nil {
-		err = records.Each(func(r record) error {
-			rec, err := encodeRecord(r)
-			if err == nil {
-				_, err = bw.Write(rec)
-			}
-			return err
-		})
+		err = writeSection(bw, records, encodeRecord)
 	}
 	if err == nil {
-		_, err = bw.Write(binary.AppendUvarint(nil, uint64(res.bindings.Len())))
-	}
-	if err == nil {
-		err = res.bindings.Each(func(b idBinding) error {
-			rec, err := encodeIDBinding(b)
-			if err == nil {
-				_, err = bw.Write(rec)
-			}
-			return err
-		})
+		err = writeSection(bw, res.bindings, encodeIDBinding)
 	}
 	if err == nil {
 		err = writeSection(bw, res.groups, encodeGroup)
@@ -384,6 +520,12 @@ func writeState(w io.Writer, fields []manifestField, records *pagination.SortedR
 	}
 	if err == nil {
 		err = writeSection(bw, res.taken, encodeTaken)
+	}
+	if err == nil {
+		err = writeSection(bw, res.contributions, encodeWith(contributionCodec))
+	}
+	if err == nil {
+		err = writeSection(bw, res.flowReads, encodeWith(flowReadCodec))
 	}
 	if err == nil {
 		if res.h == nil {
@@ -486,9 +628,9 @@ func (s stateReader) byte(what string) (byte, error) {
 	return c, nil
 }
 
-// readState streams a stored state's sections to field, rec and bind, each
-// in its stored order, and refuses a state that is short, long, out of
-// order or malformed.
+// readState streams a stored state's sections to sink, each in its stored
+// order, and refuses a state that is short, long, out of order, repeated or
+// malformed.
 func readState(r io.Reader, sink stateSink) error {
 	field, rec, bind := sink.field, sink.record, sink.binding
 	s := stateReader{br: bufio.NewReader(r)}
@@ -517,87 +659,11 @@ func readState(r io.Reader, sink stateSink) error {
 			return err
 		}
 	}
-	if n, err = s.uvarint("its record count"); err != nil {
+	if err := readSection(s, "member records", decodeRecord, compareRecord, true, rec); err != nil {
 		return err
 	}
-	var lastFile model.FileID
-	for i := uint64(0); i < n; i++ {
-		var r record
-		strs := [...]*string{(*string)(&r.File), &r.Content, &r.Digest, &r.Interface, &r.Sites}
-		for _, p := range strs {
-			if *p, err = s.str("a member record"); err != nil {
-				return err
-			}
-		}
-		tabled, err := s.byte("a member record")
-		if err != nil {
-			return err
-		}
-		if tabled > 1 {
-			return stateCorrupt("a member record is malformed")
-		}
-		r.Tabled = tabled == 1
-		for _, p := range [...]*int64{&r.Dropped, &r.Unkeyed} {
-			c, err := s.uvarint("a member record")
-			if err != nil {
-				return err
-			}
-			if c > 1<<63-1 {
-				return stateCorrupt("a member record's count is malformed")
-			}
-			*p = int64(c)
-		}
-		if i > 0 && r.File <= lastFile {
-			return stateCorrupt("its member records are out of order")
-		}
-		lastFile = r.File
-		if err := rec(r); err != nil {
-			return err
-		}
-	}
-	if n, err = s.uvarint("its binding count"); err != nil {
+	if err := readSection(s, "facts", decodeIDBinding, compareIDSite, true, bind); err != nil {
 		return err
-	}
-	var last idBinding
-	for i := uint64(0); i < n; i++ {
-		var b idBinding
-		if f, err := s.str("a binding"); err != nil {
-			return err
-		} else {
-			b.SiteFile = model.FileID(f)
-		}
-		site, err := s.uvarint("a binding")
-		if err != nil {
-			return err
-		}
-		if site > 1<<31-1 {
-			return stateCorrupt("a binding's site index is malformed")
-		}
-		b.Site = int32(site)
-		tf, err := s.str("a binding")
-		if err != nil {
-			return err
-		}
-		node, err := s.str("a binding")
-		if err != nil {
-			return err
-		}
-		b.TargetFile, b.Target = model.FileID(tf), model.NodeID(node)
-		code, err := s.byte("a binding")
-		if err != nil {
-			return err
-		}
-		if int(code) >= len(details) {
-			return stateCorrupt("a binding technique is malformed")
-		}
-		b.Detail = details[code]
-		if i > 0 && compareIDSite(last, b) >= 0 {
-			return stateCorrupt("its bindings are out of order")
-		}
-		last = b
-		if err := bind(b); err != nil {
-			return err
-		}
 	}
 	if err := readSection(s, "index groups", decodeGroup, compareGroup, true, sink.group); err != nil {
 		return err
@@ -606,6 +672,14 @@ func readState(r io.Reader, sink stateSink) error {
 		return err
 	}
 	if err := readSection(s, "address-taken functions", decodeTaken, compareTakenFrom, true, sink.taken); err != nil {
+		return err
+	}
+	if err := readSection(s, "boundary contributions", decodeWith(contributionCodec, "a boundary contribution"),
+		contributionCodec.cmp, true, sink.contribution); err != nil {
+		return err
+	}
+	if err := readSection(s, "boundary reads", decodeWith(flowReadCodec, "a boundary read"), flowReadCodec.cmp, true,
+		sink.flowRead); err != nil {
 		return err
 	}
 	switch has, err := s.byte("its hierarchy mark"); {
@@ -632,6 +706,10 @@ type stateSink struct {
 	group   func(group) error
 	read    func(read) error
 	taken   func(taken) error
+	// contribution and flowRead receive the flow family's boundary
+	// contributions and reads (refresh.go).
+	contribution func(contribution) error
+	flowRead     func(flowRead) error
 	// hierarchy reads the stored hierarchy from the stream, when there is
 	// one.
 	hierarchy func(stateReader) error
@@ -642,13 +720,15 @@ type stateSink struct {
 // state it would refuse once it had begun publishing.
 func ValidateState(r io.Reader) error {
 	return readState(r, stateSink{
-		field:     func(manifestField) error { return nil },
-		record:    func(record) error { return nil },
-		binding:   func(idBinding) error { return nil },
-		group:     func(group) error { return nil },
-		read:      func(read) error { return nil },
-		taken:     func(taken) error { return nil },
-		hierarchy: skipHierarchy,
+		field:        func(manifestField) error { return nil },
+		record:       func(record) error { return nil },
+		binding:      func(idBinding) error { return nil },
+		group:        func(group) error { return nil },
+		read:         func(read) error { return nil },
+		taken:        func(taken) error { return nil },
+		contribution: func(contribution) error { return nil },
+		flowRead:     func(flowRead) error { return nil },
+		hierarchy:    skipHierarchy,
 	})
 }
 
@@ -688,6 +768,16 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 		return nil, err
 	}
 	defer takenSort.Close()
+	contributions, err := newSort0(dir, contributionCodec, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer contributions.Close()
+	flowReads, err := newSort0(dir, flowReadCodec, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer flowReads.Close()
 	p := &previous{}
 	defer func() {
 		if p.records == nil && p.h != nil {
@@ -700,6 +790,7 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 			return nil
 		},
 		record: records.Add, binding: bindings.Add, group: groups.Add, read: reads.Add, taken: takenSort.Add,
+		contribution: contributions.Add, flowRead: flowReads.Add,
 		hierarchy: func(s stateReader) error {
 			var err error
 			p.h, err = readHierarchy(dir, s)
@@ -728,6 +819,12 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 		return nil, err
 	}
 	if p.taken, err = takenSort.Sorted(); err != nil {
+		return nil, err
+	}
+	if p.contributions, err = contributions.Sorted(); err != nil {
+		return nil, err
+	}
+	if p.flowReads, err = flowReads.Sorted(); err != nil {
 		return nil, err
 	}
 	ok = true

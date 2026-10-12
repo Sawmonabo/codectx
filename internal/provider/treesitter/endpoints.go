@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/reconcile"
@@ -256,10 +257,13 @@ func (b *builder) handlerRef(r wire.Ref) (model.NodeID, bool, error) {
 	return id, true, nil
 }
 
-// literalNode is a route handler written as a function literal, and its node.
+// literalNode is a route handler written as a function literal, and its
+// node, with the endpoint the link table names it by when a call in its body
+// is made from it.
 type literalNode struct {
 	at wire.Span
 	id model.NodeID
+	ep link.Endpoint
 }
 
 // handlerLiterals mints the node of every route handler written as a
@@ -278,12 +282,12 @@ func (b *builder) handlerLiterals() error {
 			if h.fn.End > uint32(len(b.src)) || h.fn.Start > h.fn.End {
 				return outputInvalid("a route handler's range does not fit the pinned bytes")
 			}
-			id, ok, err := b.handlerLiteral(*h.fn, f.descriptor)
+			ep, ok, err := b.handlerLiteral(*h.fn, f.descriptor)
 			if err != nil {
 				return err
 			}
 			if ok {
-				b.literals = append(b.literals, literalNode{at: *h.fn, id: id})
+				b.literals = append(b.literals, literalNode{at: *h.fn, id: ep.Node, ep: ep})
 			}
 		}
 	}
@@ -320,22 +324,22 @@ func (b *builder) literalAround(r wire.Ref) (model.NodeID, bool) {
 // place as a function node named by the endpoint it handles, keyed by its
 // range (it has no name, so no descriptor path), contained by the innermost
 // declaration around it or defined by the module.
-func (b *builder) handlerLiteral(at wire.Span, descriptor string) (model.NodeID, bool, error) {
+func (b *builder) handlerLiteral(at wire.Span, descriptor string) (link.Endpoint, bool, error) {
 	rng, err := b.rangeOf(at.Start, at.End)
 	if err != nil {
-		return "", false, err
+		return link.Endpoint{}, false, err
 	}
 	key := b.rangeKey("fn:", at.Start, at.End)
 	if key == "" {
 		b.dropped[structure]++
-		return "", false, nil
+		return link.Endpoint{}, false, nil
 	}
 	var cut truncations
 	name := cut.cut("name", descriptor, model.MaxNameBytes)
 	res, err := b.resolve(model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key,
 		Kind: model.NodeFunction, Language: b.lang.Name, Name: name, FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: rng})
 	if err != nil {
-		return "", false, err
+		return link.Endpoint{}, false, err
 	}
 	meta := map[string]any{}
 	if len(cut) > 0 {
@@ -347,7 +351,8 @@ func (b *builder) handlerLiteral(at wire.Span, descriptor string) (model.NodeID,
 		parent, kind = b.decls[i].res.Node.ID, model.RelContains
 	}
 	b.putRelation(structure, parent, kind, res.Node.ID, rng, key, "")
-	return res.Node.ID, true, nil
+	return link.Endpoint{Node: res.Node.ID, CanonicalKey: res.CanonicalKey, Kind: model.NodeFunction, Name: name,
+		Range: *rng}, true, nil
 }
 
 // innermost is the innermost declaration of the file whose range contains

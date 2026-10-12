@@ -118,24 +118,39 @@ func newGroupSort(dir string) (*pagination.ExternalSort[group], error) {
 }
 
 // idTable is the unit's ordinals translated to identities: each member's
-// FileID, and each declaration's node, by member ordinal and table index. It
-// is three scratch files, so one translation is a few positioned reads and
-// nothing of it is resident: members holds, per member, where its FileID is
-// in strs, its first declaration's position in decls and its declaration
-// count; decls holds, per declaration, where its node is in strs.
+// FileID and module node, each declaration's node, and each declared
+// parameter's node, by member ordinal, table index and parameter position. It
+// is four scratch files, so one translation is a few positioned reads and
+// nothing of it is resident: members holds, per member, where its FileID and
+// its module's node are in strs, its first declaration's position in decls
+// and its declaration count; decls holds, per declaration, where its node is
+// in strs, its first parameter's position in params and its parameter count;
+// params holds, per parameter, where its node is in strs (empty for a
+// parameter with no node).
 type idTable struct {
-	files        [3]*os.File
-	leases       [3]*scratch.Lease
-	mw, dw, sw   *bufio.Writer
-	count, decls int64
-	strs         int64
+	files                [4]*os.File
+	leases               [4]*scratch.Lease
+	mw, dw, pw, sw       *bufio.Writer
+	count, decls, params int64
+	strs                 int64
 }
 
-// The widths of a member's and a declaration's record: a string's position
-// and length, and for a member its first declaration and count.
+// The widths of a member's, a declaration's and a parameter's record: a
+// string's position and length, for a member a second string and its first
+// declaration and count, for a declaration its first parameter and count.
 const (
-	idMember = 8 + 4 + 8 + 4
-	idDecl   = 8 + 4
+	idString = 8 + 4
+	idMember = 2*idString + 8 + 4
+	idDecl   = idString + 8 + 4
+	idParam  = idString
+)
+
+// The parts of an idTable, by index into its files.
+const (
+	idMembers = iota
+	idDecls
+	idParams
+	idStrs
 )
 
 func newIDTable(dir string) (*idTable, error) {
@@ -148,7 +163,8 @@ func newIDTable(dir string) (*idTable, error) {
 		}
 		ids.leases[i], ids.files[i] = l, f
 	}
-	ids.mw, ids.dw, ids.sw = bufio.NewWriter(ids.files[0]), bufio.NewWriter(ids.files[1]), bufio.NewWriter(ids.files[2])
+	ids.mw, ids.dw = bufio.NewWriter(ids.files[idMembers]), bufio.NewWriter(ids.files[idDecls])
+	ids.pw, ids.sw = bufio.NewWriter(ids.files[idParams]), bufio.NewWriter(ids.files[idStrs])
 	return ids, nil
 }
 
@@ -161,14 +177,22 @@ func (ids *idTable) str(s string) ([]byte, error) {
 	return rec, err
 }
 
-// add records the next member, file, with t's declarations; t is nil for a
-// member without a table.
+// add records the next member, file, with t's module, declarations and
+// parameters; t is nil for a member without a table.
 func (ids *idTable) add(file model.FileID, t *Table) error {
 	rec, err := ids.str(string(file))
 	if err != nil {
 		return err
 	}
-	rec = binary.BigEndian.AppendUint64(rec, uint64(ids.decls))
+	module := ""
+	if t != nil {
+		module = string(t.Module.Node)
+	}
+	m, err := ids.str(module)
+	if err != nil {
+		return err
+	}
+	rec = binary.BigEndian.AppendUint64(append(rec, m...), uint64(ids.decls))
 	n := 0
 	if t != nil {
 		n = len(t.Decls)
@@ -177,8 +201,20 @@ func (ids *idTable) add(file model.FileID, t *Table) error {
 			if err != nil {
 				return err
 			}
+			d = binary.BigEndian.AppendUint64(d, uint64(ids.params))
+			d = binary.BigEndian.AppendUint32(d, uint32(len(t.Decls[i].Parameters)))
 			if _, err := ids.dw.Write(d); err != nil {
 				return err
+			}
+			for _, p := range t.Decls[i].Parameters {
+				pr, err := ids.str(string(p.Node))
+				if err != nil {
+					return err
+				}
+				if _, err := ids.pw.Write(pr); err != nil {
+					return err
+				}
+				ids.params++
 			}
 		}
 	}
@@ -191,7 +227,7 @@ func (ids *idTable) add(file model.FileID, t *Table) error {
 
 // finish makes what add wrote readable.
 func (ids *idTable) finish() error {
-	for _, w := range []*bufio.Writer{ids.mw, ids.dw, ids.sw} {
+	for _, w := range []*bufio.Writer{ids.mw, ids.dw, ids.pw, ids.sw} {
 		if err := w.Flush(); err != nil {
 			return err
 		}
@@ -212,46 +248,98 @@ func (ids *idTable) at(rec []byte) (string, error) {
 	if off+n > ids.strs {
 		return "", internalErr("link identity table: a string is past its end")
 	}
-	buf := make([]byte, n)
 	if n == 0 {
 		return "", nil
 	}
-	err := ids.readAt(2, buf, off)
+	buf := make([]byte, n)
+	err := ids.readAt(idStrs, buf, off)
 	return string(buf), err
 }
 
-func (ids *idTable) member(file int32) (model.FileID, int64, int32, error) {
-	if file < 0 || int64(file) >= ids.count {
-		return "", 0, 0, internalErr("member " + strconv.Itoa(int(file)) + " is past the unit's members")
-	}
+// member is the record of the member at ordinal file.
+func (ids *idTable) member(file int32) ([idMember]byte, error) {
 	var rec [idMember]byte
-	if err := ids.readAt(0, rec[:], int64(file)*idMember); err != nil {
-		return "", 0, 0, err
+	if file < 0 || int64(file) >= ids.count {
+		return rec, internalErr("member " + strconv.Itoa(int(file)) + " is past the unit's members")
 	}
-	id, err := ids.at(rec[:12])
-	return model.FileID(id), int64(binary.BigEndian.Uint64(rec[12:])), int32(binary.BigEndian.Uint32(rec[20:])), err
+	err := ids.readAt(idMembers, rec[:], int64(file)*idMember)
+	return rec, err
 }
 
 // file is the FileID of the member at ordinal file.
 func (ids *idTable) file(file int32) (model.FileID, error) {
-	id, _, _, err := ids.member(file)
-	return id, err
+	rec, err := ids.member(file)
+	if err != nil {
+		return "", err
+	}
+	id, err := ids.at(rec[:idString])
+	return model.FileID(id), err
+}
+
+// module is the file and module node of the member at ordinal file.
+func (ids *idTable) module(file int32) (target, error) {
+	rec, err := ids.member(file)
+	if err != nil {
+		return target{}, err
+	}
+	id, err := ids.at(rec[:idString])
+	if err != nil {
+		return target{}, err
+	}
+	node, err := ids.at(rec[idString : 2*idString])
+	if err == nil && node == "" {
+		err = internalErr("member " + strconv.Itoa(int(file)) + " has no table, so no module node")
+	}
+	return target{File: model.FileID(id), Node: model.NodeID(node)}, err
+}
+
+// decl is the FileID of the member r names and the record of its
+// declaration r.Index.
+func (ids *idTable) decl(r Ref) (model.FileID, [idDecl]byte, error) {
+	var d [idDecl]byte
+	rec, err := ids.member(r.File)
+	if err != nil {
+		return "", d, err
+	}
+	id, err := ids.at(rec[:idString])
+	if err != nil {
+		return "", d, err
+	}
+	first, n := int64(binary.BigEndian.Uint64(rec[2*idString:])), int32(binary.BigEndian.Uint32(rec[2*idString+8:]))
+	if r.Index < 0 || r.Index >= n {
+		return "", d, internalErr("declaration " + strconv.Itoa(int(r.Index)) + " is past its member's table")
+	}
+	err = ids.readAt(idDecls, d[:], (first+int64(r.Index))*idDecl)
+	return model.FileID(id), d, err
 }
 
 // node is the file and node of the declaration at r.
 func (ids *idTable) node(r Ref) (target, error) {
-	id, first, n, err := ids.member(r.File)
+	id, d, err := ids.decl(r)
 	if err != nil {
 		return target{}, err
 	}
-	if r.Index < 0 || r.Index >= n {
-		return target{}, internalErr("declaration " + strconv.Itoa(int(r.Index)) + " is past its member's table")
-	}
-	var rec [idDecl]byte
-	if err := ids.readAt(1, rec[:], (first+int64(r.Index))*idDecl); err != nil {
+	node, err := ids.at(d[:idString])
+	return target{File: id, Node: model.NodeID(node)}, err
+}
+
+// param is the file and node of parameter pos (an index into Decl.Parameters)
+// of the declaration at r, with an empty node for a parameter the
+// structural provider minted no node for.
+func (ids *idTable) param(r Ref, pos int32) (target, error) {
+	id, d, err := ids.decl(r)
+	if err != nil {
 		return target{}, err
 	}
-	node, err := ids.at(rec[:])
+	first, n := int64(binary.BigEndian.Uint64(d[idString:])), int32(binary.BigEndian.Uint32(d[idString+8:]))
+	if pos < 0 || pos >= n {
+		return target{}, internalErr("parameter " + strconv.Itoa(int(pos)) + " is past its declaration's parameters")
+	}
+	var p [idParam]byte
+	if err := ids.readAt(idParams, p[:], (first+int64(pos))*idParam); err != nil {
+		return target{}, err
+	}
+	node, err := ids.at(p[:])
 	return target{File: id, Node: model.NodeID(node)}, err
 }
 
@@ -289,6 +377,7 @@ var refPrefixes = []struct {
 	file   bool
 }{
 	{keyFile, true}, {keyImport, true}, {keyMethod, false}, {keySub, false}, {keySuper, false}, {keyGoField, false},
+	{keyExternalSuper, false}, {keyParam, false},
 }
 
 // traceKey is the read of key in the index scope names (scopeDecls,
@@ -492,11 +581,14 @@ func readIndex(dir string, s stateReader) (*index, error) {
 	return ix, nil
 }
 
-// writeTo writes the table's member, declaration and string byte counts,
-// then its three files.
+// writeTo writes the table's member, declaration, parameter and string byte
+// counts, then its four files.
 func (ids *idTable) writeTo(w *bufio.Writer) error {
-	out := binary.AppendUvarint(binary.AppendUvarint(nil, uint64(ids.count)), uint64(ids.decls))
-	if _, err := w.Write(binary.AppendUvarint(out, uint64(ids.strs))); err != nil {
+	var out []byte
+	for _, n := range [...]int64{ids.count, ids.decls, ids.params, ids.strs} {
+		out = binary.AppendUvarint(out, uint64(n))
+	}
+	if _, err := w.Write(out); err != nil {
 		return err
 	}
 	for i, n := range ids.sizes() {
@@ -507,28 +599,29 @@ func (ids *idTable) writeTo(w *bufio.Writer) error {
 	return nil
 }
 
-// sizes is the byte length of each of the three files.
-func (ids *idTable) sizes() [3]int64 {
-	return [3]int64{ids.count * idMember, ids.decls * idDecl, ids.strs}
+// sizes is the byte length of each of the four files.
+func (ids *idTable) sizes() [4]int64 {
+	return [4]int64{ids.count * idMember, ids.decls * idDecl, ids.params * idParam, ids.strs}
 }
 
-// readIDCounts reads the counts writeTo wrote.
-func readIDCounts(s stateReader) (count, decls, strs int64, err error) {
-	var v [3]uint64
+// readIDCounts reads the counts writeTo wrote into a table's fields.
+func readIDCounts(s stateReader) (*idTable, error) {
+	var v [4]uint64
 	for i := range v {
+		var err error
 		if v[i], err = s.uvarint("its identity table"); err != nil {
-			return 0, 0, 0, err
+			return nil, err
 		}
 	}
-	if v[0] > 1<<31 || v[1] > 1<<58 || v[2] > 1<<62 {
-		return 0, 0, 0, stateCorrupt("its identity table's counts are malformed")
+	if v[0] > 1<<31 || v[1] > 1<<56 || v[2] > 1<<56 || v[3] > 1<<62 {
+		return nil, stateCorrupt("its identity table's counts are malformed")
 	}
-	return int64(v[0]), int64(v[1]), int64(v[2]), nil
+	return &idTable{count: int64(v[0]), decls: int64(v[1]), params: int64(v[2]), strs: int64(v[3])}, nil
 }
 
 // readIDTable reads a table writeTo wrote into files of dir's arena.
 func readIDTable(dir string, s stateReader) (*idTable, error) {
-	count, decls, strs, err := readIDCounts(s)
+	c, err := readIDCounts(s)
 	if err != nil {
 		return nil, err
 	}
@@ -536,8 +629,8 @@ func readIDTable(dir string, s stateReader) (*idTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	ids.count, ids.decls, ids.strs = count, decls, strs
-	for i, w := range []*bufio.Writer{ids.mw, ids.dw, ids.sw} {
+	ids.count, ids.decls, ids.params, ids.strs = c.count, c.decls, c.params, c.strs
+	for i, w := range []*bufio.Writer{ids.mw, ids.dw, ids.pw, ids.sw} {
 		n := ids.sizes()[i]
 		if m, err := io.CopyN(w, s.br, n); err != nil || m != n {
 			ids.close()
@@ -579,13 +672,50 @@ func skipHierarchy(s stateReader) error {
 			return stateCorrupt("a hierarchy index overruns its length")
 		}
 	}
-	count, decls, strs, err := readIDCounts(s)
+	c, err := readIDCounts(s)
 	if err != nil {
 		return err
 	}
-	n := count*idMember + decls*idDecl + strs
+	n := c.sizes()[idMembers] + c.sizes()[idDecls] + c.sizes()[idParams] + c.sizes()[idStrs]
 	if m, err := io.CopyN(io.Discard, s.br, n); err != nil || m != n {
 		return stateCorrupt("its identity table is short")
 	}
 	return nil
+}
+
+// identify is the canonical fact b, about an entry of the member whose FileID
+// is site, named by identity: its target's node read from the table (a
+// declaration's, the member's module's for a FactImport, the parameter's for
+// a FactFlow). ok is false for a FactFlow into a parameter the structural
+// provider minted no node for, which is not a fact.
+func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, error) {
+	b, err := canonical(b)
+	if err != nil {
+		return idBinding{}, false, err
+	}
+	id := unnamed(site, b)
+	if b.External != "" || !b.Kind.hasTarget() {
+		return id, true, nil
+	}
+	var to target
+	switch b.Kind {
+	case FactImport:
+		to, err = ids.module(b.Target.File)
+	case FactFlow:
+		to, err = ids.param(b.Target, b.Param)
+	default:
+		to, err = ids.node(b.Target)
+	}
+	if err != nil || to.Node == "" {
+		return idBinding{}, false, err
+	}
+	id.TargetFile, id.Target = to.File, to.Node
+	return id, true, nil
+}
+
+// unnamed is the canonical fact b, about an entry of the member whose FileID
+// is site, with every field but its target named.
+func unnamed(site model.FileID, b Binding) idBinding {
+	return idBinding{Kind: b.Kind, SiteFile: site, Site: b.Site.Index, Arg: b.Arg, External: b.External,
+		Detail: b.Detail, Dispatch: b.Dispatch, Reason: b.Reason}
 }

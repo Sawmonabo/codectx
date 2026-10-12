@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/binary"
+	"errors"
 	"path"
 	"slices"
 	"strings"
@@ -39,15 +40,21 @@ import (
 //   - a static site binds the method its qualifier's type declares or
 //     inherits, and through a module receiver the module's export;
 //   - a member site binds, for each instance its receiver holds, the method
-//     the instance's type declares or inherits (DetailFlow) and, unless the
-//     instance is a construction's result, every override in a subtype
-//     (hierarchy.dispatch, DetailHierarchy); through a `super`
-//     receiver or a class object the method the type declares or inherits,
-//     and through a module the module's export (DetailDirect); and, only when
-//     its receiver binds nothing once the inference settles, every function
-//     written to the field it calls (DetailField);
+//     the instance's type declares or inherits (DetailFlow), never a
+//     subtype's override: its dispatch is virtual for an instance a
+//     declaration or an annotation types, which an override can stand in
+//     for (hierarchy.overridable), and exact for a construction's result;
+//     through a `super` receiver or a class object the method the type
+//     declares or inherits, and through a module the module's export
+//     (DetailDirect), each exact; and, only when its receiver holds no
+//     value and names no type at all, every function written to the field
+//     it calls (DetailField);
 //   - an indirect site binds every function its called value holds
-//     (DetailFlow, or DetailField when the value is a field's).
+//     (DetailFlow, or DetailField when the value is a field's);
+//   - a computed site (Site.Computed) binds nothing.
+//
+// Every other binding is exact: a bare name's declaration, a construction's
+// constructor, a function value.
 //
 // A module's exports are its exported declarations, the names its own
 // `export` statements give them, and what it re-exports from other modules
@@ -63,6 +70,22 @@ import (
 // count. The class hierarchy and the modules' exports are read by point
 // lookups into the hierarchy's index. Nothing the size of the unit is
 // resident beyond one merge group.
+//
+// The fixed point is stratified. Its first stratum is every rule but
+// field-based resolution of a member site; once it settles, a member site
+// whose receiver decided nothing (addFieldWatches) watches the field it
+// calls through, and the second stratum continues from the first. A site's
+// field watch depends on the first stratum's values alone, so what a
+// variable holds at the end of the first stratum is part of the answer.
+//
+// The inference may scan only some of the members (only), with the values
+// the others send in given (inputs): the stored boundary contributions of a
+// predecessor's members (contribution), each entered at the stratum it
+// arrived at. It then answers every scanned member's bindings and receiver
+// values and, for the next build, what each scanned member sends across its
+// boundary and what it reads there (flowRead). refresh.go decides which
+// members a refresh scans so that the inputs are what a full build would
+// compute.
 type types struct {
 	// bindingRun is every binding the fixed point found, sorted by site and
 	// target, one per pair with its best technique.
@@ -70,12 +93,20 @@ type types struct {
 	// recvRun is every value a site's receiver or called value held, sorted
 	// by site, which functions answers from.
 	recvRun *pagination.SortedRun[recv]
-	cursor  *seeker[recv]
+	// contributions are the scanned members' boundary contributions, by
+	// entry, and reads the boundary entries they read, by entry.
+	contributions *pagination.SortedRun[contribution]
+	reads         *pagination.SortedRun[flowRead]
+	cursor        *seeker[recv]
+	calls         *seeker[binding]
 }
 
-// inferTypes runs the inference over the unit's tables.
-func inferTypes(ctx context.Context, u *unit, h *hierarchy) (*types, error) {
-	in := &inference{u: u, h: h}
+// inferTypes runs the inference over the tables of the members only names
+// (every member when only is nil), the other members' values entering as
+// inputs, sorted by entry (nil for none).
+func inferTypes(ctx context.Context, u *unit, h *hierarchy, only *pagination.SortedRun[int32],
+	inputs *pagination.SortedRun[contribution]) (*types, error) {
+	in := &inference{u: u, h: h, only: only, inputs: inputs}
 	t, err := in.run(ctx)
 	in.closeAll()
 	return t, err
@@ -100,12 +131,23 @@ func (t *types) functions(ctx context.Context, site Ref, yield func(target Ref, 
 	})
 }
 
-// bindings yields every binding the inference found, sorted by site and
-// target, each pair once with the technique that found it first in rank.
-func (t *types) bindings(yield func(Binding) error) error {
-	return t.bindingRun.Each(func(b binding) error {
-		return yield(Binding{Site: b.Site, Target: b.Target, Detail: rankDetail[b.Rank]})
-	})
+// callsAt yields the bindings the inference found for site, each target
+// once with the technique first in rank. Sites asked in ascending order are
+// answered by one forward pass.
+func (t *types) callsAt(site Ref, yield func(binding) error) error {
+	if t.calls == nil {
+		t.calls = newSeeker(t.bindingRun, func(b binding) Ref { return b.Site })
+	}
+	return t.calls.each(site, yield)
+}
+
+// call is b as the FactCall it states.
+func (b binding) call() Binding {
+	d := model.DispatchExact
+	if b.Virtual {
+		d = model.DispatchVirtual
+	}
+	return Binding{Kind: FactCall, Site: b.Site, Target: b.Target, Detail: rankDetail[b.Rank], Dispatch: d}
 }
 
 // seek yields the receiver values recorded for site, each once.
@@ -132,7 +174,12 @@ func (t *types) close() error {
 	if t.cursor != nil {
 		t.cursor.stop()
 	}
+	if t.calls != nil {
+		t.calls.stop()
+	}
 	t.bindingRun.Close()
+	t.contributions.Close()
+	t.reads.Close()
 	return t.recvRun.Close()
 }
 
@@ -147,6 +194,11 @@ const (
 	// the name the module declares, joined by a NUL. The exports join
 	// seeds it with the declaration the module exports under that name.
 	varImport byte = 4
+	// varReturn is what the callable Decl of File returns: as a boundary
+	// entry, the values its returns hold; as an input, those of a callable
+	// the inference does not scan, which a binding of it reads into the
+	// site's result.
+	varReturn byte = 5
 )
 
 // variable is one place values flow into.
@@ -227,34 +279,35 @@ type recv struct {
 const (
 	rankDirect byte = iota
 	rankFlow
-	rankHierarchy
 	rankField
 )
 
-var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankHierarchy: DetailHierarchy, rankField: DetailField}
+var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankField: DetailField}
 
 // binding is one target found for a site. Flow reports that the site's
 // arguments and result connect to the target's parameters and returns (a
 // class bound for want of a constructor does not); Shift that the site's
 // first argument is the target's receiver (a Python instance method called
-// through its class), so argument i+1 is parameter i.
+// through its class), so argument i+1 is parameter i; Virtual that an
+// override of the target can run instead (the call's dispatch).
 type binding struct {
-	Site, Target Ref
-	Rank         byte
-	Flow, Shift  bool
+	Site, Target         Ref
+	Rank                 byte
+	Flow, Shift, Virtual bool
 }
 
 // lookup asks for the method Name the type Class declares, or else inherits
 // (hierarchy.declared: the nearest along each supertype path, Python's
 // method resolution order for a Python class). Unbound reports a Python call
 // through the class object, which passes an instance method its receiver as
-// the first argument.
+// the first argument; Virtual a receiver that may be an instance of a
+// subtype of Class, whose override the call then runs.
 type lookup struct {
-	Class   Ref
-	Name    string
-	Call    call
-	Rank    byte
-	Unbound bool
+	Class            Ref
+	Name             string
+	Call             call
+	Rank             byte
+	Unbound, Virtual bool
 }
 
 // exportReq asks for the export Name of the module Base for Call.
@@ -284,6 +337,45 @@ type argRec struct {
 	Op   operand
 }
 
+// siteShape is the keyword and spread of each argument of Site, which
+// argumentFlows matches against a bound callable's parameters.
+type siteShape struct {
+	Site Ref
+	Args []Argument
+}
+
+// contribution is one value member From sends across its boundary into
+// Entry, the boundary entry of another member's inference: a callable's
+// returns (varReturn, From its own member), a parameter of a callable of
+// another member (varParam), or a field (varField). Late reports a value
+// the entry holds only in the second stratum. A member's contributions are
+// a function of its table and of the contributions into the entries it
+// reads, which is what lets a refresh scan some members only (refresh.go).
+type contribution struct {
+	Entry variable
+	X     value
+	From  int32
+	Late  bool
+}
+
+// flowRead says that File's inference read the boundary entry Entry: the
+// returns of a callable of another member a site of File binds with flow,
+// or a field File reads. A parameter is read by its own member.
+type flowRead struct {
+	Entry variable
+	File  int32
+}
+
+// pendingFlow is a contribution whose value is what the variable Op holds
+// once the fixed point settles; Late reports one that only the second
+// stratum sends.
+type pendingFlow struct {
+	Entry variable
+	From  int32
+	Op    variable
+	Late  bool
+}
+
 // ---- the inference ----
 
 type inference struct {
@@ -292,6 +384,27 @@ type inference struct {
 	// python reports a Python unit. A unit is one language family, and
 	// Python's constructor is `__init__`.
 	python bool
+
+	// only is the members scanned, ascending, nil for every member; inputs
+	// the contributions the others send, by entry (inferTypes).
+	only   *pagination.SortedRun[int32]
+	inputs *pagination.SortedRun[contribution]
+	// returnsIn is the inputs into the returns of callables not scanned, by
+	// callable, which flow reads for a binding of one; late collects the
+	// input values the first stratum must not see, added when it settles.
+	returnsIn *pagination.SortedRun[contribution]
+	late      *pagination.ExternalSort[fact]
+	// early is the facts at the end of the first stratum. constants collects the contributions whose value is a
+	// constant, pending those whose value a variable holds, and readLog
+	// the boundary entries read.
+	early     *pagination.SortedRun[fact]
+	constants *pagination.ExternalSort[contribution]
+	pending   *pagination.ExternalSort[pendingFlow]
+	readLog   *pagination.ExternalSort[flowRead]
+	// shapes is the argument shape of every scanned site that has one, by
+	// site, and shapeAt reads it in site order.
+	shapes  *pagination.SortedRun[siteShape]
+	shapeAt *seeker[siteShape]
 
 	// The relations the file pass fills and the rounds read.
 	watches *pagination.SortedRun[watch]
@@ -307,9 +420,12 @@ type inference struct {
 
 	// Field-based resolution of a member site waits for the fixed point:
 	// fieldWatches are the member sites' watches of the fields they call,
-	// and fielded reports that the watches of the sites their receivers
-	// bound nothing for have been added.
+	// and fielded reports that the watches of the sites the field may
+	// decide have been added. receivers are the values each member site's
+	// receiver held until then, and a value of kind 0 for a receiver that
+	// names a module, or a type the unit does not declare.
 	fieldWatches *pagination.ExternalSort[watch]
+	receivers    *pagination.ExternalSort[recv]
 	fielded      bool
 
 	open []interface{ Close() error }
@@ -338,11 +454,34 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		return nil, err
 	}
 	in.fieldWatches.WithFold(keepFirst[watch])
+	if in.receivers, err = newSort(in, recvCodec); err != nil {
+		return nil, err
+	}
+	in.receivers.WithFold(keepFirst[recv])
+	if in.late, err = newSort(in, factCodec); err != nil {
+		return nil, err
+	}
+	in.late.WithFold(keepFirst[fact])
+	if in.constants, err = newSort(in, contributionCodec); err != nil {
+		return nil, err
+	}
+	in.constants.WithFold(earliest)
+	if in.pending, err = newSort(in, pendingCodec); err != nil {
+		return nil, err
+	}
+	in.pending.WithFold(func(a, b pendingFlow) (pendingFlow, error) { a.Late = a.Late && b.Late; return a, nil })
+	if in.readLog, err = newSort(in, flowReadCodec); err != nil {
+		return nil, err
+	}
+	in.readLog.WithFold(keepFirst[flowRead])
 	r, err := in.newRound()
 	if err != nil {
 		return nil, err
 	}
 	if err := in.scan(ctx, r); err != nil {
+		return nil, err
+	}
+	if err := in.seed(r); err != nil {
 		return nil, err
 	}
 	if in.facts, err = emptyRun(in, factCodec); err != nil {
@@ -366,8 +505,9 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 			return nil, err
 		}
 		// What the round superseded is released now, so the spill holds the
-		// current relations and nothing of earlier rounds.
-		in.release(mark, prev, in.facts, in.delta, in.edges, in.bound, in.watches)
+		// current relations, the first stratum's and nothing of other
+		// rounds.
+		in.release(mark, prev, in.facts, in.delta, in.edges, in.bound, in.watches, in.early)
 		if delta.Len() == 0 && in.fielded {
 			break
 		}
@@ -379,6 +519,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 			// The values have settled: the member sites whose receivers
 			// bound no method now read the functions written to the fields
 			// they call, and the fixed point continues from there.
+			in.early = in.facts
 			if err := in.addFieldWatches(ctx, r); err != nil {
 				return nil, err
 			}
@@ -403,20 +544,135 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 	if err != nil {
 		return nil, err
 	}
+	t := &types{bindingRun: in.bound, recvRun: recvs}
+	if t.contributions, err = in.contributions(); err != nil {
+		t.close()
+		return nil, err
+	}
+	if t.reads, err = in.boundaryReads(); err != nil {
+		t.close()
+		return nil, err
+	}
 	// The answer's runs belong to the types the inference returns.
-	in.open = slices.DeleteFunc(in.open, func(c interface{ Close() error }) bool { return c == in.bound })
-	return &types{bindingRun: in.bound, recvRun: recvs}, nil
+	in.open = slices.DeleteFunc(in.open, func(c interface{ Close() error }) bool {
+		return c == in.bound || c == t.contributions || c == t.reads
+	})
+	return t, nil
 }
 
-// addFieldWatches adds the field watch of every member site that has no
-// binding once the values settle, and hands each the values its field
-// already holds. Until then a member site is bound only through its
-// receiver, so a site with no binding is one whose receiver's values, if
-// any reached it, declare or inherit no method of its name: an instance
-// attribute (`self.cb = f; self.cb()`) that only the field can tell.
+// seed enters the inputs: a value into a parameter or a field at the
+// stratum it arrived at (the second stratum's held in late until the first
+// settles), and a value a callable not scanned returns into returnsIn.
+func (in *inference) seed(r *round) error {
+	returns, err := newSort(in, contributionCodec)
+	if err != nil {
+		return err
+	}
+	returns.WithFold(earliest)
+	err = in.inputs.Each(func(c contribution) error {
+		switch c.Entry.Kind {
+		case varReturn:
+			return returns.Add(c)
+		case varParam, varField:
+			f := fact{V: c.Entry, X: c.X}
+			if c.Late {
+				return in.late.Add(f)
+			}
+			return r.facts.Add(f)
+		}
+		return internalErr("an inference input names no boundary entry")
+	})
+	if err != nil {
+		return err
+	}
+	in.returnsIn, err = sorted(in, returns)
+	return err
+}
+
+// earliest folds two contributions of one entry, value and member: early
+// when either is.
+func earliest(a, b contribution) (contribution, error) {
+	a.Late = a.Late && b.Late
+	return a, nil
+}
+
+// contributions is what the scanned members send across their boundaries
+// once the fixed point settles, each value early when the first stratum
+// already sent it: every scanned callable's returns, every argument a
+// scanned site passes into a parameter of another member's callable
+// (recorded by flow), and every field write of a scanned member (recorded
+// by scan). A contribution whose value a variable holds takes each value
+// the variable holds, early when it held it at the end of the first stratum.
+func (in *inference) contributions() (*pagination.SortedRun[contribution], error) {
+	err := in.decls.Each(func(d declRec) error {
+		entry := variable{Kind: varReturn, File: d.Decl.File, Decl: d.Decl.Index}
+		if d.Ret.IsVar {
+			return in.pending.Add(pendingFlow{Entry: entry, From: d.Decl.File, Op: d.Ret.V})
+		}
+		return in.constants.Add(contribution{Entry: entry, X: d.Ret.X, From: d.Decl.File})
+	})
+	if err != nil {
+		return nil, err
+	}
+	pending, err := sorted(in, in.pending)
+	if err != nil {
+		return nil, err
+	}
+	for _, stage := range []struct {
+		facts *pagination.SortedRun[fact]
+		late  bool
+	}{{in.early, false}, {in.facts, true}} {
+		err := join(pending, stage.facts, func(p pendingFlow, f fact) int { return cmpVar(p.Op, f.V) },
+			func(p pendingFlow, fs []fact) error {
+				for _, f := range fs {
+					c := contribution{Entry: p.Entry, X: f.X, From: p.From, Late: p.Late || stage.late}
+					if err := in.constants.Add(c); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return sorted(in, in.constants)
+}
+
+// boundaryReads is every boundary entry the scanned members read: those
+// readLog collected and the returns of each callable of another member a
+// scanned site binds with flow.
+func (in *inference) boundaryReads() (*pagination.SortedRun[flowRead], error) {
+	err := in.bound.Each(func(b binding) error {
+		if !b.Flow || b.Target.File == b.Site.File {
+			return nil
+		}
+		return in.readLog.Add(flowRead{Entry: variable{Kind: varReturn, File: b.Target.File, Decl: b.Target.Index},
+			File: b.Site.File})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sorted(in, in.readLog)
+}
+
+// addFieldWatches adds the field watch of every member site the field may
+// decide once the values settle, and hands each the values its field
+// already holds: a site whose receiver recovered nothing, or recovered only
+// classes of the unit that neither declare nor inherit a method of the name
+// and have no supertype outside the project (an instance attribute,
+// `self.cb = f; self.cb()`, which only the field can tell). A receiver that
+// names a module or a type outside the unit, or holds a class that declares
+// the method or may inherit it from outside the project, decides the call
+// through what it recovered (externalMember), never through a function some
+// other object's field of that name holds.
 func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	in.fielded = true
 	pending, err := sorted(in, in.fieldWatches)
+	if err != nil {
+		return err
+	}
+	recovered, err := sorted(in, in.receivers)
 	if err != nil {
 		return err
 	}
@@ -424,9 +680,12 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	if err != nil {
 		return err
 	}
-	err = join(pending, in.bound, func(w watch, b binding) int { return compareRef(w.Call.Site, b.Site) }, func(w watch, bs []binding) error {
-		if len(bs) > 0 {
-			return nil
+	err = join(pending, recovered, func(w watch, v recv) int { return compareRef(w.Call.Site, v.Call.Site) }, func(w watch, vs []recv) error {
+		for _, v := range vs {
+			open, err := in.fieldDecides(v.X, w.Call.Callee)
+			if err != nil || !open {
+				return err
+			}
 		}
 		return untyped.Add(w)
 	})
@@ -435,6 +694,21 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	}
 	added, err := sorted(in, untyped)
 	if err != nil {
+		return err
+	}
+	// Each site that watches its field reads that field's entry, and the
+	// inputs the second stratum holds enter now.
+	err = added.Each(func(w watch) error {
+		return in.readLog.Add(flowRead{Entry: w.V, File: w.Call.Site.File})
+	})
+	if err != nil {
+		return err
+	}
+	late, err := sorted(in, in.late)
+	if err != nil {
+		return err
+	}
+	if err := late.Each(r.facts.Add); err != nil {
 		return err
 	}
 	err = join(in.facts, added, func(f fact, w watch) int { return cmpVar(f.V, w.V) }, func(f fact, ws []watch) error {
@@ -450,6 +724,24 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	}
 	in.watches, err = unionRuns(in, watchCodec, in.watches, added)
 	return err
+}
+
+// fieldDecides reports that a receiver holding x leaves a call of method to
+// the field it calls through: x is a class of the unit, as an instance or a
+// class object, that neither declares nor inherits method and has no
+// supertype outside the project.
+func (in *inference) fieldDecides(x value, method string) (bool, error) {
+	switch x.Kind {
+	case valInstance, valObject, valExact, valClass:
+	default:
+		return false, nil
+	}
+	declares := false
+	if err := in.h.declared(x.Ref, method, func(entry) error { declares = true; return nil }); err != nil || declares {
+		return false, err
+	}
+	outside, err := outsideSupertypes(in.h, x.Ref)
+	return len(outside) == 0, err
 }
 
 // release closes every relation opened since mark except live, which stays
@@ -538,10 +830,17 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 	if err != nil {
 		return err
 	}
-	err = in.u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
+	shapes, err := newSort(in, shapeCodec)
+	if err != nil {
+		return err
+	}
+	// A unit is one family: a Python unit's, or one whose scanned tables
+	// are Python's.
+	in.python = in.u.family == FamilyPython
+	err = in.u.filesOf(ctx, in.only, func(file int32, _ model.FileVersion, t *Table) error {
 		f := &fileScan{in: in, r: r, file: file, t: t, python: t.Language == "python"}
 		in.python = in.python || f.python
-		return f.scan(ctx, r, watches, decls, args)
+		return f.scan(ctx, r, watches, decls, args, shapes)
 	})
 	if err != nil {
 		return err
@@ -552,8 +851,39 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 	if in.decls, err = sorted(in, decls); err != nil {
 		return err
 	}
+	if in.shapes, err = sorted(in, shapes); err != nil {
+		return err
+	}
 	in.args, err = sorted(in, args)
 	return err
+}
+
+// filesOf streams the tables of the members only names (ascending
+// ordinals), or every member's when only is nil, as Files does, reading no
+// other member's table.
+func (u *unit) filesOf(ctx context.Context, only *pagination.SortedRun[int32],
+	yield func(file int32, fv model.FileVersion, t *Table) error) error {
+	if only == nil {
+		return u.Files(ctx, yield)
+	}
+	in, err := newOrdinals(only)
+	if err != nil {
+		return err
+	}
+	defer in.stop()
+	var file int32 = -1
+	return u.members(func(fv model.FileVersion) error {
+		file++
+		ok, err := in.has(file)
+		if err != nil || !ok {
+			return err
+		}
+		t, ok, err := u.tables.Table(ctx, u.gen, fv)
+		if err != nil || !ok {
+			return err
+		}
+		return yield(file, fv, t)
+	})
 }
 
 // fileScan reads one member table.
@@ -570,6 +900,7 @@ type fileScan struct {
 
 func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.ExternalSort[watch],
 	decls *pagination.ExternalSort[declRec], args *pagination.ExternalSort[argRec],
+	shapes *pagination.ExternalSort[siteShape],
 ) error {
 	t := f.t
 	for i := range t.Decls {
@@ -589,7 +920,13 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 		if err := f.site(ctx, r, watches, args, int32(i)); err != nil {
 			return err
 		}
+		if s := &t.Sites[i]; len(s.Arguments) > 0 && !s.Computed {
+			if err := shapes.Add(shapeOf(Ref{File: f.file, Index: int32(i)}, s)); err != nil {
+				return err
+			}
+		}
 	}
+	// A field write is the file's contribution to the field's entry.
 	for _, v := range t.Values {
 		if v.Field == "" {
 			continue
@@ -597,7 +934,13 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 		dst := variable{Kind: varField, Name: v.Field}
 		err := f.eval(ctx, v.Caller, v.Type, func(op operand) error {
 			if op.IsVar {
+				if err := f.in.pending.Add(pendingFlow{Entry: dst, From: f.file, Op: op.V}); err != nil {
+					return err
+				}
 				return r.edges.Add(edge{From: op.V, To: dst})
+			}
+			if err := f.in.constants.Add(contribution{Entry: dst, X: op.X, From: f.file}); err != nil {
+				return err
 			}
 			return r.facts.Add(fact{V: dst, X: op.X})
 		})
@@ -608,13 +951,44 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 	return nil
 }
 
+// namesOutside reports a receiver term that names a module, or a type or a
+// supertype no declaration of the unit is: what it names decides the call,
+// never the field it calls through.
+func (f *fileScan) namesOutside(ctx context.Context, ty wire.Type) (bool, error) {
+	for _, m := range f.members(ty) {
+		found := false
+		switch m.Kind {
+		case wire.TypeModule:
+			return true, nil
+		case wire.TypeNamed, wire.TypeClass:
+			if err := f.in.h.types(ctx, f.file, m.Name, func(Ref) error { found = true; return nil }); err != nil {
+				return false, err
+			}
+		case wire.TypeSuper:
+			if err := f.eval(ctx, -1, m, func(operand) error { found = true; return nil }); err != nil {
+				return false, err
+			}
+		default:
+			continue
+		}
+		if !found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // site records one site: its arguments, the bindings and values its own
-// table decides, and the watches for the values that arrive later.
+// table decides, and the watches for the values that arrive later. A
+// computed site names nothing and is recorded by none of them.
 func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.ExternalSort[watch],
 	args *pagination.ExternalSort[argRec], i int32,
 ) error {
 	t, in := f.t, f.in
 	s := &t.Sites[i]
+	if s.Computed {
+		return nil
+	}
 	ref := Ref{File: f.file, Index: i}
 	c := call{Site: ref, Callee: s.Callee}
 	for j, a := range s.Args {
@@ -690,11 +1064,20 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			return route(roleReceiver)
 		}
 	case wire.ShapeMember:
+		outside, err := f.namesOutside(ctx, s.Receiver)
+		if err != nil {
+			return err
+		}
+		if outside {
+			if err := in.receivers.Add(recv{Call: c, Role: roleReceiver}); err != nil {
+				return err
+			}
+		}
 		if err := route(roleReceiver); err != nil {
 			return err
 		}
 		// Field-based resolution waits until the values settle, and binds
-		// only when the receiver bound nothing (addFieldWatches).
+		// only when the receiver recovered nothing (addFieldWatches).
 		return in.fieldWatches.Add(watch{V: variable{Kind: varField, Name: s.Callee}, Role: roleField, Call: c})
 	case wire.ShapeIndirect:
 		role := roleCalled
@@ -732,14 +1115,18 @@ func scoped(t *Table, caller int32, candidates []int32) []int32 {
 }
 
 // members is the types ty stands for: a union's members, else ty.
-func (f *fileScan) members(ty wire.Type) []wire.Type {
+func (f *fileScan) members(ty wire.Type) []wire.Type { return typeMembers(f.t, ty) }
+
+// typeMembers is the types ty, written in t, stands for: a union's members,
+// else ty.
+func typeMembers(t *Table, ty wire.Type) []wire.Type {
 	if ty.Kind != wire.TypeUnion {
 		return []wire.Type{ty}
 	}
-	if int(ty.Index) >= len(f.t.Unions) {
+	if int(ty.Index) >= len(t.Unions) {
 		return nil
 	}
-	return f.t.Unions[ty.Index]
+	return t.Unions[ty.Index]
 }
 
 // eval evaluates ty, written in the callable caller of the scanned file (-1
@@ -780,7 +1167,13 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 			return yield(operand{IsVar: true, V: variable{Kind: varResult, File: f.file, Index: int32(ty.Index)}})
 		}
 	case wire.TypeField:
-		return yield(operand{IsVar: true, V: variable{Kind: varField, Name: ty.Name}})
+		// Reading a field reads its boundary entry, which every member
+		// writing it contributes to.
+		v := variable{Kind: varField, Name: ty.Name}
+		if err := f.in.readLog.Add(flowRead{Entry: v, File: f.file}); err != nil {
+			return err
+		}
+		return yield(operand{IsVar: true, V: v})
 	case wire.TypeModule:
 		// An imported name (ECMAScript `spec#name`, Python `module.name`)
 		// denotes the declaration its module exports under that name. A
@@ -858,16 +1251,16 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 		return err
 	}
 	c := v.Call
+	if v.Role == roleReceiver && !in.fielded {
+		if err := in.receivers.Add(v); err != nil {
+			return err
+		}
+	}
 	switch v.Role {
 	case roleReceiver:
 		switch v.X.Kind {
 		case valInstance:
-			if err := r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow}); err != nil {
-				return err
-			}
-			return in.h.dispatch(ctx, v.X.Ref, c.Callee, func(m Ref) error {
-				return r.bindings.Add(binding{Site: c.Site, Target: m, Rank: rankHierarchy, Flow: true})
-			})
+			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow, Virtual: true})
 		case valObject:
 			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow})
 		case valExact:
@@ -998,18 +1391,47 @@ func importVar(base, name string) variable {
 }
 
 // resolveLookups answers each lookup by the method its type declares or
-// inherits (hierarchy.declared).
+// inherits (hierarchy.declared), virtual when the lookup's receiver may be a
+// subtype's instance and the language lets an override of what it found run
+// (hierarchy.overridable).
 func (in *inference) resolveLookups(r *round) error {
 	ls, err := sorted(in, r.lookups)
 	if err != nil {
 		return err
 	}
+	var found []entry
 	return ls.Each(func(l lookup) error {
-		return in.h.declared(l.Class, l.Name, func(e entry) error {
-			b := binding{Site: l.Call.Site, Target: e.Ref, Rank: l.Rank, Flow: true, Shift: l.Unbound && e.Flags&flagStatic == 0}
-			return r.bindings.Add(b)
-		})
+		found = found[:0]
+		if err := in.h.declared(l.Class, l.Name, func(e entry) error {
+			found = append(found, e)
+			return nil
+		}); err != nil {
+			return err
+		}
+		virtual := false
+		if l.Virtual && len(found) > 0 {
+			var err error
+			if virtual, err = in.h.overridable(in.family(), l.Class, l.Name, found); err != nil {
+				return err
+			}
+		}
+		for _, e := range found {
+			b := binding{Site: l.Call.Site, Target: e.Ref, Rank: l.Rank, Flow: true,
+				Shift: l.Unbound && e.Flags&flagStatic == 0, Virtual: virtual}
+			if err := r.bindings.Add(b); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+// family is the unit's language family as the hierarchy names it.
+func (in *inference) family() string {
+	if in.python {
+		return "python"
+	}
+	return "js"
 }
 
 // mergeBindings folds the round's bindings into every earlier one and
@@ -1050,12 +1472,10 @@ func (in *inference) mergeBindings(r *round) (*pagination.SortedRun[binding], er
 }
 
 // flow connects each new binding's site to its target: the target's
-// returns to the site's result, and argument i to parameter i. Every
-// lowering counts parameters from the first one after an implicit receiver
-// (`this`, Python's `self` and `cls`), so a call's arguments and its
-// target's parameters line up for every shape but one: a Python instance
-// method called through its class takes its receiver as the first
-// argument, so its argument i+1 is parameter i (Shift).
+// returns to the site's result (a callable not scanned through its stored
+// returns, returnsIn), and each argument to the parameter it binds
+// (paramsOf). An argument into a parameter of another member's callable is
+// the site's member's contribution to that parameter.
 func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error {
 	byTarget, err := newSort(in, codec[binding]{put: bindingCodec.put, get: bindingCodec.get,
 		cmp: func(a, b binding) int { return cmp.Or(compareRef(a.Target, b.Target), compareRef(a.Site, b.Site)) }})
@@ -1088,27 +1508,119 @@ func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error 
 	if err != nil {
 		return err
 	}
-	// fresh is sorted by site, the order the arguments are.
+	err = join(targets, in.returnsIn, func(b binding, c contribution) int {
+		return cmp.Or(cmp.Compare(b.Target.File, c.Entry.File), cmp.Compare(b.Target.Index, c.Entry.Decl))
+	}, func(b binding, cs []contribution) error {
+		result := variable{Kind: varResult, File: b.Site.File, Index: b.Site.Index}
+		for _, c := range cs {
+			f := fact{V: result, X: c.X}
+			if c.Late && !in.fielded {
+				if err := in.late.Add(f); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := r.facts.Add(f); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if in.shapeAt == nil {
+		in.shapeAt = newSeeker(in.shapes, func(s siteShape) Ref { return s.Site })
+	}
+	defer func() { in.shapeAt.stop(); in.shapeAt = nil }()
+	// fresh is sorted by site, the order the arguments and shapes are.
 	return join(fresh, in.args, func(b binding, a argRec) int { return compareRef(b.Site, a.Site) },
 		func(b binding, as []argRec) error {
-			if !b.Flow {
+			if !b.Flow || len(as) == 0 {
 				return nil
 			}
+			param, err := in.paramsOf(b)
+			if err != nil {
+				return err
+			}
 			for _, a := range as {
-				i := a.Arg
-				if b.Shift {
-					if i == 0 {
-						continue
-					}
-					i--
+				i, ok := param(a.Arg)
+				if !ok {
+					continue
 				}
 				p := variable{Kind: varParam, File: b.Target.File, Decl: b.Target.Index, Index: i}
 				if err := r.into(p, a.Op); err != nil {
 					return err
 				}
+				if p.File == b.Site.File {
+					continue
+				}
+				if a.Op.IsVar {
+					err = in.pending.Add(pendingFlow{Entry: p, From: b.Site.File, Op: a.Op.V, Late: in.fielded})
+				} else {
+					err = in.constants.Add(contribution{Entry: p, X: a.Op.X, From: b.Site.File, Late: in.fielded})
+				}
+				if err != nil {
+					return err
+				}
 			}
 			return nil
 		})
+}
+
+// paramsOf is, for binding b, the parameter variable (its zero-based index
+// after any receiver) each argument of b's site binds, false for one that
+// binds none. With the site's argument shape and the target's declared
+// parameters (hierarchy.parameters), arguments bind as argumentFlows says,
+// the published flows' matcher; without either, argument i binds parameter
+// i, and for a Python instance method called through its class (Shift)
+// argument i+1 binds parameter i, its first argument being the receiver.
+func (in *inference) paramsOf(b binding) (func(arg int32) (int32, bool), error) {
+	positional := func(arg int32) (int32, bool) {
+		if b.Shift {
+			return arg - 1, arg > 0
+		}
+		return arg, true
+	}
+	var shape []Argument
+	if err := in.shapeAt.each(b.Site, func(s siteShape) error { shape = s.Args; return nil }); err != nil {
+		return nil, err
+	}
+	if len(shape) == 0 {
+		return positional, nil
+	}
+	var params []paramInfo
+	if err := in.h.parameters(b.Target, func(p paramInfo) error { params = append(params, p); return nil }); err != nil {
+		return nil, err
+	}
+	if len(params) == 0 {
+		return positional, nil
+	}
+	bound := map[int32]int32{}
+	err := argumentFlows(&Site{Arguments: shape}, params, b.Shift, func(arg, pos int32) error {
+		for _, p := range params {
+			if p.Pos == pos && p.Index > 0 {
+				bound[arg] = int32(p.Index) - 1
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return func(arg int32) (int32, bool) {
+		i, ok := bound[arg]
+		return i, ok
+	}, nil
+}
+
+// shapeOf is site s's argument shape at ref.
+func shapeOf(ref Ref, s *Site) siteShape {
+	args := make([]Argument, len(s.Arguments))
+	for i, a := range s.Arguments {
+		args[i] = Argument{Keyword: a.Keyword, Spread: a.Spread}
+	}
+	return siteShape{Site: ref, Args: args}
 }
 
 // into records that dst holds what op denotes.
@@ -1182,6 +1694,103 @@ func (in *inference) propagate(r *round) (*pagination.SortedRun[fact], error) {
 	}
 	in.facts, in.edges, in.delta = facts, edges, d
 	return d, nil
+}
+
+// ---- the facts beyond a binding ----
+
+// externalMember emits the external fact of member site, whose receiver
+// holds an instance or the class object of typ, a type of the unit, when typ
+// neither declares nor inherits method in the project (outsideCall). It
+// reports whether it emitted.
+func (t *types) externalMember(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
+	declares := false
+	if err := h.declared(typ, method, func(entry) error { declares = true; return nil }); err != nil || declares {
+		return false, err
+	}
+	return t.outsideCall(h, family, site, typ, method, emit)
+}
+
+// outsideCall emits the external fact of a call at site of method, which
+// the project's part of typ's supertype closure does not declare: with
+// exactly one supertype outside the project in the closure, a virtual
+// FactCall to that type's method of the name (externalMethod); with
+// several, a FactExternalSite, since which of them declares it is unknown.
+// A type with no supertype outside the project emits nothing. It reports
+// whether it emitted.
+func (t *types) outsideCall(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
+	outside, err := outsideSupertypes(h, typ)
+	if err != nil {
+		return false, err
+	}
+	switch len(outside) {
+	case 0:
+		return false, nil
+	case 1:
+		return true, emit(Binding{Kind: FactCall, Site: site, Detail: DetailHierarchy, Dispatch: model.DispatchVirtual,
+			External: externalMethod(family, outside[0], method)})
+	}
+	return true, emit(Binding{Kind: FactExternalSite, Site: site, Detail: DetailHierarchy})
+}
+
+// outsideSupertypes is the qualified names of the supertypes outside the
+// project of typ and of each of its supertypes of the unit, each once
+// (hierarchy.externalSupertypes).
+func outsideSupertypes(h *hierarchy, typ Ref) ([]string, error) {
+	var outside []string
+	err := h.externalSupertypes(typ, true, func(e entry) error {
+		if !slices.Contains(outside, e.Aux) {
+			outside = append(outside, e.Aux)
+		}
+		return nil
+	})
+	return outside, err
+}
+
+// externalReceiver emits the virtual FactCall of member site s, at site in
+// the file of fc, to the external method of each type its receiver names
+// that is outside the project (hierarchy.externalName). It reports whether
+// it emitted.
+func externalReceiver(ctx context.Context, h *hierarchy, fc fileCtx, site Ref, s *Site, members []wire.Type, emit func(Binding) error) (bool, error) {
+	emitted := false
+	for _, m := range members {
+		if m.Kind != wire.TypeNamed {
+			continue
+		}
+		q, ok, err := h.externalName(ctx, fc, m.Name)
+		if err != nil {
+			return emitted, err
+		}
+		if !ok {
+			continue
+		}
+		emitted = true
+		err = emit(Binding{Kind: FactCall, Site: site, Detail: DetailDirect, Dispatch: model.DispatchVirtual,
+			External: externalMethod(fc.family, q, s.Callee)})
+		if err != nil {
+			return emitted, err
+		}
+	}
+	return emitted, nil
+}
+
+// emitFlows emits a FactFlow for each argument of call site s, at site, and
+// the parameter of target it binds (argumentFlows over the target's
+// declared parameters, hierarchy.parameters); receiverFirst says the site
+// passes the target's receiver as its first argument.
+func emitFlows(h *hierarchy, site Ref, s *Site, target Ref, receiverFirst bool, emit func(Binding) error) error {
+	if len(s.Arguments) == 0 {
+		return nil
+	}
+	var params []paramInfo
+	if err := h.parameters(target, func(p paramInfo) error { params = append(params, p); return nil }); err != nil {
+		return err
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return argumentFlows(s, params, receiverFirst, func(arg, pos int32) error {
+		return emit(Binding{Kind: FactFlow, Site: site, Target: target, Detail: DetailArgument, Arg: arg, Param: pos})
+	})
 }
 
 // ---- language rules ----
@@ -1339,12 +1948,16 @@ func addAll[T any](s *pagination.ExternalSort[T], run *pagination.SortedRun[T]) 
 
 func keepFirst[T any](a, _ T) (T, error) { return a, nil }
 
-// bestBinding keeps the technique first in rank for one site and target.
+// bestBinding folds two bindings of one site and target: the technique
+// first in rank, and every connection and dispatch either found, so the
+// fold does not depend on the order the rounds found them in.
 func bestBinding(a, b binding) (binding, error) {
+	out := a
 	if b.Rank < a.Rank {
-		return b, nil
+		out = b
 	}
-	return a, nil
+	out.Flow, out.Shift, out.Virtual = a.Flow || b.Flow, a.Shift || b.Shift, a.Virtual || b.Virtual
+	return out, nil
 }
 
 // join is an ordered merge of a and b, both sorted by the key order
@@ -1597,9 +2210,10 @@ var bindingCodec = codec[binding]{
 		w.u8(b.Rank)
 		w.flag(b.Flow)
 		w.flag(b.Shift)
+		w.flag(b.Virtual)
 	},
 	get: func(r *rbuf) binding {
-		return binding{Site: r.ref(), Target: r.ref(), Rank: r.u8(), Flow: r.flag(), Shift: r.flag()}
+		return binding{Site: r.ref(), Target: r.ref(), Rank: r.u8(), Flow: r.flag(), Shift: r.flag(), Virtual: r.flag()}
 	},
 	cmp: func(a, b binding) int { return cmp.Or(compareRef(a.Site, b.Site), compareRef(a.Target, b.Target)) },
 }
@@ -1611,13 +2225,14 @@ var lookupCodec = codec[lookup]{
 		w.call(l.Call)
 		w.u8(l.Rank)
 		w.flag(l.Unbound)
+		w.flag(l.Virtual)
 	},
 	get: func(r *rbuf) lookup {
-		return lookup{Class: r.ref(), Name: r.str(), Call: r.call(), Rank: r.u8(), Unbound: r.flag()}
+		return lookup{Class: r.ref(), Name: r.str(), Call: r.call(), Rank: r.u8(), Unbound: r.flag(), Virtual: r.flag()}
 	},
 	cmp: func(a, b lookup) int {
 		return cmp.Or(compareRef(a.Class, b.Class), cmp.Compare(a.Name, b.Name), cmpCall(a.Call, b.Call),
-			cmp.Compare(a.Rank, b.Rank), cmpBool(a.Unbound, b.Unbound))
+			cmp.Compare(a.Rank, b.Rank), cmpBool(a.Unbound, b.Unbound), cmpBool(a.Virtual, b.Virtual))
 	},
 }
 
@@ -1653,4 +2268,74 @@ var argRecCodec = codec[argRec]{
 	cmp: func(a, b argRec) int {
 		return cmp.Or(compareRef(a.Site, b.Site), cmp.Compare(a.Arg, b.Arg), cmpOperand(a.Op, b.Op))
 	},
+}
+
+var contributionCodec = codec[contribution]{
+	put: func(w *wbuf, c contribution) { w.variable(c.Entry); w.value(c.X); w.i32(c.From); w.flag(c.Late) },
+	get: func(r *rbuf) contribution {
+		return contribution{Entry: r.variable(), X: r.value(), From: r.i32(), Late: r.flag()}
+	},
+	cmp: func(a, b contribution) int {
+		return cmp.Or(cmpVar(a.Entry, b.Entry), cmpValue(a.X, b.X), cmp.Compare(a.From, b.From))
+	},
+}
+
+var pendingCodec = codec[pendingFlow]{
+	put: func(w *wbuf, p pendingFlow) { w.variable(p.Op); w.variable(p.Entry); w.i32(p.From); w.flag(p.Late) },
+	get: func(r *rbuf) pendingFlow {
+		op := r.variable()
+		return pendingFlow{Op: op, Entry: r.variable(), From: r.i32(), Late: r.flag()}
+	},
+	cmp: func(a, b pendingFlow) int {
+		return cmp.Or(cmpVar(a.Op, b.Op), cmpVar(a.Entry, b.Entry), cmp.Compare(a.From, b.From))
+	},
+}
+
+var flowReadCodec = codec[flowRead]{
+	put: func(w *wbuf, f flowRead) { w.variable(f.Entry); w.i32(f.File) },
+	get: func(r *rbuf) flowRead { return flowRead{Entry: r.variable(), File: r.i32()} },
+	cmp: func(a, b flowRead) int { return cmp.Or(cmpVar(a.Entry, b.Entry), cmp.Compare(a.File, b.File)) },
+}
+
+var shapeCodec = codec[siteShape]{
+	put: func(w *wbuf, s siteShape) {
+		w.ref(s.Site)
+		w.i32(int32(len(s.Args)))
+		for _, a := range s.Args {
+			w.str(a.Keyword)
+			w.u8(byte(a.Spread))
+		}
+	},
+	get: func(r *rbuf) siteShape {
+		s := siteShape{Site: r.ref()}
+		n := r.i32()
+		if n < 0 || int(n) > len(r.b) {
+			r.bad = true
+			return s
+		}
+		s.Args = make([]Argument, n)
+		for i := range s.Args {
+			s.Args[i] = Argument{Keyword: r.str(), Spread: wire.Spread(r.u8())}
+		}
+		return s
+	},
+	cmp: func(a, b siteShape) int { return compareRef(a.Site, b.Site) },
+}
+
+// encodeWith and decodeWith are a codec's binary form as a stored state's
+// section reads and writes it.
+func encodeWith[T any](c codec[T]) func(T) ([]byte, error) {
+	return func(v T) ([]byte, error) { var w wbuf; c.put(&w, v); return w.b, nil }
+}
+
+func decodeWith[T any](c codec[T], what string) func([]byte) (T, error) {
+	return func(b []byte) (T, error) {
+		r := rbuf{b: b}
+		v := c.get(&r)
+		if r.bad || len(r.b) != 0 {
+			var zero T
+			return zero, errors.New(what + " is malformed")
+		}
+		return v, nil
+	}
 }
