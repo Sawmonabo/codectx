@@ -41,8 +41,6 @@ import (
 
 // The keys of the manifest fields.
 const (
-	// fieldGoModule is a Go unit's module path (goModulePath).
-	fieldGoModule = "go.mod\x00module"
 	// fieldRustCrate + a crate's name is that crate's root module
 	// (eachRustCrate).
 	fieldRustCrate = "Cargo.toml\x00crate\x00"
@@ -56,11 +54,11 @@ func manifestFields(ctx context.Context, u *unit) ([]manifestField, error) {
 	var out []manifestField
 	switch u.family {
 	case FamilyGo:
-		m, err := goModulePath(ctx, u)
+		fs, err := goManifestFields(ctx, u)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, manifestField{Key: fieldGoModule, Value: m})
+		out = append(out, fs...)
 	case FamilyRust:
 		err := eachRustCrate(ctx, u, func(name, root string) error {
 			out = append(out, manifestField{Key: fieldRustCrate + name, Value: root})
