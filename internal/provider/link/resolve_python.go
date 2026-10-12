@@ -25,39 +25,36 @@ func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error
 		return err
 	}
 	defer h.close()
-	t, err := inferTypes(ctx, u, h, nil, nil)
+	mods, err := buildModules(ctx, u, h)
+	if err != nil {
+		return err
+	}
+	defer mods.close()
+	t, err := inferTypes(ctx, u, h, nil, nil, nil)
 	if err != nil {
 		return err
 	}
 	defer t.close()
-	return emitPython(ctx, u, h, t, nil, emit)
+	return emitPython(ctx, u, &flowEmit{h: h, mods: mods, t: t, emit: emit})
 }
 
-// emitPython emits the facts of the members only names (every member when
-// nil), whose sites the inference t bound.
+// emitPython emits the facts of the nodes e.only selects (every node when
+// nil), whose sites the inference e.t bound.
 //
-// It reads the unit's tables once. Each site that stays inside its file (a
-// bare call of a name the file declares, a receiver whose type the file or
-// the inference recovered, a called value the inference traced) binds while
-// its table is in hand. A site that names a module (`mod.f()`, a name a
-// `from mod import f` introduced, which the worker spells as a TypeModule)
-// and each import become lookups that the unit's declarations and modules
-// answer through one ordered merge: every member's declarations and module
-// are indexed under each dotted module name its path can be imported as,
-// and both kinds of record are sorted together, so a lookup meets the
-// records of its key with nothing else resident. Every member's table is
-// read for that index; only the members only names resolve their sites and
-// imports. A second read of those members emits the argument flows of every
-// site bound to a declaration of the unit, which needs the site's arguments
-// and what the merge bound.
-func emitPython(ctx context.Context, u *unit, h *hierarchy, t *types, only *pagination.SortedRun[int32],
-	emit func(Binding) error) error {
-	keys, err := pagination.NewExternalSort(filepath.Join(u.dir, "python-modules"), 0,
-		encodeJSON[pyRecord], decodeJSON[pyRecord], comparePyRecord)
-	if err != nil {
-		return err
-	}
-	defer keys.Close()
+// It reads the selected members' tables. Each site that stays inside its
+// file (a bare call of a name the file declares, a receiver whose type the
+// file or the inference recovered, a called value the inference traced)
+// binds while its table is in hand. A site that names a module (`mod.f()`,
+// a name a `from mod import f` introduced, which the worker spells as a
+// TypeModule) and each import look the name up in the module index (every
+// member's declarations and module under each dotted module name its path
+// can be imported as, buildModules), one point lookup each, which the node
+// making it records. The hits are settled per site and per import. A second
+// read of the selected members emits the argument flows of every site bound
+// to a declaration of the unit, which needs the site's arguments and what
+// the lookups bound.
+func emitPython(ctx context.Context, u *unit, e *flowEmit) error {
+	h, emit := e.h, e.emit
 	hits, err := pagination.NewExternalSort(filepath.Join(u.dir, "python-hits"), 0,
 		encodeJSON[pyHit], decodeJSON[pyHit], comparePyHit)
 	if err != nil {
@@ -77,33 +74,28 @@ func emitPython(ctx context.Context, u *unit, h *hierarchy, t *types, only *pagi
 		}
 		return calls.Add(pyCall{Site: b.Site, Target: b.Target, First: receiverFirst})
 	}
-	resolves := func(int32) (bool, error) { return true, nil }
-	if only != nil {
-		in, err := newOrdinals(only)
-		if err != nil {
-			return err
-		}
-		defer in.stop()
-		resolves = in.has
-	}
-	err = u.Files(ctx, func(file int32, _ model.FileVersion, tab *Table) error {
+	look := func(r pyRecord) error { return lookPython(e.mods, r, hits) }
+	e.start()
+	defer e.stop()
+	err = u.filesOf(ctx, e.only, func(file int32, _ model.FileVersion, tab *Table, sel selection) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := indexPythonDecls(file, tab, keys); err != nil {
-			return err
+		if sel.has(fileNode) {
+			e.at(Ref{File: file, Index: fileNode})
+			if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
+				return err
+			}
+			if err := addPythonImports(file, tab, look); err != nil {
+				return err
+			}
 		}
-		if ok, err := resolves(file); err != nil || !ok {
-			return err
-		}
-		if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
-			return err
-		}
-		if err := addPythonImports(file, tab, keys); err != nil {
-			return err
-		}
-		r := pySite{ctx: ctx, h: h, t: t, fc: contextOf(file, tab), tab: tab, keys: keys, hits: hits, emit: emit, call: call}
+		r := pySite{ctx: ctx, h: h, t: e.t, fc: contextOf(file, tab), tab: tab, look: look, hits: hits, emit: emit, call: call}
 		for i := range tab.Sites {
+			if !sel.has(int32(i)) {
+				continue
+			}
+			e.site(Ref{File: file, Index: int32(i)}, tab.Path)
 			if err := r.resolve(Ref{File: file, Index: int32(i)}); err != nil {
 				return err
 			}
@@ -113,16 +105,59 @@ func emitPython(ctx context.Context, u *unit, h *hierarchy, t *types, only *pagi
 	if err != nil {
 		return err
 	}
-	if err := joinPythonModules(ctx, keys, hits, emit, call); err != nil {
+	if err := settlePythonHits(ctx, hits, emit, call); err != nil {
 		return err
 	}
-	return pythonFlows(ctx, u, h, calls, only, emit)
+	return pythonFlows(ctx, u, e, calls)
 }
 
-// pyRecord is one record of the module merge: a declaration, or a file's
+// lookPython answers the lookup r from the module index: one hit per record
+// the index holds under r's key (pyModuleEntry), each read from the
+// directory its module name is read from.
+func lookPython(mods *index, r pyRecord, hits *pagination.ExternalSort[pyHit]) error {
+	group := hitSite
+	if r.Import {
+		group = hitImport
+	}
+	return mods.lookup(keyPyModule+r.Key, func(e entry) error {
+		d := pyModuleRecord(e)
+		near := strings.HasPrefix(r.Root, d.Root)
+		if r.Exact {
+			near = d.Root == ""
+		}
+		return hits.Add(pyHit{Group: group, Site: r.Ref, Target: d.Ref, Init: r.Init, Class: d.Class, Near: near, Exact: r.Exact,
+			Unbound: d.Unbound, Probe: r.Probe, Rank: r.Rank})
+	})
+}
+
+// The flags of a Python record of the module index.
+const (
+	pyFlagClass   byte = 1
+	pyFlagUnbound byte = 2
+)
+
+// pyModuleEntry is the module index's entry of the declaration or module
+// record d.
+func pyModuleEntry(d pyRecord) entry {
+	var flags byte
+	if d.Class {
+		flags |= pyFlagClass
+	}
+	if d.Unbound {
+		flags |= pyFlagUnbound
+	}
+	return entry{Key: keyPyModule + d.Key, Ref: d.Ref, Aux: d.Root, Flags: flags}
+}
+
+// pyModuleRecord is the record pyModuleEntry made e of.
+func pyModuleRecord(e entry) pyRecord {
+	return pyRecord{Key: strings.TrimPrefix(e.Key, keyPyModule), Ref: e.Ref, Root: e.Aux, Class: e.Flags&pyFlagClass != 0,
+		Unbound: e.Flags&pyFlagUnbound != 0}
+}
+
+// pyRecord is one record of the module index: a declaration, or a file's
 // module, indexed under one dotted module name its file can be imported as,
-// or a lookup of a name in a module, by a site or an import. Records of one
-// Key meet in the merge, declarations and modules first.
+// or a lookup of a name in a module, by a site or an import.
 type pyRecord struct {
 	// Key is the dotted module name and the qualified name inside it,
 	// joined by a NUL: "pkg.mod\x00Class.method"; a module's own Key has
@@ -298,9 +333,9 @@ func pythonModulePath(p string) []string {
 // file can be imported as, keyed by its qualified name (a module-level
 // function or class by its name, a method by "Class.method"), and the file's
 // module under each such name with nothing after the NUL.
-func indexPythonDecls(file int32, tab *Table, keys *pagination.ExternalSort[pyRecord]) error {
+func indexPythonDecls(file int32, tab *Table, add func(pyRecord) error) error {
 	return pythonModuleNames(tab.Path, func(name, root string) error {
-		if err := keys.Add(pyRecord{Key: name + "\x00", Ref: Ref{File: file, Index: -1}, Root: root}); err != nil {
+		if err := add(pyRecord{Key: name + "\x00", Ref: Ref{File: file, Index: -1}, Root: root}); err != nil {
 			return err
 		}
 		for i, d := range tab.Decls {
@@ -309,7 +344,7 @@ func indexPythonDecls(file int32, tab *Table, keys *pagination.ExternalSort[pyRe
 			}
 			rec := pyRecord{Key: name + "\x00" + d.Qualified, Ref: Ref{File: file, Index: int32(i)}, Root: root,
 				Class: d.Kind == model.NodeClass, Unbound: d.Kind == model.NodeMethod && !d.Static}
-			if err := keys.Add(rec); err != nil {
+			if err := add(rec); err != nil {
 				return err
 			}
 		}
@@ -325,7 +360,7 @@ func indexPythonDecls(file int32, tab *Table, keys *pagination.ExternalSort[pyRe
 // the statement imports whatever b is (Rank 2). A relative module is named
 // from the repository root (absolutePythonModule) and answered by that root
 // alone; one that climbs above the root looks nothing up.
-func addPythonImports(file int32, tab *Table, keys *pagination.ExternalSort[pyRecord]) error {
+func addPythonImports(file int32, tab *Table, look func(pyRecord) error) error {
 	for i, imp := range tab.Imports {
 		mod, exact := imp.Path, strings.HasPrefix(imp.Path, ".")
 		if exact {
@@ -336,7 +371,7 @@ func addPythonImports(file int32, tab *Table, keys *pagination.ExternalSort[pyRe
 		}
 		ref := Ref{File: file, Index: int32(i)}
 		add := func(key string, rank uint8) error {
-			return keys.Add(pyRecord{Key: key, Lookup: true, Import: true, Rank: rank, Ref: ref, Root: tab.Path, Exact: exact})
+			return look(pyRecord{Key: key, Lookup: true, Import: true, Rank: rank, Ref: ref, Root: tab.Path, Exact: exact})
 		}
 		if imp.Name == "" || imp.Name == ImportAll || imp.Original == ImportAll {
 			if mod == "" {
@@ -386,7 +421,7 @@ type pySite struct {
 	t    *types
 	fc   fileCtx
 	tab  *Table
-	keys *pagination.ExternalSort[pyRecord]
+	look func(pyRecord) error
 	hits *pagination.ExternalSort[pyHit]
 	emit func(Binding) error
 	// call emits a FactCall to a declaration of the unit and records it for
@@ -416,7 +451,7 @@ func (r *pySite) resolve(site Ref) error {
 		// A name an import introduced: a module (`import a.b as m; m.f()`)
 		// or, on a bare site, the imported entity itself (`from a.b import
 		// f; f()`, spelled "a.b.f").
-		return lookupPython(site, tab.Path, s.Shape == wire.ShapeBare, s.Receiver.Name, s.Callee, true, r.keys, r.hits)
+		return lookupPython(site, tab.Path, s.Shape == wire.ShapeBare, s.Receiver.Name, s.Callee, true, r.look, r.hits)
 	}
 	switch s.Shape {
 	case wire.ShapeBare, wire.ShapeConstructor:
@@ -428,7 +463,7 @@ func (r *pySite) resolve(site Ref) error {
 	case wire.ShapeStatic:
 		// `mod.f()` through an import, or `mod.C.m()` through a class of a
 		// module, which calls the method C declares or inherits.
-		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, false, r.keys, r.hits); err != nil {
+		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, false, r.look, r.hits); err != nil {
 			return err
 		}
 		return r.h.types(r.ctx, site.File, s.Qualifier, func(typ Ref) error {
@@ -832,7 +867,7 @@ func constructed(tab *Table, c int32) int32 {
 // alone: it gets a sentinel hit and the lookups of the modules it may name,
 // which say whether a module of that name is the unit's (settlePython).
 func lookupPython(site Ref, importer string, bare bool, module, callee string, probe bool,
-	keys *pagination.ExternalSort[pyRecord], hits *pagination.ExternalSort[pyHit]) error {
+	look func(pyRecord) error, hits *pagination.ExternalSort[pyHit]) error {
 	if module == "" {
 		return nil
 	}
@@ -859,7 +894,7 @@ func lookupPython(site Ref, importer string, bare bool, module, callee string, p
 			if init {
 				q += ".__init__"
 			}
-			if err := keys.Add(pyRecord{Key: mod + "\x00" + q, Lookup: true, Ref: site, Root: importer, Init: init, Exact: exact}); err != nil {
+			if err := look(pyRecord{Key: mod + "\x00" + q, Lookup: true, Ref: site, Root: importer, Init: init, Exact: exact}); err != nil {
 				return err
 			}
 		}
@@ -869,7 +904,7 @@ func lookupPython(site Ref, importer string, bare bool, module, callee string, p
 		if !probe || mod == "" {
 			return nil
 		}
-		return keys.Add(pyRecord{Key: mod + "\x00", Lookup: true, Probe: true, Ref: site, Root: importer, Exact: exact})
+		return look(pyRecord{Key: mod + "\x00", Lookup: true, Probe: true, Ref: site, Root: importer, Exact: exact})
 	}
 	mod, last := module, ""
 	if i := strings.LastIndexByte(module, '.'); i >= 0 {
@@ -918,51 +953,11 @@ func absolutePythonModule(importer, rel string) string {
 	return strings.Join(segs, ".")
 }
 
-// joinPythonModules merges the module index with the lookups. Each key's
-// declarations and modules precede its lookups, and only one key's are
-// held. The hits, with each module-bound site's sentinel, are sorted by site
-// or import and settled per site (settlePython) and per import
-// (settlePythonImport).
-func joinPythonModules(ctx context.Context, keys *pagination.ExternalSort[pyRecord], hits *pagination.ExternalSort[pyHit],
-	emit func(Binding) error, call func(Binding, bool) error) error {
-	sorted, err := keys.Sorted()
-	if err != nil {
-		return err
-	}
-	defer sorted.Close()
-	var key string
-	var decls []pyRecord
-	err = sorted.Each(func(r pyRecord) error {
-		if r.Key != key {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			key, decls = r.Key, decls[:0]
-		}
-		if !r.Lookup {
-			decls = append(decls, r)
-			return nil
-		}
-		group := hitSite
-		if r.Import {
-			group = hitImport
-		}
-		for _, d := range decls {
-			near := strings.HasPrefix(r.Root, d.Root)
-			if r.Exact {
-				near = d.Root == ""
-			}
-			x := pyHit{Group: group, Site: r.Ref, Target: d.Ref, Init: r.Init, Class: d.Class, Near: near, Exact: r.Exact,
-				Unbound: d.Unbound, Probe: r.Probe, Rank: r.Rank}
-			if err := hits.Add(x); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
+// settlePythonHits settles the hits the lookups met (lookPython), with each
+// module-bound site's sentinel, sorted by site or import: per site
+// (settlePython) and per import (settlePythonImport).
+func settlePythonHits(ctx context.Context, hits *pagination.ExternalSort[pyHit], emit func(Binding) error,
+	call func(Binding, bool) error) error {
 	settled, err := hits.Sorted()
 	if err != nil {
 		return err
@@ -1081,12 +1076,12 @@ func initFrom(hits []pyHit, file int32) bool {
 	return false
 }
 
-// pythonFlows reads the tables of the members only names (every member
-// when nil) a second time and emits the argument flows of every call fact
-// to a declaration of the unit (emitFlows), the sites asked in ascending
-// order against calls, sorted by site.
-func pythonFlows(ctx context.Context, u *unit, h *hierarchy, calls *pagination.ExternalSort[pyCall],
-	only *pagination.SortedRun[int32], emit func(Binding) error) error {
+// pythonFlows reads the tables of the members e.only selects a site of a
+// second time and emits the argument flows of every call fact of a
+// selected site to a declaration of the unit (emitFlows), the sites asked in
+// ascending order against calls, sorted by site, each site's parameter
+// lookups recorded for it.
+func pythonFlows(ctx context.Context, u *unit, e *flowEmit, calls *pagination.ExternalSort[pyCall]) error {
 	run, err := calls.Sorted()
 	if err != nil {
 		return err
@@ -1097,17 +1092,20 @@ func pythonFlows(ctx context.Context, u *unit, h *hierarchy, calls *pagination.E
 	}
 	at := newSeeker(run, func(c pyCall) Ref { return c.Site })
 	defer at.stop()
-	return u.filesOf(ctx, only, func(file int32, _ model.FileVersion, tab *Table) error {
+	e.start()
+	defer e.stop()
+	return u.filesOf(ctx, e.only, func(file int32, _ model.FileVersion, tab *Table, sel selection) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		for i := range tab.Sites {
 			s := &tab.Sites[i]
-			if len(s.Arguments) == 0 {
+			if len(s.Arguments) == 0 || !sel.has(int32(i)) {
 				continue
 			}
 			site := Ref{File: file, Index: int32(i)}
-			err := at.each(site, func(c pyCall) error { return emitFlows(h, site, s, c.Target, c.First, emit) })
+			e.at(site)
+			err := at.each(site, func(c pyCall) error { return emitFlows(e.h, site, s, c.Target, c.First, e.emit) })
 			if err != nil {
 				return err
 			}
