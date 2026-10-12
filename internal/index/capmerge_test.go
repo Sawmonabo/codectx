@@ -31,7 +31,7 @@ func TestCapabilityFoldSumsEqualCountsAndKeepsLimits(t *testing.T) {
 			State: model.CapabilityFresh, Details: map[string]string{
 				"sites": "10", "open_sites": "3",
 				"over_max_provider_record_bytes": "1", "max_provider_record_bytes": "4096",
-				largestRecordDetail: largest}}
+				provider.DetailLargestRecordBytes: largest}}
 	}
 	a, b := unit("pkg:go:a", "5000"), unit("pkg:go:b", "7000")
 
@@ -51,7 +51,7 @@ func TestCapabilityFoldSumsEqualCountsAndKeepsLimits(t *testing.T) {
 		t.Fatalf("the fold published %v forward and %v in reverse; it must be a function of the set", forward, reverse)
 	}
 	want := map[string]string{"sites": "20", "open_sites": "6", "over_max_provider_record_bytes": "2",
-		"max_provider_record_bytes": "4096", largestRecordDetail: "7000", scopesDetail: "2"}
+		"max_provider_record_bytes": "4096", provider.DetailLargestRecordBytes: "7000", scopesDetail: "2"}
 	if !maps.Equal(forward, want) {
 		t.Fatalf("the fold published %v, want %v", forward, want)
 	}

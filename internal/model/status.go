@@ -29,7 +29,7 @@ func (r IndexRequest) Validate() error {
 }
 
 // IndexResult reports one completed indexing run. Section 13.1 requires a no-op
-// refresh to emit reuse counts and perform no parse or FTS rewrite, so reuse and
+// refresh to emit reuse counts, parse nothing and add no search index document, so reuse and
 // parse counts are first-class rather than log-only; Section 12.3 makes the
 // published binding and health the outcome of activation.
 type IndexResult struct {
@@ -390,7 +390,7 @@ type ResourceReport struct {
 	FreedBytes *uint64 `json:"freed_bytes,omitempty"`
 	// ScratchBytes is the disk the store's scratch pools hold: every working
 	// file this process writes for its own later reading -- sort runs,
-	// staging databases, blob staging surfaces, a search's state -- at its
+	// import spools, blob staging files, a path search's state -- at its
 	// current length, taken or free.
 	//
 	// It is the other half of FreedBytes and the reason that figure is small.

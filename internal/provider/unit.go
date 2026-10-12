@@ -129,6 +129,11 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 	return failedResult(req.Run, stateOf(err), sink), err
 }
 
+// DetailLargestRecordBytes is the capability detail that carries the largest
+// record one unit saw over a record bound (Degradation.Largest). It is a
+// maximum, not a count, so a fold of several units keeps the larger value.
+const DetailLargestRecordBytes = "largest_record_bytes"
+
 // reportDegradations folds the sink's counted degradations into the unit's
 // capability rows, which is where a generation stores what a run had to give
 // up.
@@ -164,7 +169,7 @@ func reportDegradations(states []model.CapabilityState, degraded []Degradation, 
 		for _, d := range degraded {
 			st = st.WithDetail("over_"+d.Limit, strconv.FormatUint(d.Count, 10)).
 				WithDetail(d.Limit, strconv.FormatInt(d.Bound, 10)).
-				WithDetail("largest_record_bytes", strconv.FormatInt(d.Largest, 10))
+				WithDetail(DetailLargestRecordBytes, strconv.FormatInt(d.Largest, 10))
 		}
 		states[i] = st
 	}

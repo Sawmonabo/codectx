@@ -1691,7 +1691,7 @@ func (s *Store) ActiveGeneration(ctx context.Context, repo model.RepositoryID) (
 // as zero, which is what a first publication passes. It is the single
 // definition of the version conflict: the activation transaction applies it at
 // the moment that decides, and Activate's preflight applies it before the
-// compaction cascade so a loser pays a row read instead of the cascade.
+// search index commit, so a loser pays a row read instead of that commit.
 func checkExpectedActive(ctx context.Context, tx *sql.Tx, repo []byte, expected model.GenerationID) error {
 	var current int64
 	if err := activeGeneration(ctx, tx, repo, &current); err != nil {
@@ -1710,7 +1710,7 @@ func checkExpectedActive(ctx context.Context, tx *sql.Tx, repo []byte, expected 
 
 // checkMembership refuses a generation with no frozen members. Like the
 // pointer comparison it is one row read, applied both in the activation
-// transaction and in the preflight before the cascade.
+// transaction and in the preflight before the search index commit.
 func checkMembership(ctx context.Context, tx *sql.Tx, row int64, gen model.GenerationID) error {
 	var members int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM generation_units WHERE generation_id = ?`, row).Scan(&members); err != nil {

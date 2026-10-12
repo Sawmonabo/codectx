@@ -642,10 +642,6 @@ func mergeDetailValue(key, a, b string, extreme bool) (value string, truncated b
 	return joinDetailValues(a, b)
 }
 
-// largestRecordDetail is the largest record one unit saw over a record bound
-// (provider.Degradation.Largest).
-const largestRecordDetail = "largest_record_bytes"
-
 // extremeDetail reports whether key is a figure the fold keeps the larger of
 // instead of summing: it is not a count, so a sum is a number nothing
 // measured. These are the largest record a unit saw, the planner's scope-key
@@ -655,7 +651,7 @@ const largestRecordDetail = "largest_record_bytes"
 // limit wherever it comes from. Every unit of one run reports the same limit,
 // so the larger of two is that limit.
 func extremeDetail(key string, a, b model.CapabilityState) bool {
-	if key == largestRecordDetail || key == plan.DetailScopeKeyBound {
+	if key == provider.DetailLargestRecordBytes || key == plan.DetailScopeKeyBound {
 		return true
 	}
 	over := "over_" + key

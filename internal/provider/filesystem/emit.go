@@ -14,8 +14,9 @@ import (
 )
 
 // Scope keys. A filesystem or manifest unit is one file: its scope is
-// "file:"+path and its only input is that file's version, so an unchanged
-// file reuses its unit with zero work.
+// "file:"+path. Its inputs are that file's version and, for a requirements
+// file, the files it includes (manifest.Includes), so an unchanged file whose
+// includes are unchanged reuses its unit with zero work.
 const scopePrefix = "file:"
 
 // ScopeKey is the unit scope for one root-relative path.

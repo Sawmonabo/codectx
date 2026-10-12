@@ -49,7 +49,7 @@ func newGCCommand(build model.BuildInfo) *cobra.Command {
 		Use:   "gc",
 		Short: "Give the workspace's pooled scratch space back to the filesystem",
 		Long: "Empties the scratch pools of the named repository's workspace: the sort runs, " +
-			"staging databases, search state, blob staging surfaces and engine temporaries " +
+			"import spools, path-search state, blob staging files and engine temporaries " +
 			"the product keeps and writes over instead of freeing, including those left by " +
 			"runs that are no longer running.\n\n" +
 			"What the pools hold is printed first, by what each surface was taken for, so the " +
