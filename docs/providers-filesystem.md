@@ -17,14 +17,23 @@ A unit is one file for both providers. The coordinator plans:
 | Provider | One unit per | Scope key | Inputs | Dependencies |
 |---|---|---|---|---|
 | `filesystem` | every non-deleted snapshot file | `filesystem.ScopeKey(path)` = `"file:"+path` | that file | none |
-| `manifest` | every file with `manifest.Recognize(path)` true | the same scope key | that file | the `filesystem` unit of the same file |
+| `manifest` | every file with `manifest.Recognize(path)` true | the same scope key | that file, and for a requirements file every file it includes | the `filesystem` unit of the same file |
 
-The unit's `InputHash` is the digest of that one file version, so an
+The unit's `InputHash` is the digest of its input file versions, so an
 unchanged file reuses its sealed unit with zero work, and a change to one
-file invalidates exactly two units. A requirements file is the one manifest
-that reads other files: its `-r` and `-c` includes are read from the same
-snapshot view, but they are not inputs of its unit, so an edit to an included
-file alone does not rebuild the unit that includes it. `filesystem.PathFromScope` recovers the
+file invalidates its two units. A requirements file is the one manifest that
+reads other files: the planner resolves its `-r` and `-c` includes,
+transitively, against the same snapshot view and under the same
+`max_parse_file_bytes` the unit reads them with (`manifest.Includes`), and
+declares each included file the snapshot holds as an input of its unit. An
+edit to an included file therefore rebuilds every requirements unit that
+includes it, directly or through another include. An include that names no
+file in the workspace (a URL, an absolute path, an environment variable, a
+path outside the workspace) or one the snapshot does not hold is not an
+input; it is reported on the unit as described under "Requirements files".
+An included file over `max_parse_file_bytes` is an input, since its size is
+in the unit's report, but the files it includes are not followed. An include
+cycle ends, with each file of it an input once. `filesystem.PathFromScope` recovers the
 path inside `IndexUnit`; a scope that is not a normalized file scope is a
 coordinator error.
 

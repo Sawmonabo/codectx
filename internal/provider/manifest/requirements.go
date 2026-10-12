@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 )
@@ -200,12 +201,8 @@ func (w *reqWalk) line(file string, l reqLogical, constraint bool) (reqVisit, bo
 		via = file
 	}
 	if strings.HasPrefix(l.text, "-") {
-		opt, value := splitOption(l.text)
-		switch opt {
-		case "-r", "--requirement":
-			return w.include(file, value, false, l.text, via, rng)
-		case "-c", "--constraint":
-			return w.include(file, value, true, l.text, via, rng)
+		if value, constraint, ok := includeOption(l.text); ok {
+			return w.include(file, value, constraint, l.text, via, rng)
 		}
 		w.unresolve(l.text, via, "", rng)
 		return reqVisit{}, false
@@ -230,28 +227,56 @@ func (w *reqWalk) include(file, value string, constraint bool, text, via string,
 	if constraint {
 		mode = "constraint"
 	}
-	switch {
-	case value == "":
-		w.unresolve(text, via, "malformed", rng)
-		w.u.malformedEntry()
-		return reqVisit{}, false
-	case strings.Contains(value, "://"):
-		w.unresolve(text, via, "url", rng)
-		return reqVisit{}, false
-	case strings.Contains(value, "${"):
-		w.unresolve(text, via, "environment", rng)
-		return reqVisit{}, false
-	case path.IsAbs(value) || (len(value) > 1 && value[1] == ':'):
-		w.unresolve(text, via, "absolute", rng)
-		return reqVisit{}, false
-	}
-	target, ok := resolveRelative(path.Dir(file), value)
-	if !ok {
-		w.unresolve(text, via, "outside_workspace", rng)
+	target, reason := includeTarget(file, value)
+	if reason != "" {
+		w.unresolve(text, via, reason, rng)
+		if reason == reasonMalformed {
+			w.u.malformedEntry()
+		}
 		return reqVisit{}, false
 	}
 	w.includes = append(w.includes, reqInclude{target: target, mode: mode, via: via, rng: rng})
 	return reqVisit{target, constraint}, true
+}
+
+// reasonMalformed is the unresolved reason of an include line that names no
+// file at all.
+const reasonMalformed = "malformed"
+
+// includeOption reports whether an option line includes another file, the
+// value it names, and whether it includes it as constraints (`-c`) rather than
+// requirements (`-r`).
+func includeOption(text string) (value string, constraint, ok bool) {
+	opt, value := splitOption(text)
+	switch opt {
+	case "-r", "--requirement":
+		return value, false, true
+	case "-c", "--constraint":
+		return value, true, true
+	}
+	return "", false, false
+}
+
+// includeTarget resolves the value of an include line in file to a
+// workspace-relative path, or answers why it names nothing in the workspace:
+// empty, a URL, an environment variable, an absolute path, or a path outside
+// the workspace.
+func includeTarget(file, value string) (target, reason string) {
+	switch {
+	case value == "":
+		return "", reasonMalformed
+	case strings.Contains(value, "://"):
+		return "", "url"
+	case strings.Contains(value, "${"):
+		return "", "environment"
+	case path.IsAbs(value) || (len(value) > 1 && value[1] == ':'):
+		return "", "absolute"
+	}
+	target, ok := resolveRelative(path.Dir(file), value)
+	if !ok {
+		return "", "outside_workspace"
+	}
+	return target, ""
 }
 
 // unresolve records a line this reader does not interpret, with the file it
@@ -269,31 +294,102 @@ func (w *reqWalk) unresolve(text, via, reason string, rng *model.SourceRange) {
 // snapshot does not hold (never retained, ignored, or deleted) and for one
 // over the parse bound; both are recorded on the unit's capability.
 func (u *unit) readIncluded(ctx context.Context, rel string) ([]byte, bool, error) {
-	rc, fv, err := u.content.Open(ctx, model.NewFileID(u.repo, rel))
-	if err != nil {
-		var me *model.Error
-		if errors.As(err, &me) && me.Code == model.CodeArgumentInvalid {
-			// The included file is not in this snapshot: pip would fail
-			// here, and the packages it declares are not visible.
-			u.malformedEntry()
-			return nil, false, nil
-		}
+	data, fv, held, err := readHeld(ctx, u.content, u.repo, rel, u.maxParse)
+	switch {
+	case err != nil:
 		return nil, false, err
-	}
-	defer rc.Close()
-	if u.maxParse.Exceeded(fv.Size) {
+	case !held:
+		// The included file is not in this snapshot: pip would fail here,
+		// and the packages it declares are not visible.
+		u.malformedEntry()
+		return nil, false, nil
+	case data == nil:
 		u.degraded("max_parse_file_bytes", rel+" is "+strconv.FormatInt(fv.Size, 10)+" over "+u.maxParse.String())
 		return nil, false, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(rc, fv.Size+1))
-	if err != nil {
-		return nil, false, err
-	}
-	if int64(len(data)) != fv.Size {
-		return nil, false, &model.Error{Code: model.CodeSourceIntegrity, Message: "retained bytes differ in length from the included requirements file"}
-	}
 	u.e.AddBytes(uint64(len(data)))
 	return data, true, nil
+}
+
+// readHeld reads one file of the snapshot under the parse admission. held is
+// false for a file the snapshot does not hold (never retained, ignored, or
+// deleted); data is nil for a held file over the parse bound, which is not
+// read.
+func readHeld(ctx context.Context, view model.SnapshotView, repo model.RepositoryID, rel string, maxParse config.Limit) (data []byte, fv model.FileVersion, held bool, err error) {
+	rc, fv, err := view.Open(ctx, model.NewFileID(repo, rel))
+	if err != nil {
+		var me *model.Error
+		if errors.As(err, &me) && me.Code == model.CodeArgumentInvalid {
+			return nil, fv, false, nil
+		}
+		return nil, fv, false, err
+	}
+	defer rc.Close()
+	if maxParse.Exceeded(fv.Size) {
+		return nil, fv, true, nil
+	}
+	data, err = io.ReadAll(io.LimitReader(rc, fv.Size+1))
+	if err != nil {
+		return nil, fv, true, err
+	}
+	if int64(len(data)) != fv.Size {
+		return nil, fv, true, &model.Error{Code: model.CodeSourceIntegrity, Message: "retained bytes differ in length from the requirements file"}
+	}
+	return data, fv, true, nil
+}
+
+// Includes answers the files a manifest unit reads beyond its own file rel:
+// for a requirements file, every file it includes through `-r` or `-c`,
+// transitively, that the snapshot holds, each once. It reads the snapshot the
+// way the unit does -- the same includes resolved against the same view under
+// the same parse bound (maxParse) -- so a planner that declares them as the
+// unit's inputs rebuilds it whenever one of them changes. An include the
+// unit cannot resolve, or that the snapshot does not hold, is not a file it
+// reads; one over the parse bound is, because its size is in the unit's
+// output, but what it includes is not followed. Every other manifest reads
+// its own file alone, and Includes answers nothing for it without reading.
+func Includes(ctx context.Context, view model.SnapshotView, repo model.RepositoryID, rel string, maxParse config.Limit) ([]model.FileVersion, error) {
+	if formatOf(rel) != formatRequirements {
+		return nil, nil
+	}
+	visited := map[reqVisit]bool{{rel, false}: true}
+	listed := map[string]bool{rel: true}
+	queue := []reqVisit{{rel, false}}
+	var out []model.FileVersion
+	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		next := queue[0]
+		queue = queue[1:]
+		data, fv, held, err := readHeld(ctx, view, repo, next.path, maxParse)
+		if err != nil {
+			return nil, err
+		}
+		if !held {
+			continue
+		}
+		if !listed[next.path] {
+			listed[next.path] = true
+			out = append(out, fv)
+		}
+		for _, l := range logicalLines(data) {
+			if !strings.HasPrefix(l.text, "-") {
+				continue
+			}
+			value, constraint, ok := includeOption(l.text)
+			if !ok {
+				continue
+			}
+			if target, reason := includeTarget(next.path, value); reason == "" {
+				if v := (reqVisit{target, constraint}); !visited[v] {
+					visited[v] = true
+					queue = append(queue, v)
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // logicalLines splits a requirements file into logical lines the way pip

@@ -54,6 +54,11 @@ const (
 	unplannedDuplicateFileNode = "manifest_duplicate_file_node"
 )
 
+// DetailScopeKeyBound is the capability detail that carries the scope-key
+// bound a refused path did not fit. It is a bound and not a count: every row
+// that carries it carries the same figure.
+const DetailScopeKeyBound = "bound"
+
 // scopeSeparator joins a provider ID and a scope key into the Reuse/Previous
 // map key. It is a byte no identifier may contain, so two different pairs can
 // never collide on one key.
@@ -139,7 +144,7 @@ type Plan struct {
 	Reuse map[string]model.UnitID
 	// Previous maps Key(providerID, scopeKey) to the sealed predecessor a
 	// rebuilt semantic unit imports its delta from. A file-invalidated unit has
-	// no entry: it is rebuilt whole from one file, and there is no delta
+	// no entry: it is rebuilt whole from its files, and there is no delta
 	// applier for it.
 	Previous map[string]model.UnitID
 	// Unplanned counts, per keyed reason, what the plan could not do. Counts
@@ -157,6 +162,13 @@ type Plan struct {
 	// or workspace-scoped unit list is bounded by the scope count, never by
 	// the repository, so it stays in heap.
 	files *pagination.SortedRun[fileUnitRecord]
+	// includes holds, by record Seq, the whole sorted input list of each file
+	// unit that reads more than its own file -- a requirements file and the
+	// files it includes (manifest.Includes). It stays in heap beside the
+	// spilled run for the reason semantic member lists do: it is bounded by
+	// the include graph, never by the repository, and a record carrying it
+	// would be variable-length and could pass the sort's record ceiling.
+	includes map[int64][]model.UnitInput
 }
 
 // CountReused calls add once for every scope Reuse holds, with its provider.
@@ -220,7 +232,8 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
 		headerKey: headerKeyOf(in.View.Header()),
 		plan: Plan{Reuse: map[string]model.UnitID{}, Previous: map[string]model.UnitID{},
-			Unplanned: map[string]int{}, States: slices.Clone(in.Selection.States)},
+			Unplanned: map[string]int{}, States: slices.Clone(in.Selection.States),
+			includes: map[int64][]model.UnitInput{}},
 		byProvider: map[string][]Unit{}, overBound: map[string]string{}, noInputs: map[string]string{},
 		providerOrder: make(map[string]int, len(in.Selection.Active))}
 	for i, p := range in.Selection.Active {
@@ -483,9 +496,16 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion) error {
 		if !fp.gate(fv) {
 			continue
 		}
-		u := Unit{ProviderID: fp.id, ProviderVersion: fp.version, ScopeKey: scopeKey, InputCount: 1,
-			Inputs: staticInputs([]model.UnitInput{{FileID: fv.ID, ContentHash: fv.ContentHash,
-				Executable: fv.Executable}})}
+		inputs := []model.UnitInput{{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable}}
+		if fp.id == manifest.ID {
+			more, err := b.manifestInputs(ctx, fv, inputs)
+			if err != nil {
+				return err
+			}
+			inputs = more
+		}
+		u := Unit{ProviderID: fp.id, ProviderVersion: fp.version, ScopeKey: scopeKey,
+			InputCount: int64(len(inputs)), Inputs: staticInputs(inputs)}
 		if header {
 			u.DependencyKeys = []string{b.headerKey}
 		}
@@ -505,7 +525,7 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion) error {
 		if err != nil {
 			return err
 		}
-		// A file unit is rebuilt whole from one file; no delta applier exists
+		// A file unit is rebuilt whole from its files; no delta applier exists
 		// for one, so its predecessor is not recorded.
 		reused, _, err := b.previous(ctx, fp.id, scopeKey, spec.ID)
 		if err != nil {
@@ -528,12 +548,34 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion) error {
 		if len(u.DependencyKeys) == 1 {
 			rec.DependencyKey = u.DependencyKeys[0]
 		}
+		if len(inputs) > 1 {
+			b.plan.includes[rec.Seq] = inputs
+		}
 		b.unitSeq++
 		if err := b.allUnits.Add(rec); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// manifestInputs is the input list of a manifest unit: its own file and,
+// for a requirements file, every file it includes that the snapshot holds
+// (manifest.Includes), read through the planner's view under the parse bound
+// the unit reads them with. The list is in ascending FileID order, which the
+// input digest requires.
+func (b *builder) manifestInputs(ctx context.Context, fv model.FileVersion, own []model.UnitInput) ([]model.UnitInput, error) {
+	included, err := manifest.Includes(ctx, b.in.View, b.in.View.Header().RepositoryID, fv.Path,
+		b.in.Config.Workspace.MaxParseFileBytes)
+	if err != nil || len(included) == 0 {
+		return own, err
+	}
+	inputs := slices.Clone(own)
+	for _, f := range included {
+		inputs = append(inputs, model.UnitInput{FileID: f.ID, ContentHash: f.ContentHash, Executable: f.Executable})
+	}
+	slices.SortFunc(inputs, func(a, c model.UnitInput) int { return compareID(a.FileID, c.FileID) })
+	return inputs, nil
 }
 
 // duplicate counts the file identity that two units publish a node fact for:
@@ -638,7 +680,7 @@ func (b *builder) emit(ctx context.Context) error {
 			slots[i] = b.byProvider[id]
 		}
 	}
-	b.plan.Units = unitSequence(files, slots)
+	b.plan.Units = unitSequence(files, slots, b.plan.includes)
 	b.degradations()
 	return nil
 }
@@ -651,7 +693,7 @@ func (b *builder) emit(ctx context.Context) error {
 // order is served by exactly one of the two sources: the run's records for
 // that position, in compareUnit's order, or that provider's bounded semantic
 // list. Peak is one unit, plus the run's own read block.
-func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) func(yield func(Unit) error) error {
+func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit, includes map[int64][]model.UnitInput) func(yield func(Unit) error) error {
 	return func(yield func(Unit) error) error {
 		next := 0
 		// flush emits every semantic provider strictly before position n. A
@@ -681,7 +723,7 @@ func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) fun
 			if err := flush(rec.Order); err != nil {
 				return err
 			}
-			return yield(rec.unit())
+			return yield(rec.unit(includes[rec.Seq]))
 		}); err != nil {
 			return err
 		}
@@ -701,7 +743,7 @@ func (b *builder) degradations() {
 		if n := b.plan.Unplanned[unplannedScopeKey+d.ID]; n > 0 {
 			for _, c := range d.Capabilities {
 				state := b.partial(d, c).WithDetail("files_over_scope_bound", strconv.Itoa(n))
-				state = state.WithDetail("bound", strconv.Itoa(model.MaxScopeKeyBytes))
+				state = state.WithDetail(DetailScopeKeyBound, strconv.Itoa(model.MaxScopeKeyBytes))
 				b.plan.States = append(b.plan.States, state.WithDetail("path", model.TruncateDetail(b.overBound[d.ID])))
 			}
 		}
@@ -872,7 +914,9 @@ func compareInput(a, b model.UnitInput) int { return compareID(a.FileID, b.FileI
 // own membership would be variable-length, would charge the run buffer by the
 // scope's size, and a large enough one would exceed the sort's record ceiling
 // and fail the plan outright. Semantic units are never spilled for exactly
-// that reason; their lists are bounded by the scope count and stay in heap.
+// that reason; their lists are bounded by the scope count and stay in heap,
+// and so does the input list of a file unit that reads more than its own file
+// (Plan.includes).
 type fileUnitRecord struct {
 	// Order is the provider's position in Selection.Active, Bytes the file's
 	// source bytes and Seq its arrival in the manifest walk: the sort key
@@ -885,7 +929,8 @@ type fileUnitRecord struct {
 	ProviderVersion string `json:"v"`
 	ScopeKey        string `json:"s"`
 
-	// FileID, ContentHash and Executable are the unit's single declared input.
+	// FileID, ContentHash and Executable are the unit's own file: its single
+	// declared input, or one of the inputs Plan.includes holds for it.
 	FileID      model.FileID `json:"f"`
 	ContentHash string       `json:"c"`
 	Executable  bool         `json:"x,omitempty"`
@@ -899,13 +944,16 @@ type fileUnitRecord struct {
 	DependencyKey string `json:"k,omitempty"`
 }
 
-// unit rehydrates the record into the Unit the executor runs. Its identity is
-// unchanged: Spec folds the same single input, the same dependency list and
-// the same synthetic key.
-func (r fileUnitRecord) unit() Unit {
+// unit rehydrates the record into the Unit the executor runs, with inputs the
+// list Plan.includes holds for it, or its own file alone where that is nil.
+// Its identity is unchanged: Spec folds the same inputs, the same dependency
+// list and the same synthetic key.
+func (r fileUnitRecord) unit(inputs []model.UnitInput) Unit {
+	if inputs == nil {
+		inputs = []model.UnitInput{{FileID: r.FileID, ContentHash: r.ContentHash, Executable: r.Executable}}
+	}
 	u := Unit{ProviderID: r.ProviderID, ProviderVersion: r.ProviderVersion, ScopeKey: r.ScopeKey,
-		InputCount: 1, Inputs: staticInputs([]model.UnitInput{{FileID: r.FileID,
-			ContentHash: r.ContentHash, Executable: r.Executable}})}
+		InputCount: int64(len(inputs)), Inputs: staticInputs(inputs)}
 	if r.DependsOn != "" {
 		u.DependsOn = []model.UnitID{r.DependsOn}
 	}

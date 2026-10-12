@@ -587,9 +587,10 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 		cmd.Wait()
 		return result, internalError("the child could not be placed under process-tree control: %v", err)
 	}
-	// The child is a group leader, so its process ID is the group the sampler
-	// follows and the runner terminates. Sampling starts only once the tree
-	// control holds it, so nothing is sampled that could still escape it.
+	// The sampler follows what the tree control holds -- the child's process
+	// group, or its job on Windows (jobControl.target). Sampling starts only
+	// once the tree control holds it, so nothing is sampled that could still
+	// escape it.
 	// The CPU figure the stall watchdog reads is refreshed by this sampler, so
 	// it must be refreshed at least as often as the watchdog polls: a stall
 	// timeout short enough to poll faster than treeSampleInterval would
@@ -599,7 +600,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	if spec.StallTimeout > 0 {
 		sampleEvery = min(sampleEvery, stallPoll(spec.StallTimeout))
 	}
-	sampler := startTreeSampler(cmd.Process.Pid, sampleEvery)
+	sampler := startTreeSampler(job.target(cmd), sampleEvery)
 	defer sampler.stopSampling()
 	// The same figure, published to a caller watching this child's progress
 	// through a protocol of its own. It is bound after the sampler exists and
@@ -746,8 +747,9 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 
 // jobControl is the platform's process-tree mechanism: a process group on Unix
 // and a Job Object on Windows. The runner calls prepare before starting the
-// child, started immediately after it is created, terminate to stop the whole
-// tree gracefully and then forcibly, and close to release the mechanism.
+// child, started immediately after it is created, target for what the tree
+// sampler reads once started has returned, terminate to stop the whole tree
+// gracefully and then forcibly, and close to release the mechanism.
 //
 // Both implementations control the entire tree. Signalling only the direct
 // child would leave a tool's own workers running, still holding the
@@ -755,6 +757,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 type jobControl interface {
 	prepare(cmd *exec.Cmd) error
 	started(cmd *exec.Cmd) error
+	target(cmd *exec.Cmd) treeTarget
 	terminate(cmd *exec.Cmd, force bool)
 	close()
 }

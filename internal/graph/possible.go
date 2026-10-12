@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -571,24 +572,39 @@ func possibleNotice(mode tailMode, list possibleList, precise int64, caps []mode
 // notice quotes them.
 var siteCountKeys = []string{"sites", "bound_sites", "open_sites", "computed_sites", "external_sites"}
 
-// siteCounts quotes the call linker's site counts off its `calls` capability
-// row, or says the index reports none.
+// siteCounts quotes the project's call-site counts: each key summed over
+// every `calls` capability row that carries it, or says the index reports
+// none.
+//
+// The stored rows stand for disjoint sets of the linker's units -- its fresh
+// units folded into one workspace row, each degraded unit in a row of its
+// own -- so their sum is the project's figure and no unit is counted twice.
+// Any one row alone is a part of it. A value that is not a count is left out of the sum rather than read
+// as zero.
 func siteCounts(caps []model.CapabilityState) string {
+	sums := make([]int64, len(siteCountKeys))
+	seen := make([]bool, len(siteCountKeys))
 	for _, c := range caps {
 		if c.Capability != string(model.RelCalls) {
 			continue
 		}
-		var parts []string
-		for _, k := range siteCountKeys {
-			if v, ok := c.Details[k]; ok {
-				parts = append(parts, strings.ReplaceAll(k, "_", " ")+" "+v)
+		for i, k := range siteCountKeys {
+			if n, err := strconv.ParseInt(c.Details[k], 10, 64); err == nil {
+				sums[i] += n
+				seen[i] = true
 			}
 		}
-		if len(parts) > 0 {
-			return "the project's call sites are " + strings.Join(parts, ", ")
+	}
+	var parts []string
+	for i, k := range siteCountKeys {
+		if seen[i] {
+			parts = append(parts, strings.ReplaceAll(k, "_", " ")+" "+strconv.FormatInt(sums[i], 10))
 		}
 	}
-	return "this index reports no call-site counts, so how many calls no analysis bound is not known"
+	if len(parts) == 0 {
+		return "this index reports no call-site counts, so how many calls no analysis bound is not known"
+	}
+	return "the project's call sites are " + strings.Join(parts, ", ")
 }
 
 // dropPlaceholders removes, from one page of a call answer, the structural
