@@ -148,6 +148,9 @@ type Decl struct {
 	// Parameters are the callable's declared parameters, in declaration
 	// order (wire.Link.Parameters).
 	Parameters []Parameter `json:"parameters,omitempty"`
+	// Property reports an ECMAScript function stored under a property path
+	// (wire.Export.Property): no bare name denotes it.
+	Property bool `json:"property,omitempty"`
 }
 
 // Parameter is one declared parameter of a callable. Endpoint is the
@@ -253,6 +256,10 @@ type Value struct {
 	Range  model.SourceRange `json:"range"`
 	Field  string            `json:"field,omitempty"`
 	Type   wire.Type         `json:"type"`
+	// Declares, when not 0, is one more than the index in Decls of the
+	// function the value's own expression declares (wire.Value.Declares):
+	// the value is that declaration, whatever its name.
+	Declares int32 `json:"declares,omitempty"`
 }
 
 // Encode is t's stored form.

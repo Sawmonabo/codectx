@@ -439,8 +439,10 @@ func (r *pySite) resolve(site Ref) error {
 			return err
 		}
 	}
-	return r.t.functions(r.ctx, site, func(target Ref, detail string) error {
-		return r.exactCall(site, detail)(target)
+	// A method value taken through its class (`f = C.m; f(obj)`) passes its
+	// receiver first; one taken through an instance is bound to it.
+	return r.t.functions(r.ctx, site, func(target Ref, detail string, receiverFirst bool) error {
+		return r.call(Binding{Kind: FactCall, Site: site, Target: target, Detail: detail, Dispatch: model.DispatchExact}, receiverFirst)
 	})
 }
 

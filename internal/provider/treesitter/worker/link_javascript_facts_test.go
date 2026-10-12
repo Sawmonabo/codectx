@@ -51,18 +51,20 @@ func TestJavaScriptArgumentsReadTheirOwnVariables(t *testing.T) {
 // TestJavaScriptDynamicImportsFoldOrKeepFragments protects the open import
 // sites: a require or import whose path is an expression sends its literal
 // parts, and one every part of which is literal folds to the one path it
-// names, an ordinary import. A literal `require("./lit")` is the structural
-// query's import record and is not sent again.
+// names, an ordinary import. A literal `require("./lit")` or
+// `import("./lit")` is the structural query's import record and is not sent
+// again.
 //
 // Mutation: treat every require as open -> `require("./x/" + "y")` is sent
-// with fragments and not Constant. Mutation: send a literal require too ->
-// five entries become six.
+// with fragments and not Constant. Mutation: send a literal require or a
+// literal import too -> five entries become six or seven.
 func TestJavaScriptDynamicImportsFoldOrKeepFragments(t *testing.T) {
 	const src = "const name = process.argv[2];\n" +
 		"const a = require(\"./x/\" + name);\n" +
 		"const b = require(\"./x/\" + \"y\");\n" +
 		"const c = require(\"./lit\");\n" +
 		"import(\"./m\");\n" +
+		"import(\"./\" + \"n\");\n" +
 		"import(`./t/${name}.js`);\n" +
 		"require(name);\n"
 	l, _ := linkOf(t, "javascript", "a.js", src)
@@ -73,7 +75,7 @@ func TestJavaScriptDynamicImportsFoldOrKeepFragments(t *testing.T) {
 	}{
 		{at: "require(\"./x/\" + name)", fragments: []string{"./x/"}},
 		{at: "require(\"./x/\" + \"y\")", fragments: []string{"./x/y"}, constant: true},
-		{at: "import(\"./m\")", fragments: []string{"./m"}, constant: true},
+		{at: "import(\"./\" + \"n\")", fragments: []string{"./n"}, constant: true},
 		{at: "import(`./t/${name}.js`)", fragments: []string{"./t/", ".js"}},
 		{at: "require(name)"},
 	}
