@@ -11,7 +11,8 @@
 //
 // One unit is one manifest file and depends on the filesystem unit of
 // the same file, whose file node the manifest's `defines` relation starts
-// from. A malformed file is reported as a failed capability at that file's
+// from. A requirements file's unit also declares the files it includes as
+// inputs (Includes), so an edit to one of them rebuilds it. A malformed file is reported as a failed capability at that file's
 // scope; the unit still seals, so one broken manifest never fails the
 // provider run.
 package manifest
