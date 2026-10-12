@@ -199,7 +199,7 @@ func (b *builder) publishEndpoint(f *endpointFact) error {
 		b.search = append(b.search, model.SearchUnit{
 			ID: model.H(searchDomain, string(b.fv.ID), string(res.Node.ID)), NodeID: res.Node.ID, FileID: b.fv.ID, Path: b.fv.Path,
 			Kind: model.NodeEndpoint, Name: name, QualifiedName: qualified,
-			Bytes: model.ByteRange{Start: uint64(f.at.Start), End: uint64(f.at.End)}, Body: body, TokenCount: int64(len(strings.Fields(body))),
+			Bytes: model.ByteRange{Start: uint64(f.at.Start), End: uint64(f.at.End)}, Body: body,
 		})
 	}
 	return nil

@@ -54,6 +54,7 @@ var purposeByName = map[string]Purpose{
 	string(Materialization):   Materialization,
 	string(LeaseReclamation):  LeaseReclamation,
 	string(ScratchCollection): ScratchCollection,
+	string(WorkspaceReset):    WorkspaceReset,
 }
 
 // A reclaimer is the one place in the process that gives disk space back. A

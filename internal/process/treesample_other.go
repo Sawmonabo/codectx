@@ -11,11 +11,15 @@ import "time"
 // reads "no measurement" as "no memory" or as "moved nothing" (Section 22).
 const treeSampled = false
 
+// treeAnonSampled reports that no running tree's anonymous resident memory is
+// read here, so nothing is added back for a child.
+const treeAnonSampled = false
+
 // treeSampler is the inert form for platforms with no tree sampling. It starts
 // no goroutine, so there is nothing to join.
 type treeSampler struct{}
 
-func startTreeSampler(int, time.Duration) *treeSampler { return nil }
+func startTreeSampler(treeTarget, time.Duration) *treeSampler { return nil }
 
 // stopSampling returns the empty sample: nothing was observed, and its zero
 // ioSampled is what makes the runner report the byte figures as absent.

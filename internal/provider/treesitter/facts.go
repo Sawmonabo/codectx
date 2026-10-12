@@ -158,6 +158,8 @@ type declFact struct {
 	// was cut, which leaves it a file-scoped identity, and what separates it
 	// from declarations sharing that path.
 	descriptor, disambiguator string
+	// nameRng is the name token's range, inside rng: the node's NameRange.
+	nameRng *model.SourceRange
 	// truncated names the fields this declaration's storage ceilings cut.
 	truncated truncations
 	// decorators are the declaration's decorators and annotations as they
@@ -327,10 +329,11 @@ func (b *builder) validateDecls() error {
 		if _, err := b.rangeOf(d.Start, d.SigEnd); err != nil {
 			return err
 		}
-		if _, err := b.rangeOf(d.NameStart, d.NameEnd); err != nil {
+		nameRng, err := b.rangeOf(d.NameStart, d.NameEnd)
+		if err != nil {
 			return err
 		}
-		f := declFact{Decl: d, kind: kind, rng: rng}
+		f := declFact{Decl: d, kind: kind, rng: rng, nameRng: nameRng}
 		f.sig = f.truncated.cut("signature", collapse(string(b.src[d.Start:d.SigEnd])), model.MaxSignatureBytes)
 		f.Name = f.truncated.cut("name", d.Name, model.MaxNameBytes)
 		f.Qualified = f.truncated.cut("qualified_name", d.Qualified, model.MaxQualifiedNameBytes)
@@ -470,6 +473,10 @@ func (b *builder) resolveDecls() error {
 		if err != nil {
 			return err
 		}
+		// The name token is an attribute of this occurrence, not an input to
+		// its identity, so it is set on the resolved node rather than the
+		// candidate.
+		res.Node.NameRange = d.nameRng
 		d.res = res
 		meta := map[string]any{}
 		if d.Exported {
@@ -1197,7 +1204,7 @@ func (b *builder) searchUnit(d *declFact) model.SearchUnit {
 	return model.SearchUnit{
 		ID: model.H(searchDomain, string(b.fv.ID), string(d.res.Node.ID)), NodeID: d.res.Node.ID, FileID: b.fv.ID, Path: b.fv.Path,
 		Kind: d.res.Node.Kind, Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
-		Bytes: model.ByteRange{Start: uint64(d.Start), End: uint64(d.End)}, Body: body, TokenCount: int64(len(strings.Fields(body))),
+		Bytes: model.ByteRange{Start: uint64(d.Start), End: uint64(d.End)}, Body: body,
 	}
 }
 

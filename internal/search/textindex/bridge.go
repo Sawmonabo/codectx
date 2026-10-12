@@ -373,11 +373,13 @@ func statusErr(what string, status C.int32_t, errBuf *C.cx_buf) error {
 			Remediation: "another codectx process is writing this workspace's search index; retry when it finishes"}
 	case C.CX_CORRUPT:
 		return &model.Error{Code: model.CodeStorageCorrupt, Message: text,
-			Remediation: "re-index the repository with `codectx index --repo <path>`"}
+			Remediation: "run `codectx reset --reindex` to build the workspace again from the repository"}
 	case C.CX_DISK_FULL:
 		return &model.Error{Code: model.CodeDiskFull, Message: text}
 	case C.CX_CANCELED:
 		return &model.Error{Code: model.CodeCanceled, Message: text}
+	case C.CX_NO_POSITION:
+		return ErrUnknownPosition
 	default:
 		return &model.Error{Code: model.CodeInternal, Message: text}
 	}

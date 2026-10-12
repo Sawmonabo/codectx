@@ -141,7 +141,7 @@ codectx mcp serve --repo .
 |---|---|
 | Installation and health | `version`, `init`, `doctor` |
 | Managed toolchain | `tools status`, `tools prefetch`, `tools verify`, `tools gc` |
-| Indexing | `index`, `refresh`, `status`, `watch` |
+| Indexing | `index`, `refresh`, `status`, `watch`, `reset` |
 | Discovery | `search`, `symbol`, `repo-map` |
 | Graph queries | `refs`, `callers`, `callees`, `path`, `impact` |
 | Context sessions | `context plan`, `status`, `next`, `entries`, `include`, `read`, `acknowledge`, `waive`, `record`, `advance`, `capsule`, `close`, `export` |

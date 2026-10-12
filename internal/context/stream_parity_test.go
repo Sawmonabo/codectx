@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -120,9 +119,13 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 	return expandScopeAfter(ctx, eng, gen, cfg, seeds, caps, seedStop{})
 }
 
-// expandScopeAfter walks the seeds' roots one group per root weight (ADR-0016
-// decision 1), the groups in descending weight with the named group first on
-// a tie, every group read to exhaustion:
+// expandScopeAfter walks the seeds' roots one group per root weight, the groups
+// in descending weight with the named group first on a tie, and lends every
+// node each group's largest (requirement, score) pairs over every route from
+// that group's roots (referenceWalks). It is the reference the streamed pass's
+// ONE weighted walk is held to: the per-weight pairs, each entity then keeping
+// its best record after ranking, are ADR-0016 decision 1's rule, and that walk
+// must equal them.
 //
 //   - The seeds fold among themselves, the earliest step keeping an entity. A
 //     seed the caller or the task named and that carries no root weight takes
@@ -135,7 +138,7 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 //     (lexicalDepthCap), a depth truncation that bound caused does not narrow
 //     the scope, and a group no depth of which can lend a pair above the stop
 //     is not walked. A kept-file seed is never a root.
-//   - After each walk page, the open call sites among its entries have their
+//   - The open call sites among the reached nodes, in node order, have their
 //     name-only candidates admitted (referenceCandidates).
 func expandScopeAfter(ctx context.Context, eng *graph.Engine, gen model.GenerationID, cfg config.Context,
 	seeds []candidate, caps []model.CapabilityState, stop seedStop) (refScope, error) {
@@ -229,87 +232,39 @@ func expandScopeAfter(ctx context.Context, eng *graph.Engine, gen model.Generati
 	if err != nil {
 		return refScope{}, err
 	}
-	// Each walk is read to exhaustion, exactly as the streamed pass reads it:
-	// graph.Impact answers one globally ranked page plus the cursor that
-	// continues it, and a reference that stopped at page one would make parity
-	// prove only that the two pipelines agree on the first page.
-	var disclosed []model.CapabilityState
-	for _, group := range groups {
-		depth, derivedDepth := walkDepth(group.MaxDepth, cfg.MaxGraphDepth)
-		cursor := ""
-		for {
-			impact, err := eng.Impact(ctx, model.ImpactRequest{
-				// The generation is pinned by the cursor on a continuation, and
-				// naming both is refused: a cursor already carries the generation
-				// its first page was answered from.
-				GenerationID: pinnedGeneration(gen, cursor),
-				Start:        group.Start,
-				Relations:    scopeRelations,
-				// Both directions: a caller reaches the seed through an incoming edge
-				// and a callee through an outgoing one, and Section 15.2 requires both.
-				Direction:  model.DirectionBoth,
-				MaxDepth:   depth,
-				MaxVisited: cfg.MaxVisitedNodes.Int(),
-				MaxEdges:   cfg.MaxGraphEdges.Int(),
-				// No limit: the engine's own page width resolves on page one and
-				// every continuation is bound to it, so the reference reads the
-				// same globally ranked list whatever width the compiler configured.
-				Page: model.PageRequest{Cursor: cursor},
-			})
-			if err != nil {
-				return refScope{}, contextErr(ctx, err)
-			}
-			// A depth truncation the group's derived bound caused is the stop's
-			// own answer, not a cut (ADR-0016 decision 3).
-			derivedCut := derivedDepth && strings.HasPrefix(impact.Meta.TruncationReason, walkDepthReason)
-			if impact.Meta.Truncated && !derivedCut {
-				res.ScopeComplete = false
-			}
-			disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
-
-			for _, e := range impact.Entries {
-				requirement := boundaryRequirement(e.Kind, e.Depth)
-				if !group.Named && requirementRank(requirement) < requirementRank(model.RequirementRecommended) {
-					// A lexical root never makes an entry required.
-					requirement = model.RequirementRecommended
-				}
-				c := candidate{
-					NodeID: e.NodeID,
-					FileID: e.FileID,
-					// Path is deliberately left empty: candidate.Path is a FILE PATH
-					// everywhere else, and ImpactEntry.Name is a qualified name.
-					// Writing the name here made hydrateFiles (compiler.go) skip the
-					// entry -- it fills Path only when it is empty -- so the file path
-					// the FileID resolves to never reached the candidate, and
-					// rank.go's packageOf() bucketed qualified names instead of
-					// directories.
-					Requirement: requirement,
-					Origin:      originExpansion,
-					Depth:       e.Depth,
-					RootWeight:  group.Weight,
-					Named:       group.Named,
-				}
-				var dropped, truncated int64
-				c.Reasons, dropped, truncated = boundReasons(e.Reasons)
-				res.ReasonsDropped += dropped
-				res.ReasonsTruncated += truncated
-				c.Paths, c.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
-				res.Candidates = append(res.Candidates, c)
-			}
-			if err := referenceCandidates(ctx, eng, gen, impact.Entries, admitted, &res); err != nil {
-				return refScope{}, err
-			}
-			if impact.Meta.NextCursor == "" {
-				break
-			}
-			cursor = impact.Meta.NextCursor
-		}
+	disclosed, err := referenceWalks(ctx, eng, gen, cfg, groups, admitted, &res)
+	if err != nil {
+		return refScope{}, err
 	}
 	res.Completeness = degradedCapabilities(caps, disclosed)
 	if len(res.Completeness) > 0 {
 		res.ScopeComplete = false
 	}
 	return res, nil
+}
+
+// walkGroup is one group of the reference: the roots of one weight and class.
+// MaxDepth is the group's derived depth bound, zero for none.
+type walkGroup struct {
+	Weight   int64
+	Named    bool
+	MaxDepth int
+	Start    []model.NodeID
+}
+
+// walkDepth is the depth bound one group's walk is asked with, and whether the
+// group's derived bound -- not the user's context.max_graph_depth -- is the one
+// that set it. A group with no derived bound walks to the user's bound
+// (unlimited is zero); a derived bound is never widened by the user's and
+// never passed as zero.
+func walkDepth(derived int, user config.Limit) (int, bool) {
+	if derived <= 0 {
+		return user.Int(), false
+	}
+	if user.IsUnlimited() || derived < user.Int() {
+		return derived, true
+	}
+	return user.Int(), false
 }
 
 // referenceWalkGroups cuts the started roots into one walk per (weight, class)

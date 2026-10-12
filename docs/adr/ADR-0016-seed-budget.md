@@ -68,9 +68,8 @@ condition that an entry's grade depends only on its own routes, and no margin re
 
 ### 3. The read stops at a score below which no unread match can rank above the packed files
 
-- Lexical matches are read in score order through the internal search call, which takes a depth or minimum-score
-  parameter and grows its depth until the floor is passed; the 200-item page is a wire bound and does not apply to
-  this in-process call.
+- Lexical matches are read in score order through the internal search call, which takes a depth and grows it until
+  the floor is passed; the 200-item page is a wire bound and does not apply to this in-process call.
 - τ(next) is the largest final score anything derived from the next unread match could reach: its origin
   contribution, a route at the full scale, and every boost the root could lend. It is computed with the compiler's own
   integer functions, never with a floating ratio. With the boosts scaled by root weight (decision 1), the margin is
@@ -153,6 +152,10 @@ only graph expansion a plain-language task gets; an agent localization study los
 
 - A broad task reads matches down to a floor set by the plan's own file budget, not to the end of the index, and
   walks only from them; the walk no longer scales with how many documents hold a common word.
+- Every root, whatever its weight, is walked in one walk. A node keeps each pair no other pair at it beats on every
+  count the ranking can only improve with (depth, class, weight, route product, remaining derived depth), so the
+  largest pair of decision 1 is among the ones it keeps; the walk is best-first on the score, because a heavier root
+  farther away can lend more than a lighter one next to the node.
 - The read is deeper than a stop at the budget's score level, by the boost margin, and costs a few path-filtered reads
   and one walk over the unreached components; that walk's cost is measured in the scale proofs.
 - Centrality becomes a signal of the named roots' neighbourhood. A task with no named seeds ranks by lexical score

@@ -226,7 +226,7 @@ func TestPlannedUnitsAreStreamedNotHeldInHeap(t *testing.T) {
 		// The executor's own walk, through the production sequence. Peak heap
 		// is read at its midpoint, with everything the plan owns alive.
 		seen, mid := 0, n/2
-		err = unitSequence(run, make([][]Unit, 1))(func(u Unit) error {
+		err = unitSequence(run, make([][]Unit, 1), nil)(func(u Unit) error {
 			if want := unitAt(seen).ScopeKey; u.ScopeKey != want {
 				return errOrder(seen, u.ScopeKey, want)
 			}
@@ -312,7 +312,7 @@ func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.
 	slots := [][]Unit{nil, {sem("scip", "pkg:a"), sem("scip", "pkg:b")}, nil, {sem("dep", "proj:r")}}
 
 	var got []string
-	if err := unitSequence(run, slots)(func(u Unit) error {
+	if err := unitSequence(run, slots, nil)(func(u Unit) error {
 		got = append(got, u.ScopeKey)
 		return nil
 	}); err != nil {
@@ -357,7 +357,7 @@ func TestAHeaderUnitIsKeyedByTheGrammarItReads(t *testing.T) {
 		defer func() { _ = run.Close() }()
 		var id model.UnitID
 		if err := run.Each(func(rec fileUnitRecord) error {
-			spec, err := rec.unit().Spec("config")
+			spec, err := rec.unit(nil).Spec("config")
 			id = spec.ID
 			return err
 		}); err != nil {

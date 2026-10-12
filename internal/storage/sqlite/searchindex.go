@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/search/textindex"
 )
 
@@ -39,6 +40,30 @@ const deletePage = 4096
 // SQLite transaction. It is set only by tests (export_test.go), which stop an
 // activation there as if the process died.
 var afterSearchCommit func() error
+
+// removeStaleSearch removes the index directory beside a database whose
+// schema is being created, before anything opens it. A directory found there
+// belongs to a database that was removed by hand without it, and adopting it
+// would corrupt every search: the new database allocates doc ids from 1 again
+// and its units are keyed by content, so the old documents would answer under
+// the new database's doc ids and units. The removal is the paced one -- the
+// directory is renamed into the to-free set and given back at the pace -- and
+// it runs inside the transaction that creates the schema, so no other process
+// can open the database and adopt the directory between the two. A removal
+// that fails fails that transaction, and the next open tries again.
+func (s *Store) removeStaleSearch() error {
+	dir := s.path + searchDirSuffix
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return internal("search index directory: " + err.Error())
+	}
+	if err := paced.RemoveAll(dir); err != nil {
+		return internal("remove the search index left beside a removed database: " + err.Error())
+	}
+	slog.Info("removed the search index directory a removed database left beside this new one", "dir", dir)
+	return nil
+}
 
 // openTextIndex opens the store's search index. A read-only open of a database
 // whose index directory is missing opens none: every search of such a store
@@ -77,7 +102,7 @@ func (s *Store) releaseSearchWriter() error {
 func searchLost(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeStorageCorrupt,
 		Message:     "the search index does not hold this generation: " + fmt.Sprintf(format, args...),
-		Remediation: "re-index into a new cache with `codectx index --rebuild`"}
+		Remediation: "run `codectx reset --reindex` to build the workspace again from the repository"}
 }
 
 // searchHolds checks that the index's last commit covers generation gen: a
@@ -525,7 +550,7 @@ func (s *Store) failUnreconciled(ctx context.Context, units []int64) error {
 			return wrap("reconcile", err)
 		}
 		if published != 0 {
-			slog.Warn("the search index lacks documents of units a published generation selects; their searches miss them until the cache is rebuilt with `codectx index --rebuild`",
+			slog.Warn("the search index lacks documents of units a published generation selects; their searches miss them until the workspace is built again with `codectx reset --reindex`",
 				"units", published)
 		}
 		final := []string{

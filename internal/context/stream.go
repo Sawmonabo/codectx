@@ -820,7 +820,7 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 // admission order with a seq on every record instead of building
 // the whole-set candidate list (refScope.Candidates, stream_parity_test.go).
 // The seeds fold among themselves under lessEntityID with foldMinSeq; every
-// walk group's entries reach the spool as their own records, and the entity
+// label the walk keeps reaches the spool as its own record, and the entity
 // takes its best one after ranking (ADR-0016 decision 1). Excluded candidates are NOT diverted:
 // they stay on the one spool with Excluded set, because relationsOnPaths
 // deliberately does not filter on it while hydrateFiles does, and P-I derives

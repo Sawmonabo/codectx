@@ -55,20 +55,19 @@ func lengthRuleName(r textindex.LengthRule) string {
 }
 
 // searchQueryHash is the cursor query-hash preimage for the search endpoint: the
-// endpoint, the normalized query text, every filter, the minimum score and the
-// length rule the lexical tier scores under. Each filter group is sorted so the
-// caller's argument order cannot mint two cursors for one query, and joined with
-// a separator no value can contain. A changed filter, a different minimum score
-// or another length rule changes which results exist and in what order, so a
-// cursor minted under one never resumes under another.
+// endpoint, the normalized query text, every filter and the length rule the
+// lexical tier scores under. Each filter group is sorted so the caller's
+// argument order cannot mint two cursors for one query, and joined with a
+// separator no value can contain. A changed filter or another length rule
+// changes which results exist and in what order, so a cursor minted under one
+// never resumes under another.
 func searchQueryHash(req model.SearchRequest, rule textindex.LengthRule) string {
 	kinds := make([]string, len(req.Kinds))
 	for i, k := range req.Kinds {
 		kinds[i] = string(k)
 	}
 	return model.H(queryHashDomain, endpointSearch, normalizeQuery(req.Query),
-		sortedJoin(kinds), sortedJoin(req.Languages), sortedJoin(req.Paths),
-		strconv.FormatInt(req.MinScoreMicros, 10), lengthRuleName(rule))
+		sortedJoin(kinds), sortedJoin(req.Languages), sortedJoin(req.Paths), lengthRuleName(rule))
 }
 
 // searchPhase is the part of a search answer a continuation resumes in.
@@ -79,7 +78,8 @@ const (
 	phaseStart searchPhase = iota
 	// phaseExact resumes inside the exact tiers, after one exact hit.
 	phaseExact
-	// phaseLexical resumes in the lexical tier, after a count of its results.
+	// phaseLexical resumes in the lexical tier, after one lexical result or
+	// at its start.
 	phaseLexical
 )
 
@@ -88,15 +88,19 @@ const (
 // is emitted once, so the pair identifies the hit, and the next page reads that
 // hit's full content key back from the same tier (positionKey) rather than
 // carrying it -- a path, a qualified name and a signature together can be far
-// larger than a cursor's sort key may be. A position in the lexical tier is the
-// number of lexical results already served after the service's own filters:
-// the library's ranking is a pure function of the generation and the query, so
-// the same count names the same place on every page.
+// larger than a cursor's sort key may be. A position in the lexical tier names
+// the last lexical result served by its textindex.Position -- its score and the
+// doc id of its document, from which the library reads the rest of its sort key
+// back -- or, with after nil, the start of the lexical tier (a page that the
+// exact tiers filled exactly). The library's ranking is a total order and a
+// pure function of the generation, the query and its filters, so the same key
+// names the same place on every page, and the next page asks the library only
+// for what follows it.
 type searchPosition struct {
-	phase  searchPhase
-	rank   int
-	node   model.NodeID
-	served int
+	phase searchPhase
+	rank  int
+	node  model.NodeID
+	after *textindex.Position
 }
 
 // The two spellings of a position in Cursor.LastKey.
@@ -105,17 +109,24 @@ const (
 	lexicalKeyTag = "l"
 )
 
-// lastKey renders a continuation position for Cursor.LastKey.
+// lastKey renders a continuation position for Cursor.LastKey. A lexical key is
+// at most a tag, two separators and two decimal 64-bit integers, far under the
+// cursor's sort-key bound.
 func (p searchPosition) lastKey() string {
 	if p.phase == phaseLexical {
-		return lexicalKeyTag + filterSep + strconv.Itoa(p.served)
+		if p.after == nil {
+			return lexicalKeyTag + filterSep
+		}
+		return lexicalKeyTag + filterSep + strconv.FormatInt(p.after.ScoreMicros, 10) +
+			filterSep + strconv.FormatUint(p.after.DocID, 10)
 	}
 	return exactKeyTag + filterSep + strconv.Itoa(p.rank) + filterSep + string(p.node)
 }
 
 // parseSearchPosition reads back what lastKey wrote. A key this endpoint did not
-// write -- empty, an unknown tag, a rank no exact tier owns, a malformed node,
-// a negative count -- is CTX_CURSOR_INVALID rather than a silently restarted
+// write -- empty, an unknown tag, a rank no exact tier owns, a malformed node, a
+// lexical position that is not two canonical decimal integers with a
+// non-negative score -- is CTX_CURSOR_INVALID rather than a silently restarted
 // answer.
 func parseSearchPosition(key string) (searchPosition, error) {
 	tag, rest, ok := strings.Cut(key, filterSep)
@@ -124,11 +135,14 @@ func parseSearchPosition(key string) (searchPosition, error) {
 	}
 	switch tag {
 	case lexicalKeyTag:
-		served, err := strconv.Atoi(rest)
-		if err != nil || served < 0 {
+		if rest == "" {
+			return searchPosition{phase: phaseLexical}, nil
+		}
+		at, ok := parseLexicalPosition(rest)
+		if !ok {
 			return searchPosition{}, cursorInvalid("the search cursor carries a malformed lexical position")
 		}
-		return searchPosition{phase: phaseLexical, served: served}, nil
+		return searchPosition{phase: phaseLexical, after: &at}, nil
 	case exactKeyTag:
 		head, node, ok := strings.Cut(rest, filterSep)
 		rank, err := strconv.Atoi(head)
@@ -139,6 +153,24 @@ func parseSearchPosition(key string) (searchPosition, error) {
 		return searchPosition{phase: phaseExact, rank: rank, node: model.NodeID(node)}, nil
 	}
 	return searchPosition{}, cursorInvalid("the search cursor does not carry a search position")
+}
+
+// parseLexicalPosition reads "score\x00docid" strictly: each part must be the
+// canonical decimal lastKey writes, so no second spelling names one position.
+func parseLexicalPosition(s string) (textindex.Position, bool) {
+	head, tail, ok := strings.Cut(s, filterSep)
+	if !ok {
+		return textindex.Position{}, false
+	}
+	score, err := strconv.ParseInt(head, 10, 64)
+	if err != nil || score < 0 || strconv.FormatInt(score, 10) != head {
+		return textindex.Position{}, false
+	}
+	doc, err := strconv.ParseUint(tail, 10, 64)
+	if err != nil || strconv.FormatUint(doc, 10) != tail {
+		return textindex.Position{}, false
+	}
+	return textindex.Position{ScoreMicros: score, DocID: doc}, true
 }
 
 // symbolQueryHash is the same preimage for the symbol endpoint. Resolve has no

@@ -119,8 +119,13 @@ The lexical tier's postings live in an embedded search library, built in this
 repository as a static library and linked into the one binary
 ([ADR-0013](adr/ADR-0013-search-index.md)). Its index is a directory beside the
 database, `<database>.search`, owned by the store: the store opens it after the
-database, closes it after the database's last user, and removes it wherever it
-removes the database. The index holds compressed postings with frequencies and
+database and closes it after the database's last user. The store removes it when
+it creates a fresh database: a directory found beside a database whose schema is
+being created belongs to a database removed by hand, and since the new database
+allocates doc ids from 1 again and keys its units by content, adopting it would
+serve the old documents under the new ones' ids. The removal is paced and runs
+inside the transaction that creates the schema, before the index is opened. The
+index holds compressed postings with frequencies and
 positions, immutable segments read through memory maps, a dictionary per
 column, and fast (columnar) fields: `doc_id`, `unit`, `kind`, the path and the
 other fields a hit serves, and the five per-column token counts. SQLite keeps
@@ -168,7 +173,11 @@ one fsync, and a commit per unit would cost minutes on a large repository.
 Documents added between commits are invisible until their generation activates.
 The writer is released after each activation's commit, and after the commit
 that ends a collection sweep run outside an activation, so another process can
-write; a release waits for running merges. The library merges its segments in
+write; a release waits for running merges. Closing a store whose writer is
+still open commits what it holds -- the documents of units a run sealed and no
+activation committed -- with the active generation as the payload, so the next
+run can reuse those units; an index that does not hold the active generation is
+released without a commit, so the loss a search reports is never hidden. The library merges its segments in
 the background, so an activation never touches postings. After each commit and
 each merge, every segment that lacks a block summary gets one
 ([queries](queries.md#how-search-serves-a-page)).
@@ -361,6 +370,19 @@ with it and no refresh can diff against state whose facts were collected.
 `Store.SelectedUnit` finds the predecessor — the unit the previous generation
 selected for the same provider and scope.
 
+A linking unit stores one `link.resolution` artifact.
+The state opens with the tag `link.resolution.boundary\n`, then: the manifest fields (count, then key and value
+strings); the member records by FileID (count, then each a string: file, content hash, member digest, interface
+digest, sites digest, a tabled byte, then unsigned varints dropped, sites, bound, open, computed, external,
+resolved imports, open import sites); the facts by file, entry table, entry, kind, argument and target (each a
+string: kind byte, entry file, entry index, argument index, target file, target node, external key, then
+technique, dispatch and reason bytes); the static family's index groups, recorded reads and address-taken
+functions (each with signature, taker, target file and node, the parameters string and a receiver-first byte); the
+flow family's boundary contributions by entry, value and contributing member (entry variable, value, member
+ordinal, a late byte for a value only the second stratum sends) and boundary reads by entry and reading member; a
+hierarchy mark byte and, when 1, the module path and root, the two indexes and the identity table. A state of any
+other tag, or short, long, out of order or repeated, fails validation and the unit builds in full.
+
 What a unit *declared* is not delta state and is never stored twice:
 `Store.UnitInputs(ctx, unit)` streams a sealed unit's `unit_inputs` rows as an
 `iter.Seq2[model.UnitInput, error]` in ascending `FileID` order — the order
@@ -440,6 +462,26 @@ capability skipped, which labels it could not map. Keys are emitted in
 ascending order, so the stored text, and therefore the digest folded into the
 generation's `AnalysisKey`, is a function of the pairs and never of the order a
 publisher added them.
+
+### A unit's own capability rows
+
+A generation's report is folded from the rows of every member unit, and most
+members of an incremental run are reused, not built. So each unit keeps what it
+reported: `unit_capabilities` holds the capability rows of the unit's provider
+result, keyed by the unit, one row per capability and scope it reported (the
+key refuses a second). They are the rows exactly as the generation that built
+the unit folded them, the delta applier's `delta_full_reason` and
+`delta_filtered` included, and `SealUnit` writes them in the transaction that
+seals the unit, so a sealed unit always has them.
+
+A generation that attaches a sealed unit, whether the plan reused it or the
+build found its key already sealed, reads that unit's rows with
+`Store.UnitCapabilities` and folds them like a built unit's. A reused unit that
+sealed `partial` keeps the generation `partial` with its diagnostic code, and
+summed details, such as the `calls` site counts, cover every member rather than
+only the units the run rebuilt. A unit's rows are bounded by its provider's
+declared capabilities, and the run reads them one unit at a time. They go
+with the unit: `deleteUnit` removes them, and the foreign key cascades.
 
 ## A second process reading while a run writes
 
@@ -750,7 +792,9 @@ at the same rate as the reclaimer's own and through the same turn.
 | A tool payload reset before a download is retried | In place | The staging file is written again from the start | — |
 | The engine's journals and its log, larger than one window | Removal | The engine deletes the log from inside its close, holding the database exclusively for the whole call; emptying it there is a quarter second of held lock per window, which every other process waits out at its next open | — |
 | The engine's journals and its log, one window or smaller | In place | A rename would cost a directory entry and a turn of the pace to give back less than one window | — |
+| A search index directory found beside a database whose schema is being created | Removal | It belongs to a database that was removed by hand, and no database will name its documents again | — |
 | The pools themselves, on `codectx gc` | Removal | An operator asked | `scratch-collection` |
+| The data directory itself, on `codectx reset` | In place | An operator asked; reset opens no store, so no to-free set serves the directory and each entry is freed where it lies while the command waits | `workspace-reset` |
 
 The list is enforced, not narrated: a test walks the source tree and fails on
 any call outside the pacing package that gives a file's blocks back and is

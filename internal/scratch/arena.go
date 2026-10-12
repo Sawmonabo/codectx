@@ -1,5 +1,5 @@
 // Package scratch is the pool of working files a store writes for its own
-// later reading: sort runs, staging databases, content-store temporaries,
+// later reading: sort runs, import spools, content-store temporaries,
 // materialized trees, cursor and traversal state.
 //
 // Freeing disk space is the expensive act. On a filesystem that discards
@@ -31,7 +31,7 @@
 // processes can run at once. SortRun and PathSearch are both taken on the
 // query path, where any number of readers may serve pages from one data
 // directory at the same time, and SortRun is taken on the index path too,
-// where the workspace's single writer takes it. ContentTemp and LexicalStage
+// where the workspace's single writer takes it. ContentTemp and ImportSpool
 // are the index path's alone, which one writer holds at a time. Two processes
 // sharing a pool would each take slot zero and each read the other's bytes as
 // its own, so the claim below applies to every purpose rather than to the two
@@ -61,7 +61,7 @@ import (
 
 // A Purpose names a family of interchangeable scratch surfaces. Files of one
 // purpose are pooled together, so a purpose groups tenants whose sizes and
-// lifetimes are alike: every sort run is one purpose, every staging database
+// lifetimes are alike: every sort run is one purpose, every import spool
 // another. The name becomes a directory under the arena's instance, so it is
 // a plain lowercase identifier.
 type Purpose string
@@ -72,8 +72,6 @@ type Purpose string
 const (
 	// SortRun is one run file of an external sort, and its merged output.
 	SortRun Purpose = "sort-run"
-	// LexicalStage is a lexical seal's staging database, one per seal slot.
-	LexicalStage Purpose = "lexical-stage"
 	// ImportSpool is one index import's native-symbol map and occurrence
 	// spool, in a database.
 	ImportSpool Purpose = "import-spool"

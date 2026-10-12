@@ -50,6 +50,11 @@ const (
 // CASDir is the content-addressed store location under a data directory.
 func CASDir(dataDir string) string { return filepath.Join(dataDir, casDirName) }
 
+// LockPath is the workspace lock file under a data directory. It lives inside
+// the directory it guards, so whatever removes that directory's contents under
+// the lock must leave this one file in place (see WorkspaceLock).
+func LockPath(dataDir string) string { return filepath.Join(dataDir, lockFileName) }
+
 // StagingDir holds per-capture staging databases.
 func StagingDir(dataDir string) string { return filepath.Join(dataDir, stagingDirName) }
 

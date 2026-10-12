@@ -90,8 +90,10 @@ as itself rather than arriving as a complete answer with per-hit footnotes. Run
 
 **Where everything is.** A `callers`, `callees` or `path` answer carries a
 `locations` entry for every node it lists — the file, its path in the pinned
-snapshot and the node's byte range — and an `occurrences` entry for every call
-site behind every `calls` relation it lists, each with its file, byte range,
+snapshot, the node's byte range and, for a declaration, its name token's byte
+range (`name_bytes`, absent for a node with no name token of its own) — and an
+`occurrences` entry for every call site behind every `calls` relation it lists,
+each with its file, byte range,
 `dispatch` (`virtual` when the call can run an override of its target, `exact`
 when it cannot) and, for a site bound to several targets, its `set_size`. One
 answer is enough to open a call hierarchy: no follow-up `symbol` or `refs` call
@@ -443,13 +445,18 @@ A ranked search answers with its best results, a page at a time
 qualified-name prefix, exact name — come first, in that order, and are not
 ranked: each returns every match, ordered by the content key (path, start
 byte, end byte, kind, name, qualified name, signature, node id), with score 0.
+A node is served once, at the earliest exact tier that matches one of its
+declarations inside the request's filters, even when the units that declare it
+disagree about its names or its file.
 
-**Then the lexical tier.** The index returns the best results to a depth of
-the results already served plus the page's limit plus one, so it knows whether
-another page exists. Documents of one node fold into one result, scored by its
-best document. A result an exact tier already served for the same query is
-dropped, and so is one outside the language filter; while that leaves the page
-short and more results exist, the depth doubles and the index is asked again.
+**Then the lexical tier.** The index returns the page's limit plus one of the
+results ranked after the last one served, so it knows whether another page
+exists; a page reads what follows the previous page, never the results before
+it again. Documents of one node fold into one result, scored by its best
+document. A result an exact tier already served for the same query is dropped,
+and so is one outside the language filter; while that leaves the page short and
+more results exist, the index is asked for twice as many results after the last
+one it returned.
 
 Block-max WAND, over blocks of 128 documents with BM25F upper bounds per block
 of the union postings, skips every block that cannot enter the top k; it
@@ -470,13 +477,13 @@ signature), and last the identity keys. Every key is an integer or an exact
 string, and the order is a pure function of the repository's content — the same
 tree indexed at another root, or re-indexed as a delta, answers in the same
 order. A cursor carries the last served position by content, not by document
-address — the tier and content key of the last exact result, or the number of
-lexical results served — so it survives the index's background merges between
-pages.
+address — the tier and node of the last exact result, or the score and stored
+document id of the last lexical result — so it survives the index's background
+merges between pages.
 
-A cursor pins the generation, the analysis key and the query with its filters
-and minimum score. Resubmitting a continuation with a different query, filter
-set or minimum score, or against a re-analysed generation, is
+A cursor pins the generation, the analysis key and the query with its filters.
+Resubmitting a continuation with a different query or filter set, or against a
+re-analysed generation, is
 `CTX_CURSOR_INVALID` rather than a quietly different answer under a continued
 page number. The generation a cursor pins is retained by the cursor's lease for
 `storage.query_cursor_ttl`, which each page renews where the process holds the

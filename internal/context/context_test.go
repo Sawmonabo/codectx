@@ -178,7 +178,7 @@ func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFix
 	t.Helper()
 	ctx := stdcontext.Background()
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
-	s, err := store.Open(ctx, dbPath, store.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+	s, err := store.Open(ctx, dbPath, store.Options{ReadConnections: config.ReadConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1573,7 +1573,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				if err := fx.Store.Close(); err != nil {
 					t.Fatalf("Close: %v", err)
 				}
-				reopened, err := store.Open(fx.ctx, fx.DBPath, store.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+				reopened, err := store.Open(fx.ctx, fx.DBPath, store.Options{ReadConnections: config.ReadConnections(config.Defaults())})
 				if err != nil {
 					t.Fatalf("reopen: %v", err)
 				}

@@ -237,11 +237,11 @@ func (c *Compiler) filePaths(ctx context.Context, reader *sqlite.PinnedReader, i
 }
 
 // closeKeptFiles is the closure walk (ADR-0016 decision 5), run once after the
-// round's last walk group:
+// round's walk:
 //
-//  1. U is the kept files' nodes that are neither a walked group's root nor a
-//     main walk's entry. A lexical root whose group was not walked (its derived
-//     depth is zero) is in U: nothing explored its neighbourhood.
+//  1. U is the kept files' nodes that are neither a walked root nor a main
+//     walk's entry. A lexical root that was not walked (its derived depth is
+//     zero) is in U: nothing explored its neighbourhood.
 //  2. One walk from U over the scope relations, both ways, under the user's
 //     bounds, gives U's components C.
 //  3. The task text is searched inside C's files; the hits whose node is in C
@@ -276,11 +276,9 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 		return nil
 	}
 	s := in.sorts
-	for _, g := range in.walks {
-		for _, n := range g.Start {
-			if err := cl.reached.Add(idRec{ID: string(n)}); err != nil {
-				return err
-			}
+	for _, r := range in.roots {
+		if err := cl.reached.Add(idRec{ID: string(r.Node)}); err != nil {
+			return err
 		}
 	}
 	reached, err := sortedRun(s, cl.reached)
@@ -358,14 +356,14 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 		return nil
 	}
 
-	group := walkGroup{Weight: cl.stop.NextContribution}
+	weight := cl.stop.NextContribution
 	return c.closureWalk(ctx, in, eng, gen, roots, func(entries []model.ImpactEntry) error {
 		admitted := make([]model.ImpactEntry, 0, len(entries))
 		for _, e := range entries {
 			if e.FileID == "" || !cl.kept[e.FileID] {
 				continue
 			}
-			if err := in.admitEntry(e, group); err != nil {
+			if err := in.admitEntry(e, weight, false); err != nil {
 				return err
 			}
 			admitted = append(admitted, e)
@@ -512,7 +510,7 @@ func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.E
 	start []string, each func([]model.ImpactEntry) error,
 ) error {
 	cfg := in.cfg
-	depth, _ := walkDepth(0, cfg.MaxGraphDepth)
+	depth := cfg.MaxGraphDepth.Int()
 	for lo := 0; lo < len(start); lo += model.MaxStartNodes {
 		hi := min(lo+model.MaxStartNodes, len(start))
 		roots := make([]model.NodeID, 0, hi-lo)

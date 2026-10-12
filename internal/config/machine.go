@@ -46,15 +46,13 @@ const UnobservedIdleFootprintBytes int64 = 32 * (1 << 20)
 // BaseFootprint is what this process holds for itself on this machine under
 // configuration c: its idle resident set above, plus the reservations it
 // makes up front -- one query slot's memory per core, the cache reservation
-// (resources.cache_bytes), the indexing queue, and every page cache it opens: the store writer
-// connection's (storage.writer_cache_kib), every reader connection's
-// (storage.reader_cache_kib) in both reader pools of every store handle
-// (ReadConnections for the writer's handle, QueryReadConnections for the
-// query-only one, PostingConnections for each of storeHandles), one lexical
-// staging database's per unit a generation
-// builds at once (LexicalStageCacheKiB, BuildWorkers), each store handle's
-// query tokenizer (TokenizerCacheKiB) and the run ledger's
-// (ledger.FootprintBytes).
+// (resources.cache_bytes), the indexing queue, and every page cache it opens:
+// the store writer connection's (storage.writer_cache_kib), every reader
+// connection's (storage.reader_cache_kib) in the short-read pool of every
+// store handle (ReadConnections for the writer's handle, QueryReadConnections
+// for the query-only one) and the run ledger's (ledger.FootprintBytes). The
+// search index's writer is not here: its memory is admitted through the
+// admission ledger when the writer opens and given back when it closes.
 //
 // It is derived from the machine and the configuration rather than compared
 // against a figure. How many queries run at once comes from the cores, so a
@@ -73,12 +71,6 @@ func BaseFootprint(c Config) int64 {
 	return total
 }
 
-// storeHandles is how many store handles this process can hold open at once:
-// the writer's, and in the serving composition a second, query-only handle
-// beside it. Counting the serving case for every composition over-states the
-// others by one handle's pools, which only leaves their children less.
-const storeHandles = 2
-
 // ReadConnections is how many connections a store handle's short-read pool
 // holds: storage.read_connections when it is set, and otherwise one for each
 // goroutine that can read the pool at once. Those are the units a generation
@@ -94,13 +86,6 @@ func ReadConnections(c Config) int {
 	return BuildWorkers(c) + QuerySlots()
 }
 
-// PostingConnections is how many connections a store handle's posting-stream
-// pool holds: storage.read_connections when it is set, and otherwise one per
-// tool call that runs at once (QuerySlots). Only a query's candidate walk
-// holds a posting session, and it holds one for the whole walk, so no unit
-// build ever reads this pool.
-func PostingConnections(c Config) int { return perQuery(c) }
-
 // QueryReadConnections is how many connections the short-read pool of the
 // serving composition's query-only handle holds: storage.read_connections
 // when it is set, and otherwise one per tool call that runs at once
@@ -115,24 +100,6 @@ func perQuery(c Config) int {
 	}
 	return QuerySlots()
 }
-
-// LexicalStageCacheKiB is the page cache of one building unit's lexical
-// staging database, which the store opens per unit that publishes search
-// rows. It is the buffer the engine sorts the seal-time read in, so a unit
-// whose vocabulary fits it is ordered without a spill file, and it is an
-// internal layout figure, not a user limit: no count of terms or documents is
-// refused because of it, and a larger unit spills under <data_dir>/tmp. It is
-// stated here, beside the footprint that counts it, because the store reads
-// its configuration from this package.
-const LexicalStageCacheKiB = 16 << 10
-
-// TokenizerCacheKiB is the page cache of a store handle's query tokenizer: one
-// in-memory connection that holds a single query text, at most
-// model.MaxQueryTextBytes, for the length of one call and nothing between
-// calls. An in-memory database cannot spill, so the figure bounds the pages it
-// keeps after a call rather than what one call may use; it is stated for the
-// same reason LexicalStageCacheKiB is.
-const TokenizerCacheKiB = 2 << 10
 
 // BuildWorkers is how many units one generation builds at once:
 // index.workers when it is set, and otherwise one per core this process may
@@ -159,13 +126,8 @@ func baseFootprintFor(c Config) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	postingConnections, err := mulNoOverflow("store handles * posting-stream connections",
-		storeHandles, int64(PostingConnections(c)))
-	if err != nil {
-		return 0, err
-	}
-	readerConnections, err := addNoOverflow("short-read + query short-read + posting-stream connections",
-		int64(ReadConnections(c)), int64(QueryReadConnections(c)), postingConnections)
+	readerConnections, err := addNoOverflow("short-read + query short-read connections",
+		int64(ReadConnections(c)), int64(QueryReadConnections(c)))
 	if err != nil {
 		return 0, err
 	}
@@ -179,14 +141,9 @@ func baseFootprintFor(c Config) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	stageCaches, err := mulNoOverflow("index.workers (or cores) * lexical staging cache",
-		int64(BuildWorkers(c)), LexicalStageCacheKiB<<10)
-	if err != nil {
-		return 0, err
-	}
 	return addNoOverflow("base footprint of this process",
 		idleFootprintBytes(), concurrent, c.Resources.CacheBytes, c.Index.QueueBytes, writerCache, readerCaches,
-		stageCaches, storeHandles*TokenizerCacheKiB<<10, ledger.FootprintBytes)
+		ledger.FootprintBytes)
 }
 
 // How much CPU-bound work runs at once is a property of the machine, not a

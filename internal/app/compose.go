@@ -200,6 +200,9 @@ type ledgerAllocation struct {
 	baseFootprintBytes int64
 	runners            []*process.Runner
 	workers            atomic.Int64
+	// observe reads the kernel's figure: admission.ObserveMachine, set at
+	// composition.
+	observe func() admission.Machine
 }
 
 // parserResidency is the parser provider's Rederive step: it records the
@@ -209,7 +212,7 @@ func (a *ledgerAllocation) parserResidency(workerResidentBytes int64) {
 }
 
 func (a *ledgerAllocation) rederive() {
-	m := admission.ObserveMachine()
+	m := a.observe()
 	if !m.Observed {
 		return
 	}
@@ -659,14 +662,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
-		BusyTimeout:        cfg.Storage.BusyTimeout.Std(),
-		ReadConnections:    config.ReadConnections(cfg),
-		PostingConnections: config.PostingConnections(cfg),
-		WriterCacheKiB:     cfg.Storage.WriterCacheKiB,
-		ReaderCacheKiB:     cfg.Storage.ReaderCacheKiB,
-		BatchRecords:       cfg.Index.BatchRecords,
-		BatchBytes:         cfg.Index.BatchBytes,
-		MaxJSONBytes:       cfg.Context.MaxManifestBytes.Value(),
+		BusyTimeout:     cfg.Storage.BusyTimeout.Std(),
+		ReadConnections: config.ReadConnections(cfg),
+		WriterCacheKiB:  cfg.Storage.WriterCacheKiB,
+		ReaderCacheKiB:  cfg.Storage.ReaderCacheKiB,
+		BatchRecords:    cfg.Index.BatchRecords,
+		BatchBytes:      cfg.Index.BatchBytes,
+		MaxJSONBytes:    cfg.Context.MaxManifestBytes.Value(),
 		// Seal clips to the same number the providers emitted under, so the
 		// retained set does not depend on whether a unit was assembled fresh
 		// or merged from carried occurrences.
@@ -693,14 +695,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// A LazyWriter open still creates the schema of an empty cache for
 		// exactly that reason, and writes nothing on any other.
 		if s.queryStore, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
-			BusyTimeout:        cfg.Storage.BusyTimeout.Std(),
-			ReadConnections:    config.QueryReadConnections(cfg),
-			PostingConnections: config.PostingConnections(cfg),
-			ReaderCacheKiB:     cfg.Storage.ReaderCacheKiB,
-			MaxJSONBytes:       cfg.Context.MaxManifestBytes.Value(),
-			Synchronous:        cfg.Storage.Synchronous,
-			ReadOnly:           true,
-			TextIndex:          s.textIndexOptions(),
+			BusyTimeout:     cfg.Storage.BusyTimeout.Std(),
+			ReadConnections: config.QueryReadConnections(cfg),
+			ReaderCacheKiB:  cfg.Storage.ReaderCacheKiB,
+			MaxJSONBytes:    cfg.Context.MaxManifestBytes.Value(),
+			Synchronous:     cfg.Storage.Synchronous,
+			ReadOnly:        true,
+			TextIndex:       s.textIndexOptions(),
 		}); err != nil {
 			return nil, err
 		}
@@ -842,7 +843,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// so the first admission on the ledger already counts every ledger
 	// child's residency (ledgerAllocation).
 	derived := &ledgerAllocation{l: s.admission, baseFootprintBytes: baseFootprint,
-		runners: []*process.Runner{shared, parsers, servers}}
+		runners: []*process.Runner{shared, parsers, servers}, observe: admission.ObserveMachine}
 	s.admission.RederiveBeforeEachAdmission(derived.rederive)
 
 	if root.HasGit {
@@ -1495,7 +1496,7 @@ func foreignHolder(err error, holder snapshot.WaitingHolder) error {
 	out := &model.Error{Code: model.CodeSchemaMismatch,
 		Message: who + " holds the workspace indexing lock and its run ledger was written by another schema: " + typed.Message,
 		Remediation: "the two processes are different builds of this product: let the holder finish, or stop it. " +
-			"Then delete the run ledger beside the index cache, or rebuild the cache with `codectx index --rebuild`"}
+			"Then delete the run ledger beside the index cache, or run `codectx reset --reindex`"}
 	if holder.PID > 0 {
 		out.WithDetail(snapshot.DetailHolderPID, strconv.Itoa(holder.PID)).
 			WithDetail(snapshot.DetailHolderOperation, holder.Operation)

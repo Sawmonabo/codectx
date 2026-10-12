@@ -62,7 +62,7 @@ func newFixture(t *testing.T) *fixture {
 	dbPath := filepath.Join(dataDir, "codectx.db")
 	cfg := config.Defaults()
 	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{
-		ReadConnections: config.ReadConnections(cfg), PostingConnections: config.PostingConnections(cfg)})
+		ReadConnections: config.ReadConnections(cfg)})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -283,17 +283,19 @@ func (f *fixture) raw() *sql.DB {
 
 // factColumns are the identifying columns of each fact table with every
 // unit-scoped column excluded: the row's own unit id, the rowid search_units
-// mints on insert, and the evidence id, which folds the unit id by
+// mints on insert, its search document id (minted per indexed document, so a
+// full import and a refresh name the same text by different ids), and the
+// evidence id, which folds the unit id by
 // construction and so can never match across two units describing the same
 // occurrence. The surrogates are compared as stored — both sides are units of
 // the same database, where one surrogate is one canonical identity, so this is
 // also what proves the refreshed unit references the dictionary rows the full
 // import did.
 var factColumns = []struct{ table, cols string }{
-	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
+	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), coalesce(name_start_byte,-1), coalesce(name_end_byte,-1), metadata_json"},
 	{"relation_facts", "relation_id"},
 	{"native_aliases", "scope_key_id, native_key_id, node_id"},
-	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, token_count"},
+	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), start_byte, end_byte"},
 	{"evidence", "coalesce(node_id, 0), coalesce(relation_id, 0), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key_id, detail, content_hash_bound"},
 }
 

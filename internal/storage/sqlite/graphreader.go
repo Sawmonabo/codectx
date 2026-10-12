@@ -641,10 +641,9 @@ func (g *graphReader) Capabilities(ctx context.Context) ([]model.CapabilityState
 var _ graph.SourceLocator = (*graphReader)(nil)
 
 // NodeLocations reads where each node is: the stored byte interval of its
-// preferred visible fact, its file and that file's path in the pinned
-// snapshot. A node with no stored range, or one the generation does not
-// publish, is omitted. No name-token range is stored for a node, so none is
-// returned.
+// preferred visible fact, the interval of that fact's name token when it
+// stores one, its file and that file's path in the pinned snapshot. A node
+// with no stored range, or one the generation does not publish, is omitted.
 func (g *graphReader) NodeLocations(ctx context.Context, ids []model.NodeID) ([]model.NodeLocation, error) {
 	var out []model.NodeLocation
 	for start := 0; start < len(ids); start += model.MaxPageItems {
@@ -677,7 +676,7 @@ func (g *graphReader) NodeLocations(ctx context.Context, ids []model.NodeID) ([]
 				continue
 			}
 			out = append(out, model.NodeLocation{NodeID: s.Node.ID, FileID: s.Node.FileID,
-				Path: paths[s.Node.FileID], Bytes: *s.Bytes})
+				Path: paths[s.Node.FileID], Bytes: *s.Bytes, NameBytes: s.NameBytes})
 		}
 	}
 	return out, nil

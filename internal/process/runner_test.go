@@ -457,8 +457,8 @@ func TestLiveSubprocessCountUnwindsOnFailure(t *testing.T) {
 // the allocation past what the host has: the freeze the ledger prevents.
 func TestReservedResidencyCountsOnlyRunningLedgerChildren(t *testing.T) {
 	requireExecutable(t, "/bin/sh")
-	if !treeSampled {
-		t.Skip("this platform samples no running tree, so there is no residency to add back")
+	if !treeAnonSampled {
+		t.Skip("this platform reads no running tree's anonymous residency, so there is none to add back")
 	}
 	runner, dir := testRunner(t)
 	spec := func(reservation int64) Spec {

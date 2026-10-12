@@ -261,13 +261,29 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
 
 - **Top-k collection.** A request asks for a depth of folded results, and the library returns the best `depth` by
   (quantized score, content tie key) and whether a further result exists, with a heap of exactly depth + 1 entries.
-  A page after `served` results asks for depth served + limit + 1, so page n of 200 holds the results ranked
-  200·(n − 1) + 1 to 200·n, whatever the match count.
+  A request may also name a resume position, a result already served: the library then returns the best `depth`
+  results ranked strictly after it. A page asks for limit + 1 results after the last result the previous page
+  served, so page n of 200 holds the results ranked 200·(n − 1) + 1 to 200·n, and its heap, the strings it
+  resolves and the buffer it returns are one page's whatever n is.
+- **Resume position.** A position is the served result's quantized score and the doc id of the document it is; the
+  library finds that document among the view's alive documents and reads the rest of the result's content key from
+  it, so a position is two integers whatever the result's strings. A result is after the position when its best
+  document sorts after the position's document under the content comparator. A document at or before the position
+  is no candidate and marks its fold group as served, whatever the group's other documents score: the group's
+  result was served at or before the position. Every block that can hold such a document is scored (its bound is
+  at least the position's score, so the skip rule below never skips it), so every served group is marked. A
+  segment's heap ends holding its best candidate groups, and a segment that turned a group away or skipped a block
+  answers exactly up to its heap's worst entry; the union of the segments is exact up to the least of those entries,
+  the groups another segment marked are removed, and when fewer than depth + 1 results remain above that entry
+  (marked groups held heap places) the segments are scored again with twice the heap. The page equals the deep
+  read's results after the position. The prefix of the ranking is still scored on every page, to mark the groups
+  it served; what a page no longer pays for its depth is the heap, the string resolution, the buffer and the
+  service's filtering of every result before it.
 - **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
   skips every document that cannot enter the top k. A block is skipped only when its bound, widened by a relative and
   an absolute margin of 10⁻⁹ against rounding, is strictly below the heap's (depth + 1)-th score. A phrase term takes
-  its bound from the block's exact phrase frequencies, never from the stored summary. A minimum score floors the
-  results and skips every block whose bound is below it. It changes the work, never the results: the top k equal exhaustive scoring's top k. The
+  its bound from the block's exact phrase frequencies, never from the stored summary. It changes the work, never
+  the results: the top k equal exhaustive scoring's top k. The
   library's own pruning returned pages equal to exhaustive scoring, with 0 misses, on 2- and 11-segment indexes, at
   about 0.5 ms a page whatever the page number. Our formula's pruned collector returned pages 1 to 3 identical to
   exhaustive scoring on 2 436 of 2 436 query-page pairs on a fixture, at 1 and 4 search threads, and on kubernetes
@@ -285,12 +301,14 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
 - **Ties.** The content comparator is score descending, then path, start byte, end byte, kind, name, qualified name,
   signature, node id and search key. Ties at the k-th entry are settled by it inside the heap of depth + 1 entries,
   never collected in a list.
-- **Paging.** A cursor carries its position by content, as a keyset: in the exact phase, the tier and content key of
-  the last exact result served; in the lexical phase, the number of lexical results served. The query hash it is
-  bound to covers the query, its filters, the minimum score and the length form, so a cursor made under one minimum
-  score never resumes under another. Filters the library does not apply (the language filter, and the drop of a
-  lexical result already served by an exact tier) run after the page returns; while the filtered page is short and
-  more results exist, the depth doubles and the page is asked again. Nothing is held between pages.
+- **Paging.** A cursor carries its position as a keyset: in the exact phase, the tier and node of the last exact
+  result served, whose content key the next page reads back from that tier; in the lexical phase, the resume
+  position of the last lexical result served (its score and doc id), or the start of the lexical phase. The query
+  hash it is bound to covers the query, its filters and the length form, so a cursor made under one never resumes
+  under another. Filters the library does not apply (the language filter, and the drop of a lexical result whose
+  node an exact tier served) run after the page returns; while the filtered page is short and more results exist,
+  the next request resumes after the last result the previous one returned and asks for twice its depth. No request
+  reads a result an earlier one returned, and nothing is held between pages.
 - **No spool.** The ranked set is never sorted to disk. ADR-0001 §2.4 is amended to this rule.
 - **Block summaries.** Each segment has one summary file, `<segment id>.cxsum`, in the index directory. For every token
   of the five columns it holds the token's df over the segment's documents and, per block holding the token, the
@@ -307,8 +325,14 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   the deadline as its reason and with no continuation. A caller's cancel is an error.
 
 The exact tiers (path and symbol lookup) come first and are not ranked: each returns every match, ordered by the
-content key (path, start byte, end byte, kind, name, qualified name, signature, node id), with score 0. A lexical
-result whose node an exact tier served for the same query is dropped from the lexical sequence.
+content key (path, start byte, end byte, kind, name, qualified name, signature, node id), with score 0. A node is
+served once, at its tier: the earliest exact tier that serves it, that is, whose row for the node passes the
+request's kind, path and language filters (a row declared in the file the query names, a qualified name equal to
+the query, a qualified name the query prefixes, a name equal to the query; for the symbol tiers, the row the tier
+lists for the node is the precedence winner among the node's rows matching it). A later tier's walk asks the earlier
+tiers for the node itself. The rule is a function of the generation and
+the query, so it holds across pages with nothing carried between them. A lexical result whose node an exact tier
+served for the same query is dropped from the lexical sequence, by the same rule over every visible row of the node.
 
 **Alternatives.** *Score every match and keep a heap after a cursor, so every page down to the last match is
 reachable.* It costs a full scoring of every match for every page (4.04 s for the 30 queries, against milliseconds

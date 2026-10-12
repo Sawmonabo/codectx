@@ -39,8 +39,8 @@ import (
 // so its process ID is the group ID, and a descendant that re-parents away
 // from it stays in the group; membership by group is also exactly what the
 // runner terminates.
-func treeSweeper(pgid int) func() treeSweep {
-	return func() treeSweep { return sweepGroup(pgid) }
+func treeSweeper(pgid treeTarget) func() treeSweep {
+	return func() treeSweep { return sweepGroup(int(pgid)) }
 }
 
 // sweepGroup sums the anonymous resident memory of every live process in the

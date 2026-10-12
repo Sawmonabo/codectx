@@ -121,7 +121,7 @@ func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 		return nil, false, &model.Error{Code: model.CodeSchemaMismatch,
 			Message:     "run ledger schema fingerprint " + fingerprint + " does not match this binary's " + Fingerprint,
 			Details:     map[string]string{"path": path},
-			Remediation: "delete the run ledger beside the index cache, or rebuild the cache with `codectx index --rebuild`"}
+			Remediation: "delete the run ledger beside the index cache, or run `codectx reset --reindex`"}
 	}
 	return &Reader{db: db}, true, nil
 }

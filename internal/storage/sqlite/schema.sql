@@ -173,6 +173,23 @@ CREATE TABLE generation_capabilities (
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
+-- unit_capabilities is what one sealed unit reported about its own scope: the
+-- capability rows of its provider result, written in the transaction that
+-- seals it. A generation that reuses the unit folds these into its report
+-- exactly as it folds the rows of a unit it builds, so a reused unit's counts
+-- and degradations are never missing from a generation it is a member of.
+-- One row per capability the unit reported; the key refuses a second.
+CREATE TABLE unit_capabilities (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    diagnostic_code TEXT NOT NULL DEFAULT '',
+    remediation TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(unit_id, provider_id, capability, scope_key)
+) WITHOUT ROWID;
 -- node_ids is the node identity dictionary (Section 12.2).
 -- id is a storage-internal surrogate: an INTEGER PRIMARY KEY is the b-tree key
 -- itself, so it costs zero payload bytes in the table and 1-4 varint bytes
@@ -197,12 +214,19 @@ CREATE TABLE node_facts (
     file_id BLOB,
     start_byte INTEGER,
     end_byte INTEGER,
+    -- The declaration's name token, inside [start_byte, end_byte); NULL for a
+    -- node with no name token of its own.
+    name_start_byte INTEGER,
+    name_end_byte INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
-           AND start_byte >= 0 AND end_byte >= start_byte))
+           AND start_byte >= 0 AND end_byte >= start_byte)),
+    CHECK((name_start_byte IS NULL AND name_end_byte IS NULL)
+       OR (start_byte IS NOT NULL AND name_start_byte IS NOT NULL AND name_end_byte IS NOT NULL
+           AND name_start_byte >= start_byte AND name_end_byte >= name_start_byte AND name_end_byte <= end_byte))
 ) WITHOUT ROWID;
 -- relation_ids mirrors node_ids: an INTEGER surrogate, the canonical 32-byte
 -- RelationID stored once in `canonical`, and the endpoints carried as node

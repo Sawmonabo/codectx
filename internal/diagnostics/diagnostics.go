@@ -39,8 +39,10 @@ type Sampler interface {
 type StoreReader interface {
 	// Check runs the Section 12.1 integrity checks. With deep false it reads
 	// the database header, the schema fingerprint and the journal mode and
-	// nothing else; deep adds quick_check, the foreign key check and the FTS5
-	// external-content check, each of which walks the whole database. An
+	// nothing else; deep adds quick_check and the foreign key check, each of
+	// which walks the whole database, the check that no search document names
+	// a doc id the sequence never allocated, and the check that the search
+	// index's last commit holds the active generation. An
 	// ordinary doctor call must pass false: Section 22's last line forbids a
 	// full database scan on an ordinary command.
 	Check(ctx context.Context, deep bool) error

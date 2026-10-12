@@ -309,19 +309,21 @@ func (a *searchAnswer) add(hit model.SearchHit, span *model.ByteRange) {
 // keeps the limit+1 least exact hits after the position, so a page that fills
 // from the exact tiers alone knows whether any exact hit follows it. When it
 // leaves room, the lexical phase fills the rest from the start of the lexical
-// sequence (or from the cursor's count), and is asked for one result beyond the
-// page so the continuation is minted exactly when more exist.
+// sequence (or after the cursor's lexical key), and is asked for one result
+// beyond the page so the continuation is minted exactly when more exist. The
+// continuation's key is the last SERVED result's, so the result past the page
+// is read again, and filtered again, by the next page.
 func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
 	filter hitFilter, pos searchPosition, limit int) (searchAnswer, error) {
 	var ans searchAnswer
-	_, pathFile, err := queryFile(ctx, reader, req.Query)
+	normalized, pathFile, err := queryFile(ctx, reader, req.Query)
 	if err != nil {
 		return ended(ctx, ans, err)
 	}
-	served := 0
 	room := limit
+	var after *textindex.Position
 	if pos.phase == phaseLexical {
-		served = pos.served
+		after = pos.after
 	} else {
 		held, err := s.exactPhase(ctx, reader, req, filter, pos, limit)
 		for i, e := range held {
@@ -340,14 +342,13 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 		}
 		room = limit - len(held)
 	}
-	fold := exactFold{reader: reader, query: req.Query, kinds: req.Kinds, pathFile: pathFile, filter: filter}
-	page, kept, err := s.lexicalPhase(ctx, reader, req, filter, fold, served+room)
+	fold := newExactFold(reader, req, normalized, pathFile, filter)
+	page, kept, err := s.lexicalPhase(ctx, reader, req, filter, fold, after, room)
 	ans.lexical = page
 	if err != nil {
 		return ended(ctx, ans, err)
 	}
-	for i := served; i < len(kept) && i < served+room; i++ {
-		h := kept[i]
+	for _, h := range kept[:min(len(kept), room)] {
 		bytes := h.Bytes
 		ans.add(model.SearchHit{NodeID: h.NodeID, FileID: h.FileID, Path: h.Path, Kind: h.Kind, Name: h.Name,
 			QualifiedName: h.QualifiedName, Signature: h.Signature, Tier: model.TierLexical,
@@ -364,8 +365,15 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 		// with no continuation.
 		return ended(ctx, ans, model.Canceled(ctx.Err()))
 	}
-	if len(kept) > served+room {
-		ans.next = &searchPosition{phase: phaseLexical, served: served + room}
+	if len(kept) > room {
+		next := searchPosition{phase: phaseLexical}
+		if room > 0 {
+			at := kept[room-1].At()
+			next.after = &at
+		} else {
+			next.after = after
+		}
+		ans.next = &next
 	}
 	return ans, nil
 }
@@ -473,21 +481,14 @@ func spanEnd(s *model.ByteRange) int64 {
 
 // exactHeap keeps the least `bound` exact hits it is offered under cmpExact. The
 // root is the entry that sorts last, which an overflowing offer evicts, so its
-// memory is the bound and never the tier's match count.
-//
-// It also holds a node once. exactCandidates can emit one node at two tiers
-// (its doc names the case); tiers are walked in rank order, so the first offer
-// of a node is its better one, and a repeat is dropped while the first is held.
-// Once the first is evicted the repeat, which sorts after it, is evicted too.
+// memory is the bound and never the tier's match count. exactCandidates emits a
+// node once, at its tier, so the heap holds no set of node ids.
 type exactHeap struct {
 	items []exactEntry
 	bound int
-	held  map[model.NodeID]struct{}
 }
 
-func newExactHeap(bound int) *exactHeap {
-	return &exactHeap{bound: bound, held: make(map[model.NodeID]struct{}, bound)}
-}
+func newExactHeap(bound int) *exactHeap { return &exactHeap{bound: bound} }
 
 func (h *exactHeap) Len() int           { return len(h.items) }
 func (h *exactHeap) Less(i, j int) bool { return cmpExact(h.items[i], h.items[j]) > 0 }
@@ -502,15 +503,9 @@ func (h *exactHeap) Pop() any {
 
 // offer admits one entry, evicting the worst once more than bound are held.
 func (h *exactHeap) offer(e exactEntry) {
-	id := e.Node.Node.ID
-	if _, ok := h.held[id]; ok {
-		return
-	}
-	h.held[id] = struct{}{}
 	heap.Push(h, e)
 	if len(h.items) > h.bound {
-		evicted := heap.Pop(h).(exactEntry)
-		delete(h.held, evicted.Node.Node.ID)
+		heap.Pop(h)
 	}
 }
 
@@ -542,7 +537,7 @@ func (s *Service) exactPhase(ctx context.Context, reader exactReader, req model.
 		after = &key
 	}
 	h := newExactHeap(limit + 1)
-	err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems, span, func(e exactHit) error {
+	err := exactCandidates(ctx, reader, req.Query, req.Kinds, filter, model.MaxPageItems, span, func(e exactHit) error {
 		if !servableExact(e, filter) {
 			return nil
 		}
@@ -567,7 +562,7 @@ var errPositionFound = errors.New("search: the continuation's position was found
 func positionKey(ctx context.Context, reader exactReader, req model.SearchRequest, filter hitFilter,
 	pos searchPosition) (exactEntry, error) {
 	var found exactEntry
-	err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems,
+	err := exactCandidates(ctx, reader, req.Query, req.Kinds, filter, model.MaxPageItems,
 		tierSpan{from: pos.rank, to: pos.rank}, func(e exactHit) error {
 			if e.Node.Node.ID != pos.node || !servableExact(e, filter) {
 				return nil
@@ -584,61 +579,60 @@ func positionKey(ctx context.Context, reader exactReader, req model.SearchReques
 	return exactEntry{}, cursorInvalid("the search cursor names a position that is not in its answer")
 }
 
-// lexicalPhase reads the lexical results through the generation's index view
-// until it holds more than `through` of them after the service's own filters,
-// or the index has no more. It answers the last index page (nil when none was
-// read) and the kept results from the start of the lexical sequence.
+// lexicalPhase reads the lexical results after `after` (nil: from the first)
+// through the generation's index view until it holds more than `room` of them
+// after the service's own filters, or the index has no more. It answers the
+// last index page (nil when none was read) and the kept results, in order.
 //
-// The index applies the kinds, the path prefixes and the minimum score itself;
-// the languages (through the snapshot's tagger) and the exact fold
-// (exactFold) are applied here, so the index can return fewer usable results
-// than it was asked for. The depth then doubles while the kept list is short
-// and the index says more exist. The index's ranking is a total order, so a
-// deeper page begins with the shallower one and only its new results are
-// filtered.
+// The index applies the kinds and the path prefixes itself; the languages
+// (through the snapshot's tagger) and the exact fold (exactFold) are applied
+// here, so the index can return fewer usable results than it was asked for.
+// The first request asks for room+1 results; while the kept list is short and
+// the index says more exist, the next request resumes after the last result
+// the previous one returned and asks for twice as many. No request re-reads a
+// result an earlier one returned, so a page costs the results it reads, never
+// the results served before it.
 func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
-	filter hitFilter, fold exactFold, through int) (*textindex.Page, []textindex.Hit, error) {
+	filter hitFilter, fold exactFold, after *textindex.Position, room int) (*textindex.Page, []textindex.Hit, error) {
 	var read *textindex.Page
 	view, err := reader.SearchView(ctx)
 	if err != nil {
 		return read, nil, err
 	}
 	defer view.Close()
-	depth := through + 1
+	want := room + 1
+	depth := want
 	var kept []textindex.Hit
-	scanned := 0
 	for {
-		page, err := view.Search(ctx, textindex.Request{Query: req.Query, Kinds: req.Kinds,
-			PathPrefixes: filter.prefixes, Depth: depth, MinScoreMicros: req.MinScoreMicros,
-			LengthRule: s.rule, MaxTerms: s.maxTerms.Value()})
+		r := textindex.Request{Query: req.Query, Kinds: req.Kinds, PathPrefixes: filter.prefixes, Depth: depth,
+			After: after, LengthRule: s.rule, MaxTerms: s.maxTerms.Value()}
+		if observeIndexRequest != nil {
+			observeIndexRequest(r)
+		}
+		page, err := view.Search(ctx, r)
 		if err != nil {
 			return read, nil, s.lexicalErr(err)
 		}
 		read = &page
-		if page.Canceled {
-			// A canceled page is the best found so far, not a prefix of the
-			// ranking, so it is filtered from its start.
-			kept, scanned = nil, 0
+		served, err := fold.served(ctx, page.Hits)
+		if err != nil {
+			return read, kept, err
 		}
-		for _, h := range page.Hits[min(scanned, len(page.Hits)):] {
-			if len(kept) > through {
+		for _, h := range page.Hits {
+			if len(kept) == want {
 				break
 			}
-			if !filter.keep(h.Path) {
-				continue
-			}
-			drop, err := fold.servedExactly(ctx, h)
-			if err != nil {
-				return read, kept, err
-			}
-			if !drop {
+			if filter.keep(h.Path) && !served[h.NodeID] {
 				kept = append(kept, h)
 			}
 		}
-		scanned = len(page.Hits)
-		if page.Canceled || len(kept) > through || !page.More {
+		// A canceled page is the best found so far, not the ranking's next
+		// results: it is served as it is, truncated, and ends the read.
+		if page.Canceled || len(kept) == want || !page.More || len(page.Hits) == 0 {
 			return read, kept, nil
 		}
+		at := page.Hits[len(page.Hits)-1].At()
+		after = &at
 		if depth > math.MaxInt/2 {
 			depth = math.MaxInt
 		} else {
@@ -647,10 +641,18 @@ func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader,
 	}
 }
 
+// observeIndexRequest, when set, sees every request lexicalPhase sends the
+// index, before it is sent. It is nil in production: it is the seam a test
+// observes the reads of a page through.
+var observeIndexRequest func(textindex.Request)
+
 // lexicalErr types an index refusal. A query over resources.max_query_terms is
 // refused rather than scored on its first terms: a query that scores only some
 // of its terms would return confidently wrong rankings.
 func (s *Service) lexicalErr(err error) error {
+	if errors.Is(err, textindex.ErrUnknownPosition) {
+		return cursorInvalid("the search cursor names a position that is not in its answer")
+	}
 	var many *textindex.TooManyTerms
 	if errors.As(err, &many) {
 		return &model.Error{Code: model.CodeArgumentInvalid,
@@ -661,56 +663,41 @@ func (s *Service) lexicalErr(err error) error {
 	return err
 }
 
-// exactFold recognizes a lexical result whose node the exact tiers already
-// served for the same query, so the answer serves that node once, at its exact
-// tier. The test reads the result's own fields first and confirms against the
-// stored node only when they say it may be an exact hit, so a result that is
-// plainly not one costs no read.
-type exactFold struct {
-	reader   exactReader
-	query    string
-	kinds    []model.NodeKind
-	pathFile model.FileID
-	filter   hitFilter
+// exactFold recognizes a lexical result whose node the exact tiers served for
+// the same request, so the answer serves that node once, at its exact tier. It
+// asks tierRule, the rule the exact walk applies: over every visible row of the
+// node and the request's filters, not over the result's own fields, which are
+// one unit's document, nor over reader.Node, which is one precedence winner.
+type exactFold struct{ rule *tierRule }
+
+// newExactFold builds the fold for one request. Its tier reads are point reads
+// (size 1): a page's nodes are sparse in any one tier.
+func newExactFold(reader exactReader, req model.SearchRequest, normalized string, pathFile model.FileID,
+	filter hitFilter) exactFold {
+	return exactFold{rule: newTierRule(reader, req.Query, req.Kinds, filter, normalized, pathFile, 1)}
 }
 
-// mayMatch is the exact tiers' predicates over one set of facts: declared in
-// the file the query names (exact_path), a qualified name equal to or prefixed
-// by the query (exact_qualified_name, qualified_name_prefix), or a name equal
-// to it (exact_name).
-func (f exactFold) mayMatch(name, qualifiedName string, file model.FileID) bool {
-	return (f.pathFile != "" && file == f.pathFile) || name == f.query || strings.HasPrefix(qualifiedName, f.query)
-}
-
-// servedExactly reports whether the exact tiers served h's node: the stored node
-// matches a tier's predicate, passes the kind filter the tiers apply, is
-// servable, and its file passes the request's path and language filters.
-func (f exactFold) servedExactly(ctx context.Context, h textindex.Hit) (bool, error) {
-	if h.NodeID == "" || !f.mayMatch(h.Name, h.QualifiedName, h.FileID) {
-		return false, nil
-	}
-	n, err := f.reader.Node(ctx, h.NodeID)
-	if err != nil {
-		var typed *model.Error
-		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
-			// Not visible as a node in this generation: no exact tier read it.
-			return false, nil
+// served answers which of the hits' nodes the exact tiers served. The nodes are
+// asked in ascending id order, so each tier's keyset is read forward and a tier
+// that holds none of them costs one read.
+func (f exactFold) served(ctx context.Context, hits []textindex.Hit) (map[model.NodeID]bool, error) {
+	ids := make([]model.NodeID, 0, len(hits))
+	for _, h := range hits {
+		if h.NodeID != "" {
+			ids = append(ids, h.NodeID)
 		}
-		return false, err
 	}
-	node := n.Node
-	if node.FileID == "" || !matchesKinds(node.Kind, f.kinds) || !f.mayMatch(node.Name, node.QualifiedName, node.FileID) {
-		return false, nil
-	}
-	p := h.Path
-	if node.FileID != h.FileID {
-		fv, err := f.reader.File(ctx, node.FileID)
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	out := make(map[model.NodeID]bool, len(ids))
+	for _, id := range ids {
+		owned, err := f.rule.owned(ctx, id)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		p = fv.Path
+		out[id] = owned
 	}
-	return p != "" && f.filter.keep(p), nil
+	return out, nil
 }
 
 // hydrated fills the source range of every hit of one page that has a byte

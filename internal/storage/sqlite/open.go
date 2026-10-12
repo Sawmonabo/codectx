@@ -42,10 +42,6 @@ type Options struct {
 	// ReadConnections sizes the short-read pool: unit states, dependency
 	// aliases and every query's short reads.
 	ReadConnections int
-	// PostingConnections is accepted and ignored: the store has no posting
-	// pool, since the search library holds the postings. The field stays only
-	// until the composition callers stop setting it.
-	PostingConnections int
 	// TextIndex sizes the search index the store opens beside its database.
 	// Dir and Writable are the store's: the directory is `<database path>.search`
 	// and it is writable unless ReadOnly is set. A zero WriterThreads is one
@@ -1106,7 +1102,7 @@ func wrap(op string, err error) error {
 			return &model.Error{Code: model.CodeWorkspaceBusy, Message: "database is busy: " + op, Retryable: true}
 		case sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB:
 			return &model.Error{Code: model.CodeStorageCorrupt, Message: "database is not readable: " + se.Error(),
-				Remediation: "run codectx doctor --deep; rebuild the cache with index --rebuild if it reports corruption"}
+				Remediation: "run codectx doctor --deep; if it reports corruption, run codectx reset --reindex"}
 		case sqlite3.SQLITE_CONSTRAINT:
 			return &model.Error{Code: model.CodeArgumentInvalid, Message: "rejected by schema constraint: " + se.Error()}
 		}

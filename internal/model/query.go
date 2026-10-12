@@ -251,12 +251,6 @@ type SearchRequest struct {
 	Languages    []string     `json:"languages,omitempty"`
 	Paths        []string     `json:"paths,omitempty"`
 	Page         PageRequest  `json:"page"`
-	// MinScoreMicros is the in-process floor of a ranked lexical read: when
-	// positive, the lexical tier ends before its first hit scoring below it,
-	// and pages continue by cursor as usual; the exact tiers are unaffected.
-	// Zero reads every match. It is never on the wire: only an in-process
-	// caller that stops reading at a score threshold sets it.
-	MinScoreMicros int64 `json:"-"`
 }
 
 // Validate enforces the Section 14.1 rule that query text, filters and limits
@@ -277,9 +271,6 @@ func (r SearchRequest) Validate() error {
 		return err
 	}
 	if err := boundStrings("search.paths", r.Paths, MaxFilterValues, MaxPathBytes); err != nil {
-		return err
-	}
-	if err := requireNonNegative("search.min_score_micros", r.MinScoreMicros); err != nil {
 		return err
 	}
 	if err := r.Page.ValidatePinned("search", r.GenerationID); err != nil {
