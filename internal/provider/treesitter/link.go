@@ -26,8 +26,9 @@ const detailLinkFailure = "link_failure"
 // reference whose callee token it names. Every call reference is a site, with
 // the reference's caller, range, callee and in-file candidates (targets). A
 // joined site takes the worker's shape, signature and types, and the
-// worker's qualifier where it names one (a static site's), else the
-// reference's, so QualifierIsImport always describes the qualifier stored;
+// worker's qualifier where it names one (a static site's: Base, not a, for
+// `a.Base::f()`), else the reference's; QualifierIsImport, which the
+// reference's qualifier decides, is kept only when that is the one stored;
 // one no Site joins takes its shape from the reference (a qualified call is a
 // member call, any other a bare one), keeps the reference's qualifier and
 // carries no recovered type. A
@@ -48,10 +49,15 @@ const detailLinkFailure = "link_failure"
 // minted for it (tableVariables). The worker's computed sites, calls whose
 // callee names nothing, follow the reference-joined sites as sites of their
 // own (link.Site.Computed). A declaration takes its export's override mark
-// and alias and its declared parameters (wire.Link.Parameters), each a
+// and alias, its property mark, the export mark of a CommonJS export (OR'd
+// into the structural one), and its declared parameters
+// (wire.Link.Parameters), each a
 // variable endpoint functions fills the same way. A dynamic import becomes a
 // link.DynamicImport, or, when its path folds to a constant, an ordinary
 // import appended to Table.Imports.
+// A value whose expression declares a function (wire.Value.Declares)
+// carries that declaration (link.Value.Declares); one whose declaration
+// joined nothing is dropped and counted, never resolved by its name.
 //
 // A file whose module has no identity (build gave up on an over-long path)
 // has no endpoint to link from and stores no table; neither does a file whose
@@ -133,6 +139,7 @@ func (b *builder) linkTable() error {
 			w, siteAt[i] = i, int32(len(t.Sites))
 			s.Described = true
 			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, cmp.Or(wl.Sites[i].Qualifier, r.Qualifier), wl.Sites[i].Signature
+			s.QualifierIsImport = s.QualifierIsImport && s.Qualifier == r.Qualifier
 		}
 		joined = append(joined, w)
 		t.Sites = append(t.Sites, s)
@@ -221,7 +228,8 @@ func (b *builder) linkTable() error {
 		d.Described, d.Receiver, d.Signature, d.Params, d.Optional, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Optional, x.Variadic
 		d.Static, d.Abstract, d.Virtual, d.Final, d.Internal = x.Static, x.Abstract, x.Virtual, x.Final, x.Internal
 		d.Returns = typ(x.Returns)
-		d.Override, d.Alias = x.Override, x.Alias
+		d.Override, d.Alias, d.Property = x.Override, x.Alias, x.Property
+		d.Exported = d.Exported || x.Exported
 	}
 	for _, p := range wl.Parameters {
 		i, ok := b.nameAt[p.Callable]
@@ -266,7 +274,18 @@ func (b *builder) linkTable() error {
 				t.Dropped++
 				continue
 			}
-			t.Values = append(t.Values, link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type)})
+			lv := link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type)}
+			if v.Declares != (wire.Span{}) {
+				// The value is the declaration its expression declares, or,
+				// when that joined nothing, no value to resolve by name.
+				i, ok := b.nameAt[v.Declares]
+				if !ok {
+					t.Dropped++
+					continue
+				}
+				lv.Declares = int32(i) + 1
+			}
+			t.Values = append(t.Values, lv)
 		}
 	}
 	b.table = t

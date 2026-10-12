@@ -110,7 +110,7 @@ var requirementByRank = [...]model.Requirement{
 // baseRequirement is the requirement of a boundary reached in one hop.
 func baseRequirement(kind model.NodeKind) model.Requirement {
 	switch kind {
-	case model.NodeInterface, model.NodeClass, model.NodeStruct, model.NodeEnum,
+	case model.NodeInterface, model.NodeClass, model.NodeStruct, model.NodeEnum, model.NodeType,
 		model.NodeTest, model.NodeConfiguration, model.NodeFile:
 		// Contracts, types, tests and configuration are read whole: half a
 		// contract is a misreading of it, and Section 15.4 forbids serving a

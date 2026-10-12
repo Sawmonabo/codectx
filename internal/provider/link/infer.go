@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"path"
 	"slices"
 	"strings"
@@ -78,14 +79,25 @@ import (
 // field watch depends on the first stratum's values alone, so what a
 // variable holds at the end of the first stratum is part of the answer.
 //
-// The inference may scan only some of the members (only), with the values
-// the others send in given (inputs): the stored boundary contributions of a
-// predecessor's members (contribution), each entered at the stratum it
-// arrived at. It then answers every scanned member's bindings and receiver
-// values and, for the next build, what each scanned member sends across its
-// boundary and what it reads there (flowRead). refresh.go decides which
-// members a refresh scans so that the inputs are what a full build would
-// compute.
+// The fixed point is decomposed into nodes, each owning a fixed set of its
+// rules: a site node (a member's ordinal and a site's index) owns the site's
+// rules (its arguments, its receiver's routing and watches, its bindings,
+// and the edges a binding makes: its arguments into the target's
+// parameters, the target's returns and a construction's object into the
+// site's result); a file node (the member's ordinal, index fileNode) owns
+// its callables' returns and its field writes. Every value of a parameter,
+// a site's result, a callable's returns or a field is put there by exactly
+// one node's rule, so the inference records it as that node's contribution,
+// and every variable a node evaluates as that node's read (flowRead).
+//
+// The inference may scan only some of the nodes (only, a region), with the
+// values the other nodes put into the variables the region reads given by
+// inputs: the stored contributions of a predecessor's nodes, each entered at
+// the stratum it arrived at. It then answers the region's bindings and
+// receiver values and, for the next build, the region's contributions and
+// reads, and tells trace each key of the hierarchy a node looked up.
+// refresh.go decides which nodes a refresh scans so that the inputs are what
+// a full build would compute.
 type types struct {
 	// bindingRun is every binding the fixed point found, sorted by site and
 	// target, one per pair with its best technique.
@@ -93,20 +105,34 @@ type types struct {
 	// recvRun is every value a site's receiver or called value held, sorted
 	// by site, which functions answers from.
 	recvRun *pagination.SortedRun[recv]
-	// contributions are the scanned members' boundary contributions, by
-	// entry, and reads the boundary entries they read, by entry.
+	// contributions are the scanned nodes' contributions, by entry, and
+	// reads the variables they read, by entry.
 	contributions *pagination.SortedRun[contribution]
 	reads         *pagination.SortedRun[flowRead]
 	cursor        *seeker[recv]
 	calls         *seeker[binding]
 }
 
-// inferTypes runs the inference over the tables of the members only names
-// (every member when only is nil), the other members' values entering as
-// inputs, sorted by entry (nil for none).
-func inferTypes(ctx context.Context, u *unit, h *hierarchy, only *pagination.SortedRun[int32],
-	inputs *pagination.SortedRun[contribution]) (*types, error) {
-	in := &inference{u: u, h: h, only: only, inputs: inputs}
+// flowInputs answers, for the variables a region reads (sorted, each once),
+// what the nodes outside the region put into them, and every value the
+// callables whose file node is outside the region return (varReturn), sorted
+// by entry.
+type flowInputs func(reads *pagination.SortedRun[variable]) (*pagination.SortedRun[contribution], error)
+
+// nodeTracer is told each key of the hierarchy the node at Ref looked up.
+type nodeTracer func(node Ref, key TraceKey) error
+
+// inferTypes runs the inference over the nodes only names (every node when
+// only is nil; an Index of wholeFile names every node of its member), the
+// other nodes' values entering through inputs (nil for none), telling trace
+// (when set) each key a node looked up.
+func inferTypes(ctx context.Context, u *unit, h *hierarchy, only *pagination.SortedRun[Ref], inputs flowInputs,
+	trace nodeTracer) (*types, error) {
+	in := &inference{u: u, h: h, only: only, inputs: inputs, trace: trace}
+	if trace != nil {
+		h.record(func(k TraceKey) error { return trace(in.cur, k) })
+		defer h.record(nil)
+	}
 	t, err := in.run(ctx)
 	in.closeAll()
 	return t, err
@@ -114,18 +140,19 @@ func inferTypes(ctx context.Context, u *unit, h *hierarchy, only *pagination.Sor
 
 // functions yields the function declarations the called value of site may
 // hold: a function value that flowed to it, or one written to the field it
-// calls through, each once with the technique that found it. Sites asked in
+// calls through, each once with the technique that found it and whether the
+// call passes the method's receiver first (valUnbound). Sites asked in
 // ascending order are answered by one forward pass.
-func (t *types) functions(ctx context.Context, site Ref, yield func(target Ref, detail string) error) error {
+func (t *types) functions(ctx context.Context, site Ref, yield func(target Ref, detail string, receiverFirst bool) error) error {
 	return t.seek(site, func(r recv) error {
-		if r.X.Kind != valFunction {
+		if r.X.Kind != valFunction && r.X.Kind != valUnbound {
 			return nil
 		}
 		switch r.Role {
 		case roleCalled:
-			return yield(r.X.Ref, DetailFlow)
+			return yield(r.X.Ref, DetailFlow, r.X.Kind == valUnbound)
 		case roleField:
-			return yield(r.X.Ref, DetailField)
+			return yield(r.X.Ref, DetailField, r.X.Kind == valUnbound)
 		}
 		return nil
 	})
@@ -222,6 +249,10 @@ const (
 	// construction of it returns: a call on it binds what the type declares
 	// or inherits, and no subtype's override.
 	valObject byte = 6
+	// valUnbound is the instance method declaration Ref taken as a value
+	// through its class object (Python `C.m`): a call of it passes the
+	// receiver as its first argument.
+	valUnbound byte = 7
 )
 
 // value is one abstract value.
@@ -288,7 +319,8 @@ var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, ran
 // arguments and result connect to the target's parameters and returns (a
 // class bound for want of a constructor does not); Shift that the site's
 // first argument is the target's receiver (a Python instance method called
-// through its class), so argument i+1 is parameter i; Virtual that an
+// through its class, or taken as a value through it), so argument i+1 is
+// parameter i; Virtual that an
 // override of the target can run instead (the call's dispatch).
 type binding struct {
 	Site, Target         Ref
@@ -310,7 +342,8 @@ type lookup struct {
 	Unbound, Virtual bool
 }
 
-// exportReq asks for the export Name of the module Base for Call.
+// exportReq asks for the export Name of the module Base for Call; an
+// imported name's request is for the node that evaluated it (Call.Site).
 type exportReq struct {
 	Base, Name string
 	Call       call
@@ -344,26 +377,34 @@ type siteShape struct {
 	Args []Argument
 }
 
-// contribution is one value member From sends across its boundary into
-// Entry, the boundary entry of another member's inference: a callable's
-// returns (varReturn, From its own member), a parameter of a callable of
-// another member (varParam), or a field (varField). Late reports a value
-// the entry holds only in the second stratum. A member's contributions are
-// a function of its table and of the contributions into the entries it
-// reads, which is what lets a refresh scan some members only (refresh.go).
+// fileNode is the Index of a member's file node (types); wholeFile, in a
+// region, stands for every node of its member.
+const (
+	fileNode  int32 = -1
+	wholeFile int32 = math.MinInt32
+)
+
+// contribution is one value the node From puts into the variable Entry: a
+// callable's returns (varReturn, From the callable's file node), a
+// parameter (varParam, From the site whose binding passes it), a site's
+// result (varResult, From the site), or a field (varField, From the writing
+// member's file node). Late reports a value the entry holds only in the
+// second stratum. A node's contributions are a function of its member's
+// table, of the keys it looked up and of the values in the variables it
+// reads, which is what lets a refresh scan some nodes only (refresh.go).
 type contribution struct {
 	Entry variable
 	X     value
-	From  int32
+	From  Ref
 	Late  bool
 }
 
-// flowRead says that File's inference read the boundary entry Entry: the
-// returns of a callable of another member a site of File binds with flow,
-// or a field File reads. A parameter is read by its own member.
+// flowRead says that the node Node read the variable Entry: an operand it
+// evaluated, the field a member site falls back to, or the returns of a
+// callable a site binds with flow.
 type flowRead struct {
 	Entry variable
-	File  int32
+	Node  Ref
 }
 
 // pendingFlow is a contribution whose value is what the variable Op holds
@@ -371,7 +412,7 @@ type flowRead struct {
 // stratum sends.
 type pendingFlow struct {
 	Entry variable
-	From  int32
+	From  Ref
 	Op    variable
 	Late  bool
 }
@@ -385,18 +426,26 @@ type inference struct {
 	// Python's constructor is `__init__`.
 	python bool
 
-	// only is the members scanned, ascending, nil for every member; inputs
-	// the contributions the others send, by entry (inferTypes).
-	only   *pagination.SortedRun[int32]
-	inputs *pagination.SortedRun[contribution]
-	// returnsIn is the inputs into the returns of callables not scanned, by
-	// callable, which flow reads for a binding of one; late collects the
-	// input values the first stratum must not see, added when it settles.
+	// only is the nodes scanned, ascending, nil for every node; inputs
+	// answers what the other nodes put into the variables they read, and
+	// trace is told each key a node looks up (inferTypes). cur is the node
+	// whose rule is being applied, to which a lookup is attributed.
+	only   *pagination.SortedRun[Ref]
+	inputs flowInputs
+	trace  nodeTracer
+	cur    Ref
+	// wants collects the variables the scanned nodes read, whose inputs the
+	// fixed point starts from.
+	wants *pagination.ExternalSort[variable]
+	// returnsIn is the inputs into the returns of callables whose file node
+	// is not scanned, by callable, which flow reads for a binding of one;
+	// late collects the input values the first stratum must not see, added
+	// when it settles.
 	returnsIn *pagination.SortedRun[contribution]
 	late      *pagination.ExternalSort[fact]
-	// early is the facts at the end of the first stratum. constants collects the contributions whose value is a
-	// constant, pending those whose value a variable holds, and readLog
-	// the boundary entries read.
+	// early is the facts at the end of the first stratum. constants
+	// collects the contributions whose value is a constant, pending those
+	// whose value a variable holds, and readLog the variables read.
 	early     *pagination.SortedRun[fact]
 	constants *pagination.ExternalSort[contribution]
 	pending   *pagination.ExternalSort[pendingFlow]
@@ -474,6 +523,10 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		return nil, err
 	}
 	in.readLog.WithFold(keepFirst[flowRead])
+	if in.wants, err = newSort(in, variableCodec); err != nil {
+		return nil, err
+	}
+	in.wants.WithFold(keepFirst[variable])
 	r, err := in.newRound()
 	if err != nil {
 		return nil, err
@@ -560,33 +613,53 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 	return t, nil
 }
 
-// seed enters the inputs: a value into a parameter or a field at the
-// stratum it arrived at (the second stratum's held in late until the first
-// settles), and a value a callable not scanned returns into returnsIn.
+// seed enters the inputs of the variables the scan read: a value into a
+// parameter, a site's result or a field at the stratum it arrived at (the
+// second stratum's held in late until the first settles), and a value a
+// callable whose file node is not scanned returns into returnsIn.
 func (in *inference) seed(r *round) error {
 	returns, err := newSort(in, contributionCodec)
 	if err != nil {
 		return err
 	}
 	returns.WithFold(earliest)
-	err = in.inputs.Each(func(c contribution) error {
-		switch c.Entry.Kind {
-		case varReturn:
-			return returns.Add(c)
-		case varParam, varField:
-			f := fact{V: c.Entry, X: c.X}
-			if c.Late {
-				return in.late.Add(f)
-			}
-			return r.facts.Add(f)
-		}
-		return internalErr("an inference input names no boundary entry")
-	})
+	wants, err := sorted(in, in.wants)
 	if err != nil {
 		return err
 	}
+	if in.inputs != nil {
+		inputs, err := in.inputs(wants)
+		if err != nil {
+			return err
+		}
+		in.keep(inputs)
+		err = inputs.Each(func(c contribution) error {
+			switch c.Entry.Kind {
+			case varReturn:
+				return returns.Add(c)
+			case varParam, varResult, varField:
+				f := fact{V: c.Entry, X: c.X}
+				if c.Late {
+					return in.late.Add(f)
+				}
+				return r.facts.Add(f)
+			}
+			return internalErr("an inference input names a variable no node contributes to")
+		})
+		if err != nil {
+			return err
+		}
+	}
 	in.returnsIn, err = sorted(in, returns)
 	return err
+}
+
+// read records that the node f is scanning read the variable v.
+func (f *fileScan) read(v variable) error {
+	if err := f.in.readLog.Add(flowRead{Entry: v, Node: f.node}); err != nil {
+		return err
+	}
+	return f.in.wants.Add(v)
 }
 
 // earliest folds two contributions of one entry, value and member: early
@@ -596,20 +669,21 @@ func earliest(a, b contribution) (contribution, error) {
 	return a, nil
 }
 
-// contributions is what the scanned members send across their boundaries
-// once the fixed point settles, each value early when the first stratum
-// already sent it: every scanned callable's returns, every argument a
-// scanned site passes into a parameter of another member's callable
-// (recorded by flow), and every field write of a scanned member (recorded
-// by scan). A contribution whose value a variable holds takes each value
-// the variable holds, early when it held it at the end of the first stratum.
+// contributions is what the scanned nodes put into variables once the fixed
+// point settles, each value early when the first stratum already put it
+// there: every scanned callable's returns, and what flow, step and scan
+// recorded (a site's arguments into its targets' parameters, its targets'
+// returns and its construction into its result, a member's field writes). A
+// contribution whose value a variable holds takes each value the variable
+// holds, early when it held it at the end of the first stratum.
 func (in *inference) contributions() (*pagination.SortedRun[contribution], error) {
 	err := in.decls.Each(func(d declRec) error {
 		entry := variable{Kind: varReturn, File: d.Decl.File, Decl: d.Decl.Index}
+		from := Ref{File: d.Decl.File, Index: fileNode}
 		if d.Ret.IsVar {
-			return in.pending.Add(pendingFlow{Entry: entry, From: d.Decl.File, Op: d.Ret.V})
+			return in.pending.Add(pendingFlow{Entry: entry, From: from, Op: d.Ret.V})
 		}
-		return in.constants.Add(contribution{Entry: entry, X: d.Ret.X, From: d.Decl.File})
+		return in.constants.Add(contribution{Entry: entry, X: d.Ret.X, From: from})
 	})
 	if err != nil {
 		return nil, err
@@ -639,16 +713,15 @@ func (in *inference) contributions() (*pagination.SortedRun[contribution], error
 	return sorted(in, in.constants)
 }
 
-// boundaryReads is every boundary entry the scanned members read: those
-// readLog collected and the returns of each callable of another member a
-// scanned site binds with flow.
+// boundaryReads is every variable the scanned nodes read: those readLog
+// collected and the returns of each callable a scanned site binds with flow.
 func (in *inference) boundaryReads() (*pagination.SortedRun[flowRead], error) {
 	err := in.bound.Each(func(b binding) error {
-		if !b.Flow || b.Target.File == b.Site.File {
+		if !b.Flow {
 			return nil
 		}
 		return in.readLog.Add(flowRead{Entry: variable{Kind: varReturn, File: b.Target.File, Decl: b.Target.Index},
-			File: b.Site.File})
+			Node: b.Site})
 	})
 	if err != nil {
 		return nil, err
@@ -681,6 +754,7 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 		return err
 	}
 	err = join(pending, recovered, func(w watch, v recv) int { return compareRef(w.Call.Site, v.Call.Site) }, func(w watch, vs []recv) error {
+		in.cur = w.Call.Site
 		for _, v := range vs {
 			open, err := in.fieldDecides(v.X, w.Call.Callee)
 			if err != nil || !open {
@@ -699,7 +773,7 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	// Each site that watches its field reads that field's entry, and the
 	// inputs the second stratum holds enter now.
 	err = added.Each(func(w watch) error {
-		return in.readLog.Add(flowRead{Entry: w.V, File: w.Call.Site.File})
+		return in.readLog.Add(flowRead{Entry: w.V, Node: w.Call.Site})
 	})
 	if err != nil {
 		return err
@@ -837,10 +911,10 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 	// A unit is one family: a Python unit's, or one whose scanned tables
 	// are Python's.
 	in.python = in.u.family == FamilyPython
-	err = in.u.filesOf(ctx, in.only, func(file int32, _ model.FileVersion, t *Table) error {
+	err = in.u.filesOf(ctx, in.only, func(file int32, _ model.FileVersion, t *Table, sel selection) error {
 		f := &fileScan{in: in, r: r, file: file, t: t, python: t.Language == "python"}
 		in.python = in.python || f.python
-		return f.scan(ctx, r, watches, decls, args, shapes)
+		return f.scan(ctx, r, sel, watches, decls, args, shapes)
 	})
 	if err != nil {
 		return err
@@ -858,31 +932,114 @@ func (in *inference) scan(ctx context.Context, r *round) error {
 	return err
 }
 
-// filesOf streams the tables of the members only names (ascending
-// ordinals), or every member's when only is nil, as Files does, reading no
-// other member's table.
-func (u *unit) filesOf(ctx context.Context, only *pagination.SortedRun[int32],
-	yield func(file int32, fv model.FileVersion, t *Table) error) error {
-	if only == nil {
-		return u.Files(ctx, yield)
+// selection is which nodes of one member a region holds: every one (whole),
+// its file node, and its sites.
+type selection struct {
+	whole, file bool
+	sites       map[int32]bool
+}
+
+// has reports that the node at index i (fileNode, or a site's index) is
+// selected.
+func (s selection) has(i int32) bool {
+	if s.whole {
+		return true
 	}
-	in, err := newOrdinals(only)
+	if i == fileNode {
+		return s.file
+	}
+	return s.sites[i]
+}
+
+// selections reads a region, sorted by member then index, one member at a
+// time: of answers a member's selection, for members asked in ascending
+// order. Only one member's selected nodes are held.
+type selections[F cmp.Ordered, N any] struct {
+	next   func() (N, bool, error)
+	stop   func()
+	split  func(N) (F, int32)
+	cur    N
+	ok     bool
+	loaded bool
+	file   F
+	sel    selection
+}
+
+func newSelections[F cmp.Ordered, N any](run *pagination.SortedRun[N], split func(N) (F, int32)) (*selections[F, N], error) {
+	next, stop := pull(run)
+	s := &selections[F, N]{next: next, stop: stop, split: split}
+	var err error
+	if s.cur, s.ok, err = next(); err != nil {
+		stop()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *selections[F, N]) of(file F) (selection, error) {
+	if s.loaded && s.file == file {
+		return s.sel, nil
+	}
+	if s.loaded && file < s.file {
+		return selection{}, internalErr("a region was asked for its members out of order")
+	}
+	s.loaded, s.file, s.sel = true, file, selection{}
+	var err error
+	for s.ok {
+		f, i := s.split(s.cur)
+		if f > file {
+			break
+		}
+		if f == file {
+			switch {
+			case i == wholeFile:
+				s.sel.whole = true
+			case i == fileNode:
+				s.sel.file = true
+			default:
+				if s.sel.sites == nil {
+					s.sel.sites = map[int32]bool{}
+				}
+				s.sel.sites[i] = true
+			}
+		}
+		if s.cur, s.ok, err = s.next(); err != nil {
+			return selection{}, err
+		}
+	}
+	return s.sel, nil
+}
+
+func splitRef(r Ref) (int32, int32) { return r.File, r.Index }
+
+// filesOf streams the tables of the members only selects a node of, each
+// with its selection (ascending ordinals; an Index of wholeFile selects
+// every node of its member), or every member's, whole, when only is nil, as
+// Files does, reading no other member's table.
+func (u *unit) filesOf(ctx context.Context, only *pagination.SortedRun[Ref],
+	yield func(file int32, fv model.FileVersion, t *Table, sel selection) error) error {
+	if only == nil {
+		return u.Files(ctx, func(file int32, fv model.FileVersion, t *Table) error {
+			return yield(file, fv, t, selection{whole: true})
+		})
+	}
+	region, err := newSelections(only, splitRef)
 	if err != nil {
 		return err
 	}
-	defer in.stop()
+	defer region.stop()
 	var file int32 = -1
 	return u.members(func(fv model.FileVersion) error {
 		file++
-		ok, err := in.has(file)
-		if err != nil || !ok {
+		sel, err := region.of(file)
+		if err != nil || !sel.whole && !sel.file && len(sel.sites) == 0 {
 			return err
 		}
 		t, ok, err := u.tables.Table(ctx, u.gen, fv)
 		if err != nil || !ok {
 			return err
 		}
-		return yield(file, fv, t)
+		return yield(file, fv, t, sel)
 	})
 }
 
@@ -893,30 +1050,82 @@ type fileScan struct {
 	file   int32
 	t      *Table
 	python bool
+	// node is the node whose rules are being scanned, which reads what it
+	// evaluates.
+	node Ref
 	// callables indexes the file's callable declarations by name, built
 	// when a function value is first evaluated.
 	callables map[string][]int32
 }
 
-func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.ExternalSort[watch],
+// at makes the node at index i of f's member the one being scanned.
+func (f *fileScan) at(i int32) {
+	f.node = Ref{File: f.file, Index: i}
+	f.in.cur = f.node
+}
+
+// scan reads the selected nodes of f's table: its file node's returns and
+// field writes, and each selected site's rules.
+func (f *fileScan) scan(ctx context.Context, r *round, sel selection, watches *pagination.ExternalSort[watch],
 	decls *pagination.ExternalSort[declRec], args *pagination.ExternalSort[argRec],
 	shapes *pagination.ExternalSort[siteShape],
 ) error {
 	t := f.t
-	for i := range t.Decls {
-		d := &t.Decls[i]
-		ref := Ref{File: f.file, Index: int32(i)}
-		if !callable(d) {
-			continue
+	if sel.has(fileNode) {
+		f.at(fileNode)
+		for i := range t.Decls {
+			d := &t.Decls[i]
+			ref := Ref{File: f.file, Index: int32(i)}
+			if !callable(d) {
+				continue
+			}
+			err := f.eval(ctx, int32(i), d.Returns, func(op operand) error {
+				return decls.Add(declRec{Decl: ref, Ret: op})
+			})
+			if err != nil {
+				return err
+			}
 		}
-		err := f.eval(ctx, int32(i), d.Returns, func(op operand) error {
-			return decls.Add(declRec{Decl: ref, Ret: op})
-		})
-		if err != nil {
-			return err
+		// A field write is the file node's contribution to the field.
+		for _, v := range t.Values {
+			if v.Field == "" {
+				continue
+			}
+			dst := variable{Kind: varField, Name: v.Field}
+			eval := f.eval
+			if v.Declares > 0 {
+				// A function the value's own expression declares is that
+				// declaration, never one its name would find.
+				eval = func(_ context.Context, _ int32, _ wire.Type, yield func(operand) error) error {
+					i := v.Declares - 1
+					if int(i) >= len(t.Decls) || !callable(&t.Decls[i]) {
+						return nil
+					}
+					return yield(operand{X: value{Kind: valFunction, Ref: Ref{File: f.file, Index: i}}})
+				}
+			}
+			err := eval(ctx, v.Caller, v.Type, func(op operand) error {
+				if op.IsVar {
+					if err := f.in.pending.Add(pendingFlow{Entry: dst, From: f.node, Op: op.V}); err != nil {
+						return err
+					}
+					return r.edges.Add(edge{From: op.V, To: dst})
+				}
+				if err := f.in.constants.Add(contribution{Entry: dst, X: op.X, From: f.node}); err != nil {
+					return err
+				}
+				return r.facts.Add(fact{V: dst, X: op.X})
+			})
+			if err != nil {
+				return err
+			}
 		}
 	}
 	for i := range t.Sites {
+		if !sel.has(int32(i)) {
+			continue
+		}
+		f.at(int32(i))
 		if err := f.site(ctx, r, watches, args, int32(i)); err != nil {
 			return err
 		}
@@ -924,28 +1133,6 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 			if err := shapes.Add(shapeOf(Ref{File: f.file, Index: int32(i)}, s)); err != nil {
 				return err
 			}
-		}
-	}
-	// A field write is the file's contribution to the field's entry.
-	for _, v := range t.Values {
-		if v.Field == "" {
-			continue
-		}
-		dst := variable{Kind: varField, Name: v.Field}
-		err := f.eval(ctx, v.Caller, v.Type, func(op operand) error {
-			if op.IsVar {
-				if err := f.in.pending.Add(pendingFlow{Entry: dst, From: f.file, Op: op.V}); err != nil {
-					return err
-				}
-				return r.edges.Add(edge{From: op.V, To: dst})
-			}
-			if err := f.in.constants.Add(contribution{Entry: dst, X: op.X, From: f.file}); err != nil {
-				return err
-			}
-			return r.facts.Add(fact{V: dst, X: op.X})
-		})
-		if err != nil {
-			return err
 		}
 	}
 	return nil
@@ -1078,7 +1265,13 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 		}
 		// Field-based resolution waits until the values settle, and binds
 		// only when the receiver recovered nothing (addFieldWatches).
-		return in.fieldWatches.Add(watch{V: variable{Kind: varField, Name: s.Callee}, Role: roleField, Call: c})
+		// The field's values are inputs the site may read once the values
+		// settle (addFieldWatches records the read when it does).
+		field := variable{Kind: varField, Name: s.Callee}
+		if err := in.wants.Add(field); err != nil {
+			return err
+		}
+		return in.fieldWatches.Add(watch{V: field, Role: roleField, Call: c})
 	case wire.ShapeIndirect:
 		role := roleCalled
 		if s.Receiver.Kind == wire.TypeField {
@@ -1092,12 +1285,13 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 // scoped is the candidates of a bare name a call in caller makes that its
 // scope binds the name to: those Table.Visible admits, declared in the
 // innermost scope enclosing caller that declares any (a nested function
-// shadows a module-level one of its name).
+// shadows a module-level one of its name). A function stored under a
+// property (Decl.Property, `obj.run = () => …`) binds no name.
 func scoped(t *Table, caller int32, candidates []int32) []int32 {
 	var out []int32
 	best := -1
 	for _, k := range candidates {
-		if !t.Visible(k, caller) {
+		if !t.Visible(k, caller) || t.Decls[k].Property {
 			continue
 		}
 		depth := 0
@@ -1160,17 +1354,25 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 		}
 	case wire.TypeParam:
 		if caller >= 0 && int(caller) < len(t.Decls) {
-			return yield(operand{IsVar: true, V: variable{Kind: varParam, File: f.file, Decl: caller, Index: int32(ty.Index)}})
+			v := variable{Kind: varParam, File: f.file, Decl: caller, Index: int32(ty.Index)}
+			if err := f.read(v); err != nil {
+				return err
+			}
+			return yield(operand{IsVar: true, V: v})
 		}
 	case wire.TypeResult:
 		if int(ty.Index) < len(t.Sites) {
-			return yield(operand{IsVar: true, V: variable{Kind: varResult, File: f.file, Index: int32(ty.Index)}})
+			v := variable{Kind: varResult, File: f.file, Index: int32(ty.Index)}
+			if err := f.read(v); err != nil {
+				return err
+			}
+			return yield(operand{IsVar: true, V: v})
 		}
 	case wire.TypeField:
 		// Reading a field reads its boundary entry, which every member
 		// writing it contributes to.
 		v := variable{Kind: varField, Name: ty.Name}
-		if err := f.in.readLog.Add(flowRead{Entry: v, File: f.file}); err != nil {
+		if err := f.read(v); err != nil {
 			return err
 		}
 		return yield(operand{IsVar: true, V: v})
@@ -1181,7 +1383,7 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 		// denotes both; the one no member file declares joins nothing.
 		if spec, name, ok := importedName(ty.Name, f.python); ok {
 			if base, found := moduleBase(t.Path, spec, f.python); found {
-				if err := f.r.imports.Add(exportReq{Base: base, Name: name}); err != nil {
+				if err := f.r.imports.Add(exportReq{Base: base, Name: name, Call: call{Site: f.node}}); err != nil {
 					return err
 				}
 				if err := yield(operand{IsVar: true, V: importVar(base, name)}); err != nil {
@@ -1196,17 +1398,26 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 			return yield(operand{X: value{Kind: valModule, Path: base}})
 		}
 	case wire.TypeFunction:
-		return f.function(ctx, caller, ty.Name, constant(valFunction))
+		// A method taken through its class object takes its receiver first
+		// (wire.TypeFunction's Index), unless it is a static or class method.
+		return f.function(ctx, caller, ty.Name, func(r Ref, static bool) error {
+			kind := valFunction
+			if ty.Index > 0 && f.python && !static {
+				kind = valUnbound
+			}
+			return yield(operand{X: value{Kind: kind, Ref: r}})
+		})
 	}
 	return nil
 }
 
 // function yields the callable declarations the function value written as
-// name in caller denotes. A bare name is read as a call's bare callee is
-// (scoped), so it never denotes a method. A member name `C.m` or `o.m` is
-// the method m that the class or object C declares in the file; failing
-// one, the method m the type C names declares or inherits.
-func (f *fileScan) function(ctx context.Context, caller int32, name string, yield func(Ref) error) error {
+// name in caller denotes, each with whether it is static (called without a
+// receiver). A bare name is read as a call's bare callee is (scoped), so it
+// never denotes a method. A member name `C.m` or `o.m` is the method m that
+// the class or object C declares in the file; failing one, the method m the
+// type C names declares or inherits.
+func (f *fileScan) function(ctx context.Context, caller int32, name string, yield func(r Ref, static bool) error) error {
 	t := f.t
 	if f.callables == nil {
 		f.callables = make(map[string][]int32)
@@ -1219,7 +1430,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 	holder, member, dotted := cutLast(name, ".")
 	if !dotted {
 		for _, i := range scoped(t, caller, f.callables[name]) {
-			if err := yield(Ref{File: f.file, Index: i}); err != nil {
+			if err := yield(Ref{File: f.file, Index: i}, t.Decls[i].Static); err != nil {
 				return err
 			}
 		}
@@ -1232,7 +1443,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 			continue
 		}
 		found = true
-		if err := yield(Ref{File: f.file, Index: i}); err != nil {
+		if err := yield(Ref{File: f.file, Index: i}, t.Decls[i].Static); err != nil {
 			return err
 		}
 	}
@@ -1240,7 +1451,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 		return nil
 	}
 	return f.in.h.types(ctx, f.file, holder, func(typ Ref) error {
-		return f.in.h.declared(typ, member, func(e entry) error { return yield(e.Ref) })
+		return f.in.h.declared(typ, member, func(e entry) error { return yield(e.Ref, e.Flags&flagStatic != 0) })
 	})
 }
 
@@ -1275,12 +1486,12 @@ func (in *inference) receive(ctx context.Context, r *round, v recv) error {
 			// Calling a Python class object constructs an instance.
 			return r.constructs.Add(construct{Class: v.X.Ref, Ctor: "__init__", Call: c})
 		}
-		if v.X.Kind == valFunction {
+		if v.X.Kind == valFunction || v.X.Kind == valUnbound {
 			rank := rankFlow
 			if v.Role == roleField {
 				rank = rankField
 			}
-			return r.bindings.Add(binding{Site: c.Site, Target: v.X.Ref, Rank: rank, Flow: true})
+			return r.bindings.Add(binding{Site: c.Site, Target: v.X.Ref, Rank: rank, Flow: true, Shift: v.X.Kind == valUnbound})
 		}
 	case roleConstruct:
 		if v.X.Kind == valInstance {
@@ -1306,6 +1517,7 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 		return nil, err
 	}
 	err = reqs.Each(func(q exportReq) error {
+		in.cur = q.Call.Site
 		return in.h.moduleExport(q.Base, q.Name, func(e entry) error {
 			switch e.Aux {
 			case exportType:
@@ -1332,7 +1544,13 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 	// its superclass's; Python looks `__init__` up the bases), and one
 	// that inherits none either is bound as the class itself.
 	err = cons.Each(func(c construct) error {
-		if err := r.facts.Add(fact{V: variable{Kind: varResult, File: c.Call.Site.File, Index: c.Call.Site.Index}, X: value{Kind: valObject, Ref: c.Class}}); err != nil {
+		in.cur = c.Call.Site
+		result := variable{Kind: varResult, File: c.Call.Site.File, Index: c.Call.Site.Index}
+		object := value{Kind: valObject, Ref: c.Class}
+		if err := in.constants.Add(contribution{Entry: result, X: object, From: c.Call.Site, Late: in.fielded}); err != nil {
+			return err
+		}
+		if err := r.facts.Add(fact{V: result, X: object}); err != nil {
 			return err
 		}
 		found := false
@@ -1372,6 +1590,7 @@ func (in *inference) seedImports(r *round) error {
 		return err
 	}
 	return names.Each(func(q exportReq) error {
+		in.cur = q.Call.Site
 		return in.h.moduleExport(q.Base, q.Name, func(e entry) error {
 			x := value{Kind: valFunction, Ref: e.Ref}
 			switch e.Aux {
@@ -1401,6 +1620,7 @@ func (in *inference) resolveLookups(r *round) error {
 	}
 	var found []entry
 	return ls.Each(func(l lookup) error {
+		in.cur = l.Call.Site
 		found = found[:0]
 		if err := in.h.declared(l.Class, l.Name, func(e entry) error {
 			found = append(found, e)
@@ -1472,10 +1692,10 @@ func (in *inference) mergeBindings(r *round) (*pagination.SortedRun[binding], er
 }
 
 // flow connects each new binding's site to its target: the target's
-// returns to the site's result (a callable not scanned through its stored
-// returns, returnsIn), and each argument to the parameter it binds
-// (paramsOf). An argument into a parameter of another member's callable is
-// the site's member's contribution to that parameter.
+// returns to the site's result (a callable whose file node is not scanned
+// through its stored returns, returnsIn), and each argument to the parameter
+// it binds (paramsOf). Each is the site's contribution to the result or the
+// parameter.
 func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error {
 	byTarget, err := newSort(in, codec[binding]{put: bindingCodec.put, get: bindingCodec.get,
 		cmp: func(a, b binding) int { return cmp.Or(compareRef(a.Target, b.Target), compareRef(a.Site, b.Site)) }})
@@ -1502,6 +1722,9 @@ func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error 
 				if err := r.into(result, d.Ret); err != nil {
 					return err
 				}
+				if err := in.contribute(result, d.Ret, b.Site); err != nil {
+					return err
+				}
 			}
 			return nil
 		})
@@ -1514,6 +1737,10 @@ func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error 
 		result := variable{Kind: varResult, File: b.Site.File, Index: b.Site.Index}
 		for _, c := range cs {
 			f := fact{V: result, X: c.X}
+			err := in.constants.Add(contribution{Entry: result, X: c.X, From: b.Site, Late: c.Late || in.fielded})
+			if err != nil {
+				return err
+			}
 			if c.Late && !in.fielded {
 				if err := in.late.Add(f); err != nil {
 					return err
@@ -1539,6 +1766,7 @@ func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error 
 			if !b.Flow || len(as) == 0 {
 				return nil
 			}
+			in.cur = b.Site
 			param, err := in.paramsOf(b)
 			if err != nil {
 				return err
@@ -1552,15 +1780,7 @@ func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error 
 				if err := r.into(p, a.Op); err != nil {
 					return err
 				}
-				if p.File == b.Site.File {
-					continue
-				}
-				if a.Op.IsVar {
-					err = in.pending.Add(pendingFlow{Entry: p, From: b.Site.File, Op: a.Op.V, Late: in.fielded})
-				} else {
-					err = in.constants.Add(contribution{Entry: p, X: a.Op.X, From: b.Site.File, Late: in.fielded})
-				}
-				if err != nil {
+				if err := in.contribute(p, a.Op, b.Site); err != nil {
 					return err
 				}
 			}
@@ -1612,6 +1832,15 @@ func (in *inference) paramsOf(b binding) (func(arg int32) (int32, bool), error) 
 		i, ok := bound[arg]
 		return i, ok
 	}, nil
+}
+
+// contribute records that the node from puts what op denotes into dst, in
+// the stratum the fixed point is in.
+func (in *inference) contribute(dst variable, op operand, from Ref) error {
+	if op.IsVar {
+		return in.pending.Add(pendingFlow{Entry: dst, From: from, Op: op.V, Late: in.fielded})
+	}
+	return in.constants.Add(contribution{Entry: dst, X: op.X, From: from, Late: in.fielded})
 }
 
 // shapeOf is site s's argument shape at ref.
@@ -2271,31 +2500,34 @@ var argRecCodec = codec[argRec]{
 }
 
 var contributionCodec = codec[contribution]{
-	put: func(w *wbuf, c contribution) { w.variable(c.Entry); w.value(c.X); w.i32(c.From); w.flag(c.Late) },
+	put: func(w *wbuf, c contribution) { w.variable(c.Entry); w.value(c.X); w.ref(c.From); w.flag(c.Late) },
 	get: func(r *rbuf) contribution {
-		return contribution{Entry: r.variable(), X: r.value(), From: r.i32(), Late: r.flag()}
+		return contribution{Entry: r.variable(), X: r.value(), From: r.ref(), Late: r.flag()}
 	},
 	cmp: func(a, b contribution) int {
-		return cmp.Or(cmpVar(a.Entry, b.Entry), cmpValue(a.X, b.X), cmp.Compare(a.From, b.From))
+		return cmp.Or(cmpVar(a.Entry, b.Entry), cmpValue(a.X, b.X), compareRef(a.From, b.From))
 	},
 }
 
 var pendingCodec = codec[pendingFlow]{
-	put: func(w *wbuf, p pendingFlow) { w.variable(p.Op); w.variable(p.Entry); w.i32(p.From); w.flag(p.Late) },
+	put: func(w *wbuf, p pendingFlow) { w.variable(p.Op); w.variable(p.Entry); w.ref(p.From); w.flag(p.Late) },
 	get: func(r *rbuf) pendingFlow {
 		op := r.variable()
-		return pendingFlow{Op: op, Entry: r.variable(), From: r.i32(), Late: r.flag()}
+		return pendingFlow{Op: op, Entry: r.variable(), From: r.ref(), Late: r.flag()}
 	},
 	cmp: func(a, b pendingFlow) int {
-		return cmp.Or(cmpVar(a.Op, b.Op), cmpVar(a.Entry, b.Entry), cmp.Compare(a.From, b.From))
+		return cmp.Or(cmpVar(a.Op, b.Op), cmpVar(a.Entry, b.Entry), compareRef(a.From, b.From))
 	},
 }
 
 var flowReadCodec = codec[flowRead]{
-	put: func(w *wbuf, f flowRead) { w.variable(f.Entry); w.i32(f.File) },
-	get: func(r *rbuf) flowRead { return flowRead{Entry: r.variable(), File: r.i32()} },
-	cmp: func(a, b flowRead) int { return cmp.Or(cmpVar(a.Entry, b.Entry), cmp.Compare(a.File, b.File)) },
+	put: func(w *wbuf, f flowRead) { w.variable(f.Entry); w.ref(f.Node) },
+	get: func(r *rbuf) flowRead { return flowRead{Entry: r.variable(), Node: r.ref()} },
+	cmp: func(a, b flowRead) int { return cmp.Or(cmpVar(a.Entry, b.Entry), compareRef(a.Node, b.Node)) },
 }
+
+var variableCodec = codec[variable]{put: func(w *wbuf, v variable) { w.variable(v) },
+	get: func(r *rbuf) variable { return r.variable() }, cmp: cmpVar}
 
 var shapeCodec = codec[siteShape]{
 	put: func(w *wbuf, s siteShape) {

@@ -136,3 +136,35 @@ func TestJavaFieldExportsAndFieldReceivers(t *testing.T) {
 		}
 	}
 }
+
+// TestJavaBareInheritedFieldIsTheEnclosingTypesField checks the receiver
+// of a bare name the file binds nothing to and no type spells: a field the
+// enclosing class inherits from another file, or an enclosing class's, sent
+// as `this.f` is, TypeField "Inner.repo", which the linker reads along
+// Inner's supertypes and then its enclosing classes. A name spelled as a
+// type stays a static call's qualifier.
+//
+// Mutation: leave a bare name nothing of the file binds unknown -> `repo`'s
+// receiver is TypeUnknown and `repo.save()` binds nothing.
+// Mutation: read every unbound bare name as a field -> `Helper.run()` is a
+// member call on TypeField "Inner.Helper".
+func TestJavaBareInheritedFieldIsTheEnclosingTypesField(t *testing.T) {
+	const src = `class Service extends Base {
+    class Inner {
+        void go() {
+            repo.save("y");
+            Helper.run();
+        }
+    }
+}
+`
+	l, _ := linkOf(t, "java", "Service.java", src)
+	s := siteNamed(l, textAt(t, src, "save", 0))
+	if s == nil || s.Shape != wire.ShapeMember || s.Receiver != (wire.Type{Kind: wire.TypeField, Name: "Inner.repo"}) {
+		t.Fatalf("repo.save() is %+v, want a member call on TypeField Inner.repo", s)
+	}
+	h := siteNamed(l, textAt(t, src, "run", 0))
+	if h == nil || h.Shape != wire.ShapeStatic || h.Qualifier != "Helper" {
+		t.Fatalf("Helper.run() is %+v, want a static call qualified Helper", h)
+	}
+}

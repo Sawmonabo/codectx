@@ -210,6 +210,49 @@ class MathOps {
 		fails: "a functional-interface call that binds the abstract method beside the referenced one, or that ignores method references, gives the wrong set",
 	},
 	{
+		name:   "unbound-method-reference",
+		anchor: "Java Language Specification §15.13.1 (Compile-Time Declaration of a Method Reference: for ReferenceType :: Identifier, an instance method takes the first parameter of the function type as its receiver and the rest as its arguments), §15.13.3, §9.8 (Functional Interfaces)",
+		files: map[string]string{
+			"Box.java": `interface Measure {
+  int of(Box b, int scale); // @abs
+}
+
+class Box {
+  int size(int scale) { return scale; } // @size
+  static int twice(Box b, int scale) { return scale; } // @twice
+  int bound(Box b, int scale) { return scale; } // @bound
+
+  int run(Box b, int k) { // @run
+    Measure m = Box::size;
+    Measure n = Box::twice;
+    Measure o = this::bound;
+    return m.of(b, k); // @call
+  }
+}
+`,
+		},
+		// Derived from the source and the anchor; the worker's values, signatures and argument reads are
+		// probed. Box::size is unbound: of's first parameter is its receiver and its second size's scale.
+		// Box::twice is static and this::bound bound, so each takes of's parameters as its own, in order.
+		// All three are of of's function type, so `m.of(b, k)` may call each.
+		want: []string{
+			"call of -> size size exact set=3",
+			"call of -> twice twice exact set=3",
+			"call of -> bound bound exact set=3",
+		},
+		facts: []string{
+			"run k flows size scale",
+			"run b flows twice b",
+			"run k flows twice scale",
+			"run b flows bound b",
+			"run k flows bound scale",
+		},
+		// Mutation: pass an unbound reference's first argument to its first parameter -> b flows to size's
+		// scale and k to nothing. Mutation: key an unbound reference by its method's own signature -> size
+		// is not of of's type and `m.of` binds twice and bound alone.
+		fails: "an unbound method reference whose receiver argument binds the first declared parameter, or that joins no call of its function type",
+	},
+	{
 		name:   "imports",
 		anchor: "Java Language Specification §6.4.1 (Shadowing), §7.3 (Compilation Units: implicit java.lang import), §7.5.1 (Single-Type-Import Declarations), §15.12.1",
 		files: map[string]string{

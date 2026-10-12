@@ -531,7 +531,7 @@ This separation permits unchanged facts to be shared safely between snapshots. N
 <a id="92-nodes-relations-and-occurrences"></a>
 ### 9.2 Nodes, Relations, and Occurrences
 
-Required node vocabulary is unchanged:
+Required node vocabulary:
 
 ```go
 type NodeKind string
@@ -560,6 +560,7 @@ const (
     NodeSection       NodeKind = "section"
     NodeEndpoint      NodeKind = "endpoint"
     NodeDatabaseEntity NodeKind = "database_entity"
+    NodeType          NodeKind = "type" // a type outside the indexed project, its own kind unknown
 )
 
 ```

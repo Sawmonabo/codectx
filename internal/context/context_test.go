@@ -2003,6 +2003,7 @@ func TestEveryNodeKindHasAScopeRequirement(t *testing.T) {
 		model.NodeClass:         model.RequirementFull,
 		model.NodeStruct:        model.RequirementFull,
 		model.NodeEnum:          model.RequirementFull,
+		model.NodeType:          model.RequirementFull,
 		model.NodeTest:          model.RequirementFull,
 		model.NodeConfiguration: model.RequirementFull,
 
@@ -2037,7 +2038,7 @@ func TestEveryNodeKindHasAScopeRequirement(t *testing.T) {
 		model.NodeClass, model.NodeInterface, model.NodeStruct, model.NodeEnum,
 		model.NodeField, model.NodeVariable, model.NodeConstant, model.NodeTest,
 		model.NodeBuildTarget, model.NodeDependency, model.NodeConfiguration,
-		model.NodeDocument, model.NodeSection, model.NodeEndpoint, model.NodeDatabaseEntity,
+		model.NodeDocument, model.NodeSection, model.NodeEndpoint, model.NodeDatabaseEntity, model.NodeType,
 	} {
 		if _, ok := want[kind]; !ok {
 			t.Errorf("node kind %q has no decided scope requirement: it would be served as optional", kind)

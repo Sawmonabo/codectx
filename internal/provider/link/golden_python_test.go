@@ -547,4 +547,51 @@ def use(h):
 		},
 		fails: "a computed callee counted as open, or bound through its subscription's names, breaks the counts; every open site given one reason misnames three",
 	},
+	{
+		name:   "method-values-bound-and-unbound",
+		anchor: "The Python Language Reference §3.2 (The standard type hierarchy: Instance methods; a function retrieved from a class is a plain function, one retrieved through an instance a bound method; Static method objects; Class method objects)",
+		files: map[string]string{
+			"values.py": `class C:  # @c
+    def m(self, x):  # @m
+        return x
+
+    @staticmethod
+    def sm(y):  # @sm
+        return y
+
+    @classmethod
+    def cm(cls, z):  # @cm
+        return z
+
+
+def run(obj, n, k, p, q):  # @run
+    f = C.m
+    f(obj, n)  # @fv
+    g = C().m  # @mk
+    g(k)  # @gv
+    h = C.sm
+    h(p)  # @hv
+    c = C.cm
+    c(q)  # @cv
+`,
+		},
+		// Derived from the source and the anchor. C.m is the plain function m, so f(obj, n) passes obj as
+		// self and n as x; C().m is bound to the new instance, so g(k) passes k as x. A static method takes
+		// no receiver and a class method is bound to its class, so p reaches y and q reaches z.
+		want: []string{
+			"mk C -> c C exact",
+			"fv f -> m m exact",
+			"gv g -> m m exact",
+			"hv h -> sm sm exact",
+			"cv c -> cm cm exact",
+		},
+		facts: []string{
+			"run k flows m x",
+			"run n flows m x",
+			"run obj flows m self",
+			"run p flows sm y",
+			"run q flows cm z",
+		},
+		fails: "a method value of a class treated as a bound method flows obj into x and n nowhere; a bound one treated as unbound flows k into self; a static or class method taken through its class treated as unbound flows p and q nowhere or into cls",
+	},
 }

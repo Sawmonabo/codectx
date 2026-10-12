@@ -8,6 +8,10 @@
 (import_statement (import_clause)? @import.clause source: (string) @import.path) @import
 ((call_expression function: (identifier) @import.fn arguments: (arguments . (string) @import.path)) @import
   (#eq? @import.fn "require"))
+; A dynamic `import("./x")` of a string literal names its module as plainly
+; as a static import; one of any other expression is the linker's open
+; import site.
+(call_expression function: (import) arguments: (arguments . (string) @import.path)) @import
 
 (function_declaration name: (identifier) @name body: (_) @body) @def.function
 (generator_function_declaration name: (identifier) @name body: (_) @body) @def.function

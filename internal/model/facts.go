@@ -29,6 +29,12 @@ const (
 	NodeSection        NodeKind = "section"
 	NodeEndpoint       NodeKind = "endpoint"
 	NodeDatabaseEntity NodeKind = "database_entity"
+	// NodeType is a type declared outside the indexed project, which the
+	// project's code names (a supertype, a receiver's type) without
+	// declaring: whether it is a class, an interface, a trait or a struct
+	// is not known from that code, so one kind keeps it one node wherever
+	// it is named.
+	NodeType NodeKind = "type"
 )
 
 // Valid reports whether k is a known wire spelling. An unknown value fails
@@ -38,7 +44,7 @@ func (k NodeKind) Valid() bool {
 	case NodeRepository, NodeDirectory, NodeFile, NodePackage, NodeModule, NodeNamespace,
 		NodeFunction, NodeMethod, NodeClass, NodeInterface, NodeStruct, NodeEnum,
 		NodeField, NodeVariable, NodeConstant, NodeTest, NodeBuildTarget, NodeDependency,
-		NodeConfiguration, NodeDocument, NodeSection, NodeEndpoint, NodeDatabaseEntity:
+		NodeConfiguration, NodeDocument, NodeSection, NodeEndpoint, NodeDatabaseEntity, NodeType:
 		return true
 	}
 	return false

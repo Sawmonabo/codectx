@@ -15,9 +15,9 @@ import (
 // worker is retired as broken, the structural unit fails and the generation
 // fails with it.
 //
-// Mutation: count exports at 45 bytes instead of 44 in DecodeLink -> the
-// decode fails. After the exports' count, n minimal exports leave 44n bytes
-// plus 32 for the eight empty trailing lists' counts, and 45n exceeds that
+// Mutation: count exports at 47 bytes instead of 46 in DecodeLink -> the
+// decode fails. After the exports' count, n minimal exports leave 46n bytes
+// plus 32 for the eight empty trailing lists' counts, and 47n exceeds that
 // once n is 33 or more, which is why the message carries more than that.
 func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 	var in Link
@@ -38,13 +38,14 @@ func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 }
 
 // TestLinkFactsBeyondCallsRoundTrip carries every field the linker's facts
-// beyond calls read through one encode and decode: an export's override mark
-// and alias, a supertype's interface mark, an argument's reads, keyword and spread, a dynamic import's
+// beyond calls read through one encode and decode: an export's override mark,
+// alias, property and exported marks, a value's declaration, a supertype's interface mark, an argument's reads, keyword and spread, a dynamic import's
 // fragments and constant flag, a parameter's marks, and a computed site with
 // its arguments. Each is written after fields that existed before it, so a
 // codec that skips or reorders one shifts every later byte.
 //
-// Mutation: AppendLink drops the alias or a supertype's interface mark, or
+// Mutation: AppendLink drops the alias, the exported mark, a value's
+// declaration or a supertype's interface mark, or
 // DecodeLink reads a computed site's arguments without their reads -> the
 // decoded message differs (or is refused as malformed).
 func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
@@ -52,7 +53,11 @@ func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 		Exports: []Export{
 			{Name: Span{Start: 1, End: 4}, Receiver: "C", Override: true},
 			{Name: Span{Start: 9, End: 12}, Alias: "log_impl"},
+			{Name: Span{Start: 13, End: 16}, Exported: true},
+			{Name: Span{Start: 17, End: 19}, Property: true},
 		},
+		Values: []Value{{At: Span{Start: 81, End: 90}, Field: "run", Type: Type{Kind: TypeFunction, Name: "obj.run"},
+			Declares: Span{Start: 13, End: 16}}},
 		Supertypes: []Supertype{{Type: "A", Super: "Thread"}, {Type: "A", Super: "Runnable", Interface: true}},
 		Sites: []Site{{Name: Span{Start: 20, End: 21}, Shape: ShapeBare, Args: []Type{{}, {Kind: TypeNamed, Name: "T"}},
 			Arguments: []Argument{
@@ -77,6 +82,9 @@ func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 	}
 	if !slices.Equal(out.Exports, in.Exports) || !slices.Equal(out.Parameters, in.Parameters) {
 		t.Fatalf("exports or parameters changed:\n got %+v %+v\nwant %+v %+v", out.Exports, out.Parameters, in.Exports, in.Parameters)
+	}
+	if !slices.Equal(out.Values, in.Values) {
+		t.Fatalf("values changed:\n got %+v\nwant %+v", out.Values, in.Values)
 	}
 	if !slices.Equal(out.Supertypes, in.Supertypes) {
 		t.Fatalf("supertypes changed:\n got %+v\nwant %+v", out.Supertypes, in.Supertypes)

@@ -39,8 +39,8 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `imports` | `imports` | file module → each file module the import resolves to | `import` |
 | `imports` | `imports` | file module → the import's open-import-site node | none |
 | `data_flows_to` | `data_flows_to` | each variable an argument reads → the parameter it binds | `argument` |
-| `extends` | `extends` | type → a supertype of its own kind | `supertype` |
-| `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `method_set` |
+| `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
+| `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
@@ -52,7 +52,11 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 - `import`: an import resolved to a file of the unit;
 - `argument`: an argument of a bound call site, matched to its parameter;
 - `supertype`: a supertype or an override the source writes;
-- `method_set`: a Go interface a type satisfies by its method set, which the source never writes.
+- `method_set`: a Go interface a type satisfies by its method set, which the source never writes;
+- `supertype_interface`, `supertype_class`: a supertype the source writes that is outside the project (a node of
+  kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
+  interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
+  base list).
 
 **Caller and target.** The caller is the anonymous route handler a site is written in when the structural provider
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
@@ -85,8 +89,9 @@ target carries no `set_size`. Nothing is capped: every target is published.
 call can run an override of its target, `exact` when it cannot. It is computed per occurrence, from the site, never
 from the technique that bound it: a `super` call, a qualified call (`a.Animal::sound()`, `Base.m(self)`), a call on a
 constructed object (`Dog().sound()`, `new C().m()`), a static, final, private or non-virtual method, a C++ call
-through a declaration that is not `virtual` or on an object declared by value (`Dog d; d.sound()`; a pointer or a
-reference stays `virtual`), and every function an address-taken or field set reaches are `exact`. A
+through a declaration that is not `virtual`, on an object declared by value (`Dog d; d.sound()`) or on the result of
+a function that returns a class by value (`Dog make(); make().sound()`; a pointer or a reference, declared or
+returned, stays `virtual`, and an `auto` return names no type), and every function an address-taken or field set reaches are `exact`. A
 member call on a receiver with a declared static type publishes one `calls` to the method that type declares or
 inherits, even when it is abstract or an interface or trait method, and never one edge per override:
 `speak(a: Animal) { a.sound() }` with `Dog` and `Cat` overriding `sound` publishes `speak calls Animal.sound`,
@@ -112,7 +117,12 @@ The candidates of an open site are computed per query as `may_call`, never store
 an endpoint and a call on a receiver of that type meets the override of that method at one node (ADR-0015 decision
 2, `internal/provider/link/external.go`). An external node has no file: it is minted in the scope `link:external`,
 keyed by the language family, the type's qualified name as the family resolves it (`hierarchy.externalName`) and, for
-a method, the method's name, with metadata `{"resolution":"external"}`. A call site does not know the parameter types
+a method, the method's name, with metadata `{"resolution":"external"}`. An external type's node is of kind `type`,
+never `class` or `interface`: whether it is a class, an interface, a trait or a struct is not known from the
+project's code, and one project can write it both ways (TypeScript lets a class implement a class), so a fixed kind
+keeps one qualified name one node in every unit. Each `extends` or `implements` into it carries the kind its own
+clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body has no node, so it
+publishes no supertype edge; its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
 an external method declares, so one node stands for all of a type's methods of one name. A Java `@Override` of
 `toString` and `o.toString()` on an `Object` receiver both target `java.lang.Object.toString`. Every run of every
 unit that names an external node republishes it with its own evidence, and the delta build replaces the index-level
@@ -132,7 +142,8 @@ An import whose path does not fold to a constant publishes one open-import-site 
 scope, keyed `openimport:<path>:<first byte>-<last byte>`, named `import`, of kind `module`, with metadata
 `{"resolution":"unresolved","reason":"computed","fragments":[…]}`, the literal parts of the path in source order
 (`require("./x/" + name)` gives `["./x/"]`). The files whose paths match the fragments are computed per query as
-`may_import`. `require("./x")` folds and is an ordinary import.
+`may_import`. A `require("./x")` or `import("./x")` of a string literal is an import record of the structural query,
+and a path that folds to a constant (`import("./" + "x")`) is an ordinary import too.
 
 **Argument flows.** A bound call site publishes `data_flows_to` from each variable an argument reads to the parameter
 of the target the argument binds (ADR-0017), and an unbound site publishes none. Arguments are matched as the
@@ -140,7 +151,8 @@ target's language binds them (`argumentFlows`, `internal/provider/link/args.go`)
 argument by its parameter's name, a spread or `*args` to the rest from its position, and the arguments past the last
 named parameter to a variadic one; a parameter an omitted default fills receives nothing. A call through a function value flows into
 every function the address-taken join binds it to. A receiver passed first (a
-Go method expression, a Rust path naming a method, Python `C.m(obj)`) binds the first parameter. A parameter with no
+Go method expression, a Rust path naming a method, a Java unbound method reference, Python `C.m(obj)`) binds the
+receiver parameter, and nothing where the callee declares none (a Java method's receiver). A parameter with no
 node of its own receives no edge.
 
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
@@ -259,10 +271,15 @@ whose bytes changed re-resolves whole. For Go, Java, Rust, C and C++ the state a
 from: a hash of each hierarchy index key's entries, the reverse index from every key a file's resolution read to that
 file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
 identities their positions denote. For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
-identity table, what each member sends across its boundary (each callable's returned values, each argument into
-another member's parameter, each field write, with the stratum, before or after field-based resolution, it arrives
-at), and which boundary entries each member read. Everything is a sorted run on disk; nothing the size of the unit
-is held in memory.
+identity table, a module index (each Python declaration and module under every dotted name its file can be imported
+as; each ECMAScript file under every module path an import may name it by) with the hash of each of its keys'
+entries, and, for every node of the value-flow fixed point (a site, or a file's node owning its callables' returns,
+its field writes, its imports and its hierarchy facts): each value it put into a variable (a parameter, a site's
+result, a callable's returns, a field) with the stratum, before or after field-based resolution, the value arrives at;
+each variable it read; and each key of the hierarchy or the module index it looked up, found or not. All of it is
+named by identity (`internal/provider/link/flowstate.go`): a node by its file and site index, a parameter by its
+callable's node and position, a value by its declaration's node, so an added or removed file renumbers nothing.
+Everything is a sorted run on disk; nothing the size of the unit is held in memory.
 
 The delta build hands `Link` the predecessor's state whenever the predecessor stored one this build can read
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
@@ -285,17 +302,29 @@ What re-resolves:
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
   and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
-  value flow and binding, which a refresh maintains by deleting and re-deriving (Gupta, Mumick and Subrahmanian,
-  "Maintaining Views Incrementally", 1993). When the layout holds, the refresh reuses the stored hierarchy and
-  re-derives a region of members: those whose table moved, with every member on a path between them in the stored
-  boundary graph, so a value cycling through untouched files is deleted and re-derived with them and cannot keep
-  supporting itself once its source is gone. The region starts from the stored contributions of the members outside
-  it, each at its stratum. The refresh then compares every boundary entry's values with the stored ones: when no
-  member outside the region reads a changed entry it stops, and otherwise the region grows by those readers and
-  every member they reach and is re-derived again. So a body edit that sends no other value re-runs its own file's
-  sites only. Members outside the final region keep their facts, contributions and reads. A refresh whose layout
-  does not hold (a member added, removed or renamed, or a moved table whose interface changed) resolves the unit in
-  full.
+  value flow and binding, decomposed into nodes (each site, and each file's node), which a refresh maintains by
+  deleting and re-deriving at the granularity of nodes (Gupta, Mumick and Subrahmanian, "Maintaining Views
+  Incrementally", 1993). When the layout holds the refresh reuses the stored hierarchy and module index; otherwise it
+  rebuilds both from every table and diffs them group by group. It then re-derives a region of nodes, starting from
+  every node of each member whose table moved, that is added or that is removed, and every node that looked up a key
+  whose group changed (a declaration, export, parameter or module added, removed or changed under it, so an added
+  file's names re-run exactly the sites whose lookups now see them). Until the region settles:
+  - the nodes the stored graph reaches from the region (each reads a variable a region node contributed to) are set
+    aside, and the region runs on the contributions of the remaining, untouched nodes alone. A value the region
+    contributed before that this isolated run and the untouched nodes no longer give its variable (or give only in a
+    later stratum) is removed: its readers outside the region, and every node they reach, join the region, which runs
+    again. A value that cycled from the region through untouched files back into it is never an input of the isolated
+    run, so it cannot keep supporting itself once its source is gone;
+  - with nothing removed, the region runs on the contributions of every node outside it, and each variable whose
+    values or strata now differ from the stored ones adds its readers outside the region, which runs again; when none
+    differ the refresh stops (early cutoff).
+
+  Every node outside the final region read exactly the values and keys it read before, so it keeps its facts,
+  contributions, reads and lookups; the region's are found again, and when the layout holds only the region's tables
+  are read. A body edit whose values come out the same re-runs its own file's sites only; a changed returned value or
+  parameter list re-runs the sites that read it, not their whole files. A cycle whose values reach the edited file
+  only through other files re-runs the cycle's readers of what the edit removed, which is conservative and never
+  unsound.
 
 What is republished (`refresh.diff`): the members whose bytes changed, the added members, the members whose bindings
 changed, and the members whose set of targeted declarations changed (a target's occurrence node is published in its
@@ -332,7 +361,10 @@ The members' language family picks the resolver:
   method that type declares or inherits, `virtual` when that method can be overridden (not static and not `Final`,
   `hierarchy.overridable`) and `exact` otherwise. An anonymous class body is a synthetic subtype of the type it
   instantiates (`anonymousType`), whose methods override that type's. A call of an abstract method (a functional
-  interface's) also joins every method reference of that method's signature. A receiver that is a field of a class,
+  interface's) also joins every method reference of that method's signature. A method reference `T::m` to an
+  instance method, `T` a type, is unbound (JLS §15.13.1): its signature is `m`'s with `T` as its first parameter, and
+  a call through it passes its first argument to the receiver and the rest to `m`'s parameters in order. A static
+  method's, a constructor's and a bound one's (`this::m`) take the arguments as their own parameters. A receiver that is a field of a class,
   in its own file or another, is typed by the field's declared type, inherited and enclosing-class fields included.
 - **Go, Rust, C, C++** (`resolveStatic`): direct binding and class-hierarchy analysis over interfaces and traits.
   Bare and static sites bind by the language's scoping: same package, import, `use`, namespace and
@@ -359,10 +391,11 @@ The members' language family picks the resolver:
 In every static family a site binds only a target its arguments fit: at least `Params - Optional` (one fewer for
 a `Variadic` one, whose last parameter may take none) and, unless `Variadic`, at most `Params` (`staticFile.fits`).
 A C or C++ definition takes `virtual`, `final` and default arguments from its prototypes of the same signature
-(`preferDefinitions`). A Go method expression or a Rust path naming a method passes
-its receiver as the first argument. A call the worker did not describe (`Site.Described` false) carries no argument list and is not filtered. A receiver that is
+(`preferDefinitions`). A Go method expression, a Rust path naming a method or a Java unbound method reference
+passes its receiver as the first argument. A call the worker did not describe (`Site.Described` false) carries no argument list and is not filtered. A receiver that is
 another call's result (`TypeResult`) has the types that call's targets return, each read in its target's file
-(`staticFile.results`).
+(`staticFile.results`), exactly that type when the target returns it by value (a C++ class, `wire.ExactObject` on
+`wire.Export.Returns`).
 
 A Rust path is read through the module it names in its own crate (`internal/provider/link/resolve_rust.go`). A
 crate is the directory Cargo's layout makes its root: the nearest `src` (`lib.rs` and `main.rs` are the root,
@@ -387,7 +420,13 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
 
 - **JavaScript, TypeScript, TSX** (`resolveECMAScript`, `internal/provider/link/resolve_ecmascript.go`): direct
   binding through imports and scopes. A bare name binds only the declarations its scope sees, those of the innermost
-  scope declaring it (`Table.Visible`), never a class member. A module's exports follow its `export` statements: a
+  scope declaring it (`Table.Visible`), never a class member nor a function stored under a property (`obj.run = () =>
+  …`, `{ k: () => … }`, `Decl.Property`); `f = () => …` binds the name `f` as a declarator does. A function a
+  property assignment or a pair declares is the value written to that property, named by its declaration exactly
+  (`Value.Declares`), so field-based resolution reaches that declaration's node. A module's exports follow its
+  `export` statements and its CommonJS exports (`module.exports.run = …`, `exports.run = …`, a key of
+  `module.exports = { run: … }`, each exported under its own name and written to no field); a name a pattern binds
+  from a literal `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is. A
   declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
   ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
   re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.
@@ -414,11 +453,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   resolution (a function written to the attribute; a method is written to no attribute, so it is reached only through
   a receiver's type) answers an attribute call only when its receiver's type bound nothing and reaches the method
   through no supertype outside the project: `class L(list)` calling `self.append(1)` calls the external
-  `builtins.list.append`, never a function written to `append` elsewhere.
+  `builtins.list.append`, never a function written to `append` elsewhere. A method taken as a value through its
+  class (`f = C.m`) is unbound: `f(obj, n)` passes `obj` as `self` and `n` to the next parameter. One taken through
+  an instance (`g = C().m`, `obj.m`, `self.m`) is bound: `g(k)` passes `k` to the first parameter after `self`. A
+  static or class method taken through its class takes no receiver argument.
 
 **Flow-based type inference** (`inferTypes`, `internal/provider/link/infer.go`) starts from the types the worker
 recovered inside each function (`wire.Type`, `wire/link.go`):
-- a `new C()` or an annotation is `TypeNamed`;
+- a `new C()` or an annotation is `TypeNamed` (a TypeScript `any`, `unknown`, `object`, `never` or `void` names no
+  class and types nothing);
 - a parameter is `TypeParam`;
 - another call's result is `TypeResult`;
 - a field read is `TypeField`;

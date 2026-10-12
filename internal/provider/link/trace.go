@@ -313,6 +313,25 @@ func (ids *idTable) decl(r Ref) (model.FileID, [idDecl]byte, error) {
 	return model.FileID(id), d, err
 }
 
+// each yields every member in ordinal order: its ordinal, FileID and
+// declaration count.
+func (ids *idTable) each(yield func(ord int32, file model.FileID, decls int32) error) error {
+	for ord := int32(0); int64(ord) < ids.count; ord++ {
+		rec, err := ids.member(ord)
+		if err != nil {
+			return err
+		}
+		id, err := ids.at(rec[:idString])
+		if err != nil {
+			return err
+		}
+		if err := yield(ord, model.FileID(id), int32(binary.BigEndian.Uint32(rec[2*idString+8:]))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // node is the file and node of the declaration at r.
 func (ids *idTable) node(r Ref) (target, error) {
 	id, d, err := ids.decl(r)
@@ -653,23 +672,8 @@ func skipHierarchy(s stateReader) error {
 		}
 	}
 	for range 2 {
-		size, err := s.uvarint("a hierarchy index")
-		if err != nil {
+		if err := skipIndex(s); err != nil {
 			return err
-		}
-		var read uint64
-		for read < size {
-			raw, err := s.str("a hierarchy index entry")
-			if err != nil {
-				return err
-			}
-			if _, err := decodeEntry([]byte(raw)); err != nil {
-				return stateCorrupt("a hierarchy index entry is malformed")
-			}
-			read += uint64(len(binary.AppendUvarint(nil, uint64(len(raw))))) + uint64(len(raw))
-		}
-		if read != size {
-			return stateCorrupt("a hierarchy index overruns its length")
 		}
 	}
 	c, err := readIDCounts(s)
@@ -679,6 +683,29 @@ func skipHierarchy(s stateReader) error {
 	n := c.sizes()[idMembers] + c.sizes()[idDecls] + c.sizes()[idParams] + c.sizes()[idStrs]
 	if m, err := io.CopyN(io.Discard, s.br, n); err != nil || m != n {
 		return stateCorrupt("its identity table is short")
+	}
+	return nil
+}
+
+// skipIndex reads an index writeTo wrote through, checking each entry.
+func skipIndex(s stateReader) error {
+	size, err := s.uvarint("a hierarchy index")
+	if err != nil {
+		return err
+	}
+	var read uint64
+	for read < size {
+		raw, err := s.str("a hierarchy index entry")
+		if err != nil {
+			return err
+		}
+		if _, err := decodeEntry([]byte(raw)); err != nil {
+			return stateCorrupt("a hierarchy index entry is malformed")
+		}
+		read += uint64(len(binary.AppendUvarint(nil, uint64(len(raw))))) + uint64(len(raw))
+	}
+	if read != size {
+		return stateCorrupt("a hierarchy index overruns its length")
 	}
 	return nil
 }

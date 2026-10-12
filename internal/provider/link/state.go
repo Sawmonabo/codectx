@@ -31,18 +31,23 @@ import (
 //     form;
 //   - the facts, by entry then target (idBinding), each a string of its
 //     encoded form;
-//   - the index groups, by key (group), the recorded reads, by key (read),
-//     and the address-taken functions, by the member taking them (taken),
-//     each record a string of its encoded form: what a refresh of a
-//     static-family unit finds its re-runs from (trace.go), empty for the
-//     flow family;
-//   - the boundary contributions, by entry, value and contributing member
-//     (contribution), and the boundary entries read, by entry and reading
-//     member (flowRead), each a string of its encoded form: what a refresh
-//     of a flow-family unit finds its region from (refresh.go), empty for
-//     the static family;
+//   - the index groups, by key (group): the hierarchy's and, for the flow
+//     family, the module index's;
+//   - the recorded reads, by key (read), and the address-taken functions,
+//     by the member taking them (taken), each record a string of its
+//     encoded form: what a refresh of a static-family unit finds its
+//     re-runs from (trace.go), empty for the flow family;
+//   - every value each node of the flow family's fixed point put into a
+//     variable, by entry, value and node (idContribution); every variable
+//     each node read, by entry and node (idRead); and every key of the
+//     hierarchy or the module index each node looked up, by key and node
+//     (nodeTrace), each named by identity (flowstate.go) and each a string
+//     of its encoded form: what a refresh of a flow-family unit finds its
+//     region from (refresh.go), empty for the static family;
 //   - a byte, 1 when the unit's hierarchy follows (its module path
 //     and root, its two indexes and its identity table, as they are on
+//     disk), else 0;
+//   - a byte, 1 when the flow family's module index follows (as it is on
 //     disk), else 0.
 //
 // A string is its length (an unsigned varint) and its bytes. A state that is
@@ -50,14 +55,14 @@ import (
 
 // stateTag opens every stored resolution state, so a state of any other form
 // is refused before anything of it is read.
-const stateTag = "link.resolution.boundary\n"
+const stateTag = "link.resolution.nodes\n"
 
 // details is every technique a fact can carry, in its stored order, which is
 // also the order of preference a fold of two equal facts keeps (better); the
 // empty technique, a fact no technique is named for (an open or external
 // site), is last.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
-	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, ""}
+	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {
@@ -522,16 +527,26 @@ func writeState(w io.Writer, fields []manifestField, records *pagination.SortedR
 		err = writeSection(bw, res.taken, encodeTaken)
 	}
 	if err == nil {
-		err = writeSection(bw, res.contributions, encodeWith(contributionCodec))
+		err = writeSection(bw, res.flowContributions, encodeWith(idContributionCodec))
 	}
 	if err == nil {
-		err = writeSection(bw, res.flowReads, encodeWith(flowReadCodec))
+		err = writeSection(bw, res.flowReads, encodeWith(idReadCodec))
+	}
+	if err == nil {
+		err = writeSection(bw, res.flowTraces, encodeWith(nodeTraceCodec))
 	}
 	if err == nil {
 		if res.h == nil {
 			err = bw.WriteByte(0)
 		} else if err = bw.WriteByte(1); err == nil {
 			err = res.h.writeTo(bw)
+		}
+	}
+	if err == nil {
+		if res.mods == nil {
+			err = bw.WriteByte(0)
+		} else if err = bw.WriteByte(1); err == nil {
+			err = res.mods.writeTo(bw)
 		}
 	}
 	if err == nil {
@@ -674,23 +689,32 @@ func readState(r io.Reader, sink stateSink) error {
 	if err := readSection(s, "address-taken functions", decodeTaken, compareTakenFrom, true, sink.taken); err != nil {
 		return err
 	}
-	if err := readSection(s, "boundary contributions", decodeWith(contributionCodec, "a boundary contribution"),
-		contributionCodec.cmp, true, sink.contribution); err != nil {
+	if err := readSection(s, "flow contributions", decodeWith(idContributionCodec, "a flow contribution"),
+		idContributionCodec.cmp, true, sink.contribution); err != nil {
 		return err
 	}
-	if err := readSection(s, "boundary reads", decodeWith(flowReadCodec, "a boundary read"), flowReadCodec.cmp, true,
+	if err := readSection(s, "flow reads", decodeWith(idReadCodec, "a flow read"), idReadCodec.cmp, true,
 		sink.flowRead); err != nil {
 		return err
 	}
-	switch has, err := s.byte("its hierarchy mark"); {
-	case err != nil:
+	if err := readSection(s, "flow lookups", decodeWith(nodeTraceCodec, "a flow lookup"), nodeTraceCodec.cmp, true,
+		sink.flowTrace); err != nil {
 		return err
-	case has == 1:
-		if err := sink.hierarchy(s); err != nil {
+	}
+	for _, part := range []struct {
+		what string
+		read func(stateReader) error
+	}{{"its hierarchy mark", sink.hierarchy}, {"its module index mark", sink.modules}} {
+		switch has, err := s.byte(part.what); {
+		case err != nil:
 			return err
+		case has == 1:
+			if err := part.read(s); err != nil {
+				return err
+			}
+		case has != 0:
+			return stateCorrupt(part.what + " is malformed")
 		}
-	case has != 0:
-		return stateCorrupt("its hierarchy mark is malformed")
 	}
 	if _, err := s.br.ReadByte(); err != io.EOF {
 		return stateCorrupt("it holds more than its sections")
@@ -706,13 +730,15 @@ type stateSink struct {
 	group   func(group) error
 	read    func(read) error
 	taken   func(taken) error
-	// contribution and flowRead receive the flow family's boundary
-	// contributions and reads (refresh.go).
-	contribution func(contribution) error
-	flowRead     func(flowRead) error
-	// hierarchy reads the stored hierarchy from the stream, when there is
-	// one.
+	// contribution, flowRead and flowTrace receive the flow family's
+	// contributions, reads and lookups (refresh.go).
+	contribution func(idContribution) error
+	flowRead     func(idRead) error
+	flowTrace    func(nodeTrace) error
+	// hierarchy and modules read the stored hierarchy and module index
+	// from the stream, when there is one.
 	hierarchy func(stateReader) error
+	modules   func(stateReader) error
 }
 
 // ValidateState reads a stored resolution state through and reports whether
@@ -726,9 +752,11 @@ func ValidateState(r io.Reader) error {
 		group:        func(group) error { return nil },
 		read:         func(read) error { return nil },
 		taken:        func(taken) error { return nil },
-		contribution: func(contribution) error { return nil },
-		flowRead:     func(flowRead) error { return nil },
+		contribution: func(idContribution) error { return nil },
+		flowRead:     func(idRead) error { return nil },
+		flowTrace:    func(nodeTrace) error { return nil },
 		hierarchy:    skipHierarchy,
+		modules:      skipIndex,
 	})
 }
 
@@ -768,20 +796,28 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 		return nil, err
 	}
 	defer takenSort.Close()
-	contributions, err := newSort0(dir, contributionCodec, nil)
+	contributions, err := newSort0(dir, idContributionCodec, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer contributions.Close()
-	flowReads, err := newSort0(dir, flowReadCodec, nil)
+	flowReads, err := newSort0(dir, idReadCodec, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer flowReads.Close()
+	flowTraces, err := newSort0(dir, nodeTraceCodec, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer flowTraces.Close()
 	p := &previous{}
 	defer func() {
-		if p.records == nil && p.h != nil {
-			_ = p.h.close()
+		if p.records == nil {
+			if p.h != nil {
+				_ = p.h.close()
+			}
+			p.mods.close()
 		}
 	}()
 	err = readState(r, stateSink{
@@ -790,10 +826,15 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 			return nil
 		},
 		record: records.Add, binding: bindings.Add, group: groups.Add, read: reads.Add, taken: takenSort.Add,
-		contribution: contributions.Add, flowRead: flowReads.Add,
+		contribution: contributions.Add, flowRead: flowReads.Add, flowTrace: flowTraces.Add,
 		hierarchy: func(s stateReader) error {
 			var err error
 			p.h, err = readHierarchy(dir, s)
+			return err
+		},
+		modules: func(s stateReader) error {
+			var err error
+			p.mods, err = readIndex(dir, s)
 			return err
 		},
 	})
@@ -821,10 +862,13 @@ func loadState(r io.Reader, dir string) (*previous, error) {
 	if p.taken, err = takenSort.Sorted(); err != nil {
 		return nil, err
 	}
-	if p.contributions, err = contributions.Sorted(); err != nil {
+	if p.flowContributions, err = contributions.Sorted(); err != nil {
 		return nil, err
 	}
 	if p.flowReads, err = flowReads.Sorted(); err != nil {
+		return nil, err
+	}
+	if p.flowTraces, err = flowTraces.Sorted(); err != nil {
 		return nil, err
 	}
 	ok = true

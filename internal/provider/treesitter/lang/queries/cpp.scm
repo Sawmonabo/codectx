@@ -10,4 +10,7 @@
 (using_declaration (_) @import.path) @import
 
 (call_expression function: (qualified_identifier scope: (_) @call.qualifier name: (identifier) @call.name)) @call
+; A qualified member call `a.Base::f()`: the qualified name's last part is a
+; field_identifier; the callee token is f.
+(call_expression function: (field_expression argument: (_) @call.qualifier field: (qualified_identifier name: (field_identifier) @call.name))) @call
 (call_expression function: (template_function name: (identifier) @call.name)) @call

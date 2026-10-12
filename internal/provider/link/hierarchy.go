@@ -156,8 +156,8 @@ const (
 	keySuper = "p\x00"
 	// keyExternalSuper + refKey(type): a supertype outside the unit, its
 	// qualified name in Aux (externalName), flagInterface in Flags when the
-	// source proves it an interface or trait (externalKind). A type of any
-	// family but Go has those its own declaration and its impls write; a Go
+	// source proves it an interface or trait (externalInterface). A type of
+	// any family but Go has those its own declaration and its impls write; a Go
 	// type has every external type it embeds, directly or through an
 	// embedded type of the unit (satisfy), flagInterface when the embedding
 	// type is an interface.
@@ -184,6 +184,11 @@ const (
 	// flagInterface marks a type declaration of kind interface (a Rust
 	// trait included), and a supertype entry naming one.
 	flagInterface
+	// flagExactReturn marks a callable whose result is an object of exactly
+	// the type it returns (Decl.Returns marked wire.ExactObject: a C++
+	// function returning a class type by value), so a call on that result
+	// runs that type's method.
+	flagExactReturn
 )
 
 // The marks of a parameter entry (keyParam).
@@ -636,6 +641,9 @@ func flagsOf(d *Decl) byte {
 	if d.Kind == model.NodeInterface {
 		f |= flagInterface
 	}
+	if d.Returns.Kind == wire.TypeNamed && d.Returns.Index == wire.ExactObject {
+		f |= flagExactReturn
+	}
 	return f
 }
 
@@ -717,7 +725,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
 			if ok {
 				var flags byte
-				if st.Interface || externalKind(fc.family, sub.Flags) == model.NodeInterface {
+				if st.Interface || externalInterface(fc.family, sub.Flags) {
 					flags = flagInterface
 				}
 				return links.Add(entry{Key: keyExternalSuper + refKey(sub.Ref), Ref: sub.Ref, Aux: external,
@@ -2007,16 +2015,12 @@ func (h *hierarchy) externalImported(fc fileCtx, p, original, local, rest string
 	return "", false, nil
 }
 
-// externalKind is the kind of an external supertype of a type whose entry
-// carries flags, of family: an interface when the source proves it one (an
+// externalInterface reports that the source proves an external supertype
+// of a type whose entry carries flags, of family, an interface or trait: an
 // interface's or trait's supertype, a Rust impl's trait, or a supertype row
-// marked wire.Supertype.Interface, whose entry carries flagInterface), a
-// class otherwise.
-func externalKind(family string, flags byte) model.NodeKind {
-	if flags&flagInterface != 0 || family == "rust" {
-		return model.NodeInterface
-	}
-	return model.NodeClass
+// marked wire.Supertype.Interface, whose entry carries flagInterface.
+func externalInterface(family string, flags byte) bool {
+	return flags&flagInterface != 0 || family == "rust"
 }
 
 // externalSupers is every supertype outside the unit of the type typ of
@@ -2147,8 +2151,11 @@ func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Bindi
 		return err
 	}
 	return h.links.lookup(keyExternalSuper+refKey(ref), func(e entry) error {
-		return emit(Binding{Kind: relation(e.Flags), Site: ref, Detail: DetailSupertype,
-			External: externalType(fc.family, externalKind(fc.family, e.Flags), e.Aux)})
+		detail := DetailSupertypeClass
+		if e.Flags&flagInterface != 0 {
+			detail = DetailSupertypeInterface
+		}
+		return emit(Binding{Kind: relation(e.Flags), Site: ref, Detail: detail, External: externalType(fc.family, e.Aux)})
 	})
 }
 
@@ -2195,8 +2202,8 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 			return err
 		}
 		if ok {
-			err := emit(Binding{Kind: FactExtends, Site: ref, Detail: DetailSupertype,
-				External: externalType(fc.family, model.NodeInterface, q)})
+			err := emit(Binding{Kind: FactExtends, Site: ref, Detail: DetailSupertypeInterface,
+				External: externalType(fc.family, q)})
 			if err != nil {
 				return err
 			}

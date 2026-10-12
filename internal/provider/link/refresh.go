@@ -3,10 +3,7 @@ package link
 import (
 	"cmp"
 	"context"
-	"encoding/binary"
-	"errors"
 	"slices"
-	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -31,9 +28,9 @@ import (
 // member's bindings; when the membership and manifest fields hold and every
 // moved table keeps its interface (layout), it also keeps the predecessor's
 // hierarchy and reads only the tables of the members that re-run. A Python
-// or ECMAScript unit whose layout holds re-derives only the region of
-// members its moved boundary values reach (resolveFlow, below), and any
-// other resolves every site. The bindings are then
+// or ECMAScript unit re-derives only the region of nodes (sites and file
+// nodes) whose recorded reads or lookups changed, or whose member moved
+// (resolveFlow, below), whatever moved. The bindings are then
 // diffed against the predecessor's: a file whose facts of any kind changed is
 // republished, and so is a file the set of whose targeted declarations,
 // modules or parameters changed, since a target's occurrence is published in
@@ -93,9 +90,10 @@ type refresh struct {
 	// and those of the predecessor's members that are gone: every file the
 	// carry-over names replaced.
 	changed *pagination.ExternalSort[model.FileID]
-	// moved collects the members whose table digest moved or that are new
-	// with a table, whose own sites resolve again whatever they read; gone
-	// the predecessor's members that are no longer members.
+	// moved collects the members whose table digest moved (a table that is
+	// gone included) or that are new with a table, whose own sites resolve
+	// again whatever they read; gone the predecessor's members that are no
+	// longer members.
 	moved, gone *pagination.ExternalSort[model.FileID]
 }
 
@@ -168,15 +166,13 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		if ok && old.File == fv.ID {
 			if old.Digest != digest {
 				rf.resolve = true
+				if err := rf.moved.Add(fv.ID); err != nil {
+					return err
+				}
 				if digest == "" {
 					rf.layout = false
-				} else {
-					if err := rf.moved.Add(fv.ID); err != nil {
-						return err
-					}
-					if err := rf.sameInterface(ctx, fv, old); err != nil {
-						return err
-					}
+				} else if err := rf.sameInterface(ctx, fv, old); err != nil {
+					return err
 				}
 			}
 			// A member whose table moved is republished even with its bytes
@@ -304,39 +300,56 @@ func diffGroups[T any, K cmp.Ordered](a, b *pagination.SortedRun[T], key func(T)
 }
 
 // The flow family's resolution (Python, ECMAScript) is one stratified least
-// fixed point over the unit (infer.go), whose answer for a member depends on
-// the values the other members send it. A refresh maintains it by
-// delete-and-rederive at the granularity of members (Gupta, Mumick and
-// Subrahmanian, "Maintaining Views Incrementally", SIGMOD 1993): every
-// value a member sends across its boundary is stored as a contribution
-// (contribution: a callable's returns, an argument into another member's
-// parameter, a field write), with the boundary entries each member read
-// (flowRead), and a refresh re-derives a region of members from the stored
-// contributions of the members outside it.
+// fixed point over the unit (infer.go), decomposed into nodes: a site node
+// owns one site's rules and facts, a file node its member's returns, field
+// writes, imports and hierarchy facts. The state keeps, named by identity
+// (flowstate.go), every value each node put into a variable (its
+// contributions), every variable each node read, and every key of the
+// hierarchy and the module index each node looked up, found or not (its
+// traces). A refresh maintains the fixed point by delete-and-rederive at
+// the granularity of nodes (Gupta, Mumick and Subrahmanian, "Maintaining
+// Views Incrementally", SIGMOD 1993), re-running a region Z of nodes from
+// the stored contributions of the nodes outside it.
 //
-// The region starts as the members whose table moved, closed under every
-// path between them in the predecessor's boundary graph (a member sends to
-// another when it contributed a value to an entry the other reads): a value
-// that cycled from a moved member through untouched ones back to it is
-// re-derived with the whole cycle, so nothing the moved member no longer
-// produces can support itself through the stored contributions. Once the
-// region is re-derived, every entry whose values (and the stratum each
-// arrives at) differ from the predecessor's names its readers outside the
-// region; when there are none the refresh stops there (an edited member
-// whose boundary values come out equal costs its own sites only), and
-// otherwise the region grows by those readers and everything they reach in
-// the predecessor's graph, and is re-derived again. Every member outside
-// the final region read exactly what it read before, so its stored
-// bindings, contributions and reads stand.
+// Z starts as every node of each member whose table moved, that is new or
+// that is gone, and every node that looked up a key whose group changed (a
+// declaration, parameter, export or module added, removed or changed under
+// it: the hierarchy and module index are rebuilt and diffed group by group
+// when the layout broke, and kept as stored when it holds). Then, until it
+// settles:
 //
-// It applies when the refresh's layout is its predecessor's: then member
-// ordinals, declaration indices and every answer of the hierarchy are the
-// predecessor's (the hierarchy is a function of the interfaces alone), so
-// the stored contributions, positional, mean the same thing, and the stored
-// hierarchy is reused. Any other refresh resolves the unit in full.
+//   - U is every node the stored graph reaches from Z (a flowNode reaches the
+//     readers of each variable it contributed to), outside Z; the other
+//     nodes are trusted, since nothing they read depends on Z.
+//   - Z runs on the trusted nodes' contributions alone (isolated). Each
+//     value Z contributed before that neither the isolated run nor a
+//     trusted node now puts into its variable (or puts there only in a
+//     later stratum) is a removal: its readers outside Z, and everything
+//     they reach, join Z, which runs again. A value that cycled from Z
+//     through untouched nodes back into Z is not an input of the isolated
+//     run, so it cannot support itself once its source is gone.
+//   - With no removal, Z runs on every node's contributions outside it
+//     (the isolated run stands when U sent nothing into a variable Z
+//     read). Each variable whose values, or the stratum a value arrives
+//     at, now differ from the stored ones names its readers outside Z,
+//     which join Z, and Z runs again; with none the refresh is done.
+//
+// Every node outside the final Z read exactly what it read before and
+// looked up keys that hold what they held, so its stored facts,
+// contributions, reads and traces are what a full build gives it, and they
+// are carried; Z's are found again. A body edit whose values come out the
+// same costs its own member's sites only, and reads no other table.
 
-// resolveFlow is a flow-family unit's resolution, in full or, when the
-// refresh's layout holds, of the region its refresh re-derives (above).
+// Observer, when the Tables a link reads also implement it, is told the
+// member path of each site of the flow family the link resolves, as it
+// resolves it: the work a build does, site by site.
+type Observer interface {
+	Resolved(path string)
+}
+
+// resolveFlow is a flow-family unit's resolution, in full or, when rf has a
+// predecessor's flow state, of the region of nodes its refresh re-derives
+// (above).
 func resolveFlow(ctx context.Context, u *unit, rf *refresh) (*resolution, error) {
 	res := &resolution{}
 	ok := false
@@ -345,44 +358,71 @@ func resolveFlow(ctx context.Context, u *unit, rf *refresh) (*resolution, error)
 			res.close()
 		}
 	}()
-	incremental := rf.prev != nil && rf.layout && rf.prev.h != nil
 	var err error
-	if incremental {
-		res.h = rf.prev.h
-	} else if res.h, err = buildHierarchy(ctx, u); err != nil {
-		return nil, err
-	}
-	if res.groups, err = emptyOf(newGroupSort(u.dir)); err != nil {
-		return nil, err
-	}
 	if res.reads, err = emptyOf(newReadSort(u.dir, compareRead)); err != nil {
 		return nil, err
 	}
 	if res.taken, err = emptyOf(newTakenSort(u.dir, compareTakenFrom)); err != nil {
 		return nil, err
 	}
-	var fr *flowRefresh
-	var t *types
+	prev := rf.prev
+	incremental := prev != nil && prev.h != nil && prev.mods != nil
+	// keys collects the changed groups' keys of a refresh.
+	var keys *pagination.ExternalSort[string]
 	if incremental {
-		if fr, err = newFlowRefresh(ctx, u, rf); err != nil {
+		if keys, err = newKeySort(u.dir); err != nil {
+			return nil, err
+		}
+		defer keys.Close()
+	}
+	if incremental && rf.layout {
+		res.h, res.mods, res.groups = prev.h, prev.mods, prev.groups
+	} else {
+		if res.h, err = buildHierarchy(ctx, u); err != nil {
+			return nil, err
+		}
+		if res.mods, err = buildModules(ctx, u, res.h); err != nil {
+			return nil, err
+		}
+		if res.groups, err = flowGroups(u.dir, res.h, res.mods); err != nil {
+			return nil, err
+		}
+		if incremental {
+			err = diffGroups(prev.groups, res.groups, func(g group) string { return g.Key },
+				func(a, b group) bool { return a == b }, keys.Add)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	var pass *flowPass
+	var region *pagination.SortedRun[flowNode]
+	var fr *flowRefresh
+	if incremental {
+		if fr, err = newFlowRefresh(u, rf, res.h); err != nil {
 			return nil, err
 		}
 		defer fr.close()
-		if t, err = fr.rederive(ctx, res.h); err != nil {
+		seeds, err := fr.seeds(keys)
+		if err != nil {
 			return nil, err
 		}
-	} else if t, err = inferTypes(ctx, u, res.h, nil, nil); err != nil {
+		pass, region, err = fr.rederive(ctx, seeds)
+		if err != nil {
+			return nil, err
+		}
+		defer region.Close()
+	} else if pass, err = runFlow(ctx, u, res.h, nil, nil); err != nil {
 		return nil, err
 	}
-	defer t.close()
+	defer pass.close()
 
 	facts, err := newIDBindingSort(u.dir)
 	if err != nil {
 		return nil, err
 	}
 	defer facts.Close()
-	// A resolver may emit from any goroutine; the sort has one producer.
-	var mu sync.Mutex
 	ids := res.h.ids
 	emit := func(b Binding) error {
 		file, err := ids.file(b.Site.File)
@@ -393,391 +433,540 @@ func resolveFlow(ctx context.Context, u *unit, rf *refresh) (*resolution, error)
 		if err != nil || !ok {
 			return err
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		return facts.Add(id)
+	}
+	e := &flowEmit{h: res.h, mods: res.mods, t: pass.t, emit: emit, trace: pass.note}
+	if o, ok := u.tables.(Observer); ok {
+		e.observe = o.Resolved
+	}
+	if fr != nil {
+		if e.only, err = fr.ordinals(region); err != nil {
+			return nil, err
+		}
+		defer e.only.Close()
 	}
 	emitFacts := emitECMAScript
 	if u.family == FamilyPython {
 		emitFacts = emitPython
 	}
-	var only *pagination.SortedRun[int32]
-	if fr != nil {
-		only = fr.region
-	}
-	if err := emitFacts(ctx, u, res.h, t, only, emit); err != nil {
+	if err := emitFacts(ctx, u, e); err != nil {
 		return nil, err
 	}
-	contributions, err := newSort0(u.dir, contributionCodec, earliest)
+
+	contributions, err := newSort0(u.dir, idContributionCodec, earliestID)
 	if err != nil {
 		return nil, err
 	}
 	defer contributions.Close()
-	reads, err := newSort0(u.dir, flowReadCodec, keepFirst[flowRead])
+	reads, err := newSort0(u.dir, idReadCodec, keepFirst[idRead])
 	if err != nil {
 		return nil, err
 	}
 	defer reads.Close()
+	traces, err := newSort0(u.dir, nodeTraceCodec, keepFirst[nodeTrace])
+	if err != nil {
+		return nil, err
+	}
+	defer traces.Close()
 	if fr != nil {
-		if err := fr.carry(facts, contributions, reads); err != nil {
+		if err := fr.carry(region, facts, contributions, reads, traces); err != nil {
 			return nil, err
 		}
 	}
-	if err := t.contributions.Each(contributions.Add); err != nil {
+	n := &namer{ids: ids}
+	err = pass.t.contributions.Each(func(c contribution) error {
+		id, err := n.contribution(c)
+		if err != nil {
+			return err
+		}
+		return contributions.Add(id)
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := t.reads.Each(reads.Add); err != nil {
+	err = pass.t.reads.Each(func(r flowRead) error {
+		id, err := n.read(r)
+		if err != nil {
+			return err
+		}
+		return reads.Add(id)
+	})
+	if err != nil {
+		return nil, err
+	}
+	looked, err := pass.traces.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer looked.Close()
+	err = looked.Each(func(t ordTrace) error {
+		at, err := n.node(t.Node)
+		if err != nil {
+			return err
+		}
+		return traces.Add(nodeTrace{Key: t.Key, Node: at})
+	})
+	if err != nil {
 		return nil, err
 	}
 	if res.bindings, err = facts.Sorted(); err != nil {
 		return nil, err
 	}
-	if res.contributions, err = contributions.Sorted(); err != nil {
+	if res.flowContributions, err = contributions.Sorted(); err != nil {
 		return nil, err
 	}
 	if res.flowReads, err = reads.Sorted(); err != nil {
+		return nil, err
+	}
+	if res.flowTraces, err = traces.Sorted(); err != nil {
 		return nil, err
 	}
 	ok = true
 	return res, nil
 }
 
-// flowRefresh is one refresh of a flow-family unit: the predecessor's
-// boundary graph, each relation sorted the ways the region's walks read it,
-// and the region, the member ordinals re-derived, ascending.
-type flowRefresh struct {
-	u  *unit
-	rf *refresh
-	// byEntry and reads are the predecessor's contributions and reads as
-	// stored, by entry; byFrom the contributions by contributing member and
-	// readsByFile the reads by reading member.
-	byEntry     *pagination.SortedRun[contribution]
-	byFrom      *pagination.SortedRun[contribution]
-	reads       *pagination.SortedRun[flowRead]
-	readsByFile *pagination.SortedRun[flowRead]
-	region      *pagination.SortedRun[int32]
+// flowPass is one run of the inference over a region, with the keys its
+// nodes looked up, which the emission of the same region adds to.
+type flowPass struct {
+	t      *types
+	traces *pagination.ExternalSort[ordTrace]
 }
 
-func newFlowRefresh(ctx context.Context, u *unit, rf *refresh) (*flowRefresh, error) {
-	fr := &flowRefresh{u: u, rf: rf, byEntry: rf.prev.contributions, reads: rf.prev.flowReads}
-	ok := false
-	defer func() {
-		if !ok {
-			fr.close()
-		}
-	}()
+func (p *flowPass) note(n Ref, k TraceKey) error {
+	return p.traces.Add(ordTrace{Key: k.hash(), Node: n})
+}
+
+func (p *flowPass) close() {
+	if p == nil {
+		return
+	}
+	if p.t != nil {
+		p.t.close()
+	}
+	p.traces.Close()
+}
+
+// runFlow runs the inference over the nodes only selects (every node when
+// nil), from inputs (stored contributions by ordinal, sorted by entry; none
+// when nil), recording every key a flowNode looks up.
+func runFlow(ctx context.Context, u *unit, h *hierarchy, only *pagination.SortedRun[Ref],
+	inputs *pagination.SortedRun[contribution]) (*flowPass, error) {
+	p := &flowPass{}
 	var err error
-	if fr.byFrom, err = resort(u.dir, fr.byEntry, contributionCodec, func(a, b contribution) int {
-		return cmp.Or(cmp.Compare(a.From, b.From), contributionCodec.cmp(a, b))
-	}); err != nil {
+	if p.traces, err = newSort0(u.dir, ordTraceCodec, keepFirst[ordTrace]); err != nil {
 		return nil, err
 	}
-	if fr.readsByFile, err = resort(u.dir, fr.reads, flowReadCodec, func(a, b flowRead) int {
-		return cmp.Or(cmp.Compare(a.File, b.File), flowReadCodec.cmp(a, b))
-	}); err != nil {
+	var in flowInputs
+	if inputs != nil {
+		in = func(wants *pagination.SortedRun[variable]) (*pagination.SortedRun[contribution], error) {
+			return collect(u.dir, contributionCodec, earliest, func(add func(contribution) error) error {
+				return join(inputs, wants, func(c contribution, v variable) int { return cmpVar(c.Entry, v) },
+					func(c contribution, read []variable) error {
+						if c.Entry.Kind != varReturn && len(read) == 0 {
+							return nil
+						}
+						return add(c)
+					})
+			})
+		}
+	}
+	if p.t, err = inferTypes(ctx, u, h, only, in, p.note); err != nil {
+		p.close()
 		return nil, err
 	}
-	seeds, err := fr.seeds(ctx)
-	if err != nil {
+	return p, nil
+}
+
+// flowRefresh is one refresh of a flow-family unit: the predecessor's
+// contributions by contributing node, and the identities of this build's
+// members and declarations with their ordinals.
+type flowRefresh struct {
+	u      *unit
+	rf     *refresh
+	h      *hierarchy
+	byNode *pagination.SortedRun[idContribution]
+	idMap  *pagination.SortedRun[idRef]
+}
+
+func newFlowRefresh(u *unit, rf *refresh, h *hierarchy) (*flowRefresh, error) {
+	fr := &flowRefresh{u: u, rf: rf, h: h}
+	var err error
+	if fr.byNode, err = resort(u.dir, rf.prev.flowContributions, contributionsByNode, contributionsByNode.cmp); err != nil {
 		return nil, err
 	}
-	defer seeds.Close()
-	ahead, err := fr.closure(seeds, fr.forward)
-	if err != nil {
+	if fr.idMap, err = idMapOf(u.dir, h.ids); err != nil {
+		fr.close()
 		return nil, err
 	}
-	defer ahead.Close()
-	behind, err := fr.closure(seeds, fr.backward)
-	if err != nil {
-		return nil, err
-	}
-	defer behind.Close()
-	if fr.region, err = fr.both(ahead, behind); err != nil {
-		return nil, err
-	}
-	ok = true
 	return fr, nil
 }
 
 func (fr *flowRefresh) close() {
-	fr.byFrom.Close()
-	fr.readsByFile.Close()
-	fr.region.Close()
+	fr.byNode.Close()
+	fr.idMap.Close()
 }
 
-// seeds is the ordinals of the members whose table moved (refresh.moved).
-func (fr *flowRefresh) seeds(ctx context.Context) (*pagination.SortedRun[int32], error) {
-	moved, err := fr.rf.moved.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer moved.Close()
-	c, err := newCursor(moved)
-	if err != nil {
-		return nil, err
-	}
-	defer c.stop()
-	out, err := newOrdinalSort(fr.u.dir)
-	if err != nil {
-		return nil, err
-	}
-	defer out.Close()
-	var file int32 = -1
-	err = fr.u.members(func(fv model.FileVersion) error {
-		file++
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		in, err := c.has(fv.ID)
-		if err != nil || !in {
-			return err
-		}
-		return out.Add(file)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out.Sorted()
-}
-
-// rederive re-derives the region (above) until no member outside it reads
-// a boundary entry whose values moved, and answers the last inference,
-// which binds the region's sites.
-func (fr *flowRefresh) rederive(ctx context.Context, h *hierarchy) (*types, error) {
-	for {
-		inputs, err := fr.inputs()
-		if err != nil {
-			return nil, err
-		}
-		t, err := inferTypes(ctx, fr.u, h, fr.region, inputs)
-		inputs.Close()
-		if err != nil {
-			return nil, err
-		}
-		readers, err := fr.dirty(t)
-		if err != nil {
-			t.close()
-			return nil, err
-		}
-		if readers.Len() == 0 {
-			readers.Close()
-			return t, nil
-		}
-		t.close()
-		grown, err := fr.closure(readers, fr.forward)
-		readers.Close()
-		if err != nil {
-			return nil, err
-		}
-		region, err := unionOrdinals(fr.u.dir, fr.region, grown)
-		grown.Close()
-		if err != nil {
-			return nil, err
-		}
-		fr.region.Close()
-		fr.region = region
-	}
-}
-
-// inputs is what the members outside the region send into it, by entry:
-// every stored contribution of a member outside it into a parameter of a
-// member inside it, into a field, or of a callable's returns.
-func (fr *flowRefresh) inputs() (*pagination.SortedRun[contribution], error) {
-	outside, err := newSort0(fr.u.dir, contributionCodec, earliest)
-	if err != nil {
-		return nil, err
-	}
-	defer outside.Close()
-	if err := keepOutside(fr.byFrom, fr.region, func(c contribution) int32 { return c.From }, outside.Add); err != nil {
-		return nil, err
-	}
-	run, err := outside.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer run.Close()
-	out, err := newSort0(fr.u.dir, contributionCodec, earliest)
-	if err != nil {
-		return nil, err
-	}
-	defer out.Close()
-	// By entry, a parameter's contributions come first and by owner, which
-	// the region's cursor is asked in ascending order.
-	in, err := newOrdinals(fr.region)
-	if err != nil {
-		return nil, err
-	}
-	defer in.stop()
-	err = run.Each(func(c contribution) error {
-		if c.Entry.Kind == varParam {
-			inside, err := in.has(c.Entry.File)
-			if err != nil || !inside {
-				return err
-			}
-		}
-		return out.Add(c)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out.Sorted()
-}
-
-// keepOutside adds every record of run (sorted by member ascending) whose
-// member region does not hold.
-func keepOutside[T any](run *pagination.SortedRun[T], region *pagination.SortedRun[int32], member func(T) int32,
-	add func(T) error) error {
-	in, err := newOrdinals(region)
-	if err != nil {
-		return err
-	}
-	defer in.stop()
-	return run.Each(func(v T) error {
-		inside, err := in.has(member(v))
-		if err != nil || inside {
-			return err
-		}
-		return add(v)
-	})
-}
-
-// entryValue is one value an entry holds, early when some contribution
-// sends it in the first stratum.
-type entryValue struct {
-	Entry variable
-	X     value
-	Early bool
-}
-
-// dirty is the members outside the region that read an entry whose values
-// t's region moved: the entry's values, each with its stratum, before
-// (every stored contribution) and now (the stored ones of the members
-// outside the region and t's), compared entry by entry. A parameter is read
-// by its own member; any other entry by the members whose stored reads name
-// it.
-func (fr *flowRefresh) dirty(t *types) (*pagination.SortedRun[int32], error) {
-	now, err := newSort0(fr.u.dir, contributionCodec, earliest)
-	if err != nil {
-		return nil, err
-	}
-	defer now.Close()
-	if err := keepOutside(fr.byFrom, fr.region, func(c contribution) int32 { return c.From }, now.Add); err != nil {
-		return nil, err
-	}
-	if err := t.contributions.Each(now.Add); err != nil {
-		return nil, err
-	}
-	after, err := now.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer after.Close()
-	changed, err := newSort0(fr.u.dir, codec[variable]{put: func(w *wbuf, v variable) { w.variable(v) },
-		get: func(r *rbuf) variable { return r.variable() }, cmp: cmpVar}, keepFirst[variable])
+// seeds is every node of each member whose table moved, that is new with a
+// table, or that is gone, and every node that looked up one of keys (the
+// changed groups).
+func (fr *flowRefresh) seeds(keys *pagination.ExternalSort[string]) (*pagination.SortedRun[flowNode], error) {
+	changed, err := keys.Sorted()
 	if err != nil {
 		return nil, err
 	}
 	defer changed.Close()
-	if err := diffEntries(fr.byEntry, after, changed.Add); err != nil {
-		return nil, err
-	}
-	entries, err := changed.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer entries.Close()
-	readers, err := newOrdinalSort(fr.u.dir)
-	if err != nil {
-		return nil, err
-	}
-	defer readers.Close()
-	if err := fr.readersOf(entries, readers.Add); err != nil {
-		return nil, err
-	}
-	all, err := readers.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	defer all.Close()
-	out, err := newOrdinalSort(fr.u.dir)
-	if err != nil {
-		return nil, err
-	}
-	defer out.Close()
-	if err := keepOutside(all, fr.region, func(f int32) int32 { return f }, out.Add); err != nil {
-		return nil, err
-	}
-	return out.Sorted()
+	return collect(fr.u.dir, nodeCodec, keepFirst[flowNode], func(add func(flowNode) error) error {
+		for _, s := range []*pagination.ExternalSort[model.FileID]{fr.rf.moved, fr.rf.gone} {
+			run, err := s.Sorted()
+			if err != nil {
+				return err
+			}
+			err = run.Each(func(id model.FileID) error { return add(flowNode{File: id, Index: wholeFile}) })
+			run.Close()
+			if err != nil {
+				return err
+			}
+		}
+		return join(fr.rf.prev.flowTraces, changed, func(t nodeTrace, k string) int { return cmp.Compare(t.Key, k) },
+			func(t nodeTrace, hit []string) error {
+				if len(hit) == 0 {
+					return nil
+				}
+				return add(t.Node)
+			})
+	})
 }
 
-// readersOf yields the readers of each entry of entries (ascending): a
-// parameter's member, and the members whose stored reads name any other.
-func (fr *flowRefresh) readersOf(entries *pagination.SortedRun[variable], yield func(int32) error) error {
-	return join(entries, fr.reads, func(v variable, r flowRead) int { return cmpVar(v, r.Entry) },
-		func(v variable, rs []flowRead) error {
-			if v.Kind == varParam {
-				return yield(v.File)
+// rederive re-derives the region z (above) until it settles, and answers
+// the last run, which binds z's sites, with z.
+func (fr *flowRefresh) rederive(ctx context.Context, z *pagination.SortedRun[flowNode]) (*flowPass, *pagination.SortedRun[flowNode], error) {
+	dir := fr.u.dir
+	fail := func(err error) (*flowPass, *pagination.SortedRun[flowNode], error) {
+		z.Close()
+		return nil, nil, err
+	}
+	if z.Len() == 0 {
+		pass, err := fr.run(ctx, z, nil)
+		if err != nil {
+			return fail(err)
+		}
+		return pass, z, nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		down, err := fr.closure(z)
+		if err != nil {
+			return fail(err)
+		}
+		u, err := minus(dir, down, z)
+		down.Close()
+		if err != nil {
+			return fail(err)
+		}
+		withU, err := unionNodes(dir, z, u)
+		if err != nil {
+			u.Close()
+			return fail(err)
+		}
+		iso, stale, err := fr.inputs(withU)
+		withU.Close()
+		if err != nil {
+			u.Close()
+			return fail(err)
+		}
+		if grown, err := fr.absorb(z, stale); err != nil || grown != nil {
+			u.Close()
+			iso.Close()
+			if err != nil {
+				return fail(err)
 			}
-			for _, r := range rs {
-				if err := yield(r.File); err != nil {
+			z = grown
+			continue
+		}
+		pass, err := fr.run(ctx, z, iso)
+		iso.Close()
+		if err != nil {
+			u.Close()
+			return fail(err)
+		}
+		removed, err := fr.removals(z, u, pass.t)
+		if err != nil {
+			u.Close()
+			pass.close()
+			return fail(err)
+		}
+		readers, err := fr.readersOutside(removed, z)
+		removed.Close()
+		if err != nil {
+			u.Close()
+			pass.close()
+			return fail(err)
+		}
+		if readers.Len() > 0 {
+			u.Close()
+			pass.close()
+			grown, err := fr.closure(readers)
+			readers.Close()
+			if err != nil {
+				return fail(err)
+			}
+			next, err := unionNodes(dir, z, grown)
+			grown.Close()
+			if err != nil {
+				return fail(err)
+			}
+			z.Close()
+			z = next
+			continue
+		}
+		readers.Close()
+		withheld, err := fr.withheld(u, pass.t)
+		u.Close()
+		if err != nil {
+			pass.close()
+			return fail(err)
+		}
+		if withheld {
+			pass.close()
+			all, stale, err := fr.inputs(z)
+			if err != nil {
+				return fail(err)
+			}
+			if grown, err := fr.absorb(z, stale); err != nil || grown != nil {
+				all.Close()
+				if err != nil {
+					return fail(err)
+				}
+				z = grown
+				continue
+			}
+			pass, err = fr.run(ctx, z, all)
+			all.Close()
+			if err != nil {
+				return fail(err)
+			}
+		}
+		changed, err := fr.changes(z, pass.t)
+		if err != nil {
+			pass.close()
+			return fail(err)
+		}
+		readers, err = fr.readersOutside(changed, z)
+		changed.Close()
+		if err != nil {
+			pass.close()
+			return fail(err)
+		}
+		if readers.Len() == 0 {
+			readers.Close()
+			return pass, z, nil
+		}
+		pass.close()
+		next, err := unionNodes(dir, z, readers)
+		readers.Close()
+		if err != nil {
+			return fail(err)
+		}
+		z.Close()
+		z = next
+	}
+}
+
+// run runs the inference over the nodes of z this build has, from inputs.
+func (fr *flowRefresh) run(ctx context.Context, z *pagination.SortedRun[flowNode],
+	inputs *pagination.SortedRun[contribution]) (*flowPass, error) {
+	only, err := fr.ordinals(z)
+	if err != nil {
+		return nil, err
+	}
+	defer only.Close()
+	return runFlow(ctx, fr.u, fr.h, only, inputs)
+}
+
+var refCodec = codec[Ref]{put: func(w *wbuf, r Ref) { w.ref(r) }, get: func(r *rbuf) Ref { return r.ref() }, cmp: compareRef}
+
+// ordinals is z by this build's ordinals, the nodes of a member that is
+// gone left out. Ordinals ascend with FileIDs.
+func (fr *flowRefresh) ordinals(z *pagination.SortedRun[flowNode]) (*pagination.SortedRun[Ref], error) {
+	return collect(fr.u.dir, refCodec, keepFirst[Ref], func(add func(Ref) error) error {
+		next, stop := pull(fr.idMap)
+		defer stop()
+		cur, ok, err := next()
+		if err != nil {
+			return err
+		}
+		return z.Each(func(n flowNode) error {
+			for ok && cur.File < n.File {
+				if cur, ok, err = next(); err != nil {
 					return err
 				}
 			}
-			return nil
+			if !ok || cur.File != n.File || cur.Decl != "" {
+				return nil
+			}
+			return add(Ref{File: cur.Ref.File, Index: n.Index})
 		})
+	})
 }
 
-// diffEntries merges two runs of contributions sorted by entry and value
-// and calls changed for each entry (ascending, once) whose values, each
-// with its stratum, differ between them.
-func diffEntries(a, b *pagination.SortedRun[contribution], changed func(variable) error) error {
+// inputs is every stored contribution of a flowNode excluded does not hold, by
+// this build's ordinals and sorted by entry, with the nodes whose stored
+// contributions name a member or declaration this build does not have
+// (stale), which must re-run.
+func (fr *flowRefresh) inputs(excluded *pagination.SortedRun[flowNode]) (*pagination.SortedRun[contribution],
+	*pagination.SortedRun[flowNode], error) {
+	dir := fr.u.dir
+	kept, err := collect(dir, idContributionCodec, nil, func(add func(idContribution) error) error {
+		return filterNodes(fr.byNode, excluded, func(c idContribution) flowNode { return c.From }, false, add)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer kept.Close()
+	stale, err := newSort0(dir, nodeCodec, keepFirst[flowNode])
+	if err != nil {
+		return nil, nil, err
+	}
+	defer stale.Close()
+	out, err := ordinalOf(dir, fr.idMap, kept, stale.Add)
+	if err != nil {
+		return nil, nil, err
+	}
+	gone, err := stale.Sorted()
+	if err != nil {
+		out.Close()
+		return nil, nil, err
+	}
+	return out, gone, nil
+}
+
+// absorb is z grown by stale when stale holds a flowNode (z and stale then
+// closed), else nil (stale closed).
+func (fr *flowRefresh) absorb(z, stale *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
+	defer stale.Close()
+	if stale.Len() == 0 {
+		return nil, nil
+	}
+	grown, err := unionNodes(fr.u.dir, z, stale)
+	if err != nil {
+		return nil, err
+	}
+	z.Close()
+	return grown, nil
+}
+
+// idEV is one value an entry holds, Early when some contribution sends it
+// in the first stratum.
+type idEV struct {
+	Entry idVar
+	X     idValue
+	Early bool
+}
+
+var idEVCodec = codec[idEV]{
+	put: func(w *wbuf, v idEV) { w.idVar(v.Entry); w.idValue(v.X); w.flag(v.Early) },
+	get: func(r *rbuf) idEV { return idEV{Entry: r.idVar(), X: r.idValue(), Early: r.flag()} },
+	cmp: func(a, b idEV) int { return cmp.Or(cmpIDVar(a.Entry, b.Entry), cmpIDValue(a.X, b.X)) },
+}
+
+func earlyEV(a, b idEV) (idEV, error) {
+	a.Early = a.Early || b.Early
+	return a, nil
+}
+
+func evOf(c idContribution) idEV { return idEV{Entry: c.Entry, X: c.X, Early: !c.Late} }
+
+// values is what the stored contributions of the nodes set holds (inside)
+// or does not hold (!inside) put into each entry, with t's contributions
+// when t is set, by entry and value.
+func (fr *flowRefresh) values(set *pagination.SortedRun[flowNode], inside bool, t *types) (*pagination.SortedRun[idEV], error) {
+	return collect(fr.u.dir, idEVCodec, earlyEV, func(add func(idEV) error) error {
+		err := filterNodes(fr.byNode, set, func(c idContribution) flowNode { return c.From }, inside,
+			func(c idContribution) error { return add(evOf(c)) })
+		if err != nil || t == nil {
+			return err
+		}
+		n := &namer{ids: fr.h.ids}
+		return t.contributions.Each(func(c contribution) error {
+			id, err := n.contribution(c)
+			if err != nil {
+				return err
+			}
+			return add(evOf(id))
+		})
+	})
+}
+
+// removals is every entry a value z contributed before is gone from, or
+// arrives at only in a later stratum, when z's values come from t (an
+// isolated run) and the stored contributions of the nodes neither z nor u
+// holds.
+func (fr *flowRefresh) removals(z, u *pagination.SortedRun[flowNode], t *types) (*pagination.SortedRun[idVar], error) {
+	dir := fr.u.dir
+	old, err := fr.values(z, true, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer old.Close()
+	zu, err := unionNodes(dir, z, u)
+	if err != nil {
+		return nil, err
+	}
+	defer zu.Close()
+	now, err := fr.values(zu, false, t)
+	if err != nil {
+		return nil, err
+	}
+	defer now.Close()
+	return collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
+		return join(old, now, idEVCodec.cmp, func(o idEV, n []idEV) error {
+			if len(n) == 0 || o.Early && !n[0].Early {
+				return add(o.Entry)
+			}
+			return nil
+		})
+	})
+}
+
+// changes is every entry whose values, each with its stratum, differ
+// between the stored contributions and those of the nodes z does not hold
+// with t's.
+func (fr *flowRefresh) changes(z *pagination.SortedRun[flowNode], t *types) (*pagination.SortedRun[idVar], error) {
+	dir := fr.u.dir
+	old, err := collect(dir, idEVCodec, earlyEV, func(add func(idEV) error) error {
+		return fr.rf.prev.flowContributions.Each(func(c idContribution) error { return add(evOf(c)) })
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer old.Close()
+	now, err := fr.values(z, false, t)
+	if err != nil {
+		return nil, err
+	}
+	defer now.Close()
+	return collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
+		return diffEV(old, now, add)
+	})
+}
+
+// diffEV merges two runs of entry values sorted by entry and value and
+// calls changed for each entry whose values, each with its stratum, differ
+// between them.
+func diffEV(a, b *pagination.SortedRun[idEV], changed func(idVar) error) error {
 	na, sa := pull(a)
 	defer sa()
 	nb, sb := pull(b)
 	defer sb()
-	// next folds the contributions of one entry and value into one.
-	next := func(n func() (contribution, bool, error), head *contribution, have *bool) (entryValue, bool, error) {
-		if !*have {
-			return entryValue{}, false, nil
-		}
-		v := entryValue{Entry: head.Entry, X: head.X, Early: !head.Late}
-		for {
-			c, ok, err := n()
-			if err != nil {
-				return entryValue{}, false, err
-			}
-			if !ok || cmpVar(c.Entry, v.Entry) != 0 || cmpValue(c.X, v.X) != 0 {
-				*head, *have = c, ok
-				return v, true, nil
-			}
-			v.Early = v.Early || !c.Late
-		}
-	}
-	var ha, hb contribution
-	var oka, okb bool
-	var err error
-	if ha, oka, err = na(); err != nil {
-		return err
-	}
-	if hb, okb, err = nb(); err != nil {
-		return err
-	}
-	x, xok, err := next(na, &ha, &oka)
+	x, xok, err := na()
 	if err != nil {
 		return err
 	}
-	y, yok, err := next(nb, &hb, &okb)
+	y, yok, err := nb()
 	if err != nil {
 		return err
-	}
-	var last variable
-	marked := false
-	mark := func(v variable) error {
-		if marked && cmpVar(last, v) == 0 {
-			return nil
-		}
-		last, marked = v, true
-		return changed(v)
 	}
 	for xok || yok {
 		var c int
@@ -787,26 +976,26 @@ func diffEntries(a, b *pagination.SortedRun[contribution], changed func(variable
 		case !xok:
 			c = 1
 		default:
-			c = cmp.Or(cmpVar(x.Entry, y.Entry), cmpValue(x.X, y.X))
+			c = idEVCodec.cmp(x, y)
 		}
 		switch {
 		case c < 0:
-			err = mark(x.Entry)
+			err = changed(x.Entry)
 		case c > 0:
-			err = mark(y.Entry)
+			err = changed(y.Entry)
 		case x.Early != y.Early:
-			err = mark(x.Entry)
+			err = changed(x.Entry)
 		}
 		if err != nil {
 			return err
 		}
 		if c <= 0 {
-			if x, xok, err = next(na, &ha, &oka); err != nil {
+			if x, xok, err = na(); err != nil {
 				return err
 			}
 		}
 		if c >= 0 {
-			if y, yok, err = next(nb, &hb, &okb); err != nil {
+			if y, yok, err = nb(); err != nil {
 				return err
 			}
 		}
@@ -814,68 +1003,49 @@ func diffEntries(a, b *pagination.SortedRun[contribution], changed func(variable
 	return nil
 }
 
-// forward yields the members that read an entry a member of frontier
-// contributed to in the predecessor.
-func (fr *flowRefresh) forward(frontier *pagination.SortedRun[int32], yield func(int32) error) error {
-	entries, err := fr.entrySort()
+// withheld reports that a flowNode of u contributed before to an entry t's
+// run read, which the isolated run did not hand it.
+func (fr *flowRefresh) withheld(u *pagination.SortedRun[flowNode], t *types) (bool, error) {
+	dir := fr.u.dir
+	sent, err := collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
+		return filterNodes(fr.byNode, u, func(c idContribution) flowNode { return c.From }, true,
+			func(c idContribution) error { return add(c.Entry) })
+	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	defer entries.Close()
-	err = keepInside(fr.byFrom, frontier, func(c contribution) int32 { return c.From },
-		func(c contribution) error { return entries.Add(c.Entry) })
+	defer sent.Close()
+	if sent.Len() == 0 {
+		return false, nil
+	}
+	n := &namer{ids: fr.h.ids}
+	read, err := collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
+		return t.reads.Each(func(r flowRead) error {
+			v, err := n.variable(r.Entry)
+			if err != nil {
+				return err
+			}
+			return add(v)
+		})
+	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	run, err := entries.Sorted()
-	if err != nil {
-		return err
-	}
-	defer run.Close()
-	return fr.readersOf(run, yield)
+	defer read.Close()
+	found := false
+	err = join(sent, read, cmpIDVar, func(_ idVar, hit []idVar) error {
+		found = found || len(hit) > 0
+		return nil
+	})
+	return found, err
 }
 
-// backward yields the members that contributed in the predecessor to an
-// entry a member of frontier read: its stored reads and its parameters.
-func (fr *flowRefresh) backward(frontier *pagination.SortedRun[int32], yield func(int32) error) error {
-	entries, err := fr.entrySort()
-	if err != nil {
-		return err
-	}
-	defer entries.Close()
-	err = keepInside(fr.readsByFile, frontier, func(r flowRead) int32 { return r.File },
-		func(r flowRead) error { return entries.Add(r.Entry) })
-	if err != nil {
-		return err
-	}
-	// By entry, the parameters' contributions come first and by owner.
-	in, err := newOrdinals(frontier)
-	if err != nil {
-		return err
-	}
-	err = fr.byEntry.Each(func(c contribution) error {
-		if c.Entry.Kind != varParam {
-			return nil
-		}
-		inside, err := in.has(c.Entry.File)
-		if err != nil || !inside {
-			return err
-		}
-		return entries.Add(c.Entry)
-	})
-	in.stop()
-	if err != nil {
-		return err
-	}
-	run, err := entries.Sorted()
-	if err != nil {
-		return err
-	}
-	defer run.Close()
-	return join(run, fr.byEntry, func(v variable, c contribution) int { return cmpVar(v, c.Entry) },
-		func(_ variable, cs []contribution) error {
-			for _, c := range cs {
-				if err := yield(c.From); err != nil {
+// readers yields the nodes the stored reads say read an entry of entries.
+func (fr *flowRefresh) readers(entries *pagination.SortedRun[idVar], yield func(flowNode) error) error {
+	return join(entries, fr.rf.prev.flowReads, func(v idVar, r idRead) int { return cmpIDVar(v, r.Entry) },
+		func(_ idVar, rs []idRead) error {
+			for _, r := range rs {
+				if err := yield(r.Node); err != nil {
 					return err
 				}
 			}
@@ -883,59 +1053,61 @@ func (fr *flowRefresh) backward(frontier *pagination.SortedRun[int32], yield fun
 		})
 }
 
-func (fr *flowRefresh) entrySort() (*pagination.ExternalSort[variable], error) {
-	return newSort0(fr.u.dir, codec[variable]{put: func(w *wbuf, v variable) { w.variable(v) },
-		get: func(r *rbuf) variable { return r.variable() }, cmp: cmpVar}, keepFirst[variable])
-}
-
-// closure is seeds and every member step reaches from them, transitively:
-// each round steps from the members the last one added, until a round adds
-// none.
-func (fr *flowRefresh) closure(seeds *pagination.SortedRun[int32],
-	step func(*pagination.SortedRun[int32], func(int32) error) error) (*pagination.SortedRun[int32], error) {
-	dir := fr.u.dir
-	reached, err := unionOrdinals(dir, seeds, nil)
+// readersOutside is the readers of entries z does not hold.
+func (fr *flowRefresh) readersOutside(entries *pagination.SortedRun[idVar], z *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
+	all, err := collect(fr.u.dir, nodeCodec, keepFirst[flowNode], func(add func(flowNode) error) error {
+		return fr.readers(entries, add)
+	})
 	if err != nil {
 		return nil, err
 	}
-	frontier, err := unionOrdinals(dir, seeds, nil)
+	defer all.Close()
+	return minus(fr.u.dir, all, z)
+}
+
+// forward is the nodes that read an entry a flowNode of frontier contributed to
+// before.
+func (fr *flowRefresh) forward(frontier *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
+	dir := fr.u.dir
+	entries, err := collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
+		return filterNodes(fr.byNode, frontier, func(c idContribution) flowNode { return c.From }, true,
+			func(c idContribution) error { return add(c.Entry) })
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer entries.Close()
+	return collect(dir, nodeCodec, keepFirst[flowNode], func(add func(flowNode) error) error {
+		return fr.readers(entries, add)
+	})
+}
+
+// closure is seeds and every node forward reaches from them, transitively.
+func (fr *flowRefresh) closure(seeds *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
+	dir := fr.u.dir
+	reached, err := unionNodes(dir, seeds, nil)
+	if err != nil {
+		return nil, err
+	}
+	frontier, err := unionNodes(dir, seeds, nil)
 	if err != nil {
 		reached.Close()
 		return nil, err
 	}
 	for frontier.Len() > 0 {
-		next, err := newOrdinalSort(dir)
-		if err == nil {
-			err = step(frontier, next.Add)
-		}
-		var stepped *pagination.SortedRun[int32]
-		if err == nil {
-			stepped, err = next.Sorted()
-		}
-		if next != nil {
-			next.Close()
-		}
+		stepped, err := fr.forward(frontier)
 		frontier.Close()
 		if err != nil {
 			reached.Close()
 			return nil, err
 		}
-		fresh, err := newOrdinalSort(dir)
-		if err == nil {
-			err = keepOutside(stepped, reached, func(f int32) int32 { return f }, fresh.Add)
-		}
+		frontier, err = minus(dir, stepped, reached)
 		stepped.Close()
-		if err == nil {
-			frontier, err = fresh.Sorted()
-		}
-		if fresh != nil {
-			fresh.Close()
-		}
 		if err != nil {
 			reached.Close()
 			return nil, err
 		}
-		grown, err := unionOrdinals(dir, reached, frontier)
+		grown, err := unionNodes(dir, reached, frontier)
 		reached.Close()
 		if err != nil {
 			frontier.Close()
@@ -947,74 +1119,80 @@ func (fr *flowRefresh) closure(seeds *pagination.SortedRun[int32],
 	return reached, nil
 }
 
-// both is the members a and b both hold.
-func (fr *flowRefresh) both(a, b *pagination.SortedRun[int32]) (*pagination.SortedRun[int32], error) {
-	out, err := newOrdinalSort(fr.u.dir)
-	if err != nil {
-		return nil, err
+// bindingNode is the node a stored fact belongs to: a site's, or its
+// member's file node for an import or a declaration's fact.
+func bindingNode(b idBinding) flowNode {
+	if b.Kind.entry() == 0 {
+		return flowNode{File: b.SiteFile, Index: b.Site}
 	}
-	defer out.Close()
-	if err := keepInside(a, b, func(f int32) int32 { return f }, out.Add); err != nil {
-		return nil, err
-	}
-	return out.Sorted()
+	return flowNode{File: b.SiteFile, Index: fileNode}
 }
 
-// carry adds to the fresh relations what the members outside the region
-// keep of the predecessor: their facts, contributions and reads.
-func (fr *flowRefresh) carry(facts *pagination.ExternalSort[idBinding], contributions *pagination.ExternalSort[contribution],
-	reads *pagination.ExternalSort[flowRead]) error {
-	ids, err := newFileIDSort(fr.u.dir)
+// carry adds to the fresh relations what the nodes outside region keep of
+// the predecessor: their facts, contributions, reads and traces.
+func (fr *flowRefresh) carry(region *pagination.SortedRun[flowNode], facts *pagination.ExternalSort[idBinding],
+	contributions *pagination.ExternalSort[idContribution], reads *pagination.ExternalSort[idRead],
+	traces *pagination.ExternalSort[nodeTrace]) error {
+	dir, prev := fr.u.dir, fr.rf.prev
+	if err := filterNodes(prev.bindings, region, bindingNode, false, facts.Add); err != nil {
+		return err
+	}
+	if err := filterNodes(fr.byNode, region, func(c idContribution) flowNode { return c.From }, false, contributions.Add); err != nil {
+		return err
+	}
+	byNode, err := resort(dir, prev.flowReads, readsByNode, readsByNode.cmp)
 	if err != nil {
 		return err
 	}
-	defer ids.Close()
-	in, err := newOrdinals(fr.region)
+	defer byNode.Close()
+	if err := filterNodes(byNode, region, func(r idRead) flowNode { return r.Node }, false, reads.Add); err != nil {
+		return err
+	}
+	looked, err := resort(dir, prev.flowTraces, tracesByNode, tracesByNode.cmp)
 	if err != nil {
 		return err
 	}
-	var file int32 = -1
-	err = fr.u.members(func(fv model.FileVersion) error {
-		file++
-		inside, err := in.has(file)
-		if err != nil || !inside {
-			return err
-		}
-		return ids.Add(fv.ID)
-	})
-	in.stop()
-	if err != nil {
-		return err
-	}
-	region, err := ids.Sorted()
-	if err != nil {
-		return err
-	}
-	defer region.Close()
-	if err := keepExcept(fr.rf.prev.bindings, region, func(b idBinding) model.FileID { return b.SiteFile }, facts.Add); err != nil {
-		return err
-	}
-	if err := keepOutside(fr.byFrom, fr.region, func(c contribution) int32 { return c.From }, contributions.Add); err != nil {
-		return err
-	}
-	return keepOutside(fr.readsByFile, fr.region, func(r flowRead) int32 { return r.File }, reads.Add)
+	defer looked.Close()
+	return filterNodes(looked, region, func(t nodeTrace) flowNode { return t.Node }, false, traces.Add)
 }
 
-// keepInside adds every record of run (sorted by member ascending) whose
-// member set holds.
-func keepInside[T any](run *pagination.SortedRun[T], set *pagination.SortedRun[int32], member func(T) int32,
+// filterNodes adds every record of run (whose nodes' files ascend) whose
+// node set holds, when keep, or does not hold, otherwise. An Index of
+// wholeFile in set holds every node of its member.
+func filterNodes[T any](run *pagination.SortedRun[T], set *pagination.SortedRun[flowNode], at func(T) flowNode, keep bool,
 	add func(T) error) error {
-	in, err := newOrdinals(set)
+	sel, err := newSelections(set, splitNode)
 	if err != nil {
 		return err
 	}
-	defer in.stop()
+	defer sel.stop()
 	return run.Each(func(v T) error {
-		inside, err := in.has(member(v))
-		if err != nil || !inside {
+		n := at(v)
+		s, err := sel.of(n.File)
+		if err != nil {
 			return err
 		}
-		return add(v)
+		if s.has(n.Index) == keep {
+			return add(v)
+		}
+		return nil
+	})
+}
+
+// unionNodes is the nodes a and b hold (b may be nil).
+func unionNodes(dir string, a, b *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
+	return collect(dir, nodeCodec, keepFirst[flowNode], func(add func(flowNode) error) error {
+		if err := a.Each(add); err != nil {
+			return err
+		}
+		return b.Each(add)
+	})
+}
+
+// minus is the nodes of a that b does not hold.
+func minus(dir string, a, b *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
+	return collect(dir, nodeCodec, nil, func(add func(flowNode) error) error {
+		return filterNodes(a, b, func(n flowNode) flowNode { return n }, false, add)
 	})
 }
 
@@ -1042,66 +1220,4 @@ func newSort0[T any](dir string, c codec[T], fold func(a, b T) (T, error)) (*pag
 		s.WithFold(fold)
 	}
 	return s, nil
-}
-
-// newOrdinalSort is a sort of member ordinals, each once.
-func newOrdinalSort(dir string) (*pagination.ExternalSort[int32], error) {
-	s, err := pagination.NewExternalSort(dir, 0,
-		func(v int32) ([]byte, error) { return binary.BigEndian.AppendUint32(nil, uint32(v)), nil },
-		func(b []byte) (int32, error) {
-			if len(b) != 4 {
-				return 0, errors.New("a member ordinal is malformed")
-			}
-			return int32(binary.BigEndian.Uint32(b)), nil
-		}, cmp.Compare[int32])
-	if err != nil {
-		return nil, err
-	}
-	return s.WithFold(func(a, _ int32) (int32, error) { return a, nil }), nil
-}
-
-// unionOrdinals is the ordinals a and b hold (b may be nil).
-func unionOrdinals(dir string, a, b *pagination.SortedRun[int32]) (*pagination.SortedRun[int32], error) {
-	s, err := newOrdinalSort(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer s.Close()
-	if err := a.Each(s.Add); err != nil {
-		return nil, err
-	}
-	if err := b.Each(s.Add); err != nil {
-		return nil, err
-	}
-	return s.Sorted()
-}
-
-// ordinals answers membership in a run of ordinals for ordinals asked in
-// ascending order, in one forward pass.
-type ordinals struct {
-	next func() (int32, bool, error)
-	stop func()
-	cur  int32
-	ok   bool
-}
-
-func newOrdinals(run *pagination.SortedRun[int32]) (*ordinals, error) {
-	next, stop := pull(run)
-	o := &ordinals{next: next, stop: stop}
-	var err error
-	if o.cur, o.ok, err = next(); err != nil {
-		stop()
-		return nil, err
-	}
-	return o, nil
-}
-
-func (o *ordinals) has(k int32) (bool, error) {
-	for o.ok && o.cur < k {
-		var err error
-		if o.cur, o.ok, err = o.next(); err != nil {
-			return false, err
-		}
-	}
-	return o.ok && o.cur == k, nil
 }
