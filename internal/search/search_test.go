@@ -679,7 +679,7 @@ func assertCode(t *testing.T, what string, err error, want string) {
 // into one lexical result counting both.
 //
 // Mutation: serve the lexical sequence without the exact fold (drop the
-// servedExactly test in lexicalPhase) and the alpha node is served twice.
+// exact fold (exactFold.served) in lexicalPhase) and the alpha node is served twice.
 func legEndToEndRanking(t *testing.T, f *fixture) {
 	s := newService(t, f.opts)
 	page, err := s.Search(f.ctx, model.SearchRequest{Query: "pkg.Alpha.Handle", Page: model.PageRequest{Limit: 10}})
@@ -949,7 +949,7 @@ type stubWideExact struct {
 
 func (s *stubWideExact) node(i int) sqlite.StoredNode {
 	return sqlite.StoredNode{
-		Node: model.Node{ID: model.NodeID(fmt.Sprintf("n%08d", i)), Kind: model.NodeFunction,
+		Node: model.Node{ID: model.NodeID(fmt.Sprintf("%0*x", model.IDHexLen, i)), Kind: model.NodeFunction,
 			Name: "Widget", QualifiedName: "Widget.m" + strconv.Itoa(i), FileID: s.file},
 		Bytes: &model.ByteRange{Start: uint64(i), End: uint64(i) + 1},
 	}
@@ -1012,15 +1012,15 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 		}
 	}
 	// The keyset resumes at the successor of `after`, which the fixed-width
-	// id encodes; rescanning from zero on every page would make the leg's cost
-	// quadratic in a corpus it walks 200 000 nodes of.
+	// hex id encodes; rescanning from zero on every page would make the leg's
+	// cost quadratic in a corpus it walks 200 000 nodes of.
 	first := 0
 	if after != "" {
-		i, err := strconv.Atoi(strings.TrimPrefix(string(after), "n"))
+		i, err := strconv.ParseUint(string(after), 16, 64)
 		if err != nil {
 			return nil, err
 		}
-		first = i + 1
+		first = int(i) + 1
 	}
 	var out []sqlite.StoredNode
 	for i := first; i < s.n; i++ {
@@ -1037,11 +1037,12 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 }
 
 // legExactTiersHoldOnePage proves the exact tiers carry no candidate-sized heap
-// structure: the `seen` set that decided the cross-tier "most specific tier
-// wins" rule held one model.NodeID per distinct candidate, so a wide
-// qualified_name_prefix scan cost heap proportional to the match count. The
-// rule is now two predicates over the candidate in hand, and the working set is
-// one read page however many candidates the tier yields.
+// structure: a `seen` set deciding the cross-tier "most specific tier wins"
+// rule would hold one model.NodeID per distinct candidate, so a wide
+// qualified_name_prefix scan would cost heap proportional to the match count.
+// The rule is decided over the candidate in hand and the earlier tiers' own
+// keysets (tierRule), and the working set is one read page per tier however
+// many candidates the tier yields.
 //
 // The heap is sampled at the LAST candidate, while anything the walk accumulated
 // is still reachable; the answer itself is counted and discarded, so what the
@@ -1071,8 +1072,8 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 		return count, held
 	}
 	// Correctness first: every node matches both the prefix tier and the
-	// exact_name tier, and each must be emitted ONCE -- supersededByLowerTier
-	// suppresses the duplicate, with no candidate-sized seen set.
+	// exact_name tier, and each must be emitted ONCE -- tierRule assigns each
+	// node its one tier, with no candidate-sized seen set.
 	small, smallHeap := walk(20_000)
 	if small != 20_000 {
 		t.Fatalf("a 20000-declaration prefix tier emitted %d candidates, want each exactly once", small)
@@ -1090,13 +1091,13 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 	t.Logf("exact-tier live set: 20000 candidates %d bytes, 200000 candidates %d bytes", smallHeap, largeHeap)
 }
 
-// legExactPathTierOwnsItsFile proves the predicate that replaced the tier-0
-// half of the removed `seen` set: when the query is BOTH a path and a symbol
-// name, every declaration of that file is emitted once, by the exact_path tier
-// that outranks the symbol tiers, and the symbol tiers do not emit it again.
+// legExactPathTierOwnsItsFile proves the tier-0 half of tierRule: when the
+// query is BOTH a path and a symbol name, every declaration of that file is
+// emitted once, by the exact_path tier that outranks the symbol tiers, and the
+// symbol tiers do not emit it again.
 //
-// Mutation: drop the `n.Node.FileID == pathFile` clause from exactCandidates
-// and the prefix tier re-emits all 500, doubling the count.
+// Mutation: drop the pathFile block from tierRule.earlier and the prefix tier
+// re-emits all 500, doubling the count.
 func legExactPathTierOwnsItsFile(t *testing.T, _ *fixture) {
 	const n = 500
 	// The query resolves as a path AND matches the symbol tiers' filters.

@@ -314,7 +314,7 @@ func (a *searchAnswer) add(hit model.SearchHit, span *model.ByteRange) {
 func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
 	filter hitFilter, pos searchPosition, limit int) (searchAnswer, error) {
 	var ans searchAnswer
-	_, pathFile, err := queryFile(ctx, reader, req.Query)
+	normalized, pathFile, err := queryFile(ctx, reader, req.Query)
 	if err != nil {
 		return ended(ctx, ans, err)
 	}
@@ -340,7 +340,7 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 		}
 		room = limit - len(held)
 	}
-	fold := exactFold{reader: reader, query: req.Query, kinds: req.Kinds, pathFile: pathFile, filter: filter}
+	fold := newExactFold(reader, req, normalized, pathFile, filter)
 	page, kept, err := s.lexicalPhase(ctx, reader, req, filter, fold, served+room)
 	ans.lexical = page
 	if err != nil {
@@ -473,21 +473,14 @@ func spanEnd(s *model.ByteRange) int64 {
 
 // exactHeap keeps the least `bound` exact hits it is offered under cmpExact. The
 // root is the entry that sorts last, which an overflowing offer evicts, so its
-// memory is the bound and never the tier's match count.
-//
-// It also holds a node once. exactCandidates can emit one node at two tiers
-// (its doc names the case); tiers are walked in rank order, so the first offer
-// of a node is its better one, and a repeat is dropped while the first is held.
-// Once the first is evicted the repeat, which sorts after it, is evicted too.
+// memory is the bound and never the tier's match count. exactCandidates emits a
+// node once, at its tier, so the heap holds no set of node ids.
 type exactHeap struct {
 	items []exactEntry
 	bound int
-	held  map[model.NodeID]struct{}
 }
 
-func newExactHeap(bound int) *exactHeap {
-	return &exactHeap{bound: bound, held: make(map[model.NodeID]struct{}, bound)}
-}
+func newExactHeap(bound int) *exactHeap { return &exactHeap{bound: bound} }
 
 func (h *exactHeap) Len() int           { return len(h.items) }
 func (h *exactHeap) Less(i, j int) bool { return cmpExact(h.items[i], h.items[j]) > 0 }
@@ -502,15 +495,9 @@ func (h *exactHeap) Pop() any {
 
 // offer admits one entry, evicting the worst once more than bound are held.
 func (h *exactHeap) offer(e exactEntry) {
-	id := e.Node.Node.ID
-	if _, ok := h.held[id]; ok {
-		return
-	}
-	h.held[id] = struct{}{}
 	heap.Push(h, e)
 	if len(h.items) > h.bound {
-		evicted := heap.Pop(h).(exactEntry)
-		delete(h.held, evicted.Node.Node.ID)
+		heap.Pop(h)
 	}
 }
 
@@ -620,18 +607,16 @@ func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader,
 			// ranking, so it is filtered from its start.
 			kept, scanned = nil, 0
 		}
-		for _, h := range page.Hits[min(scanned, len(page.Hits)):] {
+		fresh := page.Hits[min(scanned, len(page.Hits)):]
+		served, err := fold.served(ctx, fresh)
+		if err != nil {
+			return read, kept, err
+		}
+		for _, h := range fresh {
 			if len(kept) > through {
 				break
 			}
-			if !filter.keep(h.Path) {
-				continue
-			}
-			drop, err := fold.servedExactly(ctx, h)
-			if err != nil {
-				return read, kept, err
-			}
-			if !drop {
+			if filter.keep(h.Path) && !served[h.NodeID] {
 				kept = append(kept, h)
 			}
 		}
@@ -661,56 +646,60 @@ func (s *Service) lexicalErr(err error) error {
 	return err
 }
 
-// exactFold recognizes a lexical result whose node the exact tiers already
-// served for the same query, so the answer serves that node once, at its exact
-// tier. The test reads the result's own fields first and confirms against the
-// stored node only when they say it may be an exact hit, so a result that is
-// plainly not one costs no read.
+// exactFold recognizes a lexical result whose node the exact tiers served for
+// the same query, so the answer serves that node once, at its exact tier. The
+// node's tier is tierRule's, decided over every visible row of the node: not
+// over the result's own fields, which are one unit's document, nor over
+// reader.Node, which is one precedence winner. The node was served there when
+// the row that tier serves for it passes the request's filters (servableExact),
+// exactly the test the exact phase applies to the same row.
 type exactFold struct {
-	reader   exactReader
-	query    string
-	kinds    []model.NodeKind
-	pathFile model.FileID
-	filter   hitFilter
+	rule  *tierRule
+	paths *pathResolver
+	// normalized is the query read as a path: the path exact_path serves its
+	// rows at.
+	normalized string
+	filter     hitFilter
 }
 
-// mayMatch is the exact tiers' predicates over one set of facts: declared in
-// the file the query names (exact_path), a qualified name equal to or prefixed
-// by the query (exact_qualified_name, qualified_name_prefix), or a name equal
-// to it (exact_name).
-func (f exactFold) mayMatch(name, qualifiedName string, file model.FileID) bool {
-	return (f.pathFile != "" && file == f.pathFile) || name == f.query || strings.HasPrefix(qualifiedName, f.query)
+// newExactFold builds the fold for one request. Its tier reads are point reads
+// (size 1): a page's nodes are sparse in any one tier.
+func newExactFold(reader exactReader, req model.SearchRequest, normalized string, pathFile model.FileID,
+	filter hitFilter) exactFold {
+	return exactFold{rule: newTierRule(reader, req.Query, req.Kinds, pathFile, 1),
+		paths: newPathResolver(reader, 1), normalized: normalized, filter: filter}
 }
 
-// servedExactly reports whether the exact tiers served h's node: the stored node
-// matches a tier's predicate, passes the kind filter the tiers apply, is
-// servable, and its file passes the request's path and language filters.
-func (f exactFold) servedExactly(ctx context.Context, h textindex.Hit) (bool, error) {
-	if h.NodeID == "" || !f.mayMatch(h.Name, h.QualifiedName, h.FileID) {
-		return false, nil
-	}
-	n, err := f.reader.Node(ctx, h.NodeID)
-	if err != nil {
-		var typed *model.Error
-		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
-			// Not visible as a node in this generation: no exact tier read it.
-			return false, nil
+// served answers which of the hits' nodes the exact tiers served. The nodes are
+// asked in ascending id order, so each tier's keyset is read forward and a tier
+// that holds none of them costs one read.
+func (f exactFold) served(ctx context.Context, hits []textindex.Hit) (map[model.NodeID]bool, error) {
+	ids := make([]model.NodeID, 0, len(hits))
+	for _, h := range hits {
+		if h.NodeID != "" {
+			ids = append(ids, h.NodeID)
 		}
-		return false, err
 	}
-	node := n.Node
-	if node.FileID == "" || !matchesKinds(node.Kind, f.kinds) || !f.mayMatch(node.Name, node.QualifiedName, node.FileID) {
-		return false, nil
-	}
-	p := h.Path
-	if node.FileID != h.FileID {
-		fv, err := f.reader.File(ctx, node.FileID)
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	out := make(map[model.NodeID]bool, len(ids))
+	for _, id := range ids {
+		tier, row, ok, err := f.rule.owner(ctx, id)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		p = fv.Path
+		if !ok {
+			continue
+		}
+		p := f.normalized
+		if tier != model.TierExactPath {
+			if p, err = f.paths.path(ctx, row.Node.FileID); err != nil {
+				return nil, err
+			}
+		}
+		out[id] = servableExact(exactHit{Tier: tier, Path: p, Node: row}, f.filter)
 	}
-	return p != "" && f.filter.keep(p), nil
+	return out, nil
 }
 
 // hydrated fills the source range of every hit of one page that has a byte
