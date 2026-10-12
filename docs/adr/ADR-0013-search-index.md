@@ -348,9 +348,19 @@ The tokenizer reproduces today's rules:
 
 Every library tokenizer with a silent length cut is avoided. The library's default analyzer drops tokens of 40 bytes or
 more. One cut remains below the tokenizer: the library's postings writer does not index a single token longer than
-65 530 bytes. Our tokenizer still counts such a token in the document's length, so the length is exact, but a query
-for it cannot match. No identifier or word of source text reaches that size; the bound is the indexer's, and is stated
-here so that no record claims there is none.
+65 530 bytes (2^16 - 1 - 5, the width of its indexing hash map's key length). Our tokenizer never cuts a token and
+still counts such a token in the document's length, so the length is exact; a query for it could not match.
+
+No token reaches that size, and the proof is two bounds:
+- **The column bound.** A token is a run of one column's text, so it is no longer than the column. The longest column
+  is the body: the unit writer validates every search document before indexing it and rejects a body over 32 768 bytes
+  (`MaxSearchBodyBytes`), and a filesystem chunk is exactly that size. Path is rejected over 4 096 bytes; name,
+  qualified name and signature are cut by their producers to 512, 2 048 and 4 096 bytes.
+- **The fold growth bound.** Folding maps one codepoint to at most one codepoint, or drops it; camelCase parts are
+  substrings of the folded token. Over the 1 243 entries of the fold table the widest UTF-8 growth is 1.5 times:
+  U+023A (2 bytes) folds to U+2C65 (3 bytes). ASCII never grows.
+
+So the longest token any column can produce is 32 768 x 1.5 = 49 152 bytes, under 65 530.
 
 **The code-aware form is adopted.** This form emits the whole identifier, and also its camelCase and snake_case parts at
 the same position. For example, `NewController` is indexed as `newcontroller`, `new` and `controller`. Under the
