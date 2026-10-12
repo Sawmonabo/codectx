@@ -104,23 +104,42 @@ const pathScratchCacheKiB = 4096
 // which is what a continuation names and a later page reopens.
 const pathScratchFile = "path.db"
 
-// pathScratchEmpty is run before the schema on a pooled surface. The surface
-// is never truncated -- that is the point of pooling it -- so it arrives
-// holding the previous search's database, and a CREATE TABLE IF NOT EXISTS
-// would leave that search's settled set, parent edges and cost buckets in
-// place for this one to answer from. Dropping the tables returns their pages
-// to the database's own free list, which this search writes over, and gives
-// the filesystem nothing back.
-const pathScratchEmpty = `
-DROP TABLE IF EXISTS settled;
-DROP TABLE IF EXISTS parent;
-DROP TABLE IF EXISTS bucket;
-DROP TABLE IF EXISTS reach;
-DROP TABLE IF EXISTS pending;
-DROP TABLE IF EXISTS progress;
-DROP TABLE IF EXISTS hopvia;
-DROP TABLE IF EXISTS pathcount;
-`
+// emptyScratch is run before the schema on a pooled surface. The surface is
+// never truncated -- that is the point of pooling it -- so it arrives holding
+// the previous search's database, and a CREATE TABLE IF NOT EXISTS would leave
+// that search's state in place for this one to answer from. Every table the
+// file holds is dropped, whichever search wrote it: the pool serves both the
+// shortest-path search and the weighted walk (weightedwalk.go), and a surface
+// one of them used reaches the other. Dropping a table returns its pages to the
+// database's own free list, which this search writes over, and gives the
+// filesystem nothing back.
+func emptyScratch(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS "`+strings.ReplaceAll(name, `"`, `""`)+`"`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 const pathScratchSchema = `
 CREATE TABLE settled(node TEXT PRIMARY KEY, dist INTEGER NOT NULL, depth INTEGER NOT NULL) WITHOUT ROWID;
@@ -172,6 +191,13 @@ INSERT INTO progress(k, expand_after, depth_pruned, scan_done, hop_pos, possible
 // An engine with no spool store has nowhere to pool: the system temporary
 // directory then holds the ONE directory this search owns and close() removes.
 func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
+	return openScratch(ctx, parent, pathScratchSchema)
+}
+
+// openScratch is openPathScratch for any external-memory search: the same
+// pooled surface, pragma set and single transaction, under the schema the
+// search names.
+func openScratch(ctx context.Context, parent, schema string) (*pathScratch, error) {
 	s := &pathScratch{parent: parent}
 	if parent == "" {
 		dir, err := os.MkdirTemp("", "codectx-path-")
@@ -190,7 +216,11 @@ func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
 		s.close()
 		return nil, err
 	}
-	if _, err := s.db.ExecContext(ctx, pathScratchEmpty+pathScratchSchema); err != nil {
+	if err := emptyScratch(ctx, s.db); err != nil {
+		s.close()
+		return nil, internalErr("path scratch reset: " + err.Error())
+	}
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		s.close()
 		return nil, internalErr("path scratch schema: " + err.Error())
 	}

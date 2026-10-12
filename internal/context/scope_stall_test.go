@@ -16,7 +16,7 @@ import (
 // through -- with a clock the walk reads, stepped past the engine's query
 // deadline once `after` scans have run. That is the shape no other fixture in
 // this package produces: a page the deadline cuts before the walk can advance,
-// which graph.Impact answers truncated with NO continuation and NO entry (its
+// which the walk answers truncated with NO continuation and NO entry (its
 // cursor would be the one the request already carried, so it deliberately
 // withholds it). One packed scan covers a whole level, so the clock is charged
 // per SCAN: the opening page still reaches a position before any page after it
@@ -68,24 +68,31 @@ func TestAStalledWalkPageEndsThePassAndIsReIssuedOnce(t *testing.T) {
 	eng := stalledScopeEngine(t, fx, rels, &clock, &calls, 1)
 
 	// Non-vacuity: the premise is that this fixture really does produce a
-	// STALLED page -- truncated, no continuation, no entry. graph.Impact
+	// STALLED page -- truncated, no continuation, no entry. graph.WeightedWalk
 	// withholds the cursor there deliberately: it would be the one the request
-	// already carried.
-	first, err := eng.Impact(fx.ctx, model.ImpactRequest{GenerationID: fx.Gen,
-		Start: []model.NodeID{seed.NodeID}, Relations: scopeRelations,
-		Direction: model.DirectionBoth, Page: model.PageRequest{Limit: 200}})
+	// already carried. The probe asks exactly what the pass asks.
+	rule, err := scopeLabelRule()
 	if err != nil {
-		t.Fatalf("probe page 1: %v", err)
+		t.Fatalf("scopeLabelRule: %v", err)
 	}
+	walkPage := func(cursor string) graph.WeightedWalkResult {
+		t.Helper()
+		res, err := eng.WeightedWalk(fx.ctx, graph.WeightedWalkRequest{
+			Roots:     []graph.WeightedRoot{{Node: seed.NodeID, Weight: namedRootWeight(seed.Origin), Named: true}},
+			Relations: scopeRelations, Direction: model.DirectionBoth,
+			MaxDepth: fx.Cfg.Context.MaxGraphDepth.Int(), MaxVisited: fx.Cfg.Context.MaxVisitedNodes.Int(),
+			MaxEdges: fx.Cfg.Context.MaxGraphEdges.Int(), Rule: rule,
+			Page: model.PageRequest{Limit: 200, Cursor: cursor}})
+		if err != nil {
+			t.Fatalf("probe page: %v", err)
+		}
+		return res
+	}
+	first := walkPage("")
 	if first.Meta.NextCursor == "" {
 		t.Fatal("the opening page answered the whole walk, so no later page can stall")
 	}
-	probe, err := eng.Impact(fx.ctx, model.ImpactRequest{
-		Start: []model.NodeID{seed.NodeID}, Relations: scopeRelations, Direction: model.DirectionBoth,
-		Page: model.PageRequest{Limit: 200, Cursor: first.Meta.NextCursor}})
-	if err != nil {
-		t.Fatalf("probe page 2: %v", err)
-	}
+	probe := walkPage(first.Meta.NextCursor)
 	if !probe.Meta.Truncated || probe.Meta.NextCursor != "" || len(probe.Entries) != 0 {
 		t.Fatalf("the fixture's second page is not a stalled one (truncated=%v, cursor=%q, entries=%d), "+
 			"so this row would pin the ordinary halt instead of the stall",

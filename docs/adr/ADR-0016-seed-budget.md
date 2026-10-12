@@ -153,6 +153,10 @@ only graph expansion a plain-language task gets; an agent localization study los
 
 - A broad task reads matches down to a floor set by the plan's own file budget, not to the end of the index, and
   walks only from them; the walk no longer scales with how many documents hold a common word.
+- Every root, whatever its weight, is walked in one walk. A node keeps each pair no other pair at it beats on every
+  count the ranking can only improve with (depth, class, weight, route product, remaining derived depth), so the
+  largest pair of decision 1 is among the ones it keeps; the walk is best-first on the score, because a heavier root
+  farther away can lend more than a lighter one next to the node.
 - The read is deeper than a stop at the budget's score level, by the boost margin, and costs a few path-filtered reads
   and one walk over the unreached components; that walk's cost is measured in the scale proofs.
 - Centrality becomes a signal of the named roots' neighbourhood. A task with no named seeds ranks by lexical score
