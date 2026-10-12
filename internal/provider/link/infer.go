@@ -6,9 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
-	"path"
 	"slices"
-	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -1927,81 +1925,6 @@ func (in *inference) propagate(r *round) (*pagination.SortedRun[fact], error) {
 
 // ---- the facts beyond a binding ----
 
-// externalMember emits the external fact of member site, whose receiver
-// holds an instance or the class object of typ, a type of the unit, when typ
-// neither declares nor inherits method in the project (outsideCall). It
-// reports whether it emitted.
-func (t *types) externalMember(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
-	declares := false
-	if err := h.declared(typ, method, func(entry) error { declares = true; return nil }); err != nil || declares {
-		return false, err
-	}
-	return t.outsideCall(h, family, site, typ, method, emit)
-}
-
-// outsideCall emits the external fact of a call at site of method, which
-// the project's part of typ's supertype closure does not declare: with
-// exactly one supertype outside the project in the closure, a virtual
-// FactCall to that type's method of the name (externalMethod); with
-// several, a FactExternalSite, since which of them declares it is unknown.
-// A type with no supertype outside the project emits nothing. It reports
-// whether it emitted.
-func (t *types) outsideCall(h *hierarchy, family string, site, typ Ref, method string, emit func(Binding) error) (bool, error) {
-	outside, err := outsideSupertypes(h, typ)
-	if err != nil {
-		return false, err
-	}
-	switch len(outside) {
-	case 0:
-		return false, nil
-	case 1:
-		return true, emit(Binding{Kind: FactCall, Site: site, Detail: DetailHierarchy, Dispatch: model.DispatchVirtual,
-			External: externalMethod(family, outside[0], method)})
-	}
-	return true, emit(Binding{Kind: FactExternalSite, Site: site, Detail: DetailHierarchy})
-}
-
-// outsideSupertypes is the qualified names of the supertypes outside the
-// project of typ and of each of its supertypes of the unit, each once
-// (hierarchy.externalSupertypes).
-func outsideSupertypes(h *hierarchy, typ Ref) ([]string, error) {
-	var outside []string
-	err := h.externalSupertypes(typ, true, func(e entry) error {
-		if !slices.Contains(outside, e.Aux) {
-			outside = append(outside, e.Aux)
-		}
-		return nil
-	})
-	return outside, err
-}
-
-// externalReceiver emits the virtual FactCall of member site s, at site in
-// the file of fc, to the external method of each type its receiver names
-// that is outside the project (hierarchy.externalName). It reports whether
-// it emitted.
-func externalReceiver(ctx context.Context, h *hierarchy, fc fileCtx, site Ref, s *Site, members []wire.Type, emit func(Binding) error) (bool, error) {
-	emitted := false
-	for _, m := range members {
-		if m.Kind != wire.TypeNamed {
-			continue
-		}
-		q, ok, err := h.externalName(ctx, fc, m.Name)
-		if err != nil {
-			return emitted, err
-		}
-		if !ok {
-			continue
-		}
-		emitted = true
-		err = emit(Binding{Kind: FactCall, Site: site, Detail: DetailDirect, Dispatch: model.DispatchVirtual,
-			External: externalMethod(fc.family, q, s.Callee)})
-		if err != nil {
-			return emitted, err
-		}
-	}
-	return emitted, nil
-}
-
 // emitFlows emits a FactFlow for each argument of call site s, at site, and
 // the parameter of target it binds (argumentFlows over the target's
 // declared parameters, hierarchy.parameters); receiverFirst says the site
@@ -2020,93 +1943,6 @@ func emitFlows(h *hierarchy, site Ref, s *Site, target Ref, receiverFirst bool, 
 	return argumentFlows(s, params, receiverFirst, func(arg, pos int32) error {
 		return emit(Binding{Kind: FactFlow, Site: site, Target: target, Detail: DetailArgument, Arg: arg, Param: pos})
 	})
-}
-
-// ---- language rules ----
-
-// ecmaScriptExtensions are the extensions an ECMAScript import may leave
-// out, so a module's path is compared without them.
-var ecmaScriptExtensions = []string{".d.ts", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"}
-
-// moduleBases are the module paths, without extension, an import may name
-// the member file p by: ECMAScript's file path and, for an index file, its
-// directory; Python's dotted module path as a path, from every directory
-// that may be a source root, and for a package's `__init__.py` the package.
-func moduleBases(p string, python bool) []string {
-	var base string
-	if python {
-		base = strings.TrimSuffix(strings.TrimSuffix(p, ".py"), ".pyi")
-		if path.Base(base) == "__init__" {
-			base = path.Dir(base)
-		}
-		var out []string
-		for s := base; ; {
-			out = append(out, s)
-			i := strings.IndexByte(s, '/')
-			if i < 0 {
-				return out
-			}
-			s = s[i+1:]
-		}
-	}
-	base = stripExtension(p)
-	if path.Base(base) == "index" {
-		return []string{base, path.Dir(base)}
-	}
-	return []string{base}
-}
-
-// moduleBase is the module path, without extension, the import spec written
-// in the file at p denotes, and false for a spec no member file can be: an
-// ECMAScript package specifier.
-func moduleBase(p, spec string, python bool) (string, bool) {
-	dir := path.Dir(p)
-	if python {
-		dots := len(spec) - len(strings.TrimLeft(spec, "."))
-		rest := strings.ReplaceAll(spec[dots:], ".", "/")
-		if dots == 0 {
-			return rest, rest != ""
-		}
-		for range dots - 1 {
-			dir = path.Dir(dir)
-		}
-		return path.Join(dir, rest), true
-	}
-	if !strings.HasPrefix(spec, "./") && !strings.HasPrefix(spec, "../") {
-		return "", false
-	}
-	return stripExtension(path.Join(dir, spec)), true
-}
-
-// importedName splits the module receiver of a bare call of an imported
-// name into the module as written and the name the module declares: an
-// ECMAScript `spec#name` (`import {name as local} from "spec"`), a Python
-// `module.name` split at its last dot (`from module import name as local`,
-// a relative module keeping its dots).
-func importedName(written string, python bool) (spec, name string, ok bool) {
-	sep := "#"
-	if python {
-		sep = "."
-	}
-	i := strings.LastIndex(written, sep)
-	if i < 0 || i == len(written)-1 {
-		return "", "", false
-	}
-	spec, name = written[:i], written[i+1:]
-	if python && strings.Trim(spec, ".") == "" {
-		// `from . import name`: the module is the package the dots name.
-		spec = written[:i+1]
-	}
-	return spec, name, spec != ""
-}
-
-func stripExtension(p string) string {
-	for _, ext := range ecmaScriptExtensions {
-		if strings.HasSuffix(p, ext) {
-			return strings.TrimSuffix(p, ext)
-		}
-	}
-	return p
 }
 
 // ---- sorted runs and ordered merges ----
