@@ -542,6 +542,28 @@ export function run(a, b, c) { // @run
 		fails: "every require treated as open loses the import of src/x.js; a computed path resolved by its fragment imports a file it may not name",
 	},
 	{
+		name:   "dynamic-imports",
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.10 (Import Calls: `import(specifier)` loads the module the specifier names), §16.2.1.7 (HostLoadImportedModule: a relative specifier names a file)",
+		files: map[string]string{
+			"src/load.js": `export async function load(name) {
+  const a = await import("./x.js");
+  const b = await import("./x/" + name);
+  return [a, b];
+}
+`,
+			"src/x.js": `export const v = 1;
+`,
+		},
+		// Derived from the source and the anchor. The first specifier is a string literal naming src/x.js, an
+		// import as plain as a static one; the second is an expression whose only literal part is "./x/".
+		want: []string{},
+		facts: []string{
+			"src/load.js imports open ./x/",
+			"src/load.js imports src/x.js",
+		},
+		fails: "the literal `import(\"./x.js\")` left uncaptured loses the import of src/x.js",
+	},
+	{
 		name:   "open-and-computed-sites",
 		anchor: "ECMA-262 (15th edition, 2024) §13.3.6 (Function Calls), §13.3.2 (Property Accessors: a computed member), §9.4.2 (ResolveBinding: an unresolvable reference)",
 		files: map[string]string{

@@ -50,10 +50,11 @@ import (
 //
 // # Imports
 //
-// Every `import(expr)`, and a `require(expr)` whose first argument is not a
-// string literal, is a dynamic import: its path's literal parts (strings
+// An `import(expr)` or a `require(expr)` whose first argument is not a
+// string literal is a dynamic import: its path's literal parts (strings
 // joined by `+`, a template's literal text), or the one path they fold to
-// when every part is literal (Constant).
+// when every part is literal (Constant). One whose argument is a string
+// literal is an import record of the structural query and is not sent.
 //
 // The table carries no import list, so an import's origin travels in the
 // types: a named import `import {f as g} from "./a"` is TypeModule
@@ -1033,17 +1034,16 @@ func (k *javaScriptLinker) computedSite(n, f Node) wire.Site {
 	return s
 }
 
-// dynamicImport appends the dynamic import the call n makes, if any: every
-// `import(expr)`, and a `require(expr)` whose first argument is not a
-// string literal (a literal one is an import record of the structural
-// query). Its fragments are the path's literal parts; a path every part of
-// which is literal folds to one constant path.
+// dynamicImport appends the dynamic import the call n makes, if any: an
+// `import(expr)` or a `require(expr)` whose first argument is not a string
+// literal (a literal one is an import record of the structural query). Its
+// fragments are the path's literal parts; a path every part of which is
+// literal folds to one constant path.
 func (k *javaScriptLinker) dynamicImport(out *wire.Link, n Node) {
 	kk := k.k
 	f := n.ChildByFieldId(kk.fFunction)
 	switch {
-	case jsKindOf(f) == k.x.importKw:
-	case jsKindOf(f) == kk.identifier && string(textOf(k.src, f)) == "require":
+	case jsKindOf(f) == k.x.importKw, jsKindOf(f) == kk.identifier && string(textOf(k.src, f)) == "require":
 		if jsKindOf(firstOf(n.ChildByFieldId(kk.fArguments))) == k.x.str {
 			return
 		}

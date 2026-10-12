@@ -240,8 +240,10 @@ type DynamicImport struct {
 	// the path has none. When Constant, the one fragment is the whole path.
 	Fragments []string
 	// Constant reports a path that folds to a constant (`require("./x/" +
-	// "y")`, `import("./m")`, `#include NAME` with NAME defined in the file
-	// as a string or header name): an ordinary import of Fragments[0].
+	// "y")`, `import("./" + "m")`, `#include NAME` with NAME defined in the
+	// file as a string or header name): an ordinary import of Fragments[0].
+	// An ECMAScript `require` or `import()` of one string literal is an
+	// import record of the structural query and is never sent here.
 	Constant bool
 }
 
