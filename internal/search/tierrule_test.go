@@ -330,7 +330,11 @@ func TestLexicalPagesResumeByKey(t *testing.T) {
 		limit int
 		// filtered says the exact fold drops lexical results of this query.
 		filtered bool
-	}{{"omega", 4, false}, {"omega", 1, false}, {"zeta", 3, true}, {"zeta", 2, true}} {
+	}{{"omega", 4, false}, {"omega", 1, false}, {"zeta", 3, true}, {"zeta", 5, true}} {
+		// The "zeta" limits do not divide its 8 exact hits: a page the exact
+		// tiers fill exactly asks the index whether any lexical result
+		// follows, and the next page then starts the lexical tier from its
+		// start, which the "later page" check below would misread.
 		deep, err := s.Search(f.ctx, model.SearchRequest{Query: c.query, Page: model.PageRequest{Limit: 200}})
 		if err != nil {
 			t.Fatalf("%q: Search(deep): %v", c.query, err)
