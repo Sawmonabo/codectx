@@ -1493,7 +1493,7 @@ func foreignHolder(err error, holder snapshot.WaitingHolder) error {
 	out := &model.Error{Code: model.CodeSchemaMismatch,
 		Message: who + " holds the workspace indexing lock and its run ledger was written by another schema: " + typed.Message,
 		Remediation: "the two processes are different builds of this product: let the holder finish, or stop it. " +
-			"Then delete the run ledger beside the index cache, or rebuild the cache with `codectx index --rebuild`"}
+			"Then delete the run ledger beside the index cache, or run `codectx reset --reindex`"}
 	if holder.PID > 0 {
 		out.WithDetail(snapshot.DetailHolderPID, strconv.Itoa(holder.PID)).
 			WithDetail(snapshot.DetailHolderOperation, holder.Operation)

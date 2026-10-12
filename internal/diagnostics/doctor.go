@@ -531,7 +531,7 @@ func (s *Service) checkCAS(ctx context.Context, deep bool, stats StoreStats, sta
 				return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckWarn,
 					Detail:      "this workspace records " + strconv.FormatInt(stats.Blobs, 10) + " retained objects, none of them in a readable state",
 					Code:        model.CodeSourceIntegrity,
-					Remediation: "rebuild the cache with codectx index --rebuild"}
+					Remediation: "run codectx reset --reindex"}
 			}
 			return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckPass, Detail: "no source is retained yet, so there was nothing to verify"}
 		}
@@ -705,13 +705,13 @@ func failure(name string, err error) model.DoctorCheck {
 	switch code {
 	case model.CodeStorageCorrupt:
 		c.Detail = "the index database failed its integrity checks"
-		c.Remediation = "rebuild the cache with codectx index --rebuild"
+		c.Remediation = "run codectx reset --reindex"
 	case model.CodeSchemaMismatch:
 		c.Detail = "the cache was written by a different schema version than this build understands"
-		c.Remediation = "rebuild the cache with codectx index --rebuild"
+		c.Remediation = "run codectx reset --reindex, or codectx index --rebuild to build a new cache beside it and leave this one untouched"
 	case model.CodeSourceIntegrity:
 		c.Detail = "retained source did not verify against the digests recorded for it"
-		c.Remediation = "rebuild the cache with codectx index --rebuild"
+		c.Remediation = "run codectx reset --reindex"
 	case model.CodeDiskFull:
 		c.Detail = "the data directory has no room left"
 		c.Remediation = "free space under the data directory, then retry"

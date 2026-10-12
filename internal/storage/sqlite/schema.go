@@ -137,7 +137,7 @@ func (s *Store) checkFingerprint(ctx context.Context, tx *sql.Tx) error {
 		return &model.Error{Code: model.CodeSchemaMismatch,
 			Message:     "database schema fingerprint " + found + " does not match this binary's schema " + Fingerprint,
 			Details:     map[string]string{"path": s.path},
-			Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+			Remediation: "run `codectx reset --reindex` to build this cache again from the repository, or `codectx index --rebuild` to build a new cache beside it and leave this database untouched"}
 	}
 	return nil
 }
@@ -236,13 +236,13 @@ func (s *Store) checkHeader(ctx context.Context) error {
 			return &model.Error{Code: model.CodeSchemaMismatch,
 				Message:     "this database carries no readable schema_meta row",
 				Details:     map[string]string{"path": s.path},
-				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+				Remediation: "run `codectx reset --reindex` to build this cache again from the repository, or `codectx index --rebuild` to build a new cache beside it and leave this database untouched"}
 		}
 		if version != schemaVersion || fingerprint != Fingerprint {
 			return &model.Error{Code: model.CodeSchemaMismatch,
 				Message:     "database schema fingerprint " + fingerprint + " does not match this binary's schema " + Fingerprint,
 				Details:     map[string]string{"path": s.path},
-				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+				Remediation: "run `codectx reset --reindex` to build this cache again from the repository, or `codectx index --rebuild` to build a new cache beside it and leave this database untouched"}
 		}
 		var journal string
 		if err := tx.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journal); err != nil {

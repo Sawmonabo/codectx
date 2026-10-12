@@ -44,6 +44,12 @@ import (
 // the two once the bytes are the same.
 var steps atomic.Int64
 
+// Steps is the number of truncation steps this process has taken. It is how a
+// caller outside this package proves that a removal it asked for was paced: a
+// file larger than the window is emptied in one step per window it holds, and a
+// removal that bypassed this package takes none.
+func Steps() int64 { return steps.Load() }
+
 // Window is the number of bytes handed to the disk between two waits: the
 // bytes written to one file before the writer waits for the window before
 // them, and the bytes freed before the reclaimer waits. It is small enough
