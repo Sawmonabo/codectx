@@ -1503,22 +1503,33 @@ func (k *cLinker) leaves(b []byte, n, skip Node) []byte {
 
 // returns is the type a function declared by fn below top returns: the
 // named type of its result below pointers and references, nothing for
-// void, a function pointer or no declared type.
+// void, a function pointer or no declared type. In C++ a result returned by
+// value, through no pointer or reference declarator (nor one in a trailing
+// return type), is an ExactObject: a prvalue of a class type is an object
+// of exactly that type ([basic.lval], [class.virtual]), so a call on it
+// runs that type's function. A placeholder (`auto`) names no type here.
 func (k *cLinker) returns(owner, top, fn Node) wire.Type {
 	s := k.s
 	t := owner.ChildByFieldId(s.fType)
+	indirect := k.chain(top).indirect
 	if r := k.trailing(fn); !r.IsNull() {
 		t, top = r.ChildByFieldId(s.fType), fn
+		indirect = !r.ChildByFieldId(s.fDeclarator).IsNull()
 	}
 	for d := top; d != fn && !d.IsNull(); d = k.inner(d) {
 		if d.KindId() == s.functionDeclarator {
 			return wire.Type{}
 		}
 	}
-	if name := k.typeName(t); name != "void" {
-		return cNamed(name)
+	name := k.typeName(t)
+	if name == "void" {
+		return wire.Type{}
 	}
-	return wire.Type{}
+	r := cNamed(name)
+	if r.Kind == wire.TypeNamed && s.cpp && !indirect {
+		r.Index = wire.ExactObject
+	}
+	return r
 }
 
 // cChain is what a declarator chain declares: the name at its bottom (null

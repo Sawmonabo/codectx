@@ -27,12 +27,16 @@ import (
 const externalScope = "link:external"
 
 // externalType is the External key of the type qualified, outside the
-// project, of the language family family, as a node of kind kind: an
-// interface when the source proves it one (a Java or TypeScript
-// `implements`, a Java interface's `extends`, a Go interface embedding, a
-// Rust trait), a class otherwise.
-func externalType(family string, kind model.NodeKind, qualified string) string {
-	return "t\x00" + family + "\x00" + string(kind) + "\x00" + qualified
+// project, of the language family family. It carries no kind: the node is
+// of kind type (model.NodeType) in every unit, since whether a type outside
+// the project is a class, an interface, a trait or a struct is not known
+// from the project's code, and one unit's source can write it as an
+// interface (`implements X`) where another's writes it as a class
+// (`extends X`). One qualified name is so one node in every unit; the
+// evidence a relation into it has of its kind is the relation's own
+// (hierarchy.supertypeFacts).
+func externalType(family, qualified string) string {
+	return "t\x00" + family + "\x00" + qualified
 }
 
 // externalMethod is the External key of the method named method of the type
@@ -51,22 +55,21 @@ func externalLanguage(family string) string {
 	return family
 }
 
-// externalCandidate is the node candidate of an External key: a type or
-// method node keyed by its scope, qualified name, kind and language and no
-// file (reconcile.CanonicalKey's structural case), with its descriptor set to
-// that qualified name. ok is false for a key no externalType or
+// externalCandidate is the node candidate of an External key: a type node
+// (of kind type) or a method node, keyed by its scope, qualified name, kind
+// and language and no file (reconcile.CanonicalKey's structural case), with
+// its descriptor set to that qualified name. ok is false for a key no externalType or
 // externalMethod wrote, and for one whose names exceed a node's bounds.
 func externalCandidate(key string) (c model.NodeCandidate, ok bool) {
 	parts := strings.Split(key, "\x00")
 	c = model.NodeCandidate{ProviderID: ProviderID, ScopeKey: externalScope}
 	switch {
-	case len(parts) == 4 && parts[0] == "t":
-		kind := model.NodeKind(parts[2])
-		if !kind.Valid() || parts[3] == "" {
+	case len(parts) == 3 && parts[0] == "t":
+		if parts[2] == "" {
 			return model.NodeCandidate{}, false
 		}
-		c.Kind, c.Language, c.QualifiedName = kind, externalLanguage(parts[1]), parts[3]
-		c.Name = lastQualified(parts[3])
+		c.Kind, c.Language, c.QualifiedName = model.NodeType, externalLanguage(parts[1]), parts[2]
+		c.Name = lastQualified(parts[2])
 	case len(parts) == 4 && parts[0] == "m":
 		if parts[2] == "" || parts[3] == "" {
 			return model.NodeCandidate{}, false

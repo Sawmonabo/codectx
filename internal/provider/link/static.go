@@ -39,7 +39,8 @@ import (
 // with what a call through the value passes its arguments into: Params, the
 // function's declared parameters (encodeParams), and ReceiverFirst when the
 // value takes the method's receiver as its first argument (a Go method
-// expression `T.M`, a Rust path `T::m` to a method with a self parameter).
+// expression `T.M`, a Rust path `T::m` to a method with a self parameter, a
+// Java unbound method reference `T::m` to an instance method).
 type taken struct {
 	Sig           string
 	From          model.FileID
@@ -365,11 +366,16 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 			if e.Sig == "" {
 				return nil
 			}
-			sig, expression := e.Sig, r.fc.family == "go" && v.Type.Index > 0
-			if expression {
-				sig = goMethodExpression(v.Type.Name, sig)
+			sig, receiverFirst := e.Sig, false
+			switch {
+			case r.fc.family == "go" && v.Type.Index > 0:
+				sig, receiverFirst = goMethodExpression(v.Type.Name, sig), true
+			case r.fc.family == "java":
+				if recv, ok := javaUnbound(v.Type.Name, e); ok {
+					sig, receiverFirst = receiverSignature(recv, sig), true
+				}
 			}
-			return take(sig, e.Ref, expression)
+			return take(sig, e.Ref, receiverFirst)
 		})
 		if err != nil {
 			return err

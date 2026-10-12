@@ -107,7 +107,8 @@ type Export struct {
 	// or the type the worker recovered from its return statements inside the
 	// file. TypeUnknown when neither says. For a Go or Java field it is the
 	// field's declared type, reduced as a Go receiver is (`*T` is T) and, in
-	// Java, without its type arguments (`List<T>` is List).
+	// Java, without its type arguments (`List<T>` is List). A C++ class
+	// type returned by value is marked ExactObject.
 	Returns Type
 	// Override reports a method the language marks as overriding or
 	// implementing a supertype's: Java `@Override`, a C++ `override` or
@@ -334,8 +335,9 @@ const (
 // parameter, a data member, a file-scope object or an array element),
 // neither a pointer nor a reference, whose dynamic type is its declared
 // type, so a virtual call on it runs that type's function ([class.virtual]:
-// the call is virtual only through a pointer or reference). Only the C++
-// worker sends it.
+// the call is virtual only through a pointer or reference). The result of
+// a function that returns the type by value (Export.Returns) is one too.
+// Only the C++ worker sends it.
 const ExactObject uint32 = 1
 
 // Type is a value's type as the worker recovered it inside the file: a name
