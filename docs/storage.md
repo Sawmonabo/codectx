@@ -463,6 +463,26 @@ ascending order, so the stored text, and therefore the digest folded into the
 generation's `AnalysisKey`, is a function of the pairs and never of the order a
 publisher added them.
 
+### A unit's own capability rows
+
+A generation's report is folded from the rows of every member unit, and most
+members of an incremental run are reused, not built. So each unit keeps what it
+reported: `unit_capabilities` holds the capability rows of the unit's provider
+result, keyed by the unit, one row per capability and scope it reported (the
+key refuses a second). They are the rows exactly as the generation that built
+the unit folded them, the delta applier's `delta_full_reason` and
+`delta_filtered` included, and `SealUnit` writes them in the transaction that
+seals the unit, so a sealed unit always has them.
+
+A generation that attaches a sealed unit, whether the plan reused it or the
+build found its key already sealed, reads that unit's rows with
+`Store.UnitCapabilities` and folds them like a built unit's. A reused unit that
+sealed `partial` keeps the generation `partial` with its diagnostic code, and
+summed details, such as the `calls` site counts, cover every member rather than
+only the units the run rebuilt. A unit's rows are bounded by its provider's
+declared capabilities, and the run reads them one unit at a time. They go
+with the unit: `deleteUnit` removes them, and the foreign key cascades.
+
 ## A second process reading while a run writes
 
 A process that only answers questions opens the store with **no writer

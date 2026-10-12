@@ -368,6 +368,7 @@ func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error
 		`DELETE FROM gc_nodes`,
 		`DELETE FROM gc_relations`,
 		`DELETE FROM unit_delta_state WHERE unit_id = ?1`,
+		`DELETE FROM unit_capabilities WHERE unit_id = ?1`,
 		`DELETE FROM unit_inputs WHERE unit_id = ?1`,
 		`DELETE FROM unit_dependencies WHERE unit_id = ?1`,
 		`DELETE FROM units WHERE id = ?1`,

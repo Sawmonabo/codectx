@@ -6,7 +6,6 @@ import (
 	"maps"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -590,6 +589,9 @@ func (g *generation) runsPage() ([]model.ProviderResult, int64) {
 // attachReused makes every unit the plan proved identical a member of this
 // generation. Storage re-checks each one's inputs against the snapshot, so a
 // plan that was wrong about reuse is refused here rather than published.
+//
+// It runs before the build, on the coordinator's goroutine alone, so the fold
+// needs no lock here.
 func (g *generation) attachReused(ctx context.Context) (err error) {
 	ctx, span := ledger.Start(ctx, stageAttachReused, "")
 	defer func() {
@@ -600,9 +602,27 @@ func (g *generation) attachReused(ctx context.Context) (err error) {
 		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
 			return err
 		}
+		rows, err := g.c.opts.Store.UnitCapabilities(ctx, unit)
+		if err != nil {
+			return err
+		}
+		g.foldReused(rows)
 		g.reused++
 	}
 	return nil
+}
+
+// foldReused adds a reused unit's stored capability rows to the report, in the
+// same fold a built unit's rows go through. A unit the generation attaches
+// instead of building reported these rows when it sealed; leaving them out
+// would publish the generation's counts as covering only the units it rebuilt,
+// and a reused unit that sealed degraded as though it were healthy. Each unit's
+// rows are read and folded on their own, so no more of them is in heap at once
+// than one unit's and the fold's own rows.
+func (g *generation) foldReused(rows []model.CapabilityState) {
+	for _, s := range rows {
+		g.caps.add(s)
+	}
 }
 
 // build runs every unit the plan did not reuse, provider by provider in
@@ -918,9 +938,16 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, spec.ID); err != nil {
 			return err
 		}
+		// Read before the lock is taken: the read is a job on the store's
+		// writer, which a unit worker holding the lock must never wait on.
+		rows, err := g.c.opts.Store.UnitCapabilities(ctx, spec.ID)
+		if err != nil {
+			return err
+		}
 		g.mu.Lock()
 		g.reused++
 		g.markPublished(u.ProviderID)
+		g.foldReused(rows)
 		g.mu.Unlock()
 		return nil
 	}
@@ -1014,7 +1041,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 			// that failed.
 			return outcome{result: out.Result}, err
 		}
-		return outcome{result: annotate(out), parsed: parsedBy(applier, u, out),
+		return outcome{result: out.Result, parsed: parsedBy(applier, u, out),
 			invalidated: previous != ""}, nil
 	}
 	// A file-invalidated unit has no delta applier and no recorded
@@ -1068,26 +1095,6 @@ func (g *generation) replacesPredecessor(ctx context.Context, u plan.Unit, spec 
 		return false, err
 	}
 	return prev != "" && prev != spec.ID, nil
-}
-
-// annotate surfaces the delta decision on the unit's own result: which of the
-// four full-build reasons applied, and whether the emit that produced it was a
-// filtered one. Only the reasons that name an unusable predecessor count as an
-// invalidation, which is why the reason and not the Full flag is published.
-func annotate(out delta.Result) model.ProviderResult {
-	res := out.Result
-	if len(res.Capabilities) == 0 {
-		return res
-	}
-	rows := make([]model.CapabilityState, 0, len(res.Capabilities))
-	for _, c := range res.Capabilities {
-		if out.Full {
-			c = c.WithDetail("delta_full_reason", out.FullReason)
-		}
-		rows = append(rows, c.WithDetail("delta_filtered", strconv.FormatBool(out.Filtered)))
-	}
-	res.Capabilities = rows
-	return res
 }
 
 // sourceBinding is how the unit is opened: a provider that can

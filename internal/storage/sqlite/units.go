@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"time"
 
@@ -331,6 +332,10 @@ type UnitWriter struct {
 	// evidenceClipped records what SealUnit dropped to hold the evidence
 	// bound, so a caller can report the truncation instead of it being silent.
 	evidenceClipped int64
+
+	// capabilities are the rows SetCapabilities handed in, which SealUnit
+	// stores with the unit in the transaction that seals it.
+	capabilities []model.CapabilityState
 }
 
 // UnitID is the immutable key of the unit being written.
@@ -343,6 +348,35 @@ func (w *UnitWriter) UnitID() model.UnitID { return w.build.Spec.ID }
 // unit and the count, so the drop is on the record even for a caller that
 // never reads this.
 func (w *UnitWriter) EvidenceClipped() int64 { return w.evidenceClipped }
+
+// SetCapabilities records the capability rows the unit's provider reported
+// about its scope, which SealUnit stores with the unit in the same
+// transaction that seals it: a sealed unit always carries what it reported,
+// and a generation that reuses it reads them back (UnitCapabilities) instead
+// of publishing it as if it reported nothing. Each row is validated here, and
+// a unit may report a capability at a scope once; the rows are one per
+// capability the provider declares, so they are bounded by its descriptor and
+// not by the repository. A later call replaces the rows of an earlier one.
+func (w *UnitWriter) SetCapabilities(states []model.CapabilityState) error {
+	if w.done {
+		return conflict("unit %s is no longer building", w.build.Spec.ID)
+	}
+	seen := make(map[[3]string]bool, len(states))
+	for _, c := range states {
+		if err := c.Validate(); err != nil {
+			return err
+		}
+		key := [3]string{c.ProviderID, c.Capability, c.Scope}
+		if seen[key] {
+			return &model.Error{Code: model.CodeProviderOutputInvalid,
+				Message: fmt.Sprintf("unit reports capability %q of provider %q at scope %q more than once", c.Capability, c.ProviderID, c.Scope),
+				Details: map[string]string{"unit_id": string(w.build.Spec.ID)}}
+		}
+		seen[key] = true
+	}
+	w.capabilities = slices.Clone(states)
+	return nil
+}
 
 // BeginUnit opens an immutable unit for gen. It recomputes the unit identity,
 // requires every declared dependency to be sealed, streams and hashes the
@@ -1202,6 +1236,9 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {
 			return err
 		}
+		if err := w.insertCapabilities(ctx, tx); err != nil {
+			return err
+		}
 		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey)
 	})
 	if err != nil {
@@ -1221,6 +1258,66 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		}
 	}
 	return err
+}
+
+// insertCapabilities writes the rows SetCapabilities recorded, inside the
+// seal's transaction.
+func (w *UnitWriter) insertCapabilities(ctx context.Context, tx *sql.Tx) error {
+	for _, c := range w.capabilities {
+		details, err := canonicalDetails(c.Details)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO unit_capabilities(unit_id, provider_id, capability, scope_key, state, diagnostic_code, remediation, details_json)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, w.rowID, c.ProviderID, c.Capability, c.Scope, string(c.State),
+			c.DiagnosticCode, c.Remediation, details); err != nil {
+			return wrap("unit_capabilities", err)
+		}
+	}
+	return nil
+}
+
+// UnitCapabilities is the capability rows a sealed unit stored when it sealed
+// (UnitWriter.SetCapabilities), in key order. A generation that reuses the
+// unit folds them into its report exactly as it folds the rows of a unit it
+// builds. One unit's rows are one per capability its provider declares, so the
+// answer is bounded by the descriptor, never by the repository; a caller
+// reading many units reads them one unit at a time. The rows are read back as
+// untrusted: one that does not decode or validate is CTX_STORAGE_CORRUPT.
+func (s *Store) UnitCapabilities(ctx context.Context, unit model.UnitID) ([]model.CapabilityState, error) {
+	key, err := idBlob("unit_id", string(unit))
+	if err != nil {
+		return nil, err
+	}
+	var out []model.CapabilityState
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT uc.provider_id, uc.capability, uc.scope_key, uc.state, uc.diagnostic_code, uc.remediation, uc.details_json
+			FROM unit_capabilities uc JOIN units u ON u.id = uc.unit_id
+			WHERE u.unit_key = ? ORDER BY uc.provider_id, uc.capability, uc.scope_key`, key)
+		if err != nil {
+			return wrap("unit_capabilities", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c model.CapabilityState
+			var details string
+			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode,
+				&c.Remediation, &details); err != nil {
+				return wrap("unit_capabilities", err)
+			}
+			if details != "" && details != "{}" {
+				if err := json.Unmarshal([]byte(details), &c.Details); err != nil {
+					return corrupt("unit %s capability %q/%q has unreadable details", unit, c.ProviderID, c.Capability)
+				}
+			}
+			if err := c.Validate(); err != nil {
+				return corrupt("unit %s capability %q/%q is not a valid capability state: %v", unit, c.ProviderID, c.Capability, err)
+			}
+			out = append(out, c)
+		}
+		return wrap("unit_capabilities", rows.Err())
+	})
+	return out, err
 }
 
 // attach inserts the generation membership row for a unit.
@@ -1594,7 +1691,7 @@ func (s *Store) ActiveGeneration(ctx context.Context, repo model.RepositoryID) (
 // as zero, which is what a first publication passes. It is the single
 // definition of the version conflict: the activation transaction applies it at
 // the moment that decides, and Activate's preflight applies it before the
-// compaction cascade so a loser pays a row read instead of the cascade.
+// search index commit, so a loser pays a row read instead of that commit.
 func checkExpectedActive(ctx context.Context, tx *sql.Tx, repo []byte, expected model.GenerationID) error {
 	var current int64
 	if err := activeGeneration(ctx, tx, repo, &current); err != nil {
@@ -1613,7 +1710,7 @@ func checkExpectedActive(ctx context.Context, tx *sql.Tx, repo []byte, expected 
 
 // checkMembership refuses a generation with no frozen members. Like the
 // pointer comparison it is one row read, applied both in the activation
-// transaction and in the preflight before the cascade.
+// transaction and in the preflight before the search index commit.
 func checkMembership(ctx context.Context, tx *sql.Tx, row int64, gen model.GenerationID) error {
 	var members int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM generation_units WHERE generation_id = ?`, row).Scan(&members); err != nil {

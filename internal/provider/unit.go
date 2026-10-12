@@ -12,13 +12,17 @@ import (
 
 // UnitOutput is the storage side of one building unit: the writer the sink
 // drains into, sealing after whole-unit validation, and discarding on failure.
-// Seal is the only path to generation membership; Fail deletes every row the
-// unit wrote so unsealed output can never be queried (Section 11.1). Abandon
+// SetCapabilities hands over the capability rows the unit reported, which the
+// seal stores with the unit so a generation that later reuses it publishes
+// them as well. Seal is the only path to generation membership; Fail deletes
+// every row the unit wrote so unsealed output can never be queried (Section
+// 11.1). Abandon
 // is the cancel-path discard: it gives up the unit without the cascading
 // delete, leaving the rows for storage's own collection, which is what keeps
 // an interrupt from waiting on a rollback nobody is going to read.
 type UnitOutput interface {
 	Sink
+	SetCapabilities([]model.CapabilityState) error
 	Seal(context.Context) error
 	Fail(context.Context) error
 	Abandon(context.Context) error
@@ -92,6 +96,11 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 			Message: "provider reported a " + string(result.State) + " run; only a succeeded unit is admitted",
 			Details: map[string]string{"unit_id": string(req.Unit.ID)}}
 	}
+	// The rows handed to the seal are the rows returned: what a generation
+	// folds for a unit it builds is exactly what one that reuses it reads back.
+	if err == nil {
+		err = out.SetCapabilities(result.Capabilities)
+	}
 	if err == nil {
 		err = out.Seal(runCtx)
 	}
@@ -119,6 +128,11 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 	}
 	return failedResult(req.Run, stateOf(err), sink), err
 }
+
+// DetailLargestRecordBytes is the capability detail that carries the largest
+// record one unit saw over a record bound (Degradation.Largest). It is a
+// maximum, not a count, so a fold of several units keeps the larger value.
+const DetailLargestRecordBytes = "largest_record_bytes"
 
 // reportDegradations folds the sink's counted degradations into the unit's
 // capability rows, which is where a generation stores what a run had to give
@@ -155,7 +169,7 @@ func reportDegradations(states []model.CapabilityState, degraded []Degradation, 
 		for _, d := range degraded {
 			st = st.WithDetail("over_"+d.Limit, strconv.FormatUint(d.Count, 10)).
 				WithDetail(d.Limit, strconv.FormatInt(d.Bound, 10)).
-				WithDetail("largest_record_bytes", strconv.FormatInt(d.Largest, 10))
+				WithDetail(DetailLargestRecordBytes, strconv.FormatInt(d.Largest, 10))
 		}
 		states[i] = st
 	}
