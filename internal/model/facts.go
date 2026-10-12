@@ -146,6 +146,10 @@ type Node struct {
 	// ephemeral overlay answer, which has no canonical NodeID because nothing
 	// was sealed, so its pinned file and range carry the whole result.
 	SemanticSource SemanticSource `json:"semantic_source"`
+	// NameRange is the declaration's name token, inside Range: the `Foo` of
+	// `func Foo()`. It is absent for a node the source names with no token of
+	// its own (a module, an anonymous function, an endpoint, a reference).
+	NameRange *SourceRange `json:"name_range,omitempty"`
 }
 
 // Validate enforces the node_facts constraints, including the mixed-range check
@@ -190,6 +194,17 @@ func (n Node) Validate() error {
 	}
 	if err := validateLocatedRange("node.range", n.FileID, n.Range); err != nil {
 		return err
+	}
+	if n.NameRange != nil {
+		if n.Range == nil {
+			return invalid("node.name_range is present without node.range; a name lies inside its node")
+		}
+		if err := n.NameRange.Validate("node.name_range"); err != nil {
+			return err
+		}
+		if n.NameRange.Start.Byte < n.Range.Start.Byte || n.NameRange.End.Byte > n.Range.End.Byte {
+			return invalid("node.name_range lies outside node.range")
+		}
 	}
 	if len(n.Metadata) > 0 {
 		if err := boundField("node.metadata", string(n.Metadata), MaxMetadataBytes); err != nil {

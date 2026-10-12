@@ -161,10 +161,12 @@ func (r *PinnedReader) Close() error {
 
 // StoredNode is one visible node fact. Ranges are stored as bytes only; the
 // consumer derives line/column positions from the source's line checkpoints,
-// so the model.Node here carries no Range and Bytes holds the interval.
+// so the model.Node here carries no Range or NameRange: Bytes holds the
+// node's interval and NameBytes its name token's, absent when none is stored.
 type StoredNode struct {
 	Node          model.Node
 	Bytes         *model.ByteRange
+	NameBytes     *model.ByteRange
 	UnitID        model.UnitID
 	SourceBinding model.SourceBinding
 }
@@ -194,7 +196,7 @@ func (r *PinnedReader) visible(alias string) string {
 }
 
 const nodeColumns = `ni.canonical, ni.kind, nf.language, nf.name, nf.qualified_name, nf.signature, nf.file_id, ui.content_hash,
-	nf.start_byte, nf.end_byte, nf.metadata_json, u.unit_key, u.source_binding`
+	nf.start_byte, nf.end_byte, nf.name_start_byte, nf.name_end_byte, nf.metadata_json, u.unit_key, u.source_binding`
 
 // nodeOrder is the Section 9.4 attribute precedence as far as storage can
 // apply it: exact-source binding first, then provider, then the stable unit
@@ -204,10 +206,10 @@ const nodeOrder = ` ORDER BY CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1
 func scanNode(rows interface{ Scan(...any) error }) (StoredNode, error) {
 	var n StoredNode
 	var nodeID, fileID, contentHash, unitKey []byte
-	var start, end sql.NullInt64
+	var start, end, nameStart, nameEnd sql.NullInt64
 	var metadata string
 	if err := rows.Scan(&nodeID, &n.Node.Kind, &n.Node.Language, &n.Node.Name, &n.Node.QualifiedName, &n.Node.Signature,
-		&fileID, &contentHash, &start, &end, &metadata, &unitKey, &n.SourceBinding); err != nil {
+		&fileID, &contentHash, &start, &end, &nameStart, &nameEnd, &metadata, &unitKey, &n.SourceBinding); err != nil {
 		if isNoRows(err) {
 			return n, err
 		}
@@ -221,6 +223,9 @@ func scanNode(rows interface{ Scan(...any) error }) (StoredNode, error) {
 	}
 	if start.Valid {
 		n.Bytes = &model.ByteRange{Start: uint64(start.Int64), End: uint64(end.Int64)}
+	}
+	if nameStart.Valid {
+		n.NameBytes = &model.ByteRange{Start: uint64(nameStart.Int64), End: uint64(nameEnd.Int64)}
 	}
 	if metadata != "{}" {
 		n.Node.Metadata = []byte(metadata)

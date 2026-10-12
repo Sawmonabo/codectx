@@ -1444,6 +1444,9 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if err != nil {
 		return err
 	}
+	// A definition occurrence's range is the symbol's name token, and the
+	// node is located at that occurrence, so its name range is its range.
+	res.Node.NameRange = rng
 	loc := location{file: ds.doc.file, rng: rng}
 	if publish {
 		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false, sigCut); err != nil {

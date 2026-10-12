@@ -197,12 +197,19 @@ CREATE TABLE node_facts (
     file_id BLOB,
     start_byte INTEGER,
     end_byte INTEGER,
+    -- The declaration's name token, inside [start_byte, end_byte); NULL for a
+    -- node with no name token of its own.
+    name_start_byte INTEGER,
+    name_end_byte INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
-           AND start_byte >= 0 AND end_byte >= start_byte))
+           AND start_byte >= 0 AND end_byte >= start_byte)),
+    CHECK((name_start_byte IS NULL AND name_end_byte IS NULL)
+       OR (start_byte IS NOT NULL AND name_start_byte IS NOT NULL AND name_end_byte IS NOT NULL
+           AND name_start_byte >= start_byte AND name_end_byte >= name_start_byte AND name_end_byte <= end_byte))
 ) WITHOUT ROWID;
 -- relation_ids mirrors node_ids: an INTEGER surrogate, the canonical 32-byte
 -- RelationID stored once in `canonical`, and the endpoints carried as node

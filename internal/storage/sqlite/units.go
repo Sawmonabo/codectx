@@ -592,8 +592,9 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 				return err
 			}
 			defer kindOf.Close()
-			ins, err := tx.PrepareContext(ctx, `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json)
-				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(unit_id, node_id) DO NOTHING`)
+			ins, err := tx.PrepareContext(ctx, `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature, file_id, start_byte, end_byte,
+				name_start_byte, name_end_byte, metadata_json)
+				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(unit_id, node_id) DO NOTHING`)
 			if err != nil {
 				return err
 			}
@@ -624,6 +625,7 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 					return err
 				}
 				start, end := rangeBytes(n.Range)
+				nameStart, nameEnd := rangeBytes(n.NameRange)
 				metadata := "{}"
 				if len(n.Metadata) > 0 {
 					if err := requireJSONObject("node.metadata", n.Metadata); err != nil {
@@ -631,12 +633,14 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 					}
 					metadata = string(n.Metadata)
 				}
-				res, err := ins.ExecContext(ctx, w.rowID, int64(ref), n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end, metadata)
+				res, err := ins.ExecContext(ctx, w.rowID, int64(ref), n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end,
+					nameStart, nameEnd, metadata)
 				if err != nil {
 					return err
 				}
 				if err := w.checkRepeatedNode(ctx, tx, res, n, ref,
-					[]string{n.Language, n.Name, n.QualifiedName, n.Signature, blobText(fileRaw), intText(start), intText(end), metadata}); err != nil {
+					[]string{n.Language, n.Name, n.QualifiedName, n.Signature, blobText(fileRaw), intText(start), intText(end),
+						intText(nameStart), intText(nameEnd), metadata}); err != nil {
 					return err
 				}
 				if err := w.insertEvidence(ctx, tx, f.Evidence, ref, noRef); err != nil {
@@ -993,7 +997,8 @@ func canonicalDetails(details map[string]string) (string, error) {
 // nodeFactColumns names the stored columns of a node fact, in the order
 // checkRepeatedNode compares them, so the column it reports is a function of
 // the divergence and not of map order.
-var nodeFactColumns = []string{"language", "name", "qualified_name", "signature", "file_id", "start_byte", "end_byte", "metadata_json"}
+var nodeFactColumns = []string{"language", "name", "qualified_name", "signature", "file_id", "start_byte", "end_byte",
+	"name_start_byte", "name_end_byte", "metadata_json"}
 
 // checkRepeatedNode refuses a repeated node identity whose stored columns
 // differ from the row already written for it. The insert yields to the row
@@ -1011,12 +1016,15 @@ func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.
 	}
 	var language, name, qualified, signature, metadata string
 	var file []byte
-	var start, end sql.NullInt64
-	if err := w.stmts.queryRow(ctx, tx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json
-		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, int64(ref)).Scan(&language, &name, &qualified, &signature, &file, &start, &end, &metadata); err != nil {
+	var start, end, nameStart, nameEnd sql.NullInt64
+	if err := w.stmts.queryRow(ctx, tx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte,
+		name_start_byte, name_end_byte, metadata_json
+		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, int64(ref)).Scan(&language, &name, &qualified, &signature, &file,
+		&start, &end, &nameStart, &nameEnd, &metadata); err != nil {
 		return err
 	}
-	stored := []string{language, name, qualified, signature, optionalHex(file), nullIntText(start), nullIntText(end), metadata}
+	stored := []string{language, name, qualified, signature, optionalHex(file), nullIntText(start), nullIntText(end),
+		nullIntText(nameStart), nullIntText(nameEnd), metadata}
 	for i, col := range nodeFactColumns {
 		if stored[i] == incoming[i] {
 			continue
