@@ -144,7 +144,7 @@ func LockWorkspace(ctx context.Context, dataDir, operation string, wait LockWait
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, ioError("data directory", err)
 	}
-	f, err := os.OpenFile(filepath.Join(dataDir, lockFileName), os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(LockPath(dataDir), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, ioError("workspace lock file", err)
 	}

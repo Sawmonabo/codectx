@@ -26,6 +26,9 @@ const (
 	// ScratchCollection is the scratch pool itself, emptied because an
 	// operator asked for it.
 	ScratchCollection Purpose = "scratch-collection"
+	// WorkspaceReset is a workspace's whole data directory, removed because
+	// an operator asked for the workspace to be built again from nothing.
+	WorkspaceReset Purpose = "workspace-reset"
 )
 
 var (

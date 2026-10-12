@@ -1106,7 +1106,7 @@ func wrap(op string, err error) error {
 			return &model.Error{Code: model.CodeWorkspaceBusy, Message: "database is busy: " + op, Retryable: true}
 		case sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB:
 			return &model.Error{Code: model.CodeStorageCorrupt, Message: "database is not readable: " + se.Error(),
-				Remediation: "run codectx doctor --deep; rebuild the cache with index --rebuild if it reports corruption"}
+				Remediation: "run codectx doctor --deep; if it reports corruption, run codectx reset --reindex"}
 		case sqlite3.SQLITE_CONSTRAINT:
 			return &model.Error{Code: model.CodeArgumentInvalid, Message: "rejected by schema constraint: " + se.Error()}
 		}

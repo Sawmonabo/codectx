@@ -193,7 +193,7 @@ func initSchema(ctx context.Context, db *sql.DB, path string) error {
 		return &model.Error{Code: model.CodeSchemaMismatch,
 			Message:     "run ledger schema fingerprint " + found + " does not match this binary's " + Fingerprint,
 			Details:     map[string]string{"path": path},
-			Remediation: "delete the run ledger beside the index cache, or rebuild the cache with `codectx index --rebuild`"}
+			Remediation: "delete the run ledger beside the index cache, or run `codectx reset --reindex`"}
 	}
 	return wrap("commit", tx.Commit())
 }

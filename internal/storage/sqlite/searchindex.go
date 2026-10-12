@@ -77,7 +77,7 @@ func (s *Store) releaseSearchWriter() error {
 func searchLost(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeStorageCorrupt,
 		Message:     "the search index does not hold this generation: " + fmt.Sprintf(format, args...),
-		Remediation: "re-index into a new cache with `codectx index --rebuild`"}
+		Remediation: "run `codectx reset --reindex` to build the workspace again from the repository"}
 }
 
 // searchHolds checks that the index's last commit covers generation gen: a
@@ -525,7 +525,7 @@ func (s *Store) failUnreconciled(ctx context.Context, units []int64) error {
 			return wrap("reconcile", err)
 		}
 		if published != 0 {
-			slog.Warn("the search index lacks documents of units a published generation selects; their searches miss them until the cache is rebuilt with `codectx index --rebuild`",
+			slog.Warn("the search index lacks documents of units a published generation selects; their searches miss them until the workspace is built again with `codectx reset --reindex`",
 				"units", published)
 		}
 		final := []string{

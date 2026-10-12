@@ -9,6 +9,7 @@ is in [the threat model](threat-model.md).
 
 ```
 codectx gc              # give the workspace's pooled scratch space back
+codectx reset --reindex # remove the data directory and build the workspace again
 codectx doctor          # human summary
 codectx doctor --json   # one machine-stable envelope
 codectx doctor --deep   # runs the whole-database checks an ordinary run reports unverified
@@ -87,8 +88,8 @@ actually active on this host, in addition to refusing every fetch.
 | `CTX_WORKSPACE_NOT_FOUND` | No workspace was discovered from this directory upward. | Run `codectx init` at the repository root, or run from inside the repository. |
 | `CTX_CONFIG_INVALID` | A configuration key is unknown, malformed or violates a cross-key rule. | The detail names the key. Fix it in the layer that set it; there is no extension namespace, so an unknown key is always a typo or a setting from another version. |
 | `CTX_TRUST_REQUIRED` | A project file set a key only the user configuration may set, or raised a limit it may only lower. | Move the setting to your user configuration, or lower it. |
-| `CTX_SCHEMA_MISMATCH` | The database on disk was written by a different schema. **This fails closed on purpose**; there is no migration layer. It is also what a command waiting for the workspace reports when the process holding it wrote a run ledger this build cannot read. | Remove the workspace's data directory and re-index. Nothing in it is a source of truth: the repository is. When the message names a holding process instead, remove nothing: the two processes are different builds, so let the holder finish or stop it, and run the command again from one of them. |
-| `CTX_STORAGE_CORRUPT` | An integrity check failed. | Run `codectx doctor --deep` for the detail, then remove the data directory and re-index. |
+| `CTX_SCHEMA_MISMATCH` | The database on disk was written by a different schema. **This fails closed on purpose**; there is no migration layer. It is also what a command waiting for the workspace reports when the process holding it wrote a run ledger this build cannot read. | Run `codectx reset --reindex`, which removes the workspace's data directory and builds it again. Nothing in it is a source of truth: the repository is. `codectx index --rebuild` instead builds a new cache beside it and leaves the old database for the build that wrote it. When the message names a holding process instead, reset nothing: the two processes are different builds, so let the holder finish or stop it, and run the command again from one of them. |
+| `CTX_STORAGE_CORRUPT` | An integrity check failed. | Run `codectx doctor --deep` for the detail, then `codectx reset --reindex`. |
 | `CTX_SOURCE_INTEGRITY` | A stored source block did not match its recorded hash. | Same as above: re-index. Do not keep serving from the store — retained bytes are what every answer cites. |
 | `CTX_NO_ACTIVE_GENERATION` | The workspace is initialized but nothing has been published yet, or the last run failed before publication. | Run `codectx index`. A failed or unsealed unit is invisible by design, so a partial run leaves no half-visible state to clean up. |
 | `CTX_WORKSPACE_BUSY` | Another process holds the workspace lock, or a live lease or retained session still references what was asked for. | **Retryable.** Wait and retry. When the holder recorded itself in the lock file, the message and the `holder_pid`/`holder_operation` details name the process and what it is running, so you know what to wait for or stop; a holder that recorded nothing is reported as such rather than guessed at. The workspace lock is an advisory OS file lock, so it is released by the kernel if its holder dies — there is no stale lock file to remove by hand. |
@@ -521,11 +522,30 @@ safe and is the correct answer to `CTX_SCHEMA_MISMATCH`, `CTX_STORAGE_CORRUPT`
 and `CTX_SOURCE_INTEGRITY`:
 
 1. Stop anything holding the workspace — a `codectx watch` or an MCP server.
-2. Remove the workspace's data directory — `storage.data_dir`, whose empty
-   default resolves to a user-private per-workspace directory documented in
-   [configuration](configuration.md).
-3. `codectx init`, then `codectx index`.
-4. `codectx doctor --deep` to confirm.
+   Between the things they build they hold no lock, so a reset cannot see
+   them.
+2. `codectx reset --reindex`. It empties the workspace's data directory —
+   `storage.data_dir`, whose empty default resolves to a user-private
+   per-workspace directory documented in
+   [configuration](configuration.md) — and runs a full index.
+3. `codectx doctor --deep` to confirm.
+
+`codectx reset` opens no database, so a store that is corrupt or of another
+schema is removed like any other. It takes the workspace lock first and holds
+it until everything is gone: a running index, refresh or watch beat is named
+in a `CTX_WORKSPACE_BUSY` refusal and nothing is removed. It empties only the
+resolved data directory. A symbolic link inside it is removed as a link and
+its target is left alone, and a data directory that is, or holds, the
+repository, the home directory or the filesystem root is refused with
+`CTX_CONFIG_INVALID`. The workspace lock file stays, empty, for the next
+holder. A cache `codectx index --rebuild` made beside the data directory is a
+different directory and is not touched.
+
+The space goes back a window at a time, at the same pace as `codectx gc`, so
+a large data directory takes a while and the command says that a very large
+one can still stall a virtualized host. Without `--reindex` it leaves the
+workspace empty for the next `codectx index`; `--json` prints every entry it
+removed with the bytes its removal gave back.
 
 Open sessions, cursors and receipts do not survive a rebuild. That is correct:
 they cite a generation that no longer exists.
@@ -555,10 +575,11 @@ the index does not fully hold so the next run re-plans it like any unsealed
 unit, and commits. There is nothing to run by hand.
 
 Like everything else in the data directory, the index is not a source of
-truth. A search that answers `CTX_STORAGE_CORRUPT` with a re-index remediation
-has found the index directory missing, or older than the database's active
-generation: it was removed or replaced. That and a damaged index directory are
-recovered the way the store is: remove the data directory and re-index
+truth. A search that answers `CTX_STORAGE_CORRUPT` with a `codectx reset
+--reindex` remediation has found the index directory missing, or older than
+the database's active generation: it was removed or replaced. That and a
+damaged index directory are recovered the way the store is, with
+`codectx reset --reindex`
 ([Rebuilding a workspace](#rebuilding-a-workspace)). Removing the index
 directory alone is not a supported repair, because the database's activated
 generations assume the documents it holds.
