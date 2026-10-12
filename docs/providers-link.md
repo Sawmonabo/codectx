@@ -39,8 +39,8 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `imports` | `imports` | file module → each file module the import resolves to | `import` |
 | `imports` | `imports` | file module → the import's open-import-site node | none |
 | `data_flows_to` | `data_flows_to` | each variable an argument reads → the parameter it binds | `argument` |
-| `extends` | `extends` | type → a supertype of its own kind | `supertype` |
-| `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `method_set` |
+| `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
+| `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
@@ -52,7 +52,11 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 - `import`: an import resolved to a file of the unit;
 - `argument`: an argument of a bound call site, matched to its parameter;
 - `supertype`: a supertype or an override the source writes;
-- `method_set`: a Go interface a type satisfies by its method set, which the source never writes.
+- `method_set`: a Go interface a type satisfies by its method set, which the source never writes;
+- `supertype_interface`, `supertype_class`: a supertype the source writes that is outside the project (a node of
+  kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
+  interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
+  base list).
 
 **Caller and target.** The caller is the anonymous route handler a site is written in when the structural provider
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
@@ -85,8 +89,9 @@ target carries no `set_size`. Nothing is capped: every target is published.
 call can run an override of its target, `exact` when it cannot. It is computed per occurrence, from the site, never
 from the technique that bound it: a `super` call, a qualified call (`a.Animal::sound()`, `Base.m(self)`), a call on a
 constructed object (`Dog().sound()`, `new C().m()`), a static, final, private or non-virtual method, a C++ call
-through a declaration that is not `virtual` or on an object declared by value (`Dog d; d.sound()`; a pointer or a
-reference stays `virtual`), and every function an address-taken or field set reaches are `exact`. A
+through a declaration that is not `virtual`, on an object declared by value (`Dog d; d.sound()`) or on the result of
+a function that returns a class by value (`Dog make(); make().sound()`; a pointer or a reference, declared or
+returned, stays `virtual`, and an `auto` return names no type), and every function an address-taken or field set reaches are `exact`. A
 member call on a receiver with a declared static type publishes one `calls` to the method that type declares or
 inherits, even when it is abstract or an interface or trait method, and never one edge per override:
 `speak(a: Animal) { a.sound() }` with `Dog` and `Cat` overriding `sound` publishes `speak calls Animal.sound`,
@@ -112,7 +117,12 @@ The candidates of an open site are computed per query as `may_call`, never store
 an endpoint and a call on a receiver of that type meets the override of that method at one node (ADR-0015 decision
 2, `internal/provider/link/external.go`). An external node has no file: it is minted in the scope `link:external`,
 keyed by the language family, the type's qualified name as the family resolves it (`hierarchy.externalName`) and, for
-a method, the method's name, with metadata `{"resolution":"external"}`. A call site does not know the parameter types
+a method, the method's name, with metadata `{"resolution":"external"}`. An external type's node is of kind `type`,
+never `class` or `interface`: whether it is a class, an interface, a trait or a struct is not known from the
+project's code, and one project can write it both ways (TypeScript lets a class implement a class), so a fixed kind
+keeps one qualified name one node in every unit. Each `extends` or `implements` into it carries the kind its own
+clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body has no node, so it
+publishes no supertype edge; its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
 an external method declares, so one node stands for all of a type's methods of one name. A Java `@Override` of
 `toString` and `o.toString()` on an `Object` receiver both target `java.lang.Object.toString`. Every run of every
 unit that names an external node republishes it with its own evidence, and the delta build replaces the index-level
@@ -140,7 +150,8 @@ target's language binds them (`argumentFlows`, `internal/provider/link/args.go`)
 argument by its parameter's name, a spread or `*args` to the rest from its position, and the arguments past the last
 named parameter to a variadic one; a parameter an omitted default fills receives nothing. A call through a function value flows into
 every function the address-taken join binds it to. A receiver passed first (a
-Go method expression, a Rust path naming a method, Python `C.m(obj)`) binds the first parameter. A parameter with no
+Go method expression, a Rust path naming a method, a Java unbound method reference, Python `C.m(obj)`) binds the
+receiver parameter, and nothing where the callee declares none (a Java method's receiver). A parameter with no
 node of its own receives no edge.
 
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
@@ -332,7 +343,10 @@ The members' language family picks the resolver:
   method that type declares or inherits, `virtual` when that method can be overridden (not static and not `Final`,
   `hierarchy.overridable`) and `exact` otherwise. An anonymous class body is a synthetic subtype of the type it
   instantiates (`anonymousType`), whose methods override that type's. A call of an abstract method (a functional
-  interface's) also joins every method reference of that method's signature. A receiver that is a field of a class,
+  interface's) also joins every method reference of that method's signature. A method reference `T::m` to an
+  instance method, `T` a type, is unbound (JLS §15.13.1): its signature is `m`'s with `T` as its first parameter, and
+  a call through it passes its first argument to the receiver and the rest to `m`'s parameters in order. A static
+  method's, a constructor's and a bound one's (`this::m`) take the arguments as their own parameters. A receiver that is a field of a class,
   in its own file or another, is typed by the field's declared type, inherited and enclosing-class fields included.
 - **Go, Rust, C, C++** (`resolveStatic`): direct binding and class-hierarchy analysis over interfaces and traits.
   Bare and static sites bind by the language's scoping: same package, import, `use`, namespace and
@@ -359,10 +373,11 @@ The members' language family picks the resolver:
 In every static family a site binds only a target its arguments fit: at least `Params - Optional` (one fewer for
 a `Variadic` one, whose last parameter may take none) and, unless `Variadic`, at most `Params` (`staticFile.fits`).
 A C or C++ definition takes `virtual`, `final` and default arguments from its prototypes of the same signature
-(`preferDefinitions`). A Go method expression or a Rust path naming a method passes
-its receiver as the first argument. A call the worker did not describe (`Site.Described` false) carries no argument list and is not filtered. A receiver that is
+(`preferDefinitions`). A Go method expression, a Rust path naming a method or a Java unbound method reference
+passes its receiver as the first argument. A call the worker did not describe (`Site.Described` false) carries no argument list and is not filtered. A receiver that is
 another call's result (`TypeResult`) has the types that call's targets return, each read in its target's file
-(`staticFile.results`).
+(`staticFile.results`), exactly that type when the target returns it by value (a C++ class, `wire.ExactObject` on
+`wire.Export.Returns`).
 
 A Rust path is read through the module it names in its own crate (`internal/provider/link/resolve_rust.go`). A
 crate is the directory Cargo's layout makes its root: the nearest `src` (`lib.rs` and `main.rs` are the root,

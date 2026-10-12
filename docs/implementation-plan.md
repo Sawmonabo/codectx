@@ -560,6 +560,7 @@ const (
     NodeSection       NodeKind = "section"
     NodeEndpoint      NodeKind = "endpoint"
     NodeDatabaseEntity NodeKind = "database_entity"
+    NodeType          NodeKind = "type" // a type outside the indexed project, its own kind unknown
 )
 
 ```
