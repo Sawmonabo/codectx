@@ -69,7 +69,14 @@ condition that an entry's grade depends only on its own routes, and no margin re
 ### 3. The read stops at a score below which no unread match can rank above the packed files
 
 - Lexical matches are read in score order through the internal search call, which takes a depth and grows it until
-  the floor is passed; the 200-item page is a wire bound and does not apply to this in-process call.
+  the floor is passed; the 200-item page is a wire bound and does not apply to this in-process call. Each step resumes
+  after the last match served and doubles the depth, because a resumed read rescores the ranking above its position:
+  steps of a fixed P cost about N²/(2P) document scorings for N matches, doubling about 4N. A step's peak memory is
+  every index segment's heap of depth+2 places and the depth+1 hits it hands over, computed from those structures with
+  the segment count and string bytes the read has met; it must fit the query memory admission
+  (`resources.query_memory_bytes`) less the compile's sort share. When a doubling does not fit, the read keeps the
+  largest depth that does, never less than one page, so a small admission costs more steps and never a refusal or a
+  different answer. Nothing is spooled.
 - τ(next) is the largest final score anything derived from the next unread match could reach: its origin
   contribution, a route at the full scale, and every boost the root could lend. It is computed with the compiler's own
   integer functions, never with a floating ratio. With the boosts scaled by root weight (decision 1), the margin is
