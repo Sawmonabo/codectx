@@ -2145,6 +2145,7 @@ Canonical capsule hashing excludes operational timestamps, local generation/run 
 codectx init [path] [--force]
 codectx doctor [path] [--offline] [--deep] [--json]
 codectx index [--repo PATH] [--full] [--rebuild] [--watch] [--json]
+codectx reset [path] [--reindex] [--json]
 codectx refresh [paths...] [--repo PATH] [--json]
 codectx status [--repo PATH] [--json]
 codectx watch [--repo PATH] [--json]

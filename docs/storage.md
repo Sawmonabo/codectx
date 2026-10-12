@@ -774,6 +774,7 @@ at the same rate as the reclaimer's own and through the same turn.
 | The engine's journals and its log, one window or smaller | In place | A rename would cost a directory entry and a turn of the pace to give back less than one window | — |
 | A search index directory found beside a database whose schema is being created | Removal | It belongs to a database that was removed by hand, and no database will name its documents again | — |
 | The pools themselves, on `codectx gc` | Removal | An operator asked | `scratch-collection` |
+| The data directory itself, on `codectx reset` | In place | An operator asked, and the to-free set it would be renamed into is inside the directory being emptied | `workspace-reset` |
 
 The list is enforced, not narrated: a test walks the source tree and fails on
 any call outside the pacing package that gives a file's blocks back and is
