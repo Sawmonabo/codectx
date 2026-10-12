@@ -132,7 +132,8 @@ An import whose path does not fold to a constant publishes one open-import-site 
 scope, keyed `openimport:<path>:<first byte>-<last byte>`, named `import`, of kind `module`, with metadata
 `{"resolution":"unresolved","reason":"computed","fragments":[…]}`, the literal parts of the path in source order
 (`require("./x/" + name)` gives `["./x/"]`). The files whose paths match the fragments are computed per query as
-`may_import`. `require("./x")` folds and is an ordinary import.
+`may_import`. A `require("./x")` or `import("./x")` of a string literal is an import record of the structural query,
+and a path that folds to a constant (`import("./" + "x")`) is an ordinary import too.
 
 **Argument flows.** A bound call site publishes `data_flows_to` from each variable an argument reads to the parameter
 of the target the argument binds (ADR-0017), and an unbound site publishes none. Arguments are matched as the
@@ -387,7 +388,13 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
 
 - **JavaScript, TypeScript, TSX** (`resolveECMAScript`, `internal/provider/link/resolve_ecmascript.go`): direct
   binding through imports and scopes. A bare name binds only the declarations its scope sees, those of the innermost
-  scope declaring it (`Table.Visible`), never a class member. A module's exports follow its `export` statements: a
+  scope declaring it (`Table.Visible`), never a class member nor a function stored under a property (`obj.run = () =>
+  …`, `{ k: () => … }`, `Decl.Property`); `f = () => …` binds the name `f` as a declarator does. A function a
+  property assignment or a pair declares is the value written to that property, named by its declaration exactly
+  (`Value.Declares`), so field-based resolution reaches that declaration's node. A module's exports follow its
+  `export` statements and its CommonJS exports (`module.exports.run = …`, `exports.run = …`, a key of
+  `module.exports = { run: … }`, each exported under its own name and written to no field); a name a pattern binds
+  from a literal `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is. A
   declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
   ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
   re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.
@@ -414,11 +421,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   resolution (a function written to the attribute; a method is written to no attribute, so it is reached only through
   a receiver's type) answers an attribute call only when its receiver's type bound nothing and reaches the method
   through no supertype outside the project: `class L(list)` calling `self.append(1)` calls the external
-  `builtins.list.append`, never a function written to `append` elsewhere.
+  `builtins.list.append`, never a function written to `append` elsewhere. A method taken as a value through its
+  class (`f = C.m`) is unbound: `f(obj, n)` passes `obj` as `self` and `n` to the next parameter. One taken through
+  an instance (`g = C().m`, `obj.m`, `self.m`) is bound: `g(k)` passes `k` to the first parameter after `self`. A
+  static or class method taken through its class takes no receiver argument.
 
 **Flow-based type inference** (`inferTypes`, `internal/provider/link/infer.go`) starts from the types the worker
 recovered inside each function (`wire.Type`, `wire/link.go`):
-- a `new C()` or an annotation is `TypeNamed`;
+- a `new C()` or an annotation is `TypeNamed` (a TypeScript `any`, `unknown`, `object`, `never` or `void` names no
+  class and types nothing);
 - a parameter is `TypeParam`;
 - another call's result is `TypeResult`;
 - a field read is `TypeField`;

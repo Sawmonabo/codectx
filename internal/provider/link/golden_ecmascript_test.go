@@ -598,4 +598,112 @@ export function run(obj, k, cb) {
 		},
 		fails: "a computed callee counted as open, or a bound site counted open, breaks the counts; every open site given one reason misnames three",
 	},
+	{
+		name:   "property-declared-functions",
+		anchor: "ECMA-262 (15th edition, 2024) §13.15.2 (Assignment: `a.b = f` stores f under the property b; `f = g` binds the name f), §13.2.5 (Object Initializer: a property definition stores its value under its key), §13.3.6 (Function Calls)",
+		files: map[string]string{
+			"src/obj.js": `const obj = {};
+obj.run = () => 1; // @orun
+obj.run(); // @c1
+run(); // @c4
+const o = { k: () => 2 }; // @ok
+o.k(); // @c2
+let f;
+f = (a) => a; // @fa
+export function go(v) { // @go
+  f(v); // @c3
+}
+`,
+		},
+		// Derived from the source and the anchor. obj and o hold objects whose run and k properties the
+		// file writes with the two arrow functions, and nothing else types either receiver, so each call
+		// binds the function its property was written with (the field). No name run is bound anywhere, so
+		// the bare call of it is open. f is a name the assignment binds to the third arrow function, so the
+		// call in go binds it by scope and passes v to a.
+		want: []string{
+			"c1 run -> orun run exact",
+			"c2 k -> ok k exact",
+			"c3 f -> fa f exact",
+		},
+		sites: []string{
+			"c4 run open global_unbound bare 0",
+		},
+		facts: []string{
+			"go v flows fa a",
+		},
+		fails: "property-assigned declarations skipped leave c1 and c2 unbound; `f = () => …` read as an untyped value leaves c3 open; a property function taken as the binding of its bare name binds c4 to obj.run",
+	},
+	{
+		name:   "commonjs-exports",
+		anchor: "Node.js Modules: CommonJS modules (`module.exports` and its `exports` shortcut are what `require(id)` returns); ECMA-262 (15th edition, 2024) §14.3.3 (Destructuring Binding Patterns)",
+		files: map[string]string{
+			"src/m.js": `module.exports.run = () => 1; // @mrun
+exports.stop = (code) => code; // @mstop
+`,
+			"src/use.js": `const { run, stop: halt } = require("./m");
+const m = require("./m");
+export function main(n) { // @main
+  run(); // @u1
+  halt(n); // @u2
+  m.run(); // @u3
+}
+`,
+		},
+		// Derived from the source and the anchor. src/m.js exports run and stop through module.exports and
+		// exports; the destructured names and the required module's member reach them through the module,
+		// and n reaches code.
+		want: []string{
+			"u1 run -> mrun run exact",
+			"u2 halt -> mstop stop exact",
+			"u3 run -> mrun run exact",
+		},
+		facts: []string{
+			"main n flows mstop code",
+			"src/use.js imports src/m.js",
+		},
+		fails: "a CommonJS export left out of the module's exports leaves every call unbound; a destructured require read as a field binds through no module",
+	},
+	{
+		name:   "an-untyped-receiver-is-not-bound-by-name",
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.2 (Property Accessors: the property is looked up on the receiver's value at run time); Node.js Modules: CommonJS modules",
+		files: map[string]string{
+			"src/m.js": `module.exports.run = () => 1; // @mrun
+`,
+			"src/other.js": `export function other(x) {
+  x.run(); // @u4
+}
+`,
+		},
+		// Derived from the source and the anchor. Nothing tells what x holds, and run is written to no
+		// property of an object x could hold: src/m.js exports it, which only an import of that module
+		// reaches. The call is open.
+		want: []string{},
+		sites: []string{
+			"u4 run open receiver_untyped member 0",
+		},
+		fails: "a member call bound by its name alone, or a CommonJS export treated as a field write, binds u4 to src/m.js's run",
+	},
+	{
+		name:   "typescript-untyped-annotations",
+		anchor: "TypeScript Handbook, Everyday Types (`any`, `unknown` and `object` name no class whose members a call reaches)",
+		files: map[string]string{
+			"src/a.ts": `export function run(p: object) {
+  const o: any = {};
+  o.m(); // @u5
+  const u: unknown = 1;
+  (u as any).n(); // @u6
+  p.q(); // @u7
+}
+`,
+		},
+		// Derived from the source and the anchor. None of the annotations names a class, so each receiver is
+		// untyped and each call open, never a call into an external type of that name.
+		want: []string{},
+		sites: []string{
+			"u5 m open receiver_untyped member 0",
+			"u6 n open receiver_untyped member 0",
+			"u7 q open receiver_untyped member 0",
+		},
+		fails: "`any`, `unknown` or `object` read as a named type outside the project publishes an external call or external site for each",
+	},
 }

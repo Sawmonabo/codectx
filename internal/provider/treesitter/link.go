@@ -48,10 +48,15 @@ const detailLinkFailure = "link_failure"
 // minted for it (tableVariables). The worker's computed sites, calls whose
 // callee names nothing, follow the reference-joined sites as sites of their
 // own (link.Site.Computed). A declaration takes its export's override mark
-// and alias and its declared parameters (wire.Link.Parameters), each a
+// and alias, its property mark, the export mark of a CommonJS export (OR'd
+// into the structural one), and its declared parameters
+// (wire.Link.Parameters), each a
 // variable endpoint functions fills the same way. A dynamic import becomes a
 // link.DynamicImport, or, when its path folds to a constant, an ordinary
 // import appended to Table.Imports.
+// A value whose expression declares a function (wire.Value.Declares)
+// carries that declaration (link.Value.Declares); one whose declaration
+// joined nothing is dropped and counted, never resolved by its name.
 //
 // A file whose module has no identity (build gave up on an over-long path)
 // has no endpoint to link from and stores no table; neither does a file whose
@@ -221,7 +226,8 @@ func (b *builder) linkTable() error {
 		d.Described, d.Receiver, d.Signature, d.Params, d.Optional, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Optional, x.Variadic
 		d.Static, d.Abstract, d.Virtual, d.Final, d.Internal = x.Static, x.Abstract, x.Virtual, x.Final, x.Internal
 		d.Returns = typ(x.Returns)
-		d.Override, d.Alias = x.Override, x.Alias
+		d.Override, d.Alias, d.Property = x.Override, x.Alias, x.Property
+		d.Exported = d.Exported || x.Exported
 	}
 	for _, p := range wl.Parameters {
 		i, ok := b.nameAt[p.Callable]
@@ -266,7 +272,18 @@ func (b *builder) linkTable() error {
 				t.Dropped++
 				continue
 			}
-			t.Values = append(t.Values, link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type)})
+			lv := link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type)}
+			if v.Declares != (wire.Span{}) {
+				// The value is the declaration its expression declares, or,
+				// when that joined nothing, no value to resolve by name.
+				i, ok := b.nameAt[v.Declares]
+				if !ok {
+					t.Dropped++
+					continue
+				}
+				lv.Declares = int32(i) + 1
+			}
+			t.Values = append(t.Values, lv)
 		}
 	}
 	b.table = t

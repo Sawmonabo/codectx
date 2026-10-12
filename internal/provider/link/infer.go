@@ -938,7 +938,19 @@ func (f *fileScan) scan(ctx context.Context, r *round, watches *pagination.Exter
 			continue
 		}
 		dst := variable{Kind: varField, Name: v.Field}
-		err := f.eval(ctx, v.Caller, v.Type, func(op operand) error {
+		eval := f.eval
+		if v.Declares > 0 {
+			// A function the value's own expression declares is that
+			// declaration, never one its name would find.
+			eval = func(_ context.Context, _ int32, _ wire.Type, yield func(operand) error) error {
+				i := v.Declares - 1
+				if int(i) >= len(t.Decls) || !callable(&t.Decls[i]) {
+					return nil
+				}
+				return yield(operand{X: value{Kind: valFunction, Ref: Ref{File: f.file, Index: i}}})
+			}
+		}
+		err := eval(ctx, v.Caller, v.Type, func(op operand) error {
 			if op.IsVar {
 				if err := f.in.pending.Add(pendingFlow{Entry: dst, From: f.file, Op: op.V}); err != nil {
 					return err
@@ -1098,12 +1110,13 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 // scoped is the candidates of a bare name a call in caller makes that its
 // scope binds the name to: those Table.Visible admits, declared in the
 // innermost scope enclosing caller that declares any (a nested function
-// shadows a module-level one of its name).
+// shadows a module-level one of its name). A function stored under a
+// property (Decl.Property, `obj.run = () => …`) binds no name.
 func scoped(t *Table, caller int32, candidates []int32) []int32 {
 	var out []int32
 	best := -1
 	for _, k := range candidates {
-		if !t.Visible(k, caller) {
+		if !t.Visible(k, caller) || t.Decls[k].Property {
 			continue
 		}
 		depth := 0

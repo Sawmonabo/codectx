@@ -72,9 +72,12 @@ import (
 // that uses a variable declared by that name), and its type is the merge of
 // what each definition reaching that node assigns. A definition is read back
 // from the syntax at its node's span: a declarator's annotation or
-// initializer, an assignment's right side, a parameter (its annotation, else
-// TypeParam by position), an import (its TypeModule, see Imports), a
-// destructured property (TypeField of its key),
+// initializer, an assignment's right side (a function expression assigned
+// to a name declares it, as a declarator's does), a parameter (its
+// annotation, else TypeParam by position), an import (its TypeModule, see
+// Imports), a destructured property (TypeField of its key, or, in a pattern
+// a declarator binds to `require("m")`, the module's export TypeModule
+// "m#key"),
 // a function declaration (TypeFunction). A may-definition through a property
 // write, an update or a delete keeps the type the variable already held, so
 // the definitions behind it are read instead; a closure's may-definition
@@ -108,7 +111,22 @@ import (
 // function-valued variable's name; a member's name qualified by what holds
 // it, `C.m` for a class's method or function-valued field and `o.m` for a
 // method of the object literal initializing o (a bare name when nothing
-// names the object); an imported value is its TypeModule (see Imports).
+// names the object); an imported value is its TypeModule (see Imports). A
+// function expression a property assignment or a pair declares (`a.b = () =>
+// …`, `{ k: () => … }`, which the structural query declares by the property
+// name) is TypeFunction of its path and names its declaration's name token
+// (Value.Declares); one stored as a CommonJS export is no value (see
+// Exports).
+//
+// # Exports
+//
+// Every function declaration, function-valued declarator, method, function
+// signature, function-valued class field, class, and function expression a
+// property assignment or a pair declares is an Export at its name token. A
+// property-stored one is marked Property, since no bare name denotes it, and
+// one stored on `module.exports` or `exports` (`module.exports.run = …`,
+// `exports.run = …`, a key of `module.exports = { run: … }`) is marked
+// Exported: the module exports it under its own name.
 //
 // # Re-exports
 //
@@ -343,7 +361,9 @@ func (k *javaScriptLinker) function(fn Node, g *flow.Graph, du flow.Edges, src [
 				}
 			}
 		case k.x.pair:
-			if field := k.propertyName(n.ChildByFieldId(kk.fKey)); field != "" {
+			if name, f, holder, ok := k.pairFunction(n); ok {
+				k.declaredValue(f, name, holder, false)
+			} else if field := k.propertyName(n.ChildByFieldId(kk.fKey)); field != "" {
 				k.written(n.ChildByFieldId(kk.fValue), field)
 			}
 		case k.x.shorthandPropertyIdentifier:
@@ -541,6 +561,10 @@ func (k *javaScriptLinker) def(n Node) jsVal {
 	case kk.variableDeclarator:
 		return k.declarator(n)
 	case kk.assignmentExpression:
+		if name, fn, _, member, ok := k.assignedFunction(n); ok && !member {
+			// `f = () => …` declares f's function, as a declarator does.
+			return jsVal{t: wire.Type{Kind: wire.TypeFunction, Name: string(textOf(k.src, name))}, sig: k.signature(fn), set: true, decl: true}
+		}
 		return typed(k.typeOf(n.ChildByFieldId(kk.fRight)))
 	case kk.classDeclaration, kk.abstractClassDeclaration:
 		// The class's name holds the class object.
@@ -567,7 +591,7 @@ func (k *javaScriptLinker) bound(id Node) jsVal {
 		return jsUnknown
 	}
 	if id.KindId() == kk.shorthandPropertyIdentifierPattern {
-		return typed(wire.Type{Kind: wire.TypeField, Name: string(textOf(k.src, id))})
+		return k.destructured(id.Parent(), string(textOf(k.src, id)))
 	}
 	if id.KindId() != kk.identifier {
 		return jsUnknown
@@ -599,7 +623,7 @@ func (k *javaScriptLinker) bound(id Node) jsVal {
 	case kk.pairPattern:
 		if p.ChildByFieldId(kk.fValue) == id {
 			if key := k.propertyName(p.ChildByFieldId(kk.fKey)); key != "" {
-				return typed(wire.Type{Kind: wire.TypeField, Name: key})
+				return k.destructured(p.Parent(), key)
 			}
 		}
 	case x.arrowFunction:
@@ -608,6 +632,26 @@ func (k *javaScriptLinker) bound(id Node) jsVal {
 		}
 	}
 	return jsUnknown
+}
+
+// destructured is what a name the object pattern pattern binds to its
+// property key holds: the module's export key when the pattern is a
+// declarator's and its value is `require("m")` of a string literal, as the
+// structural provider's import record binds it (TypeModule "m#key", a
+// declaration a call binds through the module's exports), else the
+// property key's value.
+func (k *javaScriptLinker) destructured(pattern Node, key string) jsVal {
+	kk := k.k
+	if jsKindOf(pattern) == kk.objectPattern {
+		if d := pattern.Parent(); jsKindOf(d) == kk.variableDeclarator && d.ChildByFieldId(kk.fName) == pattern {
+			if v := d.ChildByFieldId(kk.fValue); jsKindOf(v) == kk.callExpression {
+				if m, ok := k.required(v); ok {
+					return jsVal{t: wire.Type{Kind: wire.TypeModule, Name: m + "#" + key}, set: true, decl: true, static: true}
+				}
+			}
+		}
+	}
+	return typed(wire.Type{Kind: wire.TypeField, Name: key})
 }
 
 // paramOf reports whether id is a parameter of the callable being analysed:
@@ -1112,9 +1156,14 @@ func (k *javaScriptLinker) dynamicImport(out *wire.Link, n Node) {
 }
 
 // assigned records the value an assignment writes to a property, or the
-// function it assigns to a variable.
+// function it assigns to a variable. A function the assignment declares
+// under a property (`a.b = () => …`) is that declaration (declaredValue).
 func (k *javaScriptLinker) assigned(n Node) {
 	kk := k.k
+	if name, fn, holder, member, ok := k.assignedFunction(n); ok && member {
+		k.declaredValue(fn, name, holder, true)
+		return
+	}
 	left := k.l.unparen(n.ChildByFieldId(kk.fLeft))
 	right := n.ChildByFieldId(kk.fRight)
 	if jsKindOf(left) == kk.memberExpression {
@@ -1124,6 +1173,102 @@ func (k *javaScriptLinker) assigned(n Node) {
 		return
 	}
 	k.valued(right)
+}
+
+// declaresFunction reports a function expression the structural query
+// declares where it is written: an arrow function or a function
+// expression, as the assignment or pair's own value.
+func (k *javaScriptLinker) declaresFunction(v Node) bool {
+	return jsKindOf(v) == k.x.arrowFunction || jsKindOf(v) == k.k.functionExpression
+}
+
+// assignedFunction is the declaration the assignment n makes when it
+// assigns a function expression, as the structural query declares one: its
+// name token (the identifier assigned, or the property of `a.b = …`), the
+// function, the object a property is stored on as written (`a`, `this`,
+// `module.exports`), and whether it is stored under a property.
+func (k *javaScriptLinker) assignedFunction(n Node) (name, fn Node, holder string, member, ok bool) {
+	kk := k.k
+	left, right := n.ChildByFieldId(kk.fLeft), n.ChildByFieldId(kk.fRight)
+	if !k.declaresFunction(right) {
+		return Node{}, Node{}, "", false, false
+	}
+	switch jsKindOf(left) {
+	case kk.identifier:
+		return left, right, "", false, true
+	case kk.memberExpression:
+		if p := left.ChildByFieldId(kk.fProperty); jsKindOf(p) == k.x.propertyIdentifier {
+			return p, right, k.spell(left.ChildByFieldId(kk.fObject)), true, true
+		}
+	}
+	return Node{}, Node{}, "", false, false
+}
+
+// pairFunction is the declaration the pair n makes when its key is a
+// property name and its value a function expression: the key, the
+// function, and the path of the bindings around its object (objectPath).
+func (k *javaScriptLinker) pairFunction(n Node) (name, fn Node, holder string, ok bool) {
+	key, value := n.ChildByFieldId(k.k.fKey), n.ChildByFieldId(k.k.fValue)
+	if jsKindOf(key) != k.x.propertyIdentifier || !k.declaresFunction(value) {
+		return Node{}, Node{}, "", false
+	}
+	return key, value, k.objectPath(n.Parent()), true
+}
+
+// objectPath is the path an object literal is stored under, outermost
+// first: the variable a declarator binds it to or the left side of an
+// assignment of it (`module.exports`), then the key of each pair it is
+// nested in; an object stored under no binding (an argument, a return
+// value) adds nothing.
+func (k *javaScriptLinker) objectPath(obj Node) string {
+	kk := k.k
+	var keys []string
+	for jsKindOf(obj) == k.x.object {
+		p := obj.Parent()
+		switch jsKindOf(p) {
+		case k.x.pair:
+			key := k.propertyName(p.ChildByFieldId(kk.fKey))
+			if key == "" || p.ChildByFieldId(kk.fValue) != obj {
+				return ""
+			}
+			keys = append(keys, key)
+			obj = p.Parent()
+			continue
+		case kk.variableDeclarator:
+			if name := p.ChildByFieldId(kk.fName); jsKindOf(name) == kk.identifier && p.ChildByFieldId(kk.fValue) == obj {
+				keys = append(keys, string(textOf(k.src, name)))
+			}
+		case kk.assignmentExpression:
+			if p.ChildByFieldId(kk.fRight) == obj {
+				keys = append(keys, k.spell(p.ChildByFieldId(kk.fLeft)))
+			}
+		}
+		break
+	}
+	slices.Reverse(keys)
+	return strings.Join(keys, ".")
+}
+
+// commonJSExport reports a function stored under holder that its module
+// exports under the function's own name: a property of `module.exports` or
+// of `exports` (member), or a key of the object `module.exports` is
+// assigned.
+func commonJSExport(holder string, member bool) bool {
+	return holder == "module.exports" || member && holder == "exports"
+}
+
+// declaredValue records the function fn a property assignment or a pair
+// declares under the name token name, stored on holder, as the value
+// written to that property, naming its declaration exactly
+// (wire.Value.Declares). A CommonJS export is reached through the module's
+// exports, never through a field of its name, so it is no field value.
+func (k *javaScriptLinker) declaredValue(fn, name Node, holder string, member bool) {
+	if commonJSExport(holder, member) {
+		return
+	}
+	field := string(textOf(k.src, name))
+	k.values = append(k.values, wire.Value{At: wireSpan(spanOf(fn)), Field: field,
+		Type: wire.Type{Kind: wire.TypeFunction, Name: qualify(holder, field)}, Declares: wireSpan(spanOf(name))})
 }
 
 // written records the value v written to the property field, when its type
@@ -1253,6 +1398,18 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 			name, value := n.ChildByFieldId(kk.fName), n.ChildByFieldId(kk.fValue)
 			if jsKindOf(name) == kk.identifier && (jsKindOf(value) == x.arrowFunction || jsKindOf(value) == kk.functionExpression) {
 				k.export(out, name, value, "", true, false)
+			}
+		case kk.assignmentExpression:
+			if name, fn, holder, member, ok := k.assignedFunction(n); ok {
+				k.export(out, name, fn, "", true, false)
+				out.Exports[len(out.Exports)-1].Property = member
+				out.Exports[len(out.Exports)-1].Exported = member && commonJSExport(holder, true)
+			}
+		case x.pair:
+			if name, fn, holder, ok := k.pairFunction(n); ok {
+				k.export(out, name, fn, "", true, false)
+				out.Exports[len(out.Exports)-1].Property = true
+				out.Exports[len(out.Exports)-1].Exported = commonJSExport(holder, false)
 			}
 		case kk.fieldDefinition, kk.publicFieldDefinition:
 			if _, value := k.fieldParts(n); jsKindOf(value) == x.arrowFunction || jsKindOf(value) == kk.functionExpression {
@@ -1679,14 +1836,22 @@ func (k *javaScriptLinker) returnType(fn Node) wire.Type {
 }
 
 // namedType is the name a TypeScript type node names: a type name, a
-// qualified type name or a predefined type as written, a generic type's
-// name without its arguments; empty for any other type.
+// qualified type name or a primitive type whose values have the methods of
+// a built-in class (`string`, `number`, `boolean`, `symbol`, `bigint`) as
+// written, a generic type's name without its arguments; empty for any other
+// type, `any`, `unknown`, `object`, `never` and `void` among them, which say
+// nothing of a value's class.
 func (k *javaScriptLinker) namedType(t Node) string {
 	x := k.x
 	switch jsKindOf(t) {
 	case x.genericType:
 		return k.namedType(t.ChildByFieldId(k.k.fName))
-	case x.typeIdentifier, x.nestedTypeIdentifier, x.predefinedType, k.k.identifier:
+	case x.predefinedType:
+		switch name := k.spell(t); name {
+		case "string", "number", "boolean", "symbol", "bigint":
+			return name
+		}
+	case x.typeIdentifier, x.nestedTypeIdentifier, k.k.identifier:
 		return k.spell(t)
 	}
 	return ""

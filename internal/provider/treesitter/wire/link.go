@@ -120,6 +120,15 @@ type Export struct {
 	// one identifier (`#define LOG log_impl`), that identifier; empty for
 	// every other declaration.
 	Alias string
+	// Property reports an ECMAScript function stored under a property path
+	// rather than bound to a name (`a.b = () => …`, `{ k: () => … }`): a
+	// bare name in its scope never denotes it.
+	Property bool
+	// Exported reports a declaration its module exports under its own name
+	// that no `export` statement marks: an ECMAScript function stored as a
+	// CommonJS export (`module.exports.run = …`, `exports.run = …`, a key of
+	// `module.exports = { run: … }`).
+	Exported bool
 }
 
 // Supertype is one declared subtype relation of the file: Type extends,
@@ -260,6 +269,10 @@ type Value struct {
 	// Type is the value: TypeFunction for a function taken as a value,
 	// otherwise the type recovered for what was written.
 	Type Type
+	// Declares is, for a function the value's own expression declares (an
+	// ECMAScript `a.b = () => …` or `{ k: () => … }`), that declaration's
+	// name token, which names the value exactly; empty for any other.
+	Declares Span
 }
 
 // Shape is a call site's callee expression form.
@@ -358,12 +371,13 @@ type Type struct {
 //
 //	exports    n × (name start, end; receiver; signature; params; optional;
 //	                variadic, static, abstract, virtual, final, internal
-//	                flags; returns type; override flag; alias)
+//	                flags; returns type; override flag; alias; property,
+//	                exported flags)
 //	supertypes n × (type; super; interface flag)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
 //	                signature; args n × type; arguments n × (at start, end;
 //	                keyword; spread byte; reads n × (start, end)))
-//	values     n × (at start, end; field; type)
+//	values     n × (at start, end; field; type; declares start, end)
 //	reexports  n × (name; original; from)
 //	unions     n × (n × type)
 //	parameters n × (callable start, end; name start, end; index; variadic,
@@ -389,6 +403,8 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.typ(x.Returns)
 		e.flag(x.Override)
 		e.str(x.Alias)
+		e.flag(x.Property)
+		e.flag(x.Exported)
 	}
 	e.u32(uint32(len(l.Supertypes)))
 	for _, s := range l.Supertypes {
@@ -405,6 +421,7 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.span(v.At)
 		e.str(v.Field)
 		e.typ(v.Type)
+		e.span(v.Declares)
 	}
 	e.u32(uint32(len(l.Reexports)))
 	for _, r := range l.Reexports {
@@ -494,19 +511,20 @@ func DecodeLink(payload []byte) (Link, error) {
 	d := decoder{b: payload, malformed: ErrMalformedLink}
 	var l Link
 	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
-	// flags, a 9-byte type, 1 flag and 4 alias; a supertype two strings and
+	// flags, a 9-byte type, 1 flag, 4 alias and 2 flags; a supertype two strings and
 	// 1 flag; a site 8 span, 1 shape, 4 qualifier, 9 type, 4 signature, 4
 	// args and 4 arguments; an argument 8 span, 4 keyword, 1 spread and 4
-	// reads; a read 8 span; a value 8 span, 4 field and 9 type; a reexport
+	// reads; a read 8 span; a value 8 span, 4 field, 9 type and 8 span; a reexport
 	// three strings; a union its count; a parameter two 8 spans, 4 index and 2 flags; a
 	// dynamic import 8 span, 4 fragments and 1 flag; a fragment its length.
-	l.Exports = make([]Export, 0, d.count(44))
+	l.Exports = make([]Export, 0, d.count(46))
 	for range cap(l.Exports) {
 		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32(), Optional: d.u32()}
 		x.Variadic, x.Static, x.Abstract = d.flag(), d.flag(), d.flag()
 		x.Virtual, x.Final, x.Internal = d.flag(), d.flag(), d.flag()
 		x.Returns = d.typ()
 		x.Override, x.Alias = d.flag(), d.str()
+		x.Property, x.Exported = d.flag(), d.flag()
 		l.Exports = append(l.Exports, x)
 	}
 	l.Supertypes = make([]Supertype, 0, d.count(9))
@@ -519,9 +537,9 @@ func DecodeLink(payload []byte) (Link, error) {
 	for range cap(l.Sites) {
 		l.Sites = append(l.Sites, d.site())
 	}
-	l.Values = make([]Value, 0, d.count(21))
+	l.Values = make([]Value, 0, d.count(29))
 	for range cap(l.Values) {
-		l.Values = append(l.Values, Value{At: d.span(), Field: d.str(), Type: d.typ()})
+		l.Values = append(l.Values, Value{At: d.span(), Field: d.str(), Type: d.typ(), Declares: d.span()})
 	}
 	l.Reexports = make([]Reexport, 0, d.count(12))
 	for range cap(l.Reexports) {
