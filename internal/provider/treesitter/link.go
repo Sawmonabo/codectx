@@ -337,7 +337,7 @@ func (b *builder) linkArgs(ws *wire.Site, typ func(wire.Type) wire.Type, dropped
 func (b *builder) declEndpoint(i int) link.Endpoint {
 	d := &b.decls[i]
 	return link.Endpoint{Node: d.res.Node.ID, CanonicalKey: d.res.CanonicalKey, Kind: d.kind, Name: d.Name,
-		Qualified: d.Qualified, Range: *d.rng}
+		Qualified: d.Qualified, Range: *d.rng, NameRange: d.nameRng}
 }
 
 // linkImports is the names the file's import records introduce, each with

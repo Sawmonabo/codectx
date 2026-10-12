@@ -778,6 +778,9 @@ func (p *publisher) occurrenceFact(o occurrence) model.NodeFact {
 	}
 	n := model.Node{ID: o.Node, Kind: o.Kind, Language: o.Language, Name: o.Name, QualifiedName: o.Qualified,
 		FileID: o.File, ContentHash: o.Hash, Range: rng}
+	if o.NameRange != nil && rng != nil {
+		n.NameRange = located(*o.NameRange)
+	}
 	return model.NodeFact{Node: n, CanonicalKey: o.CanonicalKey,
 		Evidence: []model.Evidence{p.evidence(o.Node, "", o.File, o.Hash, rng, key, "", "", 0)}}
 }

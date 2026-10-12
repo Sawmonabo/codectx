@@ -282,6 +282,9 @@ func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, owner
 	if err != nil {
 		return link.Endpoint{}, err
 	}
+	// A variable node's range is its declaring identifier, so the name
+	// token is the whole range.
+	res.Node.NameRange = fv.rng
 	var meta map[string]any
 	if len(truncated) > 0 {
 		meta = map[string]any{"truncated_fields": truncated}
@@ -294,7 +297,7 @@ func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, owner
 		b.putAlias(b.scope, fv.declKey, res.Node.ID)
 	}
 	return link.Endpoint{Node: res.Node.ID, CanonicalKey: res.CanonicalKey, Kind: model.NodeVariable, Name: name,
-		Qualified: qualified, Range: *fv.rng}, nil
+		Qualified: qualified, Range: *fv.rng, NameRange: fv.rng}, nil
 }
 
 // parameter is a parameter variable's identity inputs: its declaring

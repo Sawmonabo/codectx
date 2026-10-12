@@ -532,3 +532,41 @@ func TestRecordCountsCarry(t *testing.T) {
 		}
 	}
 }
+
+// TestOccurrencesCarryTheNameRange publishes a call between two
+// declarations whose tables carry each name token's range: the linker's
+// occurrence of each endpoint carries that range as its NameRange, so an
+// answer served from the linker's occurrence locates the name, not only the
+// declaration.
+//
+// Mutation: leave NameRange off occurrenceFact -> both endpoints publish
+// without it.
+func TestOccurrencesCarryTheNameRange(t *testing.T) {
+	named := func(d Decl, start, end uint64) Decl {
+		r := span(start, end)
+		d.NameRange = &r
+		return d
+	}
+	callee := named(declared("f", model.NodeFunction, "f", 0), 4, 5)
+	callee.Range = span(0, 20)
+	caller := named(declared("main", model.NodeFunction, "main", 0), 4, 8)
+	caller.Range = span(0, 30)
+	b := table("b.py", "python", []Decl{callee}, nil)
+	a := table("a.py", "python", []Decl{caller}, []Site{callAt(0, "f", wire.ShapeBare, 10)})
+	got := publishFacts(t, testUnit(t, a, b), "u", []idBinding{callFact("a.py", 0, "b.py", "f", model.DispatchExact)}, nil, nil)
+	for _, c := range []struct {
+		id         model.NodeID
+		start, end uint64
+	}{{"main", 4, 8}, {"f", 4, 5}} {
+		n, ok := got.nodes[c.id]
+		if !ok {
+			t.Fatalf("no occurrence of %s was published", c.id)
+		}
+		if n.Node.NameRange == nil {
+			t.Fatalf("the occurrence of %s carries no name range", c.id)
+		}
+		if r := *n.Node.NameRange; r.Start.Byte != c.start || r.End.Byte != c.end {
+			t.Errorf("the occurrence of %s names bytes [%d,%d), want [%d,%d)", c.id, r.Start.Byte, r.End.Byte, c.start, c.end)
+		}
+	}
+}

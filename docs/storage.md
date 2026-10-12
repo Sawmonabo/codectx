@@ -370,18 +370,21 @@ with it and no refresh can diff against state whose facts were collected.
 `Store.SelectedUnit` finds the predecessor — the unit the previous generation
 selected for the same provider and scope.
 
-A linking unit stores one `link.resolution` artifact.
-The state opens with the tag `link.resolution.boundary\n`, then: the manifest fields (count, then key and value
-strings); the member records by FileID (count, then each a string: file, content hash, member digest, interface
-digest, sites digest, a tabled byte, then unsigned varints dropped, sites, bound, open, computed, external,
-resolved imports, open import sites); the facts by file, entry table, entry, kind, argument and target (each a
-string: kind byte, entry file, entry index, argument index, target file, target node, external key, then
-technique, dispatch and reason bytes); the static family's index groups, recorded reads and address-taken
-functions (each with signature, taker, target file and node, the parameters string and a receiver-first byte); the
-flow family's boundary contributions by entry, value and contributing member (entry variable, value, member
-ordinal, a late byte for a value only the second stratum sends) and boundary reads by entry and reading member; a
-hierarchy mark byte and, when 1, the module path and root, the two indexes and the identity table. A state of any
-other tag, or short, long, out of order or repeated, fails validation and the unit builds in full.
+A linking unit stores one `link.resolution` artifact, every fact in it named by stable identity, so a fact into an
+edited file survives the edit and nothing is renumbered. The state opens with the tag `link.resolution.nodes\n`,
+then these sections, each its count and its entries in ascending order: the manifest fields the resolution read
+(key and value strings); the member records by FileID (each a string of its encoded form: file, content hash, member
+digest, interface digest, sites digest, a tabled byte, then the member's counts of dropped, sites, bound, open,
+computed, external, resolved imports and open import sites); the facts by entry, then target (a fact's entry is its
+file and its index in that file's table; its target is a file and node identity, or an external key; then
+technique, dispatch and reason bytes); the index groups of the hierarchy and, for a Python, JavaScript, TypeScript
+or TSX unit, of the module index; for the static family, the recorded reads and the address-taken functions, from
+which a refresh finds what to re-run; for the flow family, every value each node of the value-flow fixed point put
+into a variable, every variable it read and every hierarchy or module-index key it looked up, so the next refresh
+re-runs only the nodes whose reads changed; a byte, 1 when the unit's hierarchy follows (its module path and root,
+its two indexes and its identity table), else 0; and a byte, 1 when the flow family's module index follows, else 0.
+A string is its length (an unsigned varint) and its bytes. A state of any other tag, or short, long, out of order or
+malformed, fails validation and the unit builds in full.
 
 What a unit *declared* is not delta state and is never stored twice:
 `Store.UnitInputs(ctx, unit)` streams a sealed unit's `unit_inputs` rows as an

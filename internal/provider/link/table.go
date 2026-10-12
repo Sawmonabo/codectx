@@ -110,6 +110,9 @@ type Endpoint struct {
 	Name         string            `json:"name"`
 	Qualified    string            `json:"qualified"`
 	Range        model.SourceRange `json:"range"`
+	// NameRange is the name token's range inside Range, when the
+	// structural provider found one: the node's own NameRange.
+	NameRange *model.SourceRange `json:"name_range,omitempty"`
 }
 
 // Decl is one declaration and the type facts the worker sent for it
