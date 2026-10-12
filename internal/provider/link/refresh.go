@@ -367,11 +367,14 @@ func resolveFlow(ctx context.Context, u *unit, rf *refresh) (*resolution, error)
 	}
 	prev := rf.prev
 	incremental := prev != nil && prev.h != nil && prev.mods != nil
-	keys, err := newKeySort(u.dir)
-	if err != nil {
-		return nil, err
+	// keys collects the changed groups' keys of a refresh.
+	var keys *pagination.ExternalSort[string]
+	if incremental {
+		if keys, err = newKeySort(u.dir); err != nil {
+			return nil, err
+		}
+		defer keys.Close()
 	}
-	defer keys.Close()
 	if incremental && rf.layout {
 		res.h, res.mods, res.groups = prev.h, prev.mods, prev.groups
 	} else {
