@@ -448,17 +448,16 @@ roots of the Section 15.2 boundary walk, and is unlimited by default: every
 resolvable seed is walked from. Setting it leaves the seeds past it unexplored,
 and the manifest carries one exclusion row naming the limit and the number of
 roots that did not start — the overflow is never quietly re-walked as a further
-request. The walks the compiler does run are one per distinct root weight
-(explicit seeds, then the exact matches, then each lexical score level), with
-the roots of one weight walked together, and an entity several walks reach keeps
-its best (requirement, score) pair ([ADR-0016](adr/ADR-0016-seed-budget.md)
-decision 1).
+request. Every root is walked in one walk, each root carrying its weight
+(explicit seeds, the exact matches, and each lexical match at its own score
+level); every entity the walk reaches keeps the best (requirement, score) pair
+any one root lends it ([ADR-0016](adr/ADR-0016-seed-budget.md) decision 1).
 
 One residual bound stands behind the unlimited default: a single traversal
 request's start list is validated against a structural wire ceiling of 250000
 node ids, which applies to externally supplied `impact` and `graph` requests and
-also to each request the compiler issues for its own walks — one per root
-weight, so the ceiling applies to the roots of one weight. The named roots are
+also to each request the compiler issues for its own walks, so it applies to
+the roots of the compiler's one walk. The named roots are
 bounded by the request: the task text is clipped to a fixed byte bound and each
 identity it names resolves through one page of declarations. The lexical roots
 follow the plan's file budget rather than the size of the index: the lexical

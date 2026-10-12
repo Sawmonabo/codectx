@@ -120,9 +120,12 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 	return expandScopeAfter(ctx, eng, gen, cfg, seeds, caps, seedStop{})
 }
 
-// expandScopeAfter walks the seeds' roots one group per root weight (ADR-0016
-// decision 1), the groups in descending weight with the named group first on
-// a tie, every group read to exhaustion:
+// expandScopeAfter walks the seeds' roots one group per root weight, the groups
+// in descending weight with the named group first on a tie, every group read
+// to exhaustion by graph.Impact. It is the reference the streamed pass's ONE
+// weighted walk is held to: the per-weight walks, each entity then keeping its
+// best record after ranking, are what that walk must equal (ADR-0016 decision
+// 1).
 //
 //   - The seeds fold among themselves, the earliest step keeping an entity. A
 //     seed the caller or the task named and that carries no root weight takes
@@ -311,6 +314,35 @@ func expandScopeAfter(ctx context.Context, eng *graph.Engine, gen model.Generati
 	}
 	return res, nil
 }
+
+// walkGroup is one walk of the reference: the roots of one weight and class,
+// walked together by graph.Impact, which admits one parent per reached node.
+// MaxDepth is the group's derived depth bound, zero for none.
+type walkGroup struct {
+	Weight   int64
+	Named    bool
+	MaxDepth int
+	Start    []model.NodeID
+}
+
+// walkDepth is the depth bound one group's walk is asked with, and whether the
+// group's derived bound -- not the user's context.max_graph_depth -- is the one
+// that set it. A group with no derived bound walks to the user's bound
+// (unlimited is zero); a derived bound is never widened by the user's and
+// never passed as zero.
+func walkDepth(derived int, user config.Limit) (int, bool) {
+	if derived <= 0 {
+		return user.Int(), false
+	}
+	if user.IsUnlimited() || derived < user.Int() {
+		return derived, true
+	}
+	return user.Int(), false
+}
+
+// walkDepthReason is graph.Impact's truncation reason for a walk its depth
+// bound ended, matched as a prefix as walkDeadlineReason is.
+const walkDepthReason = "graph depth budget exhausted"
 
 // referenceWalkGroups cuts the started roots into one walk per (weight, class)
 // in seq order, sorts the walks by descending weight with the named walk first

@@ -466,9 +466,13 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 // directory rather than as a record stream (pathcursor.go) -- so it appears
 // here, in the one vocabulary block, purely so no two continuation shapes can
 // ever claim the same marker. pathCursor.validate is what reads it.
+//
+// "w" is the weighted walk's (weightedwalk.go), for the same reason: it
+// retains a directory, not a record stream, and weightedCursor.validate reads it.
 const (
-	spoolRecordRanked = "r"
-	spoolRecordPath   = "p"
+	spoolRecordRanked   = "r"
+	spoolRecordPath     = "p"
+	spoolRecordWeighted = "w"
 )
 
 // rankedHeader is the leading record of a ranked-tail spool: the marker above,

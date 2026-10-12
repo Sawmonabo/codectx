@@ -519,9 +519,9 @@ func TestADeadlineInsideTheGraphWalkResumesIntoTheUninterruptedPlan(t *testing.T
 	if st.ingest.cursor == "" {
 		t.Fatalf("the halt at passIngest carried no walk cursor; it ended the walk rather than suspending it")
 	}
-	if st.ingest.seq == 0 || len(st.ingest.walks) == 0 || len(st.ingest.walks[st.ingest.walkAt].Start) == 0 {
-		t.Fatalf("the halt carried seq=%d over %d walk group(s); the continuation cannot reproduce the walk from that",
-			st.ingest.seq, len(st.ingest.walks))
+	if st.ingest.seq == 0 || len(st.ingest.roots) == 0 {
+		t.Fatalf("the halt carried seq=%d over %d walk root(s); the continuation cannot reproduce the walk from that",
+			st.ingest.seq, len(st.ingest.roots))
 	}
 
 	got, err := c.CompilePage(fx.ctx, req, token)

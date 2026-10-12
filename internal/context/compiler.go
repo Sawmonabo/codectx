@@ -445,10 +445,10 @@ type compileState struct {
 	packed   *packedPlan
 
 	// ingest is P-A's live sink, and is set ONLY while the walk is halted
-	// mid-pass: a deadline that fires between two of graph.Impact's pages ends
+	// mid-pass: a deadline that fires between two of the walk's pages ends
 	// P-A here, and this is the carry the passIngest boundary checkpoints (its
 	// pre-fold sorts, the closure's reached set among them, the walk's cursor,
-	// the walk groups and the arrival counter). Every other boundary leaves it nil, because the pass that
+	// the walk's roots and the arrival counter). Every other boundary leaves it nil, because the pass that
 	// produced it has finished.
 	ingest *seedIngest
 
@@ -742,7 +742,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 	}
 	if halted {
 		// The walk stopped between two pages. The sink itself is the carry --
-		// its pre-fold sorts, its arrival counter, its walk groups and the
+		// its pre-fold sorts, its arrival counter, the walk's roots and the
 		// walk's cursor -- and the scalars are copied out here because
 		// checkpointAt reads them from st: the tail below never ran, so
 		// nothing else would have set them.
@@ -1192,7 +1192,7 @@ type candidate struct {
 
 	// RootWeight is the weight w of the root this record's (requirement,
 	// score) pair comes from (ADR-0016 decision 1): a seed's own origin
-	// contribution, or the weight of the walk group that reached a walk entry.
+	// contribution, or the weight of the root whose route reached a walk entry.
 	// Zero on a record that is no root's: a captured change, a candidate.
 	RootWeight int64
 	// Named marks a record that comes from a named root: an explicit seed, one

@@ -101,13 +101,12 @@ type routeScore struct {
 }
 
 // scoreRoutes scores every route reaching cand and keeps the maximum. Section
-// 15.3 aggregates by maximum and never by a sum over routes: graph.Impact
-// admits one parent per node, so within the one walk group cand's record comes
-// from the maximum IS the admitted route, and summing would let a cycle inflate
-// an entity above an entity that genuinely matters. Across groups nothing is
-// combined either: each group's walk lends the entity its own record, and the
-// entity keeps the record whose (requirement, score) pair ranks first
-// (ADR-0016 decision 1).
+// 15.3 aggregates by maximum and never by a sum over routes: a walk record
+// carries the one route of the label it comes from, so the maximum IS that
+// route, and summing would let a cycle inflate an entity above an entity that
+// genuinely matters. Across labels nothing is combined either: each label the
+// walk kept lends the entity its own record, and the entity keeps the record
+// whose (requirement, score) pair ranks first (ADR-0016 decision 1).
 func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 	precision map[model.RelationID]int64, pathLimit config.Limit) (routeScore, error) {
 	out := routeScore{kinds: map[model.RelationKind]struct{}{}}

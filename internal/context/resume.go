@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -93,20 +94,20 @@ type checkpointScalars struct {
 	ScopeComplete    bool                    `json:"scope_complete"`
 	ReasonsDropped   int64                   `json:"reasons_dropped,omitempty"`
 	ReasonsTruncated int64                   `json:"reasons_truncated,omitempty"`
-	// WalkCursor, WalkGroups, WalkAt and Seq are the passIngest boundary's
-	// own carry: the current walk's continuation, the walk groups (each root
-	// list every leg of its walk must repeat byte for byte, since it is inside
-	// the walk's query hash), the group being walked and the seed sink's
+	// WalkCursor, WalkRoots, Walked and Seq are the passIngest boundary's
+	// own carry: the walk's continuation, its roots (the list every leg of
+	// the walk must repeat byte for byte, since it is inside the walk's query
+	// hash), whether the walk has been read to its end and the seed sink's
 	// arrival counter. They are empty at every other boundary.
 	//
-	// WalkGroups is the one field here sized by the seed set rather than by a
+	// WalkRoots is the one field here sized by the seed set rather than by a
 	// verdict, and it adds no memory class the pass does not already hold: P-A
-	// passes each group's identical slice to graph.Impact on every page, so a
+	// passes the identical slice to graph.WeightedWalk on every page, so a
 	// walk that can run at all can carry its own roots.
-	WalkCursor string      `json:"walk_cursor,omitempty"`
-	WalkGroups []walkGroup `json:"walk_groups,omitempty"`
-	WalkAt     int         `json:"walk_at,omitempty"`
-	Seq        int64       `json:"seq,omitempty"`
+	WalkCursor string               `json:"walk_cursor,omitempty"`
+	WalkRoots  []graph.WeightedRoot `json:"walk_roots,omitempty"`
+	Walked     bool                 `json:"walked,omitempty"`
+	Seq        int64                `json:"seq,omitempty"`
 	// Stalls is the count of consecutive non-advancing walk pages. A stalled
 	// page mints the cursor the request arrived with, so this is the only
 	// state that can bound how often that token is handed back: without it the
@@ -758,8 +759,8 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 	}
 	if st.ingest != nil {
 		scalars.WalkCursor = st.ingest.cursor
-		scalars.WalkGroups = st.ingest.walks
-		scalars.WalkAt = st.ingest.walkAt
+		scalars.WalkRoots = st.ingest.roots
+		scalars.Walked = st.ingest.walked
 		scalars.Seq = st.ingest.seq
 		scalars.Stalls = st.ingest.stalls
 	}
@@ -823,7 +824,7 @@ func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) 
 //
 // started is true: foldSeeds has already run and cannot run again -- seedSort
 // was consumed by it and is not part of the carry -- and the root list it built
-// is restored verbatim because graph.Impact binds it into the walk's query hash.
+// is restored verbatim because graph.WeightedWalk binds it into the walk's query hash.
 // The scope verdict is seeded from the checkpoint's write-once-false flag, so
 // an unresolved seed or a cut the first leg disclosed still narrows the plan.
 func (c *Compiler) resumedIngest(s *compileSorts, sc checkpointScalars) *seedIngest {
@@ -831,8 +832,8 @@ func (c *Compiler) resumedIngest(s *compileSorts, sc checkpointScalars) *seedIng
 		sorts:   s,
 		cfg:     c.cfg.Context,
 		seq:     sc.Seq,
-		walks:   sc.WalkGroups,
-		walkAt:  sc.WalkAt,
+		roots:   sc.WalkRoots,
+		walked:  sc.Walked,
 		cursor:  sc.WalkCursor,
 		stalls:  sc.Stalls,
 		started: true,
