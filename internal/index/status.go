@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -572,13 +573,18 @@ func withoutScopeNamingDetails(s model.CapabilityState) model.CapabilityState {
 //
 // The merge is a function of the two maps and not of the order they arrived
 // in, which these rows require: details_json folds into the AnalysisKey, and
-// the rows come from unit workers that run concurrently. Equal values stay as
-// they are; two integers sum, because every numeric detail here is a count of
-// units, scopes, records or bytes and the merged row stands for both sets; any
-// other pair is deduped and joined in sorted order, so two reasons are both
+// the rows come from unit workers that run concurrently. Two integers sum,
+// equal ones included -- two units that each saw ten call sites saw twenty --
+// because a numeric detail is a count of units, records, sites or bytes and
+// the merged row stands for both sets. The exceptions are the figures that
+// are not counts (extremeDetail): a bound every unit reports alike and the
+// largest size one unit saw keep the larger value, never the sum. Any other
+// pair is deduped and joined in sorted order, so two reasons are both
 // reported and a reason repeated by ten units is reported once. A
 // scope-naming detail keeps the receiving row's value: that row's diagnostic
-// code is the one being published, so its exemplar scope must be too.
+// code is the one being published, so its exemplar scope must be too. The
+// scope count is not merged here at all: every caller writes it from
+// countDetail afterwards, by the rule its own fold needs.
 //
 // A joined value is bounded by model.TruncateField and a cut one is named in
 // the `details_truncated` detail. WithDetail bounds a value silently; a reader
@@ -589,7 +595,9 @@ func mergeDetails(row, other model.CapabilityState) model.CapabilityState {
 	}
 	keys := make([]string, 0, len(other.Details))
 	for k := range other.Details {
-		keys = append(keys, k)
+		if k != scopesDetail {
+			keys = append(keys, k)
+		}
 	}
 	slices.Sort(keys)
 	var cut []string
@@ -599,34 +607,59 @@ func mergeDetails(row, other model.CapabilityState) model.CapabilityState {
 			row = row.WithDetail(k, other.Details[k])
 			continue
 		}
-		value, truncated := mergeDetailValue(k, have, other.Details[k])
+		value, truncated := mergeDetailValue(k, have, other.Details[k], extremeDetail(k, row, other))
 		if truncated {
 			cut = append(cut, k)
 		}
 		row = row.WithDetail(k, value)
 	}
 	if len(cut) > 0 {
-		flagged, _ := mergeDetailValue(truncatedDetail, row.Details[truncatedDetail], strings.Join(cut, detailSeparator))
+		flagged, _ := mergeDetailValue(truncatedDetail, row.Details[truncatedDetail], strings.Join(cut, detailSeparator), false)
 		row = row.WithDetail(truncatedDetail, flagged)
 	}
 	return row
 }
 
 // mergeDetailValue combines the two values one detail key carries and reports
-// whether the result had to be cut to fit model.MaxDetailBytes.
-func mergeDetailValue(key, a, b string) (value string, truncated bool) {
-	if a == b {
-		return a, false
-	}
+// whether the result had to be cut to fit model.MaxDetailBytes. Two integers
+// sum, or, for an extreme figure, keep the larger; equal values of any other
+// kind stay as they are.
+func mergeDetailValue(key, a, b string, extreme bool) (value string, truncated bool) {
 	if scopeNamingDetails[key] {
 		return a, false
 	}
-	if x, err := strconv.Atoi(a); err == nil {
-		if y, err := strconv.Atoi(b); err == nil {
-			return strconv.Itoa(x + y), false
+	if x, err := strconv.ParseInt(a, 10, 64); err == nil {
+		if y, err := strconv.ParseInt(b, 10, 64); err == nil {
+			if extreme {
+				return strconv.FormatInt(max(x, y), 10), false
+			}
+			return strconv.FormatInt(x+y, 10), false
 		}
 	}
+	if a == b {
+		return a, false
+	}
 	return joinDetailValues(a, b)
+}
+
+// largestRecordDetail is the largest record one unit saw over a record bound
+// (provider.Degradation.Largest).
+const largestRecordDetail = "largest_record_bytes"
+
+// extremeDetail reports whether key is a figure the fold keeps the larger of
+// instead of summing: it is not a count, so a sum is a number nothing
+// measured. These are the largest record a unit saw, the planner's scope-key
+// bound, and a user-set limit a unit reports beside the count of what crossed
+// it -- a provider.Degradation publishes the limit under its configuration
+// key and the count under "over_" plus that key, which is what names a key a
+// limit wherever it comes from. Every unit of one run reports the same limit,
+// so the larger of two is that limit.
+func extremeDetail(key string, a, b model.CapabilityState) bool {
+	if key == largestRecordDetail || key == plan.DetailScopeKeyBound {
+		return true
+	}
+	over := "over_" + key
+	return a.Details[over] != "" || b.Details[over] != ""
 }
 
 // joinDetailValues unions two multi-valued details: the values are deduped and

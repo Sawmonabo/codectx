@@ -54,6 +54,11 @@ const (
 	unplannedDuplicateFileNode = "manifest_duplicate_file_node"
 )
 
+// DetailScopeKeyBound is the capability detail that carries the scope-key
+// bound a refused path did not fit. It is a bound and not a count: every row
+// that carries it carries the same figure.
+const DetailScopeKeyBound = "bound"
+
 // scopeSeparator joins a provider ID and a scope key into the Reuse/Previous
 // map key. It is a byte no identifier may contain, so two different pairs can
 // never collide on one key.
@@ -701,7 +706,7 @@ func (b *builder) degradations() {
 		if n := b.plan.Unplanned[unplannedScopeKey+d.ID]; n > 0 {
 			for _, c := range d.Capabilities {
 				state := b.partial(d, c).WithDetail("files_over_scope_bound", strconv.Itoa(n))
-				state = state.WithDetail("bound", strconv.Itoa(model.MaxScopeKeyBytes))
+				state = state.WithDetail(DetailScopeKeyBound, strconv.Itoa(model.MaxScopeKeyBytes))
 				b.plan.States = append(b.plan.States, state.WithDetail("path", model.TruncateDetail(b.overBound[d.ID])))
 			}
 		}
