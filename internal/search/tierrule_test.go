@@ -2,7 +2,9 @@ package search
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -256,5 +259,124 @@ func TestALexicalResultOfAnExactlyServedNodeIsFolded(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the Solo document is not a lexical match of its own words: %+v", lexical)
+	}
+}
+
+// pagingDocs is a corpus of 24 files, one function each. Every body holds
+// "omega" and "zeta", in four repeat counts, so the scores fall into tied runs
+// that page boundaries split. Every third function is named "zeta": for the
+// query "zeta" the exact_name tier serves those, and the exact fold drops their
+// lexical results, which the service filters after the index has answered.
+func pagingDocs() []doc {
+	var out []doc
+	for i := range 24 {
+		name := fmt.Sprintf("Fn%02d", i)
+		if i%3 == 0 {
+			name = "zeta"
+		}
+		body := "func " + name + "() { " + strings.Repeat("omega zeta ", 1+i%4) + "}"
+		out = append(out, doc{path: fmt.Sprintf("pkg/f%02d.go", i), name: name,
+			qualifiedName: fmt.Sprintf("pkg.F%02d.%s", i, name), signature: "func " + name + "()",
+			body: body, occurrences: 1})
+	}
+	return out
+}
+
+// pagedReads walks query at limit to its end and answers the hits served and,
+// per page, every request lexicalPhase sent the index.
+func pagedReads(t *testing.T, ctx context.Context, s *Service, query string, limit int) ([]model.SearchHit, [][]textindex.Request) {
+	t.Helper()
+	var current []textindex.Request
+	prev := observeIndexRequest
+	observeIndexRequest = func(r textindex.Request) { current = append(current, r) }
+	defer func() { observeIndexRequest = prev }()
+	req := model.SearchRequest{Query: query, Page: model.PageRequest{Limit: limit}}
+	var hits []model.SearchHit
+	var pages [][]textindex.Request
+	for page := 1; ; page++ {
+		if page > 100 {
+			t.Fatalf("%q: the walk did not end", query)
+		}
+		current = nil
+		got, err := s.Search(ctx, req)
+		if err != nil {
+			t.Fatalf("%q: Search(page %d): %v", query, page, err)
+		}
+		hits = append(hits, got.Items...)
+		pages = append(pages, current)
+		if got.Meta.NextCursor == "" {
+			return hits, pages
+		}
+		req.Page.Cursor = got.Meta.NextCursor
+	}
+}
+
+// TestLexicalPagesResumeByKey proves a lexical page reads only what follows the
+// previous page: every page's first index request asks for at most limit+1
+// results after the cursor's key, a request repeats only while the service's
+// own filters leave the page short (then resuming after what the last request
+// returned, at twice its depth), and the pages together are exactly the answer
+// one deep read serves.
+//
+// Mutation: page by depth (ask for served+limit+1 from the start of the
+// ranking) and the second page's request asks for 2·limit+1 with no position.
+// Mutation: resume after the last result read instead of the last one served,
+// and the result past each page is lost from the walk.
+func TestLexicalPagesResumeByKey(t *testing.T) {
+	f := newFixtureOf(t, pagingDocs())
+	s := newService(t, f.opts)
+	for _, c := range []struct {
+		query string
+		limit int
+		// filtered says the exact fold drops lexical results of this query.
+		filtered bool
+	}{{"omega", 4, false}, {"omega", 1, false}, {"zeta", 3, true}, {"zeta", 2, true}} {
+		deep, err := s.Search(f.ctx, model.SearchRequest{Query: c.query, Page: model.PageRequest{Limit: 200}})
+		if err != nil {
+			t.Fatalf("%q: Search(deep): %v", c.query, err)
+		}
+		if deep.Meta.NextCursor != "" || len(deep.Items) != 24 {
+			t.Fatalf("%q: the deep read served %d hits (continued %v), want all 24 nodes on one page",
+				c.query, len(deep.Items), deep.Meta.NextCursor != "")
+		}
+		hits, pages := pagedReads(t, f.ctx, s, c.query, c.limit)
+		if !reflect.DeepEqual(hits, deep.Items) {
+			for i := range min(len(hits), len(deep.Items)) {
+				if !reflect.DeepEqual(hits[i], deep.Items[i]) {
+					t.Fatalf("%q limit %d: paged hit %d = %+v, want %+v", c.query, c.limit, i, hits[i], deep.Items[i])
+				}
+			}
+			t.Fatalf("%q limit %d: the pages served %d hits, the deep read %d", c.query, c.limit, len(hits), len(deep.Items))
+		}
+		lexicalPages := 0
+		for p, reqs := range pages {
+			if len(reqs) == 0 {
+				continue
+			}
+			lexicalPages++
+			if reqs[0].Depth > c.limit+1 {
+				t.Fatalf("%q limit %d page %d: the first index request asks for %d results, over limit+1",
+					c.query, c.limit, p+1, reqs[0].Depth)
+			}
+			if lexicalPages > 1 && reqs[0].After == nil {
+				t.Fatalf("%q limit %d page %d: a later lexical page reads from the start of the ranking",
+					c.query, c.limit, p+1)
+			}
+			if !c.filtered && (len(reqs) != 1 || reqs[0].Depth != c.limit+1) {
+				t.Fatalf("%q limit %d page %d: with nothing filtered a page is one request of limit+1, got %+v",
+					c.query, c.limit, p+1, reqs)
+			}
+			for i := 1; i < len(reqs); i++ {
+				if reqs[i].Depth != 2*reqs[i-1].Depth || reqs[i].After == nil {
+					t.Fatalf("%q limit %d page %d: request %d asks for %d after %v; a repeat resumes after the "+
+						"previous request at twice its depth %d", c.query, c.limit, p+1, i, reqs[i].Depth,
+						reqs[i].After, reqs[i-1].Depth)
+				}
+			}
+		}
+		if lexicalPages < 2 {
+			t.Fatalf("%q limit %d: only %d pages read the lexical tier; the walk proves nothing about resuming",
+				c.query, c.limit, lexicalPages)
+		}
 	}
 }

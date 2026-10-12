@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -268,7 +269,6 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"cursor/tampered_expired_and_foreign_cursors_are_rejected", legCursorRejections},
 		{"cursor/resolve_pages_by_a_bounded_keyset", legResolveKeyset},
 		{"cursor/search_positions_round_trip_and_refuse_foreign_keys", legSearchPositionKeys},
-		{"cursor/a_minimum_score_change_refuses_the_cursor", legMinScoreRefusesTheCursor},
 		{"scenario/search_serves_the_section_14_2_order", legEndToEndRanking},
 		{"exact/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
 		{"exact/exact_tiers_hold_one_read_page", legExactTiersHoldOnePage},
@@ -295,9 +295,9 @@ func TestSearchRankingScenario(t *testing.T) {
 // different question.
 // ---------------------------------------------------------------------------
 
-// legQueryHash proves the cursor's query binding. A hash that ignored a filter,
-// the minimum score or the length rule would let a cursor minted for one answer
-// resume against another, serving page 2 of a different question under the
+// legQueryHash proves the cursor's query binding. A hash that ignored a filter
+// or the length rule would let a cursor minted for one answer resume against
+// another, serving page 2 of a different question under the
 // same token.
 func legQueryHash(t *testing.T, _ *fixture) {
 	base := model.SearchRequest{Query: "handle request",
@@ -326,11 +326,6 @@ func legQueryHash(t *testing.T, _ *fixture) {
 		if searchQueryHash(c.req, textindex.LengthTotal) == h {
 			t.Errorf("changing %s did not change the query hash", c.name)
 		}
-	}
-	floored := base
-	floored.MinScoreMicros = 1
-	if searchQueryHash(floored, textindex.LengthTotal) == h {
-		t.Error("changing the minimum score did not change the query hash")
 	}
 	if searchQueryHash(base, textindex.LengthWeighted) == h {
 		t.Error("changing the length rule did not change the query hash")
@@ -778,51 +773,31 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 
 // legSearchPositionKeys proves a continuation's position survives its token
 // and that a key this endpoint did not write is refused rather than read as a
-// restarted answer. A Resolve key, a spool cursor's empty key and a negative
-// count are all CTX_CURSOR_INVALID.
+// restarted answer. A Resolve key, a spool cursor's empty key, a negative score
+// and a second spelling of one lexical position are all CTX_CURSOR_INVALID.
 func legSearchPositionKeys(t *testing.T, f *fixture) {
 	for _, want := range []searchPosition{
 		{phase: phaseExact, rank: model.TierExactName.Rank(), node: f.nodes["pkg/alpha.go"]},
-		{phase: phaseLexical, served: 412},
+		{phase: phaseLexical},
+		{phase: phaseLexical, after: &textindex.Position{ScoreMicros: 4_120_000, DocID: 77}},
+		{phase: phaseLexical, after: &textindex.Position{ScoreMicros: math.MaxInt64, DocID: math.MaxUint64}},
 	} {
 		key := want.lastKey()
 		if len(key) > 1024 {
 			t.Fatalf("the position key is %d bytes, over the Cursor.LastKey bound", len(key))
 		}
 		got, err := parseSearchPosition(key)
-		if err != nil || got != want {
+		if err != nil || !reflect.DeepEqual(got, want) {
 			t.Fatalf("parseSearchPosition(%q) = %+v, %v; want %+v", key, got, err, want)
 		}
 	}
 	node := string(f.nodes["pkg/alpha.go"])
-	for _, bad := range []string{"", "l", "l\x00-1", "l\x00x", "x\x004\x00" + node, "x\x00-1\x00" + node,
-		"x\x001\x00not-an-id", resolveKey(model.TierExactName, node)} {
+	for _, bad := range []string{"", "l", "l\x00-1\x007", "l\x00x\x007", "l\x0012", "l\x0012\x00", "l\x00012\x007",
+		"l\x00+12\x007", "l\x0012\x0007", "l\x0012\x00-7", "l\x0012\x007\x00", "x\x004\x00" + node,
+		"x\x00-1\x00" + node, "x\x001\x00not-an-id", resolveKey(model.TierExactName, node)} {
 		_, err := parseSearchPosition(bad)
 		assertCode(t, "key "+strconv.Quote(bad), err, model.CodeCursorInvalid)
 	}
-}
-
-// legMinScoreRefusesTheCursor proves a continuation minted under one minimum
-// score is refused under another: the floor decides which lexical results
-// exist, so the count a lexical position carries would name a different place.
-//
-// Mutation: leave MinScoreMicros out of searchQueryHash and the floored
-// continuation is served.
-func legMinScoreRefusesTheCursor(t *testing.T, f *fixture) {
-	s := newService(t, f.opts)
-	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
-	first, err := s.Search(f.ctx, req)
-	if err != nil {
-		t.Fatalf("Search(page 1): %v", err)
-	}
-	if first.Meta.NextCursor == "" {
-		t.Fatal("a one-hit page over two matching nodes minted no continuation")
-	}
-	floored := req
-	floored.MinScoreMicros = 1
-	floored.Page.Cursor = first.Meta.NextCursor
-	_, err = s.Search(f.ctx, floored)
-	assertCode(t, "a continuation under another minimum score", err, model.CodeCursorInvalid)
 }
 
 // ---------------------------------------------------------------------------

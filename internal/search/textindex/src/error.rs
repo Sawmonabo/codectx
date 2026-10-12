@@ -13,6 +13,7 @@ pub const CX_CORRUPT: i32 = 4;
 pub const CX_DISK_FULL: i32 = 5;
 pub const CX_INTERNAL: i32 = 6;
 pub const CX_TOO_MANY_TERMS: i32 = 7;
+pub const CX_NO_POSITION: i32 = 8;
 
 /// A failure: its status code and the message written into *err.
 #[derive(Debug)]

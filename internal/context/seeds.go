@@ -349,11 +349,11 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, reader *sqlite.PinnedReade
 	for {
 		// A continuation names the cursor ALONE: the cursor already pins the
 		// generation it was minted against -- the same gen this compile pinned
-		// -- and naming both is refused as a contradiction.
-		//
-		// MinScoreMicros is deliberately left unset: the floor is learned while
-		// reading, and a cursor binds the floor it was minted under, so the
-		// stop is applied here on the keyset cursor rather than by the search.
+		// -- and naming both is refused as a contradiction. Each page resumes
+		// the lexical ranking after the last match the previous page served,
+		// so reading to the stop costs the matches read, never a re-read of
+		// the ones before. The stop's threshold is learned while reading and
+		// is applied here, page by page, rather than by the search.
 		read := model.SearchRequest{
 			Query: clipUTF8(task, model.MaxQueryTextBytes),
 			Page:  model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
