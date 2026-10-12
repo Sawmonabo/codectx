@@ -184,6 +184,9 @@ var staticGoldens = []golden{
 		},
 		// Mutation: read dispatch from the technique -> `a.Animal::sound()` and `Dog().sound()` carry
 		// virtual. Mutation: publish per override -> `a.sound()` binds Dog's and Puppy's sound.
+		// Mutation: remove the pattern that captures a qualified member call (`a.Animal::sound()`) -> the
+		// worker's site joins no call reference, so the `exact sound` line is missing and the unit's `calls`
+		// row is partial.
 		fails: "a qualified call or a temporary's call marked virtual; a virtual call published to each override",
 	},
 	{
