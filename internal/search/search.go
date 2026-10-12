@@ -537,7 +537,7 @@ func (s *Service) exactPhase(ctx context.Context, reader exactReader, req model.
 		after = &key
 	}
 	h := newExactHeap(limit + 1)
-	err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems, span, func(e exactHit) error {
+	err := exactCandidates(ctx, reader, req.Query, req.Kinds, filter, model.MaxPageItems, span, func(e exactHit) error {
 		if !servableExact(e, filter) {
 			return nil
 		}
@@ -562,7 +562,7 @@ var errPositionFound = errors.New("search: the continuation's position was found
 func positionKey(ctx context.Context, reader exactReader, req model.SearchRequest, filter hitFilter,
 	pos searchPosition) (exactEntry, error) {
 	var found exactEntry
-	err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems,
+	err := exactCandidates(ctx, reader, req.Query, req.Kinds, filter, model.MaxPageItems,
 		tierSpan{from: pos.rank, to: pos.rank}, func(e exactHit) error {
 			if e.Node.Node.ID != pos.node || !servableExact(e, filter) {
 				return nil
@@ -664,27 +664,17 @@ func (s *Service) lexicalErr(err error) error {
 }
 
 // exactFold recognizes a lexical result whose node the exact tiers served for
-// the same query, so the answer serves that node once, at its exact tier. The
-// node's tier is tierRule's, decided over every visible row of the node: not
-// over the result's own fields, which are one unit's document, nor over
-// reader.Node, which is one precedence winner. The node was served there when
-// the row that tier serves for it passes the request's filters (servableExact),
-// exactly the test the exact phase applies to the same row.
-type exactFold struct {
-	rule  *tierRule
-	paths *pathResolver
-	// normalized is the query read as a path: the path exact_path serves its
-	// rows at.
-	normalized string
-	filter     hitFilter
-}
+// the same request, so the answer serves that node once, at its exact tier. It
+// asks tierRule, the rule the exact walk applies: over every visible row of the
+// node and the request's filters, not over the result's own fields, which are
+// one unit's document, nor over reader.Node, which is one precedence winner.
+type exactFold struct{ rule *tierRule }
 
 // newExactFold builds the fold for one request. Its tier reads are point reads
 // (size 1): a page's nodes are sparse in any one tier.
 func newExactFold(reader exactReader, req model.SearchRequest, normalized string, pathFile model.FileID,
 	filter hitFilter) exactFold {
-	return exactFold{rule: newTierRule(reader, req.Query, req.Kinds, pathFile, 1),
-		paths: newPathResolver(reader, 1), normalized: normalized, filter: filter}
+	return exactFold{rule: newTierRule(reader, req.Query, req.Kinds, filter, normalized, pathFile, 1)}
 }
 
 // served answers which of the hits' nodes the exact tiers served. The nodes are
@@ -701,20 +691,11 @@ func (f exactFold) served(ctx context.Context, hits []textindex.Hit) (map[model.
 	ids = slices.Compact(ids)
 	out := make(map[model.NodeID]bool, len(ids))
 	for _, id := range ids {
-		tier, row, ok, err := f.rule.owner(ctx, id)
+		owned, err := f.rule.owned(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			continue
-		}
-		p := f.normalized
-		if tier != model.TierExactPath {
-			if p, err = f.paths.path(ctx, row.Node.FileID); err != nil {
-				return nil, err
-			}
-		}
-		out[id] = servableExact(exactHit{Tier: tier, Path: p, Node: row}, f.filter)
+		out[id] = owned
 	}
 	return out, nil
 }

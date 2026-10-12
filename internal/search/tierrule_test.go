@@ -1,10 +1,12 @@
 package search
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -28,18 +30,24 @@ type rowDecl struct {
 	qualifiedName string
 	// body, when set, is a search document the unit publishes for the node.
 	body string
+	// path is the file the unit declares the node in; empty is rowsPath.
+	path string
 }
 
-// rowsFixture is an activated generation over one file whose nodes are declared
-// by the units rowDecl lists.
+// rowsPath is the file a rowDecl declares its node in unless it names another.
+// A node's identity is keyed on it whichever file a unit declares the node in,
+// so two units can disagree about the file as well as the names.
+const rowsPath = "pkg/rows.go"
+
+// rowsFixture is an activated generation over the files whose nodes are
+// declared by the units rowDecl lists.
 type rowsFixture struct {
 	ctx   context.Context
 	opts  Options
 	nodes map[string]model.NodeID
 }
 
-// newRowsFixture publishes decls, one unit each, over one file, and activates
-// the generation.
+// newRowsFixture publishes decls, one unit each, and activates the generation.
 func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -65,15 +73,28 @@ func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
 	if err := st.PutBlob(ctx, rec); err != nil {
 		t.Fatalf("PutBlob: %v", err)
 	}
-	const path = "pkg/rows.go"
-	fileID := model.NewFileID(repo, path)
-	fv := model.FileVersion{ID: fileID, Path: path, Status: model.FileTracked,
-		Size: int64(len(content)), ContentHash: rec.Hash, Language: "go"}
+	var files []model.FileVersion
+	for _, d := range decls {
+		p := cmp.Or(d.path, rowsPath)
+		if !slices.ContainsFunc(files, func(fv model.FileVersion) bool { return fv.Path == p }) {
+			files = append(files, model.FileVersion{ID: model.NewFileID(repo, p), Path: p, Status: model.FileTracked,
+				Size: int64(len(content)), ContentHash: rec.Hash, Language: "go"})
+		}
+	}
+	slices.SortFunc(files, func(a, b model.FileVersion) int { return cmp.Compare(a.Path, b.Path) })
 	manifest := model.H("rows-manifest")
 	snap := model.Snapshot{ID: model.NewSnapshotID(repo, "", model.H("policy"), manifest), RepositoryID: repo,
-		CaptureConsistency: model.CaptureValidated, SourcePolicyHash: model.H("policy"), FileCount: 1,
-		ManifestHash: manifest, SourceBytes: uint64(len(content)), CreatedAt: time.Now().UTC()}
-	err = st.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error { return yield(fv) })
+		CaptureConsistency: model.CaptureValidated, SourcePolicyHash: model.H("policy"),
+		FileCount: uint64(len(files)), ManifestHash: manifest, SourceBytes: uint64(len(content) * len(files)),
+		CreatedAt: time.Now().UTC()}
+	err = st.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error {
+		for _, fv := range files {
+			if err := yield(fv); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("PutSnapshot: %v", err)
 	}
@@ -87,7 +108,9 @@ func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
 	}
 	f := &rowsFixture{ctx: ctx, nodes: map[string]model.NodeID{}}
 	for _, d := range decls {
-		key := model.CanonicalNodeKey(path, d.key)
+		path := cmp.Or(d.path, rowsPath)
+		fileID := model.NewFileID(repo, path)
+		key := model.CanonicalNodeKey(rowsPath, d.key)
 		nodeID := model.NewNodeID(repo, model.NodeFunction, key)
 		f.nodes[d.key] = nodeID
 		input := model.UnitInput{FileID: fileID, ContentHash: rec.Hash}
@@ -262,6 +285,64 @@ func TestALexicalResultOfAnExactlyServedNodeIsFolded(t *testing.T) {
 	}
 }
 
+// filteredDecls is one node, "Thing", that two units disagree about: the
+// unverified unit declares it under vendor/ with the qualified name "Thing"
+// (exact_qualified_name for the query "Thing"), the verified unit under src/
+// with the qualified name "pkg.Thing" and the name "Thing" (exact_name, whose
+// row the verified unit wins). With the path filter src/, only exact_name can
+// serve it. body, when set, gives the src/ unit a search document matching the
+// query.
+func filteredDecls(body string) []rowDecl {
+	return []rowDecl{
+		{scope: "thing-vendor", binding: model.SourceBindingUnverified, key: "Thing", name: "Thing",
+			qualifiedName: "Thing", path: "vendor/thing.go"},
+		{scope: "thing-src", binding: model.SourceBindingVerified, key: "Thing", name: "Thing",
+			qualifiedName: "pkg.Thing", path: "src/thing.go", body: body},
+	}
+}
+
+// TestAFilteredOutTierDoesNotOwnTheNode proves the tier rule reads the request's
+// filters: a node whose exact_qualified_name row lies outside the path filter
+// and whose exact_name row lies inside it is served once, at exact_name, inside
+// the filter. With a matching search document the lexical fold must agree, so
+// the node is served at exact_name and not lexically; without one, nothing but
+// the exact tiers can serve it.
+//
+// Mutation: decide the tier without the request's filters, and the node is
+// served lexically (with a document) or not at all (without one).
+func TestAFilteredOutTierDoesNotOwnTheNode(t *testing.T) {
+	for _, body := range []string{"func Thing() { thing }", ""} {
+		f := newRowsFixture(t, filteredDecls(body))
+		s := newService(t, f.opts)
+		req := model.SearchRequest{Query: "Thing", Paths: []string{"src"}, Page: model.PageRequest{Limit: 1}}
+		var tiers []model.SearchTier
+		for page := 1; ; page++ {
+			if page > 20 {
+				t.Fatalf("document %q: the walk did not end", body)
+			}
+			got, err := s.Search(f.ctx, req)
+			if err != nil {
+				t.Fatalf("document %q: Search(page %d): %v", body, page, err)
+			}
+			for _, h := range got.Items {
+				if h.NodeID == f.nodes["Thing"] {
+					tiers = append(tiers, h.Tier)
+					if h.Path != "src/thing.go" {
+						t.Errorf("document %q: Thing is served at %q, outside the path filter", body, h.Path)
+					}
+				}
+			}
+			if got.Meta.NextCursor == "" {
+				break
+			}
+			req.Page.Cursor = got.Meta.NextCursor
+		}
+		if len(tiers) != 1 || tiers[0] != model.TierExactName {
+			t.Fatalf("document %q: Thing is served at %v, want once at %q", body, tiers, model.TierExactName)
+		}
+	}
+}
+
 // pagingDocs is a corpus of 24 files, one function each. Every body holds
 // "omega" and "zeta", in four repeat counts, so the scores fall into tied runs
 // that page boundaries split. Every third function is named "zeta": for the
@@ -282,9 +363,16 @@ func pagingDocs() []doc {
 	return out
 }
 
-// pagedReads walks query at limit to its end and answers the hits served and,
-// per page, every request lexicalPhase sent the index.
-func pagedReads(t *testing.T, ctx context.Context, s *Service, query string, limit int) ([]model.SearchHit, [][]textindex.Request) {
+// pagedRead is one page of a walk: the hits it served and every request
+// lexicalPhase sent the index for it.
+type pagedRead struct {
+	items []model.SearchHit
+	reqs  []textindex.Request
+}
+
+// pagedReads walks query at limit to its end and answers the hits served and
+// each page's read.
+func pagedReads(t *testing.T, ctx context.Context, s *Service, query string, limit int) ([]model.SearchHit, []pagedRead) {
 	t.Helper()
 	var current []textindex.Request
 	prev := observeIndexRequest
@@ -292,7 +380,7 @@ func pagedReads(t *testing.T, ctx context.Context, s *Service, query string, lim
 	defer func() { observeIndexRequest = prev }()
 	req := model.SearchRequest{Query: query, Page: model.PageRequest{Limit: limit}}
 	var hits []model.SearchHit
-	var pages [][]textindex.Request
+	var pages []pagedRead
 	for page := 1; ; page++ {
 		if page > 100 {
 			t.Fatalf("%q: the walk did not end", query)
@@ -303,7 +391,7 @@ func pagedReads(t *testing.T, ctx context.Context, s *Service, query string, lim
 			t.Fatalf("%q: Search(page %d): %v", query, page, err)
 		}
 		hits = append(hits, got.Items...)
-		pages = append(pages, current)
+		pages = append(pages, pagedRead{items: got.Items, reqs: current})
 		if got.Meta.NextCursor == "" {
 			return hits, pages
 		}
@@ -322,6 +410,13 @@ func pagedReads(t *testing.T, ctx context.Context, s *Service, query string, lim
 // ranking) and the second page's request asks for 2·limit+1 with no position.
 // Mutation: resume after the last result read instead of the last one served,
 // and the result past each page is lost from the walk.
+//
+// A page's first request carries no resume position exactly when no lexical
+// result was served before the page: the page that starts the lexical tier, and
+// a page the exact tiers filled exactly (it asks the index for one result only
+// to learn whether a lexical page follows) together with the page after it.
+// "zeta" at limits 2 and 4 puts that edge on a page boundary, at 3 and 5 inside
+// a page.
 func TestLexicalPagesResumeByKey(t *testing.T) {
 	f := newFixtureOf(t, pagingDocs())
 	s := newService(t, f.opts)
@@ -330,11 +425,8 @@ func TestLexicalPagesResumeByKey(t *testing.T) {
 		limit int
 		// filtered says the exact fold drops lexical results of this query.
 		filtered bool
-	}{{"omega", 4, false}, {"omega", 1, false}, {"zeta", 3, true}, {"zeta", 5, true}} {
-		// The "zeta" limits do not divide its 8 exact hits: a page the exact
-		// tiers fill exactly asks the index whether any lexical result
-		// follows, and the next page then starts the lexical tier from its
-		// start, which the "later page" check below would misread.
+	}{{"omega", 4, false}, {"omega", 1, false}, {"zeta", 3, true}, {"zeta", 5, true},
+		{"zeta", 2, true}, {"zeta", 4, true}} {
 		deep, err := s.Search(f.ctx, model.SearchRequest{Query: c.query, Page: model.PageRequest{Limit: 200}})
 		if err != nil {
 			t.Fatalf("%q: Search(deep): %v", c.query, err)
@@ -353,7 +445,15 @@ func TestLexicalPagesResumeByKey(t *testing.T) {
 			t.Fatalf("%q limit %d: the pages served %d hits, the deep read %d", c.query, c.limit, len(hits), len(deep.Items))
 		}
 		lexicalPages := 0
-		for p, reqs := range pages {
+		servedLexical := false
+		for p, pr := range pages {
+			reqs := pr.reqs
+			before := servedLexical
+			for _, h := range pr.items {
+				if h.Tier == model.TierLexical {
+					servedLexical = true
+				}
+			}
 			if len(reqs) == 0 {
 				continue
 			}
@@ -362,9 +462,10 @@ func TestLexicalPagesResumeByKey(t *testing.T) {
 				t.Fatalf("%q limit %d page %d: the first index request asks for %d results, over limit+1",
 					c.query, c.limit, p+1, reqs[0].Depth)
 			}
-			if lexicalPages > 1 && reqs[0].After == nil {
-				t.Fatalf("%q limit %d page %d: a later lexical page reads from the start of the ranking",
-					c.query, c.limit, p+1)
+			if before != (reqs[0].After != nil) {
+				t.Fatalf("%q limit %d page %d: the first request resumes after %v with lexical results "+
+					"served before the page = %v; a page resumes exactly when it follows a served lexical result",
+					c.query, c.limit, p+1, reqs[0].After, before)
 			}
 			if !c.filtered && (len(reqs) != 1 || reqs[0].Depth != c.limit+1) {
 				t.Fatalf("%q limit %d page %d: with nothing filtered a page is one request of limit+1, got %+v",

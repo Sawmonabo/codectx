@@ -1031,7 +1031,7 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 		stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "pkg/wide.go"}
 		var held uint64
 		count := 0
-		if err := exactCandidates(context.Background(), stub, "Widget", nil, 1000, allExactTiers,
+		if err := exactCandidates(context.Background(), stub, "Widget", nil, hitFilter{}, 1000, allExactTiers,
 			func(exactHit) error {
 				count++
 				if count == n {
@@ -1078,7 +1078,7 @@ func legExactPathTierOwnsItsFile(t *testing.T, _ *fixture) {
 	// The query resolves as a path AND matches the symbol tiers' filters.
 	stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "Widget"}
 	byTier := map[model.SearchTier]int{}
-	if err := exactCandidates(context.Background(), stub, stub.path, nil, 100, allExactTiers,
+	if err := exactCandidates(context.Background(), stub, stub.path, nil, hitFilter{}, 100, allExactTiers,
 		func(h exactHit) error { byTier[h.Tier]++; return nil }); err != nil {
 		t.Fatalf("exactCandidates: %v", err)
 	}
