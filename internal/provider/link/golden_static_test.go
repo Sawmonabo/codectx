@@ -781,8 +781,7 @@ class B extends Base {}
 //
 // Mutation: mint the external type node with the kind its row proves ->
 // java.lang.Runnable is an interface node, not one of kind type. Mutation:
-// publish a supertype edge from the anonymous body's row -> a second edge,
-// into a second node.
+// publish a supertype edge from the anonymous body's row -> a second edge.
 func TestAnonymousClassOfExternalInterface(t *testing.T) {
 	l := linkSources(t, newStructural(t), map[string]string{
 		"Tasks.java": `class A implements Runnable {
