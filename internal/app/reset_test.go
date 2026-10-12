@@ -193,6 +193,10 @@ func TestResetFreesTheDataDirectoryAWindowAtATime(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The step counter is the process's, and an earlier test's closed
+	// workspace may still have removals queued with the reclaimer; they are
+	// freed first so every step counted below is this reset's.
+	paced.Drain()
 	before := paced.Steps()
 	report, err := ResetWorkspace(ctx, repo, ResetOptions{})
 	if err != nil {
