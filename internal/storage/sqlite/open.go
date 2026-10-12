@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/scratch"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -32,21 +34,28 @@ import (
 // Options are the storage settings of Section 20.1 `[storage]` plus the
 // `[index]` batch bounds the store enforces on unit writes. For the numeric
 // settings zero selects the documented default; no value means unlimited. The
-// two connection counts have no default: they are derived from the work that
-// reads each pool (config.ReadConnections, config.PostingConnections), which
-// only the caller can see, and Open refuses a store opened without them.
+// short-read connection count has no default: it is derived from the work that
+// reads the pool (config.ReadConnections), which only the caller can see, and
+// Open refuses a store opened without it.
 type Options struct {
 	BusyTimeout time.Duration // busy_timeout, default 5s
 	// ReadConnections sizes the short-read pool: unit states, dependency
 	// aliases and every query's short reads.
 	ReadConnections int
-	// PostingConnections sizes the posting-stream pool, which only a query's
-	// candidate walk reads (OpenPostings).
+	// PostingConnections is accepted and ignored: the store has no posting
+	// pool, since the search library holds the postings. The field stays only
+	// until the composition callers stop setting it.
 	PostingConnections int
-	WriterCacheKiB     int   // writer_cache_kib, default 1 GiB; also the ingestion group bound
-	ReaderCacheKiB     int   // reader_cache_kib, default 4096
-	BatchRecords       int   // index.batch_records, default 1000
-	BatchBytes         int64 // index.batch_bytes, default 4 MiB
+	// TextIndex sizes the search index the store opens beside its database.
+	// Dir and Writable are the store's: the directory is `<database path>.search`
+	// and it is writable unless ReadOnly is set. A zero WriterThreads is one
+	// thread and a zero WriterMemoryBytes is the library's floor for the
+	// writer's threads.
+	TextIndex      textindex.Options
+	WriterCacheKiB int   // writer_cache_kib, default 1 GiB; also the ingestion group bound
+	ReaderCacheKiB int   // reader_cache_kib, default 4096
+	BatchRecords   int   // index.batch_records, default 1000
+	BatchBytes     int64 // index.batch_bytes, default 4 MiB
 	// MaxJSONBytes bounds every stored JSON column that has no tighter model
 	// ceiling (manifest requests, capsules). Default 8 MiB, the Section 20.1
 	// context.max_manifest_bytes / max_capsule_bytes default.
@@ -182,20 +191,26 @@ func (o Options) withDefaults() Options {
 	if o.Synchronous == "" {
 		o.Synchronous = config.SynchronousNormal
 	}
+	if o.TextIndex.WriterThreads <= 0 {
+		o.TextIndex.WriterThreads = 1
+	}
+	if o.TextIndex.WriterMemoryBytes == 0 && !o.ReadOnly {
+		o.TextIndex.WriterMemoryBytes = textindex.WriterMemoryFloor(o.TextIndex.WriterThreads)
+	}
 	return o
 }
 
-// Store is one workspace database: a single writer connection, a short-read
-// pool, a posting-stream pool and a private in-memory connection for query
-// tokenization.
+// Store is one workspace database -- a single writer connection and a
+// short-read pool -- and the search index beside it.
 type Store struct {
 	path      string
 	freeBytes func(dir string) (uint64, bool) // the disk measurement a refused write is settled against
 	opts      Options
 	writer    *sql.DB
 	readers   *sql.DB
-	postings  *sql.DB
-	tokenizer *sql.DB
+	// text is the search index (searchindex.go). It is nil only on a
+	// read-only store whose index directory is missing.
+	text *textindex.Index
 
 	// The writer: one goroutine (runWriter) owns the writer connection, and
 	// every use of it -- an ingestion call, an exclusive write, a read of the
@@ -247,9 +262,9 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	if engineConfigErr != nil {
 		return nil, engineConfigErr
 	}
-	if opts.ReadConnections <= 0 || opts.PostingConnections <= 0 {
-		return nil, internal(fmt.Sprintf("the store was opened with %d short-read and %d posting-stream connections; the caller derives both (config.ReadConnections, config.PostingConnections)",
-			opts.ReadConnections, opts.PostingConnections))
+	if opts.ReadConnections <= 0 {
+		return nil, internal(fmt.Sprintf("the store was opened with %d short-read connections; the caller derives them (config.ReadConnections)",
+			opts.ReadConnections))
 	}
 	opts = opts.withDefaults()
 	abs, err := filepath.Abs(path)
@@ -283,9 +298,8 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	// a rename into the to-free set, and that set exists only where the
 	// directory has been registered. Registering it HERE, from the store that
 	// owns the file, is what makes that true of every process that opens a
-	// database -- rather than only of one that happened to stage a lexical unit
-	// first and claim the arena on the way. The claim itself stays lazy:
-	// nothing is created until something is actually freed.
+	// database. The claim itself stays lazy: nothing is created until
+	// something is actually freed.
 	scratch.For(filepath.Dir(abs))
 	s := &Store{path: abs, opts: opts, freeBytes: diskfree.Available}
 	busy := strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10)
@@ -372,22 +386,8 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		s.closeOpened()
 		return nil, err
 	}
-	// Posting streams hold one read transaction open for the whole candidate
-	// walk of a query. They get their own pool so that holding one can never
-	// starve the short reads (Match) the same query issues
-	// while the stream is open, which on the shared reader pool would be a
-	// deadlock as soon as two queries ran at once.
-	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.PostingConnections, opts.ReadOnly, immutable)
-	if err != nil {
-		s.closeOpened()
-		return nil, err
-	}
-	// The tokenizer database holds no data; it exists so query text can be
-	// split with the exact unicode61 tokenizer search_fts uses (Section 12.4).
-	// Its cache is stated so the base footprint counts what it runs with.
-	tokenizerCache := "-" + strconv.Itoa(config.TokenizerCacheKiB)
-	s.tokenizer, err = openPool("", []pragma{{"cache_size", tokenizerCache, tokenizerCache}}, "deferred", 1, false, false)
-	if err != nil {
+	// The search index opens after the database it is reconciled against.
+	if err := s.openTextIndex(); err != nil {
 		s.closeOpened()
 		return nil, err
 	}
@@ -397,10 +397,11 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 // closeOpened stops the writer goroutine, if Open started one, and closes
 // whichever pools Open has opened so far. Open builds them in order and a
 // read-only store never has a writer, so every failure path releases exactly
-// what exists rather than naming a fixed set.
+// what exists rather than naming a fixed set. The search index is opened
+// last, so no failure path has one to close.
 func (s *Store) closeOpened() {
 	_ = s.stopWriter()
-	for _, db := range []*sql.DB{s.tokenizer, s.postings, s.readers, s.writer} {
+	for _, db := range []*sql.DB{s.readers, s.writer} {
 		if db != nil {
 			db.Close()
 		}
@@ -618,16 +619,25 @@ func (s *Store) checkEngine(ctx context.Context) error {
 	return nil
 }
 
-// Close commits any open ingestion group, stops the writer goroutine and
-// releases every pool. It is safe to call once.
+// Close commits any open ingestion group, stops the writer goroutine,
+// releases every pool and then closes the search index, after the database's
+// last user. It is safe to call once.
 func (s *Store) Close() error {
 	first := s.stopWriter()
-	for _, db := range []*sql.DB{s.tokenizer, s.postings, s.readers, s.writer} {
+	if first == nil {
+		first = s.commitSearchOnClose()
+	}
+	for _, db := range []*sql.DB{s.readers, s.writer} {
 		if db == nil {
 			continue
 		}
 		if err := db.Close(); err != nil && first == nil {
 			first = wrap("close", err)
+		}
+	}
+	if s.text != nil {
+		if err := s.text.Close(); err != nil && first == nil {
+			first = err
 		}
 	}
 	return first
@@ -907,6 +917,7 @@ func (s *Store) commitGroup() error {
 	s.group = nil
 	g.stmts.close()
 	if err := g.tx.Commit(); err != nil {
+		s.discardSearchAdds()
 		return s.attribute(wrap("commit", err))
 	}
 	s.commits.Add(1)
@@ -928,6 +939,20 @@ func (s *Store) abandonGroup() {
 	s.group = nil
 	g.stmts.close()
 	g.tx.Rollback()
+	s.discardSearchAdds()
+}
+
+// discardSearchAdds drops the search library's uncommitted changes when an
+// ingestion group is lost. The lost group allocated doc ids that the sequence
+// hands out again, so documents added under them must never reach a library
+// commit beside the documents that reuse them. Adds of earlier groups go too;
+// their units then fail the activation's document check (commitSearch), and
+// Recover rebuilds them. It is a library call, not a writer job, so it is safe
+// on the writer goroutine.
+func (s *Store) discardSearchAdds() {
+	if err := s.releaseSearchWriter(); err != nil {
+		slog.Warn("the search index writer did not close after a lost ingestion group", "error", err)
+	}
 }
 
 // groupStmts is the open group's statement cache, or nil when no group is

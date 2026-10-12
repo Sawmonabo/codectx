@@ -109,18 +109,22 @@ instructions above — WSL is served by the Linux build.
 
 ### Build from source
 
-Requires the pinned toolchain `go1.27.1`. Release builds set the version
-identity without embedding a build timestamp:
+Requires the pinned toolchain `go1.27.1` and the Rust toolchain that
+`internal/search/textindex/rust-toolchain.toml` pins. First build the search index's static library, then the binary.
+Release builds set the version identity without embedding a build timestamp:
 
 ```sh
+go generate ./internal/search/textindex
 go build -trimpath \
   -ldflags "-X github.com/Sawmonabo/codectx/internal/model.version=$VERSION \
             -X github.com/Sawmonabo/codectx/internal/model.commit=$(git rev-parse HEAD)" \
   -o ./bin/codectx ./cmd/codectx
 ```
 
-Tree-sitter's official bindings are native code, so a source build needs a C
-toolchain and cannot claim `CGO_ENABLED=0` portability.
+Tree-sitter's official bindings and the search index are native code, so a
+source build needs a C toolchain and cannot claim `CGO_ENABLED=0` portability
+([docs/toolchain.md](docs/toolchain.md#building-the-binary-the-search-indexs-crate)
+has the details).
 
 ### First run
 
@@ -144,7 +148,7 @@ codectx mcp serve --repo .
 | Agent integration | `mcp serve` |
 
 `codectx doctor` runs the diagnostic checks — build and toolchain pins,
-workspace and data-directory permissions, free space, schema, FTS and WAL, the
+workspace and data-directory permissions, free space, schema and WAL, the
 active generation pointer, freshness, sampled content blocks, grammar
 availability and retention — each with its own state, reason code and
 remediation. A metric this host cannot measure is reported as unavailable, never
@@ -190,9 +194,12 @@ codectx symbol PaymentService.Authorize --repo .   # every candidate for a name
 ```
 
 `search` runs five retrieval tiers — exact path, exact qualified name,
-qualified-name prefix, exact name, and generation-local BM25 lexical retrieval —
-and ranks them by tier first, then by an integer score, so the same query over
-the same generation always returns the same page. Hits carry the matched entity,
+qualified-name prefix, exact name, and BM25F lexical ranking over the
+generation's own documents — and orders them by tier first, then by an integer
+score, then by content, so the same query over the same generation always
+returns the same page. A camelCase identifier is found by any of its parts:
+`controller` finds `NewPodController`. The exact tiers return every match; the
+lexical tier serves its best results a page at a time. Hits carry the matched entity,
 its path and its source range, never source bodies.
 
 `symbol` resolves a name, qualified name or canonical node ID to every node that

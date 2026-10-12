@@ -1,0 +1,22 @@
+[package]
+name = "codectx-textindex"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "The embedded search index of the lexical tier, linked into codectx as a static library."
+
+[lib]
+name = "codectx_textindex"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+tantivy = { version = "=0.26.2", default-features = false, features = ["mmap"] }
+memmap2 = "=0.9.11"
+
+[profile.release]
+codegen-units = 1
+panic = "unwind"
+debug = false
+incremental = false

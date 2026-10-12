@@ -3,9 +3,12 @@
 ## Status
 
 Accepted, 2026-10-08, by the owner after the measurement below. Amended 2026-10-09 by the owner's ruling: the
-code-aware tokenizer form is adopted (decision 6), and the visibility route is the alive set (decision 3). One choice
-waits on the quality benchmark over real task questions, and names the result that decides it: whether document
-length is weighted per column (decision 2).
+code-aware tokenizer form is adopted (decision 6), and the visibility route is the alive set (decision 3). Amended
+2026-10-10 to the built design: visibility is per document (decision 3), the statistics come from the library over
+the alive set (decision 2), the writer's lifecycle and the reconcile steps (decision 4), the order inside the exact
+tiers (decision 5), the document length under the code tokenizer (decision 6) and the crate's place and build
+(decision 1). One choice waits on the quality benchmark over real task questions, and names the result that decides
+it: whether document length is weighted per column (decision 2).
 
 This record replaces [ADR-0007](ADR-0007-lexical-first-page.md) in full. It replaces the lexical half of
 [ADR-0003](ADR-0003-storage-tier2.md) and amends [ADR-0001](ADR-0001-scale-posture.md) §2.4: a ranked search serves its
@@ -16,7 +19,7 @@ best results, not every match (decision 5).
 The lexical tier answers `codectx search` and the lexical part of every context answer. It ranks search documents (one
 per declaration, plus file and manifest documents) with BM25F over five columns, `name`, `qualified_name`, `signature`,
 `path` and `body`. The weights are 5, 5, 2, 2 and 1, with k1 1.2 and b 0.75. Scores are f64, quantized to 1e-6, and
-ties break on content only. Statistics count visible documents only. The scorer is `internal/search/bm25.go`.
+ties break on content only. Statistics count visible documents only.
 
 Today the tier stores everything in SQLite:
 - a full-text table for phrase matching;
@@ -113,8 +116,15 @@ query, never once per hit. Every export catches a panic, and an error returns as
 - No engine surveyed beats this library for an exact BM25 tier (research 22, §engines).
 
 **Consequences.**
-- Release and CI legs need a pinned Rust toolchain.
-- The crate tree is locked (`Cargo.lock`), vendored for reproducible builds and added to the license inventory.
+- The crate lives in `internal/search/textindex/`, beside the cgo package of the same name that calls it: its
+  `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml` and `src/`. It builds as a static library,
+  `libcodectx_textindex.a`, into the crate's own target directory `_build/`, which Go's `./...` patterns skip.
+- The build is two steps: `go generate ./internal/search/textindex` runs `cargo build --release --locked`, and then
+  `go build` links the archive. The toolchain is pinned by `rust-toolchain.toml`, and release and CI legs install
+  exactly that version.
+- The crate tree is locked (`Cargo.lock`); `--locked` refuses a build whose lock would change, Cargo verifies each
+  crate against the checksum the lock records, and the release profile and the generate step's
+  `--remap-path-prefix` of the home directory are set so that one commit builds the same archive bytes on any host. Every crate the archive links is in the license inventory.
 - Windows links against Go's MinGW toolchain, so the crate builds for the GNU targets: `x86_64-pc-windows-gnu`, and
   `aarch64-pc-windows-gnullvm` on arm64.
 - A Rust panic that escapes an export aborts the whole process. A catch at every export is therefore part of the
@@ -132,45 +142,65 @@ The library's own scoring was audited and not adopted.
 | f32 scores | f64, quantized to 1e-6 | An f32 step is 1.9e-6 once a score reaches 16, too coarse for a 1e-6 grid. |
 | Ties broken by internal document address, which changes with threads and merges | Ties broken on content only | Pages and cursors must repeat across builds. |
 | Statistics that count deleted documents until a merge | Exact statistics over visible documents | A delta must equal a fresh index (decision 3). |
-| A one-byte length code, exact to 40 and then up to about 11% low | The exact `token_count` | Rounded lengths add ties, and a merge re-estimates the average from the rounded values. |
+| A one-byte length code, exact to 40 and then up to about 11% low | The exact token counts, one per column | Rounded lengths add ties, and a merge re-estimates the average from the rounded values. |
 
 The collector runs inside the library's search loop. For each matching document it reads:
 - the per-column term frequencies, from the postings;
-- `token_count`, `kind`, the path ordinal and the search key, from fast fields.
+- the five per-column token counts (`len_name`, `len_qualified_name`, `len_signature`, `len_path`, `len_body`),
+  `kind`, the path and the content tie keys, from fast fields.
 
-The statistics are exact for the generation being searched:
-- N and the total token count are sums of per-unit totals held in SQLite;
-- df is counted over visible postings.
+The score is BM25F: weighted term frequency wtf = Σ_c weight(c)·tf(c), one saturation
+wtf·(k1+1)/(wtf + k1·(1 − b + b·dl/avgdl)), times idf = ln(1 + (N − df + 0.5)/(df + 0.5)), summed over the query's
+terms in query order. A document is a candidate when some term has wtf > 0. The score is quantized as
+round(score·10⁶), and a non-finite score is 0.
 
-Score arithmetic is the formula in `bm25.go`, carried into Rust, with the logarithm implementation pinned. Go's
-`math.Log` and Rust's `f64::ln` differ in the last bit on 1 891 of 200 127 inputs, so one implementation is used on
-both sides. A shared test vector proves equality.
+The statistics are exact for the generation being searched, and the library computes them over the generation's
+alive set (decision 3):
+- N, the sum of total lengths and the sum of weighted lengths are counted once per (generation, searcher) and cached
+  with it; SQLite keeps no per-unit totals;
+- df is counted per query term over alive postings. A segment that hides and deletes nothing answers df from its
+  block summary (decision 5) instead.
+
+The arithmetic is in the crate, with the logarithm implementation pinned: the argument reduction and polynomial of
+Go's pure-Go `math.Log`. Go's `math.Log` and Rust's `f64::ln` differ in the last bit on 1 891 of 200 127 inputs, so
+neither is used. Go scores nothing in production; a Go copy of the formula and the pinned logarithm lives in the
+tests, written with an explicit conversion on every product so the compiler cannot fuse a multiply-add, and a shared
+test vector proves the two agree to the quantum.
 
 **Pending, document length weighted per column.** The BM25F paper uses Σ weight(c)·length(c) as the document length,
-and so does the major engine that implements it. Ours uses the unweighted total. This is a departure, not a measured
-loss. Both forms are built: every column's token count is a fast field, and each block summary stores the minimum
-document length under both forms, so the choice is made per query and early stopping stays exact under either. The
-quality benchmark over real task questions decides it, and the chosen form then becomes a constant. Until then the
-choice is a fixed internal switch, never a user setting.
+and so does the major engine that implements it. Ours uses the unweighted total: the token count over all five
+columns. This is a departure, not a measured loss. Both forms are built: every column's token count is a fast field,
+and each block summary stores the minimum document length under both forms, so the form is chosen per query and early
+stopping stays exact under either. The quality benchmark over real task questions decides it, and the chosen form
+then becomes a constant. Until then the choice is a fixed internal switch of the benchmark harness, never a user
+setting.
 
 ## Decision 3: one index holds every retained unit; a generation is a visibility set
 
 Retention stays: branch switching, pinned reads and cursors, and reattached hidden units all depend on it.
 
 The library keeps only its latest commit. So a snapshot is not an index directory. A snapshot is a set of visible
-units over one index:
-- A unit's documents are added once, when the unit is first built. The `unit` field identifies them, and its digest is
-  content-keyed.
-- A generation's visibility set comes from SQLite's list of the generation's units. It is resolved once per term
-  ordinal of the `unit` fast field and expanded per segment into a bitset over document ids (the fixture: 0.08–0.2 ms
-  per searcher).
-- It is applied as each segment's alive set, through the library's custom-alive-set reader, or inside the collector.
-  Hidden documents are never candidates. They never count in N, in the total token count or in df.
-- A unit's documents are deleted only when collection frees the unit. Deletion is by term on the `unit` field.
-- A delta carries a unit by listing it in the new generation, never by writing its documents again. Only units the
-  delta rebuilds add documents.
-- The index is one directory beside the store's database, owned by the store: it is created, recovered (decision 4)
-  and removed with it.
+documents over one index:
+- A unit's documents are added once, when the unit is first built. Each carries a `doc_id`, a 64-bit number the store
+  allocates from a monotonic sequence and never reuses, and the adding unit's content-keyed digest in `unit`. Both are
+  indexed and fast fields.
+- A generation's visible set is a bitmap over doc ids (bit id mod 8 of byte id/8, least significant bit first) of
+  every `search_units.doc_id` row of the generation's member units. It is computed in the activation transaction and
+  stored in SQLite (`generation_search.visible`).
+- A view of the generation turns the bitmap into each segment's alive set, read from the `doc_id` column: a document is
+  alive when it is not deleted and its bit is set. Hidden documents are never candidates. They never count in N, in
+  either length sum or in df.
+- A delta carries a unit by listing it in the new generation and copying the identity rows it keeps, never by writing
+  its documents again. Only units the delta rebuilds add documents.
+- A document is deleted when collection removes the last `search_units` row that names its doc id. The `unit` column
+  counts a unit's documents for the reconcile (decision 4) and deletes a unit's documents by term.
+- The index is one directory beside the store's database, `<database>.search`, owned by the store: it is created,
+  recovered (decision 4) and removed with it.
+
+**Visibility is per document, not per unit.** A delta carry-over copies only part of its predecessor's documents: it
+drops the documents of replaced files and of nodes that no longer exist. A carried unit's documents were added by its
+predecessor, so a set of visible units would show every document the predecessor added, including those the carrying
+unit dropped. A set of doc ids shows exactly the rows the generation holds.
 
 Measured on the fixture, 18 queries: our scoring with 10% and with 50% of units hidden returned pages identical to an
 index built from only the visible documents, 18 of 18 both times. The library's own scoring did not, because its
@@ -185,21 +215,42 @@ statistics still count hidden documents.
 hidden) the alive set, a query wrapper and the collector gave identical pages and times within noise of each other.
 The alive set is the library's own mechanism for documents a searcher must not see, so the collector and the block
 bounds never meet a hidden document. Building one generation's set costs 10–22 ms per searcher, more than a warm
-query, so it is built once per (generation, segment) and cached with the searcher.
+query, so it is built once per (generation, segment) and cached with the searcher, the cache bounded by the query
+memory budget (`resources.query_memory_bytes`).
 
 ## Decision 4: writing, committing and recovering
 
-- **Writer.** The library's multi-threaded writer, with its thread count and memory budget derived from the admission's
-  measured need, like every other worker. Merge threads and the search executor are governed the same way. There is no
-  fixed constant.
+- **Writer.** The library's multi-threaded writer. Its thread count, its merge threads and the search threads are
+  the machine's CPU count; its memory is the library's per-thread floor times its threads, admitted through the
+  admission ledger before the writer opens and given back when it closes. The number of searches running at once is
+  the machine's query slots; a search past them waits for one. There is no fixed constant.
+- **Writer lifecycle.** The writer is opened by the first call that changes the index and stays open across a run.
+  It is released after each activation's commit, and after the commit that ends a collection sweep run outside an
+  activation, so another process can write; a release waits for running merges. A store that closes while its
+  writer still holds documents of units a run sealed but never activated commits them first, with the active
+  generation as the payload: they stay invisible until a generation that selects their units activates, and the
+  next run reuses those units instead of rebuilding them. A store opened read-only never takes the writer.
 - **Commit cadence.** One commit per generation activation, never one per unit. A commit costs one fsync, so a commit
-  per unit cost 954 s on kubernetes. Units added between commits are invisible until their generation activates.
+  per unit cost 954 s on kubernetes. Documents added between commits are invisible until their generation activates.
 - **Merging.** The library's background merges replace the lexical merge at activation. Activation no longer touches
   postings.
-- **Crash order.** The library commits first, with the generation's id as its payload. SQLite activates the generation
-  after that. So a generation SQLite has activated is always committed in the library. On start, reconciliation:
-  1. deletes documents of units that no SQLite generation references;
-  2. re-plans any unit whose documents never reached a commit, like any other unsealed unit.
+- **Crash order.** The library commits first, with the generation's id in decimal as its payload; queued document
+  deletes are applied in that commit. The SQLite activation transaction follows: it stores the generation's visible
+  bitmap, clears its member units' pending marks and removes the applied delete rows. So a generation SQLite has
+  activated is always committed in the library. Each unit carries a pending mark, holding the count of documents it
+  added, from the write of its rows until the activation that commits them.
+- **Reconcile.** On start, a store that writes:
+  1. applies the queued document deletes;
+  2. deletes every library document whose doc id is at or past SQLite's next unallocated doc id, which a lost SQLite
+     transaction allocated;
+  3. for every unit still marked pending, compares the library's count of the unit's documents with the unit's own
+     count; on a mismatch it fails the unit, with every unit whose rows name one of its doc ids, and those units are
+     re-planned like any other unsealed unit;
+  4. commits, with the active generation as the payload, and releases the writer.
+
+  A payload naming a generation older than the active one means the index directory was lost or replaced. The store
+  still opens; every search then answers `CTX_STORAGE_CORRUPT` with a re-index remediation. A read-only open of a
+  database whose index directory is missing answers the same way.
 
 ## Decision 5: a ranked search serves the best results, not every match
 
@@ -208,35 +259,56 @@ document. The product's no-default-limit rule (ADR-0001 §1.1) governs the data 
 rows and exact lookups are never dropped or truncated. A ranked list is a different thing. Its value is its head, and
 no search a person or an AI client runs needs the 253 589th-best match for `vendor`.
 
-- **Top-k collection.** Page n is collected as the top 200·n by (quantized score, content tie key), with a heap of
-  that size. Page 1 holds 200 entries, whatever the match count.
-- **Pruning.** Block-max WAND, with BM25F upper bounds per block of the union postings, skips every document that
-  cannot enter the top k. It changes the work, never the results: the top k equal exhaustive scoring's top k. The
+- **Top-k collection.** A request asks for a depth of folded results, and the library returns the best `depth` by
+  (quantized score, content tie key) and whether a further result exists, with a heap of exactly depth + 1 entries.
+  A page after `served` results asks for depth served + limit + 1, so page n of 200 holds the results ranked
+  200·(n − 1) + 1 to 200·n, whatever the match count.
+- **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
+  skips every document that cannot enter the top k. A block is skipped only when its bound, widened by a relative and
+  an absolute margin of 10⁻⁹ against rounding, is strictly below the heap's (depth + 1)-th score. A phrase term takes
+  its bound from the block's exact phrase frequencies, never from the stored summary. A minimum score floors the
+  results and skips every block whose bound is below it. It changes the work, never the results: the top k equal exhaustive scoring's top k. The
   library's own pruning returned pages equal to exhaustive scoring, with 0 misses, on 2- and 11-segment indexes, at
   about 0.5 ms a page whatever the page number. Our formula's pruned collector returned pages 1 to 3 identical to
   exhaustive scoring on 2 436 of 2 436 query-page pairs on a fixture, at 1 and 4 search threads, and on kubernetes
   3 030 of 3 030 pages over four query sets, 15.7 times faster summed on the 30 speed queries (4 653 ms to 296 ms). The library's pruned disjunction-max query is wrong in this release
   (the fix is merged upstream but not released), so pruning is built for our formula and never borrowed from the
   library's queries.
-- **Match count.** The count is exact when every match was visited, and otherwise a lower bound marked as one. That is
+- **Match count.** The count is exact when no block was skipped, and otherwise a lower bound marked as one. That is
   how the major engines report it.
-- **Folding.** Documents that share a deduplication key (one symbol's several documents) fold into one result whose
-  score is the group's highest. The heap holds one entry per key and keeps that maximum, so a page is 200 distinct
-  results. Pruning can skip a group member only when it cannot raise its group's score or enter the page, so the
-  folded score is exact. A folded result's occurrence count is exact when no member was skipped, and otherwise a
-  lower bound, like the match count. Exact-tier results come first and a lexical document folds into the exact-tier
-  result with its key.
+- **Folding.** Documents that share a result key (the node, or the path and start byte of a document with no node)
+  fold into one result whose score is the group's highest; its representative is the group's least document under
+  the content comparator. The heap holds one entry per key and keeps that maximum, so a page is 200 distinct results.
+  Pruning can skip a group member only when it cannot raise its group's score or enter the page, so the folded score
+  is exact. A folded result's occurrence count is exact when no block was skipped, and otherwise a lower bound, like
+  the match count.
+- **Ties.** The content comparator is score descending, then path, start byte, end byte, kind, name, qualified name,
+  signature, node id and search key. Ties at the k-th entry are settled by it inside the heap of depth + 1 entries,
+  never collected in a list.
+- **Paging.** A cursor carries its position by content, as a keyset: in the exact phase, the tier and content key of
+  the last exact result served; in the lexical phase, the number of lexical results served. The query hash it is
+  bound to covers the query, its filters, the minimum score and the length form, so a cursor made under one minimum
+  score never resumes under another. Filters the library does not apply (the language filter, and the drop of a
+  lexical result already served by an exact tier) run after the page returns; while the filtered page is short and
+  more results exist, the depth doubles and the page is asked again. Nothing is held between pages.
 - **No spool.** The ranked set is never sorted to disk. ADR-0001 §2.4 is amended to this rule.
-- **Block summaries.** Each segment has one summary: per block, the maximum weighted term frequency and the minimum
-  document length under both length forms. A summary is built for every new segment at commit and at merge, in the
-  same step that makes the segment visible; a segment without a current summary is scored exhaustively, so a stale
-  summary is never read.
-- **Bounds.** Ties at the k-th score are bounded by the heap and the content tie key, never collected in an unbounded
-  list; block metadata is read from the summary files per block, never held per segment in the heap. The number of
-  queries searching at once, the writer's memory budget and its merge and search threads are admitted by measured
-  need, like every other stage.
+- **Block summaries.** Each segment has one summary file, `<segment id>.cxsum`, in the index directory. For every token
+  of the five columns it holds the token's df over the segment's documents and, per block holding the token, the
+  maximum weighted term frequency and the minimum document length under both length forms. Deleted documents stay in
+  it; they only loosen a bound. A header names the segment and its document count; a mismatched or unreadable file
+  is no summary, and that segment is scored exhaustively, so a stale summary is never read. A summary is built for
+  every searchable segment that lacks one at each commit, after each merge (a writer release waits for merges), and
+  by a forced merge; the summaries of segments no longer present are removed.
+- **Bounds.** Ties are settled by the heap and the content comparator. A summary is read through a memory map with a
+  binary-searched term table, so nothing per segment stays in the heap, and the scoring scratch is per block (128
+  documents by the query's terms), never per segment. The writer's memory, its merge and search threads and the
+  number of searches running at once come from the machine and the admission ledger (decision 4).
+- **Deadline.** A query deadline that ends the library's search serves the best results found by then, truncated with
+  the deadline as its reason and with no continuation. A caller's cancel is an error.
 
-The exact tier (path and symbol lookup) is not ranked and keeps returning every match.
+The exact tiers (path and symbol lookup) come first and are not ranked: each returns every match, ordered by the
+content key (path, start byte, end byte, kind, name, qualified name, signature, node id), with score 0. A lexical
+result whose node an exact tier served for the same query is dropped from the lexical sequence.
 
 **Alternatives.** *Score every match and keep a heap after a cursor, so every page down to the last match is
 reachable.* It costs a full scoring of every match for every page (4.04 s for the 30 queries, against milliseconds
@@ -251,7 +323,10 @@ The tokenizer reproduces today's rules:
 - diacritics are removed.
 
 Every library tokenizer with a silent length cut is avoided. The library's default analyzer drops tokens of 40 bytes or
-more.
+more. One cut remains below the tokenizer: the library's postings writer does not index a single token longer than
+65 530 bytes. Our tokenizer still counts such a token in the document's length, so the length is exact, but a query
+for it cannot match. No identifier or word of source text reaches that size; the bound is the indexer's, and is stated
+here so that no record claims there is none.
 
 **The code-aware form is adopted.** This form emits the whole identifier, and also its camelCase and snake_case parts at
 the same position. For example, `NewController` is indexed as `newcontroller`, `new` and `controller`. Under the
@@ -261,9 +336,18 @@ queries 13 to 0), and cost name 0.023 and doc 0.009. The owner adopted it on tha
 the gap the product most needs closed, and whole identifiers keep their exact and prefix tiers ahead of it. The literature supports the whole-plus-parts form. On Go, it raised NDCG@10 from 0.309
 to 0.563 in one 2026 preprint, while parts alone scored 0.469.
 
+**As built.** Parts are emitted for a token whose spelling has at least two camelCase parts; snake_case needs nothing
+more, because `_` already separates. On the query side an unquoted word yields the whole token and each of its parts
+as separate terms, any of which may match; a quoted run is one phrase of whole tokens. A repeated term counts once.
+A phrase's frequency in a column is the number of positions where its tokens stand in order, with no offset cap.
+
+A document's length is counted by the same tokenizer when the document is added: per column, its token count with
+the parts included, stored as the five fast fields of decision 2. Under the unweighted form the length is the total
+over the five columns; under the weighted form it is Σ weight(c)·count(c).
+
 ## Decision 7: filters and new query features come from fast fields
 
-`kind`, the path and the unit are fast fields:
+`kind`, the path, the unit and the doc id are fast fields:
 - **Kind filter:** a set of term ordinals.
 - **Folder filter:** a contiguous ordinal range of the sorted path dictionary.
 
@@ -280,13 +364,15 @@ adopted one at a time and never switch on by default. Each uses an explicit limi
 | The throwaway tokenizer table | yes | each document is tokenized once |
 | Per-unit lexical staging databases, packed lexical segments, their parts and generation tables | yes | the library's segments hold the postings |
 | Lexical compaction at activation | yes | about 2.1 GB of extra writes and 3 minutes per kubernetes run |
-| The Go posting and statistics readers, the document-frequency cache | yes | fast fields and per-unit totals answer them |
+| The Go posting and statistics readers, the document-frequency cache | yes | the library counts the statistics over the alive set |
 | The ranked-set sort and spool to disk | yes | decision 5 |
-| `search_units` text columns | yes | the library stores what it serves |
+| `search_units` text columns and token count | yes | the library stores what it serves |
 
 What stays in SQLite:
-- each search document's identity row, from search key to node;
-- per-unit document and token totals;
+- each search document's identity row, from search key to node, file, byte range and `doc_id`;
+- the doc-id sequence, each unit's pending mark until its documents are committed, and the queue of document deletes
+  awaiting the next library commit;
+- each generation's visible bitmap;
 - everything that is not search: files, symbols, relations, evidence, snapshots and units.
 
 The exact tier (path and symbol lookup) and the order "tiers first, then lexical score" are unchanged.

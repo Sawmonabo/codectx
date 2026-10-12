@@ -12,16 +12,15 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 )
 
 // The stages of an activation that are recorded on their own. Each runs inside
 // the activation, not as a phase the coordinator can bracket, so its span is
 // opened here, under the activation span the caller already holds.
 const (
-	stageLexicalCompaction = "lexical_compaction"
-	stageAdjacency         = "adjacency"
-	stageLexicalBuild      = "lexical_build"
-	stageSeal              = "seal"
+	stageAdjacency = "adjacency"
+	stageSeal      = "seal"
 )
 
 // spanOutcome is how an activation stage reports itself: a span that returned
@@ -322,12 +321,6 @@ type UnitWriter struct {
 	// one batch and never of the repository.
 	ids   interner
 	nodes *refCache
-
-	// lex is the unit's lexical staging database, opened by the first
-	// PutSearchUnits batch and folded into the unit's segment at seal. It is
-	// deleted at seal, at Abandon and at Fail, so no staging outlives the
-	// building unit that owns it.
-	lex *lexicalStage
 
 	// stmts is the open ingestion group's statement cache, so the dozen SQL
 	// texts the per-row helpers issue are parsed once per group instead of
@@ -760,18 +753,20 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 	})
 }
 
-// PutSearchUnits stores lexical documents and their FTS index rows in the same
-// transaction. The FTS insert is explicit: search_fts is contentless
-// (ADR-0003 §2.1), so nothing maintains it by cascade or by row counts and the
-// body text reaches the index from this document and nowhere else -- the
-// database keeps no second copy of it (Section 12.2). Each posting's rowid is
-// recorded as the row's doc_id, which is what every read resolves a document
-// by and what a delta carry-over inherits instead of re-indexing.
+// PutSearchUnits stores one batch of the unit's search documents: the identity
+// rows in SQLite and the indexed text in the embedded search library. The
+// rows' doc ids are allocated from search_sequence inside the ingestion
+// transaction that inserts them, so an id is never reused, not even after the
+// unit is collected, and the batch's document count is added to the unit's
+// pending mark in the same transaction. The library receives the documents
+// only after that transaction's statement returns; they stay invisible until
+// the generation that selects the unit activates (one library commit per
+// activation, ADR-0013 Decision 4). A library failure fails the call.
 //
-// token_count is computed here with the index's own unicode61 tokenizer over
-// exactly the columns search_fts indexes, so the Section 12.4 length
-// statistics agree with the index. SearchUnit.TokenCount is informational on
-// input and ignored; on read it is the stored, authoritative value.
+// The pending mark is what Recover reconciles against: a unit whose rows are
+// durable but whose documents never reached a library commit is failed and
+// rebuilt (reconcileSearch). SearchUnit.TokenCount is ignored: the library
+// counts every column's tokens with its own tokenizer at add time.
 func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
@@ -786,38 +781,23 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	if err := w.s.checkBatch(len(docs), bytes); err != nil {
 		return err
 	}
-	if w.lex == nil {
-		stage, err := w.s.openLexicalStage(ctx)
-		if err != nil {
-			return err
-		}
-		w.lex = stage
+	if len(docs) == 0 {
+		return nil
 	}
-	batch := w.lex.nextBatch()
-	// One tokenizer pass serves both the token counts and the unit's lexical
-	// staging. The staged rows carry the batch-local document number; the
-	// ingestion below resolves it to the document rowid it assigns.
-	tokenCounts, err := w.s.countTokens(ctx, docs, func(doc int64, term, col string, n int64) error {
-		return w.lex.putTerm(ctx, batch, doc, term, col, n)
-	})
-	if err != nil {
-		return err
-	}
-	docIDs := make([]int64, len(docs))
-	var inserted int64
-	err = w.s.ingest(ctx, func(tx *sql.Tx) error {
+	indexed := make([]textindex.Document, len(docs))
+	err := w.s.ingest(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
-			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
-				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			var first int64
+			if err := tx.QueryRowContext(ctx, `UPDATE search_sequence SET next_doc_id = next_doc_id + ?1
+				WHERE singleton = 1 RETURNING next_doc_id - ?1`, int64(len(docs))).Scan(&first); err != nil {
+				return err
+			}
+			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, start_byte, end_byte, doc_id)
+				VALUES(?, ?, ?, ?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
 			defer content.Close()
-			index, err := tx.PrepareContext(ctx, `INSERT INTO search_fts(name, qualified_name, signature, path, body) VALUES(?, ?, ?, ?, ?)`)
-			if err != nil {
-				return err
-			}
-			defer index.Close()
 			defer w.endBatch()
 			for i, d := range docs {
 				keyRaw, _ := model.DecodeID(d.ID)
@@ -828,44 +808,26 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 						return err
 					}
 				}
-				// The posting is written FIRST so its rowid can be stored as
-				// the document's doc_id in the same insert: search_fts assigns
-				// it, search_units records it, and the carry-over copies it
-				// forward. The alternative -- insert the row, then update it
-				// with its own rowid -- costs a second b-tree write per
-				// document on the indexing hot path. A failure below rolls the
-				// whole transaction back, so an orphan posting cannot survive.
-				posting, err := index.ExecContext(ctx, d.Name, d.QualifiedName, d.Signature, d.Path, d.Body)
-				if err != nil {
+				docID := first + int64(i)
+				if _, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw,
+					int64(d.Bytes.Start), int64(d.Bytes.End), docID); err != nil {
 					return err
 				}
-				docID, err := posting.LastInsertId()
-				if err != nil {
-					return err
-				}
-				if _, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
-					int64(d.Bytes.Start), int64(d.Bytes.End), tokenCounts[i], docID); err != nil {
-					return err
-				}
-				docIDs[i] = docID
-				inserted++
+				indexed[i] = textindex.Document{DocID: uint64(docID), SearchKey: d.ID, NodeID: d.NodeID, FileID: d.FileID,
+					Path: d.Path, Kind: d.Kind, Name: d.Name, QualifiedName: d.QualifiedName, Signature: d.Signature,
+					Bytes: d.Bytes, Body: d.Body}
 			}
-			return nil
+			_, err = tx.ExecContext(ctx, `UPDATE units SET search_pending = search_pending + ? WHERE id = ?`, int64(len(docs)), w.rowID)
+			return err
 		})
 	})
 	if err != nil {
 		return err
 	}
-	// The document rowids are staged only now, after the ingestion returned:
-	// a batch whose transaction failed leaves no mapping, and the seal's join
-	// drops its staged terms rather than folding a document that does not
-	// exist.
-	for i := range docs {
-		if err := w.lex.putDoc(ctx, batch, int64(i+1), docIDs[i]); err != nil {
-			return err
-		}
+	if err := w.s.text.AddUnit(ctx, idHex(w.unitKey), indexed); err != nil {
+		return err
 	}
-	w.searchDocs += inserted
+	w.searchDocs += int64(len(docs))
 	return nil
 }
 
@@ -1126,9 +1088,6 @@ func (w *UnitWriter) Abandon(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
-	if err := w.closeStage(); err != nil {
-		return err
-	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE units SET state = ? WHERE id = ? AND state = ?`,
 			string(model.UnitFailed), w.rowID, string(model.UnitBuilding))
@@ -1143,9 +1102,6 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
-	if err := w.closeStage(); err != nil {
-		return err
-	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		var state model.UnitState
 		err := tx.QueryRowContext(ctx, `SELECT state FROM units WHERE id = ?`, w.rowID).Scan(&state)
@@ -1160,18 +1116,6 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 		}
 		return w.s.deleteUnit(ctx, tx, w.rowID)
 	})
-}
-
-// closeStage gives the unit's lexical staging slot back to the store's scratch
-// pool. Every path that ends a building unit -- seal, Abandon, Fail -- calls
-// it, so a slot is never held past the unit that took it.
-func (w *UnitWriter) closeStage() error {
-	if w.lex == nil {
-		return nil
-	}
-	stage := w.lex
-	w.lex = nil
-	return stage.close()
 }
 
 // closureCTE selects the unit row and every transitive dependency.
@@ -1208,7 +1152,7 @@ var sealChecks = []struct {
 // generation it was begun for (Section 12.2 invariants beyond DDL): evidence
 // behind every fact, ranges inside their source, relation endpoints and alias
 // targets visible through the unit/dependency closure, an acyclic dependency
-// graph, and the exact FTS document count its transactions emitted.
+// graph, and the exact search document count its batches and carry-over wrote.
 func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
@@ -1250,14 +1194,6 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {
 			return err
 		}
-		// The unit's lexical segment is folded in the seal's own transaction,
-		// so a unit becomes sealed and gains the segment its documents live in
-		// together or neither. A unit that published no document folds none.
-		if w.lex != nil {
-			if _, err := foldUnitSegment(ctx, tx, w.rowID, w.lex); err != nil {
-				return err
-			}
-		}
 		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey)
 	})
 	if err != nil {
@@ -1267,9 +1203,6 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	}
 	if err == nil {
 		w.done = true
-		if closeErr := w.closeStage(); closeErr != nil {
-			return closeErr
-		}
 		if w.evidenceClipped != 0 {
 			// One bounded line per sealed unit, and only when the bound
 			// actually truncated something: the clip is legitimate but it
@@ -1369,21 +1302,11 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 	}
 	// The two conditions an activation loses a race on are read FIRST, before
 	// any work: the pointer the caller believes is published, and the frozen
-	// membership being non-empty. Each is one row, and the cascade below is
-	// thousands of committed merges -- so a coordinator that has ALREADY been
-	// overtaken pays a read rather than a rebuild of the segment set.
-	//
-	// That is the whole of what it spares, and it is worth saying exactly:
-	// this reaches only a caller whose pointer had already moved when it got
-	// here. Two activations that start together both pass this read and both
-	// pay the cascade; the one that loses fails on the re-check inside the
-	// activation transaction below, having merged. Sparing that one too would
-	// need the two to be serialized against each other, which is a lock held
-	// across a rebuild of the segment set, and a lock that long is a worse
-	// bargain than the merges it saves. Correctness does not depend on any of
-	// it: both conditions are checked again inside the transaction, which is
-	// where they decide anything, so a pointer that moves between this read
-	// and that transaction is caught there exactly as before.
+	// membership being non-empty. Each is one row, and the search index commit
+	// below is an fsync of every document the run added -- so a coordinator
+	// that has ALREADY been overtaken pays a read rather than a commit.
+	// Correctness does not depend on it: both conditions are checked again
+	// inside the activation transaction, which is where they decide anything.
 	// readOwn, not read: the generation this is about may still be in the
 	// store's open ingestion group, which the reader pool cannot see.
 	if err := s.readOwn(ctx, func(tx *sql.Tx) error {
@@ -1398,16 +1321,23 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 	}); err != nil {
 		return model.Binding{}, err
 	}
-	// Whatever compaction the generation's segment set is due runs next, each
-	// merge its own ingestion call, so the group can commit between merges and
-	// the cascade is bounded by WALBoundBytes like any other ingestion. The
-	// activation below then names the set the merges left. See
-	// compactGeneration for why a merge committed before the swap is safe.
-	if err := s.compactBeforeActivation(ctx, gen); err != nil {
-		return model.Binding{}, err
+	// The search library commits FIRST, with the generation as its payload
+	// (ADR-0013 Decision 4): a generation SQLite has activated is therefore
+	// always committed in the library, and a crash between the two leaves a
+	// library commit ahead of SQLite, which Recover reconciles. The queued
+	// document deletes ride the same commit; their rows go in the activation
+	// transaction below.
+	applied, err := s.commitSearch(ctx, gen, expectedActive)
+	if err != nil {
+		return model.Binding{}, errors.Join(err, s.releaseSearchWriter())
+	}
+	if afterSearchCommit != nil {
+		if err := afterSearchCommit(); err != nil {
+			return model.Binding{}, errors.Join(err, s.releaseSearchWriter())
+		}
 	}
 	var binding model.Binding
-	err := s.ingestAndCommit(ctx, func(tx *sql.Tx) error {
+	err = s.ingestAndCommit(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
@@ -1502,10 +1432,12 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if err := buildGraph(ctx, tx, g.id); err != nil {
 			return err
 		}
-		// The packed term statistics follow the adjacency, under the same rule
-		// and in the same transaction (ADR-0007 Decision 1): a generation is
-		// never published without the structure every lexical query reads.
-		if err := buildLexical(ctx, tx, g.id); err != nil {
+		// The visible documents follow the adjacency, under the same rule and
+		// in the same transaction: a generation is never published without the
+		// set every lexical query searches. The members' documents are durable
+		// in the library's commit above, so their pending marks clear here, and
+		// so do the delete rows that commit applied.
+		if err := writeGenerationSearch(ctx, tx, g.id, applied); err != nil {
 			return err
 		}
 
@@ -1535,18 +1467,26 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		binding = model.Binding{RepositoryID: model.RepositoryID(idHex(g.repo)), SnapshotID: snapshotID, GenerationID: gen, AnalysisKey: key}
 		return nil
 	})
+	// The library's writer is released whatever the activation's outcome, so
+	// another process may write the index between runs; nothing is pending in
+	// it past the commit above.
+	releaseErr := s.releaseSearchWriter()
 	if err != nil {
-		return model.Binding{}, err
+		return model.Binding{}, errors.Join(err, releaseErr)
+	}
+	if releaseErr != nil {
+		// The generation is published; a writer that would not close is the
+		// next writer's problem (it is refused busy), not this activation's.
+		slog.Warn("the search index writer did not close after activation", "generation_id", int64(gen), "error", releaseErr)
 	}
 	s.refreshStatistics(ctx)
 	return binding, nil
 }
 
 // analyzedTables are the tables whose statistics the query planner actually
-// needs. A bare ANALYZE also walks search_vocab, whose posting rows outnumber
-// every other table by an order of magnitude and which no plan chooses between
-// indexes on; measured at ~1.5 s per activation on an 800-unit fixture against
-// ~30 ms for these two.
+// needs. A bare ANALYZE walks every table and index of the store, most of which
+// no plan chooses between indexes on; these two are the ones whose statistics
+// change a plan.
 var analyzedTables = [...]string{"node_facts", "generation_units"}
 
 // refreshStatistics rebuilds sqlite_stat1 for the newly published generation.

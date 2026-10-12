@@ -38,13 +38,9 @@ const (
 	streamRelEvidence   = "rel.evidence"
 )
 
-// The chunked-stream tables one partWriter serves. They have the same shape --
-// key, stream, part, bytes -- and differ only in which row the parts hang off,
-// so a partKey names the table and that key column together.
-const (
-	graphPartsTable   = "generation_graph_parts"
-	segmentPartsTable = "lexical_segment_parts"
-)
+// graphPartsTable is the chunked-stream table one partWriter serves; a partKey
+// names it together with the key column the parts hang off.
+const graphPartsTable = "generation_graph_parts"
 
 // partKey is the row a chunked stream belongs to.
 type partKey struct {
@@ -55,11 +51,6 @@ type partKey struct {
 
 func graphKey(gen int64) partKey {
 	return partKey{table: graphPartsTable, column: "generation_id", id: gen}
-}
-
-// segmentKey names one immutable lexical segment's streams.
-func segmentKey(segment int64) partKey {
-	return partKey{table: segmentPartsTable, column: "segment_id", id: segment}
 }
 
 // Part sizes. These are INTERNAL layout constants, not user limits: they bound
@@ -100,8 +91,6 @@ func partSizeFor(stream string) int {
 		return arrayPartEntries * nodeBytesEntryBytes
 	case streamRelEvidence:
 		return arrayPartEntries * evidenceEntryBytes
-	case streamTermDir, streamTermText, streamPostList, streamDocDir, streamDocAttr:
-		return lexPartBytes
 	default:
 		return 0
 	}
@@ -121,9 +110,7 @@ func isContainerKind(kind string) bool { return slices.Contains(containerKinds, 
 type partWriter struct {
 	ctx context.Context
 	tx  *sql.Tx
-	// key is the row the stream belongs to: a generation's adjacency, or one
-	// immutable lexical segment. Both chunk the same way, so one writer
-	// serves both.
+	// key is the row the stream belongs to: a generation's adjacency.
 	key    partKey
 	stream string
 	size   int

@@ -1878,12 +1878,8 @@ func searchService(t *testing.T, fx *contextFixture) *search.Service {
 	if err != nil {
 		t.Fatalf("OpenSigner: %v", err)
 	}
-	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, fx.Store)
-	if err != nil {
-		t.Fatalf("NewSpools: %v", err)
-	}
 	svc, err := search.New(search.Options{Store: fx.Store, Repo: fx.Repo, Signer: signer,
-		Spools: spools, Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
+		Leases:  pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
 		Content: cas, Resources: fx.Cfg.Resources,
 		CursorTTL: pagination.DefaultCursorTTL, Now: fx.Now})
 	if err != nil {

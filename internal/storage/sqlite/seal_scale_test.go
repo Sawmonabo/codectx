@@ -62,7 +62,7 @@ func publishOneUnit(t *testing.T, n int) (time.Duration, int64) {
 			docs = append(docs, model.SearchUnit{ID: model.H("search-scale", node.Name), NodeID: node.ID,
 				FileID: ff.id, Path: ff.path, Kind: model.NodeFunction, Name: node.Name,
 				QualifiedName: node.QualifiedName, Bytes: model.ByteRange{Start: 0, End: 16},
-				Body: "func " + node.Name + "() zqxsignature", TokenCount: providerTokenCount})
+				Body: "func " + node.Name + "() zqxsignature"})
 		}
 		if err := w.PutAliases(f.ctx, aliases); err != nil {
 			t.Fatalf("PutAliases: %v", err)

@@ -1,0 +1,477 @@
+package textindex
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+)
+
+func openWritable(t *testing.T, dir string, searchThreads int) *Index {
+	t.Helper()
+	x, err := Open(Options{
+		Dir: dir, Writable: true, WriterThreads: 1, WriterMemoryBytes: WriterMemoryFloor(1),
+		MergeThreads: 1, SearchThreads: searchThreads, QuerySlots: 1, ViewCacheBytes: 64 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = x.Close() })
+	return x
+}
+
+func openReadOnly(t *testing.T, dir string, searchThreads int) *Index {
+	t.Helper()
+	x, err := Open(Options{Dir: dir, SearchThreads: searchThreads, QuerySlots: 1, ViewCacheBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = x.Close() })
+	return x
+}
+
+// visibleOf is the bitmap holding doc ids first..last.
+func visibleOf(first, last uint64) []byte {
+	b := make([]byte, last/8+1)
+	for id := first; id <= last; id++ {
+		b[id/8] |= 1 << (id % 8)
+	}
+	return b
+}
+
+func bitmap(ids []uint64) []byte {
+	var hi uint64
+	for _, id := range ids {
+		hi = max(hi, id)
+	}
+	b := make([]byte, hi/8+1)
+	for _, id := range ids {
+		b[id/8] |= 1 << (id % 8)
+	}
+	return b
+}
+
+// corpus is a generated fixture: units of documents, doc ids from 1.
+type corpus struct {
+	units []string
+	docs  map[string][]Document
+}
+
+var syllables = []string{"ka", "lo", "mi", "ne", "pu", "ra", "si", "to", "vu", "ze", "bo", "di"}
+
+// genCorpus builds n documents in units of about unitSize. Words follow a
+// skewed distribution, lengths vary widely, about four in five documents
+// share node ids with others (some across units), the rest are file
+// documents keyed by path and start byte. The word "hot" is in every body,
+// many times in a few, so its blocks carry very different bounds.
+func genCorpus(seed uint64, n, unitSize int) corpus {
+	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+	vocab := make([]string, 0, 240)
+	for _, a := range syllables {
+		for _, b := range syllables {
+			vocab = append(vocab, a+b)
+		}
+	}
+	word := func() string {
+		u := rng.Float64()
+		return vocab[int(float64(len(vocab))*u*u*u)]
+	}
+	camel := func() string {
+		a, b := word(), word()
+		return a + strings.ToUpper(b[:1]) + b[1:]
+	}
+	kinds := []model.NodeKind{model.NodeFunction, model.NodeMethod, model.NodeClass}
+	c := corpus{docs: map[string][]Document{}}
+	for i := 0; i < n; i++ {
+		u := fmt.Sprintf("unit%03d", i/unitSize)
+		if len(c.units) == 0 || c.units[len(c.units)-1] != u {
+			c.units = append(c.units, u)
+		}
+		var body []string
+		for k := 0; k < 2+rng.IntN(60); k++ {
+			body = append(body, word())
+		}
+		hot := 1
+		if rng.IntN(20) == 0 {
+			hot = 2 + rng.IntN(12)
+		}
+		for k := 0; k < hot; k++ {
+			body = append(body, "hot")
+		}
+		path := fmt.Sprintf("pkg%d/sub%d/f%d.go", rng.IntN(4), rng.IntN(4), rng.IntN(10))
+		d := Document{
+			DocID:     uint64(i + 1),
+			SearchKey: fmt.Sprintf("sk%05d", i),
+			FileID:    model.FileID("file:" + path),
+			Path:      path,
+			Bytes:     model.ByteRange{Start: uint64(rng.IntN(50)), End: uint64(50 + rng.IntN(50))},
+			Body:      strings.Join(body, " "),
+		}
+		if rng.IntN(5) == 0 {
+			d.Kind = model.NodeFile
+		} else {
+			d.NodeID = model.NodeID(fmt.Sprintf("node%d", rng.IntN(n/2)))
+			d.Kind = kinds[rng.IntN(len(kinds))]
+			d.Name = camel()
+			d.QualifiedName = "pkg." + d.Name
+			d.Signature = "func " + d.Name + "(" + word() + " int)"
+		}
+		c.docs[u] = append(c.docs[u], d)
+	}
+	return c
+}
+
+// build adds units to an index in dir, committing every unitsPerCommit units,
+// then releases the writer. keep selects the units added (nil: all).
+func (c corpus) build(t *testing.T, dir string, unitsPerCommit int, keep func(string) bool) {
+	t.Helper()
+	x := openWritable(t, dir, 1)
+	ctx := context.Background()
+	pending := 0
+	for _, u := range c.units {
+		if keep != nil && !keep(u) {
+			continue
+		}
+		if err := x.AddUnit(ctx, u, c.docs[u]); err != nil {
+			t.Fatal(err)
+		}
+		pending++
+		if pending == unitsPerCommit {
+			if err := x.Commit(ctx, "1"); err != nil {
+				t.Fatal(err)
+			}
+			pending = 0
+		}
+	}
+	if err := x.Commit(ctx, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// visible is the bitmap of every document of the units keep selects.
+func (c corpus) visible(keep func(string) bool) []byte {
+	var ids []uint64
+	for _, u := range c.units {
+		if keep == nil || keep(u) {
+			for _, d := range c.docs[u] {
+				ids = append(ids, d.DocID)
+			}
+		}
+	}
+	return bitmap(ids)
+}
+
+// hiddenEvery hides every k-th unit (k = 0 hides nothing).
+func hiddenEvery(k int) func(string) bool {
+	return func(u string) bool {
+		var n int
+		fmt.Sscanf(u, "unit%d", &n)
+		return k == 0 || n%k != 0
+	}
+}
+
+func search(t *testing.T, v *View, r Request) Page {
+	t.Helper()
+	p, err := v.Search(context.Background(), r)
+	if err != nil {
+		t.Fatalf("search %+v: %v", r, err)
+	}
+	return p
+}
+
+// samePage reports how two pages of one request differ: their hits (every
+// served field and the score) and whether more results exist. Occurrence
+// counts are compared when both sides call theirs exact.
+func samePage(a, b Page) error {
+	if a.More != b.More {
+		return fmt.Errorf("more %v against %v", a.More, b.More)
+	}
+	if len(a.Hits) != len(b.Hits) {
+		return fmt.Errorf("%d hits against %d", len(a.Hits), len(b.Hits))
+	}
+	for i := range a.Hits {
+		x, y := a.Hits[i], b.Hits[i]
+		xo, yo := x.Occurrences, y.Occurrences
+		bothExact := x.OccurrencesExact && y.OccurrencesExact
+		x.Occurrences, y.Occurrences, x.OccurrencesExact, y.OccurrencesExact = 0, 0, false, false
+		if x != y {
+			return fmt.Errorf("hit %d: %+v against %+v", i, x, y)
+		}
+		if bothExact && xo != yo {
+			return fmt.Errorf("hit %d: exact occurrences %d against %d", i, xo, yo)
+		}
+	}
+	return nil
+}
+
+var engineQueries = []string{"hot", "kalo", "mika pune", "hot rasi", "kaloMika", "toVu zebo", "dibo"}
+
+// TestPrunedPagesEqualExhaustiveScoring compares every pruned page with the
+// exhaustive reference (IgnoreSummaries) on a fixture of several segments,
+// for both length rules, pages 1 to 5, with kind and path filters, with
+// hidden units, at one and four search threads, and checks that pruning
+// actually skipped blocks so the comparison is not vacuous.
+//
+// Mutation caught: a block bound computed with the other length rule's
+// minimum length (the bound then undercuts true scores and a page loses or
+// reorders results).
+func TestPrunedPagesEqualExhaustiveScoring(t *testing.T) {
+	c := genCorpus(1, 6000, 100)
+	dir := t.TempDir()
+	c.build(t, dir, 20, nil)
+	filters := []struct {
+		kinds    []model.NodeKind
+		prefixes []string
+	}{
+		{},
+		{kinds: []model.NodeKind{model.NodeFunction, model.NodeMethod}},
+		{prefixes: []string{"pkg1", "pkg3/sub2"}},
+		{kinds: []model.NodeKind{model.NodeFile}, prefixes: []string{"pkg2"}},
+	}
+	skipped := false
+	for _, threads := range []int{1, 4} {
+		x := openReadOnly(t, dir, threads)
+		for gen, hide := range []int{0, 4} {
+			v, err := x.OpenView(model.GenerationID(gen+1), c.visible(hiddenEvery(hide)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
+				for _, q := range engineQueries {
+					for fi, f := range filters {
+						for pageNo := 1; pageNo <= 5; pageNo++ {
+							r := Request{Query: q, Kinds: f.kinds, PathPrefixes: f.prefixes, Depth: 200 * pageNo, LengthRule: rule}
+							pruned := search(t, v, r)
+							r.IgnoreSummaries = true
+							full := search(t, v, r)
+							if err := samePage(pruned, full); err != nil {
+								t.Fatalf("threads %d hide %d rule %d query %q filter %d page %d: %v", threads, hide, rule, q, fi, pageNo, err)
+							}
+							if pruned.Stats.SegmentsWithoutSummary != 0 {
+								t.Fatalf("a committed segment has no summary: %+v", pruned.Stats)
+							}
+							if pruned.Stats.BlocksScored < pruned.Stats.BlocksTotal {
+								skipped = true
+							}
+						}
+					}
+				}
+			}
+			v.Close()
+		}
+	}
+	if !skipped {
+		t.Fatal("no search skipped a block: the comparison proves nothing about pruning")
+	}
+}
+
+// TestPrunedPhrasePagesEqualExhaustiveScoring compares quoted-phrase pages
+// with the exhaustive reference under both length rules.
+//
+// Mutation caught: a phrase term given the stored summary's block bound (the
+// bound of its first token's single-term frequency, not of its exact phrase
+// frequency), which mis-orders or wrongly skips blocks.
+func TestPrunedPhrasePagesEqualExhaustiveScoring(t *testing.T) {
+	c := genCorpus(2, 5000, 100)
+	dir := t.TempDir()
+	c.build(t, dir, 15, nil)
+	x := openReadOnly(t, dir, 1)
+	v, err := x.OpenView(1, c.visible(hiddenEvery(5)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
+		for _, q := range []string{`"hot hot"`, `"kalo kalo"`, `"func kaka"`, `"hot hot hot" kalo`, `mika "kaka kalo"`, `"pkg kakaKaka"`} {
+			for pageNo := 1; pageNo <= 3; pageNo++ {
+				r := Request{Query: q, Depth: 200 * pageNo, LengthRule: rule}
+				pruned := search(t, v, r)
+				r.IgnoreSummaries = true
+				full := search(t, v, r)
+				if err := samePage(pruned, full); err != nil {
+					t.Fatalf("rule %d query %q page %d: %v", rule, q, pageNo, err)
+				}
+				if len(full.Hits) == 0 {
+					t.Fatalf("query %q matched nothing: the fixture does not exercise phrases", q)
+				}
+			}
+		}
+	}
+}
+
+// TestHiddenUnitsRankLikeAnIndexOfTheVisibleOnes checks that a view with 10%
+// and with 50% of its units hidden ranks exactly like a fresh index holding
+// only the visible units' documents: the same hits with the same scores.
+//
+// Mutation caught: hidden documents counted in df (or in N or the length
+// sums), which shifts every score of the view with hidden units.
+func TestHiddenUnitsRankLikeAnIndexOfTheVisibleOnes(t *testing.T) {
+	c := genCorpus(3, 4000, 50)
+	allDir := t.TempDir()
+	c.build(t, allDir, 16, nil)
+	all := openReadOnly(t, allDir, 1)
+	for gen, every := range []int{10, 2} {
+		keep := hiddenEvery(every)
+		onlyDir := t.TempDir()
+		c.build(t, onlyDir, 9, keep)
+		only := openReadOnly(t, onlyDir, 1)
+		hv, err := all.OpenView(model.GenerationID(gen+1), c.visible(keep))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ov, err := only.OpenView(1, c.visible(keep))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
+			for _, q := range engineQueries {
+				for _, depth := range []int{200, 1000} {
+					r := Request{Query: q, Depth: depth, LengthRule: rule}
+					a, b := search(t, hv, r), search(t, ov, r)
+					if err := samePage(a, b); err != nil {
+						t.Fatalf("1 in %d units hidden, rule %d query %q depth %d: %v", every, rule, q, depth, err)
+					}
+					if a.MatchesExact && b.MatchesExact && a.Matches != b.Matches {
+						t.Fatalf("1 in %d units hidden, query %q: %d matches against %d", every, q, a.Matches, b.Matches)
+					}
+				}
+			}
+		}
+		hv.Close()
+		ov.Close()
+	}
+}
+
+func summaryFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	m, err := filepath.Glob(filepath.Join(dir, "*.cxsum"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// TestMergedSegmentIsSummarizedAndStaleSummariesAreNeverRead deletes
+// documents, forces a merge of every segment and checks that the merged
+// segment has a summary and its pages equal exhaustive scoring. It then makes
+// one segment's summary file a copy of another segment's (its header names
+// the other segment) and checks that the file is not read: the segment counts
+// as without a summary and pages still equal exhaustive scoring.
+//
+// Mutation caught: skipping the summary rebuild on merge (the merged segment
+// is then served without one), and reading a summary whose header names
+// another segment (its bounds belong to other documents and skip blocks that
+// hold results).
+func TestMergedSegmentIsSummarizedAndStaleSummariesAreNeverRead(t *testing.T) {
+	ctx := context.Background()
+	c := genCorpus(4, 3000, 100)
+	compare := func(t *testing.T, v *View) Page {
+		t.Helper()
+		var last Page
+		for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
+			for _, q := range engineQueries {
+				for _, depth := range []int{200, 600} {
+					r := Request{Query: q, Depth: depth, LengthRule: rule}
+					pruned := search(t, v, r)
+					r.IgnoreSummaries = true
+					if err := samePage(pruned, search(t, v, r)); err != nil {
+						t.Fatalf("rule %d query %q depth %d: %v", rule, q, depth, err)
+					}
+					last = pruned
+				}
+			}
+		}
+		return last
+	}
+
+	t.Run("merge", func(t *testing.T) {
+		dir := t.TempDir()
+		c.build(t, dir, 10, nil)
+		x := openWritable(t, dir, 1)
+		var gone []uint64
+		for id := uint64(1); id <= 3000; id += 7 {
+			gone = append(gone, id)
+		}
+		if err := x.DeleteDocs(ctx, gone); err != nil {
+			t.Fatal(err)
+		}
+		if err := x.Commit(ctx, "2"); err != nil {
+			t.Fatal(err)
+		}
+		if err := x.mergeAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		v, err := x.OpenView(2, visibleOf(1, 3000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.Close()
+		st := compare(t, v).Stats
+		if st.Segments != 1 || st.SegmentsWithoutSummary != 0 {
+			t.Fatalf("after the merge: %+v, want one summarized segment", st)
+		}
+		if files := summaryFiles(t, dir); len(files) != 1 {
+			t.Fatalf("summary files after the merge: %v, want only the merged segment's", files)
+		}
+	})
+
+	t.Run("stale", func(t *testing.T) {
+		dir := t.TempDir()
+		c.build(t, dir, 15, nil)
+		x := openReadOnly(t, dir, 1)
+		v, err := x.OpenView(1, visibleOf(1, 3000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := compare(t, v).Stats
+		v.Close()
+		if err := x.Close(); err != nil {
+			t.Fatal(err)
+		}
+		files := summaryFiles(t, dir)
+		if st.Segments != 2 || st.SegmentsWithoutSummary != 0 || len(files) != 2 {
+			t.Fatalf("before: %+v and summary files %v, want two summarized segments", st, files)
+		}
+		other, err := os.ReadFile(files[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(files[1], other, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		x = openReadOnly(t, dir, 1)
+		v, err = x.OpenView(1, visibleOf(1, 3000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.Close()
+		if st := compare(t, v).Stats; st.SegmentsWithoutSummary != 1 {
+			t.Fatalf("a summary naming another segment was read: %+v", st)
+		}
+	})
+}
+
+// TestPanicInsideAnExportReturnsAnError panics inside the library's export
+// guard and checks that the call returns an internal error naming the panic
+// and that the process carries on: a second call behaves the same.
+//
+// Mutation caught: an export without the panic guard (the unwind reaches the
+// C boundary and aborts the test process).
+func TestPanicInsideAnExportReturnsAnError(t *testing.T) {
+	for range 2 {
+		err := panicSelfTest()
+		var e *model.Error
+		if !errors.As(err, &e) || e.Code != model.CodeInternal || !strings.Contains(e.Message, "panicked on purpose") {
+			t.Fatalf("panic self-test returned %v, want an internal error naming the panic", err)
+		}
+	}
+}

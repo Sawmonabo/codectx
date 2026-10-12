@@ -47,6 +47,117 @@ Go modules (each module carries the grammar's `parser.c`); the query packs under
 by this repository's license. See `docs/providers-treesitter.md` for the pinned
 ABI and grammar metadata that the unit fingerprint folds in.
 
+## The search index library
+
+The lexical tier's index (`internal/search/textindex`, docs/adr/ADR-0013-search-index.md)
+is a Rust static library linked into the binary through cgo. It links the
+crates below: the normal dependencies of `internal/search/textindex/Cargo.toml`
+at the versions `Cargo.lock` pins, without the compile-time macro crates, which
+generate code and are not linked. Each license expression is the one the crate
+declares; each license file was read in the registry source at that version.
+None is copyleft. `htmlescape` offers MPL-2.0 only as one of three
+alternatives, and the other two (Apache-2.0, MIT) are permissive. The set is the
+Linux one; the macOS and Windows targets swap the platform crates
+(`linux-raw-sys`, `rustix`) for their own.
+
+Regenerate the crate set with:
+
+```bash
+cd internal/search/textindex
+cargo tree --locked --offline -e normal,no-proc-macro --prefix none | sort -u
+cargo metadata --locked --offline --format-version 1
+```
+
+| Crate | Version | License (as declared) | License file read |
+|---|---|---|---|
+| aho-corasick | 1.1.5 | Unlicense OR MIT | `COPYING`, `LICENSE-MIT`, `UNLICENSE` |
+| allocator-api2 | 0.2.21 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| arc-swap | 1.9.2 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| base64 | 0.22.1 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| bitflags | 2.13.2 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| bitpacking | 0.9.3 | MIT | `LICENSE` |
+| bon | 3.10.2 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| byteorder | 1.5.0 | Unlicense OR MIT | `COPYING`, `LICENSE-MIT`, `UNLICENSE` |
+| census | 0.4.2 | MIT | `LICENSE` |
+| cfg-if | 1.0.5 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| crc32fast | 1.5.2 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| crossbeam-channel | 0.5.17 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT`, `LICENSE-THIRD-PARTY` |
+| crossbeam-deque | 0.8.8 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| crossbeam-epoch | 0.9.21 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| crunchy | 0.2.4 | MIT | `LICENSE` |
+| datasketches | 0.2.0 | Apache-2.0 | none in the package; the manifest declaration |
+| deranged | 0.5.8 | MIT OR Apache-2.0 | `LICENSE-Apache`, `LICENSE-MIT` |
+| downcast-rs | 2.0.2 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| either | 1.19.0 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| equivalent | 1.0.2 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| erased-serde | 0.4.10 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| fastdivide | 0.4.2 | zlib-acknowledgement OR MIT | `LICENSE.txt` |
+| fastrand | 2.5.0 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| fnv | 1.0.7 | Apache-2.0 / MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| foldhash | 0.2.0 | Zlib | `LICENSE` |
+| fs4 | 0.13.1 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| futures-core | 0.3.34 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| futures-task | 0.3.34 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| futures-util | 0.3.34 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| getrandom | 0.4.3 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| hashbrown | 0.16.1 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| htmlescape | 0.3.1 | Apache-2.0 / MIT / MPL-2.0 | none in the package; the manifest declaration |
+| inventory | 0.3.25 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| itertools | 0.14.0 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| itoa | 1.0.18 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| levenshtein_automata | 0.2.1 | MIT | `LICENSE` |
+| libc | 0.2.190 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-Apache-2.0_WITH_LLVM-exception`, `LICENSE-MIT` |
+| log | 0.4.34 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| lru | 0.16.4 | MIT | `LICENSE` |
+| measure_time | 0.9.0 | MIT | `LICENSE` |
+| memchr | 2.8.3 | Unlicense OR MIT | `COPYING`, `LICENSE-MIT`, `UNLICENSE` |
+| memmap2 | 0.9.11 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| minimal-lexical | 0.2.1 | MIT/Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT`, `LICENSE.md` |
+| murmurhash32 | 0.3.1 | MIT | `LICENSE` |
+| nom | 7.1.3 | MIT | `LICENSE` |
+| num-conv | 0.2.2 | MIT OR Apache-2.0 | `LICENSE-Apache`, `LICENSE-MIT` |
+| num-traits | 0.2.19 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| once_cell | 1.21.4 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| oneshot | 0.1.13 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| ordered-float | 5.5.0 | MIT | `LICENSE-MIT` |
+| ownedbytes | 0.9.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| powerfmt | 0.2.1 | MIT OR Apache-2.0 | `LICENSE-Apache`, `LICENSE-MIT` |
+| rayon | 1.12.0 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| rayon-core | 1.13.0 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| regex | 1.13.1 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| regex-automata | 0.4.18 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| regex-syntax | 0.8.11 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| rustc-hash | 2.1.3 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-Apache-2.0_WITH_LLVM-exception`, `LICENSE-MIT` |
+| serde | 1.0.229 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| serde_core | 1.0.229 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| serde_json | 1.0.151 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| sketches-ddsketch | 0.4.1 | Apache-2.0 | `LICENSE` |
+| slab | 0.4.12 | MIT | `LICENSE` |
+| smallvec | 1.16.2 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| tantivy | 0.26.2 | MIT | `LICENSE` |
+| tantivy-bitpacker | 0.10.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| tantivy-columnar | 0.7.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| tantivy-common | 0.11.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| tantivy-fst | 0.5.0 | Unlicense/MIT | `COPYING`, `LICENSE-MIT`, `UNLICENSE` |
+| tantivy-query-grammar | 0.26.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| tantivy-sstable | 0.7.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| tantivy-stacker | 0.7.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| tantivy-tokenizer-api | 0.7.0 | MIT | none in the package; the library workspace `LICENSE` (MIT, read in the `tantivy` 0.26.2 package) |
+| tempfile | 3.27.0 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| thiserror | 2.0.21 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| time | 0.3.55 | MIT OR Apache-2.0 | `LICENSE-Apache`, `LICENSE-MIT` |
+| time-core | 0.1.9 | MIT OR Apache-2.0 | `LICENSE-Apache`, `LICENSE-MIT` |
+| typeid | 1.0.3 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| typetag | 0.2.23 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| utf8-ranges | 1.0.5 | Unlicense/MIT | `COPYING`, `LICENSE-MIT`, `UNLICENSE` |
+| uuid | 1.27.0 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| zmij | 1.0.23 | MIT | `LICENSE-MIT` |
+
 ## Pinned analyzer payloads
 
 The managed analyzer toolchain of Section 11.7 pins one external analyzer or

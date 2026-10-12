@@ -233,10 +233,11 @@ and raw result line).
 | Kind filter / folder filter, under our formula | 18.6 ms / 5.5 ms |
 
 A ranked page is the pruned top k (ADR-0013 decision 5), so the figure row 3
-answers to is our formula's pruned page. That pruned collector
-returned pages 1 to 3 identical to exhaustive scoring on 2 436 of 2 436
-query-page pairs on a fixture, at 1 and 4 search threads; its kubernetes run is
-being measured, and row 3 is recorded from the integrated binary.
+answers to is our formula's pruned page. That pruned collector returned pages 1
+to 3 identical to exhaustive scoring on 2 436 of 2 436 query-page pairs on a
+fixture, at 1 and 4 search threads, and on kubernetes on 3 030 of 3 030 pages
+over four query sets, 15.7 times faster summed on the 30 speed queries (4 653 ms
+to 296 ms). Row 3 is recorded from the integrated binary.
 
 ## 4. Misses, skips and unproven platforms
 
@@ -418,6 +419,7 @@ CODECTX_SCALE_PROOF=1 CODECTX_SCALE_LEAVES=2000,4000,8000 \
 ## 7. Reproducing this page
 
 ```bash
+go generate ./internal/search/textindex
 go build -trimpath -o ./bin/codectx ./cmd/codectx
 go test ./internal/bench -run TestResourceBudgets -count=1
 go test ./internal/bench -run TestSessionStatusClamp -count=1 -v

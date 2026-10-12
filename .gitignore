@@ -12,3 +12,6 @@
 .worktrees/
 .claude/worktrees/
 /tools-matrix
+
+# The search index library build (internal/search/textindex)
+/internal/search/textindex/_build/

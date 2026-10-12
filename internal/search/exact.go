@@ -31,14 +31,9 @@ type exactReader interface {
 var _ exactReader = (*sqlite.PinnedReader)(nil)
 
 // exactHit is one candidate from tiers 0-3, carrying the whole stored node and
-// its file's normalized path.
-//
-// It carries the node rather than a search_fts rowid on purpose: an exact-tier
-// candidate has no lexical rowid, so the packed hydration cannot serve it -- no
-// segment holds a document for it, and a rowid nothing packs is omitted, which
-// would drop the candidate silently. Everything model.SearchHit needs
-// except Range is already here — Kind, Name, QualifiedName, Signature,
-// FileID and Bytes on the node, Path beside it.
+// its file's normalized path: everything model.SearchHit needs except Range --
+// Kind, Name, QualifiedName, Signature, FileID and Bytes on the node, Path
+// beside it.
 type exactHit struct {
 	Tier model.SearchTier
 	Path string
@@ -169,15 +164,27 @@ func (p *pathResolver) path(ctx context.Context, file model.FileID) (string, err
 	return fv.Path, nil
 }
 
+// queryFile reads the query as a root-relative path and resolves it to a
+// visible file. ok is false when the query is not a path or names no visible
+// file, which is not an error -- the symbol tiers answer the same query.
+func queryFile(ctx context.Context, r exactReader, query string) (normalized string, file model.FileID, err error) {
+	normalized, ok := normalizeQueryPath(query)
+	if !ok {
+		return "", "", nil
+	}
+	file, err = r.FileByPath(ctx, normalized)
+	if err != nil {
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	return normalized, file, nil
+}
+
 // pathCandidates is tier 0: the query read as a root-relative path, resolved to
-// a file, then that file's visible nodes in document order. A query that is not
-// a path, or names no visible file, yields no candidates rather than an error —
-// the symbol tiers answer the same query.
-//
-// It returns the file the query resolved to, so the symbol tiers below can
-// recognize a candidate this tier already emitted without keeping a set of the
-// ids it emitted; the id is empty when the query is not a path or names no
-// visible file, which is exactly when this tier emits nothing.
+// a file (queryFile), then that file's visible nodes in document order.
 //
 // It pages DistinctNodesInFile on its (start_byte, node_id) keyset rather than
 // issuing one bounded read, because storage takes no kind filter and so applies
@@ -193,39 +200,29 @@ func (p *pathResolver) path(ctx context.Context, file model.FileID) (string, err
 // page is the READ size, not a bound on the answer: the walk runs the keyset to
 // its end and emits every kept candidate. A file's declarations are not dropped
 // because they sit past an arbitrary 200, which is the class-E truncation the
-// scale posture removes; the ranked set and its disk-backed spool own the global
-// bound instead.
-func pathCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind,
-	page int, emit func(exactHit) error) (model.FileID, error) {
-	normalized, ok := normalizeQueryPath(query)
-	if !ok {
-		return "", nil
-	}
-	file, err := r.FileByPath(ctx, normalized)
-	if err != nil {
-		var typed *model.Error
-		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
-			return "", nil
-		}
-		return "", err
+// scale posture removes.
+func pathCandidates(ctx context.Context, r exactReader, normalized string, file model.FileID, kinds []model.NodeKind,
+	page int, emit func(exactHit) error) error {
+	if file == "" {
+		return nil
 	}
 	var afterStart int64
 	var after model.NodeID
 	for {
 		// The page size is the caller's read bound, which storage clamps to at
-		// most model.MaxPageItems (query.go:291); asking for more would be a
-		// bound this code believes and the database does not, and the walk
-		// would then end on the first page.
+		// most model.MaxPageItems; asking for more would be a bound this code
+		// believes and the database does not, and the walk would then end on
+		// the first page.
 		nodes, err := r.DistinctNodesInFile(ctx, file, afterStart, after, page)
 		if err != nil {
-			return file, err
+			return err
 		}
 		if len(nodes) == 0 {
 			// An empty page is the end of the file's keyset. Only an empty one
 			// ends the walk: the read can return a short page while the
 			// keyset continues, and `after` advances strictly on every
 			// non-empty page, so this terminates.
-			return file, nil
+			return nil
 		}
 		for _, n := range nodes {
 			afterStart, after = nodeStartByte(n), n.Node.ID
@@ -233,7 +230,7 @@ func pathCandidates(ctx context.Context, r exactReader, query string, kinds []mo
 				continue
 			}
 			if err := emit(exactHit{Tier: model.TierExactPath, Path: normalized, Node: n}); err != nil {
-				return file, err
+				return err
 			}
 		}
 	}
@@ -250,8 +247,7 @@ func nodeStartByte(n sqlite.StoredNode) int64 {
 }
 
 // matchesKinds applies a kind filter to a node the storage layer could not
-// filter itself (NodesInFile takes no kinds), and to a lexical document's kind,
-// which storage cannot filter inside the MATCH either.
+// filter itself (NodesInFile takes no kinds).
 func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 	if len(kinds) == 0 {
 		return true
@@ -264,14 +260,25 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 	return false
 }
 
-// exactCandidates runs all four non-lexical tiers for one search query and
+// tierSpan is the inclusive range of exact-tier ranks one walk covers.
+type tierSpan struct{ from, to int }
+
+// allExactTiers covers every exact tier.
+var allExactTiers = tierSpan{from: model.TierExactPath.Rank(), to: model.TierExactName.Rank()}
+
+// covers reports whether the span walks tier.
+func (s tierSpan) covers(tier model.SearchTier) bool {
+	return tier.Rank() >= s.from && tier.Rank() <= s.to
+}
+
+// exactCandidates runs the non-lexical tiers in span for one search query and
 // emits their candidates in tier order, each already carrying its path. A node
 // that matches more than one tier is emitted once, at its most specific tier.
+// A tier outside span is not walked, but the file the query names is resolved
+// whatever the span, because the symbol tiers' rule against tier 0 needs it.
 //
 // page is the READ size for one keyset step, not a bound on the answer: every
-// tier is walked to the end of its keyset and nothing is dropped, so there is no
-// per-tier truncation left to report. The caller's ranked set and its
-// disk-backed spool own the global bound.
+// tier is walked to the end of its keyset and nothing is dropped.
 //
 // Peak heap here is ONE PAGE of stored nodes. The cross-tier "most specific
 // tier wins" rule is decided by two predicates over the candidate in hand, not
@@ -284,60 +291,50 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 //     query as a prefix of it), and within a tier the keyset advances strictly
 //     on node_id while Nodes collapses its duplicate rows;
 //   - against tier 0, a symbol candidate repeats the path tier exactly when it
-//     is declared in the file that tier walked, so comparing its FileID with
-//     pathFile replaces the ids of that walk. Kind is ni.kind, a per-node_id
-//     column both reads filter on identically (query.go:133), so a candidate
-//     this skips is always one pathCandidates already emitted.
+//     is declared in the file that tier walks, so comparing its FileID with
+//     the query's file replaces the ids of that walk. Kind is ni.kind, a
+//     per-node_id column both reads filter on identically, so a candidate this
+//     skips is always one pathCandidates emits.
 //
-// One case the predicates do not cover: Nodes picks the
-// precedence-winning row PER TIER's WHERE clause, so a node whose units publish
-// different qualified names can present one at exact_qualified_name and another
-// at exact_name, and the second tier's predicate then does not recognize the
-// first. That emits the candidate twice, which is not a defect: the collector
-// deduplicates on the node id, keeps the lower tier rank, and Occurrences is 0
-// on both sides -- the only visible difference is that the survivor carries the
-// reason of both tiers.
-//
-// Heap is one page: a one-character qualified_name_prefix that range-scans a
-// corpus-sized slice of node_ids never holds more than one keyset page of
-// candidates at a time.
-//
-// Every candidate scores 0: tier rank, not score, separates the
-// exact tiers, and a candidate that also matched lexically keeps that score when
-// the two are folded together.
+// One case the predicates do not cover: Nodes picks the precedence-winning row
+// PER TIER's WHERE clause, so a node whose units publish different qualified
+// names can present one at exact_qualified_name and another at exact_name, and
+// the second tier's predicate then does not recognize the first. That emits
+// the candidate twice; the search page drops the repeat when both fall on one
+// page (exactHeap).
 //
 // It takes the query and the kind filter, not the whole SearchRequest: kinds are
 // a stored column the node filter applies, while SearchRequest.Languages and
-// .Paths have to be applied the same way across every tier including the lexical
-// one, and this package's digest does not say what a Paths entry means (the only
-// precedent, model.FileSelection.Paths, is an exact file list). The caller owns
-// those two filters.
+// .Paths are applied by the caller to every tier, the lexical one included.
 func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind,
-	page int, emit func(exactHit) error) error {
-	paths := newPathResolver(r, page)
-	pathFile, err := pathCandidates(ctx, r, query, kinds, page, emit)
+	page int, span tierSpan, emit func(exactHit) error) error {
+	normalized, pathFile, err := queryFile(ctx, r, query)
 	if err != nil {
 		return err
 	}
+	if span.covers(model.TierExactPath) {
+		if err := pathCandidates(ctx, r, normalized, pathFile, kinds, page, emit); err != nil {
+			return err
+		}
+	}
+	paths := newPathResolver(r, page)
 	for _, tier := range exactTiers {
+		if !span.covers(tier) {
+			continue
+		}
 		// One row per node: where several units publish the same node fact,
 		// Nodes applies the Section 9.4 read-time precedence order (verified
 		// source binding, then provider id, then unit key) inside the query
-		// itself. The mechanism lives in storage and this note where Nodes is
-		// consumed: nothing
-		// in this package re-ranks or re-folds provider ids, and a nil-aware
-		// clause would be added here only if a leg showed a nil-valued row
-		// winning.
+		// itself. Nothing in this package re-ranks or re-folds provider ids.
 		filter := nodeFilterFor(tier, query, kinds)
 		after := model.NodeID("")
 		// The tier is walked on its keyset, not read once. Nodes applies its
 		// SQL LIMIT to node_facts rows and only then collapses the duplicate
-		// node_id rows the Section 9.4 precedence order leaves behind
-		// (storage/sqlite/query.go:246-263), so a full-bound read routinely
-		// returns fewer nodes than it asked for while the keyset still has
-		// rows: a deduped count can neither end the walk nor decide whether
-		// the tier had more. Only an EMPTY page ends it, and `after` advances
-		// strictly on every non-empty one, so it terminates.
+		// node_id rows the Section 9.4 precedence order leaves behind, so a
+		// full-bound read routinely returns fewer nodes than it asked for while
+		// the keyset still has rows: a deduped count can neither end the walk
+		// nor decide whether the tier had more. Only an EMPTY page ends it, and
+		// `after` advances strictly on every non-empty one, so it terminates.
 		for {
 			nodes, err := r.Nodes(ctx, filter, after, page)
 			if err != nil {
@@ -348,8 +345,8 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 			}
 			for _, n := range nodes {
 				after = n.Node.ID
-				// A candidate declared in the file tier 0 walked was already
-				// emitted there, at the tier that outranks this one.
+				// A candidate declared in the file tier 0 walks is emitted
+				// there, at the tier that outranks this one.
 				if (pathFile != "" && n.Node.FileID == pathFile) || supersededByLowerTier(tier, n, query) {
 					continue
 				}

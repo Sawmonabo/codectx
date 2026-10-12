@@ -40,9 +40,8 @@ type graphReader struct {
 
 var _ graph.GraphReader = (*graphReader)(nil)
 
-// partsPerStream bounds the parts one of the GRAPH reader's streams keeps
-// resident for one request; the lexical reader bounds its parts over the whole
-// cache instead, at lexPartsLive. It is an INTERNAL working-set constant, not a
+// partsPerStream bounds the parts one of the graph reader's streams keeps
+// resident for one request. It is an INTERNAL working-set constant, not a
 // user limit: a stream with more parts is read in full, one window at a time,
 // and nothing is ever refused or truncated because of it. Sixteen parts is
 // ~16 MiB for an edge stream and ~8 MiB for an offset directory in the worst

@@ -8,7 +8,7 @@ package index
 // Failure modes these protect, all of which are silent:
 //   - a refresh that rebuilds units nothing changed, rewriting lexical bodies
 //     and destroying the reuse Section 13.1 promises (asserted by comparing
-//     sealed unit ids and the generation's FTS document count across runs);
+//     sealed unit ids and the generation's lexical page across runs);
 //   - a refresh that reuses a unit whose file did change, so a query answers
 //     from source that is gone;
 //   - an optional provider's failure taking a healthy base generation down,
@@ -44,6 +44,7 @@ import (
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
+	"github.com/Sawmonabo/codectx/internal/search/textindex"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -119,9 +120,7 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 		t.Fatalf("OpenCAS: %v", err)
 	}
 	f.cas = cas
-	// Carried lexical documents are re-indexed through the content store's
-	// range reader: the database keeps no body (ADR-0003 §2.1).
-	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults())})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -298,20 +297,33 @@ func (f *fixture) units(gen model.GenerationID, paths []string) map[string]model
 	return out
 }
 
-// documents is the generation's FTS document count: the lexical bodies a
-// refresh must not rewrite.
-func (f *fixture) documents(gen model.GenerationID) int64 {
+// search is the generation's lexical page for query, deep enough for every
+// result the fixture can produce.
+func (f *fixture) search(gen model.GenerationID, query string) textindex.Page {
 	f.t.Helper()
 	pinned, err := f.store.PinGeneration(f.ctx, f.c.repo, gen, time.Minute)
 	if err != nil {
 		f.t.Fatalf("PinGeneration: %v", err)
 	}
 	defer pinned.Close()
-	docs, _, err := pinned.SearchStats(f.ctx)
+	view, err := pinned.SearchView(f.ctx)
 	if err != nil {
-		f.t.Fatalf("SearchStats: %v", err)
+		f.t.Fatalf("SearchView: %v", err)
 	}
-	return docs
+	defer view.Close()
+	page, err := view.Search(f.ctx, textindex.Request{Query: query, Depth: 1000})
+	if err != nil {
+		f.t.Fatalf("Search(%q): %v", query, err)
+	}
+	return page
+}
+
+// lexical renders the generation's page for a term every fixture document
+// carries ("pkg": the package clause and the path), scores included: what a
+// refresh that rebuilds nothing must leave exactly as it was.
+func (f *fixture) lexical(gen model.GenerationID) string {
+	f.t.Helper()
+	return fmt.Sprintf("%+v", f.search(gen, "pkg"))
 }
 
 // goFile is one fixture source file with an optional extra declaration.
@@ -365,7 +377,8 @@ func TestIncrementalScenario(t *testing.T) {
 		t.Fatalf("captured %d files, want %d", cold.FilesCaptured, len(files))
 	}
 	base := f.units(cold.Binding.GenerationID, all)
-	baseDocs := f.documents(cold.Binding.GenerationID)
+	baseLexical := f.lexical(cold.Binding.GenerationID)
+	lastGen := cold.Binding.GenerationID
 	if len(base) == 0 {
 		t.Fatal("the cold generation selected no units")
 	}
@@ -384,8 +397,8 @@ func TestIncrementalScenario(t *testing.T) {
 		}
 		after := f.units(res.Binding.GenerationID, all)
 		assertSameUnits(t, base, after, nil)
-		if docs := f.documents(res.Binding.GenerationID); docs != baseDocs {
-			t.Fatalf("the FTS corpus moved from %d to %d documents on a no-op refresh", baseDocs, docs)
+		if got := f.lexical(res.Binding.GenerationID); got != baseLexical {
+			t.Fatalf("the lexical page moved on a no-op refresh:\nbefore %s\nafter  %s", baseLexical, got)
 		}
 	})
 
@@ -409,10 +422,13 @@ func TestIncrementalScenario(t *testing.T) {
 		after := f.units(res.Binding.GenerationID, all)
 		assertSameUnits(t, base, after, changed)
 		assertRebuilt(t, base, after, changed)
-		base, baseDocs = after, f.documents(res.Binding.GenerationID)
+		base, lastGen = after, res.Binding.GenerationID
 	})
 
 	t.Run("a new symbol and dependency rebuild one file's units", func(t *testing.T) {
+		if n := f.search(lastGen, "added").Matches; n != 0 {
+			t.Fatalf("the fixture already matches the new declaration's name %d times before it is written", n)
+		}
 		p := "pkg/f11.go"
 		f.write(p, "package pkg\n\nimport \"strings\"\n\nfunc F11() int { return len(strings.TrimSpace(\" x \")) }\n\nfunc Added() int { return 2 }\n")
 		res, err := f.c.Refresh(ctx, []string{p})
@@ -422,10 +438,10 @@ func TestIncrementalScenario(t *testing.T) {
 		after := f.units(res.Binding.GenerationID, all)
 		assertSameUnits(t, base, after, []string{p})
 		assertRebuilt(t, base, after, []string{p})
-		if docs := f.documents(res.Binding.GenerationID); docs <= baseDocs {
-			t.Fatalf("a new declaration did not reach the lexical corpus: %d documents, was %d", docs, baseDocs)
+		if n := f.search(res.Binding.GenerationID, "added").Matches; n == 0 {
+			t.Fatal("a new declaration did not reach the lexical tier: its name matches no document")
 		}
-		base, baseDocs = after, f.documents(res.Binding.GenerationID)
+		base, lastGen = after, res.Binding.GenerationID
 	})
 
 	t.Run("a delete and a rename move exactly their own units", func(t *testing.T) {
@@ -449,7 +465,7 @@ func TestIncrementalScenario(t *testing.T) {
 		all = append(all, renamed)
 		after := f.units(gen, all)
 		assertSameUnits(t, base, after, []string{"pkg/f00.go", "pkg/f01.go", renamed})
-		base, baseDocs = after, f.documents(gen)
+		base, lastGen = after, gen
 	})
 
 	t.Run("a concurrent refresh publishes one generation at a time", func(t *testing.T) {
