@@ -3,6 +3,7 @@ package delta
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -47,7 +48,7 @@ func (b *build) run(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 	out := &output{UnitWriter: w, store: b.store, complete: b.complete}
-	result, runErr := provider.RunUnit(ctx, indexFunc{Provider: b.p, fn: b.index}, b.req.Unit, out, b.limits, b.pool)
+	result, runErr := provider.RunUnit(ctx, indexFunc{Provider: b.p, fn: b.annotated}, b.req.Unit, out, b.limits, b.pool)
 	// The run is recorded on both paths and under a context that survives the
 	// cancellation a sink failure raises: a provider run left running is a row
 	// no later generation can complete.
@@ -65,6 +66,30 @@ func (b *build) run(ctx context.Context) (Result, error) {
 	b.res.Unit = b.req.Build.Spec.ID
 	b.res.Result = result
 	return b.res, nil
+}
+
+// annotated runs the import and states the delta decision on each of the
+// unit's capability rows: which full-build reason applied, and whether the
+// emit was a filtered one. Only the reasons that name an unusable predecessor
+// count as an invalidation, which is why the reason and not the Full flag is
+// published. Every decision is made by the time the import returns, so the
+// rows are annotated before RunUnit hands them to the seal: the rows the unit
+// stores, and a generation that reuses it reads back, are the rows the
+// generation that built it folded.
+func (b *build) annotated(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	res, err := b.index(ctx, req, sink)
+	if err != nil || len(res.Capabilities) == 0 {
+		return res, err
+	}
+	rows := make([]model.CapabilityState, 0, len(res.Capabilities))
+	for _, c := range res.Capabilities {
+		if b.res.Full {
+			c = c.WithDetail("delta_full_reason", b.res.FullReason)
+		}
+		rows = append(rows, c.WithDetail("delta_filtered", strconv.FormatBool(b.res.Filtered)))
+	}
+	res.Capabilities = rows
+	return res, nil
 }
 
 // output is the storage side of a delta-built unit: provider.StoreUnit with
