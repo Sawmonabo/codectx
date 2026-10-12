@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 )
 
 // TestStaticDispatchGoldens runs the dispatch, hierarchy, external, macro,
@@ -160,7 +161,9 @@ var staticGoldens = []golden{
 		anchor: "ISO/IEC 14882 (C++) [class.virtual] (the final overrider), [expr.call] (a qualified call calls the named function), [expr.type.conv], [class.derived]",
 		files:  fixture("dispatch-cpp"),
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
-		// the binding rules alone); the two agree on every fact.
+		// the binding rules alone); the two agree on every fact. Checked against the pinned grammar's tree:
+		// the name of `a.Animal::sound()` is a qualified_identifier whose last part is a field_identifier,
+		// and each argument `p` reads main's local p.
 		want: []string{
 			"speak sound -> asound sound virtual",
 			"walk sound -> dsound sound virtual",
@@ -182,7 +185,69 @@ var staticGoldens = []golden{
 		},
 		// Mutation: read dispatch from the technique -> `a.Animal::sound()` and `Dog().sound()` carry
 		// virtual. Mutation: publish per override -> `a.sound()` binds Dog's and Puppy's sound.
+		// Mutation: remove the pattern that captures a qualified member call (`a.Animal::sound()`) -> the
+		// worker's site joins no call reference, so the `exact sound` line is missing and the unit's `calls`
+		// row is partial.
 		fails: "a qualified call or a temporary's call marked virtual; a virtual call published to each override",
+	},
+	{
+		name:   "cpp-by-value-result",
+		anchor: "ISO/IEC 14882 (C++) [class.virtual] (a virtual call through an object, not a pointer or reference, runs that object's type's function), [basic.lval] (a function call returning a non-reference type is a prvalue), [dcl.fct], [expr.call]",
+		files: map[string]string{
+			"result.cpp": `struct Animal { // @tanimal
+    virtual void sound() {} // @asound
+};
+
+struct Dog : Animal { // @tdog
+    void sound() override {} // @dsound
+};
+
+struct Puppy : Dog { // @tpuppy
+    void sound() override {} // @psound
+};
+
+Dog make() { // @fmake
+    return Dog(); // @c0
+}
+
+Animal* pmake() { // @fpmake
+    return nullptr;
+}
+
+Animal& rmake() { // @frmake
+    static Dog d;
+    return d;
+}
+
+void run() {
+    make().sound(); // @m1
+    pmake()->sound(); // @m2
+    rmake().sound(); // @m3
+}
+`,
+		},
+		// Derived from the source and the anchor; the C++ worker's by-value return mark is probed
+		// (TestCppByValueReturnIsExact). make returns a Dog by value, a prvalue whose dynamic type is Dog,
+		// so `make().sound()` runs Dog::sound although Puppy overrides it; pmake's and rmake's results are
+		// a pointer and a reference to Animal, whose call may run any override.
+		want: []string{
+			"c0 Dog -> tdog Dog exact",
+			"m1 make -> fmake make exact",
+			"m1 sound -> dsound sound exact",
+			"m2 pmake -> fpmake pmake exact",
+			"m2 sound -> asound sound virtual",
+			"m3 rmake -> frmake rmake exact",
+			"m3 sound -> asound sound virtual",
+		},
+		facts: []string{
+			"tdog Dog extends tanimal Animal",
+			"tpuppy Puppy extends tdog Dog",
+			"dsound sound overrides asound sound",
+			"psound sound overrides dsound sound",
+		},
+		// Mutation: read every call's result as virtual -> `make().sound()` carries virtual. Mutation: mark a
+		// pointer or reference result exact -> `pmake()->sound()` and `rmake().sound()` carry exact.
+		fails: "a call on a class returned by value marked virtual, or one on a returned pointer or reference marked exact",
 	},
 	{
 		name:   "cpp-template-dependent-receiver",
@@ -251,7 +316,7 @@ void run(int x) { // @run
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every fact. g and h are the only functions whose address
 		// is taken, both of fp's type, so `fp(x)` may call either and x reaches the parameter of each.
-		// Unprobed: the C worker's argument reads.
+		// Checked against the pinned grammar's tree: the argument `x` of `fp(x)` reads run's parameter x.
 		want: []string{
 			"c1 fp -> g g exact set=2",
 			"c1 fp -> h h exact set=2",
@@ -434,7 +499,8 @@ func use(r ReadCloser) {
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every fact. io.Reader's method set is in no table, so a
-		// type satisfies ReadCloser only by embedding io.Reader too.
+		// type satisfies ReadCloser only by embedding io.Reader too. Checked against the pinned grammar's
+		// tree: ReadCloser's Close is a method_elem, sent abstract.
 		want: []string{
 			"u1 Read -> external io.Reader.Read virtual",
 			"u2 Close -> rcclose Close virtual",
@@ -476,7 +542,8 @@ func use(r ReadCloser) {
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding. repo is Base's field, inherited by
-		// Service and read from Service's inner class.
+		// Service and read from Service's inner class, where the bare name is read as `this.repo` is, the
+		// field of Inner, then of the class enclosing it.
 		want: []string{
 			"u1 save -> save save virtual",
 			"u2 save -> save save virtual",
@@ -603,65 +670,175 @@ func TestExternalOverrideMeetsExternalCall(t *testing.T) {
 	}
 }
 
-// TestExternalSupertypeKinds checks the kind of each external type a
-// hierarchy relation names: an `implements` clause's type and a Java
-// interface's extended type are one interface node, an `extends` clause's
-// type of a class a class node, in Java and in TypeScript.
-//
-// Mutation: read every external supertype as a class (drop
-// wire.Supertype.Interface in the hierarchy) -> Runnable is a class node,
-// and A's Runnable and Task's Runnable are two nodes.
-func TestExternalSupertypeKinds(t *testing.T) {
-	cases := []struct {
-		golden string
-		from   []golden
-		// want is each external type's kind by qualified name.
-		want map[string]model.NodeKind
-	}{
-		{"java-external-implements-and-extends", staticGoldens,
-			map[string]model.NodeKind{"java.lang.Runnable": model.NodeInterface, "java.lang.Thread": model.NodeClass}},
-		{"typescript-external-implements-and-extends", ecmascriptGoldens,
-			map[string]model.NodeKind{"tasks.Runnable": model.NodeInterface, "threads.Thread": model.NodeClass}},
+// externalEdge is one `extends` or `implements` into an external type: its
+// kind, its technique and the node it reaches.
+type externalEdge struct {
+	kind   model.RelationKind
+	detail string
+	to     model.Node
+}
+
+// externalSupertypeEdges is every `extends` and `implements` l published
+// into an external type, by the name of the type it is from.
+func externalSupertypeEdges(t *testing.T, l linked) map[string]externalEdge {
+	t.Helper()
+	out := map[string]externalEdge{}
+	for _, r := range l.out.rels {
+		if r.Relation.Kind != model.RelExtends && r.Relation.Kind != model.RelImplements {
+			continue
+		}
+		to := l.out.nodes[r.Relation.To]
+		if nodeResolution(to) != model.ResolutionExternal {
+			continue
+		}
+		if len(r.Evidence) != 1 {
+			t.Fatalf("the %s edge into %s carries %d occurrences, want one", r.Relation.Kind, to.QualifiedName, len(r.Evidence))
+		}
+		out[l.out.nodes[r.Relation.From].Name] = externalEdge{kind: r.Relation.Kind, detail: r.Evidence[0].Detail, to: to}
 	}
+	return out
+}
+
+// TestExternalSupertypeIsOneTypeNode checks that a type outside the project
+// is one node of kind type however the source writes it, and that each edge
+// into it carries the kind its own clause proves: TypeScript lets a class
+// both implement and extend one class (§8.1.1), so one unit writes Base as
+// an interface and as a class. The edge from the `implements` clause is
+// `implements` with technique supertype_interface; the one from the
+// `extends` clause `extends` with supertype_class.
+//
+// Mutation: mint the external type node with the kind its clause proves
+// (interface for `implements`, class for `extends`) -> two nodes for
+// lib.Base.
+func TestExternalSupertypeIsOneTypeNode(t *testing.T) {
+	l := linkSources(t, newStructural(t), map[string]string{
+		"app.ts": `import { Base } from "lib";
+
+class A implements Base {}
+
+class B extends Base {}
+`,
+	})
+	edges := externalSupertypeEdges(t, l)
+	want := map[string]struct {
+		kind   model.RelationKind
+		detail string
+	}{
+		"A": {model.RelImplements, link.DetailSupertypeInterface},
+		"B": {model.RelExtends, link.DetailSupertypeClass},
+	}
+	if len(edges) != len(want) {
+		t.Fatalf("the external supertype edges are %v, want one from each of A and B", edges)
+	}
+	for from, w := range want {
+		e := edges[from]
+		if e.kind != w.kind || e.detail != w.detail {
+			t.Errorf("%s publishes %s (%s), want %s (%s)", from, e.kind, e.detail, w.kind, w.detail)
+		}
+		if e.to.QualifiedName != "lib.Base" || e.to.Kind != model.NodeType || e.to.FileID != "" {
+			t.Errorf("%s reaches %s of kind %s in file %q, want lib.Base of kind type with no file",
+				from, e.to.QualifiedName, e.to.Kind, e.to.FileID)
+		}
+	}
+	if edges["A"].to.ID != edges["B"].to.ID {
+		t.Errorf("A reaches %s and B %s: one external type is one node", edges["A"].to.ID, edges["B"].to.ID)
+	}
+}
+
+// TestExternalSupertypeIsOneNodeAcrossUnits links two units: one whose
+// class implements lib.Base and one whose class extends it. Each edge keeps
+// its own clause's kind, and both reach one node, since a node's identity
+// derives from its kind and the external type's kind is type in every unit.
+//
+// Mutation: mint the external type node with the kind its clause proves ->
+// the units reach an interface node and a class node, two identities.
+func TestExternalSupertypeIsOneNodeAcrossUnits(t *testing.T) {
 	structural := newStructural(t)
-	for _, c := range cases {
-		t.Run(c.golden, func(t *testing.T) {
-			var files map[string]string
-			for _, g := range c.from {
-				if g.name == c.golden {
-					files = g.files
-				}
+	a := externalSupertypeEdges(t, linkSources(t, structural, map[string]string{
+		"A.java": `import lib.Base;
+
+class A implements Base {}
+`,
+	}))["A"]
+	b := externalSupertypeEdges(t, linkSources(t, structural, map[string]string{
+		"B.java": `import lib.Base;
+
+class B extends Base {}
+`,
+	}))["B"]
+	if a.kind != model.RelImplements || a.detail != link.DetailSupertypeInterface {
+		t.Errorf("A publishes %s (%s), want implements (%s)", a.kind, a.detail, link.DetailSupertypeInterface)
+	}
+	if b.kind != model.RelExtends || b.detail != link.DetailSupertypeClass {
+		t.Errorf("B publishes %s (%s), want extends (%s)", b.kind, b.detail, link.DetailSupertypeClass)
+	}
+	if a.to.ID == "" || a.to.ID != b.to.ID || a.to.Kind != model.NodeType || a.to.QualifiedName != "lib.Base" {
+		t.Errorf("the units reach %s (%s %s) and %s (%s %s), want one lib.Base node of kind type",
+			a.to.ID, a.to.Kind, a.to.QualifiedName, b.to.ID, b.to.Kind, b.to.QualifiedName)
+	}
+}
+
+// TestAnonymousClassOfExternalInterface links, in one file, a class that
+// implements java.lang.Runnable and an anonymous class of it (JLS §15.9.5).
+// The anonymous body has no node of its own, so it publishes no supertype
+// edge; its run override and A's reach one external method node, and A's
+// `implements` reaches the one java.lang.Runnable node, of kind type: the
+// anonymous body's supertype row, which proves no kind, mints no second
+// node.
+//
+// Mutation: mint the external type node with the kind its row proves ->
+// java.lang.Runnable is an interface node, not one of kind type. Mutation:
+// publish a supertype edge from the anonymous body's row -> a second edge.
+func TestAnonymousClassOfExternalInterface(t *testing.T) {
+	l := linkSources(t, newStructural(t), map[string]string{
+		"Tasks.java": `class A implements Runnable {
+  @Override
+  public void run() {}
+}
+
+class Main {
+  Runnable task = new Runnable() {
+    @Override
+    public void run() {}
+  };
+}
+`,
+	})
+	edges := externalSupertypeEdges(t, l)
+	if len(edges) != 1 {
+		t.Fatalf("the external supertype edges are %v, want A's alone", edges)
+	}
+	a := edges["A"]
+	if a.kind != model.RelImplements || a.detail != link.DetailSupertypeInterface || a.to.Kind != model.NodeType ||
+		a.to.QualifiedName != "java.lang.Runnable" {
+		t.Errorf("A publishes %s (%s) into %s of kind %s, want implements (%s) into java.lang.Runnable of kind type",
+			a.kind, a.detail, a.to.QualifiedName, a.to.Kind, link.DetailSupertypeInterface)
+	}
+	types := map[model.NodeID]bool{}
+	for id, n := range l.out.nodes {
+		if nodeResolution(n) == model.ResolutionExternal && n.QualifiedName == "java.lang.Runnable" {
+			types[id] = true
+		}
+	}
+	if len(types) != 1 {
+		t.Errorf("the unit publishes %d java.lang.Runnable nodes, want one", len(types))
+	}
+	overridden := map[model.NodeID]int{}
+	for _, r := range l.out.rels {
+		to := l.out.nodes[r.Relation.To]
+		if r.Relation.Kind == model.RelOverrides && nodeResolution(to) == model.ResolutionExternal {
+			if to.QualifiedName != "java.lang.Runnable.run" || to.Kind != model.NodeMethod {
+				t.Errorf("an override reaches %s of kind %s, want java.lang.Runnable.run", to.QualifiedName, to.Kind)
 			}
-			if files == nil {
-				t.Fatalf("no golden %s", c.golden)
-			}
-			l := linkSources(t, structural, files)
-			got := map[string][]model.NodeKind{}
-			ids := map[string]map[model.NodeID]bool{}
-			for _, r := range l.out.rels {
-				if r.Relation.Kind != model.RelExtends && r.Relation.Kind != model.RelImplements {
-					continue
-				}
-				to := l.out.nodes[r.Relation.To]
-				if nodeResolution(to) != model.ResolutionExternal {
-					continue
-				}
-				if ids[to.QualifiedName] == nil {
-					ids[to.QualifiedName] = map[model.NodeID]bool{}
-				}
-				if !ids[to.QualifiedName][to.ID] {
-					ids[to.QualifiedName][to.ID] = true
-					got[to.QualifiedName] = append(got[to.QualifiedName], to.Kind)
-				}
-			}
-			for q, kind := range c.want {
-				if len(got[q]) != 1 || got[q][0] != kind {
-					t.Fatalf("the external type %s is published as %v, want one %s node (all: %v)", q, got[q], kind, got)
-				}
-			}
-			if len(got) != len(c.want) {
-				t.Fatalf("external supertypes %v, want %v", got, c.want)
-			}
-		})
+			overridden[to.ID]++
+		}
+	}
+	if len(overridden) != 1 {
+		t.Fatalf("the overrides reach %v, want one external method node", overridden)
+	}
+	for _, n := range overridden {
+		if n != 2 {
+			t.Errorf("%d overrides reach java.lang.Runnable.run, want A's and the anonymous body's", n)
+		}
 	}
 }

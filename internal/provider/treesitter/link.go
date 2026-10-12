@@ -26,8 +26,9 @@ const detailLinkFailure = "link_failure"
 // reference whose callee token it names. Every call reference is a site, with
 // the reference's caller, range, callee and in-file candidates (targets). A
 // joined site takes the worker's shape, signature and types, and the
-// worker's qualifier where it names one (a static site's), else the
-// reference's, so QualifierIsImport always describes the qualifier stored;
+// worker's qualifier where it names one (a static site's: Base, not a, for
+// `a.Base::f()`), else the reference's; QualifierIsImport, which the
+// reference's qualifier decides, is kept only when that is the one stored;
 // one no Site joins takes its shape from the reference (a qualified call is a
 // member call, any other a bare one), keeps the reference's qualifier and
 // carries no recovered type. A
@@ -138,6 +139,7 @@ func (b *builder) linkTable() error {
 			w, siteAt[i] = i, int32(len(t.Sites))
 			s.Described = true
 			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, cmp.Or(wl.Sites[i].Qualifier, r.Qualifier), wl.Sites[i].Signature
+			s.QualifierIsImport = s.QualifierIsImport && s.Qualifier == r.Qualifier
 		}
 		joined = append(joined, w)
 		t.Sites = append(t.Sites, s)

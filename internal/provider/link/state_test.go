@@ -19,7 +19,7 @@ func everyKind() []idBinding {
 		{Kind: FactOpenSite, SiteFile: "a", Site: 2, Reason: model.ReasonValueUntracked},
 		{Kind: FactFlow, SiteFile: "a", Site: 0, Arg: 3, TargetFile: "b", Target: "b.f.x", Detail: DetailArgument},
 		{Kind: FactImport, SiteFile: "a", Site: 4, TargetFile: "b", Target: "mod:b", Detail: DetailImport},
-		{Kind: FactExtends, SiteFile: "a", Site: 5, External: externalType("java", model.NodeClass, "java.lang.Thread"),
+		{Kind: FactExtends, SiteFile: "a", Site: 5, External: externalType("java", "java.lang.Thread"),
 			Detail: DetailSupertype},
 		{Kind: FactImplements, SiteFile: "a", Site: 5, TargetFile: "b", Target: "b.I", Detail: DetailMethodSet},
 		{Kind: FactOverrides, SiteFile: "a", Site: 6, TargetFile: "b", Target: "b.I.m", Detail: DetailSupertype},

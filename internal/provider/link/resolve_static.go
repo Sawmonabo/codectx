@@ -34,6 +34,9 @@ type staticFile struct {
 type returned struct {
 	file int32
 	name string
+	// exact reports a result that is an object of exactly the type name
+	// (flagExactReturn).
+	exact bool
 }
 
 // siteOut receives what the resolution of one site finds: each declaration
@@ -119,6 +122,37 @@ func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
 	})
 }
 
+// javaUnbound reports a Java method reference written `T::m` that resolved
+// to e, an instance method, through its qualifier T naming a type (function):
+// an unbound reference, whose functional interface method takes the receiver
+// as its first parameter and m's parameters after it (JLS §15.13.1, the
+// ReferenceType :: Identifier form whose compile-time declaration is not
+// static). recv is T as written. A reference through `this` or `super` is
+// bound, its receiver captured, and a static method or a constructor (`T::new`,
+// static in the table) takes the arguments as its own parameters.
+func javaUnbound(written string, e entry) (recv string, ok bool) {
+	q, _, found := cutLast(strings.TrimSpace(written), "::")
+	if !found || q == "this" || q == "super" || e.Flags&flagStatic != 0 {
+		return "", false
+	}
+	return q, true
+}
+
+// receiverSignature is the signature of a function value that takes the
+// receiver of the method of signature sig, a receiver of type recv, as its
+// first parameter: sig with recv put first in its parameter list, so the
+// value joins the indirect sites, or the functional interface methods, of
+// that type.
+func receiverSignature(recv, sig string) string {
+	switch {
+	case !strings.HasPrefix(sig, "("):
+		return sig
+	case strings.HasPrefix(sig, "()"):
+		return "(" + recv + sig[1:]
+	}
+	return "(" + recv + "," + sig[1:]
+}
+
 // receiverFirst reports that site s passes the receiver of e, the method it
 // calls, as its first argument: a Go method expression or a Rust path
 // naming a method.
@@ -143,7 +177,7 @@ func (r *staticFile) resolve(i int32, bySignature sigSink, out siteOut) error {
 			return nil
 		}
 		if !known && e.Returns != "" {
-			ret := returned{file: e.Ref.File, name: e.Returns}
+			ret := returned{file: e.Ref.File, name: e.Returns, exact: e.Flags&flagExactReturn != 0}
 			if !slices.Contains(rets, ret) {
 				rets = append(rets, ret)
 			}
@@ -589,7 +623,8 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 // member resolves a call of method on a receiver: over its declared type
 // (exact for a C++ object declared by value, wire.ExactObject), or over the
 // types the targets of the call it is the result of return (exact when that
-// call constructs it); along the enclosing class's
+// call constructs it, or when the target returns its type by value,
+// flagExactReturn); along the enclosing class's
 // supertypes for `super`, exact; as a qualified call through a module; or,
 // for Go and Java, over the declared type of the field it reads (fieldGo,
 // fieldJava).
@@ -605,8 +640,8 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, out sit
 			}
 			return r.named(r.fc, typ, method, true, out)
 		}
-		return r.results(int32(recv.Index), method, func(fc fileCtx, written string) error {
-			return r.named(fc, written, method, false, out)
+		return r.results(int32(recv.Index), method, func(fc fileCtx, written string, exact bool) error {
+			return r.named(fc, written, method, exact, out)
 		})
 	case wire.TypeSuper:
 		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
@@ -642,13 +677,14 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, out sit
 }
 
 // results calls each with the context of the file of each target of site j
-// and the type it returns, as that file writes it, each once: the static
-// type of a call's result (`NewServer().Start()`, a fluent chain,
-// `Config::new().load()`). A Rust result held in a smart pointer
-// (`-> Rc<Foo>`) reaches the owned type, except by a method the pointer
-// answers itself (rustReceiver). A site not yet resolved is resolved first,
+// and the type it returns, as that file writes it, each once, and whether
+// the result is an object of exactly that type (a C++ class returned by
+// value, flagExactReturn): the static type of a call's result
+// (`NewServer().Start()`, a fluent chain, `Config::new().load()`). A Rust
+// result held in a smart pointer (`-> Rc<Foo>`) reaches the owned type,
+// except by a method the pointer answers itself (rustReceiver). A site not yet resolved is resolved first,
 // without publishing anything.
-func (r *staticFile) results(j int32, method string, each func(fc fileCtx, written string) error) error {
+func (r *staticFile) results(j int32, method string, each func(fc fileCtx, written string, exact bool) error) error {
 	if j < 0 || int(j) >= len(r.t.Sites) {
 		return nil
 	}
@@ -673,7 +709,7 @@ func (r *staticFile) results(j int32, method string, each func(fc fileCtx, writt
 		if !found {
 			continue
 		}
-		if err := each(fc, name); err != nil {
+		if err := each(fc, name, ret.exact); err != nil {
 			return err
 		}
 	}

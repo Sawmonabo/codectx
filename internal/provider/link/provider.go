@@ -97,6 +97,16 @@ const (
 	// DetailMethodSet: a Go `implements` or `overrides` of an interface the
 	// type satisfies by its method set, which the source never writes.
 	DetailMethodSet = "method_set"
+	// DetailSupertypeInterface: an `extends` or `implements` the source
+	// declares into a type outside the project (a node of kind type) that
+	// the source proves an interface or trait: a class's `implements`
+	// clause, an interface's `extends` clause, a Rust trait, a Go
+	// interface's embedded interface.
+	DetailSupertypeInterface = "supertype_interface"
+	// DetailSupertypeClass: an `extends` the source declares into a type
+	// outside the project that the source proves a class: a class's
+	// `extends` clause or base list.
+	DetailSupertypeClass = "supertype_class"
 )
 
 // LinkOptions is what the delta build hands one unit's link.

@@ -220,3 +220,68 @@ func TestCMacroAlias(t *testing.T) {
 		}
 	}
 }
+
+// TestCppByValueReturnIsExact checks that a C++ function returning a class
+// type by value marks its result an ExactObject, written before the name or
+// as a trailing return type, const or not, and that one returning a
+// pointer, an lvalue or rvalue reference, or a placeholder does not.
+//
+// Mutation: mark every named return -> pmake, rmake, xmake and tpmake are
+// exact. Mutation: read only the leading declarator -> tmake is not exact,
+// or tpmake is.
+func TestCppByValueReturnIsExact(t *testing.T) {
+	const src = `struct Dog { virtual void sound() {} };
+Dog make() { return Dog(); }
+const Dog cmake() { return Dog(); }
+Dog* pmake() { return nullptr; }
+Dog& rmake() { static Dog d; return d; }
+Dog&& xmake();
+auto tmake() -> Dog { return Dog(); }
+auto tpmake() -> Dog* { return nullptr; }
+auto amake() { return Dog(); }
+`
+	l, _ := linkOf(t, "cpp", "x.cpp", src)
+	for _, tc := range []struct {
+		context string
+		want    wire.Type
+	}{
+		{"make() {", wire.Type{Kind: wire.TypeNamed, Name: "Dog", Index: wire.ExactObject}},
+		{"cmake()", wire.Type{Kind: wire.TypeNamed, Name: "Dog", Index: wire.ExactObject}},
+		{"pmake()", wire.Type{Kind: wire.TypeNamed, Name: "Dog"}},
+		{"rmake()", wire.Type{Kind: wire.TypeNamed, Name: "Dog"}},
+		{"xmake()", wire.Type{Kind: wire.TypeNamed, Name: "Dog"}},
+		{"tmake()", wire.Type{Kind: wire.TypeNamed, Name: "Dog", Index: wire.ExactObject}},
+		{"tpmake()", wire.Type{Kind: wire.TypeNamed, Name: "Dog"}},
+		{"amake()", wire.Type{}},
+	} {
+		token := tc.context[:strings.IndexByte(tc.context, '(')]
+		e := exportNamed(l, cTokenAt(t, src, tc.context, 0, token))
+		if e == nil {
+			t.Fatalf("no export for %q", tc.context)
+		}
+		if e.Returns != tc.want {
+			t.Errorf("%s returns %+v, want %+v", token, e.Returns, tc.want)
+		}
+	}
+}
+
+// TestCppQualifiedMemberCallIsStatic checks `a.Base::f()`: the grammar
+// spells the qualified name's last part a field_identifier, and the call is
+// the static call of the member function Base declares, named at f and
+// qualified by Base, never a member call on a's type.
+//
+// Mutation: accept only an identifier as the qualified name's last part ->
+// the call sends no site.
+func TestCppQualifiedMemberCallIsStatic(t *testing.T) {
+	const src = `struct Base { virtual void f() {} };
+struct D : Base { void f() override {} };
+void use(D &a) {
+	a.Base::f();
+}
+`
+	l, _ := linkOf(t, "cpp", "x.cpp", src)
+	s := siteNamed(l, cTokenAt(t, src, "f();", 0, "f"))
+	if s == nil || s.Shape != wire.ShapeStatic || s.Qualifier != "Base" {
+		t.Fatalf("a.Base::f() is %+v, want a static call qualified Base", s)
+	}
+}
