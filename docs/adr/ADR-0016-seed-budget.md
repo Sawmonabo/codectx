@@ -68,9 +68,8 @@ condition that an entry's grade depends only on its own routes, and no margin re
 
 ### 3. The read stops at a score below which no unread match can rank above the packed files
 
-- Lexical matches are read in score order through the internal search call, which takes a depth or minimum-score
-  parameter and grows its depth until the floor is passed; the 200-item page is a wire bound and does not apply to
-  this in-process call.
+- Lexical matches are read in score order through the internal search call, which takes a depth and grows it until
+  the floor is passed; the 200-item page is a wire bound and does not apply to this in-process call.
 - τ(next) is the largest final score anything derived from the next unread match could reach: its origin
   contribution, a route at the full scale, and every boost the root could lend. It is computed with the compiler's own
   integer functions, never with a floating ratio. With the boosts scaled by root weight (decision 1), the margin is
