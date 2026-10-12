@@ -326,9 +326,11 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
 
 The exact tiers (path and symbol lookup) come first and are not ranked: each returns every match, ordered by the
 content key (path, start byte, end byte, kind, name, qualified name, signature, node id), with score 0. A node is
-served once, at its tier: the earliest exact tier any of its visible rows matches (a row declared in the file the
-query names, a qualified name equal to the query, a qualified name the query prefixes, a name equal to the query),
-which a later tier's walk asks of the earlier tiers for the node itself. The rule is a function of the generation and
+served once, at its tier: the earliest exact tier that serves it, that is, whose row for the node passes the
+request's kind, path and language filters (a row declared in the file the query names, a qualified name equal to
+the query, a qualified name the query prefixes, a name equal to the query; for the symbol tiers, the row the tier
+lists for the node is the precedence winner among the node's rows matching it). A later tier's walk asks the earlier
+tiers for the node itself. The rule is a function of the generation and
 the query, so it holds across pages with nothing carried between them. A lexical result whose node an exact tier
 served for the same query is dropped from the lexical sequence, by the same rule over every visible row of the node.
 

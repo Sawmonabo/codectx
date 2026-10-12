@@ -443,8 +443,9 @@ A ranked search answers with its best results, a page at a time
 qualified-name prefix, exact name — come first, in that order, and are not
 ranked: each returns every match, ordered by the content key (path, start
 byte, end byte, kind, name, qualified name, signature, node id), with score 0.
-A node is served once, at the earliest exact tier any of its declarations
-matches, even when the units that declare it disagree about its names.
+A node is served once, at the earliest exact tier that matches one of its
+declarations inside the request's filters, even when the units that declare it
+disagree about its names or its file.
 
 **Then the lexical tier.** The index returns the page's limit plus one of the
 results ranked after the last one served, so it knows whether another page
