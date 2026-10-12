@@ -659,14 +659,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
-		BusyTimeout:        cfg.Storage.BusyTimeout.Std(),
-		ReadConnections:    config.ReadConnections(cfg),
-		PostingConnections: config.PostingConnections(cfg),
-		WriterCacheKiB:     cfg.Storage.WriterCacheKiB,
-		ReaderCacheKiB:     cfg.Storage.ReaderCacheKiB,
-		BatchRecords:       cfg.Index.BatchRecords,
-		BatchBytes:         cfg.Index.BatchBytes,
-		MaxJSONBytes:       cfg.Context.MaxManifestBytes.Value(),
+		BusyTimeout:     cfg.Storage.BusyTimeout.Std(),
+		ReadConnections: config.ReadConnections(cfg),
+		WriterCacheKiB:  cfg.Storage.WriterCacheKiB,
+		ReaderCacheKiB:  cfg.Storage.ReaderCacheKiB,
+		BatchRecords:    cfg.Index.BatchRecords,
+		BatchBytes:      cfg.Index.BatchBytes,
+		MaxJSONBytes:    cfg.Context.MaxManifestBytes.Value(),
 		// Seal clips to the same number the providers emitted under, so the
 		// retained set does not depend on whether a unit was assembled fresh
 		// or merged from carried occurrences.
@@ -693,14 +692,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// A LazyWriter open still creates the schema of an empty cache for
 		// exactly that reason, and writes nothing on any other.
 		if s.queryStore, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
-			BusyTimeout:        cfg.Storage.BusyTimeout.Std(),
-			ReadConnections:    config.QueryReadConnections(cfg),
-			PostingConnections: config.PostingConnections(cfg),
-			ReaderCacheKiB:     cfg.Storage.ReaderCacheKiB,
-			MaxJSONBytes:       cfg.Context.MaxManifestBytes.Value(),
-			Synchronous:        cfg.Storage.Synchronous,
-			ReadOnly:           true,
-			TextIndex:          s.textIndexOptions(),
+			BusyTimeout:     cfg.Storage.BusyTimeout.Std(),
+			ReadConnections: config.QueryReadConnections(cfg),
+			ReaderCacheKiB:  cfg.Storage.ReaderCacheKiB,
+			MaxJSONBytes:    cfg.Context.MaxManifestBytes.Value(),
+			Synchronous:     cfg.Storage.Synchronous,
+			ReadOnly:        true,
+			TextIndex:       s.textIndexOptions(),
 		}); err != nil {
 			return nil, err
 		}

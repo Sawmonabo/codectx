@@ -53,7 +53,7 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 		Short: "Diagnose this installation and the named workspace",
 		Long: "Runs the Section 22 diagnostic checks against the named repository, or the " +
 			"current directory when no path is given: build and toolchain pins, workspace " +
-			"and data-directory permissions, free space, the SQLite schema, FTS and WAL, " +
+			"and data-directory permissions, free space, the SQLite schema, WAL and search index, " +
 			"the active generation pointer, recent capture and freshness, sampled content " +
 			"blocks, bundled grammar availability, managed toolchain status per lock entry, " +
 			"orphan temporary state and session and lease retention.\n\n" +
@@ -129,16 +129,12 @@ func runDoctor(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 // report this command refused to print is a diagnosis the operator never sees.
 func doctorReport(ctx context.Context, build model.BuildInfo, root string,
 	req model.DoctorRequest) (model.DoctorReport, error) {
-	// A shallow report only reads, so it opens without a writer connection and
-	// answers throughout another process's index. A deep report does not: the
-	// search index's own integrity check is spelled as an insert into the
-	// virtual table and needs the writer, so --deep opens the report
-	// composition, which still takes no workspace lock.
-	open := app.OpenWorkspaceForQuery
-	if req.Deep {
-		open = app.OpenWorkspaceForReport
-	}
-	ws, openErr := open(ctx, root)
+	// A report only reads, shallow or deep, so it opens without a writer
+	// connection and answers throughout another process's index. The deep
+	// checks read too: the database walks run on the reader pool, and the
+	// search index is checked by reading its last commit's generation, which
+	// a read-only open of the index serves.
+	ws, openErr := app.OpenWorkspaceForQuery(ctx, root)
 	if openErr != nil {
 		return unopenableReport(build, req, openErr, time.Now().UTC()), nil
 	}

@@ -112,8 +112,8 @@ Four kinds of command, by what they may change:
 | | Workspace lock | Database writes | Commands |
 |---|---|---|---|
 | **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
-| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep` |
-| **Answering** | None | **None at all** | `status`, `search`, `symbol`, `refs`, `callers`, `callees`, `path`, `impact`, `repomap`, `doctor` |
+| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc` |
+| **Answering** | None | **None at all** | `status`, `search`, `symbol`, `refs`, `callers`, `callees`, `path`, `impact`, `repomap`, `doctor` (with or without `--deep`) |
 | **Both** | Held for each refresh and each watch beat, never between them | The refresh's own; its exploration tools write nothing | `mcp serve` |
 
 `tools status` is in neither row: it opens the managed-tool store and no
@@ -205,8 +205,6 @@ Two consequences an operator sees:
   walk and a `path` search re-stamp their state on every page, so their deadline
   advances with the walk. A `search` keeps no state between pages at all: its
   cursor carries its own position.
-* `doctor --deep` is in the recording row, not the answering one: it opens the
-  store as the writer. It still takes no workspace lock.
 
 ### The one process that is both
 
@@ -538,7 +536,10 @@ holds the search documents of every retained unit; a generation is the set of
 documents it makes visible, so the directory does not grow a copy per
 snapshot. Its segments merge in the background, each segment has a block
 summary file (`.cxsum`) beside it, and a document leaves the index when
-collection removes the last row that names it.
+collection removes the last row that names it. The store removes the directory
+when it creates a fresh database: an index found beside a database being
+created belongs to one that was removed without it, and its documents would
+answer under the new database's ids.
 
 Only the process that indexes holds the index's writer, and it gives the
 writer back after each activation, so a later `index`, `refresh` or `gc` in

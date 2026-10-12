@@ -80,13 +80,13 @@ func TestAReleasedSurfaceIsTakenAgainAndNeverShrinks(t *testing.T) {
 	second.Release()
 
 	// A second purpose is a separate pool: a sort run is never handed out as
-	// a staging database.
-	other, err := a.Take(LexicalStage)
+	// an import spool.
+	other, err := a.Take(ImportSpool)
 	if err != nil {
 		t.Fatalf("take other purpose: %v", err)
 	}
 	if other.Path() == path {
-		t.Fatalf("purpose %s was handed the %s surface %s", LexicalStage, SortRun, path)
+		t.Fatalf("purpose %s was handed the %s surface %s", ImportSpool, SortRun, path)
 	}
 	other.Release()
 }

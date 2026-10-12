@@ -230,7 +230,7 @@ func (f *fixture) publish(gen model.GenerationID, run model.ProviderRunID, d doc
 			ID: model.H("search-fixture-doc", d.path, hash, string(rune('a'+i))), NodeID: nodeID,
 			FileID: fileID, Path: d.path, Kind: model.NodeFunction, Name: d.name,
 			QualifiedName: d.qualifiedName, Signature: d.signature,
-			Bytes: model.ByteRange{Start: 0, End: end}, Body: d.body, TokenCount: 1,
+			Bytes: model.ByteRange{Start: 0, End: end}, Body: d.body,
 		})
 	}
 	if err := w.PutSearchUnits(f.ctx, units); err != nil {

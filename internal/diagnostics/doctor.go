@@ -346,8 +346,9 @@ func (s *Service) checkFreeDisk(ctx context.Context) model.DoctorCheck {
 // checkStorage runs the integrity checks. deep is passed straight through, and
 // it decides which check this row reports: shallow reads the database header,
 // the schema fingerprint and the journal mode -- all constant cost -- while
-// quick_check, the foreign key check and the full-text index walk are O(database
-// bytes) and belong to --deep alone.
+// quick_check, the foreign key check and the search document id check are
+// O(database bytes) and belong to --deep alone, with the search index's commit
+// check beside them.
 //
 // A shallow pass is therefore reported `unverified`, never `pass`. The row is
 // still emitted with the flag that verifies it: nothing is dropped from the

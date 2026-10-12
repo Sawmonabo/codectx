@@ -41,7 +41,7 @@ func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 	const each = 128 << 10
 	var held int64
 	// Two directories, each holding a different surface.
-	for _, p := range []scratch.Purpose{scratch.SortRun, scratch.LexicalStage} {
+	for _, p := range []scratch.Purpose{scratch.SortRun, scratch.ImportSpool} {
 		lease, f, err := scratch.For(t.TempDir()).TakeFile(p)
 		if err != nil {
 			t.Fatalf("take %s: %v", p, err)

@@ -769,8 +769,8 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 //
 // The pending mark is what Recover reconciles against: a unit whose rows are
 // durable but whose documents never reached a library commit is failed and
-// rebuilt (reconcileSearch). SearchUnit.TokenCount is ignored: the library
-// counts every column's tokens with its own tokenizer at add time.
+// rebuilt (reconcileSearch). A document's length is the library's own: it
+// counts every column's tokens with its tokenizer when the document is added.
 func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)

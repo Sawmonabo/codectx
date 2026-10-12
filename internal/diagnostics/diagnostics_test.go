@@ -263,7 +263,7 @@ var scenarios = []scenario{
 		name: "doctor never repeats a probe's own text",
 		run: func(t *testing.T) {
 			leak := &model.Error{Code: model.CodeStorageCorrupt,
-				Message:     `quick_check: SELECT * FROM search_fts failed at /home/private/.local/share/codectx/codectx.db (acme-analyzer 4.1)`,
+				Message:     `quick_check: SELECT * FROM search_units failed at /home/private/.local/share/codectx/codectx.db (acme-analyzer 4.1)`,
 				Remediation: "inspect /home/private/.local/share/codectx by hand"}
 			opts := Options{
 				Store:     &fakeStore{err: leak},
@@ -279,7 +279,7 @@ var scenarios = []scenario{
 				t.Fatalf("report state is %q, want %q when every probe failed", rep.State, model.CheckFail)
 			}
 			for _, c := range rep.Checks {
-				for _, secret := range []string{"SELECT", "search_fts", "quick_check", "/home/private", "acme-analyzer"} {
+				for _, secret := range []string{"SELECT", "search_units", "quick_check", "/home/private", "acme-analyzer"} {
 					for field, value := range map[string]string{"detail": c.Detail, "remediation": c.Remediation, "code": c.Code} {
 						if strings.Contains(value, secret) {
 							t.Fatalf("check %q %s repeated %q from the probe's own message: %q", c.Name, field, secret, value)

@@ -253,9 +253,8 @@ func (s *Service) pendingWatchEvents(ctx context.Context, report *model.Resource
 //
 // The three are the reservations config.BaseFootprint adds to this build's idle
 // overhead from the resources and index blocks; it also adds every page cache
-// the process opens (the store's writer and readers, lexical staging per unit
-// built at once, the tokenizer and the run ledger), which the storage block
-// states. The report states them and
+// the process opens (the store's writer and readers and the run ledger), which
+// the storage block states. The report states them and
 // derives nothing -- a second implementation of that arithmetic would drift
 // from the one the allocation is computed against. None of the three is
 // checked against a ceiling: the footprint follows the reservations, so there
