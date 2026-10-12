@@ -36,15 +36,9 @@ type processMemoryCountersEx struct {
 }
 
 // treeSweeper sweeps the job the child was assigned to (jobObject.started),
-// which holds every descendant the child starts, whatever its parent. It is
-// nil where no job is registered for the child, which the runner never
-// produces: sampling starts only after the job holds it.
-func treeSweeper(pid int) func() treeSweep {
-	job, ok := runningJob(uint32(pid))
-	if !ok {
-		return nil
-	}
-	return func() treeSweep { return sweepJob(job) }
+// which holds every descendant the child starts, whatever its parent.
+func treeSweeper(job treeTarget) func() treeSweep {
+	return func() treeSweep { return sweepJob(windows.Handle(job)) }
 }
 
 // sweepJob sums the anonymous resident memory of every process in the job.

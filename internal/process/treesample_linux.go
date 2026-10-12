@@ -13,10 +13,16 @@ import (
 )
 
 // treeSampled reports that this platform can observe a running process tree's
-// resident memory. Where it is false the runner records the figure as
-// unavailable rather than as zero, which Section 22 requires: a missing
-// measurement that reads as "used no memory" is worse than no measurement.
+// resident peak, its transferred bytes and its processor time. Where it is
+// false the runner records those figures as unavailable rather than as zero,
+// which Section 22 requires: a missing measurement that reads as "used no
+// memory" is worse than no measurement.
 const treeSampled = true
+
+// treeAnonSampled reports that this platform reads a running tree's
+// anonymous resident memory, which the allocation adds back
+// (Runner.ReservedResidentBytes).
+const treeAnonSampled = true
 
 // treeSampler keeps the peak of the summed resident set size over a process
 // group, sampled while the group runs.
@@ -57,7 +63,7 @@ type treeSampler struct {
 // the group ID, and a descendant that re-parents away from it stays in the
 // group. Membership by group, not by parent, is also exactly what the runner
 // terminates.
-func startTreeSampler(pgid int, interval time.Duration) *treeSampler {
+func startTreeSampler(pgid treeTarget, interval time.Duration) *treeSampler {
 	s := &treeSampler{stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
@@ -66,7 +72,7 @@ func startTreeSampler(pgid int, interval time.Duration) *treeSampler {
 		for {
 			// The sweep comes first so that a child which exits inside the
 			// first interval is still measured at least once.
-			sums := sumGroup(pgid)
+			sums := sumGroup(int(pgid))
 			if sums.rss > s.sample.peakBytes {
 				s.sample.peakBytes = sums.rss
 			}

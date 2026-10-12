@@ -200,6 +200,9 @@ type ledgerAllocation struct {
 	baseFootprintBytes int64
 	runners            []*process.Runner
 	workers            atomic.Int64
+	// observe reads the kernel's figure: admission.ObserveMachine, set at
+	// composition.
+	observe func() admission.Machine
 }
 
 // parserResidency is the parser provider's Rederive step: it records the
@@ -209,7 +212,7 @@ func (a *ledgerAllocation) parserResidency(workerResidentBytes int64) {
 }
 
 func (a *ledgerAllocation) rederive() {
-	m := admission.ObserveMachine()
+	m := a.observe()
 	if !m.Observed {
 		return
 	}
@@ -842,7 +845,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// so the first admission on the ledger already counts every ledger
 	// child's residency (ledgerAllocation).
 	derived := &ledgerAllocation{l: s.admission, baseFootprintBytes: baseFootprint,
-		runners: []*process.Runner{shared, parsers, servers}}
+		runners: []*process.Runner{shared, parsers, servers}, observe: admission.ObserveMachine}
 	s.admission.RederiveBeforeEachAdmission(derived.rederive)
 
 	if root.HasGit {

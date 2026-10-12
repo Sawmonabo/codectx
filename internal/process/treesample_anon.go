@@ -16,6 +16,10 @@ import (
 // (Section 22).
 const treeSampled = false
 
+// treeAnonSampled reports that the running tree's anonymous resident memory
+// is read here.
+const treeAnonSampled = true
+
 // treeSampler keeps the running tree's summed anonymous resident set as of
 // the last sweep that found the tree (treeSweeper, per platform), sampled
 // while the tree runs. It is read while the run is going, by the
@@ -38,14 +42,10 @@ type treeSweep struct {
 	read  bool
 }
 
-// startTreeSampler begins sampling the tree rooted at the child pid every
-// interval. It is nil, and every figure unavailable, where the platform gives
-// no way to address the tree (treeSweeper).
-func startTreeSampler(pid int, interval time.Duration) *treeSampler {
-	sweep := treeSweeper(pid)
-	if sweep == nil {
-		return nil
-	}
+// startTreeSampler begins sampling the child's tree every interval: the
+// process group on macOS and the job on Windows (treeSweeper).
+func startTreeSampler(tree treeTarget, interval time.Duration) *treeSampler {
+	sweep := treeSweeper(tree)
 	s := &treeSampler{stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)

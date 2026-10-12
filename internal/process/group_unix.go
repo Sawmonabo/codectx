@@ -27,6 +27,15 @@ func (processGroup) prepare(cmd *exec.Cmd) error {
 
 func (processGroup) started(*exec.Cmd) error { return nil }
 
+// treeTarget is what the tree sampler addresses outside Windows: the child's
+// process group.
+type treeTarget int
+
+// target is the child's process group. prepare makes the child a group
+// leader, so its process ID is the group ID, and a descendant that
+// re-parents away from it stays in the group.
+func (processGroup) target(cmd *exec.Cmd) treeTarget { return treeTarget(cmd.Process.Pid) }
+
 // terminate signals the whole group: SIGTERM first so a tool can shut down and
 // remove its own temporary files, SIGKILL when it did not.
 func (processGroup) terminate(cmd *exec.Cmd, force bool) {
