@@ -229,9 +229,9 @@ type Storage struct {
 	// with user-private permissions.
 	DataDir     string   `toml:"data_dir"`
 	BusyTimeout Duration `toml:"busy_timeout"`
-	// ReadConnections sizes both reader pools of every store handle when it is
-	// set. 0, the default, sizes each pool by the goroutines that read it
-	// (ReadConnections and PostingConnections in machine.go).
+	// ReadConnections sizes the short-read pool of every store handle when it
+	// is set. 0, the default, sizes each pool by the goroutines that read it
+	// (ReadConnections and QueryReadConnections in machine.go).
 	ReadConnections        int      `toml:"read_connections"`
 	WriterCacheKiB         int      `toml:"writer_cache_kib"`
 	ReaderCacheKiB         int      `toml:"reader_cache_kib"`

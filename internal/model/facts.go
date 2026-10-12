@@ -641,7 +641,6 @@ type SearchUnit struct {
 	Signature     string    `json:"signature,omitempty"`
 	Bytes         ByteRange `json:"bytes"`
 	Body          string    `json:"body"`
-	TokenCount    int64     `json:"token_count"`
 }
 
 // Validate enforces the search_units constraints, including the 32-KiB chunk
@@ -676,9 +675,6 @@ func (u SearchUnit) Validate() error {
 		return err
 	}
 	if err := boundField("search_unit.body", u.Body, MaxSearchBodyBytes); err != nil {
-		return err
-	}
-	if err := requireNonNegative("search_unit.token_count", u.TokenCount); err != nil {
 		return err
 	}
 	return nil

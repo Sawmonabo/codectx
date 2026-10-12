@@ -70,7 +70,7 @@ func New(t *testing.T, files map[string]string) *Harness {
 	// The reader pools are sized as the product sizes them on this machine.
 	cfg := config.Defaults()
 	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{
-		ReadConnections: config.ReadConnections(cfg), PostingConnections: config.PostingConnections(cfg)})
+		ReadConnections: config.ReadConnections(cfg)})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

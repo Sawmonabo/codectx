@@ -115,7 +115,7 @@ func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, salt strin
 			docs = append(docs, model.SearchUnit{ID: model.H("ingest-doc", node.QualifiedName), NodeID: node.ID,
 				FileID: ff.id, Path: ff.path, Kind: model.NodeFunction, Name: node.Name,
 				QualifiedName: node.QualifiedName, Bytes: model.ByteRange{Start: uint64(i * 32), End: uint64(i*32 + 16)},
-				Body: "func " + node.Name + "() { return " + words[(i+3)%len(words)] + " }", TokenCount: 8})
+				Body: "func " + node.Name + "() { return " + words[(i+3)%len(words)] + " }"})
 		}
 		if err := w.PutNodes(f.ctx, facts); err != nil {
 			t.Fatalf("PutNodes(%d): %v", ui, err)

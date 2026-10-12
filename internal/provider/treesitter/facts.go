@@ -1197,7 +1197,7 @@ func (b *builder) searchUnit(d *declFact) model.SearchUnit {
 	return model.SearchUnit{
 		ID: model.H(searchDomain, string(b.fv.ID), string(d.res.Node.ID)), NodeID: d.res.Node.ID, FileID: b.fv.ID, Path: b.fv.Path,
 		Kind: d.res.Node.Kind, Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
-		Bytes: model.ByteRange{Start: uint64(d.Start), End: uint64(d.End)}, Body: body, TokenCount: int64(len(strings.Fields(body))),
+		Bytes: model.ByteRange{Start: uint64(d.Start), End: uint64(d.End)}, Body: body,
 	}
 }
 

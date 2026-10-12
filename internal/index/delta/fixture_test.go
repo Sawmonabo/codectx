@@ -62,7 +62,7 @@ func newFixture(t *testing.T) *fixture {
 	dbPath := filepath.Join(dataDir, "codectx.db")
 	cfg := config.Defaults()
 	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{
-		ReadConnections: config.ReadConnections(cfg), PostingConnections: config.PostingConnections(cfg)})
+		ReadConnections: config.ReadConnections(cfg)})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

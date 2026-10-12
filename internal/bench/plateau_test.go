@@ -249,7 +249,7 @@ func TestIncrementalReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults()), PostingConnections: config.PostingConnections(config.Defaults())})
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{ReadConnections: config.ReadConnections(config.Defaults())})
 	if err != nil {
 		t.Fatal(err)
 	}

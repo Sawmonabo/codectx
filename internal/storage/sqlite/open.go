@@ -42,10 +42,6 @@ type Options struct {
 	// ReadConnections sizes the short-read pool: unit states, dependency
 	// aliases and every query's short reads.
 	ReadConnections int
-	// PostingConnections is accepted and ignored: the store has no posting
-	// pool, since the search library holds the postings. The field stays only
-	// until the composition callers stop setting it.
-	PostingConnections int
 	// TextIndex sizes the search index the store opens beside its database.
 	// Dir and Writable are the store's: the directory is `<database path>.search`
 	// and it is writable unless ReadOnly is set. A zero WriterThreads is one
