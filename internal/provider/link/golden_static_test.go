@@ -161,7 +161,9 @@ var staticGoldens = []golden{
 		anchor: "ISO/IEC 14882 (C++) [class.virtual] (the final overrider), [expr.call] (a qualified call calls the named function), [expr.type.conv], [class.derived]",
 		files:  fixture("dispatch-cpp"),
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
-		// the binding rules alone); the two agree on every fact.
+		// the binding rules alone); the two agree on every fact. Checked against the pinned grammar's tree:
+		// the name of `a.Animal::sound()` is a qualified_identifier whose last part is a field_identifier,
+		// and each argument `p` reads main's local p.
 		want: []string{
 			"speak sound -> asound sound virtual",
 			"walk sound -> dsound sound virtual",
@@ -183,6 +185,9 @@ var staticGoldens = []golden{
 		},
 		// Mutation: read dispatch from the technique -> `a.Animal::sound()` and `Dog().sound()` carry
 		// virtual. Mutation: publish per override -> `a.sound()` binds Dog's and Puppy's sound.
+		// Mutation: remove the pattern that captures a qualified member call (`a.Animal::sound()`) -> the
+		// worker's site joins no call reference, so the `exact sound` line is missing and the unit's `calls`
+		// row is partial.
 		fails: "a qualified call or a temporary's call marked virtual; a virtual call published to each override",
 	},
 	{
@@ -311,7 +316,7 @@ void run(int x) { // @run
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every fact. g and h are the only functions whose address
 		// is taken, both of fp's type, so `fp(x)` may call either and x reaches the parameter of each.
-		// Unprobed: the C worker's argument reads.
+		// Checked against the pinned grammar's tree: the argument `x` of `fp(x)` reads run's parameter x.
 		want: []string{
 			"c1 fp -> g g exact set=2",
 			"c1 fp -> h h exact set=2",
@@ -494,7 +499,8 @@ func use(r ReadCloser) {
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every fact. io.Reader's method set is in no table, so a
-		// type satisfies ReadCloser only by embedding io.Reader too.
+		// type satisfies ReadCloser only by embedding io.Reader too. Checked against the pinned grammar's
+		// tree: ReadCloser's Close is a method_elem, sent abstract.
 		want: []string{
 			"u1 Read -> external io.Reader.Read virtual",
 			"u2 Close -> rcclose Close virtual",
@@ -536,7 +542,8 @@ func use(r ReadCloser) {
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding. repo is Base's field, inherited by
-		// Service and read from Service's inner class.
+		// Service and read from Service's inner class, where the bare name is read as `this.repo` is, the
+		// field of Inner, then of the class enclosing it.
 		want: []string{
 			"u1 save -> save save virtual",
 			"u2 save -> save save virtual",

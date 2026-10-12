@@ -106,7 +106,11 @@ function indirect() {
 }
 `}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "area"}, targets: 2, dispatch: model.DispatchExact},
 	// Derived twice from the source and the anchor, the second time blind (the source,
-	// the anchor and the binding rules alone); the two agree on both sites.
+	// the anchor and the binding rules alone); the two agree on both sites. The
+	// TypeScript compiler (strict) reports no diagnostic; it resolves `f(1)` to seven
+	// and `s.area()` to Square's area only, the type it infers from s's initializer,
+	// to which a Circle is assignable. s carries no written type, so both classes'
+	// methods are its targets by value flow (ADR-0015 decision 1).
 	{name: "typescript", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.ts": `class Square { area(): number { return 4; } }
 class Circle { area(): number { return 3; } }
 function seven(n: number): number { return n + 7; }
@@ -121,7 +125,11 @@ function indirect(): number {
 }
 `}, indirect: [2]string{"indirect", "seven"}, several: [2]string{"ambiguous", "area"}, targets: 2, dispatch: model.DispatchExact},
 	// Derived twice from the source and the anchor, the second time blind (the source,
-	// the anchor and the binding rules alone); the two agree on both sites.
+	// the anchor and the binding rules alone); the two agree on both sites. The
+	// TypeScript compiler (strict) reports no diagnostic; it resolves `f(1)` to seven
+	// and `s.area()` to Square's area only, the type it infers from s's initializer,
+	// to which a Circle is assignable. s carries no written type, so both classes'
+	// methods are its targets by value flow (ADR-0015 decision 1).
 	{name: "tsx", anchor: `ECMA-262 §13.3.6 (Function Calls), §13.3.2 (Property Accessors)`, files: map[string]string{"calls.tsx": `class Square { area(): number { return 4; } }
 class Circle { area(): number { return 3; } }
 function seven(n: number): number { return n + 7; }

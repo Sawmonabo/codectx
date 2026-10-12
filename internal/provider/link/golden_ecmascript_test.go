@@ -370,7 +370,8 @@ main(); // @top
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding. A receiver of a declared type calls the
 		// method that type declares, once, virtual: Animal's for `a`, Dog's for `d`, the interface's own
-		// signature for `s`; the overrides are reached at query time.
+		// signature for `s`; the overrides are reached at query time. The TypeScript compiler (strict)
+		// reports no diagnostic and resolves each call to the declaration its line names here.
 		want: []string{
 			"s1 sound -> as sound virtual",
 			"s2 sound -> ds sound virtual",
@@ -409,7 +410,9 @@ class B extends Thread { // @tb
 		// the binding rules alone); the two agree on every fact. Both modules are outside the project, so
 		// each imported name is its module's: an `implements` clause names an interface, an `extends`
 		// clause a class. A's run carries no `override` modifier, so it publishes no override of a type
-		// outside the project. Unprobed: no TypeScript compiler checked the source.
+		// outside the project. The TypeScript compiler (strict), given declarations of both modules, reports
+		// no diagnostic; without them it reports the two missing modules and, its base then unknown, the
+		// `override` on B's run.
 		want: []string{},
 		facts: []string{
 			"ta A implements external tasks.Runnable",
@@ -452,7 +455,8 @@ new Dog().sound(); // @t3
 `,
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
-		// the binding rules alone); the two agree on every binding.
+		// the binding rules alone); the two agree on every binding. The TypeScript compiler (strict) reports
+		// no diagnostic and resolves each call to the declaration its line names here.
 		want: []string{
 			"sup sound -> ds sound exact",
 			"s1 sound -> as sound virtual",

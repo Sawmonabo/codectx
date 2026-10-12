@@ -30,7 +30,9 @@ import (
 //
 // A field read is sent as the field it reads, TypeField "Owner.field"
 // (wire.TypeField): `this.f` is the enclosing type's field, a bare name a
-// field in scope is its declaring type's, `x.f` the field of x's type and
+// field in scope is its declaring type's, a bare name nothing of the file
+// binds and no type spells is the enclosing type's, as `this.f` is, `x.f`
+// the field of x's type and
 // `T.f` the field of the type T as written; a field of such a field appends
 // its name. Each field, constant and enum constant whose type the file
 // declares is an Export whose Returns is that type, so the linker types the
@@ -916,6 +918,16 @@ func (k *javaLinker) exprType(n Node) wire.Type {
 				return wire.Type{Kind: wire.TypeField, Name: b.owner + "." + string(k.text(n))}
 			}
 			return k.bound[k.vars.at(i).v].typ
+		}
+		// A name no variable of the file binds that no type spells
+		// (qualifier) is a field the enclosing class inherits or an
+		// enclosing class's (JLS §6.5.6.1, §8.1.3), read as `this.f` is:
+		// the linker walks the class's supertypes, then its enclosing
+		// classes.
+		if text := k.text(n); !k.types[view(text)] && !javaTypeLike(text) {
+			if t := k.thisType(); t.Name != "" {
+				return wire.Type{Kind: wire.TypeField, Name: t.Name + "." + string(text)}
+			}
 		}
 	case j.this:
 		return k.thisType()
