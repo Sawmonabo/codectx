@@ -751,7 +751,8 @@ func writeRelationTable(b *strings.Builder, relations []model.Relation) {
 // each node with where it is, each relation with how it may run -- through a
 // base method, an override a call may dispatch to, one of n targets, a call
 // matched by name only -- and the byte ranges of its call sites, then the
-// structured counts. Byte ranges are printed as bytes: the answer carries no
+// structured counts. A node's name token is printed after its range when the
+// answer carries one. Byte ranges are printed as bytes: the answer carries no
 // line numbers, and a byte offset is never presented as one.
 func writeCallAnswer(b *strings.Builder, result model.GraphResult) {
 	where := map[model.NodeID]model.NodeLocation{}
@@ -770,6 +771,9 @@ func writeCallAnswer(b *strings.Builder, result model.GraphResult) {
 			at := ""
 			if l, ok := where[n.ID]; ok {
 				at = fmt.Sprintf("  %s bytes %d-%d", l.Path, l.Bytes.Start, l.Bytes.End)
+				if l.NameBytes != nil {
+					at += fmt.Sprintf(" name %d-%d", l.NameBytes.Start, l.NameBytes.End)
+				}
 			}
 			fmt.Fprintf(b, "  %s  %-12s %s%s\n", n.ID, clip(string(n.Kind), 12), clip(name, 80), at)
 		}

@@ -90,8 +90,10 @@ as itself rather than arriving as a complete answer with per-hit footnotes. Run
 
 **Where everything is.** A `callers`, `callees` or `path` answer carries a
 `locations` entry for every node it lists — the file, its path in the pinned
-snapshot and the node's byte range — and an `occurrences` entry for every call
-site behind every `calls` relation it lists, each with its file, byte range,
+snapshot, the node's byte range and, for a declaration, its name token's byte
+range (`name_bytes`, absent for a node with no name token of its own) — and an
+`occurrences` entry for every call site behind every `calls` relation it lists,
+each with its file, byte range,
 `dispatch` (`virtual` when the call can run an override of its target, `exact`
 when it cannot) and, for a site bound to several targets, its `set_size`. One
 answer is enough to open a call hierarchy: no follow-up `symbol` or `refs` call

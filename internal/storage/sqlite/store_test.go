@@ -1365,7 +1365,7 @@ func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a
 // and it is what proves the delta unit REFERENCES the same dictionary rows the
 // full import did, which hydrating back to hex would hide.
 var factColumns = []struct{ table, cols string }{
-	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
+	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), coalesce(name_start_byte,-1), coalesce(name_end_byte,-1), metadata_json"},
 	{"relation_facts", "relation_id"},
 	{"native_aliases", "scope_key_id, native_key_id, node_id"},
 	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), start_byte, end_byte"},
