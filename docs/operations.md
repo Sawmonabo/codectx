@@ -538,7 +538,10 @@ holds the search documents of every retained unit; a generation is the set of
 documents it makes visible, so the directory does not grow a copy per
 snapshot. Its segments merge in the background, each segment has a block
 summary file (`.cxsum`) beside it, and a document leaves the index when
-collection removes the last row that names it.
+collection removes the last row that names it. The store removes the directory
+when it creates a fresh database: an index found beside a database being
+created belongs to one that was removed without it, and its documents would
+answer under the new database's ids.
 
 Only the process that indexes holds the index's writer, and it gives the
 writer back after each activation, so a later `index`, `refresh` or `gc` in
