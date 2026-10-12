@@ -207,20 +207,22 @@ func decodeSigUse(raw []byte) (sigUse, error) {
 }
 
 // resolution is what one build's resolution leaves: the bindings by site;
-// for the static family, the index groups by key, the recorded reads by
-// key and the address-taken functions by the member taking them, empty for
-// the flow family; for the flow family, the boundary contributions and the
-// boundary entries read, by entry (refresh.go), empty for the static
-// family; and the hierarchy, which a later build of the same layout reads
-// instead of reading every table.
+// the index groups by key; for the static family, the recorded reads by key
+// and the address-taken functions by the member taking them, empty for the
+// flow family; for the flow family, every node's contributions and reads by
+// entry and its lookups by key (refresh.go), empty for the static family;
+// and the hierarchy, with the flow family's module index, which a later
+// build of the same layout reads instead of reading every table.
 type resolution struct {
-	bindings      *pagination.SortedRun[idBinding]
-	groups        *pagination.SortedRun[group]
-	reads         *pagination.SortedRun[read]
-	taken         *pagination.SortedRun[taken]
-	contributions *pagination.SortedRun[contribution]
-	flowReads     *pagination.SortedRun[flowRead]
-	h             *hierarchy
+	bindings          *pagination.SortedRun[idBinding]
+	groups            *pagination.SortedRun[group]
+	reads             *pagination.SortedRun[read]
+	taken             *pagination.SortedRun[taken]
+	flowContributions *pagination.SortedRun[idContribution]
+	flowReads         *pagination.SortedRun[idRead]
+	flowTraces        *pagination.SortedRun[nodeTrace]
+	h                 *hierarchy
+	mods              *index
 }
 
 // close releases r. A run or hierarchy r shares with the predecessor's
@@ -231,11 +233,13 @@ func (r *resolution) close() {
 		r.groups.Close()
 		r.reads.Close()
 		r.taken.Close()
-		r.contributions.Close()
+		r.flowContributions.Close()
 		r.flowReads.Close()
+		r.flowTraces.Close()
 		if r.h != nil {
 			_ = r.h.close()
 		}
+		r.mods.close()
 	}
 }
 

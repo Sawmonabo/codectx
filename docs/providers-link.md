@@ -271,10 +271,15 @@ whose bytes changed re-resolves whole. For Go, Java, Rust, C and C++ the state a
 from: a hash of each hierarchy index key's entries, the reverse index from every key a file's resolution read to that
 file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
 identities their positions denote. For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
-identity table, what each member sends across its boundary (each callable's returned values, each argument into
-another member's parameter, each field write, with the stratum, before or after field-based resolution, it arrives
-at), and which boundary entries each member read. Everything is a sorted run on disk; nothing the size of the unit
-is held in memory.
+identity table, a module index (each Python declaration and module under every dotted name its file can be imported
+as; each ECMAScript file under every module path an import may name it by) with the hash of each of its keys'
+entries, and, for every node of the value-flow fixed point (a site, or a file's node owning its callables' returns,
+its field writes, its imports and its hierarchy facts): each value it put into a variable (a parameter, a site's
+result, a callable's returns, a field) with the stratum, before or after field-based resolution, the value arrives at;
+each variable it read; and each key of the hierarchy or the module index it looked up, found or not. All of it is
+named by identity (`internal/provider/link/flowstate.go`): a node by its file and site index, a parameter by its
+callable's node and position, a value by its declaration's node, so an added or removed file renumbers nothing.
+Everything is a sorted run on disk; nothing the size of the unit is held in memory.
 
 The delta build hands `Link` the predecessor's state whenever the predecessor stored one this build can read
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
@@ -297,17 +302,29 @@ What re-resolves:
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
   and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
-  value flow and binding, which a refresh maintains by deleting and re-deriving (Gupta, Mumick and Subrahmanian,
-  "Maintaining Views Incrementally", 1993). When the layout holds, the refresh reuses the stored hierarchy and
-  re-derives a region of members: those whose table moved, with every member on a path between them in the stored
-  boundary graph, so a value cycling through untouched files is deleted and re-derived with them and cannot keep
-  supporting itself once its source is gone. The region starts from the stored contributions of the members outside
-  it, each at its stratum. The refresh then compares every boundary entry's values with the stored ones: when no
-  member outside the region reads a changed entry it stops, and otherwise the region grows by those readers and
-  every member they reach and is re-derived again. So a body edit that sends no other value re-runs its own file's
-  sites only. Members outside the final region keep their facts, contributions and reads. A refresh whose layout
-  does not hold (a member added, removed or renamed, or a moved table whose interface changed) resolves the unit in
-  full.
+  value flow and binding, decomposed into nodes (each site, and each file's node), which a refresh maintains by
+  deleting and re-deriving at the granularity of nodes (Gupta, Mumick and Subrahmanian, "Maintaining Views
+  Incrementally", 1993). When the layout holds the refresh reuses the stored hierarchy and module index; otherwise it
+  rebuilds both from every table and diffs them group by group. It then re-derives a region of nodes, starting from
+  every node of each member whose table moved, that is added or that is removed, and every node that looked up a key
+  whose group changed (a declaration, export, parameter or module added, removed or changed under it, so an added
+  file's names re-run exactly the sites whose lookups now see them). Until the region settles:
+  - the nodes the stored graph reaches from the region (each reads a variable a region node contributed to) are set
+    aside, and the region runs on the contributions of the remaining, untouched nodes alone. A value the region
+    contributed before that this isolated run and the untouched nodes no longer give its variable (or give only in a
+    later stratum) is removed: its readers outside the region, and every node they reach, join the region, which runs
+    again. A value that cycled from the region through untouched files back into it is never an input of the isolated
+    run, so it cannot keep supporting itself once its source is gone;
+  - with nothing removed, the region runs on the contributions of every node outside it, and each variable whose
+    values or strata now differ from the stored ones adds its readers outside the region, which runs again; when none
+    differ the refresh stops (early cutoff).
+
+  Every node outside the final region read exactly the values and keys it read before, so it keeps its facts,
+  contributions, reads and lookups; the region's are found again, and when the layout holds only the region's tables
+  are read. A body edit whose values come out the same re-runs its own file's sites only; a changed returned value or
+  parameter list re-runs the sites that read it, not their whole files. A cycle whose values reach the edited file
+  only through other files re-runs the cycle's readers of what the edit removed, which is conservative and never
+  unsound.
 
 What is republished (`refresh.diff`): the members whose bytes changed, the added members, the members whose bindings
 changed, and the members whose set of targeted declarations changed (a target's occurrence node is published in its

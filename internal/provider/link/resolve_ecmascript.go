@@ -4,78 +4,73 @@ import (
 	"context"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
 // resolveECMAScript resolves every site of a JavaScript, TypeScript or TSX
 // unit: direct binding through imports and scopes, flow-based type inference
-// (inferTypes) and field-based resolution, over the unit's own hierarchy
-// (emitECMAScript).
+// (inferTypes) and field-based resolution, over the unit's own hierarchy and
+// module index (emitECMAScript).
 func resolveECMAScript(ctx context.Context, u *unit, emit func(Binding) error) error {
 	h, err := buildHierarchy(ctx, u)
 	if err != nil {
 		return err
 	}
 	defer h.close()
-	t, err := inferTypes(ctx, u, h, nil, nil)
+	mods, err := buildModules(ctx, u, h)
+	if err != nil {
+		return err
+	}
+	defer mods.close()
+	t, err := inferTypes(ctx, u, h, nil, nil, nil)
 	if err != nil {
 		return err
 	}
 	defer t.close()
-	return emitECMAScript(ctx, u, h, t, nil, emit)
+	return emitECMAScript(ctx, u, &flowEmit{h: h, mods: mods, t: t, emit: emit})
 }
 
-// emitECMAScript emits the facts of the members only names (every member
-// when nil), whose sites the inference t bound as part of its fixed point,
-// since a site's targets decide what flows into their parameters: one pass
-// over their tables emits, per member, what the fixed point bound with each
-// bound site's argument flows, the external facts of the sites that reach
-// outside the project, the hierarchy facts of its declarations
-// (hierarchy.hierarchyFacts), and what its imports resolve to. An import
-// resolves against every member's module paths, which the hierarchy's file
-// contexts give without reading another member's table.
-func emitECMAScript(ctx context.Context, u *unit, h *hierarchy, t *types, only *pagination.SortedRun[int32],
-	emit func(Binding) error) error {
-	modules, err := newEntrySort(u.dir)
-	if err != nil {
-		return err
-	}
-	defer modules.Close()
-	var member int32 = -1
-	err = u.members(func(model.FileVersion) error {
-		member++
-		fc, found, err := h.fileContext(member)
-		if err != nil || !found {
-			return err
-		}
-		return addECMAScriptModule(member, fc.path, modules)
-	})
-	if err != nil {
-		return err
-	}
-	err = u.filesOf(ctx, only, func(file int32, _ model.FileVersion, tab *Table) error {
+// emitECMAScript emits the facts of the nodes e.only selects (every node
+// when nil), whose sites the inference e.t bound as part of its fixed
+// point, since a site's targets decide what flows into their parameters:
+// one pass over the selected members' tables emits, per site, what the
+// fixed point bound with each bound site's argument flows and the external
+// facts of the sites that reach outside the project, and per file node the
+// hierarchy facts of its declarations (hierarchy.hierarchyFacts) and what
+// its imports resolve to. An import resolves against the module index (every
+// member file under each module path an import may name it by,
+// buildModules), one point lookup per import, without reading another
+// member's table.
+func emitECMAScript(ctx context.Context, u *unit, e *flowEmit) error {
+	h, emit := e.h, e.emit
+	e.start()
+	defer e.stop()
+	return u.filesOf(ctx, e.only, func(file int32, _ model.FileVersion, tab *Table, sel selection) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
-			return err
-		}
-		if err := addECMAScriptImports(file, tab, modules); err != nil {
-			return err
+		if sel.has(fileNode) {
+			e.at(Ref{File: file, Index: fileNode})
+			if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
+				return err
+			}
+			if err := ecmascriptImports(e.mods, file, tab, emit); err != nil {
+				return err
+			}
 		}
 		fc := contextOf(file, tab)
 		for i := range tab.Sites {
-			if err := resolveECMAScriptSite(ctx, h, t, fc, tab, Ref{File: file, Index: int32(i)}, emit); err != nil {
+			if !sel.has(int32(i)) {
+				continue
+			}
+			site := Ref{File: file, Index: int32(i)}
+			e.site(site, tab.Path)
+			if err := resolveECMAScriptSite(ctx, h, e.t, fc, tab, site, emit); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return joinECMAScriptImports(ctx, modules, emit)
 }
 
 // resolveECMAScriptSite emits the facts of one site of tab, the table of the
@@ -165,64 +160,23 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 	return nil
 }
 
-// addECMAScriptModule adds the module records of the member at ordinal
-// file, whose path is p, to modules: the file under each module path an
-// import may name it by (moduleBases, Tag 0).
-func addECMAScriptModule(file int32, p string, modules *pagination.ExternalSort[entry]) error {
-	for _, base := range moduleBases(p, false) {
-		if err := modules.Add(entry{Key: base, Ref: Ref{File: file, Index: -1}}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// addECMAScriptImports adds the import records of the member at ordinal
-// file, whose table is tab, to modules: each of its imports whose specifier
-// a member file can be under the module path it names (moduleBase, Tag 1,
-// Ref.Index the import's index in tab.Imports). A package specifier names
-// no member file and adds nothing.
-func addECMAScriptImports(file int32, tab *Table, modules *pagination.ExternalSort[entry]) error {
+// ecmascriptImports emits what each import of the member at ordinal file,
+// whose table is tab, resolves to: one FactImport per member file under
+// the module path its specifier names (moduleBase), from the module index
+// mods. A package specifier names no member file and resolves to nothing.
+func ecmascriptImports(mods *index, file int32, tab *Table, emit func(Binding) error) error {
 	for i, imp := range tab.Imports {
 		base, ok := moduleBase(tab.Path, imp.Path, false)
 		if !ok {
 			continue
 		}
-		if err := modules.Add(entry{Key: base, Tag: 1, Ref: Ref{File: file, Index: int32(i)}}); err != nil {
+		err := mods.lookup(keyESModule+base, func(m entry) error {
+			return emit(Binding{Kind: FactImport, Site: Ref{File: file, Index: int32(i)},
+				Target: Ref{File: m.Ref.File, Index: -1}, Detail: DetailImport})
+		})
+		if err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// joinECMAScriptImports merges the module records: under each module path,
-// the member files it names precede the imports that name it, and each
-// import is one FactImport per such file. Only one module path's files are
-// held.
-func joinECMAScriptImports(ctx context.Context, modules *pagination.ExternalSort[entry], emit func(Binding) error) error {
-	run, err := modules.Sorted()
-	if err != nil {
-		return err
-	}
-	defer run.Close()
-	key, have := "", false
-	var files []int32
-	return run.Each(func(e entry) error {
-		if !have || e.Key != key {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			key, have, files = e.Key, true, files[:0]
-		}
-		if e.Tag == 0 {
-			files = append(files, e.Ref.File)
-			return nil
-		}
-		for _, f := range files {
-			if err := emit(Binding{Kind: FactImport, Site: e.Ref, Target: Ref{File: f, Index: -1}, Detail: DetailImport}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
 }

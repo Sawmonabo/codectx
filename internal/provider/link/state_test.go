@@ -106,7 +106,7 @@ func TestStateRoundTripsEveryKind(t *testing.T) {
 func TestStateRefusesCorruptAndOldForms(t *testing.T) {
 	dir := t.TempDir()
 	raw := stored(t, dir, nil, []record{{File: "a", Tabled: true}}, everyKind())
-	old := append([]byte("link.resolution.identity\n"), raw[len(stateTag):]...)
+	old := append([]byte("link.resolution.boundary\n"), raw[len(stateTag):]...)
 	for name, state := range map[string][]byte{
 		"old tag":   old,
 		"truncated": raw[:len(raw)-1],

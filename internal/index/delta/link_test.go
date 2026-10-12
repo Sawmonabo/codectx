@@ -146,11 +146,21 @@ func (s *session) callsInto(unit model.UnitID, node int64) int {
 	return n
 }
 
-// countedTables counts the tables read, by path; digests are not counted.
+// countedTables counts the tables read and the flow-family sites resolved
+// (link.Observer), by path; digests are not counted.
 type countedTables struct {
 	link.StoredTables
 	mu    sync.Mutex
 	reads map[string]int
+	sites map[string]int
+}
+
+var _ link.Observer = (*countedTables)(nil)
+
+func (c *countedTables) Resolved(path string) {
+	c.mu.Lock()
+	c.sites[path]++
+	c.mu.Unlock()
 }
 
 func (c *countedTables) Table(ctx context.Context, gen model.GenerationID, fv model.FileVersion) (*link.Table, bool, error) {
@@ -170,6 +180,7 @@ func (c *countedTables) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	clear(c.reads)
+	clear(c.sites)
 }
 
 // structuralProvider is the real structural provider over this test binary
@@ -237,15 +248,13 @@ func (f *fixture) attach(gen model.GenerationID, unit model.UnitID) {
 // leaf's sites and no interface entry and sends no value across its
 // boundary (helper is called with no argument and returns a constant), and
 // compares each refresh with a full build of the same tree (session.check).
-// The refresh re-derives leaf alone: the JavaScript refresh reads no other
-// file's table, and the Python refresh reads each other file's table once,
-// for the module index its import lookups meet, and resolves none of their
-// sites.
+// The refresh re-derives leaf's nodes alone: it reads no other file's table
+// (the hierarchy and the module index are the predecessor's) and resolves
+// no other file's site.
 //
-// Mutation: re-resolve the unit after any moved table -> the JavaScript
-// refresh reads main.js and pets.js, and the Python refresh reads main.py
-// and pets.py again for the inference's scan and the second pass of its
-// sites.
+// Mutation: re-resolve the unit after any moved table -> main and pets are
+// read and their sites resolved again. Mutation: rebuild the Python module
+// index on every refresh -> main.py and pets.py are read.
 func TestFlowBodyEditRerunsNoOtherFile(t *testing.T) {
 	for _, c := range []struct {
 		name         string
@@ -253,7 +262,6 @@ func TestFlowBodyEditRerunsNoOtherFile(t *testing.T) {
 		leaf, before string
 		after        string
 		others       []string
-		maxReads     int
 	}{
 		{
 			name: "javascript",
@@ -265,7 +273,7 @@ func TestFlowBodyEditRerunsNoOtherFile(t *testing.T) {
 					"export function main() {\n  helper();\n  new Dog().speak();\n}\n",
 			},
 			leaf: "leaf.js", before: "  return 1;\n", after: "  other();\n  return 1;\n",
-			others: []string{"main.js", "pets.js"}, maxReads: 0,
+			others: []string{"main.js", "pets.js"},
 		},
 		{
 			name: "python",
@@ -275,7 +283,7 @@ func TestFlowBodyEditRerunsNoOtherFile(t *testing.T) {
 				"main.py": "from leaf import helper\nfrom pets import Dog\n\n\ndef main():\n    helper()\n    Dog().speak()\n",
 			},
 			leaf: "leaf.py", before: "    return 1\n", after: "    other()\n    return 1\n",
-			others: []string{"main.py", "pets.py"}, maxReads: 1,
+			others: []string{"main.py", "pets.py"},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -286,13 +294,75 @@ func TestFlowBodyEditRerunsNoOtherFile(t *testing.T) {
 			b := s.only(s.advance(files))
 			s.check("body adding a call", []linkBuild{b})
 			for _, p := range c.others {
-				if n := b.reads[p]; n > c.maxReads {
-					t.Errorf("the refresh read %s's table %d times, want at most %d: no value it reads moved", p, n, c.maxReads)
+				if n := b.reads[p]; n != 0 {
+					t.Errorf("the refresh read %s's table %d times, want none: no value or name it reads moved", p, n)
+				}
+				if n := b.sites[p]; n != 0 {
+					t.Errorf("the refresh resolved %d of %s's sites, want none: no value or name they read moved", n, p)
 				}
 			}
-			if b.reads[c.leaf] == 0 {
-				t.Errorf("the refresh never read %s's table, whose sites moved", c.leaf)
+			if b.reads[c.leaf] == 0 || b.sites[c.leaf] == 0 {
+				t.Errorf("the refresh read %s's table %d times and resolved %d of its sites, want both: its sites moved",
+					c.leaf, b.reads[c.leaf], b.sites[c.leaf])
 			}
 		})
 	}
+}
+
+// TestRenamedParameterMovesKeywordFlow renames the parameter a of f to b in
+// callee.py, which caller.py calls as f(b=x): before the rename the keyword
+// names no parameter and binds f's **kw; after it, it binds b. The refresh
+// must equal the full build of the same tree (session.check), and the
+// caller's one data_flows_to relation moves from **kw to b. JavaScript and
+// TypeScript have no keyword arguments, so this is Python's alone.
+//
+// Mutation: keep the old parameter target (re-run nothing of caller.py when
+// only callee.py's parameters moved) -> the refreshed unit still flows into
+// **kw and none into b.
+func TestRenamedParameterMovesKeywordFlow(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"callee.py": "def f(a=0, **kw):\n    return a\n",
+		"caller.py": "from callee import f\n\n\ndef g(x):\n    return f(b=x)\n",
+	}
+	base := s.only(s.advance(files))
+	s.check("base", []linkBuild{base})
+	if n := s.flows(base.unit, ""); n != 1 {
+		t.Fatalf("the base unit holds %d data_flows_to relations, want the one of f(b=x) into **kw", n)
+	}
+	if n := s.flows(base.unit, "b"); n != 0 {
+		t.Fatalf("the base unit holds %d data_flows_to relations into a parameter b, want none: f has no b", n)
+	}
+	files = edit{name: "parameter renamed", replace: []sub{{"callee.py", "def f(a=0, **kw):\n    return a\n",
+		"def f(b=0, **kw):\n    return b\n"}}}.apply(t, files)
+	renamed := s.only(s.advance(files))
+	s.check("parameter renamed", []linkBuild{renamed})
+	if n := s.flows(renamed.unit, ""); n != 1 {
+		t.Errorf("the refreshed unit holds %d data_flows_to relations, want the one of f(b=x)", n)
+	}
+	if n := s.flows(renamed.unit, "b"); n != 1 {
+		t.Errorf("the refreshed unit holds %d data_flows_to relations into the parameter b, want f(b=x)'s", n)
+	}
+	if renamed.sites["caller.py"] == 0 {
+		t.Errorf("the refresh resolved none of caller.py's sites, want f(b=x): the parameter it names moved")
+	}
+}
+
+// flows counts unit's data_flows_to relations, into a node of unit named
+// name when name is set.
+func (s *session) flows(unit model.UnitID, name string) int {
+	s.t.Helper()
+	row := unitRowID(s.t, s.db, unit)
+	q := `SELECT count(*) FROM relation_facts rf JOIN relation_ids r ON r.id = rf.relation_id
+		WHERE rf.unit_id = ?1 AND r.kind = ?2`
+	args := []any{row, string(model.RelDataFlowsTo)}
+	if name != "" {
+		q += ` AND r.to_node_id IN (SELECT node_id FROM node_facts WHERE unit_id = ?1 AND name = ?3)`
+		args = append(args, name)
+	}
+	var n int
+	if err := s.db.QueryRow(q, args...).Scan(&n); err != nil {
+		s.t.Fatal(err)
+	}
+	return n
 }

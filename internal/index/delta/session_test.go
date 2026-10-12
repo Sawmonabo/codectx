@@ -47,8 +47,11 @@ type linkBuild struct {
 	unit     model.UnitID
 	full     model.UnitID
 	res      delta.Result
-	// reads is how often the refresh read each file's table.
-	reads map[string]int
+	// reads is how often the refresh read each file's table, and sites how
+	// many of each file's flow-family sites it resolved; fullSites is the
+	// same count for the full build of the tree, when the session ran one
+	// for it.
+	reads, sites, fullSites map[string]int
 	// reused is a unit whose inputs did not move, attached as it was.
 	reused bool
 }
@@ -56,7 +59,7 @@ type linkBuild struct {
 func newSession(t *testing.T) *session {
 	t.Helper()
 	f := newFixture(t)
-	tables := &countedTables{StoredTables: link.StoreTables(f.store), reads: map[string]int{}}
+	tables := &countedTables{StoredTables: link.StoreTables(f.store), reads: map[string]int{}, sites: map[string]int{}}
 	lp := link.New(tables)
 	return &session{t: t, f: f, ts: f.structuralProvider(), tables: tables, lp: lp,
 		a: delta.NewLink(f.store, lp, tables, limits, f.pool), db: f.raw(),
@@ -117,7 +120,7 @@ func (s *session) advance(files map[string]string) []linkBuild {
 			paths: owned, previous: b.previous})
 		s.tables.reset()
 		b.res = applyWithin(s.t, s.a, s.f.ctx, req, 2*time.Minute)
-		b.reads = s.tables.snapshot()
+		b.reads, b.sites = s.tables.snapshot()
 		b.unit = req.Build.Spec.ID
 		s.f.flush()
 		out = append(out, b)
@@ -135,9 +138,11 @@ func (s *session) advance(files map[string]string) []linkBuild {
 			continue
 		}
 		req := s.f.request(s.lp, build{tree: tr, gen: fullGen, cfgHash: "full", scopeKey: b.scope, paths: paths[b.scope]})
+		s.tables.reset()
 		if res := applyWithin(s.t, s.a, s.f.ctx, req, 2*time.Minute); !res.Full {
 			s.t.Fatalf("the full build of %s is %+v, want a build with no predecessor", b.scope, res)
 		}
+		_, b.fullSites = s.tables.snapshot()
 		b.full = req.Build.Spec.ID
 		s.fulls[b.inputs] = b.full
 		s.f.flush()
@@ -234,11 +239,12 @@ func (s *session) wantRepublished(step string, b linkBuild, republished []string
 	}
 }
 
-// snapshot is a copy of the reads counted since the last reset.
-func (c *countedTables) snapshot() map[string]int {
+// snapshot is a copy of the table reads and the sites resolved counted
+// since the last reset.
+func (c *countedTables) snapshot() (reads, sites map[string]int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return maps.Clone(c.reads)
+	return maps.Clone(c.reads), maps.Clone(c.sites)
 }
 
 // script is one language's tree and the edits applied to it in order.

@@ -83,8 +83,8 @@ func renamed(files map[string]string, from, to string) map[string]string {
 // and ECMAScript projects through their edits in a second order, the value
 // cycle and the changed returned value first and the removals in between,
 // and compares each refresh with a full build of the same tree, fact for
-// fact, as TestIncrementalLinkEqualsFullBuild does. A refresh re-derives a
-// region of files from the boundary values the others stored, so which
+// fact, as TestIncrementalLinkEqualsFullBuild does. A refresh re-derives the
+// nodes whose reads moved from the values the others stored, so which
 // values are stored when an edit arrives depends on the edits before it.
 //
 // Mutation: re-derive only the edited file's sites from every other file's
@@ -743,4 +743,106 @@ pub fn call(h: &Holder) -> i32 {
 		{name: "file deleted", remove: []string{"src/util.rs"}},
 		{name: "file renamed", move: [][2]string{{"src/shapes.rs", "src/shapes/mod.rs"}}},
 	},
+}
+
+// TestFlowRefreshWorkFollowsReads refreshes the Python, JavaScript,
+// TypeScript and TSX projects after one edit each, from the base tree,
+// compares every refresh with a full build of the same tree, fact for fact
+// (session.check), and compares the sites the refresh resolved with those
+// the full build resolved (link.Observer): a site re-runs only when its
+// member moved or a value or name it read changed.
+//
+//   - a body edit that changes no interface entry (feed's body) resolves no
+//     site of any other file;
+//   - a changed returned value (make returns a Cat), a changed parameter
+//     list (run gains a parameter) and a rename (run becomes execute)
+//     resolve some of main's sites, those that read the changed value or
+//     name, and not all of them, and no site of the value cycle or of ui;
+//   - a new export (later, which main imports) resolves main's sites and
+//     none of the cycle's or ui's;
+//   - a file added (extra) resolves its own sites and none of main's,
+//     factory's, the cycle's or ui's;
+//   - a file deleted (pets) resolves the sites that named its classes
+//     (factory's, ring_a's) and none of ui's;
+//   - a file renamed (factory to maker) resolves maker's and main's sites
+//     and none of the cycle's or ui's.
+//
+// Each file named as resolving nothing has sites the full build resolves.
+// Mutation: fall back to a full resolution -> every witness resolves all
+// its sites. Mutation: re-run every site of a member any of whose nodes
+// re-runs (the member region) -> main resolves all its sites after the
+// changed returned value, the changed parameter list and the rename.
+func TestFlowRefreshWorkFollowsReads(t *testing.T) {
+	ring := []string{"ring_a", "ring_b", "ring_c"}
+	type work struct {
+		edit string
+		// none resolve no site, some resolve some sites but not all, and
+		// ran resolve at least one.
+		none, some, ran []string
+	}
+	cases := []work{
+		{edit: "body edit keeps the parameters", none: append([]string{"main", "ui"}, ring...), ran: []string{"factory"}},
+		{edit: "changed returned value", none: append([]string{"ui"}, ring...), some: []string{"main"}},
+		{edit: "changed parameter list", none: append([]string{"ui"}, ring...), some: []string{"main"}},
+		{edit: "rename", none: append([]string{"ui"}, ring...), some: []string{"main"}},
+		{edit: "new declaration", none: append([]string{"ui"}, ring...), ran: []string{"main"}},
+		{edit: "file added", none: append([]string{"main", "factory", "ui"}, ring...), ran: []string{"extra"}},
+		{edit: "file deleted", none: []string{"ui"}, ran: []string{"factory", "ring_a"}},
+		{edit: "file renamed", none: append([]string{"ui"}, ring...), ran: []string{"maker", "main"}},
+	}
+	for _, l := range []struct {
+		sc    script
+		ext   string
+		param edit
+	}{
+		{pythonScript, ".py", edit{name: "changed parameter list", replace: []sub{{"factory.py", "def run(x):", "def run(x, y=0):"}}}},
+		{javascriptScript, ".js", edit{name: "changed parameter list",
+			replace: []sub{{"factory.js", "export function run(x) {", "export function run(x, y) {"}}}},
+		{typescriptScript, ".ts", edit{name: "changed parameter list",
+			replace: []sub{{"factory.ts", "export function run(x: number): number {", "export function run(x: number, y?: number): number {"}}}},
+		{tsxScript, ".tsx", edit{name: "changed parameter list",
+			replace: []sub{{"factory.tsx", "export function run(x) {", "export function run(x, y) {"}}}},
+	} {
+		byName := map[string]edit{l.param.name: l.param}
+		for _, e := range l.sc.edits {
+			byName[e.name] = e
+		}
+		for _, c := range cases {
+			t.Run(l.sc.name+"/"+c.edit, func(t *testing.T) {
+				e, ok := byName[c.edit]
+				if !ok {
+					t.Fatalf("the %s script has no edit %q", l.sc.name, c.edit)
+				}
+				s := newSession(t)
+				s.check("base", s.advance(l.sc.base))
+				b := s.only(s.advance(e.apply(t, l.sc.base)))
+				s.check(c.edit, []linkBuild{b})
+				if b.fullSites == nil {
+					t.Fatalf("the session ran no full build of the edited tree, so the work cannot be compared")
+				}
+				for _, f := range c.none {
+					p := f + l.ext
+					if b.fullSites[p] == 0 {
+						t.Fatalf("%s has no site the full build resolves, so resolving none of them proves nothing", p)
+					}
+					if n := b.sites[p]; n != 0 {
+						t.Errorf("the refresh resolved %d of %s's %d sites, want none: nothing they read moved", n, p, b.fullSites[p])
+					}
+				}
+				for _, f := range c.some {
+					p := f + l.ext
+					if n := b.sites[p]; n == 0 || n >= b.fullSites[p] {
+						t.Errorf("the refresh resolved %d of %s's %d sites, want some and not all: only some read what moved",
+							n, p, b.fullSites[p])
+					}
+				}
+				for _, f := range c.ran {
+					p := f + l.ext
+					if b.sites[p] == 0 {
+						t.Errorf("the refresh resolved none of %s's sites, want some: they read what moved", p)
+					}
+				}
+			})
+		}
+	}
 }
