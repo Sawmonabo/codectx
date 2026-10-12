@@ -531,7 +531,7 @@ This separation permits unchanged facts to be shared safely between snapshots. N
 <a id="92-nodes-relations-and-occurrences"></a>
 ### 9.2 Nodes, Relations, and Occurrences
 
-Required node vocabulary is unchanged:
+Required node vocabulary:
 
 ```go
 type NodeKind string
