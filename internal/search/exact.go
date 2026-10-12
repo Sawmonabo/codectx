@@ -379,7 +379,6 @@ type tierRule struct {
 	// inFile holds the nodes with a visible row in pathFile, read on first
 	// use; nil until then.
 	inFile    map[model.NodeID]struct{}
-	page      int
 	qualified *tierRows
 	prefixed  *tierRows
 	named     *tierRows
@@ -393,7 +392,7 @@ func newTierRule(r exactReader, query string, kinds []model.NodeKind, pathFile m
 	rows := func(tier model.SearchTier) *tierRows {
 		return &tierRows{r: r, filter: nodeFilterFor(tier, query, kinds), size: max(size, 1)}
 	}
-	return &tierRule{r: r, query: query, kinds: kinds, pathFile: pathFile, page: max(size, 1),
+	return &tierRule{r: r, query: query, kinds: kinds, pathFile: pathFile,
 		qualified: rows(model.TierExactQualifiedName), prefixed: rows(model.TierQualifiedNamePrefix),
 		named: rows(model.TierExactName)}
 }
@@ -477,7 +476,9 @@ func (t *tierRule) inPathFile(ctx context.Context, id model.NodeID) (bool, error
 		var afterStart int64
 		var after model.NodeID
 		for {
-			nodes, err := t.r.DistinctNodesInFile(ctx, t.pathFile, afterStart, after, t.page)
+			// The file is read whole, so it is read at the storage page bound
+			// whatever size the tier probes use.
+			nodes, err := t.r.DistinctNodesInFile(ctx, t.pathFile, afterStart, after, model.MaxPageItems)
 			if err != nil {
 				t.inFile = nil
 				return false, err
