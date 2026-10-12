@@ -220,3 +220,24 @@ func TestCMacroAlias(t *testing.T) {
 		}
 	}
 }
+
+// TestCppQualifiedMemberCallIsStatic checks `a.Base::f()`: the grammar
+// spells the qualified name's last part a field_identifier, and the call is
+// the static call of the member function Base declares, named at f and
+// qualified by Base, never a member call on a's type.
+//
+// Mutation: accept only an identifier as the qualified name's last part ->
+// the call sends no site.
+func TestCppQualifiedMemberCallIsStatic(t *testing.T) {
+	const src = `struct Base { virtual void f() {} };
+struct D : Base { void f() override {} };
+void use(D &a) {
+	a.Base::f();
+}
+`
+	l, _ := linkOf(t, "cpp", "x.cpp", src)
+	s := siteNamed(l, cTokenAt(t, src, "f();", 0, "f"))
+	if s == nil || s.Shape != wire.ShapeStatic || s.Qualifier != "Base" {
+		t.Fatalf("a.Base::f() is %+v, want a static call qualified Base", s)
+	}
+}

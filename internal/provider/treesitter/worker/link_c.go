@@ -984,9 +984,10 @@ func (k *cLinker) fieldCall(site *wire.Site, fe Node, member bool) (ok bool) {
 	field := lastNamed(fe)
 	if member && s.cpp && cKind(field) == s.qualifiedIdentifier {
 		// `a.Base::f()` names the member function Base declares and never
-		// dispatches: the call `Base::f()` names, on a.
+		// dispatches: the call `Base::f()` names, on a. The grammar spells
+		// the name a field_identifier here.
 		name, scope := field.ChildByFieldId(s.fName), firstNamed(field)
-		if cKind(name) != s.identifier || scope == name {
+		if cKind(name) != s.fieldIdentifier || scope == name {
 			return false
 		}
 		site.Name, site.Shape, site.Qualifier = wireSpan(spanOf(name)), wire.ShapeStatic, k.typeName(scope)
