@@ -2,6 +2,7 @@ package context
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -576,9 +577,19 @@ func TestAnEntryTakesOneRootsPairNeverAMixOfTwo(t *testing.T) {
 	full := compileFull(t, pairsSpecs(), pairsScope, req)
 	stop := stopped.final(t)
 	finish := stopped.fx.NodeOf(pairsNamed, "finish")
-	lex := stopped.fx.Node(pairsLex)
-	if _, ok := entryOf(stopped.entries, lex); ok || excludes(stopped.excluded, lex) {
-		t.Fatalf("the stopped read reached L; the row needs L unread")
+	// L is unread when the lexical read took the head matches alone: every
+	// tail, L among them, scores below them. L may still be in the stopped
+	// plan, as the scope walk's entry four hops out from the named seed (back
+	// across `L calls finish`); a walk entry is no root and lends nothing.
+	heads := 0
+	for _, spec := range stopped.fx.Specs {
+		if spec.symbol == seedHead {
+			heads++
+		}
+	}
+	if stop.Read != int64(heads) || slices.Contains(stop.Witnesses, stopped.fx.File(pairsLex).ID) {
+		t.Fatalf("the stopped read took %d matches (witnesses %v); the row needs the %d head matches read and L unread",
+			stop.Read, stop.Witnesses, heads)
 	}
 	near, ok := entryOf(stopped.entries, finish)
 	if !ok {
