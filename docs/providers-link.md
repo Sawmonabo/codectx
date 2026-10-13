@@ -785,13 +785,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   unit root, the first `tsconfig.json` or `jsconfig.json` whose `files`/`include` minus `exclude` covers it (`.js`
   files only with `allowJs` or in a `jsconfig.json`), else the configs that config's `references` reach that do, all
   of them; with none covering it, the nearest config by directory; with no config, none. The module mode is the
-  config's `moduleResolution`, else TypeScript's default for its `module` (CommonJS: Node10; node16/nodenext:
-  Node16; preserve: Bundler); a config that sets neither, or no config, resolves under both Bundler and Node16. The
-  order, under each governing config and mode: a relative or absolute path (TypeScript's extension substitution:
-  `./a.js` names `a.ts`; a directory's `index` file except for an ES module's import under Node16, which names its
-  file with its extension; then `rootDirs`); a `#` specifier through the `imports` of the file's package scope; the
-  config's `paths` (an exact key, else the longest prefix, each fallback in order, the first naming a member
-  winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`; the package's own name when it
+  config's `moduleResolution`, else TypeScript's default for its `module` (none, AMD, UMD, System: Classic;
+  CommonJS: Node10; node16/nodenext: Node16; preserve: Bundler); a config that sets neither, or no config, resolves
+  under both Bundler and Node16. The order, under each governing config and mode: a relative or absolute path
+  (TypeScript's extension substitution: `./a.js` names `a.ts`; a directory's `index` file except for an ES module's
+  import under Node16, which names its file with its extension; then `rootDirs`, the one that is the path's longest
+  prefix giving the suffix tried under each other one in order); a `#` specifier through the `imports` of the file's
+  package scope; the config's `paths` (an exact key, else the longest prefix, each fallback in order, the first
+  naming a member winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`, only when no
+  `paths` key matched; the package's own name when it
   has `exports`; a workspace package by `name` (the `package.json` files the root `workspaces`, a
   `pnpm-workspace.yaml` or a `lerna.json` declare, every `package.json` of the unit when none does) through
   `exports` where the mode reads it (an exact subpath key, else Node's `PATTERN_KEY_COMPARE` order; conditions
@@ -807,6 +809,13 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   is published, with its size. Each import's answer is computed once per build, while the hierarchy is built, and
   written to the decls index under `keyESSpec` (the importing file's path and the specifier); the import facts, the
   export resolution and the inference each look that one key up.
+  Classic resolution (`js_classic.go`, TypeScript's `classicNameResolver`) reads no `package.json`: no `exports`,
+  `imports`, own name or workspace package. It runs two passes, TypeScript and declaration files, then JavaScript
+  files, each in this order: `paths` for a bare specifier (a matching key decides), else `baseUrl`; `rootDirs` for a
+  relative one; then a relative or absolute specifier as a file beside the importing file, a bare one as a file in
+  the importing file's directory or any directory above it to the unit root, nearest first. It reads files only,
+  never a directory's `index`, and a bare specifier it finds nowhere is a package outside the repository (TypeScript
+  then reads `node_modules/@types`), so a workspace package's name under Classic is external.
 
   Limits. Aliases defined in program code (a bundler's alias table, a test runner's module mapper, a compiler plugin)
   are not data and are not read. A package outside the repository (an ignored `node_modules`, a package manager's
