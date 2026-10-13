@@ -18,7 +18,7 @@ func TestShiftedMountKeepsRoutingDigests(t *testing.T) {
 	table := func(shift int) *Table {
 		arg := wire.Type{Kind: wire.TypeModule, Name: "users.router"}
 		tab := &Table{Path: "app/main.py", Language: "python",
-			Decls: []Decl{{Endpoint: Endpoint{Node: "n1", Name: "api", Qualified: "api"}, Parent: -1}}}
+			Decls: []Decl{{Node: "n1", Name: "api", Qualified: "api", Parent: -1}}}
 		for range shift {
 			tab.Sites = append(tab.Sites, Site{Caller: -1, Callee: "setup"})
 		}
@@ -63,7 +63,7 @@ func TestShiftedMountKeepsRoutingDigests(t *testing.T) {
 func TestShiftedGoMountKeepsRoutingDigests(t *testing.T) {
 	table := func(shift int) *Table {
 		tab := &Table{Path: "api/api.go", Language: "go",
-			Decls: []Decl{{Endpoint: Endpoint{Node: "n1", Name: "Register", Qualified: "api.Register"}, Parent: -1}}}
+			Decls: []Decl{{Node: "n1", Name: "Register", Qualified: "api.Register", Parent: -1}}}
 		for range shift {
 			tab.Sites = append(tab.Sites, Site{Caller: 0, Callee: "setup"})
 		}

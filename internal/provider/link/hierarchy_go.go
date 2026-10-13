@@ -60,7 +60,7 @@ func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name, key 
 // never dispatches into the embedding type, and a call on the embedding type
 // reaches only what its method set holds, never a promoted method a
 // shallower name hides.
-func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.ExternalSort[entry], fc fileCtx, t *Table) error {
+func (h *hierarchy) goEmbeddings(methodSets *pagination.ExternalSort[entry], fc fileCtx, t *Table) error {
 	// Fields and embeddings are written in their type's declaration, part
 	// of the builds of its file.
 	cond, err := h.goFileCond(fc.file)
@@ -96,7 +96,7 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 	}
 	for _, st := range t.Supertypes {
 		var supers []Ref
-		err := h.typesIn(ctx, fc, st.Super, func(super entry) error {
+		err := h.typesIn(fc, st.Super, func(super entry) error {
 			supers = append(supers, super.Ref)
 			return nil
 		})
@@ -105,14 +105,14 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 		}
 		external, ok := "", false
 		if len(supers) == 0 {
-			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil || !ok {
+			if external, ok, err = h.externalName(fc, st.Super); err != nil || !ok {
 				return err
 			}
 		}
 		if len(supers) == 0 && !ok {
 			continue
 		}
-		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
+		err = h.typesIn(fc, st.Type, func(sub entry) error {
 			if slices.Contains(supers, sub.Ref) {
 				return nil
 			}

@@ -452,7 +452,8 @@ const (
 // can be imported as (indexPythonDecls), read from the hierarchy's member
 // projections (projection.go), which reads no table; for
 // ECMAScript, every member file under each module path an import may name
-// it by, from the hierarchy's file contexts, which reads no table.
+// it by, from the hierarchy's file contexts, which reads no table. A
+// canceled context stops it between files.
 func buildModules(ctx context.Context, u *unit, h *hierarchy) (*index, error) {
 	s, err := newEntrySort(u.dir)
 	if err != nil {
@@ -461,6 +462,9 @@ func buildModules(ctx context.Context, u *unit, h *hierarchy) (*index, error) {
 	defer s.Close()
 	if u.family == FamilyPython {
 		err = h.projected(func(file int32, t *Table) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := indexPythonRouting(file, t, s.Add); err != nil {
 				return err
 			}
@@ -469,6 +473,9 @@ func buildModules(ctx context.Context, u *unit, h *hierarchy) (*index, error) {
 	} else {
 		var file int32 = -1
 		err = u.members(func(model.FileVersion) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			file++
 			fc, found, err := h.fileContext(file)
 			if err != nil || !found {

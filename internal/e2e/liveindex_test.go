@@ -142,7 +142,7 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 	for running := true; running; {
 		cycle := make(map[string]time.Duration, len(readers))
 		for _, r := range readers {
-			cycle[r.name] = s.readDuringIndex(t, r.name, r.args...)
+			cycle[r.name] = s.readDuringIndex(t, r.args...)
 		}
 		// A pause between cycles, because the readers are readers and not a
 		// load generator: six execs per cycle with no gap saturates the cores
@@ -452,7 +452,7 @@ func mcpReadsDuringOwnRefresh(t *testing.T, ctx context.Context, s *sandbox) {
 // different defect -- CTX_NO_ACTIVE_GENERATION, for one, would mean this test
 // asked before it indexed -- and must not be quietly read as "a reader did not
 // answer, close enough".
-func (s *sandbox) readDuringIndex(t *testing.T, name string, args ...string) time.Duration {
+func (s *sandbox) readDuringIndex(t *testing.T, args ...string) time.Duration {
 	t.Helper()
 	start := time.Now()
 	env, code := s.run(t, args...)

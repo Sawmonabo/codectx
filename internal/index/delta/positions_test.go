@@ -2,6 +2,7 @@ package delta_test
 
 import (
 	"bytes"
+	"maps"
 	"strings"
 	"testing"
 
@@ -56,9 +57,7 @@ func TestShiftedCodeKeepsTableDigests(t *testing.T) {
 	for _, sc := range differentialScripts {
 		t.Run(sc.name, func(t *testing.T) {
 			files := map[string]string{}
-			for p, src := range sc.base {
-				files[p] = src
-			}
+			maps.Copy(files, sc.base)
 			if sc.name == "java" {
 				files["src/app/Anon.java"] = javaAnonymousFile
 			}

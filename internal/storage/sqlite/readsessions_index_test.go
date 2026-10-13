@@ -40,6 +40,9 @@ func TestCollectionFindsSessionsByIndex(t *testing.T) {
 			}
 			steps = append(steps, detail)
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s: EXPLAIN QUERY PLAN: %v", q.name, err)
+		}
 		rows.Close()
 		var found bool
 		for _, step := range steps {

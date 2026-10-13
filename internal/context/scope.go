@@ -345,7 +345,7 @@ func (c *Compiler) newSeedIngest(s *compileSorts) (*seedIngest, error) {
 	if in.hopSort, err = newSort[hopRec](s, "scope-hop", lessHopSeq, sizeOfHop); err != nil {
 		return nil, err
 	}
-	if in.reasonSort, err = newSort[reasonRec](s, "scope-reason", lessReasonSeq, sizeOfReason); err != nil {
+	if in.reasonSort, err = newSort(s, "scope-reason", lessReasonSeq, sizeOfReason); err != nil {
 		return nil, err
 	}
 	return in, nil

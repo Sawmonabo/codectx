@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"maps"
 	"path"
 	"sort"
 	"strconv"
@@ -473,9 +474,7 @@ func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 // is not changed.
 func withField(fields map[string]any, key, value string) map[string]any {
 	out := make(map[string]any, len(fields)+1)
-	for k, v := range fields {
-		out[k] = v
-	}
+	maps.Copy(out, fields)
 	out[key] = value
 	return out
 }

@@ -581,7 +581,7 @@ func TestOccurrencesCarryTheNameRange(t *testing.T) {
 // count nothing); publish it (a relation to an empty node); count it on
 // every row (the extends row is partial).
 func TestFactsWithoutNodeAreCounted(t *testing.T) {
-	param := Parameter{Endpoint: Endpoint{Kind: model.NodeVariable, Name: "rest"}, Index: 1}
+	param := Parameter{Kind: model.NodeVariable, Name: "rest", Index: 1}
 	b := table("b.c", "c", []Decl{declared("f", model.NodeFunction, "f", 0, param), declared("g", model.NodeFunction, "g", 20)}, nil)
 	arg := Argument{Range: span(12, 17)}
 	a := table("a.c", "c", []Decl{declared("main", model.NodeFunction, "main", 0)},

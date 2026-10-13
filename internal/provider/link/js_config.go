@@ -375,8 +375,8 @@ func pnpmPackages(data []byte) []string {
 			if i := strings.Index(rest, "#"); i == 0 {
 				rest = ""
 			}
-			if strings.HasPrefix(rest, "[") {
-				body := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(rest, "[")), "]")
+			if body, ok := strings.CutPrefix(rest, "["); ok {
+				body = strings.TrimSuffix(strings.TrimSpace(body), "]")
 				for item := range strings.SplitSeq(body, ",") {
 					if s := scalar(item); s != "" {
 						out = append(out, s)

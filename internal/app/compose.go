@@ -1944,10 +1944,3 @@ func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, str
 	// store other than the one it read.
 	return res, res.StoreDir(), nil
 }
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}

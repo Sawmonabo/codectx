@@ -109,9 +109,11 @@ func (a javaAnonymous) stable(s string) string {
 		case err != nil:
 			b.WriteString(s[i:j])
 		case isDecl:
-			b.WriteString("#d" + strconv.Itoa(int(d)))
+			b.WriteString("#d")
+			b.WriteString(strconv.Itoa(int(d)))
 		default:
-			b.WriteString("#s" + strconv.Itoa(int(a.rank[n])))
+			b.WriteString("#s")
+			b.WriteString(strconv.Itoa(int(a.rank[n])))
 		}
 		i = j - 1
 	}

@@ -19,7 +19,7 @@ import (
 // summary -> an argument-to-result relation the callee was never shown to
 // carry.
 func TestAnUnknownSummaryIsCountedNotPublished(t *testing.T) {
-	param := Parameter{Endpoint: Endpoint{Kind: model.NodeVariable, Name: "p"}, Index: 1, Unknown: true}
+	param := Parameter{Kind: model.NodeVariable, Name: "p", Index: 1, Unknown: true}
 	var facts []Binding
 	s := &Site{Results: []Endpoint{node("r", model.NodeVariable, "r", 14)}}
 	err := flowFacts(s, Ref{File: 0, Index: 0}, Ref{File: 1, Index: 0}, []paramInfo{{Pos: 0, Index: 1, Unknown: true}}, 0, 0,
@@ -66,7 +66,7 @@ func TestAnUnknownSummaryIsCountedNotPublished(t *testing.T) {
 // the parameter as neither Returned nor Unknown and finds no summary.
 func TestUnknownIsInTheParameterEntry(t *testing.T) {
 	f := decl(model.NodeFunction, "f", -1)
-	f.Parameters = []Parameter{{Endpoint: Endpoint{Kind: model.NodeVariable, Name: "p"}, Index: 1, Unknown: true}}
+	f.Parameters = []Parameter{{Kind: model.NodeVariable, Name: "p", Index: 1, Unknown: true}}
 	u := goldenUnit(t, js("src/a.js", []Decl{f}, nil, nil))
 	ctx := context.Background()
 	h, err := buildHierarchy(ctx, u, nil)

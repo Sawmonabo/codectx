@@ -72,7 +72,7 @@ func (r *staticFile) fieldGo(written string, each func(fc fileCtx, written strin
 	if len(parts) <= n {
 		return nil
 	}
-	return r.h.typesIn(r.ctx, r.fc, strings.Join(parts[:n], "."), func(typ entry) error {
+	return r.h.typesIn(r.fc, strings.Join(parts[:n], "."), func(typ entry) error {
 		return r.fieldPath(typ.Ref, parts[n:], each)
 	})
 }

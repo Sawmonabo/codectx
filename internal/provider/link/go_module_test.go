@@ -2,6 +2,7 @@ package link
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"testing"
 
@@ -125,12 +126,8 @@ func TestGoManifestFieldsMoveWithWhatResolutionReads(t *testing.T) {
 		"workspace":    {"go.work": "go 1.27\n\nuse .\n"},
 	} {
 		files := map[string]string{}
-		for k, v := range base {
-			files[k] = v
-		}
-		for k, v := range edit {
-			files[k] = v
-		}
+		maps.Copy(files, base)
+		maps.Copy(files, edit)
 		if after := fields(files); slices.Equal(before, after) {
 			t.Errorf("%s: the manifest fields did not move: %v", name, after)
 		}

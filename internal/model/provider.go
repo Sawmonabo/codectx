@@ -463,7 +463,7 @@ func (c CapabilityState) Validate() error {
 // capability the answer actually rests on, and failing the answer because the
 // repository has more capabilities than a constant anticipated withholds the
 // very report the caller needs. Each row is still bounded in every field.
-func validateCapabilityStates(field string, states []CapabilityState) error {
+func validateCapabilityStates(states []CapabilityState) error {
 	for _, s := range states {
 		if err := s.Validate(); err != nil {
 			return err
@@ -491,7 +491,7 @@ func (r ProviderResult) Validate() error {
 	if !r.State.Valid() {
 		return invalid("provider_result.state %q is not a known run state", truncateForMessage(string(r.State)))
 	}
-	if err := validateCapabilityStates("provider_result.capabilities", r.Capabilities); err != nil {
+	if err := validateCapabilityStates(r.Capabilities); err != nil {
 		return err
 	}
 	if err := boundSigned64("provider_result.records_emitted", r.RecordsEmitted); err != nil {

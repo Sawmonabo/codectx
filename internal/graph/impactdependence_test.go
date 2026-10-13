@@ -152,7 +152,7 @@ func TestImpactRanksCallImpactAboveDependence(t *testing.T) {
 	if len(entries) != chain+1 {
 		t.Fatalf("impact of s lists %d entries, want %d", len(entries), chain+1)
 	}
-	for i := 0; i < chain; i++ {
+	for i := range chain {
 		if entries[i].NodeID != fixtureNodeID(name(i+1)) {
 			t.Fatalf("entry %d is %s, want %s: the call chain must rank above the data-flow-only node",
 				i, entries[i].NodeID, name(i+1))
@@ -166,7 +166,7 @@ func TestImpactRanksCallImpactAboveDependence(t *testing.T) {
 		t.Errorf("d is served reach %q scoring %d, want the dependence reach and its plain data-flow score %d",
 			last.Reach, last.ScoreMicros, 1_000_000/(1+2))
 	}
-	for i := 0; i < chain; i++ {
+	for i := range chain {
 		if entries[i].Reach != "" || entries[i].ScoreMicros < 0 {
 			t.Fatalf("caller %s is served reach %q scoring %d, want the call reach and a non-negative score",
 				entries[i].NodeID, entries[i].Reach, entries[i].ScoreMicros)

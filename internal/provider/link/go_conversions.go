@@ -45,7 +45,7 @@ func (h *hierarchy) goConversions(ctx context.Context, links *pagination.Externa
 				continue
 			}
 		}
-		err = h.typesIn(ctx, fc, c.Type, func(sub entry) error {
+		err = h.typesIn(fc, c.Type, func(sub entry) error {
 			if sub.Flags&flagInterface != 0 {
 				return nil
 			}

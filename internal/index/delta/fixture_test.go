@@ -30,9 +30,6 @@ import (
 // generation per build and the database path to read back. This fixture is
 // that, over the same real store, CAS and snapshot view.
 
-// goScope is the scope key of the root Go module of the trees the tests build.
-const goScope = "pkg:go:"
-
 // fixture is one repository over one store.
 type fixture struct {
 	t      *testing.T

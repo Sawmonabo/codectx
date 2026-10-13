@@ -506,7 +506,7 @@ func (s SessionStatus) Validate() error {
 	if s.StateVersion < 1 || s.ScopeVersion < 1 {
 		return invalid("session_status versions start at 1, got state_version=%d scope_version=%d", s.StateVersion, s.ScopeVersion)
 	}
-	if err := validateCapabilityStates("session_status.completeness", s.Completeness); err != nil {
+	if err := validateCapabilityStates(s.Completeness); err != nil {
 		return err
 	}
 	for _, count := range []struct {
@@ -709,7 +709,7 @@ func (c Capsule) Validate() error {
 	if err := c.Counts.Validate(); err != nil {
 		return err
 	}
-	if err := validateCapabilityStates("capsule.completeness", c.Completeness); err != nil {
+	if err := validateCapabilityStates(c.Completeness); err != nil {
 		return err
 	}
 	if c.StrictGateSatisfied && c.Counts.Waivers > 0 {

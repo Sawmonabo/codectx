@@ -209,7 +209,6 @@ type fakeStore struct {
 	required map[model.FileID]model.Requirement
 	sessions map[model.SessionID]*fakeSession
 	chunks   map[string]*fakeChunk
-	nextID   int
 
 	// leases is the pagination.LeaseStore side of the fixture. The service now
 	// requires a lease store at composition (a coverage session that pins

@@ -1,6 +1,9 @@
 package link_test
 
-import "testing"
+import (
+	"maps"
+	"testing"
+)
 
 // nestController is a NestJS controller module: a string path, an array
 // route, a method version, and an options controller version-neutral.
@@ -145,9 +148,7 @@ async function setup(moduleFixture) {
 		t.Run(c.name, func(t *testing.T) {
 			files := map[string]string{"package.json": `{"name":"app"}`, "src/cats.controller.ts": ctrl,
 				"src/app.module.ts": module}
-			for p, src := range c.files {
-				files[p] = src
-			}
+			maps.Copy(files, c.files)
 			checkMounted(t, files, c.want)
 		})
 	}

@@ -30,7 +30,7 @@ func TestPositionlessClearsEveryPosition(t *testing.T) {
 	}
 }
 
-var rangeType = reflect.TypeOf(model.SourceRange{})
+var rangeType = reflect.TypeFor[model.SourceRange]()
 
 // fill sets every field v reaches: each slice to one element, each pointer
 // to a value, each range to a non-zero one, each string, number and flag to
@@ -118,11 +118,11 @@ func positions(v reflect.Value, at string) []string {
 func TestJavaAnonymousNamesHoldAcrossMoves(t *testing.T) {
 	table := func(constant, a, b string, at uint64) *Table {
 		return &Table{Path: "A.java", Language: "java", Decls: []Decl{
-			{Endpoint: Endpoint{Node: "c", Kind: model.NodeConstant, Name: "PLUS",
-				NameRange: &model.SourceRange{Start: model.Position{Byte: at}}}, Parent: -1},
-			{Endpoint: Endpoint{Node: "m1", Kind: model.NodeMethod, Name: "apply"}, Parent: -1, Receiver: constant},
-			{Endpoint: Endpoint{Node: "m2", Kind: model.NodeMethod, Name: "run"}, Parent: -1, Receiver: a},
-			{Endpoint: Endpoint{Node: "m3", Kind: model.NodeMethod, Name: "run"}, Parent: -1, Receiver: b},
+			{Node: "c", Kind: model.NodeConstant, Name: "PLUS",
+				NameRange: &model.SourceRange{Start: model.Position{Byte: at}}, Parent: -1},
+			{Node: "m1", Kind: model.NodeMethod, Name: "apply", Parent: -1, Receiver: constant},
+			{Node: "m2", Kind: model.NodeMethod, Name: "run", Parent: -1, Receiver: a},
+			{Node: "m3", Kind: model.NodeMethod, Name: "run", Parent: -1, Receiver: b},
 		}}
 	}
 	before := table("#40", "#100", "#200", 40)

@@ -41,7 +41,7 @@ func inlineEngine(t *testing.T, f *graphFixture, limit int) (*Engine, string, *f
 // next node, so every entry has two reasons.
 func twoKindChain(hops int) (*graphFixture, []model.NodeID) {
 	f, chain := newChainFixture(hops)
-	for i := 0; i < hops; i++ {
+	for i := range hops {
 		f.relations = append(f.relations, model.Relation{ID: fixtureRelationID(1000 + i),
 			From: chain[i], Kind: model.RelImports, To: chain[i+1]})
 	}

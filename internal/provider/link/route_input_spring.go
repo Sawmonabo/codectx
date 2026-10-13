@@ -1,7 +1,6 @@
 package link
 
 import (
-	"context"
 	"encoding/json"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -59,7 +58,7 @@ func addSpringLinks(links interface{ Add(entry) error }, file int32, t *Table) e
 // simple type or an enum, a combined read with no key for a class the
 // unit declares (a model attribute). Several declarations the type may
 // denote must agree.
-func (h *hierarchy) springInputFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
+func (h *hierarchy) springInputFacts(file int32, t *Table, emit func(Binding) error) error {
 	pending := false
 	for i := range t.Inputs {
 		pending = pending || t.Inputs[i].Rule == RuleSpring
@@ -79,7 +78,7 @@ func (h *hierarchy) springInputFacts(ctx context.Context, file int32, t *Table, 
 		kind := p.Kind
 		if kind != ClassSimple {
 			var err error
-			if kind, err = h.springTypeKind(ctx, file, p.Class); err != nil {
+			if kind, err = h.springTypeKind(file, p.Class); err != nil {
 				return err
 			}
 		}
@@ -109,9 +108,9 @@ func (h *hierarchy) springInputFacts(ctx context.Context, file int32, t *Table, 
 // (a model attribute) for a concrete class, classUnknown for an interface,
 // an abstract class, a type no member declares or declarations that
 // disagree.
-func (h *hierarchy) springTypeKind(ctx context.Context, file int32, written string) (uint8, error) {
+func (h *hierarchy) springTypeKind(file int32, written string) (uint8, error) {
 	kind, found := classUnknown, false
-	err := h.typeEntries(ctx, file, written, func(e entry) error {
+	err := h.typeEntries(file, written, func(e entry) error {
 		k := classUnknown
 		err := h.links.lookup(keyJavaKind+refKey(e.Ref), func(c entry) error {
 			if c.Flags == ClassSimple || c.Flags == ClassBody {
