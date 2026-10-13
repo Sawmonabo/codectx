@@ -523,9 +523,9 @@ data directory that the repository cannot produce again. A rebuild is always
 safe and is the correct answer to `CTX_SCHEMA_MISMATCH`, `CTX_STORAGE_CORRUPT`
 and `CTX_SOURCE_INTEGRITY`:
 
-1. Stop anything holding the workspace — a `codectx watch` or an MCP server.
-   Between the things they build they hold no lock, so a reset cannot see
-   them.
+1. Stop anything open on the workspace — a `codectx watch` or an MCP server.
+   Each holds the workspace's serving lock for as long as it runs, idle or
+   not, so a reset refuses with `CTX_WORKSPACE_BUSY` until they are stopped.
 2. `codectx reset --reindex`. It empties the workspace's data directory —
    `storage.data_dir`, whose empty default resolves to a user-private
    per-workspace directory documented in
@@ -535,12 +535,16 @@ and `CTX_SOURCE_INTEGRITY`:
 `codectx reset` opens no database, so a store that is corrupt or of another
 schema is removed like any other. It takes the workspace lock first and holds
 it until everything is gone: a running index, refresh or watch beat is named
-in a `CTX_WORKSPACE_BUSY` refusal and nothing is removed. It empties only the
+in a `CTX_WORKSPACE_BUSY` refusal and nothing is removed. It then takes the
+serving lock exclusive, so an open watch or MCP server refuses it the same
+way, and a server or watch started while the reset runs is refused until it
+ends. A `codectx index` waiting behind a reset waits for as long as the reset
+holds the workspace. It empties only the
 resolved data directory. A symbolic link inside it is removed as a link and
 its target is left alone, and a data directory that is, or holds, the
 repository, the home directory or the filesystem root is refused with
-`CTX_CONFIG_INVALID`. The workspace lock file stays, empty, for the next
-holder. A cache `codectx index --rebuild` made beside the data directory is a
+`CTX_CONFIG_INVALID`. The two lock files stay, empty, for the next
+holders. A cache `codectx index --rebuild` made beside the data directory is a
 different directory and is not touched.
 
 The space goes back a window at a time, at the same pace as `codectx gc`, so
@@ -648,7 +652,7 @@ reports `unavailable`. It never reports `0`.
 | Pending watch events | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | measured once a watch has completed a pass, else `unavailable` | A running watch (`codectx watch`, or `codectx index --watch`) publishes a heartbeat row of its own, carrying its process, when it last published itself, its pending-event count and **its own** expiry, refreshed while it runs and withdrawn when it stops. There is one row per watching process, not one per repository, keyed by the watch's own session identity and not by its process id, which the operating system reuses: two watches on one workspace — a terminal's and an editor's server — each keep their own row instead of overwriting each other's. `codectx status` lists every watcher whose row is live, with its process and its last beat, in any process, including one that is watching nothing itself; `status --resources` reports the figure of a watch that is covering the workspace while its row is live. A watch that is still waiting for whichever process holds the workspace has reconciled nothing, so it publishes its presence and no figure at all: the count is `unavailable` and `doctor`'s `watch_heartbeat` check says the watch is running but covering nothing, which is a different answer from a covering watch and from a workspace no watch has ever run in. Once a row expires — the watch was killed, or the machine went down — that watcher drops out of the list and its figure is `unavailable` again rather than the dead writer's last count, which would read as "the watch is caught up"; `doctor`'s `watch_heartbeat` check is what says a watch stopped. An elapsed deadline is the only death signal, the same rule the run ledger judges a run's writer by, and no process id is ever probed; the next beat published for the workspace deletes the rows that have elapsed. A watch running without filesystem notifications has no queue to count and publishes no figure. |
 | Freed, pending-free and scratch bytes | platform-independent | platform-independent | platform-independent | Counted in the process, not read from the host. `freed_bytes` is one byte-exact counter of everything this process has actually given back -- its own removals, the reclaimer's, and the file-system shim's shortening of a file the engine owns -- and `freed_by_purpose` is the labelled part of that same counter, so the two cannot disagree. `pending_free_bytes` is what a removal has renamed aside and the reclaimer has not released yet; it is neither of the other two while it waits. `scratch_bytes` is the disk the pools hold, summed over every pool this process has opened, and it is absent rather than short if a pool cannot be read. Only `scratch_bytes` reads the disk, and only it can be `unavailable`. `stuck_frees` names the queued removals the filesystem refused, with the reason, so `pending_free_bytes` that never falls is never left unexplained; it is one page at the response record bound, and `stuck_frees_omitted` counts the rest. |
 | Query, cache and queue reservations | platform-independent | platform-independent | platform-independent | Derived from the resolved `[resources]` configuration, so they are what was reserved, not what was touched, and no platform differs. |
-| Learned per-file need (`need_classes`) | measured | none recorded | none recorded | One row per learned need class of this repository -- language, grammar fingerprint and file-size class -- with the files it learned from, how many overran their reservation, and the largest drift, need minus reservation, below zero when every file fitted. Overruns over observations is the per-class figure the overrun target is stated in. Read from the run ledger's observation store, so it covers every recorded run; one page at the response record bound, and `need_classes_omitted` counts the rest. A platform that reports no resettable per-process peak measures no need, so it learns and lists no class. |
+| Learned need (`need_classes`) | measured | none recorded | none recorded | One row per learned need class of this repository -- its `kind` (`parse`, a parsed file's memory; `indexer memory`, `indexer disk`, `server memory` or `server disk`, an external indexer's or language server's), its `subject` (the language parsed or the tool run), the grammar or tool payload fingerprint, the build and the work-size class -- with the runs it learned from, how many overran their reservation, and the largest drift, need minus reservation, below zero when every run fitted. Overruns over observations is the per-class figure the overrun target is stated in. Read from the run ledger's observation store, so it covers every recorded run; one page at the response record bound, and `need_classes_omitted` counts the rest. A platform that reports no resettable per-process peak, or reads no running process tree, measures no need of that kind, so it learns and lists no such class. |
 | Hard OS memory enforcement | partial | none | partial | Enforcement uses cgroup and job controls where they exist. Where they do not, codectx **admits and monitors only**, and says so rather than implying a limit it cannot enforce. |
 
 Two limitations of the Linux sampler itself, which the figures above do not

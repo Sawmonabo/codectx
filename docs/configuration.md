@@ -460,17 +460,18 @@ request. Every root is walked in one walk, each root carrying its weight
 level); every entity the walk reaches keeps the best (requirement, score) pair
 any one root lends it ([ADR-0016](adr/ADR-0016-seed-budget.md) decision 1).
 
-One residual bound stands behind the unlimited default: a single traversal
-request's start list is validated against a structural wire ceiling of 250000
-node ids, which applies to externally supplied `impact` and `graph` requests and
-also to each request the compiler issues for its own walks, so it applies to
-the roots of the compiler's one walk. The named roots are
-bounded by the request: the task text is clipped to a fixed byte bound and each
-identity it names resolves through one page of declarations. The lexical roots
-follow the plan's file budget rather than the size of the index: the lexical
-matches are read only until no unread match can rank above the packed files
-(below). A start list that reached the ceiling is refused and reported, never
-trimmed.
+The walk's roots have no count ceiling beyond `max_start_nodes`, which is unlimited
+by default. The structural wire ceiling of 250000 node ids applies to externally
+supplied `impact` and `graph` requests and to each impact request the compiler
+issues for its kept-file closure, which splits a wider start list into several
+walks; the compiler's one weighted walk is an in-process call and takes every
+root, each queued in the walk's on-disk state. The named roots are bounded by the
+request: the task text is clipped to a fixed byte bound and each identity it
+names resolves through one page of declarations. The lexical roots follow the
+plan's file budget rather than the size of the index: the lexical matches are
+read only until no unread match can rank above the packed files (below). An
+externally supplied start list that reaches the ceiling is refused and reported,
+never trimmed.
 
 `max_seeds` bounds seed discovery — the Section 15.2 pass that turns a task's
 words into the candidates a plan starts from — and is unlimited by default. What

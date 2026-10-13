@@ -4,7 +4,8 @@
 //! across segments under the content-only comparator.
 //!
 //! Order. A result is a fold group (a node, or a file and start byte) ranked by
-//! its best document under `cmp_hits`: score descending, then the content key.
+//! its best document in result order: score descending, then the content key
+//! (`CMP_COLS`).
 //! The key ends in the node id and the search key, so two documents tie on it
 //! only when they are one group's, and the order of results is total.
 //!
@@ -40,7 +41,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use tantivy::columnar::{Column, StrColumn};
@@ -177,10 +178,9 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
     if cancel.raised() {
         return Err(Error::new(CX_CANCELED, "the search was canceled before it began"));
     }
-    let phase_a = view.index.executor.map(
-        |(seg, sv): (&SegmentReader, &SegView)| Ok(segment_df(seg, sv, &fields, &terms, req.ignore_summaries)),
-        segs.iter().copied(),
-    )?;
+    let phase_a = par(&view.index.executor, segs.clone(), |(seg, sv): (&SegmentReader, &SegView)| {
+        segment_df(seg, sv, &fields, &terms, req.ignore_summaries)
+    })?;
     let phase_a = phase_a.into_iter().collect::<Result<Vec<_>>>()?;
     if cancel.raised() {
         return Err(Error::new(CX_CANCELED, "the search was canceled before any block was scored"));
@@ -215,7 +215,8 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         let fit = usize::try_from(room / place).unwrap_or(usize::MAX);
         cap = cap.min(fit.max(2));
     }
-    let (mut blocks_scored, mut docs_scored) = (0u64, 0u64);
+    // The work counts sum over every scoring pass the page made.
+    let (mut blocks_total, mut blocks_scored, mut docs_scored) = (0u64, 0u64, 0u64);
     loop {
         let ctx = Ctx {
             fields: &fields,
@@ -232,8 +233,8 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
             scored_any: &scored_any,
         };
         let jobs: Vec<_> = segs.iter().copied().zip(phase_a.iter()).collect();
-        let fruits = view.index.executor.map(|((seg, sv), a)| Ok(score_segment(&ctx, seg, sv, a)), jobs.into_iter())?;
-        let fruits = fruits.into_iter().collect::<Result<Vec<_>>>()?;
+        let fruits = par(&view.index.executor, jobs, |((seg, sv), a)| score_segment(&ctx, seg, sv, a))?;
+        let mut fruits = fruits.into_iter().collect::<Result<Vec<_>>>()?;
         let canceled = fruits.iter().any(|f| f.canceled);
         if canceled && !scored_any.load(AtomicOrdering::Relaxed) {
             return Err(Error::new(CX_CANCELED, "the search was canceled before any block was scored"));
@@ -242,14 +243,24 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         // Merge the segments' runs.
         let skipped = fruits.iter().any(|f| f.skipped) || canceled;
         let dropping = fruits.iter().filter(|f| f.dropped).count() as u32;
-        let cut: Option<Hit> = fruits.iter().filter_map(|f| f.boundary.as_ref()).min_by(|x, y| cmp_hits(x, y)).cloned();
+        let mut cut: Option<Cut> = None;
+        for (s, f) in fruits.iter().enumerate() {
+            let Some((doc, micros)) = f.boundary else { continue };
+            let mut c = Cut { seg: s, doc, micros, strs: Default::default() };
+            let first = match &mut cut {
+                None => true,
+                Some(b) => cmp_cuts(&fruits, &mut c, b)? == Ordering::Less,
+            };
+            if first {
+                cut = Some(c);
+            }
+        }
         page.matches = 0;
-        page.blocks_total = 0;
         page.marked = 0;
         for f in &fruits {
             page.matches += f.matches;
-            page.blocks_total += f.blocks_total;
             page.marked += f.marked.len() as u64;
+            blocks_total += f.blocks_total;
             blocks_scored += f.blocks_scored;
             docs_scored += f.docs_scored;
         }
@@ -257,20 +268,27 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         let runs_bytes = live.saturating_mul(cap as u64).saturating_mul(RUN_ENTRY_BYTES);
         let scoring_bytes = place.saturating_mul(cap as u64).saturating_add(marked_bytes);
         let budget = if bounded { req.max_bytes.saturating_sub(runs_bytes + marked_bytes) } else { u64::MAX };
-        let mut m = merge(&fruits, cut.as_ref(), req.depth, first, budget, req.result_bytes)?;
+        let mut m = merge(&fruits, cut.as_mut(), req.depth, first, budget, req.result_bytes)?;
         if bounded && first == Read::Keys {
-            // A bounded page reads its results' strings in one sorted pass per
-            // column while their charges fit the bound. A key charge is never
-            // more than the full one, so when the full charges of the results
-            // the keys merge took fit, a merge reading each result's strings as
-            // it meets it takes the same results and stops no later; only when
-            // they do not fit does that merge run, stopping where the bound
-            // falls. The page is the same either way.
+            // A merge reading each result's strings as it meets it (Read::Strings)
+            // meets the results in the same order, since the order and the fold
+            // never depend on what is charged, and a key charge is never more
+            // than the full one, so it stops at or before where the keys merge
+            // stopped: at the first result past the first whose full charge
+            // would take the total over the budget. The full charges are read as
+            // string lengths, one sorted pass per column and segment, holding no
+            // string, and the keys merge's results are cut there. The page is
+            // that merge's page.
             let n = m.out.len().min(req.depth);
-            let fit = resolve(&view.index.executor, &fruits, &mut m.out[..n], Some((budget, req.result_bytes)))?;
-            if !fit {
-                drop(m);
-                m = merge(&fruits, cut.as_ref(), req.depth, Read::Strings, budget, req.result_bytes)?;
+            let mut spent = 0u64;
+            for (i, c) in charges(&view.index.executor, &fruits, &m.out[..n], req.result_bytes)?.into_iter().enumerate()
+            {
+                if i > 0 && spent.saturating_add(c) > budget {
+                    m.out.truncate(i);
+                    m.stopped = true;
+                    break;
+                }
+                spent += c;
             }
         }
         if !m.stopped && m.out.len() <= req.depth && cut.is_some() && !canceled {
@@ -292,19 +310,17 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         let mut merged = m.out;
         merged.truncate(req.depth);
         page.new_marks = page.marked + merged.last().map_or(0, |x| x.pops);
-        resolve(&view.index.executor, &fruits, &mut merged, None)?;
-        let spent: u64 = merged.iter().filter_map(|x| x.hit.as_ref()).map(|h| charge(h, req.result_bytes)).sum();
+        let hits = finish(&view.index.executor, &mut fruits, merged)?;
+        let spent: u64 = hits.iter().map(|(h, _, _)| charge(h, req.result_bytes)).sum();
         page.bytes = scoring_bytes.max(runs_bytes + marked_bytes + spent);
         page.heaps = heaps;
         page.cap = cap as u64;
         page.canceled = canceled;
         page.matches_exact = !skipped;
+        page.blocks_total = blocks_total;
         page.blocks_scored = blocks_scored;
         page.docs_scored = docs_scored;
-        page.hits = finish(&view.index.executor, &fruits, merged)?
-            .into_iter()
-            .map(|(h, n, seen)| (h, n, !skipped && seen == dropping))
-            .collect();
+        page.hits = hits.into_iter().map(|(h, n, seen)| (h, n, !skipped && seen == dropping)).collect();
         return Ok(page.encode(terms.len()));
     }
 }
@@ -321,10 +337,15 @@ const RUN_ENTRY_BYTES: u64 = std::mem::size_of::<RunEntry>() as u64;
 /// One group the resume position marked: a 24-byte entity in a HashSet whose
 /// buckets run at 7/8 load and double.
 const MARKED_BYTES: u64 = 58;
-/// One served result beyond its strings: the met-group set (a 32-byte key, 76
-/// bytes a bucket at worst), the merged entry (288), the count pass's entity
-/// map (75) and count (16), the result twice as the page is assembled (240
-/// each) and its encoded fields twice (80 each, the buffer grows by doubling).
+/// One served result beyond its strings, the sum of what it holds over the
+/// page, which bounds what it holds at once: the met-group set (a 32-byte key,
+/// 76 bytes a bucket at worst), the merged entry (288), the count pass's
+/// entity map (75) and count (16), the result twice as the page is assembled
+/// (240 each) and its encoded fields twice (80 each, the buffer grows by
+/// doubling). The count pass's key map (a 40-byte entry, 94 bytes a bucket at
+/// worst) is built once the merge has freed the met set, and lives no longer
+/// than the merged entries, so it never meets the assembled copies: the peak
+/// while counting is 288 + 94 + 75 + 16 + 240, within the sum.
 const RESULT_BYTES: u64 = 76 + 288 + 75 + 16 + 240 + 240 + 160;
 /// How many copies of a served result's strings are held: the library's hit,
 /// its key in the met-group set and in the merged entry, and the encoded
@@ -377,22 +398,27 @@ enum Read {
 
 /// The first `depth`+1 folded results in global order, by a k-way merge of
 /// the segments' runs: each run is already in comparator order, so only the
-/// heads are compared, by score alone unless two heads tie on it, when their
-/// strings are read and the content key decides. Merging stops at the cut,
-/// past which a truncated segment is not exact, and before a result whose
+/// heads are compared, by score alone unless two heads tie on it, when the
+/// content key decides, read one column at a time in comparator order and only
+/// as far as the heads tie (within a segment ordinals order the strings, across
+/// segments only the strings do). Merging stops at the cut, past which a
+/// truncated segment is not exact; the cut's own segment never passes it, its
+/// run ending at or before its worst entry. It also stops before a result whose
 /// charge would pass `budget` (the first result is always taken). A group's
 /// first result met is its best document; a later one of the same group is
 /// skipped, and so is a group some segment marked as served at or before the
 /// resume position.
 ///
 /// Read::Strings reads each result's strings as it is met and charges them
-/// all. Read::Keys reads only the fold key, from one column (two for a result
-/// without a node), and none when one segment alone has a run and marks, and
-/// charges the key's strings alone, which is never more than the full charge;
-/// `resolve` then reads the strings one sorted pass per column and segment.
+/// all. Read::Keys reads only the fold key, from one column (the node, or the
+/// path of a result without a node), and none when one segment alone has a run
+/// and marks, and charges the key's strings alone, which is never more than
+/// the full charge; `finish` then reads the strings one sorted pass per column
+/// and segment. A result whose eight strings a tie already read keeps them and
+/// is charged in full.
 fn merge(
     fruits: &[SegFruit],
-    cut: Option<&Hit>,
+    mut cut: Option<&mut Cut>,
     depth: usize,
     read: Read,
     budget: u64,
@@ -400,7 +426,7 @@ fn merge(
 ) -> Result<Merge> {
     let alone = fruits.iter().filter(|f| !f.run.is_empty() || !f.marked.is_empty()).count() <= 1;
     let mut at = vec![0usize; fruits.len()];
-    let mut heads: Vec<Option<Hit>> = vec![None; fruits.len()];
+    let mut heads: Vec<Head> = (0..fruits.len()).map(|_| Head::default()).collect();
     let mut met: HashSet<GlobalKey> = HashSet::new();
     let mut m = Merge { out: Vec::new(), spent: 0, stopped: false };
     let mut pops = 0u64;
@@ -416,12 +442,7 @@ fn merge(
             let better = match e.micros.cmp(&eb.micros) {
                 Ordering::Greater => true,
                 Ordering::Less => false,
-                Ordering::Equal => {
-                    head(fruits, &at, &mut heads, i)?;
-                    head(fruits, &at, &mut heads, b)?;
-                    let (x, y) = (heads[i].as_ref().expect("read"), heads[b].as_ref().expect("read"));
-                    cmp_hits(x, y) == Ordering::Less
-                }
+                Ordering::Equal => cmp_heads(fruits, &at, &mut heads, i, b)? == Ordering::Less,
             };
             if better {
                 best = Some(i);
@@ -429,28 +450,24 @@ fn merge(
         }
         let Some(i) = best else { break };
         let e = fruits[i].run[at[i]];
-        if let Some(c) = cut {
-            let beyond = match e.micros.cmp(&c.micros) {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => {
-                    head(fruits, &at, &mut heads, i)?;
-                    cmp_hits(heads[i].as_ref().expect("read"), c) == Ordering::Greater
-                }
-            };
+        if let Some(c) = cut.as_deref_mut() {
+            let beyond = c.seg != i
+                && match e.micros.cmp(&c.micros) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => cmp_head_cut(fruits, &at, &mut heads, i, c)? == Ordering::Greater,
+                };
             if beyond {
                 break;
             }
         }
-        let cols = fruits[i].cols.as_ref().expect("a segment with a run has its columns");
-        let mut hit = heads[i].take();
-        if read == Read::Strings && hit.is_none() {
-            hit = Some(cols.hit(e.doc, e.micros)?);
-        }
+        let (cols, run) = (fruits[i].cols.as_ref().expect("a segment with a run has its columns"), &fruits[i].run);
+        let head = heads[i].at(at[i]);
+        let hit = if read == Read::Strings || head.full() { Some(head.hit(cols, run, e.micros)?) } else { None };
         let key = match (&hit, alone) {
             (_, true) => None,
             (Some(h), false) => Some(h.key()),
-            (None, false) => Some(cols.key(e.doc)?),
+            (None, false) => Some(head.key(cols, run)?),
         };
         if key.as_ref().is_some_and(|k| met.contains(k)) {
             at[i] += 1;
@@ -483,48 +500,240 @@ fn merge(
         }
         at[i] += 1;
         pops += 1;
-        if let Some(k) = &key {
-            met.insert(k.clone());
-        }
-        if !served {
+        if served {
+            met.extend(key);
+        } else {
+            met.extend(key.clone());
             m.out.push(Merged { seg: i, doc: e.doc, micros: e.micros, key, hit, pops });
         }
     }
     Ok(m)
 }
 
-/// Reads the strings of segment i's head, once.
-fn head(fruits: &[SegFruit], at: &[usize], heads: &mut [Option<Hit>], i: usize) -> Result<()> {
-    if heads[i].is_none() {
-        let e = fruits[i].run[at[i]];
-        let cols = fruits[i].cols.as_ref().expect("a segment with a run has its columns");
-        heads[i] = Some(cols.hit(e.doc, e.micros)?);
-    }
-    Ok(())
+/// A segment's head as the merge compares it: its place in the segment's run
+/// and the strings read of it so far, in STRS order; and the path and node
+/// strings read ahead of it.
+#[derive(Default)]
+struct Head {
+    at: Option<usize>,
+    strs: [Option<String>; 8],
+    ahead: [Ahead; 2],
 }
 
-/// Reads the strings of the results the merge did not read, one sorted
-/// dictionary pass per column, the segments in parallel as they were scored.
-/// Under a bound (`bound` is the budget and the caller's bytes a result) it
-/// gives up, returning false, as soon as the results' full charges pass the
-/// budget while more than one result is held: exactly when a merge reading
-/// each result's strings as it meets it would have stopped before the last of
-/// them. Every read adds its charge to one shared total, so the outcome does
-/// not depend on the order the segments run in.
-fn resolve(exec: &Executor, fruits: &[SegFruit], merged: &mut [Merged], bound: Option<(u64, u64)>) -> Result<bool> {
-    let mut spent = 0u64;
-    let mut limit = u64::MAX;
-    if let Some((budget, rb)) = bound {
-        for m in merged.iter() {
-            spent += m.hit.as_ref().map_or(RESULT_BYTES + rb, |h| charge(h, rb));
+/// One column's strings of the run entries from `from` on, read by one sorted
+/// dictionary pass. Each read takes twice as many entries as the one before,
+/// up to AHEAD, so a segment reads at most one entry more than twice what the
+/// merge takes from it and holds at most AHEAD strings, and a run whose
+/// entries share dictionary blocks (a tied score's entries are in path order)
+/// decodes each block once rather than once per entry.
+#[derive(Default)]
+struct Ahead {
+    from: usize,
+    vals: Vec<Option<String>>,
+    next: usize,
+}
+
+/// The most run entries one read ahead takes.
+const AHEAD: usize = 64;
+
+impl Ahead {
+    /// Column k's string of run entry a, taken: each entry is read once.
+    fn take(&mut self, cols: &SegCols, k: usize, run: &[RunEntry], a: usize) -> Result<String> {
+        if a < self.from || a >= self.from + self.vals.len() {
+            let n = self.next.clamp(1, AHEAD).min(run.len() - a);
+            self.vals = cols.column(k, run[a..a + n].iter().map(|e| e.doc))?.into_iter().map(Some).collect();
+            self.from = a;
+            self.next = n * 2;
         }
-        if merged.len() > 1 {
-            limit = budget;
+        Ok(self.vals[a - self.from].take().expect("a run entry's string is taken once"))
+    }
+}
+
+impl Head {
+    /// The head at run entry a, its strings cleared when the head moved on.
+    fn at(&mut self, a: usize) -> &mut Head {
+        if self.at != Some(a) {
+            self.at = Some(a);
+            self.strs = Default::default();
+        }
+        self
+    }
+
+    /// Column k's string, read once.
+    fn col(&mut self, cols: &SegCols, run: &[RunEntry], k: usize) -> Result<&str> {
+        let a = self.at.expect("a head has its place");
+        if self.strs[k].is_none() {
+            let v = match k {
+                S_PATH => self.ahead[0].take(cols, k, run, a)?,
+                S_NODE => self.ahead[1].take(cols, k, run, a)?,
+                _ => cols.text(k, run[a].doc)?,
+            };
+            self.strs[k] = Some(v);
+        }
+        Ok(self.strs[k].as_deref().expect("read"))
+    }
+
+    fn full(&self) -> bool {
+        self.strs.iter().all(Option::is_some)
+    }
+
+    /// The head as a result, reading the strings not read yet.
+    fn hit(&mut self, cols: &SegCols, run: &[RunEntry], micros: i64) -> Result<Hit> {
+        for k in 0..self.strs.len() {
+            self.col(cols, run, k)?;
+        }
+        let d = run[self.at.expect("a head has its place")].doc;
+        let mut take = |k: usize| self.strs[k].take().expect("read");
+        Ok(Hit {
+            doc_id: cols.ids.first(d).unwrap_or(0),
+            micros,
+            path: take(0),
+            start: cols.start.first(d).unwrap_or(0),
+            end: cols.end.first(d).unwrap_or(0),
+            kind: take(1),
+            name: take(2),
+            qn: take(3),
+            sig: take(4),
+            node: take(5),
+            search_key: take(6),
+            file: take(7),
+        })
+    }
+
+    /// The head's fold key: its node, else its file's path and start byte.
+    fn key(&mut self, cols: &SegCols, run: &[RunEntry]) -> Result<GlobalKey> {
+        let d = run[self.at.expect("a head has its place")].doc;
+        let k = if cols.ranks[S_NODE].rank(d) == 0 { S_PATH } else { S_NODE };
+        self.col(cols, run, k)?;
+        let v = self.strs[k].take().expect("read");
+        Ok(if k == S_PATH { GlobalKey::File(v, cols.start.first(d).unwrap_or(0)) } else { GlobalKey::Node(v) })
+    }
+}
+
+/// The result order after the score (descending): path, start and end bytes,
+/// kind, name, qualified name, signature, node id and search key, as STRS
+/// indices, None standing for the start and end bytes.
+const CMP_COLS: [Option<usize>; 8] = [Some(0), None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)];
+
+/// Two segments' heads of one score in result order, reading each column
+/// only while the ones before it tie.
+fn cmp_heads(fruits: &[SegFruit], at: &[usize], heads: &mut [Head], i: usize, j: usize) -> Result<Ordering> {
+    let (ci, cj) = (fruits[i].cols.as_ref().expect("columns"), fruits[j].cols.as_ref().expect("columns"));
+    let (di, dj) = (fruits[i].run[at[i]].doc, fruits[j].run[at[j]].doc);
+    for c in CMP_COLS {
+        let o = match c {
+            None => (ci.start.first(di).unwrap_or(0), ci.end.first(di).unwrap_or(0))
+                .cmp(&(cj.start.first(dj).unwrap_or(0), cj.end.first(dj).unwrap_or(0))),
+            Some(k) => {
+                heads[i].at(at[i]).col(ci, &fruits[i].run, k)?;
+                heads[j].at(at[j]).col(cj, &fruits[j].run, k)?;
+                heads[i].strs[k].cmp(&heads[j].strs[k])
+            }
+        };
+        if o != Ordering::Equal {
+            return Ok(o);
         }
     }
-    if spent > limit {
-        return Ok(false);
+    Ok(Ordering::Equal)
+}
+
+/// The cut: the least of the truncated segments' worst entries, its strings
+/// read only as comparisons need them.
+struct Cut {
+    seg: usize,
+    doc: DocId,
+    micros: i64,
+    strs: [Option<String>; 8],
+}
+
+impl Cut {
+    /// Column k's string, read once.
+    fn col(&mut self, fruits: &[SegFruit], k: usize) -> Result<&str> {
+        if self.strs[k].is_none() {
+            self.strs[k] = Some(fruits[self.seg].cols.as_ref().expect("columns").text(k, self.doc)?);
+        }
+        Ok(self.strs[k].as_deref().expect("read"))
     }
+
+    /// The start and end bytes.
+    fn span(&self, fruits: &[SegFruit]) -> (u64, u64) {
+        let cols = fruits[self.seg].cols.as_ref().expect("columns");
+        (cols.start.first(self.doc).unwrap_or(0), cols.end.first(self.doc).unwrap_or(0))
+    }
+}
+
+/// Two truncated segments' worst entries in result order, reading columns
+/// only while the score and the columns before them tie.
+fn cmp_cuts(fruits: &[SegFruit], a: &mut Cut, b: &mut Cut) -> Result<Ordering> {
+    let o = b.micros.cmp(&a.micros);
+    if o != Ordering::Equal {
+        return Ok(o);
+    }
+    for col in CMP_COLS {
+        let o = match col {
+            None => a.span(fruits).cmp(&b.span(fruits)),
+            Some(k) => {
+                b.col(fruits, k)?;
+                a.col(fruits, k)?.cmp(b.strs[k].as_deref().expect("read"))
+            }
+        };
+        if o != Ordering::Equal {
+            return Ok(o);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Segment i's head against the cut, of the same score, in result order,
+/// reading columns only while the ones before tie.
+fn cmp_head_cut(fruits: &[SegFruit], at: &[usize], heads: &mut [Head], i: usize, c: &mut Cut) -> Result<Ordering> {
+    let cols = fruits[i].cols.as_ref().expect("columns");
+    let d = fruits[i].run[at[i]].doc;
+    for col in CMP_COLS {
+        let o = match col {
+            None => (cols.start.first(d).unwrap_or(0), cols.end.first(d).unwrap_or(0)).cmp(&c.span(fruits)),
+            Some(k) => {
+                c.col(fruits, k)?;
+                heads[i].at(at[i]).col(cols, &fruits[i].run, k)?.cmp(c.strs[k].as_deref().expect("read"))
+            }
+        };
+        if o != Ordering::Equal {
+            return Ok(o);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Runs f over each job, on the executor's threads when there are several;
+/// a single job runs inline, without waking the pool.
+fn par<A: Send, R: Send>(exec: &Executor, jobs: Vec<A>, f: impl Fn(A) -> R + Sync) -> Result<Vec<R>> {
+    if jobs.len() <= 1 {
+        return Ok(jobs.into_iter().map(f).collect());
+    }
+    Ok(exec.map(|a| Ok(f(a)), jobs.into_iter())?)
+}
+
+/// What each result is charged (`charge`), the strings the merge did not read
+/// counted by their lengths alone: one sorted dictionary pass per column, the
+/// segments in parallel, holding no string.
+fn charges(exec: &Executor, fruits: &[SegFruit], merged: &[Merged], result_bytes: u64) -> Result<Vec<u64>> {
+    let mut out: Vec<u64> = merged.iter().map(|m| m.hit.as_ref().map_or(0, |h| charge(h, result_bytes))).collect();
+    let jobs = unread(fruits, merged);
+    let lens = par(exec, jobs.iter().map(|(s, d)| (*s, d)).collect(), |(s, d): (usize, &Vec<usize>)| {
+        let cols = fruits[s].cols.as_ref().expect("a segment with a run has its columns");
+        let docs: Vec<DocId> = d.iter().map(|&i| merged[i].doc).collect();
+        cols.string_bytes(&docs)
+    })?;
+    for ((_, want), r) in jobs.iter().zip(lens) {
+        for (&i, n) in want.iter().zip(r?) {
+            out[i] = RESULT_BYTES + result_bytes + RESULT_STRING_COPIES * n;
+        }
+    }
+    Ok(out)
+}
+
+/// The results without strings yet, by segment: (segment, their indices).
+fn unread(fruits: &[SegFruit], merged: &[Merged]) -> Vec<(usize, Vec<usize>)> {
     let mut jobs: Vec<(usize, Vec<usize>)> = Vec::new();
     for s in 0..fruits.len() {
         let want: Vec<usize> = (0..merged.len()).filter(|&i| merged[i].seg == s && merged[i].hit.is_none()).collect();
@@ -532,86 +741,143 @@ fn resolve(exec: &Executor, fruits: &[SegFruit], merged: &mut [Merged], bound: O
             jobs.push((s, want));
         }
     }
-    if jobs.is_empty() {
-        return Ok(true);
-    }
-    let spent = AtomicU64::new(spent);
-    let docs: Vec<Vec<(DocId, i64)>> =
-        jobs.iter().map(|(_, want)| want.iter().map(|&i| (merged[i].doc, merged[i].micros)).collect()).collect();
-    let read = exec.map(
-        |(s, d): (usize, &Vec<(DocId, i64)>)| {
-            let cols = fruits[s].cols.as_ref().expect("a segment with a run has its columns");
-            Ok(cols.hits(d, &spent, limit))
-        },
-        jobs.iter().map(|j| j.0).zip(docs.iter()),
-    )?;
-    let mut fit = true;
-    for ((_, want), r) in jobs.into_iter().zip(read) {
-        match r? {
-            Some(hits) => {
-                for (i, h) in want.into_iter().zip(hits) {
-                    merged[i].hit = Some(h);
-                }
-            }
-            None => fit = false,
-        }
-    }
-    Ok(fit)
+    jobs
 }
 
-/// The served results with their occurrence counts. A result's count sums
-/// every run's entry of its group, found by the group's entity in that
-/// segment's ranks, and `seen` counts the dropping segments whose entry of it
-/// was complete. The segments are counted in parallel as they were scored:
-/// each looks the groups' entities up once and matches its run by its
-/// documents' ranks.
-fn finish(exec: &Executor, fruits: &[SegFruit], served: Vec<Merged>) -> Result<Vec<(Hit, u64, u32)>> {
-    let served: Vec<(Merged, Hit)> = served
-        .into_iter()
-        .map(|mut m| {
-            let h = m.hit.take().expect("every served result was read");
-            (m, h)
-        })
-        .collect();
-    let segs = fruits.iter().enumerate().filter(|(_, f)| f.cols.is_some() && !f.run.is_empty()).map(|(s, _)| s);
-    let per = exec.map(|s: usize| Ok(count_segment(fruits, s, &served)), segs)?;
+/// The served results, their strings and their occurrence counts, one job
+/// per segment in parallel as they were scored (`par`). A segment's job reads
+/// the strings of its results the merge did not read, one sorted dictionary
+/// pass per column, and counts its run. A result's count sums every run's entry of its group, and `seen`
+/// counts the dropping segments whose entry of it was complete.
+fn finish(exec: &Executor, fruits: &mut [SegFruit], served: Vec<Merged>) -> Result<Vec<(Hit, u64, u32)>> {
+    let keys: HashMap<KeyRef, usize> =
+        served.iter().enumerate().filter_map(|(i, m)| m.key.as_ref().map(|k| (KeyRef::of(k), i))).collect();
+    let jobs: Vec<(usize, &mut SegFruit)> =
+        fruits.iter_mut().enumerate().filter(|(_, f)| f.cols.is_some() && !f.run.is_empty()).collect();
+    let job = |(s, f): (usize, &mut SegFruit)| -> Result<(usize, Vec<Hit>, Counts)> {
+        let cols = f.cols.as_ref().expect("a segment with a run has its columns");
+        let docs: Vec<(DocId, i64, Option<&GlobalKey>)> = served
+            .iter()
+            .filter(|m| m.seg == s && m.hit.is_none())
+            .map(|m| (m.doc, m.micros, m.key.as_ref()))
+            .collect();
+        let hits = cols.hits(&docs)?;
+        Ok((s, hits, count_segment(f, s, &served, &keys)?))
+    };
+    let per = par(exec, jobs, job)?;
     let mut counts = vec![(0u64, 0u32); served.len()];
+    let mut read: Vec<Option<Hit>> = served.iter().map(|_| None).collect();
     for r in per {
-        for (i, n, seen) in r? {
+        let (s, hits, c) = r?;
+        let mut hits = hits.into_iter();
+        for (i, m) in served.iter().enumerate() {
+            if m.seg == s && m.hit.is_none() {
+                read[i] = hits.next();
+            }
+        }
+        for (i, n, seen) in c {
             counts[i].0 += n;
             counts[i].1 += seen;
         }
     }
-    Ok(served.into_iter().zip(counts).map(|((_, h), (n, seen))| (h, n, seen)).collect())
+    served
+        .into_iter()
+        .zip(read)
+        .zip(counts)
+        .map(|((m, r), (n, seen))| {
+            Ok((m.hit.or(r).ok_or_else(|| Error::corrupt("a served result was not read"))?, n, seen))
+        })
+        .collect()
+}
+
+/// A segment's share of the served results' counts: (result, count, seen).
+type Counts = Vec<(usize, u64, u32)>;
+
+/// A served result's fold key, borrowed.
+#[derive(Hash, PartialEq, Eq)]
+enum KeyRef<'a> {
+    Node(&'a [u8]),
+    File(&'a [u8], u64),
+}
+
+impl KeyRef<'_> {
+    fn of(k: &GlobalKey) -> KeyRef<'_> {
+        match k {
+            GlobalKey::Node(n) => KeyRef::Node(n.as_bytes()),
+            GlobalKey::File(p, start) => KeyRef::File(p.as_bytes(), *start),
+        }
+    }
 }
 
 /// One segment's share of the served results' counts: (result, count, seen)
-/// for each of its run's entries in a served group.
-fn count_segment(fruits: &[SegFruit], s: usize, served: &[(Merged, Hit)]) -> Result<Vec<(usize, u64, u32)>> {
-    let f = &fruits[s];
+/// for each of its run's entries in a served group. An entry of a group this
+/// segment served is matched by its entity; the others, when another segment
+/// served a result, by their fold key's string, read by one sorted dictionary
+/// pass over the node column and one over the path column (for the entries
+/// without a node), each decoding a dictionary block once for every ordinal it
+/// holds.
+///
+/// The run is consumed: its entries are reordered for the passes, and each
+/// entry's score is replaced by the place it is read in (its node ordinal, or
+/// FILE_KEYS plus its path ordinal), so the order costs no allocation.
+fn count_segment(f: &mut SegFruit, s: usize, served: &[Merged], keys: &HashMap<KeyRef, usize>) -> Result<Counts> {
     let cols = f.cols.as_ref().expect("a segment with a run has its columns");
-    let mut ents: HashMap<Entity, usize> = HashMap::with_capacity(served.len());
-    for (i, (m, h)) in served.iter().enumerate() {
-        let e = if m.seg == s {
-            Some(cols.entity(m.doc))
-        } else {
-            match &m.key {
-                Some(k) => local_entity(&cols.ranks, k)?,
-                None => local_entity(&cols.ranks, &h.key())?,
-            }
-        };
-        if let Some(e) = e {
-            ents.insert(e, i);
+    let (node, path) = (&cols.ranks[S_NODE], &cols.ranks[S_PATH]);
+    let own: HashMap<Entity, usize> =
+        served.iter().enumerate().filter(|(_, m)| m.seg == s).map(|(i, m)| (cols.entity(m.doc), i)).collect();
+    let others = own.len() < served.len();
+    let dropped = f.dropped;
+    let mut counts = Vec::with_capacity(own.len());
+    let mut add = |i: usize, e: &RunEntry| counts.push((i, e.count, u32::from(dropped && e.complete)));
+    f.run.retain_mut(|e| {
+        if let Some(&i) = own.get(&cols.entity(e.doc)) {
+            add(i, e);
+            return false;
         }
+        if !others {
+            return false;
+        }
+        match (node.rank(e.doc), node.ord(e.doc), path.ord(e.doc)) {
+            (0, _, Some(o)) => e.micros = (FILE_KEYS + o) as i64,
+            (0, _, None) => {
+                // No path value: it reads as the empty string, which the
+                // dictionary holds exactly when it ranks it 0 (RankCol).
+                let start = cols.start.first(e.doc).unwrap_or(0);
+                if let (0, Some(&i)) = (path.shift, keys.get(&KeyRef::File(b"", start))) {
+                    add(i, e);
+                }
+                return false;
+            }
+            (_, o, _) => e.micros = o.expect("a node of nonzero rank has its ordinal") as i64,
+        }
+        true
+    });
+    if f.run.is_empty() {
+        return Ok(counts);
     }
-    let mut counts = Vec::with_capacity(ents.len());
-    for e in &f.run {
-        if let Some(&i) = ents.get(&cols.entity(e.doc)) {
-            counts.push((i, e.count, u32::from(f.dropped && e.complete)));
+    f.run.sort_unstable_by_key(|e| e.micros);
+    let split = f.run.partition_point(|e| (e.micros as u64) < FILE_KEYS);
+    for (part, rc, base) in [(&f.run[..split], node, 0), (&f.run[split..], path, FILE_KEYS)] {
+        let (Some(col), false) = (&rc.col, part.is_empty()) else { continue };
+        let mut next = 0usize;
+        let found = col.dictionary().sorted_ords_to_term_cb(part.iter().map(|e| e.micros as u64 - base), |b| {
+            let e = &part[next];
+            next += 1;
+            let k = if base == 0 { KeyRef::Node(b) } else { KeyRef::File(b, cols.start.first(e.doc).unwrap_or(0)) };
+            if let Some(&i) = keys.get(&k) {
+                add(i, e);
+            }
+            Ok(())
+        })?;
+        if !found || next != part.len() {
+            return Err(Error::corrupt("a string column's dictionary is missing ordinals"));
         }
     }
     Ok(counts)
 }
+
+/// Where the count pass's file entries start: past every node ordinal.
+const FILE_KEYS: u64 = 1 << 62;
 
 /// The position a request resumes after, read back from its document: the
 /// full comparator key of the result last served. The document is found by its
@@ -827,22 +1093,6 @@ impl Hit {
     }
 }
 
-/// Score descending, then path, start byte, end byte, kind, name, qualified
-/// name, signature, node id and search key.
-fn cmp_hits(a: &Hit, b: &Hit) -> Ordering {
-    b.micros
-        .cmp(&a.micros)
-        .then_with(|| a.path.cmp(&b.path))
-        .then(a.start.cmp(&b.start))
-        .then(a.end.cmp(&b.end))
-        .then_with(|| a.kind.cmp(&b.kind))
-        .then_with(|| a.name.cmp(&b.name))
-        .then_with(|| a.qn.cmp(&b.qn))
-        .then_with(|| a.sig.cmp(&b.sig))
-        .then_with(|| a.node.cmp(&b.node))
-        .then_with(|| a.search_key.cmp(&b.search_key))
-}
-
 /// Phase A's per-segment result: df per term, and each phrase term's exact
 /// (document, weighted frequency) list over alive documents.
 struct SegA {
@@ -994,9 +1244,10 @@ struct SegFruit {
     /// order, without strings: a run entry is 24 bytes, and strings are read
     /// only for the results the merge serves or compares on a tied score.
     run: Vec<RunEntry>,
-    /// The heap's worst entry when the segment is truncated: it turned a group
-    /// away or skipped a block, so it answers exactly only up to this entry.
-    boundary: Option<Hit>,
+    /// The heap's worst entry when the segment is truncated, as its document
+    /// and score: it turned a group away or skipped a block, so it answers
+    /// exactly only up to this entry.
+    boundary: Option<(DocId, i64)>,
     /// The groups with a document at or before the resume position, in this
     /// segment's ranks, which `ranks` resolves another segment's results into.
     marked: HashSet<Entity>,
@@ -1051,102 +1302,112 @@ impl SegCols {
         }
     }
 
-    /// A document's fold key: its node, else its file's path and start byte.
-    fn key(&self, d: DocId) -> Result<GlobalKey> {
-        let node = self.text(S_NODE, d)?;
-        Ok(if node.is_empty() {
-            GlobalKey::File(self.text(S_PATH, d)?, self.start.first(d).unwrap_or(0))
-        } else {
-            GlobalKey::Node(node)
-        })
+    /// Each document's ordinals in one string column, sorted, with the
+    /// document's index: the order a sorted dictionary pass reads them in.
+    fn sorted_ords(rc: &RankCol, docs: impl Iterator<Item = DocId>) -> Vec<(u64, usize)> {
+        let mut ords: Vec<(u64, usize)> = docs.enumerate().filter_map(|(i, d)| rc.ord(d).map(|o| (o, i))).collect();
+        ords.sort_unstable();
+        ords
     }
 
-    /// Documents as results, their strings read by one sorted dictionary pass
-    /// per column, which decodes each dictionary block once for every ordinal
-    /// it holds.
-    /// Each string is charged to `spent` at its copies for every document that
-    /// holds it, and the read gives up (None) before `spent` passes `limit`.
-    fn hits(&self, docs: &[(DocId, i64)], spent: &AtomicU64, limit: u64) -> Result<Option<Vec<Hit>>> {
-        let mut strs: Vec<Vec<String>> = vec![vec![String::new(); docs.len()]; STRS.len()];
-        for (k, rc) in self.ranks.iter().enumerate() {
+    /// One column's strings of documents, by one sorted dictionary pass,
+    /// which decodes each dictionary block once for every ordinal it holds.
+    fn column(&self, k: usize, docs: impl Iterator<Item = DocId>) -> Result<Vec<String>> {
+        let rc = &self.ranks[k];
+        let docs: Vec<DocId> = docs.collect();
+        let mut out = vec![String::new(); docs.len()];
+        let ords = Self::sorted_ords(rc, docs.into_iter());
+        let Some(col) = &rc.col else { return Ok(out) };
+        // The pass calls back once per ordinal given, a repeated one included;
+        // the documents of one value are adjacent, and the last takes it.
+        let mut next = 0usize;
+        let mut last: Option<String> = None;
+        let found = col.dictionary().sorted_ords_to_term_cb(ords.iter().map(|x| x.0), |b| {
+            let v = match last.take() {
+                Some(v) if next > 0 && ords[next - 1].0 == ords[next].0 => v,
+                _ => String::from_utf8_lossy(b).into_owned(),
+            };
+            if next + 1 < ords.len() && ords[next + 1].0 == ords[next].0 {
+                out[ords[next].1].clone_from(&v);
+                last = Some(v);
+            } else {
+                out[ords[next].1] = v;
+            }
+            next += 1;
+            Ok(())
+        })?;
+        if !found || next != ords.len() {
+            return Err(Error::corrupt("a string column's dictionary is missing ordinals"));
+        }
+        Ok(out)
+    }
+
+    /// Documents as results, their strings read one sorted dictionary pass
+    /// per column (`column`), but for the node or path a document's fold key
+    /// already holds.
+    fn hits(&self, docs: &[(DocId, i64, Option<&GlobalKey>)]) -> Result<Vec<Hit>> {
+        let mut strs: Vec<Vec<String>> = Vec::with_capacity(STRS.len());
+        for k in 0..STRS.len() {
+            fn held(key: Option<&GlobalKey>, k: usize) -> Option<&String> {
+                match key {
+                    Some(GlobalKey::Node(n)) if k == S_NODE => Some(n),
+                    Some(GlobalKey::File(p, _)) if k == S_PATH => Some(p),
+                    _ => None,
+                }
+            }
+            let read: Vec<DocId> = docs.iter().filter(|x| held(x.2, k).is_none()).map(|x| x.0).collect();
+            let mut vals = self.column(k, read.into_iter())?.into_iter();
+            let col: Vec<String> = docs
+                .iter()
+                .map(|x| match held(x.2, k) {
+                    Some(v) => v.clone(),
+                    None => vals.next().expect("one string a document read"),
+                })
+                .collect();
+            strs.push(col);
+        }
+        Ok(docs
+            .iter()
+            .enumerate()
+            .map(|(i, &(d, micros, _))| {
+                let mut take = |k: usize| std::mem::take(&mut strs[k][i]);
+                Hit {
+                    doc_id: self.ids.first(d).unwrap_or(0),
+                    micros,
+                    path: take(0),
+                    start: self.start.first(d).unwrap_or(0),
+                    end: self.end.first(d).unwrap_or(0),
+                    kind: take(1),
+                    name: take(2),
+                    qn: take(3),
+                    sig: take(4),
+                    node: take(5),
+                    search_key: take(6),
+                    file: take(7),
+                }
+            })
+            .collect())
+    }
+
+    /// Each document's string bytes over every column (`Hit::string_bytes`),
+    /// by one sorted dictionary pass per column, holding no string.
+    fn string_bytes(&self, docs: &[DocId]) -> Result<Vec<u64>> {
+        let mut out = vec![0u64; docs.len()];
+        for rc in &self.ranks {
             let Some(col) = &rc.col else { continue };
-            let mut ords: Vec<(u64, usize)> =
-                docs.iter().enumerate().filter_map(|(i, &(d, _))| rc.ord(d).map(|o| (o, i))).collect();
-            ords.sort_unstable();
-            let mut uniq: Vec<(u64, u64)> = Vec::new();
-            for &(o, _) in &ords {
-                match uniq.last_mut() {
-                    Some(u) if u.0 == o => u.1 += 1,
-                    _ => uniq.push((o, 1)),
-                }
-            }
-            let mut vals = Vec::with_capacity(uniq.len());
-            let mut over = false;
-            let pass = col.dictionary().sorted_ords_to_term_cb(uniq.iter().map(|u| u.0), |b| {
-                let v = String::from_utf8_lossy(b);
-                let c = RESULT_STRING_COPIES.saturating_mul(v.len() as u64).saturating_mul(uniq[vals.len()].1);
-                if spent.fetch_add(c, AtomicOrdering::Relaxed).saturating_add(c) > limit {
-                    over = true;
-                    return Err(std::io::Error::other("the bound"));
-                }
-                vals.push(v.into_owned());
+            let ords = Self::sorted_ords(rc, docs.iter().copied());
+            let mut next = 0usize;
+            let found = col.dictionary().sorted_ords_to_term_cb(ords.iter().map(|x| x.0), |b| {
+                // A result's string is the lossy decoding of its bytes.
+                out[ords[next].1] += String::from_utf8_lossy(b).len() as u64;
+                next += 1;
                 Ok(())
-            });
-            if over {
-                return Ok(None);
-            }
-            pass?;
-            if vals.len() != uniq.len() {
+            })?;
+            if !found || next != ords.len() {
                 return Err(Error::corrupt("a string column's dictionary is missing ordinals"));
             }
-            let mut u = 0;
-            for (o, i) in ords {
-                while uniq[u].0 != o {
-                    u += 1;
-                }
-                strs[k][i].clone_from(&vals[u]);
-            }
         }
-        Ok(Some(
-            docs.iter()
-                .enumerate()
-                .map(|(i, &(d, micros))| {
-                    let mut take = |k: usize| std::mem::take(&mut strs[k][i]);
-                    Hit {
-                        doc_id: self.ids.first(d).unwrap_or(0),
-                        micros,
-                        path: take(0),
-                        start: self.start.first(d).unwrap_or(0),
-                        end: self.end.first(d).unwrap_or(0),
-                        kind: take(1),
-                        name: take(2),
-                        qn: take(3),
-                        sig: take(4),
-                        node: take(5),
-                        search_key: take(6),
-                        file: take(7),
-                    }
-                })
-                .collect(),
-        ))
-    }
-
-    /// A document as a result, its strings read one by one.
-    fn hit(&self, d: DocId, micros: i64) -> Result<Hit> {
-        Ok(Hit {
-            doc_id: self.ids.first(d).unwrap_or(0),
-            micros,
-            path: self.text(0, d)?,
-            start: self.start.first(d).unwrap_or(0),
-            end: self.end.first(d).unwrap_or(0),
-            kind: self.text(1, d)?,
-            name: self.text(2, d)?,
-            qn: self.text(3, d)?,
-            sig: self.text(4, d)?,
-            node: self.text(5, d)?,
-            search_key: self.text(6, d)?,
-            file: self.text(7, d)?,
-        })
+        Ok(out)
     }
 }
 
@@ -1514,9 +1775,7 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: &SegA) -> Resu
     let truncated = heap.dropped || out.skipped;
     let cols = SegCols { ranks, ids, start: start_col, end: end_col };
     if truncated {
-        if let Some(w) = heap.order.last() {
-            out.boundary = Some(cols.hit(w.doc, w.micros.0)?);
-        }
+        out.boundary = heap.order.last().map(|w| (w.doc, w.micros.0));
     }
     // A group marked after it took a heap place keeps that place until here;
     // the boundary above counts it, and the result is dropped now.

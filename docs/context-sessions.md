@@ -108,6 +108,12 @@ two lists.
 
 `entries` pages one projection of the current manifest.
 
+Each entry carries its `route_count`, not its routes: the evidence routes that
+explain why an entry was selected are stored in full and paged with
+`--view routes`, one row per route in (entry ordinal, route index) order. A plan's
+byte budget charges an entry's fixed fields, reasons and that count, so how many
+routes reach an entry never decides whether its file fits a slice.
+
 ## Read: bounded, lossless chunks of the pinned source
 
 ```sh

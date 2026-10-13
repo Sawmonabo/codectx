@@ -13,11 +13,11 @@ import (
 )
 
 // TestHydrateRefusesAnInvertedSpan pins the guard at the top of hydrate. A span
-// whose Start is past its End but whose End is inside the file used to reach
-// positionAt, where the window loop clamps every read at rec.Size while w.At()
-// never reaches Start: an empty window that passes the length check and
-// advances nothing, forever. A typed CTX_ARGUMENT_INVALID is what this owes and
-// what the pre-streaming code returned. The watchdog is the point of the test --
+// whose Start is past its End but whose End is inside the file would
+// otherwise reach positionAt, where the window loop clamps every read at
+// rec.Size while w.At() never reaches Start: an empty window that passes the
+// length check and advances nothing, forever. A typed CTX_ARGUMENT_INVALID is
+// what this owes. The watchdog is the point of the test --
 // dropping `span.Start > span.End` from the guard hangs it rather than failing
 // an assertion.
 func TestHydrateRefusesAnInvertedSpan(t *testing.T) {
