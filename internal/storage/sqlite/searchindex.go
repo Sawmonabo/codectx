@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/search/textindex"
@@ -194,11 +195,22 @@ func (s *Store) applyQueuedDeletes(ctx context.Context) (int64, error) {
 // for holds all of its documents. It returns the queue rowid the commit
 // applied. An index that does not hold the active generation refuses: a new
 // generation would reuse units whose documents it lacks.
-func (s *Store) commitSearch(ctx context.Context, gen, active model.GenerationID) (int64, error) {
+//
+// It is a stage of its own (stageSearchCommit): the commit writes and syncs
+// every document the run added, which on a large first index is a cost of its
+// own inside the activation. Its out count is the documents the members added
+// that this commit made durable. No processor time is attributed to it -- the
+// library writes with threads of its own while the process runs other work.
+func (s *Store) commitSearch(ctx context.Context, gen, active model.GenerationID) (applied int64, err error) {
+	var committed int64
+	ctx, span := ledger.Start(ctx, stageSearchCommit, "")
+	defer func() {
+		span.End(spanOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &committed}, err)
+	}()
 	if err := s.searchHolds(int64(active)); err != nil {
 		return 0, err
 	}
-	applied, err := s.applyQueuedDeletes(ctx)
+	applied, err = s.applyQueuedDeletes(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -228,6 +240,7 @@ func (s *Store) commitSearch(ctx context.Context, gen, active model.GenerationID
 			if held != pending {
 				return corrupt("unit %s added %d search documents but the search index commit holds %d", idHex(key), pending, held)
 			}
+			committed += pending
 		}
 		return wrap("units", rows.Err())
 	})
@@ -378,7 +391,10 @@ func (s *Store) commitSearchOnClose() error {
 //
 // An index that does not hold the active generation is not touched: its loss
 // is what searchHolds reports to every search, and a commit here would hide
-// it. Recover does not fail on it.
+// it. Recover does not fail on it. An index with nothing to reconcile
+// (searchSettled) is not touched either: the steps above would open the
+// writer, take its memory admission and pay a commit's fsync to change
+// nothing.
 func (s *Store) reconcileSearch(ctx context.Context) error {
 	active, err := s.activeGenerationID(ctx)
 	if err != nil {
@@ -392,10 +408,55 @@ func (s *Store) reconcileSearch(ctx context.Context) error {
 		}
 		return err
 	}
+	settled, err := s.searchSettled(ctx, active)
+	if err != nil || settled {
+		return err
+	}
 	if err := s.reconcileSearchIndex(ctx, active); err != nil {
 		return errors.Join(err, s.releaseSearchWriter())
 	}
 	return nil
+}
+
+// searchSettled reports whether a crash can have left anything for
+// reconcileSearch to do. Three facts together rule every step out:
+//
+//   - the library's last commit is the active generation (a commit made while
+//     none is active carries zero, and so does an index never committed). Documents whose doc ids SQLite never durably
+//     allocated reach a commit only through an activation's library commit,
+//     the one commit made while the run's ingestion group may still be open,
+//     and its payload is the new generation, above the active one until SQLite
+//     activates it. Every other commit -- a collection's (sweep commits the
+//     group first), the close's (after the group committed) and this
+//     reconcile's own -- carries the active generation and only allocated
+//     documents, and a lost group discards the writer's adds (abandonGroup);
+//   - no unit is marked pending, so no unit's documents can differ from its
+//     mark;
+//   - the delete queue is empty.
+//
+// The pending probe stops at the first marked unit; on a settled store it
+// reads the units table once, which the full reconcile would read too.
+func (s *Store) searchSettled(ctx context.Context, active int64) (bool, error) {
+	payload, ok, err := s.text.Committed()
+	if err != nil {
+		return false, err
+	}
+	committed := int64(0)
+	if ok {
+		if committed, err = strconv.ParseInt(payload, 10, 64); err != nil {
+			return false, nil
+		}
+	}
+	if committed != active {
+		return false, nil
+	}
+	var unsettled bool
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
+		return wrap("search reconcile", tx.QueryRowContext(ctx, `SELECT
+			EXISTS (SELECT 1 FROM units WHERE search_pending > 0)
+			OR EXISTS (SELECT 1 FROM search_doc_deletes)`).Scan(&unsettled))
+	})
+	return !unsettled, err
 }
 
 func (s *Store) reconcileSearchIndex(ctx context.Context, active int64) error {

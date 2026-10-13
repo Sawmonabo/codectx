@@ -239,7 +239,7 @@ const flushIntervalForTest = 250 * time.Millisecond
 func TestReaderSeesRunningCountersAdvance(t *testing.T) {
 	l, dir := openLedger(t)
 	run, ctx := newRun(t, l)
-	_, span := ledger.Start(ctx, "lexical_build", "")
+	_, span := ledger.Start(ctx, "stage", "")
 	span.AddIn(5)
 
 	awaitCounters := func(wantIn int64) {

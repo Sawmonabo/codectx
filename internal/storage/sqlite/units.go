@@ -20,8 +20,9 @@ import (
 // the activation, not as a phase the coordinator can bracket, so its span is
 // opened here, under the activation span the caller already holds.
 const (
-	stageAdjacency = "adjacency"
-	stageSeal      = "seal"
+	stageAdjacency    = "adjacency"
+	stageSeal         = "seal"
+	stageSearchCommit = "search_commit"
 )
 
 // spanOutcome is how an activation stage reports itself: a span that returned
