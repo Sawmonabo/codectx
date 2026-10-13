@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -709,5 +710,81 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	_, err = v.Search(context.Background(), Request{Query: "hot", Depth: 5, After: &Position{ScoreMicros: 1, DocID: hidden}})
 	if !errors.Is(err, ErrUnknownPosition) {
 		t.Fatalf("a position naming a hidden document returned %v, want ErrUnknownPosition", err)
+	}
+}
+
+// TestABackgroundMergesSegmentIsSummarizedBeforeItServes commits most units
+// in one segment, then eight units one commit each into a writer that stays
+// open: the eighth commit lets the merge policy merge the eight small segments
+// in the background and publish the merged segment with no commit of ours
+// after it. Views are opened until one shows the merge; its pages must already
+// find a summary for every segment, skip blocks and skip segments on their key
+// filters, and equal exhaustive scoring.
+//
+// Mutation caught: summaries built only at commits, releases and opens (the
+// merged segment serves without one until the writer's next commit).
+func TestABackgroundMergesSegmentIsSummarizedBeforeItServes(t *testing.T) {
+	ctx := context.Background()
+	c := genCorpus(1, 6000, 100)
+	dir := t.TempDir()
+	x := openWritable(t, dir, 1)
+	const per = 3
+	small := len(c.units) - 8*per
+	add := func(units []string) {
+		for _, u := range units {
+			if err := x.AddUnit(ctx, u, c.docs[u]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := x.Commit(ctx, "1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(c.units[:small])
+	for i := small; i < len(c.units); i += per {
+		add(c.units[i : i+per])
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		v, err := x.OpenView(1, visibleOf(1, 6000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		probe := search(t, v, Request{Query: "hot", Depth: 10})
+		if probe.Stats.Segments < 9 {
+			var skipped bool
+			var skips int64
+			for _, q := range engineQueries {
+				var at *Position
+				for range 4 {
+					r := Request{Query: q, Depth: 10, After: at}
+					pruned := search(t, v, r)
+					r.IgnoreSummaries = true
+					if err := samePage(pruned, search(t, v, r)); err != nil {
+						t.Fatalf("query %q: %v", q, err)
+					}
+					if pruned.Stats.SegmentsWithoutSummary != 0 {
+						t.Fatalf("a merged segment served without a summary: %+v", pruned.Stats)
+					}
+					skipped = skipped || pruned.Stats.BlocksScored < pruned.Stats.BlocksTotal
+					skips += pruned.Stats.KeySkips
+					if !pruned.More || len(pruned.Hits) == 0 {
+						break
+					}
+					a := pruned.Hits[len(pruned.Hits)-1].At()
+					at = &a
+				}
+			}
+			v.Close()
+			if !skipped || skips == 0 {
+				t.Fatalf("after the merge no page skipped a block (%v) or a segment on its key filter (%d)", skipped, skips)
+			}
+			return
+		}
+		v.Close()
+		if time.Now().After(deadline) {
+			t.Fatalf("no background merge published within 30s: %d segments", probe.Stats.Segments)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

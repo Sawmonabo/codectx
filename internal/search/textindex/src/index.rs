@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tantivy::collector::Count;
 use tantivy::index::SegmentId;
@@ -14,7 +14,9 @@ use tantivy::indexer::LogMergePolicy;
 use tantivy::query::{RangeQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::tokenizer::TextAnalyzer;
-use tantivy::{Executor, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{
+    Executor, IndexReader, IndexWriter, ReloadPolicy, Searcher, SearcherGeneration, TantivyDocument, Term, Warmer,
+};
 
 use crate::codec::Reader;
 use crate::error::{Error, Result, CX_INVALID};
@@ -49,8 +51,56 @@ pub struct Index {
     pub executor: Executor,
     opts: Options,
     writer: Mutex<Option<IndexWriter<TantivyDocument>>>,
-    summaries: Mutex<HashMap<SegmentId, Arc<Summary>>>,
+    summaries: Arc<Summaries>,
     pub alive: Mutex<AliveCache>,
+}
+
+/// The summaries of an index's segments, loaded once each, and the reader's
+/// warmer. The search library runs a reader's warmers on every searcher it
+/// builds, at its first load and at every reload, before it publishes the
+/// searcher, so a segment that reaches a reader by any path (a commit, a merge
+/// the writer ran in the background, another process, an index written before
+/// the current summary format) has its summary built before a page can score
+/// it. The build writes only a summary file, never the index, so a read-only
+/// reader warms too.
+struct Summaries {
+    dir: PathBuf,
+    fields: Fields,
+    map: Mutex<HashMap<SegmentId, Arc<Summary>>>,
+}
+
+impl Summaries {
+    /// The summary of a segment: cached, else loaded from its file. None when
+    /// the segment has no current summary.
+    fn get(&self, seg: &tantivy::SegmentReader) -> Option<Arc<Summary>> {
+        if let Some(s) = lock(&self.map).get(&seg.segment_id()) {
+            return Some(s.clone());
+        }
+        let s = Arc::new(Summary::load(&self.dir, seg)?);
+        lock(&self.map).insert(seg.segment_id(), s.clone());
+        Some(s)
+    }
+}
+
+impl Warmer for Summaries {
+    /// Builds the summary of every segment of the searcher that has none, or
+    /// one this library no longer reads. A segment whose build fails (a
+    /// read-only directory, a full disk) is scored exhaustively, which is
+    /// exact, and counted per page as a segment without a summary; a writer's
+    /// next commit builds it again and fails on the error.
+    fn warm(&self, searcher: &Searcher) -> tantivy::Result<()> {
+        for seg in searcher.segment_readers() {
+            if self.get(seg).is_none() {
+                let _ = summary::build(&self.dir, seg, &self.fields);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops the summaries of segments no live searcher holds.
+    fn garbage_collect(&self, live: &[&SearcherGeneration]) {
+        lock(&self.map).retain(|id, _| live.iter().any(|g| g.segments().contains_key(id)));
+    }
 }
 
 /// Locks a mutex; a poisoned one (a panic while held, caught at the export)
@@ -80,13 +130,15 @@ impl Index {
         };
         index.tokenizers().register(CODE_TOKENIZER, TextAnalyzer::from(Code));
         let fields = Fields::resolve(&index.schema())?;
-        let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
+        let summaries = Arc::new(Summaries { dir: dir.to_path_buf(), fields, map: Mutex::new(HashMap::new()) });
+        let warmer: Weak<dyn Warmer> = Arc::downgrade(&summaries) as Weak<dyn Warmer>;
+        let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).warmers(vec![warmer]).try_into()?;
         let executor = if opts.search_threads > 1 {
             Executor::multi_thread(opts.search_threads as usize, "cx-search-")?
         } else {
             Executor::single_thread()
         };
-        let index = Index {
+        Ok(Index {
             dir: dir.to_path_buf(),
             index,
             reader,
@@ -94,27 +146,9 @@ impl Index {
             executor,
             opts,
             writer: Mutex::new(None),
-            summaries: Mutex::new(HashMap::new()),
+            summaries,
             alive: Mutex::new(AliveCache::new(opts.view_cache_bytes)),
-        };
-        index.summarize_at_open();
-        Ok(index)
-    }
-
-    /// Builds the summary of every searchable segment that has none, or one
-    /// this library no longer reads, so no page is scored without one. It
-    /// writes only summary files, never the index, so a read-only open does it
-    /// too. A segment whose build fails (a read-only directory, a full disk)
-    /// is scored exhaustively, which is exact, and counted per page as a
-    /// segment without a summary; a writer's next commit builds it again and
-    /// fails on the error.
-    fn summarize_at_open(&self) {
-        let searcher = self.reader.searcher();
-        for seg in searcher.segment_readers() {
-            if self.summary(seg).is_none() {
-                let _ = summary::build(&self.dir, seg, &self.fields);
-            }
-        }
+        })
     }
 
     /// Runs f on the writer, opening it first when it is not open.
@@ -293,12 +327,7 @@ impl Index {
     /// The summary of a segment: cached, else loaded from its file. None when
     /// the segment has no current summary.
     pub fn summary(&self, seg: &tantivy::SegmentReader) -> Option<Arc<Summary>> {
-        if let Some(s) = lock(&self.summaries).get(&seg.segment_id()) {
-            return Some(s.clone());
-        }
-        let s = Arc::new(Summary::load(&self.dir, seg)?);
-        lock(&self.summaries).insert(seg.segment_id(), s.clone());
-        Some(s)
+        self.summaries.get(seg)
     }
 
     /// Builds the summary of every searchable segment that has none.
@@ -321,7 +350,7 @@ impl Index {
 
     fn remove_orphans(&self) -> Result<()> {
         let live = self.index.searchable_segment_ids()?;
-        lock(&self.summaries).retain(|id, _| live.contains(id));
+        lock(&self.summaries.map).retain(|id, _| live.contains(id));
         summary::remove_orphans(&self.dir, &live);
         Ok(())
     }
