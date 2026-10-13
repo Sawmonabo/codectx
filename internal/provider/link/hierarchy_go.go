@@ -442,7 +442,7 @@ func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name str
 // whole method set as that interface's subtype; sets is satisfy's. A pair
 // whose interface is outside the unit (goExternalFile) is handed to external
 // with the interface's method-set keys the type matches in a build that
-// satisfies it instead, since no index entry names that interface. A method of a name
+// satisfies the whole interface instead, since no index entry names that interface. A method of a name
 // has a key per build-dependent signature (goMethodKeys); the pair is
 // satisfied when every name is matched and some build holds, for every name,
 // one of its keys in both the interface and the type (go_build.go).
@@ -529,8 +529,10 @@ func pairSatisfied(dir string, c *goConds, links, sets *pagination.ExternalSort[
 				met = append(met, k.key)
 			}
 		} else {
-			// Some build holds, for every name, one of its keys in both.
+			// Some build holds, for every name, one of its keys in both;
+			// a key is met when such a build holds it.
 			var all goCond
+			var terms []keyed
 			j := 0
 			for i := 0; i < len(ifaceKeys); {
 				name := goKeyName(ifaceKeys[i].key)
@@ -547,7 +549,7 @@ func pairSatisfied(dir string, c *goConds, links, sets *pagination.ExternalSort[
 					if !c.holds(term) {
 						continue
 					}
-					met = append(met, ifaceKeys[i].key)
+					terms = append(terms, keyed{ifaceKeys[i].key, term})
 					if !found {
 						any, found = term, true
 					} else {
@@ -561,6 +563,11 @@ func pairSatisfied(dir string, c *goConds, links, sets *pagination.ExternalSort[
 			}
 			if !c.holds(all) {
 				return nil
+			}
+			for _, t := range terms {
+				if c.holds(c.and(t.cond, all)) {
+					met = append(met, t.key)
+				}
 			}
 		}
 		if refOf(pair[:8]).File == goExternalFile {

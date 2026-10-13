@@ -13,6 +13,28 @@ func TestGoBuildGoldens(t *testing.T) { runGoldens(t, goBuildGoldens) }
 
 var goBuildGoldens = []golden{
 	{
+		name:   "external-overrides-in-a-satisfying-build",
+		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\", \"Alias declarations\"",
+		files: map[string]string{
+			"go.mod":     "module example.com/m\n\ngo 1.27\n\nrequire example.com/arch v1.0.0\n",
+			"t.go":       "package p\n\nimport \"example.com/arch\"\n\ntype T struct{} // @tt\n\nfunc use(arch.Wide) {}\n",
+			"f_386.go":   "package p\n\nfunc (T) F() uint32 { return 0 } // @f32\n",
+			"f_amd64.go": "package p\n\nfunc (T) F() uint64 { return 0 } // @f64\n\nfunc (T) G() {} // @tg\n",
+		},
+		// Checked with go vet: arch.Wide's F returns Word, uint32 on 386 and uint64 on amd64; T implements
+		// Wide on amd64 and lacks G on 386. So T implements Wide, and only the amd64 F overrides Wide.F: the
+		// 386 F matches Wide.F's 386 key, but no build that satisfies Wide holds it.
+		want: []string{},
+		facts: []string{
+			"tt T implements external example.com/arch.Wide",
+			"f64 F overrides external example.com/arch.Wide.F",
+			"tg G overrides external example.com/arch.Wide.G",
+		},
+		// Mutation: a key counted as met when some build holds it in both, not a build that satisfies the
+		// whole interface -> f32 F overrides external example.com/arch.Wide.F.
+		fails: "an override published for a key no build satisfying the interface holds",
+	},
+	{
 		name:   "many-free-tags-decided-exactly",
 		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\"",
 		files:  manyTagsFiles(),
