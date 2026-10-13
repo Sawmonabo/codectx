@@ -265,8 +265,9 @@ func (c *Compiler) filePaths(ctx context.Context, reader *sqlite.PinnedReader, i
 //
 // It runs as one unit (closeKeptFilesUnit): what it admits goes into the
 // plan's spools under a mark, and a deadline that lands inside it on a paged
-// compile rolls them back to the mark and ends the pass before the closure, so the continuation runs it again whole and
-// the plan is the one an uninterrupted compile makes.
+// compile rolls them back to the mark and ends the pass before the closure,
+// so the continuation runs it again whole and the plan is the one an
+// uninterrupted compile makes.
 //
 // Memory: the kept files' nodes, U and S together, C's nodes, C's files and
 // the hits go through external sorts. U and R are held, as every walk's start
