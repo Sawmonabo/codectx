@@ -2,17 +2,20 @@ package search
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // noLeases is a lease store for spools whose cursors carry no lease: their
@@ -205,4 +208,73 @@ func TestExactPagesThroughASpoolServeTheUnpagedOrder(t *testing.T) {
 	if fmt.Sprint(paged) != fmt.Sprint(whole) {
 		t.Fatalf("with the spool removed mid-answer, the paged answer\n%v\nis not the unpaged one\n%v", paged, whole)
 	}
+}
+
+// TestAnExactRecordCarriesItsIdsAsRawBytes proves the spool record round-trips
+// every hit exactly while storing the node id and the file id as their 32 raw
+// bytes: a hit with a file and a byte interval, and one with neither, decode to
+// what was encoded, and a record is 33 bytes shorter for its node id and 32 for
+// its file id than the same record with the ids spelled in hex (64 characters
+// and a length byte each).
+//
+// Mutations: spell an id in hex (the record grows by 32 or 33 bytes); drop or
+// misplace the file's presence byte (the file id is lost or the strings after
+// it are misread); decode the id without re-encoding it as lowercase hex (the
+// id does not round-trip).
+func TestAnExactRecordCarriesItsIdsAsRawBytes(t *testing.T) {
+	withFile := exactEntry{exactHit{Tier: model.TierExactName, Path: "pkg/wide.go", Node: sqlite.StoredNode{
+		Node: model.Node{ID: model.NodeID(model.H("node")), FileID: model.FileID(model.H("file")),
+			Kind: model.NodeFunction, Name: "Widget", QualifiedName: "pkg.Widget", Signature: "func()",
+			SemanticSource: model.SemanticCanonical},
+		Bytes: &model.ByteRange{Start: 300, End: 70_000}}}}
+	bare := exactEntry{exactHit{Tier: model.TierQualifiedNamePrefix, Node: sqlite.StoredNode{
+		Node: model.Node{ID: model.NodeID(model.H("dependency")), Kind: model.NodeDependency, Name: "dep",
+			QualifiedName: "dep", SemanticSource: model.SemanticCanonical}}}}
+	for _, tc := range []struct {
+		name  string
+		entry exactEntry
+		ids   int
+	}{{"with a file", withFile, 2}, {"without a file", bare, 1}} {
+		record, err := exactRecord(tc.entry)
+		if err != nil {
+			t.Fatalf("%s: exactRecord: %v", tc.name, err)
+		}
+		got, err := exactFromRecord(record)
+		if err != nil {
+			t.Fatalf("%s: exactFromRecord: %v", tc.name, err)
+		}
+		if !reflect.DeepEqual(got, tc.entry) {
+			t.Fatalf("%s: the record decodes to %+v, want %+v", tc.name, got, tc.entry)
+		}
+		n := tc.entry.Node.Node
+		// The tier byte, every string length-prefixed with the ids spelled in
+		// hex, and the byte interval: the record as it was with text ids.
+		want := 1 + spanBytes(tc.entry)
+		for _, s := range []string{tc.entry.Path, string(n.ID), string(n.FileID), string(n.Kind), n.Name,
+			n.QualifiedName, n.Signature} {
+			want += 1 + len(s)
+		}
+		// Raw ids: the node id's 65 bytes become 32; a file id's 65 become a
+		// presence byte and 32; an absent file's length byte becomes its
+		// presence byte.
+		want -= 1 + model.IDHexLen - model.IDHexLen/2
+		if n.FileID != "" {
+			want -= model.IDHexLen - model.IDHexLen/2
+		}
+		if len(record) != want {
+			t.Fatalf("%s: the record is %d bytes, want %d: its %d ids are not stored as raw bytes",
+				tc.name, len(record), want, tc.ids)
+		}
+	}
+	if _, err := exactRecord(exactEntry{exactHit{Node: sqlite.StoredNode{Node: model.Node{ID: "not-an-id"}}}}); err == nil {
+		t.Fatal("a hit whose node id is not an id was encoded")
+	}
+}
+
+// spanBytes is the size of a record's byte-interval part for these fixtures.
+func spanBytes(e exactEntry) int {
+	if e.Node.Bytes == nil {
+		return 1
+	}
+	return 1 + len(binary.AppendUvarint(nil, e.Node.Bytes.Start)) + len(binary.AppendUvarint(nil, e.Node.Bytes.End))
 }

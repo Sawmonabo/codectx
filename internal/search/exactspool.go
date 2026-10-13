@@ -22,6 +22,7 @@ package search
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"time"
@@ -101,17 +102,35 @@ func encodeSearchToken(signer *pagination.Signer, t searchToken) (string, error)
 }
 
 // exactRecord encodes one exact hit: the fields cmpExact orders by and served
-// projects, nothing more. Strings are length-prefixed; a node with no byte
-// interval carries a zero flag and no offsets.
+// projects, nothing more. The node id is its 32 raw bytes, and the file id a
+// presence byte and its 32 raw bytes, not their 64-character hex spellings;
+// strings are length-prefixed; a node with no byte interval carries a zero
+// flag and no offsets.
 func exactRecord(e exactEntry) ([]byte, error) {
 	n := e.Node.Node
-	strs := [...]string{e.Path, string(n.ID), string(n.FileID), string(n.Kind), n.Name, n.QualifiedName, n.Signature}
-	size := 1 + 1 + 2*binary.MaxVarintLen64
+	node, err := model.DecodeID(string(n.ID))
+	if err != nil {
+		return nil, err
+	}
+	var file []byte
+	if n.FileID != "" {
+		if file, err = model.DecodeID(string(n.FileID)); err != nil {
+			return nil, err
+		}
+	}
+	strs := [...]string{e.Path, string(n.Kind), n.Name, n.QualifiedName, n.Signature}
+	size := 1 + len(node) + 1 + len(file) + 1 + 2*binary.MaxVarintLen64
 	for _, s := range strs {
 		size += binary.MaxVarintLen64 + len(s)
 	}
 	b := make([]byte, 0, size)
 	b = append(b, byte(e.Tier.Rank()))
+	b = append(b, node...)
+	if file == nil {
+		b = append(b, 0)
+	} else {
+		b = append(append(b, 1), file...)
+	}
 	for _, s := range strs {
 		b = binary.AppendUvarint(b, uint64(len(s)))
 		b = append(b, s...)
@@ -129,15 +148,31 @@ var errExactRecord = errors.New("search: a spooled exact hit is malformed")
 
 // exactFromRecord decodes what exactRecord wrote.
 func exactFromRecord(b []byte) (exactEntry, error) {
-	if len(b) < 1 {
+	const idBytes = model.IDHexLen / 2
+	if len(b) < 1+idBytes+1 {
 		return exactEntry{}, errExactRecord
 	}
 	tier, ok := tierOfRank(int(b[0]))
 	if !ok {
 		return exactEntry{}, errExactRecord
 	}
-	b = b[1:]
-	var strs [7]string
+	var e exactEntry
+	e.Tier = tier
+	e.Node.Node.ID = model.NodeID(hex.EncodeToString(b[1 : 1+idBytes]))
+	b = b[1+idBytes:]
+	switch b[0] {
+	case 0:
+		b = b[1:]
+	case 1:
+		if len(b) < 1+idBytes {
+			return exactEntry{}, errExactRecord
+		}
+		e.Node.Node.FileID = model.FileID(hex.EncodeToString(b[1 : 1+idBytes]))
+		b = b[1+idBytes:]
+	default:
+		return exactEntry{}, errExactRecord
+	}
+	var strs [5]string
 	for i := range strs {
 		n, w := binary.Uvarint(b)
 		if w <= 0 || uint64(len(b)-w) < n {
@@ -145,10 +180,9 @@ func exactFromRecord(b []byte) (exactEntry, error) {
 		}
 		strs[i], b = string(b[w:w+int(n)]), b[w+int(n):]
 	}
-	var e exactEntry
-	e.Tier, e.Path = tier, strs[0]
-	e.Node.Node = model.Node{ID: model.NodeID(strs[1]), FileID: model.FileID(strs[2]), Kind: model.NodeKind(strs[3]),
-		Name: strs[4], QualifiedName: strs[5], Signature: strs[6], SemanticSource: model.SemanticCanonical}
+	e.Path = strs[0]
+	e.Node.Node.Kind, e.Node.Node.Name, e.Node.Node.QualifiedName = model.NodeKind(strs[1]), strs[2], strs[3]
+	e.Node.Node.Signature, e.Node.Node.SemanticSource = strs[4], model.SemanticCanonical
 	if len(b) < 1 {
 		return exactEntry{}, errExactRecord
 	}
