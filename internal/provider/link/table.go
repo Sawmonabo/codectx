@@ -55,6 +55,9 @@ type Table struct {
 	// (wire.Conversion), Go's compile-time proofs that a type implements an
 	// interface.
 	Conversions []wire.Conversion `json:"conversions,omitempty"`
+	// Routing is the framework routing the file's route table left open
+	// (route.go).
+	Routing Routing `json:"routing,omitzero"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the
@@ -193,6 +196,12 @@ type Decl struct {
 	// MacroTranscribes reports a Rust macro_rules that transcribes its item
 	// input unchanged (wire.Decl.MacroTranscribes).
 	MacroTranscribes bool `json:"macro_transcribes,omitempty"`
+	// Visibility is, for a C or C++ object-like macro, the visibility its
+	// replacement states (wire.Export.Visibility).
+	Visibility string `json:"visibility,omitempty"`
+	// Macros are, for a C or C++ declaration, the macros written among its
+	// specifiers, each followed by one space (wire.Export.Macros).
+	Macros string `json:"macros,omitempty"`
 }
 
 // Parameter is one declared parameter of a callable. Endpoint is the

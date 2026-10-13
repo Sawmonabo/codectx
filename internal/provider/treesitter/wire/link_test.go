@@ -15,9 +15,9 @@ import (
 // worker is retired as broken, the structural unit fails and the generation
 // fails with it.
 //
-// Mutation: count exports at 55 bytes instead of 54 in DecodeLink -> the
-// decode fails. After the exports' count, n minimal exports leave 54n bytes
-// plus 36 for the nine empty trailing lists' counts, and 55n exceeds that
+// Mutation: count exports at 63 bytes instead of 62 in DecodeLink -> the
+// decode fails. After the exports' count, n minimal exports leave 62n bytes
+// plus 36 for the nine empty trailing lists' counts, and 63n exceeds that
 // once n is 37 or more, which is why the message carries more than that.
 func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 	var in Link
@@ -39,15 +39,15 @@ func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 
 // TestLinkFactsBeyondCallsRoundTrip carries every field the linker's facts
 // beyond calls read through one encode and decode: an export's override mark,
-// alias, property and exported marks, identity and trait, a Go conversion, a
-// value's declaration, a supertype's interface mark, an argument's reads, keyword and spread, a dynamic import's
+// alias, property and exported marks, identity, trait, visibility and macros,
+// a Go conversion, a value's declaration, a supertype's interface mark, an argument's reads, keyword and spread, a dynamic import's
 // fragments and constant flag, a parameter's marks, and a computed site with
 // its arguments. Each is written after fields that existed before it, so a
 // codec that skips or reorders one shifts every later byte.
 //
 // Mutation: AppendLink drops the alias, the exported mark, the identity, the
-// trait, a conversion's interface, a value's declaration or a supertype's
-// interface mark, or
+// trait, the visibility or the macros, a conversion's interface, a value's
+// declaration or a supertype's interface mark, or
 // DecodeLink reads a computed site's arguments without their reads -> the
 // decoded message differs (or is refused as malformed).
 func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
@@ -59,6 +59,8 @@ func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 			{Name: Span{Start: 17, End: 19}, Property: true},
 			{Name: Span{Start: 91, End: 92}, Receiver: "T", Identity: "( :st.ID ) ( .error )"},
 			{Name: Span{Start: 24, End: 27}, Receiver: "T", Override: true, Trait: "fmt::Display"},
+			{Name: Span{Start: 100, End: 103}, Alias: "VIS", Visibility: VisibilityDllexport},
+			{Name: Span{Start: 104, End: 107}, Macros: "API XMLCALL "},
 		},
 		Conversions: []Conversion{{Type: "T", Interface: "io.Reader"}, {Type: "U", Interface: "fmt.Stringer"}},
 		Values: []Value{{At: Span{Start: 81, End: 90}, Field: "run", Type: Type{Kind: TypeFunction, Name: "obj.run"},

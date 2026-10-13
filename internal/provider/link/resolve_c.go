@@ -7,6 +7,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
 // freeC is free for C and C++. A function of internal linkage that the
@@ -279,4 +280,106 @@ func (r *staticFile) includeFacts() error {
 		}
 	}
 	return nil
+}
+
+// The evidence detail of a C or C++ visibility occurrence: "visibility_" and
+// the visibility the macro definition states (wire.Export.Visibility).
+const (
+	DetailVisibilityDefault     = "visibility_" + wire.VisibilityDefault
+	DetailVisibilityHidden      = "visibility_" + wire.VisibilityHidden
+	DetailVisibilityProtected   = "visibility_" + wire.VisibilityProtected
+	DetailVisibilityInternal    = "visibility_" + wire.VisibilityInternal
+	DetailVisibilityDllexport   = "visibility_" + wire.VisibilityDllexport
+	DetailVisibilityDllimport   = "visibility_" + wire.VisibilityDllimport
+	DetailVisibilityUnspecified = "visibility_" + wire.VisibilityUnspecified
+	DetailVisibilityUnresolved  = "visibility_" + wire.VisibilityUnresolved
+)
+
+// visibilityFacts emits, for each C or C++ declaration of the file written
+// with macros among its specifiers (Decl.Macros), a FactVisibility to each
+// definition of each macro that states a visibility and that the file sees:
+// its own, and those of a header it includes (includes), as aliasC reads a
+// macro. A one-identifier replacement is followed to the definitions of the
+// macro it names, never to one already replaced along the expansion
+// ([cpp.rescan]). Every definition reached is a fact, so a macro defined in
+// several `#if` arms publishes each arm's visibility; a macro the file sees
+// no definition of publishes nothing. What a macro reaches is read once per
+// file.
+func (r *staticFile) visibilityFacts() error {
+	if r.fc.family != "c" {
+		return nil
+	}
+	reached := map[string][]Binding{}
+	for i := range r.t.Decls {
+		d := &r.t.Decls[i]
+		if d.Macros == "" {
+			continue
+		}
+		site := Ref{File: r.file, Index: int32(i)}
+		for _, m := range strings.Fields(d.Macros) {
+			facts, ok := reached[m]
+			if !ok {
+				var err error
+				if facts, err = r.macroVisibility(m, map[string]bool{}, nil); err != nil {
+					return err
+				}
+				reached[m] = facts
+			}
+			for _, b := range facts {
+				b.Site = site
+				if err := r.emit(b); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// macroVisibility appends to out the FactVisibility facts, with no site, of
+// the definitions the macro name reaches (visibilityFacts); seen holds the
+// names already read along the expansion.
+func (r *staticFile) macroVisibility(name string, seen map[string]bool, out []Binding) ([]Binding, error) {
+	if seen[name] {
+		return out, nil
+	}
+	seen[name] = true
+	sees := func(e entry) bool { return e.Ref.File == r.file || r.includes(e.Aux) }
+	err := r.h.decls.lookup(keyMacroVisibility+name, func(e entry) error {
+		if detail, ok := visibilityDetail(e.Sig); ok && sees(e) {
+			out = append(out, Binding{Kind: FactVisibility, Target: e.Ref, Detail: detail})
+		}
+		return nil
+	})
+	if err != nil {
+		return out, err
+	}
+	var names []string
+	err = r.h.decls.lookup(keyMacro+name, func(e entry) error {
+		if sees(e) && !slices.Contains(names, e.Sig) {
+			names = append(names, e.Sig)
+		}
+		return nil
+	})
+	if err != nil {
+		return out, err
+	}
+	for _, n := range names {
+		if out, err = r.macroVisibility(n, seen, out); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// visibilityDetail is the evidence detail of the visibility v, or false when
+// v is none of the values the worker sends.
+func visibilityDetail(v string) (string, bool) {
+	d := "visibility_" + v
+	switch d {
+	case DetailVisibilityDefault, DetailVisibilityHidden, DetailVisibilityProtected, DetailVisibilityInternal,
+		DetailVisibilityDllexport, DetailVisibilityDllimport, DetailVisibilityUnspecified, DetailVisibilityUnresolved:
+		return d, true
+	}
+	return "", false
 }

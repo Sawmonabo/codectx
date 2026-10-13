@@ -91,7 +91,7 @@ type kindIDs struct {
 	// Go: the type a type_spec declares, and a method receiver's type.
 	structType, interfaceType, typeIdentifier, parameterDeclaration uint16
 	// Python docstrings and the `__main__` guard.
-	expressionStatement, str, comparisonOperator, stringStart uint16
+	expressionStatement, str, comparisonOperator, stringStart, stringContent, parenthesized uint16
 	// Java and Rust modifiers, Rust macros and attributes.
 	modifiers, visibilityModifier, macroDefinition, attributeItem uint16
 	// ECMAScript function values and the bindings a function-valued
@@ -148,6 +148,8 @@ func (g *grammar) kindIDs() *kindIDs {
 			str:                     id("string"),
 			comparisonOperator:      id("comparison_operator"),
 			stringStart:             id("string_start"),
+			stringContent:           id("string_content"),
+			parenthesized:           id("parenthesized_expression"),
 			modifiers:               id("modifiers"),
 			visibilityModifier:      id("visibility_modifier"),
 			macroDefinition:         id("macro_definition"),
@@ -448,18 +450,58 @@ func jsRefine(d *decl, _ []byte) {
 
 // pyMainGuard keeps a module-level `if` the query captured as a `__main__`
 // guard only when its condition is exactly `__name__ == "__main__"`, in either
-// operand order: one comparison of two operands with the operator `==`, and
-// a string that is not a bytes literal. Anything else (`!=`, `is`, a chained
-// comparison, `b"__main__"`) is no guard and declares nothing.
+// operand order and inside any number of parentheses: one comparison of two
+// operands with the operator `==`, the identifier `__name__` and a string
+// that is not a bytes literal whose one content is `__main__`. Its name is
+// that content, wherever the parentheses put it. Anything else (`!=`, `is`,
+// a chained comparison, `b"__main__"`) is no guard and declares nothing.
 func pyMainGuard(d *decl, src []byte) {
 	if d.kind != "endpoint" {
 		return
 	}
 	k, f := d.ex.k, d.ex.f
+	d.name = ""
 	cond := d.node.ChildByFieldId(f.condition)
-	if cond == nil || cond.KindId() != k.comparisonOperator || !pyEqualsGuard(cond, k, src) {
-		d.name = ""
+	for cond != nil && cond.KindId() == k.parenthesized {
+		cond = soleOperand(cond)
 	}
+	if cond == nil || cond.KindId() != k.comparisonOperator || !pyEqualsGuard(cond, k, src) {
+		return
+	}
+	var name *ts.Node
+	ident := false
+	for i := uint(0); i < cond.NamedChildCount(); i++ {
+		n := cond.NamedChild(i)
+		switch {
+		case n == nil || n.IsExtra():
+		case n.KindId() == k.identifier:
+			ident = n.Utf8Text(src) == "__name__"
+		case n.KindId() == k.str:
+			if c := childOfKind(*n, k.stringContent); c != nil && c.Utf8Text(src) == "__main__" && n.NamedChildCount() == 3 {
+				name = c
+			}
+		}
+	}
+	if ident && name != nil {
+		d.name, d.nameStart, d.nameEnd = "__main__", name.StartByte(), name.EndByte()
+	}
+}
+
+// soleOperand is the one expression a parenthesized expression holds,
+// comments aside, or nil.
+func soleOperand(n *ts.Node) *ts.Node {
+	var out *ts.Node
+	for i := uint(0); i < n.NamedChildCount(); i++ {
+		c := n.NamedChild(i)
+		if c == nil || c.IsExtra() {
+			continue
+		}
+		if out != nil {
+			return nil
+		}
+		out = c
+	}
+	return out
 }
 
 // pyEqualsGuard reports a comparison of exactly two operands joined by one
