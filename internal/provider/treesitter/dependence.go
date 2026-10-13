@@ -109,6 +109,7 @@ func (b *builder) functions() error {
 			}
 			b.dependsOn(owner, model.RelWrites, ids[a.Var], nodes[a.Node], ownerKey, detail)
 		}
+		b.inputFlows(f, ids, nodes)
 	}
 	b.tableVariables(vars)
 	return nil
