@@ -1228,7 +1228,7 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
-	// The dedupe the producers no longer do: the streamed side folds the
+	// The dedupe the producers do not do: the streamed side folds the
 	// identity-carrying seeds by entity, keeping the earliest, and the
 	// reference reproduces exactly that over its slice.
 	seedCands := dedupeByEntity(sink.cands)

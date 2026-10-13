@@ -625,7 +625,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					t.Fatalf("extractSeeds: %v", err)
 				}
 				// The sink holds what discovery pushed, in discovery order and
-				// BEFORE the entity fold, which is where the dedupe now lives.
+				// BEFORE the entity fold, which is where the dedupe lives.
 				pushed := sink.cands
 
 				// Every Section 15.2 step contributes, so the order assertion below
