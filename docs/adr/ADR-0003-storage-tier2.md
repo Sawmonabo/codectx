@@ -246,7 +246,7 @@ and is ~14× the number it replaces because that number was never derived at all
 
 ### 2.6 Sequence
 
-1. **Precondition.** The content-store read ceiling that verification finding SV2 records — `byte
+1. **Precondition.** The content-store read ceiling a verification run recorded — `byte
    range spans 4292608 bytes, over the 1048576-byte read ceiling`, a bound no user set, which takes
    the whole answer down instead of truncating and flagging — becomes a user-set bound that is
    unlimited by default, and the integrity check is reimplemented. §2.1 must not land first:
