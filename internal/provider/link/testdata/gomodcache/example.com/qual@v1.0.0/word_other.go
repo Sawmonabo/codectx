@@ -9,3 +9,7 @@ type Regs struct{}
 type Getter interface{ Get() int8 }
 
 const N = 1
+
+type DotWord = int8
+
+type Same = Count

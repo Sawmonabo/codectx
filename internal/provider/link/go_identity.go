@@ -703,11 +703,10 @@ func goUnboundQualifier(n goNames, q, name string) (string, bool, error) {
 // ("Declarations and scope", "Import declarations"). So each qualifier must
 // bind the same import in both, or, bound by none, have the same candidates
 // (goUnboundQualifier); and an exported name written unqualified, which a
-// dot import may declare, needs the same dot imports in both. Files whose
-// dot imports differ are read as meaning differently even where the
-// package's own declaration decides the name: such declarations stay
-// apart, and every reader compares them by their canonical spellings.
-func goSameMeaning(a, b goNames, form string) (bool, error) {
+// dot import may declare, must be declared by the same package in both
+// (goDotName). declares answers which packages declare a name.
+func goSameMeaning(a, b goNames, form string, declares goDeclares) (bool, error) {
+	var da, db []string
 	dots := false
 	for rest := form; rest != ""; {
 		var tok string
@@ -722,22 +721,71 @@ func goSameMeaning(a, b goNames, form string) (bool, error) {
 			if err != nil || !same {
 				return false, err
 			}
-		case !dots && len(tok) > 1 && tok[0] == '.' && token.IsExported(tok[1:]):
-			dots = true
-			da, err := a.dots()
+		case len(tok) > 1 && tok[0] == '.' && token.IsExported(tok[1:]):
+			if !dots {
+				dots = true
+				var err error
+				if da, err = a.dots(); err != nil {
+					return false, err
+				}
+				if db, err = b.dots(); err != nil {
+					return false, err
+				}
+			}
+			if goSameSet(da, db) {
+				continue
+			}
+			name := tok[1:]
+			if _, found, err := declares(a.pkg(), name); err != nil || found {
+				// The package's own declaration decides the name in both
+				// files: a dot import never declares a name the package
+				// block declares ("Declarations and scope").
+				if err != nil {
+					return false, err
+				}
+				continue
+			}
+			pa, err := goDotName(da, name, declares)
 			if err != nil {
 				return false, err
 			}
-			db, err := b.dots()
-			if err != nil {
+			pb, err := goDotName(db, name, declares)
+			if err != nil || pa != pb {
 				return false, err
-			}
-			if !goSameSet(da, db) {
-				return false, nil
 			}
 		}
 	}
 	return true, nil
+}
+
+// goDeclares reports whether the package at import path p declares a type
+// or constant named name; known is false when its source is not read.
+type goDeclares func(p, name string) (known, found bool, err error)
+
+// goDotName is what an exported name the file's package does not declare
+// denotes through the file's dot imports dots, as goUnqualified and
+// goConstName read it: the dot imported package that declares it, else the
+// sorted unread ones that may, else "" (a predeclared name, or one the
+// package declares in a file the unit does not hold).
+func goDotName(dots []string, name string, declares goDeclares) (string, error) {
+	var unread []string
+	for _, d := range dots {
+		known, found, err := declares(d, name)
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case found:
+			return d, nil
+		case !known:
+			unread = append(unread, d)
+		}
+	}
+	if len(unread) == 0 {
+		return "", nil
+	}
+	slices.Sort(unread)
+	return "?" + strings.Join(slices.Compact(unread), "|"), nil
 }
 
 // goSameQualifier reports a qualifier that denotes the same package in the

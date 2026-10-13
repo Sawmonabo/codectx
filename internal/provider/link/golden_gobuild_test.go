@@ -491,6 +491,95 @@ func use(qual.Sized, qual.Getter, qual.Buf) {}
 		fails: "external declarations spelled alike joined though their qualifier names a different import in each file",
 	},
 	{
+		name:   "unqualified-name-under-a-different-dot-import-per-build",
+		anchor: "The Go Programming Language Specification, \"Declarations and scope\" (a dot import declares its package's exported names in the file block), \"Import declarations\", \"Alias declarations\", \"Method sets\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod":     "module example.com/m\n\ngo 1.27\n\nrequire example.com/qual v1.0.0\n",
+			"d32/d.go":   "package d32\n\ntype T = uint32\n",
+			"d64/d.go":   "package d64\n\ntype T = uint64\n",
+			"w_386.go":   "package p\n\nimport . \"example.com/m/d32\"\n\ntype Word = T\n\ntype Size = Count\n\nfunc (S) L() {} // @tl\n",
+			"w_amd64.go": "package p\n\nimport . \"example.com/m/d64\"\n\ntype Word = T\n\ntype Size = Count\n\nfunc (S) H() {} // @th\n",
+			"t.go": `package p
+
+import "example.com/qual"
+
+type Count = int16
+
+type S struct{} // @ts
+
+func (S) R() Word { return 0 } // @tr
+
+func (S) N() Size { return 0 } // @tn
+
+func (S) DotSize() uint64 { return 0 } // @tds
+
+func (S) N16() int16 { return 0 } // @tn16
+
+type A32L interface { // @a32l
+	R() uint32 // @a32lr
+	L() // @a32ll
+}
+
+type A64H interface { // @a64h
+	R() uint64 // @a64hr
+	H() // @a64hh
+}
+
+type A64L interface { // @a64l
+	R() uint64
+	L()
+}
+
+type NL interface { // @inl
+	N() int16 // @inln
+	L() // @inll
+}
+
+type NH interface { // @inh
+	N() int16 // @inhn
+	H() // @inhh
+}
+
+type SameH interface { // @isameh
+	N16() qual.Same // @isamehn
+	H() // @isamehh
+}
+
+func use(qual.DotSized, qual.SameN) {}
+`,
+		},
+		// Checked with go vet per GOARCH: w_386.go dot-imports d32 and w_amd64.go d64, so Word (T) is uint32
+		// on 386 and uint64 on amd64, while Size is the package's own Count (int16) in both. Outside the unit,
+		// qual's dot_386.go and dot_amd64.go dot-import qual/a and qual/b: DotWord is uint32 on 386 and uint64
+		// on amd64, Same is qual's Count (int16) on both and everywhere else. So S implements A32L and NL (386),
+		// A64H, NH and qual.DotSized (amd64), qual.SameN and SameH (amd64, where H is), never A64L.
+		want: []string{},
+		facts: []string{
+			"ts S implements a32l A32L",
+			"tr R overrides a32lr R",
+			"tl L overrides a32ll L",
+			"ts S implements a64h A64H",
+			"tr R overrides a64hr R",
+			"th H overrides a64hh H",
+			"ts S implements inl NL",
+			"tn N overrides inln N",
+			"tl L overrides inll L",
+			"ts S implements inh NH",
+			"tn N overrides inhn N",
+			"th H overrides inhh H",
+			"ts S implements external example.com/qual.DotSized",
+			"tds DotSize overrides external example.com/qual.DotSized.DotSize",
+			"ts S implements external example.com/qual.SameN",
+			"tn16 N16 overrides external example.com/qual.SameN.N16",
+			"ts S implements isameh SameH",
+			"tn16 N16 overrides isamehn N16",
+			"th H overrides isamehh H",
+		},
+		// Mutation: an unqualified name read alike whatever each file dot-imports -> Word and DotWord are one
+		// file's in both builds: S implements A64L, or misses A32L and qual.DotSized.
+		fails: "declarations spelled alike joined though a dot import gives their unqualified name another package in each file",
+	},
+	{
 		name:   "many-free-tags-decided-exactly",
 		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\"",
 		files:  manyTagsFiles(),

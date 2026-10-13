@@ -875,7 +875,7 @@ func (x *goExternal) renameImports() error {
 			}
 			f.imports = renamed
 		}
-		if err := pkg.regroup(); err != nil {
+		if err := pkg.regroup(x.h.goDeclaresIn(x)); err != nil {
 			return err
 		}
 	}
@@ -888,7 +888,7 @@ func (x *goExternal) renameImports() error {
 // spelled alike in a file whose import of its qualifier is another package
 // names other declarations, so it is a declaration of its own (a variant,
 // or another entry of the name), under its own files' conditions.
-func (p *goExtPackage) regroup() error {
+func (p *goExtPackage) regroup(declares goDeclares) error {
 	for _, t := range p.types {
 		if t.file >= 0 {
 			n := len(t.variants)
@@ -900,7 +900,7 @@ func (p *goExtPackage) regroup() error {
 				if len(d.also) == 0 {
 					continue
 				}
-				split, err := p.splitDecl(d)
+				split, err := p.splitDecl(d, declares)
 				if err != nil {
 					return err
 				}
@@ -910,14 +910,14 @@ func (p *goExtPackage) regroup() error {
 				}
 			}
 		}
-		recv, err := p.splitMembers(t.recv)
+		recv, err := p.splitMembers(t.recv, declares)
 		if err != nil {
 			return err
 		}
 		t.recv = recv
 	}
 	for name, cs := range p.consts {
-		cs, err := p.splitMembers(cs)
+		cs, err := p.splitMembers(cs, declares)
 		if err != nil {
 			return err
 		}
@@ -929,11 +929,11 @@ func (p *goExtPackage) regroup() error {
 // splitDecl keeps in d.also the files whose declaration means the same as
 // d's file's, and returns a declaration for each other meaning, its files
 // those of d.also that mean it.
-func (p *goExtPackage) splitDecl(d *goExtType) ([]*goExtType, error) {
+func (p *goExtPackage) splitDecl(d *goExtType, declares goDeclares) ([]*goExtType, error) {
 	var out []*goExtType
 	kept := d.also[:0]
 	for _, f := range d.also {
-		same, err := p.sameDeclIn(d, d.file, f)
+		same, err := p.sameDeclIn(d, d.file, f, declares)
 		if err != nil {
 			return nil, err
 		}
@@ -943,7 +943,7 @@ func (p *goExtPackage) splitDecl(d *goExtType) ([]*goExtType, error) {
 		}
 		placed := false
 		for _, v := range out {
-			if placed, err = p.sameDeclIn(d, v.file, f); err != nil {
+			if placed, err = p.sameDeclIn(d, v.file, f, declares); err != nil {
 				return nil, err
 			} else if placed {
 				v.also = append(v.also, f)
@@ -961,14 +961,14 @@ func (p *goExtPackage) splitDecl(d *goExtType) ([]*goExtType, error) {
 
 // sameDeclIn reports the declaration d, written alike in pkg's files a and
 // b, meaning the same in both: its form, embedded types and methods.
-func (p *goExtPackage) sameDeclIn(d *goExtType, a, b int) (bool, error) {
+func (p *goExtPackage) sameDeclIn(d *goExtType, a, b int, declares goDeclares) (bool, error) {
 	na, nb := p.names(a), p.names(b)
-	if same, err := goSameMeaning(na, nb, d.form); err != nil || !same {
+	if same, err := goSameMeaning(na, nb, d.form, declares); err != nil || !same {
 		return false, err
 	}
 	for _, ms := range [][]goExtMethod{d.embeds, d.methods} {
 		for _, m := range ms {
-			if same, err := goSameMeaning(na, nb, m.form); err != nil || !same {
+			if same, err := goSameMeaning(na, nb, m.form, declares); err != nil || !same {
 				return false, err
 			}
 		}
@@ -991,7 +991,7 @@ func membersIn(ms []goExtMethod, f int) []goExtMethod {
 // splitMembers is ms with each member's files parted by meaning, as
 // splitDecl parts a declaration's: another meaning is another entry of
 // the name.
-func (p *goExtPackage) splitMembers(ms []goExtMethod) ([]goExtMethod, error) {
+func (p *goExtPackage) splitMembers(ms []goExtMethod, declares goDeclares) ([]goExtMethod, error) {
 	n := len(ms)
 	for i := range n {
 		if len(ms[i].also) == 0 {
@@ -1001,7 +1001,7 @@ func (p *goExtPackage) splitMembers(ms []goExtMethod) ([]goExtMethod, error) {
 		var heads []int
 		kept := m.also[:0]
 		for _, f := range m.also {
-			same, err := goSameMeaning(p.names(m.file), p.names(f), m.form)
+			same, err := goSameMeaning(p.names(m.file), p.names(f), m.form, declares)
 			if err != nil {
 				return nil, err
 			}
@@ -1011,7 +1011,7 @@ func (p *goExtPackage) splitMembers(ms []goExtMethod) ([]goExtMethod, error) {
 			}
 			placed := false
 			for _, h := range heads {
-				if placed, err = goSameMeaning(p.names(ms[h].file), p.names(f), m.form); err != nil {
+				if placed, err = goSameMeaning(p.names(ms[h].file), p.names(f), m.form, declares); err != nil {
 					return nil, err
 				} else if placed {
 					ms[h].also = append(ms[h].also, f)

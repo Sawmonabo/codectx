@@ -200,7 +200,7 @@ func (t goUnitTypes) addWritten(written []goWritten, e entry) ([]goWritten, erro
 			if !found || !w.found {
 				continue
 			}
-			same, err := goSameMeaning(w.names, names, e.Sig)
+			same, err := goSameMeaning(w.names, names, e.Sig, t.h.goDeclaresIn(t.h.goExt))
 			if err != nil {
 				return nil, err
 			}
@@ -243,6 +243,46 @@ func (t goUnitTypes) decls(written []goWritten) ([]goDecl, error) {
 		out = append(out, d)
 	}
 	return out, nil
+}
+
+// goDeclaresIn is goDeclares over the unit's packages and the packages
+// outside it ext read (none when ext is nil). It reads only whether a
+// declaration of the name exists, never its form, so it never re-enters a
+// lookup of the name being read.
+func (h *hierarchy) goDeclaresIn(ext *goExternal) goDeclares {
+	return func(p, name string) (known, found bool, err error) {
+		inUnit := false
+		err = h.goPackages(p, func(scope string) error {
+			if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
+				return nil
+			}
+			inUnit = true
+			for _, key := range [...]string{keyGoAlias, keyType + "go\x00", keyGoConst} {
+				if found {
+					return nil
+				}
+				if err := h.decls.lookup(key+scope+"\x00"+name, func(entry) error {
+					found = true
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil || inUnit || h.goModule != "" && under(p, h.goModule) {
+			return true, found, err
+		}
+		if ext == nil {
+			return false, false, nil
+		}
+		pkg := ext.pkgs[p]
+		if pkg == nil {
+			return false, false, nil
+		}
+		t := pkg.types[name]
+		return true, t != nil && t.file >= 0 || len(pkg.consts[name]) > 0, nil
+	}
 }
 
 // goUnitNames is goNames of a member file of the unit.
