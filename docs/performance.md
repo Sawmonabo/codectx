@@ -72,18 +72,16 @@ when they were actually measured. One entry is recorded today:
 ### 1.2 Corpus shapes actually exercised by Section 3
 
 Most of Section 3 runs on `corpusSmallReal`: **124 files**, 40 packages, seed
-2101, 66 032 eligible source bytes, 248 indexing units. The context-plan walk
-over it visits **103 nodes across 40 edges and selects 39 entries**, and is not
-truncated.
+2101, 66 032 eligible source bytes, 248 indexing units. The context-plan scope
+walk over it from 64 seeds visits **769 nodes across 1 596 edges** at the
+default, unlimited bounds (Section 3.2).
 
-Four rows do not. Rows 9 and 13 are defined over the Section 23.1 reference
+Three rows do not. Rows 9 and 13 are defined over the Section 23.1 reference
 workload and run on `corpusReference` — 10 000 files, 1 052 933 lines and
 82.08 MiB, the size Section 23.1 specifies (an earlier generator produced
 262 551 lines / 5.70 MiB; Section 4 records both measurements). Row 15
 runs on `corpusOver200Files`, because no plan over a small corpus reaches a
-200-file session. Row 16 is not a generated corpus at all: it is an 810-file
-real workspace, which is the only shape that can answer whether a depth bound
-is reached in practice.
+200-file session.
 
 ## 2. Method
 
@@ -121,9 +119,8 @@ a factor of two.
 
 Measured at small-real scale (124 files) on the environment of Section 1,
 except rows 9 and 13, which are defined over the Section 23.1 reference
-workload and were taken by the verification pass on the reference corpus, and
-row 16, which was taken on a real 810-file workspace. `p95 / n` is the 95th
-percentile over `n` samples.
+workload and were taken by the verification pass on the reference corpus.
+`p95 / n` is the 95th percentile over `n` samples.
 
 | # | Row | Target | Measured | Status |
 |---|---|---|---|---|
@@ -132,7 +129,7 @@ percentile over `n` samples.
 | 3 | Lexical search | 150 ms | not yet measured on the search index | UNMEASURED — recorded from the integrated binary ([ADR-0013](adr/ADR-0013-search-index.md), decision 9); the search index at scale is below |
 | 4 | One-hop caller/callee | 100 ms | p95 **5.72 ms** / 50 | PASS |
 | 5 | Context plan, ≤50k visited nodes | 1 s | p95 **74.8 ms** / 10 | PASS |
-| 6 | Context plan visited nodes | ≤ 50 000 | **103 visited / 40 edges / 39 entries**, not truncated | PASS |
+| 6 | Context plan visited nodes | ≤ 50 000 | **769 visited / 1 596 edges** from 64 seeds at the default bounds (Section 3.2) | PASS |
 | 7 | Ten-file base refresh after debounce | 1.5 s | p95 **144 ms** / 5 | PASS |
 | 8 | No-change refresh: no parser work, no search-index rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
 | 9 | Cold base index of the reference fixture | 3 min | **1 min 32.1 s** over 10 000 files / 1 052 933 lines / 86 064 203 B (the corrected Section 23.1 size); process-tree peak **145.3 MiB** | PASS — re-measured after the external-merge planner and batched provider sinks landed (earlier: 2 min 56.3 s / 912.6 MiB) |
@@ -142,7 +139,7 @@ percentile over `n` samples.
 | 13 | Base storage vs eligible source bytes | 3.5× | **16.10×** on the corrected reference corpus: 1 385 729 099 stored over 86 064 203 eligible source bytes (db 1 299 664 896 + wal 0 + CAS 86 064 203; **CAS alone = 1.00×**). Earlier, on the undersized ~570 B/file corpus: 75.00× / 73.86×; 149.0× at small-real scale | **MISS by 4.6×** — Section 4 |
 | 14 | Low-memory profile (Section 23.3): one worker, 2 GiB | same results as the full profile | **fingerprint identical across 10 fact families**; index tree peak **47.9 MiB** | PASS |
 | 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | a **242-file** session with **216 required** files answered a first page of **199 records** and issued a cursor | PASS |
-| 16 | Default context-graph budget re-pin | measurement-driven | **`max_graph_depth` stays 3**: on a real 810-file workspace the walk saturates at depth 2 — **1 030 visited / 1 295 edges**, unchanged at depth 3, 4 and 5 | PASS |
+| 16 | Default context-graph bounds | measurement-driven | `max_graph_depth`, `max_visited_nodes` and `max_graph_edges` default to **unlimited**; the walk ends on its own at depth 4, **769 nodes / 1 596 edges**, 1.5% of row 6's ceiling (Section 3.2) | PASS |
 
 Row 11 measures a RESTING session, which is what "idle" claims. A window opened
 at process start with `mcp.watch` at its default would cover the initial
@@ -181,35 +178,35 @@ BenchmarkNoChangeRefresh-16      18   63185963 ns/op 14675458 B/op  117058 alloc
 
 ### 3.2 Context-graph depth sweep (behind rows 6 and 16)
 
-64 seeds, both traversal directions, configured bounds
-`max_graph_depth = 3` / `max_visited_nodes = 50 000` / `max_graph_edges = 100 000`:
+`TestResourceBudgets/context-plan-visited`: the plan's scope walk -- its
+boundary relations (`internal/context/scope.go`'s `scopeRelations`), both
+directions, the default unlimited depth, visited and edge bounds -- from 64
+seeds, then the same walk bounded at depths 1 to 4. The seeds are the fan-out
+function and 63 functions and methods spread evenly over the corpus's
+declarations in name order, so every run walks from the same declarations.
+`entries` is the answer's first page (200 records); `truncated` on a bounded
+line is that line's depth bound:
 
 ```
-depth 1: visited=91  edges=28  entries=27  truncated=false
-depth 2: visited=103 edges=40  entries=39  truncated=false
-depth 3: visited=103 edges=40  entries=39  truncated=false
-depth 4: visited=103 edges=40  entries=39  truncated=false
+default:  visited=769 edges=1596 truncated=false
+depth 1:  visited=265 edges=313  truncated=true (depth)
+depth 2:  visited=605 edges=1217 truncated=true (depth)
+depth 3:  visited=730 edges=1544 truncated=true (depth)
+depth 4:  visited=769 edges=1583 truncated=true (depth)
 ```
 
-The walk saturates at depth 2 on this corpus. Two conclusions are firm from it
-and one is not:
+The same walk without the two program-dependence relations
+(`data_flows_to`, `control_depends_on`) visits 727 nodes across 1 493 edges:
+dependence reach adds 42 nodes (5.8%) and 103 edges (6.9%) at this scale.
+Identical across runs.
 
-- **No raise to `max_visited_nodes`.** 50 000 *is* Section 23.2's context-plan
-  ceiling, so raising it would break a release gate by construction.
-- **No raise to `max_graph_edges`.** Measured edges-per-visited-node is 0.39
-  against a pinned ratio of 2:1 — five times the headroom the walk uses.
-- **`max_graph_depth` stays 3.** The same sweep was repeated on a real
-  810-file workspace with 30 seeds at the configured bounds, and it saturates
-  at depth 2 there too — 1 030 visited nodes across 1 295 edges in 0.22 s,
-  unchanged at depth 3, 4 and 5. That is **2.1% of `max_visited_nodes`** and
-  **1.3% of `max_graph_edges`**. `Meta.Truncated` is true at every depth ≥ 2 on
-  that workspace, but `truncation_reason` is *"affected entity record limit
-  reached"* — the 200-record answer page, not a graph bound. Reading that flag
-  as a depth truncation is what motivated the re-pin in the first place, so the
-  premise is withdrawn: narrowing 3 → 2 would change nothing measured, and
-  would drop the one hop that still adds nodes on a deeper graph. Whether a
-  work limit like this one should default to unlimited at all is a separate
-  question and is not answered by this measurement.
+- **The 50 000-node ceiling holds with room**: the whole walk is 1.5% of it.
+  50 000 is Section 23.2's context-plan ceiling and is not moved by this
+  measurement.
+- **Edges per visited node is 2.08** over the whole walk.
+- **The walk ends on its own**: +340, +125 and +39 nodes for hops 2, 3 and 4,
+  and nothing past depth 4, so no default bound is needed to keep it small
+  here; the bounds stay unlimited and a request that wants one names it.
 
 ### Row 3 at scale — the search index on a 546 613-document export
 
@@ -431,9 +428,9 @@ CODECTX_SCALE_PROOF=1 go test ./internal/context \
 The two `internal/context` lines produce Section 3.3: the first its measured
 rows, the second the compile-level rows of the same table.
 
-That block produces every row of Section 3 except three. Rows 9 and 13 need a
-cold index of the reference corpus, and row 16 needs a real workspace; both are
-run by the verification pass and neither is reproduced by a bench selector. Row
+That block produces every row of Section 3 except two. Rows 9 and 13 need a
+cold index of the reference corpus; both are run by the verification pass and
+neither is reproduced by a bench selector. Row
 15's two counts are reproduced as an invariant, not as numbers — see the note
 under Section 3's table.
 
