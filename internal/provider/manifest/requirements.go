@@ -3,7 +3,6 @@ package manifest
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"path"
@@ -40,14 +39,14 @@ import (
 // option line (`-e`, `--index-url`, `--find-links`, ...), a requirement that
 // is a bare URL, path or archive, and an include that is a URL, absolute,
 // outside the workspace, empty, or names an environment variable. Each such
-// line is one evidence row on the configuration node, with the line's range
-// and a detail of `line` (the text), `reason` (for an include) and `via` (for
-// an included file, whose rows carry no range). One row per line, rather
-// than one list in node metadata, is what keeps every line: metadata is one
-// bounded payload per node, while a node's evidence is rows, paged on read
-// and bounded only by the per-fact evidence clip, which counts what it cuts.
-// A line over the evidence detail bound is shortened and counted under
-// `evidence_detail_bytes`. An include the snapshot does not hold is
+// line is one metadata row (model.MetaUnresolvedLines) on the configuration
+// node, located at the line, whose value is `line` (the text, never cut),
+// `reason` (for an include) and `via` (for an included file, whose rows carry
+// no range); the node's metadata says how many there are under
+// `unresolved_lines_rows`. The lines are always rows, never inline, so each
+// keeps its own range; readers page them like any other metadata row, and
+// only the per-fact evidence clip, which counts what it cuts, bounds them.
+// An include the snapshot does not hold is
 // still a `configures` fact and leaves the capability partial. A requirement
 // that names an environment variable (`${TOKEN}`) after its name is published
 // with `unresolved: environment`.
@@ -80,22 +79,23 @@ func (u *unit) requirements(ctx context.Context) error {
 		}
 	}
 	qualified, name := ecosystemPyPI+":requirements:"+rel, path.Base(rel)
-	cfg, err := u.defines(ctx, model.NodeConfiguration, qualified, name, languagePython, nil, nil)
+	var meta map[string]any
+	if len(w.unresolved) > 0 {
+		meta = map[string]any{model.MetadataRowsKey(model.MetaUnresolvedLines): len(w.unresolved)}
+	}
+	cfg, err := u.defines(ctx, model.NodeConfiguration, qualified, name, languagePython, nil, meta)
 	if err != nil {
 		return err
 	}
-	cand, shortened := u.definedCandidate(model.NodeConfiguration, qualified, name, languagePython), 0
-	for _, l := range w.unresolved {
-		detail := filesystem.Detail("line", l.text, "reason", l.reason, "via", l.via)
-		if !detailKeeps(detail, "line", l.text) {
-			shortened++
-		}
-		if _, err := u.e.Node(ctx, cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: l.rng, Detail: detail}); err != nil {
+	for i, l := range w.unresolved {
+		value, err := model.EncodeMetadataValue(unresolvedLine{Line: l.text, Reason: l.reason, Via: l.via})
+		if err != nil {
 			return err
 		}
-	}
-	if shortened > 0 {
-		u.degraded(detailBytes, strconv.Itoa(shortened)+" lines over "+strconv.Itoa(model.MaxDetailBytes))
+		row := model.MetadataRow{Field: model.MetaUnresolvedLines, Ordinal: int64(i), Shape: model.RowElement, Value: value}
+		if err := u.e.AddMetadataRow(cfg.ID, model.PrecisionSyntax, l.rng, row); err != nil {
+			return err
+		}
 	}
 	for i, inc := range w.includes {
 		if u.cut(BoundEntries, u.entries, int64(i+1)) {
@@ -154,18 +154,11 @@ type reqUnresolved struct {
 	rng               *model.SourceRange
 }
 
-// detailBytes is the capability detail key that counts the unresolved lines
-// whose text was shortened to fit the evidence detail bound.
-const detailBytes = "evidence_detail_bytes"
-
-// detailKeeps reports whether a rendered evidence detail still carries value
-// under key in full.
-func detailKeeps(detail, key, value string) bool {
-	var fields map[string]string
-	if err := json.Unmarshal([]byte(detail), &fields); err != nil {
-		return false
-	}
-	return fields[key] == value
+// unresolvedLine is the value of one model.MetaUnresolvedLines row.
+type unresolvedLine struct {
+	Line   string `json:"line"`
+	Reason string `json:"reason,omitempty"`
+	Via    string `json:"via,omitempty"`
 }
 
 // reqDep is one requirement or constraint line. via is the declaring file

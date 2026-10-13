@@ -821,10 +821,10 @@ func TestRequirementsIncludeCycleYieldsExactlyItsPackages(t *testing.T) {
 // TestRequirementsKeepsEveryUnresolvedLine pins that a requirements file
 // with more uninterpreted option lines than one node's metadata can hold
 // (model.MaxMetadataBytes) still publishes every line, each as its own
-// evidence row on the configuration node carrying its text and range.
-// Mutation caught: storing the lines as one node-metadata list, which
-// filesystem.Metadata replaces with {"truncated":true} once it passes the
-// bound, so every line is lost.
+// metadata row on the configuration node carrying its text and range, and the
+// node's metadata counts them.
+// Mutation caught: storing the lines as one inline node-metadata list, which
+// has no range per line, or dropping the row-count marker a reader pages by.
 func TestRequirementsKeepsEveryUnresolvedLine(t *testing.T) {
 	const n = 400
 	var req strings.Builder
@@ -851,9 +851,10 @@ func TestRequirementsKeepsEveryUnresolvedLine(t *testing.T) {
 	if got := unresolvedLines(t, cap); !slices.Equal(got, want) {
 		t.Fatalf("published %d unresolved line records, want %d, one per line with its text and range", len(got), len(want))
 	}
+	wantMeta := fmt.Sprintf(`{"%s":%d}`, model.MetadataRowsKey(model.MetaUnresolvedLines), n)
 	for _, node := range cap.nodes {
-		if node.Kind == model.NodeConfiguration && len(node.Metadata) > 0 {
-			t.Fatalf("configuration metadata = %s, want none: the lines are records, not a metadata list", node.Metadata)
+		if node.Kind == model.NodeConfiguration && string(node.Metadata) != wantMeta {
+			t.Fatalf("configuration metadata = %s, want %s: the lines are rows, and the metadata counts them", node.Metadata, wantMeta)
 		}
 	}
 	if cs := states[manifest.ID+" "+manifest.CapabilityManifests+" "+filesystem.ScopeKey("requirements.txt")]; cs.State != model.CapabilityFresh {
@@ -861,9 +862,9 @@ func TestRequirementsKeepsEveryUnresolvedLine(t *testing.T) {
 	}
 }
 
-// unresolvedLines renders, in publication order, every evidence row of a
+// unresolvedLines renders, in ordinal order, every metadata row of a
 // configuration node that records an uninterpreted line, as its sorted
-// detail pairs followed by "ranged" when the row has a range.
+// value pairs followed by "ranged" when the row has a range.
 func unresolvedLines(t *testing.T, cap *capture) []string {
 	t.Helper()
 	ids := make([]model.NodeID, 0, len(cap.nodes))
@@ -875,23 +876,30 @@ func unresolvedLines(t *testing.T, cap *capture) []string {
 	slices.Sort(ids)
 	var out []string
 	for _, id := range ids {
+		type ranked struct {
+			row    model.MetadataRow
+			ranged bool
+		}
+		var rows []ranked
 		for _, ev := range cap.nodeEvidence[id] {
-			if ev.Detail == "" {
+			row, ok := model.ParseMetadataRow(ev.Detail)
+			if !ok || row.Field != model.MetaUnresolvedLines {
 				continue
 			}
+			rows = append(rows, ranked{row, ev.Range != nil})
+		}
+		slices.SortFunc(rows, func(a, b ranked) int { return int(a.row.Ordinal - b.row.Ordinal) })
+		for _, r := range rows {
 			var detail map[string]string
-			if err := json.Unmarshal([]byte(ev.Detail), &detail); err != nil {
-				t.Fatalf("evidence detail %q: %v", ev.Detail, err)
-			}
-			if _, ok := detail["line"]; !ok {
-				continue
+			if err := json.Unmarshal(r.row.Value, &detail); err != nil {
+				t.Fatalf("unresolved line value %s: %v", r.row.Value, err)
 			}
 			var pairs []string
 			for _, k := range sortedMapKeys(detail) {
 				pairs = append(pairs, k+"="+detail[k])
 			}
 			line := strings.Join(pairs, " ")
-			if ev.Range != nil {
+			if r.ranged {
 				line += " ranged"
 			}
 			out = append(out, line)
