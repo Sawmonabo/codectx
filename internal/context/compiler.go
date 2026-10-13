@@ -300,9 +300,9 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// another round runs with new inputs, and P-I runs once, on the final
 	// round. A resumed call re-enters the recorded round at the recorded pass
 	// and continues the loop from there. A round rebuilds the pipeline from
-	// P-A with fresh sorts in the same sort area, and the area's deferred
-	// release removes every round's runs: a compile's temporary disk is the
-	// sum of its rounds' runs, each round's no larger than a one-round compile
+	// P-A with fresh sorts in the same sort area, and a finished round's runs
+	// are released before the next round opens its own: a compile's temporary
+	// disk is its largest round's runs, each no larger than a one-round compile
 	// of the same inputs. No halt lands between two rounds -- a round that has
 	// not started has no carry to checkpoint -- so the next round's P-A is the
 	// first place the stop is asked again.
@@ -330,6 +330,12 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 		}
 		if done {
 			break
+		}
+		// Every run this round opened, a resumed checkpoint's adopted runs
+		// among them, is dead: the next round takes only next's scalars.
+		if rerr := sorts.releaseRound(); rerr != nil {
+			c.logger().Warn("a context compile could not release a finished round's sort runs",
+				"component", "context", "error", rerr)
 		}
 		st.beginRound(next)
 	}
