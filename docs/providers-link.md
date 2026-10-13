@@ -42,6 +42,8 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
+| none of its own | `defines` | file module → a route endpoint at its full path, or a declared entry point | none |
+| none of its own | `routes_to` | route endpoint → each handler; declared entry point → its declaration or module | `import` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
 - `direct`: the callee names the declaration by its package, module, import or scope;
@@ -167,6 +169,61 @@ an external one only where the language marks it (Java `@Override`, C++ `overrid
 `override`, a Rust trait impl item, Python `typing.override`) and only when its type has exactly one supertype
 outside the project; an unmarked Python method with an external base publishes no `overrides`. Go publishes nothing
 toward a type outside the unit, whose method set no table holds.
+
+## Route prefixes across files
+
+A route's full path is often made in several files: a router declares its routes in one, and another includes it
+under a prefix (`app.include_router(users.router, prefix="/v1")`, `app.register_blueprint(views.bp)`, Django's
+`path("blog/", include("blog.urls"))`). The structural provider publishes such a route with `prefix: unresolved`
+(docs/providers-treesitter.md, Framework routes), and carries what the linker needs in the file's link table,
+`Table.Routing` (`internal/provider/link/route.go`):
+
+- `Objects`: each router or application object the file binds at module level, its framework and its own prefix
+  (`APIRouter(prefix=…)`, `Blueprint(url_prefix=…)`), or that it is not a literal;
+- `Routes`: each route registered on one of them, its method, its route as written and its literal value below the
+  object, and its handlers, as declarations of the file or as names the file imports;
+- `Mounts`: each mount of an object the file does not build, with the argument as written (`users.router`), the module
+  and name it names, the mount's prefix and whether it replaces the object's own (a Flask registration's
+  `url_prefix=`), the object it is made on, and that object's prefix below an application root when the file knows it.
+  A Django settings module's `ROOT_URLCONF` literal is a mount of the module it names at `/`, anchored by the
+  settings rather than an object.
+
+Every object is indexed in the module index under each dotted name its file can be imported as. The linker walks
+down from each mount anchored at an application root (a mount on a root object of the file, or a settings module's
+`ROOT_URLCONF` when some file names that settings module in `os.environ.setdefault("DJANGO_SETTINGS_MODULE", …)` or
+`os.environ["DJANGO_SETTINGS_MODULE"] = …`). Each hop looks up the module and name the mount names, keeps the hits
+an import's lookup keeps (the nearest source root, as for `imports`), joins the mount's prefix with the object's own,
+and descends into the mounts recorded on that object; a binding already on the hop's way ends it, so a cycle of
+routers including each other ends. The walk is bounded by the mounts the unit holds, never by a depth. Each route
+reached becomes one `endpoint` in the scope of the file the root mount is in, located at that mount, keyed
+`endpoint:<method route>@<full path>`, with the endpoint metadata `framework`, `method`, `route`, `prefix: resolved`
+and `path`, defined by the file's module and routing to each handler (`routes_to`, detail `import`). A handler the
+route's file imports is resolved through the module index to its declaration.
+
+A route several mounts reach is several endpoints, one per path, and every `routes_to` of each carries `set_size`,
+the number of paths the walks of the file's root mounts gave that route. A hop whose prefix is not a literal (an
+`include_router(r, prefix=PREFIX)`) leaves every route below it `prefix: unresolved` with no `path`, keyed by the
+route's file and object instead of a path; it is still counted in the set. A mount whose argument names no indexed
+object publishes nothing. Every lookup is traced on the mount's file, so a refresh that changes a router, a route or a
+settings module republishes the endpoints that reach it, and the routing is part of the interface summary, so a
+change to it rebuilds the index. Not walked: JavaScript and Go mounts across files, a Starlette `Mount` across files,
+and an application mounted as a child of another (`app.mount("/sub", sub_app)` with `sub_app` in another file).
+
+## Declared entry points
+
+The code a project's manifest declares as its entry points is an `endpoint` of the file it resolves to (ADR-0017
+decision 8, `internal/provider/link/route_entry.go`). The linker reads the manifest at the unit's root:
+
+| Manifest | Entries | Resolved to |
+|---|---|---|
+| `pyproject.toml` | `[project.scripts]` (group `console_scripts`), `[project.gui-scripts]` (`gui_scripts`), `[project.entry-points.<group>]`, each `module:attr` or `module` | the declaration `attr` names in the member file the module can be imported as (from the root or `src/`), or that file's module |
+| `package.json` | `bin` (a path, or a map of command name to path), `main` | the member file Node's `require` loads for the path (the path, then `.js`, `.mjs`, `.cjs`, then its `index.js`), its module |
+| `Cargo.toml` | `[[bin]]` with its `path`, else `src/bin/<name>.rs` or `src/bin/<name>/main.rs` | the file's top-level `fn main`, else its module |
+
+Each is keyed `endpoint:declared:<group>:<name>@<manifest>` (the group alone when it is the name, as for `main`),
+located at its target, defined by the file's module and routing to the target (detail `import`). A name several member files can supply
+publishes one endpoint in each, each with the set size; a value that names no member publishes nothing. The entries
+are manifest fields of the unit, so a change to one re-resolves the unit.
 
 ## Endpoint identity per family
 

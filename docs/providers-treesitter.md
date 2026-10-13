@@ -92,6 +92,7 @@ minted key basis, per node kind:
 | Declaration | function, method, class, interface, struct, enum, field, variable, constant, test, module, namespace, endpoint (a Python `__main__` guard) | `file:<path>` | qualified name | the qualified name | yes, exact declaration range | `qualified_signature` (file, kind, descriptor path, disambiguator) |
 | Endpoint | `endpoint` | `file:<path>` | `endpoint:<descriptor>`, `#<disambiguator>` appended when it has one | the method and the route as written (`GET /users`, or `/users` for a route that names no method), or `main` / `script` | yes, the decorator, annotation, registration call, entry function or shebang line | `qualified_signature` |
 | Route handler literal | `function` | `file:<path>` | `fn:<path>:<first byte>-<last byte>` | none | yes, the function literal | `source_location` |
+| Request input | `variable` | `file:<path>` | `input:<path>:<first byte>-<last byte>` | none | yes, the reading expression | `source_location` |
 | Import target | `module` | `provider.ScopeWorkspace` | `import:<lang>:<import path>` | none | no; qualified name = import path | `structural_key` (same import path from any file mints the same node) |
 | Callee reference | function (bare call) or method (qualified call) | `file:<path>` | `call:<name>` or `call:<qualifier>.<name>` | none | no | `unresolved`; metadata `{"resolution":…,"candidates":…,"callee":…}` |
 
@@ -224,6 +225,8 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `defines` | file module → endpoint | every program entry point and framework route the file declares (a `__main__` guard is a declaration and is defined like one) |
 | `routes_to` | endpoint → handler | the entry function or route handler: a declaration of this file, the callee reference a call of the handler's name would name (with the call-site alias on its token), the file's module for a script, or a route handler literal |
 | `defines` / `contains` | file module or innermost enclosing declaration → route handler literal | a function literal a route registers in place, published as an anonymous `function` node keyed by its range; the calls in its body are made from it, so a walk from the endpoint reaches what the handler calls |
+| `reads` | innermost function, method or test (or route handler literal inside it, or file module) → request input | a read of the request a framework hands its handler (Request inputs); detail `request_input` |
+| `data_flows_to` | request input → variable | a definition of the read's own function whose node holds the read defines the variable (dependence evidence, detail `reaching_def`) |
 
 **Function-valued properties.** In JavaScript, TypeScript and TSX a function or
 arrow function stored under a name is a function declaration named by that
@@ -321,7 +324,7 @@ it (the link table's site result type).
 |---|---|---|---|
 | Flask | `@x.route(rule, methods=[…])` (no `methods`: `GET`, Flask's default), `@x.get`/`post`/`put`/`delete`/`patch`; `x.add_url_rule(rule, endpoint, view_func, methods=[…])`, whose default is the view's own `methods` when it is `View.as_view(…)` (no method) and `GET` otherwise | the decorated function; `view_func`, `X.as_view(…)` naming `X` | `Flask()` is a root; a `Blueprint(url_prefix=…)` through exactly one `register_blueprint(bp, url_prefix=…)` in the file, whose prefix overrides the blueprint's own |
 | FastAPI | `@x.get` … `@x.trace`, `@x.api_route(path, methods=…)` (default `GET`), `@x.websocket(path)` (method `WEBSOCKET`); `x.add_api_route(path, endpoint, methods=…)` (default `GET`), `x.add_api_websocket_route(path, endpoint)` | the decorated function; `endpoint` | `FastAPI()` is a root; an `APIRouter(prefix=…)` through exactly one `include_router(r, prefix=…)`, whose prefix adds to the router's own; `mount(path, app)` |
-| Django | `path`, `re_path`, `url` imported from Django; no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never: the including urlconf is chosen by settings, so every Django route is `unresolved` |
+| Django | `path`, `re_path`, `url` imported from Django; no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never in the file: the including urlconf is chosen by settings, so every Django route is `unresolved` here; the linker joins the settings chain and the `include()` prefixes (docs/providers-link.md, Route prefixes across files) |
 | Starlette | `Route(path, endpoint, methods=[…])` (none: `GET` for a function endpoint, every method for a class, Starlette's own rule; an endpoint not declared here as a function names no method), `WebSocketRoute(path, endpoint)` (`WEBSOCKET`), each an entry of a route list | `endpoint` | `Starlette(routes=…)` (and a FastAPI application's `routes=`) is a root; `Router(routes=…)` and `Mount(path, routes=…)` hold lists; an entry is mounted on the object whose list, written in place or held by one module binding, is innermost around it; `Mount(path, app=x)` mounts `x` |
 | Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains; a path array is one endpoint per element | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()` through exactly one `use([path,] router)` |
 | Spring | `@GetMapping` … `@PatchMapping`, `@RequestMapping(method = RequestMethod.X)` (none: no method); `value`, `path` or positional, arrays | the annotated method | the class-level `@RequestMapping` literal is the only prefix, none means no prefix; several or a non-literal one leave the class's routes `unresolved` |
@@ -338,7 +341,10 @@ expression as written when it is not one, which is then `unresolved`. `prefix`
 is `resolved`, with the full `path`, only when every prefix between the route and
 an application root is a literal in the same file; anything else is `unresolved`
 with no `path`, never a guessed URL. An application object or router mounted
-from another file is not visible to a per-file provider. A route registered by a
+from another file is not visible to a per-file provider: the file's link table
+carries its router objects, their routes and its mounts of objects it does not
+build (`link.Routing`), and the linker publishes the full path of each route a
+Python mount reaches (docs/providers-link.md, Route prefixes across files). A route registered by a
 call is read from the call's argument positions in the link table, never from
 the source text, so a file whose link pass did not run publishes no
 call-registered route; a route on a receiver the file does not build is read only
@@ -351,6 +357,42 @@ carries the method `WEBSOCKET`: its connection is an ASGI scope of type
 `add_route`/`add_websocket_route`, `const { Router } = require("express")`,
 mounts through `http.Server{Handler: …}` or `StripPrefix`, echo `Match`, a
 class-level `@RequestMapping(method = …)`, a qualified Django `urls.path(…)`.
+
+**Request inputs.** A read of the network request a framework hands its
+handler is a `variable` node at the reading expression, keyed
+`input:<path>:<first byte>-<last byte>`, with metadata
+`{"input":{"framework":…,"source":…,"key":…}}` (`model.RequestInput`), and the
+function it is made from (the innermost function, method or test around it, a
+route handler literal inside that, or the file's module) `reads` it, detail
+`request_input`. `source` is the part of the request read: `query`, `body`,
+`path`, `header`, `cookie`, `form`, `file`, `url`, `raw`, or `combined` for a
+read the framework answers from several parts at once; `key` is the key when the
+source writes it as a literal (`request.args.get("id")`, `req.query.id`,
+`r.Header.Get("X-Key")`, `@RequestParam("id")`), else empty. A definition
+whose node holds the read, in the read's own function, gets `data_flows_to`
+from the read to the variable it defines (`uid = request.args.get("uid")`
+flows to `uid`), so the file's def-use facts carry the read to every use of the
+alias. Each table is gated on the framework's import, and a member it does not
+name publishes nothing:
+
+| Framework | Request object | Members read |
+|---|---|---|
+| Flask | `request` imported from `flask` (or `flask.request`), anywhere in the file | `args`, `form`, `values` (combined), `files`, `cookies`, `headers`, `json`, `get_json()`, `data`, `get_data()`, `stream`, `view_args` (path), `query_string`, `path`, `full_path`, `url`, `base_url`, `authorization`, `user_agent` |
+| Django | the request parameter of a view: a function a route of the file names, a function a decorator imported from `django.*` decorates, and the `get`/`post`/…/`dispatch`/`setup` methods of a class extending, directly or through classes of the file, a class a `django.*views*` module exports | `GET` (query), `POST` (form), `COOKIES`, `FILES`, `META` and `headers` (header), `body`, `read()`, `readline(s)()` (raw), `path`, `path_info`, `get_full_path()`, `build_absolute_uri()` (url), `get_host()`, `get_signed_cookie(k)` |
+| FastAPI | each parameter of a route handler, by FastAPI's own rule: a marker (`Path`, `Query`, `Header`, `Cookie`, `Body`, `Form`, `File`, as a default or in `Annotated`) names the source, its `alias=` the key, a `Header` key with its underscores as hyphens unless `convert_underscores=False`; else a name the route writes is a path read, `UploadFile` a file, a model, dataclass, sequence or mapping a body, a scalar or no annotation a query; a `Depends`/`Security` parameter, a `Response`, `BackgroundTasks` or `SecurityScopes`, and a class this file does not declare publish nothing | the parameter, keyed by its name or alias; a `Request`, `WebSocket` or `HTTPConnection` parameter is the request object, read with Starlette's members |
+| Starlette | a route handler's first parameter | `query_params`, `path_params`, `headers`, `cookies`, `url`, `base_url`, `json()`, `body()`, `form()`, `stream()`, and a WebSocket's `receive_*()`/`iter_*()` |
+| Express | each route handler's first parameter, under its own name | `query`, `params` (path), `body`, `cookies`, `signedCookies`, `headers`, `get(k)`/`header(k)` (header), `param(k)` (combined), `originalUrl`, `url`, `path`, `baseUrl`, `hostname`; a property after a keyed member is its key |
+| Go `net/http` | every `*http.Request` parameter of a function, method or function literal with a body | `FormValue(k)` and `Form` (combined), `PostFormValue(k)`, `PostForm`, `MultipartForm`, `MultipartReader()` (form), `Cookie(k)`, `Cookies()`, `FormFile(k)`, `Header`, `Trailer`, `Host`, `Referer()`, `UserAgent()`, `BasicAuth()` (header), `Body` (not `Body.Close()`), `URL`, `RequestURI`, `URL.Query()`, `URL.RawQuery` (query), `PathValue(k)` (path); gorilla/mux `mux.Vars(r)[k]` and chi `chi.URLParam(r, k)` are path reads of it |
+| Spring | each method parameter a binding annotation of `org.springframework.web.bind.annotation` marks | `@RequestParam` (combined), `@PathVariable`, `@MatrixVariable` (path), `@RequestHeader`, `@CookieValue`, `@RequestBody`, `@RequestPart` (form), `@ModelAttribute` (combined), keyed by the annotation's literal name (positional, `value =` or `name =`) or else the parameter's name, which Spring binds then; a body or model attribute has no key |
+
+The tokens are read with comments and string bodies skipped (`inputs_lex.go`),
+once per file and only when a table's gate passes. A request object that is
+reassigned or passed on is followed only through the def-use facts of the read
+it is assigned from. Not read: a FastAPI parameter typed by a class another file
+declares (whether it is a model or a scalar is in that file), a handler named
+across files, an Express middleware registered with `use`, a Spring parameter
+with no binding annotation, gin and echo contexts, and Django REST framework's
+`Request`.
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped
