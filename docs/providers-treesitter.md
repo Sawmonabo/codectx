@@ -263,6 +263,33 @@ nothing. This is linkage, not shared-library visibility, which compiler flags
 (`-fvisibility`) and attribute macros decide and a syntactic reader does not
 evaluate. C++ publishes no `exports`.
 
+**C and C++ macro-prefixed declarations.** The grammars have no preprocessor,
+so a declaration written with a macro among its specifiers
+(`SQLITE_API int f(void);`, `XMLPUBFUN xmlNodePtr XMLCALL xmlNewNode(int);`,
+`void f(void) G_GNUC_CONST;`) misparses: the macro is read as the type, the
+real type lands in an error, or, in C++, `M T f(void)` reads as `T::f` with
+the `::` missing. The worker reads such a misparse from the tree alone (an
+error or missing token among a file-scope declaration's specifiers or on its
+declarator's path, a file-scope error or expression statement, or a typedef
+name combined with `signed`, `unsigned`, `short` or `long`), never from a list
+of macro names. It then classifies the identifiers before the name by the
+language's rule (C17 6.7.2p2): a typedef name never combines with another
+type specifier, so beside a keyword type or a `struct`, `union` or `enum`
+specifier every other bare identifier is a macro; otherwise exactly one is the
+type, and a name the file defines as an object-like macro before the
+declaration (the last `#define` or `#undef` decides) is not. A function-like
+macro call before the specifiers and an identifier after the parameter list
+are attribute macros. The file is parsed a second time with those tokens
+excluded (the parser's included ranges, so every offset stays the file's),
+and the second tree is kept when it has no more error bytes than the first.
+The declaration then publishes its own name, kind and return type, and the
+macros it was written with under the `specifier_macros` metadata key, in
+source order. When the rule leaves several identifiers that may be the type
+and the file defines none of them (`GLIB_AVAILABLE_IN_ALL gboolean g(void);`
+in a file that does not define the macro), all of them are published under
+`return_types` as the set the declared type is one of, they are not counted
+as macros, and the export carries no single return type or typed signature.
+
 **Decorator facts.** Every declaration publishes its decorators, annotations
 and attributes under the `decorators` metadata key, in source order, each as
 `{name, bytes, arguments}`: the name as written with whitespace folded
@@ -904,6 +931,11 @@ All MIT:
   properties are declarations with their stored path; Python (`__all__`, static
   and computed) and C (external linkage) exports; a name defined twenty times
   keeps all twenty candidates and a member call publishes none.
+- `internal/provider/treesitter/worker/macro_c_test.go`: C and C++
+  declarations written with export, attribute and calling-convention macros
+  keep their name, kind and return type and publish their macros; an
+  undecidable type is published as its candidate set; a file's own `#define`
+  and `#undef` decide whether a name is a macro.
 - `internal/provider/treesitter/entry_points_test.go`: decorators with their
   argument ranges; the `__main__` guard, Go `main`, the Java `main` forms and a
   shebang script as endpoints.

@@ -491,6 +491,12 @@ func (b *builder) resolveDecls() error {
 		if d.Impl != "" {
 			meta["receiver"] = d.Impl
 		}
+		if len(d.SpecifierMacros) > 0 {
+			meta["specifier_macros"] = d.SpecifierMacros
+		}
+		if len(d.ReturnTypes) > 0 {
+			meta["return_types"] = d.ReturnTypes
+		}
 		if len(d.truncated) > 0 {
 			// Index-time field truncation, reported on the fact itself so an
 			// answer built from it says which stored values were cut and how

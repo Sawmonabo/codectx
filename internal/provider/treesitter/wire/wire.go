@@ -185,6 +185,15 @@ type Decl struct {
 	// no number (ADR-0014 decision 1). A Rust `#[cfg(...)]` attribute is a
 	// branch too. Empty when no conditional encloses the declaration.
 	Branch string `json:"branch,omitempty"`
+	// SpecifierMacros are, for a C or C++ declaration written with macros
+	// among its specifiers (`SQLITE_API int f(void);`), each macro's name as
+	// written, in source order: the tokens the worker's second parse
+	// excluded so the declaration parses as the language reads it.
+	SpecifierMacros []string `json:"specifier_macros,omitempty"`
+	// ReturnTypes are, when the language's rule leaves several of those
+	// identifiers that may be the declaration's type and the file defines
+	// none of them, every one of them: the declared type is one of the set.
+	ReturnTypes []string `json:"return_types,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

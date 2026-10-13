@@ -227,6 +227,7 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 		}
 		kept, header = next, &choice
 	}
+	kept = w.cUnmacro(kept, src)
 	root := kept.tree.RootNode()
 	em := &emitter{w: out}
 	ex := &extraction{g: kept.g, l: kept.l, path: req.Path, src: src}

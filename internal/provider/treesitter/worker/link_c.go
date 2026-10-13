@@ -137,21 +137,83 @@ type cLinker struct {
 type cDefine struct {
 	start uint32
 	path  string
+	undef bool
 }
 
 // undef is the macro name an `#undef` directive n removes, or "" when n is
 // another directive. The directive token may be spelled with spaces after
 // its `#` (ISO C 6.10p2).
 func (k *cLinker) undef(n Node) string {
-	d := n.ChildByFieldId(k.x.fDirective)
+	d := cField(n, k.x.fDirective)
 	if d.IsNull() || strings.Join(strings.Fields(strings.TrimPrefix(k.text(d), "#")), "") != "undef" {
 		return ""
 	}
-	a := n.ChildByFieldId(k.x.fArgument)
+	a := cField(n, k.x.fArgument)
 	if a.IsNull() {
 		return ""
 	}
 	return strings.TrimSpace(cUncommented(k.text(a)))
+}
+
+// cField is n's first child in field id, read from the child's own record,
+// so a field the registry does not list is read too.
+func cField(n Node, id uint16) Node {
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		if uint16(c.rec().field) == id {
+			return c
+		}
+	}
+	return Node{}
+}
+
+// specifierMacros is cSpecifierMacros for the declaration or function
+// definition owner: the macros written among its specifiers, which the kept
+// parse excluded, and its candidate types when the rule leaves several. A
+// macro the file defines before owner, as an object-like macro, is no
+// candidate.
+func (k *cLinker) specifierMacros(owner Node) (macros, candidates []string) {
+	if owner.KindId() != k.s.declaration && owner.KindId() != k.x.functionDefinition {
+		return nil, nil
+	}
+	prev := owner.StartByte()
+	if cMayFollowMacro(k.src, prev) {
+		switch p, parent := owner.PrevSibling(), owner.Parent(); {
+		case !p.IsNull():
+			prev = p.EndByte()
+		case !parent.IsNull() && !parent.Parent().IsNull():
+			prev = parent.StartByte()
+		default:
+			// The root begins at the first byte the parse included.
+			prev = 0
+		}
+	}
+	body := owner.ChildByFieldId(k.s.fBody)
+	var spans [][2]uint
+	for c := owner.first(); !c.IsNull(); c = c.next() {
+		if !body.IsNull() && c.Id() == body.Id() {
+			break
+		}
+		spans = append(spans, [2]uint{c.StartByte(), c.EndByte()})
+	}
+	kind, name := "", ""
+	if t := owner.ChildByFieldId(k.s.fType); !t.IsNull() {
+		if t.KindId() == k.s.typeIdentifier {
+			kind = "type_identifier"
+		}
+		name = k.text(t)
+	}
+	// The last directive before owner decides: an `#undef` after a
+	// definition leaves the name undefined.
+	defined := func(s string) bool {
+		on, at := false, uint32(0)
+		for _, d := range k.defines[s] {
+			if d.start < uint32(owner.StartByte()) && d.start >= at {
+				on, at = !d.undef, d.start
+			}
+		}
+		return on
+	}
+	return cSpecifierMacros(k.src, prev, owner.StartByte(), spans, kind, name, k.x.keyword, defined)
 }
 
 // cDecl is one declarator and the declaration that owns its specifiers: a
@@ -258,7 +320,7 @@ func (k *cLinker) declare(n Node) {
 		// after it folds to no path (include), as one after a definition
 		// that is no path does.
 		if name := k.undef(n); name != "" {
-			k.defines[name] = append(k.defines[name], cDefine{start: uint32(n.StartByte())})
+			k.defines[name] = append(k.defines[name], cDefine{start: uint32(n.StartByte()), undef: true})
 		}
 	case id == x.enumerator || id == x.preprocDef:
 		if name := n.ChildByFieldId(s.fName); !name.IsNull() {
@@ -586,6 +648,12 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 		e.Internal = unnamed || k.statics[key]
 	}
 	e.Returns = k.returns(owner, d, c.fn)
+	if _, candidates := k.specifierMacros(owner); len(candidates) > 0 {
+		// The declaration's type is one of several identifiers its macros
+		// leave undecided (cSpecifierMacros): no single result type, so no
+		// typed signature either.
+		e.Returns, e.Signature = wire.Type{}, ""
+	}
 	k.out.Exports = append(k.out.Exports, e)
 	k.parameters(e.Name, c.fn.ChildByFieldId(s.fParameters), a.params)
 }
@@ -812,7 +880,7 @@ func cUncommented(text string) string {
 // with no fragments, otherwise, which includes an `#undef` of the name
 // before the directive.
 func (k *cLinker) include(n Node) {
-	p := n.ChildByFieldId(k.x.fPath)
+	p := cField(n, k.x.fPath)
 	if cKind(p) != k.s.identifier {
 		return
 	}
@@ -1700,10 +1768,13 @@ type cLinkSyntax struct {
 	variadicParameter, argumentList, fieldDesignator, abstractFunctionDeclarator, paren, ellipsis,
 	linkageSpecification, declarationList, preprocInclude, preprocCall uint16
 	// fPath is the field of an include directive's path, and fDirective and
-	// fArgument those of any other directive (`#undef NAME`), read from the
-	// grammar directly: the grammar table holds cRefine, so this table may
-	// not consult it (cLinkSyntaxIn).
+	// fArgument those of any other directive (`#undef NAME`), resolved from
+	// the grammar directly: the grammar table holds cRefine, so this table
+	// may not consult it (cLinkSyntaxIn). They are outside the field
+	// registry, so they are read through cField.
 	fPath, fDirective, fArgument uint16
+	// tl is the grammar, whose anonymous tokens are its keywords (keyword).
+	tl *ts.Language
 
 	// C++ only.
 	classSpecifier, baseClassClause, templateType, trailingReturnType, placeholderTypeSpecifier,
@@ -1734,6 +1805,10 @@ func (x *cLinkSyntax) fileScope(id uint16) bool {
 	return id == x.translationUnit || id == x.linkageSpecification || id == x.declarationList ||
 		x.classSpecifier != 0 && id == x.fieldDeclarationList
 }
+
+// keyword reports a word the grammar spells as one of its tokens: a
+// keyword, never an identifier.
+func (x *cLinkSyntax) keyword(s string) bool { return x.tl.IdForNodeKind(s, false) != 0 }
 
 // in reports whether id is marked in set.
 func (x *cLinkSyntax) in(set []bool, id uint16) bool { return int(id) < len(set) && set[id] }
@@ -1785,6 +1860,7 @@ func resolveCLinkSyntax(language string, tl *ts.Language) *cLinkSyntax {
 		fPath:                      tl.FieldIdForName("path"),
 		fDirective:                 tl.FieldIdForName("directive"),
 		fArgument:                  tl.FieldIdForName("argument"),
+		tl:                         tl,
 		declaration:                kind("declaration"),
 		object:                     make([]bool, tl.NodeKindCount()),
 		conditional:                make([]bool, tl.NodeKindCount()),

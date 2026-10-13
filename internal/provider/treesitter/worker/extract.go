@@ -114,6 +114,9 @@ type extraction struct {
 	branchAt map[span]*branchLink
 	// all is a Python module's `__all__` (pyAll).
 	all pyAll
+	// cDefines is a C or C++ file's object-like macro directives, read
+	// once when a declaration needs them (cDeclMacros).
+	cDefines cMacroDefs
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -733,6 +736,7 @@ func (e *extraction) emit(out *emitter) error {
 		if e.g.decorators != nil {
 			w.Decorators = e.g.decorators(e, d)
 		}
+		w.SpecifierMacros, w.ReturnTypes = cDeclMacros(e, d)
 		nameSpans[span{d.nameStart, d.nameEnd}] = true
 		stack = append(stack, frame{span: span{start, end}, idx: w.ID, name: d.name, kind: d.kind})
 		wireDecls = append(wireDecls, w)
