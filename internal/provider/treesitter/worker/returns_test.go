@@ -55,8 +55,11 @@ func TestReturningNodes(t *testing.T) {
 			for _, r := range f.Returns {
 				returns = append(returns, c.src[f.Nodes[r].Start:f.Nodes[r].End])
 			}
-			for _, v := range f.Returned {
-				returned = append(returned, c.src[f.Vars[v].Start:f.Vars[v].End])
+			for _, a := range f.Returned {
+				if !slices.Contains(f.Returns, a.Node) {
+					t.Fatalf("variable %d reaches node %d, which is not a returning node", a.Var, a.Node)
+				}
+				returned = append(returned, c.src[f.Vars[a.Var].Start:f.Vars[a.Var].End])
 			}
 			if !slices.Equal(returns, c.returns) || !slices.Equal(returned, c.returned) {
 				t.Fatalf("returning nodes %q reached by %q, want %q reached by %q", returns, returned, c.returns, c.returned)

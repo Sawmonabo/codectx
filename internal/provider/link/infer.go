@@ -1925,11 +1925,16 @@ func (in *inference) propagate(r *round) (*pagination.SortedRun[fact], error) {
 
 // ---- the facts beyond a binding ----
 
-// emitFlows emits a FactFlow for each argument of call site s, at site, and
-// the parameter of target it binds (argumentFlows over the target's
-// declared parameters, hierarchy.parameters); receiverFirst says the site
-// passes the target's receiver as its first argument.
+// emitFlows emits the return flow of call site s, at site, bound to target
+// (returnFact), and a FactFlow, with its FactSummary when the parameter
+// returns (flowFacts), for each argument and the parameter of target it
+// binds (argumentFlows over the target's declared parameters,
+// hierarchy.parameters); receiverFirst says the site passes the target's
+// receiver as its first argument.
 func emitFlows(h *hierarchy, site Ref, s *Site, target Ref, receiverFirst bool, emit func(Binding) error) error {
+	if err := returnFact(s, site, target, emit); err != nil {
+		return err
+	}
 	if len(s.Arguments) == 0 {
 		return nil
 	}
@@ -1941,7 +1946,7 @@ func emitFlows(h *hierarchy, site Ref, s *Site, target Ref, receiverFirst bool, 
 		return nil
 	}
 	return argumentFlows(s, params, receiverFirst, func(arg, pos int32) error {
-		return emit(Binding{Kind: FactFlow, Site: site, Target: target, Detail: DetailArgument, Arg: arg, Param: pos})
+		return flowFacts(s, site, target, params, arg, pos, emit)
 	})
 }
 

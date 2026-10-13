@@ -210,16 +210,17 @@ func (d *depLists) project(g *flow.Graph, cd, du flow.Edges, fn flow.Span, rets 
 	}
 	for _, r := range rets {
 		f.Returns = append(f.Returns, uint32(r))
-		f.Returned = append(f.Returned, d.srcOf(r)...)
+		for _, x := range d.srcOf(r) {
+			f.Returned = append(f.Returned, wire.Access{Var: x, Node: uint32(r)})
+		}
 	}
-	slices.Sort(f.Returned)
-	f.Returned = slices.Compact(f.Returned)
 	d.nodes(g)
 	for i, r := range f.Returns {
 		f.Returns[i] = uint32(d.nodeAt[r])
 	}
 	slices.Sort(f.Returns)
 	f.Returns = slices.Compact(f.Returns)
+	f.Returned = accesses(f.Returned, d.nodeAt)
 	f.Control = pairs(f.Control, d.nodeAt)
 	f.Flows = pairs(f.Flows, d.nodeAt)
 	f.Reads = accesses(f.Reads, d.nodeAt)

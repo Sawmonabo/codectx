@@ -518,7 +518,13 @@ func nodeResolution(n model.Node) model.NameResolution {
 // extends|implements|overrides <label> <name>" (or "external <qualified>"),
 // "<label> <name> flows <label> <name>" for a `data_flows_to` from an
 // argument's variable to a parameter, each with " set=<n>" when it carries a
-// set size. counts, when set, are details the `calls` row must carry.
+// set size. returns, when set, is every return flow: "<label> <name>
+// summary:<position> <label> <name>" for an argument's variable flowing into
+// a variable the site's result is written into through the callee's return
+// summary, and "<label> return return <label> <name>" for a callee's return
+// node flowing into such a variable or into the return node of the callable
+// that returns the call. counts, when set, are details the `calls` row must
+// carry.
 //
 // What the language defines, under ADR-0015 and decision 2's techniques and
 // nothing beyond them (no points-to, no reachability):
@@ -546,12 +552,13 @@ type golden struct {
 	name string
 	// anchor is the language reference, by standard title and section, the
 	// answer is read from.
-	anchor string
-	files  map[string]string
-	want   []string
-	sites  []string
-	facts  []string
-	counts map[string]string
+	anchor  string
+	files   map[string]string
+	want    []string
+	sites   []string
+	facts   []string
+	returns []string
+	counts  map[string]string
 	// fails names the wrong answer the case catches and the change to the
 	// linker that would produce it.
 	fails string
@@ -578,6 +585,9 @@ func runGoldens(t *testing.T, cases []golden) {
 			}
 			if c.facts != nil {
 				check("facts", l.facts(t), c.facts)
+			}
+			if c.returns != nil {
+				check("returns", l.returns(t), c.returns)
 			}
 			for k, v := range c.counts {
 				if got := l.calls.Details[k]; got != v {
@@ -691,9 +701,36 @@ func (l linked) facts(t *testing.T) []string {
 				}
 				add(paths[from.FileID] + " imports " + paths[to.FileID] + setSuffix(e))
 			case model.RelDataFlowsTo:
-				add(l.target(paths, from) + " flows " + l.target(paths, to) + setSuffix(e))
+				if e.Detail == link.DetailArgument {
+					add(l.target(paths, from) + " flows " + l.target(paths, to) + setSuffix(e))
+				}
 			default:
 				add(l.endpoint(paths, from) + " " + string(r.Relation.Kind) + " " + l.endpoint(paths, to) + setSuffix(e))
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// returns is every return flow (`data_flows_to` of the summary and return
+// details), in the golden spelling, sorted and each once.
+func (l linked) returns(t *testing.T) []string {
+	t.Helper()
+	paths := l.paths(t)
+	var out []string
+	for _, r := range l.out.rels {
+		if r.Relation.Kind != model.RelDataFlowsTo {
+			continue
+		}
+		from, to := l.out.nodes[r.Relation.From], l.out.nodes[r.Relation.To]
+		for _, e := range r.Evidence {
+			if e.Detail == link.DetailArgument {
+				continue
+			}
+			f := l.target(paths, from) + " " + e.Detail + " " + l.target(paths, to)
+			if !slices.Contains(out, f) {
+				out = append(out, f)
 			}
 		}
 	}

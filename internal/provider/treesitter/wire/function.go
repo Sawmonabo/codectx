@@ -53,10 +53,10 @@ type Function struct {
 	// block with a tail), the nodes that yield the body's value. Each is an
 	// index into Nodes, ascending.
 	Returns []uint32
-	// Returned are the variables whose value reaches a node of Returns: the
-	// union of Src over them (docs/providers-treesitter.md, Projection), each
-	// an index into Vars, ascending.
-	Returned []uint32
+	// Returned holds Var whose value reaches Node, a node of Returns: each
+	// variable of Src(Node) (docs/providers-treesitter.md, Projection), by
+	// node, then variable.
+	Returned []Access
 }
 
 // Span is a byte range [Start, End) of the source. The binary encodings
@@ -98,7 +98,7 @@ const (
 //	            reads   n × (var, node)
 //	            writes  n × (var, node, may as one byte 0 or 1)
 //	            returns n × node
-//	            returned n × var
+//	            returned n × (var, node)
 func AppendFunction(dst []byte, f *Function) []byte {
 	dst = binary.BigEndian.AppendUint32(dst, f.Span.Start)
 	dst = binary.BigEndian.AppendUint32(dst, f.Span.End)
@@ -139,11 +139,14 @@ func AppendFunction(dst []byte, f *Function) []byte {
 		}
 		dst = append(dst, may)
 	}
-	for _, list := range [...][]uint32{f.Returns, f.Returned} {
-		dst = binary.BigEndian.AppendUint32(dst, uint32(len(list)))
-		for _, x := range list {
-			dst = binary.BigEndian.AppendUint32(dst, x)
-		}
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(f.Returns)))
+	for _, n := range f.Returns {
+		dst = binary.BigEndian.AppendUint32(dst, n)
+	}
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(f.Returned)))
+	for _, a := range f.Returned {
+		dst = binary.BigEndian.AppendUint32(dst, a.Var)
+		dst = binary.BigEndian.AppendUint32(dst, a.Node)
 	}
 	return dst
 }
@@ -180,7 +183,7 @@ func DecodeFunction(payload []byte) (Function, error) {
 		f.Reads = d.accesses(len(f.Vars), len(f.Nodes), false)
 		f.Writes = d.accesses(len(f.Vars), len(f.Nodes), true)
 		f.Returns = d.indices(len(f.Nodes))
-		f.Returned = d.indices(len(f.Vars))
+		f.Returned = d.accesses(len(f.Vars), len(f.Nodes), false)
 	default:
 		d.fail("an unknown status byte")
 	}

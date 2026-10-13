@@ -90,6 +90,16 @@ const (
 	// DetailArgument: a `data_flows_to` from a variable an argument reads to
 	// the parameter the argument binds at a bound call site.
 	DetailArgument = "argument"
+	// DetailSummary: a `data_flows_to` from a variable an argument reads to a
+	// variable the bound call site's result is written into, through the
+	// callee's parameter whose value reaches its return (the callee's return
+	// summary). The published evidence detail is "summary:" and the
+	// parameter's position (Parameter.Index).
+	DetailSummary = "summary"
+	// DetailReturn: a `data_flows_to` from the bound callee's return node to
+	// a variable the call site's result is written into, or to the return
+	// node of the callable that returns the call's value.
+	DetailReturn = "return"
 	// DetailSupertype: an `extends`, `implements` or `overrides` the source
 	// declares: a written supertype, and a method of the same name and
 	// signature along the written supertypes.
