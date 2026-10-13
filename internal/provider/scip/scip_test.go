@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"runtime/metrics"
 	"slices"
 	"strconv"
 	"strings"
@@ -356,10 +358,13 @@ func TestCanonicalFixture(t *testing.T) {
 // incrementally, so the heap grows by a bounded amount rather than by the
 // document's size, and every byte is still processed. Failure mode: a
 // decoder that materializes a document (or the index) would exhaust memory
-// on a real index and lose or truncate facts.
+// on a real index and lose or truncate facts. Mutation: reading the text
+// field into one buffer and hashing it, instead of streaming it into the
+// hasher, peaks the live heap about 25 MB above the baseline and fails.
 func TestStreamedLargeDocumentBoundedHeap(t *testing.T) {
 	const textBytes = 24 << 20
 	const occurrences = 20000
+	const minWalkCycles = 32
 	src := "package big\n\nfunc F() { G() }\n"
 	index := bigIndex(textBytes, occurrences)
 	indexLen := len(index)
@@ -369,32 +374,42 @@ func TestStreamedLargeDocumentBoundedHeap(t *testing.T) {
 	files = nil
 	p := newProvider(t, "index.scip")
 
-	// The live heap is sampled for the duration of the run and the peak is
-	// kept: a before/after pair proves nothing, because a buffer that held the
-	// whole document is already garbage by the time the run returns. Sampling
-	// every 5 ms is often enough to catch a peak that lasts as long as a
-	// document walk and rare enough that the stop-the-world of ReadMemStats
-	// does not distort the run. TotalAlloc is deliberately not used: it counts
-	// bytes allocated over time, which a correct streaming decoder also grows.
+	// The peak live heap of the run is measured, not the allocated heap.
+	// MemStats.HeapAlloc also counts unreachable objects the collector has not
+	// yet freed, and the pacer lets that garbage grow to about GOGC percent of
+	// the live heap before a cycle runs; with the harness holding the 24-MiB
+	// index file live, a correct walk's garbage alone sat at the bound. The
+	// runtime's /gc/heap/live:bytes is the heap the last cycle marked
+	// reachable, so garbage never counts. Lowering GOGC for the run makes a
+	// cycle complete every few MiB of allocation, so a buffer that holds the
+	// document for any part of the walk is marked by some cycle, and the test
+	// requires that cycles ran during the walk at all.
+	defer debug.SetGCPercent(debug.SetGCPercent(10))
 	runtime.GC()
-	var base runtime.MemStats
-	runtime.ReadMemStats(&base)
+	sample := func(s []metrics.Sample) (live, cycles uint64) {
+		metrics.Read(s)
+		return s[0].Value.Uint64(), s[1].Value.Uint64()
+	}
+	newSamples := func() []metrics.Sample {
+		return []metrics.Sample{{Name: "/gc/heap/live:bytes"}, {Name: "/gc/cycles/total:gc-cycles"}}
+	}
+	base, baseCycles := sample(newSamples())
 	var peak atomic.Uint64
-	peak.Store(base.HeapAlloc)
+	peak.Store(base)
 	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)
-		ticker := time.NewTicker(5 * time.Millisecond)
+		ticker := time.NewTicker(time.Millisecond)
 		defer ticker.Stop()
-		var m runtime.MemStats
+		s := newSamples()
 		for {
 			select {
 			case <-done:
 				return
 			case <-ticker.C:
-				runtime.ReadMemStats(&m)
-				for seen := peak.Load(); m.HeapAlloc > seen; seen = peak.Load() {
-					if peak.CompareAndSwap(seen, m.HeapAlloc) {
+				live, _ := sample(s)
+				for seen := peak.Load(); live > seen; seen = peak.Load() {
+					if peak.CompareAndSwap(seen, live) {
 						break
 					}
 				}
@@ -402,6 +417,7 @@ func TestStreamedLargeDocumentBoundedHeap(t *testing.T) {
 		}
 	}()
 	got, result := run(t, h, p, scip.ImportScope("index.scip"), []string{"index.scip", "big.go"})
+	_, endCycles := sample(newSamples())
 	close(done)
 	<-stopped
 
@@ -417,11 +433,14 @@ func TestStreamedLargeDocumentBoundedHeap(t *testing.T) {
 	if len(got.nodes) < 2 || len(got.relations) < 1 {
 		t.Fatalf("large document yielded %d nodes and %d relations; occurrences were lost", len(got.nodes), len(got.relations))
 	}
-	growth := int64(peak.Load()) - int64(base.HeapAlloc)
+	if cycles := endCycles - baseCycles; cycles < minWalkCycles {
+		t.Fatalf("only %d collections completed during the walk, want at least %d; the live heap was not observed while the document was walked", cycles, minWalkCycles)
+	}
+	growth := int64(peak.Load()) - int64(base)
 	if growth > textBytes/2 {
 		t.Fatalf("live heap peaked %d bytes above the baseline while walking a %d-byte document; the document was materialized", growth, textBytes)
 	}
-	t.Logf("peak live heap %d bytes above baseline for a %d-byte document with %d occurrences", growth, textBytes, occurrences)
+	t.Logf("peak live heap %d bytes above baseline for a %d-byte document with %d occurrences over %d collections", growth, textBytes, occurrences, endCycles-baseCycles)
 }
 
 // bigIndex hand-encodes one SCIP index: metadata, then a single document
