@@ -13,7 +13,7 @@ once with its URL and what it was used for. Records are numbered in order and ne
 
 | Record | Title | Status |
 |---|---|---|
-| [ADR-0001](ADR-0001-scale-posture.md) | Scale posture: unlimited by default, bounded by page | Accepted, 2026-09-14; amended 2026-10-08; §2.4 per ADR-0013 |
+| [ADR-0001](ADR-0001-scale-posture.md) | Scale posture: unlimited by default, bounded by page | Accepted, 2026-09-14; §2.4 per ADR-0013 |
 | [ADR-0002](ADR-0002-storage-identities.md) | Storage identities: integer surrogates and interned keys | Accepted, 2026-09-14 |
 | [ADR-0003](ADR-0003-storage-tier2.md) | Storage tier 2: the lexical and provenance tiers, and the gate | Partially accepted, 2026-09-15; lexical tier superseded by ADR-0013, 2026-10-08 |
 | [ADR-0004](ADR-0004-wal-synchronous-mode.md) | WAL synchronous mode | Accepted, 2026-09-15 |
