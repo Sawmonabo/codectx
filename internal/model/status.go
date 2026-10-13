@@ -176,7 +176,7 @@ func (r IndexResult) Validate() error {
 	if !r.Status.Valid() {
 		return invalid("index_result.status %q is not a known generation status", truncateForMessage(string(r.Status)))
 	}
-	if err := validateCapabilityStates("index_result.completeness", r.Completeness); err != nil {
+	if err := validateCapabilityStates(r.Completeness); err != nil {
 		return err
 	}
 	for _, count := range []struct {
@@ -599,7 +599,7 @@ func (s IndexStatus) Validate() error {
 		return invalid("index_status.capture_consistency %q is not a known capture consistency",
 			truncateForMessage(string(s.CaptureConsistency)))
 	}
-	if err := validateCapabilityStates("index_status.completeness", s.Completeness); err != nil {
+	if err := validateCapabilityStates(s.Completeness); err != nil {
 		return err
 	}
 	if err := boundSigned64("index_status.file_count", s.FileCount); err != nil {

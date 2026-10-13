@@ -224,12 +224,12 @@ func (s *routeScan) functionHandler(h handler) bool {
 func (s *routeScan) argAt(site *wire.Site, pos int, kw string) int {
 	n := 0
 	for k, a := range s.siteArgs(site) {
-		switch {
-		case a.kw == "*":
+		switch a.kw {
+		case "*":
 			return -1
-		case a.kw == kw:
+		case kw:
 			return k
-		case a.kw == "":
+		case "":
 			if n == pos {
 				return k
 			}

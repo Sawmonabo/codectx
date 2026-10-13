@@ -296,7 +296,7 @@ func TestEdgeScanWalksTheWantedStreamOncePerEpoch(t *testing.T) {
 	const nodes, edgesPerNode, hops, pageItems = 60, 6, 4, 2
 	g, _, edges := relationFixture(t, nodes, edgesPerNode)
 	ids := make([]model.NodeID, 0, nodes)
-	for n := 0; n < nodes; n++ {
+	for n := range nodes {
 		ids = append(ids, model.NodeID(fmt.Sprintf("n%03d", n)))
 	}
 	cands := candidatesOver(edges, ids, hops)
@@ -308,7 +308,7 @@ func TestEdgeScanWalksTheWantedStreamOncePerEpoch(t *testing.T) {
 
 	s := openSorts(t, config.Config{})
 	candRun, hopRun := spoolCandidates(t, s, cands)
-	byRelation, err := newSort[hopRec](s, "test-hop-relid", lessRelID, sizeOfHop)
+	byRelation, err := newSort(s, "test-hop-relid", lessRelID, sizeOfHop)
 	if err != nil {
 		t.Fatalf("hop sort: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestEdgeScanWalksTheWantedStreamOncePerEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan nodes: %v", err)
 	}
-	attrs, err := newSort[relAttrRec](s, "test-rel-attr", lessRelAttr, sizeOfRelAttr)
+	attrs, err := newSort(s, "test-rel-attr", lessRelAttr, sizeOfRelAttr)
 	if err != nil {
 		t.Fatalf("attribute sort: %v", err)
 	}

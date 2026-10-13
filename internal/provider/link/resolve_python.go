@@ -197,31 +197,6 @@ type pyRecord struct {
 	Rank   uint8 `json:"n,omitempty"`
 }
 
-func comparePyRecord(a, b pyRecord) int {
-	if c := strings.Compare(a.Key, b.Key); c != 0 {
-		return c
-	}
-	if c := cmpBool(a.Lookup, b.Lookup); c != 0 {
-		return c
-	}
-	if c := cmpBool(a.Import, b.Import); c != 0 {
-		return c
-	}
-	if c := compareRef(a.Ref, b.Ref); c != 0 {
-		return c
-	}
-	if c := strings.Compare(a.Root, b.Root); c != 0 {
-		return c
-	}
-	for _, c := range []int{cmpBool(a.Class, b.Class), cmpBool(a.Unbound, b.Unbound), cmpBool(a.Init, b.Init),
-		cmpBool(a.Exact, b.Exact), cmpBool(a.Probe, b.Probe), int(a.Rank) - int(b.Rank)} {
-		if c != 0 {
-			return c
-		}
-	}
-	return 0
-}
-
 // The groups of the module merge's hits.
 const (
 	hitSite   uint8 = 0 // a call site's
@@ -472,7 +447,7 @@ func (r *pySite) resolve(site Ref) error {
 		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, false, r.look, r.hits); err != nil {
 			return err
 		}
-		return r.h.types(r.ctx, site.File, s.Qualifier, func(typ Ref) error {
+		return r.h.types(site.File, s.Qualifier, func(typ Ref) error {
 			return r.class(site, s, typ, DetailDirect)
 		})
 	case wire.ShapeMember:
@@ -482,7 +457,7 @@ func (r *pySite) resolve(site Ref) error {
 	}
 	// A method value taken through its class (`f = C.m; f(obj)`) passes its
 	// receiver first; one taken through an instance is bound to it.
-	return r.t.functions(r.ctx, site, func(target Ref, detail string, receiverFirst bool) error {
+	return r.t.functions(site, func(target Ref, detail string, receiverFirst bool) error {
 		return r.call(Binding{Kind: FactCall, Site: site, Target: target, Detail: detail, Dispatch: model.DispatchExact}, receiverFirst)
 	})
 }
@@ -502,23 +477,23 @@ func (r *pySite) receiver(site Ref, s *Site) error {
 	switch s.Receiver.Kind {
 	case wire.TypeNamed:
 		found := false
-		err := r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+		err := r.h.types(site.File, s.Receiver.Name, func(typ Ref) error {
 			found = true
 			return r.instance(site, s, typ, DetailHierarchy)
 		})
 		if err != nil || found {
 			return err
 		}
-		_, err = externalReceiver(r.ctx, r.h, r.fc, site, s, []wire.Type{s.Receiver}, r.emit)
+		_, err = externalReceiver(r.h, r.fc, site, s, []wire.Type{s.Receiver}, r.emit)
 		return err
 	case wire.TypeClass:
-		return r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+		return r.h.types(site.File, s.Receiver.Name, func(typ Ref) error {
 			return r.class(site, s, typ, DetailDirect)
 		})
 	case wire.TypeSuper:
 		return r.super(site, s)
 	case wire.TypeUnion:
-		if _, err := externalReceiver(r.ctx, r.h, r.fc, site, s, typeMembers(r.tab, s.Receiver), r.emit); err != nil {
+		if _, err := externalReceiver(r.h, r.fc, site, s, typeMembers(r.tab, s.Receiver), r.emit); err != nil {
 			return err
 		}
 	}
@@ -1163,7 +1138,8 @@ func absolutePythonModule(importer, rel string) string {
 
 // settlePythonHits settles the hits the lookups met (lookPython), with each
 // module-bound site's sentinel, sorted by site or import: per site
-// (settlePython) and per import (settlePythonImport).
+// (settlePython) and per import (settlePythonImport). A canceled context
+// stops it between groups.
 func settlePythonHits(ctx context.Context, hits *pagination.ExternalSort[pyHit], emit func(Binding) error,
 	call func(Binding, bool) error) error {
 	settled, err := hits.Sorted()
@@ -1175,6 +1151,9 @@ func settlePythonHits(ctx context.Context, hits *pagination.ExternalSort[pyHit],
 	flush := func() error {
 		if len(group) == 0 {
 			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if group[0].Group == hitImport {
 			return settlePythonImport(group, emit)

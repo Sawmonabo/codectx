@@ -3,6 +3,7 @@ package manifest
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -106,7 +107,7 @@ func (u *unit) yarnLock(ctx context.Context) error {
 				return nil
 			}
 			var descs []string
-			for _, d := range strings.Split(head, ",") {
+			for d := range strings.SplitSeq(head, ",") {
 				if d = strings.Trim(d, ` "'`); d != "" {
 					descs = append(descs, d)
 				}
@@ -336,10 +337,8 @@ func (u *unit) pnpmLock(ctx context.Context) error {
 				}
 			}
 			dep := lockDep{name: name, version: ver, kind: kind}
-			for _, have := range e.deps {
-				if have == dep {
-					return nil
-				}
+			if slices.Contains(e.deps, dep) {
+				return nil
 			}
 			if strings.HasPrefix(ver, "link:") {
 				dep.version, dep.requirement = "", ver
@@ -393,7 +392,7 @@ func pnpmSplit(key, format string) (name, version string) {
 func pnpmFlow(s string) map[string]string {
 	out := map[string]string{}
 	s = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(s), "{"), "}")
-	for _, part := range strings.Split(s, ",") {
+	for part := range strings.SplitSeq(s, ",") {
 		k, v, ok := strings.Cut(part, ":")
 		if ok {
 			out[strings.TrimSpace(k)] = unquote(strings.TrimSpace(v))

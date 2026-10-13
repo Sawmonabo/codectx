@@ -129,9 +129,7 @@ func tryApply(e edit, files map[string]string) (map[string]string, bool) {
 		}
 		out[r.path] = strings.Replace(src, r.old, r.new, 1)
 	}
-	for p, src := range e.write {
-		out[p] = src
-	}
+	maps.Copy(out, e.write)
 	for _, m := range e.move {
 		src, ok := out[m[0]]
 		if !ok {

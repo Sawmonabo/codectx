@@ -710,11 +710,7 @@ func (s *compileSorts) observations() []sortObservation {
 	if s == nil {
 		return nil
 	}
-	out := make([]sortObservation, 0, len(s.observed))
-	for _, o := range s.observed {
-		out = append(out, o)
-	}
-	return out
+	return append(make([]sortObservation, 0, len(s.observed)), s.observed...)
 }
 
 // newCompileSorts opens the sort area for one compile.

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -236,10 +237,12 @@ func foreignName(found string, recorded bool) string {
 
 // removeLedgerFiles deletes the ledger file and the write-ahead log and shared
 // memory files beside it. All three go: a log left beside a new file of the
-// same name would be replayed into it.
+// same name would be replayed into it. A ledger is as large as the runs it
+// recorded, so its blocks go back at the pace every free keeps; each name is
+// gone when paced.Remove returns, which is what the new file needs.
 func removeLedgerFiles(path string) error {
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
-		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := paced.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return internal("remove the run ledger written by another schema: " + err.Error())
 		}
 	}

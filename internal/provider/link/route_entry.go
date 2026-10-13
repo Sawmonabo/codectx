@@ -258,8 +258,8 @@ func resolveEntries(ctx context.Context, u *unit, entries []declaredEntry) ([]id
 			continue
 		}
 		target := model.NodeID("")
-		switch {
-		case c.qualified == "":
+		switch c.qualified {
+		case "":
 			target = t.Module.Node
 			if c.rustMain {
 				for i := range t.Decls {
@@ -333,10 +333,8 @@ func entryNames(u *unit, e declaredEntry, p string) (string, bool, bool) {
 		return attr, false, found
 	case FamilyJavaScript:
 		v := path.Clean(path.Join(dir, e.value))
-		for _, c := range []string{v, v + ".js", v + ".mjs", v + ".cjs", v + "/index.js"} {
-			if p == c {
-				return "", false, true
-			}
+		if slices.Contains([]string{v, v + ".js", v + ".mjs", v + ".cjs", v + "/index.js"}, p) {
+			return "", false, true
 		}
 	case FamilyRust:
 		given := strings.TrimPrefix(e.value, "path:")

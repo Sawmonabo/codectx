@@ -247,7 +247,7 @@ func (w *levelWalk) run(ctx context.Context, st walkState) (walkState, error) {
 				return st, nil
 			}
 		}
-		stop, err := w.serve(ctx, &st)
+		stop, err := w.serve(&st)
 		if err != nil {
 			return walkState{}, err
 		}
@@ -628,7 +628,7 @@ func (w *levelWalk) resolveIDs(ctx context.Context, recs []levelRecord) error {
 // serve hands the sorted level to the visitor from the offset the page starts
 // at, in batches that are named together. It reports whether the walk stops
 // inside this level.
-func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
+func (w *levelWalk) serve(st *walkState) (bool, error) {
 	o := w.o
 	if w.sorted == nil {
 		s, err := openSortedLevel(o.Retain, st.Level)

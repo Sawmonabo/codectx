@@ -330,7 +330,7 @@ func (p *cMacroScan) suspect(c *ts.Node) bool {
 		return false
 	}
 	count := c.ChildCount()
-	for i := uint(0); i < count; i++ {
+	for i := range count {
 		k := c.Child(i)
 		if k.IsError() || k.IsMissing() {
 			return true
@@ -353,7 +353,7 @@ func cDeclaratorError(d *ts.Node) bool {
 	for d != nil {
 		count := d.ChildCount()
 		var inner *ts.Node
-		for i := uint(0); i < count; i++ {
+		for i := range count {
 			k := d.Child(i)
 			if k.IsError() || k.IsMissing() {
 				return true
@@ -369,7 +369,7 @@ func cDeclaratorError(d *ts.Node) bool {
 
 func cHasKind(n *ts.Node, kind string) bool {
 	count := n.ChildCount()
-	for i := uint(0); i < count; i++ {
+	for i := range count {
 		if n.Child(i).Kind() == kind {
 			return true
 		}
@@ -458,7 +458,7 @@ func cParams(c *ts.Node) int {
 		}
 	}
 	count := c.ChildCount()
-	for i := uint(0); i < count; i++ {
+	for i := range count {
 		if at := cParams(c.Child(i)); at >= 0 {
 			return at
 		}
@@ -618,7 +618,7 @@ func cDeclMacros(e *extraction, d *decl) (macros, candidates []string, visibilit
 	var spans [][2]uint
 	typeKind, typeName := "", ""
 	count := n.ChildCount()
-	for i := uint(0); i < count; i++ {
+	for i := range count {
 		c := n.Child(i)
 		if n.FieldNameForChild(uint32(i)) == "body" {
 			break
@@ -647,7 +647,7 @@ func cDeclMacros(e *extraction, d *decl) (macros, candidates []string, visibilit
 // collectDefines records every object-like macro directive under n.
 func (p *cMacroScan) collectDefines(n *ts.Node) {
 	count := n.ChildCount()
-	for i := uint(0); i < count; i++ {
+	for i := range count {
 		c := n.Child(i)
 		switch c.Kind() {
 		case "preproc_def", "preproc_call":
@@ -773,7 +773,7 @@ func cVisibility(src []byte, toks []cTok, keyword func(string) bool) string {
 // lists, the first that states one; empty when none does.
 func cAttributeVisibility(n *ts.Node, src []byte, keyword func(string) bool) string {
 	count := n.ChildCount()
-	for i := uint(0); i < count; i++ {
+	for i := range count {
 		c := n.Child(i)
 		switch c.Kind() {
 		case "attribute_specifier", "ms_declspec_modifier", "attribute_declaration":

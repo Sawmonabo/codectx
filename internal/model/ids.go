@@ -11,8 +11,11 @@ import (
 // row number used for lookup and never a reproducible analysis fingerprint.
 // Numeric SQLite row IDs never escape as entity identity.
 type (
-	// RepositoryID is a persisted random identity for one repository within
-	// this installation. It is not derived from the repository's contents.
+	// RepositoryID is the identity of one workspace root within this
+	// installation: the domain-separated hash of the root's absolute path, the
+	// same path the workspace's data directory is keyed by, so it needs no
+	// stored state and a moved root is a new repository with a new store. It
+	// is not derived from the repository's contents.
 	RepositoryID string
 	SnapshotID   string
 	AnalysisKey  string

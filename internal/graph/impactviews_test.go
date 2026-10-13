@@ -88,7 +88,7 @@ func TestARouteLongerThanAPathBoundIsServedWhole(t *testing.T) {
 // the reason page one already served and the answer serves one reason twice.
 func TestAReasonsPageResumesInsideAnEntry(t *testing.T) {
 	f, chain := newChainFixture(3)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		f.relations = append(f.relations, model.Relation{ID: fixtureRelationID(100 + i),
 			From: chain[i], Kind: model.RelImports, To: chain[i+1]})
 	}

@@ -41,6 +41,9 @@ func schemaForeignKeys(t *testing.T, tx *sql.Tx) []foreignKey {
 			}
 			fk.cols = append(fk.cols, from)
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("foreign keys of %s: %v", table, err)
+		}
 		rows.Close()
 		for _, id := range order {
 			out = append(out, *byID[id])
@@ -63,6 +66,9 @@ func queryStrings(t *testing.T, tx *sql.Tx, query string, args ...any) []string 
 			t.Fatal(err)
 		}
 		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: %v", query, err)
 	}
 	return out
 }

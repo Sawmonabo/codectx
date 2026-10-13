@@ -372,13 +372,17 @@ func (x *goExternal) load(ctx context.Context, p string) (*goExtPackage, error) 
 				return nil, err
 			}
 			var key strings.Builder
-			key.WriteString("snap\x00" + p)
+			key.WriteString("snap\x00")
+			key.WriteString(p)
 			for _, e := range listed {
 				if e.Returns == "" {
 					key.Reset()
 					break
 				}
-				key.WriteString("\x00" + e.Aux + "\x00" + e.Returns)
+				key.WriteByte(0)
+				key.WriteString(e.Aux)
+				key.WriteByte(0)
+				key.WriteString(e.Returns)
 			}
 			if id = key.String(); id != "" {
 				if pkg, ok := readGoDecls(id, p); ok {
@@ -508,7 +512,7 @@ func (p *goExtPackage) addFile(af *ast.File, std bool, constraint string) {
 			if base == "" {
 				continue
 			}
-			t := p.typeNamed(base, fi)
+			t := p.typeNamed(base)
 			form := goASTSignature(d.Type, params)
 			if !slices.ContainsFunc(t.methods, func(m goExtMethod) bool { return m.name == d.Name.Name && m.form == form }) {
 				t.methods = append(t.methods, goExtMethod{name: d.Name.Name, form: form, file: fi})
@@ -632,7 +636,7 @@ func (x *goExternal) constant(p, name string) []goDecl {
 
 // typeNamed is the record of the type named name, made for a method whose
 // type's declaration is in a later file.
-func (p *goExtPackage) typeNamed(name string, fi int) *goExtType {
+func (p *goExtPackage) typeNamed(name string) *goExtType {
 	t := p.types[name]
 	if t == nil {
 		t = &goExtType{file: -1}

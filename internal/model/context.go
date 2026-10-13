@@ -444,7 +444,7 @@ func (m ContextManifest) Validate() error {
 	if err := requireNonNegative("manifest.slice_count", int64(m.SliceCount)); err != nil {
 		return err
 	}
-	if err := validateCapabilityStates("manifest.completeness", m.Completeness); err != nil {
+	if err := validateCapabilityStates(m.Completeness); err != nil {
 		return err
 	}
 	if err := requireField("manifest.estimate_method", m.EstimateMethod, MaxIdentifierBytes); err != nil {

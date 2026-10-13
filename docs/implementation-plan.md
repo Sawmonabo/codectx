@@ -511,7 +511,7 @@ type Binding struct {
 Identity definitions:
 
 ```text
-RepositoryID = persisted random repository identity within this installation
+RepositoryID = H("repository-identity-v1", absolute_workspace_root_path)
 FileID       = H("file-v1", repository_id, normalized_root_relative_path)
 NodeID       = H("node-v1", repository_id, kind, canonical_entity_key)
 RelationID   = H("relation-v1", repository_id, from_id, relation_kind, to_id)

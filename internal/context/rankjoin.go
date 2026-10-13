@@ -328,7 +328,7 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, s *compileSorts, g graph.G
 	scanned := 0
 	stopped := false
 
-	epochs, err := newSortSeries[relAttrRec](s, "edge-kind", lessRelAttr, sizeOfRelAttr)
+	epochs, err := newSortSeries(s, "edge-kind", lessRelAttr, sizeOfRelAttr)
 	if err != nil {
 		return 0, err
 	}

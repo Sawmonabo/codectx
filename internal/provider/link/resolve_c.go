@@ -345,7 +345,7 @@ func (r *staticFile) visibilityFacts() error {
 		}
 		closure := r.includeClosure()
 		site := Ref{File: r.file, Index: int32(i)}
-		for _, m := range strings.Fields(d.Macros) {
+		for m := range strings.FieldsSeq(d.Macros) {
 			facts, ok := reached[m]
 			if !ok {
 				var err error

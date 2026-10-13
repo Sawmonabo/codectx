@@ -115,7 +115,7 @@ func (m QueryMeta) Validate() error {
 	if err := m.Binding.Validate(); err != nil {
 		return err
 	}
-	if err := validateCapabilityStates("meta.completeness", m.Completeness); err != nil {
+	if err := validateCapabilityStates(m.Completeness); err != nil {
 		return err
 	}
 	if m.Truncated && m.TruncationReason == "" {

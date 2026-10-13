@@ -84,8 +84,8 @@ func importedName(written string, python bool) (spec, name string, ok bool) {
 
 func stripExtension(p string) string {
 	for _, ext := range ecmaScriptExtensions {
-		if strings.HasSuffix(p, ext) {
-			return strings.TrimSuffix(p, ext)
+		if before, ok := strings.CutSuffix(p, ext); ok {
+			return before
 		}
 	}
 	return p
