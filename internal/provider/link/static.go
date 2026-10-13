@@ -597,7 +597,22 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 			res.close()
 		}
 	}()
-	if rf.prev != nil && rf.layout && rf.prev.h != nil {
+	reuse := rf.prev != nil && rf.layout && rf.prev.h != nil
+	surface := ""
+	if reuse && rf.external {
+		var err error
+		if surface, reuse, err = sameGoSurface(ctx, u, rf.prev); err != nil {
+			return nil, err
+		}
+	}
+	if reuse && rf.external {
+		// The predecessor's hierarchy under this build's fields.
+		var err error
+		if res.groups, err = withFields(u.dir, rf.prev.groups, rf.prev.fields, fields, surface); err != nil {
+			return nil, err
+		}
+		res.h = rf.prev.h
+	} else if reuse {
 		res.h, res.groups = rf.prev.h, rf.prev.groups
 	} else {
 		var err error
@@ -647,18 +662,8 @@ func indexGroups(dir string, h *hierarchy, fields []manifestField) (*pagination.
 	if err := h.ids.groups(h.links, scopeLinks, groups); err != nil {
 		return nil, err
 	}
-	// fields is sorted by key; two manifests may give one key two values
-	// (two crates of one name), which are one group.
-	for i := 0; i < len(fields); {
-		j := i
-		var values []string
-		for ; j < len(fields) && fields[j].Key == fields[i].Key; j++ {
-			values = append(values, fields[j].Value)
-		}
-		if err := groups.Add(group{Key: manifestKey(fields[i].Key).hash(), Hash: model.H(groupDomain, values...)}); err != nil {
-			return nil, err
-		}
-		i = j
+	if err := fieldGroups(fields, h.goSurface, groups.Add); err != nil {
+		return nil, err
 	}
 	return groups.Sorted()
 }

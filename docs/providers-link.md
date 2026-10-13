@@ -452,14 +452,21 @@ The delta build hands `Link` the predecessor's state whenever the predecessor st
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
 classifies every member against its record (unchanged, content changed with the same table, table changed, added,
 removed) and every manifest by the fields the linker reads (`manifestFields`, `refresh.go`): a Go module's `module`
-path; a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
+path, and where each package outside the unit is read from (`goManifestFields`, `manifest_go.go`: the `go` and
+`toolchain` lines, each requirement's version, each replacement, the governing `go.work`, the vendor manifest, the
+standard library and whether the module cache holds each required version); a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
 resolution and ownership read), each `package.json`'s `name`, `type`, `exports`, `imports`, `types`/`typings`,
 `module`, `main`, `tsconfig` and `workspaces`, and each workspace file's globs (`jsManifestFields`, `js_manifest.go`).
 A changed ECMAScript field rebuilds the hierarchy, whose specifier answers (`keyESSpec`) are diffed key by key like
 every other index group, so only the nodes whose imports now resolve differently re-run, in any file of the unit.
 Nothing else of a manifest is read: the Python and Java project files decide only which unit a file belongs to, so a
-change to them is a change of membership or nothing. A dependency version bump in `go.mod` changes no field, and a new nested `go.mod` moves its
-files out of one unit into another, a removal from one and an addition to the other.
+change to them is a change of membership or nothing. A change to the Go fields that only say where a package outside
+the unit is read from keeps the layout (`goExternalField`, `go_refresh.go`): the packages outside the unit are read
+again over the stored hierarchy, and the hierarchy is kept when the digest of everything they declare
+(`goExternal.surface`, stored as a group) is the predecessor's, an early cutoff, so a dependency bump that changes no
+declaration the unit reads re-runs nothing and reads no table. One that does rebuilds the hierarchy, and only the
+members whose reads changed re-run. A new nested `go.mod` moves its files out of one unit into another, a removal
+from one and an addition to the other.
 
 What re-resolves:
 - **Nothing**, when no table, member or field moved: the predecessor's bindings stand.

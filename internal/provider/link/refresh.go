@@ -97,6 +97,11 @@ type refresh struct {
 	// is built from. Only the members whose sites moved then re-run, and no
 	// other table is read.
 	layout bool
+	// external reports that the manifest fields moved and only those that
+	// say where a Go package outside the unit is read from (goExternalField):
+	// the layout holds when what those packages declare is what the
+	// predecessor read (sameGoSurface).
+	external bool
 	// changed collects, folded, the FileIDs whose facts are republished
 	// and those of the predecessor's members that are gone: every file the
 	// carry-over names replaced.
@@ -143,7 +148,8 @@ func newFileIDSort(dir string) (*pagination.ExternalSort[model.FileID], error) {
 // each member's stored MemberDigest, empty for a member without a table.
 func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manifestField) error {
 	rf.resolve = !slices.Equal(fields, rf.prev.fields)
-	rf.layout = !rf.resolve
+	rf.layout = slices.Equal(layoutFields(fields), layoutFields(rf.prev.fields))
+	rf.external = rf.resolve && rf.layout
 	next, stop := pull(rf.prev.records)
 	defer stop()
 	old, ok, err := next()

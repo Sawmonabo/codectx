@@ -53,6 +53,9 @@ type hierarchy struct {
 	// Go packages outside the unit read for it (goExternal).
 	goInfo *goModuleInfo
 	goExt  *goExternal
+	// goSurface is the digest of what the build read from the packages
+	// outside a Go unit (goExternal.surface), empty for any other unit.
+	goSurface string
 	// note, while a member's reads are recorded (record), is told each
 	// read by its trace key.
 	note func(TraceKey) error
@@ -469,6 +472,7 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		if h.goExt, err = newGoExternal(ctx, h, u); err != nil {
 			return nil, err
 		}
+		h.goSurface = h.goExt.surface()
 		defer func() {
 			h.goExt.close()
 			h.goExt = nil

@@ -1,6 +1,7 @@
 package delta_test
 
 import (
+	"bytes"
 	"maps"
 	"slices"
 	"strings"
@@ -753,7 +754,8 @@ pub fn call(h: &Holder) -> i32 {
 // member moved or a value or name it read changed.
 //
 //   - a body edit that changes no interface entry (feed's body) resolves no
-//     site of any other file;
+//     site of any other file, and its own file's sites exactly when its
+//     table's digest moved;
 //   - a changed returned value (make returns a Cat), a changed parameter
 //     list (run gains a parameter) and a rename (run becomes execute)
 //     resolve some of main's sites, those that read the changed value or
@@ -772,16 +774,22 @@ pub fn call(h: &Holder) -> i32 {
 // its sites. Mutation: re-run every site of a member any of whose nodes
 // re-runs (the member region) -> main resolves all its sites after the
 // changed returned value, the changed parameter list and the rename.
+// Mutation: re-run nothing of a member whose table moved -> factory.js
+// resolves no site after the body edit, whose `const said` moved its table.
 func TestFlowRefreshWorkFollowsReads(t *testing.T) {
 	ring := []string{"ring_a", "ring_b", "ring_c"}
 	type work struct {
 		edit string
 		// none resolve no site, some resolve some sites but not all, and
-		// ran resolve at least one.
+		// ran resolve at least one; edited resolves some sites exactly when
+		// its table's digest moved, since a member whose table holds keeps
+		// its bindings (a Python local is no declaration, an ECMAScript
+		// `const` is).
 		none, some, ran []string
+		edited          string
 	}
 	cases := []work{
-		{edit: "body edit keeps the parameters", none: append([]string{"main", "ui"}, ring...), ran: []string{"factory"}},
+		{edit: "body edit keeps the parameters", none: append([]string{"main", "ui"}, ring...), edited: "factory"},
 		{edit: "changed returned value", none: append([]string{"ui"}, ring...), some: []string{"main"}},
 		{edit: "changed parameter list", none: append([]string{"ui"}, ring...), some: []string{"main"}},
 		{edit: "rename", none: append([]string{"ui"}, ring...), some: []string{"main"}},
@@ -840,6 +848,14 @@ func TestFlowRefreshWorkFollowsReads(t *testing.T) {
 					p := f + l.ext
 					if b.sites[p] == 0 {
 						t.Errorf("the refresh resolved none of %s's sites, want some: they read what moved", p)
+					}
+				}
+				if c.edited != "" {
+					p := c.edited + l.ext
+					moved := !bytes.Equal(s.inputDigest(b.previous, p), s.inputDigest(b.unit, p))
+					if n := b.sites[p]; moved != (n > 0) {
+						t.Errorf("the refresh resolved %d of %s's sites while its table's digest moved=%v: "+
+							"want some exactly when it moved", n, p, moved)
 					}
 				}
 			})
