@@ -3,6 +3,7 @@ package graph
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"path"
 	"strconv"
 	"strings"
@@ -53,8 +54,35 @@ func declarationReader(r GraphReader) DeclarationReader {
 // candidatesUnavailable is the answer of a reader that cannot list
 // candidates: unavailable, never an empty list.
 func candidatesUnavailable() error {
-	return &model.Error{Code: model.CodeProviderUnavailable,
-		Message: "this index cannot list name-only call candidates: its reader does not look declarations up by name"}
+	return &model.Error{Code: model.CodeProviderUnavailable, Message: candidatesUnavailableWhy}
+}
+
+// candidatesUnavailableWhy is why a reader without the seam lists no
+// candidates, in the words both the refusal and the disclosure use.
+const candidatesUnavailableWhy = "this index cannot list name-only candidates: " +
+	"its reader does not look declarations up by name"
+
+// nameOnlyUnavailable is the disclosure an answer carries when its name-only
+// rows of kind (`may_call`, `may_import`) would join it by design -- after
+// every precise row, as ADR-0015 decision 3 lays out for callers, callees,
+// imports, references and path -- but the reader cannot list candidates. The
+// precise answer stands, and the missing part is stated twice, as decision 4
+// asks: as a structured completeness row in the unavailable state, and in
+// plain words. Without it the answer would read as "nothing may call this"
+// when nothing was looked up.
+//
+// A request that NAMES the kind is not given this partial answer: it is
+// refused with candidatesUnavailable, as Candidates is, because serving it
+// without its named relation would answer a different question.
+func nameOnlyUnavailable(kind model.RelationKind) (model.CapabilityState, string) {
+	return model.CapabilityState{
+		ProviderID:     "graph",
+		Capability:     string(kind),
+		Scope:          "query",
+		State:          model.CapabilityUnavailable,
+		DiagnosticCode: model.CodeProviderUnavailable,
+	}, fmt.Sprintf("name-only `%s` rows are unavailable for this answer, which lists only what analysis bound: %s",
+		kind, candidatesUnavailableWhy)
 }
 
 // Candidates returns one ranked page of the name-only candidates of an open

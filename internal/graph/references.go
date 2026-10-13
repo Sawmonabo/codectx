@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -219,6 +220,14 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	caps, err := e.completeness(ctx)
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
+	}
+	// A method family's answer lists its name-only references after the
+	// precise ones (heuristicReferences); a reader that cannot list candidates
+	// lists none, and every page says so rather than reading as complete.
+	if walk.family && declarationReader(e.reader) == nil {
+		row, unavailable := nameOnlyUnavailable(model.RelMayCall)
+		caps = slices.Concat(caps, []model.CapabilityState{row})
+		notices = appendNotice(notices, unavailable)
 	}
 	notices = append(notices, clamps.Notices()...)
 	meta := model.QueryMeta{Binding: binding, Completeness: caps, Notices: notices}
@@ -812,6 +821,8 @@ func (e *Engine) heuristicReferences(ctx context.Context, reader GraphReader, no
 	add func(referenceRelation) error) error {
 	dr := declarationReader(reader)
 	if dr == nil {
+		// The answer discloses these references as unavailable on every
+		// page (nameOnlyUnavailable in References); the precise ones stand.
 		return nil
 	}
 	repo := reader.Binding().RepositoryID
