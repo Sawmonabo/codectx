@@ -32,7 +32,7 @@ const ScopePrefix = "file:"
 
 // extractionVersion changes whenever the worker's extraction logic changes
 // the facts it emits for the same source and query pack.
-const extractionVersion = "14"
+const extractionVersion = "15"
 
 //go:embed queries/*.scm
 var queryFS embed.FS
