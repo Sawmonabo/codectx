@@ -3,6 +3,7 @@ package delta
 import (
 	"bufio"
 	"context"
+	"errors"
 	"iter"
 	"log/slog"
 	"os"
@@ -185,7 +186,8 @@ func (a *linkApplier) Apply(ctx context.Context, req Request) (Result, error) {
 
 // previous spills the predecessor's resolution state into dir and returns its
 // path, or an empty path and the reason the unit is built in full: the
-// predecessor stored none (FullNoState), or stored one this build cannot read
+// predecessor stored none (FullNoState), stored one another version of the
+// linker wrote (FullStateVersion), or stored one this build cannot read
 // (FullStateUnreadable), which is warned about and resolved in full rather
 // than failing the unit on every build.
 func (a *linkApplier) previous(ctx context.Context, req Request, dir string) (string, string, error) {
@@ -201,7 +203,9 @@ func (a *linkApplier) previous(ctx context.Context, req Request, dir string) (st
 		return "", "", internal("link resolution state: " + err.Error())
 	}
 	defer f.Close()
-	if err := link.ValidateState(f); err != nil {
+	if err := link.ValidateState(f); errors.Is(err, link.ErrStateVersion) {
+		return "", FullStateVersion, nil
+	} else if err != nil {
 		slog.Warn("a stored link resolution state could not be read; the unit is resolved in full",
 			"component", component, "unit", string(req.Previous), "kind", link.ResolutionKind, "error", err)
 		return "", FullStateUnreadable, nil

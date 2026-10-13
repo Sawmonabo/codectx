@@ -2,11 +2,13 @@ package link
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"errors"
 	"io"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -53,9 +55,19 @@ import (
 // A string is its length (an unsigned varint) and its bytes. A state that is
 // short, long, out of order or malformed is corrupt storage.
 
-// stateTag opens every stored resolution state, so a state of any other form
-// is refused before anything of it is read.
-const stateTag = "link.resolution.nodes\n"
+// stateTag opens every stored resolution state and names the Version that
+// wrote it, which covers the state's codecs with the rest of the linker's
+// code, so a state of another version is set aside (ErrStateVersion) and one
+// of any other form refused before anything of it is read.
+func stateTag() string { return stateFamily + " " + Version() + "\n" }
+
+// stateFamily opens the tag of a resolution state of every version.
+const stateFamily = "link.resolution"
+
+// ErrStateVersion is what reading a resolution state that another Version of
+// the linker (a build of different code) wrote answers: its form and its facts are that version's, so
+// nothing of it is read and the unit resolves in full. It is no corruption.
+var ErrStateVersion = errors.New("the previous link resolution state was written by another version of the linker")
 
 // details is every technique a fact can carry, in its stored order, which is
 // also the order of preference a fold of two equal facts keeps (better); the
@@ -574,7 +586,7 @@ func (r *byteReader) count() int64 {
 // writeState stores fields, records (by FileID) and res to w.
 func writeState(w io.Writer, fields []manifestField, records *pagination.SortedRun[record], res *resolution) error {
 	bw := bufio.NewWriter(w)
-	out := binary.AppendUvarint([]byte(stateTag), uint64(len(fields)))
+	out := binary.AppendUvarint([]byte(stateTag()), uint64(len(fields)))
 	for _, f := range fields {
 		out = appendString(appendString(out, f.Key), f.Value)
 	}
@@ -717,8 +729,14 @@ func (s stateReader) byte(what string) (byte, error) {
 func readState(r io.Reader, sink stateSink) error {
 	field, rec, bind := sink.field, sink.record, sink.binding
 	s := stateReader{br: bufio.NewReader(r)}
-	tag := make([]byte, len(stateTag))
-	if _, err := io.ReadFull(s.br, tag); err != nil || string(tag) != stateTag {
+	want := stateTag()
+	tag := make([]byte, len(want))
+	if n, _ := io.ReadFull(s.br, tag); string(tag[:n]) != want {
+		// A tag of the family that this one does not begin is another
+		// version's; a short piece of this one is a short state.
+		if bytes.HasPrefix(tag[:n], []byte(stateFamily)) && !strings.HasPrefix(want, string(tag[:n])) {
+			return ErrStateVersion
+		}
 		return stateCorrupt("it is not a resolution state of this form")
 	}
 	n, err := s.uvarint("its field count")

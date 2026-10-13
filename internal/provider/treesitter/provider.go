@@ -52,10 +52,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// fingerprint is the pinned grammar and query identity every worker must
-// report before it is trusted with a parse.
-var fingerprint = lang.Fingerprint()
-
 // WorkerCommand is how a parser worker is started: the absolute path of the
 // executable and its literal arguments. In production it is this binary with
 // the hidden wire.Subcommand argument; tests point it at their
