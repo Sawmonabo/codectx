@@ -1325,6 +1325,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			return model.GraphResult{}, err
 		}
 		notices = append(notices, external...)
+		notices = appendNotice(notices, reflectiveNotice(caps))
 	}
 
 	reason := walkReason

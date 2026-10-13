@@ -386,7 +386,7 @@ func (p *publisher) capabilities(members int64, unnamed map[model.RelationKind]i
 				key string
 				n   int64
 			}{{"sites", c.Sites}, {"bound_sites", c.Bound}, {"open_sites", c.Open}, {"computed_sites", c.Computed},
-				{"external_sites", c.External}} {
+				{"external_sites", c.External}, {"reflective_sites", c.Reflective}} {
 				st = st.WithDetail(d.key, strconv.FormatInt(d.n, 10))
 			}
 		case model.RelImports:

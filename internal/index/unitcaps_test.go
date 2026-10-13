@@ -17,7 +17,7 @@ import (
 // every member, never only the units the run rebuilt.
 
 // siteDetails are the `calls` row's site counts the linking unit publishes.
-var siteDetails = []string{"sites", "bound_sites", "open_sites", "computed_sites", "external_sites"}
+var siteDetails = []string{"sites", "bound_sites", "open_sites", "computed_sites", "external_sites", "reflective_sites"}
 
 // linkingFixture is the index fixture with the linking provider registered
 // beside the file providers, as the composition root registers it, so its

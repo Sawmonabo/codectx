@@ -219,7 +219,7 @@ func compareRanked(a, b rankedCandidate) int {
 // prefix. What a caller keeps of the stream is its own choice; nothing is
 // held here.
 func scanCandidates(ctx context.Context, dr DeclarationReader, site callSite, visit func(rankedCandidate)) error {
-	if site.Reason == model.ReasonComputed || site.Name == "" {
+	if !site.Reason.Named() || site.Name == "" {
 		return nil
 	}
 	kinds := shapeKinds(site.Shape)

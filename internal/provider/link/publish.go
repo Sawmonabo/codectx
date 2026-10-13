@@ -497,14 +497,15 @@ type filePublication struct {
 
 // site publishes the facts of site i, group: one `calls` per distinct
 // target (a declaration or an external method), each with the occurrence's
-// dispatch and, when there are several, the set size; or, when the site has
-// no call fact and no FactExternalSite, its open-site node and the caller's
-// `calls` to it; for each FactFlow, one `data_flows_to` from each variable
+// dispatch and, when there are several, the set size, and beside them, for
+// a reflective call (model.ReasonReflective), its open-site node; or, when
+// the site has no call fact and no FactExternalSite, its open-site node and
+// the caller's `calls` to it; for each FactFlow, one `data_flows_to` from each variable
 // the argument reads to the parameter; for each FactSummary, one from each
 // variable the argument reads to each variable the site's result is written
 // into (returnFlows); and for each FactReturn, one from the callee's return
 // node to each of those and to the return node the result reaches. It
-// counts the site bound, external, computed or open.
+// counts the site bound, external (and reflective), computed or open.
 func (f *filePublication) site(i int32, group []idBinding) error {
 	s := &f.t.Sites[i]
 	caller, err := f.caller(s)
@@ -541,6 +542,9 @@ func (f *filePublication) site(i int32, group []idBinding) error {
 		f.counts.Bound++
 	case len(calls) > 0 || external:
 		f.counts.External++
+		if reason == model.ReasonReflective {
+			f.counts.Reflective++
+		}
 	case s.Computed:
 		f.counts.Computed++
 	default:
@@ -560,6 +564,13 @@ func (f *filePublication) site(i int32, group []idBinding) error {
 				return err
 			}
 			f.relation(caller.Node, model.RelCalls, target, located(s.Range), key, b.Detail, b.Dispatch, set)
+		}
+		if reason == model.ReasonReflective {
+			// The reflection API runs what the site cannot name: the site is
+			// open beside its call of the API (FactOpenSite).
+			if err := f.openSite(s, caller, reason); err != nil {
+				return err
+			}
 		}
 	case !external:
 		if err := f.openSite(s, caller, cmp.Or(reason, openReason(s))); err != nil {

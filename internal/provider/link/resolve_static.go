@@ -101,7 +101,13 @@ func (r *staticFile) site(i int32, bySignature sigSink) error {
 			if key == "" {
 				return r.emit(Binding{Kind: FactExternalSite, Site: ref})
 			}
-			return r.emit(Binding{Site: ref, External: key, Detail: DetailDirect, Dispatch: d})
+			if err := r.emit(Binding{Site: ref, External: key, Detail: DetailDirect, Dispatch: d}); err != nil {
+				return err
+			}
+			if reflective[key] {
+				return r.emit(Binding{Kind: FactOpenSite, Site: ref, Reason: model.ReasonReflective})
+			}
+			return nil
 		},
 	}
 	return r.resolve(i, bySignature, out)

@@ -813,16 +813,27 @@ const (
 	// name: `obj[k]()`, `require(expr)`. An open call site with this reason
 	// has no candidates.
 	ReasonComputed OpenSiteReason = "computed"
+	// ReasonReflective is a call of a reflection API that runs a method or
+	// function chosen at run time (`m.invoke(obj)`, `v.Call(args)`): the
+	// site also calls that API's external method, and what it reaches is
+	// not known.
+	ReasonReflective OpenSiteReason = "reflective"
 )
 
 // Valid reports whether r is a known wire spelling.
 func (r OpenSiteReason) Valid() bool {
 	switch r {
-	case ReasonReceiverUntyped, ReasonValueUntracked, ReasonGlobalUnbound, ReasonComputed:
+	case ReasonReceiverUntyped, ReasonValueUntracked, ReasonGlobalUnbound, ReasonComputed, ReasonReflective:
 		return true
 	}
 	return false
 }
+
+// Named reports whether an open site of reason r is named by its callee:
+// whether a declaration of that name and shape may be what it calls. A
+// computed callee names nothing, and a reflective one names the reflection
+// API it calls, not what that API runs.
+func (r OpenSiteReason) Named() bool { return r != ReasonComputed && r != ReasonReflective }
 
 // CallShape is the form of a call site's callee expression, as candidates
 // for it are matched: methods and function-valued fields for a member site,

@@ -273,7 +273,7 @@ func sitesNaming(ctx context.Context, dr DeclarationReader, n model.Node) ([]mod
 			return nil, err
 		}
 		for _, d := range page {
-			if site, ok := openCallSite(d); ok && site.Reason != model.ReasonComputed && site.fits(n) {
+			if site, ok := openCallSite(d); ok && site.Reason.Named() && site.fits(n) {
 				out = append(out, d.Node.ID)
 			}
 		}
@@ -584,7 +584,29 @@ func possibleNotice(mode tailMode, list possibleList, precise int64, caps []mode
 
 // siteCountKeys are the call linker's exact site counts, in the order a
 // notice quotes them.
-var siteCountKeys = []string{"sites", "bound_sites", "open_sites", "computed_sites", "external_sites"}
+var siteCountKeys = []string{"sites", "bound_sites", "open_sites", "computed_sites", "external_sites", "reflective_sites"}
+
+// reflectiveNotice is a callers answer's disclosure of the project's
+// reflective call sites (model.ReasonReflective), summed over every `calls`
+// capability row as siteCounts sums: each calls a reflection API that runs a
+// method chosen at run time, so a method it reaches does not list it among
+// its callers. Empty when the index reports none.
+func reflectiveNotice(caps []model.CapabilityState) string {
+	var n int64
+	for _, c := range caps {
+		if c.Capability != string(model.RelCalls) {
+			continue
+		}
+		if v, err := strconv.ParseInt(c.Details["reflective_sites"], 10, 64); err == nil {
+			n += v
+		}
+	}
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d call sites of the project call a reflection API that runs a method chosen at run time "+
+		"(open sites of reason `reflective`): a method one of them reaches does not list it among its callers", n)
+}
 
 // siteCounts quotes the project's call-site counts: each key summed over
 // every `calls` capability row that carries it, or says the index reports
@@ -1047,7 +1069,7 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 			}
 			for _, d := range page {
 				site, ok := openCallSite(d)
-				if !ok || site.Reason == model.ReasonComputed {
+				if !ok || !site.Reason.Named() {
 					continue
 				}
 				done, err := c.counted(d.Node.ID)

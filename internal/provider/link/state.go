@@ -85,7 +85,7 @@ func detailCode(d string) (byte, bool) {
 var (
 	dispatches = [...]model.Dispatch{"", model.DispatchVirtual, model.DispatchExact}
 	reasons    = [...]model.OpenSiteReason{"", model.ReasonReceiverUntyped, model.ReasonValueUntracked,
-		model.ReasonGlobalUnbound, model.ReasonComputed}
+		model.ReasonGlobalUnbound, model.ReasonComputed, model.ReasonReflective}
 )
 
 func codeOf[T comparable](values []T, v T) (byte, bool) {
@@ -426,11 +426,12 @@ func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.
 // counts are one member's share of the counts its unit's capability rows
 // carry, so a row sums them over the records without reading a carried
 // member's table: its call sites, those bound to a declaration of the unit,
-// those open (Computed ones excluded), the computed ones, those external;
-// its imports resolved to a member and its open import sites.
+// those open (Computed ones excluded), the computed ones, those external,
+// and of those the reflective ones (model.ReasonReflective); its imports
+// resolved to a member and its open import sites.
 type counts struct {
-	Sites, Bound, Open, Computed, External int64
-	Imports, OpenImports                   int64
+	Sites, Bound, Open, Computed, External, Reflective int64
+	Imports, OpenImports                               int64
 }
 
 func (c *counts) add(o counts) {
@@ -439,6 +440,7 @@ func (c *counts) add(o counts) {
 	c.Open += o.Open
 	c.Computed += o.Computed
 	c.External += o.External
+	c.Reflective += o.Reflective
 	c.Imports += o.Imports
 	c.OpenImports += o.OpenImports
 }
@@ -470,7 +472,8 @@ func encodeRecord(r record) ([]byte, error) {
 	}
 	out = append(out, tabled)
 	c := r.Counts
-	for _, n := range [...]int64{r.Dropped, c.Sites, c.Bound, c.Open, c.Computed, c.External, c.Imports, c.OpenImports} {
+	for _, n := range [...]int64{r.Dropped, c.Sites, c.Bound, c.Open, c.Computed, c.External, c.Reflective, c.Imports,
+		c.OpenImports} {
 		if n < 0 {
 			return nil, internalErr("a member record holds a negative count")
 		}
@@ -484,7 +487,8 @@ func decodeRecord(raw []byte) (record, error) {
 	rec := record{File: model.FileID(r.str()), Content: r.str(), Digest: r.str(), Interface: r.str(), Sites: r.str()}
 	tabled := r.byte()
 	c := &rec.Counts
-	for _, p := range [...]*int64{&rec.Dropped, &c.Sites, &c.Bound, &c.Open, &c.Computed, &c.External, &c.Imports, &c.OpenImports} {
+	for _, p := range [...]*int64{&rec.Dropped, &c.Sites, &c.Bound, &c.Open, &c.Computed, &c.External, &c.Reflective,
+		&c.Imports, &c.OpenImports} {
 		*p = r.count()
 	}
 	if r.err != nil || len(r.b) != 0 || tabled > 1 {

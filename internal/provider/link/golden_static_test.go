@@ -606,6 +606,62 @@ func f(x int) { // @f
 		fails: "an argument into a variadic parameter, or a spread argument, left without its flow; a flow published at an unbound site",
 	},
 	{
+		name:   "java-reflective-call",
+		anchor: "Java SE API java.lang.reflect.Method.invoke (invokes the underlying method the Method object represents), JLS §15.12.4.4; ADR-0015 decision 3 (open sites and their reasons)",
+		files: map[string]string{
+			"R.java": `import java.lang.reflect.Method;
+class Handler { void handle() {} } // @handle
+class R {
+  void go(Handler obj) throws Exception {
+    Method m = Handler.class.getMethod("handle"); // @get
+    m.invoke(obj); // @inv
+  }
+}
+`,
+		},
+		// Derived from the source and the anchors. m.invoke runs whatever method m represents, chosen at run
+		// time: the call of Method.invoke is published, and beside it the site is open for that reason.
+		want: []string{
+			"inv invoke -> external java.lang.reflect.Method.invoke virtual",
+		},
+		sites: []string{
+			"get getMethod open receiver_untyped member 1",
+			"inv invoke open reflective member 1",
+		},
+		// Mutation: drop the reflective open site -> the inv site is counted external and nothing says its
+		// target is unknown.
+		fails: "a reflective call bound to the reflection API alone, with no open site saying its target is chosen at run time",
+	},
+	{
+		name:   "go-reflective-call",
+		anchor: "Go standard library reflect.Value.Call (calls the function v with the input arguments), The Go Programming Language Specification \"Calls\"; ADR-0015 decision 3",
+		files: map[string]string{
+			"go.mod": "module example.com/p\n\ngo 1.22\n",
+			"p.go": `package p
+
+import "reflect"
+
+type H struct{}
+
+func (H) Handle() {} // @handle
+
+func run(v reflect.Value) {
+	v.Call(nil) // @call
+}
+`,
+		},
+		// Derived from the source and the anchors: v.Call runs the function or method v holds, chosen at
+		// run time.
+		want: []string{
+			"call Call -> external reflect.Value.Call virtual",
+		},
+		sites: []string{
+			"call Call open reflective member 1",
+		},
+		// Mutation: drop the reflective open site -> the call site is counted external only.
+		fails: "a reflective call bound to the reflection API alone, with no open site saying its target is chosen at run time",
+	},
+	{
 		name:   "go-open-and-external-sites",
 		anchor: "ADR-0015 decision 1 (open sites and their reasons); The Go Programming Language Specification, \"Calls\", \"Import declarations\"",
 		files: map[string]string{
