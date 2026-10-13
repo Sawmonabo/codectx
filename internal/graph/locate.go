@@ -31,10 +31,17 @@ type SourceLocator interface {
 }
 
 // occurrenceKind reports whether a graph answer lists the occurrences of a
-// relation of kind k: a call's sites are what a call hierarchy names, and an endpoint's
-// route declaration is where it is mounted.
+// relation of kind k: a call's sites are what a call hierarchy names, an
+// endpoint's route declaration is where it is mounted, a dependency's lock or
+// manifest entry carries the version it resolved to (its evidence detail),
+// and a reference carries what its evidence states, such as the visibility a
+// declaration is exported with.
 func occurrenceKind(k model.RelationKind) bool {
-	return k == model.RelCalls || k == model.RelRoutesTo
+	switch k {
+	case model.RelCalls, model.RelRoutesTo, model.RelDependsOn, model.RelReferences:
+		return true
+	}
+	return false
 }
 
 // occurrenceBudget is how many occurrences one answer may carry: the wire's

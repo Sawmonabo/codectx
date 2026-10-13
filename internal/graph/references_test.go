@@ -312,3 +312,40 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// TestReferenceOccurrenceCarriesItsEvidenceDetail asserts that a reference
+// occurrence carries its evidence row's detail, as a C declaration's
+// visibility on its `references` occurrence.
+//
+// Mutation it catches: the occurrence built without the row's detail.
+func TestReferenceOccurrenceCarriesItsEvidenceDetail(t *testing.T) {
+	f := newGraphFixture(t)
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: fixtureLimits()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := model.ReferenceRequest{NodeID: fixtureNodeID("n-b"), Operation: model.ReferenceReferences,
+		SemanticSource: model.SemanticCanonical}
+	page, err := e.References(context.Background(), req)
+	if err != nil || len(page.Items) == 0 {
+		t.Fatalf("References: %d items, %v", len(page.Items), err)
+	}
+	const detail = "visibility_hidden"
+	target := page.Items[0].EvidenceID
+	for rel, rows := range f.evidence {
+		for i := range rows {
+			if rows[i].ID == target {
+				f.evidence[rel][i].Detail = detail
+			}
+		}
+	}
+	page, err = e.References(context.Background(), req)
+	if err != nil {
+		t.Fatalf("References: %v", err)
+	}
+	for _, o := range page.Items {
+		if want := map[bool]string{true: detail}[o.EvidenceID == target]; o.Detail != want {
+			t.Fatalf("occurrence %s carries detail %q, want %q", o.EvidenceID, o.Detail, want)
+		}
+	}
+}

@@ -527,6 +527,11 @@ type ReferenceOccurrence struct {
 	// ephemeral overlay answer that has no canonical relation or evidence row,
 	// so its IDs are empty and its file/range carry the whole result.
 	SemanticSource SemanticSource `json:"semantic_source"`
+	// Detail is the evidence row's own detail, as its provider wrote it: a
+	// lock entry's resolved version, integrity and set size on a
+	// `depends_on` occurrence, a declaration's visibility on a `references`
+	// occurrence. Empty when the row carries none.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Validate enforces the occurrence shape.
@@ -590,6 +595,9 @@ func (o ReferenceOccurrence) Validate() error {
 		return err
 	}
 	if err := boundField("reference_occurrence.from_name", o.FromName, MaxQualifiedNameBytes); err != nil {
+		return err
+	}
+	if err := boundField("reference_occurrence.detail", o.Detail, MaxDetailBytes); err != nil {
 		return err
 	}
 	return nil
@@ -770,7 +778,8 @@ func (l NodeLocation) Validate() error {
 
 // RelationOccurrence is one evidence-backed occurrence of a relation in a
 // graph answer: the call site of a `calls` relation, with the occurrence's own
-// dispatch and set size.
+// dispatch and set size, a route's mount, a `depends_on` lock or manifest
+// entry, a `references` site.
 type RelationOccurrence struct {
 	RelationID RelationID `json:"relation_id"`
 	EvidenceID EvidenceID `json:"evidence_id"`
@@ -778,6 +787,8 @@ type RelationOccurrence struct {
 	Bytes      ByteRange  `json:"bytes"`
 	Dispatch   Dispatch   `json:"dispatch,omitempty"`
 	SetSize    int64      `json:"set_size,omitempty"`
+	// Detail is the evidence row's own detail, as ReferenceOccurrence.Detail.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Validate enforces the occurrence shape.
@@ -802,6 +813,9 @@ func (o RelationOccurrence) Validate() error {
 	}
 	if o.SetSize == 1 {
 		return invalid("relation_occurrence.set_size is 1; a site bound to one target carries 0")
+	}
+	if err := boundField("relation_occurrence.detail", o.Detail, MaxDetailBytes); err != nil {
+		return err
 	}
 	return nil
 }

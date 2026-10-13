@@ -701,7 +701,7 @@ func (g *graphReader) RelationOccurrences(ctx context.Context, rel model.Relatio
 		}
 		out = append(out, model.RelationOccurrence{RelationID: rel, EvidenceID: row.Evidence.ID,
 			FileID: row.Evidence.FileID, Bytes: *row.Bytes, Dispatch: row.Evidence.Dispatch,
-			SetSize: row.Evidence.SetSize})
+			SetSize: row.Evidence.SetSize, Detail: row.Evidence.Detail})
 	}
 	var next model.EvidenceID
 	if len(rows) > 0 && len(rows) >= pageLimit(ctx, limit) {

@@ -655,6 +655,7 @@ func (b *referencePageBuilder) consume(ctx context.Context, batch []referenceRel
 				Range:          row.Range,
 				Bytes:          row.Bytes,
 				SemanticSource: model.SemanticCanonical,
+				Detail:         row.Detail,
 			})
 		}
 		if len(b.items) >= b.pageLimit || b.clipped {

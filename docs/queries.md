@@ -47,7 +47,9 @@ with their evidence counts, which is a summary and never a precise symbol call.
 `refs` separates the two counts Section 9.2 requires: a symbol referenced twice
 inside one canonical relation is **one relation and two occurrences**. Each item
 is one occurrence and carries the precision class, file and byte range of the
-evidence row behind it. The order is the **canonical relation id ascending**,
+evidence row behind it, and the row's `detail` when it has one (a declaration's
+`visibility_*` on a `references` occurrence, a lock entry's version on a
+`depends_on` one). The order is the **canonical relation id ascending**,
 and a page ends on a relation boundary, so the pages of one `refs` answer
 concatenate to the single-shot answer: the same occurrences, in the same order,
 each listed exactly once. That order is a property of the facts alone — it does
@@ -95,7 +97,11 @@ range (`name_bytes`, absent for a node with no name token of its own) — and an
 `occurrences` entry for every call site behind every `calls` relation it lists,
 each with its file, byte range,
 `dispatch` (`virtual` when the call can run an override of its target, `exact`
-when it cannot) and, for a site bound to several targets, its `set_size`. One
+when it cannot) and, for a site bound to several targets, its `set_size`. A
+`routes_to`, `depends_on` or `references` relation it lists has its occurrences
+there too, each with its evidence row's `detail`: a lock entry's
+`resolved_version`, `integrity` and `set_size` (how many versions of the package
+the lock holds), a manifest requirement's range, a declaration's visibility. One
 answer is enough to open a call hierarchy: no follow-up `symbol` or `refs` call
 is needed to place a caller or a call. A relation with more call sites than one
 answer holds lists its first sites and a notice gives the exact count. The
