@@ -111,6 +111,8 @@ func (k Fact) entry() int {
 		return 3
 	case FactEntry:
 		return 4
+	case FactInput:
+		return 5
 	}
 	return 0
 }
@@ -176,6 +178,11 @@ func canonical(b Binding) (Binding, error) {
 		return bad("with a negative parameter position")
 	}
 	switch {
+	case b.Kind == FactInput:
+		if b.External == "" {
+			return bad("with no read")
+		}
+		b.Target = Ref{File: -1, Index: -1}
 	case b.Kind == FactRoute:
 		if b.External == "" {
 			return bad("with no endpoint")
@@ -404,7 +411,7 @@ func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.
 			unnamed[capabilityOf(b.Kind)]++
 			return nil
 		}
-		if b.External == "" || b.Kind == FactRoute || b.Kind == FactEntry {
+		if b.External == "" || b.Kind == FactRoute || b.Kind == FactEntry || b.Kind == FactInput {
 			return nil
 		}
 		return s.Add(b.External)

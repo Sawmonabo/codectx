@@ -61,6 +61,10 @@ type handler struct {
 	// function node keyed by its range, the identity of an anonymous
 	// function, contained by the declaration around it.
 	fn *wire.Span
+	// built reports a handler named as the function a call builds the
+	// served handler with (`auth(show)` routes to auth): the request is
+	// handed to what it returns, not to its own parameters.
+	built bool
 }
 
 // declHandler, moduleHandler, refHandler and fnHandler build each form.

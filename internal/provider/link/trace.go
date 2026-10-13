@@ -769,7 +769,7 @@ func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, err
 		return idBinding{}, false, err
 	}
 	id := unnamed(site, b)
-	if b.Kind == FactRoute && b.Target.File < 0 || b.Kind != FactRoute && (b.External != "" || !b.Kind.hasTarget()) {
+	if b.Kind == FactInput || b.Kind == FactRoute && b.Target.File < 0 || b.Kind != FactRoute && (b.External != "" || !b.Kind.hasTarget()) {
 		return id, true, nil
 	}
 	var to target

@@ -72,12 +72,41 @@ func (s *inputScan) firstParamReads(fw string, table inputTable, from, start, en
 			}
 			params = params[1:]
 		}
+		if jsLanguage(s.b.lang.Name) && len(params) > 0 && s.ident(params[0].lo) && s.text(params[0].lo) == "this" {
+			// A TypeScript `this` parameter is erased: no argument binds it.
+			params = params[1:]
+		}
+		if fw == fwExpress && s.jsArity(params) == 4 {
+			// Express runs a function of four parameters as error-handling
+			// middleware, `(err, req, res, next)`: the request is second.
+			params = params[1:]
+		}
 		if len(params) == 0 || !s.ident(params[0].lo) {
 			return
 		}
 		name, body = s.text(params[0].lo), int(s.match[open])+1
 	}
 	s.reads(fw, []string{name}, table, body, hi)
+}
+
+// jsArity is a function's `length` as ECMAScript counts it: its
+// parameters before the first with a default value or the rest parameter.
+func (s *inputScan) jsArity(params []paramRange) int {
+	for n, p := range params {
+		if s.punct(p.lo, '.') {
+			return n
+		}
+		for k := p.lo; k < p.hi; k++ {
+			if s.match[k] > 0 {
+				k = int(s.match[k])
+				continue
+			}
+			if s.punct(k, '=') && !s.punct(k+1, '=') && !s.punct(k+1, '>') && !s.punct(k-1, '=') {
+				return n
+			}
+		}
+	}
+	return len(params)
 }
 
 // djangoViewMethods are the methods of a class-based view that receive the
@@ -102,7 +131,7 @@ func (s *inputScan) djangoViews() {
 	s.lex()
 	views := map[int]bool{}
 	classes := map[int]bool{}
-	routed, _ := s.handlerSpans(fwDjango)
+	routed, _ := s.handlerSpans(fwDjango, nil)
 	for _, d := range routed {
 		if s.b.decls[d].kind == model.NodeClass {
 			classes[d] = true
@@ -129,8 +158,12 @@ func (s *inputScan) djangoViews() {
 	}
 	for i := range s.b.decls {
 		d := &s.b.decls[i]
-		if d.kind == model.NodeMethod && d.Parent >= 0 && classes[d.Parent] && djangoViewMethods[d.Name] {
-			views[i] = true
+		if d.kind == model.NodeMethod && d.Parent >= 0 && classes[d.Parent] {
+			// View.setup sets self.request before the view dispatches.
+			s.selfRequestReads(fwDjango, djangoRequest, i)
+			if djangoViewMethods[d.Name] {
+				views[i] = true
+			}
 		}
 	}
 	for i := range s.b.decls {
@@ -218,7 +251,7 @@ var (
 // routes: for Starlette, the request its first parameter receives; for
 // FastAPI, each parameter by FastAPI's own rule.
 func (s *inputScan) fastAPIHandlers(fw string) {
-	decls, _ := s.handlerSpans(fw)
+	decls, _ := s.handlerSpans(fw, nil)
 	if len(decls) == 0 {
 		return
 	}
@@ -255,7 +288,7 @@ func (s *inputScan) fastAPIHandlers(fw string) {
 		}
 		open := s.openAfter(d.NameEnd, d.End)
 		for _, p := range s.paramList(open) {
-			s.fastAPIParam(p, pathNames[i], d.End)
+			s.fastAPIParam(i, p, pathNames[i], d.End)
 		}
 	}
 }
@@ -285,9 +318,9 @@ func routeParams(route string) []string {
 // body for a model, a sequence or a mapping, a query for a scalar. A
 // Request or WebSocket parameter is the request object, whose reads in the
 // handler's body are read by Starlette's table. A dependency, a response,
-// a background-tasks object, or a type this file does not declare publishes
-// nothing.
-func (s *inputScan) fastAPIParam(p paramRange, pathNames map[string]bool, end uint32) {
+// a background-tasks object publishes nothing; a class this file does not
+// decide is left to the linker (pendingFastAPI).
+func (s *inputScan) fastAPIParam(owner int, p paramRange, pathNames map[string]bool, end uint32) {
 	if !s.ident(p.lo) {
 		return
 	}
@@ -363,7 +396,10 @@ func (s *inputScan) fastAPIParam(p paramRange, pathNames map[string]bool, end ui
 	switch {
 	case kind == pyRequest:
 		s.reads(fwFastAPI, []string{name}, starletteRequest, p.hi, s.tokenEnd(end))
-	case kind == pySkip || kind == pyUnknown:
+	case kind == pyUnknown:
+		// The class another file declares, or a base it imports, decides.
+		s.pendingFastAPI(owner, p, typ, name, pathNames[name])
+	case kind == pySkip:
 	case pathNames[name]:
 		at(model.InputPath, name)
 	case kind == pyFile:
@@ -709,17 +745,25 @@ func (s *inputScan) spring() {
 			continue
 		}
 		open := s.openAfter(d.NameEnd, d.SigEnd)
+		handler := s.springHandler(i)
 		for _, p := range s.paramList(open) {
-			s.springParam(p)
+			s.springParam(i, p, handler)
 		}
 	}
 }
 
-// springParam publishes the read one annotated parameter makes.
-func (s *inputScan) springParam(p paramRange) {
+// springParam publishes the read one annotated parameter makes, and leaves
+// a parameter of a handler that no annotation but a validation one marks to
+// Spring's default resolution (springDefault).
+func (s *inputScan) springParam(owner int, p paramRange, handler bool) {
 	src, key, found, named := model.InputSource(""), "", false, false
+	other := false
 	k := p.lo
-	for k < p.hi && s.punct(k, '@') && s.ident(k+1) {
+	for k < p.hi && (s.punct(k, '@') && s.ident(k+1) || s.ident(k) && s.text(k) == "final" && k+1 < p.hi-1) {
+		if !s.punct(k, '@') {
+			k++
+			continue
+		}
 		k++
 		first := k
 		for s.punct(k+1, '.') && s.ident(k+2) {
@@ -733,13 +777,18 @@ func (s *inputScan) springParam(p paramRange) {
 			open, k = k, int(s.match[k])+1
 		}
 		as, ok := springParams[ann]
+		if !ok && !s.springValidation(qualified) {
+			other = true
+		}
 		if !ok || found {
 			continue
 		}
 		if imp, imported := s.rs.imports[ann]; imported && imp.path != springAnnotations+"."+ann && qualified == ann {
+			other = true
 			continue
 		}
 		if qualified != ann && qualified != springAnnotations+"."+ann {
+			other = true
 			continue
 		}
 		src, found, named = as, true, ann != "RequestBody" && ann != "ModelAttribute"
@@ -753,6 +802,10 @@ func (s *inputScan) springParam(p paramRange) {
 				}
 			}
 		}
+	}
+	if !found && !other && handler {
+		s.springDefault(owner, p, k)
+		return
 	}
 	if !found || p.hi-1 <= k || !s.ident(p.hi-1) {
 		return
