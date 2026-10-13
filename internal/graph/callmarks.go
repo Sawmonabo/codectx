@@ -19,10 +19,15 @@ type callPage struct {
 	throughBase map[model.RelationID]model.NodeID
 	// mayDispatch is every `overrides` relation a callees walk descended.
 	mayDispatch []model.RelationID
+	// overridden maps each of mayDispatch to the method it overrides, and
+	// callee each `calls` relation of a callees walk to its target: the
+	// bases whose openness the answer discloses.
+	overridden, callee map[model.RelationID]model.NodeID
 }
 
 func newCallPage(mode dispatchMode) *callPage {
-	return &callPage{mode: mode, throughBase: map[model.RelationID]model.NodeID{}}
+	return &callPage{mode: mode, throughBase: map[model.RelationID]model.NodeID{},
+		overridden: map[model.RelationID]model.NodeID{}, callee: map[model.RelationID]model.NodeID{}}
 }
 
 // note records one served relation of the page: owner is the frontier state
@@ -37,8 +42,12 @@ func (p *callPage) note(owner frontierState, edge Edge, rel model.Relation, owne
 		if p.mode == dispatchCallers && owner.Step == stepBase {
 			p.throughBase[rel.ID] = ownerID
 		}
+		if p.mode == dispatchCallees {
+			p.callee[rel.ID] = rel.To
+		}
 	case rel.Kind == model.RelOverrides && p.mode == dispatchCallees && !edge.Outgoing:
 		p.mayDispatch = append(p.mayDispatch, rel.ID)
+		p.overridden[rel.ID] = rel.To
 	}
 }
 
@@ -50,8 +59,8 @@ func (p *callPage) drop(ids map[model.RelationID]bool) {
 	p.calls = slices.DeleteFunc(p.calls, func(id model.RelationID) bool { return ids[id] })
 }
 
-// marks turns the page's rows into the answer's marks and adds its counts to
-// the walk's cumulative ones: a call through a base method is marked with the
+// marks turns the page's rows into the answer's marks, its open-world
+// notices and its counts, added to the walk's cumulative ones: a call through a base method is marked with the
 // base and how many methods override it, and it lists only its virtual
 // occurrences -- its exact ones (a `super` call, a qualified call) can never
 // run the override, so they are dropped from the answer's occurrences too; a
@@ -59,11 +68,16 @@ func (p *callPage) drop(ids map[model.RelationID]bool) {
 // was bound to several targets, or bound through the values the project
 // gives it (a function pointer, a function value, a field: RelationDispatch.
 // ValueBound), is one of n, n >= 1. Every mark is a possibility
-// (model.GraphRowMark). It returns the marks and the answer's occurrences.
+// (model.GraphRowMark). A through-base or may-dispatch row whose base code
+// outside the indexed project can override is marked open and counted
+// (openBases), and each such base, and the target of each virtual call of a
+// callees walk that is one, is named in a notice: the overrides the answer
+// lists or counts for it are the project's own. It returns the marks, the
+// answer's occurrences and the notices.
 func (e *Engine) marks(ctx context.Context, p *callPage, occurrences []model.RelationOccurrence,
-	counts *model.GraphCounts) ([]model.GraphRowMark, []model.RelationOccurrence, error) {
+	counts *model.GraphCounts) ([]model.GraphRowMark, []model.RelationOccurrence, []string, error) {
 	if p == nil || p.mode == dispatchNone {
-		return nil, occurrences, nil
+		return nil, occurrences, nil, nil
 	}
 	var out []model.GraphRowMark
 	virtual := map[model.RelationID][]model.EvidenceID{}
@@ -87,7 +101,7 @@ func (e *Engine) marks(ctx context.Context, p *callPage, occurrences []model.Rel
 		if !seen {
 			var err error
 			if n, err = e.overrideCount(ctx, base); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			overrides[base] = n
 		}
@@ -101,7 +115,7 @@ func (e *Engine) marks(ctx context.Context, p *callPage, occurrences []model.Rel
 	}
 	sets, err := e.setSizes(ctx, p.calls)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for _, id := range p.calls {
 		if s := sets[id]; s.SetSize >= 2 || s.ValueBound {
@@ -109,7 +123,112 @@ func (e *Engine) marks(ctx context.Context, p *callPage, occurrences []model.Rel
 				Possible: true})
 		}
 	}
-	return out, kept, nil
+	notices, err := e.openBases(ctx, p, out, sets, counts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return out, kept, notices, nil
+}
+
+// openBases marks open each through-base and may-dispatch mark of out whose
+// base method code outside the indexed project can override (openMethod),
+// counts them, and returns one notice per such base and per open target of
+// a virtual call of a callees walk, in the order they are first met. The
+// page's bases are read in one batch.
+func (e *Engine) openBases(ctx context.Context, p *callPage, out []model.GraphRowMark,
+	sets map[model.RelationID]RelationDispatch, counts *model.GraphCounts) ([]string, error) {
+	baseOf := func(m model.GraphRowMark) model.NodeID {
+		switch m.Kind {
+		case model.MarkThroughBase:
+			return m.Base
+		case model.MarkMayDispatch:
+			return p.overridden[m.RelationID]
+		}
+		return ""
+	}
+	var order []model.NodeID
+	seen := map[model.NodeID]bool{}
+	add := func(id model.NodeID) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			order = append(order, id)
+		}
+	}
+	for _, m := range out {
+		add(baseOf(m))
+	}
+	for _, id := range p.calls {
+		if sets[id].Virtual {
+			add(p.callee[id])
+		}
+	}
+	if len(order) == 0 {
+		return nil, nil
+	}
+	nodes, err := e.adjacency.NodesByID(ctx, dedupeNodes(order))
+	if err != nil {
+		return nil, err
+	}
+	open := map[model.NodeID]model.Node{}
+	for _, n := range nodes {
+		if openMethod(n) {
+			open[n.ID] = n
+		}
+	}
+	for i := range out {
+		if _, ok := open[baseOf(out[i])]; ok {
+			out[i].Open = true
+			counts.OpenBase++
+		}
+	}
+	var notices []string
+	for _, id := range order {
+		if n, ok := open[id]; ok {
+			notices = append(notices, fitNotice(n, func(label string) string {
+				return fmt.Sprintf("%s can be overridden by code outside the indexed project: the overrides this answer "+
+					"lists or counts for it are the project's own, and a call of it may run one written outside", label)
+			}))
+		}
+	}
+	return notices, nil
+}
+
+// openSeedNotices is an impact answer's open-world disclosure: for each seed
+// that is a method code outside the indexed project can override, a change
+// to it also breaks the overrides written there, which no index of the
+// project lists. The seeds are read in one batch.
+func (e *Engine) openSeedNotices(ctx context.Context, seeds []model.NodeID) ([]string, error) {
+	nodes, err := e.adjacency.NodesByID(ctx, dedupeNodes(seeds))
+	if err != nil {
+		return nil, err
+	}
+	var notices []string
+	for _, n := range nodes {
+		if n.Kind != model.NodeMethod || !openMethod(n) {
+			continue
+		}
+		notices = append(notices, fitNotice(n, func(label string) string {
+			return fmt.Sprintf("%s can be overridden by code outside the indexed project: a change to it also "+
+				"affects the overrides written there, which this answer cannot list", label)
+		}))
+	}
+	return notices, nil
+}
+
+// openMethod reports a method code outside the indexed project can
+// override: one outside the project (isExternal), or one its language
+// leaves open (model.MetaExtensible).
+func openMethod(n model.Node) bool {
+	if isExternal(n) {
+		return true
+	}
+	if len(n.Metadata) == 0 {
+		return false
+	}
+	var meta struct {
+		Extensible bool `json:"extensible"`
+	}
+	return json.Unmarshal(n.Metadata, &meta) == nil && meta.Extensible
 }
 
 // setSizes reads the dispatch summary of each relation's occurrences: the
@@ -262,6 +381,16 @@ func (e *Engine) externalNotices(ctx context.Context, start []model.NodeID) ([]s
 		}
 	}
 	return notices, nil
+}
+
+// fitNotice is the notice say writes about n, naming it by nodeLabel, or by
+// its id when that label would make the notice longer than a notice may be
+// (model.MaxReasonBytes).
+func fitNotice(n model.Node, say func(label string) string) string {
+	if notice := say(nodeLabel(n)); len(notice) <= model.MaxReasonBytes {
+		return notice
+	}
+	return say(string(n.ID))
 }
 
 // nodeLabel is the name a notice gives a node: its qualified name, else its

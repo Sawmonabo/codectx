@@ -754,6 +754,10 @@ const (
 	// parameter's own decorators are on its variable node, under
 	// MetaDecorators.
 	MetaTypeAnnotations = "type_annotations"
+	// MetaExtensible marks a method that code outside the indexed project
+	// can override or implement under its language's rules (true), so the
+	// overrides the index lists for it may not be all of them.
+	MetaExtensible = "extensible"
 	// MetaUnresolvedLines names the rows of a requirements file's
 	// configuration node that record the lines no requirement interprets, in
 	// source order; each row's value is {"line","reason","via"} and the row is

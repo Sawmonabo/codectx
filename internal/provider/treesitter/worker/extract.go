@@ -775,6 +775,9 @@ func (e *extraction) emit(out *emitter) error {
 	// scope: its parent, or the endpoint declaration around it that is a
 	// scope but no parent.
 	scopes := make([]int, 0, len(decls))
+	// opens holds, parallel to wireDecls, whether code outside the project
+	// can subtype each type or override each method (declOpen).
+	opens := make([]bool, 0, len(decls))
 	scopeIdx := 0
 	// blank is the range of the last declaration of the grammar's blank
 	// name: a declaration strictly inside it is not extracted either (the
@@ -893,11 +896,19 @@ func (e *extraction) emit(out *emitter) error {
 			w.TypeAnnotations = e.g.typeAnnotations(e, d)
 		}
 		w.SpecifierMacros, w.ReturnTypes, w.Visibility = cDeclMacros(e, d)
+		var parent *wire.Decl
+		parentOpen := false
+		if d.parentIdx >= 0 {
+			parent, parentOpen = &wireDecls[d.parentIdx], opens[d.parentIdx]
+		}
+		open := e.declOpen(d, &w, parent, parentOpen)
+		w.Extensible = open && d.kind == "method"
 		nameSpans[span{d.nameStart, d.nameEnd}] = true
 		stack = append(stack, frame{span: span{start, end}, idx: w.ID, name: d.name, kind: d.kind})
 		wireDecls = append(wireDecls, w)
 		scopes = append(scopes, scope)
 		paths = append(paths, path)
+		opens = append(opens, open)
 	}
 	for _, w := range wireDecls {
 		if err := out.decl(w); err != nil {

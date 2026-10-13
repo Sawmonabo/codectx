@@ -526,6 +526,9 @@ func (b *builder) resolveDecls() error {
 		if d.Visibility != "" {
 			meta["visibility"] = d.Visibility
 		}
+		if d.Extensible {
+			meta[model.MetaExtensible] = true
+		}
 		if len(d.truncated) > 0 {
 			// Index-time field truncation, reported on the fact itself so an
 			// answer built from it says which stored values were cut and how

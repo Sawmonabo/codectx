@@ -833,18 +833,23 @@ func writeCallAnswer(b *strings.Builder, result model.GraphResult) {
 	}
 	c := result.Counts
 	if c != (model.GraphCounts{}) {
-		fmt.Fprintf(b, "counts      direct %d, through base %d, may dispatch %d, may call %d, open sites %d\n",
-			c.Direct, c.ThroughBase, c.MayDispatch, c.MayCall, c.OpenSites)
+		fmt.Fprintf(b, "counts      direct %d, through base %d, may dispatch %d, may call %d, open sites %d, open base %d\n",
+			c.Direct, c.ThroughBase, c.MayDispatch, c.MayCall, c.OpenSites, c.OpenBase)
 	}
 }
 
 // markText says in words how a marked relation may run.
 func markText(m model.GraphRowMark) string {
+	open := ""
+	if m.Open {
+		open = "; code outside the indexed project may override the base too"
+	}
 	switch m.Kind {
 	case model.MarkThroughBase:
-		return fmt.Sprintf("through base %s (overridden %d times): may not run this method", m.Base, m.BaseOverrides)
+		return fmt.Sprintf("through base %s (overridden %d times in the project): may not run this method%s", m.Base,
+			m.BaseOverrides, open)
 	case model.MarkMayDispatch:
-		return "may dispatch to this override: it may not run"
+		return "may dispatch to this override: it may not run" + open
 	case model.MarkValueSet:
 		return fmt.Sprintf("1 of %d targets the project's own values give the site: a value from outside it may run another",
 			m.SetSize)
