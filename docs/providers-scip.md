@@ -769,8 +769,9 @@ was read at and every regular file under the run directory less the copy,
 learned in the decaying histogram parser files use and kept in the run
 ledger's observation store under the kinds `indexer memory` and `indexer
 disk`, so a repository pays for a cold class once per indexer payload and
-build. A class nothing was measured in is reserved at the whole allocations and
-runs alone; the other units of its class wait for it and are planned from it,
+build. A class nothing was measured in is reserved at the whole allocations,
+less what standing holdings (the search index's writer, held from a run's first
+write until its generation is published) hold of them, and runs alone; the other units of its class wait for it and are planned from it,
 and once measured its holding is lowered to the prediction. A failed run's
 readings are learned as lower bounds: its class is then planned from them, one
 unit in flight at a time, until a unit succeeds. While the indexer runs, a

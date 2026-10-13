@@ -69,7 +69,8 @@ the allocation. Its temporary disk is planned the same way (`server disk`): the
 snapshot copy it is rooted in, counted for every server because the copy is
 shared, plus what its class was measured to write into its work directory,
 read at `initialize` and again when it exits. A server of a class nothing was
-measured in yet is reserved at the whole allocations until it answers
+measured in yet is reserved at the whole allocations, less what standing
+holdings such as the search index's writer hold, until it answers
 `initialize`, then holds what its class now predicts; the next server of its
 class waits for that measurement and is planned from it. A start that fails is
 learned as a lower bound, and its class then starts one server at a time until

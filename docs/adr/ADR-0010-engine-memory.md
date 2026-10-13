@@ -51,7 +51,10 @@ was the measurement for this family at this size.
 5. **Every heavy child is admitted against the one allocation, and nothing counts them.** The
    allocation of decision 2 is not the analysis engine's alone: engine runs, external indexers and
    language servers are all admitted while the sum of what they reserve fits it, and a child larger
-   than the whole allocation runs alone rather than being refused. There is no count of concurrent
+   than the whole allocation runs alone rather than being refused.
+   "Alone" counts no standing holding -- the search index's writer, which is released only after the units
+   admitted beside it end -- so a child that cannot fit beside it is granted once nothing else is held, never
+   left waiting. There is no count of concurrent
    heavy children, no per-family count and no setting for either; where the platform does not
    publish available memory the scheduler stands a conservative allocation in for the observation,
    because an admission gate with no bound is not a gate. The counts that remain anywhere in the
