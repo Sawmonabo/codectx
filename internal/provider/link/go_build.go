@@ -38,8 +38,9 @@ type goConds struct {
 	ids   map[string]goCond
 	// files are the unit's files' conditions, by file ordinal.
 	files map[int32]goCond
-	// sat remembers each decided condition's satisfiability.
-	sat goMemo[bool]
+	// sat is each condition's satisfiability by id-1, once decided: 0
+	// not decided, 1 met by some build, 2 by none.
+	sat []uint8
 	// minor is the oldest release the unit builds with (its go.mod's go
 	// line), go1.minor.
 	minor int
@@ -64,6 +65,7 @@ func (c *goConds) intern(x constraint.Expr) goCond {
 		return id
 	}
 	c.exprs = append(c.exprs, x)
+	c.sat = append(c.sat, 0)
 	id := goCond(len(c.exprs))
 	c.ids[s] = id
 	return id
@@ -126,12 +128,17 @@ func (c *goConds) holds(id goCond) bool {
 	if id == 0 {
 		return true
 	}
-	key := c.expr(id).String()
-	if v, ok := c.sat.get(key); ok {
-		return v
+	switch c.sat[id-1] {
+	case 1:
+		return true
+	case 2:
+		return false
 	}
 	v, _ := gobuild.Satisfiable(c.expr(id), c.minor)
-	c.sat.put(key, v)
+	c.sat[id-1] = 2
+	if v {
+		c.sat[id-1] = 1
+	}
 	return v
 }
 
