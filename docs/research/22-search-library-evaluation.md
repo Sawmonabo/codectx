@@ -20,7 +20,9 @@ paths were replaced.
   `r2-logs/`.
 - `ours/` — how our arm reproduces production's write and query paths (`01`–`07`), and its source.
 - `harness/` — the library arm: a summary (`00`), notes `01`–`13`, and its source.
-- `features/` (`01`–`09`) and `features-matrix/` (`00`, `10`–`18`) — every library feature, read from its source.
+- `features/` (`01`–`09`) and `features-matrix/` (`00`, `10`–`18`) — every library feature, read from its source: the
+  published crate, its README, ARCHITECTURE and CHANGELOG, and its 21 examples, 7 of them read in full and 14 by their
+  commentary (`features-matrix/00-feature-matrix.md`).
 - `web/` — eight literature and engine questions (`01`–`08`) and their summary (`00`).
 
 Two arms ran on the same documents. **Our arm** is today's tier, driven through the real store and the real
