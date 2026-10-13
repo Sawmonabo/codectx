@@ -599,10 +599,7 @@ func (g *generation) attachReused(ctx context.Context) (err error) {
 			ItemsIn: int64Ptr(int64(len(g.plan.Reuse))), ItemsOut: &g.reused}, err)
 	}()
 	for _, unit := range g.plan.Reuse {
-		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
-			return err
-		}
-		rows, err := g.c.opts.Store.UnitCapabilities(ctx, unit)
+		rows, err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit)
 		if err != nil {
 			return err
 		}
@@ -935,12 +932,10 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 		return err
 	}
 	if exists && state == model.UnitSealed {
-		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, spec.ID); err != nil {
-			return err
-		}
-		// Read before the lock is taken: the read is a job on the store's
-		// writer, which a unit worker holding the lock must never wait on.
-		rows, err := g.c.opts.Store.UnitCapabilities(ctx, spec.ID)
+		// Attached before the lock is taken: the attach is a job on the
+		// store's writer, which a unit worker holding the lock must never
+		// wait on. It returns the unit's stored capability rows too.
+		rows, err := g.c.opts.Store.AttachUnit(ctx, g.gen, spec.ID)
 		if err != nil {
 			return err
 		}
