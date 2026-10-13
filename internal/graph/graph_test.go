@@ -229,7 +229,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// that dropped it could not pass here either.
 	evidenceRow := func(rel model.RelationID, i, n int) model.Evidence {
 		return model.Evidence{
-			ID:              model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-%d", i, n))),
+			ID:              model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-%d", i, n))[:model.EvidenceIDHexLen]),
 			UnitID:          model.UnitID(fixtureID("unit-1")),
 			ProviderID:      "treesitter",
 			ProviderVersion: "0.0.1",

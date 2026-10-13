@@ -98,6 +98,15 @@ type Request struct {
 	LengthRule LengthRule
 	// MaxTerms refuses a query with more terms; zero is unlimited.
 	MaxTerms int64
+	// MaxBytes bounds what the page's allocations that grow with its depth or
+	// its position may hold, the caller's copy of each result included; zero
+	// is unbounded. A page the bound ends early holds an exact prefix of the
+	// results and says More. ResultBytes is what the caller holds per result
+	// beyond the result's strings, and MarkedBound bounds the groups the
+	// resume position marks (Stats.NewMarks of the page before).
+	MaxBytes    int64
+	ResultBytes int64
+	MarkedBound int64
 	// IgnoreSummaries scores every block, as a segment with no summary is
 	// scored. It is the reference the pruned search must equal.
 	IgnoreSummaries bool
@@ -146,6 +155,18 @@ type Stats struct {
 	BlocksTotal            int64
 	BlocksScored           int64
 	DocsScored             int64
+	// Heaps is how many segments were scored at once, each holding a heap of
+	// Cap places (the request's depth plus one, doubled on every rescoring a
+	// marked group forced, and fitted to MaxBytes); Marked is how many groups
+	// the resume position marked as served across the segments. NewMarks
+	// bounds the groups a request resuming after the page's last hit marks,
+	// and Bytes is what the page's growing allocations peaked at, as charged
+	// against MaxBytes.
+	Heaps    int64
+	Cap      int64
+	Marked   int64
+	NewMarks int64
+	Bytes    int64
 }
 
 // Page is the answer to one Request.
