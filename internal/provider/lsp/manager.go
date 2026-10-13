@@ -142,6 +142,8 @@ type Manager struct {
 	overlay *ledger.Run
 	// needs are the servers' learned need models (reserve).
 	needs admission.ChildNeeds
+	// unholder removes stopIdle from the ledger's idle-release steps (Close).
+	unholder func()
 }
 
 // materialization is one snapshot's shared tree: ready is closed once the fill
@@ -227,9 +229,15 @@ func New(opts Options) (*Manager, error) {
 	if opts.MaxOverlayBytes.Exceeded(opts.MaxFrameBytes) {
 		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %s", opts.MaxFrameBytes, opts.MaxOverlayBytes)
 	}
-	return &Manager{opts: opts,
+	m := &Manager{opts: opts,
 		servers: make(map[serverKey]*entry), live: make(map[*server]struct{}),
-		mats: make(map[model.SnapshotID]*materialization)}, nil
+		mats: make(map[model.SnapshotID]*materialization)}
+	// An idle server holds room it keeps warm for reuse, like the parser
+	// pool's idle workers, so it is given back whenever the head of the
+	// ledger's queue does not fit -- an indexer unit, a parser file or another
+	// server -- instead of only when its idle TTL expires.
+	m.unholder = opts.Admission.Holder(m.stopIdle)
+	return m, nil
 }
 
 // Open returns an overlay over view answered by profile at profile.Root,
@@ -380,27 +388,33 @@ func (m *Manager) slot(ctx context.Context, key serverKey, reserve func(context.
 // the same payload and work-size class were measured to use per byte, within
 // the allocation; the first server of a class is reserved at the allocation.
 // When it reaches the head of the queue and does not fit, an idle server is
-// stopped to make room (stopIdle). The plan reads what this
+// stopped to make room: stopIdle is this manager's idle-release step on the
+// ledger (New), which runs for every head that does not fit. The plan reads what this
 // repository's servers taught through the process's overlay run, which a
 // server start belongs to (overlayContext); the work is read from the
 // snapshot only here, by the one open that starts the server.
 func (m *Manager) reserve(ctx context.Context, view model.SnapshotView, profile Profile) (*admission.Holding, error) {
-	work, projects, err := admission.ProjectWork(ctx, view, profile.Root, profile.RootMarkers)
+	// The server is rooted in the snapshot's shared copy, which is counted as
+	// staged for every server: the copy lives as long as any server of the
+	// snapshot, so no one server's room can stand for it alone.
+	work, err := admission.ProjectWork(ctx, view, profile.Root, profile.RootMarkers, m.opts.MaxOverlayBytes.Value())
 	if err != nil {
 		return nil, err
 	}
-	key := admission.ChildKey{Tool: "server " + profile.Name, Fingerprint: profile.Tool.Fingerprint()}
-	return m.opts.Admission.HoldChild(m.overlayContext(ctx, string(view.Header().RepositoryID)), &m.needs, key,
-		work, projects, profile.DiskBudgetBytes, m.stopIdle)
+	key := admission.ChildKey{Kind: admission.ChildServer, Tool: profile.Name, Fingerprint: profile.Tool.Fingerprint()}
+	return m.opts.Admission.HoldChild(m.overlayContext(ctx, string(view.Header().RepositoryID)), &m.needs, key, work, nil)
 }
 
 // stopIdle stops one server nobody is using, which gives its room back to the
 // ledger once its process has exited -- never before, or the ledger would
 // admit the next child while the stopping one still holds the memory. It is
-// the make-room step the ledger runs for a server open that has reached the
-// head of the queue and does not fit; a manager holding nothing idle frees
-// nothing and the open simply waits its turn. An entry still starting, or
-// still waiting for room, is not ready and is never chosen.
+// the idle-release step the ledger runs whenever the head of its queue does
+// not fit, whoever the head is; a manager holding nothing idle frees nothing
+// and the head simply waits its turn. An entry still starting, or still
+// waiting for room, is not ready and is never chosen. A query that reaches an
+// idle server first takes it back into use instead: that takes no room, since
+// the server already holds its own, and stopping a server a query is about to
+// ask would only start it again.
 func (m *Manager) stopIdle() {
 	m.mu.Lock()
 	var idle *server
@@ -614,6 +628,7 @@ func (m *Manager) Close() error {
 	for _, s := range live {
 		s.stop()
 	}
+	m.unholder()
 	// Last, once no start can still open a span under it.
 	return m.endOverlay()
 }

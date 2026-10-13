@@ -19,7 +19,12 @@ import (
 // server: its name — which is also the name of its entry in the embedded tool
 // lock — the manifest language tags it serves, the argument array that puts it
 // in stdio mode, the parent environment variables it may see, the workspace
-// markers that suggest a repository is its kind, and its bounds.
+// markers that suggest a repository is its kind. A server's memory and
+// temporary disk are no figure of the definition: they are planned from the
+// project's work and the repository's measured need when the server is
+// admitted (Manager.reserve). There is no lifetime bound: a server ends when
+// it has been idle for the manager's idle TTL, when it is stopped, or when a
+// request finds it making no progress.
 //
 // A Definition is a description, not a capability. It becomes runnable only
 // through Resolve, which hands back the payload the lock pinned and the store
@@ -50,21 +55,10 @@ type Definition struct {
 	// repository is this server's kind. Detection reads their metadata through
 	// the confined root and nothing else.
 	RootMarkers []string
-	// DiskBudgetBytes is the temporary disk the server holds in the admission
-	// ledger while it runs. Its memory is no figure of the server: it is
-	// planned from the project's work and the repository's measured need when
-	// the server is admitted (Manager.slot). There is no lifetime bound: a
-	// server ends when it has been idle for the manager's idle TTL, when it is
-	// stopped, or when a request finds it making no progress.
-	DiskBudgetBytes int64
 }
 
-// Temporary disk reservations for a language server, accounted before the
-// child starts.
 const (
-	serverDiskBudget = 2 << 30
-	serverDiskLarge  = 4 << 30
-	workDirName      = "lsp"
+	workDirName = "lsp"
 	// serverJDTLS is the one payload with a platform configuration directory to
 	// seed and runtime arguments to pass; both are named by this constant
 	// rather than by a repeated string literal.
@@ -80,39 +74,34 @@ const (
 var definitions = map[string]Definition{
 	"gopls": {
 		Name: "gopls", Languages: []string{"go"},
-		Args:            []string{"serve"},
-		EnvAllowlist:    []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
-		RootMarkers:     []string{"go.mod", "go.work"},
-		DiskBudgetBytes: serverDiskBudget,
+		Args:         []string{"serve"},
+		EnvAllowlist: []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
+		RootMarkers:  []string{"go.mod", "go.work"},
 	},
 	"rust-analyzer": {
 		Name: "rust-analyzer", Languages: []string{"rust"},
-		EnvAllowlist:    []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
-		RootMarkers:     []string{"Cargo.toml"},
-		DiskBudgetBytes: serverDiskLarge,
+		EnvAllowlist: []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
+		RootMarkers:  []string{"Cargo.toml"},
 	},
 	// The python server is a native static binary started with its server
 	// subcommand, so it runs as itself, with no managed runtime composed in
 	// front of it (ADR-0006).
 	"ty": {
 		Name: "ty", Languages: []string{"python"},
-		Args:            []string{"server"},
-		EnvAllowlist:    []string{"PATH", "HOME"},
-		RootMarkers:     []string{"pyproject.toml", "ty.toml", "setup.py", "requirements.txt"},
-		DiskBudgetBytes: serverDiskBudget,
+		Args:         []string{"server"},
+		EnvAllowlist: []string{"PATH", "HOME"},
+		RootMarkers:  []string{"pyproject.toml", "ty.toml", "setup.py", "requirements.txt"},
 	},
 	"typescript-language-server": {
 		Name: "typescript-language-server", Languages: []string{"typescript", "tsx", "javascript"},
-		Args:            []string{"--stdio"},
-		EnvAllowlist:    []string{"PATH", "HOME"},
-		RootMarkers:     []string{"tsconfig.json", "jsconfig.json", "package.json"},
-		DiskBudgetBytes: serverDiskBudget,
+		Args:         []string{"--stdio"},
+		EnvAllowlist: []string{"PATH", "HOME"},
+		RootMarkers:  []string{"tsconfig.json", "jsconfig.json", "package.json"},
 	},
 	"clangd": {
 		Name: "clangd", Languages: []string{"c", "cpp"},
-		EnvAllowlist:    []string{"PATH", "HOME"},
-		RootMarkers:     []string{"compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"},
-		DiskBudgetBytes: serverDiskBudget,
+		EnvAllowlist: []string{"PATH", "HOME"},
+		RootMarkers:  []string{"compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"},
 	},
 	serverJDTLS: {
 		Name: serverJDTLS, Languages: []string{"java"},
@@ -145,9 +134,8 @@ var definitions = map[string]Definition{
 		// JAVA_HOME is deliberately absent: the resolved payload carries the
 		// managed JDK's own, and a host value in the allowlist would shadow
 		// the runtime the lock pinned.
-		EnvAllowlist:    []string{"PATH", "HOME"},
-		RootMarkers:     []string{"pom.xml", "build.gradle", "build.gradle.kts"},
-		DiskBudgetBytes: serverDiskLarge,
+		EnvAllowlist: []string{"PATH", "HOME"},
+		RootMarkers:  []string{"pom.xml", "build.gradle", "build.gradle.kts"},
 	},
 }
 

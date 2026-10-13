@@ -72,9 +72,9 @@ type argPaths struct {
 // user's `[analyzers.<name>]` table (Section 20.2): the lock
 // entry to resolve, the manifests that make a workspace a candidate, the exact
 // argument array, the parent environment variables the child may see, the
-// declared network posture, the temporary disk the run reserves and the run's
-// own bound. Its memory is no figure of the kind: it is planned from the run's
-// work and the repository's measured need (ProfileAdmission).
+// declared network posture and the run's own bound. Its memory and temporary
+// disk are no figure of the kind: they are planned from the run's work and the
+// repository's measured need (ProfileAdmission).
 //
 // Every argument array below was run against a real fixture through the
 // resolved payload before it was pinned.
@@ -84,13 +84,12 @@ type kindSpec struct {
 	// env names the parent variables the child may inherit. The child's
 	// environment is exactly these (those the parent actually has) plus the
 	// variables the resolved tool carries, and nothing else.
-	env             []string
-	network         NetworkPosture
-	diskBudgetBytes int64
-	timeout         time.Duration
+	env     []string
+	network NetworkPosture
+	timeout time.Duration
 }
 
-// kindSpecs are the six profiles. Disk budgets and timeouts are the measured
+// kindSpecs are the six profiles. Timeouts are the measured
 // figures of docs/research/08-scip-empirical-six-indexers.md widened for a
 // real repository: the one-file fixtures run in seconds, and the two profiles
 // that drive a compiler over the whole project (scip-java through the managed
@@ -110,10 +109,9 @@ var kindSpecs = map[Kind]kindSpec{
 		args: func(a argPaths) []string {
 			return []string{"index", "--output", a.OutputFile}
 		},
-		env:             []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
-		network:         NetworkAllowed,
-		diskBudgetBytes: 1 << 30,
-		timeout:         20 * time.Minute,
+		env:     []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
+		network: NetworkAllowed,
+		timeout: 20 * time.Minute,
 	},
 	// scip-typescript resolves nothing of its own: it carries its own compiler
 	// and reads only what the materialization holds, so its posture is denied
@@ -138,10 +136,9 @@ var kindSpecs = map[Kind]kindSpec{
 			return []string{"index", "--cwd", a.InputDir, "--output", a.OutputFile,
 				"--no-progress-bar", "--infer-tsconfig"}
 		},
-		env:             []string{"HOME"},
-		network:         NetworkDenied,
-		diskBudgetBytes: 2 << 30,
-		timeout:         30 * time.Minute,
+		env:     []string{"HOME"},
+		network: NetworkDenied,
+		timeout: 30 * time.Minute,
 	},
 	// scip-python resolves the project's installed distributions, which it
 	// finds through the interpreter and pip on PATH (research note 4).
@@ -162,10 +159,9 @@ var kindSpecs = map[Kind]kindSpec{
 			return []string{"index", "--cwd", a.InputDir, "--output", a.OutputFile,
 				"--project-version", pythonProjectVersion, "--quiet"}
 		},
-		env:             []string{"PATH", "HOME"},
-		network:         NetworkDenied,
-		diskBudgetBytes: 2 << 30,
-		timeout:         30 * time.Minute,
+		env:     []string{"PATH", "HOME"},
+		network: NetworkDenied,
+		timeout: 30 * time.Minute,
 	},
 	// scip-java compiles the snapshot itself, with the managed JDK's own
 	// javac, against the build description writeScipJavaConfig generates in the
@@ -187,10 +183,9 @@ var kindSpecs = map[Kind]kindSpec{
 				"--targetroot", filepath.Join(a.WorkDir, scipJavaTargetRootName),
 				"--output", a.OutputFile}
 		},
-		env:             []string{"PATH", "HOME"},
-		network:         NetworkDenied,
-		diskBudgetBytes: 4 << 30,
-		timeout:         45 * time.Minute,
+		env:     []string{"PATH", "HOME"},
+		network: NetworkDenied,
+		timeout: 45 * time.Minute,
 	},
 	// rust-analyzer's scip subcommand loads cargo metadata, so cargo must be
 	// reachable and its home addressable.
@@ -199,10 +194,9 @@ var kindSpecs = map[Kind]kindSpec{
 		args: func(a argPaths) []string {
 			return []string{"scip", a.InputDir, "--output", a.OutputFile}
 		},
-		env:             []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
-		network:         NetworkAllowed,
-		diskBudgetBytes: 4 << 30,
-		timeout:         45 * time.Minute,
+		env:     []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
+		network: NetworkAllowed,
+		timeout: 45 * time.Minute,
 	},
 	// scip-clang carries its own Clang and reads the project's compilation
 	// database. The database is normalized in the private materialization
@@ -217,10 +211,9 @@ var kindSpecs = map[Kind]kindSpec{
 				"--index-output-path=" + a.OutputFile,
 			}
 		},
-		env:             []string{"PATH", "HOME"},
-		network:         NetworkDenied,
-		diskBudgetBytes: 2 << 30,
-		timeout:         30 * time.Minute,
+		env:     []string{"PATH", "HOME"},
+		network: NetworkDenied,
+		timeout: 30 * time.Minute,
 	},
 }
 
@@ -501,15 +494,25 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	// The unit was admitted at its planned need (ProfileAdmission). While the
 	// indexer runs, its tree's live anonymous resident set raises the holding
 	// as soon as it is read above it, so the next admission is held back by
-	// what the run really uses; what it used at most is learned for the next
-	// run of its class, from a run that succeeded. A run admitted on no
-	// ledger states no memory.
+	// what the run really uses. What it used at most, and what it wrote into
+	// its run directory beside the copy, are learned for the next run of its
+	// class: from a failed run as lower bounds. The runner's own temporary
+	// disk account, which enforces the operator's resources.max_temp_bytes, is
+	// handed the planned disk, or only the staged copy for a run no
+	// measurement predicts yet. A run admitted on no ledger states no memory.
 	held := admission.HoldingFrom(ctx)
 	cpu := &process.CPUProgress{}
 	var memory int64
+	var disk int64
 	var follow *admission.Residency
+	var planned admission.ChildNeed
 	if held != nil {
-		memory = held.Bytes()
+		memory, disk = held.Bytes(), held.DiskBytes()
+		if n, ok := held.Need(); ok {
+			if planned = n; !n.Learned {
+				disk = n.StagedBytes
+			}
+		}
 		follow = admission.FollowResidency(held, cpu.AnonResidentBytes, process.TreeSampleInterval)
 	}
 	_, span := ledger.Start(ctx, stageRun, prof.Name())
@@ -517,11 +520,13 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		Path: path, Args: args, Dir: input, Env: prof.env(p.lookupEnv),
 		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
 		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace, ProgressFiles: []string{output},
-		CPUProgress: cpu, MemoryReservationBytes: memory, DiskReservationBytes: prof.spec().diskBudgetBytes,
+		CPUProgress: cpu, MemoryReservationBytes: memory, DiskReservationBytes: disk,
 	})
 	if follow != nil {
 		need, measured := follow.Stop()
-		held.Observe(need, measured && err == nil)
+		written, walked := admission.WrittenBytes(runDir, planned.StagedBytes)
+		held.Observe(admission.ChildMeasure{MemoryBytes: need, MemoryRead: measured,
+			WrittenBytes: written, WrittenRead: walked, Succeeded: err == nil})
 	}
 	// What the indexer cost is recorded on both paths: a run that failed on
 	// its deadline or its memory is the one an operator most needs the figures

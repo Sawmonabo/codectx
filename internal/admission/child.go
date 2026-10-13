@@ -1,9 +1,14 @@
 package admission
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io/fs"
 	"path"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -12,26 +17,51 @@ import (
 
 // External tools -- the precise indexers' profile units and the language
 // servers -- are reserved from their measured need, the way parser files are
-// (ADR-0012 decision 5, "External indexers and language servers"). A tool run's
-// work is the bytes of the snapshot files under the project directory it is
-// pointed at; its need is the highest anonymous resident set its process tree
-// was read at while it ran. The coordinator learns need per work byte in the
-// decaying histogram parser files use, keyed per repository, tool, tool payload
-// and work-size class, and persisted in the run ledger's observation store.
+// (ADR-0012 decision 5, "External indexers and language servers"), in both
+// dimensions the ledger holds. A tool run's work is the bytes of the snapshot
+// files under the project directory it is pointed at. Its memory need is the
+// highest anonymous resident set its process tree was read at; its disk need
+// is the bytes it staged -- the materialized snapshot, known exactly before it
+// starts -- plus the bytes it wrote, measured. The coordinator learns memory
+// and written bytes per work byte in the decaying histogram parser files use,
+// keyed per repository, kind, tool, tool payload, build and work-size class,
+// and persisted in the run ledger's observation store.
 //
-// No figure is a constant of a tool. A run whose key has no observation is
-// reserved at the whole allocation: it runs alone among the heavy children,
-// once per repository, tool payload, build and size class, because nothing
-// derivable says what it will use. Every published source on these tools'
-// memory names the project, its dependency closure or the machine itself (a
-// managed runtime's heap ceiling is a share of physical memory) as what sets
-// it, so no per-tool slope holds across repositories.
+// No figure is a constant of a tool. A class with no observation is reserved
+// at the whole allocation in both dimensions: it runs alone among the heavy
+// children, once per repository, tool payload, build and size class, because
+// nothing derivable says what it will use. Every published source on these
+// tools' memory names the project, its dependency closure or the machine
+// itself (a managed runtime's heap ceiling is a share of physical memory) as
+// what sets it, so no per-tool slope holds across repositories.
 
-// ChildKey names one external tool's need model within a repository. Tool is
-// the tool's family and name ("indexer scip-go", "server gopls"); Fingerprint
-// is the identity of the payload the lock pinned, so a repinned tool learns
-// afresh.
+// ChildKind is which external tool a need model is learned for.
+type ChildKind uint8
+
+const (
+	// ChildIndexer is a precise indexer's profile unit.
+	ChildIndexer ChildKind = iota + 1
+	// ChildServer is a language server.
+	ChildServer
+)
+
+// kinds are the observation store's kinds for the two dimensions of k, and
+// false for a kind this package does not know.
+func (k ChildKind) kinds() (memory, disk ledger.NeedKind, ok bool) {
+	switch k {
+	case ChildIndexer:
+		return ledger.NeedIndexerMemory, ledger.NeedIndexerDisk, true
+	case ChildServer:
+		return ledger.NeedServerMemory, ledger.NeedServerDisk, true
+	}
+	return "", "", false
+}
+
+// ChildKey names one external tool's need models within a repository: the kind
+// of tool, its name, and the identity of the payload the lock pinned, so a
+// repinned tool learns afresh.
 type ChildKey struct {
+	Kind        ChildKind
 	Tool        string
 	Fingerprint string
 }
@@ -51,12 +81,13 @@ func childBuild() string {
 type ChildNeeds struct {
 	mu     sync.Mutex
 	models map[childModelKey]*childModel
-	// probing holds, per key with no observation, the first run reserved at
-	// the allocation; it is closed when that run's holding ends. Every other
-	// run of the key waits for it before it is planned, so a cold repository's
-	// projects of one tool are reserved from the first one's measurement
-	// rather than each at the allocation, one after another.
-	probing map[childModelKey]chan struct{}
+	// gates hold, per class whose need no run that succeeded has measured,
+	// the one run of the class in flight; a gate is closed when that run's
+	// holding ends. Every other run of the class waits for it before it is
+	// planned, so a cold repository's projects of one tool are planned from
+	// the first one's measurement rather than each at the allocation, and a
+	// class known only from failed runs has one run in flight at a time.
+	gates map[childModelKey]chan struct{}
 }
 
 type childModelKey struct {
@@ -64,112 +95,225 @@ type childModelKey struct {
 	ledger.NeedKey
 }
 
+// childModel is one dimension's decaying histogram of a class, and whether a
+// run that succeeded is among what it learned from. A failed run's reading is
+// a lower bound of its need: the run used at least that much before it ended.
 type childModel struct {
-	mu     sync.Mutex
-	loaded bool
-	h      NeedHistogram
+	mu        sync.Mutex
+	loaded    bool
+	h         NeedHistogram
+	succeeded bool
 }
 
-// ChildNeed is one tool run's memory reservation and what is learned from it.
+// childState is a child model's encoding in the observation store: the
+// histogram's own and the evidence flag beside it.
+type childState struct {
+	Succeeded bool            `json:"succeeded"`
+	Model     json.RawMessage `json:"model"`
+}
+
+func (m *childModel) marshal() ([]byte, error) {
+	h, err := m.h.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(childState{Succeeded: m.succeeded, Model: h})
+}
+
+// unmarshal replaces the model with a stored state, and leaves it as it was
+// when the state does not decode: the next observation's state supersedes it.
+func (m *childModel) unmarshal(state []byte) {
+	dec := json.NewDecoder(bytes.NewReader(state))
+	dec.DisallowUnknownFields()
+	var st childState
+	if dec.Decode(&st) != nil {
+		return
+	}
+	var h NeedHistogram
+	if h.UnmarshalBinary(st.Model) != nil {
+		return
+	}
+	m.h.mu.Lock()
+	m.h.observations, m.h.zero, m.h.buckets = h.observations, h.zero, h.buckets
+	m.h.mu.Unlock()
+	m.succeeded = st.Succeeded
+}
+
+// ChildWork is what one tool run is planned on.
+type ChildWork struct {
+	// WorkBytes are the bytes of the snapshot files under the project the
+	// tool is pointed at: the size its need is learned per.
+	WorkBytes int64
+	// StagedBytes are the bytes of the snapshot copied for the tool before it
+	// starts, held on disk for the whole run.
+	StagedBytes int64
+	// Projects is the repository's own projects of the tool: the half-life
+	// its models are learned under.
+	Projects int64
+}
+
+// ChildNeed is one tool run's reservation and what is learned from it.
 type ChildNeed struct {
 	// Bytes is the memory the run reserves: the model's prediction for its
 	// work, or the allocation when nothing is learned yet, and never more
 	// than the allocation it was planned against nor less than one byte, so a
 	// runner always tracks the child's residency.
 	Bytes int64
-	// Learned reports a prediction; false is a first run, reserved at the
-	// allocation.
+	// DiskBytes is the temporary disk it reserves: the staged bytes plus the
+	// predicted written bytes, or at least the whole disk allocation when
+	// nothing is learned yet.
+	DiskBytes int64
+	// Learned reports a prediction from a class a run that succeeded was
+	// measured in; false is a first run, or a run of a class known only from
+	// failed runs, planned one at a time.
 	Learned bool
-	// WorkBytes is the run's work, the size the need is learned per.
-	WorkBytes int64
-	halfLife  int64
-	mk        childModelKey
-	model     *childModel
-	run       *ledger.Run
-	probe     bool
+	ChildWork
+	memKey, diskKey childModelKey
+	mem, disk       *childModel
+	run             *ledger.Run
+	gated           bool
 }
 
-// plan predicts one run's reservation within the allocation l re-derives for
-// it. halfLife is counted in the repository's own projects of the tool, so
-// the model forgets at the pace the repository in front of it produces
-// evidence. A run with no ledger run in its context is still predicted from
-// what this process learned, and what it teaches is kept in process only; a
-// model the ledger cannot read stands aside and is read again for the next
-// run. A run of a key with no observation waits for the key's first run to end
-// and is then planned from what it taught; when it taught nothing, this run is
-// the next first run. A canceled wait returns CTX_CANCELED.
-func (c *ChildNeeds) plan(ctx context.Context, l *Ledger, key ChildKey, workBytes, halfLife int64) (ChildNeed, error) {
-	run := ledger.RunFromContext(ctx)
-	n := ChildNeed{WorkBytes: workBytes, halfLife: max(halfLife, 1), run: run,
-		mk: childModelKey{repository: run.RepositoryID(),
-			NeedKey: ledger.NeedKey{Language: key.Tool, Fingerprint: key.Fingerprint, Build: childBuild(),
-				SizeClass: SizeClassOf(workBytes)}}}
+// model is the class model of key, created on first use.
+func (c *ChildNeeds) model(key childModelKey) *childModel {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.models == nil {
-		c.models, c.probing = map[childModelKey]*childModel{}, map[childModelKey]chan struct{}{}
+		c.models, c.gates = map[childModelKey]*childModel{}, map[childModelKey]chan struct{}{}
 	}
-	m := c.models[n.mk]
+	m := c.models[key]
 	if m == nil {
 		m = &childModel{}
-		c.models[n.mk] = m
+		c.models[key] = m
 	}
-	c.mu.Unlock()
-	n.model = m
-	for {
-		m.mu.Lock()
-		if !m.loaded && run != nil {
-			if state, ok, err := run.NeedModel(ctx, n.mk.NeedKey); err == nil {
-				// A state that does not decode leaves the model empty, and the
-				// next observation's state supersedes it.
-				if ok {
-					_ = m.h.UnmarshalBinary(state)
-				}
-				m.loaded = true
+	return m
+}
+
+// predict loads m from the run ledger on first use and predicts it for work.
+func (m *childModel) predict(ctx context.Context, run *ledger.Run, key ledger.NeedKey, work int64) (int64, bool, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.loaded && run != nil {
+		// A model the ledger cannot read stands aside and is read again for
+		// the next run.
+		if state, ok, err := run.NeedModel(ctx, key); err == nil {
+			if ok {
+				m.unmarshal(state)
 			}
+			m.loaded = true
 		}
-		need, learned := m.h.Predict(workBytes)
-		m.mu.Unlock()
+	}
+	need, ok := m.h.Predict(work)
+	return need, ok, m.succeeded
+}
+
+// plan predicts one run's reservation within the allocations l holds for it.
+// The memory allocation is re-derived for the admission. The half-life is
+// counted in the repository's own projects of the tool, so the models forget
+// at the pace the repository in front of it produces evidence. A run with no
+// ledger run in its context is still planned from what this process learned,
+// and what it teaches is kept in process only. A run of a class no run that
+// succeeded has measured waits for the class's run in flight to end and is
+// then planned from what it taught. A canceled wait returns CTX_CANCELED.
+func (c *ChildNeeds) plan(ctx context.Context, l *Ledger, key ChildKey, w ChildWork) (ChildNeed, error) {
+	memKind, diskKind, _ := key.Kind.kinds()
+	run := ledger.RunFromContext(ctx)
+	class := ledger.NeedKey{Subject: key.Tool, Fingerprint: key.Fingerprint, Build: childBuild(),
+		SizeClass: SizeClassOf(w.WorkBytes)}
+	n := ChildNeed{ChildWork: w, run: run}
+	n.memKey = childModelKey{repository: run.RepositoryID(), NeedKey: class}
+	n.memKey.Kind = memKind
+	n.diskKey = n.memKey
+	n.diskKey.Kind = diskKind
+	n.mem, n.disk = c.model(n.memKey), c.model(n.diskKey)
+	for {
+		memNeed, memOK, proven := n.mem.predict(ctx, run, n.memKey.NeedKey, w.WorkBytes)
+		written, diskOK, _ := n.disk.predict(ctx, run, n.diskKey.NeedKey, w.WorkBytes)
 		allocation := max(l.Allocation(), 1)
-		if learned {
-			n.Bytes, n.Learned = min(max(need, 1), allocation), true
+		diskAllocation, _ := l.DiskSnapshot()
+		n.Bytes, n.DiskBytes = allocation, max(diskAllocation, w.StagedBytes)
+		if memOK {
+			n.Bytes = min(max(memNeed, 1), allocation)
+		}
+		if diskOK {
+			n.DiskBytes = saturatingAdd(w.StagedBytes, written)
+		}
+		if memOK && proven {
+			n.Learned = true
 			return n, nil
 		}
 		c.mu.Lock()
-		first := c.probing[n.mk]
-		if first == nil {
-			c.probing[n.mk] = make(chan struct{})
+		gate := c.gates[n.memKey]
+		if gate == nil {
+			c.gates[n.memKey] = make(chan struct{})
 			c.mu.Unlock()
-			n.Bytes, n.probe = allocation, true
+			n.gated = true
 			return n, nil
 		}
 		c.mu.Unlock()
 		select {
-		case <-first:
+		case <-gate:
 		case <-ctx.Done():
 			return ChildNeed{}, model.Canceled(ctx.Err())
 		}
 	}
 }
 
-// done ends one run: a measured need is folded into its model and recorded in
-// the run ledger with the reservation it ran under, and a first run releases
-// the runs of its key waiting on it. ok false is a run no reading was taken
-// of, which teaches nothing, never a zero.
-func (c *ChildNeeds) done(n ChildNeed, needBytes int64, ok bool) {
-	if ok && needBytes >= 0 && n.model != nil {
-		n.model.mu.Lock()
-		n.model.h.Observe(needBytes, n.WorkBytes, n.halfLife)
-		state, err := n.model.h.MarshalBinary()
-		n.model.mu.Unlock()
-		if err == nil && n.run != nil {
-			n.run.ObserveNeed(ledger.NeedObservation{Key: n.mk.NeedKey, ReservedBytes: n.Bytes, NeedBytes: needBytes, State: state})
-		}
+// saturatingAdd is a + b for two non-negative figures, at the largest int64
+// rather than past it.
+func saturatingAdd(a, b int64) int64 {
+	if a > 1<<63-1-b {
+		return 1<<63 - 1
 	}
-	if n.probe {
+	return a + b
+}
+
+// ChildMeasure is what one tool run was read using. A figure that was not read
+// is marked so, never zero.
+type ChildMeasure struct {
+	// MemoryBytes is the highest anonymous resident set the run's tree was
+	// read at; MemoryRead is false when no reading was taken.
+	MemoryBytes int64
+	MemoryRead  bool
+	// WrittenBytes are the bytes the run wrote beside what was staged for it;
+	// WrittenRead is false when they could not be measured.
+	WrittenBytes int64
+	WrittenRead  bool
+	// Succeeded reports a run that did its work. A failed run's readings are
+	// learned as lower bounds of its need, and keep its class gated.
+	Succeeded bool
+}
+
+// fold folds one dimension's reading into its model and records it in the
+// run ledger with the reservation it ran under.
+func (n ChildNeed) fold(m *childModel, key childModelKey, reserved, need int64, succeeded bool) {
+	if need < 0 || m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.h.Observe(need, n.WorkBytes, max(n.Projects, 1))
+	m.succeeded = m.succeeded || succeeded
+	state, err := m.marshal()
+	m.mu.Unlock()
+	if err == nil && n.run != nil {
+		n.run.ObserveNeed(ledger.NeedObservation{Key: key.NeedKey, ReservedBytes: reserved, NeedBytes: need, State: state})
+	}
+}
+
+// done ends one run: what it was read using is learned, and a gated run
+// releases the runs of its class waiting on it.
+func (c *ChildNeeds) done(n ChildNeed, got ChildMeasure) {
+	if got.MemoryRead {
+		n.fold(n.mem, n.memKey, n.Bytes, got.MemoryBytes, got.Succeeded)
+	}
+	if got.WrittenRead {
+		n.fold(n.disk, n.diskKey, max(n.DiskBytes-n.StagedBytes, 0), got.WrittenBytes, got.Succeeded)
+	}
+	if n.gated {
 		c.mu.Lock()
-		if first := c.probing[n.mk]; first != nil {
-			delete(c.probing, n.mk)
-			close(first)
+		if gate := c.gates[n.memKey]; gate != nil {
+			delete(c.gates, n.memKey)
+			close(gate)
 		}
 		c.mu.Unlock()
 	}
@@ -181,34 +325,39 @@ type childHold struct {
 	needs *ChildNeeds
 	need  ChildNeed
 	once  sync.Once
+	// succeeded is the ended run's own report, which a later reading of what
+	// it wrote is learned under (ObserveWritten). It is written once, by end.
+	succeeded atomic.Bool
 }
 
-func (ch *childHold) end(needBytes int64, ok bool) {
-	ch.once.Do(func() { ch.needs.done(ch.need, needBytes, ok) })
+func (ch *childHold) end(got ChildMeasure) {
+	ch.once.Do(func() {
+		ch.succeeded.Store(got.Succeeded)
+		ch.needs.done(ch.need, got)
+	})
 }
 
 // HoldChild admits one external tool run -- a precise indexer's profile unit
-// or a language server -- at the memory needs predicts for its work, within
-// the allocation re-derived for this admission, and the temporary disk it
-// states. Everything Hold documents holds: strict first-in-first-out, the
-// runs-alone rule, makeRoom and the cancellation that leaks nothing. The
-// holding's Observe records what the run used; its Release ends the plan
-// either way, so a first run that is refused, canceled or teaches nothing
-// never leaves the runs of its key waiting.
-func (l *Ledger) HoldChild(ctx context.Context, needs *ChildNeeds, key ChildKey, workBytes, halfLife, diskBytes int64,
-	makeRoom func()) (*Holding, error) {
-	if key.Tool == "" || key.Fingerprint == "" {
+// or a language server -- at the memory and temporary disk needs predicts for
+// its work, within the allocations the ledger holds for this admission.
+// Everything Hold documents holds: strict first-in-first-out, the runs-alone
+// rule, makeRoom and the cancellation that leaks nothing. The holding's
+// Observe records what the run used; its Release ends the plan either way, so
+// a gated run that is refused, canceled or teaches nothing never leaves the
+// runs of its class waiting.
+func (l *Ledger) HoldChild(ctx context.Context, needs *ChildNeeds, key ChildKey, w ChildWork, makeRoom func()) (*Holding, error) {
+	if _, _, ok := key.Kind.kinds(); !ok || key.Tool == "" || key.Fingerprint == "" {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "an external tool's reservation needs the tool and the payload it learns under"}
+			Message: "an external tool's reservation needs its kind, the tool and the payload it learns under"}
 	}
-	n, err := needs.plan(ctx, l, key, workBytes, halfLife)
+	n, err := needs.plan(ctx, l, key, w)
 	if err != nil {
 		return nil, err
 	}
 	ch := &childHold{needs: needs, need: n}
-	h, err := l.Hold(ctx, Reservation{MemoryBytes: n.Bytes, DiskBytes: diskBytes}, makeRoom)
+	h, err := l.Hold(ctx, Reservation{MemoryBytes: n.Bytes, DiskBytes: n.DiskBytes}, makeRoom)
 	if err != nil {
-		ch.end(0, false)
+		ch.end(ChildMeasure{})
 		return nil, err
 	}
 	h.child = ch
@@ -224,31 +373,90 @@ func (h *Holding) Need() (ChildNeed, bool) {
 	return h.child.need, true
 }
 
-// Observe records an external tool run's measured need -- the highest
-// anonymous resident set its tree was read at -- against the plan it was
-// admitted on. It is recorded once; ok false teaches nothing. A holding that
-// is no external tool's records nothing.
+// Observe records an external tool run's readings against the plan it was
+// admitted on, once; a holding that is no external tool's records nothing.
 //
-// A first run, held at the whole allocation, is lowered once measured to what
-// its class now predicts for its work: a language server lives on after its
-// measurement, and holding the allocation for its lifetime would keep every
-// other server and unit from running beside it. A reading above the lowered
+// Written bytes above what the holding holds of disk raise it at once: they
+// are on the disk already. A run planned without a prediction from a class a
+// run that succeeded was measured in -- a first run, held at the whole
+// allocations -- is then lowered to what its class now predicts for its work,
+// in each dimension it was measured in: a language server lives on after its
+// measurement, and holding the allocations for its lifetime would keep every
+// other child from running beside it. A memory reading above the lowered
 // figure raises it again (FollowResidency).
-func (h *Holding) Observe(needBytes int64, ok bool) {
+func (h *Holding) Observe(got ChildMeasure) {
 	if h.child == nil {
 		return
 	}
-	h.child.end(needBytes, ok)
+	h.child.end(got)
 	n := h.child.need
-	if !ok || n.Learned || n.model == nil {
+	if got.WrittenRead {
+		if staged := saturatingAdd(n.StagedBytes, got.WrittenBytes); staged > h.DiskBytes() {
+			h.AdjustDisk(staged)
+		}
+	}
+	if n.Learned {
 		return
 	}
-	n.model.mu.Lock()
-	predicted, learned := n.model.h.Predict(n.WorkBytes)
-	n.model.mu.Unlock()
-	if learned && predicted < h.Bytes() {
-		h.Adjust(max(predicted, 1))
+	if got.MemoryRead {
+		n.mem.mu.Lock()
+		predicted, ok := n.mem.h.Predict(n.WorkBytes)
+		n.mem.mu.Unlock()
+		if ok && predicted < h.Bytes() {
+			h.Adjust(max(predicted, 1))
+		}
 	}
+	if got.WrittenRead {
+		n.disk.mu.Lock()
+		written, ok := n.disk.h.Predict(n.WorkBytes)
+		n.disk.mu.Unlock()
+		if want := saturatingAdd(n.StagedBytes, written); ok && want < h.DiskBytes() {
+			h.AdjustDisk(max(want, saturatingAdd(n.StagedBytes, got.WrittenBytes)))
+		}
+	}
+}
+
+// ObserveWritten records written bytes read again after the run's
+// measurement -- a language server's work directory when it exits -- into the
+// class's disk model, under the run's own success or failure, and raises the
+// holding's disk to them when they exceed it. It ends nothing: the run's plan
+// ended at Observe.
+func (h *Holding) ObserveWritten(written int64) {
+	if h.child == nil || written < 0 {
+		return
+	}
+	n := h.child.need
+	n.fold(n.disk, n.diskKey, max(h.DiskBytes()-n.StagedBytes, 0), written, h.child.succeeded.Load())
+	if staged := saturatingAdd(n.StagedBytes, written); staged > h.DiskBytes() {
+		h.AdjustDisk(staged)
+	}
+}
+
+// WrittenBytes is the apparent size of every regular file under dir, read in
+// one walk, less staged: the bytes a tool wrote beside the copy staged for it
+// in dir. ok is false when dir could not be walked. A file removed while the
+// walk runs is not counted.
+func WrittenBytes(dir string, staged int64) (int64, bool) {
+	var total int64
+	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if d == nil {
+				return err
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			total = saturatingAdd(total, info.Size())
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, false
+	}
+	return max(total-staged, 0), true
 }
 
 // Admit is how a heavy unit is admitted: the unit's provider plans its
@@ -369,21 +577,24 @@ func (r *Residency) Stop() (int64, bool) {
 	return r.peak, r.seen
 }
 
-// ProjectWork is one tool run's work and the half-life its need is learned
-// under, in one streaming pass over the snapshot manifest: the bytes of the
-// live files at or under the project directory root (the empty root is the
-// workspace root), and how many directories of the snapshot hold one of the
-// tool's project markers -- the repository's own projects of that tool.
-// Nothing of the manifest is retained but that set of project directories,
-// one per project the tool can be run for.
-func ProjectWork(ctx context.Context, view model.SnapshotView, root string, markers []string) (workBytes, projects int64, err error) {
+// ProjectWork is what one tool run is planned on, in one streaming pass over
+// the snapshot manifest: the bytes of the live files at or under the project
+// directory root (the empty root is the workspace root); the bytes of every
+// live file, which is what a whole-snapshot copy stages, or at most
+// maxStagedBytes when that is positive; and how many directories of the
+// snapshot hold one of the tool's project markers -- the repository's own
+// projects of that tool. Nothing of the manifest is retained but that set of
+// project directories, one per project the tool can be run for.
+func ProjectWork(ctx context.Context, view model.SnapshotView, root string, markers []string, maxStagedBytes int64) (ChildWork, error) {
+	var w ChildWork
 	dirs := map[string]struct{}{}
-	err = view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
+		w.StagedBytes = saturatingAdd(w.StagedBytes, fv.Size)
 		if root == "" || len(fv.Path) > len(root) && fv.Path[:len(root)] == root && fv.Path[len(root)] == '/' {
-			workBytes += fv.Size
+			w.WorkBytes = saturatingAdd(w.WorkBytes, fv.Size)
 		}
 		dir, base := path.Split(fv.Path)
 		for _, m := range markers {
@@ -395,7 +606,11 @@ func ProjectWork(ctx context.Context, view model.SnapshotView, root string, mark
 		return nil
 	})
 	if err != nil {
-		return 0, 0, err
+		return ChildWork{}, err
 	}
-	return workBytes, int64(len(dirs)), nil
+	if maxStagedBytes > 0 {
+		w.StagedBytes = min(w.StagedBytes, maxStagedBytes)
+	}
+	w.Projects = int64(len(dirs))
+	return w, nil
 }

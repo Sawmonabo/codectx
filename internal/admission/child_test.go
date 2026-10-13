@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,11 +28,11 @@ func childLedger(t *testing.T, allocation int64) *Ledger {
 // profile unit or a language server does when its run ends.
 func teach(t *testing.T, l *Ledger, needs *ChildNeeds, key ChildKey, work, need int64) {
 	t.Helper()
-	h, err := l.HoldChild(context.Background(), needs, key, work, 1, 0, nil)
+	h, err := l.HoldChild(context.Background(), needs, key, ChildWork{WorkBytes: work, Projects: 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.Observe(need, true)
+	h.Observe(ChildMeasure{MemoryBytes: need, MemoryRead: true, Succeeded: true})
 	h.Release()
 }
 
@@ -45,13 +47,13 @@ func teach(t *testing.T, l *Ledger, needs *ChildNeeds, key ChildKey, work, need 
 func TestAToolReservesInProportionToItsWork(t *testing.T) {
 	l := childLedger(t, 64*childGiB)
 	var needs ChildNeeds
-	key := ChildKey{Tool: "indexer t", Fingerprint: "f"}
+	key := ChildKey{Kind: ChildIndexer, Tool: "t", Fingerprint: "f"}
 	// 1,500 and 2,000 bytes share size class 11; 100 bytes of need per byte.
 	teach(t, l, &needs, key, 1500, 150_000)
 
 	plan := func(work int64) ChildNeed {
 		t.Helper()
-		h, err := l.HoldChild(context.Background(), &needs, key, work, 1, 0, nil)
+		h, err := l.HoldChild(context.Background(), &needs, key, ChildWork{WorkBytes: work, Projects: 1}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -80,10 +82,10 @@ func TestAToolReservesInProportionToItsWork(t *testing.T) {
 func TestNoToolReservesMoreThanTheAllocation(t *testing.T) {
 	l := childLedger(t, 64*childGiB)
 	var needs ChildNeeds
-	key := ChildKey{Tool: "server s", Fingerprint: "f"}
+	key := ChildKey{Kind: ChildServer, Tool: "s", Fingerprint: "f"}
 	teach(t, l, &needs, key, 1<<20, 40*childGiB)
 	l.SetAllocation(16 * childGiB)
-	h, err := l.HoldChild(context.Background(), &needs, key, 1<<20, 1, 0, nil)
+	h, err := l.HoldChild(context.Background(), &needs, key, ChildWork{WorkBytes: 1 << 20, Projects: 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,11 +148,11 @@ func TestAResidentSetAboveTheReservationRaisesIt(t *testing.T) {
 func TestAColdClassIsPlannedFromItsFirstRun(t *testing.T) {
 	l := childLedger(t, 64*childGiB)
 	var needs ChildNeeds
-	key := ChildKey{Tool: "indexer t", Fingerprint: "f"}
+	key := ChildKey{Kind: ChildIndexer, Tool: "t", Fingerprint: "f"}
 	guard, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	first, err := l.HoldChild(guard, &needs, key, 4096, 1, 0, nil)
+	first, err := l.HoldChild(guard, &needs, key, ChildWork{WorkBytes: 4096, Projects: 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +162,7 @@ func TestAColdClassIsPlannedFromItsFirstRun(t *testing.T) {
 	}
 	second := make(chan planned, 1)
 	go func() {
-		h, err := l.HoldChild(guard, &needs, key, 4096, 1, 0, nil)
+		h, err := l.HoldChild(guard, &needs, key, ChildWork{WorkBytes: 4096, Projects: 1}, nil)
 		second <- planned{h, err}
 	}()
 	select {
@@ -168,7 +170,7 @@ func TestAColdClassIsPlannedFromItsFirstRun(t *testing.T) {
 		t.Fatal("a second run of a cold class was planned before the first one measured anything")
 	case <-time.After(50 * time.Millisecond):
 	}
-	first.Observe(4096*10, true)
+	first.Observe(ChildMeasure{MemoryBytes: 4096 * 10, MemoryRead: true, Succeeded: true})
 	first.Release()
 	got := <-second
 	if got.err != nil {
@@ -180,13 +182,13 @@ func TestAColdClassIsPlannedFromItsFirstRun(t *testing.T) {
 	got.h.Release()
 
 	// A first run that teaches nothing hands the role on.
-	coldKey := ChildKey{Tool: "indexer u", Fingerprint: "f"}
-	probe, err := l.HoldChild(guard, &needs, coldKey, 4096, 1, 0, nil)
+	coldKey := ChildKey{Kind: ChildIndexer, Tool: "u", Fingerprint: "f"}
+	probe, err := l.HoldChild(guard, &needs, coldKey, ChildWork{WorkBytes: 4096, Projects: 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() {
-		h, err := l.HoldChild(guard, &needs, coldKey, 4096, 1, 0, nil)
+		h, err := l.HoldChild(guard, &needs, coldKey, ChildWork{WorkBytes: 4096, Projects: 1}, nil)
 		second <- planned{h, err}
 	}()
 	probe.Release()
@@ -229,7 +231,8 @@ func (v manifestView) ReadRange(context.Context, model.FileID, model.ByteRange) 
 // repository's 1,000,111 bytes and would reserve as much as the root project.
 // Mutation: match the root as a bare prefix -> "app2/big.go" is counted in
 // "app". Mutation: count marker files rather than directories -> the root's
-// two markers count twice.
+// two markers count twice. Mutation: stage only the project's bytes -> the
+// whole-snapshot copy is under-reserved on disk.
 func TestAProjectsWorkIsItsOwnDirectory(t *testing.T) {
 	view := manifestView{
 		{Path: "go.mod", Size: 10},
@@ -241,15 +244,21 @@ func TestAProjectsWorkIsItsOwnDirectory(t *testing.T) {
 		{Path: "app2/big.go", Size: 1_000_000},
 	}
 	markers := []string{"go.mod", "go.work"}
-	work, projects, err := ProjectWork(context.Background(), view, "app", markers)
+	w, err := ProjectWork(context.Background(), view, "app", markers, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if work != 100 || projects != 3 {
-		t.Fatalf("project app: work %d bytes, %d projects; want 100 bytes and 3 project directories", work, projects)
+	if w.WorkBytes != 100 || w.Projects != 3 || w.StagedBytes != 1_000_111 {
+		t.Fatalf("project app: work %d bytes, staged %d, %d projects; want 100 bytes, the snapshot's 1,000,111 staged and 3 project directories",
+			w.WorkBytes, w.StagedBytes, w.Projects)
 	}
-	if work, _, _ = ProjectWork(context.Background(), view, "", markers); work != 1_000_111 {
-		t.Fatalf("the workspace root's work is %d bytes, want every live file's 1,000,111", work)
+	if w, _ = ProjectWork(context.Background(), view, "", markers, 0); w.WorkBytes != 1_000_111 {
+		t.Fatalf("the workspace root's work is %d bytes, want every live file's 1,000,111", w.WorkBytes)
+	}
+	// A bounded copy stages at most its bound (mutation: ignore it, and the
+	// run reserves disk for files it never copies).
+	if w, _ = ProjectWork(context.Background(), view, "app", markers, 500); w.StagedBytes != 500 {
+		t.Fatalf("a copy bounded at 500 bytes stages %d", w.StagedBytes)
 	}
 }
 
@@ -263,7 +272,7 @@ func TestAProjectsWorkIsItsOwnDirectory(t *testing.T) {
 func TestAMeasuredFirstRunGivesTheAllocationBack(t *testing.T) {
 	l := childLedger(t, 16*childGiB)
 	var needs ChildNeeds
-	h, err := l.HoldChild(context.Background(), &needs, ChildKey{Tool: "server s", Fingerprint: "f"}, 1<<20, 1, 0, nil)
+	h, err := l.HoldChild(context.Background(), &needs, ChildKey{Kind: ChildServer, Tool: "s", Fingerprint: "f"}, ChildWork{WorkBytes: 1 << 20, Projects: 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +280,7 @@ func TestAMeasuredFirstRunGivesTheAllocationBack(t *testing.T) {
 	if _, reserved := l.Snapshot(); reserved != 16*childGiB {
 		t.Fatalf("a first run reserved %d bytes, want the 16 GiB allocation", reserved)
 	}
-	h.Observe(2*childGiB, true)
+	h.Observe(ChildMeasure{MemoryBytes: 2 * childGiB, MemoryRead: true, Succeeded: true})
 	if b := h.Bytes(); b < 2*childGiB || b >= 3*childGiB {
 		t.Fatalf("a first run measured at 2 GiB holds %d bytes; want its class's prediction for its work", b)
 	}
@@ -282,4 +291,129 @@ func TestAMeasuredFirstRunGivesTheAllocationBack(t *testing.T) {
 		t.Fatalf("a 1 GiB reservation waited beside a measured 2 GiB first run in a 16 GiB allocation: %v", err)
 	}
 	beside.Release()
+}
+
+// TestDiskIsTheStagedCopyPlusWhatTheClassWrites protects the disk dimension:
+// a first run holds the whole disk allocation; once measured it is lowered to
+// its copy plus what its class writes per byte of work; and a later run is
+// planned at its own copy plus its class's prediction, so a smaller project of
+// the class reserves less.
+//
+// Mutation: drop the staged bytes from the disk plan -> the learned run
+// reserves only what it writes. Mutation: drop the disk lowering in Observe ->
+// the first run keeps the 40 GiB disk allocation. Mutation: plan disk from a
+// constant -> both projects reserve the same disk.
+func TestDiskIsTheStagedCopyPlusWhatTheClassWrites(t *testing.T) {
+	l, err := NewLedger(64*childGiB, 40*childGiB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var needs ChildNeeds
+	key := ChildKey{Kind: ChildIndexer, Tool: "t", Fingerprint: "f"}
+	first, err := l.HoldChild(context.Background(), &needs, key, ChildWork{WorkBytes: 1500, StagedBytes: 10_000, Projects: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.DiskBytes() != 40*childGiB {
+		t.Fatalf("a first run holds %d bytes of disk, want the 40 GiB disk allocation", first.DiskBytes())
+	}
+	first.Observe(ChildMeasure{MemoryBytes: 150_000, MemoryRead: true, WrittenBytes: 3000, WrittenRead: true, Succeeded: true})
+	if d := first.DiskBytes(); d < 13_000 || d > 14_000 {
+		t.Fatalf("a measured first run holds %d bytes of disk, want its 10,000-byte copy plus about the 3,000 it wrote", d)
+	}
+	first.Release()
+	plan := func(work, staged int64) int64 {
+		t.Helper()
+		h, err := l.HoldChild(context.Background(), &needs, key, ChildWork{WorkBytes: work, StagedBytes: staged, Projects: 1}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Release()
+		return h.DiskBytes()
+	}
+	small, large := plan(1100, 10_000), plan(2000, 10_000)
+	if small >= large || small < 10_000+2*1100 {
+		t.Fatalf("disk planned at %d for 1,100 bytes of work and %d for 2,000; want the copy plus about 2 written bytes per work byte, less for less work", small, large)
+	}
+}
+
+// TestAClassKnownOnlyFromFailedRunsRunsOneAtATime protects the rule for a tool
+// that fails: its failed run's readings are lower bounds of its need, so its
+// next runs are planned from them rather than at the whole allocation, but
+// only one run of the class is in flight until a run succeeds; the first
+// success opens the class.
+//
+// Mutation: treat a failed run's reading like a success's -> the second run
+// is planned while the first is in flight. Mutation: learn nothing from a
+// failed run -> the next run is planned at the whole allocation again.
+func TestAClassKnownOnlyFromFailedRunsRunsOneAtATime(t *testing.T) {
+	l := childLedger(t, 64*childGiB)
+	var needs ChildNeeds
+	key := ChildKey{Kind: ChildIndexer, Tool: "t", Fingerprint: "f"}
+	work := ChildWork{WorkBytes: 4096, Projects: 1}
+	guard, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	failed, err := l.HoldChild(guard, &needs, key, work, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed.Observe(ChildMeasure{MemoryBytes: 4096 * 50, MemoryRead: true})
+	failed.Release()
+
+	next, err := l.HoldChild(guard, &needs, key, work, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := next.Need(); n.Learned || n.Bytes >= 64*childGiB || n.Bytes < 4096*50 {
+		t.Fatalf("after a failed run read at 200 KiB the next run reserves %d bytes (learned %v); want the failed run's reading as a lower bound, still gated", n.Bytes, n.Learned)
+	}
+	third := make(chan *Holding, 1)
+	go func() {
+		h, err := l.HoldChild(guard, &needs, key, work, nil)
+		if err != nil {
+			third <- nil
+			return
+		}
+		third <- h
+	}()
+	select {
+	case <-third:
+		t.Fatal("a second run of a class known only from failed runs was planned while one was in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	next.Observe(ChildMeasure{MemoryBytes: 4096 * 60, MemoryRead: true, Succeeded: true})
+	next.Release()
+	h := <-third
+	if h == nil {
+		t.Fatal("the waiting run was not planned once a run of its class succeeded")
+	}
+	if n, _ := h.Need(); !n.Learned {
+		t.Fatal("a class a run succeeded in is still planned one run at a time")
+	}
+	h.Release()
+}
+
+// TestWrittenBytesAreWhatTheToolAddedToItsDirectory protects the disk reading:
+// every regular file under the run's directory, at any depth, less the copy
+// staged there.
+//
+// Mutation: read only the top level -> the nested output is missed. Mutation:
+// leave the staged copy in -> the run is taught that it wrote its own input.
+func TestWrittenBytesAreWhatTheToolAddedToItsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	for name, size := range map[string]int{"src/a.go": 100, "src/deep/b.go": 50, "index.scip": 400, "target/x/y.bin": 25} {
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, make([]byte, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, ok := WrittenBytes(dir, 150); !ok || got != 425 {
+		t.Fatalf("the tool wrote %d bytes (ok %v) beside its 150-byte copy, want 425", got, ok)
+	}
+	if _, ok := WrittenBytes(filepath.Join(dir, "absent"), 0); ok {
+		t.Fatal("a directory that does not exist was read as written bytes")
+	}
 }

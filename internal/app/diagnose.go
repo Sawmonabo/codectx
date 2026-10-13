@@ -153,7 +153,7 @@ func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
 	return runRecord(view)
 }
 
-// NeedClasses reads the repository's learned per-file need models, one page and
+// NeedClasses reads the repository's learned need models, one page and
 // the count past it, as the model carries them. A workspace that has recorded
 // no run answers none.
 func (l runLedger) NeedClasses(ctx context.Context, repo model.RepositoryID) ([]model.NeedClass, int64, error) {
@@ -168,7 +168,7 @@ func (l runLedger) NeedClasses(ctx context.Context, repo model.RepositoryID) ([]
 	}
 	out := make([]model.NeedClass, 0, len(classes))
 	for _, c := range classes {
-		out = append(out, model.NeedClass{Language: c.Key.Language, Fingerprint: c.Key.Fingerprint,
+		out = append(out, model.NeedClass{Kind: string(c.Key.Kind), Subject: c.Key.Subject, Fingerprint: c.Key.Fingerprint,
 			Build: c.Key.Build, SizeClass: c.Key.SizeClass, Observations: c.Observations, Overruns: c.Overruns,
 			MaxDriftBytes: c.MaxDriftBytes})
 	}

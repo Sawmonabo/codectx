@@ -103,10 +103,13 @@ CREATE TABLE spans (
     diagnostic_code TEXT NOT NULL,
     failure_json TEXT NOT NULL
 );
--- The learned need of one class of parsed file in one repository: the
--- language, the grammar fingerprint the files were parsed under, the build of
--- the worker that parsed them, and the file-size class. A new build learns
--- afresh, since what a worker does with a file's tree changes with it. state is the model's own encoding, replaced by each
+-- The learned need of one class of work in one repository: its kind -- a
+-- parsed file's memory, or an external indexer's or language server's memory
+-- or temporary disk -- and its subject, the language parsed or the tool run;
+-- the fingerprint of the grammar or the pinned tool payload; the build of this
+-- product that ran it; and the size class of the work. A new build learns
+-- afresh, since what a worker does with a file's tree, and how a tool is run,
+-- change with it. state is the model's own encoding, replaced by each
 -- observation's, which already folds in every earlier one; the counts beside it
 -- are what the model was learned from and how often its reservation fell short.
 -- It is keyed by neither run nor generation, because a measurement stays true
@@ -120,7 +123,8 @@ CREATE TABLE spans (
 -- the last CHECK states.
 CREATE TABLE need_models (
     repository_id BLOB NOT NULL CHECK(length(repository_id) = 32),
-    language TEXT NOT NULL CHECK(length(language) > 0),
+    kind TEXT NOT NULL CHECK(kind IN ('parse','indexer memory','indexer disk','server memory','server disk')),
+    subject TEXT NOT NULL CHECK(length(subject) > 0),
     fingerprint TEXT NOT NULL CHECK(length(fingerprint) > 0),
     build TEXT NOT NULL CHECK(length(build) > 0),
     size_class INTEGER NOT NULL CHECK(size_class >= 0),
@@ -129,7 +133,7 @@ CREATE TABLE need_models (
     overruns INTEGER NOT NULL CHECK(overruns >= 0 AND overruns <= observations),
     max_drift_bytes INTEGER NOT NULL,
     CHECK((overruns > 0) = (max_drift_bytes > 0)),
-    PRIMARY KEY (repository_id, language, fingerprint, build, size_class)
+    PRIMARY KEY (repository_id, kind, subject, fingerprint, build, size_class)
 ) WITHOUT ROWID;
 -- Unique so that a span's end, and a child's parent lookup, name exactly one
 -- row by (run_id, seq); it is also the order a reader pages the run in.

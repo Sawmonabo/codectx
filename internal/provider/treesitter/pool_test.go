@@ -453,7 +453,7 @@ func TestAWorkerHandedBackGoesToTheLedgerHead(t *testing.T) {
 func TestANeedTheWorkerCouldNotMeasureTeachesNothing(t *testing.T) {
 	p, _ := newTestPool(t, 1, 4<<30)
 	f := &fileNeed{language: "go", size: 4096, reserved: increment{bytes: 1 << 20}, model: &needModel{loaded: true}, halfLife: 1,
-		key: needKey{NeedKey: ledger.NeedKey{Language: "go", Fingerprint: fingerprint, Build: p.build, SizeClass: admission.SizeClassOf(4096)}}}
+		key: needKey{NeedKey: ledger.NeedKey{Kind: ledger.NeedParse, Subject: "go", Fingerprint: fingerprint, Build: p.build, SizeClass: admission.SizeClassOf(4096)}}}
 	p.settle(f, wire.Memory{})
 	if _, ok := f.model.h.Predict(4096); ok {
 		t.Fatal("a file with no measured need was learned from")

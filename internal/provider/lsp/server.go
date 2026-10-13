@@ -237,7 +237,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		CPUProgress:            cpu,
 		Grace:                  m.opts.StopTimeout,
 		MemoryReservationBytes: held.Bytes(),
-		DiskReservationBytes:   p.DiskBudgetBytes,
+		DiskReservationBytes:   runnerDisk(held),
 	}
 	// From here a process tree exists (or is about to) and onExit will run, so
 	// the manager tracks the server until that happens even if it never
@@ -268,6 +268,13 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	}()
 
 	if err = s.initialize(ctx, snap); err != nil {
+		// What the failed start was read using is a lower bound of its
+		// class's need, learned so a server that never starts is not planned
+		// at the whole allocation forever.
+		need, read := s.follow.Peak()
+		written, walked := admission.WrittenBytes(workDir, 0)
+		held.Observe(admission.ChildMeasure{MemoryBytes: need, MemoryRead: read,
+			WrittenBytes: written, WrittenRead: walked})
 		// A start that failed after the process exists must not leave it: the
 		// same path a running server takes on failure.
 		s.fail(err)
@@ -282,7 +289,10 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		}
 		return nil, err
 	}
-	held.Observe(s.follow.Peak())
+	need, read := s.follow.Peak()
+	written, walked := admission.WrittenBytes(workDir, 0)
+	held.Observe(admission.ChildMeasure{MemoryBytes: need, MemoryRead: read,
+		WrittenBytes: written, WrittenRead: walked, Succeeded: true})
 	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	return s, nil
 }
@@ -431,6 +441,11 @@ func (s *server) onExit(runErr error) {
 	// held is free: given back before exited closes, so every stop that waits
 	// on exited returns with the room already in the ledger.
 	s.follow.Stop()
+	// What the server wrote over its life is its class's disk need too, read
+	// once more now that it has written all of it.
+	if written, walked := admission.WrittenBytes(s.profile.workDir(s.opts.DataDir), 0); walked {
+		s.held.ObserveWritten(written)
+	}
 	s.held.Release()
 	close(s.exited)
 	// Only now, with the tree reaped and the materialization gone, does Close
@@ -693,4 +708,15 @@ func languageID(tag string) string {
 func isNotFound(err error) bool {
 	var typed *model.Error
 	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid
+}
+
+// runnerDisk is the temporary disk a server states to the runner, whose
+// account enforces the operator's resources.max_temp_bytes: the holding's
+// planned figure, or only the snapshot copy it is rooted in for a server no
+// measurement predicts yet, whose holding stands at the whole disk allocation.
+func runnerDisk(held *admission.Holding) int64 {
+	if n, ok := held.Need(); ok && !n.Learned {
+		return n.StagedBytes
+	}
+	return held.DiskBytes()
 }
