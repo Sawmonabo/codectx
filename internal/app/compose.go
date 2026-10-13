@@ -1442,6 +1442,8 @@ func (s *stack) release() error {
 // answer -- and the grace above is what keeps that from refusing a holder that
 // is merely between stamps.
 //
+// A holder that is a reset is judged by the lock alone (see the probe).
+//
 // One open failure is not that, and it is the one this probe answers with an
 // error instead: a ledger whose schema fingerprint is not this binary's. The
 // holder is then a DIFFERENT BUILD of this product, its stamps are unreadable
@@ -1452,6 +1454,20 @@ func (s *stack) release() error {
 func ledgerProgress(dataDir string) (snapshot.HolderProbe, func()) {
 	var reader *ledger.Reader
 	probe := func(ctx context.Context, holder snapshot.WaitingHolder) (string, bool, error) {
+		if holder.Operation == resetOperation {
+			// A reset is removing the very ledger this probe reads, so the
+			// ledger can never show it progressing. It records no stamp
+			// because it needs none: it holds the lock only while it removes,
+			// and the lock dies with its process, so a reset that holds it is
+			// a reset still removing. A reader opened on the ledger it unlinks
+			// would read a file nobody writes again, so it is dropped and the
+			// next holder's ledger is opened afresh.
+			if reader != nil {
+				reader.Close()
+				reader = nil
+			}
+			return resetOperation, true, nil
+		}
 		if reader == nil {
 			r, ok, err := ledger.OpenReader(ctx, dataDir)
 			if err != nil || !ok {

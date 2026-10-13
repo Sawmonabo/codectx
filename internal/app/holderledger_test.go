@@ -92,3 +92,25 @@ func forgeForeignLedger(t *testing.T, ctx context.Context, dir string) {
 		t.Fatalf("the forged ledger still has a write-ahead log beside it")
 	}
 }
+
+// TestAResetHoldingTheWorkspaceReadsAsProgressing asks the waiting probe about
+// a reset that holds the workspace while the run ledger it is removing is
+// gone. The ledger can never show a reset progressing, so a waiter judging it
+// by the ledger would spend the liveness window and refuse a reset that is
+// still removing a large data directory. A holder of another operation with
+// no ledger still reads as not progressing, so the grace still guards it.
+//
+// Mutation that fails it: drop the reset branch from ledgerProgress (the reset
+// reads as not progressing).
+func TestAResetHoldingTheWorkspaceReadsAsProgressing(t *testing.T) {
+	ctx := context.Background()
+	probe, closeProbe := ledgerProgress(t.TempDir())
+	defer closeProbe()
+	stage, progressing, err := probe(ctx, snapshot.WaitingHolder{Waiting: true, PID: os.Getpid(), Operation: resetOperation})
+	if err != nil || !progressing || stage != resetOperation {
+		t.Fatalf("probe(reset) = %q, %v, %v; want the reset progressing", stage, progressing, err)
+	}
+	if _, progressing, err := probe(ctx, snapshot.WaitingHolder{Waiting: true, PID: os.Getpid(), Operation: "index"}); err != nil || progressing {
+		t.Fatalf("probe(index with no ledger) = %v, %v; want not progressing", progressing, err)
+	}
+}
