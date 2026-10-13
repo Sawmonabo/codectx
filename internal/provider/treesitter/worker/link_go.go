@@ -871,8 +871,21 @@ func (x *goLink) exprType(e Node) wire.Type {
 		}
 	case k.callExpression:
 		if f := x.unparen(e.ChildByFieldId(k.fFunction)); x.is(f, k.identifier) && x.text(f) == "new" && !x.local("new") {
+			// new(T) is a *T, and new(v) of an expression v (Go 1.26) a
+			// pointer to v's type; a pointer's type is its base's here, as
+			// for `&v`.
 			if args := goChild(e, k.fArguments); !args.IsNull() {
-				if name := x.baseName(firstNamed(args)); name != "" {
+				a := x.unparen(firstNamed(args))
+				if !x.typeOperand(a) {
+					if x.is(a, k.typeIdentifier) {
+						if v, ok := x.lookup(x.text(a)); ok {
+							return v.typ
+						}
+						return x.funcs[x.text(a)].typ
+					}
+					return x.exprType(a)
+				}
+				if name := x.baseName(a); name != "" {
 					return wire.Type{Kind: wire.TypeNamed, Name: name}
 				}
 			}
@@ -1053,16 +1066,55 @@ func (x *goLink) readSkip(n Node) bool {
 	return n.KindId() == x.k.callExpression || n.KindId() == x.k.funcLiteral
 }
 
-// passed sends the values a call's arguments pass, whatever its callee; the
-// arguments of new and make are types.
+// passed sends the values a call's arguments pass, whatever its callee. The
+// arguments of make are a type and sizes; the operand of new is a type or,
+// since Go 1.26 ("Allocation"), an expression whose value it copies, which
+// passes a function value like any argument.
 func (x *goLink) passed(call Node) {
-	f := call.ChildByFieldId(x.k.fFunction)
-	if !f.IsNull() && f.KindId() == x.k.identifier && (x.text(f) == "new" || x.text(f) == "make") && !x.local(x.text(f)) {
+	args := goChild(call, x.k.fArguments)
+	if args.IsNull() {
 		return
 	}
-	if args := goChild(call, x.k.fArguments); !args.IsNull() {
-		goNamed(args, func(a Node) { x.value(a, "") })
+	if f := call.ChildByFieldId(x.k.fFunction); !f.IsNull() && f.KindId() == x.k.identifier && !x.local(x.text(f)) {
+		switch x.text(f) {
+		case "make":
+			return
+		case "new":
+			if x.typeOperand(firstNamed(args)) {
+				return
+			}
+		}
 	}
+	goNamed(args, func(a Node) { x.value(a, "") })
+}
+
+// typeOperand reports an operand of new that is a type: a type's node, but
+// for a bare name the grammar reads as a type (it prefers types) that names
+// a variable or function in scope, which is the expression Go 1.26 allows.
+func (x *goLink) typeOperand(a Node) bool {
+	k, g := x.k, goIdentitySyntaxOf()
+	a = x.unparen(a)
+	if a.IsNull() {
+		return false
+	}
+	switch a.KindId() {
+	case k.typeIdentifier:
+		return !x.valueName(x.text(a))
+	case k.qualifiedType, k.pointerType, k.genericType, k.functionType, k.structType, k.interfaceType,
+		g.sliceType, g.arrayType, g.implicitLengthArrayType, g.mapType, g.channelType:
+		return true
+	}
+	return false
+}
+
+// valueName reports a name that denotes a variable or a function of the
+// file in scope, never a type.
+func (x *goLink) valueName(name string) bool {
+	if _, ok := x.lookup(name); ok {
+		return true
+	}
+	_, ok := x.funcs[name]
+	return ok
 }
 
 // values sends a value for every function in a list of values, each written
@@ -1087,8 +1139,13 @@ func (x *goLink) value(e Node, field string) {
 	}
 	var fn wire.Type
 	switch e.KindId() {
-	case k.identifier:
+	case k.identifier, k.typeIdentifier:
+		// A bare name the grammar reads as a type is an argument only as
+		// new's expression operand (typeOperand): a variable or function.
 		name := x.text(e)
+		if e.KindId() == k.typeIdentifier && !x.valueName(name) {
+			break
+		}
 		if v, ok := x.lookup(name); ok {
 			if v.typ.Kind == wire.TypeFunction {
 				fn = v.typ

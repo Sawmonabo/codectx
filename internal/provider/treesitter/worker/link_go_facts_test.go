@@ -150,3 +150,49 @@ func f() {
 		}
 	}
 }
+
+// TestGoNewOfAnExpression protects new's two operands ("Allocation", Go
+// 1.26): new(T) allocates a T, and new(v) of an expression copies v's
+// value, so new(v) has v's type and new(fn) passes the function fn as a
+// value, although the grammar reads each bare operand as a type name.
+//
+// Mutation: skip every operand of new as a type -> new(fn) sends no value.
+// Mutation: name new(v)'s type by its operand's text -> the first argument
+// of g has the type "v". Mutation: read every bare operand as an expression
+// -> new(T) has no type.
+func TestGoNewOfAnExpression(t *testing.T) {
+	src := `package p
+
+type T struct{}
+
+func fn() {}
+
+func g(a any) {}
+
+func f() {
+	v := T{}
+	g(new(v))
+	g(new(T))
+	_ = new(fn)
+}
+`
+	l, _ := linkOf(t, "go", "p.go", src)
+	call := func(needle string) *wire.Site {
+		s := textAt(t, src, needle, 0)
+		s.End = s.Start + 1
+		return siteNamed(l, s)
+	}
+	for needle, want := range map[string]string{"g(new(v))": "T", "g(new(T))": "T"} {
+		s := call(needle)
+		if s == nil || len(s.Args) != 1 || s.Args[0].Kind != wire.TypeNamed || s.Args[0].Name != want {
+			t.Fatalf("%s: argument types %+v, want the named type %s", needle, s, want)
+		}
+	}
+	var values []string
+	for _, v := range l.Values {
+		values = append(values, src[v.At.Start:v.At.End]+" "+v.Type.Name)
+	}
+	if !slices.Equal(values, []string{"fn fn"}) {
+		t.Fatalf("values %q, want new(fn)'s operand fn alone", values)
+	}
+}
