@@ -15,17 +15,22 @@
 // with one token of lookahead. The parser forks only there, so every file
 // without a generic method parses to the same tree as the release.
 //
-// src/ is generated from grammar.js and tree-sitter.json and is never edited
-// by hand: running `tree-sitter generate` in this directory with tree-sitter
-// CLI 0.25.8, the version the release was generated with, rewrites it byte
-// for byte. The same command on the unmodified release files reproduces the
-// release's src/ exactly. A change to grammar.js changes the go row's Module
-// pin in the lang registry too, so every unit sealed under the old grammar is
-// invalidated.
+// parser.c, grammar.json, node-types.json and tree_sitter/ are generated from
+// grammar.js and tree-sitter.json and are never edited by hand: running
+// `tree-sitter generate -o .` in this directory with tree-sitter CLI 0.25.8,
+// the version the release was generated with, rewrites them byte for byte,
+// and the same CLI run on the unmodified release reproduces its generated
+// src/ exactly. parser.c sits beside this file so cgo
+// compiles it as part of the package and the build cache sees every change
+// to it; the headers under tree_sitter/ change only with the CLI version,
+// which parser.c's first line names, so a regenerated parser.c carries their
+// change into the cache too. A change to grammar.js changes the go row's Module pin in the lang
+// registry too, so every unit sealed under the old grammar is invalidated.
 package gogrammar
 
 // #cgo CFLAGS: -std=c11 -fPIC
-// #include "src/parser.c"
+// #include "tree_sitter/parser.h"
+// const TSLanguage *tree_sitter_go(void);
 import "C"
 
 import "unsafe"
