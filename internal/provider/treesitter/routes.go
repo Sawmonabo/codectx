@@ -43,6 +43,7 @@ func (b *builder) routeTable() []endpointFact {
 		s.python()
 	case "javascript", "typescript", "tsx":
 		s.express()
+		s.nest()
 	case "go":
 		s.goRoutes()
 	case "java":
@@ -238,6 +239,7 @@ const (
 	// Mount inside `routes=`), which a FastAPI application may hold too.
 	fwStarlette = "starlette"
 	fwExpress   = "express"
+	fwNest      = "nestjs"
 	fwSpring    = "spring"
 	fwNetHTTP   = "net/http"
 	fwGorilla   = "gorilla/mux"
@@ -264,8 +266,11 @@ func frameworkOf(language, path string) string {
 			return fwDjango
 		}
 	case "javascript", "typescript", "tsx":
-		if path == "express" {
+		switch path {
+		case "express":
 			return fwExpress
+		case "@nestjs/common":
+			return fwNest
 		}
 	case "go":
 		switch goModule(path) {

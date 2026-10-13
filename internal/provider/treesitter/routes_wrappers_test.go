@@ -172,3 +172,39 @@ urlpatterns = [
 		"about/": {framework: "django", route: "about/", prefix: "unresolved", handlers: []string{"about"}},
 	})
 }
+
+// TestNestJSControllerRoutes is a NestJS controller: each route decorator
+// imported from `@nestjs/common` on a method of a `@Controller` class is
+// one endpoint per route, an array one per element, and none the
+// controller's own path, every one unresolved since the application's
+// global prefix is set in another file. Mutations caught: the decorators
+// not read (no endpoints), a method of a class that is no controller read,
+// a same-named decorator from another package read, and a path guessed
+// from the controller alone.
+func TestNestJSControllerRoutes(t *testing.T) {
+	c := extracted(t, newProvider(t), "cats.controller.ts", `import { Controller, Get, Post } from "@nestjs/common";
+import { Get as Fetch } from "./local";
+
+@Controller("cats")
+export class CatsController {
+  @Get()
+  findAll() { return []; }
+
+  @Post(["new", "create"])
+  create() { return {}; }
+}
+
+export class Plain {
+  @Get("x")
+  x() { return 1; }
+
+  @Fetch("y")
+  y() { return 2; }
+}
+`)
+	checkRoutes(t, c, map[string]route{
+		`GET ""`:      {framework: "nestjs", method: "GET", route: `""`, prefix: "unresolved", handlers: []string{"findAll"}},
+		"POST new":    {framework: "nestjs", method: "POST", route: "new", prefix: "unresolved", handlers: []string{"create"}},
+		"POST create": {framework: "nestjs", method: "POST", route: "create", prefix: "unresolved", handlers: []string{"create"}},
+	})
+}
