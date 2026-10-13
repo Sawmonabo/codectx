@@ -168,8 +168,12 @@ func mountArgument(t *Table, m *RouteMount) (wire.Type, bool) {
 
 // indexPythonRouting adds a Python member's routing to the module index:
 // each open object under every dotted name its file can be imported as,
-// with its payload, and each settings module the file names.
+// with its payload, each settings module the file names, and each class a
+// request input's annotation may name (indexPythonClasses).
 func indexPythonRouting(file int32, t *Table, add func(entry) error) error {
+	if err := indexPythonClasses(file, t, add); err != nil {
+		return err
+	}
 	rt := &t.Routing
 	for _, s := range rt.Settings {
 		if err := add(entry{Key: keyPyNamedSettings + s, Ref: Ref{File: file, Index: -1}, Aux: t.Path}); err != nil {

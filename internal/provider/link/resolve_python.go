@@ -92,6 +92,9 @@ func emitPython(ctx context.Context, u *unit, e *flowEmit) error {
 			if err := emitPythonRoutes(file, tab, e.mods, emit); err != nil {
 				return err
 			}
+			if err := emitPythonInputs(file, tab, e.mods, emit); err != nil {
+				return err
+			}
 		}
 		r := pySite{ctx: ctx, h: h, t: e.t, fc: contextOf(file, tab), tab: tab, look: look, hits: hits, emit: emit, call: call}
 		for i := range tab.Sites {

@@ -288,7 +288,7 @@ func (s *inputScan) fastAPIHandlers(fw string) {
 		}
 		open := s.openAfter(d.NameEnd, d.End)
 		for _, p := range s.paramList(open) {
-			s.fastAPIParam(p, pathNames[i], d.End)
+			s.fastAPIParam(i, p, pathNames[i], d.End)
 		}
 	}
 }
@@ -318,9 +318,9 @@ func routeParams(route string) []string {
 // body for a model, a sequence or a mapping, a query for a scalar. A
 // Request or WebSocket parameter is the request object, whose reads in the
 // handler's body are read by Starlette's table. A dependency, a response,
-// a background-tasks object, or a type this file does not declare publishes
-// nothing.
-func (s *inputScan) fastAPIParam(p paramRange, pathNames map[string]bool, end uint32) {
+// a background-tasks object publishes nothing; a class this file does not
+// decide is left to the linker (pendingFastAPI).
+func (s *inputScan) fastAPIParam(owner int, p paramRange, pathNames map[string]bool, end uint32) {
 	if !s.ident(p.lo) {
 		return
 	}
@@ -396,7 +396,10 @@ func (s *inputScan) fastAPIParam(p paramRange, pathNames map[string]bool, end ui
 	switch {
 	case kind == pyRequest:
 		s.reads(fwFastAPI, []string{name}, starletteRequest, p.hi, s.tokenEnd(end))
-	case kind == pySkip || kind == pyUnknown:
+	case kind == pyUnknown:
+		// The class another file declares, or a base it imports, decides.
+		s.pendingFastAPI(owner, p, typ, name, pathNames[name])
+	case kind == pySkip:
 	case pathNames[name]:
 		at(model.InputPath, name)
 	case kind == pyFile:

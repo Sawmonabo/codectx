@@ -140,10 +140,14 @@ const (
 	// launched by the method Target it declares or inherits
 	// (javaMainFacts).
 	FactMain Fact = 15
+	// FactInput: the pending input Site (an index into Table.Inputs) is
+	// the request-input read External spells (inputFact), with no target
+	// (emitPythonInputs).
+	FactInput Fact = 16
 )
 
 // factLast is the last kind of fact.
-const factLast = FactMain
+const factLast = FactInput
 
 // Binding is one fact a resolver found. Site names the entry of a member's
 // table the fact is about (a call site, an import, a declaration, by Kind),
