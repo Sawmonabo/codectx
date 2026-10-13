@@ -229,6 +229,11 @@ type treeSample struct {
 // watchdog reads is never staler than one of its own polls.
 const treeSampleInterval = 250 * time.Millisecond
 
+// TreeSampleInterval is treeSampleInterval for a caller that follows a running
+// child's live figures (CPUProgress): reading them more often than the
+// sampler refreshes them reads the same figure again.
+const TreeSampleInterval = treeSampleInterval
+
 // Limits are the runner-wide admission bounds, one rule for all three: zero is
 // no bound, a positive value is one, and a negative value is refused. A runner
 // beneath the process's reservation ledger states no memory figure and no count

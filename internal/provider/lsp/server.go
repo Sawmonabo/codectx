@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -59,11 +60,13 @@ type server struct {
 	// binding labels every result: provider, server version and input digest.
 	binding model.OverlayBinding
 
-	// room gives the server's reservation back to the admission ledger. It is
-	// called once, by onExit, after the process tree is reaped and the
+	// held is the server's reservation on the admission ledger. It is
+	// released once, by onExit, after the process tree is reaped and the
 	// materialization released: the ledger admits the next child only once
-	// this one no longer holds what it reserved.
-	room func()
+	// this one no longer holds what it reserved. While the server runs,
+	// follow raises it to the tree's live anonymous resident set.
+	held   *admission.Holding
+	follow *admission.Residency
 
 	runCancel context.CancelFunc
 	stdinR    *io.PipeReader
@@ -121,19 +124,23 @@ var errServerGone = errors.New("the language server process has exited")
 // handshake and negotiates the position encoding. Any failure releases the
 // process, the pipes and the materialization before returning.
 //
-// room is the reservation the server was admitted with, and startServer owns
+// held is the reservation the server was admitted with, and startServer owns
 // it on every path: a failure before a process exists gives it back at once,
 // and from the launch on it belongs to the server, whose exit gives it back.
+// The server's resident set once it has answered initialize -- the project
+// loaded -- is what its plan learns, which also lets the next server of its
+// class be planned from it rather than wait for this one to exit; growth past
+// the reservation afterwards raises the holding as it is read.
 //
 // The executable is not re-hashed here: internal/toolchain hashed the entry at
 // resolution and Profile.Tool carries that digest, so a second read of the same
 // file would prove nothing the fingerprint in the overlay binding does not
 // already commit to.
-func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile, room func()) (srv *server, err error) {
+func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile, held *admission.Holding) (srv *server, err error) {
 	launched := false
 	defer func() {
 		if !launched {
-			room()
+			held.Release()
 		}
 	}()
 	snap := view.Header()
@@ -229,15 +236,16 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		MaxStderrBytes:         0,
 		CPUProgress:            cpu,
 		Grace:                  m.opts.StopTimeout,
-		MemoryReservationBytes: p.MemoryBudgetBytes,
-		DiskReservationBytes:   p.DiskBudgetBytes,
+		MemoryReservationBytes: held.Bytes(),
+		DiskReservationBytes:   runnerDisk(held),
 	}
 	// From here a process tree exists (or is about to) and onExit will run, so
 	// the manager tracks the server until that happens even if it never
 	// becomes a usable entry, and the room is the server's to give back.
 	// Registering before the goroutine starts means untrack can never run
 	// before track.
-	s.room, launched = room, true
+	s.held, launched = held, true
+	s.follow = admission.FollowResidency(held, cpu.AnonResidentBytes, process.TreeSampleInterval)
 	m.track(s)
 	started := make(chan error, 1)
 	go func() {
@@ -260,6 +268,13 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	}()
 
 	if err = s.initialize(ctx, snap); err != nil {
+		// What the failed start was read using is a lower bound of its
+		// class's need, learned so a server that never starts is not planned
+		// at the whole allocation forever.
+		need, read := s.follow.Peak()
+		written, walked := admission.WrittenBytes(workDir, 0)
+		held.Observe(admission.ChildMeasure{MemoryBytes: need, MemoryRead: read,
+			WrittenBytes: written, WrittenRead: walked})
 		// A start that failed after the process exists must not leave it: the
 		// same path a running server takes on failure.
 		s.fail(err)
@@ -274,6 +289,10 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		}
 		return nil, err
 	}
+	need, read := s.follow.Peak()
+	written, walked := admission.WrittenBytes(workDir, 0)
+	held.Observe(admission.ChildMeasure{MemoryBytes: need, MemoryRead: read,
+		WrittenBytes: written, WrittenRead: walked, Succeeded: true})
 	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	return s, nil
 }
@@ -421,7 +440,13 @@ func (s *server) onExit(runErr error) {
 	// The process is gone and the materialization released, so the room it
 	// held is free: given back before exited closes, so every stop that waits
 	// on exited returns with the room already in the ledger.
-	s.room()
+	s.follow.Stop()
+	// What the server wrote over its life is its class's disk need too, read
+	// once more now that it has written all of it.
+	if written, walked := admission.WrittenBytes(s.profile.workDir(s.opts.DataDir), 0); walked {
+		s.held.ObserveWritten(written)
+	}
+	s.held.Release()
 	close(s.exited)
 	// Only now, with the tree reaped and the materialization gone, does Close
 	// no longer have to wait for this server.
@@ -683,4 +708,16 @@ func languageID(tag string) string {
 func isNotFound(err error) bool {
 	var typed *model.Error
 	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid
+}
+
+// runnerDisk is the temporary disk a server states to the runner, whose
+// account enforces the operator's resources.max_temp_bytes: the holding's
+// planned figure, or only the snapshot copy it is rooted in for a server whose
+// class has no prediction of what it writes, whose holding stands at the whole
+// disk allocation.
+func runnerDisk(held *admission.Holding) int64 {
+	if n, ok := held.Need(); ok && !n.DiskLearned {
+		return n.StagedBytes
+	}
+	return held.DiskBytes()
 }

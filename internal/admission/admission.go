@@ -397,6 +397,9 @@ func (l *Ledger) release(w *waiter) {
 type Holding struct {
 	l *Ledger
 	w *waiter
+	// child is the plan an external tool's holding was admitted on
+	// (HoldChild), and nil for every other holding.
+	child *childHold
 }
 
 // Hold blocks until r may be held and returns the admitted holding. It is the
@@ -492,8 +495,43 @@ func (h *Holding) Adjust(memoryBytes int64) {
 	}
 }
 
-// Release returns the holding, once, however often it is called.
-func (h *Holding) Release() { h.l.release(h.w) }
+// AdjustDisk is Adjust for the holding's temporary disk: upward it takes the
+// difference at once, since the bytes are on the disk already; downward it
+// returns the difference, which pumps the queue. A negative figure, and a
+// released holding, change nothing.
+func (h *Holding) AdjustDisk(diskBytes int64) {
+	if diskBytes < 0 {
+		return
+	}
+	l := h.l
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if h.w.released {
+		return
+	}
+	delta := diskBytes - h.w.diskBytes
+	h.w.diskBytes = diskBytes
+	l.diskUsed += delta
+	if delta < 0 {
+		l.pump()
+	}
+}
+
+// DiskBytes is the temporary disk the holding holds now, adjustments included.
+func (h *Holding) DiskBytes() int64 {
+	h.l.mu.Lock()
+	defer h.l.mu.Unlock()
+	return h.w.diskBytes
+}
+
+// Release returns the holding, once, however often it is called. An external
+// tool's holding also ends the plan it was admitted on (HoldChild).
+func (h *Holding) Release() {
+	h.l.release(h.w)
+	if h.child != nil {
+		h.child.end(ChildMeasure{})
+	}
+}
 
 // SetAllocation replaces the memory allocation with a re-derived figure and
 // pumps the queue: a raised figure admits the waiters that now fit, and a
