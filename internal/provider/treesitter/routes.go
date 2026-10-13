@@ -6,7 +6,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
@@ -105,10 +104,8 @@ type routeScan struct {
 	pending       []pendingMount
 	djangoEntries []djangoEntry
 	out           []routeFact
-	// nestOut are the file's NestJS routes and nestApp what it sets on
-	// the NestJS applications it creates, for the linker (nestLinks).
+	// nestOut are the file's NestJS routes, for the linker (nestLinks).
 	nestOut []nestRoute
-	nestApp *link.NestApp
 	// params are the Go routers the file's callables receive as
 	// parameters, by callable and parameter (goParamObj); fns is the
 	// file's analysed functions' callables, built on first use (goFns).
