@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -116,35 +115,50 @@ func Candidates(ctx context.Context, r GraphReader, req model.CandidateRequest) 
 	} else {
 		site = callSite{Name: req.Name, Shape: req.Shape, Arguments: req.Arguments, Language: req.Language}
 	}
-	ranked, err := rankCandidates(ctx, dr, site)
-	if err != nil {
-		return model.CandidatePage{}, err
-	}
 	query := candidateQueryHash(req)
 	after, err := parseCandidateCursor(req.Page.Cursor, gen, query)
 	if err != nil {
 		return model.CandidatePage{}, err
 	}
-	start := 0
-	if after != nil {
-		start, _ = slices.BinarySearchFunc(ranked, *after, compareRanked)
-		if start < len(ranked) && compareRanked(ranked[start], *after) == 0 {
-			start++
-		}
-	}
 	limit := pagination.PageLimit(ctx, req.Page.Limit)
-	end := min(start+limit, len(ranked))
-	page := model.CandidatePage{Total: int64(len(ranked)), Candidates: make([]model.Candidate, 0, end-start)}
+	// One pass over the name's declarations, in node id order, keeps per
+	// closeness step only the first limit candidates past the cursor: within a
+	// step they arrive in rank order already, so a later one can only rank
+	// below every one kept. The page is the first limit of the steps in order,
+	// the total is the count of every fit, and nothing past a page's own
+	// window is held.
+	var steps rankedSteps
+	var total, past int64
+	if err := scanCandidates(ctx, dr, site, func(c rankedCandidate) {
+		total++
+		if after != nil && compareRanked(c, *after) <= 0 {
+			return
+		}
+		past++
+		if len(steps[c.Step]) < limit {
+			steps[c.Step] = append(steps[c.Step], c.ID)
+		}
+	}); err != nil {
+		return model.CandidatePage{}, err
+	}
+	page := model.CandidatePage{Total: total, Candidates: make([]model.Candidate, 0, min(int64(limit), past))}
 	resolution := model.ResolutionNameOnly
-	if len(ranked) == 1 {
+	if total == 1 {
 		resolution = model.ResolutionUniqueName
 	}
-	for _, c := range ranked[start:end] {
-		page.Candidates = append(page.Candidates, model.Candidate{NodeID: c.ID, Resolution: resolution,
-			Closeness: closenessSteps[c.Step]})
+	var last rankedCandidate
+	for step, ids := range steps {
+		for _, id := range ids {
+			if len(page.Candidates) == limit {
+				break
+			}
+			page.Candidates = append(page.Candidates, model.Candidate{NodeID: id, Resolution: resolution,
+				Closeness: closenessSteps[step]})
+			last = rankedCandidate{Step: step, ID: id}
+		}
 	}
-	if end < len(ranked) {
-		page.Cursor = candidateCursor(gen, query, ranked[end-1])
+	if past > int64(len(page.Candidates)) {
+		page.Cursor = candidateCursor(gen, query, last)
 	}
 	if err := page.Validate(); err != nil {
 		return model.CandidatePage{}, err
@@ -153,7 +167,7 @@ func Candidates(ctx context.Context, r GraphReader, req model.CandidateRequest) 
 }
 
 // closenessSteps are the closeness steps in ranking order.
-var closenessSteps = []model.CandidateCloseness{
+var closenessSteps = [...]model.CandidateCloseness{
 	model.ClosenessSameFile, model.ClosenessSameDirectory, model.ClosenessImported,
 	model.ClosenessSameUnit, model.ClosenessElsewhere,
 }
@@ -171,33 +185,47 @@ func compareRanked(a, b rankedCandidate) int {
 	return cmp.Compare(a.ID, b.ID)
 }
 
-// rankCandidates reads every declaration of the site's name, keeps those that
-// fit it, and orders them. Every one is read: the total is exact and the
-// order is global, so no page can be ranked from a prefix.
-func rankCandidates(ctx context.Context, dr DeclarationReader, site callSite) ([]rankedCandidate, error) {
+// scanCandidates reads every declaration of the site's name, by node id, and
+// visits each that fits it with its closeness step. Every one is read: the
+// total is exact and the order is global, so no page can be ranked from a
+// prefix. What a caller keeps of the stream is its own choice; nothing is
+// held here.
+func scanCandidates(ctx context.Context, dr DeclarationReader, site callSite, visit func(rankedCandidate)) error {
 	if site.Reason == model.ReasonComputed || site.Name == "" {
-		return nil, nil
+		return nil
 	}
 	kinds := shapeKinds(site.Shape)
-	var out []rankedCandidate
 	var after model.NodeID
 	for {
 		page, next, err := dr.Declarations(ctx, site.Name, kinds, after, model.MaxPageItems)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, d := range page {
 			if site.fits(d.Node) {
-				out = append(out, rankedCandidate{Step: site.closeness(d), ID: d.Node.ID})
+				visit(rankedCandidate{Step: site.closeness(d), ID: d.Node.ID})
 			}
 		}
 		if next == "" {
-			break
+			return nil
 		}
 		after = next
 	}
-	slices.SortFunc(out, compareRanked)
-	return out, nil
+}
+
+// rankedSteps is the whole ranking of a site's candidates, for a caller that
+// consumes every one: the stream bucketed by closeness step, each bucket
+// already in node id order, so the ranking is the buckets in step order and
+// needs no sort.
+type rankedSteps [len(closenessSteps)][]model.NodeID
+
+// rankCandidates reads a site's whole ranking.
+func rankCandidates(ctx context.Context, dr DeclarationReader, site callSite) (rankedSteps, error) {
+	var steps rankedSteps
+	err := scanCandidates(ctx, dr, site, func(c rankedCandidate) {
+		steps[c.Step] = append(steps[c.Step], c.ID)
+	})
+	return steps, err
 }
 
 // candidateQueryHashDomain is the hash domain of the query a candidate

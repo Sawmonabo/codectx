@@ -319,8 +319,10 @@ func candidatesOfSites(ctx context.Context, r GraphReader, dr DeclarationReader,
 			if err != nil {
 				return err
 			}
-			for _, cand := range ranked {
-				emit(start, cand.ID, c.Rel)
+			for _, ids := range ranked {
+				for _, cand := range ids {
+					emit(start, cand, c.Rel)
+				}
 			}
 		}
 	}
