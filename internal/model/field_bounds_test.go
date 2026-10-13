@@ -28,7 +28,7 @@ func TestOversizeStorageFieldsDoNotFailTheUnit(t *testing.T) {
 	}
 	hit := SearchHit{NodeID: NodeID(id), FileID: FileID(id), Path: "a.go", Kind: NodeFunction,
 		Name: node.Name, QualifiedName: node.QualifiedName, Signature: wide,
-		Tier: TierExactName, Reasons: []string{strings.Repeat("r", MaxReasonBytes+1)}}
+		Tier: TierExactName}
 	if err := hit.Validate(); err != nil {
 		t.Fatalf("a search hit with oversize descriptive fields failed: %v", err)
 	}

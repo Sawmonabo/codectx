@@ -510,6 +510,18 @@ a callable's return node (kind `return`), which every callable has under the
 same name; a request whose kinds name `return` finds it. Symbol resolution
 and document symbols leave it out the same way.
 
+**Why a hit was found.** Each hit carries its `tier`, which is the whole
+explanation: an exact-tier hit scores 0 and sorts above every scored one
+because of its tier, and a lexical hit's `score_micros` is its BM25F score. A
+hit carries no list of reasons beside it, since such a list would repeat the
+tier; the table's REASON column is written from `tier` ("matched the
+exact_name tier"), after the fault of a hit whose range could not be read.
+The rule every answer follows: a list whose length grows with the repository
+(an impact entry's reasons, its route, a page of hits) is paged by reference
+and never cut; a list whose length its producer fixes (a hit's
+`unresolved_fields`, keyed by a fixed set of field names) may carry a
+validation bound.
+
 **Then the lexical tier.** The index returns the page's limit plus one of the
 results ranked after the last one served, so it knows whether another page
 exists; a page reads what follows the previous page, never the results before

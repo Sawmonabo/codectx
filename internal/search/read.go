@@ -249,15 +249,13 @@ const encodedHitOverhead = 80
 // callerResultBytes is what this side holds per result of a step beyond the
 // result's strings, which the library charges against the step's bound: the
 // encoded fields of the copy cgo hands over; the decoded index hit and its
-// kept copy; the served hit and the copy hydration fills; the span, the source
-// range and the reason the served hit carries; and hydration's index and span
-// lists.
+// kept copy; the served hit and the copy hydration fills; the span and the
+// source range the served hit carries; and hydration's index and span lists.
 func callerResultBytes() int64 {
 	return encodedHitOverhead +
 		2*int64(unsafe.Sizeof(textindex.Hit{})) +
 		2*int64(unsafe.Sizeof(model.SearchHit{})) +
 		int64(unsafe.Sizeof(model.ByteRange{})) + int64(unsafe.Sizeof(model.SourceRange{})) +
-		int64(unsafe.Sizeof("")) + int64(len(reasonFor(model.TierLexical))) +
 		int64(unsafe.Sizeof(0)) + int64(unsafe.Sizeof(model.ByteRange{}))
 }
 

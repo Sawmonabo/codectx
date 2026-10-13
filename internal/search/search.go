@@ -408,8 +408,7 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 			// A result is one occurrence even when the search counted none of
 			// its documents: a served hit reporting zero occurrences would read
 			// as a result that was not actually found.
-			OccurrenceCount: max(h.Occurrences, 1),
-			Reasons:         []string{reasonFor(model.TierLexical)}}, &bytes)
+			OccurrenceCount: max(h.Occurrences, 1)}, &bytes)
 	}
 	if page != nil && page.Canceled {
 		// The context ended the index search: what it returned is the best it
@@ -473,12 +472,12 @@ type exactEntry struct{ exactHit }
 
 // served projects the entry into the hit that is served and its byte interval.
 // The exact tiers are not ranked: a hit scores 0 and is one occurrence, and its
-// reason names the tier so a caller can see why it sorts above scored hits.
+// tier says why it sorts above scored hits.
 func (e exactEntry) served() (model.SearchHit, *model.ByteRange) {
 	n := e.Node.Node
 	return model.SearchHit{NodeID: n.ID, FileID: n.FileID, Path: e.Path, Kind: n.Kind, Name: n.Name,
 		QualifiedName: n.QualifiedName, Signature: n.Signature, Tier: e.Tier, ScoreMicros: 0,
-		OccurrenceCount: 1, Reasons: []string{reasonFor(e.Tier)}}, e.Node.Bytes
+		OccurrenceCount: 1}, e.Node.Bytes
 }
 
 // servableExact reports whether an exact candidate can be served under the
@@ -906,11 +905,6 @@ func (s *Service) hydrateNodes(ctx context.Context, reader *sqlite.PinnedReader,
 	}
 	return nil
 }
-
-// reasonFor is the bounded explanation a hit carries for the tier it was found
-// by. The exact and prefix tiers score 0 by construction, so without this a
-// caller would see a hit ranked above a scoring one with nothing saying why.
-func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + " tier" }
 
 // hitFilter is SearchRequest.Languages and .Paths, applied uniformly to every
 // tier. The lexical tier applies the path prefixes inside the search index and
