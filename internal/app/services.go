@@ -116,6 +116,7 @@ type ExploreService interface {
 	Search(ctx context.Context, req model.SearchRequest) (model.Page[model.SearchHit], error)
 	Symbol(ctx context.Context, req model.SymbolRequest) (model.Page[model.Node], error)
 	References(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
+	NodeMetadata(ctx context.Context, req model.NodeMetadataRequest) (model.Page[model.MetadataRow], error)
 	Graph(ctx context.Context, req model.GraphRequest) (model.GraphResult, error)
 	Path(ctx context.Context, req model.PathRequest) (model.PathResult, error)
 	Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error)

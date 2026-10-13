@@ -360,9 +360,14 @@ func (e *Engine) filesOfImportSites(ctx context.Context, r GraphReader, dr Decla
 			if !ok {
 				continue
 			}
-			fragments, ok := openImportFragments(d.Node)
+			fragments, rows, ok := openImportFragments(d.Node)
 			if !ok {
 				continue
+			}
+			if rows > 0 {
+				if fragments, err = rowFragments(ctx, dr, d.Node.ID, rows); err != nil {
+					return err
+				}
 			}
 			sites[c.Other] = true
 			if !loaded {

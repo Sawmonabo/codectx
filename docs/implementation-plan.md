@@ -2273,6 +2273,7 @@ Existing SDK compatibility behavior is not a reason to implement or preserve par
 | `codectx_find_symbol` | Resolve canonical IDs or names with explicit ambiguity. |
 | `codectx_symbol_info` | Definition metadata, signature, scope and paginated evidence. |
 | `codectx_references` | Reference occurrences and implementations, distinguish relations from occurrences. |
+| `codectx_node_metadata` | Paginated elements, in order, of one node metadata field stored as rows: a node whose metadata names `<field>_rows: n` (a field too long for the node row) holds those n elements here. |
 | `codectx_callers` | Bounded incoming graph with reasons. |
 | `codectx_callees` | Bounded outgoing graph with reasons. |
 | `codectx_dependency_path` | Bounded shortest path with evidence. |

@@ -644,17 +644,10 @@ func (f *filePublication) imports(imp *Import, group []idBinding) {
 // the import, named "import" and keyed in the file's scope by "openimport:",
 // the path and the import's bytes, and the file module's `imports` to it.
 func (f *filePublication) dynamicImports() error {
-	path := f.fv.Path
 	for i := range f.t.DynamicImports {
 		d := &f.t.DynamicImports[i]
 		f.counts.OpenImports++
-		meta, err := openImportMetadata(d.Fragments)
-		if err != nil {
-			return err
-		}
-		n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path,
-			NativeKey: fitKey("openimport:" + path + ":" + byteSpan(d.Range)), Kind: model.NodeModule,
-			Language: f.t.Language, Name: "import"}, d.Range, meta)
+		n, err := f.openImportSite(d)
 		if err != nil {
 			return err
 		}

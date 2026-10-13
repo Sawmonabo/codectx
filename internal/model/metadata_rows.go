@@ -276,3 +276,26 @@ func encodeJSON(v any) (json.RawMessage, error) {
 	out := bytes.TrimRight(buf.Bytes(), "\n")
 	return out, nil
 }
+
+// NodeMetadataRequest pages the metadata rows of one field of one node: the
+// field a node's metadata names with a "<field>_rows" marker. Rows come in
+// ordinal order, so the pages concatenated are the field's value in order.
+type NodeMetadataRequest struct {
+	GenerationID GenerationID `json:"generation_id,omitempty"`
+	NodeID       NodeID       `json:"node_id"`
+	// Field is the metadata field, the marker's key without its "_rows"
+	// suffix (`decorators`, `fragments`, `unresolved_lines`, `scripts`, ...).
+	Field string      `json:"field"`
+	Page  PageRequest `json:"page"`
+}
+
+// Validate enforces the request shape.
+func (r NodeMetadataRequest) Validate() error {
+	if err := requireID("node_metadata.node_id", string(r.NodeID)); err != nil {
+		return err
+	}
+	if err := requireField("node_metadata.field", r.Field, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	return r.Page.ValidatePinned("node_metadata", r.GenerationID)
+}

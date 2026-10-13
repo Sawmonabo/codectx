@@ -1,6 +1,8 @@
 package sqlite
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -862,4 +864,34 @@ func (g *graphReader) FileNodes(ctx context.Context, files []model.FileVersion) 
 		}
 	}
 	return out, nil
+}
+
+var _ graph.MetadataRowReader = (*graphReader)(nil)
+
+// MetadataRows reads every visible metadata row of node's field: the node's
+// evidence rows whose detail is a model.MetadataRow of that field, keyset
+// paged on evidence id through the node index, then ordered by ordinal. A row
+// repeated by two visible units of one carry chain is served once.
+func (g *graphReader) MetadataRows(ctx context.Context, node model.NodeID, field string) ([]model.MetadataRow, error) {
+	var out []model.MetadataRow
+	var after model.EvidenceID
+	for {
+		rows, err := g.r.Evidence(ctx, node, "", after, model.MaxPageItems)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			if r, ok := model.ParseMetadataRow(row.Evidence.Detail); ok && r.Field == field {
+				out = append(out, r)
+			}
+		}
+		if len(rows) == 0 || len(rows) < pageLimit(ctx, model.MaxPageItems) {
+			break
+		}
+		after = rows[len(rows)-1].Evidence.ID
+	}
+	slices.SortStableFunc(out, func(a, b model.MetadataRow) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
+	return slices.CompactFunc(out, func(a, b model.MetadataRow) bool {
+		return a.Ordinal == b.Ordinal && a.Shape == b.Shape && a.Key == b.Key && bytes.Equal(a.Value, b.Value)
+	}), nil
 }
