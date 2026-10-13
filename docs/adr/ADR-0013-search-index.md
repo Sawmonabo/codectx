@@ -286,8 +286,9 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   none when one segment alone holds runs and marks, since no other segment can hold its group. Strings are read only
   for the results served and for each truncated segment's worst entry, one sorted dictionary pass per column and
   segment, the segments in parallel: a sorted pass decodes each dictionary block once for all the ordinals it holds,
-  where a lookup of one ordinal decodes its block from the start (see Sources), so a page reads no more blocks than a
-  resolution of every heap did, from fewer ordinals. The occurrence counts sum each run's entry of a served group,
+  where a lookup of one ordinal decodes its block (about 4 KB of deltas) from the start (see Sources). A page thus
+  resolves at most depth ordinals per column where a resolution of every heap resolved depth + 1 per segment; the
+  key reads are the only lookups a block can see twice, one column's, and only when several segments hold runs. The occurrence counts sum each run's entry of a served group,
   each segment counted in parallel. This is the
   query-then-fetch shape of the major engines: each shard returns sort keys, a k-way merge of the sorted per-shard
   lists picks the winners, and only the winners are fetched (see Sources). Resolving every segment's heap to strings
@@ -303,7 +304,9 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   the merge before a result that would pass the bound, so a bounded page is an exact prefix that says more. A bounded
   page reads its results' strings by the sorted pass, charging each string as it is read, and gives the pass up the
   moment the charges pass the bound; only then does the merge run again reading each result's strings as it meets it,
-  so the page stops exactly where the bound falls and the pass never holds more than the bound. A page
+  so the page stops exactly where the bound falls and the pass never holds more than the bound. A key's charge is
+  never more than its result's, so when the pass fits, the merge that reads every string would take the same results
+  and stop no later. A page
   reports a bound on the groups the next position marks: its marked groups plus the run entries it took up to its last
   result, each of which sorts at or before that result.
 - **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
@@ -493,7 +496,8 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
     optimization, https://www.elastic.co/docs/solutions/search/the-search-api (`track_total_hits`);
   - a dictionary lookup of one ordinal decodes its block from the block's first term, and a sorted pass over many
     ordinals decodes each block once, `Dictionary::ord_to_term` and `Dictionary::sorted_ords_to_term_cb`,
-    https://github.com/quickwit-oss/tantivy/blob/0.26.0/sstable/src/dictionary.rs;
+    https://github.com/quickwit-oss/tantivy/blob/0.26.0/sstable/src/dictionary.rs, with blocks cut at 4,000 bytes,
+    `BLOCK_LEN` in `sstable/src/delta.rs` at the same tag;
   - query-then-fetch: the coordinator merges each shard's top keys and fetches only the winning documents,
     https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/action/search/SearchPhaseController.java
     and `FetchSearchPhase.java` at the same tag; deep pages cost memory and time in from + size,

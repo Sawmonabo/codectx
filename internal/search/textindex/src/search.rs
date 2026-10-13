@@ -260,13 +260,14 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         let mut m = merge(&fruits, cut.as_ref(), req.depth, first, budget, req.result_bytes)?;
         if bounded && first == Read::Keys {
             // A bounded page reads its results' strings in one sorted pass per
-            // column while their charges fit the bound. When the keys alone
-            // passed it, or the strings do, the merge reads each result's
-            // strings as it meets it and stops where the bound falls, so the
-            // page is the same either way.
+            // column while their charges fit the bound. A key charge is never
+            // more than the full one, so when the full charges of the results
+            // the keys merge took fit, a merge reading each result's strings as
+            // it meets it takes the same results and stops no later; only when
+            // they do not fit does that merge run, stopping where the bound
+            // falls. The page is the same either way.
             let n = m.out.len().min(req.depth);
-            let fit = !m.stopped
-                && resolve(&view.index.executor, &fruits, &mut m.out[..n], Some((budget, req.result_bytes)))?;
+            let fit = resolve(&view.index.executor, &fruits, &mut m.out[..n], Some((budget, req.result_bytes)))?;
             if !fit {
                 drop(m);
                 m = merge(&fruits, cut.as_ref(), req.depth, Read::Strings, budget, req.result_bytes)?;
