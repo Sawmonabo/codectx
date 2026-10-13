@@ -604,10 +604,10 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 		t.Errorf("one hydration read pulled %d bytes, over the %d-byte window", counter.maxRead, maxRangeWindowBytes)
 	}
 
-	// SV2: a file that is ONE LINE of megabytes -- a minified bundle, a
-	// generated data file. No line checkpoint can exist inside it, so
-	// resolving a hit 4.5 MiB in used to ask the CAS for that whole span in
-	// one call and failed the WHOLE answer with CTX_RESOURCE_LIMIT ("byte
+	// A file that is ONE LINE of megabytes -- a minified bundle, a
+	// generated data file. No line checkpoint can exist inside it. Mutation:
+	// resolving a hit 4.5 MiB in by asking the CAS for that whole span in one
+	// call fails the WHOLE answer with CTX_RESOURCE_LIMIT ("byte
 	// range spans 4292608 bytes, over the 1048576-byte read ceiling").
 	head := "// generated -- do not edit\n"
 	longTarget := "func café() string { return foo(bar) }"
@@ -1394,9 +1394,9 @@ func (s *stubFileReader) NodesAmong(context.Context, sqlite.NodeFilter, []model.
 }
 
 // legPathResolverHoldsOnePage proves the exact tiers' path cache is bounded by
-// the READ PAGE and not by the answer: the resolver used to memoize one entry
-// per distinct file of the whole request, so a symbol query spanning a
-// repository's files cost that much heap for the life of the request.
+// the READ PAGE and not by the answer. Mutation: a resolver that memoizes one
+// entry per distinct file of the whole request, so a symbol query spanning a
+// repository's files costs that much heap for the life of the request.
 //
 // Every path is still served -- the count below is the answer, and an evicted
 // entry costs one more File read, which is the whole trade.

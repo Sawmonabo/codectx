@@ -290,10 +290,9 @@ const packageDepsEndpoint = "graph.package_dependencies"
 // to expand (or runWalkToCompletion) as its visit function. The package rollup
 // ignores it: a pair is a fact about the edge's endpoints alone.
 //
-// The edge arrives as SURROGATES. That is what removed the rollup's last
-// canonical-id-to-surrogate resolution: every read it does -- the container
-// side array, the evidence counts -- is keyed by ref, so the batch now goes
-// straight into them instead of being resolved back first.
+// The edge arrives as SURROGATES, so the rollup resolves no canonical id:
+// every read it does -- the container side array, the evidence counts -- is
+// keyed by ref, and the batch goes straight into them.
 type edgeSink interface {
 	Visit(state frontierState, e Edge) error
 }

@@ -484,7 +484,7 @@ The parent cannot fulfill a subagent's read requirement by sending a summary or 
 <a id="91-identifiers-and-semantic-bindings"></a>
 ### 9.1 Identifiers and Semantic Bindings
 
-Public content-derived IDs are lowercase SHA-256 hex strings; SQLite stores their decoded 32 bytes. Numeric SQLite row IDs never escape as entity identity. `GenerationID` is an installation-local integer used for lookup, not a reproducible analysis fingerprint. Session and run IDs use cryptographic randomness and are operational identifiers, not semantic hashes.
+Public content-derived IDs are lowercase SHA-256 hex strings; SQLite stores their decoded 32 bytes. The one exception is `EvidenceID`, the first 16 bytes of its SHA-256 derivation (32 hex characters), stored as those 16 bytes. Numeric SQLite row IDs never escape as entity identity. `GenerationID` is an installation-local integer used for lookup, not a reproducible analysis fingerprint. Session and run IDs use cryptographic randomness and are operational identifiers, not semantic hashes.
 
 ```go
 type RepositoryID string
@@ -1233,9 +1233,12 @@ CREATE TABLE relation_facts (
 -- clipEvidence clips surplus evidence BY id value. The id is a pure function of the evidence
 -- fields (model.NewEvidenceID), so this uniqueness is a derived invariant, not
 -- an arbitrary surrogate, and the value reaches the wire as
--- ReferenceOccurrence.evidence_id and FactReference.evidence_ids.
+-- ReferenceOccurrence.evidence_id and FactReference.evidence_ids. It is the
+-- first 16 bytes of that derivation (model.EvidenceIDBytes, ADR-0003 SS2.2):
+-- the width is paid in the record, in the primary key's automatic index and
+-- in idx_evidence_unit, the three b-trees that carry it.
 CREATE TABLE evidence (
-    id BLOB PRIMARY KEY CHECK(length(id) = 32),
+    id BLOB PRIMARY KEY CHECK(length(id) = 16),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     node_id INTEGER,
     relation_id INTEGER,
@@ -1382,9 +1385,17 @@ CREATE TABLE context_entries (
     estimated_bytes INTEGER NOT NULL CHECK(estimated_bytes >= 0),
     estimated_tokens INTEGER NOT NULL CHECK(estimated_tokens >= 0),
     reasons_json TEXT NOT NULL,
-    evidence_paths_json TEXT NOT NULL,
+    route_count INTEGER NOT NULL CHECK(route_count >= 0),
     PRIMARY KEY(manifest_id, ordinal),
     CHECK(node_id IS NOT NULL OR file_id IS NOT NULL)
+) WITHOUT ROWID;
+CREATE TABLE context_entry_routes (
+    manifest_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL,
+    route_index INTEGER NOT NULL CHECK(route_index >= 0),
+    relations BLOB NOT NULL CHECK(length(relations) > 0 AND length(relations) % 32 = 0),
+    PRIMARY KEY(manifest_id, ordinal, route_index),
+    FOREIGN KEY(manifest_id, ordinal) REFERENCES context_entries(manifest_id, ordinal) ON DELETE CASCADE
 ) WITHOUT ROWID;
 CREATE TABLE context_slices (
     manifest_id BLOB NOT NULL REFERENCES context_manifests(id) ON DELETE CASCADE,
@@ -1597,6 +1608,39 @@ CREATE UNIQUE INDEX idx_lease_owner ON retention_leases(owner_kind, owner_ref) W
 -- The grace pass asks for the trashed blobs whose window has elapsed; without
 -- this index that question is a full scan of blobs on every collection pass.
 CREATE INDEX idx_blob_trash ON blobs(state, trashed_at);
+-- Foreign-key child keys. Every connection runs with foreign_keys=ON, so a
+-- DELETE of a parent row first proves no child row still names it, and with
+-- the child column unindexed that proof is a full scan of the child table PER
+-- DELETED ROW -- invisible to the statement's own plan. The same columns are
+-- what the collector's reachability probes ask about. Each index below turns
+-- one such scan into a lookup:
+--   snapshot_files(file_id)        the orphan-file sweep and every files delete
+--   snapshot_files(content_hash)   blob reachability and every blobs delete
+--   unit_inputs(content_hash)      the same, for the unit side
+--   session_files(snapshot_id, file_id, content_hash)
+--                                  the snapshot_files cascade of a snapshot delete
+--   retention_leases(snapshot_id), retention_leases(generation_id)
+--                                  every snapshot and generation delete
+--   provider_runs(generation_id)   the ON DELETE SET NULL of a generation delete
+--   units(origin_run_id)           the provider-run sweep and every run delete
+--   context_manifests(generation_id, snapshot_id)
+--                                  every generation delete
+--   read_sessions(manifest_id, generation_id, snapshot_id), session_manifests(manifest_id)
+--                                  every context-manifest delete
+-- The write cost is one key per child row, the largest being unit_inputs and
+-- snapshot_files: about 70 bytes per file per unit input or per retained
+-- snapshot, against a scan of the whole table per deletion without it.
+CREATE INDEX idx_snapshot_files_file ON snapshot_files(file_id);
+CREATE INDEX idx_snapshot_files_blob ON snapshot_files(content_hash);
+CREATE INDEX idx_unit_input_blob ON unit_inputs(content_hash);
+CREATE INDEX idx_session_files_snapshot ON session_files(snapshot_id, file_id, content_hash);
+CREATE INDEX idx_lease_snapshot ON retention_leases(snapshot_id);
+CREATE INDEX idx_lease_generation ON retention_leases(generation_id);
+CREATE INDEX idx_provider_runs_generation ON provider_runs(generation_id);
+CREATE INDEX idx_units_origin_run ON units(origin_run_id);
+CREATE INDEX idx_context_manifests_generation ON context_manifests(generation_id, snapshot_id);
+CREATE INDEX idx_read_sessions_manifest ON read_sessions(manifest_id, generation_id, snapshot_id);
+CREATE INDEX idx_session_manifests_manifest ON session_manifests(manifest_id);
 -- The supplied `--scip-index` paths one generation was built with, recorded
 -- whether or not the path resolved to anything. An unresolved path leaves no
 -- unit behind, so the absence of a unit is precisely the observation this table
@@ -1934,12 +1978,18 @@ type ContextEntry struct {
     EstimatedTokens int64 `json:"estimated_tokens"`
     Reasons []string `json:"reasons"`
     EvidencePaths [][]RelationID `json:"evidence_paths,omitempty"`
+    RouteCount int64 `json:"route_count"`
 }
 type ContextSlice struct {
     Index int `json:"index"`
     EntryOrdinals []int `json:"entry_ordinals"`
     EstimatedBytes int64 `json:"estimated_bytes"`
     EstimatedTokens int64 `json:"estimated_tokens"`
+}
+type ContextRoute struct {
+    Entry int `json:"entry"`
+    Index int `json:"index"`
+    Relations []RelationID `json:"relations"`
 }
 type ContextManifest struct {
     ID ManifestID `json:"id"`
@@ -2204,7 +2254,7 @@ codectx impact <name-or-id> [--depth N] [--limit N] [--cursor TOKEN] [--json]
 codectx context plan --task TEXT --phase sweep|verify --actor ID [--seed SEED] [--budget N] [--json]
 codectx context status SESSION --actor ID [--limit N] [--cursor TOKEN] [--json]
 codectx context next SESSION --actor ID [--json]
-codectx context entries SESSION --actor ID [--view entries|slices|excluded] [--limit N] [--cursor TOKEN] [--json]
+codectx context entries SESSION --actor ID [--view entries|slices|excluded|routes] [--limit N] [--cursor TOKEN] [--json]
 codectx context include SESSION --actor ID --seed SEED --expected-version N [--json]
 codectx context read SESSION FILE --actor ID [--offset N] [--max-bytes N] [--confirm-receipt TOKEN] [--json]
 codectx context acknowledge SESSION --actor ID --receipt TOKEN [--json]
@@ -3558,7 +3608,7 @@ go vet ./...
 
 **What was left open at this step, and where each item stands.** The first two have since closed; the last two are still open:
 
-- **Capsule pagination — closed since.** It was left to its own sub-track rather than half-landed here, because making the capsule a paginated, resumable surface is a schema append plus changes across the workflow, MCP and CLI layers. Until it landed, two finite default bounds — a 250 000-file coverage ceiling and a 1 000-record ceiling on every other capsule list — refused to seal an over-large capsule, explicitly (`CTX_RESOURCE_LIMIT`, naming the list and the bound) and never by truncating it; they were the last default caps in the tree. Both are gone. The capsule's lists are now durable per-list rows read one page at a time, and the two ceilings are the configuration keys `context.max_capsule_records_per_list` and `context.max_capsule_coverage_files`, unlimited by default. No default cap remains.
+- **Capsule pagination.** The capsule's lists are durable per-list rows read one page at a time, and their two ceilings are the configuration keys `context.max_capsule_records_per_list` and `context.max_capsule_coverage_files`, unlimited by default. No default cap remains.
 - **The storage-amplification redesign — landed since.** It ran as a separate track with its own verification gate: integer surrogate row identities and two interned string dictionaries. On a real 4 019-file repository indexed twice, once by each binary and with identical row counts in every identity table, 1 005 887 488 → 632 266 752 stored bytes and **5 732.8 → 3 603.5 bytes per indexed symbol, −37.1 %**. The decision and the alternatives refused on the way are [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md).
 - **Reference-scale miss: indexing memory.** Process-tree peak measured **912.6 MiB** against a **768 MiB** envelope on the 1M-line reference corpus (the cold index itself passed, at 2m56s). Open.
 - **Reference-scale miss: storage amplification.** **16.10×** stored bytes over eligible source bytes against a **3.5×** budget, measured on the corrected ~8 KiB/file reference corpus. Still open: the redesign that attacks it has landed (above), but the ratio has not been re-measured since, and bytes-per-indexed-symbol — not this ratio — is the regression metric the storage track gates on.

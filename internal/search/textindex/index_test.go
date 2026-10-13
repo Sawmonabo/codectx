@@ -217,9 +217,14 @@ var engineQueries = []string{"hot", "kalo", "mika pune", "hot rasi", "kaloMika",
 
 // TestPrunedPagesEqualExhaustiveScoring compares every pruned page with the
 // exhaustive reference (IgnoreSummaries) on a fixture of several segments,
-// for both length rules, pages 1 to 5, with kind and path filters, with
-// hidden units, at one and four search threads, and checks that pruning
-// actually skipped blocks so the comparison is not vacuous.
+// for both length rules, pages 1 to 5 of 10 and of 200 results, with kind and
+// path filters, with hidden units, at one and four search threads, and checks
+// that pruning skipped blocks under every thread count, view and length rule,
+// so no part of the comparison is vacuous. A block is skipped only once a
+// segment's heap is full and the block's bound falls below the heap's worst
+// score: on this fixture that happens on the pages of 10, while the pages of
+// 200 fill their heaps late and every remaining block's bound still beats the
+// worst score.
 //
 // Mutation caught: a block bound computed with the other length rule's
 // minimum length (the bound then undercuts true scores and a page loses or
@@ -237,7 +242,6 @@ func TestPrunedPagesEqualExhaustiveScoring(t *testing.T) {
 		{prefixes: []string{"pkg1", "pkg3/sub2"}},
 		{kinds: []model.NodeKind{model.NodeFile}, prefixes: []string{"pkg2"}},
 	}
-	skipped := false
 	for _, threads := range []int{1, 4} {
 		x := openReadOnly(t, dir, threads)
 		for gen, hide := range []int{0, 4} {
@@ -246,31 +250,36 @@ func TestPrunedPagesEqualExhaustiveScoring(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
+				skipped := false
 				for _, q := range engineQueries {
 					for fi, f := range filters {
-						for pageNo := 1; pageNo <= 5; pageNo++ {
-							r := Request{Query: q, Kinds: f.kinds, PathPrefixes: f.prefixes, Depth: 200 * pageNo, LengthRule: rule}
-							pruned := search(t, v, r)
-							r.IgnoreSummaries = true
-							full := search(t, v, r)
-							if err := samePage(pruned, full); err != nil {
-								t.Fatalf("threads %d hide %d rule %d query %q filter %d page %d: %v", threads, hide, rule, q, fi, pageNo, err)
-							}
-							if pruned.Stats.SegmentsWithoutSummary != 0 {
-								t.Fatalf("a committed segment has no summary: %+v", pruned.Stats)
-							}
-							if pruned.Stats.BlocksScored < pruned.Stats.BlocksTotal {
-								skipped = true
+						for _, size := range []int{10, 200} {
+							for pageNo := 1; pageNo <= 5; pageNo++ {
+								r := Request{Query: q, Kinds: f.kinds, PathPrefixes: f.prefixes, Depth: size * pageNo, LengthRule: rule}
+								pruned := search(t, v, r)
+								r.IgnoreSummaries = true
+								full := search(t, v, r)
+								if err := samePage(pruned, full); err != nil {
+									t.Fatalf("threads %d hide %d rule %d query %q filter %d depth %d: %v",
+										threads, hide, rule, q, fi, r.Depth, err)
+								}
+								if pruned.Stats.SegmentsWithoutSummary != 0 {
+									t.Fatalf("a committed segment has no summary: %+v", pruned.Stats)
+								}
+								if pruned.Stats.BlocksScored < pruned.Stats.BlocksTotal {
+									skipped = true
+								}
 							}
 						}
 					}
 				}
+				if !skipped {
+					t.Fatalf("threads %d hide %d rule %d: no search skipped a block, so the comparison proves nothing about pruning",
+						threads, hide, rule)
+				}
 			}
 			v.Close()
 		}
-	}
-	if !skipped {
-		t.Fatal("no search skipped a block: the comparison proves nothing about pruning")
 	}
 }
 
@@ -492,6 +501,14 @@ func TestPanicInsideAnExportReturnsAnError(t *testing.T) {
 // Mutation caught: a position applied per document rather than per folded
 // result (a node served before the position comes back through a lower-scoring
 // document of it).
+//
+// Every page's block counts cover the same scoring passes: the exhaustive page
+// scores every block it counts, and the pruned page never scores more than it
+// counts, on pages that rescored (a heap grown past depth+1) as on the rest.
+//
+// Mutation caught: blocks_total counted over the last pass while
+// blocks_scored sums every pass (a rescored exhaustive page then reports more
+// blocks scored than exist).
 func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	c := genCorpus(4, 5000, 100)
 	dir := t.TempDir()
@@ -503,7 +520,7 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	}
 	defer v.Close()
 	rng := rand.New(rand.NewPCG(4, 4))
-	ties := 0
+	ties, rescored := 0, 0
 	for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
 		for _, kinds := range [][]model.NodeKind{nil, {model.NodeFunction, model.NodeFile}} {
 			for _, q := range engineQueries {
@@ -533,10 +550,22 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 						if err := samePage(got, want); err != nil {
 							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d: %v", rule, kinds, q, i, d, err)
 						}
+						if got.Stats.BlocksScored > got.Stats.BlocksTotal {
+							t.Fatalf("query %q after hit %d depth %d: %d blocks scored of %d", q, i, d,
+								got.Stats.BlocksScored, got.Stats.BlocksTotal)
+						}
 						r.IgnoreSummaries = true
-						if err := samePage(search(t, v, r), want); err != nil {
+						full := search(t, v, r)
+						if err := samePage(full, want); err != nil {
 							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d, exhaustive: %v",
 								rule, kinds, q, i, d, err)
+						}
+						if full.Stats.BlocksScored != full.Stats.BlocksTotal {
+							t.Fatalf("query %q after hit %d depth %d, exhaustive: %d blocks scored of %d (cap %d)",
+								q, i, d, full.Stats.BlocksScored, full.Stats.BlocksTotal, full.Stats.Cap)
+						}
+						if full.Stats.Cap > int64(d)+1 {
+							rescored++
 						}
 					}
 				}
@@ -545,6 +574,9 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	}
 	if ties == 0 {
 		t.Fatal("no tied scores in the fixture: the test proves nothing about ties at a page edge")
+	}
+	if rescored == 0 {
+		t.Fatal("no page rescored: the test proves nothing about block counts across passes")
 	}
 
 	// A hidden document is not a position of this view.

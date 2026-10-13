@@ -132,7 +132,7 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		add(EntryImport, imp.Name+"\x00"+imp.Path, i, imp)
 	}
 	for i, d := range t.Decls {
-		d.Range, d.CanonicalKey = model.SourceRange{}, ""
+		d.Range, d.NameRange, d.CanonicalKey = model.SourceRange{}, nil, ""
 		if d.Return != nil {
 			ret := *d.Return
 			ret.Range, ret.NameRange, ret.CanonicalKey = model.SourceRange{}, nil, ""
@@ -141,7 +141,7 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		if len(d.Parameters) > 0 {
 			d.Parameters = slices.Clone(d.Parameters)
 			for j := range d.Parameters {
-				d.Parameters[j].Range, d.Parameters[j].CanonicalKey = model.SourceRange{}, ""
+				d.Parameters[j].Range, d.Parameters[j].NameRange, d.Parameters[j].CanonicalKey = model.SourceRange{}, nil, ""
 			}
 		}
 		add(EntryDeclaration, string(d.Node), i, d)

@@ -101,8 +101,10 @@ languages and the documentation, build and configuration extensions.
 analyzer providers call; the tags for the bundled grammars match
 `tree_sitter.languages`. A `.h` header, which the C and C++ grammars both
 declare, is tagged within its snapshot (`lang.For`): the grammar the snapshot's
-C and C++ translation-unit census parses headers with first. The manifest row,
-the search language filter and the file node all carry that tag.
+C and C++ translation-unit census parses headers with first. The manifest row
+and the file node carry that tag. The search language filter tags a header
+with the grammar the pinned generation's structural parse kept
+(`lang.Tagger.In`; docs/providers-treesitter.md "Language detection").
 
 Recognition-only nodes (a Dockerfile, a Terraform file, an OpenAPI
 description) are emitted by `filesystem`, not by `manifest`: classification is
@@ -305,18 +307,14 @@ of pip's requirements file format:
   is a bare URL, path or archive, and an include that is a URL
   (`reason: url`), absolute (`absolute`), outside the workspace
   (`outside_workspace`) or names an environment variable (`environment`).
-  Each such line is one evidence row on the file's `configuration` node, at
-  precision `syntax`, whose detail is `line` (the text), `reason` (for an
-  include) and `via` (for a line of an included file). A line of the unit's
-  own file carries its range; a line of an included file carries none, like
-  that file's requirements. The node has no metadata list of these lines: a
-  node's metadata is one payload bounded at 8 KiB, past which it is replaced
-  by `{"truncated":true}`, while its evidence is rows read a page at a time,
-  so a file with thousands of option lines keeps every one. A line longer
-  than the evidence detail bound (1 KiB) is shortened, and the capability
-  is `partial` with `CTX_RESOURCE_LIMIT` and counts such lines under the
-  detail `evidence_detail_bytes`; two identical lines of
-  the same included file, having no range to tell them apart, are one row.
+  Each such line is one metadata row (`unresolved_lines`) on the file's
+  `configuration` node, at precision `syntax`, whose value is `line` (the
+  text, never cut), `reason` (for an include) and `via` (for a line of an
+  included file), with its ordinal; the node's metadata counts them under
+  `unresolved_lines_rows`, and `codectx_node_metadata` pages them in order
+  (Node metadata, below). A line of the unit's own file carries its range; a
+  line of an included file carries none, like that file's requirements. Two
+  identical lines are two rows: the ordinal tells them apart.
   A requirement that names an environment variable after its name is
   published with `unresolved: environment`.
 - An include the snapshot does not hold, or an `-r`/`-c` with no path
@@ -343,9 +341,9 @@ scope:
 | the file does not parse as its format | `failed` | `CTX_ARGUMENT_INVALID` |
 | size over `workspace.max_parse_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |
 
-A requirements file adds the two outcomes its own section lists: an
-included file over `workspace.max_parse_file_bytes`, and a line shortened to
-the evidence detail bound, each `partial` with `CTX_RESOURCE_LIMIT`.
+A requirements file adds the outcome its own section lists: an included
+file over `workspace.max_parse_file_bytes`, `partial` with
+`CTX_RESOURCE_LIMIT`.
 
 A malformed manifest is a failed capability of that file; the unit still
 seals with the file node, and the provider run continues. Only a snapshot
@@ -361,3 +359,25 @@ it publishes, and hands records to the sink in the order storage requires:
 nodes, then relations, aliases and search documents. Streamed chunks are put
 after the nodes have been flushed. It also collects the per-file capability
 states and the run counters for the `ProviderResult`.
+
+### Node metadata
+
+A node's metadata is one JSON object on the node row, bounded at 8 KiB
+(`model.MaxMetadataBytes`) as a row-shape bound, never as a cap on facts.
+Every field stays inline while the object fits. A field whose value would
+push it past the bound (in practice a long list: a declaration's
+decorators, an open import site's fragments, a manifest's scripts, a
+requirements file's uninterpreted lines) is stored instead as metadata rows,
+one evidence row per element on the same node, and the object keeps its
+scalars inline with a marker `<field>_rows` holding the number of rows
+(`model.SplitMetadata`, `internal/model/metadata_rows.go`). The object is
+never replaced by `{"truncated":true}`. An element whose encoded JSON passes
+32 KiB (`model.MaxMetadataPieceBytes`) is stored as ordered piece rows
+(`part`, `parts`, each value a run of the element's JSON as a string), so no
+row passes the storage batch and no element is cut; readers rejoin them, so
+`codectx_node_metadata` always pages whole elements in order. The rows are
+evidence of the node, so they share its per-fact evidence bound
+(`index.max_evidence_per_fact`, unlimited by default, which resolves to the
+record ceiling `model.MaxEvidencePerFact`): a row past it is clipped and
+counted under `evidence_clipped` on the capability row, and a piece is kept or
+clipped with its siblings, never alone.

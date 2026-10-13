@@ -814,9 +814,9 @@ func TestManagedToolIdentity(t *testing.T) {
 
 // TestOverLimitFieldsAreDroppedAndCounted protects the field bounds: a value over a
 // wire field bound is degradation of that record, never a refusal of the
-// index. One 128-KiB generated symbol name in a monorepo's index used to abort
-// the whole import, so the unit published nothing at all -- the maximal
-// version of the loss it was guarding against.
+// index. Mutation: one 128-KiB generated symbol name in a monorepo's index
+// aborts the whole import, so the unit publishes nothing at all -- the maximal
+// version of the loss the bound guards against.
 //
 // The two halves the split rests on are asserted together: an over-limit
 // IDENTIFYING field (the occurrence's symbol) drops that RECORD, because a
@@ -918,9 +918,9 @@ func TestUserSetImportBoundsAreReportedNotRefused(t *testing.T) {
 
 // TestOverLimitSignatureIsTruncatedNotDropped protects signature parity: the two producers
 // of a signature must answer the same way. The structural provider truncates a
-// long signature to its ceiling and flags the cut; this one used to discard it
-// whole, so the same symbol carried a usable prefix from one and nothing at
-// all from the other.
+// long signature to its ceiling and flags the cut; this one must too, or the
+// same symbol carries a usable prefix from one and nothing at all from the
+// other.
 func TestOverLimitSignatureIsTruncatedNotDropped(t *testing.T) {
 	files := fixture(t)
 	long := strings.Repeat("s", model.MaxSignatureBytes+64)

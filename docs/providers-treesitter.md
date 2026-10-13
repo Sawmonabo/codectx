@@ -124,8 +124,11 @@ disambiguator separates declarations that share a path: the parameter types as
 written where the language overloads (Java, C++, TypeScript and TSX, from the
 link table's signature, with the parameter count), the conditional branches
 around the declaration (`wire.Decl.Branch`: `if`/`elif`/`else` arms, `try`
-arms, `switch`/`match`/`select` cases, the `#if` family, a Rust `#[cfg]`), and
-whether a C or C++ declaration is a prototype; a nested declaration carries its
+arms, `switch`/`match`/`select` cases, the `#if` family, a Rust `#[cfg]`, each
+`cfg(q)` a `#[cfg_attr(p, ...)]` applies (`cfg_attr "p" cfg "(q)"`), the cfg of a
+match arm after the arm's element, and the item-position macro body or brace
+group a Rust item is written in (`macro "<path>"`, `macro "<path>" "<header>"`)),
+and whether a C or C++ declaration is a prototype; a nested declaration carries its
 parent's disambiguator ahead of its own. Exact duplicates left after that (a
 name defined twice at one level) are settled by content: the first in source
 order keeps the plain identity, each later one is keyed by the digest of its
@@ -339,12 +342,16 @@ in a file that does not define the macro), all of them are published under
 `return_types` as the set the declared type is one of, they are not counted
 as macros, and the export carries no single return type or typed signature.
 
-**Decorator facts.** Every declaration publishes its decorators, annotations
+**Decorator facts.** Every declaration publishes all its decorators, annotations
 and attributes under the `decorators` metadata key, in source order, each as
-`{name, bytes, arguments}`: the name as written with whitespace folded
-(`app.route`, `org.junit.Test`, `tokio::main`, `gnu::cold`), the decorator's
-byte range, and each argument's, a keyword argument or element-value pair
-including its key. Python reads the decorators of a decorated definition; Java
+`{name, bytes, arguments}`; a list too long for the node's metadata bound
+(8 KiB) is stored as metadata rows on the node, one per decorator in order,
+and the metadata carries `decorators_rows` with the count, which
+`codectx_node_metadata` pages (docs/providers-filesystem.md, Node metadata).
+No decorator is dropped for size. Each entry is the name as written with
+whitespace folded (`app.route`, `org.junit.Test`, `tokio::main`, `gnu::cold`),
+the decorator's byte range, and each argument's, a keyword argument or
+element-value pair including its key. Python reads the decorators of a decorated definition; Java
 the annotations in a declaration's modifiers; JavaScript and TypeScript the
 decorators of a class (and of an export statement wrapping it), of a class
 expression (on the class node of the declaration or assignment that holds
@@ -728,6 +735,31 @@ lists in `lang/rust.go`). A call of a method the pointer itself answers through 
 `fmt`, …) on a binding or field declared as a pointer carries no receiver type. A macro invocation is not a call: the
 query pack captures it as a `macro` reference (`lang/queries/rust.scm`), which names only a `macro_rules!` of the file
 and is never a link site, and a bare call never names a Rust macro.
+
+Items written in a macro's input are declarations. A macro invocation in item position (a child of the file or of
+a declaration list) with a brace body has the body re-parsed by the same grammar over the body's bytes alone, with
+the parser's included ranges, so every node keeps the file's offsets (`worker/macro_rust.go`). The re-parse is kept
+when it has no error or missing node and its top level holds only items (the Rust Reference's items and associated
+items), attributes and comments; when the whole body is not, each brace group directly inside it whose header (the
+tokens since the previous group) holds no item keyword is tried the same way, one level deep, which recovers the
+arms of a body that selects among item lists by condition and never an item's own body. An invocation such a
+group holds that is no item list itself (`inner! { ... }`) is its own macro: its items carry the innermost macro, and
+each enclosing macro is a `macro` element of their branch chain, outermost first. A `macro_rules!` definition is
+never re-parsed. The query runs over each kept re-parse as over the file's tree, an item-position invocation inside
+it is re-parsed in turn, and its nodes replace the body's tokens in the flat array (`worker/macro_rust_flat.go`), so
+its functions are lowered and linked as their enclosing scope's own: a method written in a macro inside an impl is
+the impl's. Each such declaration carries `wire.Decl.MacroInput`, published as metadata `origin: macro_input` with
+`origin_macro`, since a macro may transcribe its input once, several times, renamed or not at all; `origin_exact`
+marks one whose macro is a `macro_rules!` of the same file in textual scope every rule of which transcribes its item
+input once, at the depth it was bound, inside no group (`worker/macro_rust_exact.go`). A macro its own file does not
+define in scope (`wire.Decl.MacroInput` set, `wire.Decl.MacroLocal` unset) is matched by the linker to the unit's
+`macro_rules!` of that name in other files, its path a single name or one after `crate::` or `$crate::`: each
+publishes a `generates` to the declaration, detail `macro_transcribes` when that definition transcribes its item
+input unchanged (`wire.Decl.MacroTranscribes`) else `macro_input`, with the number of definitions as the set size
+when there are several. A function is a test (`isTest`) only by an attribute whose path is `test` or ends in
+`::test`, or by a `cfg` that is false when `test` is unset (`worker/rust_test_attr.go`): `#[cfg(not(test))]` is no
+test. A method of `impl Trait for Type` carries its block's trait (`wire.Export.Trait`), spelled as the block's
+supertype is, also when the self type is a type parameter and no supertype is sent.
 
 The parent joins the tables to the declarations and call references it validated: every call reference becomes a
 site of the stored `link.Table` (`internal/provider/link/table.go`), with its shape from the joined wire site or,

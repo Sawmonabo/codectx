@@ -319,7 +319,7 @@ func TestStreamedBudgetRecordRoundTrip(t *testing.T) {
 }
 
 // partsOf projects a whole-set `plan` onto the streamed planParts the compiler
-// now carries, and persistPlan is persistManifest taking that whole-set form.
+// carries, and persistPlan is persistManifest taking that whole-set form.
 // Both exist so the tests that still build a `plan` directly -- the reference
 // pipeline's own tests -- reach the streamed signatures without restating the
 // projection at each call site.
@@ -341,7 +341,7 @@ func (c *Compiler) persistPlan(ctx context.Context, b model.Binding, req model.C
 }
 
 // excludedRun spools a whole-set plan's exclusions into the sorted run
-// persistManifest now takes. The reference pipeline's tests build a `plan`
+// persistManifest takes. The reference pipeline's tests build a `plan`
 // with its exclusions in heap; production never does, so the adapter lives
 // here and not in the package.
 func excludedRun(xs []model.ExcludedContextEntry) (*pagination.SortedRun[model.ExcludedContextEntry], func(), error) {

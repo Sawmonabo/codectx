@@ -52,9 +52,9 @@ func contentTemps(t *testing.T, dataDir string) map[string]int64 {
 // A capture cannot know whether the store already holds a file's content until
 // it has read the file and hashed it, so it streams EVERY file in the
 // workspace into a temporary first. When the content turns out to be already
-// published, that temporary used to be removed with its bytes — so re-indexing
-// an unchanged repository handed the filesystem the whole repository's worth
-// of deallocation, one file at a time, having produced no new object at all.
+// published, removing that temporary with its bytes would hand the filesystem
+// the whole repository's worth of deallocation on a re-index of an unchanged
+// repository, one file at a time, having produced no new object at all.
 // On a host that discards freed blocks under a sparse image that stalls every
 // writer on the machine for about a minute.
 //

@@ -769,7 +769,7 @@ func sortedMapKeys(m map[string]string) []string {
 	return keys
 }
 
-// TestRequirementsIncludeCycleYieldsExactlyItsPackages is C-T3. A
+// TestRequirementsIncludeCycleYieldsExactlyItsPackages: a
 // requirements file with markers, extras, comments, a continuation, a
 // per-requirement hash, a constraints file and an `-r` include that includes
 // the file back must publish exactly its packages and end. Mutation caught:
