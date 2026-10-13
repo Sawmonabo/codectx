@@ -479,7 +479,17 @@ The function message carries:
 - **flows**: for every node `u`, each `y` in `W(u)` and each `x` in `Src(u)` with `x ≠ y` gives `x data_flows_to y`,
   evidenced at `u`;
 - **reads**: each `v` in `R(n)`, evidenced at `n`;
-- **writes**: each `v` in `W(n)`, evidenced at `n`, marked as a may-definition when it is one.
+- **writes**: each `v` in `W(n)`, evidenced at `n`, marked as a may-definition when it is one;
+- **returns**: the returning nodes, and for each returning node `r`, evidenced at `r`, each `x` in `Src(r)` and in
+  `Src(c)` for each node `c` that decides whether `r` runs (`r` control-depends on `c`, directly or through other
+  such nodes; a node shared by two returning nodes is cited at the first), so a variable that only chooses which
+  value is returned reaches the return too. A
+  returning node is one a return statement moves to Exit (`flow.Builder.Return`, `flow.Graph.Returns`: its node Uses
+  what the returned expression reads; a Rust `?` returns its error), and, for a callable whose body is an
+  expression, each node control falls off the end from (`flow.Graph.Falls`): an ECMAScript arrow function whose
+  body is not a block, a Python lambda, a Java lambda with an expression body, a Rust closure with an expression
+  body, and a Rust function or closure whose body block has a tail (`worker/returns.go`). A Rust let-else block's
+  end diverges (`flow.Builder.Diverge`) and returns nothing.
 
 A repeated fact at one node is sent once. Nothing is capped.
 
@@ -493,6 +503,7 @@ The parent validates every range against the pinned bytes, as it does for every 
 | `data_flows_to` | variable whose value flows | variable the reached node defines | the reached node | `reaching_def` |
 | `reads` | the owning declaration | variable | the reading node | `use` |
 | `writes` | the owning declaration | variable | the defining node | `definition` or `may_definition` |
+| `data_flows_to` | variable a returning node reads, or a node deciding whether it runs reads | the callable's return node | the returning node | `reaching_def` |
 
 - **Variable entity.** Each named variable is one node, whichever functions' messages name it. When its declaring
   identifier is a structural declaration's name token (a module or class assignment, an ECMAScript declarator, a Go
@@ -519,15 +530,43 @@ The parent validates every range against the pinned bytes, as it does for every 
   structural declaration of the same file whose range contains the callable's range; a callable no declaration
   contains is owned by the file's module node. A lambda or closure is therefore owned by the declaration that
   contains it.
-- **Endpoints.** Every endpoint of `control_depends_on` and `data_flows_to` is a variable entity. A call site is not
-  an endpoint: the callee is resolved by the linking provider that publishes `calls`, and a fact that reaches only a
-  call, a return or a field is carried by `reads` alone. Fields, globals and names the lowering resolves to no
+- **Endpoints.** Every endpoint of `control_depends_on` and `data_flows_to` is a variable entity, a callable's return
+  node included. A call site is not an endpoint: the callee is resolved by the linking provider that publishes
+  `calls`, and a fact that reaches only a call or a field is carried by `reads` alone. Fields, globals and names the lowering resolves to no
   variable are not tracked (see the shared contract in `internal/provider/treesitter/worker/lower.go`).
 - **Relation evidence.** Each occurrence is one evidence row: the node's range, the owning declaration's qualified
   name as its native key, and the detail above. The existing per-fact evidence clip applies.
 - **Precision.** Every evidence row of the four families, and of a variable node the pass mints, is
   `static_analysis` (ADR-0012 decision 8). Every other fact of the provider stays `syntax`, a declaration that is
   also a variable included.
+
+### Return flow
+
+A callable's value goes back to its callers through two things the parent derives from the function message and
+the link table, which the linking provider publishes per bound site (docs/providers-link.md, Return flows;
+ADR-0017 decision 7; `internal/provider/treesitter/returns.go`):
+- **The callable.** A function message is the callable of the innermost declaration of a function, method or test
+  kind that contains its span, when no enclosing function's span lies inside that declaration too (a closure inside
+  a method is not the method's callable). A Python `__init__` and a Java or C++ constructor (a method named as the
+  type declaring it) return no value and have none.
+- **The return node.** Each such callable has one, a `variable` node named `return` at the callable's name token,
+  keyed `ret:<path>:<first byte>-<last byte>` over that token in the file's scope and, when the callable has a
+  descriptor path, by that path and the callable's disambiguator with the return mark
+  (`reconcile.ReturnDisambiguator`), so a call in another file keeps it through a body edit. It carries no
+  declaration-key alias: no source identifier declares it. The link table carries it (`Decl.Return`); the node is
+  published here when a value flows into it, and by the linker when a flow leaves it.
+- **Returned values.** Each variable of the message's `Returned` list (a variable a returning node reads, or a node
+  deciding whether it runs reads) flows into the return node, evidenced at the returning node, detail
+  `reaching_def`: an ordinary intraprocedural flow, a parameter's value included. A parameter is marked `Returned`
+  (`Parameter.Returned`, the callable's return summary) when it reaches a returning node over the message's flows
+  and its control pairs taken from the controlling variable to the dependent one (the direction an impact walk
+  follows `control_depends_on`): a parameter that decides which value is returned is in the summary too. Leaving the
+  callee is the linker's `return` edge, which a walk that entered through an argument never takes
+  (docs/providers-link.md, Return flows).
+- **A call's result.** Each site of the link table takes `Site.Results`, the variables the innermost node of the
+  innermost analysed function containing the call defines (killing or may), and `Site.Into`, that function's
+  callable when the node is one of its returning nodes; neither when another call site lies between the two (its
+  value is consumed by that call first) or no node of that function contains the call.
 
 ### Capabilities
 

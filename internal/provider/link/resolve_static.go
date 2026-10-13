@@ -70,8 +70,9 @@ func valueOut(yield func(entry) error) siteOut {
 }
 
 // site resolves site i and emits its facts: a FactCall per declaration it
-// calls, with the FactFlow of each argument into the parameter it binds
-// (argumentFlows), and a FactCall to an external method or a
+// calls, with its FactReturn (returnFact) and the FactFlow of each argument
+// into the parameter it binds and its FactSummary (argumentFlows,
+// flowFacts), and a FactCall to an external method or a
 // FactExternalSite for a proven external call. An indirect site with a
 // declared function type also joins bySignature.
 //
@@ -90,6 +91,9 @@ func (r *staticFile) site(i int32, bySignature sigSink) error {
 			if err := r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail, Dispatch: d}); err != nil {
 				return err
 			}
+			if err := returnFact(s, ref, e.Ref, r.emit); err != nil {
+				return err
+			}
 			return r.flows(ref, s, e)
 		},
 		external: func(key string, d model.Dispatch) error {
@@ -103,7 +107,8 @@ func (r *staticFile) site(i int32, bySignature sigSink) error {
 }
 
 // flows emits the FactFlow of each argument of site s at ref into the
-// parameter of e, the declaration the site calls, it binds. A Go method
+// parameter of e, the declaration the site calls, it binds, and its
+// FactSummary when that parameter returns (flowFacts). A Go method
 // expression or a Rust path naming a method (`T.M(t, x)`, `T::m(&t, x)`)
 // passes the receiver as its first argument.
 func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
@@ -118,7 +123,7 @@ func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
 		return err
 	}
 	return argumentFlows(s, params, r.receiverFirst(s, e), func(arg, pos int32) error {
-		return r.emit(Binding{Kind: FactFlow, Site: ref, Target: e.Ref, Arg: arg, Param: pos, Detail: DetailArgument})
+		return flowFacts(s, ref, e.Ref, params, arg, pos, r.emit)
 	})
 }
 
