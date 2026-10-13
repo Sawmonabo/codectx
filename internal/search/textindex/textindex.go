@@ -16,7 +16,10 @@
 // `_build/` (docs/toolchain.md).
 package textindex
 
-//go:generate cargo build --release --locked --manifest-path Cargo.toml --config "build.rustflags=[\"--remap-path-prefix=$HOME=~\"]"
+// The rustflags value is a TOML literal string, so a home directory spelled
+// with backslashes, as on Windows, is not read as escapes.
+//
+//go:generate cargo build --release --locked --manifest-path Cargo.toml --config "build.rustflags=['--remap-path-prefix=$HOME=~']"
 
 import (
 	"context"
