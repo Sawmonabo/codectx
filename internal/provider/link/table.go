@@ -154,6 +154,10 @@ type Decl struct {
 	// Property reports an ECMAScript function stored under a property path
 	// (wire.Export.Property): no bare name denotes it.
 	Property bool `json:"property,omitempty"`
+	// Trait is, for a method of a Rust `impl Trait for Type` block, the
+	// block's trait as written (wire.Export.Trait): the one trait whose item
+	// of the method's name it implements.
+	Trait string `json:"trait,omitempty"`
 }
 
 // Parameter is one declared parameter of a callable. Endpoint is the

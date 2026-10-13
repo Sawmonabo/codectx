@@ -57,12 +57,14 @@ type rsField struct {
 	ptr bool
 }
 
-// rsOwner is one enclosing impl or trait: the name `Self` means, and
-// whether it is an `impl Trait for Type` block, every method of which
-// implements the trait's.
+// rsOwner is one enclosing impl or trait: the name `Self` means, and, for
+// an `impl Trait for Type` block, every method of which implements the
+// trait's, the trait as typeName spells it (wire.Export.Trait); empty for
+// an inherent impl, a trait, or a trait path typeName cannot spell.
 type rsOwner struct {
 	self      string
 	traitImpl bool
+	trait     string
 }
 
 // rsLocal is one binding: its name, the type its value carries, whether it
@@ -340,7 +342,10 @@ func (k *rustLinker) export(n Node) {
 	if k.member(n) {
 		x.Receiver = k.self()
 		inTrait = n.Parent().Parent().KindId() == s.traitItem
-		x.Override = !inTrait && len(k.owners) > 0 && k.owners[len(k.owners)-1].traitImpl
+		if !inTrait && len(k.owners) > 0 {
+			o := k.owners[len(k.owners)-1]
+			x.Override, x.Trait = o.traitImpl, o.trait
+		}
 	}
 	x.Abstract = inTrait && n.KindId() == s.functionSignatureItem
 	ps := n.ChildByFieldId(s.fParameters)
@@ -561,7 +566,7 @@ func rsWord(b byte) bool {
 }
 
 // implItem records an `impl Trait for Type` as a supertype and walks the
-// impl's body with its self type as the owner.
+// impl's body with its self type, and its trait, as the owner.
 func (k *rustLinker) implItem(n Node) {
 	s := k.k
 	generics := len(k.generics)
@@ -570,12 +575,14 @@ func (k *rustLinker) implItem(n Node) {
 	if t := n.ChildByFieldId(s.fType); !t.IsNull() {
 		self = k.typeName(t)
 	}
-	if tr := k.kid(n, s.fTrait); !tr.IsNull() && self != "" && k.generic(self) < 0 {
-		if super := k.typeName(tr); super != "" {
-			k.out.Supertypes = append(k.out.Supertypes, wire.Supertype{Type: self, Super: super})
-		}
+	tr, trait := k.kid(n, s.fTrait), ""
+	if !tr.IsNull() {
+		trait = k.typeName(tr)
 	}
-	k.owners = append(k.owners, rsOwner{self: self, traitImpl: !k.kid(n, s.fTrait).IsNull()})
+	if trait != "" && self != "" && k.generic(self) < 0 {
+		k.out.Supertypes = append(k.out.Supertypes, wire.Supertype{Type: self, Super: trait})
+	}
+	k.owners = append(k.owners, rsOwner{self: self, traitImpl: !tr.IsNull(), trait: trait})
 	k.walk(n.ChildByFieldId(s.fBody))
 	k.owners = k.owners[:len(k.owners)-1]
 	k.generics = k.generics[:generics]

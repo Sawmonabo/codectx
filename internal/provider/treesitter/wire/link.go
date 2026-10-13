@@ -130,6 +130,15 @@ type Export struct {
 	// CommonJS export (`module.exports.run = …`, `exports.run = …`, a key of
 	// `module.exports = { run: … }`).
 	Exported bool
+	// Trait is, for a method or associated function of a Rust `impl Trait
+	// for Type` block, that block's trait spelled as a Supertype's Super is
+	// (references, `dyn` and generic arguments removed, the path as written:
+	// `fmt::Display`), whether or not the block's self type is a type
+	// parameter, which sends no Supertype. A trait impl can define only the
+	// trait's items (the Rust Reference's "Trait implementations"), so the
+	// method implements exactly this trait's item of its name and no other
+	// trait of its self type. Empty for every other export.
+	Trait string
 }
 
 // Supertype is one declared subtype relation of the file: Type extends,
@@ -374,7 +383,7 @@ type Type struct {
 //	exports    n × (name start, end; receiver; signature; params; optional;
 //	                variadic, static, abstract, virtual, final, internal
 //	                flags; returns type; override flag; alias; property,
-//	                exported flags)
+//	                exported flags; trait)
 //	supertypes n × (type; super; interface flag)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
 //	                signature; args n × type; arguments n × (at start, end;
@@ -407,6 +416,7 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.str(x.Alias)
 		e.flag(x.Property)
 		e.flag(x.Exported)
+		e.str(x.Trait)
 	}
 	e.u32(uint32(len(l.Supertypes)))
 	for _, s := range l.Supertypes {
@@ -513,13 +523,13 @@ func DecodeLink(payload []byte) (Link, error) {
 	d := decoder{b: payload, malformed: ErrMalformedLink}
 	var l Link
 	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
-	// flags, a 9-byte type, 1 flag, 4 alias and 2 flags; a supertype two strings and
+	// flags, a 9-byte type, 1 flag, 4 alias, 2 flags and 4 trait; a supertype two strings and
 	// 1 flag; a site 8 span, 1 shape, 4 qualifier, 9 type, 4 signature, 4
 	// args and 4 arguments; an argument 8 span, 4 keyword, 1 spread and 4
 	// reads; a read 8 span; a value 8 span, 4 field, 9 type and 8 span; a reexport
 	// three strings; a union its count; a parameter two 8 spans, 4 index and 2 flags; a
 	// dynamic import 8 span, 4 fragments and 1 flag; a fragment its length.
-	l.Exports = make([]Export, 0, d.count(46))
+	l.Exports = make([]Export, 0, d.count(50))
 	for range cap(l.Exports) {
 		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32(), Optional: d.u32()}
 		x.Variadic, x.Static, x.Abstract = d.flag(), d.flag(), d.flag()
@@ -527,6 +537,7 @@ func DecodeLink(payload []byte) (Link, error) {
 		x.Returns = d.typ()
 		x.Override, x.Alias = d.flag(), d.str()
 		x.Property, x.Exported = d.flag(), d.flag()
+		x.Trait = d.str()
 		l.Exports = append(l.Exports, x)
 	}
 	l.Supertypes = make([]Supertype, 0, d.count(9))
