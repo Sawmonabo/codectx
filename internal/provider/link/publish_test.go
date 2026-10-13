@@ -170,7 +170,7 @@ func publishFacts(t *testing.T, u *unit, unitID string, facts []idBinding, repub
 	defer externals.Close()
 	sink := &testSink{t: t, nodes: map[model.NodeID]model.NodeFact{}}
 	req := provider.UnitRequest{Unit: model.UnitSpec{ID: model.UnitID(model.H("link.test_unit", unitID)), ProviderID: ProviderID,
-		ProviderVersion: Version, ScopeKey: "test:" + unitID}, Resolver: testResolver{}}
+		ProviderVersion: Version(), ScopeKey: "test:" + unitID}, Resolver: testResolver{}}
 	p := &publisher{ctx: context.Background(), req: req, sink: sink, u: u}
 	if republished != nil {
 		f, err := newFileIDSort(u.dir)

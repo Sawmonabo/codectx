@@ -34,10 +34,18 @@ Required          true
 
 `lang.Fingerprint()` folds, with `model.Hasher` under the domain
 `treesitter-fingerprint-v1`: the binding module and version
-(`github.com/tree-sitter/go-tree-sitter@v0.25.0`), the extraction version, and
-for every language its name, grammar module and version, ABI, grammar metadata
-version and the full text of its composed query pack. A grammar upgrade, an ABI
-change or an edited `.scm` therefore changes `ProviderVersion`, which changes
+(`github.com/tree-sitter/go-tree-sitter@v0.25.0`), the digest of the extraction
+code, and for every language its name, grammar module and version, ABI, grammar
+metadata version and the full text of its composed query pack. The code digest
+is `codectx.Digest` (`sources.go` at the module root) of the provider and its
+parser worker: the module embeds its own Go sources, and the digest folds the
+non-test Go files of every package of the module the two import, transitively
+(read from the embedded files' import lists), the version and sum of every
+outside module those imports name, as the build resolved them, and the Go
+toolchain's version. It is computed once per process, when first asked (about
+10 ms for this digest and the linker's together). A grammar upgrade, an ABI
+change, an edited `.scm` or any change to the code that extracts therefore
+changes `ProviderVersion`, which changes
 every unit key (`NewUnitID` folds the version) and invalidates all sealed
 treesitter units, as Section 11.3 requires. The worker reports the same
 fingerprint in its hello frame and the parent refuses a worker whose value
@@ -827,8 +835,8 @@ failure stores no table and discloses `link_failure` on its structural capabilit
 ### Reuse
 
 The four families are facts of the structural file unit, so a file whose fingerprint matches its sealed unit reuses
-them with its structural facts, and an edited file recomputes all of them. The extraction version
-(`internal/provider/treesitter/lang/lang.go`) changes with the facts the worker emits.
+them with its structural facts, and an edited file recomputes all of them. The fingerprint's code digest
+(`lang.Fingerprint`) changes with any change to the code that emits them, and only then.
 
 ## Worker process
 

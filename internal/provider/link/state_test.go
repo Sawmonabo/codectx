@@ -2,6 +2,7 @@ package link
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"testing"
@@ -96,21 +97,23 @@ func TestStateRoundTripsEveryKind(t *testing.T) {
 	}
 }
 
-// TestStateRefusesCorruptAndOldForms refuses a state of the predecessor
-// form's tag, a truncated state and one with a byte past its sections, each
-// as corrupt storage, so the build resolves in full instead.
+// TestStateRefusesCorruptForms refuses a state of a tag no resolution state
+// opens with, one cut inside its tag, a truncated state and one with a byte
+// past its sections, each as corrupt storage, so the build resolves in full
+// instead.
 //
-// Mutation: keep the predecessor form's tag -> a state of that tag is read
-// as this form. Mutation: stop reading at the last section -> the trailing
-// byte is accepted.
-func TestStateRefusesCorruptAndOldForms(t *testing.T) {
+// Mutation: read a tag that is a short piece of this one as another
+// version's -> the state cut inside its tag is not corrupt. Mutation: stop
+// reading at the last section -> the trailing byte is accepted.
+func TestStateRefusesCorruptForms(t *testing.T) {
 	dir := t.TempDir()
 	raw := stored(t, dir, nil, []record{{File: "a", Tabled: true}}, everyKind())
-	old := append([]byte("link.resolution.boundary\n"), raw[len(stateTag):]...)
+	foreign := append([]byte("scip.manifest.v1\n"), raw[len(stateTag()):]...)
 	for name, state := range map[string][]byte{
-		"old tag":   old,
-		"truncated": raw[:len(raw)-1],
-		"trailing":  append(slices.Clone(raw), 0),
+		"foreign tag": foreign,
+		"cut tag":     raw[:len(stateTag())-1],
+		"truncated":   raw[:len(raw)-1],
+		"trailing":    append(slices.Clone(raw), 0),
 	} {
 		err := ValidateState(bytes.NewReader(state))
 		var typed *model.Error
@@ -169,5 +172,56 @@ func TestFactDiffCoversEveryKind(t *testing.T) {
 	}
 	if want := []model.FileID{"a.py", "b.py"}; !slices.Equal(got, want) {
 		t.Errorf("the diff republishes %v, want %v", got, want)
+	}
+}
+
+// TestStateOfAnEarlierBuildIsNotRead hands ValidateState and loadState the
+// states an earlier build wrote, under the tag it opened them with: one whose
+// fact carries technique byte 4, which that build's order gave `field` and
+// this build's gives `function_value`, and one whose member record has the
+// eight counts that build stored (no reflective count). Both are of another
+// version, never this build's form and never corrupt storage: the build
+// resolves in full, with nothing to warn about.
+//
+// Mutation: keep the tag free of Version (the linker's code digest) -> the first state is read, its
+// field fact silently becoming a function-value one, and the second is
+// refused as corrupt. Mutation: refuse every unknown tag as corrupt -> both
+// read as corrupt storage.
+func TestStateOfAnEarlierBuildIsNotRead(t *testing.T) {
+	const earlierTag = "link.resolution.nodes\n"
+	dir := t.TempDir()
+	fact := idBinding{Kind: FactCall, SiteFile: "a", Site: 0, TargetFile: "b", Target: "b.f",
+		Detail: details[4], Dispatch: model.DispatchExact}
+	raw := stored(t, dir, nil, []record{{File: "a", Tabled: true}}, []idBinding{fact})
+	if !bytes.HasPrefix(raw, []byte(stateTag())) {
+		t.Fatalf("the stored state does not open with stateTag %q", stateTag())
+	}
+	earlierFact := append([]byte(earlierTag), raw[len(stateTag()):]...)
+
+	// The earlier record: its file, four strings, the tabled byte and eight
+	// counts.
+	rec := appendString(nil, "a")
+	for range 4 {
+		rec = appendString(rec, "")
+	}
+	rec = append(rec, 1)
+	for range 8 {
+		rec = binary.AppendUvarint(rec, 0)
+	}
+	earlierRecord := binary.AppendUvarint([]byte(earlierTag), 0)
+	earlierRecord = appendString(binary.AppendUvarint(earlierRecord, 1), string(rec))
+	for range 7 {
+		earlierRecord = binary.AppendUvarint(earlierRecord, 0)
+	}
+	earlierRecord = append(earlierRecord, 0, 0)
+
+	for name, state := range map[string][]byte{"technique order": earlierFact, "record form": earlierRecord} {
+		if err := ValidateState(bytes.NewReader(state)); !errors.Is(err, ErrStateVersion) {
+			t.Errorf("%s: ValidateState = %v, want ErrStateVersion", name, err)
+		}
+		if p, err := loadState(bytes.NewReader(state), dir); !errors.Is(err, ErrStateVersion) {
+			p.close()
+			t.Errorf("%s: loadState = %v, want ErrStateVersion", name, err)
+		}
 	}
 }

@@ -14,7 +14,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/Sawmonabo/codectx"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -29,10 +31,6 @@ const ProviderID = "treesitter"
 // "file:"+path. The coordinator plans one unit per supported file, and the
 // linking provider finds a file's link tables under the same scope.
 const ScopePrefix = "file:"
-
-// extractionVersion changes whenever the worker's extraction logic changes
-// the facts it emits for the same source and query pack.
-const extractionVersion = "15"
 
 //go:embed queries/*.scm
 var queryFS embed.FS
@@ -156,15 +154,24 @@ var shared = func() map[string]bool {
 	return out
 }()
 
-// Fingerprint is the digest folded into the provider version: binding,
-// extraction version and, per language, module version, ABI, metadata and
-// the exact query source. Any change to a grammar pin or a query invalidates
-// every unit the provider has sealed, which is what Section 9.4 requires of
-// an analyzer/query version.
-func Fingerprint() string {
+// Fingerprint is the digest folded into the provider version: binding, the
+// code that extracts (codectx.Digest of the structural provider and its
+// parser worker: every package of the module they are built from, every
+// outside module they import and the toolchain) and, per language, module
+// version, ABI, metadata and the exact query source. Any change to that
+// code, a grammar pin or a query invalidates every unit the provider has
+// sealed, which is what Section 9.4 requires of an analyzer/query version,
+// and an unchanged build reuses them.
+func Fingerprint() string { return fingerprint() }
+
+var fingerprint = sync.OnceValue(func() string {
+	code, err := codectx.Digest(extractorPackages...)
+	if err != nil {
+		panic("treesitter fingerprint: " + err.Error())
+	}
 	h := model.NewHasher("treesitter-fingerprint-v1")
 	h.AddString(BindingModule)
-	h.AddString(extractionVersion)
+	h.AddString(code)
 	for _, l := range All {
 		h.AddString(l.Name)
 		h.AddString(l.Module)
@@ -173,10 +180,15 @@ func Fingerprint() string {
 		h.AddString(l.Query)
 	}
 	return h.Sum()
-}
+})
 
-// Version is the provider version string: a readable prefix plus the first
-// 24 hex digits of the fingerprint, well inside model.MaxIdentifierBytes.
+// extractorPackages are the packages whose code produces the structural
+// provider's output: the provider, which turns what the worker sends into
+// facts and link tables, and the parser worker.
+var extractorPackages = []string{"internal/provider/treesitter", "internal/provider/treesitter/worker"}
+
+// Version is the provider version string: the first 24 hex digits of the
+// fingerprint, well inside model.MaxIdentifierBytes.
 func Version() string {
-	return "1." + extractionVersion + "-" + Fingerprint()[:24]
+	return Fingerprint()[:24]
 }
