@@ -19,30 +19,39 @@ import (
 // TestWalkTierReadsEachPageFromItsOwnPosition pins the exact tiers' walk (and
 // the tier index as the driver of Nodes' statement too): it
 // serves every node of a tier once, as the row Nodes serves for it (the
-// precedence winner among the node's rows in the tier), and each page is a
-// seek into the tier's index that reads its own rows: a page deep in the tier
-// touches about as much of the database as the first page does. The fixture is
-// 4,000 nodes in 40 files, published by three units each (12,000 rows in each
-// tier), beside as many rows of other names, with the statistics an
-// activation writes. An equality tier is also read in content order from a
-// span (TierSpan), the seek a resumed exact page starts with.
+// precedence winner among the node's rows in the tier), and each window is a
+// seek into the tier's index, read from the index alone, that reads its own
+// entries: a window deep in the tier touches about as much of the database as
+// the first does. The fixture is 4,000 nodes in 40 files, published by three
+// units each (12,000 rows in each tier), beside as many rows of other names,
+// with the statistics an activation writes. An equality tier is also read in
+// content order from a span (TierSpan), the seek a resumed exact page starts
+// with.
 //
 // Mutations it catches:
-//   - drop the NOT EXISTS (every row of a node is served: 12,000, not 4,000);
-//   - flip its precedence comparison (a node is served with a losing unit's
-//     row, not the row Nodes serves);
-//   - page by node id (ORDER BY ni.canonical): the index keyset then skips
-//     and repeats nodes (600 served of 4,000 here), and the plan sorts the
-//     whole tier in a temporary b-tree on every page;
+//   - keep every visible entry instead of the winner of its node (every row
+//     of a node is served: 12,000, not 4,000);
+//   - flip unitRank.precedes (a node is served with a losing unit's row, not
+//     the row Nodes serves);
+//   - order the window by node id (ORDER BY nf.node_id): the keyset then
+//     skips and repeats nodes, and the plan sorts the tier in a temporary
+//     b-tree;
 //   - a keyset the planner only filters with, such as a row value that
-//     repeats the equality column beside the equality: the deep page reads
-//     the tier from its start, about four times the first page's b-tree
-//     pages here;
+//     repeats the equality column beside the equality: the deep window reads
+//     the tier from its start, several times the first window's b-tree pages;
 //   - start a walk from a span with a filter on the span instead of a seek,
 //     or drop the span (the walk from pkg/f20.go starts at pkg/f00.go);
-//   - plain JOINs instead of CROSS JOIN, in WalkTier's statement or in
-//     Nodes': with statistics the planner starts from the generation's units
-//     and reads every fact they hold, not from the tier index.
+//   - a window that reads a column the tier index does not hold (or sort
+//     columns that are generated, which SQLite counts as reading every
+//     column): the plan is no longer a COVERING INDEX read;
+//   - a probe that reaches the node's rows through the tier index (drop the
+//     unary +): the plan no longer seeks idx_node_facts_id by node;
+//   - a page that ends after one window that held fewer served nodes than
+//     its bound (losing units' rows, or the kind filter dropping winners):
+//     the walk ends after its first, short page;
+//   - plain JOINs instead of CROSS JOIN in Nodes': with statistics the
+//     planner starts from the generation's units and reads every fact they
+//     hold, not from the tier index.
 func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 	const nodes, units, page = 4000, 3, 200
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
@@ -61,7 +70,11 @@ func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 		w := f.beginScopeKey(gen, run, "cfg", "unit"+strconv.Itoa(u), files...)
 		var facts []model.NodeFact
 		for i := range nodes {
-			facts = append(facts, f.nodeFact(w, run, fmt.Sprintf("pkg/p%05d", i), "String", &files[i%len(files)]),
+			fact := f.nodeFact(w, run, fmt.Sprintf("pkg/p%05d", i), "String", &files[i%len(files)])
+			if i%3 == 0 {
+				fact = asKind(f, fact, model.NodeMethod)
+			}
+			facts = append(facts, fact,
 				f.nodeFact(w, run, fmt.Sprintf("other/o%05d", i), "N"+strconv.Itoa(i), nil))
 			if len(facts) == 500 {
 				if err := w.PutNodes(f.ctx, facts); err != nil {
@@ -143,11 +156,11 @@ func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 			&node); err != nil {
 			t.Fatalf("deep entry: %v", err)
 		}
-		firstQ, firstArgs, err := store.TierPageStatement(r, tc.filter, nil, nil, page)
+		firstQ, firstArgs, err := store.TierWindowStatement(r, tc.filter, nil, nil, page)
 		if err != nil {
 			t.Fatal(err)
 		}
-		deepQ, deepArgs, err := store.TierPageStatement(r, tc.filter, nil, []any{key, path, start, end, unit, node}, page)
+		deepQ, deepArgs, err := store.TierWindowStatement(r, tc.filter, nil, []any{key, path, start, end, unit, node}, page)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -160,7 +173,7 @@ func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 		var spanArgs []any
 		if tc.filter.QualifiedPrefix == "" {
 			// The last file's span: a seek reads only that file's rows.
-			if spanQ, spanArgs, err = store.TierPageStatement(r, tc.filter, &store.TierSpan{Path: "pkg/f39.go"}, nil,
+			if spanQ, spanArgs, err = store.TierWindowStatement(r, tc.filter, &store.TierSpan{Path: "pkg/f39.go"}, nil,
 				page); err != nil {
 				t.Fatal(err)
 			}
@@ -172,9 +185,16 @@ func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 		}
 		for _, q := range queries {
 			plan := explain(t, db, q.query, q.args...)
-			if strings.Contains(plan, "TEMP B-TREE") || !strings.HasPrefix(plan, "SEARCH nf USING INDEX "+tc.index) {
-				t.Errorf("%+v %s page does not read %s in its order:\n%s", tc.filter, q.name, tc.index, plan)
+			if strings.Contains(plan, "TEMP B-TREE") || !strings.HasPrefix(plan, "SEARCH nf USING COVERING INDEX "+tc.index) {
+				t.Errorf("%+v %s window does not read %s alone, in its order:\n%s", tc.filter, q.name, tc.index, plan)
 			}
+		}
+		probeQ, probeArgs, err := store.TierProbeStatement(r, tc.filter, "[1,2,3]")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan := explain(t, db, probeQ, probeArgs...); !strings.Contains(plan, "SEARCH nf USING INDEX idx_node_facts_id (node_id=?)") {
+			t.Errorf("%+v: the probe of a window's nodes does not seek idx_node_facts_id by node:\n%s", tc.filter, plan)
 		}
 		// Nodes, which pages by node id, must sort the tier, but it too reads
 		// the tier through its index rather than the generation's units.
@@ -187,18 +207,18 @@ func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 		}
 		first := pagesTouched(t, f.ctx, db, firstQ, firstArgs...)
 		deep := pagesTouched(t, f.ctx, db, deepQ, deepArgs...)
-		t.Logf("%+v: b-tree pages touched by the first page %d, by a page 300 rows from the end %d", tc.filter, first, deep)
+		t.Logf("%+v: b-tree pages touched by the first window %d, by a window 300 rows from the end %d", tc.filter, first, deep)
 		if spanQ != "" {
 			if at := pagesTouched(t, f.ctx, db, spanQ, spanArgs...); at > first+30 {
-				t.Errorf("%+v: a page from the last file's span touched %d b-tree pages, the first page %d: the "+
+				t.Errorf("%+v: a window from the last file's span touched %d b-tree pages, the first window %d: the "+
 					"span is filtered, not sought", tc.filter, at, first)
 			}
 		}
-		// The first and the deep page probe the same number of rows for their
-		// winners; what may differ is only where the index read starts.
+		// The first and the deep window read the same number of entries; what
+		// may differ is only where the index read starts.
 		if deep > first+30 {
-			t.Errorf("%+v: a page deep in the tier touched %d b-tree pages, the first page %d: the page reads the tier "+
-				"before its position", tc.filter, deep, first)
+			t.Errorf("%+v: a window deep in the tier touched %d b-tree pages, the first window %d: the window reads "+
+				"the tier before its position", tc.filter, deep, first)
 		}
 	}
 
@@ -230,6 +250,40 @@ func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 		t.Errorf("the walk from %s served %d nodes from %s to %s (sorted %v); want %d from pkg/f20.go, in path order",
 			from.Path, served, paths[0], paths[len(paths)-1], slices.IsSorted(paths), nodes/2)
 	}
+
+	// The kind filter is applied to a window's winners, so a window can
+	// serve fewer nodes than it holds winners; the page reads further windows
+	// rather than ending the tier short. Every third node is a method.
+	methods := 0
+	pages := 0
+	if err := r.WalkTier(f.ctx, store.NodeFilter{Name: "String", Kinds: []model.NodeKind{model.NodeMethod}}, nil, page,
+		func(rows []store.StoredNode) (int, error) {
+			pages++
+			for _, n := range rows {
+				if n.Node.Kind != model.NodeMethod {
+					return 0, fmt.Errorf("the method walk served a %s", n.Node.Kind)
+				}
+				methods++
+			}
+			return 0, nil
+		}); err != nil {
+		t.Fatalf("WalkTier(methods): %v", err)
+	}
+	if want := (nodes + 2) / 3; methods != want || pages != (want+page-1)/page {
+		t.Errorf("the method walk served %d nodes in %d pages; want %d in %d full pages", methods, pages, want,
+			(want+page-1)/page)
+	}
+}
+
+// asKind is fact as a node of kind: the node id folds the kind.
+func asKind(f *fixture, fact model.NodeFact, kind model.NodeKind) model.NodeFact {
+	fact.Node.Kind = kind
+	fact.Node.ID = model.NewNodeID(f.repo, kind, fact.CanonicalKey)
+	ev := fact.Evidence[0]
+	ev.NodeID = fact.Node.ID
+	ev.ID = model.NewEvidenceID(ev)
+	fact.Evidence = []model.Evidence{ev}
+	return fact
 }
 
 // tierLow and tierHigh bound the tier's index range for the fixture's deep

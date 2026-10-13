@@ -180,7 +180,7 @@ func exactFromRecord(b []byte) (exactEntry, error) {
 		}
 		strs[i], b = string(b[w:w+int(n)]), b[w+int(n):]
 	}
-	e.Path = strs[0]
+	e.Path, e.Node.Path = strs[0], strs[0]
 	e.Node.Node.Kind, e.Node.Node.Name, e.Node.Node.QualifiedName = model.NodeKind(strs[1]), strs[2], strs[3]
 	e.Node.Node.Signature, e.Node.Node.SemanticSource = strs[4], model.SemanticCanonical
 	if len(b) < 1 {

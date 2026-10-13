@@ -95,10 +95,10 @@ func batchBlobs(field string, ids []string) ([]any, error) {
 const nodeBatchColumns = `ni.canonical AS node_id, ni.kind AS kind, nf.language AS language, nf.name AS name,
 	nf.qualified_name AS qualified_name, nf.signature AS signature, nf.file_id AS file_id,
 	ui.content_hash AS content_hash, nf.start_byte AS start_byte, nf.end_byte AS end_byte,
-	nf.name_start_byte AS name_start_byte, nf.name_end_byte AS name_end_byte, nf.metadata_json AS metadata_json, u.unit_key AS unit_key, u.source_binding AS source_binding`
+	nf.name_start_byte AS name_start_byte, nf.name_end_byte AS name_end_byte, nf.metadata_json AS metadata_json, u.unit_key AS unit_key, u.source_binding AS source_binding, nf.path AS path`
 
 const nodeBatchOuterColumns = `node_id, kind, language, name, qualified_name, signature, file_id, content_hash,
-	start_byte, end_byte, name_start_byte, name_end_byte, metadata_json, unit_key, source_binding`
+	start_byte, end_byte, name_start_byte, name_end_byte, metadata_json, unit_key, source_binding, path`
 
 // nodePrecedence is nodeOrder expressed as a single sortable key so one row per
 // node can be chosen by aggregation instead of by a per-node statement: exact

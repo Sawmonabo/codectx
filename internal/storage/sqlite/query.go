@@ -163,10 +163,13 @@ func (r *PinnedReader) Close() error {
 // consumer derives line/column positions from the source's line checkpoints,
 // so the model.Node here carries no Range or NameRange: Bytes holds the
 // node's interval and NameBytes its name token's, absent when none is stored.
+// Path is the root-relative path of the node's file, stored beside the fact
+// ("" for a node with no file), so a reader of nodes needs no file lookup.
 type StoredNode struct {
 	Node          model.Node
 	Bytes         *model.ByteRange
 	NameBytes     *model.ByteRange
+	Path          string
 	UnitID        model.UnitID
 	SourceBinding model.SourceBinding
 }
@@ -196,7 +199,7 @@ func (r *PinnedReader) visible(alias string) string {
 }
 
 const nodeColumns = `ni.canonical, ni.kind, nf.language, nf.name, nf.qualified_name, nf.signature, nf.file_id, ui.content_hash,
-	nf.start_byte, nf.end_byte, nf.name_start_byte, nf.name_end_byte, nf.metadata_json, u.unit_key, u.source_binding`
+	nf.start_byte, nf.end_byte, nf.name_start_byte, nf.name_end_byte, nf.metadata_json, u.unit_key, u.source_binding, nf.path`
 
 // nodeOrder is the Section 9.4 attribute precedence as far as storage can
 // apply it: exact-source binding first, then provider, then the stable unit
@@ -209,7 +212,7 @@ func scanNode(rows interface{ Scan(...any) error }) (StoredNode, error) {
 	var start, end, nameStart, nameEnd sql.NullInt64
 	var metadata string
 	if err := rows.Scan(&nodeID, &n.Node.Kind, &n.Node.Language, &n.Node.Name, &n.Node.QualifiedName, &n.Node.Signature,
-		&fileID, &contentHash, &start, &end, &nameStart, &nameEnd, &metadata, &unitKey, &n.SourceBinding); err != nil {
+		&fileID, &contentHash, &start, &end, &nameStart, &nameEnd, &metadata, &unitKey, &n.SourceBinding, &n.Path); err != nil {
 		if isNoRows(err) {
 			return n, err
 		}
