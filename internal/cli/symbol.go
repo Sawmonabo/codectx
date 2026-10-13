@@ -53,7 +53,7 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			source, profile, err := semanticFlagValues(cmd, false)
+			source, profile, err := semanticFlagValues(cmd)
 			if err != nil {
 				return err
 			}
@@ -111,7 +111,7 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 	cmd.Flags().String(symbolOperationFlag, string(model.SymbolResolve),
 		"typed symbol operation: resolve, document-symbols, workspace-symbols or definition"+
 			" (document-symbols takes a canonical file id as its argument)")
-	addSemanticFlags(cmd, false)
+	addSemanticFlags(cmd)
 	return cmd
 }
 
@@ -127,24 +127,11 @@ const (
 )
 
 // addSemanticFlags declares --semantic-source and --profile. shared by query.go
-//
-// canonicalOnly says whether this command can actually answer from the overlay.
-// The call-hierarchy commands cannot: model.GraphRequest carries no semantic
-// source and ExploreService.Graph is canonical-only, so `--semantic-source lsp`
-// there is refused by semanticFlagValues. The flag is still declared, because
-// Section 18.1 gives the call-hierarchy commands the selector and because a
-// command that silently answered a canonical result to an `lsp` request would
-// be the substituted answer Section 11.6 forbids -- but the help text has to
-// say so rather than advertise a route the command does not have.
-func addSemanticFlags(cmd *cobra.Command, canonicalOnly bool) {
-	source := "answer from the sealed canonical index (canonical, the default) or from the managed language server named by --profile (lsp)"
-	profile := "managed language server to answer from; required with --" + semanticSourceFlag + " lsp and meaningless without it"
-	if canonicalOnly {
-		source = "answer from the sealed canonical index; this command has only the canonical route, and `lsp` is refused rather than answered from canonical facts"
-		profile = "managed language server to answer from; this command has no overlay route, so naming one is refused"
-	}
-	cmd.Flags().String(semanticSourceFlag, string(model.SemanticCanonical), source)
-	cmd.Flags().String(semanticProfileFlag, "", profile)
+func addSemanticFlags(cmd *cobra.Command) {
+	cmd.Flags().String(semanticSourceFlag, string(model.SemanticCanonical),
+		"answer from the sealed canonical index (canonical, the default) or from the managed language server named by --profile (lsp)")
+	cmd.Flags().String(semanticProfileFlag, "",
+		"managed language server to answer from; required with --"+semanticSourceFlag+" lsp and meaningless without it")
 }
 
 // semanticFlagValues reads and screens the two selectors before any workspace
@@ -158,8 +145,8 @@ func addSemanticFlags(cmd *cobra.Command, canonicalOnly bool) {
 // command line that would silently do nothing. The profile name itself is NOT
 // checked against the supported set here: that list belongs to
 // internal/provider/lsp, which the facade exists to keep out of the command
-// tree, and SymbolRequest.Validate already bounds the string.
-func semanticFlagValues(cmd *cobra.Command, canonicalOnly bool) (model.SemanticSource, string, error) {
+// tree, and the request's Validate already bounds the string.
+func semanticFlagValues(cmd *cobra.Command) (model.SemanticSource, string, error) {
 	raw, err := stringFlag(cmd, semanticSourceFlag)
 	if err != nil {
 		return "", "", err
@@ -175,18 +162,6 @@ func semanticFlagValues(cmd *cobra.Command, canonicalOnly bool) (model.SemanticS
 	if err != nil {
 		return "", "", err
 	}
-	if canonicalOnly && source == model.SemanticLSP {
-		// Section 11.6's explicit unavailable answer, not a silently
-		// substituted canonical one. CTX_PROVIDER_UNAVAILABLE is the provider
-		// exit class (5), which is where "this route cannot run" belongs; it is
-		// not the exit-2 class, because the command line is well formed and the
-		// capability is what is missing.
-		return "", "", (&model.Error{Code: model.CodeProviderUnavailable,
-			Message: "the call hierarchy is answered from canonical facts only; there is no " +
-				string(model.SemanticLSP) + " route for this command"}).
-			WithDetail("semantic_source", string(model.SemanticLSP)).
-			WithRemediation("drop --" + semanticSourceFlag + ", or ask the overlay for symbols or references instead")
-	}
 	if source == model.SemanticLSP && profile == "" {
 		return "", "", (&model.Error{Code: model.CodeArgumentInvalid,
 			Message: "--" + semanticSourceFlag + " " + string(model.SemanticLSP) +
@@ -194,19 +169,11 @@ func semanticFlagValues(cmd *cobra.Command, canonicalOnly bool) (model.SemanticS
 			WithRemediation("name one of the supported servers, for example --" + semanticProfileFlag + " gopls")
 	}
 	if source == model.SemanticCanonical && profile != "" {
-		// The remediation has to differ on the canonical-only commands:
-		// telling their caller to add `--semantic-source lsp` would send them
-		// straight into the refusal above, which is advice that cannot be
-		// followed.
-		remediation := "add --" + semanticSourceFlag + " " + string(model.SemanticLSP) +
-			", or drop --" + semanticProfileFlag
-		if canonicalOnly {
-			remediation = "drop --" + semanticProfileFlag + ": this command has no overlay route to name a server for"
-		}
 		return "", "", (&model.Error{Code: model.CodeArgumentInvalid,
 			Message: "--" + semanticProfileFlag + " names a language server, which only the " +
 				string(model.SemanticLSP) + " semantic source answers from"}).
-			WithRemediation(remediation)
+			WithRemediation("add --" + semanticSourceFlag + " " + string(model.SemanticLSP) +
+				", or drop --" + semanticProfileFlag)
 	}
 	return source, profile, nil
 }

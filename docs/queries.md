@@ -135,6 +135,33 @@ MCP `codectx_callers` and `codectx_callees` tools walk `calls` when `relations`
 is empty, exactly as these commands do; a request that names relations walks
 those.
 
+**Asking the language server instead.** `callers` and `callees` take
+`--semantic-source lsp --profile <server>` (MCP: `semantic_source` and
+`profile`), as `symbol` and `refs` do. The answer is then one level of that
+managed server's call hierarchy, over the pinned snapshot: each start node's
+item is prepared at its name token (`textDocument/prepareCallHierarchy`), and
+the answer is that item's direct incoming or outgoing calls
+(`callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`). Its nodes are
+overlay nodes (`semantic_source: lsp`, no canonical id, located by file and
+range), and its edges are in `calls`, not `relations`: each names its two ends
+by their index in `nodes` (`from` calls `to`), the start node it was prepared
+for (`seed`), and its call sites with their file, which is always the
+caller's. `meta.overlay` names the server, its version and the input digest;
+nothing is stored and no coverage credit is granted. A server that prepared
+nothing for any start node is reported `unavailable` with its reason, since
+that empty answer cannot be told apart from one the server could not analyse,
+and any one start node it prepared nothing for is named in a notice.
+
+The protocol answers one level, one direction and `calls` only, per request,
+and an overlay answer is one bounded page with no continuation. So a request
+naming another relation, both directions, `--depth` above 1 or `--cursor` is
+refused (`CTX_PROVIDER_UNAVAILABLE`, or `CTX_ARGUMENT_INVALID` for the cursor),
+never answered from the index; so is a server that does not advertise
+`callHierarchyProvider`. `--limit` bounds the calls, `--edges` and `--visited`
+bound the calls and nodes as on the canonical walk, and a cut by either is
+reported as truncation. Every start node must belong to one project, which one
+server answers; start nodes in two projects are asked separately.
+
 **Calls through a base class are found at query time.** A call is stored once,
 against the method its receiver's declared type declares: in
 
@@ -229,6 +256,8 @@ so a changed handler marks the endpoints that route to it affected.
 | `--timeout` | all | Deadline for this invocation, and the only thing that bounds one: `resources.query_timeout` is a default and not a ceiling, and it is unlimited, so a command you do not bound answers in full. Every command honours that — `search`, `symbol`, the graph walks, `context plan`, the coverage and workflow commands, and the MCP tools alike. A value here **sets** the deadline for the call — above a configured `resources.query_timeout` as readily as below it. What a call does when it expires depends on whether there is anything to resume past. `search`, `symbol`, the graph walks and `context plan` accumulate work across pages or passes, so a bounded call ends with a continuation cursor and the next call carries on from it. The coverage commands (`coverage read`, `coverage next`, `coverage ack`, `coverage session`, `coverage status`) and the workflow commands (`workflow advance`, `workflow close`, `workflow include`, `workflow status`) answer one bounded read or apply one mutation, so there is no partial state for a cursor to name: an expiry there is reported as `CTX_QUERY_DEADLINE`, naming `resources.query_timeout` / `--timeout` as the setting to move. Zero asks for no deadline of its own and leaves the configured value in charge. |
 | `--limit` | all | Items in one page; on `path`, the equal-cost routes one page lists. |
 | `--cursor` | all | Continue a previous page — on `path`, continue the same search, or the list of its equal-cost routes. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
+| `--semantic-source` | `symbol`, `refs`, `callers`, `callees` | `canonical` (the default) answers from the sealed index; `lsp` answers from the managed language server `--profile` names, as a labeled overlay. |
+| `--profile` | `symbol`, `refs`, `callers`, `callees` | The managed language server to answer from; required with `--semantic-source lsp` and refused without it. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |

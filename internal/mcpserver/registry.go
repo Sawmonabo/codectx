@@ -52,12 +52,18 @@ func register(s *mcp.Server, h *handlers) {
 		"Bounded inbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
 			"names others. Every node carries its range and every call its call-site ranges. Calls "+
 			"into a method this one overrides are listed as through that base: they may not run it. "+
-			"`may_call` rows follow every precise row and are matched by name only.", h.callers)
+			"`may_call` rows follow every precise row and are matched by name only. `semantic_source` "+
+			"\"lsp\" with a `profile` answers one level of that language server's call hierarchy instead, "+
+			"as labeled overlay nodes and `calls`; a relation, depth or direction it cannot answer is "+
+			"refused as unavailable, never answered from the index.", h.callers)
 	addTool(s, "codectx_callees", "Callees",
 		"Bounded outbound call neighborhood of one or more nodes, over `calls` unless `relations` "+
 			"names others. Every node carries its range and every call its call-site ranges. The "+
 			"overrides a virtual call may dispatch to are listed and marked: they may not run. "+
-			"`may_call` rows follow every precise row and are matched by name only.", h.callees)
+			"`may_call` rows follow every precise row and are matched by name only. `semantic_source` "+
+			"\"lsp\" with a `profile` answers one level of that language server's call hierarchy instead, "+
+			"as labeled overlay nodes and `calls`; a relation, depth or direction it cannot answer is "+
+			"refused as unavailable, never answered from the index.", h.callees)
 	addTool(s, "codectx_dependency_path", "Dependency path",
 		"Bounded shortest dependency path between two resolved nodes. `direction` chooses "+
 			"which way edges are followed: \"outgoing\" (the default: what `from` depends on), "+
