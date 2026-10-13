@@ -38,6 +38,15 @@ func SetEdgePartBytes(n int) func() {
 func OutgoingEdgeQuery() string { return outgoingEdgeQuery() }
 func IncomingEdgeQuery() string { return incomingEdgeQuery() }
 
+// PlaceholderNodesInsert, PlaceholderEdgesInsert and CallerSitesQuery are the
+// three statements the build's placeholder pass runs over the store.
+const (
+	PlaceholderNodesInsert = placeholderNodesInsert
+	PlaceholderEdgesInsert = placeholderEdgesInsert
+)
+
+func CallerSitesQuery() string { return callerSitesQuery() }
+
 // EvidenceCountQuery is the build's third ordered scan.
 func EvidenceCountQuery() string { return evidenceCountQuery() }
 

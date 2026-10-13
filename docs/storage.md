@@ -979,6 +979,20 @@ both costs grow with the repository while the answer does not. Resolving
 visibility once, at publication, and scanning a packed array instead turns the
 per-page cost into a sequential read.
 
+**One edge per call.** The structural provider names a call it cannot resolve
+inside its file by a file-less placeholder (`call:<name>`), and the linker then
+publishes, for the same call, the bound target, an open site or an external
+node, from the same caller and with evidence at the same bytes. The build leaves
+out a placeholder's `calls` edge when every one of its visible sites is covered
+that way -- another visible `calls` edge of the same caller with an occurrence at
+exactly the same file and byte range; overlap is not enough, since an inner
+call lies inside its outer call. A placeholder edge with a site nothing else
+covers (a proven external call the linker publishes no edge for) is packed whole.
+The pass reads the file-less node facts once, the edges into the placeholders
+through `idx_relations_to`, and each such caller's `calls` evidence in caller
+order, holding one caller's sites at a time, so every walk serves one edge per
+call and no query pays for the rule.
+
 **The two tables.** `generation_graph` carries one row per generation: the
 largest node and relation surrogate, the node and edge counts, and the
 relation-kind and node-kind dictionaries. `generation_graph_parts`

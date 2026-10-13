@@ -109,7 +109,9 @@ for `Cat.sound` is then a false zero.
 - **Published once per site.** An open-site node in the file's scope, located at the site, named by the callee, with
   metadata `resolution: unresolved`, a `reason` (`receiver_untyped`, `value_untracked`, `global_unbound`,
   `computed`), the call `shape` (`bare`, `member`, `value`, `construct`) and the argument count. The caller has a
-  `calls` edge to it. In answers this node replaces the structural `call:<name>` placeholder for the same site.
+  `calls` edge to it. In answers this node replaces the structural `call:<name>` placeholder for the same site, as a
+  bound target or an external node does: the packed adjacency leaves out a placeholder edge every site of which
+  another `calls` edge of the caller covers at the same bytes (docs/storage.md, One edge per call).
 - **Candidates per query, never stored.** The declarations of the same generation with the same name (as the
   language compares names), the site's shape (methods and function-valued fields for a member site, functions for a
   bare or value site, classes for a construction), the same language family, and, in the static families only, a
