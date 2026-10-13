@@ -55,6 +55,8 @@ type Table struct {
 	// (wire.Conversion), Go's compile-time proofs that a type implements an
 	// interface.
 	Conversions []wire.Conversion `json:"conversions,omitempty"`
+	// Constraint is a Go file's build constraint (wire.Link.Constraint).
+	Constraint string `json:"constraint,omitempty"`
 	// Routing is the framework routing the file's route table left open
 	// (route.go).
 	Routing Routing `json:"routing,omitzero"`

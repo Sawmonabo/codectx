@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Sawmonabo/codectx/internal/gobuild"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
@@ -47,6 +48,7 @@ func (k *goLinker) file(root Node, src []byte, out *wire.Link) {
 		x.topVar(t)
 	}
 	x.walk(root)
+	out.Constraint = gobuild.Header(src)
 }
 
 // goVar is what a name in scope says about its value: its type, its
