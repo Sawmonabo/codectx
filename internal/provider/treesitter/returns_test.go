@@ -32,6 +32,19 @@ def use():
     a = make()
     print(make())
     return a
+
+
+def gate(p):
+    y = 0
+    if p:
+        y = 1
+    return y
+
+
+def choose(p):
+    if p:
+        return 1
+    return 2
 `
 
 // TestReturnFlow pins the structural half of return-value flow on one
@@ -69,7 +82,9 @@ func TestReturnFlow(t *testing.T) {
 	slices.Sort(flows)
 	// mutation: drop the exclusion of values a parameter reaches (y, which p
 	// reaches, would flow into mix's return node); mutation: drop the
-	// boundary flow into a parameter-reached variable (k would not).
+	// boundary flow into a parameter-reached variable (k would not);
+	// mutation: follow flows only, not control dependence (gate's y, which
+	// p decides, would flow into gate's return node).
 	want := []string{"make.v -> make.return", "mix.k -> mix.return", "use.a -> use.return"}
 	if !slices.Equal(flows, want) {
 		t.Fatalf("created values into return nodes %q, want %q", flows, want)
@@ -82,12 +97,15 @@ func TestReturnFlow(t *testing.T) {
 		}
 		return &tbl.Decls[i]
 	}
-	// mutation: mark every parameter returned (wrap's x reaches no return).
-	if !decl("mix").Parameters[0].Returned || decl("wrap").Parameters[0].Returned {
-		t.Fatalf("returned marks: mix.p %v, wrap.x %v; want true, false",
-			decl("mix").Parameters[0].Returned, decl("wrap").Parameters[0].Returned)
+	// mutation: mark every parameter returned (wrap's x reaches no return);
+	// mutation: follow flows only (gate's p, which decides y, and choose's
+	// p, which decides which return runs, would not be returned).
+	for name, want := range map[string]bool{"mix": true, "wrap": false, "gate": true, "choose": true} {
+		if got := decl(name).Parameters[0].Returned; got != want {
+			t.Fatalf("%s's parameter returned %v, want %v", name, got, want)
+		}
 	}
-	for _, name := range []string{"mix", "make", "wrap", "use"} {
+	for _, name := range []string{"mix", "make", "wrap", "use", "gate", "choose"} {
 		if decl(name).Return == nil || decl(name).Return.Node == "" {
 			t.Fatalf("%s has no return node", name)
 		}

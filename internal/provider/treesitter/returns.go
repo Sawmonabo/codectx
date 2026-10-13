@@ -25,14 +25,20 @@ const detailReturn = "return"
 //
 // For each analysed function that is the callable of a declaration of the
 // file (callableOf), with E its entry variables (its parameters and the
-// variables it captures from an enclosing function) and Flows its
-// data_flows_to pairs:
-//   - F is every variable reachable from E over Flows, B every variable that
-//     reaches a returning node over Flows (wire.Function.Returned);
+// variables it captures from an enclosing function) and D its dependence
+// edges, each data_flows_to pair and each control_depends_on pair from the
+// controlling variable to the dependent one:
+//   - F is every variable reachable from E over D, B every variable that
+//     reaches a returning node over D (wire.Function.Returned): a parameter
+//     that decides which value is returned reaches the return too;
 //   - a parameter in B is Returned;
 //   - a variable of the function's own outside F that reaches a return
-//     directly, or through a flow into a variable of B ∩ F, flows into the
-//     return node, evidenced at that returning node or that flow's node.
+//     directly, or through an edge of D into a variable of B ∩ F, flows into
+//     the return node, evidenced at that returning node or that edge's node.
+//
+// F follows the same edges an impact walk follows from a parameter, so no
+// variable such a walk reaches is the source of a return flow
+// (docs/providers-link.md, Return flows).
 //
 // Each call site of the table takes its Results, the variables the
 // innermost node of the innermost function evaluating it defines, and Into,
@@ -220,12 +226,19 @@ func created(f *wire.Function, decl *link.Decl) []wire.Access {
 			seeds = append(seeds, v)
 		}
 	}
-	reach(f.Flows, seeds, fromEntry, false)
+	// D: a data flow From -> To, and a control dependence from the
+	// controlling variable (To) to the dependent one (From).
+	deps := make([]wire.Pair, 0, len(f.Flows)+len(f.Control))
+	deps = append(deps, f.Flows...)
+	for _, c := range f.Control {
+		deps = append(deps, wire.Pair{From: c.To, To: c.From, Node: c.Node})
+	}
+	reach(deps, seeds, fromEntry, false)
 	seeds = seeds[:0]
 	for _, a := range f.Returned {
 		seeds = append(seeds, a.Var)
 	}
-	reach(f.Flows, seeds, toReturn, true)
+	reach(deps, seeds, toReturn, true)
 	for v, j := range param {
 		if j >= 0 && toReturn[v] {
 			decl.Parameters[j].Returned = true
@@ -237,7 +250,7 @@ func created(f *wire.Function, decl *link.Decl) []wire.Access {
 			out = append(out, a)
 		}
 	}
-	for _, p := range f.Flows {
+	for _, p := range deps {
 		if toReturn[p.To] && fromEntry[p.To] && !fromEntry[p.From] && own(p.From) {
 			out = append(out, wire.Access{Var: p.From, Node: p.Node})
 		}
@@ -245,8 +258,8 @@ func created(f *wire.Function, decl *link.Decl) []wire.Access {
 	return out
 }
 
-// reach marks in seen every variable reachable from seeds over flows,
-// forward (From to To) or, with back, backward.
+// reach marks in seen every variable reachable from seeds over the pairs
+// flows, forward (From to To) or, with back, backward.
 func reach(flows []wire.Pair, seeds []uint32, seen []bool, back bool) {
 	next := make(map[uint32][]uint32)
 	for _, p := range flows {

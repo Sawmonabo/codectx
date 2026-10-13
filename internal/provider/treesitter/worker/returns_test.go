@@ -36,9 +36,16 @@ func TestReturningNodes(t *testing.T) {
 		// mutation: count an expression statement with its `;` as the tail.
 		{"rust statement", "rust", "a.rs", "fn g(p: i32) { let y = p; y; }\n", "fn g(p: i32) { let y = p; y; }", nil, nil},
 		// mutation: let-else's else block returns (Diverge replaced by
-		// Return), so the panic's node would return.
+		// Return), so the panic's node would return. The pattern's test
+		// decides whether the tail runs, so o reaches it too.
 		{"rust let-else", "rust", "a.rs", "fn e(o: Option<i32>) -> i32 { let Some(x) = o else { panic!(\"{}\", o) }; x }\n",
-			"fn e(o: Option<i32>) -> i32 { let Some(x) = o else { panic!(\"{}\", o) }; x }", []string{"x"}, []string{"x"}},
+			"fn e(o: Option<i32>) -> i32 { let Some(x) = o else { panic!(\"{}\", o) }; x }", []string{"x"}, []string{"o", "x"}},
+		// mutation: leave the deciding nodes' variables out of Returned (p
+		// and q, which only choose the value returned, would reach no
+		// return); a deciding node shared by both returns is cited once.
+		{"python deciding", "python", "a.py", "def c(p, q):\n    if p:\n        if q:\n            return 1\n    return 2\n",
+			"def c(p, q):\n    if p:\n        if q:\n            return 1\n    return 2", []string{"return 1", "return 2"},
+			[]string{"p", "q"}},
 		// A Go bare return reads the named results.
 		{"go bare return", "go", "a.go", "package p\nfunc f(p int) (r int) { r = p; return }\n",
 			"func f(p int) (r int) { r = p; return }", []string{"return"}, []string{"r"}},

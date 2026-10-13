@@ -173,8 +173,10 @@ has neither, and a site with neither publishes no return flow. A bound site publ
   return node of the callable `Site.Into` names, at the call expression, detail `return` (`FactReturn`). A callee
   with no return node (a type, a constructor that returns no value) publishes none.
 
-Only the values created inside a callable flow into its return node (docs/providers-treesitter.md, Return flow);
-the values its parameters reach come back only as summaries. So a walk at query time over `data_flows_to` needs no
+Only the values created inside a callable flow into its return node (docs/providers-treesitter.md, Return flow):
+no variable any parameter reaches, by data flow or by control dependence, is the source of a `return` edge, and
+every effect a parameter has on the result, the choice of which value is returned included, comes back only as its
+summary. So a walk at query time over `data_flows_to` needs no
 call stack to stay on realizable paths (ADR-0017 [S10]): a walk that enters a callee through an argument edge
 reaches only variables a parameter reaches, none of which flows into the return node, so it can leave the callee
 only through an argument edge of a call the callee makes; a walk that reaches a return node started inside the

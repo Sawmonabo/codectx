@@ -53,9 +53,11 @@ type Function struct {
 	// block with a tail), the nodes that yield the body's value. Each is an
 	// index into Nodes, ascending.
 	Returns []uint32
-	// Returned holds Var whose value reaches Node, a node of Returns: each
-	// variable of Src(Node) (docs/providers-treesitter.md, Projection), by
-	// node, then variable.
+	// Returned holds Var whose value reaches Node, a node of Returns, or
+	// decides whether Node runs: each variable of Src(Node) and of Src(c) for
+	// each node c Node control-depends on, directly or through other such
+	// nodes (docs/providers-treesitter.md, Projection), by node, then
+	// variable.
 	Returned []Access
 }
 

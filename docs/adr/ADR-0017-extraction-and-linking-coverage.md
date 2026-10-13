@@ -92,13 +92,13 @@ An import that does not resolve publishes nothing here; a non-constant one is AD
 - Transitive flow is a walk at query time, with no depth limit and no call stack. A plain edge from a callee's
   return to every call of it would let a walk enter one call and leave through another, the unrealizable-path error
   of interprocedural analysis [S10]; return values come back by summary edges instead [S10][S12]:
-  - **Return summary.** From the worker's intraprocedural def-use, each parameter whose value reaches a return of
-    its callable is marked. At each bound site whose value is written into variables, each argument bound to such a
+  - **Return summary.** From the worker's intraprocedural def-use and control dependence, each parameter whose
+    value reaches a return of its callable, or decides which return runs, is marked. At each bound site whose value is written into variables, each argument bound to such a
     parameter publishes one `data_flows_to` from each variable it reads to each of those variables, labelled
     `summary:` and the parameter's position. The walk takes it without entering the callee.
   - **Return node.** Each analysed callable has a return node, a variable keyed by the callable's identity, into
     which only the values created inside it flow: a value any parameter, or a variable captured from an enclosing
-    callable, reaches never does. Each bound site publishes the callee's return node flowing into the variables the
+    callable, reaches by data flow or by control dependence never does, since a walk follows both [S10]. Each bound site publishes the callee's return node flowing into the variables the
     call's value is written into, and into the caller's own return node when the caller returns the call's value
     (`return f()`), so a factory behind a wrapper reaches the wrapper's callers. A walk reaches a return node only
     from inside the callee, so leaving through any call of it is a partially balanced path, still realizable.

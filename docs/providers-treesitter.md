@@ -448,7 +448,10 @@ The function message carries:
   evidenced at `u`;
 - **reads**: each `v` in `R(n)`, evidenced at `n`;
 - **writes**: each `v` in `W(n)`, evidenced at `n`, marked as a may-definition when it is one;
-- **returns**: the returning nodes, and each `x` in `Src(r)` for each returning node `r`, evidenced at `r`. A
+- **returns**: the returning nodes, and for each returning node `r`, evidenced at `r`, each `x` in `Src(r)` and in
+  `Src(c)` for each node `c` that decides whether `r` runs (`r` control-depends on `c`, directly or through other
+  such nodes; a node shared by two returning nodes is cited at the first), so a variable that only chooses which
+  value is returned reaches the return too. A
   returning node is one a return statement moves to Exit (`flow.Builder.Return`, `flow.Graph.Returns`: its node Uses
   what the returned expression reads; a Rust `?` returns its error), and, for a callable whose body is an
   expression, each node control falls off the end from (`flow.Graph.Falls`): an ECMAScript arrow function whose
@@ -521,11 +524,15 @@ ADR-0017 decision 7; `internal/provider/treesitter/returns.go`):
   declaration-key alias: no source identifier declares it. The link table carries it (`Decl.Return`); the node is
   published here when a value flows into it, and by the linker when a flow leaves it.
 - **Created values.** With E the callable's parameters and the variables it captures (declared outside its span),
-  F the variables reachable from E over the message's flows, and B those that reach a returning node: a parameter
-  in B is marked `Returned` (`Parameter.Returned`, the callable's return summary); and a variable of its own outside
-  F that reaches a returning node directly, or flows into a variable of B ∩ F, flows into the return node, evidenced
-  at the returning node or the flow's node, detail `return`. A value any parameter reaches never flows into it, so
-  no walk enters through one call's argument and leaves through another's result.
+  D the message's flows and its control pairs taken from the controlling variable to the dependent one (the
+  direction an impact walk follows `control_depends_on`), F the variables reachable from E over D, and B those that
+  reach a returning node over D: a parameter in B is marked `Returned` (`Parameter.Returned`, the callable's return
+  summary); and a variable of its own outside F that reaches a returning node directly, or through an edge of D into
+  a variable of B ∩ F, flows into the return node, evidenced at the returning node or the edge's node, detail
+  `return`. A value any parameter reaches, by data flow or by control dependence, never flows into it, so no walk
+  enters through one call's argument and leaves through another's result. The cost is precision, never soundness: a
+  created value read only under a parameter's control (`k = 1` then `if p: return k`) is reached by `p` and comes
+  back only through `p`'s summary.
 - **A call's result.** Each site of the link table takes `Site.Results`, the variables the innermost node of the
   innermost analysed function containing the call defines (killing or may), and `Site.Into`, that function's
   callable when the node is one of its returning nodes; neither when another call site lies between the two (its

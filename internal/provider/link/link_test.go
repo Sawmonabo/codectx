@@ -285,6 +285,8 @@ type linked struct {
 	h     *providertest.Harness
 	files map[string]string
 	out   *capture
+	// structural is what the structural units handed their outputs.
+	structural *capture
 	// calls is the unit's `calls` capability row.
 	calls model.CapabilityState
 }
@@ -310,15 +312,21 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 		t.Fatal("the case has no source file")
 	}
 	var structIDs []model.UnitID
+	structOut := &capture{}
 	for _, p := range sources {
-		res, id, err := h.Run(t, structural, lang.ScopePrefix+p, []string{p})
+		su := h.Plan(t, structural, lang.ScopePrefix+p, []string{p})
+		structOut.UnitOutput = h.Begin(t, su, []string{p})
+		res, err := provider.RunUnit(ctx, structural, su.Request, stateCapture{structOut}, providertest.Limits, h.Pool)
+		if cerr := h.Store.CompleteProviderRun(ctx, res, provider.CodeOf(err)); cerr != nil {
+			t.Fatalf("CompleteProviderRun: %v", cerr)
+		}
 		if err != nil {
 			t.Fatalf("structural unit of %s: %v", p, err)
 		}
 		if res.State != model.RunSucceeded {
 			t.Fatalf("structural unit of %s ran %s", p, res.State)
 		}
-		structIDs = append(structIDs, id)
+		structIDs = append(structIDs, su.Build.Spec.ID)
 	}
 	// Sealing attached the structural units to the staging generation, which
 	// is where the linker reads their tables.
@@ -357,7 +365,7 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	}
 	checkCapability(t, result, scope)
 	checkEndpoints(t, out)
-	l := linked{h: h, files: files, out: out}
+	l := linked{h: h, files: files, out: out, structural: structOut}
 	for _, c := range result.Capabilities {
 		if c.Capability == string(model.RelCalls) {
 			l.calls = c
@@ -464,6 +472,18 @@ func (c *capture) PutNodes(ctx context.Context, facts []model.NodeFact) error {
 func (c *capture) PutRelations(ctx context.Context, facts []model.RelationFact) error {
 	c.rels = append(c.rels, facts...)
 	return c.UnitOutput.PutRelations(ctx, facts)
+}
+
+// stateCapture is a capture of a structural unit, which stores its link
+// table as provider state beside its facts.
+type stateCapture struct{ *capture }
+
+func (c stateCapture) PutState(ctx context.Context, kind string, payload []byte) error {
+	s, ok := c.UnitOutput.(provider.StateSink)
+	if !ok {
+		return &model.Error{Code: model.CodeInternal, Message: "the captured unit output does not store provider state"}
+	}
+	return s.PutState(ctx, kind, payload)
 }
 
 // calls is the evidence of every `calls` occurrence from a declaration

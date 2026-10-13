@@ -41,8 +41,12 @@ type depLists struct {
 	seenN, seenV []int32
 	// stack is the walk's stack of nodes.
 	stack []int32
-	// rets is the function's returning nodes (returning).
-	rets []int32
+	// rets is the function's returning nodes (returning); ctl is the control
+	// dependence pairs keyed by the dependent node, and decides marks the
+	// nodes found to decide whether a returning node runs.
+	rets    []int32
+	ctl     []uint64
+	decides []int32
 	// linker builds the file's link tables beside the pass, link holds them
 	// and linkFailure is why they were abandoned (link.go).
 	linker      linker
@@ -208,12 +212,7 @@ func (d *depLists) project(g *flow.Graph, cd, du flow.Edges, fn flow.Span, rets 
 			control(x)
 		}
 	}
-	for _, r := range rets {
-		f.Returns = append(f.Returns, uint32(r))
-		for _, x := range d.srcOf(r) {
-			f.Returned = append(f.Returned, wire.Access{Var: x, Node: uint32(r)})
-		}
-	}
+	d.returned(g, cd, rets)
 	d.nodes(g)
 	for i, r := range f.Returns {
 		f.Returns[i] = uint32(d.nodeAt[r])
@@ -226,6 +225,46 @@ func (d *depLists) project(g *flow.Graph, cd, du flow.Edges, fn flow.Span, rets 
 	f.Reads = accesses(f.Reads, d.nodeAt)
 	f.Writes = accesses(f.Writes, d.nodeAt)
 	return f
+}
+
+// returned fills f.Returns with rets and f.Returned with, for each returning
+// node r, the variables of Src(r) and the variables each node deciding
+// whether r runs reads: a controller of r, of a controller of r, and so on
+// over cd. A parameter that only chooses which value is returned thus reaches
+// the return as well. A deciding node shared by several returning nodes is
+// cited at the first of them.
+func (d *depLists) returned(g *flow.Graph, cd flow.Edges, rets []int32) {
+	f := &d.fn
+	d.ctl = d.ctl[:0]
+	for i := range cd.Len() {
+		c, dep := cd.At(i)
+		d.ctl = append(d.ctl, uint64(uint32(dep))<<32|uint64(uint32(c)))
+	}
+	slices.Sort(d.ctl)
+	d.decides = sized(d.decides, g.Len())
+	for _, r := range rets {
+		f.Returns = append(f.Returns, uint32(r))
+		for _, x := range d.srcOf(r) {
+			f.Returned = append(f.Returned, wire.Access{Var: x, Node: uint32(r)})
+		}
+		d.stack = append(d.stack[:0], r)
+		for len(d.stack) > 0 {
+			n := d.stack[len(d.stack)-1]
+			d.stack = d.stack[:len(d.stack)-1]
+			i, _ := slices.BinarySearch(d.ctl, uint64(uint32(n))<<32)
+			for ; i < len(d.ctl) && int32(uint32(d.ctl[i]>>32)) == n; i++ {
+				c := int32(uint32(d.ctl[i]))
+				if d.decides[c] >= 0 {
+					continue
+				}
+				d.decides[c] = r
+				d.stack = append(d.stack, c)
+				for _, x := range d.srcOf(c) {
+					f.Returned = append(f.Returned, wire.Access{Var: x, Node: uint32(r)})
+				}
+			}
+		}
+	}
 }
 
 // writes calls visit with each named variable node u defines (may false) or
