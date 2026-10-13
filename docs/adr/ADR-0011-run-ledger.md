@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-09-16. Amended 2026-10-08: the hosted dependence engine this record governs was deleted under ADR-0012 phase 6.
+Accepted, 2026-09-16. Dependence facts are produced in process by the native engine ([ADR-0012](ADR-0012-native-dependence-engine.md)); the stages below that name a dependence provider describe the context this record was decided in.
 
 ## Context
 
