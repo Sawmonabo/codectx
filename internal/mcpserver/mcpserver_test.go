@@ -1110,9 +1110,9 @@ var scenarios = []scenario{
 	},
 	func() scenario {
 		// Failure mode: view="export" answers with capsule RECORDS. A sealed
-		// capsule now carries only identity and its eight per-list counts --
+		// capsule carries only identity and its eight per-list counts --
 		// the records are rows read one keyset page at a time -- so the failure
-		// this row still guards is the projection: an export that omits a
+		// this row guards is the projection: an export that omits a
 		// list's count, or that also returns a page, makes a caller believe it
 		// has been told how much the capsule holds when it has not.
 		//

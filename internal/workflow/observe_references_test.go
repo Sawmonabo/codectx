@@ -14,14 +14,14 @@ import (
 //
 // The count that matters is the scope review's aggregate: a review carries its
 // references inside its eight categories, and a complete review of a large
-// scope legitimately carries hundreds. The service used to compare that
-// aggregate against a hard 64 and refuse the attestation -- which refused a
-// review for the size of the scope it attested to, and no other assertion in
-// this package sees it because every fixture review cites a handful of files.
+// scope legitimately carries hundreds. Mutation: the service compares that
+// aggregate against a hard 64 and refuses the attestation -- refusing a review
+// for the size of the scope it attests to, which no other assertion in this
+// package sees because every fixture review cites a handful of files.
 //
-// This service ceiling is now the ONLY one: the model's per-list ceiling is
-// gone, and TestObservationReferencesCarryNoModelCeiling in internal/model
-// holds that half.
+// This service ceiling is the ONLY one: the model has no per-list ceiling, and
+// TestObservationReferencesCarryNoModelCeiling in internal/model holds that
+// half.
 //
 // Second failure mode: a caller that DID set a ceiling must be told the ceiling
 // and the count, or raising it is a guess.

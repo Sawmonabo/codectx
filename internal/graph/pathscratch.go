@@ -182,11 +182,10 @@ INSERT INTO progress(k, expand_after, depth_pruned, scan_done, hop_pos, possible
 
 // openPathScratch opens the search's database on a surface of the store's
 // scratch pool under parent, emptied of whatever the search before it left
-// and never truncated. A search used to create its database and remove it at
-// the end of the page, so a store answering path queries handed the
-// filesystem one search's worth of deallocation per query, over and over. On
-// a host that discards freed blocks under a sparse image that stalls every
-// writer on the machine.
+// and never truncated. A search that created its database and removed it at
+// the end of the page would hand the filesystem one search's worth of
+// deallocation per query, over and over; on a host that discards freed blocks
+// under a sparse image that stalls every writer on the machine.
 //
 // An engine with no spool store has nowhere to pool: the system temporary
 // directory then holds the ONE directory this search owns and close() removes.

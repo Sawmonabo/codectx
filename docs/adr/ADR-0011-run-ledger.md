@@ -109,11 +109,11 @@ would spill or an exclusive writer waits ([ADR-0008](ADR-0008-ingestion-group.md
 until that commit, so a ledger inside it could not answer a question about a run in progress --
 which is half of the requirement.
 
-`Store.Activate` (`internal/storage/sqlite/units.go:1522`) commits through the writer's
-immediate transaction (`:1581`) and holds it around the adjacency build and the lexical build
-(`:1694`, `:1700`). Lexical compaction runs just before that transaction (`:1577`) as its own
-bounded ingestion rather than inside it, so the write window is narrower than the whole of activation -- and still wide enough
-to matter. Any other writer on that file waits or fails busy for its duration, which is exactly the
+`Store.Activate` commits the search library first, outside any SQLite transaction, and then
+holds one write transaction on the main store around the packed adjacency build, the generation's
+visible search-document set and the active-pointer flip, before it refreshes the planner
+statistics. The write window is therefore narrower than the whole of activation -- and still wide
+enough to matter. Any other writer on that file waits or fails busy for its duration, which is exactly the
 window an operator most wants the ledger to be answering in.
 
 There is a third reason that is not about contention. The main schema's text is hashed into a
