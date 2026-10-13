@@ -222,9 +222,15 @@ func (k *rustLinker) walk(n Node) wire.Type {
 		k.locals = k.locals[:mark]
 	case s.callExpression:
 		return k.call(n)
-	case s.macroInvocation, s.tokenTree, s.useDeclaration, s.attributeItem:
-		// A macro's arguments are tokens the parse does not read as code, and
-		// no call the structural queries capture lies inside one.
+	case s.macroInvocation:
+		// A macro's arguments are tokens the parse does not read as code,
+		// and no call the structural queries capture lies inside one, unless
+		// it is an item-position body the worker re-parsed (spliceMacros),
+		// whose items are walked as the enclosing scope's own.
+		if t := lastChild(n); !t.IsNull() && t.spliced() {
+			k.children(t)
+		}
+	case s.tokenTree, s.useDeclaration, s.attributeItem:
 	case s.structExpression:
 		return k.structLiteral(n)
 	case s.assignmentExpression:
@@ -317,12 +323,24 @@ func (k *rustLinker) functionItem(n Node) {
 // member reports a function item or signature declared in an impl or trait
 // body, whose `Self` and receiver are the innermost owner.
 func (k *rustLinker) member(n Node) bool {
-	p := n.Parent()
-	if p.IsNull() || p.KindId() != k.k.declarationList {
-		return false
-	}
-	o := p.Parent()
+	o := k.itemOwner(n)
 	return !o.IsNull() && (o.KindId() == k.k.implItem || o.KindId() == k.k.traitItem)
+}
+
+// itemOwner is the item whose declaration list holds the item n, through
+// any re-parsed macro body n is written in (a macro's items are its
+// enclosing scope's), or null when no declaration list holds it.
+func (k *rustLinker) itemOwner(n Node) Node {
+	p := n.Parent()
+	for !p.IsNull() && p.spliced() {
+		if p = p.Parent(); !p.IsNull() {
+			p = p.Parent()
+		}
+	}
+	if p.IsNull() || p.KindId() != k.k.declarationList {
+		return Node{}
+	}
+	return p.Parent()
 }
 
 // export records the Export of a function item or signature whose name is
@@ -341,7 +359,7 @@ func (k *rustLinker) export(n Node) {
 	inTrait := false
 	if k.member(n) {
 		x.Receiver = k.self()
-		inTrait = n.Parent().Parent().KindId() == s.traitItem
+		inTrait = k.itemOwner(n).KindId() == s.traitItem
 		if !inTrait && len(k.owners) > 0 {
 			o := k.owners[len(k.owners)-1]
 			x.Override, x.Trait = o.traitImpl, o.trait

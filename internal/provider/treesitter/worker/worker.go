@@ -240,6 +240,10 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 	}
 	flat, ferr := Flatten(kept.tree, kept.l.Name)
 	kept.tree.Close()
+	if ferr == nil {
+		flat, ferr = ex.macros.spliceMacros(flat)
+	}
+	ex.macros.close()
 	if ferr != nil {
 		done.DependenceFailure = ferr.Error()
 		return done, nil, nil

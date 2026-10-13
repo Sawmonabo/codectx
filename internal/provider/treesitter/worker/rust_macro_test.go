@@ -145,3 +145,50 @@ s! {
 		t.Fatalf("stat is in %q at %d", d.Branch, d.Start)
 	}
 }
+
+// TestRustMacroBodiesAreLinkedAndLowered protects the dependence and link
+// facts of the items a macro body writes: the re-parse replaces the body's
+// tokens in the file's flat array, so a function in it is lowered (one
+// function message), its call is a site, and a method written in a macro
+// inside an impl is the impl's: its receiver is the self type and, in a
+// trait impl, its trait is the block's.
+//
+// Mutation: no splice -> no export or function message for spawn, and no
+// site for take.
+// Mutation: read a member's owner without passing the macro -> fmt has no
+// receiver and no trait.
+func TestRustMacroBodiesAreLinkedAndLowered(t *testing.T) {
+	src := `pub struct S { v: u8 }
+impl std::fmt::Display for S {
+    m! { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { helper(self.v) } }
+}
+cfg_rt! {
+    pub fn spawn(s: &S) -> u8 { let x = s.v; take(x) }
+}
+fn take(x: u8) -> u8 { x }
+fn helper(x: u8) -> std::fmt::Result { Ok(()) }
+`
+	l, fns := linkOf(t, "rust", "lib.rs", src)
+	name := func(n string) wire.Span {
+		s := textAt(t, src, "fn "+n, 0)
+		return wire.Span{Start: s.Start + 3, End: s.End}
+	}
+	fmtX := exportNamed(l, name("fmt"))
+	if fmtX == nil || fmtX.Receiver != "S" || !fmtX.Override || fmtX.Trait != "std::fmt::Display" {
+		t.Fatalf("fmt in the impl's macro exports %+v, want receiver S implementing std::fmt::Display", fmtX)
+	}
+	if x := exportNamed(l, name("spawn")); x == nil || x.Receiver != "" || x.Signature != "(&S)(u8)" {
+		t.Fatalf("spawn in cfg_rt! exports %+v", x)
+	}
+	if siteNamed(l, textAt(t, src, "take", 0)) == nil {
+		t.Fatal("the call of take inside cfg_rt! is no site")
+	}
+	spawn := textAt(t, src, "pub fn spawn", 0)
+	lowered := false
+	for _, f := range fns {
+		lowered = lowered || (f.Span.Start == spawn.Start && !f.Failed)
+	}
+	if !lowered {
+		t.Fatalf("spawn was not lowered: %+v", fns)
+	}
+}

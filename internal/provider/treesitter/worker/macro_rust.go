@@ -28,7 +28,10 @@ import (
 // A kept re-parse is one more tree of the file: the structural query runs
 // over it as over the file's own, so the items it holds are declarations,
 // its calls and type references references, and an item-position invocation
-// inside it is re-parsed in turn. Each of its declarations sits in a branch
+// inside it is re-parsed in turn. Its nodes then replace the body's tokens
+// in the file's flat array (spliceMacros), so its functions are lowered and
+// linked as the enclosing scope's own: a method written in a macro inside an
+// impl is the impl's. Each of its declarations sits in a branch
 // element `macro "<path>"`, or `macro "<path>" "<header>"` for a group,
 // spelled as written, so two definitions of one name in two invocations
 // (`cfg_rt!` and `cfg_not_rt!`) or two arms are two entities; and it is
@@ -98,11 +101,16 @@ func rsMacroSyntaxOf() *rsMacroSyntax {
 	return rsMacroTables
 }
 
-// macroBody is one kept re-parse: its root and the branch element its
-// declarations sit in.
+// macroBody is one kept re-parse: its tree and root, the branch element
+// its declarations sit in, and the token tree it re-parses.
 type macroBody struct {
+	tree    *ts.Tree
 	root    ts.Node
 	element string
+	// tt is the range of the token tree re-parsed, the invocation's body or
+	// one of its groups, whose tokens the re-parse replaces in the file's
+	// flat array (spliceMacros).
+	tt span
 	// path is the invocation's macro path as written.
 	path string
 }
@@ -285,7 +293,7 @@ func (e *extraction) parseBody(t *ts.Node, s *rsMacroSyntax, element string) (ma
 		return macroBody{}, false
 	}
 	m.trees = append(m.trees, tree)
-	return macroBody{root: *root, element: element}, true
+	return macroBody{tree: tree, root: *root, element: element, tt: span{t.StartByte(), t.EndByte()}}, true
 }
 
 // cleanItems reports a re-parse with no error or missing node whose every
