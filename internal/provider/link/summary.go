@@ -111,6 +111,14 @@ const (
 // its list, because a binding names a declaration and a site by index into
 // the table: an inserted declaration changes the hashes of those after it.
 func (t *Table) Interface() ([]SummaryEntry, error) {
+	// The argument each mount passes is read from t itself: the copy
+	// clears the site indices that locate it.
+	args := make([]*wire.Type, len(t.Routing.Mounts))
+	for i := range t.Routing.Mounts {
+		if a, ok := mountArgument(t, &t.Routing.Mounts[i]); ok {
+			args[i] = &a
+		}
+	}
 	t = t.positionless()
 	var out []SummaryEntry
 	var err error
@@ -157,12 +165,6 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings) > 0 {
 		// The argument each mount passes is read with the routing
 		// (mountKey), though it is written in a site.
-		args := make([]*wire.Type, len(r.Mounts))
-		for i := range r.Mounts {
-			if a, ok := mountArgument(t, &r.Mounts[i]); ok {
-				args[i] = &a
-			}
-		}
 		add(EntryRouting, "", 0, struct {
 			Routing
 			Arguments []*wire.Type

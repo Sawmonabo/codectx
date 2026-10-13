@@ -197,7 +197,10 @@ func indexPythonRouting(file int32, t *Table, add func(entry) error) error {
 				continue
 			}
 			pm := payloadMount{RouteMount: *m, Key: key, Exact: exact}
-			pm.Range = model.SourceRange{}
+			// The walk reads the mount's key, never its range or the site
+			// it was read from: none enters the module index, so an edit
+			// that only moves the mount re-runs no reader.
+			pm.Range, pm.Site, pm.Arg = model.SourceRange{}, 0, 0
 			p.Mounts = append(p.Mounts, pm)
 		}
 		raw, err := json.Marshal(p)
@@ -555,14 +558,17 @@ func (f *filePublication) routes(m *RouteMount, group []idBinding) error {
 }
 
 // summary is the routing as the interface summary hashes it: every range
-// cleared, since no summary covers a byte range.
+// cleared, since no summary covers a byte range, and every mount's site and
+// argument index, which only locate the argument the interface hashes
+// beside the routing (Interface): a call inserted before a mount shifts
+// them and changes nothing another file reads.
 func (r Routing) summary() Routing {
 	if len(r.Mounts) == 0 {
 		return r
 	}
 	r.Mounts = slices.Clone(r.Mounts)
 	for i := range r.Mounts {
-		r.Mounts[i].Range = model.SourceRange{}
+		r.Mounts[i].Range, r.Mounts[i].Site, r.Mounts[i].Arg = model.SourceRange{}, 0, 0
 	}
 	return r
 }
