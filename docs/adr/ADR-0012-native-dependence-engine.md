@@ -328,11 +328,13 @@ Concretely:
   follows every `data_flows_to` edge. This is the property the two phases of the interprocedural forward slice
   exist to enforce (Horwitz, Reps and Binkley, TOPLAS 12(1), 1990, section 4.5), carried by the facts instead of by
   per-path walk state.
-- **Ranked below call impact.** A program-dependence hop costs its traversal cost plus 996 in impact
-  (`dependenceHorizon`), so every node a call, override or structural route reaches outranks every node only a
-  dependence route reaches unless that route costs 998 or more. Nothing is dropped; the rule orders the answer, and
-  the value is the largest that keeps one dependence hop's integer scores distinct. Paths and traversals walk the
-  plain cost table.
+- **Ranked below call impact, at every depth.** Impact ranks by the lexicographic key (reached through a
+  program-dependence hop, cost). The key is one integer: a route that takes a dependence hop carries a fixed high bit
+  in its cost (`dependenceTier`, set once, never added), so every comparison by cost puts every node a call, override
+  or structural route reaches before every node only a dependence route reaches, and orders each tier by its plain
+  cost. A dependence-reached entry's `score_micros` is its plain score minus 1 000 001, always negative, so the served
+  order is still score descending. Nothing is dropped and no threshold exists. Paths and traversals walk the plain
+  cost table.
 - **Paged evidence.** Evidence ranges are paged per pair, like every other answer.
 - **Anchored on every operand.** Control dependences on operator conditions are anchored at each operand, where the
   engine drops them.

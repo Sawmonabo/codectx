@@ -773,7 +773,7 @@ var errAdmitCrash = internalErr("graph: the level transition was cut short")
 func admitState(r levelRecord, costs kindCosts) frontierState {
 	return frontierState{
 		Depth: r.Owner.Depth + 1,
-		Cost:  r.Owner.Cost + costs.of(r.Edge.Kind),
+		Cost:  costs.add(r.Owner.Cost, r.Edge.Kind),
 		Node:  r.Edge.Neighbour,
 		Via:   r.Edge.Rel,
 		Route: appendRoute(r.Owner.Route, r.Edge.Rel),
@@ -788,7 +788,7 @@ func admitState(r levelRecord, costs kindCosts) frontierState {
 // the kind costs -- so the winner is the same on a fresh index and on a
 // delta-built one. Surrogates never enter it.
 func compareAdmitRoute(a, b levelRecord, costs kindCosts) int {
-	if c := cmp.Compare(a.Owner.Cost+costs.of(a.Edge.Kind), b.Owner.Cost+costs.of(b.Edge.Kind)); c != 0 {
+	if c := cmp.Compare(costs.add(a.Owner.Cost, a.Edge.Kind), costs.add(b.Owner.Cost, b.Edge.Kind)); c != 0 {
 		return c
 	}
 	if c := cmp.Compare(a.Owner.Depth, b.Owner.Depth); c != 0 {

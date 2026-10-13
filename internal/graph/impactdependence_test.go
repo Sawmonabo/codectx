@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -113,37 +114,45 @@ func TestImpactFollowsControlDependence(t *testing.T) {
 }
 
 // TestImpactRanksCallImpactAboveDependence is the ranking rule
-// (dependenceHorizon): every node a call route reaches outranks a node only a
-// program-dependence hop reaches, even when the call route is the deeper one.
-// s's callers are three deep; d is one data-flow hop from s.
+// (dependenceTier): every node a call route reaches outranks a node only a
+// program-dependence hop reaches, at every depth. s's callers form a chain
+// 1 000 deep; d is one data-flow hop from s. A data-flow-only node also
+// reports a lower score than every call-reached one, so the served score
+// order and the rank agree.
 //
-// Mutation caught: a program-dependence hop costing its traversal cost in
-// impact (impactCost returning Cost): d, at cost 2, then ties c2's score and
-// outranks it by depth.
+// Mutations caught: impactAdd or kindCosts.add not setting the tier (d, at
+// cost 2, ties c2's score and outranks it by depth); a fixed surcharge in
+// place of the tier, of any size below the chain's cost (d outranks the deep
+// end of the chain); scoreMicros ignoring the tier (d's score is above the
+// chain's tail).
 func TestImpactRanksCallImpactAboveDependence(t *testing.T) {
-	f := dependenceFixture(map[string]model.NodeKind{
-		"s": model.NodeFunction, "c1": model.NodeFunction, "c2": model.NodeFunction, "c3": model.NodeFunction,
-		"d": model.NodeVariable,
-	}, [][3]string{
-		{"c1", string(model.RelCalls), "s"},
-		{"c2", string(model.RelCalls), "c1"},
-		{"c3", string(model.RelCalls), "c2"},
-		{"s", string(model.RelDataFlowsTo), "d"},
-	})
-	entries := incomingImpact(t, f, "s")
-	var order []model.NodeID
-	for _, e := range entries {
-		order = append(order, e.NodeID)
+	const chain = 1000
+	nodes := map[string]model.NodeKind{"s": model.NodeFunction, "d": model.NodeVariable}
+	rels := [][3]string{{"s", string(model.RelDataFlowsTo), "d"}}
+	name := func(i int) string { return fmt.Sprintf("c%d", i) }
+	prev := "s"
+	for i := 1; i <= chain; i++ {
+		nodes[name(i)] = model.NodeFunction
+		rels = append(rels, [3]string{name(i), string(model.RelCalls), prev})
+		prev = name(i)
 	}
-	want := []model.NodeID{fixtureNodeID("c1"), fixtureNodeID("c2"), fixtureNodeID("c3"), fixtureNodeID("d")}
-	if len(order) != len(want) {
-		t.Fatalf("impact of s lists %d entries, want %d: %+v", len(order), len(want), entries)
+	entries := incomingImpact(t, dependenceFixture(nodes, rels), "s")
+	if len(entries) != chain+1 {
+		t.Fatalf("impact of s lists %d entries, want %d", len(entries), chain+1)
 	}
-	for i := range want {
-		if order[i] != want[i] {
-			t.Fatalf("entry %d is %s, want %s: the call chain must rank above the data-flow-only node (%+v)",
-				i, order[i], want[i], entries)
+	for i := 0; i < chain; i++ {
+		if entries[i].NodeID != fixtureNodeID(name(i+1)) {
+			t.Fatalf("entry %d is %s, want %s: the call chain must rank above the data-flow-only node",
+				i, entries[i].NodeID, name(i+1))
 		}
+	}
+	last, tail := entries[chain], entries[chain-1]
+	if last.NodeID != fixtureNodeID("d") {
+		t.Fatalf("the last entry is %s, want the data-flow-only node d", last.NodeID)
+	}
+	if last.ScoreMicros >= tail.ScoreMicros {
+		t.Errorf("d scores %d, not below the chain's deepest caller (%d): the served score contradicts the rank",
+			last.ScoreMicros, tail.ScoreMicros)
 	}
 }
 

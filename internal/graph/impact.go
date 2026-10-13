@@ -547,7 +547,7 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 		entry := model.ImpactEntry{NodeID: r.NodeID, Direction: r.Direction, Depth: r.Depth,
 			ScoreMicros: r.scoreMicros(), Reasons: r.Reasons}
 		if len(r.Route) > 0 && len(r.Route) <= model.MaxRelationsPerPath && !reasonPaths.Exceeded(1) {
-			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: r.Cost, Possible: r.Possible}}
+			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: plainCost(r.Cost), Possible: r.Possible}}
 		}
 		entries = append(entries, entry)
 	}
@@ -1072,7 +1072,7 @@ func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 	return a.emit(impactRecord{
 		NodeID:    reached,
 		Depth:     depth,
-		Cost:      state.Cost + impactCost(kind),
+		Cost:      impactAdd(state.Cost, kind),
 		Direction: direction,
 		Via:       a.names.rel(e.Rel),
 		Parent:    a.names.node(state.Node),

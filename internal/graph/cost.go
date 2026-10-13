@@ -117,32 +117,40 @@ func ProgramDependenceRelations() []model.RelationKind {
 	return []model.RelationKind{model.RelDataFlowsTo, model.RelControlDependsOn}
 }
 
-// dependenceHorizon is what an impact walk adds to a program-dependence hop's
-// cost (impactCost). It is the ranking rule that keeps call and override
-// impact visible: a node a route reaches without a program-dependence hop
-// outranks every node whose cheapest route takes one, unless that route costs
-// 998 or more (a chain of 998 calls). Every route stays in the answer; the
-// rule decides only the order.
+// dependenceTier is the bit an impact route's cost carries once the route
+// has taken a program-dependence hop. It makes the cost a lexicographic key,
+// (reached through dependence, cost), in one integer: every comparison that
+// orders routes by cost -- the walk's admission, the record fold and the
+// served rank -- puts every route with no program-dependence hop before every
+// route with one, at every depth, and orders each tier by its plain cost.
+// Every route stays in the answer; the rule decides only the order.
 //
-// The value is the largest that keeps one program-dependence hop's scores
-// apart. A score is 1_000_000 / (1 + cost), and the scores of costs c and c+1
-// differ while (1+c)(2+c) <= 1_000_000, that is through c = 998: data_flows_to
-// costs 2 + 996 = 998 and scores 1001, control_depends_on 3 + 996 = 999 and
-// scores 1000, so a data dependence still outranks a control dependence, and a
-// dependence reached through one `reads` hop (cost 1001, score 998) outranks
-// one reached through two (cost 1004, score 995).
-const dependenceHorizon int64 = 996
+// It is set, never added (kindCosts.add, impactAdd), so a route of any number
+// of dependence hops carries it once. The plain cost beneath it is at most the
+// dearest kind cost times the route's depth, and 2^48 / 7 hops is a walk
+// deeper than any store's node count, so the bit never collides with a plain
+// cost. A state's encoded cost grows from one or two varint bytes to seven
+// only once its route has taken a dependence hop.
+const dependenceTier int64 = 1 << 48
 
-// impactCost is the cost one edge of kind k adds to an impact route: the
-// traversal cost (Cost), plus dependenceHorizon for a program-dependence
-// kind. Every other operation walks the plain table, so a path or a traversal
-// over data flow costs what it always has.
-func impactCost(k model.RelationKind) int64 {
-	if slices.Contains(ProgramDependenceRelations(), k) {
-		return Cost(k) + dependenceHorizon
-	}
-	return Cost(k)
+// isDependence reports a program-dependence kind.
+func isDependence(k model.RelationKind) bool {
+	return slices.Contains(ProgramDependenceRelations(), k)
 }
+
+// impactAdd is the cost of an impact route extended by one edge of kind k:
+// the traversal cost (Cost) added, and dependenceTier set for a
+// program-dependence kind. Every other operation adds the plain cost, so a
+// path or a traversal over data flow costs what it always has.
+func impactAdd(total int64, k model.RelationKind) int64 {
+	if isDependence(k) {
+		total |= dependenceTier
+	}
+	return total + Cost(k)
+}
+
+// plainCost is a route cost without its tier bit: the sum of its kind costs.
+func plainCost(cost int64) int64 { return cost &^ dependenceTier }
 
 // reversedKinds are the kinds whose stored direction runs from the dependency
 // to the dependent. Every other relation kind is stored dependent first (`a

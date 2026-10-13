@@ -19,9 +19,10 @@ import (
 //     against its stored direction: the incoming half of an impact walk takes
 //     a `data_flows_to` edge OUT of the node it is at, and reports the node it
 //     reaches as incoming (it may need modification).
-//   - Cost. A program-dependence hop costs impactCost, which ranks every node
-//     a call, override or structural route reaches above the nodes only a
-//     dependence route reaches (dependenceHorizon states the rule).
+//   - Rank. A route that takes a program-dependence hop carries
+//     dependenceTier in its cost, so every node a call, override or
+//     structural route reaches ranks above every node only a dependence route
+//     reaches, at any depth.
 //
 // Interprocedural realizability is a property of the facts, not of the walk.
 // Across a call, the linking provider publishes three flows: each variable an
@@ -139,8 +140,9 @@ func impactEdgeReason(kind model.RelationKind, stored bool, dir model.Direction,
 }
 
 // dependenceCosts is the walk's cost table with each program-dependence kind
-// at its impactCost, so a frontier state's cost and the cost of the record
-// impactAccumulator.Visit emits from it are one sum over one table.
+// marked by dependenceTier, so kindCosts.add sets the tier on a frontier
+// state's cost exactly as impactAdd sets it on the record
+// impactAccumulator.Visit emits from that state.
 func dependenceCosts(r GraphReader, costs kindCosts) kindCosts {
 	table := r.Kinds()
 	if table == nil {
@@ -149,8 +151,17 @@ func dependenceCosts(r GraphReader, costs kindCosts) kindCosts {
 	out := slices.Clone(costs)
 	for _, k := range ProgramDependenceRelations() {
 		if code, ok := table.Code(k); ok && int(code) < len(out) {
-			out[code] = impactCost(k)
+			out[code] = Cost(k) | dependenceTier
 		}
 	}
 	return out
+}
+
+// add is a route's cost extended by one edge of kind code: the kind's plain
+// cost added and, for a kind marked with dependenceTier, the tier set rather
+// than added, so it is carried once however many dependence hops the route
+// takes. A table no kind of which is marked adds the plain cost.
+func (c kindCosts) add(total int64, code KindCode) int64 {
+	v := c.of(code)
+	return (total | v&dependenceTier) + v&^dependenceTier
 }
