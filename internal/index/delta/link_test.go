@@ -444,3 +444,40 @@ func (s *session) flows(unit model.UnitID, name string) int {
 	}
 	return n
 }
+
+// TestRenamedParameterMovesFlowThroughAValue renames the parameter a of f to
+// b in callee.py, which caller.py takes as a value and calls through it as
+// h(b=x): the call binds f through the value (no name at the site names f),
+// and the keyword names no parameter before the rename and binds f's **kw,
+// then binds b after it. The refresh must equal the full build of the same
+// tree (session.check), and the caller's one argument flow moves from **kw
+// to b.
+//
+// Mutation: keep the stored flows of a site bound through a value when only
+// the callee's parameters moved (re-run nothing of caller.py) -> the
+// refreshed unit still flows into **kw and none into b.
+func TestRenamedParameterMovesFlowThroughAValue(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"callee.py": "def f(a=0, **kw):\n    return a\n",
+		"caller.py": "from callee import f\n\n\ndef g(x):\n    h = f\n    return h(b=x)\n",
+	}
+	base := s.only(s.advance(files))
+	s.check("base", []linkBuild{base})
+	if n := s.flows(base.unit, ""); n != 1 {
+		t.Fatalf("the base unit holds %d argument flows, want the one of h(b=x) into **kw", n)
+	}
+	if n := s.flows(base.unit, "b"); n != 0 {
+		t.Fatalf("the base unit holds %d argument flows into a parameter b, want none: f has no b", n)
+	}
+	files = edit{name: "parameter renamed", replace: []sub{{"callee.py", "def f(a=0, **kw):\n    return a\n",
+		"def f(b=0, **kw):\n    return b\n"}}}.apply(t, files)
+	renamed := s.only(s.advance(files))
+	s.check("parameter renamed", []linkBuild{renamed})
+	if n := s.flows(renamed.unit, "b"); n != 1 {
+		t.Errorf("the refreshed unit holds %d argument flows into the parameter b, want h(b=x)'s", n)
+	}
+	if renamed.sites["caller.py"] == 0 {
+		t.Errorf("the refresh resolved none of caller.py's sites, want h(b=x): the parameter it names moved")
+	}
+}
