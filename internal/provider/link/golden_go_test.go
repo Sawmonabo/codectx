@@ -415,7 +415,7 @@ func (Ints) Len() int { return 0 }
 		name:   "external-interfaces-by-method-set",
 		anchor: "The Go Programming Language Specification, \"Interface types\", \"Method sets\", \"Struct types\" (promoted methods), \"Type identity\"; Go Modules Reference, \"Module cache\"",
 		files: map[string]string{
-			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire (\n\texample.com/dep v1.2.0\n\texample.com/old v2.0.0\n)\n",
+			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire (\n\texample.com/dep v1.2.0\n\texample.com/old v1.1.0\n)\n",
 			"p.go": `package p
 
 import (
@@ -458,7 +458,7 @@ var _ old.Pinger
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every fact. io is read from the standard library and
-		// dep from the module cache at the required v1.2.0; old is required at v2.0.0, which the cache does
+		// dep from the module cache at the required v1.2.0; old is required at v1.1.0, which the cache does
 		// not hold, so no Pinger is read and P proves nothing. F's method set covers io.Reader, io.Writer and
 		// io.ReadWriter; RuneScanner's unexported method keeps it out; E and W implement through the methods
 		// their embedded io.Reader and dep.Base promote; S's []rune is []int32, never []byte.

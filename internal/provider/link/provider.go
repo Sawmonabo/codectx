@@ -107,6 +107,13 @@ const (
 	// outside the project that the source proves a class: a class's
 	// `extends` clause or base list.
 	DetailSupertypeClass = "supertype_class"
+	// DetailSupertypeCandidate: an `overrides` of a method of a type outside
+	// the project that a Java `@Override` or C++ `override` method may
+	// override: one of the external supertypes on a path no type of the
+	// project declares the method along, read with its set size as "at least
+	// one of n" (several may hold at once), or one published beside an
+	// override of the project's own, which the mark already proves.
+	DetailSupertypeCandidate = "supertype_candidate"
 )
 
 // LinkOptions is what the delta build hands one unit's link.

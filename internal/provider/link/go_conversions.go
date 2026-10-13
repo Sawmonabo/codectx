@@ -109,8 +109,9 @@ func (h *hierarchy) goExternalOverrides(fc fileCtx, owner, ref Ref, d *Decl, emi
 
 // goExternalCoverage adds to the implements and overrides rows of a Go unit
 // how many packages outside the unit the build read and how many had no
-// readable source, and marks those rows partial when any had none: the
-// relations toward those packages are then only what conversions prove.
+// readable source. The rows keep the state the unit's facts give them: the
+// relations toward a package with no readable source are what conversions
+// prove, and the second count says how many packages that holds for.
 func goExternalCoverage(rows []model.CapabilityState, h *hierarchy) ([]model.CapabilityState, error) {
 	if h == nil || h.links == nil {
 		return rows, nil
@@ -129,9 +130,6 @@ func goExternalCoverage(rows []model.CapabilityState, h *hierarchy) ([]model.Cap
 		case model.RelImplements, model.RelOverrides:
 			rows[i] = rows[i].WithDetail("go_external_packages", itoaInt(int(read))).
 				WithDetail("go_external_packages_unavailable", itoaInt(int(unavailable)))
-			if unavailable > 0 && rows[i].State == model.CapabilityFresh {
-				rows[i].State, rows[i].DiagnosticCode = model.CapabilityPartial, model.CodeCoverageIncomplete
-			}
 		}
 	}
 	return rows, nil

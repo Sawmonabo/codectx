@@ -1034,21 +1034,14 @@ func (x *goLink) argument(a Node) wire.Argument {
 	return arg
 }
 
-// readName reports an identifier an argument reads as a value: any
-// identifier but the key of a keyed element that is a bare name, which in
-// `T{f: v}` names a struct field (the grammar cannot tell a map's variable
-// key from it, and the struct field is the form a bare name keys).
+// readName reports an identifier an argument reads as a value: every
+// identifier, the bare-name key of a keyed element included. The read index
+// names only the variables of the function, so the key reads a variable
+// exactly when it names one, as the lowering counts it a use: a map key is
+// an expression, and a struct field key the grammar cannot tell apart from
+// it is read only when a variable of that name is in scope.
 func (x *goLink) readName(n Node) bool {
-	k := x.k
-	if n.KindId() != k.identifier {
-		return false
-	}
-	el := n.Parent()
-	if el.IsNull() || el.KindId() != k.literalElement {
-		return true
-	}
-	kv := el.Parent()
-	return kv.IsNull() || kv.KindId() != k.keyedElement || goChild(kv, k.fKey) != el
+	return n.KindId() == x.k.identifier
 }
 
 // readSkip reports a subtree whose identifiers an argument does not read: a

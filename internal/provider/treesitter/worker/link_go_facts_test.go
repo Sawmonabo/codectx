@@ -8,7 +8,7 @@ import (
 )
 
 // goArgsSource calls g with positional, spread, literal, computed and
-// call-result arguments, from a function body and from a closure that reads
+// call-result arguments, k with a map literal keyed by a variable, from a function body and from a closure that reads
 // the enclosing function's local.
 const goArgsSource = `package p
 
@@ -22,8 +22,11 @@ func f(n int, xs []int) int {
 	h := func() int { return g(m) }
 	p := pt{x: m}
 	g(p.x, pt{x: n}.x)
+	k(map[int]int{m: 1})
 	return h()
 }
+
+func k(v map[int]int) {}
 
 type pt struct{ x int }
 
@@ -42,7 +45,10 @@ func (r *T) M(a, b int, c ...string) {}
 // Mutation: Reads from the whole statement instead of the argument -> `n*2`
 // also reads m and xs. Mutation: keep the `...` in the argument's range or
 // drop the spread -> the second argument of `g(m, xs...)` differs. Mutation:
-// descend into a call's arguments -> `len(xs)` reads xs.
+// descend into a call's arguments -> `len(xs)` reads xs. Mutation: skip a
+// keyed element's bare-name key (taking it for a struct field) -> the map
+// literal `map[int]int{m: 1}` reads nothing, although its key is the
+// variable m, which the lowering counts as a use.
 func TestGoArgumentsReadTheirOwnVariables(t *testing.T) {
 	src := goArgsSource
 	l, fns := linkOf(t, "go", "p.go", src)
@@ -61,6 +67,7 @@ func TestGoArgumentsReadTheirOwnVariables(t *testing.T) {
 		{"g(n*2, m, len(xs))", []argWant{{at: "n*2", reads: []wire.Span{n}}, {at: "m", reads: []wire.Span{m}}, {at: "len(xs)"}}},
 		{"g(m) }", []argWant{{at: "m", reads: []wire.Span{m}}}},
 		{"g(p.x, pt{x: n}.x)", []argWant{{at: "p.x", reads: []wire.Span{p}}, {at: "pt{x: n}.x", reads: []wire.Span{n}}}},
+		{"k(map[int]int{m: 1})", []argWant{{at: "map[int]int{m: 1}", reads: []wire.Span{m}}}},
 	}
 	for _, c := range cases {
 		t.Run(c.call, func(t *testing.T) {

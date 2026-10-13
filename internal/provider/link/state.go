@@ -62,7 +62,7 @@ const stateTag = "link.resolution.nodes\n"
 // empty technique, a fact no technique is named for (an open or external
 // site), is last.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
-	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass, ""}
+	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass, DetailSupertypeCandidate, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {

@@ -2350,15 +2350,7 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 		if fc.family == "go" {
 			return h.goExternalOverrides(fc, owner, ref, d, emit)
 		}
-		if len(targets) > 0 || !d.Override {
-			return nil
-		}
-		external, err := h.externalSupers(fc.family, owner, d.Name)
-		if err != nil || len(external) != 1 {
-			return err
-		}
-		return emit(Binding{Kind: FactOverrides, Site: ref, Detail: DetailSupertype,
-			External: externalMethod(fc.family, external[0].Aux, d.Name)})
+		return h.externalOverrides(fc, owner, ref, d, len(targets) > 0, emit)
 	})
 }
 

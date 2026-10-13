@@ -25,7 +25,7 @@ func (f *filePublication) hierarchy(d *Decl, group []idBinding) error {
 			return err
 		}
 		f.node(occurrenceOf(f.fv, f.t, d.Endpoint))
-		f.relation(d.Node, kind, target, located(d.Range), "", b.Detail, "", 0)
+		f.relation(d.Node, kind, target, located(d.Range), "", b.Detail, "", externalOverrideSet(group, b))
 	}
 	return nil
 }

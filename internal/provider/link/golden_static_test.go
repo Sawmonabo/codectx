@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -16,9 +17,13 @@ import (
 func TestStaticDispatchGoldens(t *testing.T) { runGoldens(t, staticGoldens) }
 
 // fixture is every file under testdata/dir, by its path relative to it: a
-// case's sources kept as files, so a compiler checks them as written.
+// case's sources kept as files, so a compiler checks them as written. The
+// directory is found from this source file, since the test binary also runs
+// as the parser worker, whose working directory is a temporary one, and
+// initializes this package there too.
 func fixture(dir string) map[string]string {
-	root := filepath.Join("testdata", dir)
+	_, self, _, _ := runtime.Caller(0)
+	root := filepath.Join(filepath.Dir(self), "testdata", dir)
 	files := map[string]string{}
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
