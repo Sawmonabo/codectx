@@ -272,7 +272,11 @@ A unit is one project of the repository, the scope `link.PlanUnits` derives
 candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as file versions in FileID order
 (`LinkOptions.Members`), so it keeps its members of them and sorts nothing.
 
-The unit's inputs are its member files. The unit's identity is their content, as for every unit: the facts it
+The unit's inputs are its member files and the manifests it owns; an ECMAScript unit also owns every
+`tsconfig*.json` and `jsconfig*.json` (a `tsconfig.base.json`, a referenced `tsconfig.app.json`), `package.json`,
+`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads. A
+`pnpm-workspace.yaml` or `lerna.json` marks a JavaScript project as `package.json` does, so a workspace with no root
+`package.json` is one unit, whose packages import each other by name. The unit's identity is their content, as for every unit: the facts it
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
 is its qualified name, so a unit reused on a match of anything less would serve evidence about bytes that are gone.
 Each input also records `model.UnitInput.Digest`, the member digest of the file's link table (`link.MemberDigest`,
@@ -291,8 +295,10 @@ lowering, or whose dependence or link pass failed, has neither.
 Besides the joined declarations, sites and values, the table carries what the resolvers read a name in
 (`internal/provider/link/table.go`, filled by `internal/provider/treesitter/link.go`):
 - `Package`: the file's package or module clause (`wire.Done.Package`);
-- `Imports`: one `Import{Name, Path, Original}` per name an import introduces, `Path` being what the name denotes as
-  the language writes it and `Original` the name it denotes in that module when the import renames it. A Rust use
+- `Imports`: one `Import{Name, Path, Original, Syntax}` per name an import introduces, `Path` being what the name
+  denotes as the language writes it and `Original` the name it denotes in that module when the import renames it.
+  `Syntax` is an ECMAScript import's form (`require` for `require("m")` and `import x = require("m")`, `dynamic` for
+  `import("m")`, empty for a declaration), which selects a package's `import` or `require` condition. A Rust use
   tree is split into one path per leaf (`use a::{b, c as d}` gives `b → a::b` and `d → a::c`). An import of every
   member of a path (a Go dot import, a Java on-demand import, a C++ using-directive, a Rust glob, a Python
   `from m import *`) is named `ImportAll`. An include or a side-effect import has no name;
@@ -342,7 +348,7 @@ from: a hash of each hierarchy index key's entries, the reverse index from every
 file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
 identities their positions denote. For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
 identity table, a module index (each Python declaration and module under every dotted name its file can be imported
-as; each ECMAScript file under every module path an import may name it by) with the hash of each of its keys'
+as; each ECMAScript file under its module path, its path without extension) with the hash of each of its keys'
 entries, and, for every node of the value-flow fixed point (a site, or a file's node owning its callables' returns,
 its field writes, its imports and its hierarchy facts): each value it put into a variable (a parameter, a site's
 result, a callable's returns, a field) with the stratum, before or after field-based resolution, the value arrives at;
@@ -355,9 +361,13 @@ The delta build hands `Link` the predecessor's state whenever the predecessor st
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
 classifies every member against its record (unchanged, content changed with the same table, table changed, added,
 removed) and every manifest by the fields the linker reads (`manifestFields`, `refresh.go`): a Go module's `module`
-path and a Cargo manifest's crate names. Nothing else of a manifest is read: `tsconfig.json`, `package.json` and the
-Python and Java project files decide only which unit a file belongs to, so a change to them is a change of
-membership or nothing. A dependency version bump in `go.mod` changes no field, and a new nested `go.mod` moves its
+path; a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
+resolution and ownership read), each `package.json`'s `name`, `type`, `exports`, `imports`, `types`/`typings`,
+`module`, `main`, `tsconfig` and `workspaces`, and each workspace file's globs (`jsManifestFields`, `js_manifest.go`).
+A changed ECMAScript field rebuilds the hierarchy, whose specifier answers (`keyESSpec`) are diffed key by key like
+every other index group, so only the nodes whose imports now resolve differently re-run, in any file of the unit.
+Nothing else of a manifest is read: the Python and Java project files decide only which unit a file belongs to, so a
+change to them is a change of membership or nothing. A dependency version bump in `go.mod` changes no field, and a new nested `go.mod` moves its
 files out of one unit into another, a removal from one and an addition to the other.
 
 What re-resolves:
@@ -500,9 +510,29 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   …`, `{ k: () => … }`, `Decl.Property`); `f = () => …` binds the name `f` as a declarator does. A function a
   property assignment or a pair declares is the value written to that property, named by its declaration exactly
   (`Value.Declares`), so field-based resolution reaches that declaration's node. A module's exports follow its
-  `export` statements and its CommonJS exports (`module.exports.run = …`, `exports.run = …`, a key of
-  `module.exports = { run: … }`, each exported under its own name and written to no field); a name a pattern binds
-  from a literal `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is. A
+  `export` statements and its CommonJS exports, each a module export record read by syntax at any depth
+  (`internal/provider/treesitter/worker/js_commonjs.go`): a function stored as `module.exports.run = …`, `exports.run = …` or a key of
+  `module.exports = { run: … }`, exported under its own name and written to no field; `exports.x = v`,
+  `module.exports.x = v`, `exports["x"] = v` and `Object.defineProperty(exports, "x", { value: v })` or
+  `{ get() { return v } }` with v a name, the export x aliasing v; a key of `module.exports = { a, b: c }` whose
+  value is a name; `...require("./x")` in that object and `module.exports = require("./x")`, a re-export of x.
+  `module.exports = v` (the right-most value of a chain such as `module.exports = exports = f`) and TypeScript's
+  `export = v` are the module's whole value (`export=`): a call of the required module itself (`const f =
+  require("./m"); f()`, `import f = require("./m")`) calls it, and an ES module's default import of the module
+  reads it unless the module marks itself `__esModule`, when `exports.default` is the default (the compiler's and
+  bundlers' reading; Node at run time gives the whole value, a documented difference). `exports = …`, or
+  `module.exports = …` outside a chain assigning both, unbinds `exports`, so no `exports.x` of that file is an
+  export. A file with an `import` or `export` statement is an ES module and none of these forms is read in it. A
+  class expression assigned to a name or property (`module.exports = class { … }`) is a class of that name
+  (`exports`), holding its methods, so the whole value is that class; a method of the object `module.exports` is
+  assigned (`{ run() {} }`) is exported under its own name, as a function-valued key is. A function declaration
+  whose prototype the file stores a function under (`C.prototype.run = function () {}`, a method or
+  function-valued key of `C.prototype = { … }`) is a class, a constructor function, and each such function a
+  method of it, as TypeScript's JavaScript checking reads them. A name a pattern binds from a literal
+  `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is, and a name a
+  `require` call or an `import x = require("./c")` clause binds whole is the module's whole value, so `new x()`
+  runs the constructor of the class the module assigns, as it would an imported class's. The object `new C()`
+  makes is exactly a C, so a call on it is `exact`. A
   declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
   ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
   re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.
@@ -515,6 +545,45 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   settled; a class's methods are written to no property, so they are reached only through a receiver's type. A
   receiver that reaches the method only through a supertype outside the project calls that supertype's external
   method, and the field-based fallback stays closed for it.
+  **Module resolution** (`esResolver`, `internal/provider/link/js_resolve.go`, `js_config.go`): a specifier resolves
+  as TypeScript resolves it, from the repository's own configuration in the snapshot, never `node_modules`. Every
+  `tsconfig*.json` and `jsconfig*.json` is read as JSONC; `extends` (a path, an array applied in order with the
+  later winning, or a workspace package's `tsconfig` field or `tsconfig.json`) is flattened with `compilerOptions`
+  merged key by key, `files`, `include` and `exclude` replaced whole, every path relative to the config that wrote
+  it, and `references` not inherited. A file's governing configs are those TypeScript's editor service picks: walking up from its directory to the
+  unit root, the first `tsconfig.json` or `jsconfig.json` whose `files`/`include` minus `exclude` covers it (`.js`
+  files only with `allowJs` or in a `jsconfig.json`), else the configs that config's `references` reach that do, all
+  of them; with none covering it, the nearest config by directory; with no config, none. The module mode is the
+  config's `moduleResolution`, else TypeScript's default for its `module` (CommonJS: Node10; node16/nodenext:
+  Node16; preserve: Bundler); a config that sets neither, or no config, resolves under both Bundler and Node16. The
+  order, under each governing config and mode: a relative or absolute path (TypeScript's extension substitution:
+  `./a.js` names `a.ts`; a directory's `index` file except for an ES module's import under Node16, which names its
+  file with its extension; then `rootDirs`); a `#` specifier through the `imports` of the file's package scope; the
+  config's `paths` (an exact key, else the longest prefix, each fallback in order, the first naming a member
+  winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`; the package's own name when it
+  has `exports`; a workspace package by `name` (the `package.json` files the root `workspaces`, a
+  `pnpm-workspace.yaml` or a `lerna.json` declare, every `package.json` of the unit when none does) through
+  `exports` where the mode reads it (an exact subpath key, else Node's `PATTERN_KEY_COMPARE` order; conditions
+  `types`, `default`, `import` or `require` by the import's form and, under Node16, the file's module format, `node`
+  under Node16, `customConditions`, matched in object order; a `null` target excludes the subpath), else `types`
+  or `typings`, `module`, `main`, `index`; otherwise a package outside the repository, whose calls are external. A
+  target that is no member (an `exports` entry into a build output the snapshot ignores) maps back to its source
+  through a config at or above it that emits there: `outDir` or `declarationDir` replaced by `rootDir`, or, with no
+  `rootDir`, by the config's directory and by the common directory of its `include` and `files`. Failing that, every
+  branch of the entry that names a member is the answer, as a set; failing that, the import reaches no member and
+  is counted as an open import (`FactOpenImport`), and a call through it is open, never external. Several
+  governing configs, two workspace packages of one name, both modes: each is resolved and the union of the targets
+  is published, with its size. Each import's answer is computed once per build, while the hierarchy is built, and
+  written to the decls index under `keyESSpec` (the importing file's path and the specifier); the import facts, the
+  export resolution and the inference each look that one key up.
+
+  Limits. Aliases defined in program code (a bundler's alias table, a test runner's module mapper, a compiler plugin)
+  are not data and are not read. A package outside the repository (an ignored `node_modules`, a package manager's
+  own cache) stays external, and an `extends` base inside one leaves the options it may set unknown, so a config
+  that does not set its own mode resolves under both. `typesVersions` and `types@` conditions depend on the TypeScript version and are not
+  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone. An `extends` base under a name
+  other than `tsconfig*.json`/`jsconfig*.json` is read but is not an input of the unit, so an edit to it alone is
+  seen at the unit's next rebuild.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
   `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor

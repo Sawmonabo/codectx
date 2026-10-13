@@ -98,7 +98,7 @@ func codeOf[T comparable](values []T, v T) (byte, bool) {
 // about one site, import or declaration are adjacent.
 func (k Fact) entry() int {
 	switch k {
-	case FactImport:
+	case FactImport, FactOpenImport:
 		return 1
 	case FactExtends, FactImplements, FactOverrides:
 		return 2
@@ -110,7 +110,7 @@ func (k Fact) entry() int {
 // it names no external one.
 func (k Fact) hasTarget() bool {
 	switch k {
-	case FactExternalSite, FactOpenSite:
+	case FactExternalSite, FactOpenSite, FactOpenImport:
 		return false
 	}
 	return true
@@ -133,7 +133,7 @@ func canonical(b Binding) (Binding, error) {
 	bad := func(what string) (Binding, error) {
 		return Binding{}, internalErr("a resolver emitted a fact of kind " + strconv.Itoa(int(b.Kind)) + " " + what)
 	}
-	if b.Kind > FactReturn {
+	if b.Kind > FactOpenImport {
 		return bad("that is not a kind of fact")
 	}
 	if _, ok := detailCode(b.Detail); !ok {
@@ -276,7 +276,7 @@ func encodeIDBinding(b idBinding) ([]byte, error) {
 	code, ok := detailCode(b.Detail)
 	dispatch, dok := codeOf(dispatches[:], b.Dispatch)
 	reason, rok := codeOf(reasons[:], b.Reason)
-	if !ok || !dok || !rok || b.Kind > FactReturn || b.Site < 0 || b.Arg < 0 || b.Position < 0 {
+	if !ok || !dok || !rok || b.Kind > FactOpenImport || b.Site < 0 || b.Arg < 0 || b.Position < 0 {
 		return nil, internalErr("a fact named by identity is malformed")
 	}
 	out := appendString([]byte{byte(b.Kind)}, string(b.SiteFile))
@@ -293,7 +293,7 @@ func decodeIDBinding(raw []byte) (idBinding, error) {
 	b := idBinding{Kind: Fact(r.byte()), SiteFile: model.FileID(r.str()), Site: r.index(), Arg: r.index(),
 		Position: r.index(), TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str()), External: r.str()}
 	code, dispatch, reason := r.byte(), r.byte(), r.byte()
-	if r.err != nil || len(r.b) != 0 || b.Kind > FactReturn || int(code) >= len(details) ||
+	if r.err != nil || len(r.b) != 0 || b.Kind > FactOpenImport || int(code) >= len(details) ||
 		int(dispatch) >= len(dispatches) || int(reason) >= len(reasons) {
 		return idBinding{}, errors.New("a fact is malformed")
 	}

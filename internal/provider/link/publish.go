@@ -625,17 +625,23 @@ func (f *filePublication) openSite(s *Site, caller Endpoint, reason model.OpenSi
 // imports publishes the file module's `imports` to the module of each
 // distinct member group resolves imp to, each with the set size when there
 // are several, located at the import, and counts imp resolved when there is
-// one.
+// one, or open when it names a module of the repository that no member is
+// (FactOpenImport).
 func (f *filePublication) imports(imp *Import, group []idBinding) {
 	var targets []idBinding
 	distinct := map[model.NodeID]bool{}
+	open := false
 	for _, b := range group {
 		if b.Kind == FactImport && !distinct[b.Target] {
 			distinct[b.Target] = true
 			targets = append(targets, b)
 		}
+		open = open || b.Kind == FactOpenImport
 	}
 	if len(targets) == 0 {
+		if open {
+			f.counts.OpenImports++
+		}
 		return
 	}
 	f.counts.Imports++

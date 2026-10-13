@@ -1202,10 +1202,20 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 				continue
 			}
 			spec, name, ok := importedName(m.Name, f.python)
-			if base, found := moduleBase(t.Path, spec, f.python); ok && found {
-				if err := r.exportReqs.Add(exportReq{Base: base, Name: name, Call: c}); err != nil {
-					return err
-				}
+			if !ok && f.python {
+				continue
+			}
+			if !ok {
+				// A call of a whole ECMAScript module (`const f =
+				// require("./m"); f()`) calls the value it assigns
+				// itself (`module.exports = f`, `export = f`).
+				spec, name = m.Name, wire.ExportAssignment
+			}
+			err := in.h.modulesAt(t.Path, f.python, spec, func(base string) error {
+				return r.exportReqs.Add(exportReq{Base: base, Name: name, Call: c})
+			})
+			if err != nil {
+				return err
 			}
 		}
 		for _, k := range scoped(t, s.Caller, s.Candidates) {
@@ -1339,6 +1349,12 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 			}
 		}
 	case wire.TypeNamed:
+		// An object of exactly the type (wire.ExactObject: an ECMAScript
+		// `new C()`) is that class's object; any other instance may be a
+		// subclass's.
+		if ty.Index == wire.ExactObject {
+			return f.in.h.types(ctx, f.file, ty.Name, constant(valObject))
+		}
 		return f.in.h.types(ctx, f.file, ty.Name, constant(valInstance))
 	case wire.TypeClass:
 		return f.in.h.types(ctx, f.file, ty.Name, constant(valClass))
@@ -1380,21 +1396,22 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 		// Python dotted name may instead be a module (`import a.b`), so it
 		// denotes both; the one no member file declares joins nothing.
 		if spec, name, ok := importedName(ty.Name, f.python); ok {
-			if base, found := moduleBase(t.Path, spec, f.python); found {
+			err := f.in.h.modulesAt(t.Path, f.python, spec, func(base string) error {
 				if err := f.r.imports.Add(exportReq{Base: base, Name: name, Call: call{Site: f.node}}); err != nil {
 					return err
 				}
-				if err := yield(operand{IsVar: true, V: importVar(base, name)}); err != nil {
-					return err
-				}
+				return yield(operand{IsVar: true, V: importVar(base, name)})
+			})
+			if err != nil {
+				return err
 			}
 			if !f.python {
 				return nil
 			}
 		}
-		if base, ok := moduleBase(t.Path, ty.Name, f.python); ok {
+		return f.in.h.modulesAt(t.Path, f.python, ty.Name, func(base string) error {
 			return yield(operand{X: value{Kind: valModule, Path: base}})
-		}
+		})
 	case wire.TypeFunction:
 		// A method taken through its class object takes its receiver first
 		// (wire.TypeFunction's Index), unless it is a static or class method.

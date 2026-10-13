@@ -682,3 +682,9 @@ func (d *decoder) typ() Type {
 	}
 	return Type{Kind: k, Name: d.str(), Index: d.u32()}
 }
+
+// ExportAssignment is the Reexport name of a module's whole value: the
+// CommonJS `module.exports = x` and the TypeScript `export = x`, which a
+// call or construction of the module itself (`require("./m")()`) reaches.
+// An `export *` passes it on no more than it passes on `default`.
+const ExportAssignment = "export="
