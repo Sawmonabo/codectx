@@ -455,7 +455,7 @@ site's index is valid across builds because a member whose bytes did not change 
 whose bytes changed re-resolves whole. For Go, Java, Rust, C and C++ the state also holds what the refresh re-runs
 from: a hash of each hierarchy index key's entries, the reverse index from every key a file's resolution read to that
 file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
-identities their positions denote. For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
+identities their positions denote and each member's projection (`projection.go`). For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
 identity table, a module index (each Python declaration and module under every dotted name its file can be imported
 as; each ECMAScript file under its module path, its path without extension) with the hash of each of its keys'
 entries, and, for every node of the value-flow fixed point (a site, or a file's node owning its callables' returns,
