@@ -248,7 +248,7 @@ func TestAnExactRecordCarriesItsIdsAsRawBytes(t *testing.T) {
 		Node: model.Node{ID: model.NodeID(model.H("node")), FileID: model.FileID(model.H("file")),
 			Kind: model.NodeFunction, Name: "Widget", QualifiedName: "pkg.Widget", Signature: "func()",
 			SemanticSource: model.SemanticCanonical},
-		Bytes: &model.ByteRange{Start: 300, End: 70_000}}}}
+		Bytes: &model.ByteRange{Start: 300, End: 70_000}, Path: "pkg/wide.go"}}}
 	bare := exactEntry{exactHit{Tier: model.TierQualifiedNamePrefix, Node: sqlite.StoredNode{
 		Node: model.Node{ID: model.NodeID(model.H("dependency")), Kind: model.NodeDependency, Name: "dep",
 			QualifiedName: "dep", SemanticSource: model.SemanticCanonical}}}}

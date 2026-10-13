@@ -628,8 +628,9 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 			}
 			defer kindOf.Close()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature, file_id, start_byte, end_byte,
-				name_start_byte, name_end_byte, metadata_json, path)
-				VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, coalesce((SELECT f.path FROM files f WHERE f.id = ?7), '')) ON CONFLICT(unit_id, node_id) DO NOTHING`)
+				name_start_byte, name_end_byte, metadata_json, path, sort_start, sort_end)
+				VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, coalesce((SELECT f.path FROM files f WHERE f.id = ?7), ''),
+					ifnull(?8, 0), ifnull(?9, -1)) ON CONFLICT(unit_id, node_id) DO NOTHING`)
 			if err != nil {
 				return err
 			}

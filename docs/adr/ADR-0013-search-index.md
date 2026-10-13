@@ -414,8 +414,14 @@ continuation. A sorted search over a key no index is sorted by visits every matc
 engines too (the search-after form; see Sources); the seek is what an index in the sort order buys, and the spool is
 what lets the one tier without one skip that work.
 
-Each tier walk reads its index in order, a page of 200 at a time, seeking each page to the last entry read and
-keeping each node's precedence winner inside the statement, so a walk reads its tier once. A tier that lists no node
+Each tier walk reads its index in order, a page of 200 at a time, seeking each page to the last entry read, so a
+walk reads its tier once. A page is a few statements over its own rows: a window of index entries read from the index
+alone (unit and node; the sort columns are written columns, because SQLite counts a query that names a generated
+column as reading every column, so no index would cover it), one probe of idx_node_facts_id for the rows of the
+window's nodes, the precedence of units not seen before, and the full rows of the winners only. The winner per node is
+chosen from the unit precedence held per walk, which replaces a correlated subquery that probed the node's other rows,
+their units and their generation membership once per index entry. The statements are fixed texts prepared once per
+pooled connection. A page also carries each node's path, stored beside the fact, so no hit costs a file lookup. A tier that lists no node
 for the query (most often the exact qualified-name tier, and the prefix tier for a bare name) is found so by one
 probe of its index per request, and is then never asked about a page of candidates.
 
@@ -576,8 +582,12 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
   recommended, https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html; the seek
   method needs an index in the sort order, https://use-the-index-luke.com/sql/partial-results/fetch-next-page; a
   row-value comparison on an index's columns is answered as a seek into the index ("scrolling window queries"),
-  https://www.sqlite.org/rowvalue.html; a generated column is indexed like any column,
-  https://www.sqlite.org/gencol.html; a search that runs past its time limit answers the hits it gathered and marks
+  https://www.sqlite.org/rowvalue.html; a query that names a generated column marks every column of the table as
+  used, so no index covers it (`sqlite3ExprColUsed`,
+  https://github.com/sqlite/sqlite/blob/master/src/resolve.c), and an index over a VIRTUAL generated column is an
+  expression index, https://www.sqlite.org/gencol.html; a statement prepared on a pool is prepared once per
+  connection and reused by a transaction on it (`Tx.StmtContext`), https://pkg.go.dev/database/sql#Tx.StmtContext;
+  a search that runs past its time limit answers the hits it gathered and marks
   the answer timed out (`timed_out`),
   https://www.elastic.co/guide/en/elasticsearch/reference/current/search-your-data.html.
 - The key filter (the Merge and Block summaries bullets of decision 5):

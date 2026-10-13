@@ -204,6 +204,7 @@ type Store struct {
 	opts      Options
 	writer    *sql.DB
 	readers   *sql.DB
+	reads     readStmts // the readers' prepared statements of fixed texts (readstmt.go)
 	// text is the search index (searchindex.go). It is nil only on a
 	// read-only store whose index directory is missing.
 	text *textindex.Index
@@ -623,6 +624,7 @@ func (s *Store) Close() error {
 	if first == nil {
 		first = s.commitSearchOnClose()
 	}
+	s.reads.close()
 	for _, db := range []*sql.DB{s.readers, s.writer} {
 		if db == nil {
 			continue
