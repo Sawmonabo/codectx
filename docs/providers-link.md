@@ -475,7 +475,8 @@ candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as
 
 The unit's inputs are its member files and the manifests it owns; an ECMAScript unit also owns every
 `tsconfig*.json` and `jsconfig*.json` (a `tsconfig.base.json`, a referenced `tsconfig.app.json`), `package.json`,
-`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads. A
+`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads, and every
+config its `extends` chains read under another name or outside its root (`Unit.Inputs`). A
 `pnpm-workspace.yaml` or `lerna.json` marks a JavaScript project as `package.json` does, so a workspace with no root
 `package.json` is one unit, whose packages import each other by name. The unit's identity is their content, as for every unit: the facts it
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
@@ -821,9 +822,12 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   are not data and are not read. A package outside the repository (an ignored `node_modules`, a package manager's
   own cache) stays external, and an `extends` base inside one leaves the options it may set unknown, so a config
   that does not set its own mode resolves under both. `typesVersions` and `types@` conditions depend on the TypeScript version and are not
-  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone. An `extends` base under a name
-  other than `tsconfig*.json`/`jsconfig*.json` is read but is not an input of the unit, so an edit to it alone is
-  seen at the unit's next rebuild.
+  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone.
+  Every config a unit's `extends` chains name under another name than `tsconfig*.json`/`jsconfig*.json`, or outside
+  the unit, is an input of the unit (`Unit.Inputs`, `esPlanInputs` in `js_plan.go`), present or not, so an edit to it
+  alone, or its creation, rebuilds the unit: the planner reads the unit's configs to follow the chains, and its
+  `package.json` files only when a config extends a package by name. A relative `extends` names the file as written,
+  else with `.json` added, as TypeScript's getExtendsConfigPath reads it.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
   `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor

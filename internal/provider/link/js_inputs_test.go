@@ -115,3 +115,45 @@ func TestOneConfigReadPerLink(t *testing.T) {
 		t.Fatal("the unit still holds the configuration the resolver took")
 	}
 }
+
+// TestExtendsBasesAreInputs pins that a config base an `extends` reads under
+// another name than tsconfig*/jsconfig*, or outside the unit, is an input of
+// the unit, so an edit to it alone rebuilds the unit; a JSON file no config
+// reads is not.
+func TestExtendsBasesAreInputs(t *testing.T) {
+	view := newMapView(map[string]string{
+		"app/package.json":          `{"name": "app"}`,
+		"app/tsconfig.json":         `{"extends": ["./configs/base", "../shared/tsconfig.base.json"]}`,
+		"app/src/a.ts":              "export const a = 1\n",
+		"app/configs/base.json":     `{"compilerOptions": {"moduleResolution": "bundler"}}`,
+		"app/data.json":             `{}`,
+		"shared/tsconfig.base.json": `{"compilerOptions": {"baseUrl": "."}}`,
+	})
+	plan, err := PlanUnits(context.Background(), view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(plan.Units, func(u Unit) bool { return u.Family == FamilyJavaScript })
+	if i < 0 {
+		t.Fatalf("no JavaScript unit in %+v", plan.Units)
+	}
+	u := plan.Units[i]
+	for _, p := range []string{"app/configs/base.json", "shared/tsconfig.base.json"} {
+		if !u.OwnsInput(p) {
+			// Mutations: no Inputs -> app/configs/base.json is not an input;
+			// the Contains test before Inputs -> shared/tsconfig.base.json,
+			// outside the unit, is not.
+			t.Errorf("%s is not an input of %s (inputs %q)", p, u.ScopeKey, u.Inputs)
+		}
+	}
+	if u.OwnsInput("app/data.json") {
+		// Mutation: every JSON file of the unit an input -> a data file
+		// rebuilds the unit.
+		t.Error("app/data.json is an input")
+	}
+	if view.opened["app/package.json"] != 0 {
+		// Mutation: package.json read with no `extends` by package name ->
+		// the plan reads every package manifest.
+		t.Errorf("the plan read app/package.json %d times", view.opened["app/package.json"])
+	}
+}

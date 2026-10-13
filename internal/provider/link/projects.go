@@ -105,6 +105,12 @@ type Unit struct {
 	// Files counts the unit's own source files; a unit with no files is never
 	// planned.
 	Files int64
+	// Inputs are the files, sorted, a JavaScript unit's configs read through
+	// `extends` that OwnsInput's names do not cover: a base under another
+	// name than tsconfig*.json or jsconfig*.json, or one outside the unit
+	// (esPlanInputs). PlanUnits fills it; PlanUnit, which plans membership,
+	// leaves it empty.
+	Inputs []string
 }
 
 // markers names the manifest, lock and project files of a family. The first
@@ -153,16 +159,23 @@ type Plan struct {
 
 // PlanUnits derives every unit of the snapshot. It reads the manifest twice:
 // once to find project roots and the files of the C/C++ unit, once to fold
-// each unit's file count. Nothing repository-sized is retained.
+// each unit's file count, and it reads the JavaScript configuration files
+// for the inputs their `extends` name (Unit.Inputs). Nothing
+// repository-sized is retained: the configuration files are a list of the
+// config and package manifests.
 func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 	roots := map[Family]map[string]bool{}
 	present := map[Family]bool{}
+	var esFound []model.FileVersion
 	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
 		dir, base := path.Split(fv.Path)
 		dir = strings.TrimSuffix(dir, "/")
+		if esConfigFile(base) {
+			esFound = append(esFound, fv)
+		}
 		if f := FamilyOf(srclang.Of(fv.Path)); f != "" {
 			present[f] = true
 		}
@@ -199,6 +212,13 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 	}
 	plan.Units = slices.DeleteFunc(plan.Units, func(u Unit) bool { return u.Files == 0 })
 	slices.SortFunc(plan.Units, func(a, b Unit) int { return strings.Compare(a.ScopeKey, b.ScopeKey) })
+	for i := range plan.Units {
+		if plan.Units[i].Family == FamilyJavaScript {
+			if plan.Units[i].Inputs, err = esPlanInputs(ctx, view, plan.Units[i], esFound); err != nil {
+				return Plan{}, err
+			}
+		}
+	}
 	return plan, nil
 }
 
@@ -342,7 +362,13 @@ func (u Unit) Contains(p string) bool {
 // It is a predicate over the path and not a lookup in a stored list of marker
 // paths, so it holds nothing that grows with the repository (Section 6): the
 // C/C++ unit is the whole tree, and a list would hold every Makefile in it.
+// The one list it reads is Inputs, the configs an `extends` names beyond
+// those names, which grows with such `extends` entries alone.
 func (u Unit) OwnsInput(p string) bool {
+	if _, ok := slices.BinarySearch(u.Inputs, p); ok {
+		// A config an `extends` reads, wherever it lies.
+		return true
+	}
 	if !u.Contains(p) {
 		return false
 	}
