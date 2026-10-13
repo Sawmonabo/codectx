@@ -409,7 +409,7 @@ and the one enabled grammar when `tree_sitter.languages` enables one. The
 search language filter reads that tag, so a header kept as C++ after a C first
 choice matches `cpp` and not `c`. A header the generation holds no parse of
 keeps the census's first grammar. The lookup reads the unit the generation
-already stored, through three index seeks per header path a filter tests, and
+already stored, through four index seeks per header path a filter tests, and
 writes nothing; a lookup that fails fails the request.
 
 Every other path is parsed with `FileVersion.Language` from the snapshot

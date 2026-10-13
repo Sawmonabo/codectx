@@ -14,10 +14,10 @@ import (
 // that failed or that the provider did not run leaves behind.
 //
 // It reads what the unit already stored and writes nothing. The answer is
-// three primary-key or index seeks (generation_units by its key, node_facts
-// through idx_nodes_qname on the path and the unit, node_ids by its key), so a
-// caller asking about one path per hit pays a constant per hit and holds no
-// set.
+// four primary-key or index seeks (generation_units by its key, idx_nodes_qname
+// on the path and the unit, the node_facts row it names for its language,
+// node_ids by its key), so a caller asking about one path per hit pays a
+// constant per hit and holds no set.
 func (r *PinnedReader) ParsedLanguage(ctx context.Context, provider, scope, path string) (language string, ok bool, err error) {
 	if provider == "" || scope == "" || path == "" {
 		return "", false, invalid("a parsed-language lookup needs a provider, a scope and a path")

@@ -113,7 +113,9 @@ func Of(rel string) string {
 }
 
 // Tagger tags the paths of one snapshot, or of one generation when bound by
-// In. Copies share one binding, so a copy reports the error any copy met.
+// In. Copies share one binding, so a copy reports the error any copy met; the
+// binding's lock also serializes lookups, which a reader makes from one
+// goroutine.
 type Tagger struct {
 	header string
 	kept   *keptParses
