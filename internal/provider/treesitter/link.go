@@ -76,7 +76,7 @@ func (b *builder) linkTable() error {
 		return err
 	}
 	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Package: b.ex.done.Package, Imports: imports,
-		Supertypes: wl.Supertypes, Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
+		Supertypes: wl.Supertypes, Conversions: wl.Conversions, Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
 			Name: b.module.Node.Name, Qualified: b.module.Node.QualifiedName, Range: *b.fileRng}}
 	for i := range b.ex.functions {
 		if b.ex.functions[i].Failed {
@@ -229,7 +229,7 @@ func (b *builder) linkTable() error {
 		d.Described, d.Receiver, d.Signature, d.Params, d.Optional, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Optional, x.Variadic
 		d.Static, d.Abstract, d.Virtual, d.Final, d.Internal = x.Static, x.Abstract, x.Virtual, x.Final, x.Internal
 		d.Returns = typ(x.Returns)
-		d.Override, d.Alias, d.Property, d.Trait = x.Override, x.Alias, x.Property, x.Trait
+		d.Override, d.Alias, d.Property, d.Identity, d.Trait = x.Override, x.Alias, x.Property, x.Identity, x.Trait
 		d.Exported = d.Exported || x.Exported
 	}
 	for _, p := range wl.Parameters {

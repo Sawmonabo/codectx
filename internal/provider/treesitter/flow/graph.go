@@ -64,8 +64,23 @@ type Graph struct {
 	succOff, succ    []int32
 	predOff, pred    []int32
 	declared         []Span
+	returns, falls   []int32
 	vars, unresolved int
 }
+
+// Returns is the returning nodes, ascending: every node in the fringe a
+// Builder.Return moved to Exit, whose evaluation is the value the callable
+// returns (a return statement's node; a Rust `?`, which returns its error).
+// A return that a finally intercepts is still the node that issued it.
+func (g *Graph) Returns() []int32 { return g.returns }
+
+// Falls is the nodes the fringe held when the lowering finished, ascending:
+// the nodes after which control falls off the callable's end into Exit. For
+// a callable whose body is an expression (an arrow or lambda with an
+// expression body, a Rust block with a tail) they are the nodes that yield
+// its value; for any other they are the last statements, whose value is not
+// returned.
+func (g *Graph) Falls() []int32 { return g.falls }
 
 // Len is the node count N, Entry and Exit included.
 func (g *Graph) Len() int { return len(g.nodes) }

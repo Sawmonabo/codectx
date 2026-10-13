@@ -116,7 +116,7 @@ func TestACrashBetweenTheSearchCommitAndTheActivationRecoversTheLastGeneration(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.s.AttachUnit(f.ctx, gen3, unit2); err != nil {
+	if _, err := f.s.AttachUnit(f.ctx, gen3, unit2); err != nil {
 		t.Fatalf("AttachUnit(%s): %v", unit2, err)
 	}
 	f.activate(gen3, gen1)

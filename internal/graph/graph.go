@@ -266,6 +266,12 @@ type frontierState struct {
 	// callers are walked, or down a virtual call or an override to a method
 	// the call may run instead. Every other walk leaves it stepDirect.
 	Step dispatchStep
+	// Slice is how a dependence walk's route reached this node
+	// (impactdependence.go): whether it entered a callee through a call's
+	// argument, and whether this admission only carries the right to leave
+	// through a call site to a node first admitted without it. Every other
+	// walk leaves it zero.
+	Slice sliceFlags
 }
 
 // appendRoute extends a parent's route with the edge that left it, copying
@@ -482,6 +488,17 @@ type expandOptions struct {
 	// Dispatches reports, per relation, whether any occurrence is virtual. It
 	// is required when Dispatch is set; a walk without it takes no step.
 	Dispatches DispatchReader
+	// Dependence makes the walk a dependence walk (impactdependence.go): a
+	// route's program-dependence hop sets dependenceTier on its cost, a kind
+	// stored dependency first is walked against its stored direction, and,
+	// when Flows is set, a route that entered a callee through an argument
+	// never leaves it through a call site. Every other walk leaves
+	// it unset and walks the relations as they are stored.
+	Dependence bool
+	// Flows reports, per data_flows_to relation, whether it is a call's
+	// argument flow or its return flow. A dependence walk without it treats
+	// every data flow as one inside a callable.
+	Flows FlowRoleReader
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.

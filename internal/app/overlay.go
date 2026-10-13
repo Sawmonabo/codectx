@@ -322,11 +322,27 @@ func overlaySymbolNodes(symbols []lsp.Symbol) []model.Node {
 			FileID:         sym.Location.File,
 			ContentHash:    sym.Location.ContentHash,
 			Range:          &rng,
+			NameRange:      overlayNameRange(rng, sym.Location.Selection),
 			Metadata:       overlayContainer(sym.Container),
 			SemanticSource: model.SemanticLSP,
 		})
 	}
 	return nodes
+}
+
+// overlayNameRange is the server's selection range -- the range of the
+// symbol's name, LSP DocumentSymbol.selectionRange or
+// LocationLink.targetSelectionRange -- as the node's NameRange, so an overlay
+// node carries its name token as a sealed one does. The protocol requires the
+// selection to lie inside the symbol's range; a server that sends one outside
+// it, or none, leaves the node without a name range rather than failing the
+// answer.
+func overlayNameRange(rng model.SourceRange, sel *model.SourceRange) *model.SourceRange {
+	if sel == nil || sel.Start.Byte < rng.Start.Byte || sel.End.Byte > rng.End.Byte || sel.Validate("selection") != nil {
+		return nil
+	}
+	out := *sel
+	return &out
 }
 
 // overlayBounded drops a value that would breach the field bound it is written
@@ -375,6 +391,7 @@ func overlayDefinitionNodes(query string, locations []lsp.Location) []model.Node
 			FileID:         loc.File,
 			ContentHash:    loc.ContentHash,
 			Range:          &rng,
+			NameRange:      overlayNameRange(rng, loc.Selection),
 			SemanticSource: model.SemanticLSP,
 		})
 	}

@@ -39,6 +39,8 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `imports` | `imports` | file module → each file module the import resolves to | `import` |
 | `imports` | `imports` | file module → the import's open-import-site node | none |
 | `data_flows_to` | `data_flows_to` | each variable an argument reads → the parameter it binds | `argument` |
+| `data_flows_to` | `data_flows_to` | each variable an argument reads → each variable the site's result is written into, when the parameter it binds reaches the callee's return | `summary:<position>` |
+| `data_flows_to` | `data_flows_to` | the callee's return node → each variable the site's result is written into, and the return node of the callable that returns the call | `return` |
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
@@ -51,6 +53,9 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 - `field`: a function written to the field the site calls through;
 - `import`: an import resolved to a file of the unit;
 - `argument`: an argument of a bound call site, matched to its parameter;
+- `summary:<position>`: an argument of a bound call site flowing into the site's result through the callee's
+  parameter at that position (`Parameter.Index`, 0 the receiver), whose value reaches the callee's return;
+- `return`: the bound callee's return node flowing into the site's result;
 - `supertype`: a supertype or an override the source writes;
 - `method_set`: a Go interface a type satisfies by its method set, which the source never writes;
 - `supertype_interface`, `supertype_class`: a supertype the source writes that is outside the project (a node of
@@ -72,7 +77,7 @@ range (`Site.Range`). Its native key is the call-site key, spelled as the struct
 the site's call-site key, and a hierarchy edge at the declaration that states it.
 
 **Endpoints are the structural nodes.** The linker mints no second identity for a declaration. Each table carries
-an `Endpoint` for each declaration, each parameter and the module (`table.go`): the node id, canonical key, kind,
+an `Endpoint` for each declaration, each parameter, each callable's return node and the module (`table.go`): the node id, canonical key, kind,
 names and range the structural unit resolved. The linker publishes an occurrence of every endpoint an edge names,
 with its own evidence at the declaration's range. So the edge joins the structural node, and through it the
 cross-provider `decl:` key and the call-site key of docs/providers-treesitter.md.
@@ -155,6 +160,36 @@ Go method expression, a Rust path naming a method, a Java unbound method referen
 receiver parameter, and nothing where the callee declares none (a Java method's receiver). A parameter with no
 node of its own receives no edge.
 
+**Return flows.** A call's value goes back to the caller by labelled edges, a summary per argument and a return
+edge from the callee's return node, never by an unlabelled edge from inside the callee to the call (ADR-0017
+decision 7), for every family that publishes argument flows, the address-taken join
+included (`internal/provider/link/returns.go`). A site's result is where the structural provider found its value
+goes: `Site.Results`, the variables the innermost node evaluating the call defines, and `Site.Into`, the callable
+whose return that node is (`return f()`); a call whose value another call consumes first (`g(f())`, `f().m()`)
+has neither, and a site with neither publishes no return flow. A bound site publishes:
+- for each argument bound to a parameter marked `Returned` (its value reaches the callee's return), one
+  `data_flows_to` from each variable the argument reads to each variable of `Site.Results`, at the argument, detail
+  `summary:<position>` (`FactSummary`);
+- from the callee's return node (`Decl.Return`) one `data_flows_to` to each variable of `Site.Results` and to the
+  return node of the callable `Site.Into` names, at the call expression, detail `return` (`FactReturn`). A callee
+  with no return node (a type, a constructor that returns no value) publishes none.
+
+Every value a returning node reads flows into the callable's return node (docs/providers-treesitter.md, Return
+flow), parameter-reached values included, so a value created inside the callee (`k = 1; if p: return k`) reaches
+every bound site's result. Realizability is the walk's: each `data_flows_to` carries its role in its evidence
+detail, `argument`, `return`, `summary:<position>`, or the structural `reaching_def`, and the impact walk follows
+the two-phase rule of interprocedural slicing (ADR-0017 [S10]). A path that has taken an `argument` edge never
+takes a `return` edge; a summary edge stays in the caller and carries what the parameter does to the result. So a
+path that enters a callee through one call's argument never leaves through another call's result, and a path that
+starts inside the callee leaves through every call's `return` edge, a partially balanced path. Only the linker
+publishes `argument` and `return` evidence; a stored relation may join the structural `reaching_def` of a folded
+call and the linker's `summary`, both free. A summary is the dependence facts' reach: a call folded into a node passes
+its arguments' values to what the node defines, so a parameter passed through another call reaches the return
+whatever that callee returns. The summary is part of the callee's interface (`Parameter.Returned`, the
+`paramReturned` mark of its hierarchy entry): a body edit that changes whether a parameter reaches the return
+changes the entry every bound site's argument flows read, so a refresh re-runs exactly those sites. The return node
+is keyed by the callable's identity and exists for every analysed callable, so its flows do not depend on the body.
+
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
 the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
 embedded interfaces), and `implements` to each other interface or trait it declares, or, in Go, satisfies by its
@@ -164,9 +199,41 @@ is neither static, final nor private; in C++ a virtual one of the same signature
 method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name; in Go each
 method of an interface its type satisfies. A supertype outside the project is its external node. A method overrides
 an external one only where the language marks it (Java `@Override`, C++ `override` or `final`, TypeScript
-`override`, a Rust trait impl item, Python `typing.override`) and only when its type has exactly one supertype
-outside the project; an unmarked Python method with an external base publishes no `overrides`. Go publishes nothing
-toward a type outside the unit, whose method set no table holds.
+`override`, a Rust trait impl item, Python `typing.override`), toward what the mark proves
+(`hierarchy.externalOverrides`, `internal/provider/link/hierarchy_external.go`):
+- Java and C++: the mark proves at least one overridden method, and a method overrides every supertype's of its
+  signature at once. The candidates are the supertypes outside the project reached along paths on which no type of
+  the project declares the method (and, in Java, `java.lang.Object` for one of its methods when no candidate is a
+  class). With no override in the project and one candidate, that one is published (`supertype`); otherwise each
+  candidate is published with detail `supertype_candidate` and, when there are several, the set size n, read as "at
+  least one of n". A candidate is published beside an override in the project too, so nothing the mark may name is
+  dropped: `class C extends Base implements Task` with `@Override run()`, both outside the project, publishes
+  `C.run` overrides `Base.run` and `Task.run`, each `supertype_candidate` with set size 2.
+- TypeScript: `override` proves a member of the class `extends` names, never of an interface `implements` lists, so
+  the one candidate is the extended class outside the project when no class of the project along the chain declares
+  the member.
+- Python: `typing.override` proves the first ancestor along the method resolution order that defines the method.
+  When no class of the project along the order defines it, it is one of the external bases of the classes along the
+  order, each published (`supertype`) with the set size of their number when there are several.
+- Rust: an impl item reaches its type's external trait when the type has exactly one.
+
+An unmarked method with an external supertype publishes no `overrides`.
+
+A Go type outside the unit is read from its package's source (`goExternal`, `internal/provider/link/go_external.go`):
+the transitive closure of the unit's imports outside it, each package found as the go command finds it without
+running it (`goModuleInfo.source`, `go_module.go`): the standard library of the toolchain the project builds with
+(`GOROOT`, else the `go` on `PATH`, else the toolchain the `go.mod` `toolchain` or `go` line selects in the module
+cache, `go_host.go`); a module of the governing `go.work` or a local `replace` inside the repository from the
+snapshot; a required module, after `replace`, from the module cache at its exact version (`GOMODCACHE`, else the
+first `GOPATH` entry's `pkg/mod`). A package none of these holds (a local `replace` outside the repository, a
+module the cache does not hold) is unavailable, and the `implements` and `overrides` capability rows count both
+(`go_external_packages`, `go_external_packages_unavailable`). Each package's types, aliases and method forms are read
+with `go/parser` from every non-test file (every build variant; a type or method two variants declare differently is
+left out) and cached on disk by its source's identity (`go_external_cache.go`). A Go type implements an interface
+outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
+the interface's of its name; an interface with an unexported method implements only within its own package. A
+conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
+source, and publishes `implements` (`supertype_interface`) and no `overrides` (`go_conversions.go`).
 
 ## Endpoint identity per family
 
@@ -239,13 +306,16 @@ Besides the joined declarations, sites and values, the table carries what the re
   definitions or arms reach.
 - `Import.Range`: where the import is written, the location of its `imports` edges;
 - `DynamicImports`: each import whose path does not fold to a constant, with its range and its literal fragments;
-- `Decl.Parameters`: each parameter's node, position and its variadic and keyword-only marks, which argument flows
-  bind to;
+- `Decl.Parameters`: each parameter's node, position, its variadic and keyword-only marks, which argument flows
+  bind to, and its `Returned` mark, the callable's return summary;
+- `Decl.Return`: the callable's return node, which return flows leave from;
 - `Decl.Override`: the language marks the method as overriding (`@Override`, `override`, `typing.override`, a trait
   impl item);
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
   macro calls;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
+- `Site.Results` and `Site.Into`: the variables the call's value is written into, and the callable whose return it
+  reaches;
 - `Site.Computed`: the callee is an expression that names nothing (`wire.Link.Computed`);
 - `Handlers` and `Site.Handler`: the anonymous route handlers the structural provider publishes as function nodes,
   and the one a site is written in.
@@ -384,8 +454,14 @@ The members' language family picks the resolver:
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
   cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is not
   `Final` and that the receiver's type or a supertype declares `virtual` ([class.virtual]). In C++ a bare call inside
-  a class walks out to the enclosing classes' static members. A Go interface embedded from a package outside the
-  unit counts toward its embedder's method set by name. `#define NAME func` makes a call of `NAME` a call of `func`,
+  a class walks out to the enclosing classes' static members. A Go method set compares methods by
+  name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
+  alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
+  however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
+  `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
+  parameters compare by position. A form it cannot decide (a struct or interface literal with members, an alias it
+  cannot follow, a name two dot imports declare) matches nothing, never a guess. A Go interface embedded from a
+  package outside the unit contributes its methods as read from that package (above, Hierarchy). `#define NAME func` makes a call of `NAME` a call of `func`,
   one per definition when `#if` arms define it differently, in the file and in the headers it includes.
 
 In every static family a site binds only a target its arguments fit: at least `Params - Optional` (one fewer for

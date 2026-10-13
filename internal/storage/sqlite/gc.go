@@ -83,9 +83,9 @@ func (s *Store) DeleteGeneration(ctx context.Context, gen model.GenerationID) er
 
 // sweep is the collection tail shared by DeleteGeneration and Recover: it
 // collects unreachable units, then in one transaction removes provider runs
-// that no generation or unit references, expired leases, the snapshot(s) that
-// nothing references any more, and files rows no snapshot, unit, manifest or
-// session names. snapshot limits the snapshot step to one row; nil considers
+// that no generation or unit references, expired leases and the snapshot(s)
+// that nothing references any more, and then, in bounded batches of their own,
+// the files rows no snapshot, unit, manifest or session names. snapshot limits the snapshot step to one row; nil considers
 // every snapshot, which only the indexing owner under its lock may do, since
 // a snapshot imported for a generation not yet begun is otherwise referenced
 // by nothing. Blob rows are left for the Section 10.4 grace protocol. Last, the
@@ -118,23 +118,71 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 		} else {
 			_, err = tx.ExecContext(ctx, `DELETE FROM snapshots WHERE `+unreferenced)
 		}
-		if err != nil {
-			return wrap("snapshots", err)
-		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM files WHERE
-			NOT EXISTS (SELECT 1 FROM snapshot_files sf WHERE sf.file_id = files.id)
-			AND NOT EXISTS (SELECT 1 FROM unit_inputs ui WHERE ui.file_id = files.id)
-			AND NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.file_id = files.id)
-			AND NOT EXISTS (SELECT 1 FROM evidence e WHERE e.file_id = files.id)
-			AND NOT EXISTS (SELECT 1 FROM search_units su WHERE su.file_id = files.id)
-			AND NOT EXISTS (SELECT 1 FROM context_entries ce WHERE ce.file_id = files.id)
-			AND NOT EXISTS (SELECT 1 FROM session_files s WHERE s.file_id = files.id)`)
-		return wrap("files", err)
+		return wrap("snapshots", err)
 	})
 	if err != nil {
 		return err
 	}
+	if err := s.collectUnreferencedFiles(ctx); err != nil {
+		return err
+	}
 	return s.commitSweepDeletes(ctx)
+}
+
+// unreferencedFile is the reachability of one files row, as the three tables
+// that may name it directly. Four more tables carry a file id, and each is
+// implied by one of these through a foreign key that every connection
+// enforces: node_facts, evidence and search_units reference
+// unit_inputs(unit_id, file_id), and session_files references
+// snapshot_files(snapshot_id, file_id, content_hash). A row of any of them
+// therefore exists only while the unit_inputs or snapshot_files row it names
+// does, so asking those four as well asks the same question again -- and for
+// evidence and search_units, which index no file id, asks it as a scan of the
+// largest tables in the store per candidate file.
+const unreferencedFile = `NOT EXISTS (SELECT 1 FROM snapshot_files sf WHERE sf.file_id = files.id)
+	AND NOT EXISTS (SELECT 1 FROM unit_inputs ui WHERE ui.file_id = files.id)
+	AND NOT EXISTS (SELECT 1 FROM context_entries ce WHERE ce.file_id = files.id)`
+
+// collectUnreferencedFiles deletes every files row nothing names any more. It
+// is collectUnreferencedScopeKeys' shape: a keyset over files.id in
+// gcBatchUnits-sized write transactions, each candidate proved unreferenced
+// by three index lookups (idx_snapshot_files_file, idx_unit_input_file,
+// idx_context_entries_file), which are also the indexes the foreign-key
+// checks of the delete itself use. The writer lock is held for one batch at a
+// time and the heap holds one cursor, never the table; liveness is evaluated
+// inside the transaction that deletes, so a file a concurrent import names
+// between two batches is simply seen as live.
+func (s *Store) collectUnreferencedFiles(ctx context.Context) error {
+	var after []byte
+	for {
+		var last []byte
+		err := s.write(ctx, func(tx *sql.Tx) error {
+			var err error
+			if after == nil {
+				err = tx.QueryRowContext(ctx, `SELECT max(id) FROM
+					(SELECT id FROM files ORDER BY id LIMIT ?1)`, gcBatchUnits).Scan(&last)
+			} else {
+				err = tx.QueryRowContext(ctx, `SELECT max(id) FROM
+					(SELECT id FROM files WHERE id > ?1 ORDER BY id LIMIT ?2)`, after, gcBatchUnits).Scan(&last)
+			}
+			if err != nil {
+				return wrap("files", err)
+			}
+			if last == nil {
+				return nil
+			}
+			if after == nil {
+				_, err = tx.ExecContext(ctx, `DELETE FROM files WHERE id <= ?1 AND `+unreferencedFile, last)
+			} else {
+				_, err = tx.ExecContext(ctx, `DELETE FROM files WHERE id > ?1 AND id <= ?2 AND `+unreferencedFile, after, last)
+			}
+			return wrap("files", err)
+		})
+		if err != nil || last == nil {
+			return err
+		}
+		after = last
+	}
 }
 
 // collectUnreachableUnits deletes, in bounded batches, every unit that no

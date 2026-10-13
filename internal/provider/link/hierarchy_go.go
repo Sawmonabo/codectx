@@ -2,12 +2,10 @@ package link
 
 import (
 	"context"
-	"io"
+	"go/token"
 	"path"
 	"slices"
 	"strings"
-
-	"golang.org/x/mod/modfile"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -27,7 +25,8 @@ const (
 	// is an interface.
 	goTypeRecord byte = iota
 	// goMethodRecord is a method the type itself declares: its name in Aux,
-	// its signature in Sig, its flags in Flags.
+	// its signature as written in Sig, its method-set key (goMethodKey, the
+	// name and canonical signature) in Returns, its flags in Flags.
 	goMethodRecord
 	// goFieldRecord is a field the type itself declares, its name in Aux:
 	// a named field, or an embedded field, named by its type's unqualified
@@ -43,9 +42,10 @@ const (
 )
 
 // addGoMethod records that typ itself declares the method e (keyed under
-// typ by name in links).
-func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name string, e entry) error {
-	return methodSets.Add(entry{Key: refKey(typ), Tag: goMethodRecord, Ref: e.Ref, Aux: name, Sig: e.Sig, Flags: e.Flags})
+// typ by name in links), of method-set key key.
+func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name, key string, e entry) error {
+	return methodSets.Add(entry{Key: refKey(typ), Tag: goMethodRecord, Ref: e.Ref, Aux: name, Sig: e.Sig, Flags: e.Flags,
+		Returns: key})
 }
 
 // goEmbeddings records each type declaration of a Go table, the fields
@@ -114,6 +114,13 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 				return err
 			}
 			if ok {
+				// A type outside the unit whose method set the build read
+				// promotes its methods as one of the unit's does.
+				if ext, found := h.goExt.materialized(external); found {
+					if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: ext}); err != nil {
+						return err
+					}
+				}
 				return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goExternalRecord, Aux: external})
 			}
 			for _, super := range supers {
@@ -202,37 +209,69 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 		if te.Flags&flagAbstract != 0 {
 			tag = 0
 		}
+		// A type outside the unit is read only for the interfaces it is
+		// and the methods it promotes: its own satisfaction is not the
+		// unit's, and no index entry names it.
+		outside := typ.File == goExternalFile
+		if outside && tag == 1 {
+			return nil
+		}
 		return goSelectors(ix, typ, tag == 0, func(name string, m entry, promoted bool) error {
 			if m.Tag == goExternalRecord {
-				// An external embedded type is part of the method set the
-				// satisfaction counts: an interface embedding it is
-				// satisfied only by a type that embeds it too.
 				var flags byte
 				if tag == 0 {
 					flags = flagInterface
 				}
-				err := links.Add(entry{Key: keyExternalSuper + refKey(typ), Ref: typ, Aux: m.Aux, Flags: flags})
-				if err != nil {
-					return err
+				if !outside {
+					err := links.Add(entry{Key: keyExternalSuper + refKey(typ), Ref: typ, Aux: m.Aux, Flags: flags})
+					if err != nil {
+						return err
+					}
+				}
+				// An external embedded type whose method set the build did
+				// not read is part of the method set the satisfaction
+				// counts: an interface embedding it is satisfied only by a
+				// type that embeds it too. One it read is counted by its
+				// methods instead (goEmbeddings).
+				if _, read := h.goExt.materialized(m.Aux); read {
+					return nil
 				}
 				return sets.Add(entry{Key: goExternalKey + m.Aux, Tag: tag, Ref: typ})
+			}
+			if outside {
+				return sets.Add(entry{Key: m.Returns, Tag: tag, Ref: typ})
 			}
 			if m.Tag == goFieldRecord {
 				return links.Add(entry{Key: keyGoField + refKey(typ) + name, Ref: m.Ref, Sig: m.Sig})
 			}
-			if promoted {
+			if promoted && m.Ref.File != goExternalFile {
 				err := links.Add(entry{Key: keyMethod + refKey(typ) + name, Ref: m.Ref, Sig: m.Sig, Flags: m.Flags})
 				if err != nil {
 					return err
 				}
 			}
-			return sets.Add(entry{Key: name + "\x00" + m.Sig, Tag: tag, Ref: typ})
+			return sets.Add(entry{Key: m.Returns, Tag: tag, Ref: typ})
 		})
 	})
 	if err != nil {
 		return err
 	}
-	return pairSatisfied(dir, links, sets)
+	return pairSatisfied(dir, links, sets, func(sub, iface Ref, keys []string) error {
+		q := h.goExt.qualifiedOf(iface)
+		if err := links.Add(entry{Key: keyGoExternalImpl + refKey(sub), Ref: sub, Aux: q, Sig: DetailMethodSet}); err != nil {
+			return err
+		}
+		for _, k := range keys {
+			name, _, _ := strings.Cut(k, "\x00")
+			if strings.HasPrefix(k, goExternalKey) || !token.IsExported(name) {
+				continue
+			}
+			if err := links.Add(entry{Key: keyGoExternalOverride + refKey(sub) + name, Ref: sub, Aux: q}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // goExternalKey prefixes the satisfaction key (satisfy's sets) of a type
@@ -331,8 +370,11 @@ func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry
 }
 
 // pairSatisfied adds every type whose method set includes an interface's
-// whole method set as that interface's subtype; sets is satisfy's.
-func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry]) error {
+// whole method set as that interface's subtype; sets is satisfy's. A pair
+// whose interface is outside the unit (goExternalFile) is handed to external
+// with the interface's method-set keys instead, since no index entry names
+// that interface.
+func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry], external func(sub, iface Ref, keys []string) error) error {
 	run, err := sets.Sorted()
 	if err != nil {
 		return err
@@ -375,6 +417,9 @@ func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry]) erro
 	defer counted.Close()
 	var iface, pair, method string
 	want, n := 0, 0
+	// keys are the current pair's matched keys, kept only for an interface
+	// outside the unit: its methods, at most.
+	var keys []string
 	return counted.Each(func(e entry) error {
 		if len(e.Key) == len(refKey(Ref{})) {
 			if e.Key != iface {
@@ -387,54 +432,41 @@ func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry]) erro
 			return nil
 		}
 		if e.Key != pair {
-			pair, n, method = e.Key, 0, ""
+			pair, n, method, keys = e.Key, 0, "", keys[:0]
 		}
 		if e.Sig == method {
 			return nil
 		}
 		method = e.Sig
+		outside := refOf(pair[:8]).File == goExternalFile
+		if outside {
+			keys = append(keys, e.Sig)
+		}
 		if n++; pair[:8] != iface || n != want {
 			return nil
+		}
+		if outside {
+			return external(refOf(pair[8:]), refOf(pair[:8]), keys)
 		}
 		return addSubtype(links, refOf(pair[8:]), refOf(pair[:8]), flagInterface)
 	})
 }
 
-// readGoModule reads the module path of the go.mod at the unit's project
-// root (goModulePath), which decides which import paths name the unit's own
-// packages.
+// readGoModule reads the go.mod at the unit's project root, the go.work
+// governing it and its vendor manifest (readGoModuleInfo): the module path
+// decides which import paths name the unit's own packages, the rest where
+// each package outside the unit is read from (goExternal).
 func (h *hierarchy) readGoModule(ctx context.Context, u *unit) error {
 	h.goRoot = path.Join(".", u.root)
-	var err error
-	h.goModule, err = goModulePath(ctx, u)
-	return err
-}
-
-// goModulePath is the module path the go.mod at the unit's project root
-// declares, empty when there is none. It is the only field of a go.mod the
-// linker reads: a requirement or a version bump decides nothing it does.
-func goModulePath(ctx context.Context, u *unit) (string, error) {
-	if u.content == nil {
-		return "", nil
-	}
-	var module string
-	err := u.content.EachFile(ctx, model.FileSelection{Paths: []string{path.Join(u.root, "go.mod")}}, func(fv model.FileVersion) error {
-		if fv.Status == model.FileDeleted {
-			return nil
-		}
-		rc, fv, err := u.content.Open(ctx, fv.ID)
-		if err != nil {
-			return err
-		}
-		defer rc.Close()
-		data, err := io.ReadAll(io.LimitReader(rc, fv.Size))
-		if err != nil {
-			return err
-		}
-		module = modfile.ModulePath(data)
+	if u.family != FamilyGo {
 		return nil
-	})
-	return module, err
+	}
+	info, err := readGoModuleInfo(ctx, u)
+	if err != nil {
+		return err
+	}
+	h.goInfo, h.goModule = info, info.module
+	return nil
 }
 
 // goPackages yields the scope (directory and package) of every Go package

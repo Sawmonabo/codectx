@@ -77,8 +77,13 @@ type Attrs struct {
 	Range *model.SourceRange
 	// Detail is bounded evidence detail, normally a small JSON object.
 	Detail string
-	// Metadata is the node's strictly typed JSON metadata object.
-	Metadata json.RawMessage
+	// Metadata is the node's metadata fields. They are rendered with
+	// model.SplitMetadata: every field stays inline while the object fits
+	// model.MaxMetadataBytes, and a field that would push it past the bound
+	// (a list or a map, in practice) is stored as one evidence row per
+	// element on the node, named by a "<field>_rows" marker. No field is ever
+	// dropped or cut for size.
+	Metadata map[string]any
 	// Located marks a node whose attributes bind it to the unit's file: the
 	// node fact carries the file, content hash and Range. Identity is
 	// unaffected; attribute ownership stays with the publishing unit.
@@ -150,18 +155,35 @@ func (e *Emitter) Node(ctx context.Context, cand model.NodeCandidate, a Attrs) (
 	if a.Located {
 		node.FileID, node.ContentHash, node.Range = e.file.ID, e.file.ContentHash, a.Range
 	}
+	fields := a.Metadata
 	if res.Basis == model.MatchUnresolved {
-		node.Metadata = mergeMetadata(a.Metadata, "resolution", "unresolved")
-	} else {
-		node.Metadata = a.Metadata
+		fields = withField(fields, "resolution", "unresolved")
 	}
+	meta, rows, err := model.SplitMetadata(fields)
+	if err != nil {
+		return model.Node{}, err
+	}
+	node.Metadata = meta
 	ev := e.evidence(node.ID, "", a)
 	if i, dup := e.seenNode[node.ID]; dup {
+		// The first occurrence's metadata stands, as it always has; a repeat
+		// adds only its occurrence.
 		e.nodes[i].Evidence = e.appendEvidence(e.nodes[i].Evidence, ev)
+		node.Metadata = e.nodes[i].Node.Metadata
 		return node, nil
 	}
+	evidence := []model.Evidence{ev}
+	for _, row := range rows {
+		details, err := row.Details()
+		if err != nil {
+			return model.Node{}, &model.Error{Code: model.CodeInternal, Message: "a metadata row cannot be encoded: " + err.Error()}
+		}
+		evidence = e.appendRow(evidence, details, func(detail string) model.Evidence {
+			return e.evidence(node.ID, "", Attrs{Precision: a.Precision, Detail: detail})
+		})
+	}
 	e.seenNode[node.ID] = len(e.nodes)
-	e.nodes = append(e.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey, Evidence: []model.Evidence{ev}})
+	e.nodes = append(e.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey, Evidence: evidence})
 	e.aliases = append(e.aliases, model.NativeAlias{ScopeKey: cand.ScopeKey, NativeKey: cand.NativeKey, NodeID: node.ID})
 	for _, other := range res.Ambiguous {
 		if err := e.Relation(node.ID, model.RelMayReferTo, other, Attrs{Precision: a.Precision, Range: a.Range}); err != nil {
@@ -337,18 +359,56 @@ func (e *Emitter) appendEvidence(list []model.Evidence, ev model.Evidence) []mod
 	return append(list, ev)
 }
 
-// Metadata renders a strictly typed metadata object with sorted keys. A
-// payload over the bound is replaced by one that says so rather than
-// truncated into invalid JSON.
-func Metadata(fields map[string]any) json.RawMessage {
-	if len(fields) == 0 {
-		return nil
+// appendRow adds one metadata row's evidence to a node fact's list, or counts
+// it as clipped when the list is at the evidence bound. Rows are distinct by
+// construction -- each names its field and ordinal, and the evidence identity
+// hashes the detail -- so, unlike appendEvidence, it does not scan the list for
+// a duplicate, which would make a long list quadratic.
+//
+// A row is its details, one or the pieces of a long element
+// (model.MetadataRow.Details), and is kept or clipped whole: a piece without
+// its siblings is no element at all.
+func (e *Emitter) appendRow(list []model.Evidence, details []string, mk func(detail string) model.Evidence) []model.Evidence {
+	if len(list)+len(details) > e.clip {
+		e.clipped++
+		return list
 	}
-	raw := marshal(fields)
-	if raw == nil || len(raw) > model.MaxMetadataBytes {
-		raw = marshal(map[string]any{"truncated": true})
+	for _, d := range details {
+		list = append(list, mk(d))
 	}
-	return raw
+	return list
+}
+
+// AddMetadataRow publishes one metadata row on node, a node fact this unit
+// already queued, as an evidence row located at rng in file: the unit's own
+// file when file is nil, or another of the unit's input files (a requirements
+// file's include). It is for a list the producer always stores as rows because
+// each element has its own source range (model.MetaUnresolvedLines). The node
+// is not resolved again: it is the fact already queued.
+func (e *Emitter) AddMetadataRow(node model.NodeID, precision model.Precision, file *model.FileVersion, rng *model.SourceRange, row model.MetadataRow) error {
+	if e.nodesFlushed {
+		return &model.Error{Code: model.CodeInternal, Message: "a metadata row was queued after the unit's nodes were flushed"}
+	}
+	i, ok := e.seenNode[node]
+	if !ok {
+		return &model.Error{Code: model.CodeInternal, Message: "a metadata row names a node this unit did not queue"}
+	}
+	if err := row.Validate(); err != nil {
+		return err
+	}
+	details, err := row.Details()
+	if err != nil {
+		return &model.Error{Code: model.CodeInternal, Message: "a metadata row cannot be encoded: " + err.Error()}
+	}
+	e.nodes[i].Evidence = e.appendRow(e.nodes[i].Evidence, details, func(detail string) model.Evidence {
+		ev := e.evidence(node, "", Attrs{Precision: precision, Range: rng, Detail: detail})
+		if file != nil {
+			ev.FileID, ev.ContentHash = file.ID, file.ContentHash
+			ev.ID = model.NewEvidenceID(ev)
+		}
+		return ev
+	})
+	return nil
 }
 
 // marshal renders JSON with sorted keys and without HTML escaping, so a
@@ -409,12 +469,13 @@ func cut(s string, limit int) string {
 
 func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
-// mergeMetadata sets one string field on a metadata object.
-func mergeMetadata(raw json.RawMessage, key, value string) json.RawMessage {
-	fields := map[string]any{}
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &fields)
+// withField returns a copy of fields with key set to value; the caller's map
+// is not changed.
+func withField(fields map[string]any, key, value string) map[string]any {
+	out := make(map[string]any, len(fields)+1)
+	for k, v := range fields {
+		out[k] = v
 	}
-	fields[key] = value
-	return Metadata(fields)
+	out[key] = value
+	return out
 }

@@ -48,6 +48,11 @@ type hierarchy struct {
 	// project root goRoot ("." for the repository root); empty when there
 	// is none, and then no Go import path names a package of the unit.
 	goModule, goRoot string
+	// goInfo is the rest of what a Go unit's go.mod, go.work and vendor
+	// manifest say (goModuleInfo); goExt, while the hierarchy is built, the
+	// Go packages outside the unit read for it (goExternal).
+	goInfo *goModuleInfo
+	goExt  *goExternal
 	// note, while a member's reads are recorded (record), is told each
 	// read by its trace key.
 	note func(TraceKey) error
@@ -165,7 +170,7 @@ const (
 	// keyParam + refKey(callable): one declared parameter of the callable
 	// (Decl.Parameters), its position in Aux (basePosition), its name in
 	// Sig, its Parameter.Index in MinArgs and its marks in Flags
-	// (paramVariadic, paramKeywordOnly).
+	// (paramVariadic, paramKeywordOnly, paramReturned).
 	keyParam = "pa\x00"
 	// keyMacro + name: a C or C++ object-like macro of that name whose
 	// replacement is one identifier (Decl.Alias), its file's path in Aux and
@@ -195,6 +200,10 @@ const (
 const (
 	paramVariadic byte = 1 << iota
 	paramKeywordOnly
+	// paramReturned marks a parameter whose value reaches its callable's
+	// return (Parameter.Returned): a body edit that changes it changes the
+	// entry, so every member whose argument flows read it re-runs.
+	paramReturned
 )
 
 // typeKinds are the declaration kinds a type name denotes; a Rust trait is
@@ -422,6 +431,15 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	if h.decls, err = writeIndex(u.dir, decls); err != nil {
 		return nil, err
 	}
+	if u.family == FamilyGo {
+		if h.goExt, err = newGoExternal(ctx, h, u); err != nil {
+			return nil, err
+		}
+		defer func() {
+			h.goExt.close()
+			h.goExt = nil
+		}()
+	}
 
 	links, err := newEntrySort(u.dir)
 	if err != nil {
@@ -436,6 +454,14 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		return nil, err
 	}
 	defer methodSets.Close()
+	if h.goExt != nil {
+		if err := h.goExt.materialize(ctx, methodSets); err != nil {
+			return nil, err
+		}
+		if err := links.Add(entry{Key: keyGoCoverage, MinArgs: uint32(h.goExt.read), MaxArgs: uint32(h.goExt.unavailable)}); err != nil {
+			return nil, err
+		}
+	}
 	err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
 		return h.addLinks(ctx, links, methodSets, file, t)
 	})
@@ -511,6 +537,11 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		if err := addParameters(s, ref, d); err != nil {
 			return err
 		}
+		if fc.family == "go" && strings.HasPrefix(d.Identity, "=") && isType(d.Kind) {
+			if err := s.Add(entry{Key: keyGoAlias + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
+				return err
+			}
+		}
 		if err := addRustMacro(s, fc, ref, t, d); err != nil {
 			return err
 		}
@@ -582,6 +613,9 @@ func addParameters(s *pagination.ExternalSort[entry], ref Ref, d *Decl) error {
 		}
 		if p.KeywordOnly {
 			e.Flags |= paramKeywordOnly
+		}
+		if p.Returned {
+			e.Flags |= paramReturned
 		}
 		if err := s.Add(e); err != nil {
 			return err
@@ -688,7 +722,11 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			if fc.family != "go" {
 				return nil
 			}
-			return addGoMethod(methodSets, typ, d.Name, e)
+			key, err := goMethodKey(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref)
+			if err != nil {
+				return err
+			}
+			return addGoMethod(methodSets, typ, d.Name, key, e)
 		}
 		// A Java anonymous class body's method is its synthetic type's,
 		// whatever declaration encloses it (an initializer block's is its
@@ -708,7 +746,10 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 	}
 	if fc.family == "go" {
-		return h.goEmbeddings(ctx, methodSets, fc, t)
+		if err := h.goEmbeddings(ctx, methodSets, fc, t); err != nil {
+			return err
+		}
+		return h.goConversions(ctx, links, fc, t)
 	}
 	for i, st := range t.Supertypes {
 		var supers []entry
@@ -1814,7 +1855,8 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 			return errMalformedEntry
 		}
 		return yield(paramInfo{Pos: int32(binary.BigEndian.Uint64([]byte(e.Aux))), Name: e.Sig, Index: e.MinArgs,
-			Variadic: e.Flags&paramVariadic != 0, KeywordOnly: e.Flags&paramKeywordOnly != 0})
+			Variadic: e.Flags&paramVariadic != 0, KeywordOnly: e.Flags&paramKeywordOnly != 0,
+			Returned: e.Flags&paramReturned != 0})
 	})
 }
 
@@ -2171,12 +2213,16 @@ func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Bindi
 // satisfies.
 func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
 	if d.Kind != model.NodeInterface {
-		return h.links.lookup(keySuper+refKey(ref), func(e entry) error {
+		err := h.links.lookup(keySuper+refKey(ref), func(e entry) error {
 			if e.Aux != "" {
 				return nil
 			}
 			return emit(Binding{Kind: FactImplements, Site: ref, Target: e.Ref, Detail: DetailMethodSet})
 		})
+		if err != nil {
+			return err
+		}
+		return h.goExternalImplements(fc, ref, emit)
 	}
 	for _, st := range t.Supertypes {
 		sub := false
@@ -2315,15 +2361,10 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 				return err
 			}
 		}
-		if len(targets) > 0 || !d.Override || fc.family == "go" {
-			return nil
+		if fc.family == "go" {
+			return h.goExternalOverrides(fc, owner, ref, d, emit)
 		}
-		external, err := h.externalSupers(fc.family, owner, d.Name)
-		if err != nil || len(external) != 1 {
-			return err
-		}
-		return emit(Binding{Kind: FactOverrides, Site: ref, Detail: DetailSupertype,
-			External: externalMethod(fc.family, external[0].Aux, d.Name)})
+		return h.externalOverrides(fc, owner, ref, d, len(targets) > 0, emit)
 	})
 }
 

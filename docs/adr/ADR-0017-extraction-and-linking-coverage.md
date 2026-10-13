@@ -81,7 +81,7 @@ JavaScript and TypeScript specifiers, and quoted C and C++ includes. An import t
 include matched beside the file and by path suffix) publishes one `imports` per matched file, each with `set_size`.
 An import that does not resolve publishes nothing here; a non-constant one is ADR-0015's open import site.
 
-### 7. Arguments flow into the parameters of the callee a site is bound to
+### 7. Arguments flow into the parameters of the callee a site is bound to, and back through its return summary
 
 - The worker records, on each call site's arguments, their positions, a keyword name and a spread or variadic mark;
   on each parameter, its index (the receiver or `self` is 0) and its variadic and keyword-only marks.
@@ -89,14 +89,37 @@ An import that does not resolve publishes nothing here; a non-constant one is AD
   matches: by position up to the first keyword argument, then by keyword name. A spread argument, or `*args` or
   `**kwargs` at the call, matches up to the spread point and then the callee's variadic parameter. A parameter left at
   its default gets no edge. An unbound site publishes no argument flow.
-- Transitive flow is a walk at query time, with no depth limit. Return values do not flow back to the call's result:
-  with no return edge, a walk cannot enter one call and leave through another, the unrealizable-path error of
-  interprocedural analysis [S10].
-- Parameters are keyed by their declaration's identity and position (ADR-0014), so another file's argument flow into
-  a parameter survives an edit of the callee's body.
+- Transitive flow is a walk at query time, with no depth limit and no call stack. A plain edge from a callee's
+  return to every call of it would let a walk enter one call and leave through another, the unrealizable-path error
+  of interprocedural analysis [S10]. Return values come back by labelled edges instead [S10][S12], and the walk
+  keeps its paths realizable by the two-phase rule of interprocedural slicing [S10]: a path that has taken an
+  `argument` edge never takes a `return` edge.
+  - **Return summary.** From the worker's intraprocedural def-use and control dependence, each parameter whose
+    value reaches a return of its callable, or decides which return runs, is marked. At each bound site whose
+    value is written into variables, each argument bound to such a parameter publishes one `data_flows_to` from
+    each variable it reads to each of those variables, labelled `summary:` and the parameter's position. The walk
+    takes it without entering the callee, and it carries every effect the parameter has on the result.
+  - **Return node.** Each analysed callable has a return node, a variable keyed by the callable's identity, into
+    which every value a returning node reads, or a node deciding whether it runs reads, flows as an ordinary
+    reaching definition, a parameter's value included. Each bound site publishes the callee's return node flowing
+    into the variables the call's value is written into, and into the caller's own return node when the caller
+    returns the call's value (`return f()`), labelled `return`, so a factory behind a wrapper reaches the
+    wrapper's callers. A path that starts inside the callee leaves through every call of it, a partially balanced
+    path; a path that entered through an argument does not leave, since its effect is the summary's. A value
+    created in the callee whose return a parameter decides (`k = 1; if p: return k`) still reaches every caller's
+    result.
+  - A call whose value another call consumes first (`g(f())`, `f().m()`) has no result destination and publishes
+    neither. A constructor that returns no value (a Python `__init__`, a Java or C++ constructor) has no return
+    node.
+- Parameters and return nodes are keyed by their callable's identity (ADR-0014), so another file's flow into a
+  parameter or out of a return node survives an edit of the callee's body; a body edit that changes whether a
+  parameter reaches the return changes the callee's interface entry the bound sites read, and re-runs those sites.
 
 This stores one hop where data-flow engines store the argument and parameter positions and match them at query
-time [S11][S12]; the stored hop is the same match made once per bound site.
+time [S11][S12]; the stored hop is the same match made once per bound site. The summary is the RHS summary edge
+from an actual-in to an actual-out of the site [S10]; the return node stands where a code property graph's method
+return does [S11]. With the edge's role in its evidence detail, the walk needs one flag per path, not the
+call-site matching a query-time library keeps [S12].
 
 ### 8. Program entry points, decorators and routes are facts; a route's full path only when it resolves
 
@@ -143,7 +166,11 @@ reach those answers without the verification the rest receives.
   two headers gives one `imports` per header, `set_size` 2 (mutation: keep the first match only).
 - `f(x)` bound to `g(p)` gives `x → p`; an unbound site gives none (mutation: bind by arity alone); a keyword
   argument, `*args`, a JavaScript spread and an omitted default each map to the right parameter (mutation: match by
-  position across a keyword argument).
+  position across a keyword argument). `a = ident(x)` with `ident` returning its parameter gives `x → a` labelled
+  `summary:1`, and `b = make()` gives `make`'s return node `→ b`, in every family; in `k = 1; if p: return k` called
+  at two sites, k flows into the return node and on to both results, each edge with one role (mutation: leave out a
+  value a parameter decides), and `print(make())` gives no return flow (mutation: take the innermost node's
+  definitions past another call).
 - `@app.route("/x")` yields one endpoint with `routes_to` its handler, and a decorator that is not a route yields none
   (mutation: any decorator is a route); a blueprint or `include_router` prefix that does not resolve gives
   `prefix: unresolved` and no `path` (mutation: join an unresolved prefix as empty); the kind filter returns
@@ -156,8 +183,11 @@ reach those answers without the verification the rest receives.
   imports, one argument-flow edge per argument at each bound site (an estimate, not measured), decorator facts and
   endpoints. Storage is measured in the scale proofs.
 - Endpoint and argument-flow identities rest on ADR-0014's descriptor paths and parameter keys.
-- Follow-ups outside this record: return-value flow; lock files for every ecosystem; C shared-library visibility
-  through export macros.
+- New facts per bound site whose value is used: one return flow, and one summary flow per argument bound to a
+  returning parameter; one return node per analysed callable that a used call reaches or whose returning nodes read
+  a variable.
+- Follow-ups outside this record: lock files for every ecosystem; C shared-library visibility through export
+  macros.
 
 ## Sources
 

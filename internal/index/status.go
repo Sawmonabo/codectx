@@ -1077,42 +1077,73 @@ func severityRank(s model.CapabilityStateValue) int {
 // details_json and therefore into the AnalysisKey. Two identical runs must key
 // identically.
 //
-// The whole exemplar row is what is published, not just its scope. Its
-// diagnostic code and its other details are the chosen scope's, so the fold
-// describes one scope truthfully instead of pairing one scope's key with
+// The exemplar row is the base of what is published, not just its scope. Its
+// diagnostic code and its scope-naming details are the chosen scope's, so the
+// fold describes one scope truthfully instead of pairing one scope's key with
 // whichever row happened to arrive first; diagnostic_code folds into the
 // AnalysisKey as well, so an arrival-ordered one is the same determinism
 // defect the scope exemplar exists to prevent. Rows that are all
 // workspace-scoped have no scope to choose between and are ordered by their
 // code, which is likewise arrival-independent.
+//
+// Every other row's details fold into it through mergeDetails, the rule the
+// primary-key fold uses: counts sum, extremes keep the larger, and reasons
+// union, so a collapsed row reports the units_failed of every scope it stands
+// for rather than one scope's. The rows fold in exemplar order, which is total
+// within one key (the primary-key fold left one row per scope), so the merged
+// details are a function of the set and never of arrival order. The one
+// detail that does not fold is failure_message: it is the exemplar scope's,
+// paired with the diagnostic code the row publishes, and another scope's
+// message beside that code would misreport what the exemplar failed with.
 func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 	var order []string
-	folds := map[string]model.CapabilityState{}
-	counts := map[string]int{}
-	scoped := map[string]bool{}
-	for _, c := range rows {
+	members := map[string][]int{}
+	for i, c := range rows {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + string(c.State)
-		best, ok := folds[key]
-		if !ok {
+		if _, ok := members[key]; !ok {
 			order = append(order, key)
 		}
-		if !ok || betterExemplar(c, best, scoped[key]) {
-			folds[key] = c
-			scoped[key] = c.Scope != provider.ScopeWorkspace
-		}
-		counts[key] += countDetail(c)
+		members[key] = append(members[key], i)
 	}
 	out := make([]model.CapabilityState, 0, len(order))
 	for _, key := range order {
-		row := folds[key]
+		idx := members[key]
+		slices.SortFunc(idx, func(a, b int) int {
+			switch {
+			case betterExemplar(rows[a], rows[b], rows[b].Scope != provider.ScopeWorkspace):
+				return -1
+			case betterExemplar(rows[b], rows[a], rows[a].Scope != provider.ScopeWorkspace):
+				return 1
+			}
+			return 0
+		})
+		row := rows[idx[0]]
+		count := countDetail(row)
+		for _, i := range idx[1:] {
+			row = mergeDetails(row, withoutExemplarMessage(rows[i]))
+			count += countDetail(rows[i])
+		}
 		exemplar := row.Scope
 		row.Scope = provider.ScopeWorkspace
-		if scoped[key] {
+		if exemplar != provider.ScopeWorkspace {
 			row = row.WithDetail(scopeKeyDetail, model.TruncateDetail(exemplar))
 		}
-		out = append(out, row.WithDetail(scopesDetail, strconv.Itoa(counts[key])))
+		out = append(out, row.WithDetail(scopesDetail, strconv.Itoa(count)))
 	}
 	return out
+}
+
+// withoutExemplarMessage drops the failure message a non-exemplar row carries
+// before its details fold into the exemplar's; the map is copied, never
+// edited, because rows share their detail maps (see WithDetail).
+func withoutExemplarMessage(c model.CapabilityState) model.CapabilityState {
+	if _, ok := c.Details[failureMessageDetail]; !ok {
+		return c
+	}
+	details := maps.Clone(c.Details)
+	delete(details, failureMessageDetail)
+	c.Details = details
+	return c
 }
 
 // betterExemplar answers whether candidate should replace the exemplar chosen

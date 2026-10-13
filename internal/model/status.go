@@ -429,8 +429,9 @@ type ResourceReport struct {
 	StuckFreesOmitted int64       `json:"stuck_frees_omitted"`
 	UnitsReused       *int64      `json:"units_reused,omitempty"`
 	UnitsParsed       *int64      `json:"units_parsed,omitempty"`
-	// NeedClasses is one page of this repository's learned per-file need
-	// models, in key order: for each class, how many parsed files it learned
+	// NeedClasses is one page of this repository's learned need models --
+	// parsed files' memory and external tools' memory and temporary disk -- in
+	// key order: for each class, how many runs it learned
 	// from, how many of them used more than they were reserved, and the
 	// largest drift any of them showed. It is how an operator checks the
 	// overrun target per class, and it is read from the run ledger's
@@ -459,13 +460,17 @@ type ResourceReport struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
-// A NeedClass is one learned per-file need model: its key (language, grammar
-// fingerprint, the parser worker's build identity and file-size class), how many files it learned from, how many of
-// them overran their reservation, and the largest drift -- need minus
-// reservation -- any of them showed. The drift is below zero when every file
+// A NeedClass is one learned need model: its key -- the kind of work (a
+// parsed file's memory, or an external indexer's or language server's memory
+// or temporary disk), its subject (the language parsed or the tool run), the
+// grammar or tool payload fingerprint, the build identity of the product that
+// ran it and the work's size class -- how many runs it learned from, how many
+// of them overran their reservation, and the largest drift -- need minus
+// reservation -- any of them showed. The drift is below zero when every run
 // fitted, which is a real reading, not an absence.
 type NeedClass struct {
-	Language      string `json:"language"`
+	Kind          string `json:"kind"`
+	Subject       string `json:"subject"`
 	Fingerprint   string `json:"fingerprint"`
 	Build         string `json:"build"`
 	SizeClass     int    `json:"size_class"`
@@ -551,7 +556,10 @@ func validateNeedClasses(classes []NeedClass, omitted int64) error {
 		return err
 	}
 	for _, c := range classes {
-		if err := requireField("resources.need_classes.language", c.Language, MaxIdentifierBytes); err != nil {
+		if err := requireField("resources.need_classes.kind", c.Kind, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := requireField("resources.need_classes.subject", c.Subject, MaxIdentifierBytes); err != nil {
 			return err
 		}
 		if err := requireField("resources.need_classes.fingerprint", c.Fingerprint, MaxIdentifierBytes); err != nil {

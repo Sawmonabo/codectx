@@ -316,7 +316,7 @@ func (d Dispatch) Valid() bool {
 // Validate enforces the evidence table constraints: the subject XOR, the
 // precision vocabulary and the mixed-range check.
 func (e Evidence) Validate() error {
-	if err := requireID("evidence.id", string(e.ID)); err != nil {
+	if err := requireEvidenceID("evidence.id", e.ID); err != nil {
 		return err
 	}
 	if err := requireID("evidence.unit_id", string(e.UnitID)); err != nil {
@@ -728,6 +728,12 @@ const (
 	// MetaDecorators holds a declaration's decorators and annotations, in
 	// source order ([]Decorator).
 	MetaDecorators = "decorators"
+	// MetaUnresolvedLines names the rows of a requirements file's
+	// configuration node that record the lines no requirement interprets, in
+	// source order; each row's value is {"line","reason","via"} and the row is
+	// located at its line. They are always rows, never inline, so each keeps
+	// its range.
+	MetaUnresolvedLines = "unresolved_lines"
 )
 
 // NameResolution is the `resolution` attribute of Section 9.3: the factual
@@ -854,12 +860,16 @@ type OpenImportSiteMetadata struct {
 	// Reason is always ReasonComputed.
 	Reason OpenSiteReason `json:"reason"`
 	// Fragments are the path's literal parts, in source order; empty when the
-	// path has none.
-	Fragments []string `json:"fragments"`
+	// path has none. It is absent when the list is stored as rows.
+	Fragments []string `json:"fragments,omitempty"`
+	// FragmentsRows is the number of rows holding the fragments when the list
+	// did not fit the node's metadata (MetadataRowsKey(MetaFragments)); zero
+	// when they are inline.
+	FragmentsRows int64 `json:"fragments_rows,omitempty"`
 }
 
 // Validate enforces the open-import-site metadata shape. The fragment list
-// has no count bound of its own: the node's metadata byte bound holds it.
+// has no count bound: a list too long for the node row is stored as rows.
 func (m OpenImportSiteMetadata) Validate() error {
 	if m.Resolution != ResolutionUnresolved {
 		return invalid("open_import_site.resolution is %q; an open import site is %q", truncateForMessage(string(m.Resolution)), ResolutionUnresolved)

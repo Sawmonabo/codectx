@@ -37,6 +37,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/Sawmonabo/codectx/internal/graph"
 	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
@@ -88,8 +89,21 @@ const (
 	// file its import resolves to.
 	DetailImport = "import"
 	// DetailArgument: a `data_flows_to` from a variable an argument reads to
-	// the parameter the argument binds at a bound call site.
-	DetailArgument = "argument"
+	// the parameter the argument binds at a bound call site. It is the role
+	// an impact walk reads (graph.FlowDetailArgument), so the two cannot drift.
+	DetailArgument = graph.FlowDetailArgument
+	// DetailSummary: a `data_flows_to` from a variable an argument reads to a
+	// variable the bound call site's result is written into, through the
+	// callee's parameter whose value reaches its return (the callee's return
+	// summary). The published evidence detail is "summary:" and the
+	// parameter's position (Parameter.Index).
+	DetailSummary = "summary"
+	// DetailReturn: a `data_flows_to` from the bound callee's return node to
+	// a variable the call site's result is written into, or to the return
+	// node of the callable that returns the call's value. An impact walk that
+	// has taken a DetailArgument edge never takes one (ADR-0017 decision 7);
+	// it is the role that walk reads (graph.FlowDetailReturn).
+	DetailReturn = graph.FlowDetailReturn
 	// DetailSupertype: an `extends`, `implements` or `overrides` the source
 	// declares: a written supertype, and a method of the same name and
 	// signature along the written supertypes.
@@ -107,6 +121,13 @@ const (
 	// outside the project that the source proves a class: a class's
 	// `extends` clause or base list.
 	DetailSupertypeClass = "supertype_class"
+	// DetailSupertypeCandidate: an `overrides` of a method of a type outside
+	// the project that a Java `@Override` or C++ `override` method may
+	// override: one of the external supertypes on a path no type of the
+	// project declares the method along, read with its set size as "at least
+	// one of n" (several may hold at once), or one published beside an
+	// override of the project's own, which the mark already proves.
+	DetailSupertypeCandidate = "supertype_candidate"
 	// DetailMacroInput: a `generates` from a Rust macro_rules to a
 	// declaration written in its input, which it may transcribe renamed,
 	// repeated or not at all.
@@ -299,8 +320,12 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 			return failed, err
 		}
 	}
+	rows, err := goExternalCoverage(pub.capabilities(records.Len()), res.h)
+	if err != nil {
+		return failed, err
+	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
-		Capabilities: pub.capabilities(records.Len())}, nil
+		Capabilities: rows}, nil
 }
 
 // resolve is the unit's resolution by its family's: the static family's

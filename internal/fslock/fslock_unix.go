@@ -21,6 +21,21 @@ func TryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
+// TryLockShared takes a shared advisory lock on f without blocking. Any
+// number of descriptors may hold it at once; it reports false while another
+// descriptor holds the exclusive lock, and an exclusive TryLock reports false
+// while any descriptor holds this one.
+func TryLockShared(f *os.File) (bool, error) {
+	err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return false, nil
+	}
+	return false, err
+}
+
 // Lock takes an exclusive advisory lock on f, waiting for whichever
 // descriptor holds it to let it go. It is what a turn-taking protocol needs
 // and TryLock cannot give: a caller that must have the lock, and whose only
@@ -34,7 +49,7 @@ func Lock(f *os.File) error {
 	}
 }
 
-// Unlock releases the lock TryLock took.
+// Unlock releases the lock TryLock or TryLockShared took.
 func Unlock(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }

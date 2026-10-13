@@ -2,19 +2,20 @@ package app
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/search"
-	"github.com/Sawmonabo/codectx/internal/source"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/workflow"
 )
@@ -116,6 +117,7 @@ type ExploreService interface {
 	Search(ctx context.Context, req model.SearchRequest) (model.Page[model.SearchHit], error)
 	Symbol(ctx context.Context, req model.SymbolRequest) (model.Page[model.Node], error)
 	References(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
+	NodeMetadata(ctx context.Context, req model.NodeMetadataRequest) (model.Page[model.MetadataRow], error)
 	Graph(ctx context.Context, req model.GraphRequest) (model.GraphResult, error)
 	Path(ctx context.Context, req model.PathRequest) (model.PathResult, error)
 	Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error)
@@ -1095,18 +1097,41 @@ func parseSpanKey(lastKey string) (spanKey, error) {
 
 // requestSpanKey is the selector a first call names. A path is only hashed
 // into the file id the index derives from the same root-relative path; nothing
-// is opened on it, so a path the snapshot does not hold -- one climbing out of
-// the tree, or one the capture skipped as a symbolic link -- is simply a file
-// id the manifest has no row for.
-func requestSpanKey(repo model.RepositoryID, req model.ReadChunkRequest) spanKey {
+// is opened on it, so a path the snapshot does not hold -- one the capture
+// skipped as a symbolic link, or one that was never there -- is simply a file
+// id the manifest has no row for. The path is first put in the one spelling
+// the capture stores (repositoryPath), so `./a.go` and `pkg/../a.go` name
+// a.go; one that climbs out of the tree is refused rather than hashed.
+func requestSpanKey(repo model.RepositoryID, req model.ReadChunkRequest) (spanKey, error) {
 	switch {
 	case req.NodeID != "":
-		return spanKey{kind: spanNode, id: string(req.NodeID), label: string(req.NodeID)}
+		return spanKey{kind: spanNode, id: string(req.NodeID), label: string(req.NodeID)}, nil
 	case req.FileID != "":
-		return spanKey{kind: spanFile, id: string(req.FileID), at: req.Offset, set: true, label: string(req.FileID)}
+		return spanKey{kind: spanFile, id: string(req.FileID), at: req.Offset, set: true, label: string(req.FileID)}, nil
 	}
-	return spanKey{kind: spanFile, id: string(model.NewFileID(repo, req.Path)), at: req.Offset, set: true,
-		label: strconv.Quote(req.Path)}
+	p, err := repositoryPath(req.Path)
+	if err != nil {
+		return spanKey{}, err
+	}
+	return spanKey{kind: spanFile, id: string(model.NewFileID(repo, p)), at: req.Offset, set: true,
+		label: strconv.Quote(p)}, nil
+}
+
+// repositoryPath is p in the spelling the capture stores a file under:
+// slash-separated (filepath.ToSlash, so only the platform's own separator is
+// rewritten and a backslash in a Unix file name stays a name byte), lexically
+// clean, and relative to the repository root. A path that is absolute, empty,
+// the root itself or climbs above it names no file of the repository and is
+// CTX_ARGUMENT_INVALID.
+func repositoryPath(p string) (string, error) {
+	clean := path.Clean(filepath.ToSlash(p))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "../") ||
+		filepath.IsAbs(p) {
+		return "", &model.Error{Code: model.CodeArgumentInvalid,
+			Message:     "read_chunk.path " + strconv.Quote(p) + " is not a file path inside the repository",
+			Remediation: "name the file relative to the repository root, with no \"..\" segment that leaves it"}
+	}
+	return clean, nil
 }
 
 // sourceSpan is one resolved read: the file it reads, the pinned manifest row's
@@ -1151,7 +1176,9 @@ func (s *Services) readOutside(ctx context.Context, req model.ReadChunkRequest) 
 	var key spanKey
 	var resumed *pagination.Cursor
 	if req.Cursor == "" {
-		key = requestSpanKey(st.repo, req)
+		if key, err = requestSpanKey(st.repo, req); err != nil {
+			return model.ReadChunkResponse{}, err
+		}
 	} else {
 		c, err := st.signer.DecodeCursor(req.Cursor, readSourceEndpoint, now)
 		if err != nil {
@@ -1218,49 +1245,26 @@ func (s *Services) readOutside(ctx context.Context, req model.ReadChunkRequest) 
 		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
 			"the source returned %d bytes for the %d-byte window [%d,%d)", len(window.Bytes), end-span.at, span.at, end)}
 	}
-	chunk, err := source.PlanChunk(window.Before, window.Bytes, span.at, span.end, raw)
+	chunk, err := coverage.CutChunk(window, span.at, span.end, raw)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
-	start, stop := window.Start, window.End
-	if chunk.Range.End != end {
-		cursor, err := source.NewCursorAt(window.Before, window.Bytes, span.at, window.Start.Line)
-		if err != nil {
-			return model.ReadChunkResponse{}, err
-		}
-		if stop, err = cursor.PositionAt(chunk.Range.End); err != nil {
-			return model.ReadChunkResponse{}, err
-		}
-		if stop.Line == window.Start.Line {
-			// The cursor counts columns from the window, which begins mid-line
-			// whenever the span does; the view resolved the start's real column.
-			stop.Column += window.Start.Column
-		}
-	}
-	// window.Bytes aliases the view's buffer; both encodings copy it into a
-	// fresh string, so nothing outliving this call holds it.
-	body := window.Bytes[:chunk.Range.End-chunk.Range.Start]
-	content := string(body)
-	if chunk.Encoding == model.EncodingBase64 {
-		content = base64.StdEncoding.EncodeToString(body)
-	}
-
 	resp := model.ReadChunkResponse{
 		Binding:     binding,
 		FileID:      span.file,
 		NodeID:      span.node,
 		ContentHash: span.hash,
-		ByteRange:   chunk.Range,
-		LineRange:   model.SourceRange{Start: start, End: stop},
-		Encoding:    chunk.Encoding,
-		Content:     content,
-		PartialLine: chunk.PartialLine,
-		NextOffset:  chunk.NextOffset,
+		ByteRange:   chunk.Plan.Range,
+		LineRange:   chunk.Lines,
+		Encoding:    chunk.Plan.Encoding,
+		Content:     chunk.Content,
+		PartialLine: chunk.Plan.PartialLine,
+		NextOffset:  chunk.Plan.NextOffset,
 	}
 	if err := resp.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err
 	}
-	if chunk.NextOffset == nil {
+	if chunk.Plan.NextOffset == nil {
 		// The span is served whole: the lease the presented token held has
 		// nothing left to retain. A handle that records no lease ends nothing,
 		// because the row a writer minted is not this handle's to end.
@@ -1272,7 +1276,7 @@ func (s *Services) readOutside(ctx context.Context, req model.ReadChunkRequest) 
 		}
 		return resp, nil
 	}
-	if resp.NextCursor, err = s.readSourceCursor(ctx, leases, binding, key, *chunk.NextOffset, resumed, now); err != nil {
+	if resp.NextCursor, err = s.readSourceCursor(ctx, leases, binding, key, *chunk.Plan.NextOffset, resumed, now); err != nil {
 		return model.ReadChunkResponse{}, err
 	}
 	return resp, nil

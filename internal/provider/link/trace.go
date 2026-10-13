@@ -124,7 +124,8 @@ func newGroupSort(dir string) (*pagination.ExternalSort[group], error) {
 // nothing of it is resident: members holds, per member, where its FileID and
 // its module's node are in strs, its first declaration's position in decls
 // and its declaration count; decls holds, per declaration, where its node is
-// in strs, its first parameter's position in params and its parameter count;
+// in strs, its first parameter's position in params, its parameter count and
+// where its return node is in strs (empty for a declaration with none);
 // params holds, per parameter, where its node is in strs (empty for a
 // parameter with no node).
 type idTable struct {
@@ -137,11 +138,12 @@ type idTable struct {
 
 // The widths of a member's, a declaration's and a parameter's record: a
 // string's position and length, for a member a second string and its first
-// declaration and count, for a declaration its first parameter and count.
+// declaration and count, for a declaration its first parameter and count and
+// a second string.
 const (
 	idString = 8 + 4
 	idMember = 2*idString + 8 + 4
-	idDecl   = idString + 8 + 4
+	idDecl   = idString + 8 + 4 + idString
 	idParam  = idString
 )
 
@@ -203,7 +205,15 @@ func (ids *idTable) add(file model.FileID, t *Table) error {
 			}
 			d = binary.BigEndian.AppendUint64(d, uint64(ids.params))
 			d = binary.BigEndian.AppendUint32(d, uint32(len(t.Decls[i].Parameters)))
-			if _, err := ids.dw.Write(d); err != nil {
+			ret := ""
+			if r := t.Decls[i].Return; r != nil {
+				ret = string(r.Node)
+			}
+			rs, err := ids.str(ret)
+			if err != nil {
+				return err
+			}
+			if _, err := ids.dw.Write(append(d, rs...)); err != nil {
 				return err
 			}
 			for _, p := range t.Decls[i].Parameters {
@@ -362,6 +372,17 @@ func (ids *idTable) param(r Ref, pos int32) (target, error) {
 	return target{File: id, Node: model.NodeID(node)}, err
 }
 
+// ret is the file and return node of the declaration at r, with an empty node
+// for a declaration that has none (Decl.Return).
+func (ids *idTable) ret(r Ref) (target, error) {
+	id, d, err := ids.decl(r)
+	if err != nil {
+		return target{}, err
+	}
+	node, err := ids.at(d[idString+8+4:])
+	return target{File: id, Node: model.NodeID(node)}, err
+}
+
 // scope is the stable spelling of a Ref that names a declaration, the module
 // (-1) or a Java anonymous class body (anonymousType) of a member.
 func (ids *idTable) scope(r Ref) (string, error) {
@@ -396,7 +417,7 @@ var refPrefixes = []struct {
 	file   bool
 }{
 	{keyFile, true}, {keyImport, true}, {keyMethod, false}, {keySub, false}, {keySuper, false}, {keyGoField, false},
-	{keyExternalSuper, false}, {keyParam, false},
+	{keyExternalSuper, false}, {keyParam, false}, {keyGoExternalImpl, false}, {keyGoExternalOverride, false},
 }
 
 // traceKey is the read of key in the index scope names (scopeDecls,
@@ -432,11 +453,12 @@ func (ids *idTable) stableKey(key string) (string, error) {
 // entryRef is the stable spelling of e's Ref under key: a declaration, a
 // scope (an import's), a file (a path's), or nothing for the keys whose
 // entries name no declaration (a file's context, a Go directory, a Rust
-// module or crate, a re-export, a module exported as a namespace).
+// module or crate, a re-export, a module exported as a namespace, a Go
+// unit's external coverage).
 func (ids *idTable) entryRef(key string, e entry) (string, error) {
 	switch {
 	case strings.HasPrefix(key, keyFile), strings.HasPrefix(key, keyGoDir), strings.HasPrefix(key, keyRustModule),
-		strings.HasPrefix(key, keyRustCrate), strings.HasPrefix(key, keyReexport),
+		strings.HasPrefix(key, keyRustCrate), strings.HasPrefix(key, keyReexport), key == keyGoCoverage,
 		strings.HasPrefix(key, keyExport) && e.Aux == exportModule:
 		return "", nil
 	case strings.HasPrefix(key, keyPath):
@@ -713,8 +735,10 @@ func skipIndex(s stateReader) error {
 // identify is the canonical fact b, about an entry of the member whose FileID
 // is site, named by identity: its target's node read from the table (a
 // declaration's, the member's module's for a FactImport, the parameter's for
-// a FactFlow). ok is false for a FactFlow into a parameter the structural
-// provider minted no node for, which is not a fact.
+// a FactFlow or a FactSummary, the callee's return node for a FactReturn). ok
+// is false for a FactFlow or FactSummary into a parameter the structural
+// provider minted no node for, and for a FactReturn from a callee with no
+// return node, which are not facts.
 func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, error) {
 	b, err := canonical(b)
 	if err != nil {
@@ -728,8 +752,10 @@ func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, err
 	switch b.Kind {
 	case FactImport:
 		to, err = ids.module(b.Target.File)
-	case FactFlow:
+	case FactFlow, FactSummary:
 		to, err = ids.param(b.Target, b.Param)
+	case FactReturn:
+		to, err = ids.ret(b.Target)
 	default:
 		to, err = ids.node(b.Target)
 	}
@@ -743,6 +769,6 @@ func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, err
 // unnamed is the canonical fact b, about an entry of the member whose FileID
 // is site, with every field but its target named.
 func unnamed(site model.FileID, b Binding) idBinding {
-	return idBinding{Kind: b.Kind, SiteFile: site, Site: b.Site.Index, Arg: b.Arg, External: b.External,
-		Detail: b.Detail, Dispatch: b.Dispatch, Reason: b.Reason}
+	return idBinding{Kind: b.Kind, SiteFile: site, Site: b.Site.Index, Arg: b.Arg, Position: b.Position,
+		External: b.External, Detail: b.Detail, Dispatch: b.Dispatch, Reason: b.Reason}
 }
