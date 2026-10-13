@@ -36,6 +36,8 @@ type session struct {
 	last map[string]linkBuild
 	// fulls is the full build of each set of linking inputs.
 	fulls map[string]model.UnitID
+	// sealed is the linking unit built for each scope and set of inputs.
+	sealed map[string]linkBuild
 }
 
 // linkBuild is one linking unit of one tree.
@@ -63,7 +65,8 @@ func newSession(t *testing.T) *session {
 	lp := link.New(tables)
 	return &session{t: t, f: f, ts: f.structuralProvider(), tables: tables, lp: lp,
 		a: delta.NewLink(f.store, lp, tables, limits, f.pool), db: f.raw(),
-		structural: map[string]model.UnitID{}, last: map[string]linkBuild{}, fulls: map[string]model.UnitID{}}
+		structural: map[string]model.UnitID{}, last: map[string]linkBuild{}, fulls: map[string]model.UnitID{},
+		sealed: map[string]linkBuild{}}
 }
 
 // advance records files as the next tree, refreshes every linking unit the
@@ -113,6 +116,14 @@ func (s *session) advance(files map[string]string) []linkBuild {
 			out = append(out, prev)
 			continue
 		}
+		if sealed, ok := s.sealed[pu.ScopeKey+"\x00"+b.inputs]; ok {
+			// The coordinator reuses a unit sealed for the same inputs before,
+			// when a later edit returns the tree to them.
+			s.f.attach(gen, sealed.unit)
+			sealed.reused = true
+			out = append(out, sealed)
+			continue
+		}
 		if had {
 			b.previous = prev.unit
 		}
@@ -150,6 +161,7 @@ func (s *session) advance(files map[string]string) []linkBuild {
 	s.last = map[string]linkBuild{}
 	for _, b := range out {
 		s.last[b.scope] = b
+		s.sealed[b.scope+"\x00"+b.inputs] = b
 	}
 	return out
 }
