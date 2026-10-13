@@ -1,7 +1,6 @@
 package graph
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -90,15 +89,6 @@ const (
 	levelServeBatch   = 512
 )
 
-// routeCacheEntries bounds the ref -> canonical relation id cache a SERVING
-// page resolves its ROUTES through. A route element is the admitting relation
-// of some earlier level, so the cache is fed by the records the walk has
-// already served and is hit rather than read in the common case. It is an
-// internal constant: the cache is a memory ceiling, and a walk whose routes do
-// not fit in it pays one batched read per page instead of holding a relation
-// name table sized by the walk.
-const routeCacheEntries = 65536
-
 // errLevelCut ends the streaming of a level -- the frontier chunks of a collect
 // or the records of a serve -- because the page stopped. It never escapes the
 // function that raises it.
@@ -175,7 +165,7 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 		costs = dependenceCosts(r, costs)
 	}
 	w := &levelWalk{reader: r, o: o, codes: codes, costs: costs, visit: visit,
-		routes: newRouteNames(routeCacheEntries), rule: newDispatchRule(r, mode, o.Kinds),
+		rule:       newDispatchRule(r, mode, o.Kinds),
 		dependence: newDependenceWalk(r, o)}
 	st := walkState{Level: 1, LevelState: levelCollecting}
 	if o.Resume == nil {
@@ -232,8 +222,6 @@ type levelWalk struct {
 	// sorted is the level currently being served, held open across the pages of
 	// one request's serve so a page does not reopen and re-count it.
 	sorted *sortedLevel
-	// routes names the relations a served record's ROUTE holds.
-	routes *routeNames
 	// resumedCounted marks that the leg's FIRST collected level -- the only one
 	// a resume picks up rather than starts -- has been measured.
 	resumedCounted bool
@@ -628,7 +616,6 @@ func (w *levelWalk) resolveIDs(ctx context.Context, recs []levelRecord) error {
 	byRel := make(map[RelRef]model.RelationID, len(rels))
 	for i, ref := range rels {
 		byRel[ref] = relIDs[i]
-		w.routes.remember(ref, relIDs[i])
 	}
 	for i := range recs {
 		recs[i].OwnerID = byNode[recs[i].Edge.Owner]
@@ -663,18 +650,7 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := w.nameBatch(ctx, batch); err != nil {
-			if !deadlineStop(err, o) {
-				return err
-			}
-			// The deadline fell inside the batched read that names this
-			// batch's routes. The batch is dropped whole and the page ends at
-			// the record it began with, which is where `at` already stands, so
-			// the continuation serves exactly these records.
-			o.Budget.deadlineHit = true
-			stop = true
-			return errLevelCut
-		}
+		w.nameBatch(batch)
 		for i, rec := range batch {
 			if rec.Slice&sliceSilent != 0 {
 				// It lifted a node already reached, over an edge already
@@ -785,99 +761,27 @@ func (w *levelWalk) closeGroup() error {
 	return nil
 }
 
-// nameBatch resolves the canonical ids one served batch needs. The edge's own
-// three ids travel on the record; only the ROUTE relations -- the chain of
-// admitting relations behind the owner -- have to be looked up, and they are
-// looked up through a bounded cache the records themselves keep warm, so a page
-// costs at most one batched read for its routes and never a relation name table
-// sized by the walk.
-func (w *levelWalk) nameBatch(ctx context.Context, batch []levelRecord) error {
+// nameBatch sets the canonical ids one served batch's records name. Every id a
+// record needs -- its owner, its neighbour and its relation -- travels on the
+// record, and a route is a reference into the route table rather than a chain
+// to name, so naming a batch reads nothing.
+func (w *levelWalk) nameBatch(batch []levelRecord) {
 	names := w.o.Names
 	if names == nil {
 		// The package rollup rides on the same walk and reads refs only.
-		return nil
+		return
 	}
 	nodes := make(map[NodeRef]model.NodeID, 2*len(batch))
 	rels := make(map[RelRef]model.RelationID, len(batch))
-	var missing []RelRef
 	for _, r := range batch {
 		nodes[r.Edge.Owner] = r.OwnerID
 		nodes[r.Edge.Neighbour] = r.NodeID
 		rels[r.Edge.Rel] = r.RelID
-		w.routes.remember(r.Edge.Rel, r.RelID)
-		for _, ref := range r.Owner.Route {
-			if _, ok := rels[ref]; ok {
-				continue
-			}
-			id, ok := w.routes.lookup(ref)
-			if !ok {
-				missing = append(missing, ref)
-				continue
-			}
-			rels[ref] = id
-		}
-	}
-	if len(missing) > 0 {
-		missing = ascending(missing)
-		ids, err := w.reader.RelationIDs(ctx, missing)
-		if err != nil {
-			return err
-		}
-		if len(ids) != len(missing) {
-			return internalErr("graph: the reader named a different number of relations than it was given")
-		}
-		for i, ref := range missing {
-			rels[ref] = ids[i]
-			w.routes.remember(ref, ids[i])
-		}
 	}
 	// Rebuilt, never extended: a map kept across pages would grow with the
 	// walk, which is the repository-sized heap structure the surrogate walk
 	// exists to remove.
 	names.nodes, names.rels = nodes, rels
-	return nil
-}
-
-// routeNames is the bounded ref -> canonical relation id cache. It is a plain
-// LRU: the routes a page needs are the admitting relations of the levels behind
-// it, so the entries a page reads are the entries the pages before it wrote,
-// and the oldest are the ones no live route still reaches through.
-type routeNames struct {
-	max   int
-	order *list.List
-	byRef map[RelRef]*list.Element
-}
-
-// routeName is one cache entry, held by the list so eviction knows its key.
-type routeName struct {
-	ref RelRef
-	id  model.RelationID
-}
-
-func newRouteNames(max int) *routeNames {
-	return &routeNames{max: max, order: list.New(), byRef: make(map[RelRef]*list.Element)}
-}
-
-func (c *routeNames) lookup(ref RelRef) (model.RelationID, bool) {
-	el, ok := c.byRef[ref]
-	if !ok {
-		return "", false
-	}
-	c.order.MoveToFront(el)
-	return el.Value.(routeName).id, true
-}
-
-func (c *routeNames) remember(ref RelRef, id model.RelationID) {
-	if el, ok := c.byRef[ref]; ok {
-		c.order.MoveToFront(el)
-		return
-	}
-	c.byRef[ref] = c.order.PushFront(routeName{ref: ref, id: id})
-	for c.order.Len() > c.max {
-		el := c.order.Back()
-		c.order.Remove(el)
-		delete(c.byRef, el.Value.(routeName).ref)
-	}
 }
 
 // walkState is where a walk stopped. A page that stopped on its item limit

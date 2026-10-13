@@ -455,7 +455,7 @@ func fixtureLeaseGone() error {
 func fixtureLimits() Limits {
 	return Limits{
 		MaxDepth: 3, MaxVisited: 50000, MaxEdges: 100000,
-		MaxPageItems: 200, MaxReasonPaths: 3,
+		MaxPageItems: 200,
 		QueryTimeout: 10 * time.Second, CursorTTL: 15 * time.Minute,
 		FrontierBytes: 32 << 20,
 	}
@@ -670,13 +670,15 @@ func TestGraphScenarios(t *testing.T) {
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
-				res, err := engine.Impact(context.Background(), model.ImpactRequest{
+				req := model.ImpactRequest{
 					Start:     []model.NodeID{fixtureNodeID("n-a")},
 					Direction: model.DirectionOutgoing,
-				})
+				}
+				res, err := engine.Impact(context.Background(), req)
 				if err != nil {
 					t.Fatalf("Impact: %v", err)
 				}
+				reasons, _ := explainImpact(t, engine, req, res.Answer)
 				if len(res.Entries) == 0 {
 					t.Fatal("Impact returned no entries; the fixture reaches n-b, n-c and the hub from n-a")
 				}
@@ -689,8 +691,9 @@ func TestGraphScenarios(t *testing.T) {
 					if entry.NodeID == fixtureNodeID("n-a") {
 						t.Error("the seed n-a is reported as affected by its own change")
 					}
-					if len(entry.Reasons) == 0 {
-						t.Errorf("entry %q carries no reason", entry.NodeID)
+					if int64(len(reasons[entry.Ordinal])) != entry.ReasonCount || entry.ReasonCount == 0 {
+						t.Errorf("entry %q names %d reasons and was served %d", entry.NodeID, entry.ReasonCount,
+							len(reasons[entry.Ordinal]))
 					}
 					if entry.Direction != model.DirectionOutgoing {
 						t.Errorf("entry %q direction = %q, want the outgoing discriminator",
@@ -699,7 +702,7 @@ func TestGraphScenarios(t *testing.T) {
 					// Every reason must end in the direction and the depth of the
 					// edge that contributed it; a reason naming neither is an
 					// unexplained ranking.
-					for _, reason := range entry.Reasons {
+					for _, reason := range reasons[entry.Ordinal] {
 						named := false
 						for depth := 0; depth <= fixtureLimits().MaxDepth; depth++ {
 							want := fmt.Sprintf("(outgoing, depth %d)", depth)

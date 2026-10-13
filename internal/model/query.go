@@ -1248,16 +1248,93 @@ func (r PathResult) Validate() error {
 // entry to carry an evidence-backed reason and the direction that made it
 // affected, so a caller impacted by a callee change is distinguishable from a
 // downstream dependency that merely needs reading.
+//
+// An entry's reasons and its route are served by reference: the entry names
+// how many it has, and the `reasons` and `routes` views of the same answer page
+// them in (Ordinal, index) order. ReasonCount is at least one, since every
+// affected entry is evidence backed; RouteCount is one, the route the ranking
+// kept, for every entry the walk reached.
 type ImpactEntry struct {
-	NodeID      NodeID         `json:"node_id"`
-	FileID      FileID         `json:"file_id,omitempty"`
-	Name        string         `json:"name,omitempty"`
-	Kind        NodeKind       `json:"kind"`
-	Direction   Direction      `json:"direction"`
-	Depth       int            `json:"depth"`
-	ScoreMicros int64          `json:"score_micros"`
-	Reasons     []string       `json:"reasons"`
-	Paths       []RelationPath `json:"paths,omitempty"`
+	// Ordinal is the entry's position in the ranked answer, from zero.
+	Ordinal     int64     `json:"ordinal"`
+	NodeID      NodeID    `json:"node_id"`
+	FileID      FileID    `json:"file_id,omitempty"`
+	Name        string    `json:"name,omitempty"`
+	Kind        NodeKind  `json:"kind"`
+	Direction   Direction `json:"direction"`
+	Depth       int       `json:"depth"`
+	ScoreMicros int64     `json:"score_micros"`
+	ReasonCount int64     `json:"reason_count"`
+	RouteCount  int64     `json:"route_count"`
+}
+
+// ImpactReason is one reason of one impact entry, in the order the answer
+// gives them.
+type ImpactReason struct {
+	// Entry is the Ordinal of the entry the reason explains.
+	Entry int64 `json:"entry"`
+	// Index is the reason's position among the entry's reasons, from zero.
+	Index  int64  `json:"index"`
+	Reason string `json:"reason"`
+}
+
+// Validate enforces a non-empty reason. There is no length bound: a reason is
+// served whole, one per item of its view.
+func (r ImpactReason) Validate() error {
+	if err := requireNonNegative("impact_reason.entry", r.Entry); err != nil {
+		return err
+	}
+	if err := requireNonNegative("impact_reason.index", r.Index); err != nil {
+		return err
+	}
+	if r.Reason == "" {
+		return invalid("impact_reason %d of entry %d is empty", r.Index, r.Entry)
+	}
+	return nil
+}
+
+// ImpactRoute is the route of one impact entry: every relation the walk crossed
+// from a seed to the entry, in walk order, stored and served whole however long
+// it is, with its cost and the evidence of its relations.
+type ImpactRoute struct {
+	// Entry is the Ordinal of the entry the route explains.
+	Entry int64 `json:"entry"`
+	// Index is the route's position among the entry's routes, from zero.
+	Index     int64        `json:"index"`
+	Relations []RelationID `json:"relations"`
+	CostUnits int64        `json:"cost_units"`
+	// Possible marks a route that takes a name-only `may_call` hop: it may not
+	// run.
+	Possible bool         `json:"possible,omitempty"`
+	Evidence []EvidenceID `json:"evidence,omitempty"`
+}
+
+// Validate enforces a route of at least one canonical relation. There is no
+// bound on how many: a route is served as long as the walk found it.
+func (r ImpactRoute) Validate() error {
+	if err := requireNonNegative("impact_route.entry", r.Entry); err != nil {
+		return err
+	}
+	if err := requireNonNegative("impact_route.index", r.Index); err != nil {
+		return err
+	}
+	if err := requireNonNegative("impact_route.cost_units", r.CostUnits); err != nil {
+		return err
+	}
+	if len(r.Relations) == 0 {
+		return invalid("impact_route %d of entry %d names no relation", r.Index, r.Entry)
+	}
+	for i, id := range r.Relations {
+		if err := requireID(indexed("impact_route.relations", i), string(id)); err != nil {
+			return err
+		}
+	}
+	for i, id := range r.Evidence {
+		if err := requireEvidenceID(indexed("impact_route.evidence", i), id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Validate enforces the entry shape and its bounded explanation.
@@ -1280,19 +1357,14 @@ func (e ImpactEntry) Validate() error {
 	if err := requireNonNegative("impact_entry.depth", int64(e.Depth)); err != nil {
 		return err
 	}
-	if len(e.Reasons) == 0 {
+	if err := requireNonNegative("impact_entry.ordinal", e.Ordinal); err != nil {
+		return err
+	}
+	if e.ReasonCount < 1 {
 		return invalid("impact_entry %q has no reason; every affected entry is evidence backed", e.NodeID)
 	}
-	if err := boundStrings("impact_entry.reasons", e.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+	if err := requireNonNegative("impact_entry.route_count", e.RouteCount); err != nil {
 		return err
-	}
-	if err := boundCount("impact_entry.paths", len(e.Paths), MaxReasonPathsPerEntry); err != nil {
-		return err
-	}
-	for _, p := range e.Paths {
-		if err := p.Validate(); err != nil {
-			return err
-		}
 	}
 	return nil
 }

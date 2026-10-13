@@ -229,6 +229,7 @@ so a changed handler marks the endpoints that route to it affected.
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
+| `--view` | `impact` | Which view of the answer a page serves: `entries` (the default), `reasons` or `routes`. Combine it with the `answer` token as `--cursor` to read another view of an answer already walked. |
 | `--direction` | `path` | Which way edges are followed: `outgoing` (the default), `incoming` or `both`. The other traversal commands pin their own direction — a `callers` query asked outgoing would not be a callers query — so only `path` takes it. |
 
 **`path --direction` is the difference between "no route" and "no route that way".**
@@ -267,11 +268,34 @@ answer.
 An impact answer carries two ranked lists, the affected entities and the package
 rollup over every edge the walk admitted, and one `next_cursor` pages both: each
 page takes up to `--limit` from each list, and the cursor is offered while
-either list has records left. A pair's `pair_count` and `evidence_count` are
+either list has records left. A pair runs from the dependent's package to the
+dependency's, as each relation kind defines it: `a calls b` is a pair from a's
+package to b's, and `x data_flows_to y`, in which y depends on x, a pair from
+y's package to x's. A pair's `pair_count` and `evidence_count` are
 exact totals for the whole walk, not per-page fragments to be summed. The
 package-dependency rollup answers on identical terms from its own endpoint.
 `visited_count` and `edge_count` are cumulative and grow across the pages of one
 answer.
+
+**An entry's reasons and its route are served by reference, whole.** Each
+entry carries its `ordinal` in the ranked answer, a `reason_count` and a
+`route_count`. The `reasons` view (`--view reasons`, MCP `view: "reasons"`)
+pages every reason of every entry in (`entry`, `index`) order, and the
+`routes` view pages every entry's route the same way: every relation the walk
+crossed from a seed to the entry, with its cost and the evidence of each
+relation, however long the route is. Both are paged by `--limit` like the
+entries; a reasons page may end inside one entry's reasons, and the next page
+starts at the reason after it. Nothing is cut: no reason is truncated and no
+route is clipped.
+
+Every page prints an `answer` token beside `next`. Passed as `--cursor` with any
+`--view`, it reads that view of the same ranked answer from its start, so the
+entries read from one view are explained by the others without walking again.
+A `next` token continues only its own view; presented with another view it is
+`CTX_ARGUMENT_INVALID`. The answer is kept until every view the client reads
+has been served to its end — all three, unless the request's `views` names
+fewer (`views: ["entries"]` for a client that reads only the entries) — and
+otherwise until its cursor lease expires.
 
 **What a query deadline does to that, when you set one.** There is none by
 default — `resources.query_timeout` is unlimited — so an unbounded `impact`
@@ -548,7 +572,7 @@ where the workspace is composed, and handed to it.
 | `context.max_graph_depth` | Default and ceiling for `--depth`. Unlimited by default. |
 | `context.max_visited_nodes` | Default and ceiling for `--visited`. Unlimited by default. |
 | `context.max_graph_edges` | Default and ceiling for `--edges`. Unlimited by default. |
-| `context.max_reason_paths_per_entry` | Explanation routes a context entry stores. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. It does not bound `path`, which lists every equal-cost route. |
+| `context.max_reason_paths_per_entry` | Explanation routes a context entry stores. It bounds neither `impact`, whose routes view serves every entry's route, nor `path`, which lists every equal-cost route. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Unlimited by default, so an unbounded walk answers in full. |
 | search slots (this machine's cores) | How many lexical searches the index runs at once; one past them waits for a slot. Derived from the machine, not a setting. |

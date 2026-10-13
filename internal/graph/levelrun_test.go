@@ -31,7 +31,7 @@ func newLevelWalk(t *testing.T, chunk int) *retainedWalk {
 func levelFixture(owner, neighbour NodeRef, rel RelRef, cost int64, kind KindCode) levelRecord {
 	return levelRecord{
 		Owner: frontierState{Depth: 1, Cost: cost, Node: owner, Via: RelRef(owner),
-			Route: []RelRef{RelRef(owner)}},
+			Adm: uint64(owner), Hash: routeHash{}.extend(model.RelationID(fmt.Sprintf("%064d", owner)))},
 		Edge:    Edge{Owner: owner, Neighbour: neighbour, Rel: rel, Kind: kind, Outgoing: true},
 		OwnerID: model.NodeID(fmt.Sprintf("%064d", owner)),
 		NodeID:  model.NodeID(fmt.Sprintf("%064d", neighbour)),
@@ -47,8 +47,11 @@ func levelFixture(owner, neighbour NodeRef, rel RelRef, cost int64, kind KindCod
 // the walk would notice.
 func TestLevelRecordCodecRoundTripsEveryField(t *testing.T) {
 	full := levelRecord{
-		Owner:   frontierState{Depth: 3, Cost: 4200, Node: 77, Via: 88, Route: []RelRef{5, 88}},
+		Owner: frontierState{Depth: 3, Cost: 4200, Node: 77, Via: 88, Step: stepRest, Adm: 1 << 33,
+			Hash: routeHash{}.extend("r5").extend("r88")},
 		Edge:    Edge{Owner: 77, Neighbour: 910, Rel: 1011, Kind: 7, Outgoing: true},
+		Step:    stepDescend,
+		Slice:   sliceDescended | sliceSunk,
 		OwnerID: model.NodeID("00000000000000000000000000000000000000000000000000000000000000aa"),
 		NodeID:  model.NodeID("00000000000000000000000000000000000000000000000000000000000000bb"),
 		RelID:   model.RelationID("00000000000000000000000000000000000000000000000000000000000000cc"),
@@ -60,8 +63,8 @@ func TestLevelRecordCodecRoundTripsEveryField(t *testing.T) {
 		in   levelRecord
 	}{
 		{"every field set", full},
-		// An incoming entry with no route is the seed level's shape, and it
-		// must come back with a nil route rather than an empty-but-non-nil one.
+		// The zero record -- a seed state names no admission and the zero
+		// route hash -- comes back as itself.
 		{"zero", levelRecord{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -122,6 +125,9 @@ func assertNoZeroLevelField(t *testing.T, path string, v reflect.Value) {
 	t.Helper()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Type().Field(i)
+		if levelFieldNeverWritten[path+"."+f.Name] {
+			continue
+		}
 		if v.Field(i).Kind() == reflect.Struct {
 			assertNoZeroLevelField(t, path+"."+f.Name, v.Field(i))
 			continue
@@ -130,6 +136,18 @@ func assertNoZeroLevelField(t *testing.T, path string, v reflect.Value) {
 			t.Fatalf("%s.%s is zero in the codec fixture: fill it, or the round trip does not test it", path, f.Name)
 		}
 	}
+}
+
+// levelFieldNeverWritten are the fields a level record carries in heap only:
+// each is settled before the record is appended and never read back from a
+// level file (levelRecord's own comments), so the codec leaves them out and
+// the round trip cannot be asked to keep them.
+var levelFieldNeverWritten = map[string]bool{
+	"levelRecord.Owner.Slice": true,
+	"levelRecord.check":       true,
+	"levelRecord.role":        true,
+	"levelRecord.lift":        true,
+	"levelRecord.kept":        true,
 }
 
 // TestLevelCollectorSpillsAndFinishesComplete protects the level pipeline's

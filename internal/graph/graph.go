@@ -87,7 +87,7 @@ type Options struct {
 
 // Limits is the resolved budget list for one request.
 //
-// MaxDepth, MaxVisited, MaxEdges and MaxReasonPaths carry the config.Limit
+// MaxDepth, MaxVisited and MaxEdges carry the config.Limit
 // convention verbatim: 0 is UNLIMITED, and only a negative value is a wiring
 // defect. FrontierBytes does NOT: it is a memory ceiling and must be positive. They are stored as plain integers because that is what
 // the composition root hands over (config.Limit.Int()), and every comparison
@@ -99,10 +99,6 @@ type Options struct {
 // walk resumes on the next page. The cumulative counts are still carried by the
 // cursor and reported, so a caller sees the total the walk has spent.
 //
-// MaxReasonPaths is context.max_reason_paths_per_entry: whether an impact
-// entry carries the route that admitted it. It does not bound a path answer,
-// which lists every equal-cost route a page at a time.
-//
 // MaxPageItems, CursorTTL and FrontierBytes stay strictly positive: a page with
 // no item ceiling is a wire-security bound (class B), not a scale bound, and a
 // frontier with no byte ceiling has no heap bound at all. QueryTimeout does
@@ -110,8 +106,8 @@ type Options struct {
 // is exactly the kind of shipped bound that refuses a large repository for
 // being large.
 type Limits struct {
-	MaxDepth, MaxVisited, MaxEdges, MaxPageItems, MaxReasonPaths int
-	QueryTimeout, CursorTTL                                      time.Duration
+	MaxDepth, MaxVisited, MaxEdges, MaxPageItems int
+	QueryTimeout, CursorTTL                      time.Duration
 	// FrontierBytes caps the edges one frontier level may hold at once,
 	// estimated by edgeRowBytes. A level that reaches it SPILLS: the walk stops
 	// that level, the frontier goes to the continuation spool and the next page
@@ -120,14 +116,13 @@ type Limits struct {
 	FrontierBytes int64
 }
 
-// Depth, Visited, Edges and ReasonPaths are the unlimited-capable count bounds
+// Depth, Visited and Edges are the unlimited-capable count bounds
 // read through config.Limit, which owns the 0-means-unlimited semantics. Every
 // consumer must go through them: reading the int field directly turns an
 // unlimited bound into a zero-sized budget that stops the walk immediately.
-func (l Limits) Depth() config.Limit       { return config.Limit(l.MaxDepth) }
-func (l Limits) Visited() config.Limit     { return config.Limit(l.MaxVisited) }
-func (l Limits) Edges() config.Limit       { return config.Limit(l.MaxEdges) }
-func (l Limits) ReasonPaths() config.Limit { return config.Limit(l.MaxReasonPaths) }
+func (l Limits) Depth() config.Limit   { return config.Limit(l.MaxDepth) }
+func (l Limits) Visited() config.Limit { return config.Limit(l.MaxVisited) }
+func (l Limits) Edges() config.Limit   { return config.Limit(l.MaxEdges) }
 
 // Engine answers graph queries against one pinned generation. One Engine is
 // built per request, which is why the concurrency Gate is passed in rather than
@@ -180,7 +175,6 @@ func New(o Options) (*Engine, error) {
 		{"max_depth", int64(o.Limits.MaxDepth)},
 		{"max_visited", int64(o.Limits.MaxVisited)},
 		{"max_edges", int64(o.Limits.MaxEdges)},
-		{"max_reason_paths", int64(o.Limits.MaxReasonPaths)},
 	} {
 		if b.value < 0 {
 			return nil, (&model.Error{Code: model.CodeArgumentInvalid,
@@ -250,17 +244,14 @@ type frontierState struct {
 	Cost  int64
 	Node  NodeRef
 	Via   RelRef
-	// Route is the chain of relation surrogates from a seed to this node, Via
-	// last.
-	//
-	// It travels with the frontier because a ranked answer's walk runs to completion
-	// and streams its records into a sort: there is no page-local byNode map
-	// left to walk a parent chain through, and model.ImpactEntry.Paths is not
-	// optional (Section 14.3 rejects an entry whose reason nothing backs). It
-	// is capped at model.MaxRelationsPerPath+1 by appendRoute -- one past the
-	// bound, so a consumer can tell "too long to report" from "exactly at the
-	// bound" -- which is what keeps the frontier's per-node cost bounded.
-	Route []RelRef
+	// Adm is this state's admission in the walk's route table (routetable.go),
+	// and Hash the identity of the route that reached it. A seed has neither:
+	// Adm 0 ends every route, and the zero hash seeds every route's. The route
+	// itself is never carried: it is rebuilt from the table when an entry is
+	// served, so a state costs the same however long its route is. A walk
+	// that serves no routes keeps no table and leaves both zero.
+	Adm  uint64
+	Hash routeHash
 	// Step is how a call walk's dispatch step reached this node
 	// (dispatch.go): directly, up an override to a base method whose virtual
 	// callers are walked, or down a virtual call or an override to a method
@@ -272,22 +263,6 @@ type frontierState struct {
 	// through a call site to a node first admitted without it. Every other
 	// walk leaves it zero.
 	Slice sliceFlags
-}
-
-// appendRoute extends a parent's route with the edge that left it, copying
-// rather than sharing the backing array: two neighbours of one frontier node
-// would otherwise append over each other's last element.
-//
-// It stops one past model.MaxRelationsPerPath. A route at that length is
-// already longer than a servable path, so the elements beyond it would be
-// carried through the whole walk to be discarded at hydration.
-func appendRoute(parent []RelRef, via RelRef) []RelRef {
-	if len(parent) > model.MaxRelationsPerPath {
-		return parent
-	}
-	out := make([]RelRef, len(parent), len(parent)+1)
-	copy(out, parent)
-	return append(out, via)
 }
 
 // levelNames is ONE served BATCH's canonical ids (ADR-0005 Decision 2). The
@@ -322,19 +297,6 @@ func (n *levelNames) rel(ref RelRef) model.RelationID {
 		return ""
 	}
 	return n.rels[ref]
-}
-
-// route names a whole parent chain. It returns nil for an empty route so an
-// entry with no path carries no empty slice into its record.
-func (n *levelNames) route(refs []RelRef) []model.RelationID {
-	if len(refs) == 0 {
-		return nil
-	}
-	out := make([]model.RelationID, 0, len(refs))
-	for _, r := range refs {
-		out = append(out, n.rel(r))
-	}
-	return out
 }
 
 // queryDeadline is the instant one graph query runs under.

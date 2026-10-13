@@ -90,9 +90,8 @@ type checkpointRun struct {
 // report, which is one row per provider -- so holding it in the state file is
 // never a repository-sized list.
 type checkpointScalars struct {
-	Completeness     []model.CapabilityState `json:"completeness,omitempty"`
-	ScopeComplete    bool                    `json:"scope_complete"`
-	ReasonsTruncated int64                   `json:"reasons_truncated,omitempty"`
+	Completeness  []model.CapabilityState `json:"completeness,omitempty"`
+	ScopeComplete bool                    `json:"scope_complete"`
 	// WalkCursor, WalkRoots, Walked and Seq are the passIngest boundary's
 	// own carry: the walk's continuation, its roots (the list every leg of
 	// the walk must repeat byte for byte, since it is inside the walk's query
@@ -785,7 +784,6 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 	scalars := checkpointScalars{
 		Completeness:          st.scope.Completeness,
 		ScopeComplete:         st.scopeComplete,
-		ReasonsTruncated:      st.scope.ReasonsTruncated,
 		Stop:                  st.scope.Stop,
 		Candidates:            st.scope.Candidates,
 		CandidatesUnavailable: st.scope.CandidatesUnavailable,
@@ -889,7 +887,6 @@ func scalarScope(sc checkpointScalars) scopeResult {
 	return scopeResult{
 		Completeness:          sc.Completeness,
 		ScopeComplete:         sc.ScopeComplete,
-		ReasonsTruncated:      sc.ReasonsTruncated,
 		Stop:                  sc.Stop,
 		Candidates:            sc.Candidates,
 		CandidatesUnavailable: sc.CandidatesUnavailable,

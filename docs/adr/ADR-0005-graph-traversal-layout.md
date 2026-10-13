@@ -184,9 +184,14 @@ a detached context: a deadline observed inside it would leave a half-committed l
 measured cost of finishing it is bounded by one external sort of one level.
 
 **Serving.** A page is a byte-offset read of the sorted level. The continuation names the level and
-the offset; a resumed leg holds every file its entry cursor names for the leg's duration. Route
-names for a page are resolved at delivery over the page's deduplicated route references through a
-bounded cache. The visited budget, when a caller sets one, is charged per neighbour group as the
+the offset; a resumed leg holds every file its entry cursor names for the leg's duration. Every
+id a served record needs travels on the record, so naming a page reads nothing. An impact walk
+also writes a route table: one fixed-width row per admission, naming the admission it was reached
+from and the relation that reached it, so any record's route is rebuilt whole by following those
+parents back to a seed -- the predecessor array of breadth-first search -- at a cost of one row
+read per hop, and the table moves beside the ranked answer for its later pages. Equal-cost routes
+tie on a hash of the route's content, chained from the parent's hash, so the route that survives
+does not depend on the order records arrived in. The visited budget, when a caller sets one, is charged per neighbour group as the
 group is served, so a bound of 250 on a 300-wide level returns 250 entries and a cursor, never an
 empty truncated page. A fully served level releases its sorted file, run and admitted file.
 

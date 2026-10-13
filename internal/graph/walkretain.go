@@ -179,6 +179,42 @@ type retainedWalk struct {
 	crashInAdmit bool
 	entries      *retainFile
 	pairs        *retainFile
+	// routes is the walk's route table (routetable.go), set only for a walk
+	// that serves routes (withRoutes): every other walk admits states that
+	// name no route, and keeps no table.
+	routes *routeTable
+}
+
+// withRoutes makes this walk keep a route table, so every state it admits
+// names its route by reference.
+func (w *retainedWalk) withRoutes() *retainedWalk {
+	if w.routes == nil {
+		w.routes = openRouteTable(w.home)
+	}
+	return w
+}
+
+// admitRoute adds one admission outside a level transition -- an open call
+// site's parent (possible.go) -- and answers its id.
+func (w *retainedWalk) admitRoute(parent uint64, via model.RelationID) (uint64, error) {
+	if w.routes == nil {
+		return 0, internalErr("graph: a route was admitted on a walk that keeps no route table")
+	}
+	return w.routes.admit(parent, via)
+}
+
+// routeReader opens this walk's route table for reading. The rows this
+// request wrote are flushed first, so they are readable.
+func (w *retainedWalk) routeReader() (*routeReader, error) {
+	if w.routes != nil {
+		if err := w.routes.sync(); err != nil {
+			return nil, err
+		}
+	}
+	if !w.home.exists() {
+		return &routeReader{}, nil
+	}
+	return openRouteReader(routeTablePath(w.home.path))
 }
 
 // openRetainedWalk names a fresh retained input under parent. Nothing is
@@ -347,6 +383,11 @@ func (w *retainedWalk) close() error {
 		}
 	}
 	w.entries, w.pairs = nil, nil
+	if w.routes != nil {
+		if err := w.routes.close(); err != nil && first == nil {
+			first = err
+		}
+	}
 	return first
 }
 
@@ -733,16 +774,14 @@ func (w *retainedWalk) chunk() int {
 // encodeFrontierState frames one admitted state: uvarints throughout, so a
 // level of admitted nodes costs bytes rather than 64-hex canonical ids.
 func encodeFrontierState(fs frontierState) []byte {
-	buf := make([]byte, 0, 40+len(fs.Route)*binary.MaxVarintLen64)
+	buf := make([]byte, 0, 64)
 	buf = binary.AppendUvarint(buf, uint64(int64(fs.Depth)))
 	buf = binary.AppendUvarint(buf, uint64(fs.Cost))
 	buf = binary.AppendUvarint(buf, uint64(fs.Node))
 	buf = binary.AppendUvarint(buf, uint64(fs.Via))
 	buf = append(buf, byte(fs.Step), byte(fs.Slice))
-	buf = binary.AppendUvarint(buf, uint64(len(fs.Route)))
-	for _, r := range fs.Route {
-		buf = binary.AppendUvarint(buf, uint64(r))
-	}
+	buf = binary.AppendUvarint(buf, fs.Adm)
+	buf = append(buf, fs.Hash[:]...)
 	return buf
 }
 
@@ -755,17 +794,8 @@ func decodeFrontierState(b []byte) (frontierState, error) {
 	fs.Via = RelRef(d.uvarint())
 	fs.Step = dispatchStep(d.byteAt())
 	fs.Slice = sliceFlags(d.byteAt())
-	n := d.uvarint()
-	if d.err != nil {
-		return frontierState{}, d.err
-	}
-	if n > model.MaxRelationsPerPath+1 {
-		return frontierState{}, levelCorrupt("an admitted state carries a route longer than a servable path")
-	}
-	// Nil, not empty, for a routeless state: see decodeLevelRecord.
-	for i := uint64(0); i < n; i++ {
-		fs.Route = append(fs.Route, RelRef(d.uvarint()))
-	}
+	fs.Adm = d.uvarint()
+	d.hash(&fs.Hash)
 	if d.err != nil {
 		return frontierState{}, d.err
 	}
@@ -780,18 +810,28 @@ func decodeFrontierState(b []byte) (frontierState, error) {
 var errAdmitCrash = internalErr("graph: the level transition was cut short")
 
 // admitState is the state the winning record of a neighbour group admits: one
-// hop past its owner, at its owner's cost plus the edge's kind cost, with the
-// admitting relation appended to the owner's route.
-func admitState(r levelRecord, costs kindCosts) frontierState {
-	return frontierState{
+// hop past its owner, at its owner's cost plus the edge's kind cost. A walk that
+// serves routes gives it the next row of the route table -- its owner's
+// admission and the canonical relation that reached it -- and the owner's
+// route hash extended by that relation.
+func (w *retainedWalk) admitState(r levelRecord, costs kindCosts) (frontierState, error) {
+	fs := frontierState{
 		Depth: r.Owner.Depth + 1,
 		Cost:  costs.add(r.Owner.Cost, r.Edge.Kind),
 		Node:  r.Edge.Neighbour,
 		Via:   r.Edge.Rel,
-		Route: appendRoute(r.Owner.Route, r.Edge.Rel),
 		Step:  r.Step,
 		Slice: r.Slice &^ sliceSilent,
 	}
+	if w.routes == nil {
+		return fs, nil
+	}
+	adm, err := w.routes.admit(r.Owner.Adm, r.RelID)
+	if err != nil {
+		return frontierState{}, err
+	}
+	fs.Adm, fs.Hash = adm, r.Owner.Hash.extend(r.RelID)
+	return fs, nil
 }
 
 // compareAdmitRoute picks the surviving route inside ONE neighbour group:
@@ -1027,7 +1067,11 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 			best.Slice |= sliceSunk
 		}
 		count++
-		return sorter.Add(admitState(best, costs))
+		fs, err := w.admitState(best, costs)
+		if err != nil {
+			return err
+		}
+		return sorter.Add(fs)
 	}
 	if err := s.each(0, func(r levelRecord, _ int64) error {
 		if err := ctx.Err(); err != nil {
@@ -1050,6 +1094,14 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 	}
 	if w.crashInAdmit {
 		return 0, errAdmitCrash
+	}
+	// The admitted states name their route rows, so the rows are durable
+	// before the level that names them is written. A crash after this leaves
+	// rows no level names, which no route ever reads.
+	if w.routes != nil {
+		if err := w.routes.sync(); err != nil {
+			return 0, err
+		}
 	}
 
 	run, err := sorter.Sorted()

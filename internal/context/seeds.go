@@ -279,7 +279,7 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 				Origin:      tok.Origin,
 				Status:      fv.Status,
 				SizeBytes:   fv.Size,
-				Reasons:     []string{boundReason(fmt.Sprintf("the task names the path %q", fv.Path))},
+				Reasons:     []string{fmt.Sprintf("the task names the path %q", fv.Path)},
 				RootWeight:  namedRootWeight(tok.Origin),
 				Named:       true,
 			}); err != nil {
@@ -407,8 +407,8 @@ func (c *Compiler) lexicalSeeds(ctx context.Context, reader *sqlite.PinnedReader
 				Path:        hit.Path,
 				Requirement: model.RequirementRecommended,
 				Origin:      originLexical,
-				Reasons: []string{boundReason(fmt.Sprintf("the task text matches %q lexically (tier %s, score %d)",
-					hit.Path, hit.Tier, hit.ScoreMicros))},
+				Reasons: []string{fmt.Sprintf("the task text matches %q lexically (tier %s, score %d)",
+					hit.Path, hit.Tier, hit.ScoreMicros)},
 				RootWeight: weight,
 			}
 			if hit.Range != nil {
@@ -514,7 +514,7 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 				Origin:      originChangedFile,
 				Status:      fv.Status,
 				SizeBytes:   fv.Size,
-				Reasons:     []string{boundReason(fmt.Sprintf("%q is a captured change with status %q", fv.Path, fv.Status))},
+				Reasons:     []string{fmt.Sprintf("%q is a captured change with status %q", fv.Path, fv.Status)},
 			}); err != nil {
 				return err
 			}
@@ -633,7 +633,7 @@ func nodeCandidate(n model.Node, origin originKind, reason string) candidate {
 		FileID:      n.FileID,
 		Requirement: model.RequirementFull,
 		Origin:      origin,
-		Reasons:     []string{boundReason(reason)},
+		Reasons:     []string{reason},
 		RootWeight:  namedRootWeight(origin),
 		Named:       true,
 	}
@@ -839,6 +839,8 @@ func normalizeSeedPath(tok string) string {
 // drift between the reader and the step that consumes it.
 var changedStatuses = []model.FileStatus{model.FileModified, model.FileAdded, model.FileUntracked}
 
-// boundReason clips one reason to model.MaxReasonBytes, which every stored
-// entry and exclusion is validated against.
+// boundReason clips one exclusion reason or diagnostic message to
+// model.MaxReasonBytes, the bound those single-field records are validated
+// against. An entry's reasons are never clipped: they are served whole, by
+// reference.
 func boundReason(reason string) string { return clipUTF8(reason, model.MaxReasonBytes) }

@@ -141,14 +141,13 @@ func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) (
 		Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{
-			MaxDepth:       fx.Cfg.Context.MaxGraphDepth.Int(),
-			MaxVisited:     fx.Cfg.Context.MaxVisitedNodes.Int(),
-			MaxEdges:       fx.Cfg.Context.MaxGraphEdges.Int(),
-			MaxPageItems:   fx.Cfg.Resources.MaxPageItems,
-			MaxReasonPaths: fx.Cfg.Context.MaxReasonPathsPerEntry.Int(),
-			QueryTimeout:   fx.Cfg.Resources.QueryTimeout.Std(),
-			CursorTTL:      fx.Cfg.Storage.QueryCursorTTL.Std(),
-			FrontierBytes:  fx.Cfg.Resources.QueryMemoryBytes,
+			MaxDepth:      fx.Cfg.Context.MaxGraphDepth.Int(),
+			MaxVisited:    fx.Cfg.Context.MaxVisitedNodes.Int(),
+			MaxEdges:      fx.Cfg.Context.MaxGraphEdges.Int(),
+			MaxPageItems:  fx.Cfg.Resources.MaxPageItems,
+			QueryTimeout:  fx.Cfg.Resources.QueryTimeout.Std(),
+			CursorTTL:     fx.Cfg.Storage.QueryCursorTTL.Std(),
+			FrontierBytes: fx.Cfg.Resources.QueryMemoryBytes,
 		}})
 	if err != nil {
 		pinned.Close()

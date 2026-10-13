@@ -66,7 +66,9 @@ func register(s *mcp.Server, h *handlers) {
 			"direction reports no path until `direction` is incoming or both. Every equal-cost "+
 			"route is listed, a page at a time by next_cursor, and `route_count` counts them all.", h.dependencyPath)
 	addTool(s, "codectx_impact", "Impact",
-		"Affected scope and required package boundaries, with completeness.", h.impact)
+		"Affected scope and required package boundaries, with completeness. Each entry names its "+
+			"reason and route counts; view reasons or routes pages them whole, and the answer token "+
+			"passed as the cursor reads any view of the same answer.", h.impact)
 
 	// --- session lifecycle -----------------------------------------------
 	addTool(s, "codectx_context_plan", "Plan context",
