@@ -927,15 +927,22 @@ type hitFilter struct {
 	prefixes  []string
 	languages map[string]bool
 	tag       lang.Tagger
+	// headers is the filter's verdict on the shared-header extensions it
+	// decides without a tag (decidedHeaders), and headersDecided says it
+	// decides every one, so the tagger is never bound.
+	headers        map[string]bool
+	headersDecided bool
 }
 
 // pin binds the language filter to the pinned snapshot's tagger, and that to
 // the pinned generation's parses, so a header is tagged with the grammar its
 // kept parse used. The snapshot header is read only when a language filter is
-// set, since only it tags. A lookup the bound tagger fails tags its header ""
-// and is reported by tag.Err, which every caller checks before it answers.
+// set and some shared header's verdict depends on its tag, since only that
+// binding tags one; any other path is tagged by its name alone. A lookup the
+// bound tagger fails tags its header "" and is reported by tag.Err, which
+// every caller checks before it answers.
 func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, parses lang.Parses, id model.SnapshotID) error {
-	if f.languages == nil {
+	if f.languages == nil || f.headersDecided {
 		return nil
 	}
 	snap, err := store.Snapshot(ctx, id)
@@ -965,13 +972,14 @@ func newHitFilter(req model.SearchRequest) (hitFilter, error) {
 		for _, l := range req.Languages {
 			f.languages[strings.ToLower(strings.TrimSpace(l))] = true
 		}
+		f.headers, f.headersDecided = decidedHeaders(f.languages)
 	}
 	return f, nil
 }
 
 // keep reports whether a hit at this repository path survives the filters.
 func (f hitFilter) keep(p string) bool {
-	if f.languages != nil && !f.languages[f.tag.Of(p)] {
+	if f.languages != nil && !f.keepsLanguage(p) {
 		return false
 	}
 	if len(f.prefixes) == 0 {
