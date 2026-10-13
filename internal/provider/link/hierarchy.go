@@ -1472,7 +1472,8 @@ func (h *hierarchy) moduleExport(base, name string, yield func(entry) error) err
 // statements name resolve it to, when they agree, and ambiguous when two
 // resolve it to different exports. seen holds the module and name pairs
 // already asked along the resolution, so a cycle resolves to nothing. A
-// Python module exports its own declarations only.
+// Python module exports its own declarations and also what its module-level
+// from-imports bind (addPythonReexports).
 func (h *hierarchy) resolveExport(base, name string, seen map[string]bool) (res []entry, ambiguous bool, err error) {
 	key := base + "\x00" + name
 	if seen[key] {
@@ -1533,7 +1534,8 @@ func sameExports(a, b []entry) bool {
 
 // addExports adds what a module exports itself and what it re-exports,
 // under each module path bases names its file by. A Python module exports
-// each module-level type and callable it declares. An ECMAScript module
+// each module-level type and callable it declares, and also what its
+// module-level from-imports bind (addPythonReexports). An ECMAScript module
 // exports a module-level declaration under its own name (exportedByName),
 // under the name a local `export` statement gives it (`export default C`,
 // `export { a as b }`), a module as a namespace (`export * as ns from`),
