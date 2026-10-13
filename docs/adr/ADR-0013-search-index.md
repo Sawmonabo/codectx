@@ -356,11 +356,13 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   false-positive rate (1 in 256), so 1 million keys take 1.2 to 1.4 MB. Deleted documents stay in
   it; they only loosen a bound or admit a key. A header names the segment and its document count; a mismatched or unreadable file
   is no summary, and that segment is scored exhaustively, so a stale summary is never read. A summary is built for
-  every segment that lacks one, or holds one of an earlier format, before any page can score it: the summaries are
-  the reader's warmer, which the search library runs on every searcher it builds (at open and at every reload) before
-  it publishes it, so a segment a background merge published, or another process committed, is summarized on the
-  first reload that sees it (Lucene's merged-segment warmer serves the same end, warming a merged segment before the
-  merge commits). Read-only readers warm too: the file is derived, written under a name of its own and renamed into
+  every segment that lacks one, or holds one of an earlier format, before any page can score it: a view reloads the
+  reader and builds the missing summaries of the searcher it loaded before it scores, so a segment a background
+  merge published, or another process committed, is summarized by the first view that sees it (Lucene's
+  merged-segment warmer serves the same end, warming a merged segment before the merge commits). The search
+  library's own reader warmer is not used: it starts a collection thread for every reader that registers one, and a
+  thread per open index multiplies the address space a process reserves (its stack and its own malloc arena).
+  Concurrent views of one index build a segment's summary once. Read-only readers build too: the file is derived, written under a name of its own and renamed into
   place, so builds in several processes at once agree. A reader that cannot write the directory scores those
   segments exhaustively, exact and counted per page as segments without a summary; a commit builds what is still
   missing and fails if it cannot. The summaries of segments no longer present are removed; a temporary file of a
@@ -534,10 +536,10 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
   - the implementation, `BinaryFuse8` and its zero-copy `BinaryFuse8Ref`, https://docs.rs/xorf/0.13.0/xorf/;
   - the search library keeps no term membership filter; its dictionary answers membership by a block search,
     `Dictionary::term_ord` in https://github.com/quickwit-oss/tantivy/blob/0.26.0/sstable/src/dictionary.rs.
-- Summaries built before a searcher is published (decision 5, Block summaries): the search library's `Warmer`, run in
-  `create_searcher` before `reload` stores the searcher,
-  https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/reader/mod.rs and `src/reader/warming.rs` at the same tag;
-  its merges publish the merged segment from `end_merge` with no hook of their own, `src/indexer/segment_updater.rs`
+- Summaries built before a page scores a segment (decision 5, Block summaries): the search library's `Warmer` runs in
+  `create_searcher` before `reload` stores the searcher and starts a `tantivy-warm-gc` thread per reader that has a
+  warmer, https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/reader/mod.rs and `src/reader/warming.rs` at the
+  same tag; its merges publish the merged segment from `end_merge` with no hook of their own, `src/indexer/segment_updater.rs`
   at the same tag; Lucene's `IndexWriter.IndexReaderWarmer` warms "the newly merged segment, before the merge
   commits",
   https://lucene.apache.org/core/10_3_0/core/org/apache/lucene/index/IndexWriter.IndexReaderWarmer.html.

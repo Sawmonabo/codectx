@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -786,5 +787,50 @@ func TestABackgroundMergesSegmentIsSummarizedBeforeItServes(t *testing.T) {
 			t.Fatalf("no background merge published within 30s: %d segments", probe.Stats.Segments)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestOpenIndexesAndViewsStartNoThreadEach opens many read-only handles of one
+// index directory, each with a view, and checks that the process's thread
+// count does not grow with them. A thread per open index (each reserving its
+// stack and, on first allocation, a malloc arena of its own) multiplies the
+// address space a process with many open indexes reserves: a host that caps
+// virtual memory then fails allocations.
+//
+// Mutation caught: a reader warmer registered at open (the search library
+// starts a garbage-collection thread for every reader that has one).
+func TestOpenIndexesAndViewsStartNoThreadEach(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("counts threads through /proc")
+	}
+	threads := func() int {
+		t.Helper()
+		e, err := os.ReadDir("/proc/self/task")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(e)
+	}
+	c := genCorpus(2, 600, 100)
+	dir := t.TempDir()
+	c.build(t, dir, 3, nil)
+	const n = 32
+	before := threads()
+	var views []*View
+	for range n {
+		x := openReadOnly(t, dir, 1)
+		v, err := x.OpenView(1, visibleOf(1, 600))
+		if err != nil {
+			t.Fatal(err)
+		}
+		views = append(views, v)
+		search(t, v, Request{Query: "hot", Depth: 10})
+	}
+	after := threads()
+	for _, v := range views {
+		v.Close()
+	}
+	if after-before >= n/2 {
+		t.Fatalf("%d open indexes with a view each took the process from %d threads to %d", n, before, after)
 	}
 }

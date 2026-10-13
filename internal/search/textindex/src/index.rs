@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tantivy::collector::Count;
 use tantivy::index::SegmentId;
@@ -14,9 +14,7 @@ use tantivy::indexer::LogMergePolicy;
 use tantivy::query::{RangeQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::tokenizer::TextAnalyzer;
-use tantivy::{
-    Executor, IndexReader, IndexWriter, ReloadPolicy, Searcher, SearcherGeneration, TantivyDocument, Term, Warmer,
-};
+use tantivy::{Executor, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term};
 
 use crate::codec::Reader;
 use crate::error::{Error, Result, CX_INVALID};
@@ -55,18 +53,13 @@ pub struct Index {
     pub alive: Mutex<AliveCache>,
 }
 
-/// The summaries of an index's segments, loaded once each, and the reader's
-/// warmer. The search library runs a reader's warmers on every searcher it
-/// builds, at its first load and at every reload, before it publishes the
-/// searcher, so a segment that reaches a reader by any path (a commit, a merge
-/// the writer ran in the background, another process, an index written before
-/// the current summary format) has its summary built before a page can score
-/// it. The build writes only a summary file, never the index, so a read-only
-/// reader warms too.
+/// The summaries of an index's segments, each loaded once.
 struct Summaries {
     dir: PathBuf,
-    fields: Fields,
     map: Mutex<HashMap<SegmentId, Arc<Summary>>>,
+    /// Held while the summaries of a searcher are built, so concurrent views
+    /// of one index build each segment's summary once.
+    building: Mutex<()>,
 }
 
 impl Summaries {
@@ -79,27 +72,6 @@ impl Summaries {
         let s = Arc::new(Summary::load(&self.dir, seg)?);
         lock(&self.map).insert(seg.segment_id(), s.clone());
         Some(s)
-    }
-}
-
-impl Warmer for Summaries {
-    /// Builds the summary of every segment of the searcher that has none, or
-    /// one this library no longer reads. A segment whose build fails (a
-    /// read-only directory, a full disk) is scored exhaustively, which is
-    /// exact, and counted per page as a segment without a summary; a writer's
-    /// next commit builds it again and fails on the error.
-    fn warm(&self, searcher: &Searcher) -> tantivy::Result<()> {
-        for seg in searcher.segment_readers() {
-            if self.get(seg).is_none() {
-                let _ = summary::build(&self.dir, seg, &self.fields);
-            }
-        }
-        Ok(())
-    }
-
-    /// Drops the summaries of segments no live searcher holds.
-    fn garbage_collect(&self, live: &[&SearcherGeneration]) {
-        lock(&self.map).retain(|id, _| live.iter().any(|g| g.segments().contains_key(id)));
     }
 }
 
@@ -130,9 +102,9 @@ impl Index {
         };
         index.tokenizers().register(CODE_TOKENIZER, TextAnalyzer::from(Code));
         let fields = Fields::resolve(&index.schema())?;
-        let summaries = Arc::new(Summaries { dir: dir.to_path_buf(), fields, map: Mutex::new(HashMap::new()) });
-        let warmer: Weak<dyn Warmer> = Arc::downgrade(&summaries) as Weak<dyn Warmer>;
-        let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).warmers(vec![warmer]).try_into()?;
+        let summaries =
+            Arc::new(Summaries { dir: dir.to_path_buf(), map: Mutex::new(HashMap::new()), building: Mutex::new(()) });
+        let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
         let executor = if opts.search_threads > 1 {
             Executor::multi_thread(opts.search_threads as usize, "cx-search-")?
         } else {
@@ -328,6 +300,35 @@ impl Index {
     /// the segment has no current summary.
     pub fn summary(&self, seg: &tantivy::SegmentReader) -> Option<Arc<Summary>> {
         self.summaries.get(seg)
+    }
+
+    /// The summary of every segment of a searcher, in its order, building
+    /// first each one a segment lacks or holds in an earlier format, so no
+    /// page scores a segment without one, whatever brought the segment in: a
+    /// commit, a merge the writer ran in the background and published on its
+    /// own, another process, an index written before the current format. The
+    /// build writes only a summary file, never the index, so a read-only open
+    /// builds too. A segment whose build fails (a read-only directory, a full
+    /// disk) is scored exhaustively, which is exact, and counted per page as a
+    /// segment without a summary; a writer's next commit builds it again and
+    /// fails on the error. Summaries of segments the searcher no longer holds
+    /// are dropped from the cache (a view still holding one keeps its map).
+    pub fn summaries_of(&self, searcher: &Searcher) -> Vec<Option<Arc<Summary>>> {
+        let segs = searcher.segment_readers();
+        let mut out: Vec<Option<Arc<Summary>>> = segs.iter().map(|seg| self.summaries.get(seg)).collect();
+        if out.iter().any(Option::is_none) {
+            let _building = lock(&self.summaries.building);
+            for (seg, s) in segs.iter().zip(out.iter_mut()) {
+                if s.is_none() && self.summaries.get(seg).is_none() {
+                    let _ = summary::build(&self.dir, seg, &self.fields);
+                }
+                if s.is_none() {
+                    *s = self.summaries.get(seg);
+                }
+            }
+        }
+        lock(&self.summaries.map).retain(|id, _| segs.iter().any(|seg| seg.segment_id() == *id));
+        out
     }
 
     /// Builds the summary of every searchable segment that has none.
