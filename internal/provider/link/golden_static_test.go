@@ -498,9 +498,11 @@ func use(r ReadCloser) {
 `,
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
-		// the binding rules alone); the two agree on every fact. io.Reader's method set is in no table, so a
-		// type satisfies ReadCloser only by embedding io.Reader too. Checked against the pinned grammar's
-		// tree: ReadCloser's Close is a method_elem, sent abstract.
+		// the binding rules alone); the two agree on every fact. io's interfaces are read from the
+		// standard library (the package's GOROOT fixture), so ReadCloser's method set is Read and Close,
+		// File's is its own Close and the Read its embedded io.Reader promotes, and each type implements
+		// every io interface its method set covers. Checked against the pinned grammar's tree:
+		// ReadCloser's Close is a method_elem, sent abstract.
 		want: []string{
 			"u1 Read -> external io.Reader.Read virtual",
 			"u2 Close -> rcclose Close virtual",
@@ -509,11 +511,19 @@ func use(r ReadCloser) {
 			"rc ReadCloser extends external io.Reader",
 			"file File implements rc ReadCloser",
 			"fclose Close overrides rcclose Close",
+			"file File implements external io.Reader",
+			"file File implements external io.Closer",
+			"file File implements external io.ReadCloser",
+			"plain Plain implements external io.Closer",
+			"fclose Close overrides external io.Closer.Close",
+			"fclose Close overrides external io.ReadCloser.Close",
+			"pclose Close overrides external io.Closer.Close",
 		},
-		// Mutation: satisfy an interface by its known methods alone -> Plain implements ReadCloser and its
-		// Close overrides ReadCloser's.
-		// Mutation: leave the external embedding out of the method set -> `r.Read(nil)` is open.
-		fails: "a type that lacks the embedded external interface taken to satisfy ReadCloser; a call of the external interface's method left open",
+		// Mutation: satisfy an interface by part of its method set -> Plain implements ReadCloser and its
+		// Close overrides ReadCloser's. Mutation: leave the external embedding out of the method set ->
+		// `r.Read(nil)` is open. Mutation: leave out the methods an external interface promotes -> File
+		// implements neither io.Reader nor io.ReadCloser.
+		fails: "a type that lacks the embedded external interface taken to satisfy ReadCloser; a call of the external interface's method left open; a type satisfying an external interface by its method set left without its implements",
 	},
 	{
 		name:   "java-field-receivers",
