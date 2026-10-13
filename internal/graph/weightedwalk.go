@@ -288,14 +288,25 @@ func (e *Engine) WeightedWalk(ctx context.Context, req WeightedWalkRequest) (res
 // fields the two share, and the rule's arithmetic for the rest: a factor or a
 // weight above Scale would let a longer route score higher than its prefix,
 // which is the one property the batch bound rests on.
+//
+// The root list is screened in windows of model.MaxStartNodes, so every root
+// id and every shared field meets the impact contract while the list itself
+// has no count ceiling: that ceiling bounds an externally supplied wire
+// request, and a weighted walk is only ever an in-process call whose roots its
+// caller already holds (ADR-0016 decision 3). Every root is queued in the
+// walk's on-disk state, never in heap, so a wider list costs disk rows, not
+// memory.
 func (r WeightedWalkRequest) validate() error {
 	start := make([]model.NodeID, len(r.Roots))
 	for i, root := range r.Roots {
 		start[i] = root.Node
 	}
-	if err := (model.ImpactRequest{Start: start, Relations: r.Relations, Direction: r.Direction,
-		MaxDepth: r.MaxDepth, MaxVisited: r.MaxVisited, MaxEdges: r.MaxEdges, Page: r.Page}).Validate(); err != nil {
-		return err
+	for lo := 0; lo == 0 || lo < len(start); lo += model.MaxStartNodes {
+		window := start[lo:min(lo+model.MaxStartNodes, len(start))]
+		if err := (model.ImpactRequest{Start: window, Relations: r.Relations, Direction: r.Direction,
+			MaxDepth: r.MaxDepth, MaxVisited: r.MaxVisited, MaxEdges: r.MaxEdges, Page: r.Page}).Validate(); err != nil {
+			return err
+		}
 	}
 	rule := r.Rule
 	switch {
