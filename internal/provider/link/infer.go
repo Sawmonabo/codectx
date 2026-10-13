@@ -111,10 +111,10 @@ type types struct {
 	calls         *seeker[binding]
 }
 
-// flowInputs answers, for the variables a region reads (sorted, each once),
-// what the nodes outside the region put into them, and every value the
-// callables whose file node is outside the region return (varReturn), sorted
-// by entry.
+// flowInputs answers, for the variables asked (sorted, each once), what the
+// nodes outside the region put into them, sorted by entry: the variables the
+// region's nodes read, and the returns (varReturn) of the callables outside
+// it that a round bound (outsideReturns).
 type flowInputs func(reads *pagination.SortedRun[variable]) (*pagination.SortedRun[contribution], error)
 
 // nodeTracer is told each key of the hierarchy the node at Ref looked up.
@@ -435,12 +435,9 @@ type inference struct {
 	// wants collects the variables the scanned nodes read, whose inputs the
 	// fixed point starts from.
 	wants *pagination.ExternalSort[variable]
-	// returnsIn is the inputs into the returns of callables whose file node
-	// is not scanned, by callable, which flow reads for a binding of one;
 	// late collects the input values the first stratum must not see, added
 	// when it settles.
-	returnsIn *pagination.SortedRun[contribution]
-	late      *pagination.ExternalSort[fact]
+	late *pagination.ExternalSort[fact]
 	// early is the facts at the end of the first stratum. constants
 	// collects the contributions whose value is a constant, pending those
 	// whose value a variable holds, and readLog the variables read.
@@ -613,14 +610,10 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 
 // seed enters the inputs of the variables the scan read: a value into a
 // parameter, a site's result or a field at the stratum it arrived at (the
-// second stratum's held in late until the first settles), and a value a
-// callable whose file node is not scanned returns into returnsIn.
+// second stratum's held in late until the first settles). What a callable
+// whose file node is not scanned returns is read when a site binds it
+// (flow), for the callables bound alone.
 func (in *inference) seed(r *round) error {
-	returns, err := newSort(in, contributionCodec)
-	if err != nil {
-		return err
-	}
-	returns.WithFold(earliest)
 	wants, err := sorted(in, in.wants)
 	if err != nil {
 		return err
@@ -633,8 +626,6 @@ func (in *inference) seed(r *round) error {
 		in.keep(inputs)
 		err = inputs.Each(func(c contribution) error {
 			switch c.Entry.Kind {
-			case varReturn:
-				return returns.Add(c)
 			case varParam, varResult, varField:
 				f := fact{V: c.Entry, X: c.X}
 				if c.Late {
@@ -648,8 +639,7 @@ func (in *inference) seed(r *round) error {
 			return err
 		}
 	}
-	in.returnsIn, err = sorted(in, returns)
-	return err
+	return nil
 }
 
 // read records that the node f is scanning read the variable v.
@@ -1736,9 +1726,41 @@ func (in *inference) mergeBindings(r *round) (*pagination.SortedRun[binding], er
 	return sorted(in, fresh)
 }
 
+// outsideReturns is what the nodes outside the scan stored as the returns of
+// each callable targets (bindings sorted by target) names, by callable: read
+// for those callables alone, one key range each (flowInputs), so a round
+// costs the callables it bound, never every stored return. It is empty when
+// every node is scanned.
+func (in *inference) outsideReturns(targets *pagination.SortedRun[binding]) (*pagination.SortedRun[contribution], error) {
+	if in.inputs == nil {
+		return emptyRun(in, contributionCodec)
+	}
+	callables, err := newSort(in, variableCodec)
+	if err != nil {
+		return nil, err
+	}
+	callables.WithFold(keepFirst[variable])
+	err = targets.Each(func(b binding) error {
+		return callables.Add(variable{Kind: varReturn, File: b.Target.File, Decl: b.Target.Index})
+	})
+	if err != nil {
+		return nil, err
+	}
+	wanted, err := sorted(in, callables)
+	if err != nil {
+		return nil, err
+	}
+	returns, err := in.inputs(wanted)
+	if err != nil {
+		return nil, err
+	}
+	in.keep(returns)
+	return returns, nil
+}
+
 // flow connects each new binding's site to its target: the target's
 // returns to the site's result (a callable whose file node is not scanned
-// through its stored returns, returnsIn), and each argument to the parameter
+// through its stored returns, outsideReturns), and each argument to the parameter
 // it binds (paramsOf). Each is the site's contribution to the result or the
 // parameter.
 func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error {
@@ -1776,7 +1798,11 @@ func (in *inference) flow(r *round, fresh *pagination.SortedRun[binding]) error 
 	if err != nil {
 		return err
 	}
-	err = join(targets, in.returnsIn, func(b binding, c contribution) int {
+	returns, err := in.outsideReturns(targets)
+	if err != nil {
+		return err
+	}
+	err = join(targets, returns, func(b binding, c contribution) int {
 		return cmp.Or(cmp.Compare(b.Target.File, c.Entry.File), cmp.Compare(b.Target.Index, c.Entry.Decl))
 	}, func(b binding, cs []contribution) error {
 		result := variable{Kind: varResult, File: b.Site.File, Index: b.Site.Index}

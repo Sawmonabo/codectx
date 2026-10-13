@@ -529,7 +529,8 @@ What re-resolves:
 
   The stored contributions and reads are written once per refresh to block-indexed files, by node, by entry and by
   this build's ordinals (`flow_seek.go`), and each iteration reads them by key range: the region's nodes, the entries
-  those touch, the variables its run reads and the callables' returns. A node whose stored contribution names a
+  those touch, the variables its run reads and the returns of each callable a round of the run binds, read when it
+  binds it. A node whose stored contribution names a
   member or declaration that is gone joins the first region. No iteration passes over the unit's stored state; only
   carrying the untouched nodes' state into the new one does, once.
 
