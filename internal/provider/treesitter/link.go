@@ -229,6 +229,7 @@ func (b *builder) linkTable() error {
 		d.Static, d.Abstract, d.Virtual, d.Final, d.Internal = x.Static, x.Abstract, x.Virtual, x.Final, x.Internal
 		d.Returns = typ(x.Returns)
 		d.Override, d.Alias, d.Property = x.Override, x.Alias, x.Property
+		d.Visibility, d.Macros = x.Visibility, x.Macros
 		d.Exported = d.Exported || x.Exported
 	}
 	for _, p := range wl.Parameters {

@@ -42,6 +42,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
+| none | `references` | C or C++ declaration → each definition of a macro among its specifiers that its file sees and that states a visibility | `visibility_<value>` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
 - `direct`: the callee names the declaration by its package, module, import or scope;
@@ -57,6 +58,15 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
   interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
   base list).
+- `visibility_default`, `visibility_hidden`, `visibility_protected`, `visibility_internal`, `visibility_dllexport`,
+  `visibility_dllimport`: the visibility a C or C++ macro definition's replacement states, as declared in source and
+  never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
+  `visibility_unspecified`: a definition that states none (an empty replacement, keywords only);
+  `visibility_unresolved`: one that names another macro among other tokens, which is not expanded. A declaration's
+  macros are read through the definitions its file sees: its own and those of a header it includes directly (the
+  include lookup), following a one-identifier replacement to the macro it names. Each definition reached is one
+  occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
+  with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
 **Caller and target.** The caller is the anonymous route handler a site is written in when the structural provider
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
@@ -245,6 +255,8 @@ Besides the joined declarations, sites and values, the table carries what the re
   impl item);
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
   macro calls;
+- `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or
+  C++ declaration is written with, which its `references` visibility occurrences read;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
 - `Site.Computed`: the callee is an expression that names nothing (`wire.Link.Computed`);
 - `Handlers` and `Site.Handler`: the anonymous route handlers the structural provider publishes as function nodes,

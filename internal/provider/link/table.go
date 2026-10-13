@@ -154,6 +154,12 @@ type Decl struct {
 	// Property reports an ECMAScript function stored under a property path
 	// (wire.Export.Property): no bare name denotes it.
 	Property bool `json:"property,omitempty"`
+	// Visibility is, for a C or C++ object-like macro, the visibility its
+	// replacement states (wire.Export.Visibility).
+	Visibility string `json:"visibility,omitempty"`
+	// Macros are, for a C or C++ declaration, the macros written among its
+	// specifiers, each followed by one space (wire.Export.Macros).
+	Macros string `json:"macros,omitempty"`
 }
 
 // Parameter is one declared parameter of a callable. Endpoint is the

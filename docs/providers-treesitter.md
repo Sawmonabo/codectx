@@ -259,9 +259,21 @@ declaration inside a `__main__` guard is not exported.
 (C17 6.2.2): a function definition and a file-scope object definition, not
 declared `static`; a tentative definition (`int x;`) is one, a prototype and an
 `extern` declaration without an initializer are not, since they define
-nothing. This is linkage, not shared-library visibility, which compiler flags
-(`-fvisibility`) and attribute macros decide and a syntactic reader does not
-evaluate. C++ publishes no `exports`.
+nothing. This is linkage, not shared-library visibility. C++ publishes no
+`exports`.
+
+**C and C++ visibility as declared.** A declaration's own attributes give its
+`visibility` metadata: the first `visibility("…")` attribute's value
+(`default`, `hidden`, `protected`, `internal`), or `dllexport` or `dllimport`
+from `__declspec` or the attribute of that name, in an attribute specifier,
+a `__declspec` modifier or a `[[…]]` attribute declaration anywhere outside
+its body and parameter lists. A visibility written through a macro
+(`API int f(void);`) is read by the linker from the macro's definitions
+through the file's includes and published as `references` occurrences to
+them, one per definition and so per `#if` arm, with the visibility as their
+detail (docs/providers-link.md). Both are visibility as declared in source,
+never the binary's export table: a build flag (`-fvisibility=hidden`) decides
+what a symbol with no attribute gets, so no attribute is no claim at all.
 
 **C and C++ macro-prefixed declarations.** The grammars have no preprocessor,
 so a declaration written with a macro among its specifiers
@@ -935,7 +947,13 @@ All MIT:
   declarations written with export, attribute and calling-convention macros
   keep their name, kind and return type and publish their macros; an
   undecidable type is published as its candidate set; a file's own `#define`
-  and `#undef` decide whether a name is a macro.
+  and `#undef` decide whether a name is a macro. Each `#define` sends the
+  visibility its replacement states, one per definition, and a declaration's
+  own attributes its `visibility`.
+- `internal/provider/link/visibility_c_test.go`: a declaration written with a
+  macro references each definition its file sees through its includes, with
+  the definition's visibility and the arms' set size; through an alias, and
+  through a header for a name the file alone cannot tell from its type.
 - `internal/provider/treesitter/entry_points_test.go`: decorators with their
   argument ranges; the `__main__` guard, Go `main`, the Java `main` forms and a
   shebang script as endpoints.

@@ -44,8 +44,13 @@ it is [research 26](../research/26-extraction-and-linking-coverage.md).
   names), otherwise every top-level name without a leading underscore [S2]. A module whose `__all__` is computed falls
   back to the underscore rule, and the file's capability row says that `__all__` was not static.
 - **C:** every definition with external linkage, that is, not `static` [S3]. `exports` means linkage, documented as
-  such, not shared-library visibility, which depends on compiler flags and attribute macros a syntactic reader does not
-  evaluate [S4].
+  such, not shared-library visibility.
+- **C and C++ visibility as declared in source:** a declaration's own attributes (`visibility("…")`, `__declspec`
+  `dllexport`/`dllimport`) give its `visibility` metadata; a macro among its specifiers is read by the linker through
+  the definitions its file sees by decision 4's include lookup, following one-identifier replacements, and published as
+  a `references` to each definition with the visibility it states, one per `#if` arm with the set size. It is never
+  claimed as the binary's export table: `-fvisibility` and the toolchain's export lists decide that, and no attribute
+  publishes no visibility [S4]. No macro name is known in advance; the project's own `#define` is read.
 
 ### 3. JavaScript and TypeScript function-valued properties are declarations
 
@@ -164,7 +169,7 @@ reach those answers without the verification the rest receives.
   imports, one argument-flow edge per argument at each bound site (an estimate, not measured), decorator facts and
   endpoints. Storage is measured in the scale proofs.
 - Endpoint and argument-flow identities rest on ADR-0014's descriptor paths and parameter keys.
-- Follow-ups outside this record: return-value flow; C shared-library visibility through export macros.
+- Follow-ups outside this record: return-value flow.
 
 ## Sources
 
@@ -176,7 +181,10 @@ reach those answers without the verification the rest receives.
 - [S3] *Storage duration and linkage*, https://en.cppreference.com/w/c/language/storage_duration — external linkage
   unless `static`.
 - [S4] *Code Gen Options*, https://gcc.gnu.org/onlinedocs/gcc/Code-Gen-Options.html — `-fvisibility`; and
-  *dllexport, dllimport*, https://learn.microsoft.com/en-us/cpp/cpp/dllexport-dllimport.
+  *dllexport, dllimport*, https://learn.microsoft.com/en-us/cpp/cpp/dllexport-dllimport; *Common Attributes*,
+  https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html — "four supported visibility_type values: `default`,
+  `hidden`, `protected`, or `internal`"; and *Attribute Syntax*, https://gcc.gnu.org/onlinedocs/gcc/Attribute-Syntax.html
+  — attribute names may be written with `__` before and after.
 - [S5] *tags.scm*, https://github.com/tree-sitter/tree-sitter-javascript/blob/master/queries/tags.scm — assignment and
   pair patterns tagged as function definitions.
 - [S6] *Object-like Macros*, https://gcc.gnu.org/onlinedocs/cpp/Object-like-Macros.html; and *Kythe schema*,

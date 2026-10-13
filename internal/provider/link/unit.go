@@ -99,6 +99,11 @@ const (
 	// FactOverrides: the method declaration Site directly overrides or
 	// implements the method Target, or the external method External names.
 	FactOverrides Fact = 7
+	// FactVisibility: the C or C++ declaration Site is written with a macro
+	// whose definition Target (an object-like macro the declaration's file
+	// sees) states the visibility its Detail names (visibilityDetail). A
+	// macro defined in several `#if` arms has one fact per definition.
+	FactVisibility Fact = 8
 )
 
 // Binding is one fact a resolver found. Site names the entry of a member's

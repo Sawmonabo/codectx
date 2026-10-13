@@ -171,6 +171,10 @@ const (
 	// replacement is one identifier (Decl.Alias), its file's path in Aux and
 	// the identifier in Sig.
 	keyMacro = "ma\x00"
+	// keyMacroVisibility + name: a C or C++ object-like macro of that name
+	// whose replacement states a visibility (Decl.Visibility), its file's
+	// path in Aux and the visibility in Sig.
+	keyMacroVisibility = "mv\x00"
 )
 
 // The flags of an entry.
@@ -513,6 +517,11 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		}
 		if fc.family == "c" && d.Alias != "" {
 			if err := s.Add(entry{Key: keyMacro + d.Name, Ref: ref, Aux: t.Path, Sig: d.Alias}); err != nil {
+				return err
+			}
+		}
+		if fc.family == "c" && d.Visibility != "" {
+			if err := s.Add(entry{Key: keyMacroVisibility + d.Name, Ref: ref, Aux: t.Path, Sig: d.Visibility}); err != nil {
 				return err
 			}
 		}

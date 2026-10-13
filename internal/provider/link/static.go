@@ -388,6 +388,9 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 	if err := r.includeFacts(); err != nil {
 		return err
 	}
+	if err := r.visibilityFacts(); err != nil {
+		return err
+	}
 	return s.h.hierarchyFacts(s.ctx, file, t, emit)
 }
 
