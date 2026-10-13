@@ -27,54 +27,31 @@ import (
 // with no constrained file writes and decides exactly what it did without
 // them.
 
-// goCond is a build condition's id in a hierarchy's goConds, 0 the
-// condition every build meets.
-type goCond = uint32
+// goCond is a build condition's id in a hierarchy's goConds
+// (gobuild.Conds), 0 the condition every build meets and 1 the one none
+// does; one function of the build's tags has one id however it is written.
+type goCond = gobuild.Cond
 
-// goConds interns the build conditions of one hierarchy build.
+// goConds holds the build conditions of one hierarchy build.
 type goConds struct {
-	// exprs are the conditions by id-1, ids their ids by text.
-	exprs []constraint.Expr
-	ids   map[string]goCond
+	*gobuild.Conds
 	// files are the unit's files' conditions, by file ordinal.
 	files map[int32]goCond
-	// sat is each condition's satisfiability by id-1, once decided: 0
-	// not decided, 1 met by some build, 2 by none.
-	sat []uint8
-	// minor is the oldest release the unit builds with (its go.mod's go
-	// line), go1.minor.
-	minor int
 }
 
 func newGoConds(goVersion string) *goConds {
-	c := &goConds{ids: map[string]goCond{}, files: map[int32]goCond{}}
+	minor := 0
 	if _, rest, ok := strings.Cut(goVersion, "."); ok {
 		rest, _, _ = strings.Cut(rest, ".")
-		c.minor, _ = strconv.Atoi(rest)
+		minor, _ = strconv.Atoi(rest)
 	}
-	return c
+	return &goConds{Conds: gobuild.NewConds(minor), files: map[int32]goCond{}}
 }
 
-// intern is x's id.
-func (c *goConds) intern(x constraint.Expr) goCond {
-	if x == nil {
-		return 0
-	}
-	s := x.String()
-	if id, ok := c.ids[s]; ok {
-		return id
-	}
-	c.exprs = append(c.exprs, x)
-	c.sat = append(c.sat, 0)
-	id := goCond(len(c.exprs))
-	c.ids[s] = id
-	return id
-}
-
-// parse is the id of the conjunction of the constraint expressions texts,
-// each empty or one gobuild.Header or gobuild.FileName returns.
+// parse is the conjunction of the constraint expressions texts, each empty
+// or one gobuild.Header, gobuild.FileName or gobuild.File returns.
 func (c *goConds) parse(texts ...string) goCond {
-	var all goCond
+	all := gobuild.True
 	for _, t := range texts {
 		if t == "" {
 			continue
@@ -83,7 +60,7 @@ func (c *goConds) parse(texts ...string) goCond {
 		if err != nil {
 			continue
 		}
-		all = c.and(all, c.intern(x))
+		all = c.And(all, c.Expr(x))
 	}
 	return all
 }
@@ -94,53 +71,12 @@ func (c *goConds) file(p, header string) goCond {
 	return c.parse(header, gobuild.FileName(path.Base(p)))
 }
 
-func (c *goConds) expr(id goCond) constraint.Expr { return c.exprs[id-1] }
+func (c *goConds) and(a, b goCond) goCond    { return c.And(a, b) }
+func (c *goConds) or(a, b goCond) goCond     { return c.Or(a, b) }
+func (c *goConds) andNot(a, b goCond) goCond { return c.AndNot(a, b) }
 
-func (c *goConds) and(a, b goCond) goCond {
-	switch {
-	case a == 0 || a == b:
-		return b
-	case b == 0:
-		return a
-	}
-	return c.intern(&constraint.AndExpr{X: c.expr(a), Y: c.expr(b)})
-}
-
-func (c *goConds) or(a, b goCond) goCond {
-	switch {
-	case a == 0 || b == 0:
-		return 0
-	case a == b:
-		return a
-	}
-	return c.intern(&constraint.OrExpr{X: c.expr(a), Y: c.expr(b)})
-}
-
-// andNot is a and not b, for b not 0.
-func (c *goConds) andNot(a, b goCond) goCond {
-	return c.and(a, c.intern(&constraint.NotExpr{X: c.expr(b)}))
-}
-
-// holds reports whether some build meets id. A condition naming more free
-// tags than gobuild.MaxFreeTags is not enumerated and counts as met, which
-// admits what the union of every file's declarations would.
-func (c *goConds) holds(id goCond) bool {
-	if id == 0 {
-		return true
-	}
-	switch c.sat[id-1] {
-	case 1:
-		return true
-	case 2:
-		return false
-	}
-	v, _ := gobuild.Satisfiable(c.expr(id), c.minor)
-	c.sat[id-1] = 2
-	if v {
-		c.sat[id-1] = 1
-	}
-	return v
-}
+// holds reports whether some build meets id.
+func (c *goConds) holds(id goCond) bool { return c.Holds(id) }
 
 // goFileCond is the condition of the unit's file of ordinal file, read from
 // its keyFile entry (the table's Constraint in Returns).

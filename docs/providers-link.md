@@ -314,8 +314,13 @@ different types or values (`const PtrSize = 4` for 386 and `8` for amd64) is one
 under their conditions. A type implements an interface when some build holds, for every method name, a key of it in
 both: `Regs` with `PC() uint32` in `regs_386.go` and `PC() uint64` in `regs_amd64.go` implements `interface{ PC()
 uint64; SetPC(uint64) }` and never `interface{ PC() uint64; SetPC(uint32) }`, and its `PC` overrides only the
-interface method of its own key. Only the tags a condition names are enumerated; past 16 free tags (custom tags,
-`amd64.v2`-style tool tags, taken as independent) a condition counts as met. Two embedding paths at one depth stay
+interface method of its own key. Each condition is a reduced ordered binary decision diagram (one id per function of
+the tags, however written), and some build meets it when it shares a satisfying assignment with the diagram of the
+valid builds: every port, compiler and architecture feature level, a feature tag such as `amd64.v3` holding only on
+its architecture with every lower level of its chain, `cgo` on any port, and each release above the module's go line
+only where the lower ones hold. The `-tags` flag is taken to add only tags of no fixed meaning (an operating system,
+architecture, compiler, release or feature tag is fixed by the build), and a feature tag the toolchain does not define
+holds in no build. No count of tags bounds a decision. Two embedding paths at one depth stay
 ambiguous whatever their conditions (a miss, never a false edge), and a type declared with a different structure per
 build is each of its declarations, as before. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
