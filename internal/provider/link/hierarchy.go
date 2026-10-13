@@ -1683,7 +1683,7 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 	if err != nil || found {
 		return err
 	}
-	order, err := h.pythonMRO(typ)
+	order, err := h.pythonUnitOrder(typ)
 	if err != nil {
 		return err
 	}

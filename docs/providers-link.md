@@ -847,10 +847,13 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance
   receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type of a receiver two
   disagreeing definitions reach included) binds, for each of its types, the first declaration of the method along
-  that type's C3 linearisation (`hierarchy.pythonMRO`, over the bases in the order each class lists them), never a
-  subclass's override. A class object (`A.make()`, `mod.A.make()`) binds the method `A`
+  that type's C3 linearisation (`hierarchy.pythonUnitOrder`, over the bases in the order each class lists them,
+  the bases outside the project placed as for overrides), never a subclass's override. A base outside the project
+  that the order places ahead of that declaration may hold the method instead, so the call also reaches that base's
+  method, a set counting both (`class C(Base, U)`: `c.run()` reaches `Base.run` and `U.run`, set size 2). A class object (`A.make()`, `mod.A.make()`) binds the method `A`
   declares or inherits alone, never a subclass's override. `super().m()` in class `B` binds, for `B` and each class
-  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached. Field-based
+  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached, and each
+  base outside the project a linearisation places between `B` and that `m` as a candidate beside it. Field-based
   resolution (a function written to the attribute; a method is written to no attribute, so it is reached only through
   a receiver's type) answers an attribute call only when its receiver's type bound nothing and reaches the method
   through no supertype outside the project: `class L(list)` calling `self.append(1)` calls the external
