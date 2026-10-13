@@ -795,15 +795,17 @@ class B extends Base {}
 
 // TestAnonymousClassOfExternalInterface links, in one file, a class that
 // implements java.lang.Runnable and an anonymous class of it (JLS §15.9.5).
-// The anonymous body has no node of its own, so it publishes no supertype
-// edge; its run override and A's reach one external method node, and A's
-// `implements` reaches the one java.lang.Runnable node, of kind type: the
-// anonymous body's supertype row, which proves no kind, mints no second
-// node.
+// The anonymous body is its own class node, `new Runnable`, whose one
+// `extends` to java.lang.Runnable carries supertype_anonymous: the creation
+// proves neither a class nor an interface. Its run override and A's reach
+// one external method node, and both supertype edges reach the one
+// java.lang.Runnable node, of kind type.
 //
 // Mutation: mint the external type node with the kind its row proves ->
 // java.lang.Runnable is an interface node, not one of kind type. Mutation:
-// publish a supertype edge from the anonymous body's row -> a second edge.
+// read the anonymous body's external supertype as a class -> its edge
+// carries supertype_class. Mutation: keep the body a synthetic type with no
+// node -> it publishes no edge.
 func TestAnonymousClassOfExternalInterface(t *testing.T) {
 	l := linkSources(t, newStructural(t), map[string]string{
 		"Tasks.java": `class A implements Runnable {
@@ -820,8 +822,13 @@ class Main {
 `,
 	})
 	edges := externalSupertypeEdges(t, l)
-	if len(edges) != 1 {
-		t.Fatalf("the external supertype edges are %v, want A's alone", edges)
+	if len(edges) != 2 {
+		t.Fatalf("the external supertype edges are %v, want A's and the anonymous body's", edges)
+	}
+	if anon := edges["new Runnable"]; anon.kind != model.RelExtends || anon.detail != link.DetailSupertypeAnonymous ||
+		anon.to.ID != edges["A"].to.ID {
+		t.Errorf("the anonymous body publishes %s (%s) into %s, want extends (%s) into A's java.lang.Runnable node",
+			anon.kind, anon.detail, anon.to.QualifiedName, link.DetailSupertypeAnonymous)
 	}
 	a := edges["A"]
 	if a.kind != model.RelImplements || a.detail != link.DetailSupertypeInterface || a.to.Kind != model.NodeType ||

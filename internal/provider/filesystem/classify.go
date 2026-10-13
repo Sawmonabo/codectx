@@ -21,8 +21,8 @@ type Classification struct {
 	Node   model.NodeKind
 }
 
-// Recognized formats. The manifest provider parses the first six and
-// Markdown; everything else is recognition-only.
+// Recognized formats. The manifest provider parses the first six, the lock
+// files and Markdown; everything else is recognition-only.
 const (
 	FormatGoMod       = "gomod"
 	FormatGoWork      = "gowork"
@@ -31,6 +31,20 @@ const (
 	FormatPyProject   = "pyproject"
 	FormatPom         = "pom"
 	FormatMarkdown    = "markdown"
+
+	// Lock files: each names the exact versions a resolver selected. The
+	// file name is the tool's, as package.json is npm's.
+	FormatPackageLock = "package-lock"
+	FormatPnpmLock    = "pnpm-lock"
+	FormatYarnLock    = "yarn-lock"
+	FormatBunLock     = "bun-lock"
+	FormatCargoLock   = "cargo-lock"
+	FormatPoetryLock  = "poetry-lock"
+	FormatUVLock      = "uv-lock"
+	FormatPipfileLock = "pipfile-lock"
+	FormatPylock      = "pylock"
+	FormatPDMLock     = "pdm-lock"
+	FormatGradleLock  = "gradle-lock"
 )
 
 // Language returns the language tag for a root-relative path, or "" when the
@@ -49,6 +63,18 @@ var byBasename = map[string]Classification{
 	"Cargo.toml":     {Format: FormatCargo},
 	"pyproject.toml": {Format: FormatPyProject},
 	"pom.xml":        {Format: FormatPom},
+
+	"package-lock.json": {Format: FormatPackageLock},
+	"pnpm-lock.yaml":    {Format: FormatPnpmLock},
+	"yarn.lock":         {Format: FormatYarnLock},
+	"bun.lock":          {Format: FormatBunLock},
+	"Cargo.lock":        {Format: FormatCargoLock},
+	"poetry.lock":       {Format: FormatPoetryLock},
+	"uv.lock":           {Format: FormatUVLock},
+	"Pipfile.lock":      {Format: FormatPipfileLock},
+	"pylock.toml":       {Format: FormatPylock},
+	"pdm.lock":          {Format: FormatPDMLock},
+	"gradle.lockfile":   {Format: FormatGradleLock},
 
 	"Dockerfile":              {Format: "dockerfile", Node: model.NodeBuildTarget},
 	"Jenkinsfile":             {Format: "jenkins", Node: model.NodeConfiguration},
@@ -106,6 +132,11 @@ func Classify(rel string) Classification {
 	switch {
 	case byBasename[base].Format != "":
 		c = byBasename[base]
+	case strings.HasPrefix(base, "pylock.") && strings.HasSuffix(base, ".toml") && len(base) > len("pylock..toml") &&
+		!strings.Contains(strings.TrimSuffix(strings.TrimPrefix(base, "pylock."), ".toml"), "."):
+		// PEP 751 names a lock pylock.toml or pylock.<name>.toml, the name
+		// without a dot.
+		c = Classification{Format: FormatPylock}
 	case strings.HasPrefix(base, "Dockerfile."):
 		c = Classification{Format: "dockerfile", Node: model.NodeBuildTarget}
 	case (dir == ".github/workflows") && (ext == ".yml" || ext == ".yaml"):

@@ -282,9 +282,62 @@ declaration inside a `__main__` guard is not exported.
 (C17 6.2.2): a function definition and a file-scope object definition, not
 declared `static`; a tentative definition (`int x;`) is one, a prototype and an
 `extern` declaration without an initializer are not, since they define
-nothing. This is linkage, not shared-library visibility, which compiler flags
-(`-fvisibility`) and attribute macros decide and a syntactic reader does not
-evaluate. C++ publishes no `exports`.
+nothing. This is linkage, not shared-library visibility. C++ publishes no
+`exports`.
+
+**C and C++ visibility as declared.** A declaration's own attributes give its
+`visibility` metadata: the first `visibility("…")` attribute's value
+(`default`, `hidden`, `protected`, `internal`), or `dllexport` or `dllimport`
+from `__declspec` or the attribute of that name, in an attribute specifier,
+a `__declspec` modifier or a `[[…]]` attribute declaration anywhere outside
+its body and parameter lists. A visibility written through a macro
+(`API int f(void);`) is read by the linker from the macro's definitions
+through the file's includes and published as `references` occurrences to
+them, one per definition and so per `#if` arm, with the visibility as their
+detail (docs/providers-link.md). Both are visibility as declared in source,
+never the binary's export table: a build flag (`-fvisibility=hidden`) decides
+what a symbol with no attribute gets, so no attribute is no claim at all.
+
+**Java anonymous class bodies.** A creation with a class body
+(`new Runnable() { … }`) is a `class` node (JLS §15.9.5: an anonymous class is
+a class) named `new T`, T the created type's last simple name, the token the
+creation's call reference takes (`new Comparator` for
+`new java.util.Comparator<String>() { … }`). Its descriptor path is the
+enclosing declaration's path and that name (`Sample.start.new Runnable`), and
+its methods are its members (`Sample.start.new Runnable.run`), so a body
+inserted elsewhere in the file moves no identity; two bodies of one type in one
+declaration are duplicates at one level, settled as every duplicate is
+(content digest, then order). An enum constant's body is the constant's own:
+its methods are the constant's members (`Color.RED.m`). The node's range is
+the creation; its name is not written as one token, so for a qualified or
+spaced creation the range's text does not contain it.
+
+**C and C++ macro-prefixed declarations.** The grammars have no preprocessor,
+so a declaration written with a macro among its specifiers
+(`SQLITE_API int f(void);`, `XMLPUBFUN xmlNodePtr XMLCALL xmlNewNode(int);`,
+`void f(void) G_GNUC_CONST;`) misparses: the macro is read as the type, the
+real type lands in an error, or, in C++, `M T f(void)` reads as `T::f` with
+the `::` missing. The worker reads such a misparse from the tree alone (an
+error or missing token among a file-scope declaration's specifiers or on its
+declarator's path, a file-scope error or expression statement, or a typedef
+name combined with `signed`, `unsigned`, `short` or `long`), never from a list
+of macro names. It then classifies the identifiers before the name by the
+language's rule (C17 6.7.2p2): a typedef name never combines with another
+type specifier, so beside a keyword type or a `struct`, `union` or `enum`
+specifier every other bare identifier is a macro; otherwise exactly one is the
+type, and a name the file defines as an object-like macro before the
+declaration (the last `#define` or `#undef` decides) is not. A function-like
+macro call before the specifiers and an identifier after the parameter list
+are attribute macros. The file is parsed a second time with those tokens
+excluded (the parser's included ranges, so every offset stays the file's),
+and the second tree is kept when it has no more error bytes than the first.
+The declaration then publishes its own name, kind and return type, and the
+macros it was written with under the `specifier_macros` metadata key, in
+source order. When the rule leaves several identifiers that may be the type
+and the file defines none of them (`GLIB_AVAILABLE_IN_ALL gboolean g(void);`
+in a file that does not define the macro), all of them are published under
+`return_types` as the set the declared type is one of, they are not counted
+as macros, and the export carries no single return type or typed signature.
 
 **Decorator facts.** Every declaration publishes its decorators, annotations
 and attributes under the `decorators` metadata key, in source order, each as
@@ -1027,6 +1080,17 @@ All MIT:
   properties are declarations with their stored path; Python (`__all__`, static
   and computed) and C (external linkage) exports; a name defined twenty times
   keeps all twenty candidates and a member call publishes none.
+- `internal/provider/treesitter/worker/macro_c_test.go`: C and C++
+  declarations written with export, attribute and calling-convention macros
+  keep their name, kind and return type and publish their macros; an
+  undecidable type is published as its candidate set; a file's own `#define`
+  and `#undef` decide whether a name is a macro. Each `#define` sends the
+  visibility its replacement states, one per definition, and a declaration's
+  own attributes its `visibility`.
+- `internal/provider/link/visibility_c_test.go`: a declaration written with a
+  macro references each definition its file sees through its includes, with
+  the definition's visibility and the arms' set size; through an alias, and
+  through a header for a name the file alone cannot tell from its type.
 - `internal/provider/treesitter/entry_points_test.go`: decorators with their
   argument ranges; the `__main__` guard, Go `main`, the Java `main` forms and a
   shebang script as endpoints.

@@ -60,10 +60,15 @@ const stateTag = "link.resolution.nodes\n"
 // details is every technique a fact can carry, in its stored order, which is
 // also the order of preference a fold of two equal facts keeps (better); the
 // empty technique, a fact no technique is named for (an open or external
-// site), is last.
+// site), is last. The visibility details and supertype_anonymous come just
+// before it: none of their facts folds with a fact of another technique, so
+// their place orders nothing.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
 	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
-	DetailSummary, DetailReturn, DetailSupertypeCandidate, DetailMacroInput, DetailMacroTranscribes, ""}
+	DetailSummary, DetailReturn, DetailSupertypeCandidate, DetailMacroInput, DetailMacroTranscribes,
+	DetailVisibilityDefault, DetailVisibilityHidden, DetailVisibilityProtected, DetailVisibilityInternal,
+	DetailVisibilityDllexport, DetailVisibilityDllimport, DetailVisibilityUnspecified, DetailVisibilityUnresolved,
+	DetailSupertypeAnonymous, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {
@@ -100,7 +105,7 @@ func (k Fact) entry() int {
 	switch k {
 	case FactImport, FactOpenImport:
 		return 1
-	case FactExtends, FactImplements, FactOverrides, FactGenerates:
+	case FactExtends, FactImplements, FactOverrides, FactGenerates, FactVisibility:
 		return 2
 	case FactRoute:
 		return 3

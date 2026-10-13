@@ -46,6 +46,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
 | none of its own | `defines` | file module → a route endpoint at its full path, or a declared entry point | none |
 | none of its own | `routes_to` | route endpoint → each handler; declared entry point → its declaration or module | `import` |
+| none | `references` | C or C++ declaration → each definition of a macro among its specifiers that its file sees and that states a visibility | `visibility_<value>` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
 - `direct`: the callee names the declaration by its package, module, import or scope;
@@ -64,6 +65,15 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
   interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
   base list).
+- `visibility_default`, `visibility_hidden`, `visibility_protected`, `visibility_internal`, `visibility_dllexport`,
+  `visibility_dllimport`: the visibility a C or C++ macro definition's replacement states, as declared in source and
+  never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
+  `visibility_unspecified`: a definition that states none (an empty replacement, keywords only);
+  `visibility_unresolved`: one that names another macro among other tokens, which is not expanded. A declaration's
+  macros are read through the definitions its file sees: its own and those of a header it includes directly (the
+  include lookup), following a one-identifier replacement to the macro it names. Each definition reached is one
+  occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
+  with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
 **Caller and target.** The caller is the anonymous route handler a site is written in when the structural provider
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
@@ -128,8 +138,11 @@ a method, the method's name, with metadata `{"resolution":"external"}`. An exter
 never `class` or `interface`: whether it is a class, an interface, a trait or a struct is not known from the
 project's code, and one project can write it both ways (TypeScript lets a class implement a class), so a fixed kind
 keeps one qualified name one node in every unit. Each `extends` or `implements` into it carries the kind its own
-clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body has no node, so it
-publishes no supertype edge; its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
+clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body is its own class
+node (`new T`, below); its one supertype edge into a type outside the project is an `extends` with the detail
+`supertype_anonymous`, since the creation proves neither a class nor an interface (JLS §15.9.5: the body extends a
+class, or extends `Object` and implements an interface), and into a type of the unit it is `extends` or `implements`
+by that type's kind. Its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
 an external method declares, so one node stands for all of a type's methods of one name. A Java `@Override` of
 `toString` and `o.toString()` on an `Object` receiver both target `java.lang.Object.toString`. Every run of every
 unit that names an external node republishes it with its own evidence, and the delta build replaces the index-level
@@ -310,7 +323,7 @@ toward it stays valid. What a call can bind to differs by family, and so does wh
 
 | Family | Targets | `Receiver` |
 |---|---|---|
-| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#k` for an anonymous class body or an enum constant's body, the k-th in the file in source order, sent as a subtype of the type it instantiates |
+| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#n` for an anonymous class body or an enum constant's body, n the byte offset of the name token of its declaration (the class `new T`, or the enum constant), sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
 | Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
 | C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds, and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
@@ -376,6 +389,8 @@ Besides the joined declarations, sites and values, the table carries what the re
   impl item);
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
   macro calls;
+- `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or
+  C++ declaration is written with, which its `references` visibility occurrences read;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
 - `Site.Results` and `Site.Into`: the variables the call's value is written into, and the callable whose return it
   reaches;
@@ -496,8 +511,10 @@ The members' language family picks the resolver:
   bare call binds in the innermost enclosing class that has the method, declared or inherited, walking out from an
   inner, local or anonymous class (JLS §15.12.1). A member site binds by its receiver's static type to the one
   method that type declares or inherits, `virtual` when that method can be overridden (not static and not `Final`,
-  `hierarchy.overridable`) and `exact` otherwise. An anonymous class body is a synthetic subtype of the type it
-  instantiates (`anonymousType`), whose methods override that type's. A call of an abstract method (a functional
+  `hierarchy.overridable`) and `exact` otherwise; a call on a newly created object (`new Dog().sound()`, no class
+  body) binds exactly, the object being exactly its class (JLS §15.9.4). An anonymous class body is a subtype of
+  the type it instantiates, read as its declaration (`anonymousType`: the class `new T`, or the enum constant whose
+  body it is), whose methods override that type's. A call of an abstract method (a functional
   interface's) also joins every method reference of that method's signature. A method reference `T::m` to an
   instance method, `T` a type, is unbound (JLS §15.13.1): its signature is `m`'s with `T` as its first parameter, and
   a call through it passes its first argument to the receiver and the rest to `m`'s parameters in order. A static
