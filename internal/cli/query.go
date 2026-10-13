@@ -588,6 +588,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				default:
 					writeImpactEntries(b, result.Entries)
 					writePackageEdges(b, result.Packages)
+					writeInlineImpact(b, result)
 				}
 				if result.Answer != "" {
 					fmt.Fprintf(b, "answer      %s\n", result.Answer)
@@ -974,8 +975,8 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 	for _, e := range entries {
 		// ImpactEntry.Name is the entry's qualified name (model.Node has no file
 		// path); the column is labelled for what it holds.
-		fmt.Fprintf(b, "  #%d %s  %-9s depth %d  score %d  %d %s  %d %s  name %s\n", e.Ordinal, e.NodeID,
-			e.Direction, e.Depth, e.ScoreMicros, e.ReasonCount, plural(int(e.ReasonCount), "reason", "reasons"),
+		fmt.Fprintf(b, "  #%d %s  %-9s depth %d%s  score %d  %d %s  %d %s  name %s\n", e.Ordinal, e.NodeID,
+			e.Direction, e.Depth, reachLabel(e.Reach), e.ScoreMicros, e.ReasonCount, plural(int(e.ReasonCount), "reason", "reasons"),
 			e.RouteCount, plural(int(e.RouteCount), "route", "routes"), clip(e.Name, 70))
 	}
 }
