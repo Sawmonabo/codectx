@@ -245,8 +245,8 @@ func joinClass(a, b uint8) uint8 {
 }
 
 // inputs publishes the reads the FactInputs of pending input p, group,
-// found: one `variable` node at the parameter, keyed by its owner's
-// qualified name and the parameter's name, with the read as its
+// found: one `variable` node at the parameter, keyed by its owner's node
+// and the parameter's name, with the read as its
 // MetaInput, which the owner `reads`, detail request_input.
 func (f *filePublication) inputs(p *PendingInput, group []idBinding) error {
 	for _, b := range group {
@@ -269,7 +269,9 @@ func (f *filePublication) inputs(p *PendingInput, group []idBinding) error {
 			return internalErr("input metadata: " + err.Error())
 		}
 		name := nodeName(p.Name, p.Param)
-		key := fitKey("input:" + owner.Qualified + "#" + p.Param)
+		// The owner's node, not its name, keys the read: two overloads of
+		// one method share a qualified name.
+		key := fitKey("input:" + string(owner.Node) + "#" + p.Param)
 		n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + f.fv.Path,
 			NativeKey: key, Kind: model.NodeVariable, Language: f.t.Language, Name: name, QualifiedName: name,
 			FileID: f.fv.ID, ContentHash: f.fv.ContentHash, Range: located(p.Range)}, p.Range, meta)

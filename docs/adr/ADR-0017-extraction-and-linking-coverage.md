@@ -174,7 +174,10 @@ call-site matching a query-time library keeps [S12].
   request read and its literal key, which the enclosing function `reads`, and a read assigned to a variable flows to
   it, so an alias reaches its uses through def-use. This is the shape of a remote-flow source with its source type
   [S19] and of a tag on a graph node [S11]: a node a query starts from, not a relation of its own. Each table is
-  gated on the framework's import; a read it does not model publishes nothing.
+  gated on the framework's import; a read it does not model publishes nothing. A read whose source another file
+  decides (a FastAPI parameter typed by a class of another module, a Spring parameter left to the catch-all, which
+  the project's own argument resolvers precede) is left to the linker in the link table, which publishes the same
+  node shape once the unit's index decides it, and nothing when it cannot.
 
 **Alternatives.** Publishing the guessed full path: prefixes live in other files and are often computed, and the
 best-known route models say so themselves ("relative paths of subrouters are not modeled") [S14]. Routes from the
