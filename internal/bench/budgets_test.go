@@ -17,6 +17,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/config"
+	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/testenv"
@@ -195,48 +196,85 @@ func buildFixture(tb testing.TB) *budgetFixture {
 	}
 	f.resources = *status.Resources
 
-	symbols, err := f.svc.Symbol(ctx, model.SymbolRequest{
-		Query: corpusPrefix, Operation: model.SymbolWorkspaceSymbols, SemanticSource: model.SemanticCanonical})
-	if err != nil {
-		tb.Fatalf("workspace symbols: %v", err)
-	}
 	// The traversal rows start from benchStartNodes seeds, led by the
 	// high-fanout symbol Section 23.1 asks for. A walk from one leaf visits two nodes and would measure nothing,
 	// and the visited-node row has to state an upper bound the default budget
 	// is re-pinned against, not a best case. The exact-query row wants the
 	// opposite: one ordinary symbol, resolved by name.
-	for _, n := range symbols.Items {
+	//
+	// Node ids hash the repository's identity, and the corpus lives under a
+	// fresh temporary root every run, so the order the symbol pages arrive in
+	// (by id) is a different shuffle of the corpus each time. The seeds are
+	// therefore chosen from every page, ordered by what the generator wrote --
+	// qualified name, name, language, start byte -- so every run walks from
+	// the same declarations and the visited counts are comparable from run to
+	// run.
+	var symbols []model.Node
+	for cursor := ""; ; {
+		page, err := f.svc.Symbol(ctx, model.SymbolRequest{Query: corpusPrefix,
+			Operation: model.SymbolWorkspaceSymbols, SemanticSource: model.SemanticCanonical,
+			Page: model.PageRequest{Cursor: cursor}})
+		if err != nil {
+			tb.Fatalf("workspace symbols: %v", err)
+		}
+		symbols = append(symbols, page.Items...)
+		if cursor = page.Meta.NextCursor; cursor == "" {
+			break
+		}
+	}
+	sort.Slice(symbols, func(i, j int) bool { return declarationOrder(symbols[i], symbols[j]) })
+	for _, n := range symbols {
 		if n.Kind == model.NodeFunction && strings.HasPrefix(n.Name, corpusPrefix+"GoRun") {
 			f.seedName = n.Name
 			break
 		}
 	}
-	// The fan-out symbol is asked for by name: the prefix query above answers
-	// one bounded page, and at this scale the page fills long before it.
-	fanout, err := f.svc.Symbol(ctx, model.SymbolRequest{Query: corpusPrefix + "GoFanOut",
-		Operation: model.SymbolWorkspaceSymbols, SemanticSource: model.SemanticCanonical})
-	if err != nil {
-		tb.Fatalf("fan-out symbol: %v", err)
-	}
-	for _, n := range fanout.Items {
+	for _, n := range symbols {
 		if n.Kind == model.NodeFunction && n.Name == corpusPrefix+"GoFanOut" {
 			f.seeds = append(f.seeds, n.ID)
 			break
 		}
 	}
-	for _, n := range symbols.Items {
-		if len(f.seeds) >= benchStartNodes {
-			break
+	// The rest are spread evenly over the ordered declarations rather than
+	// taken from its head: the head is the alphabetically first packages,
+	// whose neighbourhoods overlap and saturate the walk early, a best case.
+	var callables []model.NodeID
+	for _, n := range symbols {
+		if (n.Kind == model.NodeFunction || n.Kind == model.NodeMethod) && n.Name != corpusPrefix+"GoFanOut" {
+			callables = append(callables, n.ID)
 		}
-		if n.Kind == model.NodeFunction || n.Kind == model.NodeMethod {
-			f.seeds = append(f.seeds, n.ID)
-		}
+	}
+	want := min(benchStartNodes-len(f.seeds), len(callables))
+	for i := range want {
+		f.seeds = append(f.seeds, callables[i*len(callables)/want])
 	}
 	if len(f.seeds) == 0 || f.seedName == "" {
 		tb.Fatalf("the corpus produced no %sGoFanOut/%sGoRun* functions to measure against",
 			corpusPrefix, corpusPrefix)
 	}
 	return f
+}
+
+// declarationOrder orders nodes by what the corpus generator wrote, never by
+// their ids, which hash the run's temporary repository root.
+func declarationOrder(a, b model.Node) bool {
+	if a.QualifiedName != b.QualifiedName {
+		return a.QualifiedName < b.QualifiedName
+	}
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	if a.Language != b.Language {
+		return a.Language < b.Language
+	}
+	return startByte(a) < startByte(b)
+}
+
+func startByte(n model.Node) uint64 {
+	if n.Range == nil {
+		return 0
+	}
+	return n.Range.Start.Byte
 }
 
 // openWorkspace writes an isolated configuration, opens the workspace over it
@@ -887,49 +925,46 @@ var budgetRows = []budgetRow{
 }
 
 // measureScopeWalk is the Section 23.2 visited-node row and the measurement the
-// default context graph budgets are re-pinned from (obligation 8).
+// default context graph bounds are set from.
 //
-// The plan's own scope walk is exactly this call: internal/context runs
-// eng.Impact with both directions and the three configured context bounds
-// (scope.go:154-163). model.PlanResult publishes no visited count, so the
-// traversal is driven directly with those bounds rather than inferred from the
-// manifest, from the widest seed set a request may legally carry.
+// The plan's scope walk is a weighted walk over internal/context's boundary
+// relations in both directions under the three configured context bounds, all
+// unlimited by default (scope.go:35, :833-839). model.PlanResult publishes no
+// visited count and the services expose no weighted walk, so the row drives
+// impact over the same relations, directions and bounds: the same edges, so
+// the same nodes are reachable at each depth.
 //
-// It sweeps the depth as well as reporting the configured depth, because the
-// evidence was a walk that TRUNCATED at the default depth on a small
-// workspace and completed only when the depth was narrowed: the number that
-// decides the pin is how the visited and edge counts grow per hop, and one
-// depth cannot show that.
+// The row measures the walk at the configured bounds, which is the walk a plan
+// runs, and a depth ladder beside it: how the visited and edge counts grow per
+// hop is what says whether a default bound is needed, and one depth cannot show
+// that. Every walk is held to the ceiling. A truncation reason is printed with
+// each line, because a truncated answer page (200 records) and an exhausted
+// graph bound both set Meta.Truncated and only the reason tells them apart.
 func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 	bounds := config.Defaults().Context
-	// The default depth is unlimited now, so the row probes a fixed ladder
-	// instead of the default value: what it measures is how visited and edge
-	// counts GROW per hop, and the ceiling assertion below is what pins the
-	// plan size. scopeWalkProbeDepth is the depth that assertion is made at.
-	const scopeWalkProbeDepth = 3
-	var out []string
-	var atConfigured string
-	for depth := 1; depth <= scopeWalkProbeDepth+1; depth++ {
+	const ladderDepth = 4
+	walk := func(label string, depth int) string {
 		res, err := f.svc.Impact(context.Background(), model.ImpactRequest{Start: f.seeds,
-			Direction: model.DirectionBoth, MaxDepth: depth,
+			Relations: contextpkg.ScopeRelations(), Direction: model.DirectionBoth, MaxDepth: depth,
 			MaxVisited: bounds.MaxVisitedNodes.Int(), MaxEdges: bounds.MaxGraphEdges.Int()})
 		if err != nil {
-			t.Fatalf("scope traversal at depth %d: %v", depth, err)
+			t.Fatalf("scope traversal at %s: %v", label, err)
 		}
-		line := fmt.Sprintf("depth %d: visited=%d edges=%d entries=%d truncated=%v edges/visited=%.2f",
-			depth, res.VisitedCount, res.EdgeCount, len(res.Entries), res.Meta.Truncated,
+		if res.VisitedCount > budgetContextPlanVisitedNodes {
+			t.Errorf("BUDGET MISSED: the scope walk at %s visited %d nodes against a %d-node ceiling",
+				label, res.VisitedCount, budgetContextPlanVisitedNodes)
+		}
+		return fmt.Sprintf("%s: visited=%d edges=%d entries=%d truncated=%v reason=%q edges/visited=%.2f",
+			label, res.VisitedCount, res.EdgeCount, len(res.Entries), res.Meta.Truncated, res.Meta.TruncationReason,
 			float64(res.EdgeCount)/float64(max(res.VisitedCount, 1)))
-		out = append(out, line)
-		if depth == scopeWalkProbeDepth {
-			atConfigured = line
-			if res.VisitedCount > budgetContextPlanVisitedNodes {
-				t.Errorf("BUDGET MISSED: the scope walk visited %d nodes against a %d-node ceiling",
-					res.VisitedCount, budgetContextPlanVisitedNodes)
-			}
-		}
 	}
-	return fmt.Sprintf("%d seeds, ceiling %d nodes; at probe depth %s\n\t%s",
-		len(f.seeds), budgetContextPlanVisitedNodes, atConfigured, strings.Join(out, "\n\t"))
+	configured := walk(fmt.Sprintf("configured depth %s", bounds.MaxGraphDepth), bounds.MaxGraphDepth.Int())
+	out := make([]string, 0, ladderDepth)
+	for depth := 1; depth <= ladderDepth; depth++ {
+		out = append(out, walk(fmt.Sprintf("depth %d", depth), depth))
+	}
+	return fmt.Sprintf("%d seeds, ceiling %d nodes; %s\n\t%s",
+		len(f.seeds), budgetContextPlanVisitedNodes, configured, strings.Join(out, "\n\t"))
 }
 
 // measureNoChangeRefresh is the Section 23.2 reuse row.

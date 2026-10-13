@@ -15,10 +15,12 @@ import (
 //     when no class of the unit along it declares the member.
 //   - Python: `typing.override` proves the member of exactly one ancestor,
 //     the first along the method resolution order that defines it (PEP 698).
-//     When no class of the unit along the order defines it, that ancestor is
-//     one of the bases outside the unit of the classes along the order (the
-//     order places none of them, having no declaration of theirs), so each
-//     is published, a set of n when there are several: one of them holds.
+//     The order places the bases outside the unit (pythonFullMRO); those
+//     ahead of the first class of the unit that defines the member are its
+//     candidates, published with that class's own override as one set (a
+//     set of n, externalOverrideSet): one of them holds. With bases that
+//     admit no order, every base outside the unit of the classes along the
+//     unit's own order is published when no class of the unit defines it.
 //   - Java and C++: `@Override` or `override` proves at least one overridden
 //     method (JLS §9.6.4.4, [class.virtual]¶5), and a method overrides every
 //     supertype's of its signature at once (JLS §8.4.8.1, [class.virtual]¶2).
@@ -56,6 +58,30 @@ func (h *hierarchy) externalOverrides(fc fileCtx, owner, ref Ref, d *Decl, found
 		}
 		return publish(classes, DetailSupertype)
 	case "python":
+		full, err := h.pythonFullMRO(owner)
+		if err != nil {
+			return err
+		}
+		if full != nil {
+			// The bases outside the unit the order places ahead of the
+			// first class of the unit that defines the method: one of them,
+			// or that class, holds the member overridden.
+			var bases []entry
+			for _, b := range full[1:] {
+				if b.external == "" {
+					defines := false
+					if err := h.methods(b.ref, d.Name, func(entry) error { defines = true; return nil }); err != nil {
+						return err
+					}
+					if defines {
+						break
+					}
+					continue
+				}
+				bases = append(bases, entry{Aux: b.external})
+			}
+			return publish(bases, DetailSupertype)
+		}
 		if found {
 			return nil
 		}
@@ -136,22 +162,27 @@ func (h *hierarchy) externalCandidates(typ Ref, method string, keep func(entry) 
 	return out, nil
 }
 
-// externalOverrideSet is the set size of an external override published
-// with detail, among the overrides of one declaration: the number of its
-// external overrides of that detail when it is a set of candidates (two or
-// more of DetailSupertype, every DetailSupertypeCandidate), 0 otherwise.
+// externalOverrideSet is the set size of an override published with
+// detail, among the overrides of one declaration, when the overrides of
+// that detail form a set of candidates: every DetailSupertypeCandidate
+// override, and the DetailSupertype overrides when two or more of them are
+// external or one is external beside one of the unit (a Python override
+// whose order places bases outside the unit ahead of its target); 0
+// otherwise.
 func externalOverrideSet(group []idBinding, b idBinding) int64 {
-	if b.Kind != FactOverrides || b.External == "" ||
-		b.Detail != DetailSupertype && b.Detail != DetailSupertypeCandidate {
+	if b.Kind != FactOverrides || b.Detail != DetailSupertype && b.Detail != DetailSupertypeCandidate {
 		return 0
 	}
-	var n int64
+	var n, external int64
 	for _, o := range group {
-		if o.Kind == FactOverrides && o.External != "" && o.Detail == b.Detail {
+		if o.Kind == FactOverrides && o.Detail == b.Detail && (o.External != "" || b.Detail == DetailSupertype) {
 			n++
+			if o.External != "" {
+				external++
+			}
 		}
 	}
-	if n < 2 {
+	if external == 0 || n < 2 {
 		return 0
 	}
 	return n

@@ -95,6 +95,13 @@ type Compiler struct {
 	// compares a stopped plan against, never a configuration key: a compile
 	// built by New never sets it.
 	fullRead bool
+	// runRecords, when positive, bounds every sort of a compile at that many
+	// buffered records, so a run spills before the byte budget the query
+	// memory admission derives (whose floor no fixture-sized compile reaches).
+	// It lets a test drive a whole compile through spilled runs; like
+	// fullRead it is never a configuration key, and a compile built by New
+	// never sets it.
+	runRecords int
 }
 
 // New validates the options and builds a Compiler. Every dependency is
@@ -262,6 +269,7 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	if err != nil {
 		return CompileResult{}, err
 	}
+	sorts.runRecords = c.runRecords
 	defer func() {
 		// Close records each sort's final observation, so the observer runs
 		// after it and sees the peak every sort actually reached.

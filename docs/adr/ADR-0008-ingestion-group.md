@@ -4,7 +4,7 @@
 identities), ADR-0004 (WAL synchronous mode) · **Inputs:** the measurements below, taken on this
 repository's reference stores on 2026-09-15.
 
-Amended 2026-10-08: the hosted dependence engine this record governs was deleted under ADR-0012 phase 6.
+Dependence facts are produced in process by the native engine ([ADR-0012](ADR-0012-native-dependence-engine.md)); the dependence export and import named below describe the context this record was decided in.
 
 ## Context
 
@@ -72,9 +72,8 @@ bounded by the writer's page cache; nothing commits per batch.
    commit it rewrites the checksum of every frame from the first such rewrite on. The kernel's
    page cache hides those rewrites on a short run, and the disk pays for them on a long one or
    under paced writeback: under an 8 MiB cache the store's ingestion test wrote 65 MiB of log
-   frames and dirtied 555 MiB of them. The store detects a group's first frame from the log's
-   size and header (the writer's journal size limit is zero, so the engine truncates the log at
-   each reset, and a reset rewrites the header's salt and sequence), and commits. (Amended; see below.)
+   frames and dirtied 555 MiB of them. The store detects a group's first spilled frame from the
+   file-system shim's count of log writes (decision 3a) and commits.
 4. **Statement journal in memory.** Each savepoint records the prior image of every page its batch
    touches; content-addressed rows touch a fresh page each. The engine's default moves that
    journal to a temporary file past 64 KiB, rewritten from offset zero at every batch: fifteen
@@ -90,7 +89,8 @@ bounded by the writer's page cache; nothing commits per batch.
    with a bounded queue, never a burst. It changes nothing about what is durable when: the
    engine's own syncs still decide that, and find the file already written. The window is a
    layout constant, not a limit: it bounds what is outstanding, never what is written or how
-   fast the disk may run. (Amended; see below.)
+   fast the disk may run. Decisions 5a to 5f below are what the run does about the writes and
+   frees it still makes.
 6. **Exclusive writers.** State that must be visible to every connection the moment the call
    returns (sessions, leases, heartbeats, retention, the planner's statistics, generation pins)
    keeps its own transaction. It announces itself, the next ingestion call commits the group, and
@@ -108,10 +108,10 @@ bounded by the writer's page cache; nothing commits per batch.
    64 MiB through the engine in one transaction and asserts that at most two windows of it are
    still dirty when the file is truncated, and that a wait was issued.
 
-### Decision 5, amended 2026-09-16: the writer waits on the disk
+### Decision 5a: the writer waits on the disk
 
-The decision as first taken asked the kernel every hundred milliseconds to begin writing the
-log's and the database's dirty pages and never waited. Two uncapped indexes of a 6 270-file
+An interval pacer -- one that asks the kernel every hundred milliseconds to begin writing the
+log's and the database's dirty pages and never waits -- was measured and refused. Two uncapped indexes of a 6 270-file
 repository on a virtual machine that bounces every disk request through a 64 MB pool
 (`swiotlb=force`) showed what that leaves: the group's commit appended 897 MB of log and the
 checkpoint copied 892 MB into the database inside four seconds, the kernel logged the pool
@@ -122,9 +122,8 @@ as measured; the rate and the depth were not bounded by anything.
 
 An interval pacer cannot bound them: the commit writes at memory speed, so by the time the
 next tick fires the whole group is dirty, and the sync that ends the checkpoint submits all of
-it as deep as the device queue allows. Alternative 4 below was rejected on the ground that a
-bound "would need the writer to wait on the disk, which is a rate limit and a knob". The first
-half is right and is now the decision; the second is wrong: a writer that waits for the
+it as deep as the device queue allows. A bound does need the writer to wait on the disk, but
+that is neither a rate limit nor a knob (alternative 4): a writer that waits for the
 previous window before submitting the next runs at exactly the disk's rate with a fixed window
 outstanding -- the way TCP's sender is clocked by acknowledgements and the way a database's
 strict bytes-per-sync and checkpoint-flush settings are implemented -- and has no rate and no
@@ -136,14 +135,14 @@ a spilled statement journal, a sort's runs -- and only the file system sees ever
 them. On a platform without range writeback the wait is the wrapped file's own sync, which
 with at most two windows dirty is a bounded wait.
 
-### Decision 5, amended again 2026-09-16: the run reuses space and frees almost nothing
+### Decision 5b: the run reuses space and frees almost nothing
 
 With the shim in place an uncapped index of the 6 270-file repository kept dirty pages under 8 MB through a
 3.4 GB build, and an independent 4 KiB write and data-sync beside it never waited more than 245 ms (at the
 892 MB checkpoint) -- and the host still stalled for 64 s, once, 27 s after the run had freed 6 GB (the
 export's removal among them: the log itself shrank 895 MB there, and most of those extents were
-earlier frees reaching the device at that commit). The same 64 s stall followed every multi-gigabyte free in the earlier
-runs. It was then reproduced without the product: a script wrote 5 GB one window at a time in 6 s (850 MB/s,
+earlier frees reaching the device at that commit). The same 64 s stall followed every multi-gigabyte free in the other
+measured runs. It was then reproduced without the product: a script wrote 5 GB one window at a time in 6 s (850 MB/s,
 so a completed write is host-cached, not on a disk), idled two minutes with no stall, freed the file one
 window at a time in 3.6 s, and 72 s later the independent write waited 64 s. The root filesystem discards
 freed blocks as they are freed, and the host keeps the machine's disk as a sparse image, so a free becomes
@@ -164,9 +163,9 @@ frees are the sweep of a dead run at start and the export's removal after its im
 an export that never touches the disk. Windowed freeing stays for the frees that remain. What a run freed is
 disclosed by the diagnostics. There is no rate and no setting: reuse has no knob.
 
-### Decision 5, amended a third time 2026-09-16: a pooled scratch arena
+### Decision 5c: a pooled scratch arena
 
-The second amendment's principle, applied to the two surfaces it named, left a run of the 6 270-file
+Decision 5b's principle, applied to the log and the staging database alone, left a run of the 6 270-file
 repository freeing at three further moments, each a scratch surface written by the product and
 removed after use, and the host stalled 64 s after the largest. The store therefore owns a scratch
 arena under its data directory: every working file it writes for its own later reading -- a sort
@@ -189,12 +188,12 @@ the foreign outputs themselves (an indexer's index, the dependence export); and 
 surfaces the code frees: a published blob when its
 snapshot is collected, the trim of a blob's staging surface at publication, a sort run the walk
 adopted and removes itself, a retained search directory, the capture staging, and every journal the
-engine deletes through the shim. The fourth amendment below places all of these behind one paced
+engine deletes through the shim. Decision 5d places all of these behind one paced
 reclaimer. An operator command empties the arena on request; nothing else does.
 
-### Decision 5, amended a fourth time 2026-09-16: what still frees is freed at the pace the host tolerates
+### Decision 5d: what still frees is freed at the pace the host tolerates
 
-The third amendment left four frees in a run, and the next uncapped index of the 6 270-file
+With the arena alone, four frees remained in a run, and an uncapped index of the 6 270-file
 repository stalled the host 64 s again, 36 s after the removal of the largest analysis unit's export
 directory: twenty files, 1.7 GB, shrunk a window at a time and unlinked within one second, counted
 by the device as 11.4 GB of discards. The mechanism was then measured without the product. Two
@@ -207,8 +206,7 @@ and hangs on a burst; neither the byte count nor the file count is the trigger, 
 
 Every removal the product still performs is therefore paced and taken off the run's path. A removal
 renames its file or directory into the arena's to-free set, which frees nothing, and returns; a
-reclaimer frees that set at the measured pace (one pace for the whole host: the fifth amendment
-below), charging every byte to the same budget
+reclaimer frees that set at the measured pace (one pace for the whole host: decision 5e), charging every byte to the same budget
 whatever the method, so a burst of small whole-file unlinks spends their sizes too and a materialized
 tree of thousands of files drains at the rate of one large file. A crash or an exit with frees pending
 leaves the set on disk, and the startup collection pass resumes it at the same pace; nothing is freed
@@ -218,28 +216,25 @@ the code with its measurement beside it, not a setting: a user tunes nothing, an
 tolerate more loses at most the minutes a large export takes to drain behind a run that has already
 moved on.
 
-### Decision 5, amended a fifth time 2026-09-16: one pace per host, and a reclaimer that never stalls or bursts
+### Decision 5e: one pace per host, and a reclaimer that never stalls or bursts
 
-The first index with the reclaimer finished with nothing worse than 84 ms on an independent write, the
-export directory draining behind the run at the measured pace. What the run had not exercised was
-still wrong. The pace was per charger: every caller that gave bytes back waited on
-its own, so several at once handed the host several windows per interval, and two processes over one
-store handed it twice the rate. The rate the host tolerates is the host's, not a process's: the pace is
-therefore taken through one lock every process takes for each window it frees, so the sum of what this
-product frees on a host never exceeds the measured rate however many runs, servers and chargers share
-it. A file the process may unlink but not truncate -- every published
-blob is one -- was unlinked whole and charged afterwards, which is the burst itself; it is charged its
-full size first and unlinked after. One queued entry the reclaimer could not free was retried without
-pause and stopped everything behind it; a failure is recorded, the next entry is taken, and the failed
-one waits for the next wake, disclosed beside the pending bytes. The three truncations that still
-freed in place outside the reclaimer are governed, and an enumeration test keeps the list of in-place
-frees from drifting again.
+An index with the reclaimer finishes with nothing worse than 84 ms on an independent write, the
+export directory draining behind the run at the measured pace. The rate the host tolerates is the
+host's, not a process's: a pace per charger would let several chargers hand the host several windows
+per interval, and two processes over one store twice the rate. The pace is therefore taken through one
+lock every process takes for each window it frees, so the sum of what this product frees on a host
+never exceeds the measured rate however many runs, servers and chargers share it. A file the process
+may unlink but not truncate -- every published blob is one -- is charged its full size first and
+unlinked after; unlinking it whole and charging afterwards would be the burst itself. A queued entry
+the reclaimer cannot free is recorded, the next entry is taken, and the failed one waits for the next
+wake, disclosed beside the pending bytes; retrying it without pause would stop everything behind it.
+Truncations that free in place are governed too, and an enumeration test keeps the list of in-place
+frees exact.
 
-### Decision 5, amended a sixth time 2026-09-17: the turn is taken above every cache, not inside one
+### Decision 5f: the turn is taken above every cache, not inside one
 
-The fifth amendment took the turn through a lock at the CACHE ROOT, and claimed from it that the sum of
-what this product frees on a host never exceeds the measured rate. It does not follow, and an ordinary
-pair of commands breaks it: `codectx index --rebuild` writes into a sibling cache beside the one a
+A lock at the CACHE ROOT would not bound the sum of what this product frees on a host, and an ordinary
+pair of commands shows it: `codectx index --rebuild` writes into a sibling cache beside the one a
 running server is serving, so the two processes take their turns through two different files and hand
 the host two windows per interval -- twice the rate the measurement established, which is the rate at
 which this host stalls. The trigger is the rate, not the amount, so a claim about the sum is the whole
@@ -249,11 +244,11 @@ The turn is therefore taken through ONE file per user on the host, in the user's
 and above every cache root any process of that user opens; a cache root's own file remains only as the
 fallback for a process with no user cache directory at all. That fallback is a last resort and not an
 equivalent: one process on it frees at the measured rate, and two of them at twice it, which is the
-very thing this amendment closes. The rate is a property of the device that performs the discard; a directory
+rate this decision exists to prevent. The rate is a property of the device that performs the discard; a directory
 is not a device, and nothing about which cache a run writes into changes what the disk underneath will
 tolerate.
 
-### Decision 3, amended 2026-09-16: the spilled statement journal reaches the file system in pieces
+### Decision 4a: the spilled statement journal reaches the file system in pieces
 
 The statement journal's threshold is also the size of the chunks the engine's memory journal
 allocates and, when the journal spills, writes to its file one call each; and the engine's own
@@ -262,33 +257,32 @@ a write of nothing and comes back as "database or disk is full" (measured: the f
 index of the 6 270-file repository died of exactly that at its activation, the first statement to
 journal more than the threshold inside a savepoint, with 881 GB free). The shim therefore hands
 the wrapped write every call in 64 KiB pieces, whatever length the engine asks for. The threshold
-stays where decision 3 put it; the write path is what had the limit.
+is decision 4's; the write path carries the limit.
 
-### Decision 3, amended again 2026-09-16: the log is rewound, and the shim says when a group spills
+### Decision 3a: the log is rewound, and the shim says when a group spills
 
-The zero journal size limit made the engine truncate the log at every reset: on a filesystem that
+A zero journal size limit makes the engine truncate the log at every reset: on a filesystem that
 discards freed blocks that is up to the log bound of discards per checkpoint, three times in one
-uncapped index, and (decision 5, second amendment) a free of that size is what stalls the host. The
-limit is gone; the engine rewinds the log in place, the file keeps its high-water length, bounded by
-the log bound, and every later group reuses it. The store can then no longer learn from the log's
-size or header whether a group has begun to spill -- frames appended inside the existing length
+uncapped index, and (decision 5b) a free of that size is what stalls the host. The store sets no
+journal size limit; the engine rewinds the log in place, the file keeps its high-water length,
+bounded by the log bound, and every later group reuses it. The store therefore cannot learn from the
+log's size or header whether a group has begun to spill -- frames appended inside the existing length
 change neither -- and the engine's own frame count arrives only at commit, after the decision it
 serves. The signal is therefore the shim's: it sees every write the engine makes to a file the engine
 opened as a log, and the store marks that count when a group begins. The count is the process's, not
 one database's, which can only make a group commit earlier than it had to, never later than it must.
-Measured on the ingestion test after the change: 1.3× engine, 1.2× disk against the 4× bound, peak
-log 2.3 MiB under a 2 MiB cache; the 600 × 40 rows above were re-measured on today's fixture at
-85.4 MiB stored with the same ratios, so the 73.1 MiB in them is fixture drift, not this change.
+Measured on the ingestion test: 1.3× engine, 1.2× disk against the 4× bound, peak log 2.3 MiB under
+a 2 MiB cache. The 600 × 40 rows below store 73.1 MiB on the fixture they were taken on; the current
+fixture stores 85.4 MiB with the same ratios.
 
 ## What the numbers must show
 
-The ingestion test after the change, the group flushed and the log folded into the database before
-measuring. "Engine" is what the engine passed to write calls; "disk" is what the process caused to
+The ingestion test, the group flushed and the log folded into the database before measuring. "Engine" is what the engine passed to write calls; "disk" is what the process caused to
 be sent to the block layer:
 
 | units × facts | stored | engine | disk | wall |
 |---|---|---|---|---|
-| 600 × 40, per-batch commits (before) | 41.3 MiB | — | 1 854 MiB, 44.9× | 48 s |
+| 600 × 40, per-batch commits (alternative 1) | 41.3 MiB | — | 1 854 MiB, 44.9× | 48 s |
 | 600 × 40, 1 GiB log bound, 8 MiB cache, file statement journal | 73.1 MiB | 2 798 MiB, 23× | 74 MiB, 1.0× | 5.5 s |
 | the same, paced | 73.1 MiB | 2 798 MiB | 161 MiB, 2.2× | 3.8 s |
 | 600 × 40, cache-bound group, statement journal in memory, paced | 73.1 MiB | 73.1 MiB, 1.0× | 73.3 MiB, 1.0× | 3.5 s |
@@ -297,13 +291,13 @@ be sent to the block layer:
 The probe that separated the two costs: 60 000 random 16-byte keys into a table and one index
 under a 1 GiB cache wrote 10.3 MB for a 5.1 MB database (the log and the checkpoint, exactly), and
 546 MB with a savepoint every forty rows. Stored counts the database and its log; the log is
-truncated at the next reset, so the durable cost is the database plus the checkpoint copy. A
+rewound at the next reset, so the durable cost is the database plus the checkpoint copy. A
 reference repository's index must write no more than four times its database and must not stall
 its host's disk path.
 
 ## Alternatives considered
 
-1. *Commit per batch* (the state this record replaces). Rejected by the measurements above: the
+1. *Commit per batch.* Rejected by the measurements above: the
    cost is paid per commit, and a monorepo's run makes hundreds of thousands of them.
 2. *Commit on a clock: one group per second or per N units.* Rejected: a cadence is a tuning knob
    with no right value (a second is 20 units on one host and 2 000 on another), and an idle group
@@ -317,10 +311,9 @@ its host's disk path.
    kernel's expiry, or under paced writeback, each rewrite reaches the disk, and the cost grows
    with the run.
 4. *A pacer that bounds the kernel's dirty set to a constant.* Steel-man: it would make a group's
-   commit invisible to the host. First rejected as a promise, on the ground that the writer would
-   have to wait on the disk and that this is a rate limit and a knob; adopted by the amendment
-   of decision 5 after measurement, since a writer clocked by the disk has no rate and no
-   setting, and the interval pacer that was kept instead left the burst it was meant to remove.
+   commit invisible to the host. Adopted as decision 5a: the writer does wait on the disk, but a
+   writer clocked by the disk has no rate and no setting, and an interval pacer in its place
+   leaves the burst it is meant to remove.
 5. *A staging database per run, attached and merged at activation.* Steel-man: the run's writes
    would be sequential appends into an empty file with no index maintenance, and the main
    database would stay untouched until the merge. Rejected: the merge inserts every row into the

@@ -63,16 +63,21 @@ the same name is invisible to the index.
   each external supertype that may declare it (along paths no type of the project declares it on) is an edge with
   detail `supertype_candidate` and the set size n, "at least one of n", published beside any override in the
   project; a TypeScript `override` proves the extended class's member; a Python `typing.override` proves the first
-  definer along the method resolution order, one of the external bases when no class of the project defines it, a
-  set of their number.
+  definer along the method resolution order, the order placing each base outside the project as the linearisation
+  of itself (its own bases are unknown); the bases outside the project ahead of the first class of the project that
+  defines the method are candidates with that class, one set of their number.
 - **A Go interface outside the project.** Go satisfaction is structural and the source never names the interface,
   so the linker reads the interface from its package's source as the go command finds it (the toolchain's standard
   library, the workspace and local replacements in the snapshot, the module cache at the required version) and
   compares method sets by type identity: each type named by its package's import path, aliases followed, an
   unexported name qualified by its package. It does not type-check: `go/types` without every import's source
   reports a type built from a missing import identical to any other, which would publish edges the compiler
-  rejects, and holding every imported package's types resident costs memory the size of the dependency closure. A
-  form it cannot decide matches nothing. A conversion `var _ I = (*T)(nil)` proves `T` implements `I` without `I`'s
+  rejects, and holding every imported package's types resident costs memory the size of the dependency closure.
+  Struct and interface literals compare by their members, array lengths by their folded constant values; a
+  qualifier whose import's clause is not read is that import when it is the file's only such one, else the type is
+  spelled with its candidate imports and matches only that spelling; a form it cannot decide matches nothing, and
+  the capability rows count both. An interface declared differently per build constraint is one entity per
+  declaration. A conversion `var _ I = (*T)(nil)` proves `T` implements `I` without `I`'s
   source. Each unit's capability rows count the packages read and those with no readable source.
 - **Callers of `m`.** Calls into `m`; then, for every method `b` that `m` overrides at any depth, the calls into `b`
   whose `dispatch` is `virtual`, each row marked "through `b`" with `b`'s override count. The answer counts `direct`

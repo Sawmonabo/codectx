@@ -2,6 +2,7 @@ package link
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -101,7 +102,14 @@ func (h *hierarchy) goExternalImplements(fc fileCtx, ref Ref, emit func(Binding)
 // declared on owner, toward the methods of interfaces outside the unit
 // owner implements by its method set (keyGoExternalOverride).
 func (h *hierarchy) goExternalOverrides(fc fileCtx, owner, ref Ref, d *Decl, emit func(Binding) error) error {
+	// An interface declared per platform may be satisfied by several of
+	// its declarations: one override each.
+	var seen []string
 	return h.links.lookup(keyGoExternalOverride+refKey(owner)+d.Name, func(e entry) error {
+		if slices.Contains(seen, e.Aux) {
+			return nil
+		}
+		seen = append(seen, e.Aux)
 		return emit(Binding{Kind: FactOverrides, Site: ref, Detail: DetailMethodSet,
 			External: externalMethod(fc.family, e.Aux, d.Name)})
 	})
@@ -109,16 +117,23 @@ func (h *hierarchy) goExternalOverrides(fc fileCtx, owner, ref Ref, d *Decl, emi
 
 // goExternalCoverage adds to the implements and overrides rows of a Go unit
 // how many packages outside the unit the build read and how many had no
-// readable source. The rows keep the state the unit's facts give them: the
-// relations toward a package with no readable source are what conversions
-// prove, and the second count says how many packages that holds for.
+// readable source, and how many of the unit's methods have a signature
+// naming a type by its unresolved spelling (matched only by the same
+// spelling) or one that could not be spelled (matched by no method). The
+// rows keep the state the unit's facts give them: the relations toward a
+// package with no readable source are what conversions prove, and the
+// counts say how many packages and methods that holds for.
 func goExternalCoverage(rows []model.CapabilityState, h *hierarchy) ([]model.CapabilityState, error) {
 	if h == nil || h.links == nil {
 		return rows, nil
 	}
-	var read, unavailable uint32
+	var read, unavailable, unresolved, unknown uint32
 	found := false
 	err := h.links.lookup(keyGoCoverage, func(e entry) error {
+		if e.Tag == 1 {
+			unresolved, unknown = e.MinArgs, e.MaxArgs
+			return nil
+		}
 		read, unavailable, found = e.MinArgs, e.MaxArgs, true
 		return nil
 	})
@@ -129,7 +144,9 @@ func goExternalCoverage(rows []model.CapabilityState, h *hierarchy) ([]model.Cap
 		switch model.RelationKind(rows[i].Capability) {
 		case model.RelImplements, model.RelOverrides:
 			rows[i] = rows[i].WithDetail("go_external_packages", itoaInt(int(read))).
-				WithDetail("go_external_packages_unavailable", itoaInt(int(unavailable)))
+				WithDetail("go_external_packages_unavailable", itoaInt(int(unavailable))).
+				WithDetail("go_method_signatures_unresolved", itoaInt(int(unresolved))).
+				WithDetail("go_method_signatures_unknown", itoaInt(int(unknown)))
 		}
 	}
 	return rows, nil

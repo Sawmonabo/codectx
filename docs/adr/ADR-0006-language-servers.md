@@ -55,12 +55,10 @@ to tune. codectx is greenfield, so a lock entry is replaced, not migrated.
 
 ## Decision 1 — Python: the server becomes the native checker; the indexer stays
 
-The Python language-server entry of the lock is replaced by `ty`, pinned to an exact upstream
-release with the digests upstream publishes for all six platforms, run directly (no managed
-runtime), started with its server subcommand, with the replaced server's configuration marker
-(`pyrightconfig.json`) swapped for `ty.toml` in the python root-marker set and the same environment
-allowlist as before (amended 2026-09-15: the original text said the root markers were unchanged;
-the replaced server's configuration file names nothing to the new one). `scip-python` stays exactly as pinned: it is the only SCIP emitter for Python,
+The Python language-server entry of the lock is `ty`, pinned to an exact upstream release with the
+digests upstream publishes for all six platforms, run directly (no managed runtime), started with
+its server subcommand, with `ty.toml` in the python root-marker set and the python environment
+allowlist. `scip-python` stays exactly as pinned: it is the only SCIP emitter for Python,
 and canonical Python facts are unchanged by this decision.
 
 **Alternatives considered.**
@@ -84,14 +82,13 @@ and canonical Python facts are unchanged by this decision.
 **Consequences and trade-offs accepted.** The chosen checker is pre-1.0 and warns that any two
 releases may differ incompatibly; the lock pins an exact version with upstream digests, so the
 product never sees an unreviewed change, and the cost is a faster pin-refresh cadence for this one
-entry, each refresh re-running the overlay verification table. Two answers appeared to differ by two results
-(138 versus 136) between the old and new server; the implementation's own measurement could not reproduce the
-settled 138 at all -- the old server returned 2 cold and 2 after 15, 40 and 60 s -- so there is no
-second location set to diff against, and the verification table records that instead (amended
-2026-09-15). After the swap Python gains the implementation request, the overlay's provider version comes
-from the server's own report, and the negotiated position encoding becomes UTF-8; all three feed
-the overlay input digest, so previously cached Python overlay answers are correctly a different
-question. The managed Node runtime stays for the TypeScript server and two indexers.
+entry, each refresh re-running the overlay verification table. The research measured 138 answers
+from the pinned server after its settle window against the chosen checker's 136; the implementation's
+own measurement of the pinned server returned 2 cold and 2 after 15, 40 and 60 s, so there is no
+second location set to diff against, and the verification table records that. Python has the
+implementation request, the overlay's provider version comes from the server's own report, and the
+negotiated position encoding is UTF-8; all three feed the overlay input digest, so an overlay answer
+cached under another server is a different question. The managed Node runtime stays for the TypeScript server and two indexers.
 
 ## Decision 2 — every other row is kept, with two follow-ups recorded
 

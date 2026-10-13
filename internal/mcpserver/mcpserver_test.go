@@ -780,7 +780,8 @@ var scenarios = []scenario{
 		// over MCP. Mutation caught: the handler drops the field or the node
 		// on the way to the facade, or a row's raw JSON value fails the
 		// output schema (it is json.RawMessage, like Node.Metadata), so the
-		// rows a "<field>_rows" marker names are unreachable.
+		// rows a "<field>_rows" marker names are unreachable; or a row's
+		// value is altered or its rows reordered on the way.
 		name: "node_metadata forwards the node and field and returns the rows verbatim",
 		facade: func(f *fakeServices) {
 			f.nodeMetadataFn = func(_ context.Context, r model.NodeMetadataRequest) (model.Page[model.MetadataRow], error) {
@@ -801,9 +802,15 @@ var scenarios = []scenario{
 			}
 			var got result[model.Page[model.MetadataRow]]
 			decode(t, res, &got)
-			if len(got.Data.Items) != 2 || got.Data.Items[1].Ordinal != 1 ||
-				string(got.Data.Items[1].Value) != `{"name":"login_required","bytes":{"start":10,"end":25}}` {
-				t.Errorf("items = %+v, want the facade's two rows verbatim, in order", got.Data.Items)
+			// The SDK validates a tool's structured output by decoding it
+			// into a generic value and encoding it again, so an object's
+			// members come back in key order; an object's member order
+			// carries no meaning (RFC 8259 section 4). Each row's value is
+			// therefore compared as the JSON value it is, member for member.
+			if len(got.Data.Items) != 2 || got.Data.Items[0].Ordinal != 0 || got.Data.Items[1].Ordinal != 1 ||
+				!sameJSON(t, got.Data.Items[0].Value, `{"name":"app.route","bytes":{"start":0,"end":9}}`) ||
+				!sameJSON(t, got.Data.Items[1].Value, `{"name":"login_required","bytes":{"start":10,"end":25}}`) {
+				t.Errorf("items = %+v, want the facade's two rows, values unchanged, in order", got.Data.Items)
 			}
 		},
 	},
@@ -1673,4 +1680,17 @@ func TestCapsuleCursorWalkReachesEveryRecord(t *testing.T) {
 	}) {
 		t.Fatalf("the walk read %d records, the capsule sealed %d: %+v", len(walked), len(sealed), walked)
 	}
+}
+
+// sameJSON reports whether got and want encode the same JSON value.
+func sameJSON(t *testing.T, got json.RawMessage, want string) bool {
+	t.Helper()
+	var g, w any
+	if err := json.Unmarshal(got, &g); err != nil {
+		t.Fatalf("decode %s: %v", got, err)
+	}
+	if err := json.Unmarshal([]byte(want), &w); err != nil {
+		t.Fatalf("decode %s: %v", want, err)
+	}
+	return reflect.DeepEqual(g, w)
 }
