@@ -6,7 +6,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
@@ -38,8 +37,9 @@ func (b *builder) routeTable() []endpointFact {
 			// alone (djangoSettings).
 			b.links = newRouteScanOf(b).linkRoutes()
 		case mayConfigureNest(b):
-			// A helper that sets a NestJS application's prefix need not
-			// import NestJS (nestAppScan).
+			// A helper that sets a NestJS application's prefix, or a file
+			// exporting a RouterModule route tree, need not import NestJS
+			// (nestAppScan).
 			b.links = newRouteScanOf(b).nestOnly()
 		}
 		return nil
@@ -105,10 +105,8 @@ type routeScan struct {
 	pending       []pendingMount
 	djangoEntries []djangoEntry
 	out           []routeFact
-	// nestOut are the file's NestJS routes and nestApp what it sets on
-	// the NestJS applications it creates, for the linker (nestLinks).
+	// nestOut are the file's NestJS routes, for the linker (nestLinks).
 	nestOut []nestRoute
-	nestApp *link.NestApp
 	// params are the Go routers the file's callables receive as
 	// parameters, by callable and parameter (goParamObj); fns is the
 	// file's analysed functions' callables, built on first use (goFns).

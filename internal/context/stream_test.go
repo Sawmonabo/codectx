@@ -57,11 +57,15 @@ func TestStreamRecordRoundTrip(t *testing.T) {
 
 func roundTrip[T any](t *testing.T, name string, want T) {
 	t.Helper()
-	b, err := encodeRecord(want)
+	encode, decode, err := recordCodecFuncs[T]()
+	if err != nil {
+		t.Fatalf("%s: record codec: %v", name, err)
+	}
+	b, err := encode(want)
 	if err != nil {
 		t.Fatalf("%s: encode: %v", name, err)
 	}
-	got, err := decodeRecord[T](b)
+	got, err := decode(b)
 	if err != nil {
 		t.Fatalf("%s: decode: %v", name, err)
 	}
@@ -70,7 +74,7 @@ func roundTrip[T any](t *testing.T, name string, want T) {
 	}
 	// Encoding is deterministic: a run file written twice is the same bytes,
 	// which is what makes two compiles of one generation identical.
-	again, err := encodeRecord(want)
+	again, err := encode(want)
 	if err != nil {
 		t.Fatalf("%s: re-encode: %v", name, err)
 	}

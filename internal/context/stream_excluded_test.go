@@ -20,8 +20,12 @@ import (
 // replays are compared element for element under the compiler's own codec and
 // comparator -- the ones the exclusion sort is built with in Compile.
 func TestExcludedRunReplaysIdenticallyWhenItSpills(t *testing.T) {
+	encodeExcl, decodeExcl, err := recordCodecFuncs[model.ExcludedContextEntry]()
+	if err != nil {
+		t.Fatalf("record codec: %v", err)
+	}
 	sorter, err := pagination.NewExternalSort(t.TempDir(), 2,
-		encodeRecord[model.ExcludedContextEntry], decodeRecord[model.ExcludedContextEntry], lessExcludedOrdinal)
+		encodeExcl, decodeExcl, lessExcludedOrdinal)
 	if err != nil {
 		t.Fatalf("NewExternalSort: %v", err)
 	}

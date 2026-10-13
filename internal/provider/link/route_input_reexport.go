@@ -57,22 +57,46 @@ func reexportedClass(h *hierarchy, mods *index, from, mod, name string, exact bo
 }
 
 // moduleBinding is the kind of the class the member at ordinal file, module
-// mod, binds to name by an import (reexportedClass).
+// mod, binds to name by an import (reexportedClass, pyReexport).
 func moduleBinding(h *hierarchy, mods *index, file int32, mod, name string, way []Ref) (uint8, error) {
+	r, ok, err := pyReexport(h, mods, file, mod, name)
+	if err != nil || !ok || r.whole {
+		return classUnknown, err
+	}
+	return classOf(h, mods, r.at, r.module+"\x00"+r.member, way)
+}
+
+// pyBinding is what a module binds a name to by an import of its own: the
+// module as the import writes it, read from the module's file at, and the
+// name in it; whole for a whole-module import (`import a.b as name`),
+// which binds the module itself.
+type pyBinding struct {
+	at, module, member string
+	whole              bool
+}
+
+// pyReexport is what the member at ordinal file, module mod, binds name to
+// by an import (Python Language Reference, The import statement: a
+// from-import binds each name to the attribute the module has), and false
+// when no import decides it: the module declares the name itself, binds it
+// by several module-level imports, or binds it by none and its `from m
+// import *` statements supply it from several modules or none. A star
+// import supplies the name when its module declares it.
+func pyReexport(h *hierarchy, mods *index, file int32, mod, name string) (pyBinding, bool, error) {
 	declared := false
 	err := mods.lookup(keyPyModule+mod+"\x00"+name, func(e entry) error {
 		declared = declared || e.Ref.File == file
 		return nil
 	})
 	if err != nil || declared {
-		return classUnknown, err
+		return pyBinding{}, false, err
 	}
 	at := ""
 	if err := h.decls.lookup(keyFile+refKey(Ref{File: file}), func(e entry) error {
 		_, at, _ = strings.Cut(e.Aux, "\x00")
 		return nil
 	}); err != nil || at == "" {
-		return classUnknown, err
+		return pyBinding{}, false, err
 	}
 	var named []entry
 	err = h.decls.lookup(keyImport+refKey(Ref{File: file})+name, func(e entry) error {
@@ -82,27 +106,23 @@ func moduleBinding(h *hierarchy, mods *index, file int32, mod, name string, way 
 		return nil
 	})
 	if err != nil {
-		return classUnknown, err
+		return pyBinding{}, false, err
 	}
 	switch {
-	case len(named) == 1 && named[0].Sig != "*":
-		return classOf(h, mods, at, named[0].Aux+"\x00"+cmp.Or(named[0].Sig, name), way)
+	case len(named) == 1 && named[0].Sig == "*":
+		return pyBinding{at: at, module: named[0].Aux, whole: true}, true, nil
+	case len(named) == 1:
+		return pyBinding{at: at, module: named[0].Aux, member: cmp.Or(named[0].Sig, name)}, true, nil
 	case len(named) > 0:
-		return classUnknown, nil
+		return pyBinding{}, false, nil
 	}
 	var supplying []string
 	err = h.decls.lookup(keyImport+refKey(Ref{File: file})+ImportAll, func(e entry) error {
 		if e.Ref.Index >= 0 {
 			return nil
 		}
-		star := e.Aux
-		if strings.HasPrefix(star, ".") {
-			if !pythonRelativeFits(at, star) {
-				return nil
-			}
-			star = absolutePythonModule(at, star)
-		}
-		if star == "" {
+		star, ok := pyAbsolute(at, e.Aux)
+		if !ok {
 			return nil
 		}
 		hit := false
@@ -118,7 +138,20 @@ func moduleBinding(h *hierarchy, mods *index, file int32, mod, name string, way 
 		return nil
 	})
 	if err != nil || len(supplying) != 1 {
-		return classUnknown, err
+		return pyBinding{}, false, err
 	}
-	return classOf(h, mods, at, supplying[0]+"\x00"+name, way)
+	return pyBinding{at: at, module: supplying[0], member: name}, true, nil
+}
+
+// pyAbsolute is module as an import in the file at writes it, named from
+// the repository root when it is relative, and false when it climbs above
+// the root or names nothing.
+func pyAbsolute(at, module string) (string, bool) {
+	if strings.HasPrefix(module, ".") {
+		if !pythonRelativeFits(at, module) {
+			return "", false
+		}
+		module = absolutePythonModule(at, module)
+	}
+	return module, module != ""
 }
