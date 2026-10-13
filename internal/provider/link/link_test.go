@@ -782,11 +782,22 @@ func (l linked) site(t *testing.T, key string) string {
 }
 
 // target spells a bound declaration as "<label> <name>": the label of the
-// line its name is first written on inside its range.
+// line its name is first written on inside its range. A return node, which
+// no token names, takes the label of its callable's name: the callable is
+// the structural node of a callable kind at the same range.
 func (l linked) target(paths map[model.FileID]string, n model.Node) string {
 	path := paths[n.FileID]
 	src := l.files[path]
 	if n.Range == nil || int(n.Range.End.Byte) > len(src) {
+		return path + ":? " + n.Name
+	}
+	if n.Kind == model.NodeReturn {
+		for _, c := range l.structural.nodes {
+			if (c.Kind == model.NodeFunction || c.Kind == model.NodeMethod || c.Kind == model.NodeTest) &&
+				c.FileID == n.FileID && c.Range != nil && *c.Range == *n.Range && c.NameRange != nil {
+				return labelAt(path, src, int(c.NameRange.Start.Byte)) + " " + n.Name
+			}
+		}
 		return path + ":? " + n.Name
 	}
 	start := int(n.Range.Start.Byte)

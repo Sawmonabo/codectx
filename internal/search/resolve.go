@@ -181,8 +181,8 @@ func splitFileNodeKey(within string) (int64, model.NodeID, error) {
 	return start, model.NodeID(id), nil
 }
 
-// documentSymbols is the document-symbols operation: every visible node
-// declared in the pinned file, in document order, keyset on (start_byte,
+// documentSymbols is the document-symbols operation: every visible symbol
+// node declared in the pinned file, in document order, keyset on (start_byte,
 // node_id). SymbolRequest.Validate already requires the file id.
 func documentSymbols(ctx context.Context, r exactReader, req model.SymbolRequest, rank int, within string, limit int) (resolvePage, error) {
 	var afterStart int64
@@ -196,18 +196,30 @@ func documentSymbols(ctx context.Context, r exactReader, req model.SymbolRequest
 			return resolvePage{}, err
 		}
 	}
-	nodes, err := r.NodesInFile(ctx, req.FileID, afterStart, after, limit)
-	if err != nil {
-		return resolvePage{}, err
-	}
+	// A return node is read but not listed (model.NonSymbolKinds), so the
+	// walk reads on until the page is full or the file ends: a page is never
+	// left short while rows are still behind it.
 	var page resolvePage
-	for _, n := range nodes {
-		page.add(n)
+	for {
+		want := limit - len(page.Nodes)
+		nodes, err := r.NodesInFile(ctx, req.FileID, afterStart, after, want)
+		if err != nil {
+			return resolvePage{}, err
+		}
+		for _, n := range nodes {
+			afterStart, after = nodeStartByte(n), n.Node.ID
+			if n.Node.Kind.Symbol() {
+				page.add(n)
+			}
+		}
+		if len(nodes) < want {
+			return page, nil
+		}
+		if len(page.Nodes) == limit {
+			page.LastKey = resolveKey(model.TierExactPath, fileNodeKey(nodes[len(nodes)-1]))
+			return page, nil
+		}
 	}
-	if len(page.Nodes) == limit {
-		page.LastKey = resolveKey(model.TierExactPath, fileNodeKey(nodes[len(nodes)-1]))
-	}
-	return page, nil
 }
 
 // symbolTiers serves resolve, workspace-symbols and definition: the

@@ -561,6 +561,7 @@ const (
     NodeEndpoint      NodeKind = "endpoint"
     NodeDatabaseEntity NodeKind = "database_entity"
     NodeType          NodeKind = "type" // a type outside the indexed project, its own kind unknown
+    NodeReturn        NodeKind = "return" // a callable's formal return; no lookup by name or file lists it unless asked by kind
 )
 
 ```

@@ -3,6 +3,7 @@ package treesitter_test
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -130,5 +131,46 @@ func TestReturnFlow(t *testing.T) {
 	// never set Into (wrap's `return make()` would lose its way back).
 	if want := []string{"", " into wrap", "a"}; !slices.Equal(sites, want) {
 		t.Fatalf("make's call sites write into %q, want %q", sites, want)
+	}
+}
+
+// TestReturnNodeOfAValueBody pins a return node for a callable that returns
+// with no return keyword: a Rust block's tail expression and an arrow
+// function's expression body. The node is of the return kind, named
+// "return", at the whole callable, with no name range.
+func TestReturnNodeOfAValueBody(t *testing.T) {
+	// mutation: take only a body's return statements as returning nodes
+	// (neither callable below has one, so neither gets a return node);
+	// mutation: publish the return node as a variable, or at the callable's
+	// name token.
+	cases := []struct{ file, src, callable, qualified string }{
+		{"tail.rs", "fn id(p: i32) -> i32 {\n    p\n}\n", "fn id(p: i32) -> i32 {\n    p\n}", "id::return"},
+		{"arrow.js", "const id = (p) => p;\n", "id = (p) => p", "id.return"},
+	}
+	p := newProvider(t)
+	for _, c := range cases {
+		t.Run(c.file, func(t *testing.T) {
+			h := providertest.New(t, map[string]string{c.file: c.src})
+			u := h.Plan(t, p, lang.ScopePrefix+c.file, []string{c.file})
+			cp := &tableCapture{capture: &capture{UnitOutput: h.Begin(t, u, []string{c.file})}}
+			result, err := provider.RunUnit(context.Background(), p, u.Request, cp, providertest.Limits, h.Pool)
+			if err != nil || result.State != model.RunSucceeded {
+				t.Fatalf("RunUnit: %v, %s", err, result.State)
+			}
+			var got []string
+			for _, n := range cp.nodes {
+				if n.Node.Name == "return" {
+					text := ""
+					if r := n.Node.Range; r != nil {
+						text = c.src[r.Start.Byte:r.End.Byte]
+					}
+					got = append(got, string(n.Node.Kind)+" "+n.Node.QualifiedName+" "+strconv.Quote(text)+" "+strconv.FormatBool(n.Node.NameRange == nil))
+				}
+			}
+			want := []string{string(model.NodeReturn) + " " + c.qualified + " " + strconv.Quote(c.callable) + " true"}
+			if !slices.Equal(got, want) {
+				t.Fatalf("return nodes %q, want %q", got, want)
+			}
+		})
 	}
 }

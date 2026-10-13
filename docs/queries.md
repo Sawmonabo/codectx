@@ -447,7 +447,10 @@ ranked: each returns every match, ordered by the content key (path, start
 byte, end byte, kind, name, qualified name, signature, node id), with score 0.
 A node is served once, at the earliest exact tier that matches one of its
 declarations inside the request's filters, even when the units that declare it
-disagree about its names or its file.
+disagree about its names or its file. A request that names no kind leaves out
+a callable's return node (kind `return`), which every callable has under the
+same name; a request whose kinds name `return` finds it. Symbol resolution
+and document symbols leave it out the same way.
 
 **Then the lexical tier.** The index returns the page's limit plus one of the
 results ranked after the last one served, so it knows whether another page

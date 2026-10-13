@@ -112,7 +112,9 @@ An import that does not resolve publishes nothing here; a non-constant one is AD
     value is written into variables, each argument bound to such a parameter publishes one `data_flows_to` from
     each variable it reads to each of those variables, labelled `summary:` and the parameter's position. The walk
     takes it without entering the callee, and it carries every effect the parameter has on the result.
-  - **Return node.** Each analysed callable has a return node, a variable keyed by the callable's identity, into
+  - **Return node.** Each analysed callable has a return node, a node of its own kind (`return`) at the whole
+    callable with no name range, as the formal return is an unnamed node type of its own in a code property graph
+    [S11], keyed by the callable's identity, into
     which every value a returning node reads, or a node deciding whether it runs reads, flows as an ordinary
     reaching definition, a parameter's value included. Each bound site publishes the callee's return node flowing
     into the variables the call's value is written into, and into the caller's own return node when the caller
@@ -255,7 +257,8 @@ reach those answers without the verification the rest receives.
 - [S10] Reps, Horwitz, Sagiv, *Precise interprocedural dataflow analysis via graph reachability*, POPL 1995,
   https://www.cs.cornell.edu/courses/cs711/2005fa/papers/rhs-popl95.pdf — realizable paths.
 - [S11] *Code property graph specification*, https://cpg.joern.io/ — argument indices matched to parameter indices,
-  index 0 for the receiver.
+  index 0 for the receiver; METHOD_RETURN, "an (unnamed) formal method return parameter", a node type of its own
+  with no NAME property, whose CODE "MAY be set freely, e.g., to the constant RET".
 - [S12] *Data flow library design*, https://github.com/github/codeql/blob/main/docs/ql-libraries/dataflow/dataflow.md
   — argument and parameter positions matched when the query runs.
 - [S13] *The Java Language Specification, Java SE 25*, §12.1.4, https://docs.oracle.com/javase/specs/jls/se25/html/jls-12.html

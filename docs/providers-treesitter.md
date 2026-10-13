@@ -651,8 +651,11 @@ ADR-0017 decision 7; `internal/provider/treesitter/returns.go`):
   kind that contains its span, when no enclosing function's span lies inside that declaration too (a closure inside
   a method is not the method's callable). A Python `__init__` and a Java or C++ constructor (a method named as the
   type declaring it) return no value and have none.
-- **The return node.** Each such callable has one, a `variable` node named `return` at the callable's name token,
-  keyed `ret:<path>:<first byte>-<last byte>` over that token in the file's scope and, when the callable has a
+- **The return node.** Each such callable has one, a node of kind `return` named `return`, located at the whole
+  callable with no name range: no source token names it, and a body that returns a value with no `return` keyword
+  (a Rust tail expression, an arrow function's expression body) has none to point at. It stands where a code
+  property graph's method return does (its formal return parameter, which has no name). It is
+  keyed `ret:<path>:<first byte>-<last byte>` over the callable's name token in the file's scope and, when the callable has a
   descriptor path, by that path and the callable's disambiguator with the return mark
   (`reconcile.ReturnDisambiguator`), so a call in another file keeps it through a body edit. It carries no
   declaration-key alias: no source identifier declares it. The link table carries it (`Decl.Return`); the node is

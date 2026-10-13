@@ -1,6 +1,9 @@
 package model
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"slices"
+)
 
 // NodeKind is the exhaustive node vocabulary of Section 9.2.
 type NodeKind string
@@ -35,6 +38,13 @@ const (
 	// is not known from that code, so one kind keeps it one node wherever
 	// it is named.
 	NodeType NodeKind = "type"
+	// NodeReturn is a callable's formal return: the one node every value the
+	// callable returns flows into and every call's result flows out of. It
+	// is unnamed in the source, so it is named "return", located at the
+	// whole callable rather than at a token, and carries no name range; it
+	// stands where a code property graph's method return does. It is not a
+	// symbol: a by-name lookup lists it only when asked for its kind.
+	NodeReturn NodeKind = "return"
 )
 
 // Valid reports whether k is a known wire spelling. An unknown value fails
@@ -44,11 +54,21 @@ func (k NodeKind) Valid() bool {
 	case NodeRepository, NodeDirectory, NodeFile, NodePackage, NodeModule, NodeNamespace,
 		NodeFunction, NodeMethod, NodeClass, NodeInterface, NodeStruct, NodeEnum,
 		NodeField, NodeVariable, NodeConstant, NodeTest, NodeBuildTarget, NodeDependency,
-		NodeConfiguration, NodeDocument, NodeSection, NodeEndpoint, NodeDatabaseEntity, NodeType:
+		NodeConfiguration, NodeDocument, NodeSection, NodeEndpoint, NodeDatabaseEntity, NodeType, NodeReturn:
 		return true
 	}
 	return false
 }
+
+// NonSymbolKinds are the kinds a lookup by name or by file leaves out when
+// it names no kind: a return node, whose name is the same in every callable,
+// would otherwise answer every query for "return" and every qualified
+// prefix of a callable. A lookup that names the kind still finds it.
+func NonSymbolKinds() []NodeKind { return []NodeKind{NodeReturn} }
+
+// Symbol reports whether a node of kind k answers a lookup by name or by
+// file that names no kind (NonSymbolKinds).
+func (k NodeKind) Symbol() bool { return !slices.Contains(NonSymbolKinds(), k) }
 
 // RelationKind is the exhaustive relation vocabulary of Section 9.2. Reverse
 // traversal uses the indexed target column; there is no duplicated called_by.
