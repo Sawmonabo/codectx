@@ -881,7 +881,8 @@ func (s *stubExact) NodesAmong(context.Context, sqlite.NodeFilter, []model.NodeI
 }
 
 // WalkTier yields nothing, as Nodes does.
-func (s *stubExact) WalkTier(context.Context, sqlite.NodeFilter, int, func([]sqlite.StoredNode) error) error {
+func (s *stubExact) WalkTier(context.Context, sqlite.NodeFilter, *sqlite.TierSpan, int,
+	func([]sqlite.StoredNode) (int, error)) error {
 	return nil
 }
 
@@ -939,12 +940,15 @@ type stubWideExact struct {
 	n    int
 	file model.FileID
 	path string
+	// qualifier, when set, precedes every qualified name, so "Widget" no
+	// longer prefixes them and the exact_name tier serves the nodes.
+	qualifier string
 }
 
 func (s *stubWideExact) node(i int) sqlite.StoredNode {
 	return sqlite.StoredNode{
 		Node: model.Node{ID: model.NodeID(fmt.Sprintf("%0*x", model.IDHexLen, i)), Kind: model.NodeFunction,
-			Name: "Widget", QualifiedName: "Widget.m" + strconv.Itoa(i), FileID: s.file},
+			Name: "Widget", QualifiedName: s.qualifier + "Widget.m" + strconv.Itoa(i), FileID: s.file},
 		Bytes: &model.ByteRange{Start: uint64(i), End: uint64(i) + 1},
 	}
 }
@@ -1055,23 +1059,35 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 
 // WalkTier yields the tier a page at a time, in the stub's id order, with
 // storage's page bound. A short page ends the walk, as it does in storage.
-func (s *stubWideExact) WalkTier(ctx context.Context, f sqlite.NodeFilter, limit int,
-	yield func([]sqlite.StoredNode) error) error {
+// Node i sits at bytes [i, i+1) of the one file, so id order is the content
+// order, and a walk from a span starts at the node whose start is the span's.
+func (s *stubWideExact) WalkTier(ctx context.Context, f sqlite.NodeFilter, from *sqlite.TierSpan, limit int,
+	yield func([]sqlite.StoredNode) (int, error)) error {
 	limit = min(limit, model.MaxPageItems)
+	bound := limit
 	after := model.NodeID("")
+	if from != nil && from.Start > 0 {
+		after = s.node(int(from.Start) - 1).Node.ID
+	}
 	for {
-		nodes, err := s.Nodes(ctx, f, after, limit)
+		nodes, err := s.Nodes(ctx, f, after, bound)
 		if err != nil {
 			return err
 		}
-		if len(nodes) > 0 {
-			if err := yield(nodes); err != nil {
-				return err
+		if len(nodes) < bound {
+			if len(nodes) > 0 {
+				_, err = yield(nodes)
 			}
-			after = nodes[len(nodes)-1].Node.ID
+			return err
 		}
-		if len(nodes) < limit {
-			return nil
+		next, err := yield(nodes)
+		if err != nil {
+			return err
+		}
+		after = nodes[len(nodes)-1].Node.ID
+		bound = limit
+		if next > 0 && next < limit {
+			bound = next
 		}
 	}
 }
@@ -1421,7 +1437,8 @@ func (s *stubFileReader) NodesAmong(context.Context, sqlite.NodeFilter, []model.
 	return nil, errors.New("not used")
 }
 
-func (s *stubFileReader) WalkTier(context.Context, sqlite.NodeFilter, int, func([]sqlite.StoredNode) error) error {
+func (s *stubFileReader) WalkTier(context.Context, sqlite.NodeFilter, *sqlite.TierSpan, int,
+	func([]sqlite.StoredNode) (int, error)) error {
 	return errors.New("not used")
 }
 

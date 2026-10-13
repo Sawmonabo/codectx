@@ -228,34 +228,42 @@ func exactRecordBytes(e exactEntry) int64 {
 // struct with its string headers, the byte interval and the sort's own slot.
 const exactEntryFixedBytes = 512
 
-// sortedAfter walks the exact tiers from the position's tier and answers every
-// servable hit after the position, in served order, as a sorted run the caller
+// sortedAfter walks the qualified-name prefix tier, the one exact tier no
+// index holds in served order, and answers every servable hit after `after`
+// (nil: from the tier's start), in served order, as a sorted run the caller
 // closes. Memory is the sort's run share of the query memory admission; the
 // rest is on disk.
+//
+// A walk the request's deadline ends still answers a run: what the walk had
+// read, sorted, beside the deadline error, so the page can serve the head of
+// it truncated rather than nothing (an answer cut short by its time limit
+// serves the results gathered so far, as a search engine's timed-out query
+// does). Any other failure answers no run.
 func (s *Service) sortedAfter(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter,
-	pos searchPosition) (*pagination.SortedRun[exactEntry], error) {
-	key, err := positionKey(ctx, reader, rule, filter, pos)
-	if err != nil {
-		return nil, err
-	}
+	after *exactEntry) (*pagination.SortedRun[exactEntry], error) {
 	sorter, err := pagination.NewExternalSort(s.spools.SortDir(), 0, exactRecord, exactFromRecord, cmpExact)
 	if err != nil {
 		return nil, err
 	}
 	sorter = sorter.WithRunBytes(pagination.SortRunBytes(s.queryMemory), exactRecordBytes)
 	defer sorter.Close()
-	span := allExactTiers
-	span.from = pos.rank
-	if err := exactCandidates(ctx, reader, rule, model.MaxPageItems, span, func(e exactHit) error {
-		entry := exactEntry{e}
-		if !servableExact(e, filter) || cmpExact(entry, key) <= 0 {
-			return nil
-		}
-		return sorter.Add(entry)
-	}); err != nil {
-		return nil, err
+	prefix := model.TierQualifiedNamePrefix.Rank()
+	walkErr := exactCandidates(ctx, reader, rule, model.MaxPageItems, tierSpan{from: prefix, to: prefix},
+		func(e exactHit) error {
+			entry := exactEntry{e}
+			if !servableExact(e, filter) || (after != nil && cmpExact(entry, *after) <= 0) {
+				return nil
+			}
+			return sorter.Add(entry)
+		})
+	if walkErr != nil && !(isDeadline(walkErr) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+		return nil, walkErr
 	}
-	return sorter.Sorted()
+	run, err := sorter.Sorted()
+	if err != nil {
+		return nil, errors.Join(walkErr, err)
+	}
+	return run, walkErr
 }
 
 // errPageTaken stops a read once a page has its records.

@@ -578,14 +578,28 @@ type exactSource struct {
 }
 
 // exactPage answers a page's exact hits, at most limit of them, and whether
-// more exact hits follow them. A page continuing a spool reads its records
-// (ans.spooled says where it stopped); a page whose spool is gone, or a
-// positional continuation that may sort, sorts the hits after its position
-// once and serves the head of the run (ans.rest holds the remainder for a
-// spool); a first page, and a continuation that may not sort, walks with a
-// heap of limit+1 hits.
+// more exact hits follow them. It serves the tiers in order from the
+// position's, stopping once it holds limit+1 hits, and reads each tier the
+// cheapest way its order allows:
+//
+//   - exact_path: the one file the query names, through a heap of the hits
+//     still wanted;
+//   - exact_qualified_name and exact_name: by seek, in served order, from the
+//     position (seekTier), so a page costs its own hits;
+//   - qualified_name_prefix, whose order no index holds: a page that may sort
+//     (a continuation answered by this process's store) sorts the tier's hits
+//     after the position once, serves the head of the run and leaves the rest
+//     in ans.rest for a spool; any other page walks the tier with a heap.
+//
+// A page continuing a spool reads its records first (ans.spooled says where it
+// stopped) and, when the spool runs out inside the page, goes on to the tiers
+// after the prefix tier. A spool that is gone is answered from the position.
 func (s *Service) exactPage(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter,
 	pos searchPosition, limit int, src exactSource, ans *searchAnswer) ([]exactEntry, bool, error) {
+	var held []exactEntry
+	from := model.TierExactPath.Rank()
+	var after *exactEntry
+	spooled := false
 	if t := src.spool; t != nil {
 		entries, next, gone, err := s.spooledPage(ctx, t.Cursor, *t.Exact, limit, src.now)
 		if err != nil {
@@ -598,60 +612,91 @@ func (s *Service) exactPage(ctx context.Context, reader exactReader, rule *tierR
 				at.Rank, at.Node = last.Tier.Rank(), last.Node.Node.ID
 			}
 			ans.spooled = &at
-			return entries, at.Remaining > 0, nil
+			if at.Remaining > 0 {
+				return entries, true, nil
+			}
+			held, spooled = entries, true
+			from = model.TierQualifiedNamePrefix.Rank() + 1
 		}
 	}
-	if pos.phase == phaseExact && src.sort {
-		run, err := s.sortedAfter(ctx, reader, rule, filter, pos)
+	if !spooled && pos.phase == phaseExact {
+		from = pos.rank
+		key, err := positionKey(ctx, reader, rule, filter, pos)
 		if err != nil {
 			return nil, false, err
 		}
-		head, err := headOf(run, limit)
-		if err != nil || run.Len() <= int64(limit) {
-			run.Close()
-			return head, false, err
-		}
-		ans.rest = &exactRest{run: run, skip: limit}
-		return head, true, nil
-	}
-	held, err := s.exactPhase(ctx, reader, rule, filter, pos, limit)
-	if len(held) > limit {
-		return held[:limit], true, err
-	}
-	return held, false, err
-}
-
-// exactPhase walks the exact tiers from the cursor's position and answers the
-// least limit+1 hits after it, in served order. On an error it still answers
-// what it held, so a deadline can serve them.
-//
-// A position names its last hit by tier and node; the full content key that
-// hit sorted under is read back first (positionKey), and every later candidate
-// is compared against it.
-func (s *Service) exactPhase(ctx context.Context, reader exactReader, rule *tierRule,
-	filter hitFilter, pos searchPosition, limit int) ([]exactEntry, error) {
-	span := allExactTiers
-	var after *exactEntry
-	if pos.phase == phaseExact {
-		span.from = pos.rank
-		key, err := positionKey(ctx, reader, rule, filter, pos)
-		if err != nil {
-			return nil, err
-		}
 		after = &key
 	}
-	h := newExactHeap(limit + 1)
-	err := exactCandidates(ctx, reader, rule, model.MaxPageItems, span, func(e exactHit) error {
-		if !servableExact(e, filter) {
-			return nil
+	for _, tier := range servedTiers {
+		need := limit + 1 - len(held)
+		if tier.Rank() < from || need <= 0 {
+			continue
 		}
-		entry := exactEntry{e}
-		if after != nil && cmpExact(entry, *after) <= 0 {
-			return nil
+		var at *exactEntry
+		if tier.Rank() == from {
+			at = after
 		}
-		h.offer(entry)
-		return nil
-	})
+		var got []exactEntry
+		var err error
+		switch tier {
+		case model.TierQualifiedNamePrefix:
+			if src.sort && pos.phase == phaseExact {
+				// A deadline inside the walk still answers the run of what it
+				// read, sorted: the page serves its head, truncated.
+				room := limit - len(held)
+				run, err := s.sortedAfter(ctx, reader, rule, filter, at)
+				if run == nil {
+					return held, false, err
+				}
+				head, herr := headOf(run, room)
+				held = append(held, head...)
+				if err = errors.Join(err, herr); err != nil || run.Len() <= int64(room) {
+					run.Close()
+					if err != nil {
+						return held, false, err
+					}
+					continue
+				}
+				ans.rest = &exactRest{run: run, skip: room}
+				return held, true, nil
+			}
+			got, err = heapTier(ctx, reader, rule, filter, tier, at, need)
+		case model.TierExactQualifiedName, model.TierExactName:
+			got, err = seekTier(ctx, reader, rule, filter, tier, at, need)
+		default:
+			got, err = heapTier(ctx, reader, rule, filter, tier, at, need)
+		}
+		held = append(held, got...)
+		if err != nil {
+			return held[:min(len(held), limit)], false, err
+		}
+	}
+	if len(held) > limit {
+		return held[:limit], true, nil
+	}
+	return held, false, nil
+}
+
+// servedTiers is the exact tiers in served order.
+var servedTiers = [...]model.SearchTier{
+	model.TierExactPath, model.TierExactQualifiedName, model.TierQualifiedNamePrefix, model.TierExactName,
+}
+
+// heapTier walks one exact tier and answers its least `want` servable hits
+// after `after` (nil: from the tier's start), in served order. On an error it
+// still answers what it held, so a deadline can serve them.
+func heapTier(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter, tier model.SearchTier,
+	after *exactEntry, want int) ([]exactEntry, error) {
+	h := newExactHeap(want)
+	err := exactCandidates(ctx, reader, rule, model.MaxPageItems, tierSpan{from: tier.Rank(), to: tier.Rank()},
+		func(e exactHit) error {
+			entry := exactEntry{e}
+			if !servableExact(e, filter) || (after != nil && cmpExact(entry, *after) <= 0) {
+				return nil
+			}
+			h.offer(entry)
+			return nil
+		})
 	return h.sorted(), err
 }
 

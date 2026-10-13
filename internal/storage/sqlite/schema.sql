@@ -219,6 +219,14 @@ CREATE TABLE node_facts (
     name_start_byte INTEGER,
     name_end_byte INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    -- path is the root-relative path of file_id ('' for a node with no file),
+    -- and sort_start and sort_end the byte interval with a missing one read as
+    -- (0, -1): the content key the exact search tiers serve a tier in (path,
+    -- start byte, end byte), so the two name indexes below hold each equality
+    -- tier in that order and a page of it is one seek.
+    path TEXT NOT NULL DEFAULT '',
+    sort_start INTEGER GENERATED ALWAYS AS (ifnull(start_byte, 0)) VIRTUAL,
+    sort_end INTEGER GENERATED ALWAYS AS (ifnull(end_byte, -1)) VIRTUAL,
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
@@ -559,8 +567,11 @@ CREATE INDEX idx_generation_ref ON generations(repository_id, ref, activated_at)
 CREATE INDEX idx_generation_units_unit ON generation_units(unit_id, generation_id);
 CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
 CREATE INDEX idx_unit_dependencies_reverse ON unit_dependencies(dependency_id, unit_id);
-CREATE INDEX idx_nodes_name ON node_facts(name, unit_id, node_id);
-CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, unit_id, node_id);
+-- The name indexes end with the content key, so an exact name or qualified-name
+-- tier reads in served order; every key also carries (unit_id, node_id), the
+-- PRIMARY KEY suffix, which makes each entry unique for a keyset.
+CREATE INDEX idx_nodes_name ON node_facts(name, path, sort_start, sort_end);
+CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, path, sort_start, sort_end);
 -- idx_nodes_file is narrowed to the one column it probes. start_byte was a
 -- dead middle column: search.go keysets on coalesce(nf.start_byte, 0), which no
 -- plain column index can serve, and unit_id is already the leading column of
