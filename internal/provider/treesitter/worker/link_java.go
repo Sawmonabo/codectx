@@ -553,11 +553,39 @@ func (k *javaLinker) invocation(n Node) {
 	default:
 		if q, ok := k.qualifier(obj); ok {
 			s.Shape, s.Qualifier = wire.ShapeStatic, q
+		} else if i, ok := k.constructed(obj); ok {
+			s.Shape, s.Receiver = wire.ShapeMember, wire.Type{Kind: wire.TypeResult, Index: i}
 		} else {
 			s.Shape, s.Receiver = wire.ShapeMember, k.exprType(obj)
 		}
 	}
 	k.addSite(n, s)
+}
+
+// constructed is the constructor site of the receiver n when n, inside any
+// parentheses, creates an object of a named class with no class body
+// (`new Dog().sound()`): that object is exactly the class it creates
+// (JLS §15.9.4), so the linker binds the call exactly (its TypeResult names
+// a ShapeConstructor site). An anonymous class body creates an object of a
+// subclass, which may override the method, and a variable's type is never
+// read this way, since a later assignment may give it any subtype.
+func (k *javaLinker) constructed(n Node) (uint32, bool) {
+	j := k.k
+	for n.KindId() == j.parenthesized {
+		if n = firstNamed(n); n.IsNull() {
+			return 0, false
+		}
+	}
+	if n.KindId() != j.objectCreation {
+		return 0, false
+	}
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		if c.KindId() == j.classBody {
+			return 0, false
+		}
+	}
+	i, ok := k.siteAt[n.Id()]
+	return i, ok
 }
 
 // qualifiedSuper reports `X.super.m()`: a `super` child beside the object.
