@@ -72,7 +72,15 @@ included header binds through the include lookup the linker already performs
   format leaves dynamic. The supported subset is stated in the manifest documentation.
 - **`composer.json`:** `require` and `require-dev`, the platform entries `php` and `ext-*` included [S9]. It is read
   although PHP code is not indexed: the dependency facts need no PHP grammar.
-- Lock files are not read, as for every other ecosystem the provider reads.
+- **Lock files** (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `Cargo.lock`, `poetry.lock`,
+  `uv.lock`, `Pipfile.lock`, `pylock.toml`, `pdm.lock`, `gradle.lockfile`) are read, each by its published format,
+  as a stream: JSON tokens with one package decoded at a time, TOML one package table at a time, the text formats
+  line by line [S15][S16]. The lock defines a `configuration` node; each pinned package is a `depends_on`
+  occurrence from it to the dependency node a manifest's requirement of the same name reaches, with
+  `resolved_version`, the package's integrity where the format has one, and `set_size` the number of versions the
+  lock pins for the name; each package's dependencies are `depends_on` occurrences between dependency nodes, with
+  the resolved version where the lock states it. These are evidence detail, because a dependency node is shared by
+  every manifest and lock that names it. `composer.lock` is PHP's and is left out with PHP.
 
 ### 6. The linker publishes file-to-file `imports` for what it resolved
 
@@ -156,8 +164,7 @@ reach those answers without the verification the rest receives.
   imports, one argument-flow edge per argument at each bound site (an estimate, not measured), decorator facts and
   endpoints. Storage is measured in the scale proofs.
 - Endpoint and argument-flow identities rest on ADR-0014's descriptor paths and parameter keys.
-- Follow-ups outside this record: return-value flow; lock files for every ecosystem; C shared-library visibility
-  through export macros.
+- Follow-ups outside this record: return-value flow; C shared-library visibility through export macros.
 
 ## Sources
 
@@ -189,6 +196,10 @@ reach those answers without the verification the rest receives.
   — the `main` method forms.
 - [S14] *Express.qll*, https://github.com/github/codeql/blob/main/javascript/ql/lib/semmle/javascript/frameworks/Express.qll
   — "relative paths of subrouters are not modeled".
+- [S15] *OSV-Scanner, supported lockfiles*, https://google.github.io/osv-scanner/supported-languages-and-lockfiles/ —
+  "prefer a resolved lockfile"; the lock formats per ecosystem.
+- [S16] *pylock.toml specification* (PEP 751), https://packaging.python.org/en/latest/specifications/pylock-toml/ —
+  `[[packages]]` with `name`, `version`, `dependencies` and hashed sources.
 - [research 26](../research/26-extraction-and-linking-coverage.md) and
   [raw/coverage-gaps](../research/raw/coverage-gaps/findings.md) — the gap-by-gap survey, the options and the full
   source list.

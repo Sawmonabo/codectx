@@ -1,7 +1,10 @@
 // Package manifest is the Section 11.2 build-metadata and documentation
 // provider: package, module, dependency and configuration nodes parsed from
 // go.mod, go.work, package.json, composer.json, Cargo.toml, pyproject.toml,
-// pip requirements files and pom.xml, and the headings and source links of
+// pip requirements files and pom.xml, the resolved versions and dependency
+// graph of the lock files (package-lock.json, pnpm-lock.yaml, yarn.lock,
+// bun.lock, Cargo.lock, poetry.lock, uv.lock, Pipfile.lock, pylock.toml,
+// pdm.lock, gradle.lockfile), and the headings and source links of
 // Markdown documents. Every parser is a static reader of the pinned bytes:
 // nothing is fetched, evaluated or executed, and a value the format leaves
 // dynamic (a workspace-inherited version, a Maven property reference, a PEP
@@ -128,7 +131,9 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 // rootManifests are the well-known manifests detection reports when they sit
 // at the workspace root. Detection is informational: the provider is
 // available regardless, because documents are everywhere.
-var rootManifests = []string{"go.mod", "go.work", "package.json", "composer.json", "Cargo.toml", "pyproject.toml", "requirements.txt", "pom.xml"}
+var rootManifests = []string{"go.mod", "go.work", "package.json", "composer.json", "Cargo.toml", "pyproject.toml", "requirements.txt", "pom.xml",
+	"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "Cargo.lock", "poetry.lock", "uv.lock", "Pipfile.lock", "pylock.toml",
+	"pdm.lock", "gradle.lockfile"}
 
 // Detect reports the root manifests present without walking anything.
 func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Policy) (provider.Detection, error) {
@@ -187,7 +192,10 @@ func isRequirements(rel string) bool {
 func capabilityFor(format string) string {
 	switch format {
 	case filesystem.FormatGoMod, filesystem.FormatGoWork, filesystem.FormatPackageJSON, filesystem.FormatCargo, filesystem.FormatPyProject, filesystem.FormatPom,
-		formatComposer, formatRequirements:
+		formatComposer, formatRequirements,
+		filesystem.FormatPackageLock, filesystem.FormatPnpmLock, filesystem.FormatYarnLock, filesystem.FormatBunLock, filesystem.FormatCargoLock,
+		filesystem.FormatPoetryLock, filesystem.FormatUVLock, filesystem.FormatPipfileLock, filesystem.FormatPylock, filesystem.FormatPDMLock,
+		filesystem.FormatGradleLock:
 		return CapabilityManifests
 	case filesystem.FormatMarkdown, "adr":
 		return CapabilityDocumentation
@@ -246,6 +254,28 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		err = u.pom(ctx)
 	case formatRequirements:
 		err = u.requirements(ctx)
+	case filesystem.FormatPackageLock:
+		err = u.packageLock(ctx)
+	case filesystem.FormatPnpmLock:
+		err = u.pnpmLock(ctx)
+	case filesystem.FormatYarnLock:
+		err = u.yarnLock(ctx)
+	case filesystem.FormatBunLock:
+		err = u.bunLock(ctx)
+	case filesystem.FormatCargoLock:
+		err = u.cargoLock(ctx)
+	case filesystem.FormatPoetryLock:
+		err = u.poetryLock(ctx)
+	case filesystem.FormatUVLock:
+		err = u.uvLock(ctx)
+	case filesystem.FormatPipfileLock:
+		err = u.pipfileLock(ctx)
+	case filesystem.FormatPylock:
+		err = u.pylock(ctx)
+	case filesystem.FormatPDMLock:
+		err = u.pdmLock(ctx)
+	case filesystem.FormatGradleLock:
+		err = u.gradleLock(ctx)
 	default:
 		err = u.markdown(ctx)
 	}
