@@ -1017,10 +1017,6 @@ func planNotices(scoped scopeResult, packed planParts, scopeComplete bool) []str
 		// reported without a route to what is missing.
 		out = append(out, excludedViewNotice)
 	}
-	if n := packed.RelationsClipped; n > 0 {
-		add("%d evidence route(s) were stored clipped to the first %d relations; the route reaches further than the manifest records",
-			n, model.MaxRelationsPerPath)
-	}
 	if st := scoped.Stop; st.Stopped {
 		add("Lexical matches scoring below %d were not read. %d matches above it fill more than the plan's file budget of %d, "+
 			"so no unread match can rank above the packed files. Every match and walk entry inside the packed files is included. "+

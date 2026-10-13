@@ -14,18 +14,37 @@ import (
 // evidence routes in (entry ordinal, route index) order, a page at a time. An
 // entry names how many routes it has; this is where they are read, so a route
 // is stored once in full and fetched only when asked for (ADR-0016 decision 7).
-//
-// The continuation is the entries projection's own signed cursor, its key the
-// last route served as "<entry>:<index>".
 func (s *Services) routesPage(ctx context.Context, req model.ContextPageRequest, rec sqlite.SessionRecord,
 	manifest model.ContextManifest) (model.ContextPage, error) {
+	return explanationPage(ctx, s, req, rec, manifest, s.w.s.store.ManifestRoutes,
+		func(r model.ContextRoute) (int, int) { return r.Entry, r.Index },
+		func(p *model.ContextPage, rows []model.ContextRoute) { p.Routes = rows })
+}
+
+// reasonsPage answers the reasons view the same way: every entry's reasons in
+// (entry ordinal, reason index) order. An entry names how many reasons it has.
+func (s *Services) reasonsPage(ctx context.Context, req model.ContextPageRequest, rec sqlite.SessionRecord,
+	manifest model.ContextManifest) (model.ContextPage, error) {
+	return explanationPage(ctx, s, req, rec, manifest, s.w.s.store.ManifestReasons,
+		func(r model.ContextReason) (int, int) { return r.Entry, r.Index },
+		func(p *model.ContextPage, rows []model.ContextReason) { p.Reasons = rows })
+}
+
+// explanationPage pages one of a manifest's by-reference explanation tables
+// keyed by (entry ordinal, index). The continuation is the entries
+// projection's own signed cursor, its key the last row served as
+// "<entry>:<index>".
+func explanationPage[T any](ctx context.Context, s *Services, req model.ContextPageRequest, rec sqlite.SessionRecord,
+	manifest model.ContextManifest,
+	read func(ctx context.Context, id model.ManifestID, afterEntry, afterIndex, limit int) ([]T, error),
+	key func(T) (int, int), set func(*model.ContextPage, []T)) (model.ContextPage, error) {
 	st := s.w.s
 	afterEntry, afterIndex, err := s.resumeRoutes(req, rec)
 	if err != nil {
 		return model.ContextPage{}, s.fail("context entries", err)
 	}
 	limit := entriesLimit(st.cfg.Resources.MaxPageItems, req.Page.Limit)
-	rows, err := st.store.ManifestRoutes(ctx, rec.ManifestID, afterEntry, afterIndex, limit+1)
+	rows, err := read(ctx, rec.ManifestID, afterEntry, afterIndex, limit+1)
 	if err != nil {
 		return model.ContextPage{}, s.fail("context entries", err)
 	}
@@ -39,10 +58,10 @@ func (s *Services) routesPage(ctx context.Context, req model.ContextPageRequest,
 	if more {
 		rows = rows[:limit]
 	}
-	page.Routes = rows
+	set(&page, rows)
 	if more {
-		last := rows[len(rows)-1]
-		token, why, err := s.entriesCursor(ctx, rec, req.View, routeKey(last.Entry, last.Index))
+		entry, index := key(rows[len(rows)-1])
+		token, why, err := s.entriesCursor(ctx, rec, req.View, routeKey(entry, index))
 		if err != nil {
 			return model.ContextPage{}, s.fail("context entries", err)
 		}
@@ -58,13 +77,13 @@ func (s *Services) routesPage(ctx context.Context, req model.ContextPageRequest,
 	return page, nil
 }
 
-// routeKey is a routes cursor's key: the last route served.
+// routeKey is a routes or reasons cursor's key: the last row served.
 func routeKey(entry, index int) string {
 	return strconv.Itoa(entry) + ":" + strconv.Itoa(index)
 }
 
-// resumeRoutes reads the route a routes cursor ends at, (-1, -1) before the
-// first route, with the checks resumeEntries applies to every entries cursor.
+// resumeRoutes reads the row a routes or reasons cursor ends at, (-1, -1)
+// before the first row, with the checks resumeEntries applies to every entries cursor.
 func (s *Services) resumeRoutes(req model.ContextPageRequest, rec sqlite.SessionRecord) (int, int, error) {
 	if req.Page.Cursor == "" {
 		return -1, -1, nil
@@ -86,7 +105,7 @@ func (s *Services) resumeRoutes(req model.ContextPageRequest, rec sqlite.Session
 	e, eerr := strconv.Atoi(entry)
 	i, ierr := strconv.Atoi(index)
 	if !ok || eerr != nil || ierr != nil || e < 0 || i < 0 {
-		return 0, 0, cursorInvalid("cursor sort key is not a manifest route")
+		return 0, 0, cursorInvalid("cursor sort key is not a manifest route or reason")
 	}
 	return e, i, nil
 }

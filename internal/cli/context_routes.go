@@ -24,3 +24,16 @@ func writeContextRoutes(b *strings.Builder, routes []model.ContextRoute) {
 		fmt.Fprintf(b, "  %5d  #%d  %s\n", r.Entry, r.Index, strings.Join(rels, " -> "))
 	}
 }
+
+// writeContextReasons renders one page of the reasons view: each reason as its
+// entry ordinal, its index among the entry's reasons and its text.
+func writeContextReasons(b *strings.Builder, reasons []model.ContextReason) {
+	if len(reasons) == 0 {
+		b.WriteString("reasons     none on this page\n")
+		return
+	}
+	fmt.Fprintf(b, "reasons     %d on this page\n", len(reasons))
+	for _, r := range reasons {
+		fmt.Fprintf(b, "  %5d  #%d  %s\n", r.Entry, r.Index, tableCell(r.Reason))
+	}
+}

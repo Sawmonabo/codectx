@@ -922,7 +922,7 @@ func newContextEntriesCommand(build model.BuildInfo) *cobra.Command {
 	addLimitFlag(cmd)
 	addCursorFlag(cmd)
 	cmd.Flags().String(contextViewFlag, string(model.ViewEntries),
-		"which projection to page: \"entries\", \"slices\", \"excluded\" or \"routes\" (every entry's evidence routes)")
+		"which projection to page: \"entries\", \"slices\", \"excluded\", \"routes\" (every entry's evidence routes) or \"reasons\" (every entry's reasons)")
 	return cmd
 }
 
@@ -1916,10 +1916,10 @@ func writeContextPage(b *strings.Builder, page model.ContextPage) {
 		}
 		fmt.Fprintf(b, "entries     %d on this page\n", len(page.Entries))
 		for _, e := range page.Entries {
-			fmt.Fprintf(b, "  %5d  %-14s score %d  %d bytes  %d tokens  %d %s  %s\n",
+			fmt.Fprintf(b, "  %5d  %-14s score %d  %d bytes  %d tokens  %d %s  %d %s  %s\n",
 				e.Ordinal, tableCell(string(e.Requirement)), e.ScoreMicros,
-				e.EstimatedBytes, e.EstimatedTokens, e.RouteCount, plural(int(e.RouteCount), "route", "routes"),
-				contextEntrySubject(e))
+				e.EstimatedBytes, e.EstimatedTokens, e.ReasonCount, plural(int(e.ReasonCount), "reason", "reasons"),
+				e.RouteCount, plural(int(e.RouteCount), "route", "routes"), contextEntrySubject(e))
 		}
 	case model.ViewSlices:
 		if len(page.Slices) == 0 {
@@ -1943,6 +1943,8 @@ func writeContextPage(b *strings.Builder, page model.ContextPage) {
 		}
 	case model.ViewRoutes:
 		writeContextRoutes(b, page.Routes)
+	case model.ViewReasons:
+		writeContextReasons(b, page.Reasons)
 	}
 }
 

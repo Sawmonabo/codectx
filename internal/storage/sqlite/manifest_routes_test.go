@@ -14,10 +14,13 @@ import (
 // routes, and the routes view pages every route of every entry, in (entry,
 // index) order, through pages that split one entry's routes.
 //
+// The same holds for reasons and the reasons view.
+//
 // Mutations caught: a keyset on the entry ordinal alone (the page after a
-// split resumes past the rest of that entry's routes, so routes are lost); the
-// entries read still carrying the routes (an entry is then served with what
-// its charge leaves out); the count not stored (it reads back zero).
+// split resumes past the rest of that entry's routes or reasons, so some are
+// lost); the entries read still carrying the routes or reasons (an entry is
+// then served with what its charge leaves out); a count not stored (it reads
+// back zero).
 func TestManifestRoutesArePagedByEntryAndIndex(t *testing.T) {
 	f := newFixture(t, filepath.Join(t.TempDir(), "codectx.db"))
 	a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
@@ -46,11 +49,12 @@ func TestManifestRoutesArePagedByEntryAndIndex(t *testing.T) {
 		Completeness:   fixtureCaps,
 		ScopeComplete:  true,
 		EstimateMethod: "test-estimator", CreatedAt: time.Now().UTC().Truncate(time.Microsecond)}
+	reasons := [][]string{{"seed", "calls it"}, {"named by the task"}, {"r0", "r1", "r2"}}
 	var entries []model.ContextEntry
 	for i, r := range routes {
 		entries = append(entries, model.ContextEntry{Ordinal: i, FileID: a.id, Requirement: model.RequirementFull,
-			EstimatedBytes: 1, EstimatedTokens: 1, Reasons: []string{"seed"}, EvidencePaths: r,
-			RouteCount: int64(len(r))})
+			EstimatedBytes: 1, EstimatedTokens: 1, Reasons: reasons[i], EvidencePaths: r,
+			ReasonCount: int64(len(reasons[i])), RouteCount: int64(len(r))})
 	}
 	sl := []model.ContextSlice{{Index: 0, EntryOrdinals: []int{0, 1, 2}, EstimatedBytes: 3, EstimatedTokens: 3}}
 	if err := f.s.PutManifest(f.ctx, manifest, []byte(`{"task":"t"}`), entries, sl, nil); err != nil {
@@ -64,6 +68,10 @@ func TestManifestRoutesArePagedByEntryAndIndex(t *testing.T) {
 		if e.RouteCount != int64(len(routes[i])) || len(e.EvidencePaths) != 0 {
 			t.Errorf("entry %d reads back %d routes counted and %d carried, want %d counted and none carried",
 				i, e.RouteCount, len(e.EvidencePaths), len(routes[i]))
+		}
+		if e.ReasonCount != int64(len(reasons[i])) || len(e.Reasons) != 0 {
+			t.Errorf("entry %d reads back %d reasons counted and %d carried, want %d counted and none carried",
+				i, e.ReasonCount, len(e.Reasons), len(reasons[i]))
 		}
 	}
 	var read []model.ContextRoute
@@ -92,5 +100,29 @@ func TestManifestRoutesArePagedByEntryAndIndex(t *testing.T) {
 		return x.Entry == y.Entry && x.Index == y.Index && slices.Equal(x.Relations, y.Relations)
 	}) {
 		t.Fatalf("the routes view read %+v, want %+v", read, want)
+	}
+	var readReasons, wantReasons []model.ContextReason
+	afterEntry, afterIndex = -1, -1
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatal("the reasons keyset does not advance")
+		}
+		page, err := f.s.ManifestReasons(f.ctx, manifest.ID, afterEntry, afterIndex, 2)
+		if err != nil {
+			t.Fatalf("ManifestReasons: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		readReasons = append(readReasons, page...)
+		afterEntry, afterIndex = page[len(page)-1].Entry, page[len(page)-1].Index
+	}
+	for i, r := range reasons {
+		for j, text := range r {
+			wantReasons = append(wantReasons, model.ContextReason{Entry: i, Index: j, Reason: text})
+		}
+	}
+	if !slices.Equal(readReasons, wantReasons) {
+		t.Fatalf("the reasons view read %+v, want %+v", readReasons, wantReasons)
 	}
 }

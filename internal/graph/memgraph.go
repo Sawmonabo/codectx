@@ -53,9 +53,20 @@ type MemoryGraph struct {
 	nodeKinds  []model.NodeKind
 	containers []NodeRef
 	bytes      []int64
+
+	// files is the snapshot's files a fixture declared (WithFiles), by id;
+	// it places each declaration at its file's path. Nil means none.
+	files map[model.FileID]model.FileVersion
+	// roles is each relation's call role a fixture declared (WithFlowRoles);
+	// a relation it does not name reads as the zero role.
+	roles map[model.RelationID]FlowRole
 }
 
-var _ GraphReader = (*MemoryGraph)(nil)
+var (
+	_ GraphReader       = (*MemoryGraph)(nil)
+	_ DeclarationReader = (*MemoryGraph)(nil)
+	_ FlowRoleReader    = (*MemoryGraph)(nil)
+)
 
 // memKindTable is one fixture's relation-kind dictionary. Codes are dense from
 // 1 in ascending kind-spelling order, so they are a function of the fixture and
@@ -528,4 +539,126 @@ func orderOr[T any](order, fallback func(a, b T) int) func(a, b T) int {
 		return order
 	}
 	return fallback
+}
+
+// WithFiles declares the snapshot's files, which place each declaration at its
+// file's path and answer SnapshotFiles and FileNodes, and returns g.
+func (g *MemoryGraph) WithFiles(files []model.FileVersion) *MemoryGraph {
+	g.files = make(map[model.FileID]model.FileVersion, len(files))
+	for _, f := range files {
+		g.files[f.ID] = f
+	}
+	return g
+}
+
+// WithFlowRoles declares each relation's call role, and returns g.
+func (g *MemoryGraph) WithFlowRoles(roles map[model.RelationID]FlowRole) *MemoryGraph {
+	g.roles = roles
+	return g
+}
+
+// RelationFlowRoles reads the roles WithFlowRoles declared; a relation with
+// none reads as the zero role, as one with no evidence detail does in a store.
+func (g *MemoryGraph) RelationFlowRoles(ctx context.Context, rels []model.RelationID) ([]FlowRole, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]FlowRole, len(rels))
+	for i, id := range rels {
+		out[i] = g.roles[id]
+	}
+	return out, nil
+}
+
+// declaration places n at its file's path. A fixture publishes no units, so
+// Unit is empty and no candidate is ranked as being in the site's unit.
+func (g *MemoryGraph) declaration(n model.Node) Declaration {
+	return Declaration{Node: n, Path: g.files[n.FileID].Path}
+}
+
+// Declarations pages the fixture's nodes named exactly name, restricted to
+// kinds, by node id after after; next is the last id of a full page.
+func (g *MemoryGraph) Declarations(ctx context.Context, name string, kinds []model.NodeKind, after model.NodeID,
+	limit int) ([]Declaration, model.NodeID, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if limit <= 0 {
+		limit = model.MaxPageItems
+	}
+	var ids []model.NodeID
+	for _, n := range g.nodes {
+		if n.Name == name && n.ID > after && (len(kinds) == 0 || slices.Contains(kinds, n.Kind)) {
+			ids = append(ids, n.ID)
+		}
+	}
+	slices.Sort(ids)
+	var next model.NodeID
+	if len(ids) > limit {
+		ids = ids[:limit]
+		next = ids[limit-1]
+	}
+	out := make([]Declaration, len(ids))
+	for i, id := range ids {
+		out[i] = g.declaration(g.nodes[g.refByID[id]-1])
+	}
+	return out, next, nil
+}
+
+// Declared hydrates the fixture's nodes as declarations, skipping an id the
+// fixture does not carry.
+func (g *MemoryGraph) Declared(ctx context.Context, ids []model.NodeID) ([]Declaration, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var out []Declaration
+	for _, id := range ids {
+		if ref, ok := g.refByID[id]; ok {
+			out = append(out, g.declaration(g.nodes[ref-1]))
+		}
+	}
+	return out, nil
+}
+
+// SnapshotFiles pages the files WithFiles declared by id after after; next is
+// the last id of a full page.
+func (g *MemoryGraph) SnapshotFiles(ctx context.Context, after model.FileID, limit int) ([]model.FileVersion,
+	model.FileID, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if limit <= 0 {
+		limit = model.MaxPageItems
+	}
+	var out []model.FileVersion
+	for id, f := range g.files {
+		if id > after {
+			out = append(out, f)
+		}
+	}
+	slices.SortFunc(out, func(a, b model.FileVersion) int { return cmp.Compare(a.ID, b.ID) })
+	var next model.FileID
+	if len(out) >= limit {
+		out = out[:limit]
+		next = out[limit-1].ID
+	}
+	return out, next, nil
+}
+
+// FileNodes finds each file's file node by its path, which is the file node's
+// qualified name, as the store does.
+func (g *MemoryGraph) FileNodes(ctx context.Context, files []model.FileVersion) (map[model.FileID]model.NodeID, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make(map[model.FileID]model.NodeID, len(files))
+	for _, f := range files {
+		for _, n := range g.nodes {
+			if n.Kind == model.NodeFile && n.QualifiedName == f.Path {
+				out[f.ID] = n.ID
+				break
+			}
+		}
+	}
+	return out, nil
 }

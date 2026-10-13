@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -53,8 +52,7 @@ func openSiteScope(fx *contextFixture) []model.Relation {
 
 // openSiteEngine is scopeEngine with node metadata: the open-site node carries
 // the OpenSiteMetadata the compile identifies it by. scopeEngine builds its
-// nodes from the file table alone, which holds no metadata. Its reader looks
-// declarations up by name, as the store's does, so the name-only lookups run.
+// nodes from the file table alone, which holds no metadata.
 func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) *graph.Engine {
 	fx.t.Helper()
 	adj := &scopeAdjacency{binding: fx.Binding, nodes: map[model.NodeID]model.Node{},
@@ -65,6 +63,7 @@ func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) *
 		adj.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
 			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash,
 			Metadata: meta[id]}
+		adj.files = append(adj.files, fv)
 	}
 	sort.Slice(adj.relations, func(i, j int) bool { return adj.relations[i].ID < adj.relations[j].ID })
 	dir := fx.t.TempDir()
@@ -77,12 +76,7 @@ func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) *
 	if err != nil {
 		fx.t.Fatalf("NewSpools: %v", err)
 	}
-	paths := make(map[model.NodeID]string, len(fx.Specs))
-	for _, spec := range fx.Specs {
-		paths[fx.Node(spec.path)] = spec.path
-	}
-	reader := &declaringGraph{MemoryGraph: scopeMemoryGraph(adj), nodes: adj.nodes, paths: paths}
-	eng, err := graph.New(graph.Options{Adjacency: adj, Reader: reader,
+	eng, err := graph.New(graph.Options{Adjacency: adj, Reader: scopeMemoryGraph(adj),
 		Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{
@@ -201,86 +195,4 @@ func TestNameOnlyCandidatesAreNeverRequiredAndPackAfterEveryPreciseEntry(t *test
 	if !notice {
 		t.Errorf("the manifest does not say how many name-only candidates it admitted; notices: %q", m.Notices)
 	}
-}
-
-// declaringGraph is the fixture's memory graph with the declaration seam the
-// store's reader implements (graph.DeclarationReader): declarations by exact
-// name and by id, each placed at its file's path in a unit of its own, and the
-// snapshot's files. The fixture publishes no file nodes.
-type declaringGraph struct {
-	*graph.MemoryGraph
-	nodes map[model.NodeID]model.Node
-	paths map[model.NodeID]string
-}
-
-var _ graph.DeclarationReader = (*declaringGraph)(nil)
-
-func (g *declaringGraph) declaration(n model.Node) graph.Declaration {
-	return graph.Declaration{Node: n, Path: g.paths[n.ID], Unit: model.UnitID("unit/" + g.paths[n.ID])}
-}
-
-func (g *declaringGraph) sorted() []model.Node {
-	out := make([]model.Node, 0, len(g.nodes))
-	for _, n := range g.nodes {
-		out = append(out, n)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
-}
-
-func (g *declaringGraph) Declarations(ctx stdcontext.Context, name string, kinds []model.NodeKind, after model.NodeID,
-	limit int) ([]graph.Declaration, model.NodeID, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, "", err
-	}
-	var out []graph.Declaration
-	for _, n := range g.sorted() {
-		if n.Name != name || n.ID <= after || (len(kinds) > 0 && !slices.Contains(kinds, n.Kind)) {
-			continue
-		}
-		if len(out) == limit {
-			return out, out[len(out)-1].Node.ID, nil
-		}
-		out = append(out, g.declaration(n))
-	}
-	return out, "", nil
-}
-
-func (g *declaringGraph) Declared(ctx stdcontext.Context, ids []model.NodeID) ([]graph.Declaration, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var out []graph.Declaration
-	for _, id := range ids {
-		if n, ok := g.nodes[id]; ok {
-			out = append(out, g.declaration(n))
-		}
-	}
-	return out, nil
-}
-
-func (g *declaringGraph) SnapshotFiles(ctx stdcontext.Context, after model.FileID, limit int) ([]model.FileVersion,
-	model.FileID, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, "", err
-	}
-	var out []model.FileVersion
-	seen := map[model.FileID]bool{}
-	nodes := g.sorted()
-	sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].FileID < nodes[j].FileID })
-	for _, n := range nodes {
-		if n.FileID == "" || n.FileID <= after || seen[n.FileID] {
-			continue
-		}
-		if len(out) == limit {
-			return out, out[len(out)-1].ID, nil
-		}
-		seen[n.FileID] = true
-		out = append(out, model.FileVersion{ID: n.FileID, Path: g.paths[n.ID], Status: model.FileTracked})
-	}
-	return out, "", nil
-}
-
-func (g *declaringGraph) FileNodes(ctx stdcontext.Context, _ []model.FileVersion) (map[model.FileID]model.NodeID, error) {
-	return map[model.FileID]model.NodeID{}, ctx.Err()
 }

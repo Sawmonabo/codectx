@@ -846,6 +846,9 @@ func (s *Services) Entries(ctx context.Context, req model.ContextPageRequest) (m
 	if req.View == model.ViewRoutes {
 		return s.routesPage(ctx, req, rec, manifest)
 	}
+	if req.View == model.ViewReasons {
+		return s.reasonsPage(ctx, req, rec, manifest)
+	}
 	after, err := s.resumeEntries(req, rec)
 	if err != nil {
 		return model.ContextPage{}, s.fail("context entries", err)
