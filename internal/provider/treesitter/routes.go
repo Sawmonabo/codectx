@@ -257,8 +257,9 @@ func frameworkOf(language, path string) string {
 			return fwFastAPI
 		case path == "starlette" || strings.HasPrefix(path, "starlette."):
 			return fwStarlette
-		case path == "django.urls" || path == "django.conf.urls" || path == "django.core.wsgi" || path == "django.core.asgi":
-			// The urlconf functions, and the application factories a
+		case path == "django" || path == "django.urls" || path == "django.conf.urls" || path == "django.core.wsgi" || path == "django.core.asgi":
+			// The urlconf functions (`from django import urls` binds
+			// them as a module), and the application factories a
 			// deployment module serves (applications).
 			return fwDjango
 		}
@@ -778,7 +779,64 @@ func (s *routeScan) handlerAt(a routeArg) []handler {
 	if r, ok := s.nameRef(a.text, at); ok {
 		return []handler{refHandler(r)}
 	}
+	if callee, inner, ok := wrapperCall(a); ok {
+		if s.goConversion(callee.text) {
+			// A conversion to a handler type is the value itself.
+			return s.handlerAt(inner)
+		}
+		// Any other call builds the handler: the request runs what the
+		// function it calls returns, so the endpoint routes to it.
+		if r, ok := s.nameRef(callee.text, callee.at); ok {
+			return []handler{refHandler(r)}
+		}
+	}
 	return nil
+}
+
+// wrapperCall splits a handler written as a call of a name or a dotted name
+// with one argument, `http.HandlerFunc(f)` or `auth(h)`, into the callee
+// and the argument, each with its span.
+func wrapperCall(a routeArg) (callee, inner routeArg, ok bool) {
+	text := a.text
+	open := strings.IndexByte(text, '(')
+	if open <= 0 || !strings.HasSuffix(text, ")") || uint32(len(text)) != a.at.End-a.at.Start {
+		return routeArg{}, routeArg{}, false
+	}
+	depth := 0
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth--; depth == 0 && i != len(text)-1 {
+				return routeArg{}, routeArg{}, false
+			}
+		}
+	}
+	args := splitTop(text[open+1 : len(text)-1])
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return routeArg{}, routeArg{}, false
+	}
+	lead := len(args[0]) - len(strings.TrimLeft(args[0], " \t\n\r"))
+	arg := strings.TrimSpace(args[0])
+	start := a.at.Start + uint32(open+1+lead)
+	callee = routeArg{at: wire.Span{Start: a.at.Start, End: a.at.Start + uint32(open)}, text: text[:open]}
+	inner = routeArg{at: wire.Span{Start: start, End: start + uint32(len(arg))}, text: arg}
+	return callee, inner, true
+}
+
+// goConversion reports a callee that is net/http's HandlerFunc or Handler
+// type, which converts a function or a value to a handler.
+func (s *routeScan) goConversion(callee string) bool {
+	if s.b.lang.Name != "go" {
+		return false
+	}
+	pkg, name, ok := strings.Cut(callee, ".")
+	if !ok || name != "HandlerFunc" && name != "Handler" {
+		return false
+	}
+	imp, ok := s.imports[pkg]
+	return ok && strings.Trim(imp.path, "\"`") == "net/http"
 }
 
 // nameRef is a reference to text when it is a name or a dotted name with no

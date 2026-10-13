@@ -19,6 +19,9 @@ type goRouteForm struct {
 	// pattern reports a route whose literal may lead with its method,
 	// Go 1.22's `"GET /x"`.
 	pattern bool
+	// list reports a method argument that is a slice of methods (echo's
+	// Match).
+	list bool
 }
 
 // goForms are each Go framework's registration methods by name.
@@ -42,8 +45,9 @@ var goForms = map[string]map[string]goRouteForm{
 		"Handle": {method: 0, route: 1, handler: -1},
 	}),
 	fwEcho: goVerbForms([]string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"}, 1, map[string]goRouteForm{
-		"Any": {method: -1, handler: 1},
-		"Add": {method: 0, route: 1, handler: 2},
+		"Any":   {method: -1, handler: 1},
+		"Add":   {method: 0, route: 1, handler: 2},
+		"Match": {method: 0, route: 1, handler: 2, list: true},
 	}),
 }
 
@@ -86,6 +90,7 @@ func (s *routeScan) goRoutes() {
 		}
 	})
 	s.calls(func(r *wire.Ref, site *wire.Site, _ int) { s.goMount(r, site, defaultMux) })
+	s.goServerLiterals()
 	s.calls(func(r *wire.Ref, site *wire.Site, i int) { s.goRoute(r, site, i, defaultMux) })
 	s.calls(s.gorillaChain)
 }
@@ -187,6 +192,7 @@ func (s *routeScan) goMount(r *wire.Ref, site *wire.Site, defaultMux *routeObj) 
 		s.attachArgs(site, func(_ *routeObj, i int) (routeAttach, bool) {
 			return routeAttach{parent: parent, known: true}, i == 1
 		})
+		s.stripPrefix(site, parent)
 	}
 }
 
@@ -233,6 +239,8 @@ func (s *routeScan) goRoute(r *wire.Ref, site *wire.Site, i int, defaultMux *rou
 	switch {
 	case form.verb != "":
 		methods = []string{form.verb}
+	case form.list:
+		methods = s.goMethodList(args[form.method].text)
 	case form.method >= 0:
 		if m, ok := s.goMethod(args[form.method].text); ok {
 			methods = []string{m}

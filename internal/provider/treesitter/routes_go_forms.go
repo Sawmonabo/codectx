@@ -164,3 +164,141 @@ func (s *routeScan) gorillaChain(r *wire.Ref, site *wire.Site, _ int) {
 	}
 	s.emit(fwGorilla, methods, rt, obj, refSpan(r), s.handlerAt(hargs[0]), fref.Qualifier)
 }
+
+// goMethodList are the methods a slice literal of methods names
+// (`[]string{http.MethodGet, "POST"}`), nil when any is not a literal or a
+// net/http method constant: the endpoint then names no method.
+func (s *routeScan) goMethodList(text string) []string {
+	open := strings.IndexByte(text, '{')
+	if open < 0 || !strings.HasSuffix(text, "}") {
+		return nil
+	}
+	var out []string
+	for _, e := range elements(text[open:]) {
+		m, ok := s.goMethod(e)
+		if !ok {
+			return nil
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// stripPrefix mounts the handler `http.StripPrefix(prefix, h)` passes, when
+// it is a router this file builds, below parent at the stripped prefix: the
+// router sees the request's path with the prefix removed, so its routes'
+// full paths are the prefix joined to them. The registration's own pattern
+// only selects which requests reach it.
+func (s *routeScan) stripPrefix(site *wire.Site, parent *routeObj) {
+	k := s.resultSite(argType(site, 1))
+	ref := s.siteRef(k)
+	if ref == nil || !ref.Qualified || ref.Name != "StripPrefix" || s.goImported(ref.Qualifier) != fwNetHTTP {
+		return
+	}
+	strip := &s.link.Sites[k]
+	child := s.objOf(argType(strip, 1))
+	if child == nil {
+		return
+	}
+	a := routeAttach{parent: parent}
+	if args := positional(s.siteArgs(strip)); len(args) == 2 {
+		a.prefix, a.known = stringLiteral("go", args[0].text)
+	}
+	child.atts = append(child.atts, a)
+}
+
+// goServerLiterals serves each router a net/http Server literal names as
+// its Handler (`&http.Server{Addr: a, Handler: r}`), which the program then
+// serves: the router named by a call written there, or by a name the file
+// assigns exactly one router to.
+func (s *routeScan) goServerLiterals() {
+	httpName := ""
+	for name, imp := range s.imports {
+		if strings.Trim(imp.path, "\"`") == "net/http" {
+			httpName = name
+		}
+	}
+	if httpName == "" || s.link == nil || !strings.Contains(string(s.b.src), "Server{") {
+		return
+	}
+	sc := &inputScan{b: s.b}
+	sc.lex()
+	for i := 0; i+4 < len(sc.toks); i++ {
+		if !sc.ident(i) || sc.text(i) != httpName || !sc.punct(i+1, '.') || !sc.ident(i+2) || sc.text(i+2) != "Server" ||
+			!sc.punct(i+3, '{') || sc.match[i+3] < 0 {
+			continue
+		}
+		end := int(sc.match[i+3])
+		for k := i + 4; k+2 < end; k++ {
+			if sc.match[k] > 0 {
+				k = int(sc.match[k])
+				continue
+			}
+			if !(sc.punct(k-1, '{') || sc.punct(k-1, ',')) || !sc.ident(k) || sc.text(k) != "Handler" || !sc.punct(k+1, ':') {
+				continue
+			}
+			if o := s.objectAt(sc, k+2, end); o != nil {
+				o.atts = append(o.atts, routeAttach{served: true, known: true})
+			}
+		}
+		i = end
+	}
+}
+
+// objectAt is the router the expression at token k (before token end)
+// denotes: a call written there that builds one, or a name the file
+// assigns exactly one router to, by `:=`, `=` or `var … =`.
+func (s *routeScan) objectAt(sc *inputScan, k, end int) *routeObj {
+	if site, ok := s.callAt(sc, k, end); ok {
+		return s.objs[site]
+	}
+	if !sc.ident(k) || !(sc.punct(k+1, ',') || sc.punct(k+1, '}') || k+1 == end) {
+		return nil
+	}
+	name := sc.text(k)
+	var found *routeObj
+	for j := 0; j+2 < len(sc.toks); j++ {
+		if !sc.ident(j) || sc.text(j) != name || sc.punct(j-1, '.') {
+			continue
+		}
+		v := j + 1
+		if sc.punct(v, ':') {
+			v++
+		}
+		if !sc.punct(v, '=') || sc.punct(v+1, '=') {
+			continue
+		}
+		site, ok := s.callAt(sc, v+1, len(sc.toks))
+		if !ok {
+			continue
+		}
+		o := s.objs[site]
+		if o == nil {
+			continue
+		}
+		if found != nil && found != o {
+			return nil
+		}
+		found = o
+	}
+	return found
+}
+
+// callAt is the worker site of the call written at token k: a name or a
+// dotted name followed by its argument list.
+func (s *routeScan) callAt(sc *inputScan, k, end int) (int, bool) {
+	if sc.punct(k, '&') {
+		k++
+	}
+	if !sc.ident(k) {
+		return 0, false
+	}
+	for sc.punct(k+1, '.') && sc.ident(k+2) {
+		k += 2
+	}
+	if k+1 >= end || !sc.punct(k+1, '(') {
+		return 0, false
+	}
+	site, ok := s.siteAt[wire.Span{Start: sc.toks[k].start, End: sc.toks[k].end}]
+	return site, ok
+}

@@ -275,11 +275,8 @@ func (s *routeScan) soleFramework(verb string, verbs map[string][]string) string
 // and is no endpoint; `View.as_view()` routes to the class.
 func (s *routeScan) django() {
 	s.calls(func(r *wire.Ref, site *wire.Site, _ int) {
-		if r.Qualified {
-			return
-		}
-		imp, ok := s.imports[r.Name]
-		if !ok || frameworkOf("python", imp.path) != fwDjango || !slices.Contains(djangoRoutes, cmp.Or(imp.original, r.Name)) {
+		fn, ok := s.djangoFunc(r.Qualifier, r.Name, r.Qualified)
+		if !ok || !slices.Contains(djangoRoutes, fn) {
 			return
 		}
 		args := s.siteArgs(site)
@@ -296,9 +293,13 @@ func (s *routeScan) django() {
 		if !ok {
 			return
 		}
-		e := djangoEntry{at: refSpan(r), route: s.routeOf(route), regex: cmp.Or(imp.original, r.Name) != "path"}
-		if inc, ok := s.imports[calleeName(view.text)]; ok && frameworkOf("python", inc.path) == fwDjango &&
-			cmp.Or(inc.original, calleeName(view.text)) == "include" {
+		e := djangoEntry{at: refSpan(r), route: s.routeOf(route), regex: fn != "path"}
+		callee := calleeName(view.text)
+		q, name, qualified := "", callee, false
+		if dot := strings.LastIndexByte(callee, '.'); dot >= 0 {
+			q, name, qualified = callee[:dot], callee[dot+1:], true
+		}
+		if inc, ok := s.djangoFunc(q, name, qualified); ok && inc == "include" {
 			e.include = djangoIncluded(view)
 			s.djangoEntries = append(s.djangoEntries, e)
 			return
@@ -307,6 +308,32 @@ func (s *routeScan) django() {
 		s.djangoEntries = append(s.djangoEntries, e)
 		s.emitPrefixed(fwDjango, nil, e.route, "", false, e.at, e.handlers, "")
 	})
+}
+
+// djangoFunc is the Django urlconf function a call names, the name it has
+// in `django.urls` or `django.conf.urls`, and false when it names none: a
+// name imported from either (`path`, or `p` for `from django.urls import
+// path as p`), or a qualified name whose qualifier is that module, imported
+// as a name (`from django import urls`, `import django.urls as u`) or
+// written in full (`import django.urls` then `django.urls.path`).
+func (s *routeScan) djangoFunc(qualifier, name string, qualified bool) (string, bool) {
+	urlconf := func(module string) bool { return module == "django.urls" || module == "django.conf.urls" }
+	if !qualified {
+		imp, ok := s.imports[name]
+		return cmp.Or(imp.original, name), ok && urlconf(imp.path) && s.fromImport(name)
+	}
+	if imp, ok := s.imports[qualifier]; ok {
+		module := imp.path
+		if s.fromImport(qualifier) {
+			module += "." + cmp.Or(imp.original, qualifier)
+		}
+		return name, urlconf(module)
+	}
+	head, _, _ := strings.Cut(qualifier, ".")
+	if imp, ok := s.imports[head]; ok && !s.fromImport(head) && urlconf(qualifier) && strings.HasPrefix(imp.path, "django") {
+		return name, true
+	}
+	return "", false
 }
 
 // djangoEntry is one Django urlconf entry: the `path`, `re_path` or `url`
