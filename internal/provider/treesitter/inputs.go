@@ -298,16 +298,22 @@ func (s *inputScan) add(fw string, src model.InputSource, key string, start, end
 }
 
 // handlerSpans are the declarations and function literals the file's routes
-// of framework fw route to, each once.
-func (s *inputScan) handlerSpans(fw string) (decls []int, literals []wire.Span) {
+// of framework fw route to, and the handlers extra names (middleware), each
+// once.
+func (s *inputScan) handlerSpans(fw string, extra []handler) (decls []int, literals []wire.Span) {
 	seenDecl, seenLit := map[int]bool{}, map[wire.Span]bool{}
+	groups := make([][]handler, 0, len(s.b.endpointFacts)+1)
 	for i := range s.b.endpointFacts {
-		f := &s.b.endpointFacts[i]
-		if f.meta.Framework != fw {
-			continue
+		if f := &s.b.endpointFacts[i]; f.meta.Framework == fw {
+			groups = append(groups, f.handlers)
 		}
-		for _, h := range f.handlers {
+	}
+	groups = append(groups, extra)
+	for _, hs := range groups {
+		for _, h := range hs {
 			switch {
+			case h.built:
+				// A builder's parameters are not the request.
 			case h.decl >= 0 && h.decl < len(s.b.decls) && !seenDecl[h.decl]:
 				seenDecl[h.decl] = true
 				decls = append(decls, h.decl)
@@ -461,7 +467,7 @@ func (s *inputScan) express() {
 	if !s.rs.frameworks[fwExpress] {
 		return
 	}
-	decls, literals := s.handlerSpans(fwExpress)
+	decls, literals := s.handlerSpans(fwExpress, s.b.middleware)
 	if len(decls) == 0 && len(literals) == 0 {
 		return
 	}

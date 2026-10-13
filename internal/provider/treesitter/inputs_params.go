@@ -72,12 +72,41 @@ func (s *inputScan) firstParamReads(fw string, table inputTable, from, start, en
 			}
 			params = params[1:]
 		}
+		if jsLanguage(s.b.lang.Name) && len(params) > 0 && s.ident(params[0].lo) && s.text(params[0].lo) == "this" {
+			// A TypeScript `this` parameter is erased: no argument binds it.
+			params = params[1:]
+		}
+		if fw == fwExpress && s.jsArity(params) == 4 {
+			// Express runs a function of four parameters as error-handling
+			// middleware, `(err, req, res, next)`: the request is second.
+			params = params[1:]
+		}
 		if len(params) == 0 || !s.ident(params[0].lo) {
 			return
 		}
 		name, body = s.text(params[0].lo), int(s.match[open])+1
 	}
 	s.reads(fw, []string{name}, table, body, hi)
+}
+
+// jsArity is a function's `length` as ECMAScript counts it: its
+// parameters before the first with a default value or the rest parameter.
+func (s *inputScan) jsArity(params []paramRange) int {
+	for n, p := range params {
+		if s.punct(p.lo, '.') {
+			return n
+		}
+		for k := p.lo; k < p.hi; k++ {
+			if s.match[k] > 0 {
+				k = int(s.match[k])
+				continue
+			}
+			if s.punct(k, '=') && !s.punct(k+1, '=') && !s.punct(k+1, '>') && !s.punct(k-1, '=') {
+				return n
+			}
+		}
+	}
+	return len(params)
 }
 
 // djangoViewMethods are the methods of a class-based view that receive the
@@ -102,7 +131,7 @@ func (s *inputScan) djangoViews() {
 	s.lex()
 	views := map[int]bool{}
 	classes := map[int]bool{}
-	routed, _ := s.handlerSpans(fwDjango)
+	routed, _ := s.handlerSpans(fwDjango, nil)
 	for _, d := range routed {
 		if s.b.decls[d].kind == model.NodeClass {
 			classes[d] = true
@@ -218,7 +247,7 @@ var (
 // routes: for Starlette, the request its first parameter receives; for
 // FastAPI, each parameter by FastAPI's own rule.
 func (s *inputScan) fastAPIHandlers(fw string) {
-	decls, _ := s.handlerSpans(fw)
+	decls, _ := s.handlerSpans(fw, nil)
 	if len(decls) == 0 {
 		return
 	}

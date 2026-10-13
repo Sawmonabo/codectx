@@ -117,6 +117,9 @@ type builder struct {
 	mainInherited map[int]bool
 	// links is the routing the route table left open, for the link table.
 	links *routeLinks
+	// middleware are the Express middleware the route table read
+	// (expressMiddleware), whose request parameter requestInputs reads.
+	middleware []handler
 	// parameterDecorators are the decorators of each parameter by its name
 	// token, published on the parameter's variable node (variable), and
 	// placed the ones published there (decorator_targets.go).
