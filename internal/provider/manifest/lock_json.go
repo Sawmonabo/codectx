@@ -221,7 +221,7 @@ func (u *unit) npmTreeLevel(dec *json.Decoder, t *npmTree, parent string) error 
 				t.entries[i].end = int(dec.InputOffset())
 				err = u.npmTreeLevel(dec, t, key)
 			default:
-				err = skipValue(dec, 1)
+				err = skipValue(dec, 1+2*strings.Count(key, "node_modules/"))
 			}
 			if err != nil {
 				return err

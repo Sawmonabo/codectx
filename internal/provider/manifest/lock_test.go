@@ -101,8 +101,10 @@ func wantLines(t *testing.T, name string, got, want []string) {
 //     react-dom snapshot would be a second package);
 //   - pnpm-lock.yaml v5: splitting a `/name/version` key at its `@` (the
 //     scoped name would be cut) or keeping the `_peer` suffix;
-//   - bun.lock: failing on its trailing commas, or resolving a nested copy
-//     as the top-level one (other -> js-tokens would be 4.0.0);
+//   - bun.lock: failing on its trailing commas, resolving a nested copy
+//     as the top-level one (other -> js-tokens would be 4.0.0), or skipping
+//     the `workspaces` object past its own end (the skip would consume
+//     `packages` with it: no facts at all);
 //   - uv.lock: dropping optional-dependencies or the marker, or counting
 //     the wheels' hashes as the integrity;
 //   - pylock.toml: losing the `[[packages.wheels]]` sub-tables to the next
