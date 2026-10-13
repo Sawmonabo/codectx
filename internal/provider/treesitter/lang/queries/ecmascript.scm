@@ -17,6 +17,7 @@
 (generator_function_declaration name: (identifier) @name body: (_) @body) @def.function
 (class_declaration name: (_) @name body: (_) @body) @def.class
 (method_definition name: (property_identifier) @name body: (_) @body) @def.method
+(method_definition name: (private_property_identifier) @name body: (_) @body) @def.method
 (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)] @body) @def.function
 ; A function-valued property or assignment is a function declaration named by
 ; the name it is stored under, the shapes the grammar's reference tags define
@@ -36,6 +37,12 @@
 (call_expression function: (identifier) @call.name) @call
 (call_expression function: (member_expression object: (_) @call.qualifier property: (property_identifier) @call.name)) @call
 (new_expression constructor: (identifier) @call.name) @call
+; A private method `this.#p()`, and a callee in one pair of parentheses, which
+; evaluate to the reference they hold (ECMA-262 §13.2.9, the grouping operator):
+; `(f)()` calls f and `(o.m)()` calls m with o as this.
+(call_expression function: (member_expression object: (_) @call.qualifier property: (private_property_identifier) @call.name)) @call
+(call_expression function: (parenthesized_expression (identifier) @call.name)) @call
+(call_expression function: (parenthesized_expression (member_expression object: (_) @call.qualifier property: [(property_identifier) (private_property_identifier)] @call.name))) @call
 
 ((call_expression function: (identifier) @test.fn arguments: (arguments . (string) @test.name)) @def.test
   (#any-of? @test.fn "it" "test" "describe"))

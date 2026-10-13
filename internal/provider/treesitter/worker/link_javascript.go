@@ -916,12 +916,12 @@ func (k *javaScriptLinker) callee(n Node) (Node, bool) {
 	kk := k.k
 	switch n.KindId() {
 	case kk.callExpression:
-		f := n.ChildByFieldId(kk.fFunction)
+		f := k.calleeExpr(n)
 		switch jsKindOf(f) {
 		case kk.identifier:
 			return f, true
 		case kk.memberExpression:
-			if p := f.ChildByFieldId(kk.fProperty); jsKindOf(p) == k.x.propertyIdentifier {
+			if p := f.ChildByFieldId(kk.fProperty); jsKindOf(p) == k.x.propertyIdentifier || jsKindOf(p) == k.x.privatePropertyIdentifier {
 				return p, true
 			}
 		}
@@ -931,6 +931,27 @@ func (k *javaScriptLinker) callee(n Node) (Node, bool) {
 		}
 	}
 	return Node{}, false
+}
+
+// calleeExpr is the call n's callee expression seen through the wrappers
+// the structural query sees through: one pair of parentheses, then a
+// TypeScript `as`, `satisfies` or non-null assertion; or a non-null
+// assertion alone. `(f as T)()` and `f!()` call f, `(o.m)()` calls m on o.
+func (k *javaScriptLinker) calleeExpr(n Node) Node {
+	kk := k.k
+	f := n.ChildByFieldId(kk.fFunction)
+	if jsKindOf(f) == kk.parenthesizedExpression {
+		f = firstNamed(f)
+		switch jsKindOf(f) {
+		case kk.asExpression, kk.satisfiesExpression, kk.nonNullExpression:
+			return firstNamed(f)
+		}
+		return f
+	}
+	if jsKindOf(f) == kk.nonNullExpression {
+		return firstNamed(f)
+	}
+	return f
 }
 
 // testCall reports a call the extraction reports as a test declaration and
@@ -968,7 +989,7 @@ func (k *javaScriptLinker) required(call Node) (string, bool) {
 func (k *javaScriptLinker) site(n, tok Node) wire.Site {
 	kk, x := k.k, k.x
 	s := wire.Site{Name: wireSpan(spanOf(tok))}
-	switch f := n.ChildByFieldId(kk.fFunction); {
+	switch f := k.calleeExpr(n); {
 	case n.KindId() == kk.newExpression:
 		s.Shape = wire.ShapeConstructor
 	case f == tok:
@@ -1051,9 +1072,10 @@ func (k *javaScriptLinker) readSkip(n Node) bool {
 
 // computedCallee is the callee expression of the call n when it names
 // nothing, so no call reference covers the call (the structural query
-// captures a callee that is an identifier or a member with a property
-// name): a subscript `o[k]()`, a call's result `f()()`, a parenthesized,
-// logical or conditional expression, a function called where it is written.
+// captures a callee that is an identifier or a member with a property or
+// private name, seen through the wrappers calleeExpr removes): a subscript
+// `o[k]()`, a call's result `f()()`, a logical, conditional or sequence
+// expression, a function called where it is written.
 // A dynamic `import(…)` and a `super(…)` constructor call are no such call.
 func (k *javaScriptLinker) computedCallee(n Node) (Node, bool) {
 	if n.KindId() != k.k.callExpression {
@@ -1389,7 +1411,9 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 				k.export(out, name, n, "", true, false)
 			}
 		case kk.methodDefinition, x.methodSignature, x.abstractMethodSignature:
-			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == x.propertyIdentifier {
+			// A private method (`#p() {}`) is a method of its class too, which
+			// `this.#p()` calls.
+			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == x.propertyIdentifier || jsKindOf(name) == x.privatePropertyIdentifier {
 				abstract := n.KindId() != kk.methodDefinition
 				k.export(out, name, n, k.receiverOf(n), !abstract && hasToken(n, kk.staticKw), abstract)
 				out.Exports[len(out.Exports)-1].Override = !kindChild(n, x.overrideModifier).IsNull()
@@ -1934,7 +1958,7 @@ func jsKindOf(n Node) uint16 {
 // named node has, so the construct cannot occur there (the javascript
 // grammar has no TypeScript kind).
 type jsLinkSyntax struct {
-	arguments, formalParameters, propertyIdentifier, this, super, str, pair, object,
+	arguments, formalParameters, propertyIdentifier, privatePropertyIdentifier, this, super, str, pair, object,
 	shorthandPropertyIdentifier, array, returnStatement, arrowFunction, typeAnnotation, assertsAnnotation,
 	typePredicateAnnotation, typeIdentifier, nestedTypeIdentifier, genericType, predefinedType, functionType,
 	implementsClause, extendsTypeClause, interfaceDeclaration, interfaceBody, objectType, typeAliasDeclaration,
@@ -1968,7 +1992,8 @@ func (g *jsLinkGrammar) syntax() *jsLinkSyntax {
 		k := func(name string) uint16 { return tl.IdForNodeKind(name, true) }
 		g.s = jsLinkSyntax{
 			arguments: k("arguments"), formalParameters: k("formal_parameters"),
-			propertyIdentifier: k("property_identifier"), this: k("this"), super: k("super"), str: k("string"),
+			propertyIdentifier: k("property_identifier"), privatePropertyIdentifier: k("private_property_identifier"),
+			this: k("this"), super: k("super"), str: k("string"),
 			pair: k("pair"), object: k("object"), shorthandPropertyIdentifier: k("shorthand_property_identifier"),
 			array: k("array"), returnStatement: k("return_statement"), arrowFunction: k("arrow_function"),
 			typeAnnotation: k("type_annotation"), assertsAnnotation: k("asserts_annotation"),

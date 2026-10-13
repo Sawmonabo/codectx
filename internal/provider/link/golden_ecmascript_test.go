@@ -960,4 +960,42 @@ export function run() {
 		// and publishes nothing.
 		fails: "`import x = require()` read as no import loses the import of src/a.ts",
 	},
+	{
+		name: "wrapped-and-private-callees",
+		anchor: "ECMA-262 (15th edition, 2024) §13.2.9 (the grouping operator keeps the reference), §15.7 (PrivateName); " +
+			"TypeScript Handbook (non-null assertion `!`, `as` and `satisfies` change no value)",
+		files: map[string]string{
+			"src/a.ts": `export function f() {} // @f
+
+export class C {
+  #p() {} // @p
+  m() {} // @m
+  run() {
+    this.#p(); // @r1
+    (this.m)(); // @r2
+  }
+}
+
+export function go(c: C) {
+  f!(); // @rnn
+  (f as any)(); // @r4
+  (c.m satisfies () => void)(); // @r5
+  (f)(); // @r6
+}
+`,
+		},
+		// Derived from the anchors: each wrapper leaves the callee's reference, so every call names its
+		// declaration; a private name is its class body's alone, so `this.#p()` runs no override.
+		want: []string{
+			"r1 #p -> p #p exact",
+			"r2 m -> m m virtual",
+			"rnn f -> f f exact",
+			"r4 f -> f f exact",
+			"r5 m -> m m virtual",
+			"r6 f -> f f exact",
+		},
+		// Mutation: drop the wrapped and private callee patterns -> every call is a computed site and binds
+		// nothing; dispatch a private method like any other -> r1 is virtual.
+		fails: "a wrapped or private callee read as computed leaves the six calls unbound; a private method dispatched as overridable makes r1 virtual",
+	},
 }

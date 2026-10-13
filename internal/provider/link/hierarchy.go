@@ -1470,6 +1470,8 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 //     member the static type names;
 //   - Go: one of them is an interface's method; a concrete type's method is
 //     promoted into the types embedding it, never overridden;
+//   - ECMAScript: unless the method is private (`#p`), whose name is its
+//     class body's alone;
 //   - every other family: always (a Rust call reads its receiver's kind
 //     instead, staticFile.dispatchOf).
 //
@@ -1489,6 +1491,8 @@ func (h *hierarchy) overridable(family string, typ Ref, method string, found []e
 			return false, nil
 		}
 		return h.virtual(typ, method)
+	case "js":
+		return !strings.HasPrefix(method, "#"), nil
 	}
 	return true, nil
 }
@@ -2249,6 +2253,10 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 		return nil
 	case fc.family == "rust" && !d.Override:
 		// Only an item of a trait's impl implements the trait's.
+		return nil
+	case fc.family == "js" && strings.HasPrefix(d.Name, "#"):
+		// A private method's name is its class body's alone (ECMA-262
+		// §15.7.1, PrivateName): it overrides nothing.
 		return nil
 	case fc.family == "go" && d.Parent >= 0 && int(d.Parent) < len(t.Decls) && t.Decls[d.Parent].Kind == model.NodeInterface:
 		// An interface's method specification implements nothing.
