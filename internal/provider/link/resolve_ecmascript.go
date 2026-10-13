@@ -12,7 +12,7 @@ import (
 // (inferTypes) and field-based resolution, over the unit's own hierarchy and
 // module index (emitECMAScript).
 func resolveECMAScript(ctx context.Context, u *unit, emit func(Binding) error) error {
-	h, err := buildHierarchy(ctx, u)
+	h, err := buildHierarchy(ctx, u, nil)
 	if err != nil {
 		return err
 	}

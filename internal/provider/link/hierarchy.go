@@ -56,6 +56,9 @@ type hierarchy struct {
 	// goSurface is the digest of what the build read from the packages
 	// outside a Go unit (goExternal.surface), empty for any other unit.
 	goSurface string
+	// members is every member's projection with a table, by FileID
+	// (projection.go).
+	members *pagination.SortedRun[projection]
 	// note, while a member's reads are recorded (record), is told each
 	// read by its trace key.
 	note func(TraceKey) error
@@ -405,8 +408,11 @@ func refKey(r Ref) string {
 	return string(b[:])
 }
 
-// buildHierarchy reads the unit's tables into its hierarchy.
-func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
+// buildHierarchy reads the unit's members into its hierarchy: each member's
+// table once, or, for a member from holds (a refresh's members whose digest
+// held), the projection its predecessor stored, and in the second pass the
+// projections the first kept (projection.go). from is nil on a full build.
+func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hierarchy, error) {
 	h := &hierarchy{}
 	ok := false
 	defer func() {
@@ -430,15 +436,34 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		return nil, err
 	}
 	defer es.close()
+	projections, err := newProjectionSort(u.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer projections.Close()
+	held, stop, err := from.open()
+	if err != nil {
+		return nil, err
+	}
+	defer stop()
 	var file int32 = -1
 	err = u.members(func(fv model.FileVersion) error {
 		file++
-		t, ok, err := u.tables.Table(ctx, u.gen, fv)
+		t, raw, err := held(fv.ID)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			t = nil
+		if t == nil {
+			full, ok, err := u.tables.Table(ctx, u.gen, fv)
+			if err != nil {
+				return err
+			}
+			if ok {
+				t = full.project()
+				if raw, err = t.encodeProjected(); err != nil {
+					return err
+				}
+			}
 		}
 		if err := h.ids.add(fv.ID, t); err != nil {
 			return err
@@ -446,12 +471,18 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		if t == nil {
 			return nil
 		}
+		if err := projections.Add(projection{File: fv.ID, Raw: raw}); err != nil {
+			return err
+		}
 		return addDecls(ctx, decls, file, t, es)
 	})
 	if err == nil {
 		err = h.ids.finish()
 	}
 	if err != nil {
+		return nil, err
+	}
+	if h.members, err = projections.Sorted(); err != nil {
 		return nil, err
 	}
 	if u.family == FamilyRust {
@@ -494,7 +525,7 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 			return nil, err
 		}
 	}
-	err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
+	err = h.projected(func(file int32, t *Table) error {
 		return h.addLinks(ctx, links, methodSets, file, t)
 	})
 	if err != nil {
@@ -508,6 +539,30 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	}
 	ok = true
 	return h, nil
+}
+
+// projected yields, in ordinal order, each member with a table and its
+// projection, read from h's projections alone.
+func (h *hierarchy) projected(yield func(file int32, t *Table) error) error {
+	var ord int32
+	return h.members.Each(func(p projection) error {
+		for ; ; ord++ {
+			id, err := h.ids.file(ord)
+			if err != nil {
+				return err
+			}
+			if id == p.File {
+				break
+			}
+		}
+		t, err := decodeProjected(p.Raw)
+		if err != nil {
+			return err
+		}
+		err = yield(ord, t)
+		ord++
+		return err
+	})
 }
 
 // addDecls adds t's file context, type declarations and free functions,
@@ -1710,6 +1765,7 @@ func (h *hierarchy) close() error {
 	h.decls.close()
 	h.links.close()
 	h.ids.close()
+	h.members.Close()
 	return nil
 }
 

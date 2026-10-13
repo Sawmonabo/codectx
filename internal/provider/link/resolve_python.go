@@ -20,7 +20,7 @@ import (
 // declares or inherits in method resolution order, over the unit's own
 // hierarchy (emitPython).
 func resolvePython(ctx context.Context, u *unit, emit func(Binding) error) error {
-	h, err := buildHierarchy(ctx, u)
+	h, err := buildHierarchy(ctx, u, nil)
 	if err != nil {
 		return err
 	}

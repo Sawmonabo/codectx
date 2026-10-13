@@ -27,7 +27,10 @@ import (
 // recorded reads changed (static.go, trace.go), and keeps every other
 // member's bindings; when the membership and manifest fields hold and every
 // moved table keeps its interface (layout), it also keeps the predecessor's
-// hierarchy and reads only the tables of the members that re-run. A Python
+// hierarchy and reads only the tables of the members that re-run; when the
+// layout broke, it builds the hierarchy again from the projections the
+// predecessor stored for the members whose digest held and the tables of the
+// others alone (projection.go). A Python
 // or ECMAScript unit re-derives only the region of nodes (sites and file
 // nodes) whose recorded reads or lookups changed, or whose member moved
 // (resolveFlow, below), whatever moved. The bindings are then
@@ -111,6 +114,9 @@ type refresh struct {
 	// again whatever they read; gone the predecessor's members that are no
 	// longer members.
 	moved, gone *pagination.ExternalSort[model.FileID]
+	// kept collects the members whose table digest held, whose stored
+	// projection a hierarchy built again reads in place of the table.
+	kept *pagination.ExternalSort[model.FileID]
 }
 
 // open makes rf's sorts in its unit's directory.
@@ -122,12 +128,15 @@ func (rf *refresh) open() error {
 	if rf.moved, err = newFileIDSort(rf.u.dir); err != nil {
 		return err
 	}
-	rf.gone, err = newFileIDSort(rf.u.dir)
+	if rf.gone, err = newFileIDSort(rf.u.dir); err != nil {
+		return err
+	}
+	rf.kept, err = newFileIDSort(rf.u.dir)
 	return err
 }
 
 func (rf *refresh) close() {
-	for _, s := range []*pagination.ExternalSort[model.FileID]{rf.changed, rf.moved, rf.gone} {
+	for _, s := range []*pagination.ExternalSort[model.FileID]{rf.changed, rf.moved, rf.gone, rf.kept} {
 		if s != nil {
 			s.Close()
 		}
@@ -181,6 +190,11 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 			return err
 		}
 		if ok && old.File == fv.ID {
+			if old.Digest == digest && digest != "" {
+				if err := rf.kept.Add(fv.ID); err != nil {
+					return err
+				}
+			}
 			if old.Digest != digest {
 				rf.resolve = true
 				if err := rf.moved.Add(fv.ID); err != nil {
@@ -215,6 +229,20 @@ func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manif
 		err = gone()
 	}
 	return err
+}
+
+// held is what a hierarchy built again on this refresh reads in place of
+// tables (heldProjections), nil without a predecessor's hierarchy; release
+// frees it.
+func (rf *refresh) held() (*heldProjections, func(), error) {
+	if rf.prev == nil || rf.prev.h == nil {
+		return nil, func() {}, nil
+	}
+	kept, err := rf.kept.Sorted()
+	if err != nil {
+		return nil, nil, err
+	}
+	return &heldProjections{prev: rf.prev.h.members, kept: kept}, func() { kept.Close() }, nil
 }
 
 // sameInterface clears rf.layout unless fv's fresh table keeps the interface
@@ -395,7 +423,12 @@ func resolveFlow(ctx context.Context, u *unit, rf *refresh) (*resolution, error)
 	if incremental && rf.layout {
 		res.h, res.mods, res.groups = prev.h, prev.mods, prev.groups
 	} else {
-		if res.h, err = buildHierarchy(ctx, u); err != nil {
+		held, release, err := rf.held()
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		if res.h, err = buildHierarchy(ctx, u, held); err != nil {
 			return nil, err
 		}
 		if res.mods, err = buildModules(ctx, u, res.h); err != nil {
