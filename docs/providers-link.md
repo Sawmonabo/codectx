@@ -39,6 +39,8 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `imports` | `imports` | file module → each file module the import resolves to | `import` |
 | `imports` | `imports` | file module → the import's open-import-site node | none |
 | `data_flows_to` | `data_flows_to` | each variable an argument reads → the parameter it binds | `argument` |
+| `data_flows_to` | `data_flows_to` | each variable an argument reads → each variable the site's result is written into, when the parameter it binds reaches the callee's return | `summary:<position>` |
+| `data_flows_to` | `data_flows_to` | the callee's return node → each variable the site's result is written into, and the return node of the callable that returns the call | `return` |
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
@@ -51,6 +53,9 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 - `field`: a function written to the field the site calls through;
 - `import`: an import resolved to a file of the unit;
 - `argument`: an argument of a bound call site, matched to its parameter;
+- `summary:<position>`: an argument of a bound call site flowing into the site's result through the callee's
+  parameter at that position (`Parameter.Index`, 0 the receiver), whose value reaches the callee's return;
+- `return`: the bound callee's return node flowing into the site's result;
 - `supertype`: a supertype or an override the source writes;
 - `method_set`: a Go interface a type satisfies by its method set, which the source never writes;
 - `supertype_interface`, `supertype_class`: a supertype the source writes that is outside the project (a node of
@@ -72,7 +77,7 @@ range (`Site.Range`). Its native key is the call-site key, spelled as the struct
 the site's call-site key, and a hierarchy edge at the declaration that states it.
 
 **Endpoints are the structural nodes.** The linker mints no second identity for a declaration. Each table carries
-an `Endpoint` for each declaration, each parameter and the module (`table.go`): the node id, canonical key, kind,
+an `Endpoint` for each declaration, each parameter, each callable's return node and the module (`table.go`): the node id, canonical key, kind,
 names and range the structural unit resolved. The linker publishes an occurrence of every endpoint an edge names,
 with its own evidence at the declaration's range. So the edge joins the structural node, and through it the
 cross-provider `decl:` key and the call-site key of docs/providers-treesitter.md.
@@ -154,6 +159,33 @@ every function the address-taken join binds it to. A receiver passed first (a
 Go method expression, a Rust path naming a method, a Java unbound method reference, Python `C.m(obj)`) binds the
 receiver parameter, and nothing where the callee declares none (a Java method's receiver). A parameter with no
 node of its own receives no edge.
+
+**Return flows.** A call's value goes back to the caller by summary edges, never by a plain edge from inside the
+callee to the call (ADR-0017 decision 7), for every family that publishes argument flows, the address-taken join
+included (`internal/provider/link/returns.go`). A site's result is where the structural provider found its value
+goes: `Site.Results`, the variables the innermost node evaluating the call defines, and `Site.Into`, the callable
+whose return that node is (`return f()`); a call whose value another call consumes first (`g(f())`, `f().m()`)
+has neither, and a site with neither publishes no return flow. A bound site publishes:
+- for each argument bound to a parameter marked `Returned` (its value reaches the callee's return), one
+  `data_flows_to` from each variable the argument reads to each variable of `Site.Results`, at the argument, detail
+  `summary:<position>` (`FactSummary`);
+- from the callee's return node (`Decl.Return`) one `data_flows_to` to each variable of `Site.Results` and to the
+  return node of the callable `Site.Into` names, at the call expression, detail `return` (`FactReturn`). A callee
+  with no return node (a type, a constructor that returns no value) publishes none.
+
+Only the values created inside a callable flow into its return node (docs/providers-treesitter.md, Return flow);
+the values its parameters reach come back only as summaries. So a walk at query time over `data_flows_to` needs no
+call stack to stay on realizable paths (ADR-0017 [S10]): a walk that enters a callee through an argument edge
+reaches only variables a parameter reaches, none of which flows into the return node, so it can leave the callee
+only through an argument edge of a call the callee makes; a walk that reaches a return node started inside the
+callee (or in a callee whose return it returns) and may leave through any site's `return` edge, a partially
+balanced path; a summary edge stays in the caller. What the walk can never do is enter through one call's argument
+and leave through another call's result. A summary is the dependence facts' reach: a call folded into a node passes
+its arguments' values to what the node defines, so a parameter passed through another call reaches the return
+whatever that callee returns. The summary is part of the callee's interface (`Parameter.Returned`, the
+`paramReturned` mark of its hierarchy entry): a body edit that changes whether a parameter reaches the return
+changes the entry every bound site's argument flows read, so a refresh re-runs exactly those sites. The return node
+is keyed by the callable's identity and exists for every analysed callable, so its flows do not depend on the body.
 
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
 the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
@@ -239,13 +271,16 @@ Besides the joined declarations, sites and values, the table carries what the re
   definitions or arms reach.
 - `Import.Range`: where the import is written, the location of its `imports` edges;
 - `DynamicImports`: each import whose path does not fold to a constant, with its range and its literal fragments;
-- `Decl.Parameters`: each parameter's node, position and its variadic and keyword-only marks, which argument flows
-  bind to;
+- `Decl.Parameters`: each parameter's node, position, its variadic and keyword-only marks, which argument flows
+  bind to, and its `Returned` mark, the callable's return summary;
+- `Decl.Return`: the callable's return node, which return flows leave from;
 - `Decl.Override`: the language marks the method as overriding (`@Override`, `override`, `typing.override`, a trait
   impl item);
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
   macro calls;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
+- `Site.Results` and `Site.Into`: the variables the call's value is written into, and the callable whose return it
+  reaches;
 - `Site.Computed`: the callee is an expression that names nothing (`wire.Link.Computed`);
 - `Handlers` and `Site.Handler`: the anonymous route handlers the structural provider publishes as function nodes,
   and the one a site is written in.
