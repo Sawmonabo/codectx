@@ -255,10 +255,17 @@ type Spool struct {
 	pending int64
 }
 
-// Create allocates a spool for cursor c. The header is written, flushed and
-// synced before Create returns, so a sweep or a crash never finds a live spool
-// as an empty file, and a later Open can validate it even if no record was
-// ever appended.
+// Create allocates a spool for cursor c. The header is written and flushed
+// before Create returns, so a sweep or a later Open in any process finds a
+// live spool with its header even if no record was ever appended.
+//
+// It is not synced. A spool is continuation state that lives at most one
+// cursor lease and is swept after it, like a database's temporary files,
+// which take no fsync either: a process crash loses nothing the page cache
+// holds, and a power loss that tears the file leaves a spool whose header is
+// missing or short, which Open answers as expired continuation state (re-run
+// from the first page) and the sweep removes once headerlessGrace has passed.
+// The sync cost one flush to stable storage on every spooled page.
 func (s *Spools) Create(c Cursor) (*Spool, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -293,10 +300,6 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 	if err := sp.w.Flush(); err != nil {
 		sp.discard()
 		return nil, spoolRefused("spool header flush", s.dir, err)
-	}
-	if err := f.Sync(); err != nil {
-		sp.discard()
-		return nil, spoolRefused("spool header sync", s.dir, err)
 	}
 	return sp, nil
 }
@@ -514,13 +517,16 @@ func (s *Spools) OpenAt(ctx context.Context, c Cursor, now time.Time, offset int
 }
 
 // readHeader reads and validates the first frame. A file that ends before a
-// header is a typed corruption, never a bare io.EOF leaking to the caller.
-// It also reports the byte offset one past the header frame, which is where
-// the first record of the spool begins.
+// whole header -- what a power loss leaves of a spool, whose header is never
+// synced (Create) -- is continuation state that did not survive, answered as
+// CTX_CURSOR_INVALID so the caller re-runs from the first page, never a bare
+// io.EOF leaking to the caller. It also reports the byte offset one past the
+// header frame, which is where the first record of the spool begins.
 func readHeader(r *bufio.Reader, max int64) (SpoolHeader, int64, error) {
 	head, err := readFrame(r, max)
-	if errors.Is(err, io.EOF) {
-		return SpoolHeader{}, 0, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool has no header"}
+	var typed *model.Error
+	if errors.Is(err, io.EOF) || (errors.As(err, &typed) && typed.Code == model.CodeStorageCorrupt) {
+		return SpoolHeader{}, 0, cursorInvalid("continuation state was lost before its header reached the disk")
 	}
 	if err != nil {
 		return SpoolHeader{}, 0, err
