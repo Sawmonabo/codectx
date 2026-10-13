@@ -153,7 +153,7 @@ func asciiTokens(s string) []string {
 func TestPageScoresMatchGoReference(t *testing.T) {
 	vocab := []string{"alpha", "beta", "gamma", "delta", "omega", "sigma", "kappa", "lambda", "theta", "zeta", "rho", "tau"}
 	var docs []refDoc
-	for i := 0; i < 400; i++ {
+	for i := range 400 {
 		w := func(k int) string { return vocab[(i*7+k*k*3+i/5)%len(vocab)] }
 		name := w(1)
 		body := make([]string, 0, 30)
@@ -180,7 +180,7 @@ func TestPageScoresMatchGoReference(t *testing.T) {
 	dir := t.TempDir()
 	x := openWritable(t, dir, 1)
 	ctx := context.Background()
-	for u := 0; u < 4; u++ {
+	for u := range 4 {
 		var batch []Document
 		for _, d := range docs[u*100 : (u+1)*100] {
 			batch = append(batch, d.doc)
