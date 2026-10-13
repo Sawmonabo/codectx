@@ -199,7 +199,7 @@ type Decl struct {
 	// which every value its returning nodes read flows. It is nil
 	// for a declaration no analysed function is the callable of.
 	Return *Endpoint `json:"return,omitempty"`
-	// Identity is a Go method's or alias's identity form
+	// Identity is a Go method's, alias's or constant's identity form
 	// (wire.Export.Identity), which the linker resolves to the packages
 	// declaring its types (goIdentity).
 	Identity string `json:"identity,omitempty"`

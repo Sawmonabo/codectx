@@ -59,6 +59,8 @@ type hierarchy struct {
 	// goSpellings counts the unit's Go methods by how exactly their
 	// method-set keys spell their signatures (goMethodKey).
 	goSpellings [3]uint32
+	// goMemo remembers Go lookups while the hierarchy is built (goMemo).
+	goMemo goMemos
 	// members is every member's projection with a table, by FileID
 	// (projection.go).
 	members *pagination.SortedRun[projection]
@@ -501,9 +503,12 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 			return nil, err
 		}
 		h.goSurface = h.goExt.surface()
+		// The memos answer for this build's indexes and packages alone.
+		h.goMemo = goMemos{}
 		defer func() {
 			h.goExt.close()
 			h.goExt = nil
+			h.goMemo = goMemos{}
 		}()
 	}
 
@@ -654,6 +659,11 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 		}
 		if fc.family == "go" && strings.HasPrefix(d.Identity, "=") && isType(d.Kind) {
 			if err := s.Add(entry{Key: keyGoAlias + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
+				return err
+			}
+		}
+		if fc.family == "go" && strings.HasPrefix(d.Identity, "#") && d.Kind == model.NodeConstant {
+			if err := s.Add(entry{Key: keyGoConst + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
 				return err
 			}
 		}

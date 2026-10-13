@@ -24,12 +24,13 @@ import (
 
 // goDeclarationsFormat names the encoding of a cache entry, so an entry
 // written in another encoding is never decoded as this one.
-const goDeclarationsFormat = "go-declarations\x00name files(imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds)"
+const goDeclarationsFormat = "go-declarations\x00name files(imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds variants) consts(name form file) forms(struct interface array-constant)"
 
 type goDeclPackage struct {
-	Name  string
-	Files []goDeclFile
-	Types []goDeclType
+	Name   string
+	Files  []goDeclFile
+	Types  []goDeclType
+	Consts []goDeclMethod
 }
 
 type goDeclFile struct {
@@ -44,6 +45,7 @@ type goDeclType struct {
 	Alias, Iface, Ineligible, Conflict bool
 	Form                               string
 	Methods, Embeds                    []goDeclMethod
+	Variants                           []goDeclType
 }
 
 type goDeclMethod struct {
@@ -95,12 +97,37 @@ func readGoDecls(id, p string) (*goExtPackage, bool) {
 		}
 		return out
 	}
-	for _, t := range d.Types {
+	for _, c := range d.Consts {
+		if c.File < 0 || c.File >= len(pkg.files) {
+			return nil, false
+		}
+		if pkg.consts == nil {
+			pkg.consts = map[string]goExtMethod{}
+		}
+		pkg.consts[c.Name] = goExtMethod{name: c.Name, form: c.Form, file: c.File}
+	}
+	var decode func(t goDeclType) (*goExtType, bool)
+	decode = func(t goDeclType) (*goExtType, bool) {
 		if t.File >= len(pkg.files) {
 			return nil, false
 		}
-		pkg.types[t.Name] = &goExtType{file: t.File, alias: t.Alias, form: t.Form, iface: t.Iface,
+		et := &goExtType{file: t.File, alias: t.Alias, form: t.Form, iface: t.Iface,
 			ineligible: t.Ineligible, conflict: t.Conflict, methods: methods(t.Methods), embeds: methods(t.Embeds)}
+		for _, v := range t.Variants {
+			ev, ok := decode(v)
+			if !ok {
+				return nil, false
+			}
+			et.variants = append(et.variants, ev)
+		}
+		return et, true
+	}
+	for _, t := range d.Types {
+		et, ok := decode(t)
+		if !ok {
+			return nil, false
+		}
+		pkg.types[t.Name] = et
 	}
 	return pkg, true
 }
@@ -123,9 +150,20 @@ func writeGoDecls(id string, pkg *goExtPackage) {
 		}
 		return out
 	}
+	for _, c := range pkg.consts {
+		d.Consts = append(d.Consts, goDeclMethod{Name: c.name, Form: c.form, File: c.file})
+	}
+	var encode func(name string, t *goExtType) goDeclType
+	encode = func(name string, t *goExtType) goDeclType {
+		dt := goDeclType{Name: name, File: t.file, Alias: t.alias, Form: t.form, Iface: t.iface,
+			Ineligible: t.ineligible, Conflict: t.conflict, Methods: methods(t.methods), Embeds: methods(t.embeds)}
+		for _, v := range t.variants {
+			dt.Variants = append(dt.Variants, encode(name, v))
+		}
+		return dt
+	}
 	for name, t := range pkg.types {
-		d.Types = append(d.Types, goDeclType{Name: name, File: t.file, Alias: t.alias, Form: t.form, Iface: t.iface,
-			Ineligible: t.ineligible, Conflict: t.conflict, Methods: methods(t.methods), Embeds: methods(t.embeds)})
+		d.Types = append(d.Types, encode(name, t))
 	}
 	dir := filepath.Dir(file)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

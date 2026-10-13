@@ -34,6 +34,7 @@ func (n fakeNames) unresolved() ([]string, error) { return n.unread, nil }
 // defined type, any other value an alias's form written in aliasIn.
 type fakeTypes struct {
 	pkgs    map[string]map[string]string
+	consts  map[string]map[string]string
 	aliasIn goNames
 }
 
@@ -50,6 +51,11 @@ func (t fakeTypes) lookup(_ context.Context, p, name string) (goTypeAnswer, bool
 		return goTypeAnswer{found: true}, true, nil
 	}
 	return goTypeAnswer{found: true, alias: true, form: form, names: t.aliasIn}, true, nil
+}
+
+func (t fakeTypes) constant(_ context.Context, p, name string) (string, goNames, bool, error) {
+	form, ok := t.consts[p][name]
+	return form, t.aliasIn, ok, nil
 }
 
 // TestGoIdentityResolvesEveryName protects the canonical spelling method
@@ -71,11 +77,16 @@ func (t fakeTypes) lookup(_ context.Context, p, name string) (goTypeAnswer, bool
 // would compare equal; the several-imports case differs. Mutation: stop at
 // the first unread dot import -> the read one no longer decides. Mutation:
 // let a dot import supply an unexported name -> `local` is spelled
-// unresolved.
+// unresolved. Mutation: keep an interface literal's elements in written
+// order -> the sorted case differs. Mutation: leave an unexported field or
+// method name unqualified -> two packages' `a` compare equal. Mutation:
+// spell a constant length without folding -> `[ 12 ]` is not written.
 func TestGoIdentityResolvesEveryName(t *testing.T) {
 	ctx := context.Background()
 	store := fakeNames{path: "example.com/m/store"}
-	types := fakeTypes{pkgs: map[string]map[string]string{
+	types := fakeTypes{consts: map[string]map[string]string{
+		"example.com/m/store": {"N": "( 1 << 4 )", "Odd": "?"},
+	}, pkgs: map[string]map[string]string{
 		"example.com/m/store": {"ID": "", "Item": "", "Key": ".ID", "error": ""},
 		"example.com/m/mem":   {"Local": ""},
 		"example.com/a":       {"T": ""},
@@ -111,6 +122,14 @@ func TestGoIdentityResolvesEveryName(t *testing.T) {
 			unread: []string{"example.com/p1", "example.com/p2"}}, "( :yaml.Node , .int )",
 			"( ?example.com/p1|example.com/p2:yaml.Node , int )"},
 		{"type parameter", mem, "( $0 ) ( $1 )", "( $0 ) ( $1 )"},
+		{"interface literal elements sorted", mem, "( interface{ @Z ( ) ( ) ; ^ :s.Item ; @A ( .byte ) ( ) } )",
+			"( interface{ @A ( uint8 ) ( ) ; @Z ( ) ( ) ; ^ example.com/m/store.Item } )"},
+		{"unexported field and method names are their package's", mem,
+			"( struct{ @a .int ; @B * :s.ID } , interface{ @m ( ) ( ) } )",
+			"( struct{ @example.com/m/mem.a int ; @B * example.com/m/store.ID } , interface{ @example.com/m/mem.m ( ) ( ) } )"},
+		{"constant length folds", mem, "( [# ( :s.N - 4 ) ] .byte )", "( [ 12 ] uint8 )"},
+		{"length of an unfoldable constant is spelled", mem, "( [# :s.Odd ] .byte )",
+			"( [# example.com/m/store.Odd ] uint8 )"},
 		{"unspellable form", mem, "?", "?"},
 	}
 	for _, c := range cases {
@@ -136,7 +155,10 @@ func TestGoIdentityResolvesEveryName(t *testing.T) {
 // Mutation: spell a receive-only channel `chan <-` -> Add differs. Mutation:
 // write results without their parentheses -> Load differs. Mutation: drop
 // the variadic marker -> Add differs. Mutation: spell a struct literal with
-// members -> Lit is not "?".
+// members as "?" -> Lit differs. Mutation: read an array length's literal
+// as written -> Arr's `0x10` differs. Mutation: leave an embedded field's
+// `*` out -> Iface differs. Mutation: give each constant spec iota 0 ->
+// Kth and Lth differ.
 func TestGoASTFormsMatchTheWorkers(t *testing.T) {
 	const src = `package p
 
@@ -156,6 +178,25 @@ func (s *Set[T]) Load(id st.ID) (*st.Item, error) { return nil, nil }
 func (s *Set[T]) Lit(x struct{ a int }) {}
 
 func (s Set[T]) Pair(a, b string) {}
+
+const (
+	Size = 1 << 4
+	Kth  = iota * 2
+	Lth
+)
+
+func (s *Set[T]) Arr(a [Size]byte, b [0x10]byte, c [st.N + 1]int) {}
+
+func (s *Set[T]) Bad(d [len("x")]int) {}
+
+func (s *Set[T]) Iface(x interface {
+	Close() error
+	io.Reader
+}, y struct {
+	*Base
+	B int ` + "`json:\"b c\"`" + `
+}) {
+}
 `
 	f, err := parser.ParseFile(token.NewFileSet(), "p.go", src, parser.SkipObjectResolution)
 	if err != nil {
@@ -164,6 +205,9 @@ func (s Set[T]) Pair(a, b string) {}
 	pkg := &goExtPackage{path: "p", types: map[string]*goExtType{}}
 	pkg.addFile(f, false)
 	got := map[string]string{"A": pkg.types["A"].form}
+	for name, c := range pkg.consts {
+		got[name] = "#" + c.form
+	}
 	for _, m := range pkg.types["I"].methods {
 		got[m.name] = m.form
 	}
@@ -178,8 +222,15 @@ func (s Set[T]) Pair(a, b string) {}
 		"Get":  "( $0 ) ( $1 , .bool )",
 		"Add":  "( $0 , <- chan .int , chan <- $0 , map [ .string ] [ 4 ] .byte , func ( .int ) ( .error ) , interface{} , struct{} , ... [ ] .byte ) ( )",
 		"Load": "( :st.ID ) ( * :st.Item , .error )",
-		"Lit":  "?",
+		"Lit":  "( struct{ @a .int } ) ( )",
 		"Pair": "( .string , .string ) ( )",
+		"Arr":  "( [# .Size ] .byte , [ 16 ] .byte , [# ( :st.N + 1 ) ] .int ) ( )",
+		"Bad":  "?",
+		"Iface": `( interface{ @Close ( ) ( .error ) ; ^ :io.Reader } , ` +
+			`struct{ ^ * .Base ; @B .int #"json:\"b\x20c\"" } ) ( )`,
+		"Size": "#( 1 << 4 )",
+		"Kth":  "#( 1 * 2 )",
+		"Lth":  "#( 2 * 2 )",
 	}
 	for k, w := range want {
 		if got[k] != w {

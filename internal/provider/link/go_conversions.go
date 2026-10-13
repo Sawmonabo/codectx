@@ -2,6 +2,7 @@ package link
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -101,7 +102,14 @@ func (h *hierarchy) goExternalImplements(fc fileCtx, ref Ref, emit func(Binding)
 // declared on owner, toward the methods of interfaces outside the unit
 // owner implements by its method set (keyGoExternalOverride).
 func (h *hierarchy) goExternalOverrides(fc fileCtx, owner, ref Ref, d *Decl, emit func(Binding) error) error {
+	// An interface declared per platform may be satisfied by several of
+	// its declarations: one override each.
+	var seen []string
 	return h.links.lookup(keyGoExternalOverride+refKey(owner)+d.Name, func(e entry) error {
+		if slices.Contains(seen, e.Aux) {
+			return nil
+		}
+		seen = append(seen, e.Aux)
 		return emit(Binding{Kind: FactOverrides, Site: ref, Detail: DetailMethodSet,
 			External: externalMethod(fc.family, e.Aux, d.Name)})
 	})

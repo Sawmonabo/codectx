@@ -3,6 +3,7 @@ package link
 import (
 	"context"
 	"go/token"
+	"math/big"
 	"path"
 	"slices"
 	"strings"
@@ -96,6 +97,11 @@ type goPackageTypes interface {
 	// known is false when the source of p is not read, so whether it
 	// declares one is not known.
 	lookup(ctx context.Context, p, name string) (answer goTypeAnswer, known bool, err error)
+	// constant is the form of the integer value of the constant the package
+	// at import path p declares under name (wire.Export.Identity past its
+	// "#"), written in the file names; found is false when the package
+	// declares none or its source is not read.
+	constant(ctx context.Context, p, name string) (form string, names goNames, found bool, err error)
 }
 
 // goIdentity is the canonical spelling of form, written in the file n,
@@ -113,16 +119,67 @@ func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form stri
 	if form == "" || form == goIdentityUnknown || depth > goAliasDepth {
 		return false, nil
 	}
-	for tok := range strings.SplitSeq(form, " ") {
+	toks := strings.Split(form, " ")
+	rest, ok, err := goCanonicalTokens(ctx, types, n, toks, depth, b)
+	if err != nil || !ok {
+		return false, err
+	}
+	return len(rest) == 0, nil
+}
+
+// goCanonicalTokens writes the canonical spelling of toks up to the `}`
+// that closes the literal they are written in, or to their end, and returns
+// the tokens past it. An interface literal's elements are written sorted
+// (goInterfaceElements); a field or method name of a literal (`@name`) that
+// is not exported is qualified by the file's package, since such a name
+// from another package is always different ("Type identity").
+func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, toks []string, depth int, b *strings.Builder) ([]string, bool, error) {
+	for len(toks) > 0 {
+		tok := toks[0]
+		toks = toks[1:]
 		var name, pkg string
 		switch {
 		case tok == goIdentityUnknown:
-			return false, nil
+			return nil, false, nil
+		case tok == "}":
+			goWrite(b, tok)
+			return toks, true, nil
+		case tok == "struct{":
+			goWrite(b, tok)
+			rest, ok, err := goCanonicalTokens(ctx, types, n, toks, depth, b)
+			if err != nil || !ok {
+				return nil, false, err
+			}
+			toks = rest
+			continue
+		case tok == "[#":
+			end := slices.Index(toks, "]")
+			if end < 0 {
+				return nil, false, nil
+			}
+			if ok, err := goArrayLength(ctx, types, n, toks[:end], depth, b); err != nil || !ok {
+				return nil, false, err
+			}
+			toks = toks[end+1:]
+			continue
+		case tok == "interface{":
+			rest, ok, err := goInterfaceElements(ctx, types, n, toks, depth, b)
+			if err != nil || !ok {
+				return nil, false, err
+			}
+			toks = rest
+			continue
+		case strings.HasPrefix(tok, "@"):
+			if !token.IsExported(tok[1:]) {
+				tok = "@" + n.pkg() + "." + tok[1:]
+			}
+			goWrite(b, tok)
+			continue
 		case strings.HasPrefix(tok, "."):
 			name = tok[1:]
 			p, ok, err := goUnqualified(ctx, types, n, name)
 			if err != nil || !ok {
-				return false, err
+				return nil, false, err
 			}
 			if strings.HasPrefix(p, "?") {
 				goWrite(b, p)
@@ -132,16 +189,16 @@ func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form stri
 		case strings.HasPrefix(tok, ":"):
 			q, nm, ok := strings.Cut(tok[1:], ".")
 			if !ok {
-				return false, nil
+				return nil, false, nil
 			}
 			p, ok, err := n.imported(q)
 			if err != nil {
-				return false, err
+				return nil, false, err
 			}
 			if !ok {
 				spelled, ok, err := goUnboundQualifier(n, q, nm)
 				if err != nil || !ok {
-					return false, err
+					return nil, false, err
 				}
 				if strings.HasPrefix(spelled, "?") {
 					goWrite(b, spelled)
@@ -160,17 +217,279 @@ func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form stri
 		}
 		a, known, err := types.lookup(ctx, pkg, name)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		if known && a.alias {
 			if ok, err := goCanonical(ctx, types, a.names, a.form, depth+1, b); err != nil || !ok {
-				return false, err
+				return nil, false, err
 			}
 			continue
 		}
 		goWrite(b, pkg+"."+name)
 	}
+	return nil, true, nil
+}
+
+// goArrayLength writes an array length written as the constant expression
+// expr (the worker's goLink.constForm) in the file n: `[ v ]` with v its
+// value when every constant it names folds (goFold), else `[#` the
+// expression with each constant named by its package and name `]`, which
+// denotes one length wherever it is written ("Array types", "Constant
+// expressions").
+func goArrayLength(ctx context.Context, types goPackageTypes, n goNames, expr []string, depth int, b *strings.Builder) (bool, error) {
+	v, err := goFold(ctx, types, n, expr, depth)
+	if err != nil {
+		return false, err
+	}
+	if v != nil {
+		goWrite(b, "[")
+		goWrite(b, v.String())
+		goWrite(b, "]")
+		return true, nil
+	}
+	spelled := []string{"[#"}
+	for _, tok := range expr {
+		if !strings.HasPrefix(tok, ".") && !strings.HasPrefix(tok, ":") {
+			spelled = append(spelled, tok)
+			continue
+		}
+		name, p, ok, err := goConstName(ctx, types, n, tok)
+		if err != nil || !ok {
+			return false, err
+		}
+		if strings.HasPrefix(p, "?") {
+			spelled = append(spelled, p)
+		} else {
+			spelled = append(spelled, p+"."+name)
+		}
+	}
+	for _, tok := range append(spelled, "]") {
+		goWrite(b, tok)
+	}
 	return true, nil
+}
+
+// goConstName is the package a constant's name token tok names (`.N` or
+// `:pkg.N`) and its name, the package "" for the universe's or an
+// unresolved spelling (goUnqualified, goUnboundQualifier); ok is false for
+// a token that names no constant.
+func goConstName(ctx context.Context, types goPackageTypes, n goNames, tok string) (name, pkg string, ok bool, err error) {
+	switch {
+	case strings.HasPrefix(tok, "."):
+		// The scopes an unqualified constant is read in, as goUnqualified
+		// reads a type's: the package, then the dot imports, which declare
+		// exported names only.
+		name = tok[1:]
+		own := n.pkg()
+		if _, _, found, err := types.constant(ctx, own, name); err != nil || found || !token.IsExported(name) {
+			return name, own, err == nil, err
+		}
+		dots, err := n.dots()
+		if err != nil {
+			return "", "", false, err
+		}
+		var unread []string
+		for _, d := range dots {
+			_, _, found, err := types.constant(ctx, d, name)
+			if err != nil {
+				return "", "", false, err
+			}
+			if found {
+				return name, d, true, nil
+			}
+			if _, known, err := types.lookup(ctx, d, name); err != nil {
+				return "", "", false, err
+			} else if !known {
+				unread = append(unread, d)
+			}
+		}
+		if len(unread) > 0 {
+			slices.Sort(unread)
+			return name, "?." + own + "|" + strings.Join(slices.Compact(unread), "|") + "." + name, true, nil
+		}
+		return name, own, true, nil
+	case strings.HasPrefix(tok, ":"):
+		q, nm, found := strings.Cut(tok[1:], ".")
+		if !found {
+			return "", "", false, nil
+		}
+		p, ok, err := n.imported(q)
+		if err != nil {
+			return "", "", false, err
+		}
+		if !ok {
+			spelled, ok, err := goUnboundQualifier(n, q, nm)
+			if err != nil || !ok {
+				return "", "", false, err
+			}
+			if strings.HasPrefix(spelled, "?") {
+				return nm, spelled, true, nil
+			}
+			p = spelled
+		}
+		return nm, p, true, nil
+	}
+	return "", "", false, nil
+}
+
+// goFold is the value of the integer constant expression expr written in
+// the file n, nil when a constant it names is not known or its value is
+// not an integer the form spells. Constants are exact ("Constant
+// expressions": arbitrary precision), so the value is a big.Int; division
+// truncates and shifts take a non-negative count, as for integer constants.
+func goFold(ctx context.Context, types goPackageTypes, n goNames, expr []string, depth int) (*big.Int, error) {
+	if depth > goAliasDepth {
+		return nil, nil
+	}
+	pos := 0
+	var parse func() (*big.Int, error)
+	parse = func() (*big.Int, error) {
+		if pos >= len(expr) {
+			return nil, nil
+		}
+		tok := expr[pos]
+		pos++
+		switch {
+		case tok == "(":
+			l, err := parse()
+			if err != nil || l == nil || pos >= len(expr) {
+				return nil, err
+			}
+			if expr[pos] == ")" {
+				pos++
+				return l, nil
+			}
+			op := expr[pos]
+			pos++
+			r, err := parse()
+			if err != nil || r == nil || pos >= len(expr) || expr[pos] != ")" {
+				return nil, err
+			}
+			pos++
+			return goBinary(op, l, r), nil
+		case len(tok) == 2 && tok[0] == 'u':
+			v, err := parse()
+			if err != nil || v == nil {
+				return nil, err
+			}
+			switch tok[1] {
+			case '+':
+				return v, nil
+			case '-':
+				return new(big.Int).Neg(v), nil
+			case '^':
+				return new(big.Int).Not(v), nil
+			}
+			return nil, nil
+		case strings.HasPrefix(tok, ".") || strings.HasPrefix(tok, ":"):
+			name, p, ok, err := goConstName(ctx, types, n, tok)
+			if err != nil || !ok || p == "" || strings.HasPrefix(p, "?") {
+				return nil, err
+			}
+			form, names, found, err := types.constant(ctx, p, name)
+			if err != nil || !found || form == goIdentityUnknown {
+				return nil, err
+			}
+			return goFold(ctx, types, names, strings.Split(form, " "), depth+1)
+		}
+		v, ok := new(big.Int).SetString(tok, 10)
+		if !ok {
+			return nil, nil
+		}
+		return v, nil
+	}
+	v, err := parse()
+	if err != nil || pos != len(expr) {
+		return nil, err
+	}
+	return v, nil
+}
+
+// goBinary is l op r for integer constants, nil when it is undefined.
+func goBinary(op string, l, r *big.Int) *big.Int {
+	z := new(big.Int)
+	switch op {
+	case "+":
+		return z.Add(l, r)
+	case "-":
+		return z.Sub(l, r)
+	case "*":
+		return z.Mul(l, r)
+	case "/", "%":
+		if r.Sign() == 0 {
+			return nil
+		}
+		if op == "/" {
+			return z.Quo(l, r)
+		}
+		return z.Rem(l, r)
+	case "<<", ">>":
+		if r.Sign() < 0 || !r.IsUint64() || r.Uint64() > 1<<16 {
+			return nil
+		}
+		if op == "<<" {
+			return z.Lsh(l, uint(r.Uint64()))
+		}
+		return z.Rsh(l, uint(r.Uint64()))
+	case "&":
+		return z.And(l, r)
+	case "|":
+		return z.Or(l, r)
+	case "^":
+		return z.Xor(l, r)
+	case "&^":
+		return z.AndNot(l, r)
+	}
+	return nil
+}
+
+// goInterfaceElements writes an interface literal whose `interface{` has
+// been read: its elements, each canonical, sorted and separated by `;`,
+// then `}`; it returns the tokens past the `}`. An interface's identity is
+// its method set ("Type identity"), whatever order its elements are
+// written in.
+func goInterfaceElements(ctx context.Context, types goPackageTypes, n goNames, toks []string, depth int, b *strings.Builder) ([]string, bool, error) {
+	var elems []string
+	for {
+		var e strings.Builder
+		// One element: up to a `;` or the closing `}` at its own depth.
+		end, nested := 0, 0
+		for ; end < len(toks); end++ {
+			t := toks[end]
+			if nested == 0 && (t == ";" || t == "}") {
+				break
+			}
+			switch t {
+			case "struct{", "interface{":
+				nested++
+			case "}":
+				nested--
+			}
+		}
+		if end == len(toks) {
+			return nil, false, nil
+		}
+		rest, ok, err := goCanonicalTokens(ctx, types, n, toks[:end], depth, &e)
+		if err != nil || !ok || len(rest) != 0 {
+			return nil, false, err
+		}
+		elems = append(elems, e.String())
+		sep := toks[end]
+		toks = toks[end+1:]
+		if sep == "}" {
+			break
+		}
+	}
+	slices.Sort(elems)
+	goWrite(b, "interface{")
+	for i, e := range elems {
+		if i > 0 {
+			goWrite(b, ";")
+		}
+		goWrite(b, e)
+	}
+	goWrite(b, "}")
+	return toks, true, nil
 }
 
 // goUnqualified is the package of the type an unqualified name denotes in
@@ -253,7 +572,8 @@ func goUnboundQualifier(n goNames, q, name string) (string, bool, error) {
 // goUnresolvedIdentity reports a canonical spelling that names a type by
 // its unresolved spelling (goUnboundQualifier, goUnqualified).
 func goUnresolvedIdentity(identity string) bool {
-	return strings.HasPrefix(identity, "?") && identity != goIdentityUnknown || strings.Contains(identity, " ?")
+	return strings.HasPrefix(identity, "?") && identity != goIdentityUnknown || strings.Contains(identity, " ?") ||
+		strings.Contains(identity, "[#")
 }
 
 func goWrite(b *strings.Builder, tok string) {
