@@ -85,8 +85,14 @@ func TestOneAllocationAdmitsHeavyUnitsAndServersTogether(t *testing.T) {
 	// what the composition root builds.
 	sched := plan.NewScheduler(led)
 
-	unit := admission.Reservation{MemoryBytes: 6 * giB}
-	releaseUnit, err := sched.Admit(context.Background(), unit)
+	hold := func(r admission.Reservation) admission.Admit {
+		return func(ctx context.Context, l *admission.Ledger) (*admission.Holding, error) { return l.Hold(ctx, r, nil) }
+	}
+	server := func(ctx context.Context) (*admission.Holding, error) {
+		return led.Hold(ctx, admission.Reservation{MemoryBytes: 4 * giB}, mgr.stopIdle)
+	}
+	unit := hold(admission.Reservation{MemoryBytes: 6 * giB})
+	heldUnit, err := sched.Admit(context.Background(), unit)
 	if err != nil {
 		t.Fatalf("an idle allocation refused one 6 GiB unit: %v", err)
 	}
@@ -97,13 +103,13 @@ func TestOneAllocationAdmitsHeavyUnitsAndServersTogether(t *testing.T) {
 	key := serverKey{snapshot: model.SnapshotID("s"), profile: "p", root: "proj"}
 	waiting, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	if _, _, err := mgr.slot(waiting, key, admission.Reservation{MemoryBytes: 4 * giB}); err == nil {
+	if _, _, err := mgr.slot(waiting, key, server); err == nil {
 		t.Fatal("a 4 GiB server was admitted while a 6 GiB unit held the 8 GiB allocation; the process is reserving more memory than the machine has")
 	}
 
 	// The unit gives its room back and the same server is admitted at once.
-	releaseUnit()
-	e, room, err := mgr.slot(context.Background(), key, admission.Reservation{MemoryBytes: 4 * giB})
+	heldUnit.Release()
+	e, room, err := mgr.slot(context.Background(), key, server)
 	if err != nil {
 		t.Fatalf("the waiting server was not admitted once the unit released: %v", err)
 	}
@@ -115,11 +121,11 @@ func TestOneAllocationAdmitsHeavyUnitsAndServersTogether(t *testing.T) {
 	// The sum holds in the other direction too: 4 + 2 fits and is admitted,
 	// 4 + 6 does not and waits. Without one ledger the unit would see an empty
 	// total and be admitted on top of the server.
-	fits, err := sched.Admit(context.Background(), admission.Reservation{MemoryBytes: 2 * giB})
+	fits, err := sched.Admit(context.Background(), hold(admission.Reservation{MemoryBytes: 2 * giB}))
 	if err != nil {
 		t.Fatalf("a 2 GiB unit was refused beside a 4 GiB server in an 8 GiB allocation: %v", err)
 	}
-	fits()
+	fits.Release()
 	blocked, cancelBlocked := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancelBlocked()
 	if _, err := sched.Admit(blocked, unit); err == nil {
@@ -127,7 +133,7 @@ func TestOneAllocationAdmitsHeavyUnitsAndServersTogether(t *testing.T) {
 	}
 	// No server was started on that room, so the starter gives it back itself,
 	// as startServer does on a start that never reached a process.
-	room()
+	room.Release()
 	if err := mgr.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -155,7 +161,7 @@ func TestOneAllocationAdmitsHeavyUnitsAndServersTogether(t *testing.T) {
 func TestOneServerIsOneReservationHoweverManyOpensAskForIt(t *testing.T) {
 	const giB int64 = 1 << 30
 	key := serverKey{snapshot: model.SnapshotID("s"), profile: "p", root: "proj"}
-	server := admission.Reservation{MemoryBytes: 5 * giB}
+	const serverBytes = 5 * giB
 	setup := func(t *testing.T) (*Manager, *admission.Ledger, func()) {
 		t.Helper()
 		led, err := admission.NewLedger(8*giB, 64<<30)
@@ -177,15 +183,20 @@ func TestOneServerIsOneReservationHoweverManyOpensAskForIt(t *testing.T) {
 		}
 		return mgr, led, releaseUnit
 	}
+	server := func(led *admission.Ledger, mgr *Manager) func(context.Context) (*admission.Holding, error) {
+		return func(ctx context.Context) (*admission.Holding, error) {
+			return led.Hold(ctx, admission.Reservation{MemoryBytes: serverBytes}, mgr.stopIdle)
+		}
+	}
 	type result struct {
 		e    *entry
-		room func()
+		room *admission.Holding
 		err  error
 	}
-	reserveInBackground := func(ctx context.Context, mgr *Manager) chan result {
+	reserveInBackground := func(ctx context.Context, mgr *Manager, led *admission.Ledger) chan result {
 		out := make(chan result, 1)
 		go func() {
-			e, room, err := mgr.slot(ctx, key, server)
+			e, room, err := mgr.slot(ctx, key, server(led, mgr))
 			out <- result{e, room, err}
 		}()
 		// The entry is published before the wait for room begins.
@@ -201,10 +212,10 @@ func TestOneServerIsOneReservationHoweverManyOpensAskForIt(t *testing.T) {
 
 	t.Run("a second open waits on the first one's reservation", func(t *testing.T) {
 		mgr, led, releaseUnit := setup(t)
-		first := reserveInBackground(context.Background(), mgr)
+		first := reserveInBackground(context.Background(), mgr, led)
 		ctx, cancel := guard()
 		defer cancel()
-		e, room, err := mgr.slot(ctx, key, server)
+		e, room, err := mgr.slot(ctx, key, server(led, mgr))
 		if err != nil || room != nil {
 			t.Fatalf("the second open of a server still waiting for room got room=%v err=%v; it must wait on the pending entry and reserve nothing", room != nil, err)
 		}
@@ -213,10 +224,10 @@ func TestOneServerIsOneReservationHoweverManyOpensAskForIt(t *testing.T) {
 		if got.err != nil || got.room == nil || got.e != e {
 			t.Fatalf("the first open was not the one starter of the entry the second one waits on: %+v", got)
 		}
-		if _, reserved := led.Snapshot(); reserved != server.MemoryBytes {
-			t.Fatalf("the ledger holds %d bytes for one server of %d; two opens reserved it twice", reserved, server.MemoryBytes)
+		if _, reserved := led.Snapshot(); reserved != serverBytes {
+			t.Fatalf("the ledger holds %d bytes for one server of %d; two opens reserved it twice", reserved, serverBytes)
 		}
-		got.room()
+		got.room.Release()
 		close(e.ready)
 		if err := mgr.Close(); err != nil {
 			t.Fatal(err)
@@ -227,8 +238,8 @@ func TestOneServerIsOneReservationHoweverManyOpensAskForIt(t *testing.T) {
 		mgr, led, releaseUnit := setup(t)
 		defer releaseUnit()
 		ctx, cancel := context.WithCancel(context.Background())
-		first := reserveInBackground(ctx, mgr)
-		e, room, err := mgr.slot(context.Background(), key, server)
+		first := reserveInBackground(ctx, mgr, led)
+		e, room, err := mgr.slot(context.Background(), key, server(led, mgr))
 		if err != nil || room != nil {
 			t.Fatalf("second open: room=%v err=%v, want the pending entry", room != nil, err)
 		}

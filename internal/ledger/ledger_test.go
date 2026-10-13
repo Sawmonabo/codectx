@@ -647,7 +647,7 @@ func TestALearnedNeedSurvivesItsRunsDiscard(t *testing.T) {
 			t.Errorf("stop the ledger: %v", err)
 		}
 	}()
-	key := ledger.NeedKey{Language: "go", Fingerprint: "grammar-a", Build: "build-a", SizeClass: 12}
+	key := ledger.NeedKey{Kind: ledger.NeedParse, Subject: "go", Fingerprint: "grammar-a", Build: "build-a", SizeClass: 12}
 	measuring, measuringCtx := newRun(t, l)
 	// A span gives the run a row, so the discard below deletes something.
 	_, span := ledger.Start(measuringCtx, "parse", "")

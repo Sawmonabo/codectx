@@ -1469,7 +1469,7 @@ func (p *pool) plan(ctx context.Context, view model.SnapshotView, language strin
 		return nil, err
 	}
 	key := needKey{repository: t.repository,
-		NeedKey: ledger.NeedKey{Language: language, Fingerprint: fingerprint, Build: p.build, SizeClass: admission.SizeClassOf(size)}}
+		NeedKey: ledger.NeedKey{Kind: ledger.NeedParse, Subject: language, Fingerprint: fingerprint, Build: p.build, SizeClass: admission.SizeClassOf(size)}}
 	p.mu.Lock()
 	m := p.models[key]
 	if m == nil {
