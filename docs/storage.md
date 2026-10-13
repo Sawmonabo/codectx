@@ -263,6 +263,26 @@ uncollectable in practice. The native-key pass carries a rows-examined budget
 as a safety bound: it defers, never skips, so a key a run does not reach is
 still unreferenced on the next one.
 
+Files rows are collected the same way, after the snapshot step. A file is
+unreferenced when no `snapshot_files`, `unit_inputs` or `context_entries` row
+names it; those are the only tables that name a file directly. `node_facts`,
+`evidence` and `search_units` name one only through their foreign key onto
+`unit_inputs(unit_id, file_id)`, and `session_files` (and through it the
+session tables below it) only through its foreign key onto `snapshot_files`, so
+each is implied and asking it again would be a scan of the largest tables per
+candidate. Each probe is an index lookup, `idx_snapshot_files_file` among them.
+
+Every foreign-key child key has an index that leads with one of its columns.
+With foreign keys enforced on every connection, deleting a parent row first
+proves no child row names it, and an unindexed child key makes that proof a
+scan of the child table per deleted row, invisible in the deleting statement's
+own plan: a blob deletion scanned `unit_inputs` and `snapshot_files`, a snapshot
+deletion `retention_leases` and, through its cascade, `session_files`, a
+generation deletion `retention_leases`, `provider_runs` and
+`context_manifests`, and the provider-run sweep `units` per run. The indexes
+that close these are listed with their reasons in `schema.sql`, and a test holds
+every foreign key of the schema to the rule.
+
 ## What a delta names
 
 `Replaced` expresses a delta per file: a changed or removed path and its alias
