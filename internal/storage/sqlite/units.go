@@ -311,7 +311,7 @@ type UnitWriter struct {
 	done       bool
 
 	// ids resolves a canonical identity or an interned string to the
-	// storage-internal surrogate every reference column now carries (ids.go),
+	// storage-internal surrogate every reference column carries (ids.go),
 	// and nodes caches the lookup-only direction: a node that must ALREADY be
 	// registered -- a relation endpoint, an alias target, a search document's
 	// symbol -- is never minted here, so it is resolved by canonical lookup and
@@ -1611,8 +1611,7 @@ var analyzedTables = [...]string{"node_facts", "generation_units"}
 // runs -- the transaction above committed -- so refusing to return the binding
 // would turn a slower query plan into a failed index. The operator is told
 // instead: a stale plan is a performance fact they can act on, not a silent
-// one. Generations published before this landed keep the old plan until the
-// next activation rewrites the statistics.
+// one; the next activation rewrites the statistics.
 func (s *Store) refreshStatistics(ctx context.Context) {
 	// analysis_limit bounds each index scan instead of walking it end to end,
 	// which is what makes this affordable inside an activation; the statistics

@@ -1,7 +1,7 @@
 # Native-engine research, raw evidence — native building blocks
 
 Method: every row fetched over the network with WebFetch/WebSearch on 2026-09-16. Nothing was
-cloned or installed — the Joern clone was this lane's one permitted download. Licence and
+cloned or installed — the Joern clone was this research's one permitted download. Licence and
 last-activity are as observed at fetch time.
 
 | project | URL | language | licence (observed) | last activity (observed) | what it gives | usable from Go |
@@ -58,7 +58,7 @@ analysis, and dormant 21 months. Semgrep is ruled out by language (OCaml) before
 taint is intraprocedural-only — the same scope codectx already imports, so a subprocess buys no
 capability. CodeQL's MIT QL libraries are readable but the CLI/extractors bar redistribution,
 hosting, and automated analysis of private code without GHAS. Fraunhofer `cpg` and flatgraph are
-Apache-2.0 but JVM — either one reinstates the runtime profile the lane is leaving; `cpg` stays the
+Apache-2.0 but JVM — either one reinstates the runtime profile the native engine is leaving; `cpg` stays the
 best per-language CFG-delta anchor.
 
 **UNVERIFIED:** `syn` and `rustc_mir`/rustc internals were not fetched (budget); the "no stable

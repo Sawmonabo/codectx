@@ -1,4 +1,4 @@
-=== speed 18:09:33 <bench>/store <bench>/queries.txt 5
+=== speed <bench>/store <bench>/queries.txt 5
 {"cold_ms":9777.674,"hits":253589,"kinds":null,"open_ms":6.882,"page_without_range":0,"path_prefixes":null,"query":"vendor","served_hits":252683,"served_page":200,"warm_ms":[5893.007,5798.841,6013.858,5823.079,6053.079]}
 {"cold_ms":7989.862,"hits":201750,"kinds":null,"open_ms":1.711,"page_without_range":0,"path_prefixes":null,"query":"func","served_hits":199866,"served_page":200,"warm_ms":[7186.603,7106.879,7129.43,7109.328,7096.161]}
 {"cold_ms":5045.279,"hits":169436,"kinds":null,"open_ms":1.514,"page_without_range":0,"path_prefixes":null,"query":"src","served_hits":167573,"served_page":200,"warm_ms":[4768.724,4833.149,4915.42,4856.884,5004.234]}
@@ -29,8 +29,8 @@
 {"cold_ms":514.352,"hits":1052,"kinds":null,"open_ms":1.464,"page_without_range":0,"path_prefixes":null,"query":"\"service account\"","served_hits":784,"served_page":200,"warm_ms":[392.415,381.78,397.643,391.027,383.198]}
 {"cold_ms":1681.404,"hits":935,"kinds":null,"open_ms":1.498,"page_without_range":0,"path_prefixes":null,"query":"\"node name\"","served_hits":784,"served_page":200,"warm_ms":[926.56,1036.731,1081.455,1077.046,1060.058]}
 {"cold_ms":553.067,"hits":309,"kinds":null,"open_ms":1.593,"page_without_range":0,"path_prefixes":null,"query":"\"admission controller\"","served_hits":261,"served_page":200,"warm_ms":[365.56,338.463,339.339,337.415,345.064]}
-rc=0 18:15:04
-=== speed-kind 18:15:04 --kind function --kind method <bench>/store <bench>/queries.txt 5
+rc=0
+=== speed-kind --kind function --kind method <bench>/store <bench>/queries.txt 5
 {"cold_ms":4415.577,"hits":65823,"kinds":["function","method"],"open_ms":1.615,"page_without_range":0,"path_prefixes":null,"query":"vendor","served_hits":65823,"served_page":200,"warm_ms":[4272.244,4398.349,4903.118,4155.815,4075.641]}
 {"cold_ms":6361.275,"hits":167364,"kinds":["function","method"],"open_ms":1.542,"page_without_range":0,"path_prefixes":null,"query":"func","served_hits":167364,"served_page":200,"warm_ms":[6388.929,6607.143,6466.931,6544.805,6440.501]}
 {"cold_ms":3853.025,"hits":68325,"kinds":["function","method"],"open_ms":1.547,"page_without_range":0,"path_prefixes":null,"query":"src","served_hits":68325,"served_page":200,"warm_ms":[3880.347,3846.09,3881.073,3914.438,4012.654]}
@@ -61,8 +61,8 @@ rc=0 18:15:04
 {"cold_ms":492.321,"hits":69,"kinds":["function","method"],"open_ms":1.479,"page_without_range":0,"path_prefixes":null,"query":"\"service account\"","served_hits":69,"served_page":69,"warm_ms":[378.147,361.694,372.964,367.362,364.571]}
 {"cold_ms":1618.913,"hits":78,"kinds":["function","method"],"open_ms":1.518,"page_without_range":0,"path_prefixes":null,"query":"\"node name\"","served_hits":78,"served_page":78,"warm_ms":[915.998,924.966,893.521,945.037,1019.039]}
 {"cold_ms":430.907,"hits":26,"kinds":["function","method"],"open_ms":1.566,"page_without_range":0,"path_prefixes":null,"query":"\"admission controller\"","served_hits":26,"served_page":26,"warm_ms":[296.563,278.889,304.887,315.687,303.629]}
-rc=0 18:19:47
-=== speed-path 18:19:47 --path-prefix pkg <bench>/store <bench>/queries.txt 5
+rc=0
+=== speed-path --path-prefix pkg <bench>/store <bench>/queries.txt 5
 {"cold_ms":3514.883,"hits":40,"kinds":null,"open_ms":1.811,"page_without_range":0,"path_prefixes":["pkg"],"query":"vendor","served_hits":21,"served_page":21,"warm_ms":[3449.969,3461.84,3479.346,3618.387,3610.613]}
 {"cold_ms":5958.685,"hits":41923,"kinds":null,"open_ms":1.705,"page_without_range":0,"path_prefixes":["pkg"],"query":"func","served_hits":41206,"served_page":200,"warm_ms":[5886.16,5910.767,6066.047,5843.955,5880.255]}
 {"cold_ms":3540.218,"hits":65,"kinds":null,"open_ms":1.686,"page_without_range":0,"path_prefixes":["pkg"],"query":"src","served_hits":62,"served_page":62,"warm_ms":[3513.458,3514.113,3486.199,3506.002,3476.979]}
@@ -93,8 +93,8 @@ rc=0 18:19:47
 {"cold_ms":543.337,"hits":216,"kinds":null,"open_ms":1.44,"page_without_range":0,"path_prefixes":["pkg"],"query":"\"service account\"","served_hits":177,"served_page":177,"warm_ms":[421.809,441.799,413.749,418.434,406.462]}
 {"cold_ms":1842.492,"hits":270,"kinds":null,"open_ms":1.518,"page_without_range":0,"path_prefixes":["pkg"],"query":"\"node name\"","served_hits":220,"served_page":200,"warm_ms":[970.48,987.675,1005.343,1043.281,1009.107]}
 {"cold_ms":568.972,"hits":21,"kinds":null,"open_ms":2.044,"page_without_range":0,"path_prefixes":["pkg"],"query":"\"admission controller\"","served_hits":17,"served_page":17,"warm_ms":[346.409,308.864,376.806,312.891,298.303]}
-rc=0 18:24:30
-=== qual-name 18:24:30 <bench>/store <bench>/qual/queries-name.txt 1
+rc=0
+=== qual-name <bench>/store <bench>/qual/queries-name.txt 1
 {"cold_ms":181.106,"hits":4,"kinds":null,"open_ms":1.925,"page_without_range":0,"path_prefixes":null,"query":"withHealthStatus","served_hits":4,"served_page":4,"warm_ms":[122.212]}
 {"cold_ms":137.826,"hits":2,"kinds":null,"open_ms":1.607,"page_without_range":0,"path_prefixes":null,"query":"checkNodeAllocatableTest","served_hits":2,"served_page":2,"warm_ms":[96.827]}
 {"cold_ms":164.496,"hits":4,"kinds":null,"open_ms":1.699,"page_without_range":0,"path_prefixes":null,"query":"UnsafeDeleteRole","served_hits":4,"served_page":4,"warm_ms":[118.236]}
@@ -1095,8 +1095,8 @@ rc=0 18:24:30
 {"cold_ms":238.995,"hits":140,"kinds":null,"open_ms":1.656,"page_without_range":0,"path_prefixes":null,"query":"fakeAuthorizer","served_hits":136,"served_page":136,"warm_ms":[197.622]}
 {"cold_ms":208.606,"hits":296,"kinds":null,"open_ms":3.008,"page_without_range":0,"path_prefixes":null,"query":"CloseNotify","served_hits":286,"served_page":200,"warm_ms":[167.27]}
 {"cold_ms":1925.636,"hits":21956,"kinds":null,"open_ms":1.831,"page_without_range":0,"path_prefixes":null,"query":"yaml_parser_parse_document_content","served_hits":20265,"served_page":200,"warm_ms":[1666.141]}
-rc=0 18:54:02
-=== qual-doc 18:54:02 <bench>/store <bench>/qual/queries-doc.txt 1
+rc=0
+=== qual-doc <bench>/store <bench>/qual/queries-doc.txt 1
 {"cold_ms":772.076,"hits":1323,"kinds":null,"open_ms":1.579,"page_without_range":0,"path_prefixes":null,"query":"rundensitybatchtest nodeallocatable density reported","served_hits":1023,"served_page":200,"warm_ms":[715.536]}
 {"cold_ms":3663.64,"hits":72863,"kinds":null,"open_ms":1.748,"page_without_range":0,"path_prefixes":null,"query":"m data byte int","served_hits":70538,"served_page":200,"warm_ms":[3569.467]}
 {"cold_ms":1765.035,"hits":14087,"kinds":null,"open_ms":1.58,"page_without_range":0,"path_prefixes":null,"query":"authzmode authorization mode valid","served_hits":11819,"served_page":200,"warm_ms":[1557.245]}
@@ -2097,8 +2097,8 @@ rc=0 18:54:02
 {"cold_ms":934.139,"hits":2848,"kinds":null,"open_ms":1.822,"page_without_range":0,"path_prefixes":null,"query":"conform conflicting templates replaced","served_hits":2165,"served_page":200,"warm_ms":[754.145]}
 {"cold_ms":476.045,"hits":62,"kinds":null,"open_ms":2.094,"page_without_range":0,"path_prefixes":null,"query":"testarg podlatencydata densitytest testinfo","served_hits":62,"served_page":62,"warm_ms":[299]}
 {"cold_ms":2338.372,"hits":25636,"kinds":null,"open_ms":2.039,"page_without_range":0,"path_prefixes":null,"query":"bundle ignored mode new","served_hits":23041,"served_page":200,"warm_ms":[2199.055]}
-rc=0 20:01:40
-=== qual-subword 20:01:40 <bench>/store <bench>/qual/queries-subword.txt 1
+rc=0
+=== qual-subword <bench>/store <bench>/qual/queries-subword.txt 1
 {"cold_ms":457.461,"hits":1711,"kinds":null,"open_ms":1.897,"page_without_range":0,"path_prefixes":null,"query":"health","served_hits":1482,"served_page":200,"warm_ms":[424.86]}
 {"cold_ms":1323.15,"hits":17473,"kinds":null,"open_ms":1.629,"page_without_range":0,"path_prefixes":null,"query":"node","served_hits":16035,"served_page":200,"warm_ms":[1281.526]}
 {"cold_ms":852.674,"hits":5730,"kinds":null,"open_ms":2.043,"page_without_range":0,"path_prefixes":null,"query":"delete","served_hits":4323,"served_page":200,"warm_ms":[818.957]}
@@ -3099,5 +3099,5 @@ rc=0 20:01:40
 {"cold_ms":458.916,"hits":968,"kinds":null,"open_ms":1.663,"page_without_range":0,"path_prefixes":null,"query":"allocate","served_hits":785,"served_page":200,"warm_ms":[398.233]}
 {"cold_ms":258.421,"hits":520,"kinds":null,"open_ms":1.476,"page_without_range":0,"path_prefixes":null,"query":"divisor","served_hits":303,"served_page":200,"warm_ms":[182.542]}
 {"cold_ms":319.905,"hits":509,"kinds":null,"open_ms":1.994,"page_without_range":0,"path_prefixes":null,"query":"async","served_hits":472,"served_page":200,"warm_ms":[293.758]}
-rc=0 20:28:31
+rc=0
 ALLDONE

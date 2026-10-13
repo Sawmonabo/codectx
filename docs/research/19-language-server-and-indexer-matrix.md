@@ -77,7 +77,7 @@ driver-plus-server tree, overstating by ~15 MB): cold pyright 1.02 s / **90** / 
 completeness gap does not appear because the queried class sits in the opened file's own import
 closure — the condition that fails on the large Python repository.
 
-**MEASURED.** The decisive result of this lane. On a cold session — the only kind codectx has —
+**MEASURED.** The decisive result of this note. On a cold session — the only kind codectx has —
 pyright and pyrefly answer **2 of ~136** references; ty answers the full set in 0.21 s at 168
 MB. pyright needs a settle window (0 s → 2, 15 s → 138) because its `references` walks the
 *program*, i.e. the opened file's import closure, until background workspace indexing widens
@@ -86,7 +86,7 @@ it. pyright also never advertises `implementationProvider`, which is why
 disagreement is unexplained and needs adjudicating before a swap.
 
 **Amended 2026-09-15.** The 138 above is this note's own one-off measurement and was **not
-reproduced** by the implementation lane: driven over the same repository with the client the
+reproduced** when the swap was implemented: driven over the same repository with the client the
 product itself uses, the replaced server returned 2 locations cold and still 2 after settle
 windows of 15, 40 and 60 seconds, so no settled location set exists to diff against
 (`docs/providers-lsp.md` "The python row was re-measured for the swap"). The decisive comparison
@@ -156,7 +156,7 @@ languages codectx does not index.
   memory-eviction heuristics so it analyses everything [2], which is why it is both complete
   and expensive. A ty-based emitter would be the highest-value tool change available to codectx
   and does not exist; building one means writing a SCIP backend against ty's semantic index,
-  which is not a lane-sized task.
+  which is a project of its own, not a change.
 - **TypeScript.** scip-typescript 0.4.0 is still actively developed (symbol-kind emission
   merged 2026-09-11) and there is **no SCIP emitter on the native port**; a tsgo-based indexer
   would need the 7.1 API that does not exist yet [11].

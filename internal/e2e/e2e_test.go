@@ -410,7 +410,7 @@ func TestE2ESearchParity(t *testing.T) {
 
 	// The index is built first and the process exits: this row compares the
 	// CLI's answer with the server's over one published generation, so both
-	// must read the same one. `mcp serve` no longer needs the order -- it
+	// must read the same one. `mcp serve` does not need the order -- it
 	// starts and answers beside a running index -- but an overlapping index
 	// would leave the two halves comparing different generations.
 	indexEnv, indexCode := s.run(t, "index")

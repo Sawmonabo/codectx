@@ -20,7 +20,7 @@ import (
 // from the end of the answer. The bound is RESOLVED and disclosed, the same way
 // a traversal's bounds are.
 //
-// Mutation (resolvePageItems replaced by the old `if pageLimit <= 0 ||
+// Mutation (resolvePageItems replaced by a silent `if pageLimit <= 0 ||
 // pageLimit > e.limits.MaxPageItems` clamp): Notices is empty and this fails.
 func TestReferencePageBoundIsDisclosedNotClamped(t *testing.T) {
 	f := newGraphFixture(t)
