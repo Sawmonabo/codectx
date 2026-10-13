@@ -331,14 +331,14 @@ func routeReason(cand candidate, best model.RelationPath,
 		len(best.Relations), kind, cand.Depth, contribution)
 }
 
-// appendReason keeps the explanation inside the Section 15.3 bounds that
-// model.ContextEntry validates: at most MaxReasonsPerEntry reasons of at most
-// MaxReasonBytes each, with no duplicate. A reason dropped here is dropped
-// because the entry is already fully explained, never because it was silently
-// truncated into something else.
+// appendReason keeps the explanation inside the Section 15.3 bound that
+// model.ContextEntry validates: reasons of at most MaxReasonBytes each, with
+// no duplicate. There is no count bound: an entry's reasons are stored and
+// paged by reference, so every one is kept. A reason dropped here is a repeat
+// or an empty one, never one silently truncated into something else.
 func appendReason(reasons []string, reason string) []string {
 	reason = strings.TrimSpace(reason)
-	if reason == "" || len(reasons) >= model.MaxReasonsPerEntry {
+	if reason == "" {
 		return reasons
 	}
 	if len(reason) > model.MaxReasonBytes {
@@ -371,7 +371,7 @@ func appendReason(reasons []string, reason string) []string {
 // It carries only what P-F still needs from the route pass, which is why
 // routeScore itself is not the record: `paths` already travel as their own
 // retained pathRec/hopRec streams, `admittedEdges` are consumed into the
-// centrality sort by P-D, and `reasons` are appended to Cand.Reasons by P-D --
+// centrality sort by P-D, and `reasons` go to the routed reason stream by P-D --
 // so nothing here is unbounded.
 //
 //   - Pkg is packageOf(PathAtRank), computed once by P-D. The

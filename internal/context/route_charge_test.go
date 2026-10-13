@@ -44,9 +44,9 @@ func TestAnEntrysChargeDoesNotMoveWithItsRoutes(t *testing.T) {
 }
 
 // TestAnEntrysChargeDoesNotMoveWithItsReasons pins the same for reasons: an
-// entry explained by one short reason and one explained by every reason it
-// may carry, each at the byte bound, cost the same, and both keep their
-// reasons whole for the reasons view.
+// entry explained by one short reason and one explained by many reasons --
+// more than the old per-entry count, each at the byte bound -- cost the same,
+// and both keep their reasons whole for the reasons view.
 //
 // Mutation caught: measuring the entry with its reasons (or with its real
 // reason count's digits).
@@ -55,7 +55,7 @@ func TestAnEntrysChargeDoesNotMoveWithItsReasons(t *testing.T) {
 		Requirement: model.RequirementSymbol, SizeBytes: 4096}
 	short, long := base, base
 	short.Reasons = []string{"x"}
-	for i := range model.MaxReasonsPerEntry {
+	for i := range 4 * model.MaxReasonsPerEntry {
 		long.Reasons = append(long.Reasons, fmt.Sprintf("%0*d", model.MaxReasonBytes, i))
 	}
 	a, err := measureEntry(short, 3, true)

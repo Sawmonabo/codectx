@@ -102,9 +102,8 @@ func referenceWalks(ctx context.Context, eng *graph.Engine, gen model.Generation
 		if !ok {
 			continue
 		}
-		var dropped, truncated int64
-		c.Reasons, dropped, truncated = boundReasons(c.Reasons)
-		res.ReasonsDropped += dropped
+		var truncated int64
+		c.Reasons, truncated = boundReasons(c.Reasons)
 		res.ReasonsTruncated += truncated
 		c.Paths, c.MorePaths = boundPaths(c.Paths, cfg.MaxReasonPathsPerEntry)
 		res.Candidates = append(res.Candidates, c)
@@ -465,9 +464,6 @@ func (w *refWalker) reasons(rec refRecord) ([]string, error) {
 	}
 	slices.Sort(out)
 	out = slices.Compact(out)
-	if len(out) > model.MaxReasonsPerEntry {
-		out = out[:model.MaxReasonsPerEntry]
-	}
 	return out, nil
 }
 

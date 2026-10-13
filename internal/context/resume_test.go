@@ -207,7 +207,7 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	st := checkpointState{Pass: 4, RequestHash: "sha256:abc",
 		Streams: map[string][]checkpointRun{"ranked": {{Name: "ctx-resume-ranked-run0", Bytes: 512}}},
-		Scalars: checkpointScalars{ScopeComplete: true, ReasonsDropped: 7}}
+		Scalars: checkpointScalars{ScopeComplete: true, ReasonsTruncated: 7}}
 	if err := writeCheckpointState(dir, st); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	if got.Pass != 4 || got.RequestHash != "sha256:abc" ||
-		got.Scalars.ReasonsDropped != 7 || !got.Scalars.ScopeComplete ||
+		got.Scalars.ReasonsTruncated != 7 || !got.Scalars.ScopeComplete ||
 		len(got.Streams["ranked"]) != 1 || got.Streams["ranked"][0].Bytes != 512 {
 		t.Fatalf("state round-tripped as %+v", got)
 	}

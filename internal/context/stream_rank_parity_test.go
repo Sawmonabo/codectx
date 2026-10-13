@@ -198,7 +198,13 @@ func streamRank(t *testing.T, ctx stdcontext.Context, c *Compiler, reader *sqlit
 	candSort := mustSort(t, sorts, "cand", func(a, b candRec) int { return cmpInt(a.Seq, b.Seq) }, sizeOfCand)
 	routeSort := mustSort(t, sorts, "path", lessPathSeq, sizeOfPath)
 	hopSort := mustSort(t, sorts, "hop", lessHopSeq, sizeOfHop)
+	// Every pass's reasons go to one sort here: its (Seq, Phase, Idx) order is
+	// the order P-G's re-key reads the three streams in.
+	reasonSort := mustSort(t, sorts, "reason", lessReasonSeq, sizeOfReason)
 	for seq, cand := range cands {
+		for i, r := range cand.Reasons {
+			mustAdd(t, reasonSort.Add(reasonRec{Seq: int64(seq), Phase: reasonAdmitted, Idx: int32(i), Text: r}))
+		}
 		rec := candRecOf(cand, int64(seq))
 		if splitPath {
 			// A path whose directory differs per candidate, so bucketing
@@ -223,7 +229,7 @@ func streamRank(t *testing.T, ctx stdcontext.Context, c *Compiler, reader *sqlit
 	edgeSort := mustSort(t, sorts, "pkg-edge", lessPkgEdge, sizeOfPkgEdge).WithFold(foldPkgEdgeDistinct)
 
 	scoredRun, err := c.passDRouteScoring(ctx, sorts, candRun, routeRun, hopRun,
-		retainedPaths, retainedHops, edgeSort)
+		retainedPaths, retainedHops, reasonSort, edgeSort)
 	if err != nil {
 		t.Fatalf("passDRouteScoring: %v", err)
 	}
@@ -234,10 +240,18 @@ func streamRank(t *testing.T, ctx stdcontext.Context, c *Compiler, reader *sqlit
 	}
 
 	rankedSort := mustSort(t, sorts, "ranked", lessRank, sizeOfCand)
-	if err := c.passFBoosts(ctx, scoredRun, countRun, rankedSort); err != nil {
+	if err := c.passFBoosts(ctx, scoredRun, countRun, rankedSort, reasonSort); err != nil {
 		t.Fatalf("passFBoosts: %v", err)
 	}
 	rankedRun := mustSorted(t, sorts, rankedSort)
+
+	reasons := map[int64][]string{}
+	if err := mustSorted(t, sorts, reasonSort).Each(func(r reasonRec) error {
+		reasons[r.Seq] = appendReason(reasons[r.Seq], r.Text)
+		return nil
+	}); err != nil {
+		t.Fatalf("reading the reason stream: %v", err)
+	}
 
 	routes := map[int64][]model.RelationPath{}
 	keptRoutes, keptHops := mustSorted(t, sorts, retainedPaths), mustSorted(t, sorts, retainedHops)
@@ -266,6 +280,7 @@ func streamRank(t *testing.T, ctx stdcontext.Context, c *Compiler, reader *sqlit
 	if err := rankedRun.Each(func(rec candRec) error {
 		cand := rec.rankCandidate()
 		cand.Paths = routes[rec.Seq]
+		cand.Reasons = reasons[rec.Seq]
 		out[rec.Seq] = cand
 		order = append(order, rec.Seq)
 		return nil

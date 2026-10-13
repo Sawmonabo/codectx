@@ -92,7 +92,6 @@ type checkpointRun struct {
 type checkpointScalars struct {
 	Completeness     []model.CapabilityState `json:"completeness,omitempty"`
 	ScopeComplete    bool                    `json:"scope_complete"`
-	ReasonsDropped   int64                   `json:"reasons_dropped,omitempty"`
 	ReasonsTruncated int64                   `json:"reasons_truncated,omitempty"`
 	// WalkCursor, WalkRoots, Walked and Seq are the passIngest boundary's
 	// own carry: the walk's continuation, its roots (the list every leg of
@@ -369,6 +368,7 @@ const (
 	streamSeedCand   = "seed-cand"
 	streamSeedPath   = "seed-path"
 	streamSeedHop    = "seed-hop"
+	streamSeedReason = "seed-reason"
 	// streamSeedReached is the closure's reached set: the kept-file nodes the
 	// round's walks reached so far, PRE-fold. A round that runs no closure has
 	// none and checkpoints it as no files.
@@ -389,7 +389,13 @@ const (
 	streamExcluded  = "excluded"
 	streamMeasPaths = "measured-path"
 	streamMeasHops  = "measured-hop"
-	streamVerdicts  = "verdicts"
+	// The reason streams: P-A's admitted reasons, P-D's routed and P-F's
+	// boosted ones, each keyed on Seq, and P-G's re-key of all three.
+	streamReasons        = "reason"
+	streamRoutedReasons  = "routed-reason"
+	streamBoostedReasons = "boosted-reason"
+	streamMeasReasons    = "measured-reason"
+	streamVerdicts       = "verdicts"
 )
 
 // passStreams answers the streams a checkpoint taken at boundary `pass` carries
@@ -412,24 +418,29 @@ func passStreams(pass int) []string {
 		// of them folded and none of them merged. seedSort is deliberately
 		// absent -- foldSeeds consumed it and nothing after it reads it, or
 		// `stages`, or `resolved`.
-		return []string{streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReached}
+		return []string{streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReason,
+			streamSeedReached}
 	case passHydrate:
-		return []string{streamCands, streamRoutes, streamHops}
+		return []string{streamCands, streamRoutes, streamHops, streamReasons}
 	case passAttributes:
-		return []string{streamCands, streamHydrated, streamRoutes, streamHops}
+		return []string{streamCands, streamHydrated, streamRoutes, streamHops, streamReasons}
 	case passRoutes:
-		return []string{streamHydrated, streamRoutes, streamHops}
+		return []string{streamHydrated, streamRoutes, streamHops, streamReasons}
 	case passCentrality:
-		return []string{streamScored, streamKeptPaths, streamKeptHops, streamEdges}
+		return []string{streamScored, streamKeptPaths, streamKeptHops, streamEdges,
+			streamReasons, streamRoutedReasons}
 	case passBoosts:
-		return []string{streamScored, streamCounts, streamKeptPaths, streamKeptHops}
+		return []string{streamScored, streamCounts, streamKeptPaths, streamKeptHops,
+			streamReasons, streamRoutedReasons}
 	case passMeasure:
-		return []string{streamRanked, streamKeptPaths, streamKeptHops}
+		return []string{streamRanked, streamKeptPaths, streamKeptHops,
+			streamReasons, streamRoutedReasons, streamBoostedReasons}
 	case passPack:
-		return []string{streamByFile, streamGroups, streamExcluded, streamMeasPaths, streamMeasHops}
+		return []string{streamByFile, streamGroups, streamExcluded, streamMeasPaths, streamMeasHops,
+			streamMeasReasons}
 	case passEmit:
 		return []string{streamByFile, streamGroups, streamExcluded, streamMeasPaths, streamMeasHops,
-			streamVerdicts}
+			streamMeasReasons, streamVerdicts}
 	default:
 		return nil
 	}
@@ -479,6 +490,8 @@ func (st *compileState) checkpointIngest(dir, name string) ([]checkpointRun, err
 		return cpSort(dir, name, st.ingest.candSort)
 	case streamSeedPath:
 		return cpSort(dir, name, st.ingest.pathSort)
+	case streamSeedReason:
+		return cpSort(dir, name, st.ingest.reasonSort)
 	case streamSeedReached:
 		if st.ingest.closure == nil {
 			// The round runs no closure, so it has no reached set; the restore
@@ -498,7 +511,7 @@ func (st *compileState) checkpointIngest(dir, name string) ([]checkpointRun, err
 // checkpointSort.
 func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]checkpointRun, error) {
 	switch name {
-	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReached:
+	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReason, streamSeedReached:
 		return st.checkpointIngest(dir, name)
 	case streamCands:
 		return cpRun(dir, name, runBytes, st.cands, lessCandSeq, sizeOfCand)
@@ -516,6 +529,12 @@ func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]ch
 		return cpRun(dir, name, runBytes, st.keptPaths, lessPathSeq, sizeOfPath)
 	case streamKeptHops:
 		return cpRun(dir, name, runBytes, st.keptHops, lessHopSeq, sizeOfHop)
+	case streamReasons:
+		return cpRun(dir, name, runBytes, st.reasons, lessReasonSeq, sizeOfReason)
+	case streamRoutedReasons:
+		return cpRun(dir, name, runBytes, st.routedReasons, lessReasonSeq, sizeOfReason)
+	case streamBoostedReasons:
+		return cpRun(dir, name, runBytes, st.boostedReasons, lessReasonSeq, sizeOfReason)
 	case streamEdges:
 		// The one PRE-fold carry: P-D has finished writing it but P-E has not
 		// merged it, so it is detached as it stands and restored with
@@ -545,6 +564,11 @@ func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]ch
 			return nil, missingStream(name)
 		}
 		return cpRun(dir, name, runBytes, st.measured.Hops, lessHopSeq, sizeOfHop)
+	case streamMeasReasons:
+		if st.measured == nil {
+			return nil, missingStream(name)
+		}
+		return cpRun(dir, name, runBytes, st.measured.Reasons, lessReasonSeq, sizeOfReason)
 	case streamVerdicts:
 		if st.packed == nil {
 			return nil, missingStream(name)
@@ -574,7 +598,7 @@ func (st *compileState) measuredRun(name string) *pagination.SortedRun[candRec] 
 func (st *compileState) restoreStream(s *compileSorts, dir, name string, files []checkpointRun) error {
 	var err error
 	switch name {
-	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReached:
+	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop, streamSeedReason, streamSeedReached:
 		if st.ingest == nil {
 			return missingStream(name)
 		}
@@ -597,6 +621,8 @@ func (st *compileState) restoreStream(s *compileSorts, dir, name string, files [
 		st.ingest.pathSort, err = restoreSort(s, dir, name, files, lessPathSeq, sizeOfPath)
 	case streamSeedHop:
 		st.ingest.hopSort, err = restoreSort(s, dir, name, files, lessHopSeq, sizeOfHop)
+	case streamSeedReason:
+		st.ingest.reasonSort, err = restoreSort(s, dir, name, files, lessReasonSeq, sizeOfReason)
 	case streamSeedReached:
 		cl := st.ingest.closure
 		if cl == nil {
@@ -628,6 +654,12 @@ func (st *compileState) restoreStream(s *compileSorts, dir, name string, files [
 		st.keptPaths, err = restoreRun(s, dir, name, files, lessPathSeq, sizeOfPath)
 	case streamKeptHops:
 		st.keptHops, err = restoreRun(s, dir, name, files, lessHopSeq, sizeOfHop)
+	case streamReasons:
+		st.reasons, err = restoreRun(s, dir, name, files, lessReasonSeq, sizeOfReason)
+	case streamRoutedReasons:
+		st.routedReasons, err = restoreRun(s, dir, name, files, lessReasonSeq, sizeOfReason)
+	case streamBoostedReasons:
+		st.boostedReasons, err = restoreRun(s, dir, name, files, lessReasonSeq, sizeOfReason)
 	case streamEdges:
 		var sorter *pagination.ExternalSort[pkgEdgeRec]
 		sorter, err = restoreSort(s, dir, name, files, lessPkgEdge, sizeOfPkgEdge)
@@ -649,6 +681,8 @@ func (st *compileState) restoreStream(s *compileSorts, dir, name string, files [
 		st.ensureMeasured().Paths, err = restoreRun(s, dir, name, files, lessPathSeq, sizeOfPath)
 	case streamMeasHops:
 		st.ensureMeasured().Hops, err = restoreRun(s, dir, name, files, lessHopSeq, sizeOfHop)
+	case streamMeasReasons:
+		st.ensureMeasured().Reasons, err = restoreRun(s, dir, name, files, lessReasonSeq, sizeOfReason)
 	case streamVerdicts:
 		var run *pagination.SortedRun[packVerdict]
 		run, err = restoreRun(s, dir, name, files, lessVerdict, sizeOfVerdict)
@@ -751,7 +785,6 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 	scalars := checkpointScalars{
 		Completeness:          st.scope.Completeness,
 		ScopeComplete:         st.scopeComplete,
-		ReasonsDropped:        st.scope.ReasonsDropped,
 		ReasonsTruncated:      st.scope.ReasonsTruncated,
 		Stop:                  st.scope.Stop,
 		Candidates:            st.scope.Candidates,
@@ -856,7 +889,6 @@ func scalarScope(sc checkpointScalars) scopeResult {
 	return scopeResult{
 		Completeness:          sc.Completeness,
 		ScopeComplete:         sc.ScopeComplete,
-		ReasonsDropped:        sc.ReasonsDropped,
 		ReasonsTruncated:      sc.ReasonsTruncated,
 		Stop:                  sc.Stop,
 		Candidates:            sc.Candidates,

@@ -517,9 +517,8 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 		}
 		cands[i].ScoreMicros = score
 		// The routes that were not enumerated are disclosed BEFORE the boost
-		// reasons: appendReason drops silently at MaxReasonsPerEntry, and a
-		// bounded explanation that lost this line reads as an unexplained
-		// selection -- the one thing MorePaths exists to prevent.
+		// reasons, the order the streamed passes give them in (reasonRouted
+		// before reasonBoosted).
 		for _, reason := range append(morePathsReason(cands[i].MorePaths), routed[i].reasons...) {
 			cands[i].Reasons = appendReason(cands[i].Reasons, reason)
 		}

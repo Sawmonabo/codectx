@@ -70,13 +70,12 @@ type scopeResult struct {
 	// and none sets it true, so no later pass can repair a truncated walk, a
 	// degraded capability or an unresolved seed by scoring around it.
 	ScopeComplete bool
-	// ReasonsDropped and ReasonsTruncated count the Section 15.3 explanation
-	// cuts boundReasons applied across the whole expansion. They are COUNTS and
-	// not one notice per entry: an entry-sized disclosure list is
-	// repository-sized in heap, which a streamed compile never holds, while the
-	// two counts are what a caller deciding whether an explanation is whole
-	// actually needs. The compiler turns them into manifest notices.
-	ReasonsDropped   int64
+	// ReasonsTruncated counts the reasons boundReasons shortened to the
+	// one-reason byte bound across the whole expansion. It is a COUNT and not
+	// one notice per entry: an entry-sized disclosure list is
+	// repository-sized in heap, which a streamed compile never holds. No
+	// reason is dropped for a count: an entry keeps every reason, stored and
+	// paged by reference. The compiler turns the count into a manifest notice.
 	ReasonsTruncated int64
 	// Stop is how the lexical read ended, for the manifest notice.
 	Stop seedStop
@@ -143,25 +142,16 @@ func baseRequirement(kind model.NodeKind) model.Requirement {
 	return model.RequirementOptional
 }
 
-// boundReasons clamps an entry's explanation to the Section 15.3 caps and
-// returns what it had to cut. The engine already bounds them, so this guards a
-// future engine change from producing a manifest that
-// model.ContextEntry.Validate would reject at persistence time, one pass too
-// late to explain itself.
+// boundReasons clamps each reason of an entry's explanation to the one-reason
+// byte bound and counts the ones it shortened. Every reason is kept: the
+// explanation is stored and paged by reference, so its length never reaches
+// the entry's charge and there is no count to cut it to.
 //
-// The cut is never silent. Both halves are counted and surfaced as manifest
-// notices by the compiler: an explanation shortened without saying so reads as
-// the whole reason an entity was selected. The flag does NOT ride on the
-// entry's own Reasons -- the caps this function enforces are exactly the ones
-// ContextEntry.Validate checks, so appending a disclosure there would produce
-// MaxReasonsPerEntry+1 reasons and turn a disclosed clamp into a failed
-// compile. The per-reason cut goes through model.TruncateField, which never
-// leaves a partial UTF-8 sequence behind as the raw slice did.
-func boundReasons(reasons []string) (out []string, dropped, truncated int64) {
-	if len(reasons) > model.MaxReasonsPerEntry {
-		dropped = int64(len(reasons) - model.MaxReasonsPerEntry)
-		reasons = reasons[:model.MaxReasonsPerEntry]
-	}
+// The cut is never silent: the count is surfaced as a manifest notice by the
+// compiler, because an explanation shortened without saying so reads as the
+// whole reason an entity was selected. The cut goes through
+// model.TruncateField, which never leaves a partial UTF-8 sequence behind.
+func boundReasons(reasons []string) (out []string, truncated int64) {
 	out = make([]string, 0, len(reasons))
 	for _, r := range reasons {
 		bounded, original := model.TruncateField(r, model.MaxReasonBytes)
@@ -170,7 +160,7 @@ func boundReasons(reasons []string) (out []string, dropped, truncated int64) {
 		}
 		out = append(out, bounded)
 	}
-	return out, dropped, truncated
+	return out, truncated
 }
 
 // boundPaths applies context.max_reason_paths_per_entry to the routes an
@@ -252,10 +242,11 @@ func degradedCapabilities(reported, disclosed []model.CapabilityState) []model.C
 // exclusion projection by replaying this spool in seq order. Every run is registered with the compile's sort area, so all
 // three are released by compileSorts.Close on every exit path.
 type ingested struct {
-	Cands *pagination.SortedRun[candRec]
-	Paths *pagination.SortedRun[pathRec]
-	Hops  *pagination.SortedRun[hopRec]
-	Scope scopeResult
+	Cands   *pagination.SortedRun[candRec]
+	Paths   *pagination.SortedRun[pathRec]
+	Hops    *pagination.SortedRun[hopRec]
+	Reasons *pagination.SortedRun[reasonRec]
+	Scope   scopeResult
 }
 
 // lessCandSeq orders a candidate stream by ingest sequence: the admission order
@@ -302,10 +293,12 @@ type seedIngest struct {
 	// them is idempotent, and it is the carry a halted walk checkpoints them
 	// in); candSort is the admission-order spool every later pass replays, and
 	// every walk entry goes straight to it; the two route sorts take the walk's
-	// routes as each page arrives.
+	// routes as each page arrives, and reasonSort every admitted candidate's
+	// reasons under its seq.
 	seedSort, entitySort, candSort *pagination.ExternalSort[candRec]
 	pathSort                       *pagination.ExternalSort[pathRec]
 	hopSort                        *pagination.ExternalSort[hopRec]
+	reasonSort                     *pagination.ExternalSort[reasonRec]
 	// seq is the arrival counter: the seed's discovery position, then the
 	// walk's entries after it. It is the only per-seed state this sink keeps.
 	seq int64
@@ -380,7 +373,26 @@ func (c *Compiler) newSeedIngest(s *compileSorts) (*seedIngest, error) {
 	if in.hopSort, err = newSort[hopRec](s, "scope-hop", lessHopSeq, sizeOfHop); err != nil {
 		return nil, err
 	}
+	if in.reasonSort, err = newSort[reasonRec](s, "scope-reason", lessReasonSeq, sizeOfReason); err != nil {
+		return nil, err
+	}
 	return in, nil
+}
+
+// add puts one candidate on sort under seq and its reasons on the reason sort
+// under the same seq, in the order the candidate gives them. The reasons do
+// not ride on the record: a candidate's explanation has no count bound, and
+// the record is what every sort buffers and every pass replays.
+func (in *seedIngest) add(sort *pagination.ExternalSort[candRec], c candidate, seq int64) error {
+	if err := sort.Add(candRecOf(c, seq)); err != nil {
+		return err
+	}
+	for i, r := range c.Reasons {
+		if err := in.reasonSort.Add(reasonRec{Seq: seq, Phase: reasonAdmitted, Idx: int32(i), Text: r}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // BeginStep names the Section 15.2 step whose seeds follow. A producer calls it
@@ -411,7 +423,7 @@ func (in *seedIngest) Admit(sd candidate) error {
 		// An unresolved extracted token stays visible as an exclusion and
 		// carries the answer down to discovery rather than out of it.
 		in.scope.ScopeComplete = false
-		return in.candSort.Add(candRecOf(sd, seq))
+		return in.add(in.candSort, sd, seq)
 	}
 	in.resolved++
 	sd.Depth = 0
@@ -432,9 +444,9 @@ func (in *seedIngest) Admit(sd candidate) error {
 	if sd.entityID() == "" {
 		// No identity, so no dedupe key and no fold: the seed goes straight to
 		// the admission spool in arrival order.
-		return in.candSort.Add(candRecOf(sd, seq))
+		return in.add(in.candSort, sd, seq)
 	}
-	return in.seedSort.Add(candRecOf(sd, seq))
+	return in.add(in.seedSort, sd, seq)
 }
 
 // emitRoutes writes one walk entry's routes into the two route sorts.
@@ -694,7 +706,7 @@ func strongestHop() (int64, error) {
 func (in *seedIngest) discloseUnwalkedRoots(n int64, width config.Limit) error {
 	seq := in.seq
 	in.seq++
-	return in.candSort.Add(candRecOf(candidate{
+	return in.add(in.candSort, candidate{
 		// As with seedCut: the row names the step that stopped, because
 		// ContextReference refuses a reference naming no entity at all.
 		Path:   "seed discovery: walk roots",
@@ -702,7 +714,7 @@ func (in *seedIngest) discloseUnwalkedRoots(n int64, width config.Limit) error {
 		Excluded: boundReason(fmt.Sprintf(
 			"%d resolved seeds beyond the context.max_start_nodes limit of %s were not walked; "+
 				"their boundaries are unexplored", n, width)),
-	}, seq))
+	}, seq)
 }
 
 // discloseCut names every Section 15.2 step the context.max_seeds bound stopped:
@@ -722,7 +734,7 @@ func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 		}
 		seq := in.seq
 		in.seq++
-		if err := in.candSort.Add(candRecOf(seedCut(st.origin, st.step, limit), seq)); err != nil {
+		if err := in.add(in.candSort, seedCut(st.origin, st.step, limit), seq); err != nil {
 			return err
 		}
 	}
@@ -780,7 +792,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			return nil, true, nil
 		}
 		out.Scope = in.scope
-		done, err := finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort)
+		done, err := finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort, in.reasonSort)
 		return done, false, err
 	}
 
@@ -984,9 +996,8 @@ func (in *seedIngest) admitEntry(e model.ImpactEntry, weight int64, named, peer 
 		RootWeight:  weight,
 		Named:       named,
 	}
-	var dropped, truncated int64
-	cand.Reasons, dropped, truncated = boundReasons(e.Reasons)
-	in.scope.ReasonsDropped += dropped
+	var truncated int64
+	cand.Reasons, truncated = boundReasons(e.Reasons)
 	in.scope.ReasonsTruncated += truncated
 	// Only the disclosure count is kept on the record; the routes themselves
 	// go to the route sorts, and finishIngest keeps the ones whose candidate
@@ -994,7 +1005,7 @@ func (in *seedIngest) admitEntry(e model.ImpactEntry, weight int64, named, peer 
 	cand.MorePaths = countBoundPaths(e.Paths, in.cfg.MaxReasonPathsPerEntry)
 	seq := in.seq
 	in.seq++
-	if err := in.candSort.Add(candRecOf(cand, seq)); err != nil {
+	if err := in.add(in.candSort, cand, seq); err != nil {
 		return err
 	}
 	return in.emitRoutes(seq, e.Paths)
@@ -1028,8 +1039,8 @@ func pinnedGeneration(gen model.GenerationID, cursor string) model.GenerationID 
 }
 
 // finishIngest drains the seed survivors into the admission spool,
-// materializes the spool in seq order, and keeps the routes of the records on
-// it.
+// materializes the spool in seq order, and keeps the routes and reasons of the
+// records on it.
 //
 // It is the ONE tail of expandScopeStream: the two early returns above reach it
 // as well, so no path hands the next pass an unfinalized sort.
@@ -1050,6 +1061,7 @@ func pinnedGeneration(gen model.GenerationID, cursor string) model.GenerationID 
 func finishIngest(s *compileSorts, out *ingested,
 	entitySort, candSort *pagination.ExternalSort[candRec],
 	pathSort *pagination.ExternalSort[pathRec], hopSort *pagination.ExternalSort[hopRec],
+	reasonSort *pagination.ExternalSort[reasonRec],
 ) (*ingested, error) {
 	entityRun, err := entitySort.Sorted()
 	if err != nil {
@@ -1081,6 +1093,15 @@ func finishIngest(s *compileSorts, out *ingested,
 	}
 	if out.Hops, err = keptBySeq(s, "scope-hop-kept", rawHops, candRun,
 		func(r hopRec) int64 { return r.Seq }, lessHopSeq, sizeOfHop); err != nil {
+		return nil, err
+	}
+	rawReasons, err := reasonSort.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	trackRun(s, rawReasons)
+	if out.Reasons, err = keptBySeq(s, "scope-reason-kept", rawReasons, candRun,
+		func(r reasonRec) int64 { return r.Seq }, lessReasonSeq, sizeOfReason); err != nil {
 		return nil, err
 	}
 	out.Cands = candRun
