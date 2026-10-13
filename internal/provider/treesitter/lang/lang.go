@@ -90,7 +90,7 @@ func build() []Language {
 	all := []Language{
 		{Name: "c", Module: "github.com/tree-sitter/tree-sitter-c@v0.24.2", ABI: 15, Metadata: "0.24.2", Extensions: []string{".c", ".h"}, Headers: []string{".h"}, Query: c, Separator: "::"},
 		{Name: "cpp", Module: "github.com/tree-sitter/tree-sitter-cpp@v0.23.4", ABI: 14, Extensions: []string{".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx"}, Headers: []string{".h", ".hpp", ".hh", ".hxx"}, Query: cpp, Separator: "::"},
-		{Name: "go", Module: "github.com/tree-sitter/tree-sitter-go@v0.25.0", ABI: 15, Metadata: "0.25.0", Extensions: []string{".go"}, Query: read("go"), Separator: "."},
+		{Name: "go", Module: "github.com/Sawmonabo/codectx/internal/provider/treesitter/gogrammar@tree-sitter-go-v0.25.0+method-type-parameters+new-expression", ABI: 15, Metadata: "0.25.0", Extensions: []string{".go"}, Query: read("go"), Separator: "."},
 		{Name: "java", Module: "github.com/tree-sitter/tree-sitter-java@v0.23.5", ABI: 14, Extensions: []string{".java"}, Query: read("java"), Separator: "."},
 		{Name: "javascript", Module: "github.com/tree-sitter/tree-sitter-javascript@v0.25.0", ABI: 15, Metadata: "0.25.0", Extensions: []string{".js", ".mjs", ".cjs", ".jsx"}, Query: js, Separator: "."},
 		{Name: "python", Module: "github.com/tree-sitter/tree-sitter-python@v0.25.0", ABI: 15, Metadata: "0.25.0", Extensions: []string{".py", ".pyi"}, Query: read("python"), Separator: "."},
