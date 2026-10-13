@@ -13,13 +13,15 @@
 //	go generate ./internal/search/textindex
 //
 // which runs `cargo build --release --locked` here and leaves the archive under
-// `_build/` (docs/toolchain.md).
+// `_build/`, then writes archive_id.go, the archive's SHA-256, so the go
+// command's caches see a rebuilt archive (docs/toolchain.md).
 package textindex
 
 // The rustflags value is a TOML literal string, so a home directory spelled
 // with backslashes, as on Windows, is not read as escapes.
 //
 //go:generate cargo build --release --locked --manifest-path Cargo.toml --config "build.rustflags=['--remap-path-prefix=$HOME=~']"
+//go:generate go run archiveid_gen.go
 
 import (
 	"context"
@@ -161,6 +163,11 @@ type Stats struct {
 	BlocksTotal            int64
 	BlocksScored           int64
 	DocsScored             int64
+	// KeySkips counts the segments a resumed page's served-group check
+	// skipped because their key filter holds no value of the result's fold
+	// key; KeyLookups counts the dictionary lookups it made instead.
+	KeySkips   int64
+	KeyLookups int64
 	// Heaps is how many segments were scored at once, each holding a heap of
 	// Cap places (the request's depth plus one, doubled on every rescoring a
 	// marked group forced, and fitted to MaxBytes); Marked is how many groups

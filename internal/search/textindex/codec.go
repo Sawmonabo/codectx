@@ -169,6 +169,8 @@ func decodePage(b []byte) (Page, error) {
 	p.Stats.BlocksTotal = int64(r.uvarint())
 	p.Stats.BlocksScored = int64(r.uvarint())
 	p.Stats.DocsScored = int64(r.uvarint())
+	p.Stats.KeySkips = int64(r.uvarint())
+	p.Stats.KeyLookups = int64(r.uvarint())
 	p.Stats.Heaps = int64(r.uvarint())
 	p.Stats.Cap = int64(r.uvarint())
 	p.Stats.Marked = int64(r.uvarint())

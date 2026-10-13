@@ -1,6 +1,7 @@
 package textindex
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -373,13 +375,14 @@ func summaryFiles(t *testing.T, dir string) []string {
 // documents, forces a merge of every segment and checks that the merged
 // segment has a summary and its pages equal exhaustive scoring. It then makes
 // one segment's summary file a copy of another segment's (its header names
-// the other segment) and checks that the file is not read: the segment counts
-// as without a summary and pages still equal exhaustive scoring.
+// the other segment) and checks that the file is not read: the next open
+// builds the segment's own summary in its place, and pages still equal
+// exhaustive scoring.
 //
 // Mutation caught: skipping the summary rebuild on merge (the merged segment
 // is then served without one), and reading a summary whose header names
 // another segment (its bounds belong to other documents and skip blocks that
-// hold results).
+// hold results, and the open keeps the file).
 func TestMergedSegmentIsSummarizedAndStaleSummariesAreNeverRead(t *testing.T) {
 	ctx := context.Background()
 	c := genCorpus(4, 3000, 100)
@@ -463,10 +466,116 @@ func TestMergedSegmentIsSummarizedAndStaleSummariesAreNeverRead(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer v.Close()
-		if st := compare(t, v).Stats; st.SegmentsWithoutSummary != 1 {
-			t.Fatalf("a summary naming another segment was read: %+v", st)
+		if st := compare(t, v).Stats; st.SegmentsWithoutSummary != 0 {
+			t.Fatalf("the open did not rebuild the summary naming another segment: %+v", st)
+		}
+		if again, err := os.ReadFile(files[1]); err != nil || bytes.Equal(again, other) {
+			t.Fatalf("the summary naming another segment is still in place (read error %v)", err)
 		}
 	})
+}
+
+// TestSummariesOfAnEarlierFormatAreRebuiltAtOpen gives every segment a summary
+// file of an earlier format (its magic) and opens the index read-only, then
+// writable: each open builds the summaries again, so the pages skip blocks
+// and resumed pages skip segments on their key filters, and every page equals
+// exhaustive scoring. An open whose directory refuses writes keeps the old
+// files and scores every segment exhaustively, still exactly.
+//
+// Mutation caught: no summary build at open (every segment is served without
+// a summary), and a loader that accepts the earlier format.
+func TestSummariesOfAnEarlierFormatAreRebuiltAtOpen(t *testing.T) {
+	c := genCorpus(1, 6000, 100)
+	dir := t.TempDir()
+	c.build(t, dir, 20, nil)
+	age := func() {
+		t.Helper()
+		files := summaryFiles(t, dir)
+		if len(files) < 3 {
+			t.Fatalf("summary files %v, want one per segment of at least three", files)
+		}
+		for _, f := range files {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			copy(b, "CXBLKSUM")
+			if err := os.WriteFile(f, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// check serves every engine query page by page against exhaustive scoring
+	// and returns the summed stats of the pruned pages.
+	check := func(t *testing.T, x *Index) Stats {
+		t.Helper()
+		v, err := x.OpenView(1, visibleOf(1, 6000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.Close()
+		var sum Stats
+		for _, q := range engineQueries {
+			var at *Position
+			for range 4 {
+				r := Request{Query: q, Depth: 10, After: at}
+				pruned := search(t, v, r)
+				r.IgnoreSummaries = true
+				if err := samePage(pruned, search(t, v, r)); err != nil {
+					t.Fatalf("query %q: %v", q, err)
+				}
+				sum.Segments = pruned.Stats.Segments
+				sum.SegmentsWithoutSummary = pruned.Stats.SegmentsWithoutSummary
+				sum.BlocksTotal += pruned.Stats.BlocksTotal
+				sum.BlocksScored += pruned.Stats.BlocksScored
+				sum.KeySkips += pruned.Stats.KeySkips
+				if !pruned.More || len(pruned.Hits) == 0 {
+					break
+				}
+				a := pruned.Hits[len(pruned.Hits)-1].At()
+				at = &a
+			}
+		}
+		return sum
+	}
+
+	if os.Geteuid() != 0 {
+		age()
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		x := openReadOnly(t, dir, 1)
+		st := check(t, x)
+		if err := x.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if st.SegmentsWithoutSummary != st.Segments || st.BlocksScored != st.BlocksTotal || st.KeySkips != 0 {
+			t.Fatalf("an open that cannot write served summaries of the earlier format: %+v", st)
+		}
+	}
+	for _, open := range []func(*testing.T, string, int) *Index{openReadOnly, openWritable} {
+		age()
+		x := open(t, dir, 1)
+		st := check(t, x)
+		if err := x.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if st.SegmentsWithoutSummary != 0 || st.BlocksScored >= st.BlocksTotal || st.KeySkips == 0 {
+			t.Fatalf("after the open: %+v, want every segment summarized, blocks skipped and keys filtered", st)
+		}
+		for _, f := range summaryFiles(t, dir) {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.HasPrefix(b, []byte("CXBLKSUM")) {
+				t.Fatalf("%s keeps the earlier format", filepath.Base(f))
+			}
+		}
+	}
 }
 
 // TestPanicInsideAnExportReturnsAnError panics inside the library's export
@@ -506,9 +615,15 @@ func TestPanicInsideAnExportReturnsAnError(t *testing.T) {
 // scores every block it counts, and the pruned page never scores more than it
 // counts, on pages that rescored (a heap grown past depth+1) as on the rest.
 //
+// The pruned pages skip segments on their key filters (KeySkips) where the
+// exhaustive reference looks every key up, and serve the same results.
+//
 // Mutation caught: blocks_total counted over the last pass while
 // blocks_scored sums every pass (a rescored exhaustive page then reports more
 // blocks scored than exist).
+// Mutation caught: a key filter built from or probed with the wrong column's
+// values (it rejects a segment that marked the group, and a group served
+// before the position comes back).
 func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	c := genCorpus(4, 5000, 100)
 	dir := t.TempDir()
@@ -521,6 +636,7 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	defer v.Close()
 	rng := rand.New(rand.NewPCG(4, 4))
 	ties, rescored := 0, 0
+	var skips, lookups int64
 	for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
 		for _, kinds := range [][]model.NodeKind{nil, {model.NodeFunction, model.NodeFile}} {
 			for _, q := range engineQueries {
@@ -550,6 +666,8 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 						if err := samePage(got, want); err != nil {
 							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d: %v", rule, kinds, q, i, d, err)
 						}
+						skips += got.Stats.KeySkips
+						lookups += got.Stats.KeyLookups
 						if got.Stats.BlocksScored > got.Stats.BlocksTotal {
 							t.Fatalf("query %q after hit %d depth %d: %d blocks scored of %d", q, i, d,
 								got.Stats.BlocksScored, got.Stats.BlocksTotal)
@@ -563,6 +681,10 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 						if full.Stats.BlocksScored != full.Stats.BlocksTotal {
 							t.Fatalf("query %q after hit %d depth %d, exhaustive: %d blocks scored of %d (cap %d)",
 								q, i, d, full.Stats.BlocksScored, full.Stats.BlocksTotal, full.Stats.Cap)
+						}
+						if full.Stats.KeySkips != 0 {
+							t.Fatalf("query %q after hit %d depth %d, exhaustive: %d segments skipped on a key filter",
+								q, i, d, full.Stats.KeySkips)
 						}
 						if full.Stats.Cap > int64(d)+1 {
 							rescored++
@@ -578,11 +700,91 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	if rescored == 0 {
 		t.Fatal("no page rescored: the test proves nothing about block counts across passes")
 	}
+	if skips == 0 || lookups == 0 {
+		t.Fatalf("key filters skipped %d segments and %d keys were looked up: the test needs both", skips, lookups)
+	}
+	t.Logf("key filters skipped %d segments; %d keys were looked up", skips, lookups)
 
 	// A hidden document is not a position of this view.
 	hidden := c.docs[c.units[0]][0].DocID
 	_, err = v.Search(context.Background(), Request{Query: "hot", Depth: 5, After: &Position{ScoreMicros: 1, DocID: hidden}})
 	if !errors.Is(err, ErrUnknownPosition) {
 		t.Fatalf("a position naming a hidden document returned %v, want ErrUnknownPosition", err)
+	}
+}
+
+// TestABackgroundMergesSegmentIsSummarizedBeforeItServes commits most units
+// in one segment, then eight units one commit each into a writer that stays
+// open: the eighth commit lets the merge policy merge the eight small segments
+// in the background and publish the merged segment with no commit of ours
+// after it. Views are opened until one shows the merge; its pages must already
+// find a summary for every segment, skip blocks and skip segments on their key
+// filters, and equal exhaustive scoring.
+//
+// Mutation caught: summaries built only at commits, releases and opens (the
+// merged segment serves without one until the writer's next commit).
+func TestABackgroundMergesSegmentIsSummarizedBeforeItServes(t *testing.T) {
+	ctx := context.Background()
+	c := genCorpus(1, 6000, 100)
+	dir := t.TempDir()
+	x := openWritable(t, dir, 1)
+	const per = 3
+	small := len(c.units) - 8*per
+	add := func(units []string) {
+		for _, u := range units {
+			if err := x.AddUnit(ctx, u, c.docs[u]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := x.Commit(ctx, "1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(c.units[:small])
+	for i := small; i < len(c.units); i += per {
+		add(c.units[i : i+per])
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		v, err := x.OpenView(1, visibleOf(1, 6000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		probe := search(t, v, Request{Query: "hot", Depth: 10})
+		if probe.Stats.Segments < 9 {
+			var skipped bool
+			var skips int64
+			for _, q := range engineQueries {
+				var at *Position
+				for range 4 {
+					r := Request{Query: q, Depth: 10, After: at}
+					pruned := search(t, v, r)
+					r.IgnoreSummaries = true
+					if err := samePage(pruned, search(t, v, r)); err != nil {
+						t.Fatalf("query %q: %v", q, err)
+					}
+					if pruned.Stats.SegmentsWithoutSummary != 0 {
+						t.Fatalf("a merged segment served without a summary: %+v", pruned.Stats)
+					}
+					skipped = skipped || pruned.Stats.BlocksScored < pruned.Stats.BlocksTotal
+					skips += pruned.Stats.KeySkips
+					if !pruned.More || len(pruned.Hits) == 0 {
+						break
+					}
+					a := pruned.Hits[len(pruned.Hits)-1].At()
+					at = &a
+				}
+			}
+			v.Close()
+			if !skipped || skips == 0 {
+				t.Fatalf("after the merge no page skipped a block (%v) or a segment on its key filter (%d)", skipped, skips)
+			}
+			return
+		}
+		v.Close()
+		if time.Now().After(deadline) {
+			t.Fatalf("no background merge published within 30s: %d segments", probe.Stats.Segments)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
