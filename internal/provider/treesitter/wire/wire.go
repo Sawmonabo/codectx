@@ -177,6 +177,17 @@ type Decl struct {
 	// Decorators are the declaration's decorators and annotations, in source
 	// order.
 	Decorators []Decorator `json:"decorators,omitempty"`
+	// ParameterDecorators are the decorators and annotations of the
+	// declaration's parameters (a TypeScript parameter decorator, a Java
+	// parameter annotation), in source order, each with its parameter's
+	// name token, where the dependence pass declares the parameter's
+	// variable.
+	ParameterDecorators []ParameterDecorator `json:"parameter_decorators,omitempty"`
+	// TypeAnnotations are the annotations written on the types of the
+	// declaration's signature (Java type-use annotations: `List<@NonNull
+	// String>`, `String @A []`), in source order: they annotate a type, not
+	// the declaration.
+	TypeAnnotations []Decorator `json:"type_annotations,omitempty"`
 	// Branch names the conditional branches between the declaration and its
 	// parent declaration (or the file), outermost first, each as the
 	// construct, its condition as written with whitespace collapsed, and the
@@ -231,6 +242,13 @@ type Decorator struct {
 	Start     uint32 `json:"start"`
 	End       uint32 `json:"end"`
 	Arguments []Span `json:"arguments,omitempty"`
+}
+
+// ParameterDecorator is one decorator of a parameter: the parameter's name
+// token and the decorator.
+type ParameterDecorator struct {
+	Parameter Span      `json:"parameter"`
+	Decorator Decorator `json:"decorator"`
 }
 
 // Import is one import/include/use statement.
@@ -300,6 +318,10 @@ type Done struct {
 	// by a statement that is not one of the static forms, so its exports
 	// follow the underscore rule instead (ADR-0017 decision 2).
 	ComputedAll bool `json:"computed_all,omitempty"`
+	// ModuleDecorators are the attributes the file applies to itself, its
+	// Rust inner attributes (`#![allow(...)]` at the top of the file), in
+	// source order: decorators of the file's module.
+	ModuleDecorators []Decorator `json:"module_decorators,omitempty"`
 	// LinkFailure is why the file's link pass sent no KindLink message
 	// although its dependence pass ran: a panic the worker recovered in the
 	// link tables' construction. It never fails the file's structural or

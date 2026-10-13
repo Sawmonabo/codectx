@@ -793,6 +793,12 @@ func (e *extraction) emit(out *emitter) error {
 		if e.g.decorators != nil {
 			w.Decorators = e.g.decorators(e, d)
 		}
+		if e.g.parameterDecorators != nil {
+			w.ParameterDecorators = e.g.parameterDecorators(e, d)
+		}
+		if e.g.typeAnnotations != nil {
+			w.TypeAnnotations = e.g.typeAnnotations(e, d)
+		}
 		w.SpecifierMacros, w.ReturnTypes, w.Visibility = cDeclMacros(e, d)
 		nameSpans[span{d.nameStart, d.nameEnd}] = true
 		stack = append(stack, frame{span: span{start, end}, idx: w.ID, name: d.name, kind: d.kind})

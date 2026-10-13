@@ -112,6 +112,11 @@ type builder struct {
 	endpointFacts []endpointFact
 	// links is the routing the route table left open, for the link table.
 	links *routeLinks
+	// parameterDecorators are the decorators of each parameter by its name
+	// token, published on the parameter's variable node (variable), and
+	// placed the ones published there (decorator_targets.go).
+	parameterDecorators map[wire.Span][]model.Decorator
+	placed              map[wire.Span]bool
 	// inputs are the file's request-input reads, published, by start
 	// (inputs.go).
 	inputs   []inputRead
@@ -172,6 +177,9 @@ type declFact struct {
 	// against the pinned bytes. The worker's own list stays on Decl, every
 	// range of it validated too, for the route table.
 	decorators []model.Decorator
+	// typeAnnotations are the annotations on the types of the
+	// declaration's signature, published under model.MetaTypeAnnotations.
+	typeAnnotations []model.Decorator
 
 	// body is the search document's text: the attached documentation and the
 	// signature, composed and bounded once at extraction so a cut is recorded
@@ -268,7 +276,11 @@ func (b *builder) build() error {
 	if err := b.linkTable(); err != nil {
 		return err
 	}
-	return b.functions()
+	if err := b.functions(); err != nil {
+		return err
+	}
+	b.unplacedParameterDecorators()
+	return nil
 }
 
 // rangeOf derives a located range from two byte offsets the worker reported.
@@ -379,17 +391,31 @@ func (b *builder) validateDecls() error {
 // is valid source this provider cannot store: that one decorator is left
 // out of the published list and counted, so the file reports partial.
 func (b *builder) validateDecorators(d *declFact) error {
-	for _, w := range d.Decorators {
+	var err error
+	if d.decorators, err = b.decoratorList(d.Decorators); err != nil {
+		return err
+	}
+	if d.typeAnnotations, err = b.decoratorList(d.TypeAnnotations); err != nil {
+		return err
+	}
+	return b.keepParameterDecorators(d.ParameterDecorators)
+}
+
+// decoratorList validates decorators the worker sent and answers them as
+// they are published; a name over its bound is left out and counted.
+func (b *builder) decoratorList(ws []wire.Decorator) ([]model.Decorator, error) {
+	var out []model.Decorator
+	for _, w := range ws {
 		if w.Name == "" || !utf8.ValidString(w.Name) {
-			return outputInvalid("decorator name is empty or not UTF-8")
+			return nil, outputInvalid("decorator name is empty or not UTF-8")
 		}
 		if _, err := b.rangeOf(w.Start, w.End); err != nil {
-			return err
+			return nil, err
 		}
 		m := model.Decorator{Name: w.Name, Bytes: model.ByteRange{Start: uint64(w.Start), End: uint64(w.End)}}
 		for _, a := range w.Arguments {
 			if _, err := b.rangeOf(a.Start, a.End); err != nil {
-				return err
+				return nil, err
 			}
 			m.Arguments = append(m.Arguments, model.ByteRange{Start: uint64(a.Start), End: uint64(a.End)})
 		}
@@ -398,11 +424,11 @@ func (b *builder) validateDecorators(d *declFact) error {
 			continue
 		}
 		if err := m.Validate(); err != nil {
-			return outputInvalid(err.Error())
+			return nil, outputInvalid(err.Error())
 		}
-		d.decorators = append(d.decorators, m)
+		out = append(out, m)
 	}
-	return nil
+	return out, nil
 }
 
 // resolveModule mints the file's module node: the container every top-level
@@ -420,6 +446,13 @@ func (b *builder) resolveModule() error {
 	meta := map[string]any{"path": b.fv.Path}
 	if b.ex.done.Package != "" {
 		meta["package"] = bound(b.ex.done.Package, model.MaxNameBytes)
+	}
+	decorators, err := b.decoratorList(b.ex.done.ModuleDecorators)
+	if err != nil {
+		return err
+	}
+	if len(decorators) > 0 {
+		meta[model.MetaDecorators] = decorators
 	}
 	b.putNode(structure, res, b.fileRng, b.modKey, meta)
 	b.putAlias(b.scope, b.modKey, res.Node.ID)
@@ -489,6 +522,9 @@ func (b *builder) resolveDecls() error {
 			// Every decorator is published: inline while the node's metadata
 			// fits its bound, as metadata rows when it does not (putNode).
 			meta[model.MetaDecorators] = d.decorators
+		}
+		if len(d.typeAnnotations) > 0 {
+			meta[model.MetaTypeAnnotations] = d.typeAnnotations
 		}
 		first := b.putNode(structure, res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)

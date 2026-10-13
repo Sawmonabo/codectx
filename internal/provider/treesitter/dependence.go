@@ -290,6 +290,7 @@ func (b *builder) variable(v wire.Span, fv fileVar, claims map[string]int, owner
 	if len(truncated) > 0 {
 		meta = map[string]any{"truncated_fields": truncated}
 	}
+	meta = b.placeParameterDecorators(v, meta)
 	b.putNode(dependence, res, fv.rng, key, meta)
 	b.ambiguous(res, fv.rng)
 	if fv.declKey == "" || claims[fv.declKey] > 1 || b.declKeys[fv.declKey] {

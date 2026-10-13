@@ -345,15 +345,26 @@ and attributes under the `decorators` metadata key, in source order, each as
 (`app.route`, `org.junit.Test`, `tokio::main`, `gnu::cold`), the decorator's
 byte range, and each argument's, a keyword argument or element-value pair
 including its key. Python reads the decorators of a decorated definition; Java
-the annotations in a declaration's modifiers (not type-use annotations); JavaScript
-and TypeScript the decorators of a class (and of an export statement wrapping
-it), of a method and of a field, not of a parameter or a class expression; Rust
-the outer attributes preceding an item, arguments split at the token tree's
-top-level commas, the value of `#[name = value]` as its one argument; C and C++
-each attribute of a `[[...]]` or `__attribute__((...))` on the declaration or its
-declarator (not `__declspec` or `alignas`). Go has no such construct. The range of
-every decorator and argument is validated against the pinned bytes like any
-other offset. Decorators past the metadata bound, or with a name over the
+the annotations in a declaration's modifiers; JavaScript and TypeScript the
+decorators of a class (and of an export statement wrapping it), of a class
+expression (on the class node of the declaration or assignment that holds
+it), of a method and of a field; Rust the outer attributes preceding an item,
+then the inner attributes (`#![...]`) its body opens with, arguments split at
+the token tree's top-level commas, the value of `#[name = value]` as its one
+argument, a file's own inner attributes on its module node; C and C++ each
+attribute of a `[[...]]` or `__attribute__((...))` on the declaration or its
+declarator, and an alignment specifier (`alignas(16)`, `_Alignas(8)`) as the
+keyword as written with its operand as the argument. A `__declspec` is read
+for `visibility` only. Go has no such construct. A parameter's decorators
+(TypeScript) and annotations (Java) are on the parameter's `variable` node,
+not on its callable; one whose parameter publishes no variable node (its
+function's analysis failed, or the parameter is a destructuring pattern) is
+counted as dropped and the file reports partial. Java's type-use annotations
+in a declaration's type, its parameters' types and its array dimensions
+(`java.util.@NonNull List<@A String>`) are published apart, under the
+`type_annotations` key, since they annotate a type rather than the
+declaration. The range of every decorator and argument is validated against
+the pinned bytes like any other offset. Decorators past the metadata bound, or with a name over the
 qualified-name bound, are counted and the file reports partial; any other
 metadata a node cannot fit is counted the same way, never dropped in silence.
 
@@ -1091,6 +1102,10 @@ All MIT:
   macro references each definition its file sees through its includes, with
   the definition's visibility and the arms' set size; through an alias, and
   through a header for a name the file alone cannot tell from its type.
+- `internal/provider/treesitter/decorator_targets_test.go`: TypeScript
+  parameter and class-expression decorators, Java parameter and type-use
+  annotations, Rust inner attributes and C and C++ alignment specifiers, each
+  on the node it decorates.
 - `internal/provider/treesitter/entry_points_test.go`: decorators with their
   argument ranges; the `__main__` guard, Go `main`, the Java `main` forms and a
   shebang script as endpoints.
