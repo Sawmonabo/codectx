@@ -626,7 +626,10 @@ differently, and both are load-bearing:
   `--deep` has `state: "unverified"` -- also not `pass`.
 
 `status` also reports a completeness table: the capability state of each
-provider that produced the sealed units of the active generation. The
+provider that produced the sealed units of the active generation. Its rows are
+ordered by provider, capability and scope, in that order, the same in the
+report `codectx index` prints, whether the run built its units or reused them,
+and in `status`. The
 query-time working-tree overlay has **no row in it, by design** -- it seals
 nothing and reports its state per query instead; [the overlay
 page](providers-lsp.md) says what to read ahead of a query.
