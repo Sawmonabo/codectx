@@ -84,7 +84,8 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   each `#include` of the file and of every header it reaches resolved by the include lookup (a quoted path beside the
   including file, and either form by its path suffix), each header read once, which ends a cycle as an include guard
   does, and only as far as a definition asked about needs (`include_c.go` `cClosure`); a one-identifier replacement is
-  followed to the macro it names. Each definition reached is one
+  followed to the macro it names. The same closure, read once per file, decides which macros replace a call's name
+  and which functions of internal linkage it may call. Each definition reached is one
   occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
   with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
@@ -460,7 +461,7 @@ toward it stays valid. What a call can bind to differs by family, and so does wh
 | Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#n` for an anonymous class body or an enum constant's body, n the byte offset of the name token of its declaration (the class `new T`, or the enum constant), sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
 | Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
-| C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds, and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
+| C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file or a file whose include closure reaches its header binds (or, with the functions of external linkage, a file whose closure holds a directive the unit cannot follow: an `#include` of an unfolded macro or a quoted path no member file answers), and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
 | JavaScript, TypeScript, TSX | functions, class methods, object-literal methods | the class |
 | Python | functions and methods; `Static` for `@staticmethod` and `@classmethod` | the class |
 
@@ -524,7 +525,7 @@ Besides the joined declarations, sites and values, the table carries what the re
   the trait's method of that name when the trait is the unit's, else the external trait's method, the self type
   never consulted, so a blanket impl over a type parameter implements its trait's item too;
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
-  macro calls;
+  macro calls in every file whose include closure reaches the macro's file;
 - `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or
   C++ declaration is written with, which its `references` visibility occurrences read;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;

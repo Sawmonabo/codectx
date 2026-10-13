@@ -8,6 +8,56 @@ func TestCGoldens(t *testing.T) { runGoldens(t, cGoldens) }
 
 var cGoldens = []golden{
 	{
+		name:   "c-include-closure",
+		anchor: "ISO/IEC 9899 (C) §6.10.2 (Source file inclusion: the directive is replaced by the entire contents of the file, whose own directives are processed), §6.10.3 (Macro replacement), §6.2.2 (Linkages of identifiers)",
+		files: map[string]string{
+			"inner.h": `static int helper(void) { return 1; } // @inner
+#define CALL run_impl
+`,
+			"mid.h": `#include "inner.h"
+int run_impl(void);
+`,
+			"other.h": `static int helper(void) { return 2; } // @other
+#define CALL other_impl
+`,
+			"impl.c": `int run_impl(void) { return 0; } // @impl
+int other_impl(void) { return 9; } // @oimpl
+`,
+			"a.c": `#include "mid.h"
+
+int a(void) {
+  CALL(); // @a1
+  return helper(); // @a2
+}
+`,
+			"b.c": `#include "gen.h"
+
+int b(void) {
+  return helper(); // @b1
+}
+`,
+			"c.c": `int c(void) {
+  return helper(); // @c1
+}
+`,
+		},
+		// Derived from the source and the anchor, then confirmed by a probe of the pinned grammar: a.c reads
+		// inner.h through mid.h, so CALL is replaced by run_impl and helper is inner.h's, the one function of
+		// internal linkage in its translation unit; other.h is in no translation unit here. b.c includes a
+		// header no member file answers (generated), so inner.h and other.h may both be in it: the set of two.
+		// c.c includes nothing, so no helper is in its translation unit and the call binds nothing.
+		want: []string{
+			"a1 CALL -> impl run_impl exact",
+			"a2 helper -> inner helper exact",
+			"b1 helper -> inner helper exact set=2",
+			"b1 helper -> other helper exact set=2",
+		},
+		// Mutation: read only direct includes -> CALL binds nothing and a2 is the set of both helpers.
+		// Mutation: never open the closure -> b1 binds nothing.
+		// Mutation: keep every header's helper when the closure is closed -> c1 binds both helpers.
+		fails: "a macro or a function of internal linkage in a header reached only through another header not seen, a header outside the translation unit read into it, or a directive the unit cannot follow treated as following nothing",
+	},
+	{
 		name:   "linkage-and-prototypes",
 		anchor: "ISO/IEC 9899 (C) §6.2.2 (Linkages of identifiers), §6.9 (External definitions), §6.5.2.2 (Function calls)",
 		files: map[string]string{

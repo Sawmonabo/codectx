@@ -28,6 +28,8 @@ type staticFile struct {
 	// return, which a receiver of kind TypeResult naming it reads. A site
 	// is present while it is being resolved, so a cycle reads nothing.
 	returns map[int32][]returned
+	// closure is a C or C++ member's include closure (includeClosure).
+	closure *cClosure
 }
 
 // returned is a type a target returns, as the target's own file writes it.
