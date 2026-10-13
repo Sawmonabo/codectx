@@ -566,6 +566,7 @@ func (x *goLink) enter(n Node) {
 			x.export(n, name, "", true, false)
 		} else {
 			x.export(n, name, x.copiedReceiver(n), false, false)
+			x.out.Exports[len(x.out.Exports)-1].Identity = x.methodIdentity(n, x.receiverParams(n))
 		}
 	case k.methodElem:
 		name := n.ChildByFieldId(k.fName)
@@ -576,6 +577,8 @@ func (x *goLink) enter(n Node) {
 			if spec := t.Parent(); !spec.IsNull() && spec.KindId() == k.typeSpec {
 				if sn := spec.ChildByFieldId(k.fName); !sn.IsNull() {
 					x.export(n, name, x.copied(sn), false, true)
+					params := x.typeParams(goChild(spec, goIdentitySyntaxOf().fTypeParameters))
+					x.out.Exports[len(x.out.Exports)-1].Identity = x.methodIdentity(n, params)
 				}
 			}
 		}
@@ -589,7 +592,10 @@ func (x *goLink) enter(n Node) {
 		x.eachName(n, func(id Node) { x.blankDecl(n, id) })
 		if n.KindId() == k.varSpec {
 			x.values(n.ChildByFieldId(k.fValue), func(int) string { return "" })
+			x.conversions(n)
 		}
+	case goIdentitySyntaxOf().typeAlias:
+		x.aliasExport(n)
 	case k.shortVarDeclaration:
 		x.boundFunctions(n)
 		x.values(n.ChildByFieldId(k.fRight), func(int) string { return "" })
