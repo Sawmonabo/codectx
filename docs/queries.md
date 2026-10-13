@@ -458,6 +458,13 @@ A `search` continuation's exact-tier spool is the one exception: when the
 budget cannot hold it, the cursor carries the position instead and the next
 page walks the tiers from it, so the answer is complete and only slower.
 
+**Continuation state does not outlive a restart of the host.** It is written
+for the cursor's lifetime and never forced to stable storage, so on Linux and
+macOS every spool and retained walk records the boot that wrote it, and after
+a reboot a cursor issued before it answers `CTX_CURSOR_INVALID`: re-run from
+the first page. Whatever a power loss left of those files is never read as an
+answer; the next `gc` or `index` removes it.
+
 On every command but `path`, the query deadline ends a page and not an answer:
 a walk that runs out of time
 returns what it has, reports `query deadline reached` and hands back a cursor the
@@ -526,6 +533,18 @@ a callable's return node (kind `return`), which every callable has under the
 same name; a request whose kinds name `return` finds it. Symbol resolution
 and document symbols leave it out the same way.
 
+**Why a hit was found.** Each hit carries its `tier`, which is the whole
+explanation: an exact-tier hit scores 0 and sorts above every scored one
+because of its tier, and a lexical hit's `score_micros` is its BM25F score. A
+hit carries no list of reasons beside it, since such a list would repeat the
+tier; the table's REASON column is written from `tier` ("matched the
+exact_name tier"), after the fault of a hit whose range could not be read.
+The rule every answer follows: a list whose length grows with the repository
+(an impact entry's reasons, its route, a page of hits) is paged by reference
+and never cut; a list whose length its producer fixes (a hit's
+`unresolved_fields`, keyed by a fixed set of field names) may carry a
+validation bound.
+
 **Then the lexical tier.** The index returns the page's limit plus one of the
 results ranked after the last one served, so it knows whether another page
 exists; a page reads what follows the previous page, never the results before
@@ -558,11 +577,13 @@ tree indexed at another root, or re-indexed as a delta, answers in the same
 order. A cursor carries the last served position by content, not by document
 address — the tier and node of the last exact result, or the score and stored
 document id of the last lexical result — so it survives the index's background
-merges between pages. A continuation inside the exact tiers sorts the hits
-after its position once and spools them; the cursors after it name that spool
-and the offset of their next record, so a deep exact answer costs each page its
-own page. A page whose spool is gone walks from the position instead and
-serves the same hits.
+merges between pages. The exact qualified-name and exact-name tiers are kept in
+served order by their indexes, so a page of either seeks to its position and
+reads its own hits. The qualified-name prefix tier cannot seek: a continuation
+that reaches it sorts its hits after the position once and spools them; the
+cursors after it name that spool and the offset of their next record, so a deep
+prefix answer costs each page its own page too. A page whose spool is gone
+walks from the position instead and serves the same hits.
 
 A cursor pins the generation, the analysis key and the query with its filters.
 Resubmitting a continuation with a different query or filter set, or against a
@@ -575,7 +596,10 @@ writer; a search keeps no other state between pages.
 **What a query deadline does to a search.** A deadline that ends the index's
 search serves the best results found by then, truncated with the deadline as
 its reason and with no continuation: the order of a cut-short search is not
-the true ranking, so there is no position to resume from. Re-run with a longer
+the true ranking, so there is no position to resume from. A deadline inside an
+exact tier does the same: a seek serves the hits it had read in order, and a
+continuation's sort of the prefix tier serves the head of what it had read,
+sorted. Re-run with a longer
 `--timeout`. Cancelling the call is an error, not a page.
 
 ## Configuration these commands read

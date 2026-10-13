@@ -80,9 +80,15 @@ type checkpointState struct {
 // nothing truncates: the bytes past a run's own belong to whatever tenant held
 // the surface before it, and a resumed merge that read to end of file would
 // decode them as records of this compile.
+//
+// Layout is the digest of the record layout the run was written in
+// (recordCodec.layout). A run is binary and carries no field names, so a build
+// whose record struct changed would read it as wrong values; restore refuses
+// a run of another layout as an expired continuation instead.
 type checkpointRun struct {
-	Name  string `json:"name"`
-	Bytes int64  `json:"bytes"`
+	Name   string `json:"name"`
+	Bytes  int64  `json:"bytes"`
+	Layout string `json:"layout"`
 }
 
 // checkpointScalars is the non-stream carry. Each field is bounded by something
@@ -221,11 +227,15 @@ func checkpointSort[T any](dir, name string, sorter *pagination.ExternalSort[T])
 	if sorter == nil {
 		return nil, nil
 	}
+	layout, err := recordLayout[T]()
+	if err != nil {
+		return nil, err
+	}
 	refs, err := sorter.DetachTo(dir, checkpointRunName(name))
 	if err != nil {
 		return nil, err
 	}
-	return checkpointRuns(refs), nil
+	return checkpointRuns(refs, layout), nil
 }
 
 // checkpointStream is the shared body of checkpointSortedRun: it drains a record
@@ -233,8 +243,15 @@ func checkpointSort[T any](dir, name string, sorter *pagination.ExternalSort[T])
 func checkpointStream[T any](dir, name string, runBytes int64, each func(func(T) error) error,
 	compare func(a, b T) int, sizeOf func(T) int64,
 ) ([]checkpointRun, error) {
-	sorter, err := pagination.NewExternalSort(dir, 0,
-		encodeRecord[T], decodeRecord[T], compare)
+	encode, decode, err := recordCodecFuncs[T]()
+	if err != nil {
+		return nil, err
+	}
+	layout, err := recordLayout[T]()
+	if err != nil {
+		return nil, err
+	}
+	sorter, err := pagination.NewExternalSort(dir, 0, encode, decode, compare)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +271,7 @@ func checkpointStream[T any](dir, name string, runBytes int64, each func(func(T)
 		sorter.Close()
 		return nil, err
 	}
-	return checkpointRuns(refs), nil
+	return checkpointRuns(refs, layout), nil
 }
 
 // restoreRun adopts a checkpointed ALREADY-FOLDED stream and answers it as a
@@ -288,12 +305,24 @@ func restoreSort[T any](s *compileSorts, dir, name string, runs []checkpointRun,
 	if len(runs) == 0 {
 		return newSort(s, "restored-"+name, compare, sizeOf)
 	}
+	layout, err := recordLayout[T]()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range runs {
+		if r.Layout != layout {
+			return nil, cursorExpired("the continuation state was written by a build with another record layout")
+		}
+	}
 	abs, err := absoluteRuns(dir, runs)
 	if err != nil {
 		return nil, err
 	}
-	sorter, err := pagination.AdoptRuns(dir, 0, abs,
-		encodeRecord[T], decodeRecord[T], compare)
+	encode, decode, err := recordCodecFuncs[T]()
+	if err != nil {
+		return nil, err
+	}
+	sorter, err := pagination.AdoptRuns(dir, 0, abs, encode, decode, compare)
 	if err != nil {
 		return nil, err
 	}
@@ -310,10 +339,10 @@ func checkpointRunName(stream string) func(i int) string {
 }
 
 // checkpointRuns records what a detached sort moved into the state directory.
-func checkpointRuns(refs []pagination.RunRef) []checkpointRun {
+func checkpointRuns(refs []pagination.RunRef, layout string) []checkpointRun {
 	runs := make([]checkpointRun, 0, len(refs))
 	for _, ref := range refs {
-		runs = append(runs, checkpointRun{Name: filepath.Base(ref.Path), Bytes: ref.Bytes})
+		runs = append(runs, checkpointRun{Name: filepath.Base(ref.Path), Bytes: ref.Bytes, Layout: layout})
 	}
 	return runs
 }

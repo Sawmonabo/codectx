@@ -89,6 +89,15 @@ The reasoning behind the redesign, the alternatives that were refused and the
 sources are in
 [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md).
 
+A node fact also carries its file's root-relative `path` (`''` for a node with
+no file) and two generated sort columns, `sort_start` and `sort_end`, the byte
+interval with a missing one read as 0 and -1. `idx_nodes_name` and
+`idx_nodes_qname` are `(name or qualified_name, path, sort_start, sort_end)`,
+with the primary key `(unit_id, node_id)` after them, so an exact name or exact
+qualified name is held in the order search serves it (path, start byte, end
+byte first; [ADR-0013](adr/ADR-0013-search-index.md)) and a page of it is one
+seek. The path is written beside the fact from `files`, by the same insert.
+
 ## Why a refresh is a new unit
 
 A unit identity folds its input hash, so a refresh over edited source is

@@ -1568,7 +1568,7 @@ func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases [
 		}
 	}
 	if python {
-		return nil
+		return addPythonReexports(s, t, bases)
 	}
 	from := func(name, spec, original string) error {
 		for _, target := range es.targets(t.Path, spec) {

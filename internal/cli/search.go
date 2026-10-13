@@ -168,29 +168,19 @@ func flushTableInto(tw *tabwriter.Writer) {
 	_ = tw.Flush()
 }
 
-// reasonCell renders a hit's bounded explanation. The exact and prefix tiers
-// report ScoreMicros 0 and say why in a reason, so a table without this column
-// would show those hits as scoring nothing with nothing to explain it. Only the
-// first reason fits a column; the rest are counted, and --json carries them all.
-// It also carries the per-hit fault the JSON answer reports in
-// `unresolved_fields`: a hit whose range the content store could not supply
-// stays in the answer, so the reason it lost its position must reach an
-// operator reading the table and not only one reading --json.
+// reasonCell renders why a hit was found: the tier that matched it. The exact
+// and prefix tiers report ScoreMicros 0, so a table without this column would
+// show those hits as scoring nothing with nothing to explain it. It also
+// carries the per-hit fault the JSON answer reports in `unresolved_fields`: a
+// hit whose range the content store could not supply stays in the answer, so
+// the reason it lost its position must reach an operator reading the table and
+// not only one reading --json. The fault comes first, since it is what the
+// LINE column's "!" points at, and the tier is counted after it.
 func reasonCell(hit model.SearchHit) string {
-	reasons := hit.Reasons
 	if why := hit.UnresolvedFields[model.SearchHitFieldRange]; why != "" {
-		// A fresh slice: the hit's own Reasons must not grow a rendering
-		// artifact that a later --json of the same page would then publish.
-		reasons = append([]string{"range unresolved: " + why}, reasons...)
+		return tableCell("range unresolved: "+why) + " (+1 more)"
 	}
-	if len(reasons) == 0 {
-		return "-"
-	}
-	cell := tableCell(reasons[0])
-	if extra := len(reasons) - 1; extra > 0 {
-		cell += fmt.Sprintf(" (+%d more)", extra)
-	}
-	return cell
+	return tableCell("matched the " + string(hit.Tier) + " tier")
 }
 
 // hitRangeCell renders a search hit's LINE column. It separates the two ways a

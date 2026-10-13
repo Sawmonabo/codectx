@@ -571,12 +571,16 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 			finished = append(finished, v)
 		}
 	}
-	if done && (run.Len() == 0 || len(finished) == len(model.ImpactViews)) {
+	// An answer with no entity is still read through its entries view while
+	// that view has package pairs this page did not serve: its pairs are the
+	// whole of it.
+	pairsUnread := !slices.Contains(finished, model.ImpactViewEntries) && pairRun.Len() > 0
+	if done && ((run.Len() == 0 && !pairsUnread) || len(finished) == len(model.ImpactViews)) {
 		// Nothing left that any view will read: the page is the answer.
 		return served, "", nil
 	}
 	header := rankedHeader{Total: run.Len(), Count: int(run.Len()), PairTotal: pairRun.Len(), PairCount: int(pairRun.Len())}
-	next, answerToken, err := e.spillImpactAnswer(ctx, b, queryHash, header, pos, done, finished, retain, meta,
+	next, answerToken, err := e.spillImpactAnswer(ctx, b, queryHash, header, pos, done, pairsUnread, finished, retain, meta,
 		rankedSection{tail: rankedRunTail(ctx, run, 0, encodeImpactRecord), mark: at.consumed},
 		rankedSection{tail: rankedRunTail(ctx, pairRun, 0, encodePairRecord), mark: int(pos.pairServed)})
 	served.Answer = answerToken
@@ -610,8 +614,12 @@ type rankedSection struct {
 // route table beside it under the same lease, and signs the two tokens a page
 // hands back: the answer token, which reads any view from its start, and --
 // when this view has more to serve -- the continuation of this view.
+//
+// pairsUnread is an answer whose entries view, not read yet, has package pairs
+// to serve. An answer with no entity is retained for them alone, and its
+// answer token is how the entries view reads them.
 func (e *Engine) spillImpactAnswer(ctx context.Context, b *budget, queryHash string, header rankedHeader,
-	pos rankedPos, done bool, finished []model.ImpactView, routes *retainedWalk, meta *model.QueryMeta,
+	pos rankedPos, done, pairsUnread bool, finished []model.ImpactView, routes *retainedWalk, meta *model.QueryMeta,
 	sections ...rankedSection) (string, string, error) {
 	if e.signer == nil || e.spools == nil {
 		if !done {
@@ -652,14 +660,15 @@ func (e *Engine) spillImpactAnswer(ctx context.Context, b *budget, queryHash str
 		e.releaseConsumed(ctx, id, "")
 		return "", "", e.releaseLease(ctx, leaseID, err)
 	}
+	retained := header.Total > 0 || pairsUnread
 	var answerToken string
-	if header.Total > 0 {
+	if retained {
 		if answerToken, err = e.signRanked(c.answer()); err != nil {
 			return fail(err)
 		}
 	}
 	if done {
-		if header.Total == 0 {
+		if !retained {
 			// Only the rollup was spilled, and this page served all of it:
 			// no other view has anything to read.
 			e.releaseConsumed(ctx, id, leaseID)

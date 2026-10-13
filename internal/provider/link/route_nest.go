@@ -14,12 +14,15 @@ import (
 // (packages/core/router/route-path-factory.ts). The controller's file
 // holds the controller's and the method's paths and versions; the global
 // prefix and the versioning are set on the application another file
-// creates (`NestFactory.create`), and the RouterModule paths by a module
-// another file declares. The structural provider records the first in the
-// controller's table (Routing.Nest) and the second in the creating file's
-// (Routing.NestApp); the linker joins them when every application the unit
-// creates is decided, and publishes nothing otherwise, leaving the
-// structural provider's `unresolved` endpoint as the route's only one.
+// creates (`NestFactory.create`), and the RouterModule path on the module
+// whose `controllers` list the controller, by a `RouterModule.register`
+// route tree (packages/core/router/router-module.ts). The structural
+// provider records the first in the controller's table (Routing.Nest) and
+// the rest in the table of the file that creates, declares or registers
+// them (Routing.NestApp); the linker joins them when every application and
+// module path the unit has is decided, and publishes nothing otherwise,
+// leaving the structural provider's `unresolved` endpoint as the route's
+// only one.
 
 // NestRoute is one NestJS route decorator of the file on a method of a
 // `@Controller` class: its method and route as written, the controller's
@@ -51,19 +54,24 @@ type NestVersion struct {
 // with no version segment.
 const NestNeutral = "\x00neutral"
 
-// NestApp is what a file sets on the NestJS applications it creates: Apps
-// is how many `NestFactory.create` calls it makes; Prefixes are its
-// `setGlobalPrefix` calls on one of them, in source order, and Versioning
-// its `enableVersioning` calls. Open reports a call that sets either on an
-// application the file does not create (a helper's parameter), which no
-// table ties to an application; RouterModule reports a file naming Nest's
-// RouterModule, whose module paths this design does not follow.
+// NestApp is what a file sets on the NestJS applications it creates and
+// declares of their modules: Apps is how many `NestFactory.create` calls it
+// makes; Prefixes are its `setGlobalPrefix` calls on one of them, in source
+// order, and Versioning its `enableVersioning` calls. Open reports a call
+// that sets either on an application the file does not create (a helper's
+// parameter), which no table ties to an application. RouterModule reports a
+// file naming Nest's RouterModule and Routers its `RouterModule.register`
+// calls; Modules are its `@Module` classes whose controllers it can read,
+// ModulesUnknown one whose controllers it cannot (route_nest_modules.go).
 type NestApp struct {
-	Apps         int              `json:"apps,omitempty"`
-	Prefixes     []NestPrefix     `json:"prefixes,omitempty"`
-	Versioning   []NestVersioning `json:"versioning,omitempty"`
-	Open         bool             `json:"open,omitempty"`
-	RouterModule bool             `json:"router_module,omitempty"`
+	Apps           int              `json:"apps,omitempty"`
+	Prefixes       []NestPrefix     `json:"prefixes,omitempty"`
+	Versioning     []NestVersioning `json:"versioning,omitempty"`
+	Open           bool             `json:"open,omitempty"`
+	RouterModule   bool             `json:"router_module,omitempty"`
+	Routers        []NestRouter     `json:"routers,omitempty"`
+	Modules        []NestModule     `json:"modules,omitempty"`
+	ModulesUnknown bool             `json:"modules_unknown,omitempty"`
 }
 
 // NestPrefix is one `setGlobalPrefix(prefix[, options])` call: Known when
@@ -96,26 +104,44 @@ type nestConfig struct {
 	versioning *NestVersioning
 }
 
-// addNestApp adds the member's NestApp to the hierarchy's links.
+// addNestApp adds the member's NestApp to the hierarchy's links: its
+// settings and flags under keyNestApp, its modules and routers under keys
+// of their own (addNestModules).
 func addNestApp(links interface{ Add(entry) error }, file int32, t *Table) error {
 	if t.Routing.NestApp == nil {
 		return nil
 	}
-	raw, err := json.Marshal(t.Routing.NestApp)
+	a := *t.Routing.NestApp
+	if err := addNestModules(links, file, t, &a); err != nil {
+		return err
+	}
+	a.Routers, a.Modules = nil, nil
+	raw, err := json.Marshal(a)
 	if err != nil {
 		return internalErr("nest application: " + err.Error())
 	}
 	return links.Add(entry{Key: keyNestApp, Ref: Ref{File: file, Index: -1}, Sig: string(raw)})
 }
 
-// nestConfigs are the distinct configurations of the applications the unit
-// creates, and false when any is undecided: no application created, a
-// setting made where no table ties it to an application, a file creating
-// several applications and setting either, two settings of one file that
-// disagree, a setting that is no literal, or RouterModule in use.
-func (h *hierarchy) nestConfigs() ([]nestConfig, bool, error) {
-	var out []nestConfig
-	ok := true
+// nestUnit is what the unit's files set on its NestJS applications: the
+// distinct configurations of the applications it creates, and whether
+// RouterModule is in use, with its route trees (routers).
+type nestUnit struct {
+	configs []nestConfig
+	router  bool
+	routers []nestRouterOf
+}
+
+// nestUnitOf reads every member's NestApp: the distinct configurations of
+// the applications the unit creates, and false when any is undecided (no
+// application created, a setting made where no table ties it to an
+// application, a file creating several applications and setting either,
+// two settings of one file that disagree, a setting that is no literal)
+// or, with RouterModule in use, a module's controllers or a route tree are
+// no literal.
+func (h *hierarchy) nestUnitOf() (*nestUnit, bool, error) {
+	u := &nestUnit{}
+	ok, unknownModules := true, false
 	err := h.links.lookup(keyNestApp, func(e entry) error {
 		var a NestApp
 		if err := json.Unmarshal([]byte(e.Sig), &a); err != nil {
@@ -125,20 +151,27 @@ func (h *hierarchy) nestConfigs() ([]nestConfig, bool, error) {
 		switch {
 		case !decided:
 			ok = false
-		case a.Apps > 0 && !slices.ContainsFunc(out, c.equal):
-			out = append(out, c)
+		case a.Apps > 0 && !slices.ContainsFunc(u.configs, c.equal):
+			u.configs = append(u.configs, c)
 		}
+		u.router = u.router || a.RouterModule
+		unknownModules = unknownModules || a.ModulesUnknown
 		return nil
 	})
-	if err != nil || !ok || len(out) == 0 {
+	if err != nil || !ok || len(u.configs) == 0 || u.router && unknownModules {
 		return nil, false, err
 	}
-	return out, true, nil
+	if u.router {
+		if u.routers, ok, err = h.nestRouters(); err != nil || !ok {
+			return nil, false, err
+		}
+	}
+	return u, true, nil
 }
 
 // config is the configuration every application a's file creates has.
 func (a *NestApp) config() (nestConfig, bool) {
-	if a.Open || a.RouterModule || a.Apps > 1 && len(a.Prefixes)+len(a.Versioning) > 0 {
+	if a.Open || a.Apps > 1 && len(a.Prefixes)+len(a.Versioning) > 0 {
 		return nestConfig{}, false
 	}
 	var c nestConfig
@@ -177,32 +210,48 @@ func (v *NestVersion) equal(o *NestVersion) bool {
 }
 
 // nestRouteFacts emits, for each NestJS route of the member at ordinal file,
-// one FactRoute per path the unit's applications serve it at, on the
-// route's own mount and to its handler: nothing when any application is
+// one FactRoute per path the unit's applications serve it at, under each
+// RouterModule path of its controller (modulePaths), on the route's own
+// mount and to its handler: nothing when any application or module path is
 // undecided or the route's paths or version are no literal.
 func (h *hierarchy) nestRouteFacts(file int32, t *Table, emit func(Binding) error) error {
 	rt := &t.Routing
 	if len(rt.Nest) == 0 {
 		return nil
 	}
-	configs, ok, err := h.nestConfigs()
+	u, ok, err := h.nestUnitOf()
 	if err != nil || !ok {
 		return err
 	}
+	modules := map[int32]nestModulePaths{}
 	for i := range rt.Mounts {
 		m := &rt.Mounts[i]
 		if m.Nest <= 0 || int(m.Nest) > len(rt.Nest) {
 			continue
 		}
 		r := &rt.Nest[m.Nest-1]
+		if r.Handler < 0 || int(r.Handler) >= len(t.Decls) || t.Decls[r.Handler].Parent < 0 {
+			continue
+		}
+		ctrl := t.Decls[r.Handler].Parent
+		if _, done := modules[ctrl]; !done {
+			ps, known, err := h.modulePaths(u, file, t, ctrl)
+			if err != nil {
+				return err
+			}
+			modules[ctrl] = nestModulePaths{ps, known}
+		}
+		mps := modules[ctrl]
 		var paths []string
-		decided := r.Known
-		for _, c := range configs {
-			ps, known := nestPaths(r, c)
-			decided = decided && known
-			for _, p := range ps {
-				if !slices.Contains(paths, p) {
-					paths = append(paths, p)
+		decided := r.Known && mps.known
+		for _, c := range u.configs {
+			for _, mp := range mps.paths {
+				ps, known := nestPaths(r, c, mp)
+				decided = decided && known
+				for _, p := range ps {
+					if !slices.Contains(paths, p) {
+						paths = append(paths, p)
+					}
 				}
 			}
 		}
@@ -233,9 +282,10 @@ func (h *hierarchy) nestRouteFacts(file int32, t *Table, emit func(Binding) erro
 const nestFramework = "nestjs"
 
 // nestPaths are the paths an application of configuration c serves route
-// r at, as RoutePathFactory.create builds them with no RouterModule path,
-// and false when the version it needs is no literal.
-func nestPaths(r *NestRoute, c nestConfig) ([]string, bool) {
+// r at under the RouterModule path modulePath (empty for none), as
+// RoutePathFactory.create builds them, and false when the version it needs
+// is no literal.
+func nestPaths(r *NestRoute, c nestConfig, modulePath string) ([]string, bool) {
 	paths := []string{""}
 	if v := c.versioning; v != nil && v.URI {
 		version := r.Version
@@ -278,6 +328,9 @@ func nestPaths(r *NestRoute, c nestConfig) ([]string, bool) {
 	}
 	if len(methods) == 0 {
 		methods = []string{"/"}
+	}
+	if modulePath != "" {
+		paths = nestAppend(paths, []string{modulePath})
 	}
 	paths = nestAppend(paths, controllers)
 	paths = nestAppend(paths, methods)

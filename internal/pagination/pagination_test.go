@@ -3,6 +3,8 @@ package pagination_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -457,5 +459,77 @@ func TestATornSpoolIsExpiredContinuationState(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, "spool-"+sp.ID())); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("a spool torn to %d bytes is still on disk after the sweep: %v", keep, err)
 		}
+	}
+}
+
+// TestAnotherBootsSpoolIsExpired pins what lets continuation state go unsynced:
+// a spool whose header names another boot -- what every spool is after the
+// restart a power loss implies -- is expired, whatever its lease or recorded
+// expiry: a cursor that names it answers CTX_CURSOR_INVALID and the sweep
+// removes it, so no file a power loss tore is read as records. On a platform
+// with no boot identity the state is not boot-scoped and the spool stays live.
+//
+// Mutation caught: Spools.live ignoring the header's boot (the other boot's
+// spool is served and kept).
+func TestAnotherBootsSpoolIsExpired(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Now()
+	spools, err := pagination.NewSpools(dir, 0, &leaseTable{expiry: map[string]time.Time{}})
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	cursor := pagination.Cursor{Endpoint: "graph", GenerationID: 7,
+		AnalysisKey: model.AnalysisKey(model.H("analysis", "a")), QueryHash: model.H("query", "q"),
+		ExpiresAt: now.Add(15 * time.Minute)}
+	sp, err := spools.Create(cursor)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cursor.SpoolID = sp.ID()
+	if err := sp.Append([]byte("tail-1")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := sp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	read := func() error { return spools.Open(ctx, cursor, now, func([]byte) error { return nil }) }
+	if err := read(); err != nil {
+		t.Fatalf("this boot's spool: %v", err)
+	}
+	// Rewrite the header frame as another boot would have written it.
+	path := filepath.Join(dir, "spool-"+sp.ID())
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := binary.BigEndian.Uint32(raw[:4])
+	var h map[string]any
+	if err := json.Unmarshal(raw[4:4+n], &h); err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	h["boot"] = "another-boot"
+	head, err := json.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := binary.BigEndian.AppendUint32(nil, uint32(len(head)))
+	frame = append(append(frame, head...), raw[4+n:]...)
+	if err := os.WriteFile(path, frame, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = read()
+	live, serr := spools.Sweep(ctx, now)
+	if !pagination.BootKnown() {
+		if err != nil || serr != nil || live == 0 {
+			t.Fatalf("with no boot identity the spool must stay live: open %v, sweep %d %v", err, live, serr)
+		}
+		return
+	}
+	if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeCursorInvalid {
+		t.Fatalf("another boot's spool opened as %v, want %s", err, model.CodeCursorInvalid)
+	}
+	if serr != nil || live != 0 {
+		t.Fatalf("the sweep kept another boot's spool: %d live bytes, %v", live, serr)
 	}
 }

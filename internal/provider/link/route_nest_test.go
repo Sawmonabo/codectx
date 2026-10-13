@@ -83,8 +83,8 @@ bootstrap();
 // applications with different prefixes give each route both paths, each
 // with the set size. No application in the unit, a prefix set through a
 // helper's parameter, a prefix with options (an exclude list matched at
-// run time), a prefix that is no literal, and RouterModule in use publish
-// nothing.
+// run time), a prefix that is no literal, and RouterModule in use with no
+// module listing the controller publish nothing.
 // Mutation: a testing application read as any other receiver -> nothing
 // published for "testing application".
 // Mutation: a helper's call ignored -> /api/... published for "helper".

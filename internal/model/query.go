@@ -318,8 +318,8 @@ func (t SearchTier) Valid() bool { return t.Rank() < len(searchTiers) }
 
 // SearchHit is one deduplicated search result. Section 14.2 fixes its contents:
 // the canonical entity or file chunk that was matched, the integer ranking
-// component with its retrieval tier, bounded reasons and the occurrence count
-// that deduplication folded away. It carries no source body — Section 19.3
+// component with its retrieval tier, which says why it was found, and the
+// occurrence count that deduplication folded away. It carries no source body — Section 19.3
 // reserves those for codectx_read_source, which reads a hit's node or file by
 // id within a context session or outside one, from the generation the hit's
 // binding names.
@@ -335,7 +335,6 @@ type SearchHit struct {
 	ScoreMicros     int64        `json:"score_micros"`
 	Range           *SourceRange `json:"range,omitempty"`
 	OccurrenceCount int64        `json:"occurrence_count"`
-	Reasons         []string     `json:"reasons,omitempty"`
 	// UnresolvedFields names the fields of THIS hit that could not be
 	// resolved, against the typed reason each failed with. It is the search
 	// counterpart of the truncated-fields map a stored record carries: a hit
@@ -395,9 +394,6 @@ func (h SearchHit) Validate() error {
 		}
 	}
 	if err := requireNonNegative("search_hit.occurrence_count", h.OccurrenceCount); err != nil {
-		return err
-	}
-	if err := boundStrings("search_hit.reasons", h.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
 	}
 	// The same wire bound Error.Details and CapabilityState.Details carry: the

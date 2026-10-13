@@ -12,7 +12,9 @@ import (
 // distinct node ids among the visible facts that match f. It is one statement
 // over the name or qualified-name index, so the exact count of a name that
 // thousands of nodes carry costs one indexed range scan instead of a walk of
-// every keyset page.
+// every keyset page. The joins are CROSS JOINs so the name or qualified-name
+// index drives the scan whatever the statistics say about the generation's
+// units.
 func (r *PinnedReader) CountNodes(ctx context.Context, f NodeFilter) (int64, error) {
 	query, args, err := r.countNodesStatement(f)
 	if err != nil {
@@ -31,8 +33,10 @@ func (r *PinnedReader) countNodesStatement(f NodeFilter) (string, []any, error) 
 	if err != nil {
 		return "", nil, err
 	}
-	return `SELECT count(DISTINCT nf.node_id) FROM node_facts nf` + r.visible("nf") +
-		`JOIN node_ids ni ON ni.id = nf.node_id WHERE ` + where, append([]any{r.gen}, args...), nil
+	return `SELECT count(DISTINCT nf.node_id) FROM node_facts nf
+		CROSS JOIN generation_units gu ON gu.unit_id = nf.unit_id AND gu.generation_id = ?1
+		CROSS JOIN units u ON u.id = gu.unit_id
+		CROSS JOIN node_ids ni ON ni.id = nf.node_id WHERE ` + where, append([]any{r.gen}, args...), nil
 }
 
 // nodeFilterWhere is the predicate Nodes applies for f: exactly one of the
