@@ -858,6 +858,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		if p := d.Parent; !d.Described && p >= 0 && t.Decls[p].Kind == model.NodeInterface {
 			e.Flags |= flagAbstract
 		}
+		counted := false
 		add := func(typ Ref) error {
 			e.Key = keyMethod + refKey(typ) + d.Name
 			if err := links.Add(e); err != nil {
@@ -870,7 +871,12 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			if err != nil {
 				return err
 			}
-			h.goSpellings[spelling]++
+			if !counted {
+				// A method is counted once, whatever types its receiver
+				// names.
+				h.goSpellings[spelling]++
+				counted = true
+			}
 			return addGoMethod(methodSets, typ, d.Name, key, e)
 		}
 		// A Java anonymous class body's method is its synthetic type's,
