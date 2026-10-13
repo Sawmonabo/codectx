@@ -42,7 +42,8 @@ func (s *routeScan) nestLinks(out *routeLinks) *routeLinks {
 }
 
 // nestOnly is the routing of a file that imports no framework but may set
-// a NestJS application's global prefix or versioning.
+// a NestJS application's global prefix or versioning or export a route
+// tree.
 func (s *routeScan) nestOnly() *routeLinks {
 	app := s.nestAppScan()
 	if app == nil {
@@ -57,9 +58,31 @@ func (s *routeScan) nestOnly() *routeLinks {
 func mayConfigureNest(b *builder) bool {
 	switch b.lang.Name {
 	case "javascript", "typescript", "tsx":
-		return bytes.Contains(b.src, []byte("setGlobalPrefix")) || bytes.Contains(b.src, []byte("enableVersioning"))
+		return bytes.Contains(b.src, []byte("setGlobalPrefix")) || bytes.Contains(b.src, []byte("enableVersioning")) ||
+			mayHoldNestTree(b.src)
 	}
 	return false
+}
+
+// mayHoldNestTree reports bytes writing a `module` property (`module:`,
+// spaces allowed before the colon), which a RouterModule route tree a
+// file exports for another's register call holds (nestTreeDecls), though
+// the file need import nothing of NestJS.
+func mayHoldNestTree(src []byte) bool {
+	for i := 0; ; {
+		j := bytes.Index(src[i:], []byte("module"))
+		if j < 0 {
+			return false
+		}
+		k := i + j + len("module")
+		for k < len(src) && (src[k] == ' ' || src[k] == '\t') {
+			k++
+		}
+		if k < len(src) && src[k] == ':' {
+			return true
+		}
+		i = i + j + 1
+	}
 }
 
 // nestAppScan is what the file sets on NestJS applications (link.NestApp),
@@ -123,10 +146,12 @@ func (s *routeScan) nestAppScan() *link.NestApp {
 		}
 	}
 	s.nestModules(app)
+	s.nestTreeDecls(app)
 	if app.RouterModule {
 		s.nestRouters(app)
 	}
-	if app.Apps == 0 && !app.Open && !app.RouterModule && len(app.Modules) == 0 && !app.ModulesUnknown {
+	if app.Apps == 0 && !app.Open && !app.RouterModule && len(app.Modules) == 0 && !app.ModulesUnknown &&
+		len(app.Trees) == 0 {
 		return nil
 	}
 	return app

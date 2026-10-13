@@ -1,6 +1,7 @@
 package treesitter
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -101,8 +102,7 @@ func (s *routeScan) nestRef(text string) (link.NestRef, bool) {
 }
 
 // nestRouters records on app each `RouterModule.register(routes)` call of
-// the file: its route tree flattened (nestFlatten), read from an array
-// literal in place or the one module-level binding the argument names.
+// the file (nestRouter).
 func (s *routeScan) nestRouters(app *link.NestApp) {
 	s.calls(func(ref *wire.Ref, site *wire.Site, i int) {
 		if !s.nestRegisters(ref, site, i) {
@@ -110,15 +110,71 @@ func (s *routeScan) nestRouters(app *link.NestApp) {
 		}
 		r := link.NestRouter{}
 		if args := s.siteArgs(site); len(args) == 1 && args[0].kw == "" && len(site.Args) == 1 {
-			if text, ok := s.nestTreeText(args[0].text); ok {
-				var tree []*nestTree
-				if tree, r.Known = s.nestTrees(text); r.Known {
-					nestFlatten(tree, &r.Entries)
-				}
-			}
+			r = s.nestRouter(args[0].text)
 		}
 		app.Routers = append(app.Routers, r)
 	})
+}
+
+// nestRouter is the route tree a register call's argument writes,
+// flattened (nestFlatten): an array literal in place, the initializer of
+// the one module-level binding of the file it names, or, for a name the
+// file imports, that import (link.NestRouter.Import), which the linker
+// follows to the module exporting the tree.
+func (s *routeScan) nestRouter(arg string) link.NestRouter {
+	if !strings.HasPrefix(arg, "[") && isIdentText(arg) {
+		decl, ok := s.nestBinding(arg)
+		switch {
+		case !ok:
+			return link.NestRouter{}
+		case decl >= 0:
+			arg, ok = s.nestInitializer(decl)
+			if !ok {
+				return link.NestRouter{}
+			}
+		default:
+			imp, imported := s.imports[arg]
+			if !imported || imp.original == "*" {
+				return link.NestRouter{}
+			}
+			name := imp.original
+			if name == "" {
+				name = arg
+			}
+			return link.NestRouter{Import: &link.NestRef{Local: -1, Spec: imp.path, Name: name}}
+		}
+	}
+	tree, ok := s.nestTrees(arg)
+	if !ok {
+		return link.NestRouter{}
+	}
+	r := link.NestRouter{Known: true}
+	nestFlatten(tree, &r.Entries)
+	return r
+}
+
+// nestTreeDecls records on app the file's module-level bindings whose
+// initializer is a route tree, an array of route objects (one at least
+// naming a `module` or `children`), which another file's register call
+// may import (link.NestApp.Trees).
+func (s *routeScan) nestTreeDecls(app *link.NestApp) {
+	for i := range s.b.decls {
+		d := &s.b.decls[i]
+		if d.Parent >= 0 || d.kind != model.NodeConstant && d.kind != model.NodeVariable {
+			continue
+		}
+		text, ok := s.nestInitializer(i)
+		if !ok {
+			continue
+		}
+		tree, ok := s.nestTrees(text)
+		if !ok || !slices.ContainsFunc(tree, func(t *nestTree) bool { return t.module != nil || t.children != nil }) {
+			continue
+		}
+		r := link.NestRouter{Known: true}
+		nestFlatten(tree, &r.Entries)
+		app.Trees = append(app.Trees, link.NestTreeDecl{Decl: int32(i), Router: r})
+	}
 }
 
 // nestRegisters reports a call of `RouterModule.register`: one jsTarget
@@ -136,38 +192,37 @@ func (s *routeScan) nestRegisters(ref *wire.Ref, site *wire.Site, i int) bool {
 	return ok && imp.path == "@nestjs/core" && (imp.original == "RouterModule" || imp.original == "" && ref.Qualifier == "RouterModule")
 }
 
-// nestTreeText is the array literal a register call's argument writes: in
-// place, or the initializer of the one module-level binding it names.
-func (s *routeScan) nestTreeText(arg string) (string, bool) {
-	if strings.HasPrefix(arg, "[") {
-		return arg, true
-	}
-	if !isIdentText(arg) {
-		return "", false
-	}
+// nestBinding is the module-level binding of the file named name: its
+// declaration, -1 when the file declares none, and false when it declares
+// several or one that is no constant or variable.
+func (s *routeScan) nestBinding(name string) (int, bool) {
 	found := -1
 	for i := range s.b.decls {
 		d := &s.b.decls[i]
-		if d.Parent < 0 && d.Name == arg {
+		if d.Parent < 0 && d.Name == name {
 			if found >= 0 || d.kind != model.NodeConstant && d.kind != model.NodeVariable {
-				return "", false
+				return -1, false
 			}
 			found = i
 		}
 	}
-	if found < 0 {
-		return "", false
-	}
-	text := s.text(wire.Span{Start: s.b.decls[found].Start, End: s.b.decls[found].End})
+	return found, true
+}
+
+// nestInitializer is the array literal a module-level binding is
+// initialized with, false when it is anything else.
+func (s *routeScan) nestInitializer(decl int) (string, bool) {
+	d := &s.b.decls[decl]
+	text := s.text(wire.Span{Start: d.Start, End: d.End})
 	eq := strings.IndexByte(text, '=')
 	if eq < 0 || eq+1 < len(text) && (text[eq+1] == '=' || text[eq+1] == '>') {
 		return "", false
 	}
-	value := strings.TrimSuffix(strings.TrimSpace(text[eq+1:]), ";")
+	value := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(text[eq+1:]), ";"))
 	if !strings.HasPrefix(value, "[") {
 		return "", false
 	}
-	return strings.TrimSpace(value), true
+	return value, true
 }
 
 // nestTree is one element of a RouterModule route tree: a route object's
