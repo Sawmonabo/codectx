@@ -221,6 +221,14 @@ type Decl struct {
 	// encoding, as declared in source, never the binary's export table.
 	// Empty when its attributes state none.
 	Visibility string `json:"visibility,omitempty"`
+	// Constructor is, for a Rust struct or enum variant, the value its name
+	// is in the value namespace (the Rust Reference's "Struct expressions"
+	// and "Enumerations"): "unit" for a unit struct or variant, whose path
+	// is a value of its type; "tuple" for a tuple struct or variant, whose
+	// path is a constructor function that a call expression calls. Empty
+	// for a struct or variant with named fields, which only a struct
+	// expression builds, and for every other declaration.
+	Constructor string `json:"constructor,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

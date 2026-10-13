@@ -217,7 +217,7 @@ func (b *builder) linkTable() error {
 		d := &b.decls[i]
 		t.Decls[i] = link.Decl{Endpoint: b.declEndpoint(i), Parent: int32(d.Parent), Exported: d.Exported,
 			Prototype: d.Prototype, Macro: d.Macro, MacroInput: d.MacroInput, MacroLocal: d.MacroLocal,
-			MacroTranscribes: d.MacroTranscribes}
+			MacroTranscribes: d.MacroTranscribes, Constructor: d.Constructor}
 	}
 	for _, x := range wl.Exports {
 		i, ok := b.nameAt[x.Name]
