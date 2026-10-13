@@ -311,3 +311,39 @@ func fixtureEdges(t *testing.T, e *Engine, relations []model.Relation) []Edge {
 	}
 	return out
 }
+
+// TestAPackagePairRunsFromTheDependentToTheDependency pins each kind's
+// direction in the rollup: `a calls b` makes a's package depend on b's, while
+// `x data_flows_to y` makes y's package depend on x's, so one of each between
+// the same two packages is two pairs, one each way.
+//
+// Mutation caught: the pair taken in the relation's stored orientation for
+// every kind (dependencyEnds answering edgeEnds unchanged), which folds both
+// relations into one two-count pair from the first package to the second.
+func TestAPackagePairRunsFromTheDependentToTheDependency(t *testing.T) {
+	f, calls := newPairFixture(t, 1, 2)
+	from, to := calls[0].From, calls[0].To
+	flow := model.Relation{ID: fixtureRelationID(len(f.relations)), From: from,
+		Kind: model.RelDataFlowsTo, To: to}
+	f.relations = append(f.relations, flow)
+	e := pairEngine(t, f)
+	meta := model.QueryMeta{}
+	got, err := rollupSlice(e, &meta, []model.Relation{calls[0], flow})
+	if err != nil {
+		t.Fatalf("rollup: %v", err)
+	}
+	type pair struct{ from, to string }
+	counts := map[pair]int64{}
+	for _, edge := range got {
+		counts[pair{edge.FromPath, edge.ToPath}] += edge.PairCount
+	}
+	want := map[pair]int64{{"pkg000", "pkg001"}: 1, {"pkg001", "pkg000"}: 1}
+	if len(counts) != len(want) {
+		t.Fatalf("the rollup served pairs %v, want %v", counts, want)
+	}
+	for k, n := range want {
+		if counts[k] != n {
+			t.Fatalf("the rollup served pairs %v, want %v", counts, want)
+		}
+	}
+}

@@ -268,7 +268,10 @@ answer.
 An impact answer carries two ranked lists, the affected entities and the package
 rollup over every edge the walk admitted, and one `next_cursor` pages both: each
 page takes up to `--limit` from each list, and the cursor is offered while
-either list has records left. A pair's `pair_count` and `evidence_count` are
+either list has records left. A pair runs from the dependent's package to the
+dependency's, as each relation kind defines it: `a calls b` is a pair from a's
+package to b's, and `x data_flows_to y`, in which y depends on x, a pair from
+y's package to x's. A pair's `pair_count` and `evidence_count` are
 exact totals for the whole walk, not per-page fragments to be summed. The
 package-dependency rollup answers on identical terms from its own endpoint.
 `visited_count` and `edge_count` are cumulative and grow across the pages of one

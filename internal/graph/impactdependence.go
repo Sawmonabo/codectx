@@ -74,20 +74,32 @@ func newDependenceWalk(r GraphReader, o expandOptions) dependenceWalk {
 	if code, ok := table.Code(model.RelDataFlowsTo); ok && o.Flows != nil {
 		d.flow, d.roles = code, o.Flows
 	}
+	d.reversed = reversedCodes(table, o.Kinds)
+	return d
+}
+
+// reversedCodes resolves the reversed kinds among kinds -- every kind when
+// kinds is empty -- against the generation's dictionary, nil when none is
+// present.
+func reversedCodes(table KindTable, kinds []model.RelationKind) map[KindCode]bool {
+	var out map[KindCode]bool
+	if table == nil {
+		return nil
+	}
 	for _, k := range reversedKinds() {
-		if len(o.Kinds) > 0 && !slices.Contains(o.Kinds, k) {
+		if len(kinds) > 0 && !slices.Contains(kinds, k) {
 			continue
 		}
 		code, ok := table.Code(k)
 		if !ok {
 			continue
 		}
-		if d.reversed == nil {
-			d.reversed = map[KindCode]bool{}
+		if out == nil {
+			out = map[KindCode]bool{}
 		}
-		d.reversed[code] = true
+		out[code] = true
 	}
-	return d
+	return out
 }
 
 // active reports whether the walk reads any kind against its stored direction.

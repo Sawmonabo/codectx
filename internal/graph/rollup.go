@@ -328,6 +328,12 @@ type pairRollup struct {
 	// packages than symbols, so the cache is a page-sized structure by
 	// construction.
 	labels map[NodeRef]containerLabel
+	// reversed are the kind codes stored dependency first (reversedKinds),
+	// resolved once from the generation's dictionary: a pair runs from the
+	// dependent's package to the dependency's, which for these kinds is
+	// against the stored direction.
+	reversed map[KindCode]bool
+	resolved bool
 	// peak is the largest batch the sink ever held, the memory high-water mark
 	// rollupStats reports.
 	peak int
@@ -385,8 +391,15 @@ func (p *pairRollup) flush() error {
 	p.batch = p.batch[:0]
 	endpoints := make([]NodeRef, 0, 2*len(batch))
 	rels := make([]RelRef, 0, len(batch))
+	if !p.resolved {
+		reader, err := p.e.Reader()
+		if err != nil {
+			return err
+		}
+		p.reversed, p.resolved = reversedCodes(reader.Kinds(), nil), true
+	}
 	for _, e := range batch {
-		from, to := edgeEnds(e)
+		from, to := dependencyEnds(e, p.reversed)
 		endpoints = append(endpoints, from, to)
 		rels = append(rels, e.Rel)
 	}
@@ -403,7 +416,7 @@ func (p *pairRollup) flush() error {
 		return err
 	}
 	for _, e := range batch {
-		fromRef, toRef := edgeEnds(e)
+		fromRef, toRef := dependencyEnds(e, p.reversed)
 		from, okFrom := containers[fromRef]
 		to, okTo := containers[toRef]
 		// An edge whose endpoints share a container contributes nothing: a
@@ -478,14 +491,26 @@ func (p *pairRollup) containerLabels(refs []NodeRef) (map[NodeRef]containerLabel
 	return out, nil
 }
 
-// edgeEnds is the edge's from-node and to-node, read off the owner and the
-// direction flag the reader set. The PAIR is directed -- "this package depends
-// on that one" -- so which end is which is part of the answer, not a detail.
+// edgeEnds is the edge's from-node and to-node as the relation is stored, read
+// off the owner and the direction flag the reader set.
 func edgeEnds(e Edge) (from, to NodeRef) {
 	if e.Outgoing {
 		return e.Owner, e.Neighbour
 	}
 	return e.Neighbour, e.Owner
+}
+
+// dependencyEnds is the edge's dependent and its dependency: its from-node
+// and to-node for a kind stored dependent first (`a calls b`), and the other
+// way round for a kind reversed names (`x data_flows_to y`: y depends on x).
+// A package pair is "this package depends on that one", so each kind's own
+// definition, not its stored orientation, decides which end is which.
+func dependencyEnds(e Edge, reversed map[KindCode]bool) (dependent, dependency NodeRef) {
+	from, to := edgeEnds(e)
+	if reversed[e.Kind] {
+		return to, from
+	}
+	return from, to
 }
 
 // evidenceCounts reads one batch's per-relation evidence counts off the
