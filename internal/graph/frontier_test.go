@@ -485,15 +485,18 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		// The rank KEY, not merely agreement with a single-shot run of the same
 		// build: comparing the pages against a baseline the same code produced
 		// cannot see an order that is wrong in both. The served key is
-		// (ScoreMicros desc, Depth asc, NodeID asc); Name is not a tie-break.
+		// (Reach, the call tier first; ScoreMicros desc; Depth asc; NodeID
+		// asc); Name is not a tie-break.
 		for i := 1; i < len(entries); i++ {
 			prev, cur := entries[i-1], entries[i]
-			ordered := prev.ScoreMicros > cur.ScoreMicros ||
+			prevTier, curTier := prev.Reach != "", cur.Reach != ""
+			ordered := (!prevTier && curTier) || (prevTier == curTier && (prev.ScoreMicros > cur.ScoreMicros ||
 				(prev.ScoreMicros == cur.ScoreMicros && (prev.Depth < cur.Depth ||
-					(prev.Depth == cur.Depth && prev.NodeID < cur.NodeID)))
+					(prev.Depth == cur.Depth && prev.NodeID < cur.NodeID)))))
 			if !ordered {
-				t.Fatalf("ranks %d and %d are out of the served order: (score %d, depth %d, %s) then (score %d, depth %d, %s)",
-					i-1, i, prev.ScoreMicros, prev.Depth, prev.NodeID, cur.ScoreMicros, cur.Depth, cur.NodeID)
+				t.Fatalf("ranks %d and %d are out of the served order: (reach %q, score %d, depth %d, %s) then (reach %q, score %d, depth %d, %s)",
+					i-1, i, prev.Reach, prev.ScoreMicros, prev.Depth, prev.NodeID,
+					cur.Reach, cur.ScoreMicros, cur.Depth, cur.NodeID)
 			}
 		}
 	})

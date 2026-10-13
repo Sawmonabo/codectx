@@ -17,3 +17,12 @@ func writeInlineImpact(b *strings.Builder, result model.ImpactResult) {
 		writeImpactRoutes(b, result.Routes)
 	}
 }
+
+// reachLabel names an impact entry's tier in the entries table: nothing for
+// the call tier, which ranks first, and the tier otherwise.
+func reachLabel(r model.ImpactReach) string {
+	if r == "" {
+		return ""
+	}
+	return "  reach " + string(r)
+}

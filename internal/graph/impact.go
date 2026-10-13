@@ -853,7 +853,7 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, base int64
 	entries := make([]model.ImpactEntry, 0, len(page))
 	for i, r := range page {
 		entry := model.ImpactEntry{Ordinal: base + int64(i), NodeID: r.NodeID, Direction: r.Direction,
-			Depth: r.Depth, ScoreMicros: r.scoreMicros(), ReasonCount: int64(len(r.Reasons))}
+			Depth: r.Depth, Reach: r.reach(), ScoreMicros: r.scoreMicros(), ReasonCount: int64(len(r.Reasons))}
 		if r.Via != "" {
 			entry.RouteCount = 1
 		}
@@ -1436,8 +1436,8 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 		entry.Name = clipTo(n.QualifiedName, model.MaxQualifiedNameBytes)
 		out = append(out, entry)
 	}
-	// The page arrives ALREADY ordered, by the served key (ScoreMicros desc,
-	// Depth asc, NodeID asc), which the ranking pass applied over the whole
+	// The page arrives ALREADY ordered, by the served key (Reach, ScoreMicros
+	// desc, Depth asc, NodeID asc), which the ranking pass applied over the whole
 	// answer. No tie-break is re-applied here: Name is known only after
 	// hydration, so re-sorting a page by it would reorder one page of a
 	// globally ordered answer and no two pages would agree on where a record

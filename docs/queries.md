@@ -58,9 +58,10 @@ entity only a dependence route reaches. Across calls the slice is realizable: a
 value passed at one call site enters the callee through its argument flow and
 leaves only through that site's summary flow, never through another site's
 result, while a value the callee creates itself leaves through every call site's
-return flow. A dependence-reached entry's `score_micros` is negative (its plain
-score minus 1 000 001), so the order stays `score_micros` descending; its path's
-`cost_units` is the plain sum of its hop costs. `path` and the traversals walk
+return flow. A dependence-reached entry says so with `reach: "dependence"`
+(the field is omitted on a call-reached entry), and its `score_micros` is the
+plain score of its route's cost, never negative; its path's `cost_units` is the
+plain sum of its hop costs. `path` and the traversals walk
 `data_flows_to` at its plain cost.
 
 `impact` also
@@ -260,10 +261,11 @@ What that buys is the contract a single unbounded walk gives, and it is what
 the same entities, in the same global order, each listed exactly once. An entity
 reached again from a later frontier is one record, not two; the cheapest route
 to it wins, and the reasons of every edge that touched it are merged into that
-one entry. The order is `score_micros` descending, then `depth` ascending, then
-`node_id` ascending. A `score_micros` below zero marks an entity reached only
-through data or control dependence; every such entity ranks after every entity a
-call, override or structural route reaches. **`name` is not a tie-break** — it is known only after
+one entry. The order is the reach first — every entity a call, override or
+structural route reaches, then every entity only a data or control dependence
+hop reaches, marked `reach: "dependence"` — then `score_micros` descending, then
+`depth` ascending, then `node_id` ascending. `score_micros` is the score within
+its reach and never negative. **`name` is not a tie-break** — it is known only after
 hydration, so ranking on it would reorder one page of a globally ordered
 answer.
 
