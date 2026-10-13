@@ -4,13 +4,15 @@ import "github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 
 // paramInfo is one declared parameter of a callable as resolution reads it
 // (hierarchy.parameters): Pos is its index in the callable's
-// Decl.Parameters, and the rest is that Parameter's name and marks.
+// Decl.Parameters, and the rest is that Parameter's name, marks and return
+// summary.
 type paramInfo struct {
 	Pos         int32
 	Name        string
 	Index       uint32
 	Variadic    bool
 	KeywordOnly bool
+	Returned    bool
 }
 
 // argumentFlows yields each argument of the bound call site s with the

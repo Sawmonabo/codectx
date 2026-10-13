@@ -111,7 +111,7 @@ func (b *builder) functions() error {
 		}
 	}
 	b.tableVariables(vars)
-	return nil
+	return b.returnFlows(vars, byStart)
 }
 
 // tableVariables completes the variable endpoints linkTable left with their

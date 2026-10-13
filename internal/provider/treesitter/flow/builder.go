@@ -175,6 +175,9 @@ type Builder struct {
 	// declared holds, per variable, the span of the identifier that declares
 	// it (Named), or the zero Span for a variable the lowering owns (Var).
 	declared []Span
+	// returns are the fringe nodes each Return moved to Exit, and falls the
+	// fringe Finish moved there; Finish sorts and deduplicates both.
+	returns, falls []int32
 
 	// vars is the variable count.
 	vars int
@@ -306,6 +309,8 @@ func (b *Builder) reset(a *Arena, fn Span) {
 		mayOff:   b.mayOff[:0],
 		mayVars:  b.mayVars[:0],
 		declared: b.declared[:0],
+		returns:  b.returns[:0],
+		falls:    b.falls[:0],
 	}
 	b.add(EntryNode)
 }
@@ -361,7 +366,9 @@ func (b *Builder) scratchSize(count func(n, c int) int) int {
 		count(len(b.defVars), cap(b.defVars))*4 +
 		count(len(b.mayOff), cap(b.mayOff))*4 +
 		count(len(b.mayVars), cap(b.mayVars))*4 +
-		count(len(b.declared), cap(b.declared))*int(unsafe.Sizeof(Span{}))
+		count(len(b.declared), cap(b.declared))*int(unsafe.Sizeof(Span{})) +
+		count(len(b.returns), cap(b.returns))*4 +
+		count(len(b.falls), cap(b.falls))*4
 }
 
 // release drops every scratch list's backing array. Arena.Release calls
@@ -610,8 +617,19 @@ func (b *Builder) Continue(label string) {
 	b.jump(continueJump, t)
 }
 
-// Return moves the current fringe to Exit and empties it.
+// Return moves the current fringe to Exit and empties it. The fringe's nodes
+// are the callable's returning nodes (Graph.Returns): a return statement's
+// node, which Uses what its value reads.
 func (b *Builder) Return() {
+	b.returns = append(b.returns, b.cur...)
+	b.jump(returnJump, toExit)
+}
+
+// Diverge moves the current fringe to Exit and empties it, as Return does,
+// for a fringe that leaves the callable without returning a value: the end
+// of a block the language requires to diverge, which only a panic reaches.
+// Its nodes are not returning nodes.
+func (b *Builder) Diverge() {
 	b.jump(returnJump, toExit)
 }
 
@@ -829,6 +847,7 @@ func (b *Builder) Finish() *Graph {
 		panic("flow: Builder.Finish with an open frame")
 	}
 	b.finished = true
+	b.falls = append(b.falls, b.cur...)
 	b.edgesTo(b.cur, ExitNode)
 	b.clearCur()
 	b.resolveGotos()
@@ -845,6 +864,10 @@ func (b *Builder) Finish() *Graph {
 	b.defs = slices.Compact(b.defs)
 	slices.Sort(b.mayDefs)
 	b.mayDefs = slices.Compact(b.mayDefs)
+	slices.Sort(b.returns)
+	b.returns = slices.Compact(b.returns)
+	slices.Sort(b.falls)
+	b.falls = slices.Compact(b.falls)
 	// A may-definition of a variable its node also defines is dropped: the
 	// killing definition wins. Both lists are sorted by (node, variable), so
 	// one merge walk finds every such pair.
@@ -893,6 +916,8 @@ func (b *Builder) Finish() *Graph {
 		predOff:    predOff,
 		pred:       pred,
 		declared:   b.declared,
+		returns:    b.returns,
+		falls:      b.falls,
 		vars:       b.vars,
 		unresolved: b.unresolved,
 	}

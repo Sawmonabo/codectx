@@ -162,7 +162,7 @@ func TestValidationRejectsBadRangesAndEnums(t *testing.T) {
 	// same occurrence be stored twice under different keys, defeating the
 	// Section 9.3 dedup property the derivation exists to provide.
 	forgedID := validEvidence
-	forgedID.ID = model.EvidenceID(model.H("evidence-v1", "invented"))
+	forgedID.ID = model.EvidenceID(model.H("evidence-v1", "invented")[:model.EvidenceIDHexLen])
 	bothSubjects := validEvidence
 	bothSubjects.RelationID = relID
 	noSubject := validEvidence
