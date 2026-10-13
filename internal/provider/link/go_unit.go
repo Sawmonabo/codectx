@@ -13,6 +13,10 @@ const (
 	// name in that package scope, the form of the type it denotes in Sig
 	// (wire.Export.Identity past its "=").
 	keyGoAlias = "ga\x00"
+	// keyGoConst + scope + "\x00" + name: a package-level Go constant of
+	// that name in that package scope, the form of its integer value in Sig
+	// (wire.Export.Identity past its "#").
+	keyGoConst = "gk\x00"
 	// keyGoExternalImpl + refKey(type): an interface outside the unit the
 	// type implements, its qualified name in Aux and the evidence detail in
 	// Sig: DetailMethodSet when its method set satisfies the interface's
@@ -24,8 +28,15 @@ const (
 	// that name implements.
 	keyGoExternalOverride = "gy\x00"
 	// keyGoCoverage: the unit's count of packages outside it read
-	// (MinArgs) and of those with no readable source (MaxArgs).
+	// (MinArgs) and of those with no readable source (MaxArgs), Tag 0; and
+	// of its methods whose signature names a type by its unresolved
+	// spelling (MinArgs) and of those whose signature could not be spelled
+	// (MaxArgs), Tag 1.
 	keyGoCoverage = "gc\x00"
+	// goImportList, past keyImport + refKey(file), lists every named import
+	// of a Go file, its path in Aux and its name in Sig; no import's name
+	// is spelled with it.
+	goImportList = "\x01"
 )
 
 // goTypes is goPackageTypes over the unit's packages and the packages
@@ -35,6 +46,23 @@ func (h *hierarchy) goTypes() goPackageTypes { return goUnitTypes{h} }
 type goUnitTypes struct{ h *hierarchy }
 
 func (t goUnitTypes) lookup(ctx context.Context, p, name string) (goTypeAnswer, bool, error) {
+	h := t.h
+	if !h.goMemoOn() {
+		return t.read(p, name)
+	}
+	key := p + "\x00" + name
+	if m, ok := h.goMemo.types.get(key); ok {
+		return m.answer, m.known, nil
+	}
+	a, known, err := t.read(p, name)
+	if err == nil {
+		h.goMemo.types.put(key, goTypeMemo{a, known})
+	}
+	return a, known, err
+}
+
+// read is lookup's answer read from the indexes.
+func (t goUnitTypes) read(p, name string) (goTypeAnswer, bool, error) {
 	h := t.h
 	var scopes []string
 	if err := h.goPackages(p, func(scope string) error {
@@ -90,6 +118,66 @@ func (t goUnitTypes) lookup(ctx context.Context, p, name string) (goTypeAnswer, 
 	return answer, true, nil
 }
 
+func (t goUnitTypes) constant(ctx context.Context, p, name string) (string, goNames, bool, error) {
+	h := t.h
+	if !h.goMemoOn() {
+		return t.readConstant(p, name)
+	}
+	key := p + "\x00" + name
+	if m, ok := h.goMemo.consts.get(key); ok {
+		return m.form, m.names, m.found, nil
+	}
+	form, names, found, err := t.readConstant(p, name)
+	if err == nil {
+		h.goMemo.consts.put(key, goConstMemo{form, names, found})
+	}
+	return form, names, found, err
+}
+
+// readConstant is constant's answer read from the indexes.
+func (t goUnitTypes) readConstant(p, name string) (string, goNames, bool, error) {
+	h := t.h
+	var scopes []string
+	if err := h.goPackages(p, func(scope string) error {
+		scopes = append(scopes, scope)
+		return nil
+	}); err != nil {
+		return "", nil, false, err
+	}
+	if len(scopes) == 0 && !(h.goModule != "" && under(p, h.goModule)) {
+		if h.goExt == nil {
+			return "", nil, false, nil
+		}
+		form, names, found := h.goExt.constant(p, name)
+		return form, names, found, nil
+	}
+	var c *entry
+	for _, scope := range scopes {
+		if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
+			continue
+		}
+		err := h.decls.lookup(keyGoConst+scope+"\x00"+name, func(e entry) error {
+			if c == nil {
+				c = &e
+			} else if c.Sig != e.Sig {
+				c.Sig = goIdentityUnknown
+			}
+			return nil
+		})
+		if err != nil {
+			return "", nil, false, err
+		}
+	}
+	if c == nil {
+		return "", nil, false, nil
+	}
+	fc, found, err := h.fileContext(c.Ref.File)
+	if err != nil || !found {
+		return goIdentityUnknown, nil, true, err
+	}
+	return c.Sig, goUnitNames{h: h, fc: fc}, true, nil
+}
+
 // goUnitNames is goNames of a member file of the unit.
 type goUnitNames struct {
 	h  *hierarchy
@@ -126,7 +214,11 @@ func (n goUnitNames) imported(name string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	for _, imp := range n.fc.imports {
+	imports, err := n.imports()
+	if err != nil {
+		return "", false, err
+	}
+	for _, imp := range imports {
 		if imp.Name != goPackageName(imp.Path) || imp.Name == name {
 			continue
 		}
@@ -140,6 +232,41 @@ func (n goUnitNames) imported(name string) (string, bool, error) {
 		return "", false, nil
 	}
 	return paths[0], true, nil
+}
+
+// imports are the file's imports: its context's, or, for a context read
+// back from the index (an alias's file), the ones the index lists for the
+// file (keyImport + goImportList).
+func (n goUnitNames) imports() ([]Import, error) {
+	if n.fc.imports != nil {
+		return n.fc.imports, nil
+	}
+	var out []Import
+	err := n.h.decls.lookup(keyImport+refKey(Ref{File: n.fc.file})+goImportList, func(e entry) error {
+		out = append(out, Import{Name: e.Sig, Path: e.Aux})
+		return nil
+	})
+	return out, err
+}
+
+func (n goUnitNames) unresolved() ([]string, error) {
+	imports, err := n.imports()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, imp := range imports {
+		if imp.Path == "C" || imp.Name != goPackageName(imp.Path) || slices.Contains(out, imp.Path) {
+			continue
+		}
+		if _, ok, err := n.h.goClause(imp.Path); err != nil {
+			return nil, err
+		} else if !ok {
+			out = append(out, imp.Path)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
 func (n goUnitNames) dots() ([]string, error) {
@@ -156,6 +283,21 @@ func (n goUnitNames) dots() ([]string, error) {
 // goClause is the package clause of the package at import path p, when the
 // unit holds it or the build read it.
 func (h *hierarchy) goClause(p string) (string, bool, error) {
+	if !h.goMemoOn() {
+		return h.readClause(p)
+	}
+	if m, ok := h.goMemo.clause.get(p); ok {
+		return m.clause, m.ok, nil
+	}
+	clause, ok, err := h.readClause(p)
+	if err == nil {
+		h.goMemo.clause.put(p, goClauseMemo{clause, ok})
+	}
+	return clause, ok, err
+}
+
+// readClause is goClause's answer read from the indexes.
+func (h *hierarchy) readClause(p string) (string, bool, error) {
 	var names []string
 	err := h.goPackages(p, func(scope string) error {
 		if _, pkg, _ := strings.Cut(scope, "\x00"); !strings.HasSuffix(pkg, "_test") {
@@ -195,14 +337,34 @@ func (h *hierarchy) inUnit(p string) (bool, error) {
 // identity form form, declared at ref in the file n: its canonical
 // signature (goIdentity), and for an unexported name its package's import
 // path, since a non-exported name is unique to its package ("Uniqueness of
-// identifiers").
-func goMethodKey(ctx context.Context, types goPackageTypes, n goNames, name, form string, ref Ref) (string, error) {
+// identifiers"). spelling says how exact the signature is.
+func goMethodKey(ctx context.Context, types goPackageTypes, n goNames, name, form string, ref Ref) (key string, spelling goSpelling, err error) {
 	id, err := goIdentity(ctx, types, n, form)
 	if err != nil {
-		return "", err
+		return "", 0, err
+	}
+	switch {
+	case id == goIdentityUnknown:
+		spelling = goSpellingUnknown
+	case goUnresolvedIdentity(id):
+		spelling = goSpellingUnresolved
 	}
 	if !token.IsExported(name) {
 		name = n.pkg() + "." + name
 	}
-	return goIdentityKey(name, id, ref), nil
+	return goIdentityKey(name, id, ref), spelling, nil
 }
+
+// goSpelling is how exactly a method's canonical signature names its types.
+type goSpelling uint8
+
+const (
+	// goSpellingExact names every type by its package and name.
+	goSpellingExact goSpelling = iota
+	// goSpellingUnresolved names a type by its unresolved spelling
+	// (goUnboundQualifier, goUnqualified).
+	goSpellingUnresolved
+	// goSpellingUnknown is a signature goIdentity could not spell, whose
+	// key matches no other method's.
+	goSpellingUnknown
+)
