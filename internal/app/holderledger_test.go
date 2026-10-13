@@ -18,15 +18,21 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// TestAHolderWhoseLedgerThisBuildCannotReadIsDiagnosedNotWaitedOut protects the
-// invariant that a waiter which cannot read the holder's stamps AT ALL says so
-// immediately, instead of calling the holder stalled.
+// TestAHolderWhoseLedgerThisBuildCannotReadIsDiagnosedNotWaitedOut protects
+// the invariant that a waiter which cannot read the holder's stamps AT ALL says
+// so immediately, instead of calling the holder stalled.
 //
-// The failure mode: the schema-mismatch open failure reads as "no progress", so
-// a waiter behind a different build of this product spends the whole liveness
-// window and then reports CTX_WORKSPACE_BUSY -- a wrong diagnosis of a healthy
-// holder, after a wait that could never have succeeded. Both halves matter, so
-// both are asserted: the code, and that it arrived without spending the grace.
+// The failure mode: this build reads a ledger another schema wrote as absent,
+// so the holder -- a process of another build -- never shows progress, and a
+// waiter spends the whole liveness window and then reports the holder stalled:
+// a wrong diagnosis of a healthy holder, after a wait that could never have
+// succeeded. Both halves matter, so both are asserted: the busy refusal naming
+// the holder, and that it arrived without spending the grace. It is retryable
+// like every busy refusal: once the holder exits, the next holder replaces the
+// ledger with its own schema's.
+//
+// Mutations it catches: the probe reading the foreign ledger as "no progress"
+// (the wait spends the grace), or the refusal naming no holder.
 //
 // The fixture is a real ledger file whose fingerprint is then changed in place,
 // because ledger.OpenReader reads ledger_meta and ledger.Fingerprint is derived
@@ -45,8 +51,8 @@ func TestAHolderWhoseLedgerThisBuildCannotReadIsDiagnosedNotWaitedOut(t *testing
 	start := time.Now()
 	_, err = (&stack{dataDir: dir, operation: "refresh"}).acquire(ctx, index.HoldPatiently)
 	var typed *model.Error
-	if !errors.As(err, &typed) || typed.Code != model.CodeSchemaMismatch {
-		t.Fatalf("a holder whose ledger carries a foreign fingerprint must end the wait with CTX_SCHEMA_MISMATCH, got %v", err)
+	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
+		t.Fatalf("a holder whose ledger carries a foreign fingerprint must end the wait with CTX_WORKSPACE_BUSY, got %v", err)
 	}
 	if waited := time.Since(start); waited > ledger.LiveWindow/10 {
 		t.Fatalf("the wait ended after %s: the mismatch must end it at once, not after the %s grace", waited, ledger.LiveWindow)
@@ -55,8 +61,8 @@ func TestAHolderWhoseLedgerThisBuildCannotReadIsDiagnosedNotWaitedOut(t *testing
 		typed.Details[snapshot.DetailHolderOperation] != "index" {
 		t.Fatalf("the diagnosis must name the holder's pid and operation, got %v", typed.Details)
 	}
-	if typed.Retryable {
-		t.Fatalf("a foreign ledger is still there after the holder exits, so the refusal must not be retryable")
+	if !typed.Retryable {
+		t.Fatalf("the refusal must be retryable: the next holder replaces the foreign ledger")
 	}
 }
 

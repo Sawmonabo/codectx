@@ -130,3 +130,47 @@ func TestResetNamingTheRepositoryTwiceRemovesNothing(t *testing.T) {
 		t.Fatalf("a refused reset removed %s: %v", kept, err)
 	}
 }
+
+// TestAFailedReindexStillReportsWhatTheResetRemoved runs `codectx reset
+// --reindex` on the text path over a workspace whose removal succeeds and
+// whose index then fails: its `.git` is a file naming a git directory that
+// does not exist, which discovery accepts and capture cannot read. The
+// operator must be told what went, entry by entry, on stdout, and then the
+// failure, once, on stderr, and the command must fail with the typed error.
+//
+// Mutations that fail it: returning the index failure before printing the
+// removal report (the removed entry is named nowhere), printing the report
+// only on the --json path, or writing the failure twice.
+func TestAFailedReindexStillReportsWhatTheResetRemoved(t *testing.T) {
+	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}
+	isolateUserDirs(t, "")
+	dir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if err := cli.Execute(context.Background(), build, cli.NewRoot(build, &stdout, &stderr), []string{"init", dir}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+filepath.Join(dir, "missing-git-dir")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(resetDataDir(t, dir), "left-by-an-older-run")
+	if err := os.WriteFile(stale, []byte("derived"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	err := cli.Execute(context.Background(), build, cli.NewRoot(build, &stdout, &stderr), []string{"reset", dir, "--reindex"})
+	var typed *model.Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("reset --reindex over an unreadable repository = %v, want a typed failure", err)
+	}
+	if !strings.Contains(stdout.String(), "removed "+stale) || !strings.Contains(stdout.String(), "bytes freed") {
+		t.Fatalf("stdout does not report the removal of %s and its total:\n%s", stale, stdout.String())
+	}
+	if _, statErr := os.Lstat(stale); !os.IsNotExist(statErr) {
+		t.Fatalf("the entry the reset reported removing is still there: %v", statErr)
+	}
+	if n := strings.Count(stderr.String(), "Error: "+typed.Message); n != 1 {
+		t.Fatalf("stderr carries the failure %d times, want once:\n%s", n, stderr.String())
+	}
+}
