@@ -447,9 +447,13 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   bundlers' reading; Node at run time gives the whole value, a documented difference). `exports = …`, or
   `module.exports = …` outside a chain assigning both, unbinds `exports`, so no `exports.x` of that file is an
   export. A file with an `import` or `export` statement is an ES module and none of these forms is read in it. A
-  class or object method assigned to `module.exports` declares nothing the structural query names and is not
-  exported. A name a pattern binds from a literal `require("./m")` (`const { run } = require("./m")`) is the
-  module's export, as an import's is. A
+  class expression assigned to a name or property (`module.exports = class { … }`) is a class of that name
+  (`exports`), holding its methods, so the whole value is that class; a method of the object `module.exports` is
+  assigned (`{ run() {} }`) is exported under its own name, as a function-valued key is. A function or class
+  stored on a prototype (`C.prototype.run = …`) is not read as an export. A name a pattern binds from a literal
+  `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is, and a name a
+  `require` call binds whole (`const C = require("./c")`) is the module's whole value, so `new C()` runs the
+  constructor of the class the module assigns, as it would an imported class's. A
   declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
   ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
   re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.

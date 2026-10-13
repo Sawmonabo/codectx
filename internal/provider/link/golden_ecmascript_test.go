@@ -1105,6 +1105,83 @@ export function go2() {
 			"a rebound `exports` or an ES module's `module.exports` read as exports binds ry or re",
 	},
 	{
+		name: "required-class-constructed",
+		anchor: "Node.js Modules: CommonJS modules (`require` returns `module.exports`); " +
+			"ECMA-262 (15th edition, 2024) §13.3.5 (The new Operator)",
+		files: map[string]string{
+			"src/c.js": `class C {
+  constructor() {} // @cc
+  hi() {} // @ch
+}
+module.exports = C;
+`,
+			"src/d.js": `class D {
+  constructor() {} // @dc
+  hi() {} // @dh
+}
+module.exports = { D };
+`,
+			"src/main.js": `const C = require("./c");
+const { D } = require("./d");
+
+function go() {
+  new C().hi(); // @nc
+  new D().hi(); // @nd
+}
+`,
+		},
+		// Derived from the anchors: C is c.js's whole value and D the value of d.js's key D, so each `new`
+		// runs that class's constructor and the object it makes has the class's methods.
+		want: []string{
+			"nc C -> cc constructor exact",
+			"nc hi -> ch hi exact",
+			"nd D -> dc constructor exact",
+			"nd hi -> dh hi exact",
+		},
+		// Mutation: read a `require` namespace binding as no type (the whole value unread) -> nc is unbound;
+		// skip a re-export under a declaration's own name that the provider does not mark exported -> nd is
+		// unbound. With no instance, neither hi binds.
+		fails: "a class taken from a required module and constructed binds neither its constructor nor its methods",
+	},
+	{
+		name: "commonjs-exported-class-and-methods",
+		anchor: "Node.js Modules: CommonJS modules (`module.exports` holds any value); " +
+			"ECMA-262 (15th edition, 2024) §15.7 (Class Definitions: a class expression), §13.2.5 (Object Initializer: a method definition)",
+		files: map[string]string{
+			"src/k.js": `module.exports = class {
+  constructor() {} // @kc
+  m() {} // @km
+};
+`,
+			"src/o.js": `module.exports = {
+  m() {}, // @om
+  n: function () {}, // @on
+};
+`,
+			"src/main.js": `const K = require("./k");
+const { m, n } = require("./o");
+
+function go() {
+  new K().m(); // @nk
+  m(); // @mo
+  n(); // @no
+}
+`,
+		},
+		// Derived from the anchors: k.js's whole value is the class, so `new K()` runs its constructor and
+		// the object has its method m; o.js's value is the object, whose method m and function-valued key n
+		// are what the destructured names hold.
+		want: []string{
+			"nk K -> kc constructor exact",
+			"nk m -> km m exact",
+			"mo m -> om m exact",
+			"no n -> on n exact",
+		},
+		// Mutation: leave a class expression unnamed (drop its declaration by the property it is stored
+		// under) -> both nk bindings are lost; leave an object's method definitions unexported -> mo is unbound.
+		fails: "a class expression assigned to `module.exports`, or a method of the object assigned to it, is no export",
+	},
+	{
 		name:   "typescript-export-assignment",
 		anchor: "TypeScript Handbook, Modules (`export =` assigns the module's value; `import x = require()` imports it)",
 		files: map[string]string{

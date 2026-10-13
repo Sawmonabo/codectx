@@ -898,6 +898,20 @@ func (k *javaScriptLinker) named(name string) wire.Type {
 func (k *javaScriptLinker) className(body Node) string {
 	kk := k.k
 	c := body.Parent()
+	if jsKindOf(c) == kk.class {
+		// A class expression assigned to a name or a property
+		// (`module.exports = class { … }`) is declared by that name.
+		if a := c.Parent(); jsKindOf(a) == kk.assignmentExpression && a.ChildByFieldId(kk.fRight) == c {
+			switch left := a.ChildByFieldId(kk.fLeft); jsKindOf(left) {
+			case kk.identifier:
+				return string(textOf(k.src, left))
+			case kk.memberExpression:
+				if p := left.ChildByFieldId(kk.fProperty); jsKindOf(p) == k.x.propertyIdentifier {
+					return string(textOf(k.src, p))
+				}
+			}
+		}
+	}
 	switch jsKindOf(c) {
 	case kk.classDeclaration, kk.abstractClassDeclaration, kk.class:
 		if name := c.ChildByFieldId(kk.fName); !name.IsNull() {
@@ -997,11 +1011,13 @@ func (k *javaScriptLinker) site(n, tok Node) wire.Site {
 	case f == tok:
 		s.Shape = wire.ShapeBare
 		switch v := k.resolve(tok); {
+		case v.t.Kind == wire.TypeModule:
+			// A call of an import names its module and exported name, a
+			// variable a `require` call assigns (`const f = require("./m");
+			// f()`) as well: the module's whole value.
+			s.Receiver = v.t
 		case v.set && !v.decl:
 			s.Shape, s.Receiver, s.Signature = wire.ShapeIndirect, v.t, v.sig
-		case v.t.Kind == wire.TypeModule:
-			// A call of an import names its module and exported name.
-			s.Receiver = v.t
 		}
 	default:
 		s.Shape = wire.ShapeMember
@@ -1421,6 +1437,13 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 				abstract := n.KindId() != kk.methodDefinition
 				k.export(out, name, n, k.receiverOf(n), !abstract && hasToken(n, kk.staticKw), abstract)
 				out.Exports[len(out.Exports)-1].Override = !kindChild(n, x.overrideModifier).IsNull()
+				if p := n.Parent(); jsKindOf(p) == x.object && commonJSExport(k.objectPath(p), false) {
+					// A method of the object `module.exports` is assigned
+					// is exported under its own name, as a function-valued
+					// key is (pairFunction).
+					out.Exports[len(out.Exports)-1].Property = true
+					out.Exports[len(out.Exports)-1].Exported = true
+				}
 			}
 		case kk.variableDeclarator:
 			name, value := n.ChildByFieldId(kk.fName), n.ChildByFieldId(kk.fValue)

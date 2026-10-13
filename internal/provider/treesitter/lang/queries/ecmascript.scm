@@ -28,6 +28,10 @@
 (assignment_expression left: (identifier) @name right: [(arrow_function) (function_expression)] @body) @def.function
 (assignment_expression left: (member_expression object: (_) @name.scope property: (property_identifier) @name) right: [(arrow_function) (function_expression)] @body) @def.function
 (pair key: (property_identifier) @name value: [(arrow_function) (function_expression)] @body) @def.function
+; A class expression assigned the same way (`module.exports = class { … }`) is
+; a class declaration of that name, holding its methods.
+(assignment_expression left: (identifier) @name right: (class body: (_) @body)) @def.class
+(assignment_expression left: (member_expression object: (_) @name.scope property: (property_identifier) @name) right: (class body: (_) @body)) @def.class
 (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant)
 (variable_declarator name: (identifier) @name) @def.variable
 

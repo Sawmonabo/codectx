@@ -143,9 +143,9 @@ func (k *javaScriptLinker) cjsWhole(v Node) {
 	switch jsKindOf(v) {
 	case kk.identifier:
 		k.cjs.whole, k.cjs.wholeFrom = string(textOf(k.src, v)), ""
-	case x.arrowFunction, kk.functionExpression:
-		// The structural query declares the function by the property it is
-		// stored under, `exports`.
+	case x.arrowFunction, kk.functionExpression, kk.class:
+		// The structural query declares the function or class by the name
+		// or property it is stored under, `exports`.
 		k.cjs.whole, k.cjs.wholeFrom = "exports", ""
 	case kk.callExpression:
 		if m, ok := k.required(v); ok {

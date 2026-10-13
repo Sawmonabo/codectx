@@ -87,7 +87,7 @@ const (
 	// written in (Ref.Index, -1 the module), the path a name the file's
 	// imports introduce denotes (Aux), ImportAll for an import of every member, and
 	// the name it denotes in that path's module when the import renames it
-	// (Sig, Import.Original).
+	// (Sig, Import.Original), importRequired in Flags for a `require`.
 	keyImport = "i\x00"
 	// keyGoDir + directory: a Go package declared in that directory, its
 	// name in Aux, which an import path ending in the directory reaches.
@@ -189,6 +189,14 @@ const (
 	// function returning a class type by value), so a call on that result
 	// runs that type's method.
 	flagExactReturn
+)
+
+// The marks of an import entry (keyImport).
+const (
+	// importRequired marks an ECMAScript `require` binding (Import.Syntax
+	// ImportRequire), whose namespace binding (`const x = require("m")`)
+	// is the module's whole value as well as its exports object.
+	importRequired byte = 1 << iota
 )
 
 // The marks of a parameter entry (keyParam).
@@ -472,7 +480,11 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 		if imp.Name == "" {
 			continue
 		}
-		if err := s.Add(entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}); err != nil {
+		e := entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}
+		if imp.Syntax == ImportRequire {
+			e.Flags = importRequired
+		}
+		if err := s.Add(e); err != nil {
 			return err
 		}
 	}
@@ -1070,10 +1082,16 @@ func (h *hierarchy) importedType(fc fileCtx, local, p string, scope int32, yield
 		}
 		return h.rustModuleDecls(keyTypeModule, fc, scope, module, last, yield)
 	case "js", "python":
-		original, err := h.importOriginal(fc, local, p)
+		original, required, err := h.importOriginal(fc, local, p)
 		switch {
-		case err != nil || original == ImportAll:
+		case err != nil:
 			return err
+		case original == ImportAll && required:
+			// `const C = require("./c")` binds the module's whole value
+			// (`module.exports = C`, `export = C`).
+			local = wire.ExportAssignment
+		case original == ImportAll:
+			return nil
 		case original != "":
 			local = original
 		}
@@ -1260,8 +1278,10 @@ func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases [
 			continue
 		}
 		if x.Name == x.Original {
-			// The declaration's own name: exportedByName decides it.
-			if slices.ContainsFunc(t.Decls, func(d Decl) bool { return d.Parent < 0 && d.Name == x.Name }) {
+			// The declaration's own name: exportedByName decides it for a
+			// declaration the provider marks exported. One it does not (a
+			// CommonJS `module.exports = { helper }`) is exported here.
+			if slices.ContainsFunc(t.Decls, func(d Decl) bool { return d.Parent < 0 && d.Name == x.Name && d.Exported }) {
 				continue
 			}
 		}
@@ -1318,16 +1338,16 @@ func exportedByName(t *Table, i int) bool {
 
 // importOriginal is the name the import of fc's file binding local to path p
 // denotes in p's module when the import renames it ("default" for a default
-// import, "*" for a namespace import), else empty.
-func (h *hierarchy) importOriginal(fc fileCtx, local, p string) (string, error) {
-	original := ""
-	err := h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+local, func(e entry) error {
+// import, "*" for a namespace import), else empty; required reports a
+// `require` binding (importRequired).
+func (h *hierarchy) importOriginal(fc fileCtx, local, p string) (original string, required bool, err error) {
+	err = h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+local, func(e entry) error {
 		if e.Aux == p && e.Sig != "" {
-			original = e.Sig
+			original, required = e.Sig, e.Flags&importRequired != 0
 		}
 		return nil
 	})
-	return original, err
+	return original, required, err
 }
 
 // imports yields the path each import of fc's file binding name denotes,
