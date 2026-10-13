@@ -165,7 +165,10 @@ func TestLanguageFixtures(t *testing.T) {
 					t.Fatalf("node %q range [%d,%d) does not fit %d bytes", n.Name, r.Start.Byte, r.End.Byte, len(src))
 				}
 				text := string(src[r.Start.Byte:r.End.Byte])
-				if n.Kind != model.NodeModule && !strings.Contains(text, n.Name) {
+				// A callable's return node is named `return` and located at
+				// the callable's name token (docs/providers-treesitter.md,
+				// The return node), so its range holds the callable's name.
+				if n.Kind != model.NodeModule && !returnNode(cap.nodes[i]) && !strings.Contains(text, n.Name) {
 					t.Fatalf("node %s %q range [%d,%d) selects %q, which does not contain its name", n.Kind, n.Name, r.Start.Byte, r.End.Byte, text)
 				}
 				if got := lineOf(src, r.Start.Byte); got != r.Start.Line {
@@ -266,6 +269,12 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 	var owner model.NodeID
 	for _, n := range cap.nodes {
 		switch {
+		case n.Node.Kind == model.NodeVariable && returnNode(n):
+			// No source identifier declares a return node, so it carries
+			// no declaration-key alias.
+			if slices.ContainsFunc(cap.aliases, func(a model.NativeAlias) bool { return a.NodeID == n.Node.ID }) {
+				t.Fatalf("%s: the return node of a callable carries an alias", file)
+			}
 		case n.Node.Kind == model.NodeVariable:
 			if prev, ok := vars[n.Node.Name]; ok && prev != n.Node.ID {
 				t.Fatalf("%s: two variable nodes named %s; nodes: %s", file, n.Node.Name, names(cap.nodes))
@@ -346,6 +355,12 @@ func TestAnEmptyFileIndexes(t *testing.T) {
 			wantFresh(t, result.Capabilities)
 		})
 	}
+}
+
+// returnNode reports a callable's return node, keyed `ret:` over the
+// callable's name token.
+func returnNode(f model.NodeFact) bool {
+	return f.Node.Kind == model.NodeVariable && len(f.Evidence) > 0 && strings.HasPrefix(f.Evidence[0].NativeKey, "ret:")
 }
 
 // capture records the facts a unit persisted so the test can read the
@@ -581,15 +596,19 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 		// `ns` is bound by a namespace import, so `ns.start()` is a call
 		// through that import, although the file declares a method start. A
 		// clause walk that binds nothing resolves it to that method instead.
-		wantCallee(t, meta, file, "start", "import")
+		// `new Server().start("x")` is a call of a member on a receiver
+		// value, which binds nothing in the file (the linker binds it by the
+		// receiver's type), so it is the one unresolved placeholder.
+		wantCallees(t, meta, file, "start", "import", "unresolved")
 		return
 	case "sample.rs":
 		// `use std::io::{self, Write}` binds io, not "self": `io::stdout()`
-		// is a call through the import, and `self.width()` is the file's own
-		// method, resolved to it with no callee placeholder at all. Binding
-		// "self" makes the second a call through an import and drops it.
+		// is a call through the import, and `self.width()` is a call of a
+		// member on a receiver value, which binds nothing in the file (the
+		// linker binds it by the receiver's type): its placeholder is
+		// unresolved. Binding "self" makes it a call through an import.
 		wantCallee(t, meta, file, "stdout", "import")
-		wantCallee(t, meta, file, "width", "")
+		wantCallee(t, meta, file, "width", "unresolved")
 		return
 	case "sample.go":
 	default:
@@ -634,6 +653,30 @@ func wantCallee(t *testing.T, meta map[model.NodeID]string, file, callee, resolu
 		t.Fatalf("%s: the call to %s published callee placeholders %v; it names the file's own declaration", file, callee, got)
 	case resolution != "" && (len(got) != 1 || !strings.Contains(got[0], `"resolution":"`+resolution+`"`)):
 		t.Fatalf("%s: the call to %s published callee placeholders %v, want one with resolution %s", file, callee, got, resolution)
+	}
+}
+
+// wantCallees asserts the resolutions of the callee placeholders a file's
+// calls to callee published, one per resolution given, in any order.
+func wantCallees(t *testing.T, meta map[model.NodeID]string, file, callee string, resolutions ...string) {
+	t.Helper()
+	var got []string
+	for _, m := range meta {
+		if strings.Contains(m, `"callee":"`+callee+`"`) {
+			got = append(got, m)
+		}
+	}
+	missing := slices.Clone(resolutions)
+	for _, m := range got {
+		for i, r := range missing {
+			if strings.Contains(m, `"resolution":"`+r+`"`) {
+				missing = slices.Delete(missing, i, i+1)
+				break
+			}
+		}
+	}
+	if len(got) != len(resolutions) || len(missing) > 0 {
+		t.Fatalf("%s: the calls to %s published callee placeholders %v, want one each with resolution %v", file, callee, got, resolutions)
 	}
 }
 
