@@ -27,8 +27,10 @@ import (
 //     with no override of the unit and one candidate, that one is proven;
 //     otherwise each candidate is published as one (DetailSupertypeCandidate,
 //     "at least one of n"), so a call on any of them reaches d.
-//   - Rust: an impl item implements its impl's trait, the self type's
-//     single external trait when the type has exactly one.
+//   - Rust: an impl item implements its impl's trait (rustTraitOverrides);
+//     only an item whose trait path the worker could not spell
+//     (Decl.Trait empty) falls back to the self type's single external
+//     trait, when the type has exactly one.
 //
 // A method with no mark gets nothing: the mark is the only proof that a
 // type outside the unit has the member.

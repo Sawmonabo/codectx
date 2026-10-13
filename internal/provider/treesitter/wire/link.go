@@ -143,6 +143,15 @@ type Export struct {
 	// declaration (`type A = T`) it is "=" and T's form. Empty for every
 	// other declaration.
 	Identity string
+	// Trait is, for a method or associated function of a Rust `impl Trait
+	// for Type` block, that block's trait spelled as a Supertype's Super is
+	// (references, `dyn` and generic arguments removed, the path as written:
+	// `fmt::Display`), whether or not the block's self type is a type
+	// parameter, which sends no Supertype. A trait impl can define only the
+	// trait's items (the Rust Reference's "Trait implementations"), so the
+	// method implements exactly this trait's item of its name and no other
+	// trait of its self type. Empty for every other export.
+	Trait string
 	// Visibility is, for a C or C++ object-like macro, the symbol visibility
 	// its replacement list states (one of the Visibility values); empty when the replacement
 	// is no specifier sequence or is one identifier (Alias).
@@ -387,7 +396,8 @@ const (
 // type, so a virtual call on it runs that type's function ([class.virtual]:
 // the call is virtual only through a pointer or reference). The result of
 // a function that returns the type by value (Export.Returns) is one too.
-// Only the C++ worker sends it.
+// The ECMAScript worker sends it for the value of `new C()`, whose dynamic
+// type is exactly C.
 const ExactObject uint32 = 1
 
 // Type is a value's type as the worker recovered it inside the file: a name
@@ -406,7 +416,7 @@ type Type struct {
 //	exports    n × (name start, end; receiver; signature; params; optional;
 //	                variadic, static, abstract, virtual, final, internal
 //	                flags; returns type; override flag; alias; property,
-//	                exported flags; identity; visibility; macros)
+//	                exported flags; identity; trait; visibility; macros)
 //	supertypes n × (type; super; interface flag)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
 //	                signature; args n × type; arguments n × (at start, end;
@@ -441,6 +451,7 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.flag(x.Property)
 		e.flag(x.Exported)
 		e.str(x.Identity)
+		e.str(x.Trait)
 		e.str(x.Visibility)
 		e.str(x.Macros)
 	}
@@ -554,14 +565,14 @@ func DecodeLink(payload []byte) (Link, error) {
 	d := decoder{b: payload, malformed: ErrMalformedLink}
 	var l Link
 	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
-	// flags, a 9-byte type, 1 flag, 4 alias, 2 flags, 4 identity, 4 visibility
-	// and 4 macros; a conversion two strings; a supertype two strings and
+	// flags, a 9-byte type, 1 flag, 4 alias, 2 flags, 4 identity, 4 trait, 4
+	// visibility and 4 macros; a conversion two strings; a supertype two strings and
 	// 1 flag; a site 8 span, 1 shape, 4 qualifier, 9 type, 4 signature, 4
 	// args and 4 arguments; an argument 8 span, 4 keyword, 1 spread and 4
 	// reads; a read 8 span; a value 8 span, 4 field, 9 type and 8 span; a reexport
 	// three strings; a union its count; a parameter two 8 spans, 4 index and 2 flags; a
 	// dynamic import 8 span, 4 fragments and 1 flag; a fragment its length.
-	l.Exports = make([]Export, 0, d.count(58))
+	l.Exports = make([]Export, 0, d.count(62))
 	for range cap(l.Exports) {
 		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32(), Optional: d.u32()}
 		x.Variadic, x.Static, x.Abstract = d.flag(), d.flag(), d.flag()
@@ -570,6 +581,7 @@ func DecodeLink(payload []byte) (Link, error) {
 		x.Override, x.Alias = d.flag(), d.str()
 		x.Property, x.Exported = d.flag(), d.flag()
 		x.Identity = d.str()
+		x.Trait = d.str()
 		x.Visibility, x.Macros = d.str(), d.str()
 		l.Exports = append(l.Exports, x)
 	}
@@ -695,6 +707,12 @@ func (d *decoder) typ() Type {
 	}
 	return Type{Kind: k, Name: d.str(), Index: d.u32()}
 }
+
+// ExportAssignment is the Reexport name of a module's whole value: the
+// CommonJS `module.exports = x` and the TypeScript `export = x`, which a
+// call or construction of the module itself (`require("./m")()`) reaches.
+// An `export *` passes it on no more than it passes on `default`.
+const ExportAssignment = "export="
 
 // The symbol visibility a C or C++ attribute states: the GCC `visibility`
 // attribute's four values, the MSVC `__declspec` storage classes, none

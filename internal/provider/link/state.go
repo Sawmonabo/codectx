@@ -60,16 +60,15 @@ const stateTag = "link.resolution.nodes\n"
 // details is every technique a fact can carry, in its stored order, which is
 // also the order of preference a fold of two equal facts keeps (better); the
 // empty technique, a fact no technique is named for (an open or external
-// site), is last.
-// The visibility details and supertype_anonymous follow it: none of their
-// facts folds with a fact of another technique, so their place orders
-// nothing.
+// site), is last. The visibility details and supertype_anonymous come just
+// before it: none of their facts folds with a fact of another technique, so
+// their place orders nothing.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
 	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
-	DetailSummary, DetailReturn, DetailSupertypeCandidate, "",
+	DetailSummary, DetailReturn, DetailSupertypeCandidate, DetailMacroInput, DetailMacroTranscribes,
 	DetailVisibilityDefault, DetailVisibilityHidden, DetailVisibilityProtected, DetailVisibilityInternal,
 	DetailVisibilityDllexport, DetailVisibilityDllimport, DetailVisibilityUnspecified, DetailVisibilityUnresolved,
-	DetailSupertypeAnonymous}
+	DetailSupertypeAnonymous, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {
@@ -104,9 +103,9 @@ func codeOf[T comparable](values []T, v T) (byte, bool) {
 // about one site, import or declaration are adjacent.
 func (k Fact) entry() int {
 	switch k {
-	case FactImport:
+	case FactImport, FactOpenImport:
 		return 1
-	case FactExtends, FactImplements, FactOverrides, FactVisibility:
+	case FactExtends, FactImplements, FactOverrides, FactGenerates, FactVisibility:
 		return 2
 	}
 	return 0
@@ -116,7 +115,7 @@ func (k Fact) entry() int {
 // it names no external one.
 func (k Fact) hasTarget() bool {
 	switch k {
-	case FactExternalSite, FactOpenSite:
+	case FactExternalSite, FactOpenSite, FactOpenImport:
 		return false
 	}
 	return true

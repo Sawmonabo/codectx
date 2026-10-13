@@ -64,7 +64,7 @@ const (
 // Capabilities are the capabilities the provider declares, one row of each
 // per unit.
 var Capabilities = []string{string(model.RelCalls), string(model.RelImports), string(model.RelDataFlowsTo),
-	string(model.RelExtends), string(model.RelImplements), string(model.RelOverrides)}
+	string(model.RelExtends), string(model.RelImplements), string(model.RelOverrides), string(model.RelGenerates)}
 
 // The evidence detail of a published occurrence names the technique that
 // found its fact.
@@ -128,6 +128,14 @@ const (
 	// one of n" (several may hold at once), or one published beside an
 	// override of the project's own, which the mark already proves.
 	DetailSupertypeCandidate = "supertype_candidate"
+	// DetailMacroInput: a `generates` from a Rust macro_rules to a
+	// declaration written in its input, which it may transcribe renamed,
+	// repeated or not at all.
+	DetailMacroInput = "macro_input"
+	// DetailMacroTranscribes: a `generates` from a Rust macro_rules every
+	// rule of which transcribes its item input once, unchanged: the
+	// declaration is exactly an item of its expansion.
+	DetailMacroTranscribes = "macro_transcribes"
 )
 
 // LinkOptions is what the delta build hands one unit's link.

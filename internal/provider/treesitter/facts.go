@@ -461,6 +461,7 @@ func (b *builder) resolveDecls() error {
 		if d.Impl != "" {
 			meta["receiver"] = d.Impl
 		}
+		macroOrigin(meta, d.MacroInput, d.MacroExact)
 		if len(d.SpecifierMacros) > 0 {
 			meta["specifier_macros"] = d.SpecifierMacros
 		}

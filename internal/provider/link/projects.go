@@ -2,9 +2,10 @@ package link
 
 // Project planning (Section 11.6). A linking unit is one project of the
 // repository: a Go module, a Maven or Gradle module, a `package.json`/
-// `tsconfig.json` project, a Python package, a Cargo workspace. C and C++ are
-// one unit per repository, because header resolution spans the whole tree and
-// a call into a header can land on any file of it.
+// `tsconfig.json`/`pnpm-workspace.yaml`/`lerna.json` project, a Python
+// package, a Cargo workspace. C and C++ are one unit per repository,
+// because header resolution spans the whole tree and a call into a header
+// can land on any file of it.
 //
 // The boundaries are the ones linking needs, not preferences. A call resolves
 // only to a declaration the unit holds, so a unit is the set of files whose
@@ -107,12 +108,15 @@ type Unit struct {
 }
 
 // markers names the manifest, lock and project files of a family. The first
-// group defines a project root; the second only joins the unit's closure.
+// group defines a project root; the second only joins the unit's closure. A
+// pnpm-workspace.yaml or lerna.json declares the JavaScript project its
+// packages are linked in, even with no package.json beside it; every config
+// an ECMAScript resolution reads joins the closure too (esConfigFile).
 var (
 	projectMarkers = map[Family][]string{
 		FamilyGo:         {"go.mod"},
 		FamilyJava:       {"pom.xml", "build.gradle", "build.gradle.kts"},
-		FamilyJavaScript: {"tsconfig.json", "jsconfig.json", "package.json"},
+		FamilyJavaScript: {"tsconfig.json", "jsconfig.json", "package.json", "pnpm-workspace.yaml", "lerna.json"},
 		FamilyPython:     {"pyproject.toml", "setup.py", "setup.cfg"},
 		FamilyRust:       {"Cargo.toml"},
 	}
@@ -346,6 +350,11 @@ func (u Unit) OwnsInput(p string) bool {
 		return true
 	}
 	base := path.Base(p)
+	if u.Family == FamilyJavaScript && esConfigFile(base) {
+		// Every config module resolution reads (tsconfig.base.json, a
+		// referenced tsconfig.app.json) is an input.
+		return true
+	}
 	return slices.Contains(projectMarkers[u.Family], base) || slices.Contains(closureMarkers[u.Family], base)
 }
 

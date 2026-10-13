@@ -92,7 +92,7 @@ const (
 	// written in (Ref.Index, -1 the module), the path a name the file's
 	// imports introduce denotes (Aux), ImportAll for an import of every member, and
 	// the name it denotes in that path's module when the import renames it
-	// (Sig, Import.Original).
+	// (Sig, Import.Original), importRequired in Flags for a `require`.
 	keyImport = "i\x00"
 	// keyGoDir + directory: a Go package declared in that directory, its
 	// name in Aux, which an import path ending in the directory reaches.
@@ -198,6 +198,14 @@ const (
 	// function returning a class type by value), so a call on that result
 	// runs that type's method.
 	flagExactReturn
+)
+
+// The marks of an import entry (keyImport).
+const (
+	// importRequired marks an ECMAScript `require` binding (Import.Syntax
+	// ImportRequire), whose namespace binding (`const x = require("m")`)
+	// is the module's whole value as well as its exports object.
+	importRequired byte = 1 << iota
 )
 
 // The marks of a parameter entry (keyParam).
@@ -417,6 +425,11 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	if h.ids, err = newIDTable(u.dir); err != nil {
 		return nil, err
 	}
+	es, err := newESResolver(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	defer es.close()
 	var file int32 = -1
 	err = u.members(func(fv model.FileVersion) error {
 		file++
@@ -433,7 +446,7 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		if t == nil {
 			return nil
 		}
-		return addDecls(decls, file, t)
+		return addDecls(ctx, decls, file, t, es)
 	})
 	if err == nil {
 		err = h.ids.finish()
@@ -496,8 +509,12 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	return h, nil
 }
 
-// addDecls adds t's file context, type declarations and free functions.
-func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
+// addDecls adds t's file context, type declarations and free functions,
+// and, through es, what an ECMAScript file's specifiers resolve to.
+func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32, t *Table, es *esResolver) error {
+	if err := es.add(ctx, s, t); err != nil {
+		return err
+	}
 	fc := contextOf(file, t)
 	fileKey := refKey(Ref{File: file})
 	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
@@ -507,7 +524,11 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		if imp.Name == "" {
 			continue
 		}
-		if err := s.Add(entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}); err != nil {
+		e := entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}
+		if imp.Syntax == ImportRequire {
+			e.Flags = importRequired
+		}
+		if err := s.Add(e); err != nil {
 			return err
 		}
 	}
@@ -559,6 +580,9 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 			if err := s.Add(entry{Key: keyGoAlias + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
 				return err
 			}
+		}
+		if err := addRustMacro(s, fc, ref, t, d); err != nil {
+			return err
 		}
 		if fc.family == "c" && d.Alias != "" {
 			if err := s.Add(entry{Key: keyMacro + d.Name, Ref: ref, Aux: t.Path, Sig: d.Alias}); err != nil {
@@ -618,7 +642,7 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		}
 	}
 	if len(bases) > 0 {
-		return addExports(s, file, t, bases, fc.family == "python")
+		return addExports(s, file, t, bases, fc.family == "python", es)
 	}
 	return nil
 }
@@ -1142,10 +1166,16 @@ func (h *hierarchy) importedType(fc fileCtx, local, p string, scope int32, yield
 		}
 		return h.rustModuleDecls(keyTypeModule, fc, scope, module, last, yield)
 	case "js", "python":
-		original, err := h.importOriginal(fc, local, p)
+		original, required, err := h.importOriginal(fc, local, p)
 		switch {
-		case err != nil || original == ImportAll:
+		case err != nil:
 			return err
+		case original == ImportAll && required:
+			// `const C = require("./c")` binds the module's whole value
+			// (`module.exports = C`, `export = C`).
+			local = wire.ExportAssignment
+		case original == ImportAll:
+			return nil
 		case original != "":
 			local = original
 		}
@@ -1180,15 +1210,13 @@ func (h *hierarchy) memberType(fc fileCtx, p string, scope int32, name string, y
 // ECMAScript or Python import spec written in fc's file names, following
 // the module's re-exports.
 func (h *hierarchy) moduleType(fc fileCtx, spec, name string, yield func(entry) error) error {
-	base, ok := moduleBase(fc.path, spec, fc.family == "python")
-	if !ok {
-		return nil
-	}
-	return h.moduleExport(base, name, func(e entry) error {
-		if e.Aux != exportType {
-			return nil
-		}
-		return yield(e)
+	return h.modules(fc, spec, func(base string) error {
+		return h.moduleExport(base, name, func(e entry) error {
+			if e.Aux != exportType {
+				return nil
+			}
+			return yield(e)
+		})
 	})
 }
 
@@ -1235,7 +1263,7 @@ func (h *hierarchy) resolveExport(base, name string, seen map[string]bool) (res 
 		res, ambiguous = append(res, r...), ambiguous || amb
 		return err
 	})
-	if err != nil || indirect || name == "default" {
+	if err != nil || indirect || name == "default" || name == wire.ExportAssignment {
 		return res, ambiguous, err
 	}
 	err = h.decls.lookup(keyReexport+base+"\x00*", func(e entry) error {
@@ -1281,7 +1309,7 @@ func sameExports(a, b []entry) bool {
 // `export { a as b }`), a module as a namespace (`export * as ns from`),
 // and re-exports another module's name (`export { x } from`, `export *
 // from`, a local export of an import binding).
-func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases []string, python bool) error {
+func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases []string, python bool, es *esResolver) error {
 	add := func(prefix, name string, e entry) error {
 		for _, b := range bases {
 			e.Key = prefix + b + "\x00" + name
@@ -1313,14 +1341,18 @@ func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases [
 		return nil
 	}
 	from := func(name, spec, original string) error {
-		target, ok := moduleBase(t.Path, spec, false)
-		switch {
-		case !ok:
-			return nil
-		case original == "*" && name != "*":
-			return add(keyExport, name, entry{Aux: exportModule, Sig: target})
+		for _, target := range es.targets(t.Path, spec) {
+			var err error
+			if original == "*" && name != "*" {
+				err = add(keyExport, name, entry{Aux: exportModule, Sig: target})
+			} else {
+				err = add(keyReexport, name, entry{Aux: target, Sig: original})
+			}
+			if err != nil {
+				return err
+			}
 		}
-		return add(keyReexport, name, entry{Aux: target, Sig: original})
+		return nil
 	}
 	for _, x := range t.Reexports {
 		if x.From != "" {
@@ -1330,8 +1362,10 @@ func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases [
 			continue
 		}
 		if x.Name == x.Original {
-			// The declaration's own name: exportedByName decides it.
-			if slices.ContainsFunc(t.Decls, func(d Decl) bool { return d.Parent < 0 && d.Name == x.Name }) {
+			// The declaration's own name: exportedByName decides it for a
+			// declaration the provider marks exported. One it does not (a
+			// CommonJS `module.exports = { helper }`) is exported here.
+			if slices.ContainsFunc(t.Decls, func(d Decl) bool { return d.Parent < 0 && d.Name == x.Name && d.Exported }) {
 				continue
 			}
 		}
@@ -1388,16 +1422,16 @@ func exportedByName(t *Table, i int) bool {
 
 // importOriginal is the name the import of fc's file binding local to path p
 // denotes in p's module when the import renames it ("default" for a default
-// import, "*" for a namespace import), else empty.
-func (h *hierarchy) importOriginal(fc fileCtx, local, p string) (string, error) {
-	original := ""
-	err := h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+local, func(e entry) error {
+// import, "*" for a namespace import), else empty; required reports a
+// `require` binding (importRequired).
+func (h *hierarchy) importOriginal(fc fileCtx, local, p string) (original string, required bool, err error) {
+	err = h.decls.lookup(keyImport+refKey(Ref{File: fc.file})+local, func(e entry) error {
 		if e.Aux == p && e.Sig != "" {
-			original = e.Sig
+			original, required = e.Sig, e.Flags&importRequired != 0
 		}
 		return nil
 	})
-	return original, err
+	return original, required, err
 }
 
 // imports yields the path each import of fc's file binding name denotes,
@@ -1540,6 +1574,8 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 //     member the static type names;
 //   - Go: one of them is an interface's method; a concrete type's method is
 //     promoted into the types embedding it, never overridden;
+//   - ECMAScript: unless the method is private (`#p`), whose name is its
+//     class body's alone;
 //   - every other family: always (a Rust call reads its receiver's kind
 //     instead, staticFile.dispatchOf).
 //
@@ -1559,6 +1595,8 @@ func (h *hierarchy) overridable(family string, typ Ref, method string, found []e
 			return false, nil
 		}
 		return h.virtual(typ, method)
+	case "js":
+		return !strings.HasPrefix(method, "#"), nil
 	}
 	return true, nil
 }
@@ -2070,8 +2108,8 @@ func (h *hierarchy) externalImported(fc fileCtx, p, original, local, rest string
 		// `from m import sub`, a submodule: its names are m.sub's.
 		return join(p, local, rest), true, nil
 	case "js":
-		if strings.HasPrefix(p, ".") || strings.HasPrefix(p, "/") {
-			return "", false, nil
+		if outside, err := h.esOutside(fc.path, p); err != nil || !outside {
+			return "", false, err
 		}
 		switch original {
 		case "*":
@@ -2208,6 +2246,9 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		case isCallable(d.Kind):
 			err = h.overrideFacts(ctx, fc, t, ref, d, emit)
 		}
+		if err == nil {
+			err = h.macroInputFacts(fc, ref, d, emit)
+		}
 		if err != nil {
 			return err
 		}
@@ -2328,6 +2369,12 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 	case fc.family == "rust" && !d.Override:
 		// Only an item of a trait's impl implements the trait's.
 		return nil
+	case fc.family == "js" && strings.HasPrefix(d.Name, "#"):
+		// A private method's name is its class body's alone (ECMA-262
+		// §15.7.1, PrivateName): it overrides nothing.
+		return nil
+	case fc.family == "rust" && d.Trait != "":
+		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
 	case fc.family == "go" && d.Parent >= 0 && int(d.Parent) < len(t.Decls) && t.Decls[d.Parent].Kind == model.NodeInterface:
 		// An interface's method specification implements nothing.
 		return nil

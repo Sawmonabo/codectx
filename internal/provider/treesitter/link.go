@@ -216,7 +216,8 @@ func (b *builder) linkTable() error {
 	for i := range b.decls {
 		d := &b.decls[i]
 		t.Decls[i] = link.Decl{Endpoint: b.declEndpoint(i), Parent: int32(d.Parent), Exported: d.Exported,
-			Prototype: d.Prototype, Macro: d.Macro}
+			Prototype: d.Prototype, Macro: d.Macro, MacroInput: d.MacroInput, MacroLocal: d.MacroLocal,
+			MacroTranscribes: d.MacroTranscribes}
 	}
 	for _, x := range wl.Exports {
 		i, ok := b.nameAt[x.Name]
@@ -228,7 +229,7 @@ func (b *builder) linkTable() error {
 		d.Described, d.Receiver, d.Signature, d.Params, d.Optional, d.Variadic = true, x.Receiver, x.Signature, x.Params, x.Optional, x.Variadic
 		d.Static, d.Abstract, d.Virtual, d.Final, d.Internal = x.Static, x.Abstract, x.Virtual, x.Final, x.Internal
 		d.Returns = typ(x.Returns)
-		d.Override, d.Alias, d.Property, d.Identity = x.Override, x.Alias, x.Property, x.Identity
+		d.Override, d.Alias, d.Property, d.Identity, d.Trait = x.Override, x.Alias, x.Property, x.Identity, x.Trait
 		d.Visibility, d.Macros = x.Visibility, x.Macros
 		d.Exported = d.Exported || x.Exported
 	}
@@ -264,7 +265,8 @@ func (b *builder) linkTable() error {
 			t.Dropped++
 			continue
 		}
-		t.Imports = append(t.Imports, link.Import{Path: x.Fragments[0], Scope: scope, Range: *rng})
+		t.Imports = append(t.Imports, link.Import{Path: x.Fragments[0], Scope: scope, Range: *rng,
+			Syntax: ecmaImportSyntax(b.lang.Name, string(b.src[x.At.Start:x.At.End]))})
 	}
 
 	if len(wl.Values) > 0 {
@@ -385,14 +387,15 @@ func (b *builder) linkImports() ([]link.Import, error) {
 				names = nil
 			}
 		}
+		syntax := ecmaImportSyntax(b.lang.Name, text)
 		if len(names) == 0 {
-			out = append(out, link.Import{Path: imp.Path, Scope: scope, Range: *rng})
+			out = append(out, link.Import{Path: imp.Path, Scope: scope, Range: *rng, Syntax: syntax})
 		}
 		// A Python `import a.b as c` binds c to the module a.b itself, which
 		// `from a.b import c` never does: its name denotes the whole module.
 		wholeModule := b.lang.Name == "python" && strings.HasPrefix(strings.TrimSpace(text), "import")
 		for i, n := range names {
-			li := link.Import{Name: n, Path: imp.Path, Scope: scope, Range: *rng}
+			li := link.Import{Name: n, Path: imp.Path, Scope: scope, Range: *rng, Syntax: syntax}
 			switch {
 			case wholeModule && n != link.ImportAll:
 				li.Original = "*"
@@ -403,6 +406,27 @@ func (b *builder) linkImports() ([]link.Import, error) {
 		}
 	}
 	return out, nil
+}
+
+// ecmaImportSyntax is the form of an ECMAScript import whose statement,
+// call or clause text is text (link.Import.Syntax): a `require` call or an
+// `x = require(...)` clause, an `import(...)` call, else a declaration.
+// Every other language has none.
+func ecmaImportSyntax(language, text string) string {
+	switch language {
+	case "javascript", "typescript", "tsx":
+	default:
+		return ""
+	}
+	switch rest, isImport := strings.CutPrefix(text, "import"); {
+	case isImport && strings.HasPrefix(strings.TrimSpace(rest), "("):
+		return link.ImportDynamic
+	case isImport:
+		return ""
+	case strings.Contains(text, "require"):
+		return link.ImportRequire
+	}
+	return ""
 }
 
 // enclosing is the index of the innermost declaration whose range contains

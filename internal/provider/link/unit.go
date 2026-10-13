@@ -111,11 +111,20 @@ const (
 	// Results, and the return node of the callable its value is returned
 	// from (Site.Into). Only a bound site with a result has one.
 	FactReturn Fact = 9
+	// FactOpenImport: the import Site (an index into Table.Imports) names
+	// a module of the repository (a workspace package, the file's own
+	// package, a `#` import) that resolves to no member file, such as an
+	// `exports` entry into a build output the snapshot ignores. It is
+	// counted as an open import, never as an external one.
+	FactOpenImport Fact = 10
+	// FactGenerates: the Rust macro_rules Target of another member may
+	// generate the declaration Site, written in its input (macro_rust.go).
+	FactGenerates Fact = 11
 	// FactVisibility: the C or C++ declaration Site is written with a macro
 	// whose definition Target (an object-like macro the declaration's file
 	// sees) states the visibility its Detail names (visibilityDetail). A
 	// macro defined in several `#if` arms has one fact per definition.
-	FactVisibility Fact = 11
+	FactVisibility Fact = 12
 )
 
 // Binding is one fact a resolver found. Site names the entry of a member's

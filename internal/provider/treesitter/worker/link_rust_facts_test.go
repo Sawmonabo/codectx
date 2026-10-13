@@ -91,3 +91,50 @@ func TestRustTraitImplMethodsAreMarkedOverride(t *testing.T) {
 		}
 	}
 }
+
+// TestRustTraitImplMethodsNameTheirOwnTrait protects the trait each method
+// of a trait impl carries (wire.Export.Trait): a type implementing two
+// traits that both declare `fmt` gives each `fmt` its own block's trait,
+// spelled as the block's supertype is, a blanket impl over a type parameter
+// still names its trait though it sends no supertype, and an inherent
+// impl's method names none.
+//
+// Mutation: carry only the trait-impl mark, not the trait -> Trait is empty.
+// Mutation: take the self type's first trait for every method -> the second
+// `fmt` names fmt::Display.
+// Mutation: set the trait only where a supertype is sent -> the blanket
+// impl's `describe` names none.
+func TestRustTraitImplMethodsNameTheirOwnTrait(t *testing.T) {
+	src := `use std::fmt;
+pub struct T;
+impl fmt::Display for T {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { Ok(()) }
+}
+impl fmt::Debug for T {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { Ok(()) }
+}
+pub trait Describe { fn describe(&self) -> String; }
+impl<X: fmt::Debug> Describe for X {
+    fn describe(&self) -> String { String::new() }
+}
+impl T {
+    pub fn plain(&self) {}
+}
+`
+	l, _ := linkOf(t, "rust", "lib.rs", src)
+	for _, c := range []struct {
+		name  string
+		nth   int
+		trait string
+	}{{"fmt", 0, "fmt::Display"}, {"fmt", 1, "fmt::Debug"}, {"describe", 1, "Describe"}, {"plain", 0, ""}, {"describe", 0, ""}} {
+		// The name token follows "fn " in its nth declaration.
+		s := textAt(t, src, "fn "+c.name, c.nth)
+		x := exportNamed(l, wire.Span{Start: s.Start + 3, End: s.End})
+		if x == nil {
+			t.Fatalf("no export for %s #%d", c.name, c.nth)
+		}
+		if x.Trait != c.trait {
+			t.Fatalf("%s #%d: trait %q, want %q", c.name, c.nth, x.Trait, c.trait)
+		}
+	}
+}

@@ -86,7 +86,19 @@ type Import struct {
 	// Range is the import statement, directive or call, the range of the
 	// evidence of each `imports` it resolves to.
 	Range model.SourceRange `json:"range"`
+	// Syntax is an ECMAScript import's form: ImportRequire, ImportDynamic,
+	// or empty for an import declaration. It selects the `import` or
+	// `require` condition of a package's `exports`.
+	Syntax string `json:"syntax,omitempty"`
 }
+
+// The forms of an ECMAScript import (Import.Syntax).
+const (
+	// ImportRequire is `require("m")` or `import x = require("m")`.
+	ImportRequire = "require"
+	// ImportDynamic is `import("m")`.
+	ImportDynamic = "dynamic"
+)
 
 // DynamicImport is one import whose path is an expression that does not
 // fold to a constant (`require("./x/" + name)`, `import(expr)`,
@@ -168,6 +180,19 @@ type Decl struct {
 	// (wire.Export.Identity), which the linker resolves to the packages
 	// declaring its types (goIdentity).
 	Identity string `json:"identity,omitempty"`
+	// Trait is, for a method of a Rust `impl Trait for Type` block, the
+	// block's trait as written (wire.Export.Trait): the one trait whose item
+	// of the method's name it implements.
+	Trait string `json:"trait,omitempty"`
+	// MacroInput is, for a Rust declaration written in an item-position
+	// macro's body, the innermost macro's path as written
+	// (wire.Decl.MacroInput); MacroLocal reports that a macro_rules of the
+	// same file in scope there is that macro (wire.Decl.MacroLocal).
+	MacroInput string `json:"macro_input,omitempty"`
+	MacroLocal bool   `json:"macro_local,omitempty"`
+	// MacroTranscribes reports a Rust macro_rules that transcribes its item
+	// input unchanged (wire.Decl.MacroTranscribes).
+	MacroTranscribes bool `json:"macro_transcribes,omitempty"`
 	// Visibility is, for a C or C++ object-like macro, the visibility its
 	// replacement states (wire.Export.Visibility).
 	Visibility string `json:"visibility,omitempty"`
