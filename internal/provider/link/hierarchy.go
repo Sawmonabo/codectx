@@ -176,6 +176,10 @@ const (
 	// replacement is one identifier (Decl.Alias), its file's path in Aux and
 	// the identifier in Sig.
 	keyMacro = "ma\x00"
+	// keyMacroVisibility + name: a C or C++ object-like macro of that name
+	// whose replacement states a visibility (Decl.Visibility), its file's
+	// path in Aux and the visibility in Sig.
+	keyMacroVisibility = "mv\x00"
 )
 
 // The flags of an entry.
@@ -280,6 +284,11 @@ type fileCtx struct {
 	// the index; a Rust path written inside an inline module is read from
 	// that module (rustScope).
 	decls []Decl
+	// anonymous maps, for a Java file, the byte offset of the name token of
+	// each anonymous class body's declaration (a class named `new T`, or the
+	// enum constant whose body it is) to its index in decls
+	// (anonymousType).
+	anonymous map[uint64]int32
 }
 
 // closedState caches a file's closedImports answer.
@@ -296,6 +305,15 @@ func contextOf(file int32, t *Table) fileCtx {
 		fc.scopes = []string{path.Dir(t.Path) + "\x00" + t.Package}
 	case "java":
 		fc.scopes = []string{t.Package}
+		for i := range t.Decls {
+			d := &t.Decls[i]
+			if d.NameRange != nil && (d.Kind == model.NodeConstant || anonymousClass(d)) {
+				if fc.anonymous == nil {
+					fc.anonymous = map[uint64]int32{}
+				}
+				fc.anonymous[d.NameRange.Start.Byte] = int32(i)
+			}
+		}
 	case "c":
 		fc.scopes = []string{""}
 		add := func(ns string) {
@@ -571,6 +589,11 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 				return err
 			}
 		}
+		if fc.family == "c" && d.Visibility != "" {
+			if err := s.Add(entry{Key: keyMacroVisibility + d.Name, Ref: ref, Aux: t.Path, Sig: d.Visibility}); err != nil {
+				return err
+			}
+		}
 		ns := ""
 		if fc.family == "c" {
 			ns = namespaceOf(d, fc.sep)
@@ -795,8 +818,13 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 		external, ok := "", false
 		if len(supers) == 0 {
-			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil || !ok {
+			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil {
 				return err
+			}
+			if !ok {
+				// A supertype that names nothing the unit or the language
+				// knows leaves the file's other rows linked.
+				continue
 			}
 		}
 		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
@@ -917,7 +945,7 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 		return nil
 	}
 	if fc.family == "java" {
-		if ref, ok := anonymousType(fc.file, name); ok {
+		if ref, ok := anonymousType(fc, name); ok {
 			return yield(entry{Ref: ref})
 		}
 	}
@@ -993,25 +1021,42 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 	return h.decls.lookup(keyTypeName+fc.family+"\x00"+name, yield)
 }
 
-// anonymousType is the synthetic type of the Java anonymous class body a
-// name written in file denotes: the Java worker names each anonymous class
-// body (and each enum constant's body) of a file `#k`, k its one-based
-// ordinal in source order, a name no Java identifier can spell (JLS §3.8).
-// Its methods are its own and it is a subtype of the type it instantiates
-// (JLS §15.9.5), so a call on that type dispatches into them and a call on
-// any other subtype does not. It has no declaration: its Ref's Index is
-// -1-k, below the module's -1, and it is only ever a key of the hierarchy.
-func anonymousType(file int32, name string) (Ref, bool) {
+// anonymousType is the type of the Java anonymous class body a name written
+// in the file of fc denotes: the Java worker names each anonymous class body
+// (and each enum constant's body) `#n`, n the byte offset of the name token
+// of the declaration the structural provider publishes for it (a class
+// named `new T`, or the enum constant), a name no Java identifier can spell
+// (JLS §3.8). Its methods are its own and it is a subtype of the type it
+// instantiates (JLS §15.9.5), so a call on that type dispatches into them
+// and a call on any other subtype does not. A body with no such declaration
+// (a creation the structural query does not capture) is a synthetic type of
+// the hierarchy alone: its Ref's Index is -2-n, below the module's -1.
+func anonymousType(fc fileCtx, name string) (Ref, bool) {
 	digits, ok := strings.CutPrefix(name, "#")
 	if !ok {
 		return Ref{}, false
 	}
-	k, err := strconv.ParseInt(digits, 10, 32)
-	if err != nil || k < 1 {
+	n, err := strconv.ParseUint(digits, 10, 31)
+	if err != nil {
 		return Ref{}, false
 	}
-	return Ref{File: file, Index: int32(-1 - k)}, true
+	if i, ok := fc.anonymous[n]; ok {
+		return Ref{File: fc.file, Index: i}, true
+	}
+	return Ref{File: fc.file, Index: int32(-2 - int64(n))}, true
 }
+
+// anonymousClass reports the declaration of a Java anonymous class body: a
+// class whose name, `new T`, no Java identifier can spell.
+func anonymousClass(d *Decl) bool {
+	return d.Kind == model.NodeClass && strings.HasPrefix(d.Name, "new ")
+}
+
+// DetailSupertypeAnonymous: an `extends` from a Java anonymous class body
+// to the type outside the project it instantiates, which the creation
+// proves neither a class nor an interface (JLS §15.9.5: the body extends a
+// class, or extends Object and implements an interface).
+const DetailSupertypeAnonymous = "supertype_anonymous"
 
 // anonymousReceiver reports a method of a Java anonymous class body: its
 // receiver is the body's synthetic type (anonymousType).
@@ -1019,7 +1064,7 @@ func anonymousReceiver(fc fileCtx, d *Decl) bool {
 	if fc.family != "java" {
 		return false
 	}
-	_, ok := anonymousType(fc.file, d.Receiver)
+	_, ok := anonymousType(fc, d.Receiver)
 	return ok
 }
 
@@ -1962,9 +2007,10 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 //     (`builtins.list`), unless a star import may supply it;
 //   - ECMAScript: as written, a global (`Error`);
 //   - Rust: a qualified name as written unless it starts in the crate
-//     (`crate`, `self`, `super`, a crate of the unit); a simple name as
-//     written (the prelude's), unless a glob of a path outside the crate may
-//     supply it;
+//     (`crate`, `self`, `super`, a crate of the unit); a global path
+//     (`::std::fmt::Display`) without its leading `::` unless its crate is
+//     the unit's (rustGlobalExternal); a simple name as written (the
+//     prelude's), unless a glob of a path outside the crate may supply it;
 //   - C and C++: a qualified name as written; a simple name only through a
 //     using-declaration, since any other may be a template parameter.
 //
@@ -1990,6 +2036,9 @@ func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string
 			return nil
 		})
 	}
+	if global, ok := strings.CutPrefix(name, "::"); ok && fc.family == "rust" {
+		return h.rustGlobalExternal(global)
+	}
 	if head, rest, isQualified := strings.Cut(name, fc.sep); isQualified {
 		if err := collect(head); err != nil {
 			return "", false, err
@@ -2004,7 +2053,7 @@ func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string
 		case "go":
 			return "", false, nil
 		case "rust":
-			if head == "crate" || head == "self" || head == "super" || head == "" {
+			if head == "crate" || head == "self" || head == "super" {
 				return "", false, nil
 			}
 			crate := false
@@ -2282,7 +2331,10 @@ func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Bindi
 	}
 	return h.links.lookup(keyExternalSuper+refKey(ref), func(e entry) error {
 		detail := DetailSupertypeClass
-		if e.Flags&flagInterface != 0 {
+		switch {
+		case anonymousClass(d):
+			detail = DetailSupertypeAnonymous
+		case e.Flags&flagInterface != 0:
 			detail = DetailSupertypeInterface
 		}
 		return emit(Binding{Kind: relation(e.Flags), Site: ref, Detail: detail, External: externalType(fc.family, e.Aux)})
@@ -2354,7 +2406,7 @@ func (h *hierarchy) owners(ctx context.Context, fc fileCtx, t *Table, d *Decl, y
 		return yield(Ref{File: fc.file, Index: p})
 	}
 	if anonymousReceiver(fc, d) {
-		ref, _ := anonymousType(fc.file, d.Receiver)
+		ref, _ := anonymousType(fc, d.Receiver)
 		return yield(ref)
 	}
 	if d.Receiver == "" {
@@ -2370,15 +2422,13 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 	case d.Static && (fc.family == "java" || fc.family == "c"):
 		// A static method hides; it overrides nothing.
 		return nil
-	case fc.family == "rust" && !d.Override:
-		// Only an item of a trait's impl implements the trait's.
-		return nil
+	case fc.family == "rust":
+		// Only an item of a trait's impl implements, and only its trait's.
+		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
 	case fc.family == "js" && strings.HasPrefix(d.Name, "#"):
 		// A private method's name is its class body's alone (ECMA-262
 		// §15.7.1, PrivateName): it overrides nothing.
 		return nil
-	case fc.family == "rust" && d.Trait != "":
-		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
 	case fc.family == "go" && d.Parent >= 0 && int(d.Parent) < len(t.Decls) && t.Decls[d.Parent].Kind == model.NodeInterface:
 		// An interface's method specification implements nothing.
 		return nil

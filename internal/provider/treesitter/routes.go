@@ -31,6 +31,11 @@ import (
 func (b *builder) routeTable() []endpointFact {
 	s := newRouteScan(b)
 	if s == nil {
+		if b.lang.Name == "python" && b.mayNameSettings() {
+			// A settings module imports no framework: its chain is read
+			// alone (djangoSettings).
+			b.links = newRouteScanOf(b).linkRoutes()
+		}
 		return nil
 	}
 	switch b.lang.Name {
@@ -38,10 +43,15 @@ func (b *builder) routeTable() []endpointFact {
 		s.python()
 	case "javascript", "typescript", "tsx":
 		s.express()
+		s.nest()
 	case "go":
 		s.goRoutes()
 	case "java":
 		s.spring()
+	}
+	s.applications()
+	if b.lang.Name == "python" {
+		b.links = s.linkRoutes()
 	}
 	return s.facts()
 }
@@ -69,7 +79,21 @@ type routeScan struct {
 	// methodsOn is, for gorilla/mux, the `.Methods(...)` site called on each
 	// site's result, by the worker index of the site it is called on.
 	methodsOn map[int]int
-	out       []routeFact
+	// closures are, for chi, the router each `Route` or `Group` closure
+	// receives as its parameter, by the closure's bytes.
+	closures map[wire.Span]*routeObj
+	// apps are the sites of application factories that build no object the
+	// table mounts routes on (Django's get_wsgi_application), by worker
+	// index; applications publishes them beside the root objects.
+	apps []int
+	// lists are the Starlette route lists this file passes as `routes=`,
+	// each with the object that holds its entries.
+	lists []routeList
+	// pending are the mounts of objects this file does not build, and
+	// djangoEntries the file's Django urlconf entries, for linkRoutes.
+	pending       []pendingMount
+	djangoEntries []djangoEntry
+	out           []routeFact
 }
 
 // routeImport is one local name an import binds: the module path as written
@@ -81,6 +105,12 @@ type routeImport struct{ path, original string }
 type routeFact struct {
 	endpointFact
 	receiver string
+	// obj is the object the route is registered on, nil when none this
+	// file builds; value and literal are its route's literal value, which
+	// the linker joins below the object's prefix (linkRoutes).
+	obj     *routeObj
+	value   string
+	literal bool
 }
 
 // newRouteScan indexes the file's sites, call references and imports, or is
@@ -92,6 +122,20 @@ func newRouteScan(b *builder) *routeScan {
 	if len(s.frameworks) == 0 {
 		return nil
 	}
+	return s.index()
+}
+
+// newRouteScanOf is the scan of a file whatever it imports.
+func newRouteScanOf(b *builder) *routeScan {
+	s := &routeScan{b: b, link: b.ex.link, imports: map[string]routeImport{}, frameworks: map[string]bool{},
+		objs: map[int]*routeObj{}}
+	s.routeImports()
+	return s.index()
+}
+
+// index indexes the file's call references and worker sites.
+func (s *routeScan) index() *routeScan {
+	b := s.b
 	s.refAt = make(map[wire.Span]int, len(b.ex.refs))
 	for i, r := range b.ex.refs {
 		if r.Kind != "call" {
@@ -191,13 +235,17 @@ const (
 	fwFlask   = "flask"
 	fwFastAPI = "fastapi"
 	fwDjango  = "django"
-	fwExpress = "express"
-	fwSpring  = "spring"
-	fwNetHTTP = "net/http"
-	fwGorilla = "gorilla/mux"
-	fwChi     = "chi"
-	fwGin     = "gin"
-	fwEcho    = "echo"
+	// fwStarlette is Starlette's route lists (Route, WebSocketRoute and
+	// Mount inside `routes=`), which a FastAPI application may hold too.
+	fwStarlette = "starlette"
+	fwExpress   = "express"
+	fwNest      = "nestjs"
+	fwSpring    = "spring"
+	fwNetHTTP   = "net/http"
+	fwGorilla   = "gorilla/mux"
+	fwChi       = "chi"
+	fwGin       = "gin"
+	fwEcho      = "echo"
 )
 
 // frameworkOf is the framework an import path of language names, or empty.
@@ -209,12 +257,20 @@ func frameworkOf(language, path string) string {
 			return fwFlask
 		case path == "fastapi" || strings.HasPrefix(path, "fastapi."):
 			return fwFastAPI
-		case path == "django.urls" || path == "django.conf.urls":
+		case path == "starlette" || strings.HasPrefix(path, "starlette."):
+			return fwStarlette
+		case path == "django" || path == "django.urls" || path == "django.conf.urls" || path == "django.core.wsgi" || path == "django.core.asgi":
+			// The urlconf functions (`from django import urls` binds
+			// them as a module), and the application factories a
+			// deployment module serves (applications).
 			return fwDjango
 		}
 	case "javascript", "typescript", "tsx":
-		if path == "express" {
+		switch path {
+		case "express":
 			return fwExpress
+		case "@nestjs/common":
+			return fwNest
 		}
 	case "go":
 		switch goModule(path) {
@@ -376,7 +432,11 @@ func (s *routeScan) emit(fw string, methods []string, r routeText, obj *routeObj
 	if r.literal {
 		prefix, ok = s.resolve(obj)
 	}
+	n := len(s.out)
 	s.emitPrefixed(fw, methods, r, prefix, ok, at, handlers, receiver)
+	for k := n; k < len(s.out); k++ {
+		s.out[k].obj, s.out[k].value, s.out[k].literal = obj, cmp.Or(r.path, r.value), r.literal
+	}
 }
 
 // emitPrefixed is emit with the prefix already decided.
@@ -724,7 +784,64 @@ func (s *routeScan) handlerAt(a routeArg) []handler {
 	if r, ok := s.nameRef(a.text, at); ok {
 		return []handler{refHandler(r)}
 	}
+	if callee, inner, ok := wrapperCall(a); ok {
+		if s.goConversion(callee.text) {
+			// A conversion to a handler type is the value itself.
+			return s.handlerAt(inner)
+		}
+		// Any other call builds the handler: the request runs what the
+		// function it calls returns, so the endpoint routes to it.
+		if r, ok := s.nameRef(callee.text, callee.at); ok {
+			return []handler{refHandler(r)}
+		}
+	}
 	return nil
+}
+
+// wrapperCall splits a handler written as a call of a name or a dotted name
+// with one argument, `http.HandlerFunc(f)` or `auth(h)`, into the callee
+// and the argument, each with its span.
+func wrapperCall(a routeArg) (callee, inner routeArg, ok bool) {
+	text := a.text
+	open := strings.IndexByte(text, '(')
+	if open <= 0 || !strings.HasSuffix(text, ")") || uint32(len(text)) != a.at.End-a.at.Start {
+		return routeArg{}, routeArg{}, false
+	}
+	depth := 0
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth--; depth == 0 && i != len(text)-1 {
+				return routeArg{}, routeArg{}, false
+			}
+		}
+	}
+	args := splitTop(text[open+1 : len(text)-1])
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return routeArg{}, routeArg{}, false
+	}
+	lead := len(args[0]) - len(strings.TrimLeft(args[0], " \t\n\r"))
+	arg := strings.TrimSpace(args[0])
+	start := a.at.Start + uint32(open+1+lead)
+	callee = routeArg{at: wire.Span{Start: a.at.Start, End: a.at.Start + uint32(open)}, text: text[:open]}
+	inner = routeArg{at: wire.Span{Start: start, End: start + uint32(len(arg))}, text: arg}
+	return callee, inner, true
+}
+
+// goConversion reports a callee that is net/http's HandlerFunc or Handler
+// type, which converts a function or a value to a handler.
+func (s *routeScan) goConversion(callee string) bool {
+	if s.b.lang.Name != "go" {
+		return false
+	}
+	pkg, name, ok := strings.Cut(callee, ".")
+	if !ok || name != "HandlerFunc" && name != "Handler" {
+		return false
+	}
+	imp, ok := s.imports[pkg]
+	return ok && strings.Trim(imp.path, "\"`") == "net/http"
 }
 
 // nameRef is a reference to text when it is a name or a dotted name with no

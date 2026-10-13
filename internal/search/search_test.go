@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -674,7 +675,7 @@ func assertCode(t *testing.T, what string, err error, want string) {
 // into one lexical result counting both.
 //
 // Mutation: serve the lexical sequence without the exact fold (drop the
-// exact fold (exactFold.served) in lexicalPhase) and the alpha node is served twice.
+// exact fold (servedExactly) in lexicalPhase) and the alpha node is served twice.
 func legEndToEndRanking(t *testing.T, f *fixture) {
 	s := newService(t, f.opts)
 	page, err := s.Search(f.ctx, model.SearchRequest{Query: "pkg.Alpha.Handle", Page: model.PageRequest{Limit: 10}})
@@ -866,6 +867,12 @@ func (s *stubExact) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int)
 	return nil, nil
 }
 
+// NodesAmong lists nothing, as Nodes does: the symbol tiers of this stub are
+// empty.
+func (s *stubExact) NodesAmong(context.Context, sqlite.NodeFilter, []model.NodeID) ([]sqlite.StoredNode, error) {
+	return nil, nil
+}
+
 // legPathTierLossless proves the exact_path tier drops nothing: it walks the
 // whole keyset and emits every kept candidate, with the read page size bounding
 // only one round trip. Serving five of eight candidates -- or answering
@@ -975,17 +982,40 @@ func (s *stubWideExact) DistinctNodesInFile(ctx context.Context, file model.File
 	return s.NodesInFile(ctx, file, afterStart, after, limit)
 }
 
-func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
-	match := func(n sqlite.StoredNode) bool {
-		switch {
-		case f.QualifiedName != "":
-			return n.Node.QualifiedName == f.QualifiedName
-		case f.QualifiedPrefix != "":
-			return strings.HasPrefix(n.Node.QualifiedName, f.QualifiedPrefix)
-		default:
-			return n.Node.Name == f.Name
+// matches is the NodeFilter's tier predicate, as storage applies it.
+func (s *stubWideExact) matches(f sqlite.NodeFilter, n sqlite.StoredNode) bool {
+	switch {
+	case f.QualifiedName != "":
+		return n.Node.QualifiedName == f.QualifiedName
+	case f.QualifiedPrefix != "":
+		return strings.HasPrefix(n.Node.QualifiedName, f.QualifiedPrefix)
+	default:
+		return n.Node.Name == f.Name
+	}
+}
+
+// NodesAmong synthesizes each asked node from its hex index and keeps those the
+// filter matches, in ascending id order, as storage answers them.
+func (s *stubWideExact) NodesAmong(_ context.Context, f sqlite.NodeFilter, ids []model.NodeID) ([]sqlite.StoredNode, error) {
+	var out []sqlite.StoredNode
+	for _, id := range ids {
+		i, err := strconv.ParseUint(string(id), 16, 64)
+		if err != nil {
+			return nil, err
+		}
+		if int(i) >= s.n {
+			continue
+		}
+		if n := s.node(int(i)); s.matches(f, n) {
+			out = append(out, n)
 		}
 	}
+	slices.SortFunc(out, func(a, b sqlite.StoredNode) int { return strings.Compare(string(a.Node.ID), string(b.Node.ID)) })
+	return out, nil
+}
+
+func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	match := func(n sqlite.StoredNode) bool { return s.matches(f, n) }
 	// The keyset resumes at the successor of `after`, which the fixed-width
 	// hex id encodes; rescanning from zero on every page would make the leg's
 	// cost quadratic in a corpus it walks 200 000 nodes of.
@@ -1015,8 +1045,8 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 // structure: a `seen` set deciding the cross-tier "most specific tier wins"
 // rule would hold one model.NodeID per distinct candidate, so a wide
 // qualified_name_prefix scan would cost heap proportional to the match count.
-// The rule is decided over the candidate in hand and the earlier tiers' own
-// keysets (tierRule), and the working set is one read page per tier however
+// The rule is decided over each read page of candidates and the earlier tiers'
+// rows for that page (tierRule), and the working set is one read page however
 // many candidates the tier yields.
 //
 // The heap is sampled at the LAST candidate, while anything the walk accumulated
@@ -1031,7 +1061,11 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 		stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "pkg/wide.go"}
 		var held uint64
 		count := 0
-		if err := exactCandidates(context.Background(), stub, "Widget", nil, hitFilter{}, 1000, allExactTiers,
+		rule, err := newSearchRule(context.Background(), stub, "Widget", nil, hitFilter{})
+		if err != nil {
+			t.Fatalf("newSearchRule: %v", err)
+		}
+		if err := exactCandidates(context.Background(), stub, rule, 1000, allExactTiers,
 			func(exactHit) error {
 				count++
 				if count == n {
@@ -1071,14 +1105,18 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 // emitted once, by the exact_path tier that outranks the symbol tiers, and the
 // symbol tiers do not emit it again.
 //
-// Mutation: drop the pathFile block from tierRule.earlier and the prefix tier
+// Mutation: drop the pathKept block from tierRule.ownedBefore and the prefix tier
 // re-emits all 500, doubling the count.
 func legExactPathTierOwnsItsFile(t *testing.T, _ *fixture) {
 	const n = 500
 	// The query resolves as a path AND matches the symbol tiers' filters.
 	stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "Widget"}
 	byTier := map[model.SearchTier]int{}
-	if err := exactCandidates(context.Background(), stub, stub.path, nil, hitFilter{}, 100, allExactTiers,
+	rule, err := newSearchRule(context.Background(), stub, stub.path, nil, hitFilter{})
+	if err != nil {
+		t.Fatalf("newSearchRule: %v", err)
+	}
+	if err := exactCandidates(context.Background(), stub, rule, 100, allExactTiers,
 		func(h exactHit) error { byTier[h.Tier]++; return nil }); err != nil {
 		t.Fatalf("exactCandidates: %v", err)
 	}
@@ -1341,6 +1379,10 @@ func (s *stubFileReader) DistinctNodesInFile(context.Context, model.FileID, int6
 }
 
 func (s *stubFileReader) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, errors.New("not used")
+}
+
+func (s *stubFileReader) NodesAmong(context.Context, sqlite.NodeFilter, []model.NodeID) ([]sqlite.StoredNode, error) {
 	return nil, errors.New("not used")
 }
 

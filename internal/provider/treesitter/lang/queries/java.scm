@@ -13,6 +13,14 @@
 (field_declaration declarator: (variable_declarator name: (identifier) @name)) @def.field
 (constant_declaration declarator: (variable_declarator name: (identifier) @name)) @def.constant
 (enum_constant name: (identifier) @name) @def.constant
+; An anonymous class body (JLS §15.9.5) is a class named `new T`, T the
+; created type's last simple name as the creation's call reference takes
+; it; its methods are its members. An enum constant's body is the
+; constant's own.
+(object_creation_expression type: (type_identifier) @name (class_body) @body) @def.class @anonymous
+(object_creation_expression type: (generic_type (type_identifier) @name) (class_body) @body) @def.class @anonymous
+(object_creation_expression type: (scoped_type_identifier (type_identifier) @name .) (class_body) @body) @def.class @anonymous
+(object_creation_expression type: (generic_type (scoped_type_identifier (type_identifier) @name .)) (class_body) @body) @def.class @anonymous
 
 (method_invocation !object name: (identifier) @call.name) @call
 (method_invocation object: (_) @call.qualifier name: (identifier) @call.name) @call

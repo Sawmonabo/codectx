@@ -44,6 +44,9 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
+| none of its own | `defines` | file module → a route endpoint at its full path, or a declared entry point | none |
+| none of its own | `routes_to` | route endpoint → each handler; declared entry point → its declaration or module | `import` |
+| none | `references` | C or C++ declaration → each definition of a macro among its specifiers that its file sees and that states a visibility | `visibility_<value>` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
 - `direct`: the callee names the declaration by its package, module, import or scope;
@@ -62,6 +65,15 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
   interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
   base list).
+- `visibility_default`, `visibility_hidden`, `visibility_protected`, `visibility_internal`, `visibility_dllexport`,
+  `visibility_dllimport`: the visibility a C or C++ macro definition's replacement states, as declared in source and
+  never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
+  `visibility_unspecified`: a definition that states none (an empty replacement, keywords only);
+  `visibility_unresolved`: one that names another macro among other tokens, which is not expanded. A declaration's
+  macros are read through the definitions its file sees: its own and those of a header it includes directly (the
+  include lookup), following a one-identifier replacement to the macro it names. Each definition reached is one
+  occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
+  with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
 **Caller and target.** The caller is the anonymous route handler a site is written in when the structural provider
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
@@ -126,8 +138,11 @@ a method, the method's name, with metadata `{"resolution":"external"}`. An exter
 never `class` or `interface`: whether it is a class, an interface, a trait or a struct is not known from the
 project's code, and one project can write it both ways (TypeScript lets a class implement a class), so a fixed kind
 keeps one qualified name one node in every unit. Each `extends` or `implements` into it carries the kind its own
-clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body has no node, so it
-publishes no supertype edge; its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
+clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body is its own class
+node (`new T`, below); its one supertype edge into a type outside the project is an `extends` with the detail
+`supertype_anonymous`, since the creation proves neither a class nor an interface (JLS §15.9.5: the body extends a
+class, or extends `Object` and implements an interface), and into a type of the unit it is `extends` or `implements`
+by that type's kind. Its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
 an external method declares, so one node stands for all of a type's methods of one name. A Java `@Override` of
 `toString` and `o.toString()` on an `Object` receiver both target `java.lang.Object.toString`. Every run of every
 unit that names an external node republishes it with its own evidence, and the delta build replaces the index-level
@@ -235,6 +250,61 @@ the interface's of its name; an interface with an unexported method implements o
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
 source, and publishes `implements` (`supertype_interface`) and no `overrides` (`go_conversions.go`).
 
+## Route prefixes across files
+
+A route's full path is often made in several files: a router declares its routes in one, and another includes it
+under a prefix (`app.include_router(users.router, prefix="/v1")`, `app.register_blueprint(views.bp)`, Django's
+`path("blog/", include("blog.urls"))`). The structural provider publishes such a route with `prefix: unresolved`
+(docs/providers-treesitter.md, Framework routes), and carries what the linker needs in the file's link table,
+`Table.Routing` (`internal/provider/link/route.go`):
+
+- `Objects`: each router or application object the file binds at module level, its framework and its own prefix
+  (`APIRouter(prefix=…)`, `Blueprint(url_prefix=…)`), or that it is not a literal;
+- `Routes`: each route registered on one of them, its method, its route as written and its literal value below the
+  object, and its handlers, as declarations of the file or as names the file imports;
+- `Mounts`: each mount of an object the file does not build, with the argument as written (`users.router`), the module
+  and name it names, the mount's prefix and whether it replaces the object's own (a Flask registration's
+  `url_prefix=`), the object it is made on, and that object's prefix below an application root when the file knows it.
+  A Django settings module's `ROOT_URLCONF` literal is a mount of the module it names at `/`, anchored by the
+  settings rather than an object.
+
+Every object is indexed in the module index under each dotted name its file can be imported as. The linker walks
+down from each mount anchored at an application root (a mount on a root object of the file, or a settings module's
+`ROOT_URLCONF` when some file names that settings module in `os.environ.setdefault("DJANGO_SETTINGS_MODULE", …)` or
+`os.environ["DJANGO_SETTINGS_MODULE"] = …`). Each hop looks up the module and name the mount names, keeps the hits
+an import's lookup keeps (the nearest source root, as for `imports`), joins the mount's prefix with the object's own,
+and descends into the mounts recorded on that object; a binding already on the hop's way ends it, so a cycle of
+routers including each other ends. The walk is bounded by the mounts the unit holds, never by a depth. Each route
+reached becomes one `endpoint` in the scope of the file the root mount is in, located at that mount, keyed
+`endpoint:<method route>@<full path>`, with the endpoint metadata `framework`, `method`, `route`, `prefix: resolved`
+and `path`, defined by the file's module and routing to each handler (`routes_to`, detail `import`). A handler the
+route's file imports is resolved through the module index to its declaration.
+
+A route several mounts reach is several endpoints, one per path, and every `routes_to` of each carries `set_size`,
+the number of paths the walks of the file's root mounts gave that route. A hop whose prefix is not a literal (an
+`include_router(r, prefix=PREFIX)`) leaves every route below it `prefix: unresolved` with no `path`, keyed by the
+route's file and object instead of a path; it is still counted in the set. A mount whose argument names no indexed
+object publishes nothing. Every lookup is traced on the mount's file, so a refresh that changes a router, a route or a
+settings module republishes the endpoints that reach it, and the routing is part of the interface summary, so a
+change to it rebuilds the index. Not walked: JavaScript and Go mounts across files, a Starlette `Mount` across files,
+and an application mounted as a child of another (`app.mount("/sub", sub_app)` with `sub_app` in another file).
+
+## Declared entry points
+
+The code a project's manifest declares as its entry points is an `endpoint` of the file it resolves to (ADR-0017
+decision 8, `internal/provider/link/route_entry.go`). The linker reads the manifest at the unit's root:
+
+| Manifest | Entries | Resolved to |
+|---|---|---|
+| `pyproject.toml` | `[project.scripts]` (group `console_scripts`), `[project.gui-scripts]` (`gui_scripts`), `[project.entry-points.<group>]`, each `module:attr` or `module` | the declaration `attr` names in the member file the module can be imported as (from the root or `src/`), or that file's module |
+| `package.json` | `bin` (a path, or a map of command name to path), `main` | the member file Node's `require` loads for the path (the path, then `.js`, `.mjs`, `.cjs`, then its `index.js`), its module |
+| `Cargo.toml` | `[[bin]]` with its `path`, else `src/bin/<name>.rs` or `src/bin/<name>/main.rs` | the file's top-level `fn main`, else its module |
+
+Each is keyed `endpoint:declared:<group>:<name>@<manifest>` (the group alone when it is the name, as for `main`),
+located at its target, defined by the file's module and routing to the target (detail `import`). A name several member files can supply
+publishes one endpoint in each, each with the set size; a value that names no member publishes nothing. The entries
+are manifest fields of the unit, so a change to one re-resolves the unit.
+
 ## Endpoint identity per family
 
 Every endpoint is a structural declaration node. Its scope is `file:<path>` and its native key is the qualified
@@ -253,7 +323,7 @@ toward it stays valid. What a call can bind to differs by family, and so does wh
 
 | Family | Targets | `Receiver` |
 |---|---|---|
-| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#k` for an anonymous class body or an enum constant's body, the k-th in the file in source order, sent as a subtype of the type it instantiates |
+| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#n` for an anonymous class body or an enum constant's body, n the byte offset of the name token of its declaration (the class `new T`, or the enum constant), sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
 | Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
 | C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds, and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
@@ -319,6 +389,8 @@ Besides the joined declarations, sites and values, the table carries what the re
   impl item);
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
   macro calls;
+- `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or
+  C++ declaration is written with, which its `references` visibility occurrences read;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
 - `Site.Results` and `Site.Into`: the variables the call's value is written into, and the callable whose return it
   reaches;
@@ -439,8 +511,10 @@ The members' language family picks the resolver:
   bare call binds in the innermost enclosing class that has the method, declared or inherited, walking out from an
   inner, local or anonymous class (JLS §15.12.1). A member site binds by its receiver's static type to the one
   method that type declares or inherits, `virtual` when that method can be overridden (not static and not `Final`,
-  `hierarchy.overridable`) and `exact` otherwise. An anonymous class body is a synthetic subtype of the type it
-  instantiates (`anonymousType`), whose methods override that type's. A call of an abstract method (a functional
+  `hierarchy.overridable`) and `exact` otherwise; a call on a newly created object (`new Dog().sound()`, no class
+  body) binds exactly, the object being exactly its class (JLS §15.9.4). An anonymous class body is a subtype of
+  the type it instantiates, read as its declaration (`anonymousType`: the class `new T`, or the enum constant whose
+  body it is), whose methods override that type's. A call of an abstract method (a functional
   interface's) also joins every method reference of that method's signature. A method reference `T::m` to an
   instance method, `T` a type, is unbound (JLS §15.13.1): its signature is `m`'s with `T` as its first parameter, and
   a call through it passes its first argument to the receiver and the rest to `m`'s parameters in order. A static
