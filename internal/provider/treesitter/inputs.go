@@ -461,6 +461,7 @@ func (s *inputScan) python() {
 		s.reads(fwFlask, recv, flaskRequest, 0, len(s.toks))
 	}
 	s.djangoViews()
+	s.drfViews()
 	s.fastAPIHandlers(fwFastAPI)
 	s.fastAPIHandlers(fwStarlette)
 }

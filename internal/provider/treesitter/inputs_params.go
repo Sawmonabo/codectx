@@ -158,8 +158,12 @@ func (s *inputScan) djangoViews() {
 	}
 	for i := range s.b.decls {
 		d := &s.b.decls[i]
-		if d.kind == model.NodeMethod && d.Parent >= 0 && classes[d.Parent] && djangoViewMethods[d.Name] {
-			views[i] = true
+		if d.kind == model.NodeMethod && d.Parent >= 0 && classes[d.Parent] {
+			// View.setup sets self.request before the view dispatches.
+			s.selfRequestReads(fwDjango, djangoRequest, i)
+			if djangoViewMethods[d.Name] {
+				views[i] = true
+			}
 		}
 	}
 	for i := range s.b.decls {

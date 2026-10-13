@@ -104,3 +104,75 @@ func list(c echo.Context) error {
 		"c.ShouldBindJSON(&in) -> in",
 	})
 }
+
+// TestDRFViewRequestReads is REST framework's request: an `@api_view`
+// function's parameter, a viewset's action and `@action` method, and
+// `self.request` in any method of a view class, read with REST framework's
+// own members beside Django's; a class that is no view reads nothing.
+// Mutations caught: data or query_params not modelled (their reads lost),
+// the view class not followed through a generics module import, actions
+// not read (no list read), `@action` not read (no recent read),
+// `self.request` not read (no get_queryset read), and the view-class gate
+// dropped (Plain's method read).
+func TestDRFViewRequestReads(t *testing.T) {
+	checkInputs(t, "views.py", `from rest_framework import generics, viewsets
+from rest_framework.decorators import action, api_view
+
+
+@api_view(["POST"])
+def create(request):
+    return request.data["name"]
+
+
+class Base(viewsets.ModelViewSet):
+    pass
+
+
+class Users(Base):
+    def list(self, request):
+        return request.query_params.get("page")
+
+    @action(detail=False)
+    def recent(self, request):
+        return request.COOKIES["sid"]
+
+    def get_queryset(self):
+        return self.request.query_params["q"]
+
+
+class Items(generics.ListAPIView):
+    def get(self, request):
+        return request.META["HTTP_X"]
+
+
+class Plain:
+    def list(self, request):
+        return request.data["x"]
+`, []string{
+		"create djangorestframework body name | request.data[\"name\"]",
+		"get djangorestframework header HTTP_X | request.META[\"HTTP_X\"]",
+		"get_queryset djangorestframework query q | self.request.query_params[\"q\"]",
+		"list djangorestframework query page | request.query_params.get(\"page\")",
+		"recent djangorestframework cookie sid | request.COOKIES[\"sid\"]",
+		"request.META[\"HTTP_X\"] -> get",
+		"request.query_params.get(\"page\") -> list",
+		"self.request.query_params[\"q\"] -> get_queryset",
+	})
+}
+
+// TestDjangoClassViewSelfRequest is `self.request` in any method of a
+// Django class-based view, which View.setup sets before dispatch. Mutation
+// caught: self.request not read in a Django view (get_context_data reads
+// nothing).
+func TestDjangoClassViewSelfRequest(t *testing.T) {
+	checkInputs(t, "views.py", `from django.views.generic import TemplateView
+
+
+class Home(TemplateView):
+    def get_context_data(self, **kwargs):
+        return {"q": self.request.GET["q"]}
+`, []string{
+		"get_context_data django query q | self.request.GET[\"q\"]",
+		"self.request.GET[\"q\"] -> get_context_data",
+	})
+}
