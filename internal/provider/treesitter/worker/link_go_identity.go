@@ -607,19 +607,23 @@ func (x *goLink) methodIdentity(n Node, params map[string]int) string {
 // aliasExport appends the export of the alias declaration n (`type A = T`),
 // its Identity "=" and the form of T: a type alias denotes T itself ("Alias
 // declarations"), so the linker reads the alias's name as T wherever a form
-// names it. A generic alias's form is "=?": an instantiation of it is a
-// type the form cannot spell.
+// names it. A generic alias's form is "=$$n" and T's form with its n type
+// parameters by position: an instantiation denotes T with its arguments.
 func (x *goLink) aliasExport(n Node) {
 	s := goIdentitySyntaxOf()
 	name := goChild(n, s.fName)
 	if name.IsNull() || x.blankDecl(n, name) {
 		return
 	}
-	form := goIdentityUnknown
-	if goChild(n, s.fTypeParameters).IsNull() {
-		f := x.newForm(nil)
-		f.typ(goChild(n, s.fType))
-		form = f.String()
+	params := x.typeParams(goChild(n, s.fTypeParameters))
+	f := x.newForm(params)
+	f.typ(goChild(n, s.fType))
+	form := f.String()
+	if len(params) > 0 && form != goIdentityUnknown {
+		// A generic alias: `$$n`, its number of type parameters, then its
+		// type's form with each parameter `$i`, which the linker replaces
+		// by an instantiation's arguments.
+		form = "$$" + itoa(len(params)) + " " + form
 	}
 	x.out.Exports = append(x.out.Exports, wire.Export{Name: goSpan(name), Identity: "=" + form})
 }

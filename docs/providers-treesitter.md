@@ -696,8 +696,17 @@ ADR-0017 decision 7; `internal/provider/treesitter/returns.go`):
   (docs/providers-link.md, Return flows).
 - **A call's result.** Each site of the link table takes `Site.Results`, the variables the innermost node of the
   innermost analysed function containing the call defines (killing or may), and `Site.Into`, that function's
-  callable when the node is one of its returning nodes; neither when another call site lies between the two (its
-  value is consumed by that call first) or no node of that function contains the call.
+  callable when the node is one of its returning nodes; neither when no node of that function contains the call.
+  When another call site lies between the two, the call's value is consumed by that call directly: the call records
+  the consuming site (`Site.Feeds`) and the consuming site records the call with the argument it is part of, or
+  `NestedReceiver` when the call is the receiver of a member call (`Site.Nested`, `nestInto` in
+  `internal/provider/treesitter/returns_nested.go`); a call in the consuming call's callee expression otherwise
+  (`f()()`) is recorded nowhere.
+- **A failed analysis.** A callable whose function message carries `Failed` publishes no flows and no parameter
+  variables, so whether a parameter reaches its return is not known: each of its parameters with no node is marked
+  `Unknown` (`Parameter.Unknown`, `unknownSummaries` in `internal/provider/treesitter/dependence.go`). The linker
+  counts each summary a bound site then finds for it as a fact with no node and publishes none
+  (docs/providers-link.md, Return flows).
 
 ### Capabilities
 

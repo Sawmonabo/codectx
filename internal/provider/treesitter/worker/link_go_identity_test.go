@@ -87,7 +87,8 @@ func f() {
 // repetition -> Kth or Lth differ. Mutation: spell a call in a length -> Bad is
 // not "?".
 // Mutation: drop the "=" -> an alias reads as a method's signature.
-// Mutation: spell a generic alias's form -> its instantiation looks exact.
+// Mutation: spell a generic alias's parameters by name or leave out its
+// arity -> the linker cannot substitute its arguments; G differs.
 func TestGoIdentityForms(t *testing.T) {
 	src := goIdentitySource
 	l, _ := linkOf(t, "go", "p.go", src)
@@ -98,7 +99,7 @@ func TestGoIdentityForms(t *testing.T) {
 		want string
 	}{
 		{"alias", "A", 0, "=:io.Reader"},
-		{"generic alias", "G", 0, "=?"},
+		{"generic alias", "G", 0, "=$$1 [ ] $0"},
 		{"interface method", "Get", 0, "( $0 ) ( $1 , .bool )"},
 		{"literal types", "Add", 0, "( $0 , <- chan .int , chan <- $0 , map [ .string ] [ 4 ] .byte , func ( .int ) ( .error ) , interface{} , struct{} , ... [ ] .byte ) ( )"},
 		{"qualified", "Load", 0, "( :st.ID ) ( * :st.Item , .error )"},

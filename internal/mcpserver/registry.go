@@ -67,8 +67,10 @@ func register(s *mcp.Server, h *handlers) {
 			"route is listed, a page at a time by next_cursor, and `route_count` counts them all.", h.dependencyPath)
 	addTool(s, "codectx_impact", "Impact",
 		"Affected scope and required package boundaries, with completeness. Each entry names its "+
-			"reason and route counts; view reasons or routes pages them whole, and the answer token "+
-			"passed as the cursor reads any view of the same answer.", h.impact)
+			"reason and route counts. When one page of each view holds the whole answer, the entries, "+
+			"reasons and routes all arrive in this one response and no answer token is minted; otherwise "+
+			"view reasons or routes pages them whole, and the answer token passed as the cursor reads any "+
+			"view of the same answer.", h.impact)
 
 	// --- session lifecycle -----------------------------------------------
 	addTool(s, "codectx_context_plan", "Plan context",

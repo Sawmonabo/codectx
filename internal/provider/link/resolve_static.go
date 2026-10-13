@@ -28,6 +28,8 @@ type staticFile struct {
 	// return, which a receiver of kind TypeResult naming it reads. A site
 	// is present while it is being resolved, so a cycle reads nothing.
 	returns map[int32][]returned
+	// closure is a C or C++ member's include closure (includeClosure).
+	closure *cClosure
 }
 
 // returned is a type a target returns, as the target's own file writes it.
@@ -112,7 +114,7 @@ func (r *staticFile) site(i int32, bySignature sigSink) error {
 // expression or a Rust path naming a method (`T.M(t, x)`, `T::m(&t, x)`)
 // passes the receiver as its first argument.
 func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
-	if len(s.Arguments) == 0 {
+	if len(s.Arguments) == 0 && len(s.Nested) == 0 {
 		return nil
 	}
 	var params []paramInfo
@@ -120,6 +122,9 @@ func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
 		params = append(params, p)
 		return nil
 	}); err != nil {
+		return err
+	}
+	if err := receiverFlows(s, ref, e.Ref, params, r.emit); err != nil {
 		return err
 	}
 	return argumentFlows(s, params, r.receiverFirst(s, e), func(arg, pos int32) error {

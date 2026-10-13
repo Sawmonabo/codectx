@@ -60,9 +60,10 @@ entity only a dependence route reaches. Across calls the slice is realizable: a
 value passed at one call site enters the callee through its argument flow and
 leaves only through that site's summary flow, never through another site's
 result, while a value the callee creates itself leaves through every call site's
-return flow. A dependence-reached entry's `score_micros` is negative (its plain
-score minus 1 000 001), so the order stays `score_micros` descending; its path's
-`cost_units` is the plain sum of its hop costs. `path` and the traversals walk
+return flow. A dependence-reached entry says so with `reach: "dependence"`
+(the field is omitted on a call-reached entry), and its `score_micros` is the
+plain score of its route's cost, never negative; its path's `cost_units` is the
+plain sum of its hop costs. `path` and the traversals walk
 `data_flows_to` at its plain cost.
 
 `impact` also
@@ -231,7 +232,7 @@ so a changed handler marks the endpoints that route to it affected.
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
-| `--view` | `impact` | Which view of the answer a page serves: `entries` (the default), `reasons` or `routes`. Combine it with the `answer` token as `--cursor` to read another view of an answer already walked. |
+| `--view` | `impact` | Which view of the answer a page serves: `entries` (the default), `reasons` or `routes`. Combine it with the `answer` token as `--cursor` to read another view of an answer already walked. An answer that one page of every view holds needs no second read: it is served whole, every view in the one response. |
 | `--direction` | `path` | Which way edges are followed: `outgoing` (the default), `incoming` or `both`. The other traversal commands pin their own direction — a `callers` query asked outgoing would not be a callers query — so only `path` takes it. |
 
 **`path --direction` is the difference between "no route" and "no route that way".**
@@ -251,19 +252,22 @@ reports stay cumulative across the pages of the one walk, so replaying a cursor
 neither resets nor doubles them. `impact` carries a different contract: **its first page pays for the whole
 walk.** The request that mints an impact answer expands until the walk is
 exhausted, streams every admitted edge into a disk-backed sort, ranks the whole
-affected set once, serves the first page and spools the globally ranked
-remainder behind the continuation. Later pages read that spool and walk nothing,
-which is why page 1 is the slow one and every page after it is a file read.
+affected set once and serves the first page. An answer that one page of every
+view holds is served whole in that response, as described below; any longer
+answer spools the globally ranked remainder behind the continuation. Later pages
+read that spool and walk nothing, which is why page 1 is the slow one and every
+page after it is a file read.
 
 What that buys is the contract a single unbounded walk gives, and it is what
 `impact` guarantees: the pages **concatenate** to the single-shot answer —
 the same entities, in the same global order, each listed exactly once. An entity
 reached again from a later frontier is one record, not two; the cheapest route
 to it wins, and the reasons of every edge that touched it are merged into that
-one entry. The order is `score_micros` descending, then `depth` ascending, then
-`node_id` ascending. A `score_micros` below zero marks an entity reached only
-through data or control dependence; every such entity ranks after every entity a
-call, override or structural route reaches. **`name` is not a tie-break** — it is known only after
+one entry. The order is the reach first — every entity a call, override or
+structural route reaches, then every entity only a data or control dependence
+hop reaches, marked `reach: "dependence"` — then `score_micros` descending, then
+`depth` ascending, then `node_id` ascending. `score_micros` is the score within
+its reach and never negative. **`name` is not a tie-break** — it is known only after
 hydration, so ranking on it would reorder one page of a globally ordered
 answer.
 
@@ -290,9 +294,19 @@ entries; a reasons page may end inside one entry's reasons, and the next page
 starts at the reason after it. Nothing is cut: no reason is truncated and no
 route is clipped.
 
-Every page prints an `answer` token beside `next`. Passed as `--cursor` with any
-`--view`, it reads that view of the same ranked answer from its start, so the
-entries read from one view are explained by the others without walking again.
+**An answer that fits one page is served whole, inline.** When one page of
+every view the request reads holds that whole view — at most `--limit` entries
+and package pairs, at most `--limit` reasons, and so at most `--limit` routes —
+the one response carries the entries, every reason and every route, and nothing
+is retained: no spool, no lease, no `answer` token and no `next`. The bound is
+the page bound each view already serves under, so an inline response is never
+larger than the pages a client would otherwise fetch one view at a time. The
+CLI prints the reasons and routes after the entries.
+
+Any longer answer is spooled, and every page prints an `answer` token beside
+`next`. Passed as `--cursor` with any `--view`, it reads that view of the same
+ranked answer from its start, so the entries read from one view are explained
+by the others without walking again.
 A `next` token continues only its own view; presented with another view it is
 `CTX_ARGUMENT_INVALID`. The answer is kept until every view the client reads
 has been served to its end — all three, unless the request's `views` names
@@ -444,6 +458,13 @@ A `search` continuation's exact-tier spool is the one exception: when the
 budget cannot hold it, the cursor carries the position instead and the next
 page walks the tiers from it, so the answer is complete and only slower.
 
+**Continuation state does not outlive a restart of the host.** It is written
+for the cursor's lifetime and never forced to stable storage, so on Linux and
+macOS every spool and retained walk records the boot that wrote it, and after
+a reboot a cursor issued before it answers `CTX_CURSOR_INVALID`: re-run from
+the first page. Whatever a power loss left of those files is never read as an
+answer; the next `gc` or `index` removes it.
+
 On every command but `path`, the query deadline ends a page and not an answer:
 a walk that runs out of time
 returns what it has, reports `query deadline reached` and hands back a cursor the
@@ -512,6 +533,18 @@ a callable's return node (kind `return`), which every callable has under the
 same name; a request whose kinds name `return` finds it. Symbol resolution
 and document symbols leave it out the same way.
 
+**Why a hit was found.** Each hit carries its `tier`, which is the whole
+explanation: an exact-tier hit scores 0 and sorts above every scored one
+because of its tier, and a lexical hit's `score_micros` is its BM25F score. A
+hit carries no list of reasons beside it, since such a list would repeat the
+tier; the table's REASON column is written from `tier` ("matched the
+exact_name tier"), after the fault of a hit whose range could not be read.
+The rule every answer follows: a list whose length grows with the repository
+(an impact entry's reasons, its route, a page of hits) is paged by reference
+and never cut; a list whose length its producer fixes (a hit's
+`unresolved_fields`, keyed by a fixed set of field names) may carry a
+validation bound.
+
 **Then the lexical tier.** The index returns the page's limit plus one of the
 results ranked after the last one served, so it knows whether another page
 exists; a page reads what follows the previous page, never the results before
@@ -544,11 +577,13 @@ tree indexed at another root, or re-indexed as a delta, answers in the same
 order. A cursor carries the last served position by content, not by document
 address — the tier and node of the last exact result, or the score and stored
 document id of the last lexical result — so it survives the index's background
-merges between pages. A continuation inside the exact tiers sorts the hits
-after its position once and spools them; the cursors after it name that spool
-and the offset of their next record, so a deep exact answer costs each page its
-own page. A page whose spool is gone walks from the position instead and
-serves the same hits.
+merges between pages. The exact qualified-name and exact-name tiers are kept in
+served order by their indexes, so a page of either seeks to its position and
+reads its own hits. The qualified-name prefix tier cannot seek: a continuation
+that reaches it sorts its hits after the position once and spools them; the
+cursors after it name that spool and the offset of their next record, so a deep
+prefix answer costs each page its own page too. A page whose spool is gone
+walks from the position instead and serves the same hits.
 
 A cursor pins the generation, the analysis key and the query with its filters.
 Resubmitting a continuation with a different query or filter set, or against a
@@ -561,7 +596,10 @@ writer; a search keeps no other state between pages.
 **What a query deadline does to a search.** A deadline that ends the index's
 search serves the best results found by then, truncated with the deadline as
 its reason and with no continuation: the order of a cut-short search is not
-the true ranking, so there is no position to resume from. Re-run with a longer
+the true ranking, so there is no position to resume from. A deadline inside an
+exact tier does the same: a seek serves the hits it had read in order, and a
+continuation's sort of the prefix tier serves the head of what it had read,
+sorted. Re-run with a longer
 `--timeout`. Cancelling the call is an error, not a page.
 
 ## Configuration these commands read

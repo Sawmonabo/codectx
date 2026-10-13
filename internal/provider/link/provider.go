@@ -296,6 +296,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	} else {
 		res = &rf.prev.resolution
 	}
+	u.es = nil // a resolution that reused its predecessor's hierarchy read no configuration past the fields
 	if pub.spilled, err = spill.sorted(); err != nil {
 		return failed, err
 	}

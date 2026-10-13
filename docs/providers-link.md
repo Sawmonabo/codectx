@@ -84,7 +84,8 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   each `#include` of the file and of every header it reaches resolved by the include lookup (a quoted path beside the
   including file, and either form by its path suffix), each header read once, which ends a cycle as an include guard
   does, and only as far as a definition asked about needs (`include_c.go` `cClosure`); a one-identifier replacement is
-  followed to the macro it names. Each definition reached is one
+  followed to the macro it names. The same closure, read once per file, decides which macros replace a call's name
+  and which functions of internal linkage it may call. Each definition reached is one
   occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
   with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
@@ -200,14 +201,25 @@ edge from the callee's return node, never by an unlabelled edge from inside the 
 decision 7), for every family that publishes argument flows, the address-taken join
 included (`internal/provider/link/returns.go`). A site's result is where the structural provider found its value
 goes: `Site.Results`, the variables the innermost node evaluating the call defines, and `Site.Into`, the callable
-whose return that node is (`return f()`); a call whose value another call consumes first (`g(f())`, `f().m()`)
-has neither, and a site with neither publishes no return flow. A bound site publishes:
+whose return that node is (`return f()`); a call whose value another call consumes directly (`g(f())`, `f().m()`)
+has neither and is that call's nested call instead (`Site.Nested`, `Site.Feeds`, below). A site with none of
+these publishes no return flow. A bound site publishes:
 - for each argument bound to a parameter marked `Returned` (its value reaches the callee's return), one
   `data_flows_to` from each variable the argument reads to each variable of `Site.Results`, at the argument, detail
   `summary:<position>` (`FactSummary`);
 - from the callee's return node (`Decl.Return`) one `data_flows_to` to each variable of `Site.Results` and to the
   return node of the callable `Site.Into` names, at the call expression, detail `return` (`FactReturn`). A callee
   with no return node (a type, a constructor that returns no value) publishes none.
+
+- for a nested call, whose value is part of an argument of the consuming call or is its receiver
+  (`returns_nested.go`): from the nested callee's return node one `data_flows_to` to each parameter the argument
+  binds at the consuming call's bound callee (the receiver parameter for a receiver, where the callee declares one:
+  Python `self`, a Go or Rust receiver), carrying two evidence details, `argument` and `return`, since it leaves one
+  callee and enters another; and, when that parameter is `Returned`, one to each variable of the consuming call's
+  `Site.Results` and to the return node its `Site.Into` names, detail `return`, the consuming callee's summary at
+  this site. Both are evidenced at the nested call. The impact walk reads a relation with both roles as leaving and
+  then entering: a path that entered the nested callee through another call's argument never takes it, and a path
+  that takes it is inside the consuming callee and never leaves it through a return edge.
 
 Every value a returning node reads flows into the callable's return node (docs/providers-treesitter.md, Return
 flow), parameter-reached values included, so a value created inside the callee (`k = 1; if p: return k`) reaches
@@ -224,6 +236,13 @@ whatever that callee returns. The summary is part of the callee's interface (`Pa
 `paramReturned` mark of its hierarchy entry): a body edit that changes whether a parameter reaches the return
 changes the entry every bound site's argument flows read, so a refresh re-runs exactly those sites. The return node
 is keyed by the callable's identity and exists for every analysed callable, so its flows do not depend on the body.
+A callable whose analysis failed in the worker has no flows and no parameter nodes, so whether a parameter reaches
+its return is not known: each parameter is marked `Unknown` (`Parameter.Unknown`, the `paramUnknown` mark of its
+entry, traced like `Returned`), and a bound site whose value is written into a variable finds a summary for each
+argument bound to it that is kept with no node, never published and counted on the `data_flows_to` row
+(`facts_without_node`), beside the argument flow into the same parameter. No flow is claimed the callee was not
+shown to carry, and none is lost in silence; an analysis that later succeeds changes the entry and re-runs the
+sites.
 
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
 the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
@@ -278,8 +297,12 @@ type by its unresolved spelling or could not be spelled (`go_method_signatures_u
 from every non-test file, whatever its build constraints, and cached on disk by its source's identity
 (`go_external_cache.go`). An interface two files declare differently (per platform or build tag: `Handle` with
 `Fd() uintptr` for unix and `Fd() int` for windows) is each of its declarations, one entity per declaration as the
-project's own conditional declarations are, and a type satisfying one implements it; an alias declared differently,
-or a method declared with two signatures, makes a form naming it unknown. A Go type implements an interface
+project's own conditional declarations are, and a type satisfying one implements it. Declarations are compared by
+their canonical spellings, not as written: `type Num = Count` (with `Count = int`) for unix and `type Num = int` for
+windows are one alias of `int`, `const Width = 4` and `2 + 2` one value, `Sum() [16]byte` and `Sum() [Size]byte` (with
+`Size = 16`) one method, and interface declarations that spell one method set are one interface; an alias, constant or
+method whose declarations spell different types or values makes a form naming it unknown, in the project's own
+packages as in packages outside it. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
@@ -544,7 +567,7 @@ toward it stays valid. What a call can bind to differs by family, and so does wh
 | Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#n` for an anonymous class body or an enum constant's body, n the byte offset of the name token of its declaration (the class `new T`, or the enum constant), sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
 | Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
-| C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds, and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
+| C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file or a file whose include closure reaches its header binds (or, with the functions of external linkage, a file whose closure holds a directive the unit cannot follow: an `#include` of an unfolded macro or a quoted path no member file answers), and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
 | JavaScript, TypeScript, TSX | functions, class methods, object-literal methods | the class |
 | Python | functions and methods; `Static` for `@staticmethod` and `@classmethod` | the class |
 
@@ -562,7 +585,8 @@ candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as
 
 The unit's inputs are its member files and the manifests it owns; an ECMAScript unit also owns every
 `tsconfig*.json` and `jsconfig*.json` (a `tsconfig.base.json`, a referenced `tsconfig.app.json`), `package.json`,
-`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads. A
+`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads, and every
+config its `extends` chains read under another name or outside its root (`Unit.Inputs`). A
 `pnpm-workspace.yaml` or `lerna.json` marks a JavaScript project as `package.json` does, so a workspace with no root
 `package.json` is one unit, whose packages import each other by name. The unit's identity is their content, as for every unit: the facts it
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
@@ -608,7 +632,7 @@ Besides the joined declarations, sites and values, the table carries what the re
   the trait's method of that name when the trait is the unit's, else the external trait's method, the self type
   never consulted, so a blanket impl over a type parameter implements its trait's item too;
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
-  macro calls;
+  macro calls in every file whose include closure reaches the macro's file;
 - `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or
   C++ declaration is written with, which its `references` visibility occurrences read;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
@@ -784,7 +808,8 @@ The members' language family picks the resolver:
   name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
   alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
   however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
-  `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
+  `int32`, `any` `interface{}`, a user alias its type, a generic alias `List[string]` its type with its arguments
+  substituted), and qualifies an unexported method name by its package. Type
   parameters compare by position. A struct literal compares by its fields in order (name, an unexported one
   qualified by its package, type, tag by value, embedding) and an interface literal by its sorted methods and
   embedded interfaces ("Type identity"); an array length by its value, a constant expression folded over the
@@ -883,13 +908,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   unit root, the first `tsconfig.json` or `jsconfig.json` whose `files`/`include` minus `exclude` covers it (`.js`
   files only with `allowJs` or in a `jsconfig.json`), else the configs that config's `references` reach that do, all
   of them; with none covering it, the nearest config by directory; with no config, none. The module mode is the
-  config's `moduleResolution`, else TypeScript's default for its `module` (CommonJS: Node10; node16/nodenext:
-  Node16; preserve: Bundler); a config that sets neither, or no config, resolves under both Bundler and Node16. The
-  order, under each governing config and mode: a relative or absolute path (TypeScript's extension substitution:
-  `./a.js` names `a.ts`; a directory's `index` file except for an ES module's import under Node16, which names its
-  file with its extension; then `rootDirs`); a `#` specifier through the `imports` of the file's package scope; the
-  config's `paths` (an exact key, else the longest prefix, each fallback in order, the first naming a member
-  winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`; the package's own name when it
+  config's `moduleResolution`, else TypeScript's default for its `module` (none, AMD, UMD, System: Classic;
+  CommonJS: Node10; node16/nodenext: Node16; preserve: Bundler); a config that sets neither, or no config, resolves
+  under both Bundler and Node16. The order, under each governing config and mode: a relative or absolute path
+  (TypeScript's extension substitution: `./a.js` names `a.ts`; a directory's `index` file except for an ES module's
+  import under Node16, which names its file with its extension; then `rootDirs`, the one that is the path's longest
+  prefix giving the suffix tried under each other one in order); a `#` specifier through the `imports` of the file's
+  package scope; the config's `paths` (an exact key, else the longest prefix, each fallback in order, the first
+  naming a member winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`, only when no
+  `paths` key matched; the package's own name when it
   has `exports`; a workspace package by `name` (the `package.json` files the root `workspaces`, a
   `pnpm-workspace.yaml` or a `lerna.json` declare, every `package.json` of the unit when none does) through
   `exports` where the mode reads it (an exact subpath key, else Node's `PATTERN_KEY_COMPARE` order; conditions
@@ -905,14 +932,24 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   is published, with its size. Each import's answer is computed once per build, while the hierarchy is built, and
   written to the decls index under `keyESSpec` (the importing file's path and the specifier); the import facts, the
   export resolution and the inference each look that one key up.
+  Classic resolution (`js_classic.go`, TypeScript's `classicNameResolver`) reads no `package.json`: no `exports`,
+  `imports`, own name or workspace package. It runs two passes, TypeScript and declaration files, then JavaScript
+  files, each in this order: `paths` for a bare specifier (a matching key decides), else `baseUrl`; `rootDirs` for a
+  relative one; then a relative or absolute specifier as a file beside the importing file, a bare one as a file in
+  the importing file's directory or any directory above it to the unit root, nearest first. It reads files only,
+  never a directory's `index`, and a bare specifier it finds nowhere is a package outside the repository (TypeScript
+  then reads `node_modules/@types`), so a workspace package's name under Classic is external.
 
   Limits. Aliases defined in program code (a bundler's alias table, a test runner's module mapper, a compiler plugin)
   are not data and are not read. A package outside the repository (an ignored `node_modules`, a package manager's
   own cache) stays external, and an `extends` base inside one leaves the options it may set unknown, so a config
   that does not set its own mode resolves under both. `typesVersions` and `types@` conditions depend on the TypeScript version and are not
-  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone. An `extends` base under a name
-  other than `tsconfig*.json`/`jsconfig*.json` is read but is not an input of the unit, so an edit to it alone is
-  seen at the unit's next rebuild.
+  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone.
+  Every config a unit's `extends` chains name under another name than `tsconfig*.json`/`jsconfig*.json`, or outside
+  the unit, is an input of the unit (`Unit.Inputs`, `esPlanInputs` in `js_plan.go`), present or not, so an edit to it
+  alone, or its creation, rebuilds the unit: the planner reads the unit's configs to follow the chains, and its
+  `package.json` files only when a config extends a package by name. A relative `extends` names the file as written,
+  else with `.json` added, as TypeScript's getExtendsConfigPath reads it.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
   `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor
@@ -920,10 +957,13 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance
   receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type of a receiver two
   disagreeing definitions reach included) binds, for each of its types, the first declaration of the method along
-  that type's C3 linearisation (`hierarchy.pythonMRO`, over the bases in the order each class lists them), never a
-  subclass's override. A class object (`A.make()`, `mod.A.make()`) binds the method `A`
+  that type's C3 linearisation (`hierarchy.pythonUnitOrder`, over the bases in the order each class lists them,
+  the bases outside the project placed as for overrides), never a subclass's override. A base outside the project
+  that the order places ahead of that declaration may hold the method instead, so the call also reaches that base's
+  method, a set counting both (`class C(Base, U)`: `c.run()` reaches `Base.run` and `U.run`, set size 2). A class object (`A.make()`, `mod.A.make()`) binds the method `A`
   declares or inherits alone, never a subclass's override. `super().m()` in class `B` binds, for `B` and each class
-  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached. Field-based
+  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached, and each
+  base outside the project a linearisation places between `B` and that `m` as a candidate beside it. Field-based
   resolution (a function written to the attribute; a method is written to no attribute, so it is reached only through
   a receiver's type) answers an attribute call only when its receiver's type bound nothing and reaches the method
   through no supertype outside the project: `class L(list)` calling `self.append(1)` calls the external
@@ -960,8 +1000,8 @@ The provider publishes one row of each of its six capabilities per unit, at the 
   of these is fatal.
 - `partial`, with `coverage_incomplete`, on the row of each relation a fact was found for whose target the structural
   provider minted no node (`facts_without_node`, counted by `externalsOf`, `state.go`): a call or hierarchy fact into
-  a declaration with no node, or an argument's flow into a parameter with none (one whose key did not fit, a C or C++
-  `...`) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
+  a declaration with no node, or an argument's flow or summary into a parameter with none (one whose key did not fit,
+  a C or C++ `...`, one of a callable whose analysis failed) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
   and no node (`idBinding.unnamed`), so a refresh carries and counts it like any other. A flow into a callable with
   no body (an abstract method, a prototype) and a return flow from a callee with no return node are not facts. A fact
   whose relation is no capability of its own (a route's handler, a declared entry point, a launchable `main`, a

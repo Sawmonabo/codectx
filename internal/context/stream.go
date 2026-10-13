@@ -809,11 +809,7 @@ func (s *compileSorts) releaseRound() error { return s.Close() }
 // already applies.
 func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 	sizeOf func(T) int64) (*pagination.ExternalSort[T], error) {
-	if s == nil {
-		return nil, argumentInvalid("a context compile sort requires an open sort area")
-	}
-	sorter, err := pagination.NewExternalSort(s.dir, s.runRecords,
-		encodeRecord[T], decodeRecord[T], compare)
+	sorter, err := openSorter(s, compare, sizeOf)
 	if err != nil {
 		return nil, err
 	}
@@ -833,7 +829,82 @@ func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 		return nil
 	})
 	s.track(sorter.Close)
+	return sorter, nil
+}
+
+// openSorter builds one sort in this compile's area, byte-budgeted with sizeOf,
+// and registers nothing: the caller owns its observation and its release.
+func openSorter[T any](s *compileSorts, compare func(a, b T) int,
+	sizeOf func(T) int64) (*pagination.ExternalSort[T], error) {
+	if s == nil {
+		return nil, argumentInvalid("a context compile sort requires an open sort area")
+	}
+	sorter, err := pagination.NewExternalSort(s.dir, s.runRecords,
+		encodeRecord[T], decodeRecord[T], compare)
+	if err != nil {
+		return nil, err
+	}
 	return sorter.WithRunBytes(s.runBytes, sizeOf), nil
+}
+
+// sortSeries is a succession of sorts under one name, at most one open at a
+// time, for a pass that sorts its input in epochs: each epoch is sorted, read
+// and closed before the next opens. The series registers ONE observation and
+// ONE release however many epochs it runs, so the compile's observation list
+// stays bounded by the pipeline's sorts rather than by the input, and the
+// observation reports the series' peak, its total records and its total runs.
+type sortSeries[T any] struct {
+	s       *compileSorts
+	name    string
+	compare func(a, b T) int
+	sizeOf  func(T) int64
+	idx     int
+	obs     sortObservation
+	cur     *pagination.ExternalSort[T]
+}
+
+func newSortSeries[T any](s *compileSorts, name string, compare func(a, b T) int,
+	sizeOf func(T) int64) (*sortSeries[T], error) {
+	if s == nil {
+		return nil, argumentInvalid("a context compile sort requires an open sort area")
+	}
+	q := &sortSeries[T]{s: s, name: name, compare: compare, sizeOf: sizeOf,
+		idx: len(s.observed), obs: sortObservation{Name: name}}
+	s.observed = append(s.observed, q.obs)
+	s.track(q.retire)
+	return q, nil
+}
+
+// open answers the series' open sort, opening the next epoch when none is.
+func (q *sortSeries[T]) open() (*pagination.ExternalSort[T], error) {
+	if q.cur != nil {
+		return q.cur, nil
+	}
+	sorter, err := openSorter(q.s, q.compare, q.sizeOf)
+	if err != nil {
+		return nil, err
+	}
+	q.cur = sorter
+	return sorter, nil
+}
+
+// current answers the open epoch, nil when none is open.
+func (q *sortSeries[T]) current() *pagination.ExternalSort[T] { return q.cur }
+
+// retire closes the open epoch, if any, and folds what it held into the
+// series' observation. It is safe after the epoch's Sorted and on every exit
+// path, which is why it is also the series' release.
+func (q *sortSeries[T]) retire() error {
+	cur := q.cur
+	if cur == nil {
+		return nil
+	}
+	q.cur = nil
+	q.obs.Peak = max(q.obs.Peak, cur.PeakLiveRecords())
+	q.obs.Added += cur.Len()
+	q.obs.Spilled += cur.SpilledRuns()
+	q.s.observed[q.idx] = q.obs
+	return cur.Close()
 }
 
 // trackRun registers a sorted run for release with the compile's sort area, so

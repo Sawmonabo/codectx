@@ -318,8 +318,8 @@ func (t SearchTier) Valid() bool { return t.Rank() < len(searchTiers) }
 
 // SearchHit is one deduplicated search result. Section 14.2 fixes its contents:
 // the canonical entity or file chunk that was matched, the integer ranking
-// component with its retrieval tier, bounded reasons and the occurrence count
-// that deduplication folded away. It carries no source body — Section 19.3
+// component with its retrieval tier, which says why it was found, and the
+// occurrence count that deduplication folded away. It carries no source body — Section 19.3
 // reserves those for codectx_read_source, which reads a hit's node or file by
 // id within a context session or outside one, from the generation the hit's
 // binding names.
@@ -335,7 +335,6 @@ type SearchHit struct {
 	ScoreMicros     int64        `json:"score_micros"`
 	Range           *SourceRange `json:"range,omitempty"`
 	OccurrenceCount int64        `json:"occurrence_count"`
-	Reasons         []string     `json:"reasons,omitempty"`
 	// UnresolvedFields names the fields of THIS hit that could not be
 	// resolved, against the typed reason each failed with. It is the search
 	// counterpart of the truncated-fields map a stored record carries: a hit
@@ -395,9 +394,6 @@ func (h SearchHit) Validate() error {
 		}
 	}
 	if err := requireNonNegative("search_hit.occurrence_count", h.OccurrenceCount); err != nil {
-		return err
-	}
-	if err := boundStrings("search_hit.reasons", h.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
 	}
 	// The same wire bound Error.Details and CapabilityState.Details carry: the
@@ -1256,17 +1252,34 @@ func (r PathResult) Validate() error {
 // kept, for every entry the walk reached.
 type ImpactEntry struct {
 	// Ordinal is the entry's position in the ranked answer, from zero.
-	Ordinal     int64     `json:"ordinal"`
-	NodeID      NodeID    `json:"node_id"`
-	FileID      FileID    `json:"file_id,omitempty"`
-	Name        string    `json:"name,omitempty"`
-	Kind        NodeKind  `json:"kind"`
-	Direction   Direction `json:"direction"`
-	Depth       int       `json:"depth"`
-	ScoreMicros int64     `json:"score_micros"`
-	ReasonCount int64     `json:"reason_count"`
-	RouteCount  int64     `json:"route_count"`
+	Ordinal   int64     `json:"ordinal"`
+	NodeID    NodeID    `json:"node_id"`
+	FileID    FileID    `json:"file_id,omitempty"`
+	Name      string    `json:"name,omitempty"`
+	Kind      NodeKind  `json:"kind"`
+	Direction Direction `json:"direction"`
+	Depth     int       `json:"depth"`
+	// Reach is the tier the entry was reached in: empty for an entry a call,
+	// override or structural route reaches, ImpactReachDependence for one only
+	// a data or control dependence hop reaches. Every entry of the first tier
+	// ranks before every entry of the second.
+	Reach ImpactReach `json:"reach,omitempty"`
+	// ScoreMicros is the entry's score within its tier, never negative.
+	ScoreMicros int64 `json:"score_micros"`
+	ReasonCount int64 `json:"reason_count"`
+	RouteCount  int64 `json:"route_count"`
 }
+
+// ImpactReach names the tier an impact entry was reached in.
+type ImpactReach string
+
+// ImpactReachDependence is the tier of an entry only a program-dependence
+// hop (data_flows_to, control_depends_on) reaches. The call tier, which ranks
+// first, is the empty value and is omitted from the wire.
+const ImpactReachDependence ImpactReach = "dependence"
+
+// Valid reports whether r is the call tier (empty) or a known tier.
+func (r ImpactReach) Valid() bool { return r == "" || r == ImpactReachDependence }
 
 // ImpactReason is one reason of one impact entry, in the order the answer
 // gives them.
@@ -1358,6 +1371,12 @@ func (e ImpactEntry) Validate() error {
 		return err
 	}
 	if err := requireNonNegative("impact_entry.ordinal", e.Ordinal); err != nil {
+		return err
+	}
+	if !e.Reach.Valid() {
+		return invalid("impact_entry.reach %q is not a known tier", truncateForMessage(string(e.Reach)))
+	}
+	if err := requireNonNegative("impact_entry.score_micros", e.ScoreMicros); err != nil {
 		return err
 	}
 	if e.ReasonCount < 1 {
