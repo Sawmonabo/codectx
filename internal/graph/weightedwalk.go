@@ -978,14 +978,15 @@ func (e *Engine) weightedEntries(ctx context.Context, w *weightedWalk, page []se
 			dropped++
 			continue
 		}
-		direction := model.DirectionIncoming
-		if l.outgoing {
-			direction = model.DirectionOutgoing
-		}
+		// The direction an impact entry reports for the hop: a kind stored
+		// dependency first (data_flows_to) reads against its stored direction,
+		// as the impact walk reports it (impactDirection).
+		kind := model.RelationKind(l.kind)
+		direction := impactDirection(kind, l.outgoing)
 		// The label's own last hop explains it when the breadth-first rule
 		// delivers no relation into it from its weight's walk: a route that
 		// rule never takes still needs its reason.
-		reasons := []string{impactReason(model.RelationKind(l.kind), direction, l.depth)}
+		reasons := []string{impactEdgeReason(kind, l.outgoing, direction, l.depth)}
 		if why, ok := explained[l.id]; ok && len(why.reasons) > 0 {
 			reasons, direction = why.reasons, model.DirectionOutgoing
 			if why.incoming {
@@ -1136,12 +1137,9 @@ func (w *weightedWalk) explain(ctx context.Context, page []servedLabel) (map[int
 			if near != far+1 && !(near == far && leaves) {
 				continue
 			}
-			direction := model.DirectionIncoming
-			if leaves {
-				direction = model.DirectionOutgoing
-			}
+			direction := impactDirection(kind, leaves)
 			x := out[l.id]
-			x.reasons = mergeReasons(x.reasons, []string{impactReason(kind, direction, far+1)})
+			x.reasons = mergeReasons(x.reasons, []string{impactEdgeReason(kind, leaves, direction, far+1)})
 			x.incoming = x.incoming || direction == model.DirectionIncoming
 			out[l.id] = x
 		}

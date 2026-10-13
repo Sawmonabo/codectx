@@ -408,11 +408,18 @@ func (w *refWalker) reasons(rec refRecord) ([]string, error) {
 	return out, nil
 }
 
-// refReason is a walk reason's wording (docs/queries.md): outgoing when the
-// relation leaves the node the walk came from.
+// refReason is a walk reason's wording (docs/queries.md): "this symbol <kind>
+// it" when the relation leaves the node the walk came from, and the reported
+// direction outgoing for every kind but data_flows_to, which is stored
+// dependency first and reports the other direction (an impact entry its value
+// flows to may need modification).
 func refReason(kind model.RelationKind, outgoing bool, depth int) string {
-	if outgoing {
-		return fmt.Sprintf("this symbol %s it (outgoing, depth %d)", kind, depth)
+	dir := "incoming"
+	if outgoing != (kind == model.RelDataFlowsTo) {
+		dir = "outgoing"
 	}
-	return fmt.Sprintf("%s this symbol (incoming, depth %d)", kind, depth)
+	if outgoing {
+		return fmt.Sprintf("this symbol %s it (%s, depth %d)", kind, dir, depth)
+	}
+	return fmt.Sprintf("%s this symbol (%s, depth %d)", kind, dir, depth)
 }
