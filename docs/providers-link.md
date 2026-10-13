@@ -165,7 +165,9 @@ may supply) is counted external and publishes no edge.
 
 **Imports.** An import the linker resolves publishes `imports` from the file's module to the module of each file it
 names: a JavaScript, TypeScript or TSX specifier the module resolution reaches, a Python `import a.b` or
-`from a import b` (to the file that declares `b`, else the submodule `a.b`, else the module `a`), and a quoted C or C++ `#include` (the
+`from a import b` (to the file that declares `b`, else the submodule `a.b`, else the module `a`; a module that declares
+no `b` but binds it by an import of its own, as a package's `__init__.py` re-exports `from .user import User`, is
+followed to what that import names, `internal/provider/link/resolve_python_reexport.go`), and a quoted C or C++ `#include` (the
 file beside the including one, and every member file whose path ends in the header's at a component boundary). An
 angled include, a package outside the unit, and an import naming no member file publish nothing. An ECMAScript
 import of a module of the repository that resolves to no member file (a workspace package whose `exports` name an
