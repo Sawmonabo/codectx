@@ -249,6 +249,12 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	}
 	u := &unit{gen: req.Binding.GenerationID, tables: p.tables, dir: dir, root: pu.Root, content: req.Content,
 		family: pu.Family, members: each}
+	tables, spill, err := spillTargets(dir, u.tables)
+	if err != nil {
+		return failed, err
+	}
+	defer spill.close()
+	u.tables = tables
 	fields, err := manifestFields(ctx, u)
 	if err != nil {
 		return failed, err
@@ -290,6 +296,11 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	} else {
 		res = &rf.prev.resolution
 	}
+	u.es = nil // a resolution that reused its predecessor's hierarchy read no configuration past the fields
+	if pub.spilled, err = spill.sorted(); err != nil {
+		return failed, err
+	}
+	defer pub.spilled.Close()
 	bindings := res.bindings
 	targets, err := targetsOf(dir, bindings)
 	if err != nil {

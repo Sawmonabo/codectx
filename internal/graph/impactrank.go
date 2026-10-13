@@ -73,19 +73,20 @@ type impactRecord struct {
 	Possible bool `json:"po,omitempty"`
 }
 
-// scoreMicros is the frozen integer score: a cheaper, more direct route always
-// outranks a longer one and no float ever enters the ordering. A route with
-// no program-dependence hop scores 1_000_000 / (1 + cost), which is never
-// negative; a route that took one (dependenceTier) scores the same of its
-// plain cost minus 1_000_001, which is always negative, so the served order,
-// score descending, is the lexicographic key (reached through dependence,
-// cost) the walk ranked by.
-func (r impactRecord) scoreMicros() int64 {
-	score := 1_000_000 / (1 + plainCost(r.Cost))
+// scoreMicros is the frozen integer score within the record's tier: a
+// cheaper, more direct route always outranks a longer one and no float ever
+// enters the ordering. It is 1_000_000 / (1 + cost) of the route's plain cost,
+// never negative; the tier the route was reached in is reach, served beside
+// it, and ranks first.
+func (r impactRecord) scoreMicros() int64 { return 1_000_000 / (1 + plainCost(r.Cost)) }
+
+// reach is the tier the record was reached in: the call tier (empty) unless
+// its route took a program-dependence hop (dependenceTier).
+func (r impactRecord) reach() model.ImpactReach {
 	if r.Cost&dependenceTier != 0 {
-		return score - 1_000_001
+		return model.ImpactReachDependence
 	}
-	return score
+	return ""
 }
 
 // pairRecord is one (from-package, to-package) pair of the rollup, with the
@@ -272,7 +273,7 @@ func mergeLabel(a, b string) string {
 func lessByNode(a, b impactRecord) int { return cmp.Compare(a.NodeID, b.NodeID) }
 
 // lessByRank is pass 2's key and the served order:
-// (ScoreMicros desc, Depth asc, NodeID asc).
+// (Reach, the call tier first; ScoreMicros desc; Depth asc; NodeID asc).
 //
 // Name is not a tie-break. It is known only after hydration, and the whole
 // answer is ranked before any of it is hydrated, so ranking on it would make
@@ -281,6 +282,9 @@ func lessByNode(a, b impactRecord) int { return cmp.Compare(a.NodeID, b.NodeID) 
 // and still deterministic. A served page therefore arrives already ordered and
 // must NOT be re-sorted after hydration.
 func lessByRank(a, b impactRecord) int {
+	if c := cmp.Compare(a.Cost&dependenceTier, b.Cost&dependenceTier); c != 0 {
+		return c
+	}
 	if c := cmp.Compare(b.scoreMicros(), a.scoreMicros()); c != 0 {
 		return c
 	}

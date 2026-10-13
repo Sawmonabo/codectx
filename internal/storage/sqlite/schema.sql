@@ -633,6 +633,13 @@ CREATE INDEX idx_search_unit ON search_units(unit_id, doc_id);
 -- ids. Without this index both are a scan of search_units per probe.
 CREATE INDEX idx_search_doc ON search_units(doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
+-- Collection asks whether any session still names a snapshot (the snapshot
+-- delete's NOT EXISTS, once per candidate snapshot) and how many name a
+-- generation (DeleteGeneration's refusal count). Neither column is a child
+-- key no other index leads with -- idx_read_sessions_manifest leads with the
+-- manifest -- so without these both questions scan every session row.
+CREATE INDEX idx_read_sessions_snapshot ON read_sessions(snapshot_id);
+CREATE INDEX idx_read_sessions_generation ON read_sessions(generation_id);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
 CREATE INDEX idx_lease_expiry ON retention_leases(expires_at);

@@ -405,7 +405,8 @@ published and is counted, so the file reports partial.
 **Framework routes.** The provider reads routes from decorators, annotations
 and registration calls, only in a file that imports the framework (Python
 `flask`, `fastapi`, `starlette`, `django.urls` or `django.conf.urls`; JavaScript and
-TypeScript `express` and `@nestjs/common`; Go `net/http`, `github.com/gorilla/mux`,
+TypeScript `express` and `@nestjs/common` or `@nestjs/core`, and a file importing neither that names
+`setGlobalPrefix` or `enableVersioning` is scanned for those calls alone; Go `net/http`, `github.com/gorilla/mux`,
 `github.com/go-chi/chi`, `github.com/gin-gonic/gin`, `github.com/labstack/echo`;
 Java `org.springframework.web.bind.annotation`). Each method and route is one
 endpoint with `routes_to` its handler. A receiver is known by the call that built
@@ -418,7 +419,7 @@ it (the link table's site result type).
 | Django | `path`, `re_path`, `url` imported from `django.urls` or `django.conf.urls`, or called through that module (`from django import urls` then `urls.path(…)`, `import django.urls`); no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never in the file: the including urlconf is chosen by settings, so every Django route is `unresolved` here; the linker joins the settings chain and the `include()` prefixes (docs/providers-link.md, Route prefixes across files) |
 | Starlette | `Route(path, endpoint, methods=[…])` (none: `GET` for a function endpoint, every method for a class, Starlette's own rule; an endpoint not declared here as a function names no method), `WebSocketRoute(path, endpoint)` (`WEBSOCKET`), each an entry of a route list | `endpoint` | `Starlette(routes=…)` (and a FastAPI application's `routes=`) is a root; `Router(routes=…)` and `Mount(path, routes=…)` hold lists; an entry is mounted on the object whose list, written in place or held by one module binding, is innermost around it; `Mount(path, app=x)` mounts `x` |
 | Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains; a path array is one endpoint per element | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()`, or `Router()` imported or destructured from `require("express")`, through exactly one `use([path,] router)` |
-| NestJS | `@Get` … `@Head`, `@QueryMethod` (`QUERY`), `@All` (no method), imported from `@nestjs/common`, on a method of a `@Controller` class; a string, an array (one endpoint per element) or none (written `""`, the controller's own path) | the decorated method | never in the file: Nest joins the controller's path, the application's `setGlobalPrefix` and `RouterModule` paths, which another file sets, so every NestJS route is `unresolved` |
+| NestJS | `@Get` … `@Head`, `@QueryMethod` (`QUERY`), `@All` (no method), imported from `@nestjs/common`, on a method of a `@Controller` class; a string, an array (one endpoint per element) or none (written `""`, the controller's own path) | the decorated method | never in the file: Nest joins the controller's path, the application's `setGlobalPrefix`, its URI versioning and `RouterModule` paths, which another file sets, so every NestJS route is `unresolved` here; the route is recorded for the linker, which publishes its full paths when every application the unit creates is decided (docs/providers-link.md, NestJS paths) |
 | Spring | `@GetMapping` … `@PatchMapping`, `@RequestMapping(method = RequestMethod.X)` (none: no method); `value`, `path` or positional, arrays | the annotated method | the class-level `@RequestMapping` is the only prefix, none means no prefix; each literal route it names is a prefix, every method route mapped below each (Spring combines the patterns pairwise); a non-literal one leaves the class's routes `unresolved`. Its `method =` adds to each method mapping's own methods, a union as Spring combines them, and a mapping naming none takes the class's |
 | Go `net/http` | `http.Handle`/`HandleFunc` on the default mux, a `ServeMux`'s `Handle`/`HandleFunc`; a Go 1.22 pattern `"GET /x"` gives the method and the route `/x` | the second argument | the default mux is a root; `NewServeMux()` when the file serves it once (`ListenAndServe[TLS]`, `Serve[TLS]`, or the `Handler` of an `http.Server{…}` literal, written as the router's construction or a name the file assigns exactly one router to) or another router handles it once; a router `Handle(p, http.StripPrefix(prefix, r))` passes sits below the stripped literal prefix |
 | gorilla/mux | `Handle`/`HandleFunc`, methods from `.Methods(…)` on the registration; a matcher chain closed by `Handler(h)`/`HandlerFunc(h)` (`PathPrefix(p).Handler(h)`, `Methods(m).Path(p).HandlerFunc(h)`, from the router or `NewRoute()`) whose one `Path` or `PathPrefix` is the route | the second argument; the closing call's argument | `NewRouter()` served or handled once; `PathPrefix(p).Subrouter()` a child |
@@ -695,8 +696,17 @@ ADR-0017 decision 7; `internal/provider/treesitter/returns.go`):
   (docs/providers-link.md, Return flows).
 - **A call's result.** Each site of the link table takes `Site.Results`, the variables the innermost node of the
   innermost analysed function containing the call defines (killing or may), and `Site.Into`, that function's
-  callable when the node is one of its returning nodes; neither when another call site lies between the two (its
-  value is consumed by that call first) or no node of that function contains the call.
+  callable when the node is one of its returning nodes; neither when no node of that function contains the call.
+  When another call site lies between the two, the call's value is consumed by that call directly: the call records
+  the consuming site (`Site.Feeds`) and the consuming site records the call with the argument it is part of, or
+  `NestedReceiver` when the call is the receiver of a member call (`Site.Nested`, `nestInto` in
+  `internal/provider/treesitter/returns_nested.go`); a call in the consuming call's callee expression otherwise
+  (`f()()`) is recorded nowhere.
+- **A failed analysis.** A callable whose function message carries `Failed` publishes no flows and no parameter
+  variables, so whether a parameter reaches its return is not known: each of its parameters with no node is marked
+  `Unknown` (`Parameter.Unknown`, `unknownSummaries` in `internal/provider/treesitter/dependence.go`). The linker
+  counts each summary a bound site then finds for it as a fact with no node and publishes none
+  (docs/providers-link.md, Return flows).
 
 ### Capabilities
 

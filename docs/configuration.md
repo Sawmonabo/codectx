@@ -406,8 +406,10 @@ them should know which. It walks **once for the whole answer** and then ranks
 what the walk admitted, so `max_visited_nodes` and `max_graph_edges` are
 answer-level bounds there: spending one truncates that answer and is reported,
 rather than ending a page. What the pages then serve is the finished ranking —
-one globally ordered list, `score_micros` descending, then `depth` ascending,
-then `node_id` ascending, with each entity listed **exactly once** no matter how
+one globally ordered list: every call-reached entity before every entity only a
+dependence hop reaches (`reach: "dependence"`), then `score_micros` descending,
+then `depth` ascending, then `node_id` ascending, with each entity listed
+**exactly once** no matter how
 many frontiers reached it (the cheapest route wins and the reasons of every edge
 that touched it are merged into that one entry). Paging does not re-rank: a page
 is a window on the one global order, never a chunk ranked against itself, so no

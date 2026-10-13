@@ -76,7 +76,17 @@ func (x *goExternal) surface() string {
 			for _, n := range names {
 				parts = append(parts, n, strings.Join(f.imports[n], "\x00"))
 			}
-			parts = append(parts, "\x01"+strings.Join(f.dot, "\x00"))
+			parts = append(parts, "\x01"+strings.Join(f.dot, "\x00"), "\x02"+strings.Join(f.unnamed, "\x00"))
+		}
+		consts := make([]string, 0, len(pkg.consts))
+		for n := range pkg.consts {
+			consts = append(consts, n)
+		}
+		slices.Sort(consts)
+		for _, n := range consts {
+			for _, c := range pkg.consts[n] {
+				parts = append(parts, "\x03"+n, c.form, strconv.Itoa(c.file))
+			}
 		}
 		types := make([]string, 0, len(pkg.types))
 		for n := range pkg.types {
@@ -84,12 +94,13 @@ func (x *goExternal) surface() string {
 		}
 		slices.Sort(types)
 		for _, n := range types {
-			t := pkg.types[n]
-			parts = append(parts, n, strconv.Itoa(t.file), t.form, flagString(t.alias, t.iface, t.ineligible, t.conflict))
-			for _, ms := range [][]goExtMethod{t.methods, t.embeds} {
-				parts = append(parts, strconv.Itoa(len(ms)))
-				for _, m := range ms {
-					parts = append(parts, m.name, m.form, strconv.Itoa(m.file))
+			for _, t := range append([]*goExtType{pkg.types[n]}, pkg.types[n].variants...) {
+				parts = append(parts, n, strconv.Itoa(t.file), t.form, flagString(t.alias, t.iface, t.ineligible, t.conflict))
+				for _, ms := range [][]goExtMethod{t.methods, t.embeds} {
+					parts = append(parts, strconv.Itoa(len(ms)))
+					for _, m := range ms {
+						parts = append(parts, m.name, m.form, strconv.Itoa(m.file))
+					}
 				}
 			}
 		}

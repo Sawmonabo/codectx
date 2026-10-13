@@ -371,6 +371,11 @@ func (d dependenceWalk) settleSlice(ctx context.Context, w *levelWalk, recs []le
 					continue
 				}
 				r.Slice = 0
+				if enters {
+					// A nested call's value leaves one callee and enters
+					// another (both roles): the route is in the second.
+					r.Slice = sliceDescended
+				}
 			case enters:
 				continue
 			default:

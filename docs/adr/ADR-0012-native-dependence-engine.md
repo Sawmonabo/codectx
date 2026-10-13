@@ -297,16 +297,21 @@ Concretely:
   again only to carry the right to leave: they are not served a second time, and only the return flows it may now
   take are new. So the walk marks exactly the nodes the two phases mark, admitting a node at most twice. Walked
   against the stored direction the rule swaps the roles: a return flow walked backwards enters the callee and an
-  argument flow walked backwards leaves it. The descent describes one chain of dependence, so an edge of any other
+  argument flow walked backwards leaves it. A nested call's value (`g(f())`, `f().m()`) is one relation carrying
+  both roles: it leaves the inner callee and enters the outer one, so the route that takes it is descended into the
+  outer callee. The descent describes one chain of dependence, so an edge of any other
   kind starts a new one. Each data flow's role is read in one grouped evidence read per batch of the walk, as the
   dispatch of a call is.
 - **Ranked below call impact, at every depth.** Impact ranks by the lexicographic key (reached through a
   program-dependence hop, cost). The key is one integer: a route that takes a dependence hop carries a fixed high bit
   in its cost (`dependenceTier`, set once, never added), so every comparison by cost puts every node a call, override
   or structural route reaches before every node only a dependence route reaches, and orders each tier by its plain
-  cost. A dependence-reached entry's `score_micros` is its plain score minus 1 000 001, always negative, so the served
-  order is still score descending. Nothing is dropped and no threshold exists. Paths and traversals walk the plain
-  cost table.
+  cost. The served entry carries the tier as its own field, `reach: "dependence"` (omitted for the call tier), beside
+  a `score_micros` that is the plain score of its cost and never negative; the served order is (reach, score
+  descending, depth, node id), the same total order. A tier and a score the reader sees are served as separate
+  values, as a multi-level search sort serves its sort values beside the score and a code-scanning result its
+  `level` beside its severity score; one folded number would have to be decoded by every reader. Nothing is
+  dropped and no threshold exists. Paths and traversals walk the plain cost table.
 - **Paged evidence.** Evidence ranges are paged per pair, like every other answer.
 - **Anchored on every operand.** Control dependences on operator conditions are anchored at each operand, where the
   engine drops them.
@@ -907,6 +912,12 @@ code.
   — the decaying histogram and percentile behind the learned model.
 - Microsoft, *Memory grant feedback*, https://learn.microsoft.com/sql/relational-databases/performance/intelligent-query-processing-memory-grant-feedback
   — percentile-over-history grants, and the oscillation that motivated percentile over last value.
+- Elasticsearch reference, *Sort search results*,
+  https://www.elastic.co/guide/en/elasticsearch/reference/current/sort-search-results.html — a multi-level sort
+  whose response carries each level's sort value beside the score; the separate tier field of decision 3.
+- GitHub, *SARIF support for code scanning*,
+  https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning
+  — results ordered by `level` and precision, each served as its own field beside the severity score.
 - Buck2, *Resource control*, https://buck2.build/docs/users/advanced/resource_control/ — the pressure-learned cap
   weighed and rejected in decision 5, and the "first running action is never suspended" forward-progress rule.
 - Bazel, *actions.run resource_set*, https://bazel.build/rules/lib/builtins/actions, and Pants, *Global options*,

@@ -82,6 +82,8 @@ const (
 	modeNode10 esMode = iota
 	modeNode16
 	modeBundler
+	// modeClassic is TypeScript's `classic` (js_classic.go).
+	modeClassic
 )
 
 // esResult is what one specifier resolves to.
@@ -122,10 +124,13 @@ func newESResolver(ctx context.Context, u *unit) (*esResolver, error) {
 	if u.family != FamilyJavaScript {
 		return nil, nil
 	}
-	in, err := readESInputs(ctx, u)
+	in, err := esInputsOf(ctx, u)
 	if err != nil {
 		return nil, err
 	}
+	// The resolver holds the configuration from here; the unit lets it go,
+	// so it is released with the hierarchy.
+	u.es = nil
 	s, err := newEntrySort(u.dir)
 	if err != nil {
 		return nil, err
@@ -321,16 +326,19 @@ func (r *esResolver) owning(ctx context.Context, c *tsConfig, from string, seen 
 	return out, nil
 }
 
-// modesOf is the moduleResolution c selects (TypeScript's defaults: Node10
-// for CommonJS output, Node16 for node16/nodenext, Bundler for preserve);
-// when c sets none it can be read from, or there is no config, both module
-// modes a current project may compile under, Bundler and Node16.
+// modesOf is the moduleResolution c selects (TypeScript's defaults: Classic
+// for none, AMD, UMD and System output, Node10 for CommonJS output, Node16
+// for node16/nodenext, Bundler for preserve); when c sets none it can be
+// read from, or there is no config, both module modes a current project may
+// compile under, Bundler and Node16.
 func modesOf(c *tsConfig) []esMode {
 	if c == nil {
 		return []esMode{modeBundler, modeNode16}
 	}
 	switch c.moduleResolution {
-	case "node", "node10", "classic":
+	case "classic":
+		return []esMode{modeClassic}
+	case "node", "node10":
 		return []esMode{modeNode10}
 	case "node16", "nodenext":
 		return []esMode{modeNode16}
@@ -338,6 +346,10 @@ func modesOf(c *tsConfig) []esMode {
 		return []esMode{modeBundler}
 	}
 	switch c.module {
+	case "none", "amd", "umd", "system":
+		// TypeScript 5.9 and 6.0 both default these to classic; 7.0
+		// accepts none of them.
+		return []esMode{modeClassic}
 	case "commonjs":
 		return []esMode{modeNode10}
 	case "node16", "node18", "node20", "nodenext":
@@ -434,31 +446,20 @@ func (r *esResolver) strictESM(from string, form byte, mode esMode) bool {
 // resolveUnder is one resolution of spec under config c and mode (the order
 // above).
 func (r *esResolver) resolveUnder(ctx context.Context, from, spec string, form byte, c *tsConfig, mode esMode) (esResult, error) {
+	if mode == modeClassic {
+		return r.resolveClassic(from, spec, c)
+	}
 	strict := r.strictESM(from, form, mode)
-	if strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") || strings.HasPrefix(spec, "/") || spec == "." || spec == ".." {
-		p := path.Join(path.Dir(from), spec)
-		if strings.HasPrefix(spec, "/") {
-			p = strings.TrimPrefix(path.Clean(spec), "/")
-		}
+	if esRelative(spec) {
+		p := esJoin(from, spec)
 		got, err := r.probe(p, strict)
 		if err != nil || got != "" {
 			return one(got), err
 		}
-		if c != nil {
-			for _, rd := range c.rootDirs {
-				rel, ok := strings.CutPrefix(p, rd+"/")
-				if !ok {
-					continue
-				}
-				for _, other := range c.rootDirs {
-					if other == rd {
-						continue
-					}
-					got, err := r.probe(path.Join(other, rel), strict)
-					if err != nil || got != "" {
-						return one(got), err
-					}
-				}
+		for _, alt := range rootDirCandidates(c, p) {
+			got, err := r.probe(alt, strict)
+			if err != nil || got != "" {
+				return one(got), err
 			}
 		}
 		return esResult{}, nil
@@ -470,21 +471,23 @@ func (r *esResolver) resolveUnder(ctx context.Context, from, spec string, form b
 		}
 		return r.packageMap(ctx, p, *p.imports, spec, from, form, c, mode, true)
 	}
+	matched := false
 	if c != nil && c.paths != nil {
-		root := c.pathsDir
-		if c.baseURL != "" {
-			root = c.baseURL
-		}
-		if targets, star, ok := matchPaths(*c.paths, spec); ok {
+		var targets []string
+		var star string
+		if targets, star, matched = matchPaths(*c.paths, spec); matched {
 			for _, t := range targets {
-				got, err := r.probe(path.Join(root, strings.Replace(t, "*", star, 1)), strict)
+				got, err := r.probe(path.Join(c.pathsRoot(), strings.Replace(t, "*", star, 1)), strict)
 				if err != nil || got != "" {
 					return one(got), err
 				}
 			}
 		}
 	}
-	if c != nil && c.baseURL != "" {
+	// A `paths` key that matches decides the settings' answer, found or
+	// not: the baseUrl is read only when none does
+	// (tryLoadModuleUsingOptionalResolutionSettings).
+	if c != nil && c.baseURL != "" && !matched {
 		got, err := r.probe(path.Join(c.baseURL, spec), strict)
 		if err != nil || got != "" {
 			return one(got), err
@@ -510,6 +513,58 @@ func (r *esResolver) resolveUnder(ctx context.Context, from, spec string, form b
 		all.unresolved = true
 	}
 	return all, nil
+}
+
+// esRelative reports a specifier TypeScript reads as a path
+// (isExternalModuleNameRelative): relative, or rooted.
+func esRelative(spec string) bool {
+	return strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") || strings.HasPrefix(spec, "/") || spec == "." || spec == ".."
+}
+
+// esJoin is the repository path a relative or rooted specifier written in
+// the member at from names.
+func esJoin(from, spec string) string {
+	if strings.HasPrefix(spec, "/") {
+		return strings.TrimPrefix(path.Clean(spec), "/")
+	}
+	return path.Join(path.Dir(from), spec)
+}
+
+// rootDirCandidates is where c's rootDirs send the relative path p besides
+// p itself (tryLoadModuleUsingRootDirs): the rootDir that is p's longest
+// matching prefix decides the suffix, which is tried under every other
+// rootDir in order.
+func rootDirCandidates(c *tsConfig, p string) []string {
+	if c == nil {
+		return nil
+	}
+	best := -1
+	for i, rd := range c.rootDirs {
+		if within(p, rd) && p != rd && (best < 0 || len(rd) > len(c.rootDirs[best])) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return nil
+	}
+	rel := strings.TrimPrefix(p, c.rootDirs[best])
+	rel = strings.TrimPrefix(rel, "/")
+	var out []string
+	for i, rd := range c.rootDirs {
+		if i != best && rd != c.rootDirs[best] {
+			out = append(out, path.Join(rd, rel))
+		}
+	}
+	return out
+}
+
+// pathsRoot is the directory c's `paths` targets are relative to: the
+// baseUrl, else the directory of the config that wrote `paths`.
+func (c *tsConfig) pathsRoot() string {
+	if c.baseURL != "" {
+		return c.baseURL
+	}
+	return c.pathsDir
 }
 
 func one(target string) esResult {

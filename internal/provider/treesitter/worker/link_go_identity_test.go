@@ -33,6 +33,25 @@ func (s *Set[T]) Lit(x struct{ a int }) {}
 
 func (s Set[T]) Pair(a, b string) {}
 
+const (
+	Size = 1 << 4
+	Kth  = iota * 2
+	Lth
+)
+
+func (s *Set[T]) Arr(a [Size]byte, b [0x10]byte, c [st.N + 1]int) {}
+
+func (s *Set[T]) Bad(d [len("x")]int) {}
+
+func (s *Set[T]) Iface(x interface {
+	Close() error
+	io.Reader
+}, y struct {
+	*Base
+	B int ` + "`json:\"b c\"`" + `
+}) {
+}
+
 type T struct{}
 
 var _ io.Reader = (*T)(nil)
@@ -52,7 +71,8 @@ func f() {
 // sets by: every type marked by how it is written, a receiver's or an
 // interface's type parameters by position, the channel direction and an
 // array's length kept, one type per declared name, a struct or interface
-// literal with members unspellable, and an alias's form behind "=".
+// literal with its members, an array length as its value or constant
+// expression, an alias's form behind "=" and a constant's value behind "#".
 //
 // Mutation: spell a qualified type without its package marker (`.ID`) ->
 // Load's form names a type of its own package. Mutation: write a type
@@ -61,8 +81,14 @@ func f() {
 // `chan<- T` lose their direction. Mutation: count a grouped declaration
 // once -> Pair takes one string. Mutation: spell a struct literal with
 // members as `struct{}` -> Lit matches any method of an empty struct.
+// Mutation: keep an integer literal as written -> `0x10` is not `16`.
+// Mutation: drop a field's tag or the embedded marker -> Iface differs.
+// Mutation: give every constant spec iota 0, or skip the implicit
+// repetition -> Kth or Lth differ. Mutation: spell a call in a length -> Bad is
+// not "?".
 // Mutation: drop the "=" -> an alias reads as a method's signature.
-// Mutation: spell a generic alias's form -> its instantiation looks exact.
+// Mutation: spell a generic alias's parameters by name or leave out its
+// arity -> the linker cannot substitute its arguments; G differs.
 func TestGoIdentityForms(t *testing.T) {
 	src := goIdentitySource
 	l, _ := linkOf(t, "go", "p.go", src)
@@ -73,11 +99,18 @@ func TestGoIdentityForms(t *testing.T) {
 		want string
 	}{
 		{"alias", "A", 0, "=:io.Reader"},
-		{"generic alias", "G", 0, "=?"},
+		{"generic alias", "G", 0, "=$$1 [ ] $0"},
 		{"interface method", "Get", 0, "( $0 ) ( $1 , .bool )"},
 		{"literal types", "Add", 0, "( $0 , <- chan .int , chan <- $0 , map [ .string ] [ 4 ] .byte , func ( .int ) ( .error ) , interface{} , struct{} , ... [ ] .byte ) ( )"},
 		{"qualified", "Load", 0, "( :st.ID ) ( * :st.Item , .error )"},
-		{"struct literal", "Lit", 0, "?"},
+		{"struct literal", "Lit", 0, "( struct{ @a .int } ) ( )"},
+		{"array lengths", "Arr", 0, "( [# .Size ] .byte , [ 16 ] .byte , [# ( :st.N + 1 ) ] .int ) ( )"},
+		{"a length the form cannot spell", "Bad", 0, "?"},
+		{"interface and struct literals", "Iface", 0,
+			`( interface{ @Close ( ) ( .error ) ; ^ :io.Reader } , struct{ ^ * .Base ; @B .int #"json:\"b\x20c\"" } ) ( )`},
+		{"constant", "Size", 0, "#( 1 << 4 )"},
+		{"constant of iota", "Kth", 0, "#( 1 * 2 )"},
+		{"constant repeating its declaration's value", "Lth", 0, "#( 2 * 2 )"},
 		{"grouped names", "Pair", 0, "( .string , .string ) ( )"},
 	}
 	for _, c := range cases {
