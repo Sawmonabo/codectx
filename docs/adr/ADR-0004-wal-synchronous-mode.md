@@ -68,7 +68,7 @@ few seconds earlier, which no setting can prevent.
 
 A new configuration key `storage.synchronous` (`"normal"` | `"full"`, default `"normal"`) lets an
 operator who disagrees — or who runs on hardware where a re-index is genuinely expensive and power
-loss genuinely likely — buy the old behaviour back with one line. An unrecognized spelling is
+loss genuinely likely — choose a sync at every commit with one line. An unrecognized spelling is
 refused at load time with `storage.synchronous is "…"; use "normal" or "full"`, and the store fails
 closed on one too: it never picks a durability mode the operator did not ask for.
 

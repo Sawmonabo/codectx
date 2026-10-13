@@ -11,7 +11,6 @@ import (
 	"errors"
 	"log/slog"
 	"math"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -954,7 +953,7 @@ func newHitFilter(req model.SearchRequest) (hitFilter, error) {
 	var f hitFilter
 	for i, p := range req.Paths {
 		clean := strings.TrimSuffix(strings.ReplaceAll(strings.TrimSpace(p), `\`, "/"), "/")
-		if clean == "" || strings.HasPrefix(clean, "/") || clean != path.Clean(clean) || strings.HasPrefix(clean, "../") || clean == ".." {
+		if !model.IsRepoPath(clean) {
 			return hitFilter{}, &model.Error{Code: model.CodeArgumentInvalid,
 				Message:     "search.paths[" + strconv.Itoa(i) + "] is not a root-relative repository path",
 				Remediation: "list paths relative to the repository root, with \"/\" separators and no \"..\" segment"}

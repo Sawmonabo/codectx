@@ -35,6 +35,10 @@ type lockEntry struct {
 	// group is the lock's own grouping of the package when it has one (a
 	// Pipfile.lock section, a PDM or Poetry group), empty otherwise.
 	group string
+	// alias is the name the package is installed under when the lock
+	// installs it under another name than its own (an npm alias,
+	// `alias@npm:name@version`); name is then the package's own.
+	alias string
 	deps  []lockDep
 	// start and end are the entry's byte span, used as the evidence range.
 	start, end int
@@ -42,9 +46,11 @@ type lockEntry struct {
 
 // lockDep is one dependency of a locked package: the name it is declared
 // by, the requirement as the lock records it, the version the lock resolves
-// it to when the lock says which, and the dependency kind.
+// it to when the lock says which, and the dependency kind. target is the
+// package's own name when the lock says the declared name is an alias of
+// another package (the dependency is then on that package).
 type lockDep struct {
-	name, requirement, version, kind string
+	name, requirement, version, kind, target string
 }
 
 // lockFile is what one lock reader produces: the ecosystem and language its
@@ -55,10 +61,11 @@ type lockFile struct {
 	version string
 	entries []lockEntry
 	// resolve, when set, resolves a dependency of entry i the lock names
-	// without a version to the version it selects (npm's node_modules
-	// lookup, bun's nested keys). Without it a dependency resolves only when
-	// the lock pins exactly one version of its name.
-	resolve func(i int, dep string) string
+	// without a version to the package and version it selects (npm's
+	// node_modules lookup, bun's nested keys): the name is the package's own,
+	// another than dep when dep is an alias. Without it a dependency
+	// resolves only when the lock pins exactly one version of its name.
+	resolve func(i int, dep string) (name, version string)
 }
 
 // lock publishes a lock file: a `configuration` node the file defines, one
@@ -116,6 +123,9 @@ func (u *unit) lock(ctx context.Context, lf lockFile) error {
 		if e.group != "" {
 			detail = append(detail, "group", e.group)
 		}
+		if e.alias != "" {
+			detail = append(detail, "alias", e.alias)
+		}
 		if err := u.e.Relation(cfg.ID, model.RelDependsOn, dep.ID, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng,
 			Detail: filesystem.Detail(detail...)}); err != nil {
 			return err
@@ -125,19 +135,29 @@ func (u *unit) lock(ctx context.Context, lf lockFile) error {
 				u.malformedEntry()
 				continue
 			}
-			resolved := d.version
+			resolved, target := d.version, d.target
 			if resolved == "" && lf.resolve != nil {
-				resolved = lf.resolve(i, d.name)
+				var name string
+				if name, resolved = lf.resolve(i, d.name); name != "" && name != d.name {
+					target = name
+				}
 			}
-			if vs := versions[d.name]; resolved == "" && len(vs) == 1 {
+			if target == "" {
+				target = d.name
+			}
+			if vs := versions[target]; resolved == "" && len(vs) == 1 {
 				resolved = vs[0]
 			}
-			to, ok := nodes[d.name]
+			to, ok := nodes[target]
 			if !ok {
-				if to, err = u.e.Node(ctx, dependencyCandidate(lf.ecosystem, d.name, lf.language), filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng}); err != nil {
+				if to, err = u.e.Node(ctx, dependencyCandidate(lf.ecosystem, target, lf.language), filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng}); err != nil {
 					return err
 				}
-				nodes[d.name] = to
+				nodes[target] = to
+			}
+			alias := ""
+			if target != d.name {
+				alias = d.name
 			}
 			kind := d.kind
 			if kind == "" {
@@ -145,7 +165,7 @@ func (u *unit) lock(ctx context.Context, lf lockFile) error {
 			}
 			if err := u.e.Relation(dep.ID, model.RelDependsOn, to.ID, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng,
 				Detail: filesystem.Detail("kind", kind, "version", e.version, "requirement", d.requirement,
-					"resolved_version", resolved)}); err != nil {
+					"resolved_version", resolved, "alias", alias)}); err != nil {
 				return err
 			}
 		}
