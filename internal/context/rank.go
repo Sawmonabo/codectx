@@ -331,17 +331,12 @@ func routeReason(cand candidate, best model.RelationPath,
 		len(best.Relations), kind, cand.Depth, contribution)
 }
 
-// appendReason keeps the explanation inside the Section 15.3 bound that
-// model.ContextEntry validates: reasons of at most MaxReasonBytes each, with
-// no duplicate. There is no count bound: an entry's reasons are stored and
-// paged by reference, so every one is kept. A reason dropped here is a repeat
-// or an empty one, never one silently truncated into something else.
+// appendReason adds reason to an entry's explanation unless it is empty or a
+// repeat. There is no count or length bound: an entry's reasons are stored and
+// paged by reference, so every one is kept whole.
 func appendReason(reasons []string, reason string) []string {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
-		return reasons
-	}
-	if len(reason) > model.MaxReasonBytes {
 		return reasons
 	}
 	for _, existing := range reasons {

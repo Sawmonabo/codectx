@@ -49,7 +49,8 @@ func TestImpactRankResumesTheInterruptedSortItself(t *testing.T) {
 	f := newGraphFixture(t)
 	req := model.ImpactRequest{GenerationID: 1,
 		Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
-		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+		Views: entriesOnly}
 
 	// Ground truth: the same query with nothing interrupting the ranking. A
 	// frontier ceiling the fixture never reaches, so the WALK cannot split and
@@ -222,7 +223,8 @@ func TestRankContinuationAfterACompletedRankAdoptsNoRemovedRun(t *testing.T) {
 	f := newGraphFixture(t)
 	req := model.ImpactRequest{GenerationID: 1,
 		Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
-		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+		Views: entriesOnly}
 
 	whole, _, _ := rankResumeEngine(t, f, 0)
 	all, err := whole.Impact(context.Background(), req)

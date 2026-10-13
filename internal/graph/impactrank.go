@@ -43,13 +43,12 @@ import (
 //
 //   - there is no `seen` map. A map cannot be encoded deterministically and
 //     would be re-allocated per decoded record; the reasons list is deduped by
-//     the same slice scan boundReasons uses in internal/search.
-//   - the parent CHAIN travels with the record, as Route. The served page no
-//     longer has a page-local byNode map to walk parents through -- the page
-//     comes out of a ranked spool -- and ImpactEntry.Paths is not optional:
-//     Section 14.3 rejects an entry whose reason nothing backs, and the single
-//     route is that backing. Route is bounded by model.MaxRelationsPerPath,
-//     the same bound impactAccumulator.path applies.
+//     a slice scan (unionReasons).
+//   - the parent chain is a REFERENCE, Adm, into the walk's route table. The
+//     served page has no page-local byNode map to walk parents through -- the
+//     page comes out of a ranked spool -- so the route is rebuilt from the
+//     table when it is served, whole however long it is, and the record costs
+//     the same at any depth.
 //
 // ScoreMicros is deliberately NOT a field: it is derived from Cost, and a
 // stored copy could disagree with the Cost a fold just lowered. scoreMicros()
@@ -57,14 +56,18 @@ import (
 // the division is integer, so distinct costs collapse to equal scores and
 // ranking on cost would be a strictly finer order than the served key.
 type impactRecord struct {
-	NodeID    model.NodeID       `json:"n"`
-	Depth     int                `json:"d"`
-	Cost      int64              `json:"c"`
-	Direction model.Direction    `json:"dir"`
-	Via       model.RelationID   `json:"v,omitempty"`
-	Parent    model.NodeID       `json:"p,omitempty"`
-	Route     []model.RelationID `json:"rt,omitempty"`
-	Reasons   []string           `json:"rs,omitempty"`
+	NodeID    model.NodeID     `json:"n"`
+	Depth     int              `json:"d"`
+	Cost      int64            `json:"c"`
+	Direction model.Direction  `json:"dir"`
+	Via       model.RelationID `json:"v,omitempty"`
+	Parent    model.NodeID     `json:"p,omitempty"`
+	// Adm is the route-table admission the record was reached from, and the
+	// record's route is that admission's route followed by Via (routetable.go).
+	// Hash is the identity of that whole route, Via included.
+	Adm     uint64    `json:"a,omitempty"`
+	Hash    routeHash `json:"h"`
+	Reasons []string  `json:"rs,omitempty"`
 	// Possible is set on a record whose route takes a name-only `may_call`
 	// hop (expandOpenSites): its path may not run.
 	Possible bool `json:"po,omitempty"`
@@ -154,14 +157,10 @@ func decodePairRecord(b []byte) (pairRecord, error) {
 
 // sizeOfImpactRecord charges one buffered record against the sort's run budget
 // (ExternalSort.WithRunBytes). It is an estimate by construction -- the record
-// is encoded only when a run spills -- and it errs high. The route makes the
-// charge depth-dependent, which is why it is counted rather than folded into
-// the fixed allowance.
+// is encoded only when a run spills -- and it errs high. The route is a
+// reference, so the charge does not depend on the record's depth.
 func sizeOfImpactRecord(v impactRecord) int64 {
 	n := len(v.NodeID) + len(v.Via) + len(v.Parent) + len(v.Direction)
-	for _, rel := range v.Route {
-		n += len(rel) + 16
-	}
 	for _, reason := range v.Reasons {
 		n += len(reason) + 16
 	}
@@ -177,7 +176,7 @@ func sizeOfPairRecord(v pairRecord) int64 {
 // them. It reproduces what impactAccumulator.Visit does per node, with every
 // order-dependence removed:
 //
-//   - the CHEAPEST route wins, and Depth, Via, Parent and Route all come from
+//   - the CHEAPEST route wins, and Depth, Via, Parent and the route all come from
 //     that same winner, so the served path never describes a route whose cost
 //     contradicts the reported score. Visit kept the first admission's cost
 //     because the page-local walk admitted a node once; across a completed
@@ -185,10 +184,7 @@ func sizeOfPairRecord(v pairRecord) int64 {
 //   - DirectionIncoming is sticky: a node reachable both ways under
 //     DirectionBoth is reported as incoming, because "may need modification"
 //     is the stronger claim. Taking it from either side makes it commutative.
-//   - the reasons of both sides survive, deduplicated and ordered, up to
-//     model.MaxReasonsPerEntry. They are ordered BEFORE the bound is applied:
-//     truncating an arrival-ordered list would make the surviving SET depend
-//     on where the page boundaries fell.
+//   - the reasons of both sides survive, deduplicated and ordered (unionReasons), every one of them.
 //
 // It cannot fail; the error is the signature ExternalSort.WithFold takes.
 func foldImpact(a, b impactRecord) (impactRecord, error) {
@@ -199,15 +195,16 @@ func foldImpact(a, b impactRecord) (impactRecord, error) {
 	if a.Direction == model.DirectionIncoming || b.Direction == model.DirectionIncoming {
 		keep.Direction = model.DirectionIncoming
 	}
-	keep.Reasons = mergeReasons(a.Reasons, b.Reasons)
+	keep.Reasons = unionReasons(a.Reasons, b.Reasons)
 	return keep, nil
 }
 
 // compareImpactRoute is the tie-break that picks the surviving route: cheapest
-// cost, then shallowest, then the smallest admitting edge, then the
-// lexicographically smallest route, then the smallest parent. It is a total
-// order over the routes that can reach one node, so foldImpact's winner is
-// unique however the records are grouped.
+// cost, then shallowest, then the smallest admitting edge, then the smallest
+// route hash, then the smallest parent. Every term is derived from canonical
+// content, never from the order records arrived in, so foldImpact's winner is
+// the same however the records are grouped: two records that tie on all of
+// them describe the same route, and either serves it.
 func compareImpactRoute(x, y impactRecord) int {
 	if c := cmp.Compare(x.Cost, y.Cost); c != 0 {
 		return c
@@ -218,33 +215,20 @@ func compareImpactRoute(x, y impactRecord) int {
 	if c := cmp.Compare(x.Via, y.Via); c != 0 {
 		return c
 	}
-	if c := slices.Compare(x.Route, y.Route); c != 0 {
+	if c := x.Hash.compare(y.Hash); c != 0 {
 		return c
 	}
 	return cmp.Compare(x.Parent, y.Parent)
 }
 
-// mergeReasons is the deterministic reason merge: unionReasons, and only then
-// cut to model.MaxReasonsPerEntry -- so the surviving set is a function of the
-// reasons alone.
-func mergeReasons(a, b []string) []string {
-	out := unionReasons(a, b)
-	if len(out) > model.MaxReasonsPerEntry {
-		out = out[:model.MaxReasonsPerEntry]
-	}
-	return out
-}
-
-// unionReasons is the union of both sides, deduplicated, each clipped to
-// model.MaxReasonBytes and sorted, with no count cut. Empty reasons are
-// dropped: an entry must never fail validation because of a merge.
+// unionReasons is the union of both sides, deduplicated and sorted, every
+// reason whole: an entry's reasons are served by reference, so neither their
+// count nor their length is cut. Empty reasons are dropped: an entry must
+// never fail validation because of a merge.
 func unionReasons(a, b []string) []string {
 	out := make([]string, 0, len(a)+len(b))
 	for _, side := range [2][]string{a, b} {
 		for _, r := range side {
-			if len(r) > model.MaxReasonBytes {
-				r = r[:model.MaxReasonBytes]
-			}
 			if r == "" || slices.Contains(out, r) {
 				continue
 			}

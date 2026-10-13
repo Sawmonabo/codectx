@@ -1011,9 +1011,6 @@ func planNotices(scoped scopeResult, packed planParts, scopeComplete bool) []str
 		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
 		out = append(out, note)
 	}
-	if n := scoped.ReasonsTruncated; n > 0 {
-		add("%d selection reason(s) were truncated to the %d-byte reason bound", n, model.MaxReasonBytes)
-	}
 	if n := packed.Excluded; n > 0 {
 		// The manifest header carries no exclusion list -- exclusions are a
 		// paged projection, and embedding them would make the header
@@ -1202,7 +1199,7 @@ type candidate struct {
 	ScoreMicros int64
 	SizeBytes   int64 // model.FileVersion.Size; 0 until sized
 	Status      model.FileStatus
-	Reasons     []string             // every reason, each <= MaxReasonBytes
+	Reasons     []string             // every reason, each whole
 	Paths       []model.RelationPath // <= cfg.Context.MaxReasonPathsPerEntry
 	MorePaths   int64                // routes not enumerated (Section 15.3)
 	Excluded    string               // non-empty => excluded, with this reason

@@ -106,10 +106,13 @@ type WeightedWalkRequest struct {
 }
 
 // WeightedEntry is one kept label: the node it ends at, hydrated as an impact
-// entry is, with the route that lends it, and the weight and class of the
-// root the route starts at. A node appears once per kept label.
+// entry is, with every reason that explains it, the route that lends it (none
+// for a root), and the weight and class of the root the route starts at. A
+// node appears once per kept label.
 type WeightedEntry struct {
 	model.ImpactEntry
+	Reasons    []string
+	Route      *model.ImpactRoute
 	RootWeight int64
 	Named      bool
 	// Peer is set when the label's route went up a LabelRule.Peer kind and
@@ -1103,8 +1106,8 @@ func (e *Engine) weightedEntries(ctx context.Context, w *weightedWalk, page []se
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]model.ImpactEntry, 0, len(page))
-	kept := make([]servedLabel, 0, len(page))
+	out := make([]WeightedEntry, 0, len(page))
+	var routes []model.ImpactRoute
 	dropped := 0
 	for _, l := range page {
 		n, ok := nodes[model.NodeID(l.key.node)]
@@ -1129,28 +1132,31 @@ func (e *Engine) weightedEntries(ctx context.Context, w *weightedWalk, page []se
 		}
 		entry := model.ImpactEntry{NodeID: n.ID, FileID: n.FileID, Kind: n.Kind,
 			Name: clipTo(n.QualifiedName, model.MaxQualifiedNameBytes), Direction: direction,
-			Depth: l.depth, ScoreMicros: l.score, Reasons: reasons}
+			Depth: l.depth, ScoreMicros: l.score, ReasonCount: int64(len(reasons))}
 		rels, cost, err := w.route(l)
 		if err != nil {
 			return nil, err
 		}
 		if len(rels) > 0 {
-			entry.Paths = []model.RelationPath{{Relations: rels, CostUnits: cost}}
+			entry.RouteCount = 1
+			routes = append(routes, model.ImpactRoute{Relations: rels, CostUnits: cost})
 		}
-		entries = append(entries, entry)
-		kept = append(kept, l)
+		out = append(out, WeightedEntry{ImpactEntry: entry, Reasons: reasons, RootWeight: l.key.weight,
+			Named: l.key.named != 0, Peer: l.key.peer != 0})
 	}
 	if dropped > 0 {
 		meta.Notices = appendNotice(meta.Notices, fmt.Sprintf(
 			"weighted walk: %d reached label(s) could not be hydrated from the pinned generation and are not listed", dropped))
 	}
-	if err := impactPhaseError(ctx, e.attachImpactEvidence(deliverCtx(ctx), entries), meta); err != nil {
+	if err := impactPhaseError(ctx, e.attachRouteEvidence(deliverCtx(ctx), routes), meta); err != nil {
 		return nil, err
 	}
-	out := make([]WeightedEntry, len(entries))
-	for i, entry := range entries {
-		out[i] = WeightedEntry{ImpactEntry: entry, RootWeight: kept[i].key.weight, Named: kept[i].key.named != 0,
-			Peer: kept[i].key.peer != 0}
+	next := 0
+	for i := range out {
+		if out[i].RouteCount == 1 {
+			out[i].Route = &routes[next]
+			next++
+		}
 	}
 	return out, nil
 }

@@ -88,7 +88,7 @@ func TestDependencyAnswerCarriesTheLockDetail(t *testing.T) {
 		t.Fatal("the store's graph reader does not hydrate nodes")
 	}
 	e, err := graph.New(graph.Options{Adjacency: adj, Reader: g, Limits: graph.Limits{
-		MaxDepth: 3, MaxVisited: 1000, MaxEdges: 1000, MaxPageItems: 200, MaxReasonPaths: 3,
+		MaxDepth: 3, MaxVisited: 1000, MaxEdges: 1000, MaxPageItems: 200,
 		QueryTimeout: 10 * time.Second, CursorTTL: time.Minute, FrontierBytes: 1 << 20,
 	}})
 	if err != nil {

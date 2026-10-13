@@ -77,7 +77,7 @@ func TestAHeavierRootTwoHopsAwayLendsMoreThanALighterOneNextToIt(t *testing.T) {
 		t.Fatalf("target's best label is weight %d at depth %d scoring %d; the heavier root's two-hop route "+
 			"lends weight %d at depth 2 scoring 583200", best.RootWeight, best.Depth, best.ScoreMicros, heavy)
 	}
-	if len(best.Paths) != 1 || len(best.Paths[0].Relations) != 2 {
-		t.Fatalf("the best label's route is %v; it is the two hops heavy -> middle -> target", best.Paths)
+	if best.Route == nil || len(best.Route.Relations) != 2 {
+		t.Fatalf("the best label's route is %+v; it is the two hops heavy -> middle -> target", best.Route)
 	}
 }

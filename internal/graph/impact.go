@@ -43,7 +43,7 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	// never stopped.
 	queryHash := traversalQueryHash(req.Direction, kinds, req.Start, maxDepth.Int(), limit)
 
-	answer, entries, b, nextCursor, err := e.walkImpact(ctx, req, kinds, maxDepth, limit, queryHash, deadline)
+	answer, served, b, nextCursor, err := e.walkImpact(ctx, req, kinds, maxDepth, limit, queryHash, deadline)
 	if err != nil {
 		return model.ImpactResult{}, err
 	}
@@ -56,8 +56,11 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	}
 	result := model.ImpactResult{
 		Meta:     meta,
-		Entries:  entries,
+		Entries:  served.Entries,
 		Packages: answer.Packages,
+		Reasons:  served.Reasons,
+		Routes:   served.Routes,
+		Answer:   served.Answer,
 		// Cumulative spend, the same accounting the traversal operations
 		// report: a resumed page carries what the earlier pages already spent
 		// and adds its own, so the counters GROW across the pages of one walk
@@ -118,11 +121,11 @@ type impactAnswer struct {
 // reported as truncation with the ranked answer it did reach.
 func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds []model.RelationKind,
 	maxDepth config.Limit, limit int, queryHash string,
-	deadline time.Time) (answer impactAnswer, _ []model.ImpactEntry, _ *budget, _ string, err error) {
+	deadline time.Time) (answer impactAnswer, _ impactServed, _ *budget, _ string, err error) {
 	meta := model.QueryMeta{}
 	caps, err := e.completeness(ctx)
 	if err != nil {
-		return answer, nil, nil, "", err
+		return answer, impactServed{}, nil, "", err
 	}
 	meta.Completeness = caps
 
@@ -142,16 +145,16 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	if req.Page.Cursor != "" {
 		c, rb, err := e.verifyContinuation(req.Page.Cursor, impactEndpoint, queryHash, deadline)
 		if err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 		if c.Ranked {
 			// The walk is over and the order is settled: this page is a read of
 			// the ranked spool and expands nothing.
-			return e.serveRankedImpact(ctx, c, rb, limit, answer, meta)
+			return e.serveRankedImpact(ctx, c, rb, limit, req.View.Normalized(), answer, meta)
 		}
 		resume, err = e.resumeTraversal(ctx, req.Page.Cursor, impactEndpoint, queryHash, deadline)
 		if err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 		// The consumed continuation's spool outlives the walk: the membership
 		// probes and the spill that copies the cumulative set forward both read
@@ -186,9 +189,12 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	retain := resumeRetained(resume)
 	if retain == nil {
 		if retain, err = e.openWalkState(); err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 	}
+	// Every state the walk admits names its route by reference into the
+	// walk's route table, which the answer serves its routes from.
+	retain.withRoutes()
 	// Discarded AFTER the continuation below has taken it: a leg that mints a
 	// walk cursor detaches the directory, and this then finds nothing to remove.
 	defer retain.discard()
@@ -200,7 +206,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	if resume == nil || !resume.Cursor.WalkDone {
 		reader, err := e.Reader()
 		if err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 		names := &levelNames{}
 		// Every affected node is also counted, per depth, by the open call
@@ -282,13 +288,13 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return werr
 		}, retain.addPair, e.rollupProbe())
 		if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 		// Counted before any continuation is minted, so the token carries
 		// this leg's last level too. The count reads the store and is
 		// delivery, not walking, so it runs past the deadline.
 		if err := sites.flush(context.WithoutCancel(ctx)); err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 	}
 	if b.deadlineHit && state.More {
@@ -307,16 +313,16 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			markTruncated(&meta, reasonDeadlineStalled)
 			answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
 				Notices: answer.Notices, Completeness: meta.Completeness}
-			return answer, nil, b, "", nil
+			return answer, impactServed{}, b, "", nil
 		}
 		markTruncated(&meta, reasonDeadline)
 		next, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state, retain)
 		if err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 		answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
 			Notices: answer.Notices, Completeness: meta.Completeness}
-		return answer, nil, b, next, nil
+		return answer, impactServed{}, b, next, nil
 	}
 	switch {
 	case acc != nil && acc.reason != "":
@@ -339,11 +345,11 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	if acc != nil && slices.Contains(kinds, model.RelMayCall) {
 		reader, err := e.Reader()
 		if err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 		if err := e.expandOpenSites(ctx, reader, req, maxDepth, retain); err != nil {
 			if err := impactPhaseError(ctx, err, &meta); err != nil {
-				return answer, nil, nil, "", err
+				return answer, impactServed{}, nil, "", err
 			}
 		}
 	}
@@ -356,7 +362,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		defer ranked.Close()
 	}
 	if err := impactPhaseError(ctx, rankErr, &meta); err != nil {
-		return answer, nil, nil, "", err
+		return answer, impactServed{}, nil, "", err
 	}
 	var pairs *pagination.SortedRun[pairRecord]
 	if ranked != nil {
@@ -366,7 +372,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			defer pairs.Close()
 		}
 		if err := impactPhaseError(ctx, pairErr, &meta); err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 	}
 	if ranked == nil || pairs == nil {
@@ -378,37 +384,126 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		markTruncated(&meta, reasonDeadline)
 		next, err := e.continueRank(ctx, b, impactEndpoint, queryHash, retain)
 		if err != nil {
-			return answer, nil, nil, "", err
+			return answer, impactServed{}, nil, "", err
 		}
 		answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
 			Notices: answer.Notices, Completeness: meta.Completeness}
-		return answer, nil, b, next, nil
+		return answer, impactServed{}, b, next, nil
 	}
-	entries, nextCursor, err := e.serveRankedRun(ctx, ranked, pairs, queryHash, b, limit, &answer, &meta)
+	served, nextCursor, err := e.serveRankedRun(ctx, ranked, pairs, retain, req,
+		queryHash, b, limit, &answer, &meta)
 	if err != nil {
-		return answer, nil, nil, "", err
-	}
-	if err := impactPhaseError(ctx, e.attachImpactEvidence(deliverCtx(ctx), entries), &meta); err != nil {
-		return answer, nil, nil, "", err
+		return answer, impactServed{}, nil, "", err
 	}
 	answer.Truncated, answer.Reason = meta.Truncated, meta.TruncationReason
 	answer.Completeness = meta.Completeness
-	return answer, entries, b, nextCursor, nil
+	return answer, served, b, nextCursor, nil
 }
 
-// serveRankedRun serves the FIRST page off the two freshly ranked runs -- the
-// affected entities and the package pairs the same walk produced -- and spools
-// everything after it behind one ranked continuation.
+// impactServed is one page of one view of an impact answer, and the token that
+// names the whole answer.
+type impactServed struct {
+	Entries []model.ImpactEntry
+	Reasons []model.ImpactReason
+	Routes  []model.ImpactRoute
+	Answer  string
+}
+
+// viewPage is where one page of a view stands in the ranked records: how many
+// records it used up, and how many reasons of the next one it already served
+// (the reasons view alone splits a record across pages).
+type viewPage struct {
+	consumed int
+	skip     int64
+}
+
+// servePageOf cuts one page of view out of records, the ranked records from
+// ordinal base on, the first of them with skip of its reasons already served.
+// Entries and routes take one item per record; reasons take each record's
+// reasons in order, up to limit.
+func (e *Engine) servePageOf(ctx context.Context, view model.ImpactView, records []impactRecord,
+	base, skip int64, limit int, routes *routeReader, answer *impactAnswer, meta *model.QueryMeta,
+) (impactServed, viewPage, error) {
+	var out impactServed
+	switch view {
+	case model.ImpactViewReasons:
+		reasons, at := cutReasons(records, base, skip, limit)
+		out.Reasons = reasons
+		return out, at, nil
+	case model.ImpactViewRoutes:
+		var err error
+		if out.Routes, err = routesOf(records, base, routes); err != nil {
+			return impactServed{}, viewPage{}, err
+		}
+		if err := impactPhaseError(ctx, e.attachRouteEvidence(deliverCtx(ctx), out.Routes), meta); err != nil {
+			return impactServed{}, viewPage{}, err
+		}
+		return out, viewPage{consumed: len(records)}, nil
+	default:
+		var err error
+		if out.Entries, err = e.impactPage(ctx, records, base, answer, meta); err != nil {
+			return impactServed{}, viewPage{}, err
+		}
+		return out, viewPage{consumed: len(records)}, nil
+	}
+}
+
+// cutReasons takes up to limit reasons from records, in order, starting skip
+// reasons into the first record, and reports where it stopped.
+func cutReasons(records []impactRecord, base, skip int64, limit int) ([]model.ImpactReason, viewPage) {
+	out := make([]model.ImpactReason, 0, min(limit, 64))
+	for i, r := range records {
+		from := int64(0)
+		if i == 0 {
+			from = skip
+		}
+		for j := from; j < int64(len(r.Reasons)); j++ {
+			if len(out) == limit {
+				return out, viewPage{consumed: i, skip: j}
+			}
+			out = append(out, model.ImpactReason{Entry: base + int64(i), Index: j, Reason: r.Reasons[j]})
+		}
+	}
+	return out, viewPage{consumed: len(records)}
+}
+
+// routesOf rebuilds the route of every record from the route table, whole.
+func routesOf(records []impactRecord, base int64, routes *routeReader) ([]model.ImpactRoute, error) {
+	out := make([]model.ImpactRoute, 0, len(records))
+	for i, r := range records {
+		if r.Via == "" {
+			continue
+		}
+		rels, err := routes.route(r.Adm, r.Via)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, model.ImpactRoute{Entry: base + int64(i), Relations: rels,
+			CostUnits: plainCost(r.Cost), Possible: r.Possible})
+	}
+	return out, nil
+}
+
+// serveRankedRun serves the FIRST page of the requested view off the two
+// freshly ranked runs -- the affected entities and the package pairs the same
+// walk produced -- and spools the WHOLE ranked answer behind it: every view
+// reads the same spool, so the answer token this page mints reads any view
+// from its start and the continuation reads on in this one.
 //
-// Both lists are cut to the SAME page bound and paged together: an impact
-// result has room for one cursor, and a page that served the whole rollup
-// beside a cut entity list would overrun the record bound the result validates
-// itself against.
+// The entries view cuts both lists to the SAME page bound and pages them
+// together: an impact result has room for one cursor, and a page that served
+// the whole rollup beside a cut entity list would overrun the record bound the
+// result validates itself against. The reasons and routes views serve no
+// pairs.
+//
+// The page's routes are read from the walk's own route table; the table then
+// moves beside the spool, where every later page reads them.
 func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[impactRecord],
-	pairRun *pagination.SortedRun[pairRecord], queryHash string, b *budget, limit int,
-	answer *impactAnswer, meta *model.QueryMeta) ([]model.ImpactEntry, string, error) {
+	pairRun *pagination.SortedRun[pairRecord], retain *retainedWalk, req model.ImpactRequest, queryHash string,
+	b *budget, limit int, answer *impactAnswer, meta *model.QueryMeta) (impactServed, string, error) {
+	view := req.View.Normalized()
 	// Delivery, for serveRankedImpact's reason: both runs are ranked and this
-	// reads one page off them and spills the remainder.
+	// reads one page off them and spills the answer.
 	ctx = deliverCtx(ctx)
 	page := make([]impactRecord, 0, limit)
 	if err := run.Each(func(r impactRecord) error {
@@ -421,109 +516,312 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 		}
 		return nil
 	}); err != nil && !errors.Is(err, errStopExpansion) {
-		return nil, "", err
+		return impactServed{}, "", err
 	}
 	pairPage := make([]model.PackageEdge, 0, limit)
-	if err := pairRun.Each(func(r pairRecord) error {
-		if err := ctx.Err(); err != nil {
-			return typedContextError(ctx, err)
+	if view == model.ImpactViewEntries {
+		if err := pairRun.Each(func(r pairRecord) error {
+			if err := ctx.Err(); err != nil {
+				return typedContextError(ctx, err)
+			}
+			pairPage = append(pairPage, r.edge())
+			if len(pairPage) == limit {
+				return errStopExpansion
+			}
+			return nil
+		}); err != nil && !errors.Is(err, errStopExpansion) {
+			return impactServed{}, "", err
 		}
-		pairPage = append(pairPage, r.edge())
-		if len(pairPage) == limit {
-			return errStopExpansion
-		}
-		return nil
-	}); err != nil && !errors.Is(err, errStopExpansion) {
-		return nil, "", err
 	}
 	answer.Packages = pairPage
-	entries, err := e.impactPage(ctx, page, answer, meta)
+	routes, err := retain.routeReader()
 	if err != nil {
-		return nil, "", err
+		return impactServed{}, "", err
 	}
-	if int64(len(page)) >= run.Len() && int64(len(pairPage)) >= pairRun.Len() {
-		return entries, "", nil
+	served, at, err := e.servePageOf(ctx, view, page, 0, 0, limit, routes, answer, meta)
+	if cerr := routes.close(); err == nil && cerr != nil {
+		err = internalErr("graph: the route table: " + cerr.Error())
 	}
-	header := rankedHeader{
-		Total: run.Len(), Count: int(run.Len()) - len(page),
-		PairTotal: pairRun.Len(), PairCount: int(pairRun.Len()) - len(pairPage),
+	if err != nil {
+		return impactServed{}, "", err
 	}
-	next, err := e.spillRankedCursor(ctx, b, impactEndpoint, queryHash, header,
-		int64(len(page)), int64(len(pairPage)), meta,
-		rankedRunTail(ctx, run, len(page), encodeImpactRecord),
-		rankedRunTail(ctx, pairRun, len(pairPage), encodePairRecord))
-	return entries, next, err
+	pos := rankedPos{view: view, served: int64(at.consumed), skip: at.skip, pairServed: pairRun.Len()}
+	if view == model.ImpactViewEntries {
+		pos.pairServed = int64(len(pairPage))
+	}
+	done := pos.complete(run.Len(), pairRun.Len())
+	// finished is every view no later request reads: the ones the client said
+	// it will not read, and this one when this page served it whole.
+	var finished []model.ImpactView
+	for _, v := range model.ImpactViews {
+		if !req.Reads(v) || (v == view && done) {
+			finished = append(finished, v)
+		}
+	}
+	if done && (run.Len() == 0 || len(finished) == len(model.ImpactViews)) {
+		// Nothing left that any view will read: the page is the answer.
+		return served, "", nil
+	}
+	header := rankedHeader{Total: run.Len(), Count: int(run.Len()), PairTotal: pairRun.Len(), PairCount: int(pairRun.Len())}
+	next, answerToken, err := e.spillImpactAnswer(ctx, b, queryHash, header, pos, done, finished, retain, meta,
+		rankedSection{tail: rankedRunTail(ctx, run, 0, encodeImpactRecord), mark: at.consumed},
+		rankedSection{tail: rankedRunTail(ctx, pairRun, 0, encodePairRecord), mark: int(pos.pairServed)})
+	served.Answer = answerToken
+	return served, next, err
 }
 
-// serveRankedImpact serves a LATER page: it seeks to this cursor's two byte
-// offsets in the spool the FIRST page wrote, reads at most one page out of each
-// section, and reports the answer-level facts the first page settled. Nothing
-// is copied forward, so the page costs its own page.
+// rankedPos is where one view of a ranked answer stands: the records it has
+// used up, the reasons of the next record it already served, and the pairs it
+// has served (all of them, for a view that serves none).
+type rankedPos struct {
+	view       model.ImpactView
+	served     int64
+	skip       int64
+	pairServed int64
+}
+
+// complete reports that the view has served the whole answer.
+func (p rankedPos) complete(total, pairTotal int64) bool {
+	return p.served >= total && p.skip == 0 && p.pairServed >= pairTotal
+}
+
+// rankedSection is one section of a ranked spool: the records it streams, and
+// the record count after which the writer records its byte offset -- where the
+// view that minted the spool resumes.
+type rankedSection struct {
+	tail func(func([]byte) error) error
+	mark int
+}
+
+// spillImpactAnswer writes the WHOLE ranked answer into one spool, moves the
+// route table beside it under the same lease, and signs the two tokens a page
+// hands back: the answer token, which reads any view from its start, and --
+// when this view has more to serve -- the continuation of this view.
+func (e *Engine) spillImpactAnswer(ctx context.Context, b *budget, queryHash string, header rankedHeader,
+	pos rankedPos, done bool, finished []model.ImpactView, routes *retainedWalk, meta *model.QueryMeta,
+	sections ...rankedSection) (string, string, error) {
+	if e.signer == nil || e.spools == nil {
+		if !done {
+			markTruncated(meta, reasonNoContinuation)
+		}
+		return "", "", nil
+	}
+	binding := e.adjacency.Binding()
+	var leaseID string
+	if e.leases.Retains() {
+		lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return "", "", err
+		}
+		leaseID = lease.ID
+	}
+	c := traversalCursor{
+		Version: traversalCursorVersion, Endpoint: impactEndpoint,
+		GenerationID: binding.GenerationID, AnalysisKey: binding.AnalysisKey,
+		QueryHash: queryHash, LeaseID: leaseID, Ranked: true,
+		RankTotal: header.Total, PairTotal: header.PairTotal,
+		Visited: b.visited, Edges: b.edges,
+		ExpiresAt: e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
+	}
+	id, starts, marks, err := e.spillRankedMarked(c, header, sections...)
+	if err != nil {
+		return "", "", e.releaseLease(ctx, leaseID, err)
+	}
+	c.SpoolID, c.RankStart, c.PairStart = id, starts[0], starts[1]
+	if header.Total > 0 {
+		if c.RouteID, err = e.adoptRoutes(c, routes, finished); err != nil {
+			e.releaseConsumed(ctx, id, "")
+			return "", "", e.releaseLease(ctx, leaseID, err)
+		}
+	}
+	fail := func(err error) (string, string, error) {
+		e.releaseConsumed(ctx, c.RouteID, "")
+		e.releaseConsumed(ctx, id, "")
+		return "", "", e.releaseLease(ctx, leaseID, err)
+	}
+	var answerToken string
+	if header.Total > 0 {
+		if answerToken, err = e.signRanked(c.answer()); err != nil {
+			return fail(err)
+		}
+	}
+	if done {
+		if header.Total == 0 {
+			// Only the rollup was spilled, and this page served all of it:
+			// no other view has anything to read.
+			e.releaseConsumed(ctx, id, leaseID)
+		}
+		return "", answerToken, nil
+	}
+	next := c.at(pos, marks[0], marks[1])
+	token, err := e.signRanked(next)
+	if err != nil {
+		return fail(err)
+	}
+	return token, answerToken, nil
+}
+
+// spillRankedMarked writes the ranked header and then every record each
+// section streams, one at a time, so the answer is never in heap. It reports
+// the spool id, the byte offset each section begins at, and the byte offset
+// after each section's mark records.
+func (e *Engine) spillRankedMarked(next traversalCursor, h rankedHeader,
+	sections ...rankedSection) (string, []int64, []int64, error) {
+	sp, err := e.spools.Create(next.spoolCursor())
+	if err != nil {
+		return "", nil, nil, err
+	}
+	header, err := encodeRankedHeader(h)
+	if err != nil {
+		return "", nil, nil, e.releaseSpool(sp, err)
+	}
+	if err := sp.Append(header); err != nil {
+		return "", nil, nil, e.releaseSpool(sp, err)
+	}
+	starts := make([]int64, len(sections))
+	marks := make([]int64, len(sections))
+	for i, s := range sections {
+		starts[i], marks[i] = sp.Written(), -1
+		count := 0
+		if err := s.tail(func(rec []byte) error {
+			if count == s.mark {
+				marks[i] = sp.Written()
+			}
+			count++
+			return sp.Append(rec)
+		}); err != nil {
+			return "", nil, nil, e.releaseSpool(sp, err)
+		}
+		if marks[i] < 0 {
+			marks[i] = sp.Written()
+		}
+	}
+	if err := sp.Close(); err != nil {
+		return "", nil, nil, e.releaseSpool(sp, err)
+	}
+	e.recordSpoolWritten(sp.Written())
+	return sp.ID(), starts, marks, nil
+}
+
+// serveRankedImpact serves a LATER page of one view: it seeks to the cursor's
+// byte offsets in the spool the FIRST page wrote, reads at most one page, and
+// reports the answer-level facts the first page settled. Nothing is copied
+// forward, so the page costs its own page.
+//
+// The cursor is either the continuation of one view -- presented again with
+// that view -- or the answer token, which starts whichever view the request
+// names.
 func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *budget, limit int,
-	answer impactAnswer, meta model.QueryMeta) (_ impactAnswer, _ []model.ImpactEntry, _ *budget, _ string, err error) {
-	// The spool and its lease are released when the ANSWER ends, not when a
-	// page does: every later page reads the same spool, so releasing it on a
-	// page that still has a remainder would destroy the rest of the answer.
-	// complete is explicit rather than "no cursor was minted", because a
-	// renewal, signing or marshal failure also mints no cursor and must leave
-	// this cursor adoptable so the caller can present it again.
-	complete := false
+	view model.ImpactView, answer impactAnswer, meta model.QueryMeta) (_ impactAnswer, _ impactServed, _ *budget, _ string, err error) {
+	// The answer is released when EVERY view of it has been served whole,
+	// not when one view ends: the others read the same spool. done is
+	// explicit rather than "no cursor was minted", because a renewal, signing
+	// or marshal failure also mints no cursor and must leave this cursor
+	// adoptable so the caller can present it again.
+	done := false
 	// Serving a ranked page is DELIVERY, so it runs deadline-detached like
 	// every other delivery step: the walk is over, the order is settled, and
-	// what is left is one bounded read of at most `limit` records off a local
-	// spool plus the token that names the rest. Charged against the request
-	// deadline these reads returned the context's own error and the page came
-	// back as ok:false with data:null -- the whole answer unreachable because
-	// the clock ran out while handing back records already on disk.
+	// what is left is one bounded read off a local spool plus the tokens that
+	// name the rest.
 	ctx = deliverCtx(ctx)
+	pos, rankOff, pairOff, err := c.position(view)
+	if err != nil {
+		return answer, impactServed{}, nil, "", err
+	}
 	defer func() {
-		if terminalOutcome(err) && complete {
-			e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
+		if terminalOutcome(err) && done {
+			e.finishView(ctx, c, view)
 		}
 	}()
 	if e.spools == nil {
-		return answer, nil, nil, "", cursorInvalid("continuation state has expired or was released")
+		return answer, impactServed{}, nil, "", cursorInvalid("continuation state has expired or was released")
 	}
 	h, _, read, err := rankedSpoolHeader(ctx, e.spools, c.spoolCursor(), e.now())
 	if err != nil {
-		return answer, nil, nil, "", err
+		return answer, impactServed{}, nil, "", err
 	}
-	rankLeft, pairLeft := c.RankTotal-c.RankServed, c.PairTotal-c.PairServed
+	rankLeft, pairLeft := c.RankTotal-pos.served, c.PairTotal-pos.pairServed
 	if err := h.checkAgainst(rankLeft, pairLeft); err != nil {
-		return answer, nil, nil, "", err
+		return answer, impactServed{}, nil, "", err
 	}
-	page, pairPage, endRank, endPair, sectionBytes, err := serveRankedSections(ctx, e.spools,
-		c.spoolCursor(), e.now(), c.RankOffset, c.PairOffset,
-		pageWant(limit, rankLeft), pageWant(limit, pairLeft))
+	routes, err := e.openRankedRoutes(ctx, c)
 	if err != nil {
-		return answer, nil, nil, "", err
+		return answer, impactServed{}, nil, "", err
+	}
+	defer routes.close()
+	page, pairPage, endRank, endPair, sectionBytes, err := serveRankedSections(ctx, e.spools,
+		c.spoolCursor(), e.now(), rankOff, pairOff, pageWant(limit, rankLeft), pageWant(limit, pairLeft))
+	if err != nil {
+		return answer, impactServed{}, nil, "", err
 	}
 	e.recordSpoolRead(read + sectionBytes)
 	answer.Packages = make([]model.PackageEdge, 0, len(pairPage))
 	for _, r := range pairPage {
 		answer.Packages = append(answer.Packages, r.edge())
 	}
-	entries, err := e.impactPage(ctx, page, &answer, &meta)
+	served, at, err := e.servePageOf(ctx, view, page, pos.served, pos.skip, limit, routes, &answer, &meta)
 	if err != nil {
-		return answer, nil, nil, "", err
+		return answer, impactServed{}, nil, "", err
 	}
-	if err := impactPhaseError(ctx, e.attachImpactEvidence(deliverCtx(ctx), entries), &meta); err != nil {
-		return answer, nil, nil, "", err
-	}
-	var next string
-	// Served counts records CONSUMED FROM THE SPOOL rather than entries handed
-	// back, so a hydration drop cannot end the answer a record early.
-	served, pairServed := c.RankServed+int64(len(page)), c.PairServed+int64(len(pairPage))
-	complete = served >= c.RankTotal && pairServed >= c.PairTotal
-	if !complete {
-		next, err = e.continueRankedCursor(ctx, b, c, served, pairServed, endRank, endPair, &meta)
-		if err != nil {
-			return answer, nil, nil, "", err
+	if at.consumed < len(page) {
+		// The reasons view stopped inside a record: the next page resumes at
+		// that record's first byte, which is where the records it used up end.
+		if endRank, _, err = readRankedSection(ctx, e.spools, c.spoolCursor(), e.now(), rankOff,
+			at.consumed, func([]byte) error { return nil }); err != nil {
+			return answer, impactServed{}, nil, "", err
 		}
 	}
+	// Served counts records CONSUMED FROM THE SPOOL rather than entries handed
+	// back, so a hydration drop cannot end the answer a record early.
+	next := rankedPos{view: view, served: pos.served + int64(at.consumed), skip: at.skip,
+		pairServed: pos.pairServed + int64(len(pairPage))}
+	done = next.complete(c.RankTotal, c.PairTotal)
+	token, answerToken, err := e.continueImpactCursor(ctx, b, c, next, done, endRank, endPair, &meta)
+	if err != nil {
+		return answer, impactServed{}, nil, "", err
+	}
+	served.Answer = answerToken
 	answer.Completeness = meta.Completeness
 	answer.Truncated, answer.Reason = meta.Truncated, meta.TruncationReason
-	return answer, entries, b, next, nil
+	return answer, served, b, token, nil
+}
+
+// continueImpactCursor renews the answer's lease and signs the answer token
+// and, when the view has more to serve, its continuation. It writes nothing to
+// the database beyond the renewal: a ranked page is O(page).
+//
+// A LEASED spool is renewed on every page, because its liveness is its lease's
+// (pagination.Spools.live) and the answer is not over. A leaseless spool -- and
+// a leased one presented to a process that writes nothing -- has no renewal:
+// the tokens carry forward the expiry its header was stamped with.
+func (e *Engine) continueImpactCursor(ctx context.Context, b *budget, c traversalCursor, pos rankedPos,
+	done bool, rankOff, pairOff int64, meta *model.QueryMeta) (string, string, error) {
+	if e.signer == nil {
+		if !done {
+			markTruncated(meta, reasonNoContinuation)
+		}
+		return "", "", nil
+	}
+	c.Version = traversalCursorVersion
+	c.Visited, c.Edges = b.visited, b.edges
+	if c.LeaseID != "" && e.leases.Retains() {
+		if _, err := e.leases.Renew(ctx, c.LeaseID); err != nil {
+			return "", "", err
+		}
+		c.ExpiresAt = e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second)
+	}
+	answerToken, err := e.signRanked(c.answer())
+	if err != nil {
+		return "", "", err
+	}
+	if done {
+		return "", answerToken, nil
+	}
+	token, err := e.signRanked(c.at(pos, rankOff, pairOff))
+	if err != nil {
+		return "", "", err
+	}
+	return token, answerToken, nil
 }
 
 // pageWant is how many records of one ranked section a page takes: its limit,
@@ -539,17 +837,18 @@ func pageWant(limit int, left int64) int {
 	return limit
 }
 
-// impactPage projects one page of ranked records into served entries and
-// hydrates them. The records arrive in the served order and stay in it.
-func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *impactAnswer,
-	meta *model.QueryMeta) ([]model.ImpactEntry, error) {
-	reasonPaths := e.limits.ReasonPaths()
+// impactPage projects one page of ranked records, the first at ordinal base,
+// into served entries and hydrates them. The records arrive in the served order
+// and stay in it. An entry names how many reasons and routes it has; the
+// reasons and routes views serve them.
+func (e *Engine) impactPage(ctx context.Context, page []impactRecord, base int64,
+	answer *impactAnswer, meta *model.QueryMeta) ([]model.ImpactEntry, error) {
 	entries := make([]model.ImpactEntry, 0, len(page))
-	for _, r := range page {
-		entry := model.ImpactEntry{NodeID: r.NodeID, Direction: r.Direction, Depth: r.Depth,
-			ScoreMicros: r.scoreMicros(), Reasons: r.Reasons}
-		if len(r.Route) > 0 && len(r.Route) <= model.MaxRelationsPerPath && !reasonPaths.Exceeded(1) {
-			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: plainCost(r.Cost), Possible: r.Possible}}
+	for i, r := range page {
+		entry := model.ImpactEntry{Ordinal: base + int64(i), NodeID: r.NodeID, Direction: r.Direction,
+			Depth: r.Depth, ScoreMicros: r.scoreMicros(), ReasonCount: int64(len(r.Reasons))}
+		if r.Via != "" {
+			entry.RouteCount = 1
 		}
 		entries = append(entries, entry)
 	}
@@ -1068,17 +1367,21 @@ func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 	// Every identifier on the record is CANONICAL, resolved from this level's
 	// one batched read. That is ADR-0005 Decision 2's whole point: the walk is
 	// free to carry build-dependent surrogates, and the order the answer is
-	// served in is not -- foldImpact's route tie-break reads Via, Route and
-	// Parent, so leaving any of the three a surrogate would let a fresh index
-	// and a delta-built index of the same tree serve different pages.
+	// served in is not -- foldImpact's route tie-break reads Via, the route
+	// hash and Parent, so deriving any of the three from a surrogate would let
+	// a fresh index and a delta-built index of the same tree serve different
+	// pages. The route itself is the owner's admission plus Via: the rows
+	// behind the admission hold canonical ids too.
+	via := a.names.rel(e.Rel)
 	return a.emit(impactRecord{
 		NodeID:    reached,
 		Depth:     depth,
 		Cost:      impactAdd(state.Cost, kind),
 		Direction: direction,
-		Via:       a.names.rel(e.Rel),
+		Via:       via,
 		Parent:    a.names.node(state.Node),
-		Route:     a.names.route(appendRoute(state.Route, e.Rel)),
+		Adm:       state.Adm,
+		Hash:      state.Hash.extend(via),
 		Reasons:   []string{impactEdgeReason(kind, e.Outgoing, direction, depth)},
 	})
 }
@@ -1150,15 +1453,13 @@ func (e *Engine) nodesByID(ctx context.Context, ids []model.NodeID) (map[model.N
 	return out, nil
 }
 
-// attachImpactEvidence makes every returned reason evidence-backed: the
-// evidence for a whole page of paths is hydrated in bounded batches, never one
-// query per edge.
-func (e *Engine) attachImpactEvidence(ctx context.Context, entries []model.ImpactEntry) error {
+// attachRouteEvidence makes every served route evidence-backed: the evidence
+// for a whole page of routes is hydrated in bounded batches, never one query
+// per edge, and a route carries the evidence of every relation it crosses.
+func (e *Engine) attachRouteEvidence(ctx context.Context, routes []model.ImpactRoute) error {
 	var ids []model.RelationID
-	for _, entry := range entries {
-		for _, p := range entry.Paths {
-			ids = append(ids, p.Relations...)
-		}
+	for _, r := range routes {
+		ids = append(ids, r.Relations...)
 	}
 	evidence := make(map[model.RelationID][]model.EvidenceID, len(ids))
 	for _, batch := range impactChunkRelations(dedupeRelations(ids)) {
@@ -1170,19 +1471,12 @@ func (e *Engine) attachImpactEvidence(ctx context.Context, entries []model.Impac
 			evidence[id] = ev
 		}
 	}
-	for i := range entries {
-		for j := range entries[i].Paths {
-			p := &entries[i].Paths[j]
-			var ev []model.EvidenceID
-			for _, rel := range p.Relations {
-				ev = append(ev, evidence[rel]...)
-				if len(ev) >= model.MaxRelationsPerPath {
-					ev = ev[:model.MaxRelationsPerPath]
-					break
-				}
-			}
-			p.Evidence = ev
+	for i := range routes {
+		var ev []model.EvidenceID
+		for _, rel := range routes[i].Relations {
+			ev = append(ev, evidence[rel]...)
 		}
+		routes[i].Evidence = ev
 	}
 	return nil
 }

@@ -517,6 +517,9 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 			"the direction is the discriminator the answer reports: an incoming entry may need " +
 			"modification, an outgoing entry may need reading. Every entry carries at least one " +
 			"reason naming the relation kind and direction that made it affected.\n\n" +
+			"An entry names how many reasons and routes explain it; --view reasons and --view routes " +
+			"page them, in entry order, every one whole. Each page prints the answer token: passed as " +
+			"--cursor with any --view, it reads that view of the same answer from its start.\n\n" +
 			"The answer also carries the package rollup that summarises it: distinct " +
 			"package-to-package pairs with their evidence counts. A rollup pair is a summary, " +
 			"never a precise symbol-level call.\n\n" +
@@ -536,6 +539,16 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 			gen, err := generationFlag(cmd)
 			if err != nil {
 				return err
+			}
+			viewName, err := stringFlag(cmd, impactViewFlag)
+			if err != nil {
+				return err
+			}
+			view := model.ImpactView(viewName)
+			if !view.Valid() {
+				return (&model.Error{Code: model.CodeArgumentInvalid,
+					Message: fmt.Sprintf("--%s %q is not one of entries, reasons, routes", impactViewFlag, clip(viewName, 64))}).
+					WithDetail("argument", clip(viewName, 64))
 			}
 			var result model.ImpactResult
 			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
@@ -557,6 +570,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 					MaxDepth:     base.MaxDepth,
 					MaxVisited:   base.MaxVisited,
 					MaxEdges:     base.MaxEdges,
+					View:         view,
 					Page:         base.Page,
 				})
 				return err
@@ -566,8 +580,18 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 			return emitQuery(cmd, build, args, result, result.Meta, func(b *strings.Builder) {
 				fmt.Fprintf(b, "walked      %d visited, %d %s\n", result.VisitedCount,
 					result.EdgeCount, plural(int(result.EdgeCount), "edge", "edges"))
-				writeImpactEntries(b, result.Entries)
-				writePackageEdges(b, result.Packages)
+				switch view.Normalized() {
+				case model.ImpactViewReasons:
+					writeImpactReasons(b, result.Reasons)
+				case model.ImpactViewRoutes:
+					writeImpactRoutes(b, result.Routes)
+				default:
+					writeImpactEntries(b, result.Entries)
+					writePackageEdges(b, result.Packages)
+				}
+				if result.Answer != "" {
+					fmt.Fprintf(b, "answer      %s\n", result.Answer)
+				}
 			})
 		},
 	}
@@ -575,8 +599,13 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 	addLimitFlag(cmd)
 	addCursorFlag(cmd)
 	addTraversalFlags(cmd, true, true)
+	cmd.Flags().String(impactViewFlag, string(model.ImpactViewEntries),
+		"the view of the answer to page: entries, reasons or routes")
 	return cmd
 }
+
+// impactViewFlag is `impact --view`.
+const impactViewFlag = "view"
 
 // checkNodeArgs screens the positional arguments before any database is opened.
 // It cannot resolve a name -- that needs the pinned generation the service
@@ -934,7 +963,8 @@ func writePaths(b *strings.Builder, paths []model.RelationPath) {
 }
 
 // writeImpactEntries renders the ranked entries in the order the engine ranked
-// them, each with the direction that made it affected and its reasons.
+// them, each with its ordinal, the direction that made it affected, and how
+// many reasons and routes explain it.
 func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 	if len(entries) == 0 {
 		b.WriteString("entries     none\n")
@@ -944,10 +974,42 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 	for _, e := range entries {
 		// ImpactEntry.Name is the entry's qualified name (model.Node has no file
 		// path); the column is labelled for what it holds.
-		fmt.Fprintf(b, "  %s  %-9s depth %d  score %d  name %s\n", e.NodeID, e.Direction, e.Depth,
-			e.ScoreMicros, clip(e.Name, 70))
-		for _, reason := range e.Reasons {
-			fmt.Fprintf(b, "    %s\n", clip(reason, 100))
+		fmt.Fprintf(b, "  #%d %s  %-9s depth %d  score %d  %d %s  %d %s  name %s\n", e.Ordinal, e.NodeID,
+			e.Direction, e.Depth, e.ScoreMicros, e.ReasonCount, plural(int(e.ReasonCount), "reason", "reasons"),
+			e.RouteCount, plural(int(e.RouteCount), "route", "routes"), clip(e.Name, 70))
+	}
+}
+
+// writeImpactReasons renders one page of the reasons view, each reason whole
+// under the ordinal of the entry it explains.
+func writeImpactReasons(b *strings.Builder, reasons []model.ImpactReason) {
+	if len(reasons) == 0 {
+		b.WriteString("reasons     none\n")
+		return
+	}
+	fmt.Fprintf(b, "reasons     %d\n", len(reasons))
+	for _, r := range reasons {
+		fmt.Fprintf(b, "  #%d.%d %s\n", r.Entry, r.Index, r.Reason)
+	}
+}
+
+// writeImpactRoutes renders one page of the routes view, each route whole --
+// every relation it crosses -- under the ordinal of the entry it reaches.
+func writeImpactRoutes(b *strings.Builder, routes []model.ImpactRoute) {
+	if len(routes) == 0 {
+		b.WriteString("routes      none\n")
+		return
+	}
+	fmt.Fprintf(b, "routes      %d\n", len(routes))
+	for _, r := range routes {
+		possible := ""
+		if r.Possible {
+			possible = ", possible"
+		}
+		fmt.Fprintf(b, "  #%d.%d cost %d, %d %s, %d evidence%s\n", r.Entry, r.Index, r.CostUnits,
+			len(r.Relations), plural(len(r.Relations), "edge", "edges"), len(r.Evidence), possible)
+		for _, id := range r.Relations {
+			fmt.Fprintf(b, "    %s\n", id)
 		}
 	}
 }

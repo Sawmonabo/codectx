@@ -681,11 +681,12 @@ func runScenario(t *testing.T, a adapter, actor string, s seed) walk {
 	t.Helper()
 	var w walk
 
-	impact := a.impact(t, model.ImpactRequest{Start: []model.NodeID{s.Node}, Direction: model.DirectionBoth})
+	impactReq := model.ImpactRequest{Start: []model.NodeID{s.Node}, Direction: model.DirectionBoth}
+	impact := a.impact(t, impactReq)
 	if len(impact.Entries) == 0 {
 		t.Fatalf("%s: impact on the seed node reported nothing affected", a.kind())
 	}
-	w.Impact = impactKeys(impact.Entries)
+	w.Impact = impactKeys(impact.Entries, impactRoutes(t, a, impactReq, impact.Answer))
 
 	plan, opened := a.plan(t, model.PlanRequest{
 		ActorID: actor,
@@ -837,11 +838,37 @@ func requiredFiles(files []model.FileCoverage) []model.FileCoverage {
 	return out
 }
 
-func impactKeys(entries []model.ImpactEntry) []impactKey {
+// impactRoutes reads the whole routes view of the answer token names, through
+// the adapter, a page at a time.
+func impactRoutes(t *testing.T, a adapter, req model.ImpactRequest, answer string) []model.ImpactRoute {
+	t.Helper()
+	if answer == "" {
+		t.Fatalf("%s: the impact answer carries no answer token to read its routes by", a.kind())
+	}
+	req.View, req.Page.Cursor = model.ImpactViewRoutes, answer
+	var out []model.ImpactRoute
+	for page := 0; ; page++ {
+		if page > 1000 {
+			t.Fatalf("%s: the routes view did not end in 1000 pages", a.kind())
+		}
+		res := a.impact(t, req)
+		out = append(out, res.Routes...)
+		if res.Meta.NextCursor == "" {
+			return out
+		}
+		req.Page.Cursor = res.Meta.NextCursor
+	}
+}
+
+func impactKeys(entries []model.ImpactEntry, routes []model.ImpactRoute) []impactKey {
+	byEntry := map[int64][]model.ImpactRoute{}
+	for _, r := range routes {
+		byEntry[r.Entry] = append(byEntry[r.Entry], r)
+	}
 	keys := make([]impactKey, 0, len(entries))
 	for _, e := range entries {
 		var relations bytes.Buffer
-		for _, p := range e.Paths {
+		for _, p := range byEntry[e.Ordinal] {
 			for _, id := range p.Relations {
 				fmt.Fprintf(&relations, "%s,", id)
 			}
@@ -981,6 +1008,12 @@ func (a cliAdapter) impact(t *testing.T, req model.ImpactRequest) model.ImpactRe
 	args := []string{"impact"}
 	for _, node := range req.Start {
 		args = append(args, string(node))
+	}
+	if req.View != "" {
+		args = append(args, "--view", string(req.View))
+	}
+	if req.Page.Cursor != "" {
+		args = append(args, "--cursor", req.Page.Cursor)
 	}
 	env, code := a.s.run(t, args...)
 	return data[model.ImpactResult](t, env, code)
@@ -1263,13 +1296,10 @@ func TestE2EProductBoundary(t *testing.T) {
 	}
 	impactEnv, impactCode := s.run(t, "impact", string(node))
 	whole := data[model.ImpactResult](t, impactEnv, impactCode)
+	routesEnv, routesCode := s.run(t, "impact", string(node), "--view", "routes", "--cursor", whole.Answer)
 	var relation model.RelationID
-	for _, entry := range whole.Entries {
-		for _, path := range entry.Paths {
-			if len(path.Relations) > 0 {
-				relation = path.Relations[0]
-			}
-		}
+	for _, route := range data[model.ImpactResult](t, routesEnv, routesCode).Routes {
+		relation = route.Relations[0]
 	}
 	if relation == "" {
 		t.Fatalf("impact on %s produced no evidence-backed relation to cite", node)

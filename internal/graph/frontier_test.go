@@ -840,7 +840,8 @@ func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
 
 	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
 	req := model.ImpactRequest{GenerationID: 1, Start: seeds,
-		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+		Views: entriesOnly}
 
 	// Ground truth: the same walk, one request, no deadline in the way.
 	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
@@ -1093,7 +1094,8 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 
 	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
 	base := model.ImpactRequest{GenerationID: 1, Start: seeds,
-		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+		Views: entriesOnly}
 
 	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})

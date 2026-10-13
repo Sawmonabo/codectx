@@ -102,9 +102,6 @@ func referenceWalks(ctx context.Context, eng *graph.Engine, gen model.Generation
 		if !ok {
 			continue
 		}
-		var truncated int64
-		c.Reasons, truncated = boundReasons(c.Reasons)
-		res.ReasonsTruncated += truncated
 		c.Paths, c.MorePaths = boundPaths(c.Paths, cfg.MaxReasonPathsPerEntry)
 		res.Candidates = append(res.Candidates, c)
 		if n := len(reached); n == 0 || reached[n-1].NodeID != c.NodeID {

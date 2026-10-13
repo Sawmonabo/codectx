@@ -18,7 +18,64 @@ type ImpactRequest struct {
 	MaxDepth     int            `json:"max_depth,omitempty"`
 	MaxVisited   int            `json:"max_visited,omitempty"`
 	MaxEdges     int            `json:"max_edges,omitempty"`
-	Page         PageRequest    `json:"page,omitempty"`
+	// View is the projection of the answer a page serves: its entries (the
+	// default), every entry's reasons, or every entry's route. A page of any
+	// view reads the same ranked answer, so an answer token or a cursor of one
+	// view presented with another of its views reads that view of the same
+	// answer.
+	View ImpactView `json:"view,omitempty"`
+	// Views names every view the client will read of the answer, all three
+	// when it names none. The answer is retained until each has been served
+	// whole, so a client that reads only the entries says so and the answer
+	// is released when its entries end rather than when its lease expires.
+	Views []ImpactView `json:"views,omitempty"`
+	Page  PageRequest  `json:"page,omitempty"`
+}
+
+// ImpactViews is every view of an impact answer.
+var ImpactViews = []ImpactView{ImpactViewEntries, ImpactViewReasons, ImpactViewRoutes}
+
+// Reads reports whether a request reads view: every view when it names none.
+func (r ImpactRequest) Reads(view ImpactView) bool {
+	if len(r.Views) == 0 {
+		return true
+	}
+	for _, v := range r.Views {
+		if v.Normalized() == view {
+			return true
+		}
+	}
+	return false
+}
+
+// ImpactView names one projection of an impact answer.
+type ImpactView string
+
+const (
+	// ImpactViewEntries pages the ranked entries and the package rollup.
+	ImpactViewEntries ImpactView = "entries"
+	// ImpactViewReasons pages every entry's reasons, in (entry, index) order.
+	ImpactViewReasons ImpactView = "reasons"
+	// ImpactViewRoutes pages every entry's route, in (entry, index) order.
+	ImpactViewRoutes ImpactView = "routes"
+)
+
+// Normalized answers the view a request names, the entries view when it names
+// none.
+func (v ImpactView) Normalized() ImpactView {
+	if v == "" {
+		return ImpactViewEntries
+	}
+	return v
+}
+
+// Valid reports whether v is a known view or empty.
+func (v ImpactView) Valid() bool {
+	switch v {
+	case "", ImpactViewEntries, ImpactViewReasons, ImpactViewRoutes:
+		return true
+	}
+	return false
 }
 
 // Validate enforces bounded seeds, a known relation vocabulary, a known
@@ -46,6 +103,17 @@ func (r ImpactRequest) Validate() error {
 	if !r.Direction.Valid() {
 		return invalid("impact.direction %q is not a known direction", truncateForMessage(string(r.Direction)))
 	}
+	if !r.View.Valid() {
+		return invalid("impact.view %q is not a known view", truncateForMessage(string(r.View)))
+	}
+	for _, v := range r.Views {
+		if v == "" || !v.Valid() {
+			return invalid("impact.views %q is not a known view", truncateForMessage(string(v)))
+		}
+	}
+	if len(r.Views) > 0 && !r.Reads(r.View.Normalized()) {
+		return invalid("impact.views does not name impact.view %q", r.View.Normalized())
+	}
 	// Zero defers to the configured traversal caps; see PageRequest.
 	for _, b := range []struct {
 		field string
@@ -70,11 +138,20 @@ func (r ImpactRequest) Validate() error {
 // traversal accounting Section 14.3 requires. Exhausting a hard budget is
 // reported through Meta.Truncated rather than presented as exhaustive impact.
 type ImpactResult struct {
-	Meta         QueryMeta     `json:"meta"`
-	Entries      []ImpactEntry `json:"entries"`
-	Packages     []PackageEdge `json:"packages,omitempty"`
-	VisitedCount int64         `json:"visited_count"`
-	EdgeCount    int64         `json:"edge_count"`
+	Meta     QueryMeta     `json:"meta"`
+	Entries  []ImpactEntry `json:"entries"`
+	Packages []PackageEdge `json:"packages,omitempty"`
+	// Reasons and Routes are the page of the reasons view and of the routes
+	// view: the explanation of the entries, by entry ordinal.
+	Reasons []ImpactReason `json:"reasons,omitempty"`
+	Routes  []ImpactRoute  `json:"routes,omitempty"`
+	// Answer names this whole ranked answer: presented as Page.Cursor with any
+	// view, it reads that view from its start. Every page carries it while the
+	// answer is retained, so an entry read from the entries view can be
+	// explained from the reasons and routes views of the same answer.
+	Answer       string `json:"answer,omitempty"`
+	VisitedCount int64  `json:"visited_count"`
+	EdgeCount    int64  `json:"edge_count"`
 	// OpenSitesByDepth counts, at each depth (index 0 is depth 1, the depth an
 	// entry's Depth names), the open call sites whose candidates name a node
 	// of the frontier: possibly affected, counted and not expanded unless the
@@ -100,6 +177,22 @@ func (r ImpactResult) Validate() error {
 	}
 	for _, p := range r.Packages {
 		if err := p.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := boundPage("impact_result.reasons", len(r.Reasons)); err != nil {
+		return err
+	}
+	for _, x := range r.Reasons {
+		if err := x.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := boundPage("impact_result.routes", len(r.Routes)); err != nil {
+		return err
+	}
+	for _, x := range r.Routes {
+		if err := x.Validate(); err != nil {
 			return err
 		}
 	}

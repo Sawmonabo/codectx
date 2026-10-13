@@ -122,7 +122,8 @@ func smallestFixtureImpactRecord() impactRecord {
 		Depth:  1, Cost: 1, Direction: model.DirectionOutgoing,
 		Via:     fixtureRelationID(1),
 		Parent:  fixtureNodeID("bound-seed"),
-		Route:   []model.RelationID{fixtureRelationID(1)},
+		Adm:     1,
+		Hash:    routeHash{}.extend(fixtureRelationID(1)),
 		Reasons: []string{string(model.RelCalls)},
 	}
 }

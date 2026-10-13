@@ -161,14 +161,13 @@ func (a adjacency) Binding() model.Binding { return a.reader.Binding() }
 // already refuses.
 func graphLimits(cfg config.Config) graph.Limits {
 	return graph.Limits{
-		MaxDepth:       cfg.Context.MaxGraphDepth.Int(),
-		MaxVisited:     cfg.Context.MaxVisitedNodes.Int(),
-		MaxEdges:       cfg.Context.MaxGraphEdges.Int(),
-		MaxPageItems:   cfg.Resources.MaxPageItems,
-		MaxReasonPaths: cfg.Context.MaxReasonPathsPerEntry.Int(),
-		QueryTimeout:   cfg.Resources.QueryTimeout.Std(),
-		CursorTTL:      cfg.Storage.QueryCursorTTL.Std(),
-		FrontierBytes:  cfg.Resources.QueryMemoryBytes,
+		MaxDepth:      cfg.Context.MaxGraphDepth.Int(),
+		MaxVisited:    cfg.Context.MaxVisitedNodes.Int(),
+		MaxEdges:      cfg.Context.MaxGraphEdges.Int(),
+		MaxPageItems:  cfg.Resources.MaxPageItems,
+		QueryTimeout:  cfg.Resources.QueryTimeout.Std(),
+		CursorTTL:     cfg.Storage.QueryCursorTTL.Std(),
+		FrontierBytes: cfg.Resources.QueryMemoryBytes,
 	}
 }
 
