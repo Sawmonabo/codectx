@@ -215,7 +215,8 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         let fit = usize::try_from(room / place).unwrap_or(usize::MAX);
         cap = cap.min(fit.max(2));
     }
-    let (mut blocks_scored, mut docs_scored) = (0u64, 0u64);
+    // The work counts sum over every scoring pass the page made.
+    let (mut blocks_total, mut blocks_scored, mut docs_scored) = (0u64, 0u64, 0u64);
     loop {
         let ctx = Ctx {
             fields: &fields,
@@ -244,12 +245,11 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         let dropping = fruits.iter().filter(|f| f.dropped).count() as u32;
         let cut: Option<Hit> = fruits.iter().filter_map(|f| f.boundary.as_ref()).min_by(|x, y| cmp_hits(x, y)).cloned();
         page.matches = 0;
-        page.blocks_total = 0;
         page.marked = 0;
         for f in &fruits {
             page.matches += f.matches;
-            page.blocks_total += f.blocks_total;
             page.marked += f.marked.len() as u64;
+            blocks_total += f.blocks_total;
             blocks_scored += f.blocks_scored;
             docs_scored += f.docs_scored;
         }
@@ -299,6 +299,7 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         page.cap = cap as u64;
         page.canceled = canceled;
         page.matches_exact = !skipped;
+        page.blocks_total = blocks_total;
         page.blocks_scored = blocks_scored;
         page.docs_scored = docs_scored;
         page.hits = finish(&view.index.executor, &fruits, merged)?
