@@ -77,7 +77,9 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "create the bench root %s: %v\n", benchRoot, err)
 		os.Exit(1)
 	}
+	done := testenv.GoHost()
 	code := m.Run()
+	done()
 	if err := closeRows(); err != nil {
 		fmt.Fprintf(os.Stderr, "close the benchmark row file: %v\n", err)
 		code = 1

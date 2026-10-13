@@ -23,6 +23,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 )
 
 // TestMain makes this test binary its own parser worker, as the codectx
@@ -31,7 +32,7 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
 	}
-	done := goTestHost()
+	done := testenv.GoHost()
 	code := m.Run()
 	done()
 	os.Exit(code)

@@ -30,8 +30,10 @@ func TestAnAmbiguousNameCountsAndNamesEveryCandidate(t *testing.T) {
 	home := t.TempDir()
 	repo := filepath.Join(home, "repo")
 	userCfg := filepath.Join(home, "config", "codectx")
-	if err := os.MkdirAll(userCfg, 0o700); err != nil {
-		t.Fatal(err)
+	for _, dir := range []string{userCfg, repo} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg := "[storage]\ndata_dir = \"" + filepath.Join(home, "data") + "\"\n" +
 		"[tools]\noffline = true\n" +

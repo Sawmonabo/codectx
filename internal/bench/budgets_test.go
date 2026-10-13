@@ -19,6 +19,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 	_ "modernc.org/sqlite"
 )
 
@@ -350,6 +351,7 @@ func releaseBinary(tb testing.TB) string {
 		}
 		binaryPath = filepath.Join(dir, "codectx")
 		cmd := exec.Command("go", "build", "-trimpath", "-o", binaryPath, "github.com/Sawmonabo/codectx/cmd/codectx")
+		cmd.Env = testenv.HostEnviron()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			binaryErr = fmt.Errorf("go build: %v: %s", err, out)
 		}

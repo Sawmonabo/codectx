@@ -19,6 +19,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 
 	_ "modernc.org/sqlite"
 )
@@ -58,6 +59,9 @@ func TestMain(m *testing.M) {
 				return 1
 			}
 		}
+		// After the build: the go command itself needs the host's GOROOT.
+		done := testenv.GoHost()
+		defer done()
 		return m.Run()
 	}())
 }

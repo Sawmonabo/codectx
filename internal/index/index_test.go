@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/Sawmonabo/codectx/internal/admission"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -56,7 +57,10 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
 	}
-	os.Exit(m.Run())
+	done := testenv.GoHost()
+	code := m.Run()
+	done()
+	os.Exit(code)
 }
 
 // fixture is one workspace, one store and one coordinator over real
