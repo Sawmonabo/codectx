@@ -41,6 +41,8 @@ type depLists struct {
 	seenN, seenV []int32
 	// stack is the walk's stack of nodes.
 	stack []int32
+	// rets is the function's returning nodes (returning).
+	rets []int32
 	// linker builds the file's link tables beside the pass, link holds them
 	// and linkFailure is why they were abandoned (link.go).
 	linker      linker
@@ -131,7 +133,8 @@ func (w *state) analyse(l *Lowering, fn Node, src []byte) (cause string, failed 
 	pd := flow.PostDominators(g, &w.arena)
 	cd := flow.ControlDependence(g, pd, &w.arena)
 	du := flow.DefUse(g, &w.arena)
-	w.dep.msg = wire.AppendFunction(w.dep.msg[:0], w.dep.project(g, cd, du, spanOf(fn)))
+	w.dep.rets = returning(l, fn, g, w.dep.rets[:0])
+	w.dep.msg = wire.AppendFunction(w.dep.msg[:0], w.dep.project(g, cd, du, spanOf(fn), w.dep.rets))
 	w.linkFunction(fn, g, du, src)
 	return "", false
 }
@@ -152,9 +155,10 @@ const linkOwned = 1 << 31
 // project is g's dependence facts as the function message spanning fn, by the
 // projection of docs/providers-treesitter.md (Dependence facts): the named
 // variables, the cited nodes, and the control, flow, read and write facts
-// between them, each sent once per node. The message and its lists are d's,
+// between them, each sent once per node, and the returning nodes rets with
+// the variables whose value reaches them. The message and its lists are d's,
 // valid until the next project.
-func (d *depLists) project(g *flow.Graph, cd, du flow.Edges, fn flow.Span) *wire.Function {
+func (d *depLists) project(g *flow.Graph, cd, du flow.Edges, fn flow.Span, rets []int32) *wire.Function {
 	f := &d.fn
 	*f = wire.Function{
 		Span:       wireSpan(fn),
@@ -165,6 +169,8 @@ func (d *depLists) project(g *flow.Graph, cd, du flow.Edges, fn flow.Span) *wire
 		Flows:      f.Flows[:0],
 		Reads:      f.Reads[:0],
 		Writes:     f.Writes[:0],
+		Returns:    f.Returns[:0],
+		Returned:   f.Returned[:0],
 	}
 	d.variables(g)
 	d.sources(g, du)
@@ -202,7 +208,18 @@ func (d *depLists) project(g *flow.Graph, cd, du flow.Edges, fn flow.Span) *wire
 			control(x)
 		}
 	}
+	for _, r := range rets {
+		f.Returns = append(f.Returns, uint32(r))
+		f.Returned = append(f.Returned, d.srcOf(r)...)
+	}
+	slices.Sort(f.Returned)
+	f.Returned = slices.Compact(f.Returned)
 	d.nodes(g)
+	for i, r := range f.Returns {
+		f.Returns[i] = uint32(d.nodeAt[r])
+	}
+	slices.Sort(f.Returns)
+	f.Returns = slices.Compact(f.Returns)
 	f.Control = pairs(f.Control, d.nodeAt)
 	f.Flows = pairs(f.Flows, d.nodeAt)
 	f.Reads = accesses(f.Reads, d.nodeAt)
@@ -248,9 +265,10 @@ func (d *depLists) variables(g *flow.Graph) {
 	}
 }
 
-// nodes numbers every node a fact cites in the order of their spans into
-// d.nodeAt and d.fn.Nodes, two nodes of one span being one node of the
-// message, as the parent publishes one evidence range for both.
+// nodes numbers every node a fact cites, and every returning node, in the
+// order of their spans into d.nodeAt and d.fn.Nodes, two nodes of one span
+// being one node of the message, as the parent publishes one evidence range
+// for both.
 func (d *depLists) nodes(g *flow.Graph) {
 	d.nodeAt = sized(d.nodeAt, g.Len())
 	cite := func(n uint32) { d.nodeAt[n] = 0 }
@@ -265,6 +283,9 @@ func (d *depLists) nodes(g *flow.Graph) {
 	}
 	for _, a := range d.fn.Writes {
 		cite(a.Node)
+	}
+	for _, n := range d.fn.Returns {
+		cite(n)
 	}
 	d.order = d.order[:0]
 	for n, at := range d.nodeAt {
