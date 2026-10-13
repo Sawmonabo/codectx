@@ -151,8 +151,8 @@ func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobReco
 // Section 10.3 requires that everything a published generation names is on
 // disk before that generation is visible; it does not require each blob to be
 // durable the instant it is written. A batch keeps that invariant and pays for
-// it once: bytes are written to private temporaries under <cas>/tmp, the
-// temporaries are fsynced in parallel groups, and only a synced temporary is
+// it once: bytes are written to surfaces of the store's scratch pool, the
+// surfaces are fsynced in parallel groups, and only a synced surface is
 // linked into its bucket. Barrier flushes whatever is still staged and then
 // fsyncs each bucket directory the batch touched -- at most 256, one per
 // two-hex-digit prefix, instead of one per blob. The caller commits the
@@ -160,7 +160,7 @@ func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobReco
 //
 // Publishing after the fsync rather than ahead of it is what keeps a crash
 // recoverable: an interrupted batch leaves nothing in the buckets, only
-// temporaries that Sweep already removes. A bucket entry whose bytes had not
+// surfaces the next run writes over. A bucket entry whose bytes had not
 // reached the disk would survive as a short file and fail every later capture
 // of the same content as an integrity error.
 //
@@ -297,10 +297,11 @@ func (b *Batch) Barrier(ctx context.Context) error {
 	return nil
 }
 
-// Discard drops the temporaries of blobs staged but never made durable. It is
-// the failure-path counterpart of Barrier, so an abandoned capture does not
-// leave its temporaries for the next startup sweep to find; Sweep remains the
-// backstop for a process that dies before either runs.
+// Discard gives back the surfaces of blobs staged but never made durable. It
+// is the failure-path counterpart of Barrier, so an abandoned capture returns
+// its surfaces to the pool at once; a process that dies before either runs
+// leaves them in its pool instance, which the next process inherits and
+// writes over.
 func (b *Batch) Discard() {
 	for i := range b.open {
 		b.open[i].f.Close()
@@ -595,9 +596,9 @@ func (c *CAS) SweepOrphans(ctx context.Context, known func(context.Context, []st
 	var removed int64
 	var errs []error
 	for _, b := range buckets {
-		// Only the two-hex-digit buckets path derives are objects. <cas>/tmp is
-		// snapshot.Sweep's to reclaim and holds the temporaries a live batch is
-		// still filling; widening this filter would delete them mid-publication.
+		// Only the two-hex-digit buckets path derives hold objects. Any other
+		// entry under the store is not an object, so it is not this sweep's to
+		// judge; widening this filter would delete files the store never named.
 		if !b.IsDir() || !isBucketName(b.Name()) {
 			continue
 		}
