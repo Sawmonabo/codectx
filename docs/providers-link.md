@@ -710,7 +710,8 @@ The members' language family picks the resolver:
   name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
   alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
   however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
-  `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
+  `int32`, `any` `interface{}`, a user alias its type, a generic alias `List[string]` its type with its arguments
+  substituted), and qualifies an unexported method name by its package. Type
   parameters compare by position. A struct literal compares by its fields in order (name, an unexported one
   qualified by its package, type, tag by value, embedding) and an interface literal by its sorted methods and
   embedded interfaces ("Type identity"); an array length by its value, a constant expression folded over the

@@ -24,7 +24,7 @@ import (
 
 // goDeclarationsFormat names the encoding of a cache entry, so an entry
 // written in another encoding is never decoded as this one.
-const goDeclarationsFormat = "go-declarations\x00name files(imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds variants) consts(name form file) forms(struct interface array-constant)"
+const goDeclarationsFormat = "go-declarations\x00name files(imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds variants) consts(name form file) forms(struct interface array-constant generic-alias)"
 
 type goDeclPackage struct {
 	Name   string

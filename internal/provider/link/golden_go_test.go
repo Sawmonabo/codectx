@@ -420,6 +420,8 @@ func (Ints) Len() int { return 0 }
 
 type T = int
 
+type List[E any] = []E
+
 const (
 	Base = iota + 2
 	Size = Base << 3
@@ -431,6 +433,7 @@ type Sized interface { // @isized
 		Close() error
 		Name() string
 	}) T
+	Each(xs List[string]) // @ieach
 }
 `,
 			"b/b.go": `package b
@@ -438,6 +441,8 @@ type Sized interface { // @isized
 type T struct{}
 
 type W struct{} // @tw
+
+func (W) Each(xs []string) {} // @weach
 
 func (W) Put(k [0x10]byte, v struct{ N int ` + "`json:\"n\"`" + ` }) {} // @wput
 
@@ -450,6 +455,8 @@ func (W) Get(x interface { // @wget
 
 type X struct{}
 
+func (X) Each(xs []string) {}
+
 func (X) Put(k [16]byte, v struct{ N T ` + "`json:\"n\"`" + ` }) {}
 
 func (X) Get(x interface {
@@ -460,6 +467,8 @@ func (X) Get(x interface {
 }
 
 type Y struct{}
+
+func (Y) Each(xs []string) {}
 
 func (Y) Put(k [16]byte, v struct{ N int ` + "`json:\"m\"`" + ` }) {}
 
@@ -498,6 +507,7 @@ func (R) Load(n yaml.Node) error { return nil } // @rload
 			"tw W implements isized Sized",
 			"wput Put overrides iput Put",
 			"wget Get overrides iget Get",
+			"weach Each overrides ieach Each",
 			"tr R implements idoc Doc",
 			"rload Load overrides iload Load",
 		},
@@ -506,7 +516,8 @@ func (R) Load(n yaml.Node) error { return nil } // @rload
 		// struct tags -> Y implements Sized. Mutation: spell a constant length without folding, or fold
 		// iota as 0 -> W's Put misses. Mutation: memoize a type lookup by name alone -> a.T's alias answers
 		// b.T and X implements Sized (or W misses). Mutation: leave an unbound qualifier unknown (no
-		// bijection) -> R implements nothing.
+		// bijection) -> R implements nothing. Mutation: leave a generic alias's instantiation unknown -> W
+		// implements nothing (Each misses).
 		fails: "a method set compared without literal or constant identity: a struct or interface literal, a constant array length or an import whose clause is unread making the signature match nothing; a field tag, a type of the same name in another package, or a constant of another value taken as identical",
 	},
 	{

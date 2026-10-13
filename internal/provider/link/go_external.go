@@ -103,8 +103,8 @@ type goExtFile struct {
 // goExtType is one type name a package declares.
 type goExtType struct {
 	file int
-	// alias is set for `type A = T`, its form T's (goIdentityUnknown for a
-	// generic alias).
+	// alias is set for `type A = T`, its form T's (for a generic alias
+	// `$$n` and T's form over its n parameters).
 	alias bool
 	form  string
 	iface bool
@@ -626,9 +626,10 @@ func (p *goExtPackage) addType(ts *ast.TypeSpec, fi int) {
 	}
 	switch {
 	case ts.Assign.IsValid():
-		n.alias, n.form = true, goIdentityUnknown
-		if params == nil {
-			n.form = goASTForm(ts.Type, nil)
+		n.alias, n.form = true, goASTForm(ts.Type, params)
+		if len(params) > 0 && n.form != goIdentityUnknown {
+			// A generic alias (the worker's rule, aliasExport).
+			n.form = "$$" + itoaInt(len(params)) + " " + n.form
 		}
 	default:
 		switch t := ts.Type.(type) {

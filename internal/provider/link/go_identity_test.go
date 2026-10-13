@@ -81,13 +81,17 @@ func (t fakeTypes) constant(_ context.Context, p, name string) (string, goNames,
 // order -> the sorted case differs. Mutation: leave an unexported field or
 // method name unqualified -> two packages' `a` compare equal. Mutation:
 // spell a constant length without folding -> `[ 12 ]` is not written.
+// Mutation: leave a generic alias unknown, or substitute its arguments in
+// another order -> the instantiated cases differ. Mutation: accept a
+// generic alias without its argument list -> that case is not "?".
 func TestGoIdentityResolvesEveryName(t *testing.T) {
 	ctx := context.Background()
 	store := fakeNames{path: "example.com/m/store"}
 	types := fakeTypes{consts: map[string]map[string]string{
 		"example.com/m/store": {"N": "( 1 << 4 )", "Odd": "?"},
 	}, pkgs: map[string]map[string]string{
-		"example.com/m/store": {"ID": "", "Item": "", "Key": ".ID", "error": ""},
+		"example.com/m/store": {"ID": "", "Item": "", "Key": ".ID", "error": "", "Vec": "$$1 [ ] $0",
+			"Pair": "$$2 map [ $0 ] $1"},
 		"example.com/m/mem":   {"Local": ""},
 		"example.com/a":       {"T": ""},
 		"example.com/b":       {"T": ""},
@@ -122,6 +126,10 @@ func TestGoIdentityResolvesEveryName(t *testing.T) {
 			unread: []string{"example.com/p1", "example.com/p2"}}, "( :yaml.Node , .int )",
 			"( ?example.com/p1|example.com/p2:yaml.Node , int )"},
 		{"type parameter", mem, "( $0 ) ( $1 )", "( $0 ) ( $1 )"},
+		{"generic alias instantiated", mem, "( :s.Vec [ .byte ] )", "( [ ] uint8 )"},
+		{"generic alias of generic alias arguments", mem, "( :s.Pair [ .string , :s.Vec [ $0 ] ] )",
+			"( map [ string ] [ ] $0 )"},
+		{"generic alias without its arguments", mem, "( :s.Vec )", "?"},
 		{"interface literal elements sorted", mem, "( interface{ @Z ( ) ( ) ; ^ :s.Item ; @A ( .byte ) ( ) } )",
 			"( interface{ @A ( uint8 ) ( ) ; @Z ( ) ( ) ; ^ example.com/m/store.Item } )"},
 		{"unexported field and method names are their package's", mem,
