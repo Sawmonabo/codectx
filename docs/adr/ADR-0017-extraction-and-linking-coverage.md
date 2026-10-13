@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-10-09, by the owner's ruling: all eight, each in the form below. Not yet implemented. The survey behind
+Accepted, 2026-10-09, by the owner's ruling: all eight, each in the form below. Implemented, every decision and every proof of §10. The survey behind
 it is [research 26](../research/26-extraction-and-linking-coverage.md).
 
 ## Context

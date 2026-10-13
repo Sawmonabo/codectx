@@ -163,7 +163,7 @@ CREATE TABLE generation_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     -- remediation is what an operator can do about this row, in prose. It is a
     -- column rather than an entry in details_json because details_json is the
@@ -184,7 +184,7 @@ CREATE TABLE unit_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     remediation TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
