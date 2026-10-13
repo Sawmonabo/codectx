@@ -16,7 +16,7 @@ import (
 // explicit that no zero or negative setting ever means unlimited; the default a
 // zero resolves to is itself a finite configured bound.
 type PageRequest struct {
-	Limit  int    `json:"limit"`
+	Limit  int    `json:"limit,omitempty"`
 	Cursor string `json:"cursor,omitempty"`
 }
 
@@ -250,7 +250,7 @@ type SearchRequest struct {
 	Kinds        []NodeKind   `json:"kinds,omitempty"`
 	Languages    []string     `json:"languages,omitempty"`
 	Paths        []string     `json:"paths,omitempty"`
-	Page         PageRequest  `json:"page"`
+	Page         PageRequest  `json:"page,omitempty"`
 }
 
 // Validate enforces the Section 14.1 rule that query text, filters and limits
@@ -429,7 +429,7 @@ type SymbolRequest struct {
 	Profile        string          `json:"profile,omitempty"`
 	FileID         FileID          `json:"file_id,omitempty"`
 	Range          *SourceRange    `json:"range,omitempty"`
-	Page           PageRequest     `json:"page"`
+	Page           PageRequest     `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape, including the Section 11.6 rule that a
@@ -471,7 +471,7 @@ type ReferenceRequest struct {
 	Operation      ReferenceOperation `json:"operation"`
 	SemanticSource SemanticSource     `json:"semantic_source"`
 	Profile        string             `json:"profile,omitempty"`
-	Page           PageRequest        `json:"page"`
+	Page           PageRequest        `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape.
@@ -603,10 +603,10 @@ type GraphRequest struct {
 	Start        []NodeID       `json:"start"`
 	Relations    []RelationKind `json:"relations,omitempty"`
 	Direction    Direction      `json:"direction"`
-	MaxDepth     int            `json:"max_depth"`
-	MaxVisited   int            `json:"max_visited"`
-	MaxEdges     int            `json:"max_edges"`
-	Page         PageRequest    `json:"page"`
+	MaxDepth     int            `json:"max_depth,omitempty"`
+	MaxVisited   int            `json:"max_visited,omitempty"`
+	MaxEdges     int            `json:"max_edges,omitempty"`
+	Page         PageRequest    `json:"page,omitempty"`
 }
 
 // Validate enforces bounded seeds, depth and work budgets. A zero bound means
@@ -985,7 +985,7 @@ type CandidateRequest struct {
 	Shape        CallShape    `json:"shape,omitempty"`
 	Arguments    int64        `json:"arguments,omitempty"`
 	Language     string       `json:"language,omitempty"`
-	Page         PageRequest  `json:"page"`
+	Page         PageRequest  `json:"page,omitempty"`
 }
 
 // Validate enforces exactly one request form.
@@ -1090,15 +1090,15 @@ type PathRequest struct {
 	// backwards and DirectionBoth follows them either way, which makes the
 	// result the undirected cheapest route.
 	Direction  Direction `json:"direction,omitempty"`
-	MaxDepth   int       `json:"max_depth"`
-	MaxVisited int       `json:"max_visited"`
+	MaxDepth   int       `json:"max_depth,omitempty"`
+	MaxVisited int       `json:"max_visited,omitempty"`
 	// Page carries the continuation of a path search: of a walk whose earlier
 	// page spent its work budget or its deadline before reaching the target,
 	// which carries on settling cost buckets rather than restarting, and of
 	// the list of equal-cost routes, which goes on after the last route the
 	// page before listed. Limit is the routes one page lists (0 is the
 	// endpoint default).
-	Page PageRequest `json:"page"`
+	Page PageRequest `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape.
@@ -1288,7 +1288,7 @@ func (e ImpactEntry) Validate() error {
 type OverviewRequest struct {
 	GenerationID GenerationID `json:"generation_id,omitempty"`
 	Depth        int          `json:"depth"`
-	Page         PageRequest  `json:"page"`
+	Page         PageRequest  `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape.

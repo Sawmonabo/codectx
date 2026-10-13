@@ -89,10 +89,58 @@ func TestResetRefusesAHeldWorkspaceAndRemovesNothing(t *testing.T) {
 	}
 }
 
+// The requirement: a session that stays open on the workspace -- an MCP
+// server or a watch -- is seen by a reset even while it is idle and holds no
+// workspace lock, and the reset is refused with nothing removed. Two sessions
+// open at once both hold, and a session started while a reset holds is
+// refused instead of opening what is being removed.
+//
+// Mutation: skip the serving lock in emptyDataDir (the idle session's database
+// is removed under it), or take it shared in HoldServing as exclusive (the
+// second session is refused).
+func TestResetRefusesAWorkspaceAnIdleSessionIsOpenOn(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	data := filepath.Join(home, "data")
+	repo := resetFixture(t, home, data)
+	first, err := snapshot.HoldServing(data)
+	if err != nil {
+		t.Fatalf("open the first session: %v", err)
+	}
+	second, err := snapshot.HoldServing(data)
+	if err != nil {
+		t.Fatalf("a second session beside the first was refused: %v", err)
+	}
+	db := filepath.Join(data, databaseName)
+	writeFile(t, db, []byte("the sessions' database"))
+
+	_, err = ResetWorkspace(ctx, repo, ResetOptions{})
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
+		t.Fatalf("reset of a workspace a session is open on = %v, want %s", err, model.CodeWorkspaceBusy)
+	}
+	if _, err := os.Stat(db); err != nil {
+		t.Fatalf("the sessions' database did not survive a refused reset: %v", err)
+	}
+	if err := errors.Join(first.Close(), second.Close()); err != nil {
+		t.Fatal(err)
+	}
+
+	resetting, err := snapshot.LockServingExclusive(data)
+	if err != nil {
+		t.Fatalf("take the serving lock as a reset: %v", err)
+	}
+	defer resetting.Close()
+	if late, err := snapshot.HoldServing(data); !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
+		late.Close()
+		t.Fatalf("a session started during a reset = %v, want %s", err, model.CodeWorkspaceBusy)
+	}
+}
+
 // The requirement: a reset empties the data directory and nothing else. A
 // symbolic link inside it -- to a file or to a directory outside -- is removed
-// as a link, and what it points at is left exactly as it was. The lock file is
-// the one entry left, for the next holder to take.
+// as a link, and what it points at is left exactly as it was. The two lock
+// files are the entries left, for the next holders to take.
 //
 // Mutation: follow links (stat an entry instead of lstat-ing it, or resolve it
 // before removing) and the directory outside is emptied through the link.
@@ -125,7 +173,8 @@ func TestResetRemovesOnlyTheDataDirectoryAndNoLinkTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	if got, want := entryNames(t, data), []string{filepath.Base(snapshot.LockPath(data))}; !slices.Equal(got, want) {
+	if got, want := entryNames(t, data), []string{filepath.Base(snapshot.ServingLockPath(data)),
+		filepath.Base(snapshot.LockPath(data))}; !slices.Equal(got, want) {
 		t.Fatalf("the data directory holds %v after a reset; want only %v", got, want)
 	}
 	var removed []string

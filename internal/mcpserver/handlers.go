@@ -84,7 +84,7 @@ type symbolInfoInput struct {
 	Query          string               `json:"query"`
 	SemanticSource model.SemanticSource `json:"semantic_source"`
 	Profile        string               `json:"profile,omitempty"`
-	Page           model.PageRequest    `json:"page"`
+	Page           model.PageRequest    `json:"page,omitempty"`
 }
 
 // symbolInfoOutput is metadata beside evidence. The handler threads the first
@@ -105,10 +105,10 @@ type graphInput struct {
 	GenerationID model.GenerationID   `json:"generation_id,omitempty"`
 	Start        []model.NodeID       `json:"start"`
 	Relations    []model.RelationKind `json:"relations,omitempty"`
-	MaxDepth     int                  `json:"max_depth"`
-	MaxVisited   int                  `json:"max_visited"`
-	MaxEdges     int                  `json:"max_edges"`
-	Page         model.PageRequest    `json:"page"`
+	MaxDepth     int                  `json:"max_depth,omitempty"`
+	MaxVisited   int                  `json:"max_visited,omitempty"`
+	MaxEdges     int                  `json:"max_edges,omitempty"`
+	Page         model.PageRequest    `json:"page,omitempty"`
 }
 
 // planOutput shows the manifest and the opened session's status together, so
@@ -130,7 +130,7 @@ type planOutput struct {
 type statusInput struct {
 	SessionID model.SessionID   `json:"session_id"`
 	ActorID   string            `json:"actor_id"`
-	Page      model.PageRequest `json:"page"`
+	Page      model.PageRequest `json:"page,omitempty"`
 }
 
 // statusOutput pairs the coverage page with the session status.

@@ -103,7 +103,8 @@ func TestCaptureBuilderCarriesTheConfiguredRetryBudget(t *testing.T) {
 //
 // Mutation proof: delete the `walk.End(...)` call in generation.capture and the
 // walk stage reads as unfinished; or drop the adjacency span's End in
-// buildGraph and that stage reads unfinished too.
+// buildGraph and that stage reads unfinished too; or drop the search_commit
+// span from commitSearch and the run records no such stage.
 func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
 	res, err := f.c.Index(f.ctx, model.IndexRequest{})
@@ -125,7 +126,7 @@ func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 	// The stage activation opens for itself, spelled where it is opened:
 	// internal/storage/sqlite opens them under the activation span, so this
 	// package cannot name their constants.
-	inner := map[string]bool{"adjacency": true}
+	inner := map[string]bool{"adjacency": true, "search_commit": true}
 	stages := map[string]ledger.SpanRow{}
 	for _, span := range view.Spans {
 		if span.ParentSeq == nil || span.Stage == stageWalk || inner[span.Stage] {
@@ -134,7 +135,7 @@ func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 	}
 	for _, want := range []string{stageCapture, stageWalk, stagePlan, stageAttachReused,
 		stageBuild, stageCoverage, stageActivation, stageRetention,
-		"adjacency"} {
+		"adjacency", "search_commit"} {
 		span, ok := stages[want]
 		if !ok {
 			t.Errorf("the run recorded no %q stage", want)

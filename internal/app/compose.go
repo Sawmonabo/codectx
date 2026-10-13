@@ -288,12 +288,16 @@ const (
 	// with it, none of which needs the lock or the writer. So the read-only
 	// handle opens first, the store is opened LazyWriter, and the lock, the
 	// startup recovery and the collection pass are taken at the first
-	// operation that needs them: the refresh tool, or a watch pass.
+	// operation that needs them: the refresh tool, or a watch pass. The one
+	// lock it does take at its open is the serving lock, shared
+	// (snapshot.ServingLockPath): it blocks no index, and it is what lets a
+	// reset see a server that is idle.
 	modeServe
 	// modeWatch composes for a command whose whole life is a watch: `codectx
 	// watch`, and `codectx index --watch` once its base generation is built.
 	// It BUILDS, so it is one of the Section 13.2 owners, but like the server
-	// it does not take the workspace at its open.
+	// it does not take the workspace at its open; like the server, it holds
+	// the serving lock shared from its open to its close.
 	//
 	// The reason is the same one and so is the mechanism. A watch is idle
 	// between its beats, and a session that owned the workspace while it was
@@ -406,8 +410,13 @@ type stack struct {
 	// lock file for whoever is refused while it is held, and builds records
 	// whether this composition may take it at all -- a report or a query
 	// composition never does.
-	lock      *snapshot.WorkspaceLock
-	lockMu    sync.Mutex
+	lock   *snapshot.WorkspaceLock
+	lockMu sync.Mutex
+	// serving is the presence lock a session that stays open -- the server, a
+	// watch -- holds shared for its whole life, so a reset, which takes it
+	// exclusive, sees the session even while it is idle and holds no
+	// workspace lock. Nil in every other composition.
+	serving   *snapshot.ServingLock
 	operation string
 	builds    bool
 	// onWaiting is the caller's waiting line, told about the process holding
@@ -578,6 +587,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			if err = os.MkdirAll(dir, 0o700); err != nil {
 				return nil, dataDirNotWritable(dir, err)
 			}
+		}
+	}
+	// A session that stays open says so before it opens anything else, and a
+	// reset emptying the directory refuses it here rather than leaving it
+	// serving files that are being removed.
+	if o.mode == modeServe || o.mode == modeWatch {
+		if s.serving, err = snapshot.HoldServing(s.dataDir); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1442,6 +1459,8 @@ func (s *stack) release() error {
 // answer -- and the grace above is what keeps that from refusing a holder that
 // is merely between stamps.
 //
+// A holder that is a reset is judged by the lock alone (see the probe).
+//
 // One open failure is not that, and it is the one this probe answers with an
 // error instead: a ledger whose schema fingerprint is not this binary's. The
 // holder is then a DIFFERENT BUILD of this product, its stamps are unreadable
@@ -1452,6 +1471,20 @@ func (s *stack) release() error {
 func ledgerProgress(dataDir string) (snapshot.HolderProbe, func()) {
 	var reader *ledger.Reader
 	probe := func(ctx context.Context, holder snapshot.WaitingHolder) (string, bool, error) {
+		if holder.Operation == resetOperation {
+			// A reset is removing the very ledger this probe reads, so the
+			// ledger can never show it progressing. It records no stamp
+			// because it needs none: it holds the lock only while it removes,
+			// and the lock dies with its process, so a reset that holds it is
+			// a reset still removing. A reader opened on the ledger it unlinks
+			// would read a file nobody writes again, so it is dropped and the
+			// next holder's ledger is opened afresh.
+			if reader != nil {
+				reader.Close()
+				reader = nil
+			}
+			return resetOperation, true, nil
+		}
 		if reader == nil {
 			r, ok, err := ledger.OpenReader(ctx, dataDir)
 			if err != nil || !ok {
@@ -1849,6 +1882,9 @@ func (s *stack) Close() error {
 		s.lock = nil
 	}
 	s.lockMu.Unlock()
+	// Last of the workspace's own files: the session is no longer open on it.
+	errs = append(errs, s.serving.Close())
+	s.serving = nil
 	errs = append(errs, s.root.Close())
 	// The engine temp directory this composition fell back to is this
 	// process's own, so it goes with the process rather than being left for
