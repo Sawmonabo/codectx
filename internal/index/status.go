@@ -465,7 +465,7 @@ func stateKey(providerID, capability, scope string, state model.CapabilityStateV
 // per unit it sealed, so keeping them per scope would fill the whole report
 // with "this file worked" on any repository past a few hundred files and push
 // the degradations -- the only rows a reader acts on -- past the bound. A row
-// that is not fresh keeps its scope: which file or package is stale, partial
+// that is not fresh keeps its scope: which file or package is partial
 // or failed is exactly what the reader needs.
 func (r *capabilityReport) add(s model.CapabilityState) {
 	if s.State == model.CapabilityFresh {
@@ -824,7 +824,7 @@ func (r *capabilityReport) reported(providerID, capability string) bool {
 //
 // A capability with facts in this generation is `partial`; one with none is
 // `failed` and never `unavailable`. That choice is load-bearing: healthOf
-// makes partial, stale and failed degrade the generation and deliberately
+// makes partial and failed degrade the generation and deliberately
 // leaves unavailable fresh, because `unavailable` is the state of a capability
 // nobody attempted -- no units planned. A provider
 // whose every planned unit failed WAS attempted and is broken, so reporting it
@@ -1100,8 +1100,6 @@ func severityRank(s model.CapabilityStateValue) int {
 	switch s {
 	case model.CapabilityFailed:
 		return 0
-	case model.CapabilityStale:
-		return 1
 	case model.CapabilityPartial:
 		return 2
 	case model.CapabilityUnavailable:
