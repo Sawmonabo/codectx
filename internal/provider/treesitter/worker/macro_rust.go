@@ -42,9 +42,9 @@ import (
 // rsMacroSyntax is the Rust grammar's ids a re-parse is decided by,
 // resolved once.
 type rsMacroSyntax struct {
-	sourceFile, declarationList, tokenTree, macroInvocation uint16
-	open, close                                             uint16
-	fMacro                                                  uint16
+	sourceFile, declarationList, tokenTree uint16
+	open, close                            uint16
+	fMacro                                 uint16
 	// items reports, by kind id, a node a clean re-parse may hold at its
 	// top level.
 	items []bool
@@ -82,8 +82,7 @@ func rsMacroSyntaxOf() *rsMacroSyntax {
 		kind := func(name string) uint16 { return mustKind(tl, language, name, true) }
 		s := &rsMacroSyntax{
 			sourceFile: kind("source_file"), declarationList: kind("declaration_list"), tokenTree: kind("token_tree"),
-			macroInvocation: kind("macro_invocation"),
-			open:            mustKind(tl, language, "{", false), close: mustKind(tl, language, "}", false),
+			open: mustKind(tl, language, "{", false), close: mustKind(tl, language, "}", false),
 			fMacro: tl.FieldIdForName("macro"),
 			items:  make([]bool, tl.NodeKindCount()), keywords: make([]bool, tl.NodeKindCount()),
 		}

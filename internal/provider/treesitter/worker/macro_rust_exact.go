@@ -20,10 +20,10 @@ import (
 
 // rsMacroRulesSyntax is the Rust grammar's ids the shape check reads.
 type rsMacroRulesSyntax struct {
-	macroDefinition, macroRule, tokenTree, tokenRepetition         uint16
-	tokenRepetitionPattern, tokenBindingPattern, fragmentSpecifier uint16
-	metavariable                                                   uint16
-	fName, fType, fLeft, fRight                                    uint16
+	macroDefinition, macroRule, tokenTree, tokenRepetition uint16
+	tokenRepetitionPattern, tokenBindingPattern            uint16
+	metavariable                                           uint16
+	fName, fType, fLeft, fRight                            uint16
 }
 
 var (
@@ -46,9 +46,9 @@ func rsMacroRulesSyntaxOf() *rsMacroRulesSyntax {
 		rsMacroRulesTables = &rsMacroRulesSyntax{
 			macroDefinition: kind("macro_definition"), macroRule: kind("macro_rule"), tokenTree: kind("token_tree"),
 			tokenRepetition: kind("token_repetition"), tokenRepetitionPattern: kind("token_repetition_pattern"),
-			tokenBindingPattern: kind("token_binding_pattern"), fragmentSpecifier: kind("fragment_specifier"),
-			metavariable: kind("metavariable"),
-			fName:        field("name"), fType: field("type"), fLeft: field("left"), fRight: field("right"),
+			tokenBindingPattern: kind("token_binding_pattern"),
+			metavariable:        kind("metavariable"),
+			fName:               field("name"), fType: field("type"), fLeft: field("left"), fRight: field("right"),
 		}
 	})
 	return rsMacroRulesTables
