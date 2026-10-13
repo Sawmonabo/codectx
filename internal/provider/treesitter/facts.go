@@ -110,6 +110,11 @@ type builder struct {
 	// handlers written as function literals among them, by start, each with
 	// its node.
 	endpointFacts []endpointFact
+	// mainForms are the Java methods a class can be launched by, each
+	// declaration's form, and mainInherited the Java classes whose main
+	// the linker resolves (javaMains), for the link table.
+	mainForms     map[int]uint8
+	mainInherited map[int]bool
 	// links is the routing the route table left open, for the link table.
 	links *routeLinks
 	// parameterDecorators are the decorators of each parameter by its name

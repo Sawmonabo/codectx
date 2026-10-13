@@ -180,6 +180,9 @@ const (
 	// whose replacement states a visibility (Decl.Visibility), its file's
 	// path in Aux and the visibility in Sig.
 	keyMacroVisibility = "mv\x00"
+	// keyJavaMain + refKey(type): a Java method the type declares that a
+	// class can be launched by (Decl.Main), its form in Flags.
+	keyJavaMain = "jm\x00"
 )
 
 // The flags of an entry.
@@ -778,6 +781,12 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		if p := d.Parent; p >= 0 && isType(t.Decls[p].Kind) && !anonymousReceiver(fc, d) {
 			if err := add(Ref{File: file, Index: p}); err != nil {
 				return err
+			}
+			if d.Main != 0 {
+				err := links.Add(entry{Key: keyJavaMain + refKey(Ref{File: file, Index: p}), Ref: ref, Flags: d.Main})
+				if err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -2304,6 +2313,9 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		}
 		if err == nil {
 			err = h.macroInputFacts(fc, ref, d, emit)
+		}
+		if err == nil && d.MainInherited {
+			err = h.javaMainFacts(ref, emit)
 		}
 		if err != nil {
 			return err

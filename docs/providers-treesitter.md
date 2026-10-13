@@ -390,7 +390,7 @@ published and is counted, so the file reports partial.
 |---|---|---|
 | a module-level Python `if __name__ == "__main__":` (`==`, either operand order, inside any parentheses) | `__main__` | each function its block calls directly; the guard is a declaration, so its block's calls are made from it. It is a scope but no container: a function defined in it is a declaration of the module under its own name, told apart from one outside the guard by the branch it sits in (its disambiguator), and is not exported |
 | Go `func main` in `package main` | `main` | the function |
-| every Java `main` of JLS SE 25 §12.1.4, per class: `static` or instance, one `String[]`/`String...` parameter or none, not `private`, `void`; a class of the file that inherits one from a superclass of the same file (a superclass in another file is not visible here) | `main`, disambiguated by the class's qualified name | the method |
+| every Java `main` of JLS SE 25 §12.1.4, per class: `static` or instance, one `String[]`/`String...` parameter or none, not `private`, `void`, the `String[]` one before the one with none; a class of the file that inherits one from a superclass of the same file. A class whose superclass chain leaves the file, with no `String[]` main declared nearer, is left to the linker (`link.Decl.MainInherited`), which reads the chain through the other files (docs/providers-link.md, Inherited Java `main`); every launchable form is marked on its method in the link table (`link.Decl.Main`) | `main`, disambiguated by the class's qualified name | the method |
 | a top-level Rust `fn main`; a file-scope C or C++ `main` definition that is not `static` | `main` | the function |
 | a file starting with `#!` (not Rust's `#![`) | `script` | the file's module |
 | a module-level binding whose value is exactly a call building an application: `Flask(…)`, `FastAPI(…)`, `Starlette(…)`, `express()`, or Django's `get_wsgi_application()` / `get_asgi_application()` imported from `django.core.wsgi` / `django.core.asgi` (PEP 3333 and ASGI name no file, so the file's name is never read) | `application`, disambiguated by the binding's name when a file binds two | the binding's declaration |
@@ -1109,6 +1109,10 @@ All MIT:
 - `internal/provider/treesitter/entry_points_test.go`: decorators with their
   argument ranges; the `__main__` guard, Go `main`, the Java `main` forms and a
   shebang script as endpoints.
+- `internal/provider/link/java_main_test.go`: a Java class's `main` inherited
+  through superclasses in other files, the `String[]` form chosen before the
+  class's own no-parameter `main`, a chain that leaves the project, and the
+  classes the structural provider keeps.
 - `internal/provider/treesitter/routes_test.go`: one case per framework (route,
   method, prefix, path, handler); a decorator that is not a route publishes
   nothing; an unregistered blueprint or an `APIRouter` included elsewhere is
