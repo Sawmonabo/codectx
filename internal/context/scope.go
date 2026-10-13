@@ -70,13 +70,6 @@ type scopeResult struct {
 	// and none sets it true, so no later pass can repair a truncated walk, a
 	// degraded capability or an unresolved seed by scoring around it.
 	ScopeComplete bool
-	// ReasonsTruncated counts the reasons boundReasons shortened to the
-	// one-reason byte bound across the whole expansion. It is a COUNT and not
-	// one notice per entry: an entry-sized disclosure list is
-	// repository-sized in heap, which a streamed compile never holds. No
-	// reason is dropped for a count: an entry keeps every reason, stored and
-	// paged by reference. The compiler turns the count into a manifest notice.
-	ReasonsTruncated int64
 	// Stop is how the lexical read ended, for the manifest notice.
 	Stop seedStop
 	// Candidates counts the name-only call candidates the ranked plan holds
@@ -140,27 +133,6 @@ func baseRequirement(kind model.NodeKind) model.Requirement {
 	}
 	// An unknown kind informs rather than binds: it is never silently required.
 	return model.RequirementOptional
-}
-
-// boundReasons clamps each reason of an entry's explanation to the one-reason
-// byte bound and counts the ones it shortened. Every reason is kept: the
-// explanation is stored and paged by reference, so its length never reaches
-// the entry's charge and there is no count to cut it to.
-//
-// The cut is never silent: the count is surfaced as a manifest notice by the
-// compiler, because an explanation shortened without saying so reads as the
-// whole reason an entity was selected. The cut goes through
-// model.TruncateField, which never leaves a partial UTF-8 sequence behind.
-func boundReasons(reasons []string) (out []string, truncated int64) {
-	out = make([]string, 0, len(reasons))
-	for _, r := range reasons {
-		bounded, original := model.TruncateField(r, model.MaxReasonBytes)
-		if original > len(bounded) {
-			truncated++
-		}
-		out = append(out, bounded)
-	}
-	return out, truncated
 }
 
 // boundPaths applies context.max_reason_paths_per_entry to the routes an
@@ -1001,9 +973,8 @@ func (in *seedIngest) admitEntry(e walkEntry, weight int64, named, peer bool) er
 		RootWeight:  weight,
 		Named:       named,
 	}
-	var truncated int64
-	cand.Reasons, truncated = boundReasons(e.Reasons)
-	in.scope.ReasonsTruncated += truncated
+	// Every reason whole: the explanation is stored and paged by reference.
+	cand.Reasons = e.Reasons
 	// Only the disclosure count is kept on the record; the routes themselves
 	// go to the route sorts, and finishIngest keeps the ones whose candidate
 	// is on the spool.

@@ -133,9 +133,9 @@ func (c *Compiler) keptFileSeeds(ctx context.Context, reader *sqlite.PinnedReade
 				Path:        hit.Path,
 				Requirement: model.RequirementRecommended,
 				Origin:      originLexical,
-				Reasons: []string{boundReason(fmt.Sprintf(
+				Reasons: []string{fmt.Sprintf(
 					"the task text matches %q lexically inside a file the plan keeps (tier %s, score %d)",
-					hit.Path, hit.Tier, hit.ScoreMicros))},
+					hit.Path, hit.Tier, hit.ScoreMicros)},
 				RootWeight: weight,
 			}
 			if hit.Range != nil {

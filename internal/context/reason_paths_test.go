@@ -114,45 +114,49 @@ func hexID(seed byte) string {
 	return strings.Repeat(fmt.Sprintf("%02x", seed), 32)
 }
 
-// TestBoundedExplanationsReachTheManifestNotices guards explanation disclosure:
-// the two field cuts the compile applies to an entry's explanation -- a reason
-// past its byte bound, and the page size a configuration asked for and could
-// not have -- are DISCLOSED on the manifest header rather than applied
-// silently, and no reason is dropped for a count. Mutation caught: a
-// boundReasons that cuts the reasons to a per-entry count again (kept falls
-// short of every reason), or a cut that is no longer counted (the notice goes
-// missing).
-func TestBoundedExplanationsReachTheManifestNotices(t *testing.T) {
+// TestAReasonIsKeptWholeAndThePageCutIsDisclosed guards explanation
+// disclosure: an entry keeps every reason whole -- one longer than any field
+// bound included -- through the append the ranking makes and the record that
+// serves it, and the one cut the compile does apply to an explanation, the
+// page size a configuration asked for and could not have, is disclosed on the
+// manifest header rather than applied silently.
+//
+// Mutations caught: appendReason dropping a reason past model.MaxReasonBytes
+// again (the long reason goes missing); ContextEntry.Validate or
+// ContextReason.Validate bounding a reason at model.MaxReasonBytes again (the
+// entry or the served reason is refused); and the page-size notice no longer
+// emitted (the notice goes missing).
+func TestAReasonIsKeptWholeAndThePageCutIsDisclosed(t *testing.T) {
 	const n = model.MaxReasonsPerEntry + 2
-	reasons := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		reasons = append(reasons, fmt.Sprintf("reason %d", i))
+	long := strings.Repeat("x", model.MaxReasonBytes+7)
+	var reasons []string
+	reasons = appendReason(reasons, long)
+	for i := 1; i < n; i++ {
+		reasons = appendReason(reasons, fmt.Sprintf("reason %d", i))
 	}
-	reasons[0] = strings.Repeat("x", model.MaxReasonBytes+7)
-	kept, truncated := boundReasons(reasons)
-	if len(kept) != n || truncated != 1 {
-		t.Fatalf("boundReasons kept %d and reported %d truncated; want all %d kept, 1 truncated",
-			len(kept), truncated, n)
+	if len(reasons) != n || reasons[0] != long {
+		t.Fatalf("the explanation kept %d reasons, the first %d bytes; want all %d, the first whole at %d bytes",
+			len(reasons), len(reasons[0]), n, len(long))
 	}
-	if len(kept[0]) != model.MaxReasonBytes {
-		t.Fatalf("the truncated reason is %d bytes, want the %d-byte bound", len(kept[0]), model.MaxReasonBytes)
+	entry := model.ContextEntry{NodeID: model.NodeID(hexID(1)), Requirement: model.RequirementRecommended,
+		Reasons: reasons, ReasonCount: int64(len(reasons))}
+	for i, r := range entry.Reasons {
+		if err := (model.ContextReason{Entry: 0, Index: i, Reason: r}).Validate(); err != nil {
+			t.Fatalf("reason %d (%d bytes) is refused as served: %v", i, len(r), err)
+		}
+	}
+	if err := entry.Validate(); err != nil {
+		t.Fatalf("an entry carrying a %d-byte reason is refused over it: %v", len(long), err)
 	}
 
 	c := &Compiler{}
 	c.cfg.Resources.MaxPageItems = model.MaxPageItems + 500
-	notices := c.withPageNotice(planNotices(scopeResult{ReasonsTruncated: truncated},
-		planParts{}, true))
-	if len(notices) != 2 {
-		t.Fatalf("the compile disclosed %d notices %q, want one per cut", len(notices), notices)
+	notices := c.withPageNotice(planNotices(scopeResult{}, planParts{}, true))
+	if len(notices) != 1 {
+		t.Fatalf("the compile disclosed %d notices %q, want the page cut alone", len(notices), notices)
 	}
-	joined := strings.Join(notices, "\n")
-	for _, want := range []string{
-		fmt.Sprintf("requested %d, effective %d", model.MaxPageItems+500, model.MaxPageItems),
-		"1 selection reason(s) were truncated",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("the notices %q do not disclose %q", notices, want)
-		}
+	if want := fmt.Sprintf("requested %d, effective %d", model.MaxPageItems+500, model.MaxPageItems); !strings.Contains(notices[0], want) {
+		t.Fatalf("the notice %q does not disclose %q", notices[0], want)
 	}
 	// The header must not be refusable over its own disclosure.
 	m := model.ContextManifest{Notices: notices}

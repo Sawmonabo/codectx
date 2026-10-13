@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -194,3 +195,37 @@ func TestAnAnswerIsReleasedOnceEveryViewItReadsIsDone(t *testing.T) {
 // entriesOnly is the Views of a request that reads the entries view alone, so
 // its answer is released when its entries end.
 var entriesOnly = []model.ImpactView{model.ImpactViewEntries}
+
+// TestAnImpactReasonIsKeptWhole pins that an entry's reasons reach the reasons
+// view whole: the fold that merges two records of one entity keeps a reason
+// longer than any field bound at its full length, and the served reason
+// validates.
+//
+// Mutations caught: unionReasons clipping a reason to model.MaxReasonBytes
+// again (the folded reason is shorter), and ImpactReason.Validate bounding a
+// reason at model.MaxReasonBytes again (the served reason is refused).
+func TestAnImpactReasonIsKeptWhole(t *testing.T) {
+	long := strings.Repeat("y", model.MaxReasonBytes+9)
+	a := impactRecord{Reasons: []string{long}}
+	b := impactRecord{Reasons: []string{"calls this symbol (incoming, depth 1)"}}
+	kept, err := foldImpact(a, b)
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if !slices.Contains(kept.Reasons, long) || len(kept.Reasons) != 2 {
+		t.Fatalf("the fold kept reasons of %v bytes, want both, the long one whole at %d", reasonLens(kept.Reasons), len(long))
+	}
+	for i, r := range kept.Reasons {
+		if err := (model.ImpactReason{Entry: 0, Index: int64(i), Reason: r}).Validate(); err != nil {
+			t.Fatalf("reason %d (%d bytes) is refused as served: %v", i, len(r), err)
+		}
+	}
+}
+
+func reasonLens(rs []string) []int {
+	out := make([]int, len(rs))
+	for i, r := range rs {
+		out[i] = len(r)
+	}
+	return out
+}

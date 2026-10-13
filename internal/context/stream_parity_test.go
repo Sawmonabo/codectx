@@ -396,9 +396,9 @@ func referenceCandidates(ctx context.Context, eng *graph.Engine, gen model.Gener
 					FileID:      n.FileID,
 					Requirement: model.RequirementOptional,
 					Origin:      originCandidate,
-					Reasons: []string{boundReason(fmt.Sprintf(
+					Reasons: []string{fmt.Sprintf(
 						"the open call site %q may call this declaration: matched by name only (%s, %s), no analysis bound the call",
-						site.Name, cd.Resolution, cd.Closeness))},
+						site.Name, cd.Resolution, cd.Closeness)},
 					Possible:   true,
 					Closeness:  closeness,
 					Compatible: page.Total,

@@ -43,7 +43,7 @@ import (
 //
 //   - there is no `seen` map. A map cannot be encoded deterministically and
 //     would be re-allocated per decoded record; the reasons list is deduped by
-//     the same slice scan boundReasons uses in internal/search.
+//     a slice scan (unionReasons).
 //   - the parent chain is a REFERENCE, Adm, into the walk's route table. The
 //     served page has no page-local byNode map to walk parents through -- the
 //     page comes out of a ranked spool -- so the route is rebuilt from the
@@ -221,16 +221,14 @@ func compareImpactRoute(x, y impactRecord) int {
 	return cmp.Compare(x.Parent, y.Parent)
 }
 
-// unionReasons is the union of both sides, deduplicated, each clipped to
-// model.MaxReasonBytes and sorted, with no count cut. Empty reasons are
-// dropped: an entry must never fail validation because of a merge.
+// unionReasons is the union of both sides, deduplicated and sorted, every
+// reason whole: an entry's reasons are served by reference, so neither their
+// count nor their length is cut. Empty reasons are dropped: an entry must
+// never fail validation because of a merge.
 func unionReasons(a, b []string) []string {
 	out := make([]string, 0, len(a)+len(b))
 	for _, side := range [2][]string{a, b} {
 		for _, r := range side {
-			if len(r) > model.MaxReasonBytes {
-				r = r[:model.MaxReasonBytes]
-			}
 			if r == "" || slices.Contains(out, r) {
 				continue
 			}

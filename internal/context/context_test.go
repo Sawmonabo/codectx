@@ -1056,8 +1056,8 @@ func TestContextCompilerScenario(t *testing.T) {
 							i, got.Path, got.NodeID, got.ScoreMicros, w.path, w.id, w.score)
 					}
 					for _, r := range got.Reasons {
-						if r == "" || len(r) > model.MaxReasonBytes {
-							t.Fatalf("rank[%d] carries a %d-byte reason, outside the 1..%d bound", i, len(r), model.MaxReasonBytes)
+						if r == "" {
+							t.Fatalf("rank[%d] carries an empty reason", i)
 						}
 					}
 				}

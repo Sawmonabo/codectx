@@ -1278,7 +1278,8 @@ type ImpactReason struct {
 	Reason string `json:"reason"`
 }
 
-// Validate enforces a non-empty reason within the one-reason byte bound.
+// Validate enforces a non-empty reason. There is no length bound: a reason is
+// served whole, one per item of its view.
 func (r ImpactReason) Validate() error {
 	if err := requireNonNegative("impact_reason.entry", r.Entry); err != nil {
 		return err
@@ -1286,8 +1287,8 @@ func (r ImpactReason) Validate() error {
 	if err := requireNonNegative("impact_reason.index", r.Index); err != nil {
 		return err
 	}
-	if err := requireField("impact_reason.reason", r.Reason, MaxReasonBytes); err != nil {
-		return err
+	if r.Reason == "" {
+		return invalid("impact_reason %d of entry %d is empty", r.Index, r.Entry)
 	}
 	return nil
 }

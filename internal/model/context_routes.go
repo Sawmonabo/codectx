@@ -25,8 +25,8 @@ type ContextReason struct {
 	Reason string `json:"reason"`
 }
 
-// Validate enforces the context_entry_reasons constraints: a non-empty reason
-// within the one-reason byte bound.
+// Validate enforces the context_entry_reasons constraints: a non-empty reason,
+// of any length, since a reason is stored and served whole.
 func (r ContextReason) Validate() error {
 	if err := requireNonNegative("context_reason.entry", int64(r.Entry)); err != nil {
 		return err
@@ -34,7 +34,10 @@ func (r ContextReason) Validate() error {
 	if err := requireNonNegative("context_reason.index", int64(r.Index)); err != nil {
 		return err
 	}
-	return requireField("context_reason.reason", r.Reason, MaxReasonBytes)
+	if r.Reason == "" {
+		return invalid("context_reason %d of entry %d is empty", r.Index, r.Entry)
+	}
+	return nil
 }
 
 // Validate enforces the context_entry_routes constraints: a route names at
