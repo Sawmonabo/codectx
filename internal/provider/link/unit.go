@@ -115,7 +115,7 @@ const (
 	// whose definition Target (an object-like macro the declaration's file
 	// sees) states the visibility its Detail names (visibilityDetail). A
 	// macro defined in several `#if` arms has one fact per definition.
-	FactVisibility Fact = 10
+	FactVisibility Fact = 11
 )
 
 // Binding is one fact a resolver found. Site names the entry of a member's
