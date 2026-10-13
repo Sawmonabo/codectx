@@ -94,7 +94,8 @@ type boundParam struct {
 }
 
 // encodeParams spells params, in order, as one string: each parameter's
-// position, index, marks (variadic, keyword-only, returned), name and node.
+// position, index, marks (variadic, keyword-only, returned, unknown), name
+// and node.
 func encodeParams(params []boundParam) string {
 	var out []byte
 	for _, p := range params {
@@ -107,6 +108,9 @@ func encodeParams(params []boundParam) string {
 		}
 		if p.Returned {
 			marks |= 4
+		}
+		if p.Unknown {
+			marks |= 8
 		}
 		out = binary.AppendUvarint(binary.AppendUvarint(out, uint64(p.Pos)), uint64(p.Index))
 		out = appendString(appendString(append(out, marks), p.Name), string(p.Node))
@@ -122,8 +126,8 @@ func decodeParams(s string) ([]boundParam, error) {
 		pos, index := b.index(), b.uvarint()
 		marks := b.byte()
 		p := boundParam{paramInfo: paramInfo{Pos: pos, Index: uint32(index), Variadic: marks&1 != 0, KeywordOnly: marks&2 != 0,
-			Returned: marks&4 != 0, Name: b.str()}, Node: model.NodeID(b.str())}
-		if index > 1<<32-1 || marks > 7 {
+			Returned: marks&4 != 0, Unknown: marks&8 != 0, Name: b.str()}, Node: model.NodeID(b.str())}
+		if index > 1<<32-1 || marks > 15 {
 			b.fail()
 		}
 		out = append(out, p)
@@ -358,7 +362,10 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 		}
 		ts := &t.Sites[e.Ref.Index]
 		args := argumentShapes(ts.Arguments)
-		results, into := len(ts.Results) > 0, ts.Into > 0
+		// A nested call's value reaches the consuming call (Site.Feeds), and a
+		// returned consuming call's summaries carry its nested calls' values
+		// (returns_nested.go).
+		results, into := len(ts.Results) > 0 || ts.Into > 0 && len(ts.Nested) > 0, ts.Into > 0 || ts.Feeds > 0
 		if e.Tag == 1 {
 			return s.uses.Add(sigUse{Sig: e.Key, Args: args, Results: results, Into: into, Site: idBinding{Kind: FactCall,
 				SiteFile: fv.ID, Site: e.Ref.Index, Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
@@ -578,7 +585,7 @@ func joinFlows(site *Site, call idBinding, file model.FileID, params []boundPara
 		}
 		err := out.Add(idBinding{Kind: FactFlow, SiteFile: call.SiteFile, Site: call.Site, Arg: arg, TargetFile: file,
 			Target: p.Node, Detail: DetailArgument})
-		if err != nil || !results || !p.Returned {
+		if err != nil || !results || !p.Returned && !p.Unknown {
 			return err
 		}
 		return out.Add(idBinding{Kind: FactSummary, SiteFile: call.SiteFile, Site: call.Site, Arg: arg,

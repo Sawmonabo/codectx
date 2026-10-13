@@ -2008,7 +2008,7 @@ func emitFlows(h *hierarchy, site Ref, s *Site, target Ref, receiverFirst bool, 
 	if err := returnFact(s, site, target, emit); err != nil {
 		return err
 	}
-	if len(s.Arguments) == 0 {
+	if len(s.Arguments) == 0 && len(s.Nested) == 0 {
 		return nil
 	}
 	var params []paramInfo
@@ -2017,6 +2017,9 @@ func emitFlows(h *hierarchy, site Ref, s *Site, target Ref, receiverFirst bool, 
 	}
 	if len(params) == 0 {
 		return nil
+	}
+	if err := receiverFlows(s, site, target, params, emit); err != nil {
+		return err
 	}
 	return argumentFlows(s, params, receiverFirst, func(arg, pos int32) error {
 		return flowFacts(s, site, target, params, arg, pos, emit)

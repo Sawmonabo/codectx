@@ -230,6 +230,8 @@ const (
 	// return (Parameter.Returned): a body edit that changes it changes the
 	// entry, so every member whose argument flows read it re-runs.
 	paramReturned
+	// paramUnknown marks Parameter.Unknown, traced as paramReturned is.
+	paramUnknown
 )
 
 // typeKinds are the declaration kinds a type name denotes; a Rust trait is
@@ -752,6 +754,9 @@ func addParameters(s *pagination.ExternalSort[entry], ref Ref, d *Decl) error {
 		}
 		if p.Returned {
 			e.Flags |= paramReturned
+		}
+		if p.Unknown {
+			e.Flags |= paramUnknown
 		}
 		if err := s.Add(e); err != nil {
 			return err
@@ -2107,7 +2112,7 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 		}
 		return yield(paramInfo{Pos: int32(binary.BigEndian.Uint64([]byte(e.Aux))), Name: e.Sig, Index: e.MinArgs,
 			Variadic: e.Flags&paramVariadic != 0, KeywordOnly: e.Flags&paramKeywordOnly != 0,
-			Returned: e.Flags&paramReturned != 0})
+			Returned: e.Flags&paramReturned != 0, Unknown: e.Flags&paramUnknown != 0})
 	})
 }
 

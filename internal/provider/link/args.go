@@ -13,6 +13,8 @@ type paramInfo struct {
 	Variadic    bool
 	KeywordOnly bool
 	Returned    bool
+	// Unknown is Parameter.Unknown.
+	Unknown bool
 }
 
 // argumentFlows yields each argument of the bound call site s with the
