@@ -2,62 +2,27 @@
 
 ## Status
 
-Accepted, 2026-09-26. On 2026-09-25 the owner directed that the hosted engine be replaced now, not after the MVP, and
-the earlier "nothing in this record is started before the MVP ships" is withdrawn. The phase order, the gates and the
-retirement conditions stand.
+Accepted, 2026-09-26; implemented. The hosted engine is retired: its package (the provider, its backend, its
+importer and its engine driver), its import path, its configuration, its tool lock entry and every consumer are absent.
+The structural provider publishes `control_depends_on`, `data_flows_to`, `reads` and `writes` for all nine advertised
+languages, and the linking provider of decision 9 publishes `calls` for all nine. The project planner the linking
+provider uses lives in `internal/provider/link/projects.go`, and the machine memory reading admission uses lives in
+`internal/admission/machine.go`. The Java runtime stays in the tool lock, because the Java precise indexer and the Java
+language server run on it. Decision 3 is built: the program-dependence relation set
+(`graph.ProgramDependenceRelations`) joins both families, and impact walks it as a forward slice.
 
-A benchmark over a public corpus matrix revised decisions 1, 2, 5 and 6 and added decisions 9 and 10. The matrix is one
-large pinned repository per language family, plus a compiler checkout. Every decision names the measurement that
-confirms it. If a confirmation fails, that decision is reopened, not the whole record. The per-language control-flow
-lowerings of phase 0 exist for all nine advertised languages, each with a golden table. They are not yet wired into
-the worker, the wire protocol or a provider. Phase 0 is not yet claimable under its own golden rule (decision 6). A
-review on 2026-09-26 found these gaps:
-- most Go and JavaScript cases cite no reference anchor;
-- some C cases cite none, and the TypeScript cases cite a handbook, which is not a language reference;
-- several handled constructs have no case;
-- no table has had its blind second derivation.
+The gate for every family's move is the authored goldens, each table derived twice, the second derivation blind, from
+the source text and the language reference, plus one test pass, one review and one fix round over the integrated
+change; no engine run gates it (decisions 6 and 7). The two call-resolution targets of the measurements section,
+≥ 95% on a configured typed repository and ≥ 85% on an unconfigured or dynamic-language one, are measured by the
+proofs, not gates. Decision 9's identity and delta are those of
+[ADR-0014](ADR-0014-stable-identity-incremental-linking.md) (identity keyed on the name path, two summaries per file,
+per-site traces and identity-keyed resolution), and its `calls` publication for several targets and for unbound sites
+is that of [ADR-0015](ADR-0015-open-call-sites-and-dispatch.md).
 
-Each gap is closed before phase 0 is claimed.
-
-**Amended 2026-10-08 (October 8, 2026), by the owner's ruling.** Testing is halted and the replacement is integrated
-now, with no proofs, benchmarks, corpus differentials or engine runs. The gates that need the engine to run are
-withdrawn:
-- decision 6's band conditions for phases 1 to 3;
-- decision 7's band;
-- the seven-corpus substitution differential that was to license the substitution.
-
-The gate actually used is the authored goldens, each table derived twice, blind, from the source text and the
-language reference, plus one test pass, one review and one fix round over the integrated change. The four file-local
-families move to the structural provider for every language at once, so decision 9's graduation set is not built.
-The engine's importer stops publishing those four families for every language in the same change.
-
-The same ruling withdraws the engine-run gates of phases 4 and 5:
-- the in-repo-resolved band against the engine;
-- the pinned-corpus diffs.
-
-`calls` moves to the linking provider of decision 9 for all nine languages at once, under the same gate: authored
-goldens, each derived twice, the second derivation blind, plus one test pass, one review and one fix round. The
-engine's importer publishes no relation from that change on, and the engine is then deleted. The two call-resolution
-targets of the measurements section, ≥ 95% on a configured typed repository and ≥ 85% on an unconfigured or
-dynamic-language one, are not gates of phases 4 and 5. They are measured in the proofs after the engine's deletion.
-Decision 9's `calls` keying is amended in place: the linking unit is keyed on its files' content, and the table
-digests decide what a rebuild costs.
-Decisions 1, 2, 4, 5, 8 and 10 stand unchanged. Decision 3 is built: the program-dependence relation set
-(`graph.ProgramDependenceRelations`) joins both families, and impact walks it as a forward slice (decision 3).
-
-**Amended 2026-10-09.** Decision 9's delta is replaced by
-[ADR-0014](ADR-0014-stable-identity-incremental-linking.md): identity keyed on the name path, two summaries per file,
-per-site traces and identity-keyed resolution. Its `calls` publication for several targets and for unbound sites is
-replaced by [ADR-0015](ADR-0015-open-call-sites-and-dispatch.md).
-
-**Amended 2026-10-08, phase 6 done.** By the owner's ruling, phase 6 is carried out in the change that records
-this amendment: the hosted engine, its package (the provider, its backend, its importer and its engine driver), its
-import path, its configuration, its tool lock entry and every consumer are deleted. The structural provider publishes
-`control_depends_on`, `data_flows_to`, `reads` and `writes`, and the linking provider publishes `calls`. The project
-planner the linking provider uses lives in `internal/provider/link/projects.go`, and the machine memory reading
-admission uses lives in `internal/admission/machine.go`. The Java runtime stays in the tool lock, because the Java
-precise indexer and the Java language server run on it. The retirement gate is amended in decision 6, and the oracle's
-relocation in decision 7.
+A benchmark over a public corpus matrix shaped decisions 1, 2, 5, 6, 9 and 10. The matrix is one large pinned
+repository per language family, plus a compiler checkout. Every decision names the measurement that confirms it. If a
+confirmation fails, that decision is reopened, not the whole record.
 
 ## Context
 
@@ -142,7 +107,7 @@ its call sites and **42.81% [42.04, 43.57]** of the second corpus's configured l
 denominator the producers resolve **28.60%** and **94.26%** respectively. The measurement, its method
 and its limitations are
 [20-call-ceiling-sample](../research/raw/native-engine/20-call-ceiling-sample.md); the figures enter
-this record in the measurements section, and they are what decisions 2 and 6 are now stated on.
+this record in the measurements section, and they are what decisions 2 and 6 are stated on.
 
 **What the precise tier could ever replace, and what that turned out to depend on.** Had every planned
 precise unit run on the reference repository, precise resolution would cover **4.87–5.25%** of its
@@ -568,18 +533,9 @@ minute later, after the product has reported done.
 
 ### 6. Seven phases, each with a residue and a measured end
 
-**Amended 2026-10-08.** The band conditions of phases 1, 2 and 3 below are withdrawn (Status): no engine run gates
-them. Phases 1 to 3 close together, for all nine languages, when the authored golden tables, derived twice, pass
-and the integrated change has had its one test pass, review and fix round. Phase 3's zero-rows condition is met by
-construction: the engine's importer no longer publishes the four families.
-
-Phases 4 and 5 are amended by the same ruling. Their engine-run conditions, the in-repo-resolved band and the
-pinned-corpus diffs, are withdrawn. They close together, for all nine languages, when the linker's authored goldens,
-each derived twice, pass and the integrated change has had its one test pass, review and fix round. The two
-call-resolution targets are not gates of either phase; they are measured in the proofs after the engine's deletion.
-The engine's importer publishes no relation once the linking provider publishes `calls`.
-
-The text below is the plan as accepted on 2026-09-26; the phase table marks what the amendment changes.
+Phases 1 to 3 close together, for all nine languages, when the authored golden tables, derived twice, pass and the
+integrated change has had its one test pass, review and fix round; phases 4 and 5 close together the same way on the
+linker's goldens. No engine run gates any phase. The class rules below govern the measurements the proofs take.
 
 Every gate is stated per **repository class**, never per repository. A class is claimed only on at least two instances
 from different language families, and **every** instance must pass, not the average. Two classes cannot be claimed yet,
@@ -589,24 +545,6 @@ because each has one pinned instance:
 
 A second public instance of each is pinned before its gate is claimed.
 
-**The oracle unit per language**, a rule that applies to any repository of the class:
-
-| language | unit |
-|---|---|
-| Go | the whole package; a file-only parse invents 960 spurious reaching-definition edges from a synthetic package initialiser |
-| C/C++ | a component directory holding its headers; header facts form their own band |
-| Java | the build module |
-| Python | the package |
-| JavaScript/TypeScript | the project configuration, never split |
-| Rust | none: authored goldens only |
-
-**Choosing units within a class:**
-- A unit's edge count × the band must be at least one edge.
-- The engine's priced peak must fit the allocation.
-- Take the smallest eligible unit, one at least twice its size, the largest that fits, one vendored unit and one
-  generated unit.
-- A unit the engine crashes on is excluded, never counted as agreement.
-
 **Authored goldens.** An authored golden is a valid equality gate only when:
 - every case cites its language-reference anchor;
 - two people derive it independently;
@@ -614,43 +552,25 @@ A second public instance of each is pinned before its gate is claimed.
 - every construct the lowering handles has a case.
 
 Rust goldens are authored from the Rust Reference, with `?` on both `Result` and `Option` mandatory. Java goldens are
-authored from the Java Language Specification, chapters 14 and 15. The golden tables that exist now were each derived
-once, by the lowering's author. So phase 0's equality gate is not claimed until a second, blind derivation of
-every case agrees. That derivation is made from the source text and the reference alone, without the lowering, its
-output or the first table.
+authored from the Java Language Specification, chapters 14 and 15. A table derived once, by the lowering's author,
+does not claim the equality gate until a second, blind derivation of every case agrees. That derivation is made
+from the source text and the reference alone, without the lowering, its output or the first table.
 
 | phase | what becomes native | what still needs the engine at the end | the measured condition that ends it |
 |---|---|---|---|
 | **0 — shared core and every lowering** | CFG, post-dominators, control dependence, def-use; the lowering of all nine languages with their authored goldens; the one-pass worker walk and the per-file memory of decisions 1, 2 and 5 | all four families for every language (nothing is published yet) | each authored golden table reproduces **100%** of its cases and emits nothing outside them. Equality is right here and only here, because the corpus is authored rather than observed. Mandatory golden cases: the try operator must yield a control dependence, which the engine does not emit. The benchmark shows the need-derived reservation holding its overrun target over the matrix |
-| **1 to 3, as amended 2026-10-08 — all four families, every language at once** | `control_depends_on`, `data_flows_to`, `reads` and `writes` for all nine advertised languages, published by the structural provider (decision 9) | **`calls` only**; the engine's importer publishes none of the four families | the authored golden tables, each derived twice, reproduce every case, and the integrated change has had one test pass, one review and one fix round. No engine run gates it. The rows for phases 1, 2 and 3 below are withdrawn |
-| **1 — Go and Rust publish, the calibration gate** (withdrawn) | `control_depends_on` and `data_flows_to` for Go and Rust, published by the structural provider (decision 9) | the same two families for the other seven languages; `reads`/`writes` and `calls` everywhere | per family, the symmetric difference against the engine is **≤ the band measured first from two engine runs on the same units**, per class. Rust's gate is its authored goldens, because the engine has no Rust test corpus and emits no try-operator control dependence. Second required output: **differential-test cost per language**, the number nobody has, from which every later phase is priced |
-| **2 — ECMAScript family, and the shared write algebra** (withdrawn) | all four dependence families for JavaScript, TypeScript, TSX, Go and Rust | resolved `calls` everywhere no precise profile applies; all four families for Python, Java, C/C++ | the per-family band gate per class (Rust's by its authored goldens, since no engine band exists for it), **and** on every instance of the class the native pass completes with a lower wall *and* a lower tree-summed peak than the engine on the same units, on the same 250 ms sampler |
-| **3 — Python, Java, C/C++ dependence** (withdrawn) | all four dependence families for all nine advertised languages | **resolved `calls` only**, where no precise profile applies | the per-family band gate per language and class; Java control and data dependence are diffed against the engine like any other language, and only Java `calls` is authored. **And** a store query over a fresh index returns **zero** dependence-provider rows of the four dependence kinds at the active generation, which is what licenses deleting the import path |
-| **4 and 5, as amended 2026-10-08 — `calls` for every language at once** | resolved `calls` for all nine advertised languages, published by the package-scoped linking provider of decision 9: class-hierarchy analysis for Java; direct binding, the signature-keyed address-taken × indirect-site cross-product and class-hierarchy analysis for Go, Rust, C and C++; flow-based type inference, field-based resolution and class-hierarchy analysis for the ECMAScript family and Python | **nothing**; the engine's importer publishes no relation | the linker's authored goldens, each derived twice, the second blind, reproduce every case, and the integrated change has had one test pass, one review and one fix round. No engine run gates it: there is no in-repo-resolved band and no pinned-corpus diff. The two call-resolution targets are not gates here; they are measured in the proofs after the engine's deletion. The rows for phases 4 and 5 below are withdrawn |
-| **4 — static call linking, the four frontends with no type recovery** (withdrawn) | resolved `calls` for C/C++, Go, Rust **and Java**, by the package-scoped linker of decision 9 | resolved `calls` for the ECMAScript family and Python, where no precise profile applies | the native `calls` key set matches the engine's **in-repo-resolved** subset within the per-family band, on pinned corpora of each class. Rust's gate is its authored goldens. Java's gate is an **authored corpus and a capability gain**, not a parity diff, because the engine type-recovers nothing for it |
-| **5 — type recovery, the two frontends that have it** (withdrawn) | resolved `calls` for all nine languages. Order: ECMAScript family, then Python | **nothing** | per language: the in-repo-resolved band gate, **and** the two per-class call-resolution targets of the measurements section — **≥ 95%** of in-repo-targeted call sites on a configured typed repository, from the call-site join **and** this decision's inference together rather than from the join alone, and **≥ 85%** on an unconfigured or dynamic-language one, both measured by that section's sample method — while the ambiguous syntax-tier population does not rise |
-| **6 — the retirement gate**, done 2026-10-08 | nothing is ported; the engine, its package, its import path, its configuration, its tool lock entry and every consumer are deleted | **nothing** | as amended 2026-10-08: conditions 2 and 5 below as checked at the deletion; conditions 3 and 4 measured in the proofs after it; condition 1 withdrawn |
+| **1 to 3 — all four families, every language at once** | `control_depends_on`, `data_flows_to`, `reads` and `writes` for all nine advertised languages, published by the structural provider (decision 9) | **`calls` only**; the engine's importer publishes none of the four families | the authored golden tables, each derived twice, reproduce every case, and the integrated change has had one test pass, one review and one fix round. No engine run gates it |
+| **4 and 5 — `calls` for every language at once** | resolved `calls` for all nine advertised languages, published by the package-scoped linking provider of decision 9: class-hierarchy analysis for Java; direct binding, the signature-keyed address-taken × indirect-site cross-product and class-hierarchy analysis for Go, Rust, C and C++; flow-based type inference, field-based resolution and class-hierarchy analysis for the ECMAScript family and Python | **nothing**; the engine's importer publishes no relation | the linker's authored goldens, each derived twice, the second blind, reproduce every case, and the integrated change has had one test pass, one review and one fix round. No engine run gates it: there is no in-repo-resolved band and no pinned-corpus diff. The two call-resolution targets are not gates here; the proofs measure them |
+| **6 — the retirement gate** | nothing is ported; the engine, its package, its import path, its configuration, its tool lock entry and every consumer are deleted | **nothing** | conditions 2 and 5 below, checked at the deletion; conditions 3 and 4, measured by the proofs |
 
-**The retirement gate — all five at once.** **Amended 2026-10-08.** Conditions 1 and 3 are not gates of the
-deletion: condition 1's engine band is withdrawn with the band itself (decision 7), and the targets of condition 3 are
-measured in the proofs after the engine's deletion, against the same denominator and by the same sample method.
-
-**Amended again 2026-10-08, by the owner's ruling: the gate as the deletion uses it.** Phase 6 is done in the change
-that records this amendment. The conditions are checked as follows:
-- **Condition 5** is checked by a final search of the tree for the engine's package names, its tool name, its
-  configuration keys and its capability mapping. The search returns only research documents.
+**The retirement gate.**
+- **Condition 5** is checked by a search of the tree for the engine's package names, its tool name, its configuration
+  keys and its capability mapping. The search returns only research documents.
 - **Condition 2** is checked by a test that indexes the multi-language fixture and asserts every capability row at the
-  state it had before the deletion, with no provider id `dependence` present anywhere.
-- **Conditions 3 and 4** (the resolution targets and coexistence) are measured in the proofs after the deletion, which
-  the owner's halt on testing defers.
-- **Condition 1** stays withdrawn.
+  state it has with the engine present, with no provider id `dependence` present anywhere.
+- **Conditions 3 and 4** (the resolution targets and coexistence) are measured by the proofs.
 
-The conditions below are the gate as accepted.
-
-1. **Parity.** For each of the nine advertised languages and each of the five published families, the native key set
-   is within the per-family band measured from two engine runs on that language's pinned units, on every instance of
-   every claimed class. For `calls`, the comparison is the in-repo-resolved subset. Two exemptions, where no engine
-   band exists: Rust's families and Java's `calls` pass by their authored goldens instead.
+1. **Parity** is not a gate: no engine run is taken, and the authored goldens are the parity check (decision 7).
 2. **No capability depends on it.** On every instance of every claimed class, a fresh index with the dependence provider
    absent publishes every capability at the same state as one with it present.
 3. **No resolution regression, stated per repository class against the honest denominator.**
@@ -677,46 +597,14 @@ The conditions below are the gate as accepted.
    references left, and all are deleted in the same change: no dead consumer, no unreachable path, and no configuration
    key that nothing reads.
 
-### 7. The oracle is the existing key algebra, and it measures a band
+### 7. The authored goldens are the oracle; no engine band is measured
 
-**Amended 2026-10-08.** The band below is withdrawn as a gate for the four file-local families (Status): it needs
-two engine runs per unit, and no engine run gates their substitution. The authored goldens, derived twice, are that
-gate. What follows records the design of the band as accepted.
-
-The importer already derives an id-independent semantic key per fact. The key covers the label, its owning method's
-full name, its file, the operator it was lowered from, its target name, its ordered byte ranges and, for a relation,
-both endpoints' published identities. It streams the key set to a sorted file and diffs two sets in one merge pass. A
-native producer is a **second producer feeding an existing algebra**, not a new framework.
-
-**What relocates.** As accepted, the key, the key set, its loader, the diff, the key writer and the delta marker were
-to move to the differential harness when the import package is deleted, so 339 of its lines would relocate rather
-than die. **Amended 2026-10-08:** nothing relocates. The differential harness is deleted, not built: once the engine is
-gone and the band is withdrawn it has no consumer. The key algebra is deleted with the rest of the package, and the
-deletion credit in the measurements section is the whole package.
-
-**The comparison key, normalised.**
-- The owner's full name and the operator are normalised away.
-- Both endpoints become the existing cross-provider declaration key, so the two producers' identities meet.
-- Each line of a key file carries the digest and its pre-image, so every mismatch is classified into a signed cause.
-
-**The named causes.**
-- For `data_flows_to`: φ-depth, the engine's over-kill, substring over-connection, the depth-8 cutoff, call-site
-  endpoints, the Go package initialiser, byte range only, and cross-file globals.
-- For control dependence: exit augmentation, try-block modelling, and operator conditions.
-
-**The band.** Two engine runs differ by about 0.01%, and a claim of equality between them is a defect. So every
-engine-referenced gate is stated "within the band". The band is measured from two engine runs on the same units
-**before** a native run is judged, and it is measured **per fact family**:
-- control dependence diverges for normalisation reasons;
-- reaching definitions for def/use reasons;
-- `reads`/`writes` for resolution reasons.
-
-For `data_flows_to` the band is also **signed and per-cause**, because the formulation change of decision 2 produces
-divergence in both directions, and an unsigned aggregate would let an over-connection cancel a miss.
-
-**Offline shadow.** The native side of every comparison is taken **offline, in the harness**: the engine runs whole
-units, the native pass runs the same files, and nothing native is attached to a generation until its family graduates
-(decision 9).
+Each family's substitution is judged by its authored golden tables, derived twice, the second blind, from the source
+text and the language reference (decision 6). A band measured from two engine runs per unit was the alternative: two
+engine runs differ by about 0.01%, so every engine-referenced gate would be stated "within the band", measured per
+fact family and, for `data_flows_to`, signed and per cause. It needs the engine to run, and no engine remains to run,
+so it is not built: no differential harness exists, and the importer's id-independent key algebra is deleted with the
+rest of its package (the measurements section counts the deletion).
 
 ### 8. Precision names the analysis, not the toolchain
 
@@ -751,43 +639,32 @@ what it is, and the retirement gate's parity condition is what proves the label 
   file's structural facts.
   The structural provider is Required, and a failed unit fails the generation
   (`internal/index/generation.go:1392-1394`).
-- **`calls`.** A new package-scoped linking provider publishes `calls`. As accepted, it was to be keyed on per-file
-  digests of each file's export table and call-site table, so that an edit inside a function body would not trigger a
-  relink. **Amended 2026-10-08:** the unit is keyed on its member files' content, like every unit (`Request.Inputs`,
-  `internal/index/delta/delta.go:63-80`), and the digests decide what a rebuild costs.
+- **`calls`.** A package-scoped linking provider publishes `calls`. The unit is keyed on its member files' content,
+  like every unit (`Request.Inputs`, `internal/index/delta/delta.go:63-80`), and the per-file digests decide what a
+  rebuild costs.
   - *Why not the digests.* The published facts bind their evidence to each file's bytes and ranges
     (`model.NewEvidenceID`), and units are reused only on a full fingerprint match. A unit keyed on the digests would
     be reused after a body edit with evidence about bytes that are gone.
-  - *What a body edit costs.* Each structural unit stores its table's member digest beside the table, and each linking
-    input records it (`model.UnitInput.Digest`, a model addition). The rebuild reads one small digest per member and
-    decodes no table to compare them. When membership and every digest hold, it resolves nothing. It inherits the
-    predecessor's resolution and coverage, and republishes only the facts whose evidence lies in a file whose bytes
-    changed, and the facts of every file with a call bound into such a file, since a length-changing edit moves the
-    identities those calls target. Every other fact is carried over with those files named replaced. A table is read
-    only when that republication needs it: the republished files', and the tables of the declarations their sites
-    bind.
-  - **Amended 2026-10-09:** identity no longer moves with bytes, and the delta reruns only the sites whose recorded
-    reads changed: [ADR-0014](ADR-0014-stable-identity-incremental-linking.md). The single digest and positional
-    resolution above are replaced by its two summaries, per-site traces and identity-keyed resolution.
+  - *What a body edit costs* is [ADR-0014](ADR-0014-stable-identity-incremental-linking.md)'s: identity is keyed on
+    the name path and does not move with bytes, and the delta reruns only the sites whose recorded reads changed, by
+    two summaries per file, per-site traces and identity-keyed resolution.
   - *What it does not save.* The edited file's own facts are republished. The rebuild also walks the unit's inputs
     without reading a table: to compare the digests, and to name the changed files to each publication pass and to the
     carry-over.
 - **Per-file reindexing.** The four file-local families reuse structural file units on a fingerprint match.
-- **The `dependence` id is never reused.** That keeps two conditions measurable: phase 3's zero dependence-provider rows
-  and retirement condition 2.
-- **Graduation.** As accepted, a per-language graduation set was to decide which producer publishes during the gates.
-  **Amended 2026-10-08:** it is not built. Every language moves at once, so the engine's importer drops the four
-  families for every language in one change, and the structural provider publishes them for every language.
+- **The `dependence` id is never reused.** That keeps retirement condition 2 measurable: no row carries that
+  provider id.
+- **No graduation set.** Every language moves at once: the structural provider publishes the four families for every
+  language, and no per-language set decides between two producers.
 
 **Alternative weighed:** a native backend under the `dependence` id. Its strength is real: none of the nine
 consumers keyed on that id would change. It loses on three counts:
-- the phase-3 gate and retirement condition 2 become unmeasurable;
+- retirement condition 2 becomes unmeasurable;
 - a provider has one invalidation scope, and `dependence` was package-scoped (`Provider.Descriptor` of the `dependence` package, deleted under phase 6);
 - it would parse every file a second time.
 
-**Trade-off accepted:** the nine id-keyed consumers learn a second publisher of those families for the length of the
-gates. **Amended 2026-10-08:** with no graduation set there is never a second publisher; the four families change
-publisher for every language in one change.
+**Trade-off accepted:** the nine id-keyed consumers learn a new publisher of those families. With no graduation set
+there is never a second publisher at the same time.
 
 ### 10. A header's language is decided by the repository, not by its extension
 
@@ -833,15 +710,14 @@ Sizing, in Scala lines measured at the pinned tag and Go lines estimated from th
 | Per-language normalise + def/use | — | 370–920 each |
 | Scope/binding resolver where no precise index covers a unit | — | 0, or 400–900 per language |
 | Differential harness + corpora | — | 2,500–4,500 + 400–900 per language |
-| **Credit: the import and staging package deleted** (as accepted; amended 2026-10-08 below) | — | **−4,535** |
+| **Credit: the import and staging package deleted** (see below) | — | **−4,535** |
 
 Held out of the sums on purpose: a 633-line closure-and-capture scope manager, because the
 scope/binding resolver row already prices it; and 1,628 lines belonging to three frontends the product
 never invokes. The familiar "5,413" figure for type recovery is the aggregate of two directories, not
-the product's cost. As accepted, the deletion credit was **4,535**: the package was 4,874 lines of source,
-less the 339-line comparator that was to relocate to the oracle; 99 lines of Go fixture source went with it.
-**Amended 2026-10-08:** nothing relocates and no differential harness is built (decision 7), so the harness row
-above is not spent, and the whole `dependence` package is deleted. Counted at the deletion, the package (the
+the product's cost. The credit row prices the package at 4,874 lines of source less a 339-line comparator an
+oracle would have kept. No differential harness is built (decision 7), so the harness row above is not spent, and
+the whole `dependence` package is deleted: counted at the deletion, the package (the
 provider, its backend, its importer and its engine driver) is **6,964 lines of Go source and 9,370 with its tests**,
 fixtures excluded.
 
