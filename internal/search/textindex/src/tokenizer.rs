@@ -224,3 +224,48 @@ pub fn parse_query(text: &str) -> Vec<QueryTerm> {
     }
     terms
 }
+
+#[cfg(test)]
+mod tests {
+    use tantivy::tokenizer::MAX_TOKEN_LEN;
+
+    use super::{fold, for_each_code_token};
+    use crate::tables;
+
+    /// The longest column a search document carries: the body, which the unit
+    /// writer refuses over model.MaxSearchBodyBytes (32 KiB).
+    const MAX_COLUMN_BYTES: usize = 32_768;
+
+    /// No token reaches the postings writer's length limit, which it drops a
+    /// token over (ADR-0013 decision 6): a token is a run of one column, folding
+    /// maps a codepoint to at most one codepoint, and over every entry of the
+    /// fold table the widest UTF-8 growth is 3/2 (U+023A, 2 bytes, to U+2C65, 3
+    /// bytes), while ASCII never grows. So the longest token is 32 768 x 1.5 =
+    /// 49 152 bytes, under 65 530; a column of U+023A alone reaches it.
+    ///
+    /// Mutation: a fold-table entry that widens a codepoint more than 3/2 (a
+    /// 2-byte letter folding to a 4-byte codepoint) raises the growth to 2 and
+    /// the bound to 65 536, over the limit; a fold that splits a codepoint in
+    /// two lengthens the end-to-end token past 49 152.
+    #[test]
+    fn the_longest_folded_token_stays_under_the_postings_limit() {
+        let (mut out, mut inp, mut at) = (1usize, 1usize, 0u32);
+        for &(from, to) in tables::FOLDS.iter() {
+            let i = char::from_u32(from).expect("a fold key is a scalar value").len_utf8();
+            let o = if to == 0 { 0 } else { char::from_u32(to).expect("a fold value is a scalar value").len_utf8() };
+            if o * inp > out * i {
+                (out, inp, at) = (o, i, from);
+            }
+        }
+        for b in 0u8..128 {
+            assert_eq!(fold(b as char).map(char::len_utf8), Some(1), "ASCII {b:#x} grows when folded");
+        }
+        assert_eq!((out, inp), (3, 2), "the widest fold growth is {out}/{inp}, at U+{at:04X}");
+        assert!(MAX_COLUMN_BYTES * out / inp < MAX_TOKEN_LEN);
+
+        let column: String = std::iter::repeat_n('\u{23A}', MAX_COLUMN_BYTES / 2).collect();
+        let mut longest = 0;
+        for_each_code_token(&column, |_, _, _, t| longest = longest.max(t.len()));
+        assert_eq!(longest, MAX_COLUMN_BYTES * 3 / 2);
+    }
+}
