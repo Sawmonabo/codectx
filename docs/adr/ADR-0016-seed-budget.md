@@ -216,8 +216,9 @@ only graph expansion a plain-language task gets; an agent localization study los
   Adaptive-k*, EMNLP 2025, https://arxiv.org/html/2506.08479v3 — largest-gap cut-off and its recall.
 - [S7] Meng et al., *Ranked List Truncation for Large Language Model-based Re-Ranking*, SIGIR 2024,
   https://arxiv.org/html/2404.18185v1 — learned truncation shows no clear advantage over a fixed depth.
-- [S8] *LocAgent: Graph-Guided LLM Agents for Code Localization*, https://arxiv.org/abs/2503.09089 — the no-traversal
-  ablation (cited through an earlier survey, not re-read).
+- [S8] Chen, Tang, Deng, Wu, Wu, Jiang, Prasanna, Cohan, Wang, *LocAgent: Graph-Guided LLM Agents for Code
+  Localization*, arXiv:2503.09089v2, https://arxiv.org/html/2503.09089 — section 5.6, Table 6: with the fine-tuned
+  Qwen-2.5-7B, removing the graph-traversal tool drops function-level Acc@10 from 71.53 to 66.06.
 - [S12] *Model Context Protocol, tools, 2025-06-18*, https://modelcontextprotocol.io/specification/2025-06-18/server/tools
   — a tool result may return a `resource_link`, a URI the client fetches or subscribes to for additional context.
 - [S9] Sun, Han, Yan, Yu, Wu, *PathSim: Meta Path-Based Top-K Similarity Search in Heterogeneous Information
