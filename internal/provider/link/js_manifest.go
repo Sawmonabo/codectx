@@ -20,7 +20,7 @@ const (
 // unit's hierarchy, whose specifier answers (keyESSpec) are then diffed key
 // by key, so only the nodes whose answers moved re-run.
 func jsManifestFields(ctx context.Context, u *unit) ([]manifestField, error) {
-	in, err := readESInputs(ctx, u)
+	in, err := esInputsOf(ctx, u)
 	if err != nil {
 		return nil, err
 	}
