@@ -1107,7 +1107,7 @@ func pythonFlows(ctx context.Context, u *unit, e *flowEmit, calls *pagination.Ex
 		}
 		for i := range tab.Sites {
 			s := &tab.Sites[i]
-			if (len(s.Arguments) == 0 && !hasResult(s)) || !sel.has(int32(i)) {
+			if (len(s.Arguments) == 0 && len(s.Nested) == 0 && !hasResult(s)) || !sel.has(int32(i)) {
 				continue
 			}
 			site := Ref{File: file, Index: int32(i)}

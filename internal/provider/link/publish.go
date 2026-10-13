@@ -374,6 +374,9 @@ func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pa
 				return err
 			}
 		}
+		if err := f.nestedFlows(); err != nil {
+			return err
+		}
 		if err := past(0, len(t.Sites)); err != nil {
 			return err
 		}
@@ -474,6 +477,10 @@ type filePublication struct {
 	nodes  []model.NodeFact
 	rels   []model.RelationFact
 	counts counts
+	// nestRets and nestOuts are what nestedFlows reads, by site
+	// (noteNested).
+	nestRets map[int32][]model.NodeID
+	nestOuts map[int32]nestedOut
 }
 
 // site publishes the facts of site i, group: one `calls` per distinct
@@ -550,12 +557,17 @@ func (f *filePublication) site(i int32, group []idBinding) error {
 	if err := f.returnFlows(s, group, key); err != nil {
 		return err
 	}
+	f.noteNested(i, s, group)
 	for _, b := range group {
 		if b.Kind != FactFlow {
 			continue
 		}
-		if b.Arg >= int32(len(s.Arguments)) {
+		if b.Arg > s.receiverArg() || b.Arg == s.receiverArg() && !s.nests(b.Arg) {
 			return internalErr("a flow names argument " + strconv.Itoa(int(b.Arg)) + " past the arguments of a site of " + f.fv.Path)
+		}
+		if b.Arg == s.receiverArg() {
+			// The receiver is a nested call (nestedFlows).
+			continue
 		}
 		a := &s.Arguments[b.Arg]
 		read := map[model.NodeID]bool{}

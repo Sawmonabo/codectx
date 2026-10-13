@@ -343,6 +343,15 @@ type Site struct {
 	// whose return the call's value reaches directly (`return f()`): the
 	// callee's return node flows into that callable's (Decl.Return).
 	Into int32 `json:"into,omitempty"`
+	// Nested are the calls whose value this call consumes directly, each
+	// with the argument it is part of, or the receiver (`g(f())`,
+	// `f().m()`): the callee's return node flows into this call's
+	// parameter (returns_nested.go).
+	Nested []Nested `json:"nested,omitempty"`
+	// Feeds, when not 0, is one more than the index in Sites of the call
+	// that consumes this call's value directly (the site whose Nested names
+	// this one).
+	Feeds int32 `json:"feeds,omitempty"`
 }
 
 // Argument is one argument of a call site (wire.Argument): where it is,
@@ -381,3 +390,15 @@ func DecodeTable(b []byte) (*Table, error) {
 	}
 	return &t, nil
 }
+
+// Nested is one call whose value a site consumes directly: its index in
+// Sites, and the index in the consuming site's Arguments of the argument it
+// is part of, or NestedReceiver when it is the receiver of a member call.
+type Nested struct {
+	Site int32 `json:"site"`
+	Arg  int32 `json:"arg"`
+}
+
+// NestedReceiver is Nested.Arg for a call that is the receiver of a member
+// call (`f().m()`).
+const NestedReceiver int32 = -1

@@ -195,14 +195,25 @@ edge from the callee's return node, never by an unlabelled edge from inside the 
 decision 7), for every family that publishes argument flows, the address-taken join
 included (`internal/provider/link/returns.go`). A site's result is where the structural provider found its value
 goes: `Site.Results`, the variables the innermost node evaluating the call defines, and `Site.Into`, the callable
-whose return that node is (`return f()`); a call whose value another call consumes first (`g(f())`, `f().m()`)
-has neither, and a site with neither publishes no return flow. A bound site publishes:
+whose return that node is (`return f()`); a call whose value another call consumes directly (`g(f())`, `f().m()`)
+has neither and is that call's nested call instead (`Site.Nested`, `Site.Feeds`, below). A site with none of
+these publishes no return flow. A bound site publishes:
 - for each argument bound to a parameter marked `Returned` (its value reaches the callee's return), one
   `data_flows_to` from each variable the argument reads to each variable of `Site.Results`, at the argument, detail
   `summary:<position>` (`FactSummary`);
 - from the callee's return node (`Decl.Return`) one `data_flows_to` to each variable of `Site.Results` and to the
   return node of the callable `Site.Into` names, at the call expression, detail `return` (`FactReturn`). A callee
   with no return node (a type, a constructor that returns no value) publishes none.
+
+- for a nested call, whose value is part of an argument of the consuming call or is its receiver
+  (`returns_nested.go`): from the nested callee's return node one `data_flows_to` to each parameter the argument
+  binds at the consuming call's bound callee (the receiver parameter for a receiver, where the callee declares one:
+  Python `self`, a Go or Rust receiver), carrying two evidence details, `argument` and `return`, since it leaves one
+  callee and enters another; and, when that parameter is `Returned`, one to each variable of the consuming call's
+  `Site.Results` and to the return node its `Site.Into` names, detail `return`, the consuming callee's summary at
+  this site. Both are evidenced at the nested call. The impact walk reads a relation with both roles as leaving and
+  then entering: a path that entered the nested callee through another call's argument never takes it, and a path
+  that takes it is inside the consuming callee and never leaves it through a return edge.
 
 Every value a returning node reads flows into the callable's return node (docs/providers-treesitter.md, Return
 flow), parameter-reached values included, so a value created inside the callee (`k = 1; if p: return k`) reaches

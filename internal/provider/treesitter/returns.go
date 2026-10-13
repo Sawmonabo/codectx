@@ -306,6 +306,7 @@ func (b *builder) siteResults(spans []wire.Span, callable []int32, rets map[int3
 			}
 			node := f.Nodes[n]
 			if o := outer[s]; o >= 0 && sites[o].Start >= node.Start && sites[o].End <= node.End {
+				nestInto(t, s, o)
 				continue
 			}
 			site := &t.Sites[s]

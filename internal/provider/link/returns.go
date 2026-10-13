@@ -22,7 +22,7 @@ import (
 //     one site's argument and leaves through another site's result.
 
 // hasResult reports whether site s's value reaches a variable or a return.
-func hasResult(s *Site) bool { return len(s.Results) > 0 || s.Into > 0 }
+func hasResult(s *Site) bool { return len(s.Results) > 0 || s.Into > 0 || s.Feeds > 0 }
 
 // flowFacts emits, for argument arg of site s at site bound to parameter pos
 // of target among params (target's declared parameters), the argument's
@@ -34,7 +34,7 @@ func flowFacts(s *Site, site, target Ref, params []paramInfo, arg, pos int32, em
 	if err := emit(Binding{Kind: FactFlow, Site: site, Target: target, Detail: DetailArgument, Arg: arg, Param: pos}); err != nil {
 		return err
 	}
-	if len(s.Results) == 0 {
+	if len(s.Results) == 0 && (s.Into == 0 || !s.nests(arg)) {
 		return nil
 	}
 	for i := range params {
@@ -73,8 +73,12 @@ func (f *filePublication) returnFlows(s *Site, group []idBinding, key string) er
 	for _, b := range group {
 		switch b.Kind {
 		case FactSummary:
-			if b.Arg >= int32(len(s.Arguments)) {
+			if b.Arg > s.receiverArg() || b.Arg == s.receiverArg() && !s.nests(b.Arg) {
 				return internalErr("a summary names argument " + strconv.Itoa(int(b.Arg)) + " past the arguments of a site of " + f.fv.Path)
+			}
+			if b.Arg == s.receiverArg() {
+				// The receiver is a nested call (nestedFlows).
+				continue
 			}
 			a := &s.Arguments[b.Arg]
 			detail := DetailSummary + ":" + strconv.Itoa(int(b.Position))

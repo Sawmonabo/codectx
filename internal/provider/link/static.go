@@ -362,7 +362,10 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 		}
 		ts := &t.Sites[e.Ref.Index]
 		args := argumentShapes(ts.Arguments)
-		results, into := len(ts.Results) > 0, ts.Into > 0
+		// A nested call's value reaches the consuming call (Site.Feeds), and a
+		// returned consuming call's summaries carry its nested calls' values
+		// (returns_nested.go).
+		results, into := len(ts.Results) > 0 || ts.Into > 0 && len(ts.Nested) > 0, ts.Into > 0 || ts.Feeds > 0
 		if e.Tag == 1 {
 			return s.uses.Add(sigUse{Sig: e.Key, Args: args, Results: results, Into: into, Site: idBinding{Kind: FactCall,
 				SiteFile: fv.ID, Site: e.Ref.Index, Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
