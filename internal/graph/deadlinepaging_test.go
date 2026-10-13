@@ -128,8 +128,7 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 		// page's FIRST read is the no-progress case below -- a different
 		// assertion, because such a page cannot advance at all.
 		//
-		// It was 512, then 200, while a level cost one round trip per node
-		// chunk per page. A level is now ONE scan over the whole frontier plus
+		// A level is ONE scan over the whole frontier plus
 		// one charged round trip per adjacencyBatch entries it delivers, so the
 		// whole of this fixture is about eighty round trips and a trigger in the
 		// hundreds would never split the walk at all.

@@ -409,7 +409,7 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 // keeps changing under the builder is recaptured until the user-set retry
 // budget is spent and the capture then fails with CTX_SNAPSHOT_UNSTABLE,
 // rather than publishing a manifest whose bytes were never validated or
-// retrying forever. The budget is now the caller's (zero is unlimited, bounded
+// retrying forever. The budget is the caller's (zero is unlimited, bounded
 // by RetryDeadline), so the test sets it instead of reading a constant.
 func TestUnstableCaptureIsReported(t *testing.T) {
 	const retries = 4

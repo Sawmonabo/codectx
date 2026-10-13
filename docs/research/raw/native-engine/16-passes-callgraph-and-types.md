@@ -231,7 +231,7 @@ closures are invisible to the engine's capture modelling today; only disjunct (1
 
 ## B5. Which of the product's six frontends actually get type recovery — re-verified, and corrected
 
-Re-verified by reading every generator's `applyPostProcessingPasses` override at the tag, as the brief
+Re-verified by reading every generator's `applyPostProcessingPasses` override at the tag, as the research question
 required, rather than inheriting `12-source-anatomy-v4.0.627.md` §A3's table.
 
 | product `--language` | generator | overrides `applyPostProcessingPasses`? | runs type recovery on the **pinned argv**? | evidence |
@@ -312,13 +312,13 @@ Determined from `scratch.go`'s label sets read in full (`stagedNodeLabels` `:47-
 | `XInheritanceFullNamePass` | `inheritsFromTypeFullName` property → `INHERITS_FROM` edge | no — recognised, not read (`:78`) | **yes, indirectly.** `DynamicCallLinker`'s `allSubclasses`/`allSuperClasses` read `INHERITS_FROM` (`DynamicCallLinker.scala:122-123`). Dropping the pass does not drop a fact; it silently shrinks `validM` and therefore the call graph. A port that skips it must accept the same loss knowingly |
 | `XImportResolverPass` and its four language subclasses | `TAG` / `TAG_NODE_PAIR` nodes | no — recognised, not read (`:63`) | **yes, indirectly and decisively.** The tags are the symbol table's seed for `XTypeRecovery`, which is the only producer of this corpus's `calls` (§B0). The tags themselves are worthless to the product; what they enable is everything |
 | `ObjectPropertyCallLinker` | a `methodFullName` property rewrite, **no edge** | the property is staged, but the projection reads `method_full_name` only to exclude `<operator>.%` | **no.** Its work cannot reach a published fact under the current projection |
-| `MethodRefLinker` | `REF` edge METHOD_REF→METHOD | the edge label **is** staged (`:71`), but the anchor query rejects it | **yes — and this is the one actionable gap in the list.** METHOD_REF is in the anchor's label set (`scratch.go:556`) yet the join demands `d.kind = 'decl'`, so a method-valued reference never anchors. Admitting `kindMethod` there would publish call-through-a-function-value edges from facts already in the store. **Out of this sub-lane's scope; flagged, not acted on** |
+| `MethodRefLinker` | `REF` edge METHOD_REF→METHOD | the edge label **is** staged (`:71`), but the anchor query rejects it | **yes — and this is the one actionable gap in the list.** METHOD_REF is in the anchor's label set (`scratch.go:556`) yet the join demands `d.kind = 'decl'`, so a method-valued reference never anchors. Admitting `kindMethod` there would publish call-through-a-function-value edges from facts already in the store. **Outside this note's scope; flagged, not acted on** |
 | `XTypeHintCallLinker`'s `<speculatedMethods>` NAMESPACE_BLOCK | `NAMESPACE_BLOCK` node + `AST` edge | `NAMESPACE_BLOCK` recognised, not staged (`:60`) | **no** — but note the stub METHODs it parents *are* staged and *are* published, as the 81.3% external bucket. The marker that says "this callee may not exist" is dropped while the callee is kept |
 
 The last row is worth stating on its own: **the engine labels its invented callees
 `<speculatedMethods>` and the product discards the label.** A user of `codectx_callees` cannot tell a
 speculated stub from a real external dependency. That is a product observability gap in today's
-importer, independent of any port, and it is outside this sub-lane's scope to fix.
+importer, independent of any port, and it is outside this note's scope to fix.
 
 ---
 
@@ -334,7 +334,7 @@ expression to a declaration through a per-file scope/binding resolver (already p
 swing factor), then, where the callee is a method on a type, widen to the set of implementations using
 whatever hierarchy the resolver recovered.** The widening step is where class-hierarchy analysis, rapid
 type analysis and points-to differ, and this file deliberately does not choose between them — that is
-the algorithm lane's call. What this file fixes for that lane is the **input contract**: the widening
+the call-graph algorithm's decision. What this file fixes for that algorithm is the **input contract**: the widening
 gets a resolved declaration and a type set from the resolver, never a `METHOD_FULL_NAME` string, and
 the output contract is a caller-declaration → callee-declaration edge with a site range, which is
 exactly the tuple the product's projection already publishes (`scratch.go:574-577`). The engine's
@@ -378,7 +378,7 @@ passes, the stub parser). The figure that is addable to an effort table is **2,4
 per-language for the six product frontends = 4,885**, with the 633-line scope-manager row held out
 because doc 20 §7.5 already carries it.
 
-**Reconciling `passes/frontend/` in full**, since the brief asked for every file in that directory:
+**Reconciling `passes/frontend/` in full**, since the research question asked for every file in that directory:
 the directory aggregates to **2,206** and the shared type-recovery figure above is **1,941** over seven
 files. The remaining **265** are three passes that are not in these families and are deliberately
 excluded — `MetaDataPass` (**52**, `NewMetaData` plus the root `NewNamespaceBlock`), `TypeNodePass`

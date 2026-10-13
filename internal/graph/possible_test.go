@@ -190,8 +190,8 @@ func TestImpactCountsOpenSitesAndDoesNotWalkThem(t *testing.T) {
 	}
 }
 
-// TestCalleesListTheOpenSiteOnceWithItsCandidates pins E15 and the callees
-// half: a call the linker left open is one row, to its open-site node -- the
+// TestCalleesListTheOpenSiteOnceWithItsCandidates pins the callees half of
+// open sites: a call the linker left open is one row, to its open-site node -- the
 // structural placeholder for the same site is not a second callee -- and the
 // candidates of the site follow as possible callees.
 //
@@ -236,7 +236,7 @@ func TestCalleesListTheOpenSiteOnceWithItsCandidates(t *testing.T) {
 	}
 }
 
-// TestOpenImportSiteListsTheFilesItMayImport pins E14: an import whose path
+// TestOpenImportSiteListsTheFilesItMayImport pins the open import: an import whose path
 // does not fold lists the files matching its literal fragments as possible
 // imports, after the precise ones, and the walk does not go on through them.
 //
