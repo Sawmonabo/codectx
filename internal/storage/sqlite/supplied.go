@@ -40,8 +40,8 @@ func (s *Store) RecordSuppliedIndex(ctx context.Context, gen model.GenerationID,
 // SuppliedIndexes reports the supplied indexes recorded against a generation,
 // ordered by path so two calls produce the same report. A generation with no
 // recorded path returns an empty list, which is the answer "this generation was
-// built with no supplied index" -- a measurement now that the recording half
-// exists, where before the same emptiness was merely the absence of a feature.
+// built with no supplied index": every supplied index a generation was built
+// with is recorded, so the empty list is a measurement.
 func (s *Store) SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]SuppliedIndex, error) {
 	var out []SuppliedIndex
 	err := s.readOwn(ctx, func(tx *sql.Tx) error {

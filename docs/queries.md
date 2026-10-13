@@ -229,9 +229,9 @@ the same entities, in the same global order, each listed exactly once. An entity
 reached again from a later frontier is one record, not two; the cheapest route
 to it wins, and the reasons of every edge that touched it are merged into that
 one entry. The order is `score_micros` descending, then `depth` ascending, then
-`node_id` ascending. **`name` is no longer a tie-break** — it is known only
-after hydration, so ranking on it would have reordered one page of a globally
-ordered answer.
+`node_id` ascending. **`name` is not a tie-break** — it is known only after
+hydration, so ranking on it would reorder one page of a globally ordered
+answer.
 
 An impact answer carries two ranked lists, the affected entities and the package
 rollup over every edge the walk admitted, and one `next_cursor` pages both: each

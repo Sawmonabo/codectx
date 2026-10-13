@@ -27,7 +27,12 @@ Two arms were measured on the same 546 613 search documents:
 
 - **Placeholders.** `<bench>` stands for the measurement's working directory on the host, and
   `<checkout>/kubernetes` for the kubernetes checkout. Every absolute host path in the logs, `/usr/bin/time`
-  reports and notes was replaced with one of the two. Nothing else in those files changed.
+  reports and notes was replaced with one of the two. Apart from the clock times below, nothing else in those
+  files changed.
+- **Clock times.** In both rounds the time of day was removed from each log's `===` record titles and `rc=`
+  lines, and `runs/host-load.tsv` and `runs/r2-logs/host-load-r2.tsv` give each sample's seconds since the first
+  (`t_s`) in place of its clock time. Every duration a run measured is unchanged. The runner scripts write and
+  read the unedited logs under `<bench>`, so `runs/r2-logs/r2.py`'s record-title pattern still expects the clock time.
 - **Arm names.** The two arms are called "our arm" and "library arm" throughout. The matrix column that marks what
   the library arm uses is headed "library arm".
 - **Numbering.** Every note has its own number. `features/` holds the long feature notes, 01–09 (its 01–04 were a
@@ -40,16 +45,15 @@ Two arms were measured on the same 546 613 search documents:
   The matrix's search-runtime features are RT1 to RT7.
 - **Split log.** The library arm's query log is published as `runs/tquery-speed.log` (speed, filters, pages, explain,
   top-k checks) and `runs/tquery-quality.log` (the quality sets). Concatenated, they are byte-identical to the
-  original log; it was split to keep each file under 2 MB.
+  scrubbed log; it was split to keep each file under 2 MB.
 - **A separate module.** `ours/source/go.mod` makes the our-arm sources their own module, so the repository's
   `./...` never compiles them. They import codectx's internal packages at 16dfef6 and build only inside such a tree.
 - **Derived tables.** `runs/03-pooled-latency.txt` and `runs/03-first-page.txt` were computed by `runs/03-derive.py`
   from the per-run result lines, which are not published (see below).
 - `runs/host-load.tsv` is the host's load average and free memory every 5 s, copied while later runs were going.
 - **Round 2.** In `runs/05`–`07`, `runs/r2-logs/` and `harness/13-weighted-length.md`, `<bench>` replaces the
-  measurement's working directory, clock times were removed from the log lines and record titles, and wording about
-  how the round was scheduled was replaced by what ran and what did not. `runs/r2-logs/host-load-r2.tsv` gives each
-  sample's seconds since the first in place of its clock time. The weighted-length run's log is published as
+  measurement's working directory, and wording about how the round was scheduled was replaced by what ran and what
+  did not. The weighted-length run's log is published as
   `runs/r2-logs/f-weighted-name.log` and `runs/r2-logs/f-weighted-doc-subword.log`; concatenated, they are
   byte-identical to the scrubbed log, split to keep each file under 2 MB.
 - **Harness source.** `harness/source/` is the build round 2 used: it adds the weighted document length

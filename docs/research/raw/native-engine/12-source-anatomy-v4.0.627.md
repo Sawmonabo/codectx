@@ -208,7 +208,7 @@ CallGraph, `X2Cpg.scala:383-385`) **and then** `new OssDataFlow(options).run(con
 `OssDataFlow` if the overlay is missing (`CpgBasedTool.scala:28-35`). The pinned `--max-num-def 40000`
 overrides `defaultMaxNumberOfDefinitions = 4000` (`DefaultOverlays.scala:11`).
 
-**`--repr=all --format=neo4jcsv` — correcting the brief.** Enums are
+**`--repr=all --format=neo4jcsv` — correcting the research question.** Enums are
 `Representation { Ast, Cfg, Ddg, Cdg, Pdg, Cpg14, Cpg, All }` (`JoernExport.scala:34-36`) and
 `Format { Dot, Neo4jCsv, Graphml, Graphson }` (`:48-50`). `Format.Neo4jCsv` dispatches unconditionally
 to `exportWithFlatgraphFormat` (`:113-114`), which accepts **two** reprs (`:144-166`): `All` →
