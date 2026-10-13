@@ -430,66 +430,80 @@ func resolveOneName(ctx context.Context, reader *sqlite.PinnedReader, name strin
 	return "", ambiguousName(name, first, total)
 }
 
-// nameCandidates counts every node the filter selects, exactly, and returns
-// the first page of them. It walks the store's keyset pages by node id, so it
-// holds one page at a time however many nodes carry the name, and a page the
-// store returns short -- it collapses duplicate fact rows of one node after
-// its limit -- is not taken for the end: only an empty page ends the walk.
+// nameCandidates reads the first page of the nodes the filter selects and,
+// when there is any, counts all of them exactly in one statement
+// (PinnedReader.CountNodes), so the count of a name thousands of nodes carry
+// costs one indexed range scan and the heap holds one page.
 func nameCandidates(ctx context.Context, reader *sqlite.PinnedReader, f sqlite.NodeFilter) ([]sqlite.StoredNode, int64, error) {
-	var first []sqlite.StoredNode
-	var total int64
-	after := model.NodeID("")
-	for {
-		page, err := reader.Nodes(ctx, f, after, 0)
-		if err != nil {
-			return nil, 0, err
-		}
-		if len(page) == 0 {
-			return first, total, nil
-		}
-		if first == nil {
-			first = page
-		}
-		total += int64(len(page))
-		after = page[len(page)-1].Node.ID
+	first, err := reader.Nodes(ctx, f, "", 0)
+	if err != nil || len(first) == 0 {
+		return nil, 0, err
 	}
+	total, err := reader.CountNodes(ctx, f)
+	if err != nil {
+		return nil, 0, err
+	}
+	return first, total, nil
 }
 
-// ambiguousName builds the rejection for a name several nodes carry. It states
-// the exact number of candidates and names the first page of them -- every one
-// when they fit a page, which is how an ambiguous abbreviated object name is
-// answered by version control, so the operator can pick without a second
-// command. The candidates ride in the remediation text rather than in the
-// details map because they are what the operator reads to choose one, and each
-// is rendered as its qualified name plus a short id prefix -- enough to tell
-// the candidates apart and to paste back. When more candidates exist than one
-// page holds, the rest are listed by `codectx symbol`, a page at a time with
-// its --cursor, from the same exact-name lookup.
+// ambiguousName builds the rejection for a name several nodes carry.
+//
+// The remediation leads with what must survive the model.MaxDetailBytes bound
+// every remediation is held to: the exact number of candidates, and the
+// command that lists every one of them, `codectx symbol` with the name, a page
+// at a time with its --cursor. Then come as many candidates of the first page,
+// in node-id order, as fit whole in what is left, each as its qualified name
+// and a 12-hex id prefix to paste back -- every one when they fit, as version
+// control answers an ambiguous abbreviated object name -- and the text states
+// how many it names. The bound can therefore only shorten the list of names,
+// never cut a name, the count or the pointer; the `candidates` and
+// `candidates_named` details carry the two counts for a machine reader.
 func ambiguousName(name string, shown []sqlite.StoredNode, total int64) error {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d nodes carry this name", total)
-	if int64(len(shown)) < total {
-		fmt.Fprintf(&b, "; the first %d by node id", len(shown))
-	}
-	b.WriteString("; pass one of these node ids: ")
-	for i, c := range shown {
-		if i > 0 {
-			b.WriteString(", ")
-		}
+	labels := make([]string, 0, len(shown))
+	for _, c := range shown {
 		label := c.Node.QualifiedName
 		if label == "" {
 			label = c.Node.Name
 		}
-		fmt.Fprintf(&b, "%s %s…", label, string(c.Node.ID)[:12])
+		labels = append(labels, label+" "+string(c.Node.ID)[:12]+"…")
 	}
-	if int64(len(shown)) < total {
-		fmt.Fprintf(&b, ". `codectx symbol %s` lists all %d, a page at a time with --cursor", strconv.Quote(name), total)
+	pointer := "`codectx symbol " + strconv.Quote(name) + "`"
+	head := func(named int) string {
+		text := fmt.Sprintf("%d nodes carry this name; %s lists every match, a page at a time with --cursor", total, pointer)
+		switch {
+		case named == 0:
+			return text + "; pass the node id of the one you mean"
+		case int64(named) == total:
+			return text + fmt.Sprintf("; pass one of these %d node ids: ", named)
+		}
+		return text + fmt.Sprintf("; pass a node id, the first %d by node id being: ", named)
+	}
+	if len(head(1)) > model.MaxDetailBytes {
+		// A name too long to quote inside the bound is not repeated: the
+		// `name` detail carries it.
+		pointer = "`codectx symbol` with this name"
+	}
+	// named grows while the head for one more name plus the list so far and
+	// that name still fit, so the head finally written is one that was
+	// measured with exactly the names it introduces.
+	named, listed := 0, 0
+	for named < len(labels) {
+		width := len(labels[named])
+		if named > 0 {
+			width += len(", ")
+		}
+		if len(head(named+1))+listed+width > model.MaxDetailBytes {
+			break
+		}
+		listed += width
+		named++
 	}
 	return (&model.Error{Code: model.CodeArgumentInvalid,
 		Message: "this name resolves to more than one node"}).
 		WithDetail("name", name).
 		WithDetail("candidates", strconv.FormatInt(total, 10)).
-		WithRemediation(b.String())
+		WithDetail("candidates_named", strconv.Itoa(named)).
+		WithRemediation(head(named) + strings.Join(labels[:named], ", "))
 }
 
 // suppliedIndexes turns the composition-time `--scip-index` path into the

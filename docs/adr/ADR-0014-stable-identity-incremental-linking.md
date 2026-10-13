@@ -103,7 +103,39 @@ republishes `helpers.go`, and the existing overloads keep their identities.
 - A unit-boundary move, such as a new nested `go.mod`, is a removal from one unit and an addition to the other: the
   moved files' sites, the sites bound into them, and the sites whose lookups see the moved names rerun.
 
-### 6. Proof
+### 6. A layout break rebuilds the hierarchy from stored per-file projections, then cuts off early
+
+- A file's projection is its table without what only its own resolution reads (sites, values, handlers, dynamic
+  imports), plus the few parts of those the hierarchy does read (each routing mount's argument, the offsets of Java
+  anonymous bodies). The state keeps every member's projection, as the table's own JSON.
+- When the layout holds (the same members and fields, every moved table keeping its interface), the refresh keeps the
+  stored hierarchy. When it breaks (a file added, removed or renamed, an interface changed), the cross-file structure
+  (the declaration and link indexes, Go's method sets and interface satisfaction, the module index) is rebuilt in full
+  from the projections of the members whose digest held and the tables of the others, so no unchanged member's table
+  is read.
+- The rebuilt indexes are then diffed group by group against the stored ones, and only the members whose recorded
+  reads name a changed group re-run (decision 4): the rebuild is the input to early cutoff, not a rerun of resolution.
+
+This is the shape mature incremental analyzers use: a position-independent per-file summary is the firewall, the
+whole-crate name-resolution query re-executes when files are added or removed or module declarations change, and
+propagation stops at the first unchanged result [S13][S10].
+
+**Alternative.** Maintaining the hierarchy incrementally per member. Measured on this repository's link package (57
+files, 24,636 lines, one Go unit, real pipeline): a refresh that breaks the layout takes 0.97-1.29 s, one that keeps
+it 1.10-1.23 s, because every refresh already reads and writes the unit's state and carries its facts over, which is
+linear in the unit; the rebuild from projections is about 0.16 s of CPU, about 15% of the refresh, most of it Go
+method-signature lookups. An incremental hierarchy would still rewrite both indexes on any added or removed file (their
+keys carry member ordinals), would have to record and store the hierarchy's own cross-file reads on every full build
+(more time and state for every unit), and would still recompute Go interface satisfaction across the unit; its
+saving is bounded by the second pass over unchanged members, under a tenth of the refresh.
+
+**Alternative.** Compressing the stored projections. Measured on the same unit, a layout-break refresh takes a
+median 1.06 s whether the projections are stored as JSON, s2 or zstd (fastest level), 18 refreshes each; on the
+projection path alone, JSON needs no codec work and allocates 9.5 MB, s2 adds about 2.4 ms of encoding and allocates
+17.9 MB, and zstd adds about 9 ms of encoding, about 6 ms of decoding over the two passes and 37.6 MB of allocation and holds about
+20 MB of codec state. Disk is not a constraint, so the projections stay JSON.
+
+### 7. Proof
 
 The gate is a differential test, for every language: after each scripted edit — body only; body adding a call; new
 declaration; rename; overload inserted before an existing one; conditional redefinition; changed returned value in a
@@ -153,5 +185,8 @@ inserted overload keeps every existing overload's identity.
   https://github.com/microsoft/TypeScript/tree/v5.9.2/src/compiler — options marked by what they affect.
 - [S12] *diff metadata before invalidating on changes to go.mod*, https://github.com/golang/go/issues/36589 — from
   invalidating all metadata on a manifest change to reloading only what is invalid.
+- [S13] *Guide to rust-analyzer*, https://rust-analyzer.github.io/book/contributing/guide.html — modules lowered to
+  a position-independent representation that body edits do not change; the crate def map query re-executed only when
+  files are added or removed or `mod` declarations change.
 - [research 23](../research/23-stable-identity-and-incremental-linking.md) and
   [raw/stable-identity](../research/raw/stable-identity/sources.md) — the full survey and the quoted excerpts.

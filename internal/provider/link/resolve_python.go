@@ -800,17 +800,17 @@ func (h *hierarchy) bases(typ Ref) ([]Ref, error) {
 // mergeC3 is C3's merge of seqs: repeatedly the first head of a sequence that
 // is in no sequence's tail, removed from every head; false when sequences
 // remain and every head is in some tail.
-func mergeC3(seqs [][]Ref) ([]Ref, bool) {
-	var out []Ref
+func mergeC3[T comparable](seqs [][]T) ([]T, bool) {
+	var out []T
 	for {
-		seqs = slices.DeleteFunc(seqs, func(s []Ref) bool { return len(s) == 0 })
+		seqs = slices.DeleteFunc(seqs, func(s []T) bool { return len(s) == 0 })
 		if len(seqs) == 0 {
 			return out, true
 		}
-		var next Ref
+		var next T
 		ok := false
 		for _, s := range seqs {
-			inTail := slices.ContainsFunc(seqs, func(o []Ref) bool { return slices.Contains(o[1:], s[0]) })
+			inTail := slices.ContainsFunc(seqs, func(o []T) bool { return slices.Contains(o[1:], s[0]) })
 			if !inTail {
 				next, ok = s[0], true
 				break
@@ -826,6 +826,104 @@ func mergeC3(seqs [][]Ref) ([]Ref, bool) {
 			}
 		}
 	}
+}
+
+// pyBase is one class of a Python method resolution order with the bases
+// outside the unit placed (pythonFullMRO): a class of the unit (ref), or a
+// base outside it, its qualified name in external.
+type pyBase struct {
+	ref      Ref
+	external string
+}
+
+// pythonFullMRO is typ's C3 linearisation with every base outside the unit
+// placed where the linearisation puts it ("The Python 2.3 Method Resolution
+// Order": the merge of the bases' linearisations and the bases as listed,
+// local precedence order and monotonicity kept). The unit has no
+// declaration of a base outside it, so its own bases are not known: it
+// enters the merge as the linearisation of itself alone. Its unknown
+// ancestors are all outside the unit and follow it in the true order, and
+// a member they define is reached through it (attribute lookup on the base
+// finds it), so the order decides, for each class of the unit, which bases
+// outside the unit precede it. That is exact unless a base outside the unit
+// is itself an ancestor of another one the hierarchy names, which no
+// declaration read can show: the true order then places that ancestor
+// after its descendant, which this order does not know, so it may list
+// that ancestor ahead of a class of the unit the true order puts first.
+// nil when typ is no Python class or its bases admit no linearisation
+// (Python refuses to create such a class).
+func (h *hierarchy) pythonFullMRO(typ Ref) ([]pyBase, error) {
+	language, err := h.fileLanguage(typ.File)
+	if err != nil || language != "python" {
+		return nil, err
+	}
+	memo := map[Ref][]pyBase{}
+	active := map[Ref]bool{}
+	var linearise func(t Ref) ([]pyBase, error)
+	linearise = func(t Ref) ([]pyBase, error) {
+		if l, ok := memo[t]; ok {
+			return l, nil
+		}
+		if active[t] {
+			return nil, nil
+		}
+		active[t] = true
+		defer delete(active, t)
+		bases, err := h.writtenBases(t)
+		if err != nil {
+			return nil, err
+		}
+		seqs := make([][]pyBase, 0, len(bases)+1)
+		for _, b := range bases {
+			if b.external != "" {
+				seqs = append(seqs, []pyBase{b})
+				continue
+			}
+			l, err := linearise(b.ref)
+			if err != nil || l == nil {
+				return nil, err
+			}
+			seqs = append(seqs, l)
+		}
+		merged, ok := mergeC3(append(seqs, bases))
+		if !ok {
+			return nil, nil
+		}
+		memo[t] = append([]pyBase{{ref: t}}, merged...)
+		return memo[t], nil
+	}
+	return linearise(typ)
+}
+
+// writtenBases are typ's direct bases, of the unit (keySuper, position in
+// Aux) and outside it (keyExternalSuper, position in Sig), in the order its
+// declaration lists them, each once.
+func (h *hierarchy) writtenBases(typ Ref) ([]pyBase, error) {
+	type placed struct {
+		pos string
+		b   pyBase
+	}
+	var all []placed
+	if err := h.links.lookup(keySuper+refKey(typ), func(e entry) error {
+		all = append(all, placed{e.Aux, pyBase{ref: e.Ref}})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := h.links.lookup(keyExternalSuper+refKey(typ), func(e entry) error {
+		all = append(all, placed{e.Sig, pyBase{external: e.Aux}})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	slices.SortStableFunc(all, func(a, b placed) int { return strings.Compare(a.pos, b.pos) })
+	out := make([]pyBase, 0, len(all))
+	for _, p := range all {
+		if !slices.Contains(out, p.b) {
+			out = append(out, p.b)
+		}
+	}
+	return out, nil
 }
 
 // fileLanguage is the language of a member file, as the hierarchy indexed it.

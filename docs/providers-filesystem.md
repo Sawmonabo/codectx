@@ -225,14 +225,14 @@ its tool's file name:
 
 | File | Ecosystem | Reader | Integrity | Dependency graph |
 |---|---|---|---|---|
-| `package-lock.json` | `npm` | JSON tokens; `packages` (lock versions 2 and 3) one entry per decode, else the version 1 `dependencies` tree | `integrity` | each entry's dependency tables; a dependency resolves as Node does, to the nearest `node_modules/<name>` up the requiring package's path |
+| `package-lock.json`, `npm-shrinkwrap.json` (the same format) | `npm` | JSON tokens; `packages` (lock versions 2 and 3) one entry per decode, else the version 1 `dependencies` tree | `integrity` | each entry's dependency tables; a dependency resolves as Node does, to the nearest `node_modules/<name>` up the requiring package's path |
 | `bun.lock` | `npm` | JSON tokens after comments and trailing commas are blanked in place, so every offset is the file's | the tuple's integrity | the tuple's dependency tables; resolved through the nested install paths (`parent/name`, then each enclosing path, then `name`) |
 | `yarn.lock` | `npm` | line reader of both formats (classic `key "value"`, and the YAML one with `__metadata`) | `integrity` (classic), `checksum` (YAML) | each block's dependency tables; a dependency resolves to the block whose descriptor list holds `name@range` |
-| `pnpm-lock.yaml` | `npm` | line reader of `packages` and `snapshots` (keys `/name/version`, `/name@version` and `name@version`, peer suffixes dropped) | `resolution.integrity` | `dependencies` and `optionalDependencies` with the exact version each resolves to (in `snapshots` from format 9) |
-| `Cargo.lock` | `cargo` | TOML, one `[[package]]` decoded at a time | `checksum` | `dependencies` strings `name`, `name version`, `name version (source)` |
-| `poetry.lock`, `pdm.lock`, `uv.lock`, `pylock.toml` / `pylock.<name>.toml` (PEP 751) | `pypi` | TOML, one package table decoded at a time | the hash of the package's one source distribution | `[package.dependencies]` (Poetry), PEP 508 strings (PDM), `dependencies` / `optional-dependencies` / `dev-dependencies` tables (uv), `dependencies` (PEP 751) |
+| `pnpm-lock.yaml` | `npm` | line reader of `packages` and `snapshots` (keys `/name/version`, `/name@version` and `name@version`, peer suffixes dropped, a registry host before format 9 dropped) | `resolution.integrity` | `dependencies` and `optionalDependencies` with the exact version each resolves to, or the dependency path of the package an alias installs (in `snapshots` from format 9) |
+| `Cargo.lock` | `cargo` | TOML, one `[[package]]` decoded at a time; the first format's `[metadata]` one statement at a time | `checksum`, or the first format's `"checksum name version (source)"` entry (`<none>` is no checksum) | `dependencies` strings `name`, `name version`, `name version (source)` |
+| `poetry.lock`, `pdm.lock`, `uv.lock`, `pylock.toml` / `pylock.<name>.toml` (PEP 751) | `pypi` | TOML, one package table decoded at a time; Poetry 1.x's `[metadata.files]` (and the earliest `[metadata.hashes]`) one package's list at a time | the hash of the package's one source distribution; for Poetry 1.x, among the files its name lists, those of its own version when the lock pins the name more than once | `[package.dependencies]` (Poetry), PEP 508 strings (PDM), `dependencies` / `optional-dependencies` / `dev-dependencies` tables (uv), `dependencies` (PEP 751) |
 | `Pipfile.lock` | `pypi` | JSON tokens, one package per decode | none (per-file hashes are counted) | none: the format records no graph |
-| `gradle.lockfile` | `maven` | line reader of `group:artifact:version=configurations` | none | none |
+| `gradle.lockfile`, `buildscript-gradle.lockfile` (the build script's classpath) | `maven` | line reader of `group:artifact:version=configurations` | none | none |
 
 The lock file defines a `configuration` node `<ecosystem>:lock:<path>`
 (metadata `format` and the format's `lock_version`). Each pinned package is
@@ -242,7 +242,11 @@ as the manifest readers normalize them: PEP 503 for Python,
 `group:artifact` for Maven), with the detail `kind: locked`,
 `resolved_version`, `integrity` where the format records one for the
 package, `hashes` (the count of distribution-file hashes a Python lock pins),
-`source` as the lock writes it, `group` (a Pipfile.lock section, a Poetry or
+`source` as the lock writes it (a VCS checkout as `<vcs>+<url>@<revision>`, the
+VCS being `git`, `hg`, `svn` or `bzr` as Pipfile.lock and pdm.lock key it and
+PEP 751's `vcs.type`), `alias` when the lock installs the package under
+another name (an npm alias, `alias@npm:name@version`; the package's own name
+is the node), `group` (a Pipfile.lock section, a Poetry or
 PDM group, the Gradle configurations), `local: true` for a package of the
 repository itself (a workspace member, a path, editable or virtual install)
 and `set_size`, the number of versions the lock pins for that name. A name
@@ -254,7 +258,13 @@ Each pinned package then has one `depends_on` occurrence from its
 `optional`, `peer`, `dev`), the depending package's `version`, the
 `requirement` as the lock records it, and `resolved_version` when the lock
 says which version it is: by the format's own lookup, or because the lock
-pins that name exactly once.
+pins that name exactly once. A dependency the lock resolves to an aliased
+package reaches that package's own node, with `alias` the name it is
+declared by: npm's `name` member of the `node_modules` entry (and lock
+version 1's `npm:name@version`), bun's resolved `name@version`, yarn's
+`alias@npm:name@range` descriptor, and pnpm's dependency-path value (one
+beginning with `@` or holding an `@` before any `:` from format 9, one
+holding a `/` before it).
 
 Resolved versions and integrity are evidence detail, not node metadata: the
 dependency node is workspace-wide (every manifest and lock naming the
@@ -269,11 +279,9 @@ document. The unit holds one small record per pinned package (name,
 version, integrity, dependency names) to count each name's versions before
 publishing, which is proportional to the lock, as the unit's own facts are.
 
-Not read: a Python lock's per-file hashes beyond the count, Cargo.lock
-version 1's `[metadata]` checksums, and Poetry lock 1.x's
-`[metadata.files]`; `npm-shrinkwrap.json` (the package-lock format under
-another name), `bun.lockb` (binary) and the per-configuration Gradle lock
-files of `gradle/dependency-locks/`.
+Not read: a Python lock's per-file hashes beyond the count, `bun.lockb`
+(binary) and the per-configuration Gradle lock files of
+`gradle/dependency-locks/`.
 
 ### Requirements files
 

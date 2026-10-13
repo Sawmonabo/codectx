@@ -211,13 +211,23 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	// A name-only call is admitted only when the search proved there is no
 	// precise route: an exhausted search, not one a budget, the clock or the
 	// depth bound stopped, which owes a continuation or a truncation instead.
+	//
+	// A reader that cannot list candidates cannot make that search, and the
+	// answer says so (nameOnlyUnavailable): "no route" there means no route
+	// analysis bound, not that no call could link the two.
 	if !w.routing && !w.possible && !w.targetSettled && !w.resumable() && !w.depthPruned &&
-		slices.Contains(kinds, model.RelCalls) && declarationReader(e.reader) != nil {
-		if err := w.startPossible(); err != nil {
-			return model.PathResult{}, err
-		}
-		if err := w.run(ctx, req.From, req.To); err != nil {
-			return model.PathResult{}, err
+		slices.Contains(kinds, model.RelCalls) {
+		if declarationReader(e.reader) == nil {
+			row, notice := nameOnlyUnavailable(model.RelMayCall)
+			res.Meta.Completeness = slices.Concat(res.Meta.Completeness, []model.CapabilityState{row})
+			res.Meta.Notices = appendNotice(res.Meta.Notices, notice)
+		} else {
+			if err := w.startPossible(); err != nil {
+				return model.PathResult{}, err
+			}
+			if err := w.run(ctx, req.From, req.To); err != nil {
+				return model.PathResult{}, err
+			}
 		}
 	}
 	res.VisitedCount = w.visited
