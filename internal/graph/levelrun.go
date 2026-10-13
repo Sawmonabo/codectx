@@ -59,6 +59,15 @@ type levelRecord struct {
 	// its relation has a virtual occurrence. It is settled before the record
 	// is appended to the level and never written.
 	check bool
+	// Slice is the slice flags the neighbour is admitted with when this
+	// record wins its group, and sliceSilent on a record that admits but is
+	// never served (impactdependence.go); zero outside a dependence walk.
+	Slice sliceFlags
+	// role, lift and kept are settleSlice's inputs: the record's relation
+	// role decides it, it comes from a lifting owner, and the direction
+	// dedup rule kept it. Settled before the record is appended and never
+	// written.
+	role, lift, kept bool
 }
 
 // encodeLevelRecord frames one record: uvarints for every number and every
@@ -83,7 +92,7 @@ func encodeLevelRecord(r levelRecord) []byte {
 	if r.Edge.Outgoing {
 		outgoing = 1
 	}
-	buf = append(buf, outgoing, byte(r.Step))
+	buf = append(buf, outgoing, byte(r.Step), byte(r.Slice))
 	for _, id := range []string{string(r.OwnerID), string(r.NodeID), string(r.RelID)} {
 		buf = binary.AppendUvarint(buf, uint64(len(id)))
 		buf = append(buf, id...)
@@ -121,6 +130,7 @@ func decodeLevelRecord(b []byte) (levelRecord, error) {
 	r.Edge.Kind = KindCode(d.byteAt())
 	r.Edge.Outgoing = d.byteAt() == 1
 	r.Step = dispatchStep(d.byteAt())
+	r.Slice = sliceFlags(d.byteAt())
 	r.OwnerID = model.NodeID(d.text())
 	r.NodeID = model.NodeID(d.text())
 	r.RelID = model.RelationID(d.text())

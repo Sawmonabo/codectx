@@ -74,6 +74,10 @@ jobs:
           pip3 --version
           cargo --version
 
+      # The search index library the codectx binary and the smoke both link.
+      - name: Build the search index library
+        uses: ./.github/actions/search-index
+
       - name: Build codectx
         run: |
           # GOEXE is ".exe" on Windows and empty everywhere else; -o takes the

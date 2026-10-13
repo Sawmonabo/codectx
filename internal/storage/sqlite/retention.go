@@ -349,7 +349,11 @@ func (s *Store) generationBytes(ctx context.Context, gen int64, exclusive bool) 
 			FROM evidence WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 FROM native_aliases WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 FROM search_units WHERE unit_id IN (SELECT id FROM ex))
-	  + (SELECT count(*) * ?2 + coalesce(sum(length(payload)), 0) FROM unit_delta_state WHERE unit_id IN (SELECT id FROM ex))`
+	  + (SELECT count(*) * ?2 + coalesce(sum(length(payload)), 0) FROM unit_delta_state WHERE unit_id IN (SELECT id FROM ex))
+	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(provider_id AS BLOB)) + length(cast(capability AS BLOB))
+			+ length(cast(scope_key AS BLOB)) + length(cast(state AS BLOB)) + length(cast(diagnostic_code AS BLOB))
+			+ length(cast(remediation AS BLOB)) + length(cast(details_json AS BLOB))), 0)
+			FROM unit_capabilities WHERE unit_id IN (SELECT id FROM ex))`
 	cte := members
 	if exclusive {
 		cte = exclusiveMembers

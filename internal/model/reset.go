@@ -14,9 +14,9 @@ type WorkspaceReset struct {
 	// in, after every symbolic link above it was followed.
 	DataDir string `json:"data_dir"`
 	// Removed is every entry the data directory held, in name order. The
-	// workspace lock file is not one of them: it is the lock this reset held
-	// while it removed the rest, and it stays as the empty file the next
-	// holder takes.
+	// workspace and serving lock files are not among them: they are the locks
+	// this reset held while it removed the rest, and they stay as the empty
+	// files the next holders take.
 	Removed    []RemovedEntry `json:"removed"`
 	FreedBytes uint64         `json:"freed_bytes"`
 	// Index is the full index run after the removal, present only when the

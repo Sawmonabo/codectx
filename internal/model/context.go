@@ -74,10 +74,10 @@ func EstimateTokensUTF8Bytes(n int64) (int64, error) {
 // slice, MaxFiles applies to distinct selected files across the whole plan and
 // MaxSlices caps total slices (Section 15.4).
 type Budget struct {
-	MaxEstimatedTokens int64 `json:"max_estimated_tokens"`
-	MaxBytes           int64 `json:"max_bytes"`
-	MaxFiles           int   `json:"max_files"`
-	MaxSlices          int   `json:"max_slices"`
+	MaxEstimatedTokens int64 `json:"max_estimated_tokens,omitempty"`
+	MaxBytes           int64 `json:"max_bytes,omitempty"`
+	MaxFiles           int   `json:"max_files,omitempty"`
+	MaxSlices          int   `json:"max_slices,omitempty"`
 	// MaxManifestBytes is the stored-manifest byte budget for THIS request. It
 	// is a caller budget, not a deployment ceiling: a request that knows it can
 	// hold a larger manifest may raise the configured value, and zero takes the
@@ -128,7 +128,7 @@ type ContextRequest struct {
 	Task         string       `json:"task"`
 	Seeds        []string     `json:"seeds,omitempty"`
 	Phase        Phase        `json:"phase"`
-	Budget       Budget       `json:"budget"`
+	Budget       Budget       `json:"budget,omitempty"`
 	GenerationID GenerationID `json:"generation_id,omitempty"`
 }
 
@@ -535,7 +535,7 @@ type ContextPageRequest struct {
 	SessionID SessionID   `json:"session_id"`
 	ActorID   string      `json:"actor_id"`
 	View      ContextView `json:"view"`
-	Page      PageRequest `json:"page"`
+	Page      PageRequest `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape. There is deliberately no cursor/generation

@@ -153,7 +153,13 @@ impl Tokenizer for Code {
     fn token_stream<'a>(&'a mut self, text: &'a str) -> CodeStream {
         let mut tokens = Vec::new();
         for_each_code_token(text, |p, from, to, t| {
-            tokens.push(Token { offset_from: from, offset_to: to, position: p, text: t.to_string(), position_length: 1 })
+            tokens.push(Token {
+                offset_from: from,
+                offset_to: to,
+                position: p,
+                text: t.to_string(),
+                position_length: 1,
+            })
         });
         CodeStream { tokens, at: 0 }
     }

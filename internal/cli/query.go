@@ -72,10 +72,12 @@ func newSourceCommand(build model.BuildInfo) *cobra.Command {
 			"A node id prints that node's range as the pinned generation holds it: a node that moved " +
 			"between generations is read where the asked generation has it, and a node that generation " +
 			"does not hold is refused as not in this generation. A file id or a path prints the file from " +
-			"--offset to its end. A path is the root-relative path the index stores; it is only turned " +
+			"--offset to its end. A path is relative to the repository root and is put in the spelling " +
+			"the index stores, so ./pkg/a.go and pkg/../pkg/a.go both name pkg/a.go; a path that is " +
+			"absolute or climbs out of the tree is refused as an invalid argument. It is only turned " +
 			"into a file id and looked up in the generation's manifest, never opened, so a path the " +
-			"snapshot does not hold -- outside the tree, ignored, or a symbolic link the capture skipped " +
-			"-- is refused as not in this generation. An argument of 64 lowercase hex characters is an " +
+			"snapshot does not hold -- ignored, or a symbolic link the capture skipped -- is refused " +
+			"as not in this generation. An argument of 64 lowercase hex characters is an " +
 			"id: it is read as a node id and, when no such node is in the generation, as a file id.\n\n" +
 			"Text output is the span's bytes and nothing else, so redirecting it reproduces them " +
 			"exactly; a chunk that is not valid UTF-8 is decoded back to its bytes. --json writes one " +

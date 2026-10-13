@@ -51,7 +51,7 @@ import (
 //     route is that backing. Route is bounded by model.MaxRelationsPerPath,
 //     the same bound impactAccumulator.path applies.
 //
-// ScoreMicros is deliberately NOT a field: it is 1_000_000 / (1 + Cost), and a
+// ScoreMicros is deliberately NOT a field: it is derived from Cost, and a
 // stored copy could disagree with the Cost a fold just lowered. scoreMicros()
 // derives it, and lessByRank ranks on that derived value rather than on Cost --
 // the division is integer, so distinct costs collapse to equal scores and
@@ -71,10 +71,19 @@ type impactRecord struct {
 }
 
 // scoreMicros is the frozen integer score: a cheaper, more direct route always
-// outranks a longer one and no float ever enters the ordering. It is the same
-// arithmetic impactAccumulator.Entries applies, kept in one place so the two
-// cannot drift.
-func (r impactRecord) scoreMicros() int64 { return 1_000_000 / (1 + r.Cost) }
+// outranks a longer one and no float ever enters the ordering. A route with
+// no program-dependence hop scores 1_000_000 / (1 + cost), which is never
+// negative; a route that took one (dependenceTier) scores the same of its
+// plain cost minus 1_000_001, which is always negative, so the served order,
+// score descending, is the lexicographic key (reached through dependence,
+// cost) the walk ranked by.
+func (r impactRecord) scoreMicros() int64 {
+	score := 1_000_000 / (1 + plainCost(r.Cost))
+	if r.Cost&dependenceTier != 0 {
+		return score - 1_000_001
+	}
+	return score
+}
 
 // pairRecord is one (from-package, to-package) pair of the rollup, with the
 // number of symbol edges and the number of evidence records behind it. It is

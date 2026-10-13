@@ -74,7 +74,7 @@ type Options struct {
 	Logger *slog.Logger
 }
 
-// Server is the codectx MCP server: the SDK server with the 23 Section 19.2
+// Server is the codectx MCP server: the SDK server with the 24 Section 19.2
 // tools registered and the Section 19.3 bounds installed as receiving
 // middleware.
 //
@@ -90,7 +90,7 @@ type Server struct {
 	limits limits
 }
 
-// New builds the server: metadata, options, the bounds middleware, then the 23
+// New builds the server: metadata, options, the bounds middleware, then the 24
 // tools. It registers no prompts, resources or completion handlers — Section
 // 19.3 scopes V1 to tools — and sets no KeepAlive, which the SDK documents as
 // unavailable for protocol versions >= 2026-07-28.

@@ -21,6 +21,9 @@ type nodeMeta struct {
 	Arguments  int64                `json:"arguments"`
 	Callee     *string              `json:"callee"`
 	Fragments  *[]string            `json:"fragments"`
+	// FragmentsRows is set instead of Fragments when the site's fragment
+	// list is stored as metadata rows (model.SplitMetadata).
+	FragmentsRows *int64 `json:"fragments_rows"`
 }
 
 func readMeta(n model.Node) (nodeMeta, bool) {
@@ -36,7 +39,7 @@ func readMeta(n model.Node) (nodeMeta, bool) {
 // `callee` and no shape, and an open import site carries fragments.
 func openSiteMeta(n model.Node) (nodeMeta, bool) {
 	m, ok := readMeta(n)
-	if !ok || m.Resolution != model.ResolutionUnresolved || !m.Shape.Valid() || m.Fragments != nil {
+	if !ok || m.Resolution != model.ResolutionUnresolved || !m.Shape.Valid() || m.Fragments != nil || m.FragmentsRows != nil {
 		return nodeMeta{}, false
 	}
 	return m, true
@@ -48,13 +51,21 @@ func isOpenCallSite(n model.Node) bool {
 	return ok
 }
 
-// openImportFragments reads an open import site's fragments.
-func openImportFragments(n model.Node) ([]string, bool) {
-	m, ok := readMeta(n)
-	if !ok || m.Resolution != model.ResolutionUnresolved || m.Reason != model.ReasonComputed || m.Fragments == nil {
-		return nil, false
+// openImportFragments reads an open import site's inline fragments, or, when
+// they are stored as metadata rows, how many rows hold them (rows > 0, nil
+// fragments). ok is false for a node that is not an open import site.
+func openImportFragments(n model.Node) (fragments []string, rows int64, ok bool) {
+	m, read := readMeta(n)
+	if !read || m.Resolution != model.ResolutionUnresolved || m.Reason != model.ReasonComputed {
+		return nil, 0, false
 	}
-	return *m.Fragments, true
+	switch {
+	case m.Fragments != nil:
+		return *m.Fragments, 0, true
+	case m.FragmentsRows != nil && *m.FragmentsRows > 0:
+		return nil, *m.FragmentsRows, true
+	}
+	return nil, 0, false
 }
 
 // isCallPlaceholder reports whether n is the structural provider's
