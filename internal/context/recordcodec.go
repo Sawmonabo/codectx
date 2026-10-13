@@ -77,11 +77,13 @@ func deriveCodec(t reflect.Type) (*recordCodec, string, error) {
 	}
 	c := &recordCodec{fields: make([]codecField, 0, t.NumField())}
 	var desc strings.Builder
-	desc.WriteString(t.String() + "{")
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
+	desc.WriteString(t.String())
+	desc.WriteByte('{')
+	for f := range t.Fields() {
 		cf := codecField{offset: f.Offset, kind: f.Type.Kind()}
-		desc.WriteString(f.Name + ":" + cf.kind.String())
+		desc.WriteString(f.Name)
+		desc.WriteByte(':')
+		desc.WriteString(cf.kind.String())
 		switch cf.kind {
 		case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int32, reflect.Int64, reflect.String:
 		case reflect.Slice:

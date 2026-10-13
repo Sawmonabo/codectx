@@ -735,7 +735,7 @@ func (c *tsConfig) sourceRoots() []string {
 	first := true
 	for _, p := range append(slices.Clone(c.include), c.files...) {
 		var lit []string
-		for _, seg := range strings.Split(p, "/") {
+		for seg := range strings.SplitSeq(p, "/") {
 			if strings.ContainsAny(seg, "*?") {
 				break
 			}

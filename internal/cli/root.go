@@ -87,8 +87,7 @@ func Execute(ctx context.Context, build model.BuildInfo, root *cobra.Command, ar
 	}
 	if jsonRequested(cmd, args) {
 		env := failureEnvelope(build.SchemaVersion, commandName(cmd), typed)
-		var produced *failedWithData
-		if errors.As(err, &produced) {
+		if produced, ok := errors.AsType[*failedWithData](err); ok {
 			env.Data = produced.data
 		}
 		if writeErr := writeEnvelope(root.OutOrStdout(), env); writeErr != nil {

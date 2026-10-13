@@ -37,6 +37,9 @@ func TestSealVisibilityChecksSeekEachEndpointByNode(t *testing.T) {
 			}
 			steps = append(steps, detail)
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s: EXPLAIN QUERY PLAN: %v", c.what, err)
+		}
 		rows.Close()
 		found := false
 		for _, step := range steps {

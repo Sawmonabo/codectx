@@ -74,7 +74,7 @@ func newChainFixture(hops int) (*graphFixture, []model.NodeID) {
 			Language: "go", SemanticSource: model.SemanticCanonical}
 		chain = append(chain, id)
 	}
-	for i := 0; i < hops; i++ {
+	for i := range hops {
 		f.relations = append(f.relations, model.Relation{ID: fixtureRelationID(i),
 			From: chain[i], Kind: model.RelCalls, To: chain[i+1]})
 	}

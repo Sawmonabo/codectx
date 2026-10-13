@@ -125,8 +125,8 @@ func decodeParams(s string) ([]boundParam, error) {
 	for len(b.b) > 0 && b.err == nil {
 		pos, index := b.index(), b.uvarint()
 		marks := b.byte()
-		p := boundParam{paramInfo: paramInfo{Pos: pos, Index: uint32(index), Variadic: marks&1 != 0, KeywordOnly: marks&2 != 0,
-			Returned: marks&4 != 0, Unknown: marks&8 != 0, Name: b.str()}, Node: model.NodeID(b.str())}
+		p := boundParam{Pos: pos, Index: uint32(index), Variadic: marks&1 != 0, KeywordOnly: marks&2 != 0,
+			Returned: marks&4 != 0, Unknown: marks&8 != 0, Name: b.str(), Node: model.NodeID(b.str())}
 		if index > 1<<32-1 || marks > 15 {
 			b.fail()
 		}

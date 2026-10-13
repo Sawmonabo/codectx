@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -220,11 +221,9 @@ func (m *childModel) predict(ctx context.Context, run *ledger.Run, key ledger.Ne
 func (c *ChildNeeds) plan(ctx context.Context, l *Ledger, key ChildKey, w ChildWork) (ChildNeed, error) {
 	memKind, diskKind, _ := key.Kind.kinds()
 	run := ledger.RunFromContext(ctx)
-	class := ledger.NeedKey{Subject: key.Tool, Fingerprint: key.Fingerprint, Build: childBuild(),
-		SizeClass: SizeClassOf(w.WorkBytes)}
 	n := ChildNeed{ChildWork: w, run: run}
-	n.memKey = childModelKey{repository: run.RepositoryID(), NeedKey: class}
-	n.memKey.Kind = memKind
+	n.memKey = childModelKey{repository: run.RepositoryID(), NeedKey: ledger.NeedKey{Kind: memKind, Subject: key.Tool,
+		Fingerprint: key.Fingerprint, Build: childBuild(), SizeClass: SizeClassOf(w.WorkBytes)}}
 	n.diskKey = n.memKey
 	n.diskKey.Kind = diskKind
 	n.mem, n.disk = c.model(n.memKey), c.model(n.diskKey)
@@ -596,11 +595,8 @@ func ProjectWork(ctx context.Context, view model.SnapshotView, root string, mark
 			w.WorkBytes = saturatingAdd(w.WorkBytes, fv.Size)
 		}
 		dir, base := path.Split(fv.Path)
-		for _, m := range markers {
-			if base == m {
-				dirs[dir] = struct{}{}
-				break
-			}
+		if slices.Contains(markers, base) {
+			dirs[dir] = struct{}{}
 		}
 		return nil
 	})

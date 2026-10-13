@@ -17,8 +17,7 @@ import (
 // rewrite), string lists of zero to three elements (zero as nil, the one
 // normalization the layout makes) and nested structs filled the same way.
 func fillRecord(r *rand.Rand, v reflect.Value) {
-	for i := 0; i < v.NumField(); i++ {
-		f := v.Field(i)
+	for _, f := range v.Fields() {
 		switch f.Kind() {
 		case reflect.Bool:
 			f.SetBool(r.IntN(2) == 1)
@@ -44,7 +43,7 @@ func fillRecord(r *rand.Rand, v reflect.Value) {
 				continue
 			}
 			list := reflect.MakeSlice(f.Type(), n, n)
-			for j := 0; j < n; j++ {
+			for j := range n {
 				list.Index(j).SetString(randomBytes(r))
 			}
 			f.Set(list)
@@ -101,7 +100,7 @@ func checkCodec[T any](t *testing.T, r *rand.Rand) {
 	if err != nil {
 		t.Fatalf("%T: %v", *new(T), err)
 	}
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		var want T
 		fillRecord(r, reflect.ValueOf(&want).Elem())
 		b, err := encode(want)
@@ -119,7 +118,7 @@ func checkCodec[T any](t *testing.T, r *rand.Rand) {
 		if string(again) != string(b) {
 			t.Fatalf("%T: encoding is not deterministic", want)
 		}
-		for cut := 0; cut < len(b); cut++ {
+		for cut := range b {
 			if _, err := decode(b[:cut]); err == nil {
 				t.Fatalf("%T: a %d-byte prefix of a %d-byte record decoded", want, cut, len(b))
 			}
