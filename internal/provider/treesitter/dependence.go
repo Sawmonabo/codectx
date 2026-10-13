@@ -381,3 +381,19 @@ func (b *builder) capabilities(structureRow model.CapabilityState) []model.Capab
 	}
 	return rows
 }
+
+// unknownSummaries marks each parameter of decl, a callable whose function
+// message failed, Unknown: the worker sent no flows for its body, so whether
+// a parameter reaches the return is not known. Such a parameter has no
+// variable node (only an analysed function's variables are published), so
+// each summary a bound site finds for it is kept with no node and counted on
+// the unit's data_flows_to row (facts_without_node), never published; the
+// mark is in the callable's parameter entries, so an analysis that later
+// succeeds re-runs every site bound to it.
+func unknownSummaries(decl *link.Decl) {
+	for j := range decl.Parameters {
+		if p := &decl.Parameters[j]; p.Node == "" {
+			p.Unknown = true
+		}
+	}
+}

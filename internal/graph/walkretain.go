@@ -1095,7 +1095,7 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 	if w.crashInAdmit {
 		return 0, errAdmitCrash
 	}
-	// The admitted states name their route rows, so the rows are durable
+	// The admitted states name their route rows, so the rows are written
 	// before the level that names them is written. A crash after this leaves
 	// rows no level names, which no route ever reads.
 	if w.routes != nil {

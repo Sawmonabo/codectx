@@ -29,6 +29,9 @@ type unit struct {
 	// family is the unit's language family; a Rust unit reads its crates'
 	// names from their Cargo.toml (rustCrates).
 	family Family
+	// es is an ECMAScript unit's parsed configuration, read once per link
+	// (esInputsOf) and handed to the hierarchy's resolver.
+	es *esInputs
 }
 
 // Files streams the unit's member tables in ascending FileID order, one

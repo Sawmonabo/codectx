@@ -563,6 +563,26 @@ func (r *pySite) instance(site Ref, s *Site, typ Ref, detail string) error {
 			return err
 		}
 	}
+	return r.ahead(site, typ, typ, s.Callee, detail, d)
+}
+
+// ahead emits, beside the binding of site to the first class of the unit
+// along typ's order after from that defines method, a call to the method of
+// each base outside the unit the order places ahead of that class
+// (pythonAhead): the true callee is one of them or that class, a set the
+// site's targets count.
+func (r *pySite) ahead(site, typ, from Ref, method, detail string, d model.Dispatch) error {
+	bases, err := r.h.pythonAhead(typ, from, method, true)
+	if err != nil {
+		return err
+	}
+	for _, q := range bases {
+		err := r.emit(Binding{Kind: FactCall, Site: site, Detail: detail, Dispatch: d,
+			External: externalMethod(r.fc.family, q, method)})
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -574,8 +594,11 @@ func (r *pySite) object(site Ref, s *Site, typ Ref, detail string) error {
 		found = true
 		return r.exactCall(site, detail)(e.Ref)
 	})
-	if err != nil || found {
+	if err != nil {
 		return err
+	}
+	if found {
+		return r.ahead(site, typ, typ, s.Callee, detail, model.DispatchExact)
 	}
 	_, err = r.t.outsideCall(r.h, r.fc.family, site, typ, s.Callee, r.emit)
 	return err
@@ -591,8 +614,11 @@ func (r *pySite) class(site Ref, s *Site, typ Ref, detail string) error {
 		b := Binding{Kind: FactCall, Site: site, Target: e.Ref, Detail: detail, Dispatch: model.DispatchExact}
 		return r.call(b, e.Flags&flagStatic == 0)
 	})
-	if err != nil || found {
+	if err != nil {
 		return err
+	}
+	if found {
+		return r.ahead(site, typ, typ, s.Callee, detail, model.DispatchExact)
 	}
 	_, err = r.t.outsideCall(r.h, r.fc.family, site, typ, s.Callee, r.emit)
 	return err
@@ -607,6 +633,9 @@ func (r *pySite) super(site Ref, s *Site) error {
 	err := resolvePythonSuper(r.ctx, r.h, site, r.tab, s, func(target Ref) error {
 		found = true
 		return bind(target)
+	}, func(q string) error {
+		return r.emit(Binding{Kind: FactCall, Site: site, Detail: DetailHierarchy, Dispatch: model.DispatchExact,
+			External: externalMethod(r.fc.family, q, s.Callee)})
 	})
 	if err != nil || found {
 		return err
@@ -693,14 +722,29 @@ func pythonSubtypes(ctx context.Context, h *hierarchy, typ Ref, yield func(Ref) 
 // sibling base a subclass lists after B is (cooperative multiple
 // inheritance). A type whose bases admit no order reaches nothing; for B
 // itself the nearest declaration along each of its bases' paths answers.
-func resolvePythonSuper(ctx context.Context, h *hierarchy, site Ref, tab *Table, s *Site, bind func(Ref) error) error {
+func resolvePythonSuper(ctx context.Context, h *hierarchy, site Ref, tab *Table, s *Site, bind func(Ref) error, external func(string) error) error {
 	class := enclosingClass(tab, s.Caller)
 	if class < 0 {
 		return nil
 	}
 	b := Ref{File: site.File, Index: class}
+	// external is told, once each, the bases outside the unit some
+	// subtype's order places after B and ahead of the class it binds.
+	told := map[string]bool{}
 	return pythonSubtypes(ctx, h, b, func(sub Ref) error {
-		order, err := h.pythonMRO(sub)
+		ahead, err := h.pythonAhead(sub, b, s.Callee, false)
+		if err != nil {
+			return err
+		}
+		for _, q := range ahead {
+			if !told[q] {
+				told[q] = true
+				if err := external(q); err != nil {
+					return err
+				}
+			}
+		}
+		order, err := h.pythonUnitOrder(sub)
 		if err != nil {
 			return err
 		}
@@ -893,6 +937,66 @@ func (h *hierarchy) pythonFullMRO(typ Ref) ([]pyBase, error) {
 		return memo[t], nil
 	}
 	return linearise(typ)
+}
+
+// pythonUnitOrder is typ's method resolution order over the classes of the
+// unit: pythonFullMRO's without the bases outside the unit, else, when the
+// bases outside the unit admit no linearisation, pythonMRO's.
+func (h *hierarchy) pythonUnitOrder(typ Ref) ([]Ref, error) {
+	full, err := h.pythonFullMRO(typ)
+	if err != nil || full == nil {
+		if err != nil {
+			return nil, err
+		}
+		return h.pythonMRO(typ)
+	}
+	out := make([]Ref, 0, len(full))
+	for _, b := range full {
+		if b.external == "" {
+			out = append(out, b.ref)
+		}
+	}
+	return out, nil
+}
+
+// pythonAhead is the bases outside the unit that typ's full order
+// (pythonFullMRO) places after the class from and ahead of the first class
+// of the unit after it that defines method, when a lookup starting past
+// from reaches that class (`super()` in from); with self, the lookup starts
+// at from itself (a call on from's instance, from being typ), and from
+// defining method leaves none. Each may hold the method instead of that
+// class, so the call's targets are a set of them and that class. Empty when
+// no such class follows, or when the order does not exist.
+func (h *hierarchy) pythonAhead(typ, from Ref, method string, self bool) ([]string, error) {
+	full, err := h.pythonFullMRO(typ)
+	if err != nil || full == nil {
+		return nil, err
+	}
+	start := slices.IndexFunc(full, func(b pyBase) bool { return b.external == "" && b.ref == from })
+	if start < 0 {
+		return nil, nil
+	}
+	if self {
+		defines := false
+		if err := h.methods(from, method, func(entry) error { defines = true; return nil }); err != nil || defines {
+			return nil, err
+		}
+	}
+	var ahead []string
+	for _, b := range full[start+1:] {
+		if b.external != "" {
+			ahead = append(ahead, b.external)
+			continue
+		}
+		defines := false
+		if err := h.methods(b.ref, method, func(entry) error { defines = true; return nil }); err != nil {
+			return nil, err
+		}
+		if defines {
+			return ahead, nil
+		}
+	}
+	return nil, nil
 }
 
 // writtenBases are typ's direct bases, of the unit (keySuper, position in
@@ -1205,7 +1309,7 @@ func pythonFlows(ctx context.Context, u *unit, e *flowEmit, calls *pagination.Ex
 		}
 		for i := range tab.Sites {
 			s := &tab.Sites[i]
-			if (len(s.Arguments) == 0 && !hasResult(s)) || !sel.has(int32(i)) {
+			if (len(s.Arguments) == 0 && len(s.Nested) == 0 && !hasResult(s)) || !sel.has(int32(i)) {
 				continue
 			}
 			site := Ref{File: file, Index: int32(i)}

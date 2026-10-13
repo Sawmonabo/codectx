@@ -230,7 +230,7 @@ func writeDirHeader(dir, id string, c Cursor) error {
 // not touch the directory until the reservation has been granted.
 func dirHeaderFrame(id string, c Cursor) ([]byte, error) {
 	h := SpoolHeader{Version: spoolVersion, SpoolID: id, LeaseID: c.LeaseID, GenerationID: c.GenerationID,
-		AnalysisKey: c.AnalysisKey, QueryHash: c.QueryHash, ExpiresAt: c.ExpiresAt.UTC()}
+		AnalysisKey: c.AnalysisKey, QueryHash: c.QueryHash, ExpiresAt: c.ExpiresAt.UTC(), Boot: thisBoot()}
 	head, err := json.Marshal(h)
 	if err != nil {
 		return nil, internalErr("spool header: " + err.Error())

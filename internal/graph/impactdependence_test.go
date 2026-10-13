@@ -126,15 +126,17 @@ func TestImpactFollowsControlDependence(t *testing.T) {
 // TestImpactRanksCallImpactAboveDependence is the ranking rule
 // (dependenceTier): every node a call route reaches outranks a node only a
 // program-dependence hop reaches, at every depth. s's callers form a chain
-// 1 000 deep; d is one data-flow hop from s. A data-flow-only node also
-// reports a lower score than every call-reached one, so the served score
-// order and the rank agree.
+// 1 000 deep; d is one data-flow hop from s. The served entries say so: d is
+// served the dependence reach and every caller the call reach, and every score
+// is the plain score of the route's cost within its tier, never negative.
 //
 // Mutations caught: impactAdd or kindCosts.add not setting the tier (d, at
 // cost 2, ties c2's score and outranks it by depth); a fixed surcharge in
 // place of the tier, of any size below the chain's cost (d outranks the deep
-// end of the chain); scoreMicros ignoring the tier (d's score is above the
-// chain's tail).
+// end of the chain); lessByRank ranking on the score alone (d, scoring above
+// the chain's tail, outranks it); reach not served (d reports the call
+// reach); scoreMicros folding the tier into the score again (d's score is
+// negative, not its plain cost's).
 func TestImpactRanksCallImpactAboveDependence(t *testing.T) {
 	const chain = 1000
 	nodes := map[string]model.NodeKind{"s": model.NodeFunction, "d": model.NodeVariable}
@@ -156,13 +158,19 @@ func TestImpactRanksCallImpactAboveDependence(t *testing.T) {
 				i, entries[i].NodeID, name(i+1))
 		}
 	}
-	last, tail := entries[chain], entries[chain-1]
+	last := entries[chain]
 	if last.NodeID != fixtureNodeID("d") {
 		t.Fatalf("the last entry is %s, want the data-flow-only node d", last.NodeID)
 	}
-	if last.ScoreMicros >= tail.ScoreMicros {
-		t.Errorf("d scores %d, not below the chain's deepest caller (%d): the served score contradicts the rank",
-			last.ScoreMicros, tail.ScoreMicros)
+	if last.Reach != model.ImpactReachDependence || last.ScoreMicros != 1_000_000/(1+2) {
+		t.Errorf("d is served reach %q scoring %d, want the dependence reach and its plain data-flow score %d",
+			last.Reach, last.ScoreMicros, 1_000_000/(1+2))
+	}
+	for i := 0; i < chain; i++ {
+		if entries[i].Reach != "" || entries[i].ScoreMicros < 0 {
+			t.Fatalf("caller %s is served reach %q scoring %d, want the call reach and a non-negative score",
+				entries[i].NodeID, entries[i].Reach, entries[i].ScoreMicros)
+		}
 	}
 }
 

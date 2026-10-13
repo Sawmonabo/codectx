@@ -85,27 +85,24 @@ func (t goUnitTypes) read(p, name string) (goTypeAnswer, bool, error) {
 		if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
 			continue
 		}
-		var alias *entry
+		// An alias declared once per platform or build tag is each of its
+		// distinctly written declarations (goTypeAnswer.others).
+		var aliases []entry
 		err := h.decls.lookup(keyGoAlias+scope+"\x00"+name, func(e entry) error {
-			if alias == nil {
-				alias = &e
-			} else if alias.Sig != e.Sig {
-				alias.Sig = goIdentityUnknown
+			if !slices.ContainsFunc(aliases, func(a entry) bool { return a.Sig == e.Sig }) {
+				aliases = append(aliases, e)
 			}
 			return nil
 		})
 		if err != nil {
 			return goTypeAnswer{}, false, err
 		}
-		if alias != nil {
-			fc, found, err := h.fileContext(alias.Ref.File)
+		if len(aliases) > 0 {
+			decls, err := t.decls(aliases)
 			if err != nil {
 				return goTypeAnswer{}, false, err
 			}
-			if !found {
-				return goTypeAnswer{found: true, alias: true, form: goIdentityUnknown, names: goUnitNames{h: h, fc: fc}}, true, nil
-			}
-			return goTypeAnswer{found: true, alias: true, form: alias.Sig, names: goUnitNames{h: h, fc: fc}}, true, nil
+			return goTypeAnswer{found: true, alias: true, form: decls[0].form, names: decls[0].names, others: decls[1:]}, true, nil
 		}
 		err = h.decls.lookup(keyType+"go\x00"+scope+"\x00"+name, func(entry) error {
 			answer.found = true
@@ -118,64 +115,72 @@ func (t goUnitTypes) read(p, name string) (goTypeAnswer, bool, error) {
 	return answer, true, nil
 }
 
-func (t goUnitTypes) constant(ctx context.Context, p, name string) (string, goNames, bool, error) {
+func (t goUnitTypes) constant(ctx context.Context, p, name string) ([]goDecl, error) {
 	h := t.h
 	if !h.goMemoOn() {
 		return t.readConstant(p, name)
 	}
 	key := p + "\x00" + name
 	if m, ok := h.goMemo.consts.get(key); ok {
-		return m.form, m.names, m.found, nil
+		return m, nil
 	}
-	form, names, found, err := t.readConstant(p, name)
+	decls, err := t.readConstant(p, name)
 	if err == nil {
-		h.goMemo.consts.put(key, goConstMemo{form, names, found})
+		h.goMemo.consts.put(key, decls)
 	}
-	return form, names, found, err
+	return decls, err
 }
 
 // readConstant is constant's answer read from the indexes.
-func (t goUnitTypes) readConstant(p, name string) (string, goNames, bool, error) {
+func (t goUnitTypes) readConstant(p, name string) ([]goDecl, error) {
 	h := t.h
 	var scopes []string
 	if err := h.goPackages(p, func(scope string) error {
 		scopes = append(scopes, scope)
 		return nil
 	}); err != nil {
-		return "", nil, false, err
+		return nil, err
 	}
 	if len(scopes) == 0 && !(h.goModule != "" && under(p, h.goModule)) {
 		if h.goExt == nil {
-			return "", nil, false, nil
+			return nil, nil
 		}
-		form, names, found := h.goExt.constant(p, name)
-		return form, names, found, nil
+		return h.goExt.constant(p, name), nil
 	}
-	var c *entry
+	var cs []entry
 	for _, scope := range scopes {
 		if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
 			continue
 		}
 		err := h.decls.lookup(keyGoConst+scope+"\x00"+name, func(e entry) error {
-			if c == nil {
-				c = &e
-			} else if c.Sig != e.Sig {
-				c.Sig = goIdentityUnknown
+			if !slices.ContainsFunc(cs, func(c entry) bool { return c.Sig == e.Sig }) {
+				cs = append(cs, e)
 			}
 			return nil
 		})
 		if err != nil {
-			return "", nil, false, err
+			return nil, err
 		}
 	}
-	if c == nil {
-		return "", nil, false, nil
+	return t.decls(cs)
+}
+
+// decls are the forms (Sig) of the declarations es, each written in its
+// own file; a form whose file cannot be read is unknown.
+func (t goUnitTypes) decls(es []entry) ([]goDecl, error) {
+	var out []goDecl
+	for _, e := range es {
+		fc, found, err := t.h.fileContext(e.Ref.File)
+		if err != nil {
+			return nil, err
+		}
+		d := goDecl{form: e.Sig, names: goUnitNames{h: t.h, fc: fc}}
+		if !found {
+			d.form = goIdentityUnknown
+		}
+		out = append(out, d)
 	}
-	fc, found, err := h.fileContext(c.Ref.File)
-	if err != nil || !found {
-		return goIdentityUnknown, nil, true, err
-	}
-	return c.Sig, goUnitNames{h: h, fc: fc}, true, nil
+	return out, nil
 }
 
 // goUnitNames is goNames of a member file of the unit.

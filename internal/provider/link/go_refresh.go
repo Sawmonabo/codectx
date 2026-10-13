@@ -84,8 +84,9 @@ func (x *goExternal) surface() string {
 		}
 		slices.Sort(consts)
 		for _, n := range consts {
-			c := pkg.consts[n]
-			parts = append(parts, "\x03"+n, c.form, strconv.Itoa(c.file))
+			for _, c := range pkg.consts[n] {
+				parts = append(parts, "\x03"+n, c.form, strconv.Itoa(c.file))
+			}
 		}
 		types := make([]string, 0, len(pkg.types))
 		for n := range pkg.types {

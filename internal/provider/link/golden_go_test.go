@@ -420,6 +420,8 @@ func (Ints) Len() int { return 0 }
 
 type T = int
 
+type List[E any] = []E
+
 const (
 	Base = iota + 2
 	Size = Base << 3
@@ -431,6 +433,7 @@ type Sized interface { // @isized
 		Close() error
 		Name() string
 	}) T
+	Each(xs List[string]) // @ieach
 }
 `,
 			"b/b.go": `package b
@@ -438,6 +441,8 @@ type Sized interface { // @isized
 type T struct{}
 
 type W struct{} // @tw
+
+func (W) Each(xs []string) {} // @weach
 
 func (W) Put(k [0x10]byte, v struct{ N int ` + "`json:\"n\"`" + ` }) {} // @wput
 
@@ -450,6 +455,8 @@ func (W) Get(x interface { // @wget
 
 type X struct{}
 
+func (X) Each(xs []string) {}
+
 func (X) Put(k [16]byte, v struct{ N T ` + "`json:\"n\"`" + ` }) {}
 
 func (X) Get(x interface {
@@ -460,6 +467,8 @@ func (X) Get(x interface {
 }
 
 type Y struct{}
+
+func (Y) Each(xs []string) {}
 
 func (Y) Put(k [16]byte, v struct{ N int ` + "`json:\"m\"`" + ` }) {}
 
@@ -498,6 +507,7 @@ func (R) Load(n yaml.Node) error { return nil } // @rload
 			"tw W implements isized Sized",
 			"wput Put overrides iput Put",
 			"wget Get overrides iget Get",
+			"weach Each overrides ieach Each",
 			"tr R implements idoc Doc",
 			"rload Load overrides iload Load",
 		},
@@ -506,7 +516,8 @@ func (R) Load(n yaml.Node) error { return nil } // @rload
 		// struct tags -> Y implements Sized. Mutation: spell a constant length without folding, or fold
 		// iota as 0 -> W's Put misses. Mutation: memoize a type lookup by name alone -> a.T's alias answers
 		// b.T and X implements Sized (or W misses). Mutation: leave an unbound qualifier unknown (no
-		// bijection) -> R implements nothing.
+		// bijection) -> R implements nothing. Mutation: leave a generic alias's instantiation unknown -> W
+		// implements nothing (Each misses).
 		fails: "a method set compared without literal or constant identity: a struct or interface literal, a constant array length or an import whose clause is unread making the signature match nothing; a field tag, a type of the same name in another package, or a constant of another value taken as identical",
 	},
 	{
@@ -629,6 +640,78 @@ var _ plat.Handle
 		// -> X or W misses, or each needs both Fd signatures. Mutation: emit one override per satisfied
 		// declaration -> a declaration's override repeats when both match.
 		fails: "an interface declared per platform or build tag left without its implementations, or its declarations merged into one method set no build has",
+	},
+	{
+		name:   "external-declarations-written-differently-that-spell-one-type",
+		anchor: "The Go Programming Language Specification, \"Type identity\", \"Alias declarations\", \"Constant expressions\", \"Array types\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire example.com/plat v1.0.0\n",
+			"p.go": `package p
+
+import "example.com/plat"
+
+type C struct{} // @tc
+
+func (C) Count() int { return 0 } // @ccount
+
+type G struct{} // @tg
+
+func (G) Cells() [4]int { return [4]int{} } // @gcells
+
+type Big interface { // @ibig
+	plat.Sizer
+	Extra() // @iextra
+}
+
+type B struct{} // @tb
+
+func (B) Size() int { return 0 } // @bsize
+
+func (B) Extra() {} // @bextra
+
+type Summer interface { // @isum
+	Sum() [16]byte // @isumsum
+}
+
+type E struct{ plat.Tag } // @te
+
+type Getter interface { // @igetter
+	Get() int // @iget
+}
+
+type L struct{} // @tl
+
+func (L) Get() Local { return 0 } // @lget
+`,
+			"local_unix.go":    "//go:build unix\n\npackage p\n\nimport \"example.com/plat\"\n\ntype Local = plat.Count\n",
+			"local_windows.go": "//go:build windows\n\npackage p\n\ntype Local = int\n",
+		},
+		// Derived from the fixture and the anchor, each build checked with the go command (GOOS=linux,
+		// GOOS=windows). plat writes each of these per platform, differently but naming one type in every
+		// build: Num is Count (an alias of int) for unix and int for windows; Width is 4 and 2 + 2; Sizer's
+		// Size returns Count and int; Tag's Sum returns [16]byte and [Size]byte with Size 16. So C
+		// implements Counter, G implements Grid, B implements Sizer and, Sizer being one method set, Big;
+		// E, promoting Tag's one Sum, implements Summer; and the unit's own Local, plat.Count for unix and int
+		// for windows, is int in both, so L implements Getter.
+		want: []string{},
+		facts: []string{
+			"tc C implements external example.com/plat.Counter",
+			"ccount Count overrides external example.com/plat.Counter.Count",
+			"tg G implements external example.com/plat.Grid",
+			"gcells Cells overrides external example.com/plat.Grid.Cells",
+			"tb B implements external example.com/plat.Sizer",
+			"bsize Size overrides external example.com/plat.Sizer.Size",
+			"tb B implements ibig Big",
+			"ibig Big extends external example.com/plat.Sizer",
+			"bextra Extra overrides iextra Extra",
+			"te E implements isum Summer",
+			"tl L implements igetter Getter",
+			"lget Get overrides iget Get",
+		},
+		// Mutation: compare the declarations' written forms instead of their canonical spellings -> Num and
+		// Width unknown (C and G implement nothing), Sizer two declarations that are never read as one
+		// method set (B implements no Big, which extends no Sizer), and Tag's Sum unknown (E implements no Summer), and Local unknown (L implements no Getter).
+		fails: "declarations of one name written differently per platform or build tag judged different though every build spells one type",
 	},
 	{
 		name:   "conversions-prove-external-interfaces",
