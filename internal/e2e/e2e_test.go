@@ -690,7 +690,7 @@ func runScenario(t *testing.T, a adapter, actor string, s seed) walk {
 	if len(impact.Entries) == 0 {
 		t.Fatalf("%s: impact on the seed node reported nothing affected", a.kind())
 	}
-	w.Impact = impactKeys(impact.Entries, impactRoutes(t, a, impactReq, impact.Answer))
+	w.Impact = impactKeys(impact.Entries, impactRoutes(t, a, impactReq, impact))
 
 	plan, opened := a.plan(t, model.PlanRequest{
 		ActorID: actor,
@@ -842,14 +842,18 @@ func requiredFiles(files []model.FileCoverage) []model.FileCoverage {
 	return out
 }
 
-// impactRoutes reads the whole routes view of the answer token names, through
-// the adapter, a page at a time.
-func impactRoutes(t *testing.T, a adapter, req model.ImpactRequest, answer string) []model.ImpactRoute {
+// impactRoutes reads the whole routes view of the impact answer first opened,
+// through the adapter, a page at a time: inline when the answer was served
+// whole in its first response, and through its answer token otherwise.
+func impactRoutes(t *testing.T, a adapter, req model.ImpactRequest, first model.ImpactResult) []model.ImpactRoute {
 	t.Helper()
-	if answer == "" {
-		t.Fatalf("%s: the impact answer carries no answer token to read its routes by", a.kind())
+	if first.Answer == "" {
+		if first.Meta.NextCursor != "" {
+			t.Fatalf("%s: a paged impact answer carries no answer token to read its routes by", a.kind())
+		}
+		return first.Routes
 	}
-	req.View, req.Page.Cursor = model.ImpactViewRoutes, answer
+	req.View, req.Page.Cursor = model.ImpactViewRoutes, first.Answer
 	var out []model.ImpactRoute
 	for page := 0; ; page++ {
 		if page > 1000 {

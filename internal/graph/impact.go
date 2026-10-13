@@ -28,13 +28,19 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	if err := req.Validate(); err != nil {
 		return model.ImpactResult{}, err
 	}
+	// Settled with the request, before the gate and the walk: a reader that
+	// cannot answer what the request names refuses it at no cost.
+	kinds := impactAllowlist(req.Relations)
+	seamRows, seamNotice, err := e.openSiteSeam(kinds)
+	if err != nil {
+		return model.ImpactResult{}, err
+	}
 	ctx, deadline, done, err := beginImpactQuery(ctx, e)
 	if err != nil {
 		return model.ImpactResult{}, err
 	}
 	defer done()
 
-	kinds := impactAllowlist(req.Relations)
 	maxDepth, depthNotice := resolveLimit("max_depth", req.MaxDepth, e.limits.Depth())
 	limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
 	// The page limit is part of the normalized query a continuation is bound
@@ -48,8 +54,8 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		return model.ImpactResult{}, err
 	}
 
-	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: answer.Completeness,
-		Notices:    appendNotice(append([]string(nil), answer.Notices...), depthNotice),
+	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: slices.Concat(answer.Completeness, seamRows),
+		Notices:    appendNotice(appendNotice(append([]string(nil), answer.Notices...), depthNotice), seamNotice),
 		NextCursor: nextCursor}
 	if answer.Truncated {
 		markTruncated(&meta, answer.Reason)
@@ -486,7 +492,9 @@ func routesOf(records []impactRecord, base int64, routes *routeReader) ([]model.
 
 // serveRankedRun serves the FIRST page of the requested view off the two
 // freshly ranked runs -- the affected entities and the package pairs the same
-// walk produced -- and spools the WHOLE ranked answer behind it: every view
+// walk produced. An answer one page of each view it is read through holds is
+// served whole in this response and nothing is retained (serveInline).
+// Otherwise it spools the WHOLE ranked answer behind the page: every view
 // reads the same spool, so the answer token this page mints reads any view
 // from its start and the continuation reads on in this one.
 //
@@ -517,6 +525,11 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 		return nil
 	}); err != nil && !errors.Is(err, errStopExpansion) {
 		return impactServed{}, "", err
+	}
+	// An answer one page of every view it is read through holds is served
+	// whole, here, and retains nothing.
+	if served, inline, err := e.serveInline(ctx, run, pairRun, page, retain, req, limit, answer, meta); err != nil || inline {
+		return served, "", err
 	}
 	pairPage := make([]model.PackageEdge, 0, limit)
 	if view == model.ImpactViewEntries {
@@ -846,7 +859,7 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, base int64
 	entries := make([]model.ImpactEntry, 0, len(page))
 	for i, r := range page {
 		entry := model.ImpactEntry{Ordinal: base + int64(i), NodeID: r.NodeID, Direction: r.Direction,
-			Depth: r.Depth, ScoreMicros: r.scoreMicros(), ReasonCount: int64(len(r.Reasons))}
+			Depth: r.Depth, Reach: r.reach(), ScoreMicros: r.scoreMicros(), ReasonCount: int64(len(r.Reasons))}
 		if r.Via != "" {
 			entry.RouteCount = 1
 		}
@@ -1429,8 +1442,8 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 		entry.Name = clipTo(n.QualifiedName, model.MaxQualifiedNameBytes)
 		out = append(out, entry)
 	}
-	// The page arrives ALREADY ordered, by the served key (ScoreMicros desc,
-	// Depth asc, NodeID asc), which the ranking pass applied over the whole
+	// The page arrives ALREADY ordered, by the served key (Reach, ScoreMicros
+	// desc, Depth asc, NodeID asc), which the ranking pass applied over the whole
 	// answer. No tie-break is re-applied here: Name is known only after
 	// hydration, so re-sorting a page by it would reorder one page of a
 	// globally ordered answer and no two pages would agree on where a record
