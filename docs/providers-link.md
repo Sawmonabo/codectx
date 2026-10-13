@@ -470,16 +470,16 @@ The delta build hands `Link` the predecessor's state whenever the predecessor st
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
 classifies every member against its record (unchanged, content changed with the same table, table changed, added,
 removed) and every manifest by the fields the linker reads (`manifestFields`, `refresh.go`): a Go module's `module`
-path, and where each package outside the unit is read from (`goManifestFields`, `manifest_go.go`: the `go` and
-`toolchain` lines, each requirement's version, each replacement, the governing `go.work`, the vendor manifest, the
-standard library and whether the module cache holds each required version); a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
+path, its `go` and `toolchain` lines, each `require` and `replace`, the governing `go.work` and its `use` and
+`replace` directives, the vendor directory's digest, and the host's Go root and the presence of each required module
+version in the module cache (`goManifestFields`, `manifest_go.go`); a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
 resolution and ownership read), each `package.json`'s `name`, `type`, `exports`, `imports`, `types`/`typings`,
 `module`, `main`, `tsconfig` and `workspaces`, and each workspace file's globs (`jsManifestFields`, `js_manifest.go`).
 A changed ECMAScript field rebuilds the hierarchy, whose specifier answers (`keyESSpec`) are diffed key by key like
 every other index group, so only the nodes whose imports now resolve differently re-run, in any file of the unit.
 Nothing else of a manifest is read: the Python and Java project files decide only which unit a file belongs to, so a
-change to them is a change of membership or nothing. A change to the Go fields that only say where a package outside
-the unit is read from keeps the layout (`goExternalField`, `go_refresh.go`): the packages outside the unit are read
+change to them is a change of membership or nothing. A change to the Go fields other than the `module` path, which only
+say where a package outside the unit is read from, keeps the layout (`goExternalField`, `go_refresh.go`): the packages outside the unit are read
 again over the stored hierarchy, and the hierarchy is kept when the digest of everything they declare
 (`goExternal.surface`, stored as a group) is the predecessor's, an early cutoff, so a dependency bump that changes no
 declaration the unit reads re-runs nothing and reads no table. One that does rebuilds the hierarchy, and only the
@@ -494,7 +494,7 @@ What re-resolves:
   (`internal/provider/link/trace.go`). A refresh re-runs the members whose table moved, the added members, the members
   whose reverse-index keys name a changed index group or a changed manifest field, and then the members whose
   indirect sites read a signature whose set of taken functions changed. A file re-runs whole, since its sites read
-  each other's results. When the layout holds (the same members, the same fields, and every member whose table moved
+  each other's results. When the layout holds (the same members, the same fields but those saying where a Go package outside the unit is read from, and every member whose table moved
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
   and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
