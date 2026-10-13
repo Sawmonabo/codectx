@@ -68,6 +68,11 @@ func manifestFields(ctx context.Context, u *unit) ([]manifestField, error) {
 			return nil, err
 		}
 	}
+	entries, err := entryFields(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, entries...)
 	slices.SortFunc(out, compareField)
 	return slices.Compact(out), nil
 }

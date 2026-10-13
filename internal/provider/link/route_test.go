@@ -46,6 +46,11 @@ func (l linked) mountedEndpoints(t *testing.T) []string {
 		if m.Prefix == model.PrefixUnresolved {
 			path = "unresolved"
 		}
+		if m.Route == "" {
+			// A declared entry point carries no route: its name is its
+			// descriptor.
+			path = n.Name
+		}
 		out = append(out, strings.Join(strings.Fields(paths[n.FileID]+" "+m.Method+" "+m.Route+" "+path), " ")+" -> "+
 			strings.Join(handlers, ",")+set)
 	}

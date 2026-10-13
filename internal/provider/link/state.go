@@ -103,6 +103,8 @@ func (k Fact) entry() int {
 		return 2
 	case FactRoute:
 		return 3
+	case FactEntry:
+		return 4
 	}
 	return 0
 }

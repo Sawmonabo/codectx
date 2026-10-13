@@ -249,6 +249,15 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 			return failed, err
 		}
 		defer res.close()
+		resolved := res.bindings
+		defer resolved.Close()
+		var prevFields []manifestField
+		if rf.prev != nil {
+			prevFields = rf.prev.fields
+		}
+		if res.bindings, err = withEntries(ctx, u, resolved, fields, prevFields); err != nil {
+			return failed, err
+		}
 	} else {
 		res = &rf.prev.resolution
 	}

@@ -104,10 +104,15 @@ const (
 	// the handler declaration Target, or to none when Target.File is -1
 	// (emitPythonRoutes).
 	FactRoute Fact = 8
+	// FactEntry: the member Site.File holds the target of an entry point
+	// its unit's manifest declares, External its payload (entryPayload),
+	// Target the declaration or the file's module it routes to
+	// (withEntries).
+	FactEntry Fact = 9
 )
 
 // factLast is the last kind of fact.
-const factLast = FactRoute
+const factLast = FactEntry
 
 // Binding is one fact a resolver found. Site names the entry of a member's
 // table the fact is about (a call site, an import, a declaration, by Kind),
