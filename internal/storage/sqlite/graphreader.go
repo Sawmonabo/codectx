@@ -871,7 +871,9 @@ var _ graph.MetadataRowReader = (*graphReader)(nil)
 // MetadataRows reads every visible metadata row of node's field: the node's
 // evidence rows whose detail is a model.MetadataRow of that field, keyset
 // paged on evidence id through the node index, then ordered by ordinal. A row
-// repeated by two visible units of one carry chain is served once.
+// repeated by two visible units of one carry chain is served once, and the
+// pieces of an element longer than model.MaxMetadataPieceBytes are served as
+// the one element they were.
 func (g *graphReader) MetadataRows(ctx context.Context, node model.NodeID, field string) ([]model.MetadataRow, error) {
 	var out []model.MetadataRow
 	var after model.EvidenceID
@@ -890,8 +892,15 @@ func (g *graphReader) MetadataRows(ctx context.Context, node model.NodeID, field
 		}
 		after = rows[len(rows)-1].Evidence.ID
 	}
-	slices.SortStableFunc(out, func(a, b model.MetadataRow) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
-	return slices.CompactFunc(out, func(a, b model.MetadataRow) bool {
-		return a.Ordinal == b.Ordinal && a.Shape == b.Shape && a.Key == b.Key && bytes.Equal(a.Value, b.Value)
-	}), nil
+	slices.SortStableFunc(out, func(a, b model.MetadataRow) int {
+		return cmp.Or(cmp.Compare(a.Ordinal, b.Ordinal), cmp.Compare(a.Part, b.Part))
+	})
+	out = slices.CompactFunc(out, func(a, b model.MetadataRow) bool {
+		return a.Ordinal == b.Ordinal && a.Part == b.Part && a.Parts == b.Parts && a.Shape == b.Shape &&
+			a.Key == b.Key && bytes.Equal(a.Value, b.Value)
+	})
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return model.JoinMetadataPieces(out)
 }

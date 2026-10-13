@@ -174,11 +174,13 @@ func (e *Emitter) Node(ctx context.Context, cand model.NodeCandidate, a Attrs) (
 	}
 	evidence := []model.Evidence{ev}
 	for _, row := range rows {
-		detail, err := row.Detail()
+		details, err := row.Details()
 		if err != nil {
 			return model.Node{}, &model.Error{Code: model.CodeInternal, Message: "a metadata row cannot be encoded: " + err.Error()}
 		}
-		evidence = e.appendRow(evidence, e.evidence(node.ID, "", Attrs{Precision: a.Precision, Detail: detail}))
+		evidence = e.appendRow(evidence, details, func(detail string) model.Evidence {
+			return e.evidence(node.ID, "", Attrs{Precision: a.Precision, Detail: detail})
+		})
 	}
 	e.seenNode[node.ID] = len(e.nodes)
 	e.nodes = append(e.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey, Evidence: evidence})
@@ -362,12 +364,19 @@ func (e *Emitter) appendEvidence(list []model.Evidence, ev model.Evidence) []mod
 // construction -- each names its field and ordinal, and the evidence identity
 // hashes the detail -- so, unlike appendEvidence, it does not scan the list for
 // a duplicate, which would make a long list quadratic.
-func (e *Emitter) appendRow(list []model.Evidence, ev model.Evidence) []model.Evidence {
-	if len(list) >= e.clip {
+//
+// A row is its details, one or the pieces of a long element
+// (model.MetadataRow.Details), and is kept or clipped whole: a piece without
+// its siblings is no element at all.
+func (e *Emitter) appendRow(list []model.Evidence, details []string, mk func(detail string) model.Evidence) []model.Evidence {
+	if len(list)+len(details) > e.clip {
 		e.clipped++
 		return list
 	}
-	return append(list, ev)
+	for _, d := range details {
+		list = append(list, mk(d))
+	}
+	return list
 }
 
 // AddMetadataRow publishes one metadata row on node, a node fact this unit
@@ -387,16 +396,18 @@ func (e *Emitter) AddMetadataRow(node model.NodeID, precision model.Precision, f
 	if err := row.Validate(); err != nil {
 		return err
 	}
-	detail, err := row.Detail()
+	details, err := row.Details()
 	if err != nil {
 		return &model.Error{Code: model.CodeInternal, Message: "a metadata row cannot be encoded: " + err.Error()}
 	}
-	ev := e.evidence(node, "", Attrs{Precision: precision, Range: rng, Detail: detail})
-	if file != nil {
-		ev.FileID, ev.ContentHash = file.ID, file.ContentHash
-		ev.ID = model.NewEvidenceID(ev)
-	}
-	e.nodes[i].Evidence = e.appendRow(e.nodes[i].Evidence, ev)
+	e.nodes[i].Evidence = e.appendRow(e.nodes[i].Evidence, details, func(detail string) model.Evidence {
+		ev := e.evidence(node, "", Attrs{Precision: precision, Range: rng, Detail: detail})
+		if file != nil {
+			ev.FileID, ev.ContentHash = file.ID, file.ContentHash
+			ev.ID = model.NewEvidenceID(ev)
+		}
+		return ev
+	})
 	return nil
 }
 

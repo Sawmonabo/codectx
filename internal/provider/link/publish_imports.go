@@ -47,11 +47,13 @@ func (f *filePublication) openImportSite(d *DynamicImport) (model.NodeID, error)
 	}
 	fact := &f.nodes[len(f.nodes)-1]
 	for _, row := range rows {
-		detail, err := row.Detail()
+		details, err := row.Details()
 		if err != nil {
 			return "", internalErr("open import site metadata row: " + err.Error())
 		}
-		fact.Evidence = append(fact.Evidence, f.p.evidence(n, "", f.fv.ID, f.fv.ContentHash, nil, c.NativeKey, detail, "", 0))
+		for _, detail := range details {
+			fact.Evidence = append(fact.Evidence, f.p.evidence(n, "", f.fv.ID, f.fv.ContentHash, nil, c.NativeKey, detail, "", 0))
+		}
 	}
 	return n, nil
 }

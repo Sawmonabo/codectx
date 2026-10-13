@@ -365,20 +365,70 @@ func (s *BatchSink) Reserve(ctx context.Context, n int64) (release func(), err e
 // PutNodes accepts node facts. Batches are sorted by node ID before they are
 // written so the transaction shape is a function of content, not of the
 // order workers finished.
+//
+// A fact past BatchBytes -- a node with thousands of metadata rows, a relation
+// with tens of thousands of occurrences -- is handed on as consecutive facts
+// of the same node or relation, each carrying a run of its evidence that fits
+// one batch. The writer stores a repeated fact once and its evidence whole
+// (sqlite.UnitWriter.PutNodes and PutRelations), so the stored rows are the
+// same as one fact's; refusing the batch instead would fail the unit.
 func (s *BatchSink) PutNodes(ctx context.Context, facts []model.NodeFact) error {
 	for _, f := range facts {
-		if err := put(s, ctx, &s.nodes, f, NodeFactBytes(f)); err != nil {
-			return err
+		size := NodeFactBytes(f)
+		if size <= s.limits.BatchBytes || len(f.Evidence) < 2 {
+			if err := put(s, ctx, &s.nodes, f, size); err != nil {
+				return err
+			}
+			continue
+		}
+		base := f
+		base.Evidence = nil
+		for _, run := range evidenceRuns(f.Evidence, s.limits.BatchBytes-NodeFactBytes(base)) {
+			part := base
+			part.Evidence = run
+			if err := put(s, ctx, &s.nodes, part, NodeFactBytes(part)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
+// evidenceRuns cuts list into consecutive runs whose evidenceBytes each fit
+// budget; a run holds at least one row, so a row wider than budget travels
+// alone and the batch reports it as it would any oversize record.
+func evidenceRuns(list []model.Evidence, budget int64) [][]model.Evidence {
+	var runs [][]model.Evidence
+	start, used := 0, int64(0)
+	for i := range list {
+		size := evidenceBytes(list[i : i+1])
+		if i > start && used+size > budget {
+			runs = append(runs, list[start:i])
+			start, used = i, 0
+		}
+		used += size
+	}
+	return append(runs, list[start:])
+}
+
 // PutRelations accepts relation facts.
 func (s *BatchSink) PutRelations(ctx context.Context, facts []model.RelationFact) error {
 	for _, f := range facts {
-		if err := put(s, ctx, &s.relations, f, RelationFactBytes(f)); err != nil {
-			return err
+		size := RelationFactBytes(f)
+		if size <= s.limits.BatchBytes || len(f.Evidence) < 2 {
+			if err := put(s, ctx, &s.relations, f, size); err != nil {
+				return err
+			}
+			continue
+		}
+		base := f
+		base.Evidence = nil
+		for _, run := range evidenceRuns(f.Evidence, s.limits.BatchBytes-RelationFactBytes(base)) {
+			part := base
+			part.Evidence = run
+			if err := put(s, ctx, &s.relations, part, RelationFactBytes(part)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

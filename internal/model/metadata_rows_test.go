@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -35,10 +36,11 @@ func TestSplitMetadataMovesOnlyWhatDoesNotFit(t *testing.T) {
 		if err := r.Validate(); err != nil {
 			t.Fatalf("row %+v: %v", r, err)
 		}
-		detail, err := r.Detail()
-		if err != nil {
-			t.Fatal(err)
+		details, err := r.Details()
+		if err != nil || len(details) != 1 {
+			t.Fatalf("row %+v renders %d details (%v), want one", r, len(details), err)
 		}
+		detail := details[0]
 		back, ok := ParseMetadataRow(detail)
 		if !ok || back.Ordinal != r.Ordinal || string(back.Value) != string(r.Value) {
 			t.Fatalf("row %+v does not survive its detail %s", r, detail)
@@ -74,5 +76,67 @@ func TestJoinMetadataRowsRefusesAGap(t *testing.T) {
 	}
 	if _, err := JoinMetadataRows(rows); err == nil {
 		t.Fatal("rows 0 and 2 joined; want an error for the missing row 1")
+	}
+}
+
+// TestALongElementIsStoredAsPiecesAndRejoinedWhole protects an element whose
+// encoded JSON passes MaxMetadataPieceBytes -- a string literal of megabytes
+// used as an import fragment -- which one row would carry past the storage
+// batch. It is stored as piece rows, each of bounded width, and rejoins into
+// exactly the element; a missing piece is an error, never a shorter element.
+//
+// Mutations it catches: one detail for the whole element, a piece cut inside
+// a rune (its string re-encodes the bytes as U+FFFD and the element changes),
+// pieces rejoined out of order, or a gap rejoined silently.
+func TestALongElementIsStoredAsPiecesAndRejoinedWhole(t *testing.T) {
+	long := strings.Repeat(`é"\x`, 50_000)
+	value, err := EncodeMetadataValue([]string{"head", long, "tail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rows, err := SplitMetadata(map[string]any{"fragments": []string{"head", long, "tail"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored []MetadataRow
+	pieces := 0
+	for _, r := range rows {
+		details, err := r.Details()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range details {
+			if len(d) > 2*MaxMetadataPieceBytes+512 {
+				t.Fatalf("a piece detail is %d bytes, past twice the piece bound", len(d))
+			}
+			back, ok := ParseMetadataRow(d)
+			if !ok {
+				t.Fatalf("detail %.80s... is not a metadata row", d)
+			}
+			stored = append(stored, back)
+		}
+		if len(details) > 1 {
+			pieces += len(details)
+		}
+	}
+	if pieces < 2 {
+		t.Fatalf("the %d-byte element is stored as one row, want pieces", len(long))
+	}
+	slices.Reverse(stored)
+	got, err := JoinMetadataRows(stored)
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if string(got) != string(value) {
+		t.Fatalf("the pieces rejoin into %d bytes, want the %d-byte value exactly", len(got), len(value))
+	}
+	for i, r := range stored {
+		if r.Parts != 0 && r.Part == 1 {
+			gap := slices.Delete(slices.Clone(stored), i, i+1)
+			if _, err := JoinMetadataRows(gap); err == nil {
+				t.Fatal("an element with a missing piece rejoined without an error")
+			}
+			break
+		}
 	}
 }

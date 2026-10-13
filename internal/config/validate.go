@@ -246,6 +246,10 @@ func (c Config) validateBudgets() error {
 		return configInvalid("resources.max_metadata_response_bytes %d is not smaller than the source budget %d; generic tools must stay under the smaller metadata limit",
 			c.Resources.MaxMetadataResponseBytes, c.Resources.MaxSourceResponseBytes)
 	}
+	if c.Index.BatchBytes < MinBatchBytes {
+		return configInvalid("index.batch_bytes %d is below %d; one node fact with a metadata row piece must fit one batch",
+			c.Index.BatchBytes, MinBatchBytes)
+	}
 	if c.Index.BatchBytes > c.Index.QueueBytes {
 		return configInvalid("index.batch_bytes %d exceeds index.queue_bytes %d; a batch must fit the queue reservation",
 			c.Index.BatchBytes, c.Index.QueueBytes)

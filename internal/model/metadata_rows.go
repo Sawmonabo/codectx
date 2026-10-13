@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"slices"
 	"strconv"
+	"unicode/utf8"
 )
 
 // A node's metadata is one JSON object held on the node row, bounded by
@@ -18,6 +19,18 @@ import (
 // holding how many rows the field has. A reader that meets the marker pages
 // the rows (MetadataRows) and rebuilds the value (JoinMetadataRows). Every
 // metadata object that fits keeps every field inline and writes no row.
+
+// MaxMetadataPieceBytes bounds the encoded element one metadata row carries
+// whole. A longer element -- a string literal of megabytes used as an import
+// fragment, a requirements line as long as its file -- is stored as ordered
+// piece rows of that many bytes of its encoded JSON each, which every reader
+// rejoins before it serves the element (JoinMetadataPieces). The bound keeps
+// one row, and so one node fact, far below the storage batch reservation
+// (index.batch_bytes), which a single row could otherwise pass and fail its
+// unit. A piece's detail is its bytes as a JSON string, at most twice as long
+// when every byte is a quote or a backslash, so the bound is a quarter of the
+// smallest batch the configuration admits (config.MinBatchBytes).
+const MaxMetadataPieceBytes = 32 << 10
 
 // metadataRowsSuffix is appended to a field's key to name its row-count
 // marker.
@@ -53,7 +66,13 @@ type MetadataRow struct {
 	Ordinal int64            `json:"ordinal"`
 	Shape   MetadataRowShape `json:"shape"`
 	Key     string           `json:"key,omitempty"`
-	Value   json.RawMessage  `json:"value"`
+	// Part and Parts are set only on a piece of an element longer than
+	// MaxMetadataPieceBytes: the element is Parts rows of one ordinal, and
+	// Value of piece Part is the Part-th run of the element's encoded JSON,
+	// as a JSON string. A served row is never a piece.
+	Part  int64           `json:"part,omitempty"`
+	Parts int64           `json:"parts,omitempty"`
+	Value json.RawMessage `json:"value"`
 }
 
 // Validate enforces the row shape.
@@ -76,18 +95,104 @@ func (r MetadataRow) Validate() error {
 	if len(r.Value) == 0 || !json.Valid(r.Value) {
 		return invalid("metadata_row.value is not valid JSON")
 	}
+	if r.Parts == 0 && r.Part != 0 {
+		return invalid("metadata_row.part is %d on a row that is not a piece", r.Part)
+	}
+	if r.Parts != 0 {
+		if r.Parts < 2 || r.Part < 0 || r.Part >= r.Parts {
+			return invalid("metadata_row piece %d of %d is not a piece of an element", r.Part, r.Parts)
+		}
+		if r.Value[0] != '"' {
+			return invalid("metadata_row piece value is not a JSON string")
+		}
+	}
 	return nil
 }
 
-// Detail renders r as the evidence detail that carries it. It is never cut:
-// the element is source data bounded by its file, and a shortened element
-// would be a different fact.
-func (r MetadataRow) Detail() (string, error) {
-	raw, err := encodeJSON(r)
-	if err != nil {
-		return "", err
+// Details renders r as the evidence details that carry it, in piece order:
+// one detail, or, for an element whose encoded JSON passes
+// MaxMetadataPieceBytes, one per piece. Nothing is cut: the element is source
+// data bounded by its file, and a shortened element would be a different
+// fact. The pieces are cut on UTF-8 boundaries, so each is a valid string.
+func (r MetadataRow) Details() ([]string, error) {
+	if len(r.Value) <= MaxMetadataPieceBytes {
+		raw, err := encodeJSON(r)
+		if err != nil {
+			return nil, err
+		}
+		return []string{string(raw)}, nil
 	}
-	return string(raw), nil
+	var runs [][]byte
+	for rest := []byte(r.Value); len(rest) > 0; {
+		cut := min(len(rest), MaxMetadataPieceBytes)
+		for cut < len(rest) && !utf8.RuneStart(rest[cut]) {
+			cut--
+		}
+		runs = append(runs, rest[:cut])
+		rest = rest[cut:]
+	}
+	out := make([]string, len(runs))
+	for i, run := range runs {
+		value, err := encodeJSON(string(run))
+		if err != nil {
+			return nil, err
+		}
+		piece := r
+		piece.Part, piece.Parts, piece.Value = int64(i), int64(len(runs)), value
+		raw, err := encodeJSON(piece)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = string(raw)
+	}
+	return out, nil
+}
+
+// compareRows orders rows by ordinal, then by piece.
+func compareRows(a, b MetadataRow) int {
+	return cmp.Or(cmp.Compare(a.Ordinal, b.Ordinal), cmp.Compare(a.Part, b.Part))
+}
+
+// JoinMetadataPieces rejoins the piece rows of each element into the one row
+// the element was, and returns every row in ordinal order. It fails when an
+// element's pieces are not exactly its Parts runs 0..Parts-1, or do not
+// rejoin into valid JSON: a missing piece is a lost element, never a shorter
+// one.
+func JoinMetadataPieces(rows []MetadataRow) ([]MetadataRow, error) {
+	sorted := slices.Clone(rows)
+	slices.SortFunc(sorted, compareRows)
+	out := sorted[:0]
+	for i := 0; i < len(sorted); {
+		r := sorted[i]
+		if r.Parts == 0 {
+			out = append(out, r)
+			i++
+			continue
+		}
+		var buf []byte
+		for part := int64(0); part < r.Parts; part++ {
+			if i >= len(sorted) {
+				return nil, invalid("metadata field %q row %d is missing piece %d of %d", truncateForMessage(r.Field), r.Ordinal, part, r.Parts)
+			}
+			p := sorted[i]
+			if p.Ordinal != r.Ordinal || p.Part != part || p.Parts != r.Parts || p.Field != r.Field || p.Shape != r.Shape || p.Key != r.Key {
+				return nil, invalid("metadata field %q row %d is missing piece %d of %d", truncateForMessage(r.Field), r.Ordinal, part, r.Parts)
+			}
+			var run string
+			if err := json.Unmarshal(p.Value, &run); err != nil {
+				return nil, invalid("metadata field %q row %d piece %d is not a string: %s", truncateForMessage(r.Field), r.Ordinal, part, err.Error())
+			}
+			buf = append(buf, run...)
+			i++
+		}
+		if !json.Valid(buf) {
+			return nil, invalid("metadata field %q row %d does not rejoin into valid JSON", truncateForMessage(r.Field), r.Ordinal)
+		}
+		whole := r
+		whole.Part, whole.Parts, whole.Value = 0, 0, buf
+		out = append(out, whole)
+	}
+	return out, nil
 }
 
 // ParseMetadataRow reads a metadata row from an evidence detail, and false
@@ -214,8 +319,10 @@ func JoinMetadataRows(rows []MetadataRow) (json.RawMessage, error) {
 	if len(rows) == 0 {
 		return nil, invalid("a metadata field stored as rows has no rows")
 	}
-	sorted := slices.Clone(rows)
-	slices.SortFunc(sorted, func(a, b MetadataRow) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
+	sorted, err := JoinMetadataPieces(rows)
+	if err != nil {
+		return nil, err
+	}
 	field, shape := sorted[0].Field, sorted[0].Shape
 	for i, r := range sorted {
 		if r.Field != field || r.Shape != shape {

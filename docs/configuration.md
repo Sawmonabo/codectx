@@ -180,7 +180,7 @@ the analysis config hash.
 |---|---|---|
 | `workers` | `0` | Indexing workers; `0` chooses from available CPUs and memory reservations. |
 | `batch_records` | `1000` | Records per provider batch. |
-| `batch_bytes` | `4194304` | Bytes per provider batch. Must fit `index.queue_bytes`. |
+| `batch_bytes` | `4194304` | Bytes per provider batch. At least `131072` (one node with one stored metadata piece) and must fit `index.queue_bytes`. |
 | `queue_bytes` | `16777216` | Reserved bytes for the staging queue. |
 | `watch_pending_paths` | `10000` | Pending watch events before coalescing. |
 | `watch_pending_bytes` | `2097152` | Reserved bytes for pending watch events. |
@@ -576,6 +576,10 @@ relationships that must hold:
 - `resources.max_provider_record_bytes` ≤ `index.batch_bytes` ≤ `index.queue_bytes`,
   the first pairing only when you set a record bound at all.
   One record must fit one batch, and one batch must fit the queue reservation.
+  `index.batch_bytes` is at least 128 KiB: a fact whose evidence passes one
+  batch is written as several batches of the same fact, and a metadata element
+  longer than 32 KiB is stored as ordered pieces the readers rejoin, so the
+  widest thing one batch must hold is one node with one such piece.
   There is no separate ceiling on a record beyond that: `index.batch_bytes` is
   the real constraint, and inventing a second one would refuse a configuration
   that is internally consistent.

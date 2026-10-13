@@ -1088,16 +1088,20 @@ func (b *builder) putNode(fam family, res model.Resolution, rng *model.SourceRan
 		} else {
 			node.Metadata = raw
 			for _, row := range rows {
-				detail, err := row.Detail()
+				details, err := row.Details()
 				if err != nil {
 					b.dropped[fam]++
 					continue
 				}
-				if b.evidenceFull(len(evidence)) {
+				// A long element's pieces are kept or clipped together: a
+				// piece without its siblings is no element at all.
+				if b.evidenceFull(len(evidence) + len(details) - 1) {
 					b.clipped[fam]++
 					continue
 				}
-				evidence = append(evidence, b.evidence(fam, node.ID, "", nil, nativeKey, detail))
+				for _, detail := range details {
+					evidence = append(evidence, b.evidence(fam, node.ID, "", nil, nativeKey, detail))
+				}
 			}
 		}
 	}
