@@ -242,7 +242,7 @@ func (e *extraction) expandMacros(q *ts.Query, cursor *ts.QueryCursor, names []s
 func (e *extraction) reparse(n ts.Node, s *rsMacroSyntax) []macroBody {
 	path := ""
 	if p := n.ChildByFieldId(s.fMacro); p != nil {
-		path = collapseSpace(p.Utf8Text(e.src))
+		path = rawPath(collapseSpace(p.Utf8Text(e.src)))
 	}
 	return e.bodies(bodyOf(n, s), []macroElement{{text: "macro " + strconv.Quote(path), path: path}}, s)
 }
@@ -333,7 +333,7 @@ func (e *extraction) invoked(t *ts.Node, first, i uint, s *rsMacroSyntax) (strin
 		}
 		j, start = k, id.StartByte()
 	}
-	return collapseSpace(string(e.src[start:bang.StartByte()])), start, true
+	return rawPath(collapseSpace(string(e.src[start:bang.StartByte()]))), start, true
 }
 
 // parseBody re-parses the interior of the brace token tree t, between its

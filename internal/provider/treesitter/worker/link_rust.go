@@ -274,7 +274,7 @@ func (k *rustLinker) walk(n Node) wire.Type {
 		recv := k.walk(n.ChildByFieldId(s.fValue))
 		f := k.kid(n, s.fField)
 		if recv.Kind == wire.TypeNamed && !f.IsNull() && f.KindId() == s.fieldIdentifier {
-			if fl, ok := k.fields[recv.Name+"\x00"+view(textOf(k.src, f))]; ok {
+			if fl, ok := k.fields[recv.Name+"\x00"+view(k.text(f))]; ok {
 				return wire.Type{Kind: wire.TypeNamed, Name: fl.typ}
 			}
 		}
@@ -526,7 +526,7 @@ func (k *rustLinker) spell(b []byte, t Node) []byte {
 		case n.IsExtra() || n.KindId() == s.lifetime:
 			descend = false
 		case n.first().IsNull():
-			w := textOf(k.src, n)
+			w := k.text(n)
 			if n.KindId() == s.typeIdentifier && string(w) == "Self" {
 				if self := k.self(); self != "" {
 					w = []byte(self)
@@ -562,7 +562,7 @@ func (k *rustLinker) selfType(b []byte, p Node) []byte {
 	}
 	ref := false
 	for c := p.first(); !c.IsNull(); c = c.next() {
-		switch w := string(textOf(k.src, c)); {
+		switch w := string(k.text(c)); {
 		case c.IsExtra() || c.KindId() == s.lifetime:
 		case w == "&":
 			ref, b = true, append(b, '&')
@@ -638,7 +638,7 @@ func (k *rustLinker) traitItem(n Node) {
 				continue
 			}
 			left, bounds := p.ChildByFieldId(s.fLeft), k.kid(p, s.fBounds)
-			if !left.IsNull() && !bounds.IsNull() && left.KindId() == s.typeIdentifier && string(textOf(k.src, left)) == "Self" {
+			if !left.IsNull() && !bounds.IsNull() && left.KindId() == s.typeIdentifier && string(k.text(left)) == "Self" {
 				super(bounds)
 			}
 		}
@@ -682,7 +682,7 @@ func (k *rustLinker) typeParams(n Node) {
 			if left.IsNull() || bounds.IsNull() || left.KindId() != s.typeIdentifier {
 				continue
 			}
-			if i := k.generic(view(textOf(k.src, left))); i >= from {
+			if i := k.generic(view(k.text(left))); i >= from {
 				k.bound(i, bounds)
 			}
 		}
@@ -736,7 +736,7 @@ func (k *rustLinker) param(p Node) {
 		return
 	}
 	typ, ptr := k.declared(t)
-	k.locals = append(k.locals, rsLocal{name: view(textOf(k.src, pat)), typ: typ, ptr: ptr, sig: k.fnSig(t)})
+	k.locals = append(k.locals, rsLocal{name: view(k.text(pat)), typ: typ, ptr: ptr, sig: k.fnSig(t)})
 }
 
 // declared is the type a value of the declared type t carries (unwrap): the
@@ -748,7 +748,7 @@ func (k *rustLinker) declared(t Node) (wire.Type, bool) {
 		return wire.Type{}, ptr
 	}
 	if t.KindId() == k.k.typeIdentifier {
-		if i := k.generic(view(textOf(k.src, t))); i >= 0 {
+		if i := k.generic(view(k.text(t))); i >= 0 {
 			if g := k.generics[i]; g.bounds == 1 {
 				return wire.Type{Kind: wire.TypeNamed, Name: g.bound}, ptr
 			}
@@ -807,7 +807,7 @@ func (k *rustLinker) pointer(n Node) bool {
 				owner = k.locals[i].typ.Name
 			}
 		}
-		return owner != "" && k.fields[owner+"\x00"+view(textOf(k.src, f))].ptr
+		return owner != "" && k.fields[owner+"\x00"+view(k.text(f))].ptr
 	}
 	return false
 }
@@ -834,7 +834,7 @@ func (k *rustLinker) fnSig(t Node) string {
 			}
 			t = firstNamed(args)
 		case s.typeIdentifier:
-			if i := k.generic(view(textOf(k.src, t))); i >= 0 {
+			if i := k.generic(view(k.text(t))); i >= 0 {
 				return k.generics[i].sig
 			}
 			return ""
@@ -861,7 +861,7 @@ func (k *rustLinker) let(n Node) {
 		k.bindAll(pat)
 		return
 	}
-	l := rsLocal{name: view(textOf(k.src, pat)), typ: t}
+	l := rsLocal{name: view(k.text(pat)), typ: t}
 	if !declared.IsNull() {
 		d, ptr := k.declared(declared)
 		if d.Kind != wire.TypeUnknown {
@@ -889,7 +889,7 @@ func (k *rustLinker) bindAll(p Node) {
 		case n.IsExtra() || n.KindId() == s.scopedIdentifier || (n != p && uint16(n.rec().field) == s.fType):
 			descend = false
 		case n.KindId() == s.identifier, n.KindId() == s.shorthandFieldIdentifier:
-			k.locals = append(k.locals, rsLocal{name: view(textOf(k.src, n))})
+			k.locals = append(k.locals, rsLocal{name: view(k.text(n))})
 		}
 		if descend && c.GotoFirstChild() {
 			continue
@@ -904,7 +904,7 @@ func (k *rustLinker) bindAll(p Node) {
 
 // lookup is the index of the binding the identifier n names, or -1.
 func (k *rustLinker) lookup(n Node) int {
-	name := view(textOf(k.src, n))
+	name := view(k.text(n))
 	for i := len(k.locals) - 1; i >= k.base; i-- {
 		if k.locals[i].name == name {
 			return i
@@ -987,7 +987,7 @@ func (k *rustLinker) qualifier(n Node) string {
 	}
 	switch p.KindId() {
 	case s.identifier:
-		if string(textOf(k.src, p)) == "Self" {
+		if string(k.text(p)) == "Self" {
 			if self := k.self(); self != "" {
 				return self
 			}
@@ -1029,7 +1029,7 @@ func (k *rustLinker) call(n Node) wire.Type {
 		recv := k.walk(value)
 		if f := k.kid(fn, s.fField); !f.IsNull() && f.KindId() == s.fieldIdentifier {
 			name, site.Shape, site.Receiver = f, wire.ShapeMember, recv
-			if !value.IsNull() && lang.RustPointerMethod(view(textOf(k.src, f))) && k.pointer(value) {
+			if !value.IsNull() && lang.RustPointerMethod(view(k.text(f))) && k.pointer(value) {
 				// The smart pointer's own method, which no table declares.
 				site.Receiver = wire.Type{}
 			}
@@ -1121,7 +1121,7 @@ func (k *rustLinker) typeName(t Node) string {
 	for !t.IsNull() {
 		switch t.KindId() {
 		case s.typeIdentifier, s.identifier:
-			if string(textOf(k.src, t)) == "Self" {
+			if string(k.text(t)) == "Self" {
 				if self := k.self(); self != "" {
 					return self
 				}
@@ -1168,7 +1168,10 @@ func (k *rustLinker) kid(n Node, field uint16) Node {
 }
 
 // str is n's text as a string the tables may keep.
-func (k *rustLinker) str(n Node) string { return string(textOf(k.src, n)) }
+func (k *rustLinker) str(n Node) string { return string(k.text(n)) }
+
+// text is n's source text, a raw identifier's without its `r#` (rawIdent).
+func (k *rustLinker) text(n Node) []byte { return rawIdent(textOf(k.src, n)) }
 
 // rsLinkSyntax holds the kind and field ids the Rust linker matches,
 // resolved once by name against the pinned grammar. A name the grammar does

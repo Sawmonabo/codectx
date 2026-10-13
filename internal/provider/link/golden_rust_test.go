@@ -373,6 +373,114 @@ impl<T: fmt::Debug> Describe for T {
 		// and the blanket impl's describe, whose self type is a parameter, overrides nothing.
 		fails: "an impl item published as implementing a same-named item of another trait of its self type; an external trait's item dropped when the type implements several; a blanket impl's item left without its trait's",
 	},
+	{
+		name:   "raw-identifiers",
+		anchor: "The Rust Reference, \"Identifiers\" (raw identifiers: the `r#` prefix is not part of the identifier), \"Paths\", \"Modules\" (module source filenames)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "raw"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `pub mod r#async;
+
+pub trait r#Raw { // @traw
+    fn raw(&self); // @rraw
+}
+
+pub trait Plain { // @tplain
+    fn plain(&self); // @pplain
+}
+
+pub struct S; // @ts
+
+impl S {
+    pub fn go(&self) {} // @sgo
+}
+
+impl Raw for S {
+    fn raw(&self) {} // @qraw
+}
+
+impl r#Plain for S {
+    fn plain(&self) {} // @qplain
+}
+
+pub fn r#run() {} // @frun
+
+pub fn caller() { // @fcaller
+    run(); // @c1
+    let r#v: r#S = S;
+    v.go(); // @c2
+    crate::r#async::helper(); // @c3
+    r#caller(); // @c4
+}
+`,
+			"src/async.rs": "pub fn helper() {} // @ahelper\n",
+		},
+		want: []string{
+			"c1 run -> frun run exact",
+			"c2 go -> sgo go exact",
+			"c3 helper -> ahelper helper exact",
+			"c4 r#caller -> fcaller caller exact",
+		},
+		// Derived from the source and the anchor: each raw identifier is the identifier without its
+		// `r#`, so the declarations, the calls, the module path and the trait impls written either way
+		// meet; a site still spells the bytes as written.
+		facts: []string{
+			"ts S implements traw Raw",
+			"ts S implements tplain Plain",
+			"qraw raw overrides rraw raw",
+			"qplain plain overrides pplain plain",
+		},
+		// Mutation: read names as written -> run, caller and helper are not found, v has no type, and
+		// both trait impls name a trait outside the unit.
+		fails: "a raw identifier read with its `r#`, so a declaration and a use spelled the other way never meet",
+	},
+	{
+		name:   "trait-impl-global-path",
+		anchor: "The Rust Reference, \"Paths\" (path qualifiers: a path starting with `::` resolves from the extern prelude, 2018 edition and later), \"Implementations\" (trait implementations), \"Use declarations\" (glob imports)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "global"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `use other::*;
+
+pub trait Shape { // @tshape
+    fn area(&self) -> u32; // @sarea
+}
+
+pub struct Square; // @tsquare
+
+impl Hidden for Square {
+    fn hide(&self) {} // @qhide
+}
+
+impl ::std::fmt::Display for Square {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result { Ok(()) } // @qdisplay
+}
+
+impl Shape for Square {
+    fn area(&self) -> u32 { 1 } // @qarea
+}
+`,
+		},
+		// Derived from the source and the anchor: Hidden may come from the glob of a crate outside the
+		// unit, so it names nothing known and publishes nothing, while the rows after it still link;
+		// `::std::fmt::Display` is std's, whatever the file's use declarations bind.
+		want: []string{},
+		facts: []string{
+			"tsquare Square implements external std::fmt::Display",
+			"tsquare Square implements tshape Shape",
+			"qdisplay fmt overrides external std::fmt::Display::fmt",
+			"qarea area overrides sarea area",
+		},
+		// Mutation: stop at a supertype that names nothing known -> Square implements neither Display
+		// nor Shape. Mutation: read a leading `::` as the crate's own -> the Display rows are gone.
+		fails: "a file's supertype rows after one that names nothing known dropped; a global path to a crate outside the unit read as naming nothing",
+	},
 }
 
 // TestRustMacroInputIsGeneratedAcrossFiles protects the crate-wide match of a
