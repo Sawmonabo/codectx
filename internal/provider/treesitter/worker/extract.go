@@ -235,6 +235,10 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 	if d.kind == "test" {
 		d.test = true
 	}
+	if len(caps["anonymous"]) > 0 {
+		// A Java anonymous class body: named `new T` (java.scm).
+		d.name = "new " + d.name
+	}
 	e.putDecl(d)
 }
 

@@ -61,13 +61,15 @@ const stateTag = "link.resolution.nodes\n"
 // also the order of preference a fold of two equal facts keeps (better); the
 // empty technique, a fact no technique is named for (an open or external
 // site), is last.
-// The visibility details follow it: a FactVisibility never folds with a fact
-// of another kind, so their place orders nothing.
+// The visibility details and supertype_anonymous follow it: none of their
+// facts folds with a fact of another technique, so their place orders
+// nothing.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
 	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
 	DetailSummary, DetailReturn, DetailSupertypeCandidate, "",
 	DetailVisibilityDefault, DetailVisibilityHidden, DetailVisibilityProtected, DetailVisibilityInternal,
-	DetailVisibilityDllexport, DetailVisibilityDllimport, DetailVisibilityUnspecified, DetailVisibilityUnresolved}
+	DetailVisibilityDllexport, DetailVisibilityDllimport, DetailVisibilityUnspecified, DetailVisibilityUnresolved,
+	DetailSupertypeAnonymous}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {

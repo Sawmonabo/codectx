@@ -295,6 +295,20 @@ detail (docs/providers-link.md). Both are visibility as declared in source,
 never the binary's export table: a build flag (`-fvisibility=hidden`) decides
 what a symbol with no attribute gets, so no attribute is no claim at all.
 
+**Java anonymous class bodies.** A creation with a class body
+(`new Runnable() { … }`) is a `class` node (JLS §15.9.5: an anonymous class is
+a class) named `new T`, T the created type's last simple name, the token the
+creation's call reference takes (`new Comparator` for
+`new java.util.Comparator<String>() { … }`). Its descriptor path is the
+enclosing declaration's path and that name (`Sample.start.new Runnable`), and
+its methods are its members (`Sample.start.new Runnable.run`), so a body
+inserted elsewhere in the file moves no identity; two bodies of one type in one
+declaration are duplicates at one level, settled as every duplicate is
+(content digest, then order). An enum constant's body is the constant's own:
+its methods are the constant's members (`Color.RED.m`). The node's range is
+the creation; its name is not written as one token, so for a qualified or
+spaced creation the range's text does not contain it.
+
 **C and C++ macro-prefixed declarations.** The grammars have no preprocessor,
 so a declaration written with a macro among its specifiers
 (`SQLITE_API int f(void);`, `XMLPUBFUN xmlNodePtr XMLCALL xmlNewNode(int);`,
