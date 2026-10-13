@@ -333,8 +333,8 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 
 	// A corrupt block is detected by the range read that touches it and by a
 	// full stream, while a range in another block still verifies. Byte 10 of
-	// the object lies inside the first block's frame; corrupt(true) flips it
-	// and corrupt(false) restores the byte it held.
+	// the object lies inside the first block; corrupt(true) flips it and
+	// corrupt(false) restores the byte it held.
 	longPath := filepath.Join(CASDir(f.dataDir), long.ContentHash[:2], long.ContentHash)
 	var original [1]byte
 	corrupt := func(flip bool) {
