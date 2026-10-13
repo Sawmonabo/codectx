@@ -385,7 +385,7 @@ func (u *unit) defines(ctx context.Context, kind model.NodeKind, qualified, name
 	if err != nil {
 		return model.Node{}, err
 	}
-	node, err := u.e.Node(ctx, cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng, Located: true, Metadata: filesystem.Metadata(meta)})
+	node, err := u.e.Node(ctx, cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng, Located: true, Metadata: meta})
 	if err != nil {
 		return model.Node{}, err
 	}
@@ -456,7 +456,7 @@ func (u *unit) pathTarget(ctx context.Context, target string, dir bool, rng *mod
 	attrs := filesystem.Attrs{Precision: precision, Range: rng}
 	if kind == model.NodeFile {
 		// This unit did not observe the file; it only names it.
-		attrs.Metadata = filesystem.Metadata(map[string]any{"resolution": "referenced"})
+		attrs.Metadata = map[string]any{"resolution": "referenced"}
 	}
 	node, err := u.e.Node(ctx, filesystem.PathCandidate(ID, kind, rel), attrs)
 	return node, err == nil, err
@@ -469,7 +469,7 @@ func (u *unit) referencedFile(ctx context.Context, rel string, rng *model.Source
 		return u.fileNode(ctx)
 	}
 	return u.e.Node(ctx, filesystem.PathCandidate(ID, model.NodeFile, rel), filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng,
-		Metadata: filesystem.Metadata(map[string]any{"resolution": "referenced"})})
+		Metadata: map[string]any{"resolution": "referenced"}})
 }
 
 // resolveRelative joins a manifest-relative path onto the manifest's

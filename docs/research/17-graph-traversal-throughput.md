@@ -1,6 +1,6 @@
 # 17 — Graph traversal throughput: external-memory BFS, adjacency layout, visited sets, ranking
 
-- **Lane:** GPERF-R (research, read-only) · **Date:** 2026-09-15 · **Scope:** impact / callers /
+- **Kind:** research, read-only · **Date:** 2026-09-15 · **Scope:** impact / callers /
   callees / package-deps / shortest-path; search out of scope.
 - **Evaluates:** ADR-0001 §2 §3.3; `internal/graph/{traverse,visited,visitedstore,walkrun,impactrank,path,pathscratch}.go`;
   `internal/storage/sqlite/adjacency.go`; ADR-0002 (integer surrogates), ADR-0003.
@@ -17,16 +17,16 @@ schema change and no new structure**, only a keyset key that agrees with an inde
 
 ---
 
-## 1. Empirical baseline (this lane's own measurements)
+## 1. Empirical baseline (measured for this note)
 
 Two real stores, `immutable=1`, warm page cache, WSL2 host. R-mid is a different, smaller corpus,
 cited only where the two agree in shape; every number marked R-large is from the 1.36 GiB store the
-brief's 3 800 nodes/s refers to.
+measured 3 800 nodes/s figure refers to.
 
 | Store | bytes | nodes | edges | max out-deg | avg out-deg |
 |---|---|---|---|---|---|
-| **R-large** (`codectx-gperf/store`, the 1.36 GiB reference) | 1 464 328 192 | 477 602 | 739 529 | **8 017** | 5.91 |
-| R-mid (`codectx-cert/.../fe42192f…`) | 700 219 392 | 201 850 | 344 703 | 320 | 4.08 |
+| **R-large** (the 1.36 GiB reference store) | 1 464 328 192 | 477 602 | 739 529 | **8 017** | 5.91 |
+| R-mid (a 0.70 GB store of a smaller corpus) | 700 219 392 | 201 850 | 344 703 | 320 | 4.08 |
 
 ### 1.1 The plan defect, as the engine reports it
 

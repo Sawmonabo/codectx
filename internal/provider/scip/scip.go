@@ -36,6 +36,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -252,6 +253,11 @@ type Provider struct {
 	// number by New.
 	evidenceClip int
 	lookupEnv    func(string) (string, bool)
+	// identities are the payload identity of every kind that can produce
+	// facts (resolveProfiles): what a kind's need model is learned under.
+	identities map[Kind]string
+	// needs are the indexers' learned need models (ProfileAdmission).
+	needs admission.ChildNeeds
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -322,7 +328,8 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 	}
 	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
 		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout, stallTimeout: o.StallTimeout,
-		workDir: o.WorkDir, limits: o.Limits, evidenceClip: o.MaxEvidencePerFact, lookupEnv: o.LookupEnv}, nil
+		workDir: o.WorkDir, limits: o.Limits, evidenceClip: o.MaxEvidencePerFact, lookupEnv: o.LookupEnv,
+		identities: identities}, nil
 }
 
 // Descriptor declares the provider: optional, workspace-invalidated, on top

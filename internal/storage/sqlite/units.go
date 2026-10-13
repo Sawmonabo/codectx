@@ -20,8 +20,9 @@ import (
 // the activation, not as a phase the coordinator can bracket, so its span is
 // opened here, under the activation span the caller already holds.
 const (
-	stageAdjacency = "adjacency"
-	stageSeal      = "seal"
+	stageAdjacency    = "adjacency"
+	stageSeal         = "seal"
+	stageSearchCommit = "search_commit"
 )
 
 // spanOutcome is how an activation stage reports itself: a span that returned
@@ -310,7 +311,7 @@ type UnitWriter struct {
 	done       bool
 
 	// ids resolves a canonical identity or an interned string to the
-	// storage-internal surrogate every reference column now carries (ids.go),
+	// storage-internal surrogate every reference column carries (ids.go),
 	// and nodes caches the lookup-only direction: a node that must ALREADY be
 	// registered -- a relation endpoint, an alias target, a search document's
 	// symbol -- is never minted here, so it is resolved by canonical lookup and
@@ -932,7 +933,7 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 // resolving them again per row would buy nothing. Exactly one of them is
 // valid, which is what the evidence CHECK constraint requires.
 //
-// evidence.id is the canonical 32-byte digest, not a surrogate: the id is a
+// evidence.id is the canonical 16-byte identity, not a surrogate: the id is a
 // pure function of the occurrence's fields and ON CONFLICT(id) DO NOTHING is
 // what makes a republished occurrence idempotent.
 func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence, node nodeRef, rel relRef) error {
@@ -951,7 +952,7 @@ func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []mode
 		defer stmt.Close()
 	}
 	for _, e := range list {
-		idRaw, _ := model.DecodeID(string(e.ID))
+		idRaw, _ := model.DecodeEvidenceID(e.ID)
 		fileRaw, err := w.inputFile(ctx, tx, e.FileID, e.ContentHash)
 		if err != nil {
 			return err
@@ -1277,47 +1278,37 @@ func (w *UnitWriter) insertCapabilities(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// UnitCapabilities is the capability rows a sealed unit stored when it sealed
-// (UnitWriter.SetCapabilities), in key order. A generation that reuses the
-// unit folds them into its report exactly as it folds the rows of a unit it
-// builds. One unit's rows are one per capability its provider declares, so the
-// answer is bounded by the descriptor, never by the repository; a caller
-// reading many units reads them one unit at a time. The rows are read back as
+// unitCapabilities is the capability rows a sealed unit stored when it sealed
+// (UnitWriter.SetCapabilities), in key order, read inside tx. One unit's rows
+// are one per capability its provider declares, so the answer is bounded by
+// the descriptor, never by the repository. The rows are read back as
 // untrusted: one that does not decode or validate is CTX_STORAGE_CORRUPT.
-func (s *Store) UnitCapabilities(ctx context.Context, unit model.UnitID) ([]model.CapabilityState, error) {
-	key, err := idBlob("unit_id", string(unit))
+func unitCapabilities(ctx context.Context, tx *sql.Tx, row int64, unit model.UnitID) ([]model.CapabilityState, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code, remediation, details_json
+		FROM unit_capabilities WHERE unit_id = ? ORDER BY provider_id, capability, scope_key`, row)
 	if err != nil {
-		return nil, err
+		return nil, wrap("unit_capabilities", err)
 	}
+	defer rows.Close()
 	var out []model.CapabilityState
-	err = s.readOwn(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT uc.provider_id, uc.capability, uc.scope_key, uc.state, uc.diagnostic_code, uc.remediation, uc.details_json
-			FROM unit_capabilities uc JOIN units u ON u.id = uc.unit_id
-			WHERE u.unit_key = ? ORDER BY uc.provider_id, uc.capability, uc.scope_key`, key)
-		if err != nil {
-			return wrap("unit_capabilities", err)
+	for rows.Next() {
+		var c model.CapabilityState
+		var details string
+		if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode,
+			&c.Remediation, &details); err != nil {
+			return nil, wrap("unit_capabilities", err)
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var c model.CapabilityState
-			var details string
-			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode,
-				&c.Remediation, &details); err != nil {
-				return wrap("unit_capabilities", err)
+		if details != "" && details != "{}" {
+			if err := json.Unmarshal([]byte(details), &c.Details); err != nil {
+				return nil, corrupt("unit %s capability %q/%q has unreadable details", unit, c.ProviderID, c.Capability)
 			}
-			if details != "" && details != "{}" {
-				if err := json.Unmarshal([]byte(details), &c.Details); err != nil {
-					return corrupt("unit %s capability %q/%q has unreadable details", unit, c.ProviderID, c.Capability)
-				}
-			}
-			if err := c.Validate(); err != nil {
-				return corrupt("unit %s capability %q/%q is not a valid capability state: %v", unit, c.ProviderID, c.Capability, err)
-			}
-			out = append(out, c)
 		}
-		return wrap("unit_capabilities", rows.Err())
-	})
-	return out, err
+		if err := c.Validate(); err != nil {
+			return nil, corrupt("unit %s capability %q/%q is not a valid capability state: %v", unit, c.ProviderID, c.Capability, err)
+		}
+		out = append(out, c)
+	}
+	return out, wrap("unit_capabilities", rows.Err())
 }
 
 // attach inserts the generation membership row for a unit.
@@ -1337,16 +1328,20 @@ func (s *Store) attach(ctx context.Context, tx *sql.Tx, gen model.GenerationID, 
 	return nil
 }
 
-// AttachUnit reuses a sealed unit in gen. Reuse is admitted only when every
-// declared input is exactly the selected snapshot's version of that file
-// (content hash and mode); otherwise CTX_SNAPSHOT_CHANGED. Membership of the
-// unit's dependencies is validated at Activate.
-func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit model.UnitID) error {
+// AttachUnit reuses a sealed unit in gen and returns the capability rows the
+// unit stored when it sealed, which a generation that reuses it folds into its
+// report exactly as it folds the rows of a unit it builds. Reuse is admitted
+// only when every declared input is exactly the selected snapshot's version of
+// that file (content hash and mode); otherwise CTX_SNAPSHOT_CHANGED.
+// Membership of the unit's dependencies is validated at Activate. The rows are
+// read in the attach's own transaction, so a reused unit costs one writer job.
+func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit model.UnitID) ([]model.CapabilityState, error) {
 	key, err := idBlob("unit_id", string(unit))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return s.ingest(ctx, func(tx *sql.Tx) error {
+	var caps []model.CapabilityState
+	err = s.ingest(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
@@ -1375,8 +1370,16 @@ func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit mod
 				Message: fmt.Sprintf("unit cannot be reused: %d of its inputs differ from the selected snapshot", mismatched),
 				Details: map[string]string{"unit_id": string(unit)}}
 		}
-		return s.attach(ctx, tx, gen, row, providerID, scopeKey)
+		if err := s.attach(ctx, tx, gen, row, providerID, scopeKey); err != nil {
+			return err
+		}
+		caps, err = unitCapabilities(ctx, tx, row, unit)
+		return err
 	})
+	if err != nil {
+		return nil, err
+	}
+	return caps, nil
 }
 
 // Activate validates the frozen membership, computes the AnalysisKey and runs
@@ -1608,8 +1611,7 @@ var analyzedTables = [...]string{"node_facts", "generation_units"}
 // runs -- the transaction above committed -- so refusing to return the binding
 // would turn a slower query plan into a failed index. The operator is told
 // instead: a stale plan is a performance fact they can act on, not a silent
-// one. Generations published before this landed keep the old plan until the
-// next activation rewrites the statistics.
+// one; the next activation rewrites the statistics.
 func (s *Store) refreshStatistics(ctx context.Context) {
 	// analysis_limit bounds each index scan instead of walking it end to end,
 	// which is what makes this affordable inside an activation; the statistics

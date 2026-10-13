@@ -614,7 +614,7 @@ func (r FactReference) Validate() error {
 		return err
 	}
 	for i, id := range r.EvidenceIDs {
-		if err := requireID(indexed("fact_reference.evidence_ids", i), string(id)); err != nil {
+		if err := requireEvidenceID(indexed("fact_reference.evidence_ids", i), id); err != nil {
 			return err
 		}
 	}
@@ -838,7 +838,7 @@ type CapsuleRequest struct {
 	SessionID SessionID   `json:"session_id"`
 	ActorID   string      `json:"actor_id"`
 	View      CapsuleView `json:"view"`
-	Page      PageRequest `json:"page"`
+	Page      PageRequest `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape. There is no generation on it for the

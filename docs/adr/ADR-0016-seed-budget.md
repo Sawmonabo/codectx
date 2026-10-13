@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted, 2026-10-09, by the owner's ruling. Not yet implemented. The survey and the line-by-line check of the
+Accepted, 2026-10-09, by the owner's ruling. Implemented: decisions 1 to 6 in the context compiler and the search
+service's in-process read, decision 7's proofs in the context tests. The survey and the line-by-line check of the
 proposed stop against the code are [research 25](../research/25-seed-budget.md).
 
 ## Context
@@ -69,7 +70,20 @@ condition that an entry's grade depends only on its own routes, and no margin re
 ### 3. The read stops at a score below which no unread match can rank above the packed files
 
 - Lexical matches are read in score order through the internal search call, which takes a depth and grows it until
-  the floor is passed; the 200-item page is a wire bound and does not apply to this in-process call.
+  the floor is passed; the 200-item page is a wire bound and does not apply to this in-process call. Each step resumes
+  after the last match served and doubles the depth, because a resumed read rescores the ranking above its position:
+  steps of a fixed P cost about N²/(2P) document scorings for N matches, doubling about 4N. A step's peak memory,
+  computed from the library's and the service's structures, must fit the query memory admission
+  (`resources.query_memory_bytes`) less the compile's sort share. When a doubling does not fit, the read keeps the
+  largest depth that does, never less than one page, so a small admission costs more steps and never a refusal or a
+  different answer. The bound is enforced, not estimated: every index request of a step carries the bytes the step may
+  still hold, and the library charges every allocation that grows with depth or position (the heaps of the segments
+  scored at once, every segment's 24-byte run entries, the marked groups, any rescoring and each served result with
+  the caller's copy), fits its heap to the bound beside the marked groups' bound, and ends a page early, with an exact
+  prefix that says more, rather than hold more. The marked-group bound is exact: every group a later position marks
+  is marked already or is a run entry the page before took. The hits are handed over and hydrated a page at a time, so a
+  stop mid-step reads nothing from storage past its page. A query deadline that ends the read leaves the scope
+  incomplete and names the step in the exclusions. Nothing is spooled.
 - τ(next) is the largest final score anything derived from the next unread match could reach: its origin
   contribution, a route at the full scale, and every boost the root could lend. It is computed with the compiler's own
   integer functions, never with a floating ratio. With the boosts scaled by root weight (decision 1), the margin is

@@ -1,4 +1,4 @@
-=== tquery 20:30:56 <bench>/idx/t16-large-end <bench>/qual/queries-name.txt 1 library --phase qual-name
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-name.txt 1 library --phase qual-name
 tantivy-library/qual-name "withHealthStatus": hits 4, page 4, cold 3.591 ms, warm median 0.226 ms
 tantivy-library/qual-name "checkNodeAllocatableTest": hits 2, page 2, cold 0.330 ms, warm median 0.110 ms
 tantivy-library/qual-name "UnsafeDeleteRole": hits 4, page 4, cold 1.184 ms, warm median 0.136 ms
@@ -999,8 +999,8 @@ tantivy-library/qual-name "StringToInt64": hits 6, page 6, cold 0.257 ms, warm m
 tantivy-library/qual-name "fakeAuthorizer": hits 140, page 140, cold 1.653 ms, warm median 0.607 ms
 tantivy-library/qual-name "CloseNotify": hits 296, page 200, cold 0.953 ms, warm median 0.381 ms
 tantivy-library/qual-name "yaml_parser_parse_document_content": hits 21956, page 200, cold 2.826 ms, warm median 1.358 ms
-rc=0 20:31:00
-=== tquery 20:31:00 <bench>/idx/t16-large-end <bench>/qual/queries-name.txt 1 library-all --phase qual-name
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-name.txt 1 library-all --phase qual-name
 tantivy-library-all/qual-name "withHealthStatus": hits 4, page 4, cold 0.464 ms, warm median 0.276 ms
 tantivy-library-all/qual-name "checkNodeAllocatableTest": hits 2, page 2, cold 0.294 ms, warm median 0.145 ms
 tantivy-library-all/qual-name "UnsafeDeleteRole": hits 4, page 4, cold 0.323 ms, warm median 0.114 ms
@@ -2001,8 +2001,8 @@ tantivy-library-all/qual-name "StringToInt64": hits 6, page 6, cold 0.234 ms, wa
 tantivy-library-all/qual-name "fakeAuthorizer": hits 140, page 140, cold 1.210 ms, warm median 0.741 ms
 tantivy-library-all/qual-name "CloseNotify": hits 296, page 200, cold 1.894 ms, warm median 1.368 ms
 tantivy-library-all/qual-name "yaml_parser_parse_document_content": hits 21956, page 200, cold 6.316 ms, warm median 2.515 ms
-rc=0 20:31:05
-=== tquery 20:31:05 <bench>/idx/t16-large-end <bench>/qual/queries-name.txt 1 product --phase qual-name
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-name.txt 1 product --phase qual-name
   product "withHealthStatus": 4 candidate documents, 4 hits
 tantivy-product/qual-name "withHealthStatus": hits 4, page 4, cold 3.654 ms, warm median 4.581 ms
   product "checkNodeAllocatableTest": 2 candidate documents, 2 hits
@@ -4003,8 +4003,8 @@ tantivy-product/qual-name "fakeAuthorizer": hits 136, page 136, cold 7.111 ms, w
 tantivy-product/qual-name "CloseNotify": hits 286, page 200, cold 8.270 ms, warm median 5.680 ms
   product "yaml_parser_parse_document_content": 21956 candidate documents, 20265 hits
 tantivy-product/qual-name "yaml_parser_parse_document_content": hits 20265, page 200, cold 142.810 ms, warm median 136.231 ms
-rc=0 20:32:24
-=== tquery 20:32:24 <bench>/idx/t16-large-end-code <bench>/qual/queries-name.txt 1 library --phase qual-name-code
+rc=0
+=== tquery <bench>/idx/t16-large-end-code <bench>/qual/queries-name.txt 1 library --phase qual-name-code
 tantivy-library/qual-name-code "withHealthStatus": hits 75842, page 200, cold 69.011 ms, warm median 3.501 ms
 tantivy-library/qual-name-code "checkNodeAllocatableTest": hits 126583, page 200, cold 24.452 ms, warm median 3.392 ms
 tantivy-library/qual-name-code "UnsafeDeleteRole": hits 16089, page 200, cold 16.323 ms, warm median 1.902 ms
@@ -5005,8 +5005,8 @@ tantivy-library/qual-name-code "StringToInt64": hits 180187, page 200, cold 4.95
 tantivy-library/qual-name-code "fakeAuthorizer": hits 12135, page 200, cold 2.932 ms, warm median 1.396 ms
 tantivy-library/qual-name-code "CloseNotify": hits 4850, page 200, cold 1.251 ms, warm median 0.498 ms
 tantivy-library/qual-name-code "yaml_parser_parse_document_content": hits 26653, page 200, cold 2.487 ms, warm median 1.203 ms
-rc=0 20:32:33
-=== tquery 20:32:33 <bench>/idx/t16-large-end-code <bench>/qual/queries-name.txt 1 library-all --phase qual-name-code
+rc=0
+=== tquery <bench>/idx/t16-large-end-code <bench>/qual/queries-name.txt 1 library-all --phase qual-name-code
 tantivy-library-all/qual-name-code "withHealthStatus": hits 75842, page 200, cold 40.693 ms, warm median 12.225 ms
 tantivy-library-all/qual-name-code "checkNodeAllocatableTest": hits 126583, page 200, cold 25.594 ms, warm median 23.314 ms
 tantivy-library-all/qual-name-code "UnsafeDeleteRole": hits 16089, page 200, cold 10.071 ms, warm median 3.798 ms
@@ -6007,8 +6007,8 @@ tantivy-library-all/qual-name-code "StringToInt64": hits 180187, page 200, cold 
 tantivy-library-all/qual-name-code "fakeAuthorizer": hits 12135, page 200, cold 4.047 ms, warm median 2.411 ms
 tantivy-library-all/qual-name-code "CloseNotify": hits 4850, page 200, cold 3.069 ms, warm median 1.772 ms
 tantivy-library-all/qual-name-code "yaml_parser_parse_document_content": hits 26653, page 200, cold 5.824 ms, warm median 5.718 ms
-rc=0 20:32:51
-=== tquery 20:32:51 <bench>/idx/t16-large-end <bench>/qual/queries-doc.txt 1 library --phase qual-doc
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-doc.txt 1 library --phase qual-doc
 tantivy-library/qual-doc "rundensitybatchtest nodeallocatable density reported": hits 1323, page 200, cold 2.722 ms, warm median 2.760 ms
 tantivy-library/qual-doc "m data byte int": hits 72863, page 200, cold 6.514 ms, warm median 3.105 ms
 tantivy-library/qual-doc "authzmode authorization mode valid": hits 14087, page 200, cold 4.261 ms, warm median 1.616 ms
@@ -7009,8 +7009,8 @@ tantivy-library/qual-doc "tableoptions table r metav1": hits 18248, page 200, co
 tantivy-library/qual-doc "conform conflicting templates replaced": hits 2848, page 200, cold 2.146 ms, warm median 0.839 ms
 tantivy-library/qual-doc "testarg podlatencydata densitytest testinfo": hits 62, page 62, cold 0.980 ms, warm median 0.278 ms
 tantivy-library/qual-doc "bundle ignored mode new": hits 25636, page 200, cold 2.913 ms, warm median 1.400 ms
-rc=0 20:32:57
-=== tquery 20:32:57 <bench>/idx/t16-large-end <bench>/qual/queries-doc.txt 1 library-all --phase qual-doc
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-doc.txt 1 library-all --phase qual-doc
 tantivy-library-all/qual-doc "rundensitybatchtest nodeallocatable density reported": hits 1323, page 200, cold 2.512 ms, warm median 2.592 ms
 tantivy-library-all/qual-doc "m data byte int": hits 72863, page 200, cold 12.013 ms, warm median 11.583 ms
 tantivy-library-all/qual-doc "authzmode authorization mode valid": hits 14087, page 200, cold 4.075 ms, warm median 3.056 ms
@@ -8011,8 +8011,8 @@ tantivy-library-all/qual-doc "tableoptions table r metav1": hits 18248, page 200
 tantivy-library-all/qual-doc "conform conflicting templates replaced": hits 2848, page 200, cold 2.201 ms, warm median 1.246 ms
 tantivy-library-all/qual-doc "testarg podlatencydata densitytest testinfo": hits 62, page 62, cold 0.905 ms, warm median 0.467 ms
 tantivy-library-all/qual-doc "bundle ignored mode new": hits 25636, page 200, cold 5.504 ms, warm median 2.871 ms
-rc=0 20:33:07
-=== tquery 20:33:07 <bench>/idx/t16-large-end <bench>/qual/queries-doc.txt 1 product --phase qual-doc
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-doc.txt 1 product --phase qual-doc
   product "rundensitybatchtest nodeallocatable density reported": 1323 candidate documents, 1023 hits
 tantivy-product/qual-doc "rundensitybatchtest nodeallocatable density reported": hits 1023, page 200, cold 24.745 ms, warm median 23.157 ms
   product "m data byte int": 72863 candidate documents, 70538 hits
@@ -10013,8 +10013,8 @@ tantivy-product/qual-doc "conform conflicting templates replaced": hits 2165, pa
 tantivy-product/qual-doc "testarg podlatencydata densitytest testinfo": hits 62, page 62, cold 5.844 ms, warm median 2.438 ms
   product "bundle ignored mode new": 25636 candidate documents, 23041 hits
 tantivy-product/qual-doc "bundle ignored mode new": hits 23041, page 200, cold 167.319 ms, warm median 147.499 ms
-rc=0 20:36:11
-=== tquery 20:36:11 <bench>/idx/t16-large-end-code <bench>/qual/queries-doc.txt 1 library --phase qual-doc-code
+rc=0
+=== tquery <bench>/idx/t16-large-end-code <bench>/qual/queries-doc.txt 1 library --phase qual-doc-code
 tantivy-library/qual-doc-code "rundensitybatchtest nodeallocatable density reported": hits 1380, page 200, cold 2.601 ms, warm median 1.994 ms
 tantivy-library/qual-doc-code "m data byte int": hits 78023, page 200, cold 3.854 ms, warm median 3.525 ms
 tantivy-library/qual-doc-code "authzmode authorization mode valid": hits 18843, page 200, cold 2.780 ms, warm median 1.625 ms
@@ -11015,8 +11015,8 @@ tantivy-library/qual-doc-code "tableoptions table r metav1": hits 20115, page 20
 tantivy-library/qual-doc-code "conform conflicting templates replaced": hits 3405, page 200, cold 2.655 ms, warm median 1.185 ms
 tantivy-library/qual-doc-code "testarg podlatencydata densitytest testinfo": hits 62, page 62, cold 1.067 ms, warm median 0.361 ms
 tantivy-library/qual-doc-code "bundle ignored mode new": hits 46004, page 200, cold 3.849 ms, warm median 1.961 ms
-rc=0 20:36:17
-=== tquery 20:36:17 <bench>/idx/t16-large-end-code <bench>/qual/queries-doc.txt 1 library-all --phase qual-doc-code
+rc=0
+=== tquery <bench>/idx/t16-large-end-code <bench>/qual/queries-doc.txt 1 library-all --phase qual-doc-code
 tantivy-library-all/qual-doc-code "rundensitybatchtest nodeallocatable density reported": hits 1380, page 200, cold 2.667 ms, warm median 2.085 ms
 tantivy-library-all/qual-doc-code "m data byte int": hits 78023, page 200, cold 14.800 ms, warm median 17.427 ms
 tantivy-library-all/qual-doc-code "authzmode authorization mode valid": hits 18843, page 200, cold 5.146 ms, warm median 4.305 ms
@@ -12017,8 +12017,8 @@ tantivy-library-all/qual-doc-code "tableoptions table r metav1": hits 20115, pag
 tantivy-library-all/qual-doc-code "conform conflicting templates replaced": hits 3405, page 200, cold 2.318 ms, warm median 1.274 ms
 tantivy-library-all/qual-doc-code "testarg podlatencydata densitytest testinfo": hits 62, page 62, cold 0.933 ms, warm median 0.376 ms
 tantivy-library-all/qual-doc-code "bundle ignored mode new": hits 46004, page 200, cold 8.239 ms, warm median 4.389 ms
-rc=0 20:36:27
-=== tquery 20:36:27 <bench>/idx/t16-large-end <bench>/qual/queries-subword.txt 1 library --phase qual-subword
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-subword.txt 1 library --phase qual-subword
 tantivy-library/qual-subword "health": hits 1711, page 200, cold 2.167 ms, warm median 1.505 ms
 tantivy-library/qual-subword "node": hits 17473, page 200, cold 2.912 ms, warm median 2.049 ms
 tantivy-library/qual-subword "delete": hits 5730, page 200, cold 2.679 ms, warm median 1.526 ms
@@ -13019,8 +13019,8 @@ tantivy-library/qual-subword "bpxystat": hits 46, page 46, cold 0.445 ms, warm m
 tantivy-library/qual-subword "allocate": hits 968, page 200, cold 2.120 ms, warm median 0.812 ms
 tantivy-library/qual-subword "divisor": hits 520, page 200, cold 0.964 ms, warm median 0.410 ms
 tantivy-library/qual-subword "async": hits 509, page 200, cold 1.548 ms, warm median 0.592 ms
-rc=0 20:36:32
-=== tquery 20:36:32 <bench>/idx/t16-large-end <bench>/qual/queries-subword.txt 1 library-all --phase qual-subword
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-subword.txt 1 library-all --phase qual-subword
 tantivy-library-all/qual-subword "health": hits 1711, page 200, cold 2.178 ms, warm median 1.854 ms
 tantivy-library-all/qual-subword "node": hits 17473, page 200, cold 4.020 ms, warm median 4.084 ms
 tantivy-library-all/qual-subword "delete": hits 5730, page 200, cold 3.498 ms, warm median 2.756 ms
@@ -14021,8 +14021,8 @@ tantivy-library-all/qual-subword "bpxystat": hits 46, page 46, cold 0.511 ms, wa
 tantivy-library-all/qual-subword "allocate": hits 968, page 200, cold 1.706 ms, warm median 1.068 ms
 tantivy-library-all/qual-subword "divisor": hits 520, page 200, cold 1.576 ms, warm median 1.018 ms
 tantivy-library-all/qual-subword "async": hits 509, page 200, cold 1.713 ms, warm median 1.220 ms
-rc=0 20:36:37
-=== tquery 20:36:37 <bench>/idx/t16-large-end <bench>/qual/queries-subword.txt 1 product --phase qual-subword
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/qual/queries-subword.txt 1 product --phase qual-subword
   product "health": 1711 candidate documents, 1482 hits
 tantivy-product/qual-subword "health": hits 1482, page 200, cold 30.961 ms, warm median 33.060 ms
   product "node": 17473 candidate documents, 16035 hits
@@ -16023,8 +16023,8 @@ tantivy-product/qual-subword "allocate": hits 785, page 200, cold 18.025 ms, war
 tantivy-product/qual-subword "divisor": hits 303, page 200, cold 8.858 ms, warm median 7.787 ms
   product "async": 509 candidate documents, 472 hits
 tantivy-product/qual-subword "async": hits 472, page 200, cold 12.502 ms, warm median 8.991 ms
-rc=0 20:37:59
-=== tquery 20:37:59 <bench>/idx/t16-large-end-code <bench>/qual/queries-subword.txt 1 library --phase qual-subword-code
+rc=0
+=== tquery <bench>/idx/t16-large-end-code <bench>/qual/queries-subword.txt 1 library --phase qual-subword-code
 tantivy-library/qual-subword-code "health": hits 3217, page 200, cold 2.396 ms, warm median 2.127 ms
 tantivy-library/qual-subword-code "node": hits 28519, page 200, cold 2.725 ms, warm median 1.643 ms
 tantivy-library/qual-subword-code "delete": hits 9175, page 200, cold 2.367 ms, warm median 1.206 ms
@@ -17025,8 +17025,8 @@ tantivy-library/qual-subword-code "bpxystat": hits 46, page 46, cold 0.401 ms, w
 tantivy-library/qual-subword-code "allocate": hits 1496, page 200, cold 2.109 ms, warm median 1.252 ms
 tantivy-library/qual-subword-code "divisor": hits 526, page 200, cold 1.490 ms, warm median 0.457 ms
 tantivy-library/qual-subword-code "async": hits 860, page 200, cold 1.941 ms, warm median 0.782 ms
-rc=0 20:38:03
-=== tquery 20:38:03 <bench>/idx/t16-large-end-code <bench>/qual/queries-subword.txt 1 library-all --phase qual-subword-code
+rc=0
+=== tquery <bench>/idx/t16-large-end-code <bench>/qual/queries-subword.txt 1 library-all --phase qual-subword-code
 tantivy-library-all/qual-subword-code "health": hits 3217, page 200, cold 3.065 ms, warm median 1.944 ms
 tantivy-library-all/qual-subword-code "node": hits 28519, page 200, cold 5.591 ms, warm median 4.853 ms
 tantivy-library-all/qual-subword-code "delete": hits 9175, page 200, cold 3.685 ms, warm median 2.336 ms
@@ -18027,5 +18027,5 @@ tantivy-library-all/qual-subword-code "bpxystat": hits 46, page 46, cold 0.614 m
 tantivy-library-all/qual-subword-code "allocate": hits 1496, page 200, cold 1.982 ms, warm median 1.179 ms
 tantivy-library-all/qual-subword-code "divisor": hits 526, page 200, cold 1.655 ms, warm median 1.094 ms
 tantivy-library-all/qual-subword-code "async": hits 860, page 200, cold 1.810 ms, warm median 1.169 ms
-rc=0 20:38:09
+rc=0
 ALLDONE

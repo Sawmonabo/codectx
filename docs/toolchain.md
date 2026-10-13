@@ -82,7 +82,7 @@ published.
 
 ### Mirrors
 
-Because the lock now names several hosts, `tools.mirror` replaces the scheme
+Because the lock names several hosts, `tools.mirror` replaces the scheme
 and host of a payload URL and keeps the original host as the first path
 segment:
 
@@ -482,7 +482,9 @@ package of the same name that calls it:
 | `Cargo.toml` | the crate, built as a static library, its exact dependency versions and the release profile |
 | `Cargo.lock` | every crate in the tree, with its version and checksum |
 | `rust-toolchain.toml` | the one Rust toolchain version the crate builds with, and the components it needs |
+| `rustfmt.toml` | the crate's formatting: 120 columns, the width the source is written to |
 | `.cargo/config.toml` | the target directory, `_build/`, which Go's `./...` patterns skip |
+| `deny.toml` | the dependency policy CI checks with `cargo deny`: permissive licenses, no advisory or yanked crate, crates.io as the only source |
 
 **The build is two steps.**
 
@@ -516,6 +518,14 @@ SHA-256.
   `aarch64-pc-windows-gnullvm` on arm64, never for the MSVC targets.
 - **The crates `Cargo.lock` names**, fetched from the registry or present in
   the leg's Cargo cache, and the `go generate` step before `go build`.
+
+Every CI and release leg gets these from one composite action,
+`.github/actions/search-index`: it installs the pinned toolchain (switching the
+Windows host to the GNU target first), runs `cargo fetch --locked --target
+host-tuple`, the only step that reaches the network, and then runs
+`go generate` with `CARGO_NET_OFFLINE=true`, which makes the generate line's
+`--locked` build the equivalent of `--frozen`. A local build keeps `--locked`
+alone, so a fresh clone still fetches on its first build.
 
 **Nothing reaches the user.** The crate is linked into the binary, so the user
 installs no Rust toolchain and no library; codectx is still one executable.

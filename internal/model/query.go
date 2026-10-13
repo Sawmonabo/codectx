@@ -16,7 +16,7 @@ import (
 // explicit that no zero or negative setting ever means unlimited; the default a
 // zero resolves to is itself a finite configured bound.
 type PageRequest struct {
-	Limit  int    `json:"limit"`
+	Limit  int    `json:"limit,omitempty"`
 	Cursor string `json:"cursor,omitempty"`
 }
 
@@ -250,7 +250,7 @@ type SearchRequest struct {
 	Kinds        []NodeKind   `json:"kinds,omitempty"`
 	Languages    []string     `json:"languages,omitempty"`
 	Paths        []string     `json:"paths,omitempty"`
-	Page         PageRequest  `json:"page"`
+	Page         PageRequest  `json:"page,omitempty"`
 }
 
 // Validate enforces the Section 14.1 rule that query text, filters and limits
@@ -429,7 +429,7 @@ type SymbolRequest struct {
 	Profile        string          `json:"profile,omitempty"`
 	FileID         FileID          `json:"file_id,omitempty"`
 	Range          *SourceRange    `json:"range,omitempty"`
-	Page           PageRequest     `json:"page"`
+	Page           PageRequest     `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape, including the Section 11.6 rule that a
@@ -471,7 +471,7 @@ type ReferenceRequest struct {
 	Operation      ReferenceOperation `json:"operation"`
 	SemanticSource SemanticSource     `json:"semantic_source"`
 	Profile        string             `json:"profile,omitempty"`
-	Page           PageRequest        `json:"page"`
+	Page           PageRequest        `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape.
@@ -540,7 +540,6 @@ func (o ReferenceOccurrence) Validate() error {
 		value string
 	}{
 		{"reference_occurrence.relation_id", string(o.RelationID)},
-		{"reference_occurrence.evidence_id", string(o.EvidenceID)},
 		{"reference_occurrence.from_node_id", string(o.FromNodeID)},
 		{"reference_occurrence.to_node_id", string(o.ToNodeID)},
 	} {
@@ -554,6 +553,13 @@ func (o ReferenceOccurrence) Validate() error {
 		if err := check(f.field, f.value); err != nil {
 			return err
 		}
+	}
+	checkEvidence := requireEvidenceID
+	if overlay {
+		checkEvidence = optionalEvidenceID
+	}
+	if err := checkEvidence("reference_occurrence.evidence_id", o.EvidenceID); err != nil {
+		return err
 	}
 	if overlay {
 		// The pinned file and range are then the only thing that makes the
@@ -597,10 +603,10 @@ type GraphRequest struct {
 	Start        []NodeID       `json:"start"`
 	Relations    []RelationKind `json:"relations,omitempty"`
 	Direction    Direction      `json:"direction"`
-	MaxDepth     int            `json:"max_depth"`
-	MaxVisited   int            `json:"max_visited"`
-	MaxEdges     int            `json:"max_edges"`
-	Page         PageRequest    `json:"page"`
+	MaxDepth     int            `json:"max_depth,omitempty"`
+	MaxVisited   int            `json:"max_visited,omitempty"`
+	MaxEdges     int            `json:"max_edges,omitempty"`
+	Page         PageRequest    `json:"page,omitempty"`
 }
 
 // Validate enforces bounded seeds, depth and work budgets. A zero bound means
@@ -779,7 +785,7 @@ func (o RelationOccurrence) Validate() error {
 	if err := requireID("relation_occurrence.relation_id", string(o.RelationID)); err != nil {
 		return err
 	}
-	if err := requireID("relation_occurrence.evidence_id", string(o.EvidenceID)); err != nil {
+	if err := requireEvidenceID("relation_occurrence.evidence_id", o.EvidenceID); err != nil {
 		return err
 	}
 	if err := requireID("relation_occurrence.file_id", string(o.FileID)); err != nil {
@@ -907,7 +913,7 @@ func (m GraphRowMark) Validate() error {
 		return err
 	}
 	for i, id := range m.Occurrences {
-		if err := requireID(indexed("graph_row_mark.occurrences", i), string(id)); err != nil {
+		if err := requireEvidenceID(indexed("graph_row_mark.occurrences", i), id); err != nil {
 			return err
 		}
 	}
@@ -979,7 +985,7 @@ type CandidateRequest struct {
 	Shape        CallShape    `json:"shape,omitempty"`
 	Arguments    int64        `json:"arguments,omitempty"`
 	Language     string       `json:"language,omitempty"`
-	Page         PageRequest  `json:"page"`
+	Page         PageRequest  `json:"page,omitempty"`
 }
 
 // Validate enforces exactly one request form.
@@ -1084,15 +1090,15 @@ type PathRequest struct {
 	// backwards and DirectionBoth follows them either way, which makes the
 	// result the undirected cheapest route.
 	Direction  Direction `json:"direction,omitempty"`
-	MaxDepth   int       `json:"max_depth"`
-	MaxVisited int       `json:"max_visited"`
+	MaxDepth   int       `json:"max_depth,omitempty"`
+	MaxVisited int       `json:"max_visited,omitempty"`
 	// Page carries the continuation of a path search: of a walk whose earlier
 	// page spent its work budget or its deadline before reaching the target,
 	// which carries on settling cost buckets rather than restarting, and of
 	// the list of equal-cost routes, which goes on after the last route the
 	// page before listed. Limit is the routes one page lists (0 is the
 	// endpoint default).
-	Page PageRequest `json:"page"`
+	Page PageRequest `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape.
@@ -1160,7 +1166,7 @@ func (p RelationPath) Validate() error {
 		return err
 	}
 	for i, id := range p.Evidence {
-		if err := requireID(indexed("relation_path.evidence", i), string(id)); err != nil {
+		if err := requireEvidenceID(indexed("relation_path.evidence", i), id); err != nil {
 			return err
 		}
 	}
@@ -1282,7 +1288,7 @@ func (e ImpactEntry) Validate() error {
 type OverviewRequest struct {
 	GenerationID GenerationID `json:"generation_id,omitempty"`
 	Depth        int          `json:"depth"`
-	Page         PageRequest  `json:"page"`
+	Page         PageRequest  `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape.

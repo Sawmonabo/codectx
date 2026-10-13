@@ -1,11 +1,15 @@
 package model
 
-import "strconv"
+import (
+	"encoding/hex"
+	"strconv"
+)
 
 // Public content-derived identifiers (Section 9.1). Every one of these is a
-// lowercase SHA-256 hex string except GenerationID, which is an
-// installation-local row number used for lookup and never a reproducible
-// analysis fingerprint. Numeric SQLite row IDs never escape as entity identity.
+// lowercase SHA-256 hex string except EvidenceID, which is the first
+// EvidenceIDBytes of one, and GenerationID, which is an installation-local
+// row number used for lookup and never a reproducible analysis fingerprint.
+// Numeric SQLite row IDs never escape as entity identity.
 type (
 	// RepositoryID is a persisted random identity for one repository within
 	// this installation. It is not derived from the repository's contents.
@@ -92,9 +96,23 @@ func NewRelationID(repo RepositoryID, from NodeID, kind RelationKind, to NodeID)
 	return RelationID(H(domainRelation, string(repo), string(from), string(kind), string(to)))
 }
 
+// EvidenceIDBytes is the width of an evidence identity, stored and public: the
+// first 16 bytes of its SHA-256 derivation (ADR-0003 section 2.2). Evidence is
+// the most numerous row the store keeps and the identity is its primary key,
+// so the width is paid in the row, in the key's index and in the unit index
+// that carries it. At 128 bits the chance that any two of n rows share an
+// identity is about n^2/2^129 -- 10^-25 at ten million rows -- and a row is
+// never compared with anything but rows of the same store.
+const EvidenceIDBytes = 16
+
+// EvidenceIDHexLen is the length of an EvidenceID in lowercase hex.
+const EvidenceIDHexLen = 2 * EvidenceIDBytes
+
 // NewEvidenceID derives evidence identity from semantic unit identity, subject,
 // precision, native key, source hash/range, bounded detail, and a call
-// occurrence's dispatch and set size (Section 9.3).
+// occurrence's dispatch and set size (Section 9.3), keeping the first
+// EvidenceIDBytes of the digest. A prefix keeps the digest's order, so every
+// order taken over evidence ids is the order of their full digests.
 // It excludes OriginRunID and every timestamp, so a reused unit keeps its
 // original evidence rows and a rerun over unchanged input is a no-op.
 //
@@ -121,7 +139,46 @@ func NewEvidenceID(e Evidence) EvidenceID {
 	h.AddString(e.Detail)
 	h.AddString(string(e.Dispatch))
 	h.AddString(strconv.FormatInt(e.SetSize, 10))
-	return EvidenceID(h.Sum())
+	return EvidenceID(h.Sum()[:EvidenceIDHexLen])
+}
+
+// ValidEvidenceID reports whether s is a well-formed evidence identity:
+// exactly EvidenceIDHexLen lowercase hex characters.
+func ValidEvidenceID(s string) bool {
+	if len(s) != EvidenceIDHexLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// DecodeEvidenceID decodes an evidence identity to the bytes the store keeps.
+func DecodeEvidenceID(id EvidenceID) ([]byte, error) {
+	if !ValidEvidenceID(string(id)) {
+		return nil, invalid("evidence identifier %q is not %d lowercase hex characters", truncateForMessage(string(id)), EvidenceIDHexLen)
+	}
+	return hex.DecodeString(string(id))
+}
+
+// requireEvidenceID validates a present evidence identity.
+func requireEvidenceID(field string, id EvidenceID) *Error {
+	if id == "" {
+		return invalid("%s is required", field)
+	}
+	return optionalEvidenceID(field, id)
+}
+
+// optionalEvidenceID validates an evidence identity that may be absent.
+func optionalEvidenceID(field string, id EvidenceID) *Error {
+	if id != "" && !ValidEvidenceID(string(id)) {
+		return invalid("%s %q is not %d lowercase hex characters", field, truncateForMessage(string(id)), EvidenceIDHexLen)
+	}
+	return nil
 }
 
 // NewSnapshotID derives snapshot identity. manifestHash is the aggregate digest

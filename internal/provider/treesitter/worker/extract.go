@@ -333,6 +333,34 @@ func nextEntry(cur *ts.TreeCursor, first bool) bool {
 	return false
 }
 
+// constructorFunctions declares as a class each function declaration whose
+// prototype the file stores a function under: `C.prototype.m = function
+// () {}`, or a method or function-valued key of an object assigned to
+// `C.prototype`. ECMAScript gives the object `new C()` makes C.prototype as
+// its prototype (EvaluateNew, OrdinaryCreateFromConstructor), and
+// TypeScript's JavaScript checking reads such a function as a class with
+// those methods (AssignmentDeclarationKind PrototypeProperty, Prototype).
+func constructorFunctions(e *extraction, decls []*decl) {
+	owners := map[string]bool{}
+	for _, d := range decls {
+		p := d.prefix
+		if p == "" && d.node.Kind() == "method_definition" {
+			p = e.pairPath(d.node)
+		}
+		if owner, ok := strings.CutSuffix(p, ".prototype"); ok && owner != "" && !strings.ContainsAny(owner, ".[( ") {
+			owners[owner] = true
+		}
+	}
+	if len(owners) == 0 {
+		return
+	}
+	for _, d := range decls {
+		if d.kind == "function" && owners[d.name] && d.node.Kind() == "function_declaration" {
+			d.kind = "class"
+		}
+	}
+}
+
 // putDecl records d under its declaration range and name position. Two
 // patterns may capture the same declaration; the more specific kind wins.
 func (e *extraction) putDecl(d *decl) {
@@ -360,7 +388,13 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 		e.imports[key] = rec
 	}
 	if p := caps["import.path"]; len(p) > 0 && rec.path == "" {
-		rec.path = strings.Trim(p[0].Utf8Text(e.src), "\"'`")
+		switch raw := p[0].Utf8Text(e.src); e.l.Name {
+		case "javascript", "typescript", "tsx":
+			// A module specifier is the string literal's value.
+			rec.path = jsString(raw)
+		default:
+			rec.path = strings.Trim(raw, "\"'`")
+		}
 	}
 	// An aliased name's original (`from m import a as b`) is captured in
 	// the same match as its alias.
@@ -373,6 +407,13 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	}
 	if len(caps["import.fn"]) > 0 {
 		e.requireBindings(node, rec)
+	}
+	if node.Kind() == "import_require_clause" {
+		// TypeScript's `import x = require("m")` binds x to the module's
+		// whole value, as `const x = require("m")` does.
+		if id := node.NamedChild(0); id != nil && id.KindId() == e.k.identifier {
+			rec.addAs(id.Utf8Text(e.src), "*")
+		}
 	}
 	if clauses := caps["import.clause"]; len(clauses) > 0 {
 		ids := e.g.importSyntax(e.l.Name)
@@ -615,6 +656,10 @@ func (e *extraction) emit(out *emitter) error {
 		return cmpUint(a.nameStart, b.nameStart)
 	})
 	slices.SortFunc(e.scopes, func(a, b scopeNode) int { return cmpUint(a.start, b.start) })
+	switch e.l.Name {
+	case "javascript", "typescript", "tsx":
+		constructorFunctions(e, decls)
+	}
 
 	// Containment via a stack of open declarations; scope nodes take part in
 	// the chain but are never emitted.

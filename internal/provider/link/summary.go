@@ -101,9 +101,10 @@ const (
 // module identity (path, language, package, module node and the unions its
 // types name), each import, declaration (its node identity, kind, names,
 // parent, signature, flags, argument counts and returned type), supertype
-// row, re-export, and each value it stores: a function taken as a value or
-// written to a field, which the address-taken cross-product and field-based
-// resolution read, and the values the flow-based inference starts from.
+// row, Go conversion (a proven subtype relation), re-export, and each value
+// it stores: a function taken as a value or written to a field, which the
+// address-taken cross-product and field-based resolution read, and the values
+// the flow-based inference starts from.
 //
 // No byte range is in it. Each entry's hash includes the entry's position in
 // its list, because a binding names a declaration and a site by index into
@@ -132,6 +133,11 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 	}
 	for i, d := range t.Decls {
 		d.Range, d.CanonicalKey = model.SourceRange{}, ""
+		if d.Return != nil {
+			ret := *d.Return
+			ret.Range, ret.NameRange, ret.CanonicalKey = model.SourceRange{}, nil, ""
+			d.Return = &ret
+		}
 		if len(d.Parameters) > 0 {
 			d.Parameters = slices.Clone(d.Parameters)
 			for j := range d.Parameters {
@@ -142,6 +148,9 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 	}
 	for i, st := range t.Supertypes {
 		add(EntrySupertype, st.Type+"\x00"+st.Super, i, st)
+	}
+	for i, c := range t.Conversions {
+		add(EntrySupertype, "\x00"+c.Type+"\x00"+c.Interface, i, c)
 	}
 	for i, x := range t.Reexports {
 		add(EntryExport, x.Name+"\x00"+x.From, i, x)
@@ -187,15 +196,16 @@ func (t *Table) InterfaceDigest() (string, error) {
 // SitesDigest is the digest of t's sites summary: every call site in order,
 // with its caller, callee, shape, qualifier, receiver, signature, arguments
 // (their types, keywords and spreads) and in-file candidates, and the unions
-// their types name, but no byte range, callee offset or argument read: the
-// variables an argument reads are file-scoped nodes keyed by their ranges,
-// published only from the site's own file, which a content change
-// republishes. A body edit that adds, removes or rewrites a call changes it;
+// their types name, but no byte range, callee offset, argument read or
+// result: the variables an argument reads and a result is written into are
+// file-scoped nodes keyed by their ranges, and the return a result reaches is
+// the site's own file's, all published only from the site's own file, which a
+// content change republishes. A body edit that adds, removes or rewrites a call changes it;
 // one that only moves code does not.
 func (t *Table) SitesDigest() (string, error) {
 	sites := make([]Site, len(t.Sites))
 	for i, s := range t.Sites {
-		s.Range, s.NameStart, s.NameEnd = model.SourceRange{}, 0, 0
+		s.Range, s.NameStart, s.NameEnd, s.Results, s.Into = model.SourceRange{}, 0, 0, nil, 0
 		if len(s.Arguments) > 0 {
 			s.Arguments = slices.Clone(s.Arguments)
 			for j := range s.Arguments {

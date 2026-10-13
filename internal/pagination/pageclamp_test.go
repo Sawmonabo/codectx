@@ -12,8 +12,8 @@ import (
 //
 // Failure mode: a caller asks for more rows than the wire ceiling, is served the
 // ceiling, and nothing on the answer says so -- it reads as a complete result.
-// Since an edge batch limit of 0 became "no caller bound" rather than a refusal,
-// the silent path is now reachable from ordinary configuration.
+// An edge batch limit of 0 is "no caller bound" rather than a refusal, so the
+// silent path is reachable from ordinary configuration.
 //
 // Mutation: drop the record call in pageLimit and the clamped case reports no
 // notice while still returning 200.

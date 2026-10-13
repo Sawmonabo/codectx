@@ -238,7 +238,7 @@ func (f *fixture) structural(p provider.Provider, tr *tree, gen model.Generation
 // whose bytes did not move.
 func (f *fixture) attach(gen model.GenerationID, unit model.UnitID) {
 	f.t.Helper()
-	if err := f.store.AttachUnit(f.ctx, gen, unit); err != nil {
+	if _, err := f.store.AttachUnit(f.ctx, gen, unit); err != nil {
 		f.t.Fatalf("AttachUnit: %v", err)
 	}
 }
@@ -348,13 +348,15 @@ func TestRenamedParameterMovesKeywordFlow(t *testing.T) {
 	}
 }
 
-// flows counts unit's data_flows_to relations, into a node of unit named
-// name when name is set.
+// flows counts unit's argument flows, the data_flows_to relations an
+// argument's evidence carries (not the return flows beside them), into a
+// node of unit named name when name is set.
 func (s *session) flows(unit model.UnitID, name string) int {
 	s.t.Helper()
 	row := unitRowID(s.t, s.db, unit)
 	q := `SELECT count(*) FROM relation_facts rf JOIN relation_ids r ON r.id = rf.relation_id
-		WHERE rf.unit_id = ?1 AND r.kind = ?2`
+		WHERE rf.unit_id = ?1 AND r.kind = ?2 AND EXISTS (SELECT 1 FROM evidence e
+			WHERE e.unit_id = rf.unit_id AND e.relation_id = rf.relation_id AND e.detail = 'argument')`
 	args := []any{row, string(model.RelDataFlowsTo)}
 	if name != "" {
 		q += ` AND r.to_node_id IN (SELECT node_id FROM node_facts WHERE unit_id = ?1 AND name = ?3)`

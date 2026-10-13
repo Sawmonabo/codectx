@@ -398,7 +398,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// Phase: changed-input rejection. b1's unit was built over the old bytes;
 	// attaching it to a generation whose snapshot has different bytes for that
 	// file must fail.
-	if err := f.s.AttachUnit(ctx, gen2, unitB1); err == nil {
+	if _, err := f.s.AttachUnit(ctx, gen2, unitB1); err == nil {
 		t.Fatal("AttachUnit accepted a unit whose input bytes changed; stale facts would be served as fresh")
 	} else {
 		wantCode(t, err, model.CodeSnapshotChanged)
@@ -428,7 +428,7 @@ func TestStorePublicationScenario(t *testing.T) {
 
 	// Phase: unchanged reuse. Attaching unitA writes only a membership row: no
 	// new node, evidence, alias or search rows.
-	if err := f.s.AttachUnit(ctx, gen2, unitA); err != nil {
+	if _, err := f.s.AttachUnit(ctx, gen2, unitA); err != nil {
 		t.Fatalf("AttachUnit(unitA): %v", err)
 	}
 	before := f.stats()
@@ -931,10 +931,10 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginGeneration(feature): %v", err)
 	}
-	if err := f.s.AttachUnit(ctx, genFeature, unitA); err != nil {
+	if _, err := f.s.AttachUnit(ctx, genFeature, unitA); err != nil {
 		t.Fatalf("AttachUnit(unitA) into the feature generation: %v", err)
 	}
-	if err := f.s.AttachUnit(ctx, genFeature, unitB2); err != nil {
+	if _, err := f.s.AttachUnit(ctx, genFeature, unitB2); err != nil {
 		t.Fatalf("AttachUnit(unitB2) into the feature generation: %v", err)
 	}
 	bindFeature := f.activate(genFeature, gen2)
@@ -978,12 +978,12 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginGeneration(stale): %v", err)
 	}
-	if err := f.s.AttachUnit(ctx, genStale, unitA); err == nil {
+	if _, err := f.s.AttachUnit(ctx, genStale, unitA); err == nil {
 		t.Fatal("AttachUnit reused a unit whose input bytes changed")
 	} else {
 		wantCode(t, err, model.CodeSnapshotChanged)
 	}
-	if err := f.s.AttachUnit(ctx, genStale, unitB2); err != nil {
+	if _, err := f.s.AttachUnit(ctx, genStale, unitB2); err != nil {
 		t.Fatalf("AttachUnit(unitB2): %v", err)
 	}
 	bindStale := f.activate(genStale, genOwn)
@@ -998,7 +998,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginGeneration(deleted input): %v", err)
 	}
-	if err := f.s.AttachUnit(ctx, genGone, unitA); err == nil {
+	if _, err := f.s.AttachUnit(ctx, genGone, unitA); err == nil {
 		t.Fatal("AttachUnit reused a unit whose input file is gone from the snapshot")
 	} else {
 		wantCode(t, err, model.CodeSnapshotChanged)
@@ -1642,7 +1642,7 @@ func TestActivateCapabilityDetails(t *testing.T) {
 		unit := reuse
 		if unit == "" {
 			unit = f.unit(gen, f.run(gen), a)
-		} else if err := f.s.AttachUnit(f.ctx, gen, unit); err != nil {
+		} else if _, err := f.s.AttachUnit(f.ctx, gen, unit); err != nil {
 			t.Fatalf("AttachUnit: %v", err)
 		}
 		b, err := f.s.Activate(f.ctx, gen, expected, model.HealthDegraded, caps, "norm-v1")

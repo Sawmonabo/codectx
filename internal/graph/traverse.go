@@ -171,8 +171,12 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 	if err != nil {
 		return walkState{}, err
 	}
+	if o.Dependence {
+		costs = dependenceCosts(r, costs)
+	}
 	w := &levelWalk{reader: r, o: o, codes: codes, costs: costs, visit: visit,
-		routes: newRouteNames(routeCacheEntries), rule: newDispatchRule(r, mode, o.Kinds)}
+		routes: newRouteNames(routeCacheEntries), rule: newDispatchRule(r, mode, o.Kinds),
+		dependence: newDependenceWalk(r, o)}
 	st := walkState{Level: 1, LevelState: levelCollecting}
 	if o.Resume == nil {
 		if err := w.seed(ctx, seeds); err != nil {
@@ -222,6 +226,9 @@ type levelWalk struct {
 	visit  func(frontierState, Edge) error
 	// rule is the call walk's dispatch step, inactive for every other walk.
 	rule dispatchRule
+	// dependence is the impact walk's orientation rule (impactdependence.go),
+	// inactive for every other walk.
+	dependence dependenceWalk
 	// sorted is the level currently being served, held open across the pages of
 	// one request's serve so a page does not reopen and re-count it.
 	sorted *sortedLevel
@@ -431,6 +438,13 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 		if err := w.resolveIDs(ctx, pending); err != nil {
 			return err
 		}
+		if w.dependence.slicing() {
+			kept, err := w.dependence.settleSlice(ctx, w, pending)
+			if err != nil {
+				return err
+			}
+			pending = kept
+		}
 		if w.rule.active() {
 			kept, err := w.rule.settle(ctx, o.Dispatches, pending)
 			if err != nil {
@@ -481,7 +495,7 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 			// the batched id read below can then drop the batch and resume the
 			// level exactly where that batch started.
 			full := false
-			at, err := w.reader.Neighbours(ctx, refs, w.rule.direction(o.Direction), w.codes, start, func(e Edge) error {
+			at, err := w.reader.Neighbours(ctx, refs, w.dependence.scanDirection(o.Direction, w.rule), w.codes, start, func(e Edge) error {
 				if seen%edgeScanCheckEvery == 0 {
 					if err := checkWalk(ctx, o.Budget); err != nil {
 						if !deadlineStop(err, o) {
@@ -504,16 +518,9 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 					// attributing it to an arbitrary node would invent a path.
 					return nil
 				}
-				keep, err := w.keepEntry(e)
-				if err != nil || !keep {
-					return err
-				}
 				rec := levelRecord{Owner: owner, Edge: e}
-				if w.rule.active() {
-					var take bool
-					if take, rec.Step, rec.check = w.rule.entry(owner, e); !take {
-						return nil
-					}
+				if take, err := w.decideEntry(owner, e, &rec); err != nil || !take {
+					return err
 				}
 				if len(pending) >= levelResolveBatch {
 					// Stopped BEFORE this entry is taken, so the position the
@@ -669,6 +676,12 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 			return errLevelCut
 		}
 		for i, rec := range batch {
+			if rec.Slice&sliceSilent != 0 {
+				// It lifted a node already reached, over an edge already
+				// served (impactdependence.go): nothing is served again.
+				at = ends[i]
+				continue
+			}
 			if w.groupOpen && rec.NodeID != w.groupID {
 				if err := w.closeGroup(); err != nil {
 					return err
@@ -1409,7 +1422,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	}
 	// A continuation is offered for EVERY stop that left a frontier standing --
 	// a full page, a spent per-page visited or edge budget, a level the frontier
-	// byte ceiling spilled. All three are now per-page budgets, so the resumed
+	// byte ceiling spilled. All three are per-page budgets, so the resumed
 	// page makes progress rather than stopping at once.
 	//
 	// The depth bound is the single exception, and DepthLimited on walkState

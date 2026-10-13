@@ -37,12 +37,13 @@ type fakeServices struct {
 	refreshFn     func(context.Context, model.IndexRequest) (model.IndexResult, error)
 	indexStatusFn func(context.Context, model.StatusRequest) (model.IndexStatus, error)
 
-	overviewFn   func(context.Context, model.OverviewRequest) (model.Page[model.OverviewItem], error)
-	searchFn     func(context.Context, model.SearchRequest) (model.Page[model.SearchHit], error)
-	symbolFn     func(context.Context, model.SymbolRequest) (model.Page[model.Node], error)
-	referencesFn func(context.Context, model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
-	graphFn      func(context.Context, model.GraphRequest) (model.GraphResult, error)
-	pathFn       func(context.Context, model.PathRequest) (model.PathResult, error)
+	overviewFn     func(context.Context, model.OverviewRequest) (model.Page[model.OverviewItem], error)
+	searchFn       func(context.Context, model.SearchRequest) (model.Page[model.SearchHit], error)
+	symbolFn       func(context.Context, model.SymbolRequest) (model.Page[model.Node], error)
+	referencesFn   func(context.Context, model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
+	nodeMetadataFn func(context.Context, model.NodeMetadataRequest) (model.Page[model.MetadataRow], error)
+	graphFn        func(context.Context, model.GraphRequest) (model.GraphResult, error)
+	pathFn         func(context.Context, model.PathRequest) (model.PathResult, error)
 	// impactFn tracks ExploreService.Impact, which returns model.ImpactResult
 	// whole.
 	impactFn func(context.Context, model.ImpactRequest) (model.ImpactResult, error)
@@ -120,6 +121,13 @@ func (f *fakeServices) References(ctx context.Context, r model.ReferenceRequest)
 		return model.Page[model.ReferenceOccurrence]{}, unset("References")
 	}
 	return f.referencesFn(ctx, r)
+}
+
+func (f *fakeServices) NodeMetadata(ctx context.Context, r model.NodeMetadataRequest) (model.Page[model.MetadataRow], error) {
+	if f.nodeMetadataFn == nil {
+		return model.Page[model.MetadataRow]{}, unset("NodeMetadata")
+	}
+	return f.nodeMetadataFn(ctx, r)
 }
 
 func (f *fakeServices) Graph(ctx context.Context, r model.GraphRequest) (model.GraphResult, error) {
@@ -266,7 +274,7 @@ func newTestHandlers(f *fakeServices) *handlers {
 	}
 }
 
-// newTestServer registers all 23 tools over the given fake. register panics if
+// newTestServer registers all 24 tools over the given fake. register panics if
 // jsonschema inference fails for any In or Out type, so simply reaching the
 // return statement is the reflection smoke test for the whole surface.
 func newTestServer(f *fakeServices) *mcp.Server {
@@ -362,30 +370,34 @@ func connectWith(t *testing.T, s *mcp.Server, c *mcp.Client, wantClean bool) *mc
 // exactly the silent change a snapshot exists to catch.
 //
 // codectx_refresh_index takes no arguments, and codectx_read_source has two
-// modes whose fields its Validate checks, so they require none.
+// modes whose fields its Validate checks, so they require none. A field whose
+// zero value means "the configured or endpoint default" -- the page and its
+// limit, the walk bounds, the context budget -- is never required: a client
+// that leaves it out asks for the default, as a zero would.
 var toolSchemas = map[string][]string{
 	"codectx_index_status":        {"resources"},
 	"codectx_refresh_index":       nil,
-	"codectx_repo_overview":       {"depth", "page"},
-	"codectx_search":              {"query", "page"},
-	"codectx_find_symbol":         {"query", "operation", "semantic_source", "page"},
-	"codectx_symbol_info":         {"query", "semantic_source", "page"},
-	"codectx_references":          {"node_id", "operation", "semantic_source", "page"},
-	"codectx_callers":             {"start", "max_depth", "max_visited", "max_edges", "page"},
-	"codectx_callees":             {"start", "max_depth", "max_visited", "max_edges", "page"},
-	"codectx_dependency_path":     {"from", "to", "max_depth", "max_visited", "page"},
-	"codectx_impact":              {"start", "direction", "max_depth", "max_visited", "max_edges", "page"},
+	"codectx_repo_overview":       {"depth"},
+	"codectx_search":              {"query"},
+	"codectx_find_symbol":         {"query", "operation", "semantic_source"},
+	"codectx_symbol_info":         {"query", "semantic_source"},
+	"codectx_references":          {"node_id", "operation", "semantic_source"},
+	"codectx_node_metadata":       {"node_id", "field"},
+	"codectx_callers":             {"start"},
+	"codectx_callees":             {"start"},
+	"codectx_dependency_path":     {"from", "to"},
+	"codectx_impact":              {"start", "direction"},
 	"codectx_context_plan":        {"context", "actor_id"},
-	"codectx_context_status":      {"session_id", "actor_id", "page"},
+	"codectx_context_status":      {"session_id", "actor_id"},
 	"codectx_context_next":        {"session_id", "actor_id"},
-	"codectx_context_entries":     {"session_id", "actor_id", "view", "page"},
+	"codectx_context_entries":     {"session_id", "actor_id", "view"},
 	"codectx_context_include":     {"session_id", "actor_id", "seeds", "expected_version"},
 	"codectx_read_source":         nil,
 	"codectx_context_acknowledge": {"session_id", "actor_id", "kind"},
 	"codectx_context_waive":       {"session_id", "actor_id", "file_id", "reason"},
 	"codectx_context_record":      {"session_id", "actor_id", "expected_scope_version", "kind", "note"},
 	"codectx_context_advance":     {"session_id", "actor_id", "target", "expected_version"},
-	"codectx_context_capsule":     {"session_id", "actor_id", "view", "page"},
+	"codectx_context_capsule":     {"session_id", "actor_id", "view"},
 	"codectx_context_close":       {"session_id", "actor_id", "expected_version"},
 }
 
@@ -539,6 +551,9 @@ type scenario struct {
 	callCtx func(*testing.T, *fakeServices) context.Context
 }
 
+// testNodeID is a well-formed node id for rows that address one node.
+const testNodeID model.NodeID = "0000000000000000000000000000000000000000000000000000000000000001"
+
 var scenarios = []scenario{
 	// The shared envelope.
 	{
@@ -546,7 +561,7 @@ var scenarios = []scenario{
 		// envelope loses the build's schema version, warnings serializes as
 		// null instead of [], or the facade's answer does not survive
 		// StructuredContent. Every other handler copies this shape, so
-		// this row failing means all 23 are suspect.
+		// this row failing means all 24 are suspect.
 		name: "index_status round-trips the shared envelope",
 		facade: func(f *fakeServices) {
 			f.indexStatusFn = func(_ context.Context, r model.StatusRequest) (model.IndexStatus, error) {
@@ -757,6 +772,38 @@ var scenarios = []scenario{
 			}
 			if strings.Contains(string(raw), `"content"`) {
 				t.Errorf("find_symbol answer carries source bytes: %s", raw)
+			}
+		},
+	},
+	{
+		// Failure mode: a node metadata field stored as rows cannot be read
+		// over MCP. Mutation caught: the handler drops the field or the node
+		// on the way to the facade, or a row's raw JSON value fails the
+		// output schema (it is json.RawMessage, like Node.Metadata), so the
+		// rows a "<field>_rows" marker names are unreachable.
+		name: "node_metadata forwards the node and field and returns the rows verbatim",
+		facade: func(f *fakeServices) {
+			f.nodeMetadataFn = func(_ context.Context, r model.NodeMetadataRequest) (model.Page[model.MetadataRow], error) {
+				if r.NodeID != testNodeID || r.Field != model.MetaDecorators {
+					return model.Page[model.MetadataRow]{}, unset("NodeMetadata: node or field was not forwarded")
+				}
+				return model.Page[model.MetadataRow]{Items: []model.MetadataRow{
+					{Field: model.MetaDecorators, Ordinal: 0, Shape: model.RowElement, Value: json.RawMessage(`{"name":"app.route","bytes":{"start":0,"end":9}}`)},
+					{Field: model.MetaDecorators, Ordinal: 1, Shape: model.RowElement, Value: json.RawMessage(`{"name":"login_required","bytes":{"start":10,"end":25}}`)},
+				}}, nil
+			}
+		},
+		tool: "codectx_node_metadata",
+		args: model.NodeMetadataRequest{NodeID: testNodeID, Field: model.MetaDecorators, Page: model.PageRequest{Limit: 10}},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("node_metadata reported a tool error: %s", firstText(res))
+			}
+			var got result[model.Page[model.MetadataRow]]
+			decode(t, res, &got)
+			if len(got.Data.Items) != 2 || got.Data.Items[1].Ordinal != 1 ||
+				string(got.Data.Items[1].Value) != `{"name":"login_required","bytes":{"start":10,"end":25}}` {
+				t.Errorf("items = %+v, want the facade's two rows verbatim, in order", got.Data.Items)
 			}
 		},
 	},
@@ -1066,9 +1113,9 @@ var scenarios = []scenario{
 	},
 	func() scenario {
 		// Failure mode: view="export" answers with capsule RECORDS. A sealed
-		// capsule now carries only identity and its eight per-list counts --
+		// capsule carries only identity and its eight per-list counts --
 		// the records are rows read one keyset page at a time -- so the failure
-		// this row still guards is the projection: an export that omits a
+		// this row guards is the projection: an export that omits a
 		// list's count, or that also returns a page, makes a caller believe it
 		// has been told how much the capsule holds when it has not.
 		//

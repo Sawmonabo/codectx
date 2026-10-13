@@ -3,7 +3,6 @@ package manifest
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"path"
@@ -13,6 +12,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
+	"github.com/Sawmonabo/codectx/internal/source"
 )
 
 // requirements reads a pip requirements file and every file it includes.
@@ -40,14 +40,16 @@ import (
 // option line (`-e`, `--index-url`, `--find-links`, ...), a requirement that
 // is a bare URL, path or archive, and an include that is a URL, absolute,
 // outside the workspace, empty, or names an environment variable. Each such
-// line is one evidence row on the configuration node, with the line's range
-// and a detail of `line` (the text), `reason` (for an include) and `via` (for
-// an included file, whose rows carry no range). One row per line, rather
-// than one list in node metadata, is what keeps every line: metadata is one
-// bounded payload per node, while a node's evidence is rows, paged on read
-// and bounded only by the per-fact evidence clip, which counts what it cuts.
-// A line over the evidence detail bound is shortened and counted under
-// `evidence_detail_bytes`. An include the snapshot does not hold is
+// line is one metadata row (model.MetaUnresolvedLines) on the configuration
+// node, located at the line, whose value is `line` (the text, never cut),
+// `reason` (for an include) and `via` (for an included file); a line of an
+// included file is located in that file, one of the unit's inputs, so two
+// identical lines are two rows at two ranges. The node's metadata says how
+// many there are under
+// `unresolved_lines_rows`. The lines are always rows, never inline, so each
+// keeps its own range; readers page them like any other metadata row, and
+// only the per-fact evidence clip, which counts what it cuts, bounds them.
+// An include the snapshot does not hold is
 // still a `configures` fact and leaves the capability partial. A requirement
 // that names an environment variable (`${TOKEN}`) after its name is published
 // with `unresolved: environment`.
@@ -61,18 +63,18 @@ func (u *unit) requirements(ctx context.Context) error {
 		}
 		next := queue[0]
 		queue = queue[1:]
-		data := u.data
+		w.cur = reqSource{data: u.data, cursor: u.cursor}
 		if next.path != rel {
-			read, ok, err := u.readIncluded(ctx, next.path)
+			read, fv, ok, err := u.readIncluded(ctx, next.path)
 			if err != nil {
 				return err
 			}
 			if !ok {
 				continue
 			}
-			data = read
+			w.cur = reqSource{file: &fv, data: read, cursor: source.NewCursor(read)}
 		}
-		for _, l := range logicalLines(data) {
+		for _, l := range logicalLines(w.cur.data) {
 			if target, ok := w.line(next.path, l, next.constraint); ok && !w.visited[target] {
 				w.visited[target] = true
 				queue = append(queue, target)
@@ -80,22 +82,23 @@ func (u *unit) requirements(ctx context.Context) error {
 		}
 	}
 	qualified, name := ecosystemPyPI+":requirements:"+rel, path.Base(rel)
-	cfg, err := u.defines(ctx, model.NodeConfiguration, qualified, name, languagePython, nil, nil)
+	var meta map[string]any
+	if len(w.unresolved) > 0 {
+		meta = map[string]any{model.MetadataRowsKey(model.MetaUnresolvedLines): len(w.unresolved)}
+	}
+	cfg, err := u.defines(ctx, model.NodeConfiguration, qualified, name, languagePython, nil, meta)
 	if err != nil {
 		return err
 	}
-	cand, shortened := u.definedCandidate(model.NodeConfiguration, qualified, name, languagePython), 0
-	for _, l := range w.unresolved {
-		detail := filesystem.Detail("line", l.text, "reason", l.reason, "via", l.via)
-		if !detailKeeps(detail, "line", l.text) {
-			shortened++
-		}
-		if _, err := u.e.Node(ctx, cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: l.rng, Detail: detail}); err != nil {
+	for i, l := range w.unresolved {
+		value, err := model.EncodeMetadataValue(unresolvedLine{Line: l.text, Reason: l.reason, Via: l.via})
+		if err != nil {
 			return err
 		}
-	}
-	if shortened > 0 {
-		u.degraded(detailBytes, strconv.Itoa(shortened)+" lines over "+strconv.Itoa(model.MaxDetailBytes))
+		row := model.MetadataRow{Field: model.MetaUnresolvedLines, Ordinal: int64(i), Shape: model.RowElement, Value: value}
+		if err := u.e.AddMetadataRow(cfg.ID, model.PrecisionSyntax, l.file, l.rng, row); err != nil {
+			return err
+		}
 	}
 	for i, inc := range w.includes {
 		if u.cut(BoundEntries, u.entries, int64(i+1)) {
@@ -145,27 +148,54 @@ type reqWalk struct {
 	deps       []reqDep
 	includes   []reqInclude
 	unresolved []reqUnresolved
+	// cur is the file the walk is reading and at the logical line it is on,
+	// so an unresolved line is located in its own file, an included one
+	// included.
+	cur reqSource
+	at  reqLogical
+}
+
+// reqSource is one file the walk reads: file is nil for the unit's own file
+// and the included file's version otherwise, and cursor converts its bytes to
+// positions.
+type reqSource struct {
+	file   *model.FileVersion
+	data   []byte
+	cursor *source.Cursor
+}
+
+// rangeOf is the source range of [start,end) in s, or nil when the interval is
+// not a valid one.
+func (s reqSource) rangeOf(start, end int) *model.SourceRange {
+	if start < 0 || end < start || end > len(s.data) {
+		return nil
+	}
+	a, err := s.cursor.PositionAt(uint64(start))
+	if err != nil {
+		return nil
+	}
+	b, err := s.cursor.PositionAt(uint64(end))
+	if err != nil {
+		return nil
+	}
+	return &model.SourceRange{Start: a, End: b}
 }
 
 // reqUnresolved is one line the reader does not interpret, as written. reason
-// is set for an include line pip would act on; via and rng follow reqDep.
+// is set for an include line pip would act on; via names an included file.
+// rng is the line's range in its own file, file that file when it is an
+// included one (nil for the unit's own file).
 type reqUnresolved struct {
 	text, reason, via string
+	file              *model.FileVersion
 	rng               *model.SourceRange
 }
 
-// detailBytes is the capability detail key that counts the unresolved lines
-// whose text was shortened to fit the evidence detail bound.
-const detailBytes = "evidence_detail_bytes"
-
-// detailKeeps reports whether a rendered evidence detail still carries value
-// under key in full.
-func detailKeeps(detail, key, value string) bool {
-	var fields map[string]string
-	if err := json.Unmarshal([]byte(detail), &fields); err != nil {
-		return false
-	}
-	return fields[key] == value
+// unresolvedLine is the value of one model.MetaUnresolvedLines row.
+type unresolvedLine struct {
+	Line   string `json:"line"`
+	Reason string `json:"reason,omitempty"`
+	Via    string `json:"via,omitempty"`
 }
 
 // reqDep is one requirement or constraint line. via is the declaring file
@@ -193,6 +223,7 @@ type reqLogical struct {
 // line classifies one logical line of file, read in constraint mode or not.
 // It returns the include to follow, if the line is one.
 func (w *reqWalk) line(file string, l reqLogical, constraint bool) (reqVisit, bool) {
+	w.at = l
 	var rng *model.SourceRange
 	via := ""
 	if file == w.root {
@@ -204,7 +235,7 @@ func (w *reqWalk) line(file string, l reqLogical, constraint bool) (reqVisit, bo
 		if value, constraint, ok := includeOption(l.text); ok {
 			return w.include(file, value, constraint, l.text, via, rng)
 		}
-		w.unresolve(l.text, via, "", rng)
+		w.unresolve(l.text, via, "")
 		return reqVisit{}, false
 	}
 	args, options := breakArgsOptions(l.text)
@@ -212,7 +243,7 @@ func (w *reqWalk) line(file string, l reqLogical, constraint bool) (reqVisit, bo
 	if !pep508Name(name) || !pep508Rest(spec) || archiveName(name) {
 		// A bare URL, path or archive installs what it names, which this
 		// static reader cannot know.
-		w.unresolve(l.text, via, "", rng)
+		w.unresolve(l.text, via, "")
 		return reqVisit{}, false
 	}
 	w.deps = append(w.deps, reqDep{name: name, spec: spec, options: options, via: via,
@@ -229,7 +260,7 @@ func (w *reqWalk) include(file, value string, constraint bool, text, via string,
 	}
 	target, reason := includeTarget(file, value)
 	if reason != "" {
-		w.unresolve(text, via, reason, rng)
+		w.unresolve(text, via, reason)
 		if reason == reasonMalformed {
 			w.u.malformedEntry()
 		}
@@ -280,35 +311,37 @@ func includeTarget(file, value string) (target, reason string) {
 }
 
 // unresolve records a line this reader does not interpret, with the file it
-// came from when that is an include, its range when it is the unit's own
-// file, and the reason when the line itself is one pip would act on.
-func (w *reqWalk) unresolve(text, via, reason string, rng *model.SourceRange) {
+// came from when that is an include, its range in that file, and the reason
+// when the line itself is one pip would act on. Every line is located, an
+// included file's in the included file, which is one of the unit's inputs.
+func (w *reqWalk) unresolve(text, via, reason string) {
 	if w.u.cut(BoundEntries, w.u.entries, int64(len(w.unresolved)+1)) {
 		return
 	}
-	w.unresolved = append(w.unresolved, reqUnresolved{text: text, reason: reason, via: via, rng: rng})
+	w.unresolved = append(w.unresolved, reqUnresolved{text: text, reason: reason, via: via,
+		file: w.cur.file, rng: w.cur.rangeOf(w.at.start, w.at.end)})
 }
 
 // readIncluded reads an included file from the unit's snapshot under the
 // same parse admission as the unit's own file. ok is false for a file the
 // snapshot does not hold (never retained, ignored, or deleted) and for one
 // over the parse bound; both are recorded on the unit's capability.
-func (u *unit) readIncluded(ctx context.Context, rel string) ([]byte, bool, error) {
+func (u *unit) readIncluded(ctx context.Context, rel string) ([]byte, model.FileVersion, bool, error) {
 	data, fv, held, err := readHeld(ctx, u.content, u.repo, rel, u.maxParse)
 	switch {
 	case err != nil:
-		return nil, false, err
+		return nil, fv, false, err
 	case !held:
 		// The included file is not in this snapshot: pip would fail here,
 		// and the packages it declares are not visible.
 		u.malformedEntry()
-		return nil, false, nil
+		return nil, fv, false, nil
 	case data == nil:
 		u.degraded("max_parse_file_bytes", rel+" is "+strconv.FormatInt(fv.Size, 10)+" over "+u.maxParse.String())
-		return nil, false, nil
+		return nil, fv, false, nil
 	}
 	u.e.AddBytes(uint64(len(data)))
-	return data, true, nil
+	return data, fv, true, nil
 }
 
 // readHeld reads one file of the snapshot under the parse admission. held is

@@ -181,8 +181,8 @@ func (p *publisher) republishes() (func(model.FileID) (bool, error), func(), err
 }
 
 // targetable is every node of t a fact can target, by node: its
-// declarations (the first of each node), its module and each parameter with
-// a node.
+// declarations (the first of each node), its module, each parameter with a
+// node and each declaration's return node.
 func targetable(t *Table) map[model.NodeID]Endpoint {
 	byNode := make(map[model.NodeID]Endpoint, len(t.Decls)+1)
 	add := func(e Endpoint) {
@@ -197,6 +197,9 @@ func targetable(t *Table) map[model.NodeID]Endpoint {
 	for i := range t.Decls {
 		for _, pa := range t.Decls[i].Parameters {
 			add(pa.Endpoint)
+		}
+		if r := t.Decls[i].Return; r != nil {
+			add(*r)
 		}
 	}
 	return byNode
@@ -457,9 +460,12 @@ type filePublication struct {
 // target (a declaration or an external method), each with the occurrence's
 // dispatch and, when there are several, the set size; or, when the site has
 // no call fact and no FactExternalSite, its open-site node and the caller's
-// `calls` to it; and, for each FactFlow, one `data_flows_to` from each
-// variable the argument reads to the parameter. It counts the site bound,
-// external, computed or open.
+// `calls` to it; for each FactFlow, one `data_flows_to` from each variable
+// the argument reads to the parameter; for each FactSummary, one from each
+// variable the argument reads to each variable the site's result is written
+// into (returnFlows); and for each FactReturn, one from the callee's return
+// node to each of those and to the return node the result reaches. It
+// counts the site bound, external, computed or open.
 func (f *filePublication) site(i int32, group []idBinding) error {
 	s := &f.t.Sites[i]
 	caller, err := f.caller(s)
@@ -520,6 +526,9 @@ func (f *filePublication) site(i int32, group []idBinding) error {
 		if err := f.openSite(s, caller, cmp.Or(reason, openReason(s))); err != nil {
 			return err
 		}
+	}
+	if err := f.returnFlows(s, group, key); err != nil {
+		return err
 	}
 	for _, b := range group {
 		if b.Kind != FactFlow {
@@ -637,17 +646,23 @@ func (f *filePublication) openSite(s *Site, caller Endpoint, reason model.OpenSi
 // imports publishes the file module's `imports` to the module of each
 // distinct member group resolves imp to, each with the set size when there
 // are several, located at the import, and counts imp resolved when there is
-// one.
+// one, or open when it names a module of the repository that no member is
+// (FactOpenImport).
 func (f *filePublication) imports(imp *Import, group []idBinding) {
 	var targets []idBinding
 	distinct := map[model.NodeID]bool{}
+	open := false
 	for _, b := range group {
 		if b.Kind == FactImport && !distinct[b.Target] {
 			distinct[b.Target] = true
 			targets = append(targets, b)
 		}
+		open = open || b.Kind == FactOpenImport
 	}
 	if len(targets) == 0 {
+		if open {
+			f.counts.OpenImports++
+		}
 		return
 	}
 	f.counts.Imports++
@@ -665,17 +680,10 @@ func (f *filePublication) imports(imp *Import, group []idBinding) {
 // the import, named "import" and keyed in the file's scope by "openimport:",
 // the path and the import's bytes, and the file module's `imports` to it.
 func (f *filePublication) dynamicImports() error {
-	path := f.fv.Path
 	for i := range f.t.DynamicImports {
 		d := &f.t.DynamicImports[i]
 		f.counts.OpenImports++
-		meta, err := openImportMetadata(d.Fragments)
-		if err != nil {
-			return err
-		}
-		n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path,
-			NativeKey: fitKey("openimport:" + path + ":" + byteSpan(d.Range)), Kind: model.NodeModule,
-			Language: f.t.Language, Name: "import"}, d.Range, meta)
+		n, err := f.openImportSite(d)
 		if err != nil {
 			return err
 		}

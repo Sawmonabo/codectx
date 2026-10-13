@@ -710,4 +710,564 @@ export function main(n) { // @main
 		},
 		fails: "`any`, `unknown` or `object` read as a named type outside the project publishes an external call or external site for each",
 	},
+	{
+		name: "workspace-package-exports-into-build-output",
+		anchor: "Node.js Packages (`exports`, conditional exports in object order); npm Workspaces (a workspace is linked by its `name`); " +
+			"TypeScript Modules Reference (local packages: an outDir target maps back to rootDir)",
+		files: map[string]string{
+			"package.json": `{"name": "root", "private": true, "workspaces": ["packages/*"]}
+`,
+			"packages/util/package.json": `{
+  // JSONC is not valid in package.json, but the reader tolerates it.
+  "name": "@acme/util",
+  "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js"}},
+}
+`,
+			"packages/util/tsconfig.json": `{
+  // The build emits src into dist.
+  "compilerOptions": {"outDir": "dist", "rootDir": "src",},
+}
+`,
+			"packages/util/src/index.ts": `export function helper() {} // @helper
+`,
+			"packages/app/package.json": `{"name": "app"}
+`,
+			"packages/app/src/main.ts": `import { helper } from "@acme/util";
+
+export function run() {
+  helper(); // @r1
+}
+`,
+		},
+		// Derived from the anchors: the import names the workspace package @acme/util, whose "." export's first
+		// matching condition is "types" (always matched) -> ./dist/index.d.ts, not a member; the package's own
+		// tsconfig emits src into dist, so dist/index.d.ts maps back to src/index.ts.
+		want: []string{
+			"r1 helper -> helper helper exact",
+		},
+		facts: []string{
+			"packages/app/src/main.ts imports packages/util/src/index.ts",
+		},
+		// Mutation: drop the outDir -> rootDir remap (or never read the workspace map) -> the import and r1 resolve
+		// to nothing.
+		fails: "a bare workspace specifier treated as a package outside the repository, or an exports target into dist left unmapped, leaves r1 unbound",
+	},
+	{
+		name:   "tsconfig-paths-longest-prefix",
+		anchor: "TypeScript tsconfig reference (`paths`: the longest matching prefix wins; targets resolve against `baseUrl`)",
+		files: map[string]string{
+			"tsconfig.json": `{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"], "@/lib/*": ["lib/*"]}}}
+`,
+			"src/a.ts": `export function a() {} // @a
+`,
+			"lib/b.ts": `export function b() {} // @b
+`,
+			"src/main.ts": `import { a } from "@/a";
+import { b } from "@/lib/b";
+
+export function run() {
+  a(); // @ra
+  b(); // @rb
+}
+`,
+		},
+		// Derived from the anchor: "@/lib/b" matches both keys; "@/lib/*" has the longer prefix, so it names
+		// lib/b.ts, never src/lib/b.
+		want: []string{
+			"ra a -> a a exact",
+			"rb b -> b b exact",
+		},
+		facts: []string{
+			"src/main.ts imports lib/b.ts",
+			"src/main.ts imports src/a.ts",
+		},
+		// Mutation: take the first matching `paths` key instead of the longest prefix -> "@/lib/b" resolves to
+		// src/lib/b, which no member is, and rb is unbound.
+		fails: "a paths alias resolved by the first matching key rather than the longest prefix leaves rb unbound",
+	},
+	{
+		name:   "duplicate-workspace-names",
+		anchor: "npm Workspaces (a workspace is linked by its declared `name`); two packages of one name are the repository's own ambiguity",
+		files: map[string]string{
+			"package.json": `{"name": "root", "workspaces": ["packages/*"]}
+`,
+			"packages/x1/package.json": `{"name": "dup", "main": "index.js"}
+`,
+			"packages/x1/index.js": `export function f() {} // @f1
+`,
+			"packages/x2/package.json": `{"name": "dup", "main": "index.js"}
+`,
+			"packages/x2/index.js": `export function f() {} // @f2
+`,
+			"main.js": `import { f } from "dup";
+
+export function run() {
+  f(); // @r
+}
+`,
+		},
+		// Derived from the anchor: both packages declare "dup", so the import names both, each through its main.
+		want: []string{
+			"r f -> f1 f exact set=2",
+			"r f -> f2 f exact set=2",
+		},
+		facts: []string{
+			"main.js imports packages/x1/index.js set=2",
+			"main.js imports packages/x2/index.js set=2",
+		},
+		// Mutation: keep one directory per package name (the last one read) -> one target and no set size.
+		fails: "two workspace packages of one name resolved by preference publish one target instead of the set",
+	},
+	{
+		name: "nodenext-esm-directory-import",
+		anchor: "TypeScript Modules Reference (node16/nodenext: directory modules and extensionless paths are supported only in require calls; " +
+			"a .ts file is an ES module when its package.json says \"type\": \"module\")",
+		files: map[string]string{
+			"package.json": `{"name": "m", "type": "module"}
+`,
+			"tsconfig.json": `{"compilerOptions": {"module": "nodenext"}}
+`,
+			"src/lib/index.ts": `export function g() {} // @g
+`,
+			"src/main.ts": `import { g } from "./lib";
+import { g as h } from "./lib/index.js";
+
+export function run() {
+  g(); // @r1
+  h(); // @r2
+}
+`,
+		},
+		// Derived from the anchor: under nodenext an ES module's `import "./lib"` names no file; "./lib/index.js"
+		// names src/lib/index.ts by extension substitution.
+		want: []string{
+			"r2 h -> g g exact",
+		},
+		facts: []string{
+			"src/main.ts imports src/lib/index.ts",
+		},
+		// Mutation: add a directory's index form for every import whatever the mode -> r1 binds to g.
+		fails: "the directory index form admitted under nodenext ESM binds r1 to src/lib/index.ts's g",
+	},
+	{
+		name:   "require-condition",
+		anchor: "Node.js Packages (conditional exports: \"require\" matches a require call, \"import\" an import)",
+		files: map[string]string{
+			"package.json": `{"name": "root", "workspaces": ["packages/*"]}
+`,
+			"packages/dual/package.json": `{"name": "dual", "exports": {"import": "./esm.js", "require": "./cjs.js"}}
+`,
+			"packages/dual/esm.js": `export function f() {} // @fe
+`,
+			"packages/dual/cjs.js": `export function f() {} // @fc
+`,
+			"main.js": `const { f } = require("dual");
+
+export function run() {
+  f(); // @r
+}
+`,
+		},
+		// Derived from the anchor: a require call matches the "require" condition, so it names cjs.js alone.
+		want: []string{
+			"r f -> fc f exact",
+		},
+		facts: []string{
+			"main.js imports packages/dual/cjs.js",
+		},
+		// Mutation: ignore the import's form and match "import" for every import -> the require names esm.js.
+		fails: "a require resolved under the import condition binds r to esm.js's f",
+	},
+	{
+		name:   "exports-into-unbuilt-output",
+		anchor: "Node.js Packages (`exports`); an in-repository package whose exports name no member is an open import, not an external one",
+		files: map[string]string{
+			"package.json": `{"name": "root", "workspaces": ["packages/*"]}
+`,
+			"packages/u/package.json": `{"name": "u", "exports": "./dist/u.js"}
+`,
+			"packages/u/src/u.js": `export function x() {} // @x
+`,
+			"main.js": `import { x } from "u";
+
+export function run() {
+  x(); // @r
+}
+`,
+		},
+		// Derived from the anchor: the package is the repository's, its only export target is unbuilt output and
+		// no config maps it back, so the import resolves to no member and the call is open, not external.
+		want: []string{},
+		counts: map[string]string{
+			"sites": "1", "bound_sites": "0", "external_sites": "0", "open_sites": "1",
+		},
+		// Mutation: treat an in-repository import that reaches no member as a package outside the repository ->
+		// external_sites is 1.
+		fails: "an in-repository package whose exports name no member counted as an external call",
+	},
+	{
+		name:   "pnpm-workspace-without-root-package",
+		anchor: "pnpm pnpm-workspace.yaml (`packages` globs declare the workspace; packages link by name)",
+		files: map[string]string{
+			"pnpm-workspace.yaml": `packages:
+  # every library
+  - 'libs/*'
+`,
+			"libs/k/package.json": `{"name": "k", "main": "src/index.js"}
+`,
+			"libs/k/src/index.js": `export function k() {} // @k
+`,
+			"apps/w/package.json": `{"name": "w"}
+`,
+			"apps/w/main.js": `import { k } from "k";
+
+export function run() {
+  k(); // @r
+}
+`,
+		},
+		// Derived from the anchor: the workspace file is the project's root, so libs/k and apps/w are one unit and
+		// "k" names libs/k through its main.
+		want: []string{
+			"r k -> k k exact",
+		},
+		facts: []string{
+			"apps/w/main.js imports libs/k/src/index.js",
+		},
+		// Mutation: drop pnpm-workspace.yaml from the project markers -> apps/w is a unit of its own and r is
+		// unbound.
+		fails: "a pnpm workspace with no root package.json planned as one unit per package leaves r unbound",
+	},
+	{
+		name:   "typescript-import-equals-require",
+		anchor: "TypeScript Handbook, Modules (`import x = require(\"m\")` imports the module m)",
+		files: map[string]string{
+			"src/a.ts": `export function f() {} // @f
+`,
+			"src/main.ts": `import a = require("./a");
+
+export function run() {
+  return a;
+}
+`,
+		},
+		// Derived from the anchor: the clause imports src/a.ts.
+		want: []string{},
+		facts: []string{
+			"src/main.ts imports src/a.ts",
+		},
+		// Mutation: drop the import_require_clause pattern from typescript.scm -> the import is no import record
+		// and publishes nothing.
+		fails: "`import x = require()` read as no import loses the import of src/a.ts",
+	},
+	{
+		name: "wrapped-and-private-callees",
+		anchor: "ECMA-262 (15th edition, 2024) §13.2.9 (the grouping operator keeps the reference), §15.7 (PrivateName); " +
+			"TypeScript Handbook (non-null assertion `!`, `as` and `satisfies` change no value)",
+		files: map[string]string{
+			"src/a.ts": `export function f() {} // @f
+
+export class C {
+  #p() {} // @p
+  m() {} // @m
+  run() {
+    this.#p(); // @r1
+    (this.m)(); // @r2
+  }
+}
+
+export function go(c: C) {
+  f!(); // @rnn
+  (f as any)(); // @r4
+  (c.m satisfies () => void)(); // @r5
+  (f)(); // @r6
+}
+`,
+		},
+		// Derived from the anchors: each wrapper leaves the callee's reference, so every call names its
+		// declaration; a private name is its class body's alone, so `this.#p()` runs no override.
+		want: []string{
+			"r1 #p -> p #p exact",
+			"r2 m -> m m virtual",
+			"rnn f -> f f exact",
+			"r4 f -> f f exact",
+			"r5 m -> m m virtual",
+			"r6 f -> f f exact",
+		},
+		// Mutation: drop the wrapped and private callee patterns -> every call is a computed site and binds
+		// nothing; dispatch a private method like any other -> r1 is virtual.
+		fails: "a wrapped or private callee read as computed leaves the six calls unbound; a private method dispatched as overridable makes r1 virtual",
+	},
+	{
+		name:   "escaped-specifiers",
+		anchor: "ECMA-262 (15th edition, 2024) §12.9.4 (String Literals: a string's value decodes its escape sequences); §16.2.2 (Imports)",
+		files: map[string]string{
+			"src/a.js": `export function f() {} // @fa
+`,
+			"src/b.js": `export function g() {} // @gb
+`,
+			"src/main.js": `import { f } from "./\u0061.js";
+const { g } = require('./\x62');
+
+export function run() {
+  f(); // @ra
+  g(); // @rb
+}
+`,
+		},
+		// Derived from the anchor: "./\u0061.js" is "./a.js" and './\x62' is './b'.
+		want: []string{
+			"ra f -> fa f exact",
+			"rb g -> gb g exact",
+		},
+		facts: []string{
+			"src/main.js imports src/a.js",
+			"src/main.js imports src/b.js",
+		},
+		// Mutation: read a specifier as its raw text -> "./\u0061.js" names no file and both calls are unbound.
+		fails: "a specifier's escapes left undecoded name files that do not exist and leave ra and rb unbound",
+	},
+	{
+		name: "commonjs-export-forms",
+		anchor: "Node.js Modules: CommonJS modules (`module.exports`, the `exports` shortcut and its reassignment); " +
+			"TypeScript binder (ModuleExports, ExportsProperty, ObjectDefinePropertyExports; an ES module ignores them)",
+		files: map[string]string{
+			"src/m.js": `module.exports = function () {}; // @mf
+`,
+			"src/lib.js": `function helper() {} // @h
+function other() {} // @o
+module.exports = { helper, run: other };
+`,
+			"src/a.js": `function a() {} // @a
+exports.x = a;
+`,
+			"src/b.js": `function b() {} // @b
+exports.y = b;
+exports = {};
+`,
+			"src/c.js": `function impl() {} // @i
+function def() {} // @d
+Object.defineProperty(exports, "__esModule", { value: true });
+Object.defineProperty(exports, "impl", { enumerable: true, get: function () { return impl; } });
+exports.default = def;
+`,
+			"src/proxy.js": `module.exports = require("./m");
+`,
+			"src/esm.js": `export function q() {}
+function z() {} // @z
+module.exports = z;
+`,
+			"src/main.js": `const f = require("./m");
+const { helper, run } = require("./lib");
+const { x } = require("./a");
+const { y } = require("./b");
+const p = require("./proxy");
+const e = require("./esm");
+
+export function go() {
+  f(); // @rf
+  helper(); // @rh
+  run(); // @rr
+  x(); // @rx
+  y(); // @ry
+  p(); // @rp
+  e(); // @re
+}
+`,
+			"src/esmmain.js": `import d, { impl } from "./c.js";
+import mf from "./m.js";
+
+export function go2() {
+  d(); // @rd
+  impl(); // @ri
+  mf(); // @rm
+}
+`,
+		},
+		// Derived from the anchors: a call of a required module calls its whole value; an object literal's
+		// keys alias the names they hold; `exports = {}` unbinds the shortcut, so y is no export of b.js; a
+		// getter returning impl exports impl; with __esModule, the default import is exports.default; without
+		// it, the whole value; a module re-exporting another's whole value is that value; an ES module's
+		// `module.exports` is no export.
+		want: []string{
+			"rf f -> mf exports exact",
+			"rh helper -> h helper exact",
+			"rr run -> o other exact",
+			"rx x -> a a exact",
+			"rp p -> mf exports exact",
+			"rd d -> d def exact",
+			"ri impl -> i impl exact",
+			"rm mf -> mf exports exact",
+		},
+		// Mutation: read only function values (or drop the whole-value export) -> rf, rh, rr, rx, rp and rm are
+		// unbound; ignore `exports = {}` -> ry binds b; read CommonJS forms in an ES module -> re binds z.
+		fails: "CommonJS whole-value, alias, getter, default and re-export forms unread leave the calls unbound; " +
+			"a rebound `exports` or an ES module's `module.exports` read as exports binds ry or re",
+	},
+	{
+		name: "required-class-constructed",
+		anchor: "Node.js Modules: CommonJS modules (`require` returns `module.exports`); " +
+			"ECMA-262 (15th edition, 2024) §13.3.5 (The new Operator)",
+		files: map[string]string{
+			"src/c.js": `class C {
+  constructor() {} // @cc
+  hi() {} // @ch
+}
+module.exports = C;
+`,
+			"src/d.js": `class D {
+  constructor() {} // @dc
+  hi() {} // @dh
+}
+module.exports = { D };
+`,
+			"src/main.js": `const C = require("./c");
+const { D } = require("./d");
+
+function go() {
+  new C().hi(); // @nc
+  new D().hi(); // @nd
+}
+`,
+		},
+		// Derived from the anchors: C is c.js's whole value and D the value of d.js's key D, so each `new`
+		// runs that class's constructor and the object it makes has the class's methods.
+		want: []string{
+			"nc C -> cc constructor exact",
+			"nc hi -> ch hi exact",
+			"nd D -> dc constructor exact",
+			"nd hi -> dh hi exact",
+		},
+		// Mutation: read a `require` namespace binding as no type (the whole value unread) -> nc is unbound;
+		// skip a re-export under a declaration's own name that the provider does not mark exported -> nd is
+		// unbound. With no instance, neither hi binds.
+		fails: "a class taken from a required module and constructed binds neither its constructor nor its methods",
+	},
+	{
+		name: "commonjs-exported-class-and-methods",
+		anchor: "Node.js Modules: CommonJS modules (`module.exports` holds any value); " +
+			"ECMA-262 (15th edition, 2024) §15.7 (Class Definitions: a class expression), §13.2.5 (Object Initializer: a method definition)",
+		files: map[string]string{
+			"src/k.js": `module.exports = class {
+  constructor() {} // @kc
+  m() {} // @km
+};
+`,
+			"src/o.js": `module.exports = {
+  m() {}, // @om
+  n: function () {}, // @on
+};
+`,
+			"src/main.js": `const K = require("./k");
+const { m, n } = require("./o");
+
+function go() {
+  new K().m(); // @nk
+  m(); // @mo
+  n(); // @no
+}
+`,
+		},
+		// Derived from the anchors: k.js's whole value is the class, so `new K()` runs its constructor and
+		// the object has its method m; o.js's value is the object, whose method m and function-valued key n
+		// are what the destructured names hold.
+		want: []string{
+			"nk K -> kc constructor exact",
+			"nk m -> km m exact",
+			"mo m -> om m exact",
+			"no n -> on n exact",
+		},
+		// Mutation: leave a class expression unnamed (drop its declaration by the property it is stored
+		// under) -> both nk bindings are lost; leave an object's method definitions unexported -> mo is unbound.
+		fails: "a class expression assigned to `module.exports`, or a method of the object assigned to it, is no export",
+	},
+	{
+		name:   "typescript-import-equals-require-constructed",
+		anchor: "TypeScript Handbook, Modules (`export =` assigns the module's value; `import x = require()` imports it)",
+		files: map[string]string{
+			"src/c.ts": `class C {
+  constructor() {} // @cc
+  hi() {} // @ch
+}
+export = C;
+`,
+			"src/main.ts": `import X = require("./c");
+
+export function go() {
+  new X().hi(); // @nx
+}
+`,
+		},
+		// Derived from the anchor: X is c.ts's whole value, the class C, so `new X()` runs C's constructor and
+		// the object it makes has C's method hi.
+		want: []string{
+			"nx X -> cc constructor exact",
+			"nx hi -> ch hi exact",
+		},
+		// Mutation: record no local name for an `import x = require()` clause -> X denotes no type of the unit:
+		// nx binds no constructor and hi binds an external X.hi.
+		fails: "a class `import x = require()` takes binds neither its constructor nor its method",
+	},
+	{
+		name: "constructor-function-prototype-methods",
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.5.1.1 (EvaluateNew), §10.1.13 (OrdinaryCreateFromConstructor: the " +
+			"object's prototype is the constructor's `prototype`); TypeScript, JavaScript checking (constructor functions are " +
+			"classes; AssignmentDeclarationKind PrototypeProperty `C.prototype.m = …` and Prototype `C.prototype = { … }`)",
+		files: map[string]string{
+			"src/animal.js": `function Animal(name) { this.name = name; } // @an
+Animal.prototype.speak = function () {}; // @sp
+module.exports = Animal;
+`,
+			"src/dog.js": `function Dog() {} // @dg
+Dog.prototype = {
+  bark() {}, // @bk
+  sit: function () {}, // @st
+};
+module.exports = Dog;
+`,
+			"src/main.js": `const Animal = require("./animal");
+const Dog = require("./dog");
+
+function go() {
+  new Animal("a").speak(); // @na
+  new Dog().bark(); // @nb
+  new Dog().sit(); // @ns
+}
+`,
+		},
+		// Derived from the anchors: each module's whole value is a constructor function, which `new` runs, and
+		// the object it makes inherits what the function's prototype holds.
+		want: []string{
+			"na Animal -> an Animal exact",
+			"na speak -> sp speak exact",
+			"nb Dog -> dg Dog exact",
+			"nb bark -> bk bark exact",
+			"ns Dog -> dg Dog exact",
+			"ns sit -> st sit exact",
+		},
+		// Mutation: leave a function whose prototype holds methods a function (no class) -> every row is lost;
+		// give a prototype's function no receiver -> speak, bark and sit are unbound.
+		fails: "a constructor function and the methods its prototype holds are no class and no methods",
+	},
+	{
+		name:   "typescript-export-assignment",
+		anchor: "TypeScript Handbook, Modules (`export =` assigns the module's value; `import x = require()` imports it)",
+		files: map[string]string{
+			"src/m.ts": `function f() {} // @f
+export = f;
+`,
+			"src/main.ts": `import g = require("./m");
+
+export function run() {
+  g(); // @r
+}
+`,
+		},
+		// Derived from the anchor: `export = f` is m's whole value, which g names.
+		want: []string{
+			"r g -> f f exact",
+		},
+		// Mutation: no `export =` branch in the export reader -> r is unbound.
+		fails: "`export = f` not read as the module's whole value leaves r unbound",
+	},
 }

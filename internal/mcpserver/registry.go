@@ -11,7 +11,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// register installs the 23 tools of Section 19.2, in Section 19.2's order.
+// register installs the 24 tools of Section 19.2, in Section 19.2's order.
 //
 // This is the whole tool surface in one place: there is no second
 // registration file, so adding a tool, dropping one or renaming one is a
@@ -43,6 +43,9 @@ func register(s *mcp.Server, h *handlers) {
 	// --- references -----------------------------------------------------
 	addTool(s, "codectx_references", "References",
 		"Reference, implementation or type-definition occurrences of a node.", h.references)
+	addTool(s, "codectx_node_metadata", "Node metadata rows",
+		"The elements of one node metadata field stored as rows: a node whose metadata names "+
+			"`<field>_rows: n` holds that field's n elements here, in order, a page at a time.", h.nodeMetadata)
 
 	// --- traversal -------------------------------------------------------
 	addTool(s, "codectx_callers", "Callers",
@@ -98,10 +101,10 @@ func register(s *mcp.Server, h *handlers) {
 		"Close a session under its expected state version.", h.contextClose)
 }
 
-// toolCount is the Section 19.2 surface size: the 23 tools Section 19.2 lists.
+// toolCount is the Section 19.2 surface size: the 24 tools Section 19.2 lists.
 // There is no doctor tool, which is why this package takes no
 // app.DiagnoseService at all.
-const toolCount = 23
+const toolCount = 24
 
 // addTool registers one tool with BOTH of its schemas preset from the handler's
 // own request and answer types.
@@ -128,7 +131,7 @@ func addTool[In, Out any](s *mcp.Server, name, title, description string,
 // JSON property name.
 //
 // jsonschema-go infers a plain `"type":"string"` for a named string type, so
-// Section 19.3's enum validation would otherwise be missing from all 23
+// Section 19.3's enum validation would otherwise be missing from all 24
 // schemas. Keying by reflect.Type is what makes a single table correct: the
 // property name `kind` means AcknowledgeKind on one tool and ObservationKind on
 // another, and `operation` means SymbolOperation on one and ReferenceOperation

@@ -20,7 +20,9 @@ paths were replaced.
   `r2-logs/`.
 - `ours/` — how our arm reproduces production's write and query paths (`01`–`07`), and its source.
 - `harness/` — the library arm: a summary (`00`), notes `01`–`13`, and its source.
-- `features/` (`01`–`09`) and `features-matrix/` (`00`, `10`–`18`) — every library feature, read from its source.
+- `features/` (`01`–`09`) and `features-matrix/` (`00`, `10`–`18`) — every library feature, read from its source: the
+  published crate, its README, ARCHITECTURE and CHANGELOG, and its 21 examples, 7 of them read in full and 14 by their
+  commentary (`features-matrix/00-feature-matrix.md`).
 - `web/` — eight literature and engine questions (`01`–`08`) and their summary (`00`).
 
 Two arms ran on the same documents. **Our arm** is today's tier, driven through the real store and the real
@@ -458,7 +460,7 @@ ADR-0013 does not settle it and no run here decides it. Decisions are ADR-0013's
 | T8 | compound-word splitting | not used | needs a dictionary; identifiers are open vocabulary |
 | T9 | camelCase and snake_case parts at the whole token's position | used, always on, the whole identifier kept (owner's ruling of Oct 9, 2026; decision 6) | the largest quality lever: under our scoring subword +0.121 MRR@10, name −0.023, doc −0.009 (§2.4); 33 MB (+9.4%) of disk |
 | T10 | pre-tokenized text | not used | each document is tokenized once, in the library |
-| T11 | the indexer's 65 530-byte token limit | never reached | our tokenizer cuts at 32 768 bytes first |
+| T11 | the indexer's 65 530-byte token limit | never reached | our tokenizer never cuts a token; the body is bounded at 32 768 bytes and folding grows text at most 1.5 times, so no token exceeds 49 152 bytes (ADR-0013 decision 6) |
 
 ### Queries
 

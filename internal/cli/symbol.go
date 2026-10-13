@@ -59,9 +59,9 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			}
 			// Both selectors are carried explicitly because Validate rejects an
 			// empty either way, and a zero value would be a default nobody
-			// wrote down. Their flag defaults are the pre-Task-17 request, so a
-			// bare `codectx symbol NAME` builds exactly the request it always
-			// did.
+			// wrote down. Their flag defaults are the canonical source and no
+			// profile, so a bare `codectx symbol NAME` asks for the canonical
+			// facts.
 			req := model.SymbolRequest{
 				GenerationID:   generation,
 				Operation:      operation,

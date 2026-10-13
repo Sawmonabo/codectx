@@ -54,7 +54,7 @@ func emitECMAScript(ctx context.Context, u *unit, e *flowEmit) error {
 			if err := h.hierarchyFacts(ctx, file, tab, emit); err != nil {
 				return err
 			}
-			if err := ecmascriptImports(e.mods, file, tab, emit); err != nil {
+			if err := ecmascriptImports(h, e.mods, file, tab, emit); err != nil {
 				return err
 			}
 		}
@@ -145,8 +145,12 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 		if sp, _, ok := importedName(m.Name, false); ok {
 			spec = sp
 		}
-		if _, ok := moduleBase(fc.path, spec, false); !ok {
-			// A package's module: no member file is it.
+		outside, err := h.esOutside(fc.path, spec)
+		if err != nil {
+			return err
+		}
+		if outside {
+			// A package outside the repository: no member file is it.
 			return emit(Binding{Kind: FactExternalSite, Site: site, Detail: DetailDirect})
 		}
 	}
@@ -161,21 +165,49 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 }
 
 // ecmascriptImports emits what each import of the member at ordinal file,
-// whose table is tab, resolves to: one FactImport per member file under
-// the module path its specifier names (moduleBase), from the module index
-// mods. A package specifier names no member file and resolves to nothing.
-func ecmascriptImports(mods *index, file int32, tab *Table, emit func(Binding) error) error {
+// whose table is tab, resolves to (keyESSpec, under the import's own form):
+// one FactImport per member file its specifier resolves to, found in the
+// module index mods, or a FactOpenImport when it names a module of the
+// repository that no member is. A package outside the repository resolves
+// to nothing.
+func ecmascriptImports(h *hierarchy, mods *index, file int32, tab *Table, emit func(Binding) error) error {
 	for i, imp := range tab.Imports {
-		base, ok := moduleBase(tab.Path, imp.Path, false)
-		if !ok {
-			continue
-		}
-		err := mods.lookup(keyESModule+base, func(m entry) error {
-			return emit(Binding{Kind: FactImport, Site: Ref{File: file, Index: int32(i)},
-				Target: Ref{File: m.Ref.File, Index: -1}, Detail: DetailImport})
+		site := Ref{File: file, Index: int32(i)}
+		form := esForm(imp.Syntax)
+		var targets []string
+		answered, open := false, false
+		err := h.decls.lookup(keyESSpec+tab.Path+"\x00"+imp.Path, func(e entry) error {
+			if e.Flags&form == 0 {
+				return nil
+			}
+			answered = true
+			if e.Aux != "" {
+				targets = append(targets, e.Aux)
+			}
+			open = open || e.Flags&esUnresolved != 0
+			return nil
 		})
 		if err != nil {
 			return err
+		}
+		if !answered {
+			if base, ok := moduleBase(tab.Path, imp.Path, false); ok {
+				targets = append(targets, base)
+			}
+		}
+		if open && len(targets) == 0 {
+			if err := emit(Binding{Kind: FactOpenImport, Site: site, Detail: DetailImport}); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, base := range targets {
+			err := mods.lookup(keyESModule+base, func(m entry) error {
+				return emit(Binding{Kind: FactImport, Site: site, Target: Ref{File: m.Ref.File, Index: -1}, Detail: DetailImport})
+			})
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil

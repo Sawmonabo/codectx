@@ -62,7 +62,8 @@ const stateTag = "link.resolution.nodes\n"
 // empty technique, a fact no technique is named for (an open or external
 // site), is last.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
-	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass, ""}
+	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
+	DetailSummary, DetailReturn, DetailSupertypeCandidate, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {
@@ -97,7 +98,7 @@ func codeOf[T comparable](values []T, v T) (byte, bool) {
 // about one site, import or declaration are adjacent.
 func (k Fact) entry() int {
 	switch k {
-	case FactImport:
+	case FactImport, FactOpenImport:
 		return 1
 	case FactExtends, FactImplements, FactOverrides:
 		return 2
@@ -113,7 +114,7 @@ func (k Fact) entry() int {
 // it names no external one.
 func (k Fact) hasTarget() bool {
 	switch k {
-	case FactExternalSite, FactOpenSite:
+	case FactExternalSite, FactOpenSite, FactOpenImport:
 		return false
 	}
 	return true
@@ -159,10 +160,15 @@ func canonical(b Binding) (Binding, error) {
 	} else {
 		b.Reason = ""
 	}
-	if b.Kind != FactFlow {
+	if b.Kind != FactFlow && b.Kind != FactSummary {
 		b.Arg, b.Param = 0, 0
 	} else if b.Arg < 0 || b.Param < 0 {
 		return bad("with a negative argument or parameter index")
+	}
+	if b.Kind != FactSummary {
+		b.Position = 0
+	} else if b.Position < 0 {
+		return bad("with a negative parameter position")
 	}
 	switch {
 	case b.Kind == FactRoute:
@@ -229,10 +235,12 @@ func foldReason(a, b model.OpenSiteReason) model.OpenSiteReason {
 // its external key. A fact with no target (an open or external site) has all
 // three empty.
 type idBinding struct {
-	Kind       Fact
-	SiteFile   model.FileID
-	Site       int32
-	Arg        int32
+	Kind     Fact
+	SiteFile model.FileID
+	Site     int32
+	Arg      int32
+	// Position is a FactSummary's parameter position (Binding.Position).
+	Position   int32
 	TargetFile model.FileID
 	Target     model.NodeID
 	External   string
@@ -281,11 +289,12 @@ func encodeIDBinding(b idBinding) ([]byte, error) {
 	code, ok := detailCode(b.Detail)
 	dispatch, dok := codeOf(dispatches[:], b.Dispatch)
 	reason, rok := codeOf(reasons[:], b.Reason)
-	if !ok || !dok || !rok || b.Kind > factLast || b.Site < 0 || b.Arg < 0 {
+	if !ok || !dok || !rok || b.Kind > factLast || b.Site < 0 || b.Arg < 0 || b.Position < 0 {
 		return nil, internalErr("a fact named by identity is malformed")
 	}
 	out := appendString([]byte{byte(b.Kind)}, string(b.SiteFile))
 	out = binary.AppendUvarint(binary.AppendUvarint(out, uint64(b.Site)), uint64(b.Arg))
+	out = binary.AppendUvarint(out, uint64(b.Position))
 	out = appendString(out, string(b.TargetFile))
 	out = appendString(out, string(b.Target))
 	out = appendString(out, b.External)
@@ -295,7 +304,7 @@ func encodeIDBinding(b idBinding) ([]byte, error) {
 func decodeIDBinding(raw []byte) (idBinding, error) {
 	r := byteReader{b: raw}
 	b := idBinding{Kind: Fact(r.byte()), SiteFile: model.FileID(r.str()), Site: r.index(), Arg: r.index(),
-		TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str()), External: r.str()}
+		Position: r.index(), TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str()), External: r.str()}
 	code, dispatch, reason := r.byte(), r.byte(), r.byte()
 	if r.err != nil || len(r.b) != 0 || b.Kind > factLast || int(code) >= len(details) ||
 		int(dispatch) >= len(dispatches) || int(reason) >= len(reasons) {

@@ -1,6 +1,6 @@
 # Incremental re-indexing: what SCIP indexers and LSP servers can actually skip
 
-Round 4 empirical research, 2026-09-13, linux/amd64 (WSL2, 48 GB RAM, 16 threads).
+Empirical research, 2026-09-13, linux/amd64 (WSL2, 48 GB RAM, 16 threads).
 
 **Question.** After the first full index, when a user edits one file or commits a few
 files, can any of our six SCIP indexers do less work than a whole-unit re-index? What does

@@ -13,8 +13,10 @@ package plan
 // The allocation, the running total and the queue are not this file's: they
 // belong to the process's one admission ledger, which every other heavy child
 // -- language servers above all -- is admitted against as well. What is here
-// is the heavy-unit front of it: a unit carries the two-dimension reservation
-// its planner derived, and this admits it.
+// is the heavy-unit front of it: a unit carries its provider's admission step
+// (admission.Admit), which plans the two-dimension reservation from the
+// provider's learned need at the moment the unit is admitted, and this runs
+// it against the one ledger.
 //
 // Admission is strict first-in-first-out across every reserver, and priority
 // ordering (Section 11.6: a query promotes the units it needs to the head of
@@ -42,19 +44,18 @@ type Scheduler struct {
 // multiple of the machine's memory.
 func NewScheduler(l *admission.Ledger) *Scheduler { return &Scheduler{ledger: l} }
 
-// Admit blocks until this reservation may run: the summed reservations of
-// everything admitted -- by this scheduler or by any other reserver sharing
+// Admit blocks until the unit's reservation may run: the summed reservations
+// of everything admitted -- by this scheduler or by any other reserver sharing
 // the ledger -- plus this one within the machine-derived allocation, in every
-// dimension it requests. It returns a release function that is idempotent and
-// must be called on every path.
+// dimension it requests. It returns the holding, whose Release is idempotent
+// and must be called on every path, and which the unit's run raises to what
+// its child is read using (admission.FollowResidency).
 //
 // A unit larger than the whole allocation is admitted when the ledger holds
 // nothing. Refusing it would refuse work the user never asked to have refused;
 // serializing it is the whole point of the reservation.
 //
 // A canceled wait returns CTX_CANCELED and no release function.
-func (s *Scheduler) Admit(ctx context.Context, r admission.Reservation) (func(), error) {
-	// No makeRoom step: a heavy unit holds nothing it could give back to let
-	// itself in. It waits its turn, which the ledger keeps for it.
-	return s.ledger.ReserveWith(ctx, r, nil)
+func (s *Scheduler) Admit(ctx context.Context, admit admission.Admit) (*admission.Holding, error) {
+	return admit(ctx, s.ledger)
 }

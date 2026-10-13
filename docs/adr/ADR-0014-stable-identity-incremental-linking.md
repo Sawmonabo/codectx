@@ -87,11 +87,15 @@ republishes `helpers.go`, and the existing overloads keep their identities.
 ### 5. A manifest change reruns only the sites that read the changed fields
 
 - Each manifest has a fingerprint of the fields the linker reads: a Go module's path and its nested module roots; a
-  TypeScript project's module-resolution options (`baseUrl`, `paths`, `rootDirs`, `moduleResolution`, `module`,
-  `typeRoots`, package `exports`/`imports` resolution, `resolveJsonModule`) [S11]; a package's `exports` and
-  `imports`; a crate's name; a Python or Java project root.
+  TypeScript or JavaScript config's module-resolution and ownership options after `extends` (`baseUrl`, `paths`,
+  `rootDirs`, `rootDir`, `outDir`, `declarationDir`, `moduleResolution`, `module`, `customConditions`,
+  `resolvePackageJsonExports`, `resolvePackageJsonImports`, `allowJs`, `files`, `include`, `exclude`,
+  `references`) [S11]; a package's `name`, `type`, `exports`, `imports`, `types`/`typings`, `module`, `main` and
+  `workspaces`, and a pnpm or Lerna workspace's globs; a crate's name; a Python or Java project root.
 - An unchanged fingerprint reruns nothing: a dependency version bump changes no field the linker reads.
-- A changed field reruns only the sites whose traces read it [S12].
+- A changed field reruns only the sites whose traces read it [S12]. For ECMAScript the read is the specifier's
+  answer: each import's resolution is an index entry keyed by the importing file and the specifier, so a changed
+  config reruns exactly the nodes whose imports now resolve differently, in whichever package they are written.
 - A unit-boundary move, such as a new nested `go.mod`, is a removal from one unit and an addition to the other: the
   moved files' sites, the sites bound into them, and the sites whose lookups see the moved names rerun.
 

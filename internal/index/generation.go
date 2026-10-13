@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -599,10 +600,7 @@ func (g *generation) attachReused(ctx context.Context) (err error) {
 			ItemsIn: int64Ptr(int64(len(g.plan.Reuse))), ItemsOut: &g.reused}, err)
 	}()
 	for _, unit := range g.plan.Reuse {
-		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit); err != nil {
-			return err
-		}
-		rows, err := g.c.opts.Store.UnitCapabilities(ctx, unit)
+		rows, err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit)
 		if err != nil {
 			return err
 		}
@@ -914,8 +912,8 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 	if err != nil {
 		return err
 	}
-	if u.Heavy {
-		release, admitErr := g.c.sched.Admit(ctx, u.Admission)
+	if u.Admit != nil {
+		held, admitErr := g.c.sched.Admit(ctx, u.Admit)
 		if admitErr != nil {
 			// The admission gate refused or was cancelled, so the unit never
 			// reached its work: unavailable with that reason, not a failure of
@@ -923,7 +921,8 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 			span.End(ledger.OutcomeUnavailable, notAdmitted(provider.CodeOf(admitErr)), nil)
 			return admitErr
 		}
-		defer release()
+		defer held.Release()
+		ctx = admission.WithHolding(ctx, held)
 	}
 	// A unit whose key is already sealed is the same bytes under the same
 	// configuration by construction, so it is attached rather than rebuilt.
@@ -935,12 +934,10 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 		return err
 	}
 	if exists && state == model.UnitSealed {
-		if err := g.c.opts.Store.AttachUnit(ctx, g.gen, spec.ID); err != nil {
-			return err
-		}
-		// Read before the lock is taken: the read is a job on the store's
-		// writer, which a unit worker holding the lock must never wait on.
-		rows, err := g.c.opts.Store.UnitCapabilities(ctx, spec.ID)
+		// Attached before the lock is taken: the attach is a job on the
+		// store's writer, which a unit worker holding the lock must never
+		// wait on. It returns the unit's stored capability rows too.
+		rows, err := g.c.opts.Store.AttachUnit(ctx, g.gen, spec.ID)
 		if err != nil {
 			return err
 		}
