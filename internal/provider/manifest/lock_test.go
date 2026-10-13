@@ -101,14 +101,41 @@ func wantLines(t *testing.T, name string, got, want []string) {
 //     react-dom snapshot would be a second package);
 //   - pnpm-lock.yaml v5: splitting a `/name/version` key at its `@` (the
 //     scoped name would be cut) or keeping the `_peer` suffix;
-//   - bun.lock: failing on its trailing commas, or resolving a nested copy
-//     as the top-level one (other -> js-tokens would be 4.0.0);
+//   - bun.lock: failing on its trailing commas, resolving a nested copy
+//     as the top-level one (other -> js-tokens would be 4.0.0), or skipping
+//     the `workspaces` object past its own end (the skip would consume
+//     `packages` with it: no facts at all);
 //   - uv.lock: dropping optional-dependencies or the marker, or counting
 //     the wheels' hashes as the integrity;
 //   - pylock.toml: losing the `[[packages.wheels]]` sub-tables to the next
 //     segment (attrs's hash count would be 0);
 //   - gradle.lockfile: reading `empty=` as a module, or dropping the
-//     configurations.
+//     configurations;
+//   - npm-shrinkwrap.json: not reading the file as a package lock (no facts),
+//     or naming an aliased package by its node_modules folder (the lock and
+//     app would reach npm:js-yaml, not npm:@zkochan/js-yaml);
+//   - package-lock v1 alias: keeping `npm:@zkochan/js-yaml@0.0.6` as the
+//     version and js-yaml as the name;
+//   - bun.lock alias: naming the package by its install path instead of the
+//     tuple's `name@version`;
+//   - yarn.lock alias: naming the block by the alias of its descriptor, or
+//     resolving a dependency to the alias name; an alias with no range
+//     (`lodash@npm:awesome-lodash`) named without its `resolved` URL, or
+//     with the URL's path prefix (api/npm/remote/awesome-lodash);
+//   - pnpm-lock.yaml v9 and v6 alias: reading a dependency path value as a
+//     version (other -> js-yaml would publish resolved_version
+//     @zkochan/js-yaml@0.0.6 on npm:js-yaml), or reading tslib's plain
+//     version as a path;
+//   - Cargo.lock v1: not reading `[metadata]` (rand loses its integrity), or
+//     taking `<none>` as a checksum (rand_core would gain one);
+//   - poetry.lock 1.1: not reading `[metadata.files]` (no hashes), or giving
+//     each pinned version every file of its name (six 1.16.0 would count 3
+//     hashes and, with two source distributions, no integrity);
+//   - poetry.lock 1.0: not reading `[metadata.hashes]` (no hashes);
+//   - Pipfile.lock, pdm.lock and pylock.<name>.toml VCS: reading git alone
+//     (mylib would have no source), or dropping the VCS from the source;
+//   - buildscript-gradle.lockfile: not reading the file as a Gradle lock
+//     (no facts).
 func TestLockFilesPublishResolvedVersionsAndTheirGraph(t *testing.T) {
 	const npmA = "https://registry.npmjs.org/a/-/a-1.2.0.tgz"
 	const npmB1 = "https://registry.npmjs.org/b/-/b-1.5.0.tgz"
@@ -682,6 +709,313 @@ empty=annotationProcessor
 			want: []string{
 				"maven:lock:app/gradle.lockfile -> maven:com.google.guava:guava group=compileClasspath,runtimeClasspath kind=locked resolved_version=33.0.0-jre set_size=1 ranged",
 				"maven:lock:app/gradle.lockfile -> maven:org.slf4j:slf4j-api group=runtimeClasspath kind=locked resolved_version=2.0.9 set_size=1 ranged",
+			},
+		},
+		{
+			name: "npm-shrinkwrap.json",
+			path: "npm-shrinkwrap.json",
+			body: `{
+  "name": "app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "app",
+      "version": "1.0.0",
+      "dependencies": {
+        "js-yaml": "npm:@zkochan/js-yaml@0.0.6"
+      }
+    },
+    "node_modules/js-yaml": {
+      "name": "@zkochan/js-yaml",
+      "version": "0.0.6",
+      "integrity": "sha512-zk"
+    }
+  }
+}
+`,
+			want: []string{
+				"npm:lock:npm-shrinkwrap.json -> npm:@zkochan/js-yaml alias=js-yaml integrity=sha512-zk kind=locked resolved_version=0.0.6 set_size=1 ranged",
+				"npm:lock:npm-shrinkwrap.json -> npm:app kind=locked local=true resolved_version=1.0.0 set_size=1 ranged",
+				"npm:app -> npm:@zkochan/js-yaml alias=js-yaml kind=runtime requirement=npm:@zkochan/js-yaml@0.0.6 resolved_version=0.0.6 version=1.0.0 ranged",
+			},
+		},
+		{
+			name: "package-lock v1 alias",
+			path: "package-lock.json",
+			body: `{
+  "name": "app",
+  "lockfileVersion": 1,
+  "dependencies": {
+    "js-yaml": {
+      "version": "npm:@zkochan/js-yaml@0.0.6",
+      "integrity": "sha512-zk"
+    },
+    "other": {
+      "version": "1.0.0",
+      "requires": {
+        "js-yaml": "npm:@zkochan/js-yaml@0.0.6"
+      }
+    }
+  }
+}
+`,
+			want: []string{
+				"npm:lock:package-lock.json -> npm:@zkochan/js-yaml alias=js-yaml integrity=sha512-zk kind=locked resolved_version=0.0.6 set_size=1 ranged",
+				"npm:lock:package-lock.json -> npm:other kind=locked resolved_version=1.0.0 set_size=1 ranged",
+				"npm:other -> npm:@zkochan/js-yaml alias=js-yaml kind=runtime requirement=npm:@zkochan/js-yaml@0.0.6 resolved_version=0.0.6 version=1.0.0 ranged",
+			},
+		},
+		{
+			name: "bun.lock alias",
+			path: "web/bun.lock",
+			body: `{
+  "lockfileVersion": 1,
+  "packages": {
+    "js-yaml": ["@zkochan/js-yaml@0.0.6", "", {}, "sha512-zk"],
+    "other": ["other@1.0.0", "", { "dependencies": { "js-yaml": "npm:@zkochan/js-yaml@0.0.6" } }, "sha512-oth"],
+  }
+}
+`,
+			want: []string{
+				"npm:lock:web/bun.lock -> npm:@zkochan/js-yaml alias=js-yaml integrity=sha512-zk kind=locked resolved_version=0.0.6 set_size=1 ranged",
+				"npm:lock:web/bun.lock -> npm:other integrity=sha512-oth kind=locked resolved_version=1.0.0 set_size=1 ranged",
+				"npm:other -> npm:@zkochan/js-yaml alias=js-yaml kind=runtime requirement=npm:@zkochan/js-yaml@0.0.6 resolved_version=0.0.6 version=1.0.0 ranged",
+			},
+		},
+		{
+			name: "yarn.lock alias",
+			path: "yarn.lock",
+			body: `# yarn lockfile v1
+
+
+"js-yaml@npm:@zkochan/js-yaml@0.0.6":
+  version "0.0.6"
+  resolved "https://registry.yarnpkg.com/@zkochan/js-yaml/-/js-yaml-0.0.6.tgz#abc"
+  integrity sha512-zk
+
+other@^1.0.0:
+  version "1.0.0"
+  dependencies:
+    js-yaml "npm:@zkochan/js-yaml@0.0.6"
+
+lodash@npm:awesome-lodash:
+  version "1.2.0"
+  resolved "https://npm.example.com/api/npm/remote/awesome-lodash/-/awesome-lodash-1.2.0.tgz#abc"
+`,
+			want: []string{
+				"npm:lock:yarn.lock -> npm:@zkochan/js-yaml alias=js-yaml integrity=sha512-zk kind=locked resolved_version=0.0.6 set_size=1 source=https://registry.yarnpkg.com/@zkochan/js-yaml/-/js-yaml-0.0.6.tgz#abc ranged",
+				"npm:lock:yarn.lock -> npm:awesome-lodash alias=lodash kind=locked resolved_version=1.2.0 set_size=1 source=https://npm.example.com/api/npm/remote/awesome-lodash/-/awesome-lodash-1.2.0.tgz#abc ranged",
+				"npm:lock:yarn.lock -> npm:other kind=locked resolved_version=1.0.0 set_size=1 ranged",
+				"npm:other -> npm:@zkochan/js-yaml alias=js-yaml kind=runtime requirement=npm:@zkochan/js-yaml@0.0.6 resolved_version=0.0.6 version=1.0.0 ranged",
+			},
+		},
+		{
+			name: "pnpm-lock.yaml v9 alias",
+			path: "pnpm-lock.yaml",
+			body: `lockfileVersion: '9.0'
+
+packages:
+
+  '@zkochan/js-yaml@0.0.6':
+    resolution: {integrity: sha512-zk}
+
+  other@1.0.0:
+    resolution: {integrity: sha512-oth}
+
+snapshots:
+
+  '@zkochan/js-yaml@0.0.6': {}
+
+  other@1.0.0:
+    dependencies:
+      js-yaml: '@zkochan/js-yaml@0.0.6'
+`,
+			want: []string{
+				"npm:lock:pnpm-lock.yaml -> npm:@zkochan/js-yaml integrity=sha512-zk kind=locked resolved_version=0.0.6 set_size=1 ranged",
+				"npm:lock:pnpm-lock.yaml -> npm:other integrity=sha512-oth kind=locked resolved_version=1.0.0 set_size=1 ranged",
+				"npm:other -> npm:@zkochan/js-yaml alias=js-yaml kind=runtime resolved_version=0.0.6 version=1.0.0 ranged",
+			},
+		},
+		{
+			name: "pnpm-lock.yaml v6 alias",
+			path: "pnpm-lock.yaml",
+			body: `lockfileVersion: '6.0'
+
+packages:
+
+  /@zkochan/js-yaml@0.0.6:
+    resolution: {integrity: sha512-zk}
+    dev: false
+
+  /other@1.0.0:
+    resolution: {integrity: sha512-oth}
+    dependencies:
+      js-yaml: /@zkochan/js-yaml@0.0.6
+      tslib: 2.6.2
+    dev: false
+`,
+			want: []string{
+				"npm:lock:pnpm-lock.yaml -> npm:@zkochan/js-yaml integrity=sha512-zk kind=locked resolved_version=0.0.6 set_size=1 ranged",
+				"npm:lock:pnpm-lock.yaml -> npm:other integrity=sha512-oth kind=locked resolved_version=1.0.0 set_size=1 ranged",
+				"npm:other -> npm:@zkochan/js-yaml alias=js-yaml kind=runtime resolved_version=0.0.6 version=1.0.0 ranged",
+				"npm:other -> npm:tslib kind=runtime resolved_version=2.6.2 version=1.0.0 ranged",
+			},
+		},
+		{
+			name: "Cargo.lock v1",
+			path: "Cargo.lock",
+			body: `[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.5 (` + crates + `)",
+]
+
+[[package]]
+name = "rand"
+version = "0.8.5"
+source = "` + crates + `"
+
+[[package]]
+name = "rand_core"
+version = "0.6.4"
+source = "` + crates + `"
+
+[metadata]
+"checksum rand 0.8.5 (` + crates + `)" = "34af8d1a"
+"checksum rand_core 0.6.4 (` + crates + `)" = "<none>"
+`,
+			want: []string{
+				"cargo:lock:Cargo.lock -> cargo:app kind=locked local=true resolved_version=0.1.0 set_size=1 ranged",
+				"cargo:lock:Cargo.lock -> cargo:rand integrity=34af8d1a kind=locked resolved_version=0.8.5 set_size=1 source=" + crates + " ranged",
+				"cargo:lock:Cargo.lock -> cargo:rand_core kind=locked resolved_version=0.6.4 set_size=1 source=" + crates + " ranged",
+				"cargo:app -> cargo:rand kind=runtime resolved_version=0.8.5 version=0.1.0 ranged",
+			},
+		},
+		{
+			name: "poetry.lock 1.1",
+			path: "poetry.lock",
+			body: `[[package]]
+name = "attrs"
+version = "21.4.0"
+description = "Classes Without Boilerplate"
+category = "main"
+optional = false
+python-versions = ">=2.7"
+
+[[package]]
+name = "six"
+version = "1.16.0"
+category = "main"
+optional = false
+python-versions = ">=2.7"
+
+[[package]]
+name = "six"
+version = "1.15.0"
+category = "dev"
+optional = false
+python-versions = ">=2.7"
+
+[metadata]
+lock-version = "1.1"
+python-versions = "^3.8"
+content-hash = "abc"
+
+[metadata.files]
+attrs = [
+    {file = "attrs-21.4.0-py2.py3-none-any.whl", hash = "sha256:aaa"},
+    {file = "attrs-21.4.0.tar.gz", hash = "sha256:bbb"},
+]
+six = [
+    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:s16w"},
+    {file = "six-1.16.0.tar.gz", hash = "sha256:s16"},
+    {file = "six-1.15.0.tar.gz", hash = "sha256:s15"},
+]
+`,
+			want: []string{
+				"pypi:lock:poetry.lock -> pypi:attrs group=main hashes=2 integrity=sha256:bbb kind=locked resolved_version=21.4.0 set_size=1 ranged",
+				"pypi:lock:poetry.lock -> pypi:six group=dev hashes=1 integrity=sha256:s15 kind=locked resolved_version=1.15.0 set_size=2 ranged",
+				"pypi:lock:poetry.lock -> pypi:six group=main hashes=2 integrity=sha256:s16 kind=locked resolved_version=1.16.0 set_size=2 ranged",
+			},
+		},
+		{
+			name: "poetry.lock 1.0",
+			path: "poetry.lock",
+			body: `[[package]]
+name = "attrs"
+version = "19.3.0"
+category = "main"
+optional = false
+python-versions = "*"
+
+[metadata]
+content-hash = "abc"
+python-versions = "*"
+
+[metadata.hashes]
+attrs = ["sha256:aaa", "sha256:bbb"]
+`,
+			want: []string{
+				"pypi:lock:poetry.lock -> pypi:attrs group=main hashes=2 kind=locked resolved_version=19.3.0 set_size=1 ranged",
+			},
+		},
+		{
+			name: "Pipfile.lock hg",
+			path: "Pipfile.lock",
+			body: `{
+    "_meta": {"pipfile-spec": 6},
+    "default": {
+        "mylib": {"hg": "https://hg.example.org/mylib", "ref": "abc123"}
+    },
+    "develop": {}
+}
+`,
+			want: []string{
+				"pypi:lock:Pipfile.lock -> pypi:mylib group=default kind=locked resolved_version=abc123 set_size=1 source=hg+https://hg.example.org/mylib ranged",
+			},
+		},
+		{
+			name: "pdm.lock svn",
+			path: "pdm.lock",
+			body: `[metadata]
+lock_version = "4.5.0"
+
+[[package]]
+name = "mylib"
+version = "1.0"
+svn = "https://svn.example.org/mylib"
+revision = "42"
+`,
+			want: []string{
+				"pypi:lock:pdm.lock -> pypi:mylib kind=locked resolved_version=1.0 set_size=1 source=svn+https://svn.example.org/mylib@42 ranged",
+			},
+		},
+		{
+			name: "pylock.<name>.toml vcs",
+			path: "pylock.dev.toml",
+			body: `lock-version = "1.0"
+created-by = "tool"
+
+[[packages]]
+name = "mylib"
+version = "1.0"
+vcs = {type = "hg", url = "https://hg.example.org/mylib", commit-id = "deadbeef"}
+`,
+			want: []string{
+				"pypi:lock:pylock.dev.toml -> pypi:mylib kind=locked resolved_version=1.0 set_size=1 source=hg+https://hg.example.org/mylib@deadbeef ranged",
+			},
+		},
+		{
+			name: "buildscript-gradle.lockfile",
+			path: "buildscript-gradle.lockfile",
+			body: `# This is a Gradle generated file for dependency locking.
+com.example:plugin:1.0=classpath
+empty=
+`,
+			want: []string{
+				"maven:lock:buildscript-gradle.lockfile -> maven:com.example:plugin group=classpath kind=locked resolved_version=1.0 set_size=1 ranged",
 			},
 		},
 	}

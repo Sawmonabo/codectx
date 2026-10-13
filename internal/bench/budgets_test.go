@@ -17,6 +17,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/config"
+	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/testenv"
@@ -931,8 +932,7 @@ var budgetRows = []budgetRow{
 // unlimited by default (scope.go:35, :833-839). model.PlanResult publishes no
 // visited count and the services expose no weighted walk, so the row drives
 // impact over the same relations, directions and bounds: the same edges, so
-// the same nodes are reachable at each depth. scopeWalkRelations mirrors that
-// list.
+// the same nodes are reachable at each depth.
 //
 // The row measures the walk at the configured bounds, which is the walk a plan
 // runs, and a depth ladder beside it: how the visited and edge counts grow per
@@ -945,7 +945,7 @@ func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 	const ladderDepth = 4
 	walk := func(label string, depth int) string {
 		res, err := f.svc.Impact(context.Background(), model.ImpactRequest{Start: f.seeds,
-			Relations: scopeWalkRelations, Direction: model.DirectionBoth, MaxDepth: depth,
+			Relations: contextpkg.ScopeRelations(), Direction: model.DirectionBoth, MaxDepth: depth,
 			MaxVisited: bounds.MaxVisitedNodes.Int(), MaxEdges: bounds.MaxGraphEdges.Int()})
 		if err != nil {
 			t.Fatalf("scope traversal at %s: %v", label, err)
@@ -965,20 +965,6 @@ func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 	}
 	return fmt.Sprintf("%d seeds, ceiling %d nodes; %s\n\t%s",
 		len(f.seeds), budgetContextPlanVisitedNodes, configured, strings.Join(out, "\n\t"))
-}
-
-// scopeWalkRelations is internal/context's scopeRelations (scope.go:35), the
-// relation kinds a plan's scope walk crosses.
-var scopeWalkRelations = []model.RelationKind{
-	model.RelCalls,
-	model.RelImplements, model.RelExtends, model.RelOverrides, model.RelDefines,
-	model.RelReads, model.RelWrites, model.RelDataFlowsTo, model.RelControlDependsOn,
-	model.RelDependsOn, model.RelImports,
-	model.RelConfigures,
-	model.RelTests,
-	model.RelDocuments,
-	model.RelReferences, model.RelExports,
-	model.RelRoutesTo,
 }
 
 // measureNoChangeRefresh is the Section 23.2 reuse row.

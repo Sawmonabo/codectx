@@ -2,9 +2,8 @@
 
 - **Status:** Accepted (implemented)
 - **Date:** 2026-09-14
-- **Amended 2026-10-08:** the `fact_keys` table this record sizes and indexes (§2.5) was deleted
-  with the per-fact-key delta when the hosted dependence engine, its only producer, was retired
-  under [ADR-0012](ADR-0012-native-dependence-engine.md) phase 6.
+- **Scope:** the `fact_keys` table §2.5 sizes and indexes is not in the schema: its only producer,
+  the hosted dependence engine, is retired ([ADR-0012](ADR-0012-native-dependence-engine.md)).
 - **Refines:** [`ADR-0001 — Scale posture`](ADR-0001-scale-posture.md) §2.8, which took the
   decision to make this change; this record carries the shape that was built, the alternatives that
   were refused on the way, and the sources cited for it
@@ -21,8 +20,8 @@ Three figures drove this decision. They come from three different stores and mus
 their corpus attached; none of them is a restatement of another.
 
 - **73.86× stored bytes over eligible source bytes** — 420 810 752 B over 5 697 273 B on the
-  10 000-file generated corpus, against a 3.5× budget. An earlier run of the same corpus reported
-  75.00×. This is `docs/performance.md` row 13's miss.
+  10 000-file generated corpus, against a 3.5× budget. This was `docs/performance.md` row 13's miss
+  on that corpus.
 - **6 784.0 bytes per indexed symbol** — taken with per-b-tree byte attribution [S1] over a
   read-only copy of a prepared control store: 587 776 000 database bytes (`page_size` 4096,
   `page_count` 143 500, 51 free pages, no write-ahead log bytes outstanding) over 86 642
@@ -237,8 +236,8 @@ values. Surrogate *values* depend on insert order, which is exactly why they nev
 **Migration is a rebuild, and only a rebuild.** An existing store is refused with
 `CTX_SCHEMA_MISMATCH`; there is no upgrade path and none is offered.
 
-**Retention accounting reports smaller figures**, deliberately. The interned columns no longer
-exist as per-row text, and they are not replaced by a join back to the dictionary: a dictionary row
+**Retention accounting reports smaller figures**, deliberately. The interned columns are not
+stored as per-row text, and accounting does not join back to the dictionary: a dictionary row
 is shared by every generation that used the key, so charging it to one generation would claim as
 reclaimable bytes that deleting that generation cannot free.
 
@@ -304,10 +303,9 @@ The two indexes the sweep needs, built on the after store and measured:
 `idx_alias_native ON native_aliases(native_key_id)` = 6 799 360 B and
 `idx_evidence_native ON evidence(native_key_id)` = 7 352 320 B, together
 **14 151 680 B = 2.24 % of the 632 266 752 B store**, the second of them on the
-largest table there. Both are **added**, reversing the earlier refusal: that
-refusal priced them against the collector's probe, while the cost that decides
-the question is foreign-key enforcement on the parent row (the alternatives
-section above). With them the probes and both foreign-key checks are index
+largest table there. Both are **kept**: priced against the collector's probe
+alone they look unnecessary, but the cost that decides the question is
+foreign-key enforcement on the parent row (the alternatives section above). With them the probes and both foreign-key checks are index
 lookups —
 
 ```
@@ -328,8 +326,8 @@ phrasing of this statement in which they are visible at all. Measured on stores
 of the reference shape and of a tenth of it, one run clears the whole backlog:
 201 285 keys in 0.30 s (1.5 µs/key) against 274 807 alias and 477 388 evidence
 rows, and 20 128 keys in 0.02 s (1.0 µs/key) against a tenth of those. The cost
-is flat in child-table size where it was previously linear (2.7 ms/key at the
-small shape, ~27 ms/key at the reference one), which is the property the
+is flat in child-table size; without the two indexes it is linear (2.7 ms/key at
+the small shape, ~27 ms/key at the reference one), which is the property the
 foreign-key check acquires when it can descend an index. The rows-examined
 budget stays as a safety bound; at two rows examined per deletion it admits
 100 M keys per run.

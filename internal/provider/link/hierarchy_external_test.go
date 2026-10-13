@@ -162,3 +162,84 @@ class D(Base):
 		}
 	}
 }
+
+// TestPythonOverrideFollowsTheFullOrder protects where the bases outside the
+// project stand in the method resolution order an override is read along:
+// the C3 linearisation places each base outside the project as the
+// linearisation of itself ("The Python 2.3 Method Resolution Order"), and
+// `typing.override` proves the first ancestor along it that defines the
+// method (PEP 698). A base outside the project ahead of the first class of
+// the project defining it may be that ancestor, so it and that class form
+// one set; one after it is not a candidate.
+//
+// Mutation: read the bases outside the project only when no class of the
+// project defines the method (the order without them) -> C.run and E.run
+// reach U.run alone. Mutation: keep each class's external bases in written
+// order after the project's classes -> E.run misses lib.Base.run, which C3
+// places ahead of U (E, M, Base, U). Mutation: place the external bases
+// first whatever the order -> D.run gains lib.Base.run. Mutation: count
+// only the external edges in the set -> C.run's edges carry set 0.
+func TestPythonOverrideFollowsTheFullOrder(t *testing.T) {
+	l := linkSources(t, newStructural(t), map[string]string{
+		"app.py": `from typing import override
+
+from lib import Base
+
+
+class U:
+    def run(self):
+        pass
+
+
+class C(Base, U):
+    @override
+    def run(self):
+        pass
+
+
+class D(U, Base):
+    @override
+    def run(self):
+        pass
+
+
+class M(Base):
+    pass
+
+
+class E(M, U):
+    @override
+    def run(self):
+        pass
+`,
+	})
+	var got []externalOverride
+	for _, r := range l.out.rels {
+		if r.Relation.Kind != model.RelOverrides || len(r.Evidence) != 1 {
+			continue
+		}
+		got = append(got, externalOverride{from: l.out.nodes[r.Relation.From].QualifiedName,
+			to: l.out.nodes[r.Relation.To].QualifiedName, detail: r.Evidence[0].Detail, set: r.Evidence[0].SetSize})
+	}
+	sort.Slice(got, func(i, j int) bool {
+		if got[i].from != got[j].from {
+			return got[i].from < got[j].from
+		}
+		return got[i].to < got[j].to
+	})
+	want := []externalOverride{
+		{"C.run", "U.run", link.DetailSupertype, 2},
+		{"C.run", "lib.Base.run", link.DetailSupertype, 2},
+		{"D.run", "U.run", link.DetailSupertype, 0},
+		{"E.run", "U.run", link.DetailSupertype, 2},
+		{"E.run", "lib.Base.run", link.DetailSupertype, 2},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("overrides %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("override %+v, want %+v", got[i], want[i])
+		}
+	}
+}

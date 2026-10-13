@@ -2,9 +2,10 @@
 // provider: package, module, dependency and configuration nodes parsed from
 // go.mod, go.work, package.json, composer.json, Cargo.toml, pyproject.toml,
 // pip requirements files and pom.xml, the resolved versions and dependency
-// graph of the lock files (package-lock.json, pnpm-lock.yaml, yarn.lock,
-// bun.lock, Cargo.lock, poetry.lock, uv.lock, Pipfile.lock, pylock.toml,
-// pdm.lock, gradle.lockfile), and the headings and source links of
+// graph of the lock files (package-lock.json and npm-shrinkwrap.json,
+// pnpm-lock.yaml, yarn.lock, bun.lock, Cargo.lock, poetry.lock, uv.lock,
+// Pipfile.lock, pylock.toml and pylock.<name>.toml, pdm.lock,
+// gradle.lockfile and buildscript-gradle.lockfile), and the headings and source links of
 // Markdown documents. Every parser is a static reader of the pinned bytes:
 // nothing is fetched, evaluated or executed, and a value the format leaves
 // dynamic (a workspace-inherited version, a Maven property reference, a PEP
@@ -132,8 +133,8 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 // at the workspace root. Detection is informational: the provider is
 // available regardless, because documents are everywhere.
 var rootManifests = []string{"go.mod", "go.work", "package.json", "composer.json", "Cargo.toml", "pyproject.toml", "requirements.txt", "pom.xml",
-	"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "Cargo.lock", "poetry.lock", "uv.lock", "Pipfile.lock", "pylock.toml",
-	"pdm.lock", "gradle.lockfile"}
+	"package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "Cargo.lock", "poetry.lock", "uv.lock",
+	"Pipfile.lock", "pylock.toml", "pdm.lock", "gradle.lockfile", "buildscript-gradle.lockfile"}
 
 // Detect reports the root manifests present without walking anything.
 func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Policy) (provider.Detection, error) {
