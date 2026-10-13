@@ -220,7 +220,7 @@ var rowsDecls = []rowDecl{
 // once, at the earlier tier, however the pages fall. At limit 1 the two
 // matches land on pages 1 and 3, with "Other" on page 2 between them.
 //
-// Mutation: decide the repeat per page (drop tierRule.earlier's tier reads and
+// Mutation: decide the repeat per page (drop tierRule.ownedBefore's tier reads and
 // keep only the row-in-hand predicates, as a per-page heap dedupe would) and the
 // node is served again at exact_name on page 3.
 func TestANodeIsServedOnceAcrossExactTierPages(t *testing.T) {
