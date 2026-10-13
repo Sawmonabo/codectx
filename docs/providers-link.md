@@ -435,14 +435,20 @@ routing to the method (detail `direct`). The paths are computed for every applic
 paths are published together, each `routes_to` carrying their number as `set_size`.
 
 The module path is RouterModule's (packages/core/router/router-module.ts). A register call's tree is read from an
-array literal in place or the one module-level binding of the same file its argument names, and flattened as Nest's
+array literal in place, the one module-level binding of the same file its argument names, or, for a name the file
+imports, the tree the module it names exports under that name, through re-exports as ECMAScript resolves an export
+(`nestTreeOf`; each module-level binding initialized with a route tree is indexed under `keyNestTree` by the names its
+module exports it under, read from any ECMAScript file writing a `module:` property, NestJS imported or not), its
+modules resolved from the tree's own file. Each tree is flattened as Nest's
 `flattenRoutePaths` does: a route object with a `module` and a non-empty `path` gives the module that path, a child
 object's path becomes its parent's joined to its own (each normalized: a leading slash, no trailing one), a class
 written as a child takes its parent's path, and a child object with no path joins its own children to no parent path.
 Each module's path is the normalized path of its last entry in the call, as the metadata Nest sets replaces an earlier
 one. A controller is served under the path of every module listing it, matched by the names its file declares or
-exports it under and confirmed by resolving the listing through the module file's imports (`esModules`, re-exports
-included), so a same-named class of another file is not taken; a module no tree names has no path. The register calls
+exports it under and every name a renaming export gives one of them (`export { A as B } from`, indexed under
+`keyJSRenamed` by the name renamed, followed transitively), and confirmed by resolving the listing through the module
+file's imports (`esModules`, re-exports included), so a same-named class of another file is not taken; a module no
+tree names has no path. The register calls
 are taken to apply to every application of the unit; the module import tree from `NestFactory.create` is not walked.
 
 Nothing is published, and the structural `unresolved` endpoint stays the route's only one, when the unit creates no
@@ -452,12 +458,12 @@ option is no literal, or `setGlobalPrefix` passes options (its `exclude` list is
 time); and when the route's or the controller's path or the version it needs is no literal. With RouterModule in use
 (any file naming it from `@nestjs/core`), nothing is published for a controller no module lists, and nothing at all
 when a module's `controllers` are no literal list of names the file binds (a shorthand or spread `@Module` metadata
-hides them), when a route tree is no literal of the same file (a tree imported from another file, a path or module
-that is no literal or class name), when a tree's entry names no class the unit declares, or, for a module, when two
-register calls give it different paths (which holds is the order Nest initializes the modules in). A controller a
-barrel re-exports under another name, and a module lists by that name, is not matched. Every application, module
-listing and route tree is read through traced lookups, and all of them are part of their file's interface summary, so
-an edit to `main.ts`, a module, a tree or a re-exporting index re-resolves the NestJS routes that read it.
+hides them), when a route tree is no literal (a call's result, an import that reaches no tree or several, a path or
+module that is no literal or class name), when a tree's entry names no class the unit declares, or, for a module,
+when two register calls give it different paths (which holds is the order Nest initializes the modules in). Every
+application, module listing, rename and route tree is read through traced lookups, and all of them are part of their
+file's interface summary, so an edit to `main.ts`, a module, a tree, a renaming or re-exporting index re-resolves the
+NestJS routes that read it.
 
 ## Request inputs across files
 
@@ -966,7 +972,12 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   `package.json` files only when a config extends a package by name. A relative `extends` names the file as written,
   else with `.json` added, as TypeScript's getExtendsConfigPath reads it.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
-  `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
+  `from … import` and modules. A name a module does not declare but binds by a module-level import of its own (a
+  package's `__init__.py` re-exporting `from .user import User`, or a `from m import *` whose one supplying module
+  declares it) is followed to that import's target, for calls and imports (`lookPythonFollowing`,
+  `resolve_python_reexport.go`) and for the class a receiver's type names (the re-exports are indexed under
+  `keyReexport` beside ECMAScript's, `addPythonReexports`); a name the module declares itself, binds by several
+  imports, or several star imports supply, is not followed. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor
   a function nested in another function. A call of a class is its construction and binds its `__init__` when
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance

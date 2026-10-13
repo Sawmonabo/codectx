@@ -33,10 +33,19 @@ type NestModule struct {
 // NestRouter is one `RouterModule.register(routes)` call: the route tree
 // flattened as flattenRoutePaths does, each module with the path
 // RouterModule gives it, in that order; Known false when the tree is no
-// literal the file holds.
+// literal the file holds. Import is the binding a tree another module
+// exports is imported by, which the linker follows (nestTreeOf).
 type NestRouter struct {
 	Entries []NestRouterEntry `json:"entries,omitempty"`
 	Known   bool              `json:"known,omitempty"`
+	Import  *NestRef          `json:"import,omitempty"`
+}
+
+// NestTreeDecl is a module-level binding (Decl) whose initializer is a
+// route tree, flattened as a register call's (Router).
+type NestTreeDecl struct {
+	Decl   int32      `json:"decl"`
+	Router NestRouter `json:"router"`
 }
 
 // NestRouterEntry is one module and its RouterModule path, as the flattened
@@ -53,6 +62,14 @@ const (
 	keyNestModule = "nm\x00"
 	// keyNestRouter: one `RouterModule.register` call, Sig a nestRouterOf.
 	keyNestRouter = "nr\x00"
+	// keyNestTree + a module path without extension + NUL + an export
+	// name: the route tree that export of that module is, Sig a
+	// nestRouterOf.
+	keyNestTree = "nt\x00"
+	// keyJSRenamed + a name: an ECMAScript module exporting what that name
+	// denotes (its own declaration, an import, or another module's export)
+	// under another name, Aux the new name.
+	keyJSRenamed = "jn\x00"
 )
 
 // nestListing is one controller a module lists: the reference as the
@@ -102,25 +119,94 @@ func addNestModules(links interface{ Add(entry) error }, file int32, t *Table, a
 			return err
 		}
 	}
+	base := stripExtension(t.Path)
+	for _, tr := range a.Trees {
+		if tr.Decl < 0 || int(tr.Decl) >= len(t.Decls) {
+			continue
+		}
+		raw, err := json.Marshal(nestRouterOf{Path: t.Path, Router: tr.Router})
+		if err != nil {
+			return internalErr("nest tree: " + err.Error())
+		}
+		for _, name := range jsExportNames(t, int(tr.Decl)) {
+			if err := links.Add(entry{Key: keyNestTree + base + "\x00" + name, Ref: Ref{File: file, Index: tr.Decl},
+				Sig: string(raw)}); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
-// nestRouters are the unit's register calls, false when any tree is no
-// literal.
+// addJSRenames adds each renaming export of an ECMAScript member under the
+// name it renames (keyJSRenamed): `export { A as B }`, `export { A as B }
+// from`, `export { default as B } from`, so a controller a barrel renames
+// is found under the name a module lists it by (modulePaths).
+func addJSRenames(links interface{ Add(entry) error }, file int32, t *Table) error {
+	for _, x := range t.Reexports {
+		if x.Name == x.Original || x.Name == "*" || x.Original == "*" || x.Name == "" || x.Original == "" {
+			continue
+		}
+		if err := links.Add(entry{Key: keyJSRenamed + x.Original, Ref: Ref{File: file, Index: -1}, Aux: x.Name}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// nestRouters are the unit's register calls, each tree another module
+// exports followed to it (nestTreeOf), false when any tree is no literal.
 func (h *hierarchy) nestRouters() ([]nestRouterOf, bool, error) {
 	var out []nestRouterOf
-	ok := true
 	err := h.links.lookup(keyNestRouter, func(e entry) error {
 		var r nestRouterOf
 		if err := json.Unmarshal([]byte(e.Sig), &r); err != nil {
 			return internalErr("nest router: " + err.Error())
 		}
-		ok = ok && r.Router.Known
 		r.file = e.Ref.File
 		out = append(out, r)
 		return nil
 	})
-	return out, ok, err
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range out {
+		if imp := out[i].Router.Import; imp != nil {
+			r, ok, err := h.nestTreeOf(out[i].Path, *imp)
+			if err != nil || !ok {
+				return nil, false, err
+			}
+			out[i] = r
+		}
+		if !out[i].Router.Known {
+			return nil, false, nil
+		}
+	}
+	return out, true, nil
+}
+
+// nestTreeOf is the route tree the import imp of the member at path p
+// binds: the one tree binding the module it names exports under that name,
+// through re-exports (jsExported); false when it reaches none or several.
+func (h *hierarchy) nestTreeOf(p string, imp NestRef) (nestRouterOf, bool, error) {
+	var hits []entry
+	err := h.esModules(p, imp.Spec, func(mod string) error {
+		return h.jsExported(keyNestTree, mod, imp.Name, map[string]bool{}, func(e entry) error {
+			if !slices.ContainsFunc(hits, func(x entry) bool { return x.Ref == e.Ref }) {
+				hits = append(hits, e)
+			}
+			return nil
+		})
+	})
+	if err != nil || len(hits) != 1 {
+		return nestRouterOf{}, false, err
+	}
+	var r nestRouterOf
+	if err := json.Unmarshal([]byte(hits[0].Sig), &r); err != nil {
+		return nestRouterOf{}, false, internalErr("nest tree: " + err.Error())
+	}
+	r.file = hits[0].Ref.File
+	return r, true, nil
 }
 
 // nestModulePaths are a controller's RouterModule paths, known false when
@@ -145,11 +231,9 @@ func (h *hierarchy) modulePaths(u *nestUnit, file int32, t *Table, ctrl int32) (
 		return []string{""}, true, nil
 	}
 	target := Ref{File: file, Index: ctrl}
-	names := []string{t.Decls[ctrl].Name}
-	for _, x := range t.Reexports {
-		if x.From == "" && x.Original == names[0] && !slices.Contains(names, x.Name) {
-			names = append(names, x.Name)
-		}
+	names, err := h.nestNames(t, ctrl)
+	if err != nil {
+		return nil, false, err
 	}
 	var modules []Ref
 	for _, name := range names {
@@ -220,6 +304,28 @@ func (h *hierarchy) modulePaths(u *nestUnit, file int32, t *Table, ctrl int32) (
 		}
 	}
 	return out, true, nil
+}
+
+// nestNames are the names a module may list the controller declared at
+// ctrl by: its own, each its module exports it under, and each a renaming
+// export of any of them gives it (keyJSRenamed), transitively. Each listing
+// found under one is confirmed by resolving it (modulePaths), so a name
+// another class shares adds a lookup, never a match.
+func (h *hierarchy) nestNames(t *Table, ctrl int32) ([]string, error) {
+	names := append([]string{t.Decls[ctrl].Name}, jsExportNames(t, int(ctrl))...)
+	slices.Sort(names)
+	names = slices.Compact(names)
+	for i := 0; i < len(names); i++ {
+		if err := h.links.lookup(keyJSRenamed+names[i], func(e entry) error {
+			if !slices.Contains(names, e.Aux) {
+				names = append(names, e.Aux)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return names, nil
 }
 
 // nestResolve is the class declarations a reference written in the member

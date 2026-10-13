@@ -36,6 +36,9 @@ func addJSRouting(links interface{ Add(entry) error }, file int32, t *Table) err
 	if err := addNestApp(links, file, t); err != nil {
 		return err
 	}
+	if err := addJSRenames(links, file, t); err != nil {
+		return err
+	}
 	if len(rt.Objects) == 0 {
 		return nil
 	}
@@ -188,13 +191,19 @@ func (w *jsWalk) mount(from string, m *RouteMount, base string, known bool, way 
 // *` statements resolve it to when exactly one module supplies it (as
 // resolveExport decides an export). seen ends a cycle.
 func (h *hierarchy) jsRouters(base, name string, seen map[string]bool, yield func(entry) error) error {
+	return h.jsExported(keyJSRouting, base, name, seen, yield)
+}
+
+// jsExported yields the links under prefix that the export name of the
+// module at base is, resolved as jsRouters describes. seen ends a cycle.
+func (h *hierarchy) jsExported(prefix, base, name string, seen map[string]bool, yield func(entry) error) error {
 	key := base + "\x00" + name
 	if seen[key] {
 		return nil
 	}
 	seen[key] = true
 	found := false
-	if err := h.links.lookup(keyJSRouting+key, func(e entry) error {
+	if err := h.links.lookup(prefix+key, func(e entry) error {
 		found = true
 		return yield(e)
 	}); err != nil || found {
@@ -203,13 +212,13 @@ func (h *hierarchy) jsRouters(base, name string, seen map[string]bool, yield fun
 	indirect := false
 	if err := h.decls.lookup(keyReexport+key, func(e entry) error {
 		indirect = true
-		return h.jsRouters(e.Aux, e.Sig, seen, yield)
+		return h.jsExported(prefix, e.Aux, e.Sig, seen, yield)
 	}); err != nil || indirect || name == "default" || name == wire.ExportAssignment {
 		return err
 	}
 	var hits []entry
 	if err := h.decls.lookup(keyReexport+base+"\x00*", func(e entry) error {
-		return h.jsRouters(e.Aux, name, seen, func(r entry) error {
+		return h.jsExported(prefix, e.Aux, name, seen, func(r entry) error {
 			if !slices.ContainsFunc(hits, func(x entry) bool { return x.Ref == r.Ref }) {
 				hits = append(hits, r)
 			}

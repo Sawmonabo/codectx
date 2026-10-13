@@ -61,8 +61,10 @@ const NestNeutral = "\x00neutral"
 // that sets either on an application the file does not create (a helper's
 // parameter), which no table ties to an application. RouterModule reports a
 // file naming Nest's RouterModule and Routers its `RouterModule.register`
-// calls; Modules are its `@Module` classes whose controllers it can read,
-// ModulesUnknown one whose controllers it cannot (route_nest_modules.go).
+// calls; Trees are its module-level bindings holding a route tree, which a
+// register call of another file may import; Modules are its `@Module`
+// classes whose controllers it can read, ModulesUnknown one whose
+// controllers it cannot (route_nest_modules.go).
 type NestApp struct {
 	Apps           int              `json:"apps,omitempty"`
 	Prefixes       []NestPrefix     `json:"prefixes,omitempty"`
@@ -70,6 +72,7 @@ type NestApp struct {
 	Open           bool             `json:"open,omitempty"`
 	RouterModule   bool             `json:"router_module,omitempty"`
 	Routers        []NestRouter     `json:"routers,omitempty"`
+	Trees          []NestTreeDecl   `json:"trees,omitempty"`
 	Modules        []NestModule     `json:"modules,omitempty"`
 	ModulesUnknown bool             `json:"modules_unknown,omitempty"`
 }
@@ -115,7 +118,7 @@ func addNestApp(links interface{ Add(entry) error }, file int32, t *Table) error
 	if err := addNestModules(links, file, t, &a); err != nil {
 		return err
 	}
-	a.Routers, a.Modules = nil, nil
+	a.Routers, a.Trees, a.Modules = nil, nil, nil
 	raw, err := json.Marshal(a)
 	if err != nil {
 		return internalErr("nest application: " + err.Error())
