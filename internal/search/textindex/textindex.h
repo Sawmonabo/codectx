@@ -132,6 +132,9 @@ void cx_view_close(cx_view *v);
  *   u8      matches_exact (1: every match was visited)
  *   uvarint segments, uvarint segments_without_summary,
  *   uvarint blocks_total, uvarint blocks_scored, uvarint docs_scored
+ *   uvarint heaps         (segments scored at once)
+ *   uvarint cap           (heap places per segment, after any rescoring)
+ *   uvarint marked        (groups the resume position marked as served)
  *   uvarint hits, hits x { uvarint doc_id, string search_key, string node_id, string file_id,
  *                          string path, string kind, string name,
  *                          string qualified_name, string signature,

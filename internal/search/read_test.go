@@ -9,6 +9,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/search/textindex"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -141,7 +142,8 @@ func TestReadAnswerHoldsToItsBudget(t *testing.T) {
 		}
 	}
 
-	z := stepSizer{first: 2, budget: stepBytes(1, 4, 100), segments: 1, strBytes: 100}
+	shape := stepShape{segments: 1, heaps: 1, strBytes: 100}
+	z := stepSizer{first: 2, budget: stepBytes(shape, 4), shape: shape, measured: true}
 	if n := z.next(2); n != 4 {
 		t.Fatalf("next(2) = %d under a budget that holds a step of 4, want 4", n)
 	}
@@ -151,6 +153,77 @@ func TestReadAnswerHoldsToItsBudget(t *testing.T) {
 	z.budget = 1
 	if n := z.next(4); n != 2 {
 		t.Fatalf("next(4) = %d under a one-byte budget, want the first depth 2", n)
+	}
+}
+
+// TestStepBytesCountsRescoringAndMarks proves the admission covers the two
+// library allocations that do not follow the depth asked: a step whose heaps
+// were doubled by rescoring, and the groups the resume position marks, which
+// grow with the results served. Either one alone must make a step that fits
+// without it not fit.
+//
+// Mutation: drop the rescoring ratio, or the marked groups, from stepBytes.
+func TestStepBytesCountsRescoringAndMarks(t *testing.T) {
+	base := stepShape{segments: 4, heaps: 2, strBytes: 200}
+	budget := stepBytes(base, 64)
+	rescored := base
+	rescored.capNum, rescored.capDen = 4*66, 66
+	if stepBytes(rescored, 64) <= budget {
+		t.Fatalf("a step whose heaps were rescored at four times the depth costs %d, no more than %d",
+			stepBytes(rescored, 64), budget)
+	}
+	marked := base
+	marked.markedNum, marked.markedDen, marked.served = 3, 1, 1<<20
+	if stepBytes(marked, 64) <= budget {
+		t.Fatalf("a step after a million results with three marked groups each costs %d, no more than %d",
+			stepBytes(marked, 64), budget)
+	}
+}
+
+// TestReadAnswerHydratesOnlyWhatItHandsOver proves a step is hydrated a page
+// at a time: a caller that stops after the first page of the third step (8
+// hits at pages of 2, over steps of 2, 4 and 8) costs the content store
+// exactly the reads a wire page of those 8 hits costs, not the 14 hits the
+// three steps hold.
+//
+// Mutation: hydrate the whole step before handing its first page over.
+func TestReadAnswerHydratesOnlyWhatItHandsOver(t *testing.T) {
+	f := newFixtureOf(t, pagingDocs())
+	cas, ok := f.opts.Content.(*snapshot.CAS)
+	if !ok {
+		t.Fatalf("the fixture's content reader is %T, want the CAS", f.opts.Content)
+	}
+	counted := &countingCAS{cas: cas}
+	opts := f.opts
+	opts.Content = counted
+	s := newService(t, opts)
+	handed := 0
+	_, err := s.ReadAnswer(f.ctx, pinned(t, f), model.SearchRequest{Query: "omega"}, 2, math.MaxInt64,
+		func(page []model.SearchHit) (bool, error) {
+			if len(page) > 2 {
+				t.Fatalf("a page of %d hits was handed over, want at most 2", len(page))
+			}
+			handed += len(page)
+			return handed < 8, nil
+		})
+	if err != nil {
+		t.Fatalf("ReadAnswer: %v", err)
+	}
+	if handed != 8 {
+		t.Fatalf("the read handed over %d hits before the caller stopped, want 8", handed)
+	}
+	read := counted.reads
+	counted.reads = 0
+	page, err := s.Search(f.ctx, model.SearchRequest{Query: "omega", Page: model.PageRequest{Limit: 8}})
+	if err != nil || len(page.Items) != 8 {
+		t.Fatalf("Search(limit 8) = %d hits, %v", len(page.Items), err)
+	}
+	if counted.reads == 0 {
+		t.Fatal("hydrating 8 hits read nothing from the content store; the test proves nothing")
+	}
+	if read != counted.reads {
+		t.Fatalf("the read stopped after 8 hits made %d content reads, a page of those 8 makes %d",
+			read, counted.reads)
 	}
 }
 

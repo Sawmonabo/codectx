@@ -61,6 +61,11 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Index {
+    /// How many segments one search scores at once.
+    pub fn search_threads(&self) -> u64 {
+        u64::from(self.opts.search_threads.max(1))
+    }
+
     pub fn open(dir: &Path, opts: Options) -> Result<Index> {
         let exists = dir.join("meta.json").exists();
         let index = if exists {

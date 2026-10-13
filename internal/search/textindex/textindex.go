@@ -146,6 +146,14 @@ type Stats struct {
 	BlocksTotal            int64
 	BlocksScored           int64
 	DocsScored             int64
+	// Heaps is how many segments were scored at once, each holding a heap of
+	// Cap places (the request's depth plus two, doubled on every rescoring a
+	// marked group forced); Marked is how many groups the resume position
+	// marked as served across the segments. A search's memory scales with
+	// these three.
+	Heaps  int64
+	Cap    int64
+	Marked int64
 }
 
 // Page is the answer to one Request.

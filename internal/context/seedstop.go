@@ -6,7 +6,6 @@ package context
 import (
 	"context"
 	"math/bits"
-	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -46,8 +45,8 @@ func lexicalContribution(score, top int64, tier model.SearchTier) (int64, error)
 
 // lexicalStop is the stop's running state over one task's lexical read
 // (ADR-0016 decision 3). The read admits a match only after admit has
-// decided on it, so the match that stops the read -- which may sit in the next
-// step -- is examined and never admitted.
+// decided on it, so the match that stops the read -- which may sit on the next
+// page -- is examined and never admitted.
 type lexicalStop struct {
 	// full disables the stop: every match is read.
 	full bool
@@ -65,7 +64,7 @@ type lexicalStop struct {
 	seen     map[model.FileID]bool
 	floor    int64
 	floorSet bool
-	// sizes is the current step's file sizes, by file id.
+	// sizes is the current page's file sizes, by file id.
 	sizes map[model.FileID]int64
 	stop  seedStop
 }
@@ -79,12 +78,11 @@ func newLexicalStop(full bool, b resolvedBudget, round roundInputs) *lexicalStop
 	}
 }
 
-// loadPage reads the sizes of the files one step of matches names, through
-// FilesByID over the step's distinct file ids in batches of its bound
-// (model.MaxPageItems), since a step of the in-process read can be deeper than
-// one batch. It reads nothing once the floor is known or when the stop is
-// disabled, since no further witness is counted then. A file the pinned
-// snapshot lacks is absent from the result and is therefore no witness.
+// loadPage reads the sizes of the files one page of matches names, in one
+// FilesByID call over the page's distinct file ids. It reads nothing once the
+// floor is known or when the stop is disabled, since no further witness is
+// counted then. A file the pinned snapshot lacks is absent from the result and
+// is therefore no witness.
 func (s *lexicalStop) loadPage(ctx context.Context, reader *sqlite.PinnedReader, hits []model.SearchHit) error {
 	s.sizes = nil
 	if s.full || s.floorSet {
@@ -101,15 +99,13 @@ func (s *lexicalStop) loadPage(ctx context.Context, reader *sqlite.PinnedReader,
 	if len(ids) == 0 {
 		return nil
 	}
-	s.sizes = make(map[model.FileID]int64, len(ids))
-	for batch := range slices.Chunk(ids, model.MaxPageItems) {
-		files, err := reader.FilesByID(ctx, batch)
-		if err != nil {
-			return contextErr(ctx, err)
-		}
-		for _, fv := range files {
-			s.sizes[fv.ID] = fv.Size
-		}
+	files, err := reader.FilesByID(ctx, ids)
+	if err != nil {
+		return contextErr(ctx, err)
+	}
+	s.sizes = make(map[model.FileID]int64, len(files))
+	for _, fv := range files {
+		s.sizes[fv.ID] = fv.Size
 	}
 	return nil
 }
@@ -118,7 +114,7 @@ func (s *lexicalStop) loadPage(ctx context.Context, reader *sqlite.PinnedReader,
 // contribution and whether it is read; a match that is not read ends the read
 // and is recorded as the stop's next match. Once the floor is known, a match
 // is read only while lexicalTau of its contribution is at least the floor, so
-// matches of equal score are read together whatever the step size.
+// matches of equal score are read together whatever the page size.
 func (s *lexicalStop) admit(hit model.SearchHit) (int64, bool, error) {
 	if hit.Tier == model.TierLexical && !s.topSet {
 		s.top, s.topSet = hit.ScoreMicros, true

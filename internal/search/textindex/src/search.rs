@@ -196,75 +196,189 @@ pub fn search(view: &View, req: &[u8], cancel: Cancel) -> Result<Vec<u8>> {
             return Err(Error::new(CX_CANCELED, "the search was canceled before any block was scored"));
         }
 
-        // Fold across segments.
+        // Merge the segments' runs.
         let skipped = fruits.iter().any(|f| f.skipped) || canceled;
         let dropping = fruits.iter().filter(|f| f.dropped).count() as u32;
         let cut: Option<Hit> =
             fruits.iter().filter_map(|f| f.boundary.as_ref()).min_by(|x, y| cmp_hits(x, y)).cloned();
-        let mut marked: Vec<(&[RankCol], &HashSet<Entity>)> = Vec::new();
-        let mut global: HashMap<GlobalKey, (Hit, u64, u32)> = HashMap::new();
         page.matches = 0;
         page.blocks_total = 0;
+        page.marked = 0;
         for f in &fruits {
             page.matches += f.matches;
             page.blocks_total += f.blocks_total;
+            page.marked += f.marked.len() as u64;
             blocks_scored += f.blocks_scored;
             docs_scored += f.docs_scored;
-            if !f.marked.is_empty() {
-                marked.push((&f.ranks, &f.marked));
-            }
         }
-        for f in fruits.iter() {
-            for (hit, count, complete) in &f.hits {
-                let seen = u32::from(f.dropped && *complete);
-                match global.get_mut(&hit.key()) {
-                    Some(e) => {
-                        if cmp_hits(hit, &e.0) == Ordering::Less {
-                            e.0 = hit.clone();
-                        }
-                        e.1 += count;
-                        e.2 += seen;
-                    }
-                    None => {
-                        global.insert(hit.key(), (hit.clone(), *count, seen));
-                    }
-                }
-            }
-        }
-        let mut all: Vec<(Hit, u64, u32)> = Vec::with_capacity(global.len());
-        for e in global.into_values() {
-            if let Some(c) = &cut {
-                if cmp_hits(&e.0, c) == Ordering::Greater {
-                    continue;
-                }
-            }
-            let mut served = false;
-            for (ranks, set) in &marked {
-                if local_entity(ranks, &e.0)?.is_some_and(|k| set.contains(&k)) {
-                    served = true;
-                    break;
-                }
-            }
-            if !served {
-                all.push(e);
-            }
-        }
-        if all.len() <= req.depth && cut.is_some() && !canceled {
-            // Marked groups held heap places: fewer than depth+1 results are
+        let mut merged = merge(&fruits, cut.as_ref(), req.depth)?;
+        if merged.len() <= req.depth && cut.is_some() && !canceled {
+            // Marked groups held run places: fewer than depth+1 results are
             // known exactly, and more may exist past the cut.
             cap = cap.saturating_mul(2);
             continue;
         }
-        all.sort_by(|a, b| cmp_hits(&a.0, &b.0));
-        page.more = all.len() > req.depth;
-        all.truncate(req.depth);
+        page.more = merged.len() > req.depth;
+        merged.truncate(req.depth);
+        let scoring = fruits.iter().filter(|f| f.cols.is_some()).count() as u64;
+        page.heaps = scoring.min(view.index.search_threads());
+        page.cap = cap as u64;
         page.canceled = canceled;
         page.matches_exact = !skipped;
         page.blocks_scored = blocks_scored;
         page.docs_scored = docs_scored;
-        page.hits = all.into_iter().map(|(h, n, seen)| (h, n, !skipped && seen == dropping)).collect();
+        page.hits = finish(&fruits, merged)?
+            .into_iter()
+            .map(|(h, n, seen)| (h, n, !skipped && seen == dropping))
+            .collect();
         return Ok(page.encode(terms.len()));
     }
+}
+
+/// One merged result: the segment and document of its best document, its
+/// score, its fold key, and its strings once a comparison needed them.
+struct Merged {
+    seg: usize,
+    doc: DocId,
+    micros: i64,
+    key: GlobalKey,
+    hit: Option<Hit>,
+}
+
+/// The first `depth`+1 folded results in global order, by a k-way merge of
+/// the segments' runs: each run is already in comparator order, so only the
+/// heads are compared, by score alone unless two heads tie on it, when their
+/// strings are read and the content key decides. Merging stops at the cut,
+/// past which a truncated segment is not exact. A group's first result met is
+/// its best document; a later one of the same group is skipped, and so is a
+/// group some segment marked as served at or before the resume position.
+fn merge(fruits: &[SegFruit], cut: Option<&Hit>, depth: usize) -> Result<Vec<Merged>> {
+    let mut at = vec![0usize; fruits.len()];
+    let mut heads: Vec<Option<Hit>> = vec![None; fruits.len()];
+    let mut met: HashSet<GlobalKey> = HashSet::new();
+    let mut out: Vec<Merged> = Vec::new();
+    while out.len() <= depth {
+        let mut best: Option<usize> = None;
+        for i in 0..fruits.len() {
+            let Some(e) = fruits[i].run.get(at[i]) else { continue };
+            let Some(b) = best else {
+                best = Some(i);
+                continue;
+            };
+            let eb = &fruits[b].run[at[b]];
+            let better = match e.micros.cmp(&eb.micros) {
+                Ordering::Greater => true,
+                Ordering::Less => false,
+                Ordering::Equal => {
+                    head(fruits, &at, &mut heads, i)?;
+                    head(fruits, &at, &mut heads, b)?;
+                    cmp_hits(heads[i].as_ref().expect("read"), heads[b].as_ref().expect("read")) == Ordering::Less
+                }
+            };
+            if better {
+                best = Some(i);
+            }
+        }
+        let Some(i) = best else { break };
+        let e = fruits[i].run[at[i]];
+        if let Some(c) = cut {
+            let beyond = match e.micros.cmp(&c.micros) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => {
+                    head(fruits, &at, &mut heads, i)?;
+                    cmp_hits(heads[i].as_ref().expect("read"), c) == Ordering::Greater
+                }
+            };
+            if beyond {
+                break;
+            }
+        }
+        let hit = heads[i].take();
+        at[i] += 1;
+        let cols = fruits[i].cols.as_ref().expect("a segment with a run has its columns");
+        let key = match &hit {
+            Some(h) => h.key(),
+            None => cols.key(e.doc)?,
+        };
+        if !met.insert(key.clone()) {
+            continue;
+        }
+        let mut served = false;
+        for f in fruits.iter().filter(|f| !f.marked.is_empty()) {
+            let ranks = &f.cols.as_ref().expect("a segment that marked has its columns").ranks;
+            if local_entity(ranks, &key)?.is_some_and(|k| f.marked.contains(&k)) {
+                served = true;
+                break;
+            }
+        }
+        if !served {
+            out.push(Merged { seg: i, doc: e.doc, micros: e.micros, key, hit });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads the strings of segment i's head, once.
+fn head(fruits: &[SegFruit], at: &[usize], heads: &mut [Option<Hit>], i: usize) -> Result<()> {
+    if heads[i].is_none() {
+        let e = fruits[i].run[at[i]];
+        let cols = fruits[i].cols.as_ref().expect("a segment with a run has its columns");
+        heads[i] = Some(cols.hit(e.doc, e.micros)?);
+    }
+    Ok(())
+}
+
+/// The served results with their strings and occurrence counts. A result's
+/// strings are read in one sorted dictionary pass per column of its segment;
+/// its count sums every run's entry of its group, and `seen` counts the
+/// dropping segments whose entry of it was complete.
+fn finish(fruits: &[SegFruit], merged: Vec<Merged>) -> Result<Vec<(Hit, u64, u32)>> {
+    let mut hits: Vec<Option<Hit>> = Vec::with_capacity(merged.len());
+    let mut keys: HashMap<GlobalKey, usize> = HashMap::with_capacity(merged.len());
+    let mut want: Vec<Vec<(usize, DocId, i64)>> = vec![Vec::new(); fruits.len()];
+    for (i, m) in merged.into_iter().enumerate() {
+        if m.hit.is_none() {
+            want[m.seg].push((i, m.doc, m.micros));
+        }
+        hits.push(m.hit);
+        keys.insert(m.key, i);
+    }
+    for (s, w) in want.iter().enumerate() {
+        if w.is_empty() {
+            continue;
+        }
+        let cols = fruits[s].cols.as_ref().expect("a segment with a run has its columns");
+        let docs: Vec<DocId> = w.iter().map(|x| x.1).collect();
+        let strs = cols.strings(&ALL_STRS, &docs)?;
+        for (j, &(i, doc, micros)) in w.iter().enumerate() {
+            hits[i] = Some(cols.assemble(doc, micros, &strs, j)?);
+        }
+    }
+    let mut counts = vec![(0u64, 0u32); hits.len()];
+    for f in fruits {
+        let Some(cols) = &f.cols else { continue };
+        if f.run.is_empty() {
+            continue;
+        }
+        let docs: Vec<DocId> = f.run.iter().map(|e| e.doc).collect();
+        let strs = cols.strings(&[S_NODE, S_PATH], &docs)?;
+        for (j, e) in f.run.iter().enumerate() {
+            let key = if strs[0][j].is_empty() {
+                GlobalKey::File(strs[1][j].clone(), cols.start.first(e.doc).unwrap_or(0))
+            } else {
+                GlobalKey::Node(strs[0][j].clone())
+            };
+            if let Some(&i) = keys.get(&key) {
+                counts[i].0 += e.count;
+                counts[i].1 += u32::from(f.dropped && e.complete);
+            }
+        }
+    }
+    hits.into_iter()
+        .zip(counts)
+        .map(|(h, (n, seen))| Ok((h.ok_or_else(|| Error::corrupt("a merged result has no strings"))?, n, seen)))
+        .collect()
 }
 
 /// The position a request resumes after, read back from its document: the
@@ -357,13 +471,19 @@ fn rank_code(rc: &RankCol, v: &[u8]) -> Result<u64> {
 /// and the start byte.
 type Entity = (u8, u64, u64);
 
-/// A resolved result's group in another segment's ranks, or None when that
-/// segment holds no document of it.
-fn local_entity(ranks: &[RankCol], h: &Hit) -> Result<Option<Entity>> {
-    let (rc, key) = if h.node.is_empty() { (&ranks[S_PATH], &h.path) } else { (&ranks[S_NODE], &h.node) };
+/// A result's group in a segment's ranks, or None when that segment holds no
+/// document of it.
+fn local_entity(ranks: &[RankCol], key: &GlobalKey) -> Result<Option<Entity>> {
+    let (rc, text, start) = match key {
+        GlobalKey::Node(n) => (&ranks[S_NODE], n, None),
+        GlobalKey::File(p, st) => (&ranks[S_PATH], p, Some(*st)),
+    };
     let Some(c) = &rc.col else { return Ok(None) };
-    let Some(o) = c.dictionary().term_ord(key.as_bytes())? else { return Ok(None) };
-    Ok(Some(if h.node.is_empty() { (1, o + rc.shift, h.start) } else { (0, o + rc.shift, 0) }))
+    let Some(o) = c.dictionary().term_ord(text.as_bytes())? else { return Ok(None) };
+    Ok(Some(match start {
+        Some(st) => (1, o + rc.shift, st),
+        None => (0, o + rc.shift, 0),
+    }))
 }
 
 #[derive(Default)]
@@ -377,6 +497,11 @@ struct Page {
     blocks_total: u64,
     blocks_scored: u64,
     docs_scored: u64,
+    /// Segments scored at once, the heap places each held, and the groups the
+    /// resume position marked: what the page's memory scaled with.
+    heaps: u64,
+    cap: u64,
+    marked: u64,
     hits: Vec<(Hit, u64, bool)>,
 }
 
@@ -388,7 +513,16 @@ impl Page {
         b.push(u8::from(self.canceled));
         put_uvarint(&mut b, self.matches);
         b.push(u8::from(self.matches_exact));
-        for v in [self.segments, self.segments_without_summary, self.blocks_total, self.blocks_scored, self.docs_scored] {
+        for v in [
+            self.segments,
+            self.segments_without_summary,
+            self.blocks_total,
+            self.blocks_scored,
+            self.docs_scored,
+            self.heaps,
+            self.cap,
+            self.marked,
+        ] {
             put_uvarint(&mut b, v);
         }
         put_uvarint(&mut b, self.hits.len() as u64);
@@ -426,7 +560,7 @@ struct Hit {
     file: String,
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 enum GlobalKey {
     Node(String),
     File(String, u64),
@@ -596,14 +730,19 @@ struct Ctx<'a> {
 }
 
 struct SegFruit {
-    hits: Vec<(Hit, u64, bool)>,
+    /// The segment's candidate groups at their best documents, in comparator
+    /// order, without strings: a run entry is 24 bytes, and strings are read
+    /// only for the results the merge serves or compares on a tied score.
+    run: Vec<RunEntry>,
     /// The heap's worst entry when the segment is truncated: it turned a group
     /// away or skipped a block, so it answers exactly only up to this entry.
     boundary: Option<Hit>,
     /// The groups with a document at or before the resume position, in this
     /// segment's ranks, which `ranks` resolves another segment's results into.
     marked: HashSet<Entity>,
-    ranks: Vec<RankCol>,
+    /// The segment's columns, which resolve a run entry's strings and another
+    /// segment's results into this segment's ranks; None for an empty segment.
+    cols: Option<SegCols>,
     dropped: bool,
     skipped: bool,
     canceled: bool,
@@ -611,6 +750,108 @@ struct SegFruit {
     blocks_total: u64,
     blocks_scored: u64,
     docs_scored: u64,
+}
+
+/// One candidate group of a segment at its best document.
+#[derive(Clone, Copy)]
+struct RunEntry {
+    micros: i64,
+    count: u64,
+    doc: DocId,
+    complete: bool,
+}
+
+/// Every string column, in STRS order.
+const ALL_STRS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/// The columns a segment's results are read from.
+struct SegCols {
+    ranks: Vec<RankCol>,
+    ids: Column<u64>,
+    start: Column<u64>,
+    end: Column<u64>,
+}
+
+impl SegCols {
+    /// One string of a document.
+    fn text(&self, k: usize, d: DocId) -> Result<String> {
+        let rc = &self.ranks[k];
+        let (Some(c), Some(o)) = (&rc.col, rc.ord(d)) else { return Ok(String::new()) };
+        let mut b = Vec::new();
+        if !c.ord_to_bytes(o, &mut b)? {
+            return Err(Error::corrupt("a string column's dictionary is missing an ordinal"));
+        }
+        Ok(String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// A document's fold key.
+    fn key(&self, d: DocId) -> Result<GlobalKey> {
+        let node = self.text(S_NODE, d)?;
+        Ok(if node.is_empty() {
+            GlobalKey::File(self.text(S_PATH, d)?, self.start.first(d).unwrap_or(0))
+        } else {
+            GlobalKey::Node(node)
+        })
+    }
+
+    /// A document as a result, its strings read one by one.
+    fn hit(&self, d: DocId, micros: i64) -> Result<Hit> {
+        let mut strs: Vec<Vec<String>> = Vec::with_capacity(STRS.len());
+        for k in ALL_STRS {
+            strs.push(vec![self.text(k, d)?]);
+        }
+        self.assemble(d, micros, &strs, 0)
+    }
+
+    /// Document j of a strings() answer over ALL_STRS as a result.
+    fn assemble(&self, d: DocId, micros: i64, strs: &[Vec<String>], j: usize) -> Result<Hit> {
+        let s = |k: usize| strs[k][j].clone();
+        Ok(Hit {
+            doc_id: self.ids.first(d).unwrap_or(0),
+            micros,
+            path: s(0),
+            start: self.start.first(d).unwrap_or(0),
+            end: self.end.first(d).unwrap_or(0),
+            kind: s(1),
+            name: s(2),
+            qn: s(3),
+            sig: s(4),
+            node: s(5),
+            search_key: s(6),
+            file: s(7),
+        })
+    }
+
+    /// The strings of the given columns for each document, one sorted
+    /// dictionary pass per column: strings[c][i] is column cols[c] of docs[i].
+    fn strings(&self, cols: &[usize], docs: &[DocId]) -> Result<Vec<Vec<String>>> {
+        let mut out = vec![vec![String::new(); docs.len()]; cols.len()];
+        for (c, &k) in cols.iter().enumerate() {
+            let rc = &self.ranks[k];
+            let Some(col) = &rc.col else { continue };
+            let mut ords: Vec<(u64, usize)> =
+                docs.iter().enumerate().filter_map(|(i, &d)| rc.ord(d).map(|o| (o, i))).collect();
+            ords.sort_unstable();
+            let mut uniq: Vec<u64> = ords.iter().map(|x| x.0).collect();
+            uniq.dedup();
+            let mut vals = Vec::with_capacity(uniq.len());
+            col.dictionary().sorted_ords_to_term_cb(uniq.iter().copied(), |b| {
+                vals.push(String::from_utf8_lossy(b).into_owned());
+                Ok(())
+            })?;
+            if vals.len() != uniq.len() {
+                return Err(Error::corrupt("a string column's dictionary is missing ordinals"));
+            }
+            let mut u = 0;
+            for (o, i) in ords {
+                while uniq[u] != o {
+                    u += 1;
+                }
+                out[c][i].clone_from(&vals[u]);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A string fast column as an order-preserving rank: an empty or absent value
@@ -810,10 +1051,10 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: &SegA) -> Resu
     let nt = ctx.terms.len();
     let max_doc = seg.max_doc();
     let mut out = SegFruit {
-        hits: Vec::new(),
+        run: Vec::new(),
         boundary: None,
         marked: HashSet::new(),
-        ranks: Vec::new(),
+        cols: None,
         dropped: false,
         skipped: false,
         canceled: false,
@@ -975,17 +1216,25 @@ fn score_segment(ctx: &Ctx, seg: &SegmentReader, sv: &SegView, a: &SegA) -> Resu
     }
     out.dropped = heap.dropped;
     let truncated = heap.dropped || out.skipped;
-    let mut hits = resolve(&ranks, &ids, heap)?;
+    let cols = SegCols { ranks, ids, start: start_col, end: end_col };
     if truncated {
-        out.boundary = hits.iter().map(|h| &h.0).max_by(|x, y| cmp_hits(x, y)).cloned();
+        if let Some(w) = heap.order.last() {
+            out.boundary = Some(cols.hit(w.doc, w.micros.0)?);
+        }
     }
     // A group marked after it took a heap place keeps that place until here;
     // the boundary above counts it, and the result is dropped now.
-    hits.retain(|h| !out.marked.contains(&h.3));
-    out.hits = hits.into_iter().map(|(h, n, complete, _)| (h, n, complete)).collect();
-    if !out.marked.is_empty() {
-        out.ranks = ranks;
+    out.run = Vec::with_capacity(heap.order.len());
+    for k in &heap.order {
+        let e = k.entity();
+        if out.marked.contains(&e) {
+            continue;
+        }
+        let slot = &heap.slots[&e];
+        out.run.push(RunEntry { micros: k.micros.0, count: slot.count, doc: k.doc, complete: slot.complete });
     }
+    drop(heap);
+    out.cols = Some(cols);
     Ok(out)
 }
 
@@ -1036,54 +1285,3 @@ fn bounds(ctx: &Ctx, s: &Summary, a: &SegA, dl_of: &impl Fn(DocId) -> u64) -> Ve
     blocks
 }
 
-/// The heap's entries with their strings, one sorted dictionary pass per column,
-/// each with its group in the segment's ranks.
-fn resolve(ranks: &[RankCol], ids: &Column<u64>, heap: Heap) -> Result<Vec<(Hit, u64, bool, Entity)>> {
-    let entries: Vec<Slot> = heap.slots.into_values().collect();
-    let mut strings: Vec<Vec<String>> = vec![vec![String::new(); entries.len()]; STRS.len()];
-    for (k, rc) in ranks.iter().enumerate() {
-        let Some(col) = &rc.col else { continue };
-        let mut ords: Vec<(u64, usize)> =
-            entries.iter().enumerate().filter_map(|(i, s)| rc.ord(s.key.doc).map(|o| (o, i))).collect();
-        ords.sort_unstable();
-        let mut uniq: Vec<u64> = ords.iter().map(|x| x.0).collect();
-        uniq.dedup();
-        let mut vals = Vec::with_capacity(uniq.len());
-        col.dictionary().sorted_ords_to_term_cb(uniq.iter().copied(), |b| {
-            vals.push(String::from_utf8_lossy(b).into_owned());
-            Ok(())
-        })?;
-        if vals.len() != uniq.len() {
-            return Err(Error::corrupt("a string column's dictionary is missing ordinals"));
-        }
-        let mut u = 0;
-        for (o, i) in ords {
-            while uniq[u] != o {
-                u += 1;
-            }
-            strings[k][i].clone_from(&vals[u]);
-        }
-    }
-    Ok(entries
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let mut take = |k: usize| std::mem::take(&mut strings[k][i]);
-            let hit = Hit {
-                doc_id: ids.first(s.key.doc).unwrap_or(0),
-                micros: s.key.micros.0,
-                path: take(0),
-                start: s.key.start,
-                end: s.key.end,
-                kind: take(1),
-                name: take(2),
-                qn: take(3),
-                sig: take(4),
-                node: take(5),
-                search_key: take(6),
-                file: take(7),
-            };
-            (hit, s.count, s.complete, s.key.entity())
-        })
-        .collect())
-}

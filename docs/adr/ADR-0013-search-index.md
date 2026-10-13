@@ -279,6 +279,18 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   read's results after the position. The prefix of the ranking is still scored on every page, to mark the groups
   it served; what a page no longer pays for its depth is the heap, the string resolution, the buffer and the
   service's filtering of every result before it.
+- **Merge.** A scored segment's heap becomes a run: its groups in comparator order, each a score, a count, a document
+  and a flag (24 bytes), with no strings; the heap is freed. The runs are merged k ways, comparing heads by score
+  alone and reading two heads' strings only when their scores tie, and the merge stops at the cut or at depth + 1
+  groups. Strings are read, one sorted dictionary pass per column, only for the results served and for each truncated
+  segment's worst entry, and the occurrence counts sum each run's entry of a served group. This is the
+  query-then-fetch shape of the major engines: each shard returns sort keys, a k-way merge of the sorted per-shard
+  lists picks the winners, and only the winners are fetched (see Sources). Resolving every segment's heap to strings
+  before a hash fold would cost each segment place about 2.2 KB plus three copies of its strings. A shared minimum
+  competitive score across segments is not used: it saves scoring but not memory, since a segment can still hold k
+  places above it, and it lowers occurrence counts, which is why a major engine enables it only when exact hit counts
+  are not required. One heap shared by every segment, as a single-slice search keeps, would score segments one at a
+  time and lose the parallel scoring.
 - **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
   skips every document that cannot enter the top k. A block is skipped only when its bound, widened by a relative and
   an absolute margin of 10⁻⁹ against rounding, is strictly below the heap's (depth + 1)-th score. A phrase term takes
@@ -443,6 +455,23 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
   - the collector trait (`src/collector/mod.rs`);
   - the garbage collection of superseded commits (`src/indexer/segment_updater.rs`);
   - the silent caps named in decisions 6 and 7.
+- Deep top-k across segments and shards (the Merge bullet of decision 5):
+  - per-slice top-k collectors merged at the end, and one collector for every segment without an executor,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/TopScoreDocCollectorManager.java
+    and `IndexSearcher.java` at the same tag;
+  - the k-way merge of sorted per-shard lists, `TopDocs.merge`,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/TopDocs.java;
+  - the shared minimum competitive score, built only when hit counts need not be exact,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/MaxScoreAccumulator.java;
+  - per-segment string ordinals compared within a segment and term bytes across segments,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/comparators/TermOrdValComparator.java;
+  - the search library's per-segment top-n buffers, all held and pushed again through one buffer at merge,
+    https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/collector/top_score_collector.rs and
+    `src/collector/sort_key_top_collector.rs` at the same tag;
+  - query-then-fetch: the coordinator merges each shard's top keys and fetches only the winning documents,
+    https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/action/search/SearchPhaseController.java
+    and `FetchSearchPhase.java` at the same tag; deep pages cost memory and time in from + size,
+    https://www.elastic.co/docs/reference/elasticsearch/index-settings/index-modules.
 - The search library's fix for its pruned disjunction-max scoring, https://github.com/quickwit-oss/tantivy/pull/3022
   (decision 5).
 - The Rust 1.81 release notes, https://blog.rust-lang.org/2024/09/05/Rust-1.81.0/: an uncaught unwind across a C ABI
