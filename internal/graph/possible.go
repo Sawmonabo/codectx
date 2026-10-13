@@ -154,13 +154,18 @@ func storedList(ctx context.Context, r GraphReader, nodes []model.NodeID, direct
 }
 
 // possibleRows computes a walk's possible rows from its start nodes. With
-// through set the rows' far ends are walked on, up to depth hops.
+// through set the rows' far ends are walked on, up to depth hops. A reader
+// that cannot list candidates is refused, never answered with no rows: the
+// caller decides whether its answer refuses or discloses (nameOnlyUnavailable).
 func (e *Engine) possibleRows(ctx context.Context, r GraphReader, mode tailMode, starts []model.NodeID,
 	through bool, depth int) (possibleList, error) {
 	var list possibleList
-	dr := declarationReader(r)
-	if dr == nil || mode == tailNone {
+	if mode == tailNone {
 		return list, nil
+	}
+	dr := declarationReader(r)
+	if dr == nil {
+		return list, candidatesUnavailable()
 	}
 	repo := r.Binding().RepositoryID
 	at := map[model.RelationID]int{}
