@@ -63,7 +63,7 @@ func TestRustItemPositionMacroBodiesAreDeclarations(t *testing.T) {
 }
 
 // TestRustMacroBraceGroupsAreArms protects the one-level fallback for a body
-// that is no item list (`cfg_if!`): each brace group whose header holds no
+// that is no item list (`cfg_select!`): each brace group whose header holds no
 // item keyword is re-parsed on its own, its items in the element `macro
 // "<path>" "<header>"`, so the three `imp`s are three entities, and a group
 // after an item's head (`struct F: u32 { const A = 1; }`) is never one, so
@@ -74,7 +74,7 @@ func TestRustItemPositionMacroBodiesAreDeclarations(t *testing.T) {
 // branch.
 // Mutation: try every group whatever its header -> A is declared.
 func TestRustMacroBraceGroupsAreArms(t *testing.T) {
-	src := `cfg_if::cfg_if! {
+	src := `cfg::select! {
     if #[cfg(unix)] {
         mod imp { pub fn f() {} }
     } else if #[cfg(windows)] {
@@ -83,7 +83,7 @@ func TestRustMacroBraceGroupsAreArms(t *testing.T) {
         fn imp() {}
     }
 }
-bitflags! {
+flags! {
     struct F: u32 {
         const A = 1;
     }
@@ -91,15 +91,15 @@ bitflags! {
 `
 	decls := rustDecls(t, src)
 	wantBranches(t, decls, "imp",
-		`macro "cfg_if::cfg_if" "if #[cfg(unix)]"`,
-		`macro "cfg_if::cfg_if" "else if #[cfg(windows)]"`,
-		`macro "cfg_if::cfg_if" "else"`)
-	if f := declNamed(t, decls, "f", 0); f.Qualified != "imp::f" || f.MacroInput != "cfg_if::cfg_if" {
+		`macro "cfg::select" "if #[cfg(unix)]"`,
+		`macro "cfg::select" "else if #[cfg(windows)]"`,
+		`macro "cfg::select" "else"`)
+	if f := declNamed(t, decls, "f", 0); f.Qualified != "imp::f" || f.MacroInput != "cfg::select" {
 		t.Fatalf("f inside the recovered module is %q, the input of %q", f.Qualified, f.MacroInput)
 	}
 	for _, d := range decls {
 		if d.Name == "A" || d.Name == "F" {
-			t.Fatalf("%s of a bitflags body was recovered as an item: %+v", d.Name, d)
+			t.Fatalf("%s of a flags! body was recovered as an item: %+v", d.Name, d)
 		}
 	}
 }
@@ -203,6 +203,8 @@ fn helper(x: u8) -> std::fmt::Result { Ok(()) }
 // Mutation: accept any number of uses -> c (transcribed twice) is exact.
 // Mutation: ignore the definition's module -> f (defined inside m) is exact.
 // Mutation: accept item fragments only -> d (a tt pass-through) is not.
+// Mutation: mark no item local -> a to d are left to the linker.
+// Mutation: send no definition's mark -> cfg_rt does not transcribe.
 func TestRustMacroInputIsExactOnlyForAPassThroughMacro(t *testing.T) {
 	src := `macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = "rt")] $item )* } }
 macro_rules! wrap { ($($t:tt)*) => { mod inner { $($t)* } } }
@@ -220,6 +222,19 @@ hidden! { fn f() {} }
 	for name, exact := range map[string]bool{"a": true, "b": false, "c": false, "d": true, "e": false, "f": false} {
 		if d := declNamed(t, decls, name, 0); d.MacroInput == "" || d.MacroExact != exact {
 			t.Errorf("%s: macro %q exact %v, want exact %v", name, d.MacroInput, d.MacroExact, exact)
+		}
+	}
+	// The items whose macro the file defines in scope are decided here; the
+	// others (other!, and hidden!, whose definition's module has closed) are
+	// the linker's, which matches them by each definition's own mark.
+	for name, local := range map[string]bool{"a": true, "b": true, "c": true, "d": true, "e": false, "f": false} {
+		if d := declNamed(t, decls, name, 0); d.MacroLocal != local {
+			t.Errorf("%s: local %v, want %v", name, d.MacroLocal, local)
+		}
+	}
+	for name, transcribes := range map[string]bool{"cfg_rt": true, "wrap": false, "twice": false, "pass": true, "hidden": true} {
+		if d := declNamed(t, decls, name, 0); !d.Macro || d.MacroTranscribes != transcribes {
+			t.Errorf("macro_rules %s: transcribes %v, want %v", name, d.MacroTranscribes, transcribes)
 		}
 	}
 }

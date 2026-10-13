@@ -62,7 +62,8 @@ const stateTag = "link.resolution.nodes\n"
 // empty technique, a fact no technique is named for (an open or external
 // site), is last.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
-	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass, ""}
+	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
+	DetailMacroInput, DetailMacroTranscribes, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {
@@ -99,7 +100,7 @@ func (k Fact) entry() int {
 	switch k {
 	case FactImport:
 		return 1
-	case FactExtends, FactImplements, FactOverrides:
+	case FactExtends, FactImplements, FactOverrides, FactGenerates:
 		return 2
 	}
 	return 0
@@ -132,7 +133,7 @@ func canonical(b Binding) (Binding, error) {
 	bad := func(what string) (Binding, error) {
 		return Binding{}, internalErr("a resolver emitted a fact of kind " + strconv.Itoa(int(b.Kind)) + " " + what)
 	}
-	if b.Kind > FactOverrides {
+	if b.Kind > FactGenerates {
 		return bad("that is not a kind of fact")
 	}
 	if _, ok := detailCode(b.Detail); !ok {
@@ -268,7 +269,7 @@ func encodeIDBinding(b idBinding) ([]byte, error) {
 	code, ok := detailCode(b.Detail)
 	dispatch, dok := codeOf(dispatches[:], b.Dispatch)
 	reason, rok := codeOf(reasons[:], b.Reason)
-	if !ok || !dok || !rok || b.Kind > FactOverrides || b.Site < 0 || b.Arg < 0 {
+	if !ok || !dok || !rok || b.Kind > FactGenerates || b.Site < 0 || b.Arg < 0 {
 		return nil, internalErr("a fact named by identity is malformed")
 	}
 	out := appendString([]byte{byte(b.Kind)}, string(b.SiteFile))
@@ -284,7 +285,7 @@ func decodeIDBinding(raw []byte) (idBinding, error) {
 	b := idBinding{Kind: Fact(r.byte()), SiteFile: model.FileID(r.str()), Site: r.index(), Arg: r.index(),
 		TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str()), External: r.str()}
 	code, dispatch, reason := r.byte(), r.byte(), r.byte()
-	if r.err != nil || len(r.b) != 0 || b.Kind > FactOverrides || int(code) >= len(details) ||
+	if r.err != nil || len(r.b) != 0 || b.Kind > FactGenerates || int(code) >= len(details) ||
 		int(dispatch) >= len(dispatches) || int(reason) >= len(reasons) {
 		return idBinding{}, errors.New("a fact is malformed")
 	}

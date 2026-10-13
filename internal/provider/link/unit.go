@@ -99,6 +99,9 @@ const (
 	// FactOverrides: the method declaration Site directly overrides or
 	// implements the method Target, or the external method External names.
 	FactOverrides Fact = 7
+	// FactGenerates: the Rust macro_rules Target of another member may
+	// generate the declaration Site, written in its input (macro_rust.go).
+	FactGenerates Fact = 8
 )
 
 // Binding is one fact a resolver found. Site names the entry of a member's

@@ -158,6 +158,15 @@ type Decl struct {
 	// block's trait as written (wire.Export.Trait): the one trait whose item
 	// of the method's name it implements.
 	Trait string `json:"trait,omitempty"`
+	// MacroInput is, for a Rust declaration written in an item-position
+	// macro's body, the innermost macro's path as written
+	// (wire.Decl.MacroInput); MacroLocal reports that a macro_rules of the
+	// same file in scope there is that macro (wire.Decl.MacroLocal).
+	MacroInput string `json:"macro_input,omitempty"`
+	MacroLocal bool   `json:"macro_local,omitempty"`
+	// MacroTranscribes reports a Rust macro_rules that transcribes its item
+	// input unchanged (wire.Decl.MacroTranscribes).
+	MacroTranscribes bool `json:"macro_transcribes,omitempty"`
 }
 
 // Parameter is one declared parameter of a callable. Endpoint is the

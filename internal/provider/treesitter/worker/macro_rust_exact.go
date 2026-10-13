@@ -11,12 +11,13 @@ import (
 // binds its input as item fragments (`$x:item`, or token trees `$t:tt` under
 // a repetition) and transcribes each such binding exactly once, under the
 // same repetitions and inside no other group, so the expansion holds every
-// input item as written, with at most attributes added around it. tokio's
-// `macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = "rt")]
-// $item )* } }` is one. The check reads the definition alone; it is no
-// expander, and it applies to a definition the file itself holds in textual
-// scope at the invocation (the Rust Reference's "Macros By Example",
-// textual scope: after the definition, inside the module holding it).
+// input item as written, with at most attributes added around it. For
+// example `macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = "rt")]
+// $item )* } }`. The check reads the definition alone; it is no expander.
+// A definition of the file in textual scope at the invocation decides it in
+// the worker (the Rust Reference's "Macros By Example", textual scope: after
+// the definition, inside the module holding it); any other is the linker's
+// to match across the crate, by the mark each definition carries.
 
 // rsMacroRulesSyntax is the Rust grammar's ids the shape check reads.
 type rsMacroRulesSyntax struct {
@@ -54,19 +55,29 @@ func rsMacroRulesSyntaxOf() *rsMacroRulesSyntax {
 	return rsMacroRulesTables
 }
 
-// macroExact reports that the declaration starting at start, the input of
-// the macro named path, is exactly an item of the expansion: path is one
-// identifier naming a `macro_rules!` of the file in textual scope at start
-// whose every rule transcribes its item input unchanged. The file's
-// definitions are indexed by name once, and each definition is checked
-// once.
-func (e *extraction) macroExact(path string, start uint) bool {
-	m := e.macros
-	if path == "" || m == nil {
-		return false
+// macroScope reports, for the declaration starting at start, the input of
+// the macro named path, whether path is one identifier naming a
+// `macro_rules!` of the file in textual scope at start (local), and whether
+// that definition transcribes its item input unchanged (exact). A macro no
+// definition of the file has in scope there is resolved by the linker,
+// across the crate (wire.Decl.MacroTranscribes). The file's definitions are
+// indexed by name once, and each definition is checked once.
+func (e *extraction) macroScope(path string, start uint) (local, exact bool) {
+	if path == "" || e.macros == nil {
+		return false, false
 	}
-	s := rsMacroRulesSyntaxOf()
+	def := inScope(e.macroRulesNamed(path), start)
+	if def == nil {
+		return false, false
+	}
+	return true, e.macroTranscribes(*def)
+}
+
+// macroRulesNamed is the file's macro_rules definitions named name.
+func (e *extraction) macroRulesNamed(name string) []ts.Node {
+	m := e.macros
 	if m.rules == nil {
+		s := rsMacroRulesSyntaxOf()
 		m.rules = map[string][]ts.Node{}
 		for _, byName := range e.decls {
 			for _, d := range byName {
@@ -75,15 +86,25 @@ func (e *extraction) macroExact(path string, start uint) bool {
 				}
 			}
 		}
-		m.exact = map[uintptr]bool{}
 	}
-	def := inScope(m.rules[path], start)
-	if def == nil {
+	return m.rules[name]
+}
+
+// macroTranscribes reports that the Rust macro_rules definition def passes
+// its item input through (transcribesItems), checked once per definition;
+// false for any other node and in any other language.
+func (e *extraction) macroTranscribes(def ts.Node) bool {
+	m := e.macros
+	s := rsMacroRulesSyntaxOf()
+	if m == nil || def.KindId() != s.macroDefinition {
 		return false
+	}
+	if m.exact == nil {
+		m.exact = map[uintptr]bool{}
 	}
 	exact, seen := m.exact[def.Id()]
 	if !seen {
-		exact = transcribesItems(def, s, e.src)
+		exact = transcribesItems(&def, s, e.src)
 		m.exact[def.Id()] = exact
 	}
 	return exact

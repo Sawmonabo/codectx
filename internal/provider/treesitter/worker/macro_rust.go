@@ -10,7 +10,7 @@ import (
 // Rust items inside an item-position macro invocation.
 //
 // The grammar parses a macro's body as a flat token tree, so the items a
-// `cfg_rt! { pub fn spawn() {} }` or a `cfg_if! { if #[cfg(unix)] { ... }
+// `cfg_rt! { pub fn spawn() {} }` or a `cfg_select! { if #[cfg(unix)] { ... }
 // else { ... } }` writes are no declarations of the file. A macro invocation
 // in item position (a child of the file or of a declaration list) with a
 // brace body has that body re-parsed by the same grammar, restricted to the
@@ -21,8 +21,8 @@ import (
 // (rsItemKinds). When the whole body is not, each brace group directly
 // inside it whose header (its tokens since the previous group) holds no item
 // keyword is tried the same way, one level deep, which recovers the arms of
-// a `cfg_if!`-style body and never a nested body of an item (the `{ const A
-// = 1; }` of `bitflags! { struct F: u32 { const A = 1; } }`). A
+// a `cfg_select!`-style body and never a nested body of an item (the `{ const A
+// = 1; }` of `flags! { struct F: u32 { const A = 1; } }`). A
 // `macro_rules!` definition is never re-parsed: it is no invocation.
 //
 // A kept re-parse is one more tree of the file: the structural query runs
