@@ -110,7 +110,12 @@ type builder struct {
 	// handlers written as function literals among them, by start, each with
 	// its node.
 	endpointFacts []endpointFact
-	literals      []literalNode
+	// links is the routing the route table left open, for the link table.
+	links *routeLinks
+	// inputs are the file's request-input reads, published, by start
+	// (inputs.go).
+	inputs   []inputRead
+	literals []literalNode
 	// callees holds the callee reference node of each key a call or a route
 	// handler of this file minted (callee).
 	callees map[string]model.Resolution
@@ -255,6 +260,9 @@ func (b *builder) build() error {
 		return err
 	}
 	if err := b.endpoints(); err != nil {
+		return err
+	}
+	if err := b.requestInputs(); err != nil {
 		return err
 	}
 	if err := b.linkTable(); err != nil {

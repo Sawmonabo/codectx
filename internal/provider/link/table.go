@@ -55,6 +55,9 @@ type Table struct {
 	// (wire.Conversion), Go's compile-time proofs that a type implements an
 	// interface.
 	Conversions []wire.Conversion `json:"conversions,omitempty"`
+	// Routing is the framework routing the file's route table left open
+	// (route.go).
+	Routing Routing `json:"routing,omitzero"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the

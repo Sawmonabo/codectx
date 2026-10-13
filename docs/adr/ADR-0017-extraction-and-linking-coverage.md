@@ -127,7 +127,9 @@ call-site matching a query-time library keeps [S12].
   argument.
 - **Program entry points** are `endpoint` nodes with `routes_to` to the entry function: a Python `__main__` guard; Go
   `package main` with `func main`; every Java `main` form the language specification defines, instance and
-  parameterless forms and inherited candidates included [S13]; and a script with a shebang.
+  parameterless forms and inherited candidates included [S13]; a script with a shebang; and an application object a
+  module binds (a Flask, FastAPI, Starlette or Express application, Django's WSGI or ASGI application), found by its
+  constructor call and never by the file's name, since neither PEP 3333 nor ASGI names a file.
 - **Framework routes** come from a per-framework table over those facts and the call sites, for Flask, FastAPI,
   Django, Express, Spring and Go `net/http` with its common routers. Each publishes an `endpoint` node with
   `routes_to` to the handler and the metadata `framework`, `method`, `route` as written, and `prefix`: `resolved` or
@@ -136,10 +138,36 @@ call-site matching a query-time library keeps [S12].
   as empty and never guessed.
 - An endpoint's identity is its file, kind and descriptor (the method and the route as written, or `__main__` /
   `main`), never its range.
+- **Prefixes across files** are joined by the linker, never by the per-file provider. Each Python file's link table
+  carries its router objects, the routes registered on each (the route's literal value below the object), and its
+  mounts of objects it does not build (`include_router`, `register_blueprint`, Django `include()`). The linker resolves
+  a mount's argument through the import to the binding it names, joins the prefixes (a Flask registration's
+  `url_prefix=` replaces the blueprint's own), and walks down from each mount anchored at an application root,
+  publishing one `endpoint` per route reached on the mount's file, at its full path. A Django urlconf is a root only
+  when the settings module some file names in `DJANGO_SETTINGS_MODULE` names it in `ROOT_URLCONF` [S15]. A route
+  several mounts reach is published once per path, each with the set size; a hop whose prefix is not a literal
+  leaves the route `unresolved` with no path; the walk ends where a binding repeats on its way and is bounded by the
+  mounts the unit holds. The linker is where this happens because only it sees every file of the unit and already
+  resolves imports to bindings; the per-file provider would need every other file's routers to do it.
+- **Declared entry points** are the ones a project's manifest declares: `[project.scripts]`, `[project.gui-scripts]`
+  and `[project.entry-points.*]` of `pyproject.toml` [S16], `bin` and `main` of `package.json` [S17], `[[bin]]` and the
+  `src/bin` defaults of `Cargo.toml` [S18]. The linker reads the manifest at the unit's root and publishes an
+  `endpoint` at the declaration each names (the function of an object reference, the module of a JavaScript file,
+  a Rust binary's `fn main`), because resolving a dotted module or a file path to a declaration needs the whole
+  unit's module index.
+- **Request inputs** are facts on the reading expression: a `variable` node with the framework, the part of the
+  request read and its literal key, which the enclosing function `reads`, and a read assigned to a variable flows to
+  it, so an alias reaches its uses through def-use. This is the shape of a remote-flow source with its source type
+  [S19] and of a tag on a graph node [S11]: a node a query starts from, not a relation of its own. Each table is
+  gated on the framework's import; a read it does not model publishes nothing.
 
 **Alternatives.** Publishing the guessed full path: prefixes live in other files and are often computed, and the
 best-known route models say so themselves ("relative paths of subrouters are not modeled") [S14]. Routes from the
-running application's OpenAPI document: needs the application to run, which the index never does.
+running application's OpenAPI document: needs the application to run, which the index never does. Joining
+cross-file prefixes in the per-file provider: every other file's routers would have to be read into each file's run.
+A request input as a relation from the function to a synthetic request node: one node per request would join every
+handler's reads into one node, and the expression's range, key and source would ride on edge evidence that a query
+cannot filter on.
 
 ### 9. All eight are one change
 
@@ -219,6 +247,15 @@ reach those answers without the verification the rest receives.
   — the `main` method forms.
 - [S14] *Express.qll*, https://github.com/github/codeql/blob/main/javascript/ql/lib/semmle/javascript/frameworks/Express.qll
   — "relative paths of subrouters are not modeled".
+- [S15] *Django settings: ROOT_URLCONF; Designating the settings*, https://docs.djangoproject.com/en/stable/ref/settings/#root-urlconf
+  and https://docs.djangoproject.com/en/stable/topics/settings/#designating-the-settings — the urlconf a request
+  starts from, named by the settings module `DJANGO_SETTINGS_MODULE` names.
+- [S16] *Entry points specification*, https://packaging.python.org/en/latest/specifications/entry-points/ — an object
+  reference `module:attr`, console and GUI scripts.
+- [S17] *package.json*, https://docs.npmjs.com/cli/v10/configuring-npm/package-json — `bin` and `main`.
+- [S18] *Cargo targets*, https://doc.rust-lang.org/cargo/reference/cargo-targets.html — `[[bin]]` and `src/bin`.
+- [S19] *RemoteFlowSource*, https://codeql.github.com/codeql-standard-libraries/python/semmle/python/dataflow/new/RemoteFlowSources.qll/type.RemoteFlowSources$RemoteFlowSource.html
+  — a source node with its source type.
 - [research 26](../research/26-extraction-and-linking-coverage.md) and
   [raw/coverage-gaps](../research/raw/coverage-gaps/findings.md) — the gap-by-gap survey, the options and the full
   source list.
