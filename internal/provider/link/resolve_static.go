@@ -429,6 +429,11 @@ func (r *staticFile) bare(caller int32, callee string, out siteOut) error {
 		found = true
 		return out.call(e, DetailDirect, model.DispatchExact)
 	})
+	if err == nil && !found && r.fc.family == "rust" {
+		// A tuple struct's constructor (rustValue).
+		_, err = r.rustConstruct(caller, callee, out)
+		return err
+	}
 	if err != nil || found || r.fc.language != "cpp" {
 		return err
 	}
@@ -564,7 +569,19 @@ func (r *staticFile) free(caller int32, callee string, yield func(entry) error) 
 func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error {
 	yield := exactly(out, DetailDirect)
 	if r.fc.language == "rust" && q == "Self" {
-		return r.innermostTypes(caller, func(typ Ref) error { return r.h.declared(typ, name, yield) })
+		found := false
+		err := r.innermostTypes(caller, func(typ Ref) error {
+			return r.h.declared(typ, name, func(e entry) error {
+				found = true
+				return yield(e)
+			})
+		})
+		if err != nil || found {
+			return err
+		}
+		// A tuple variant's constructor (rustValue).
+		_, err = r.rustConstruct(caller, q+"::"+name, out)
+		return err
 	}
 	if r.fc.family == "go" {
 		imported, inUnit, err := r.qualifiedGo(q, name, yield)
@@ -586,6 +603,14 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 			return err
 		}
 		if len(members) == 0 {
+			if r.fc.family == "rust" {
+				// A tuple variant's constructor (rustValue).
+				variant, err := r.rustConstruct(caller, q+"::"+name, out)
+				if err != nil || variant {
+					found = variant
+					return err
+				}
+			}
 			return r.inherited(typ.Ref, name, model.DispatchExact, out)
 		}
 		found = true
@@ -610,8 +635,17 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 		}
 		return out.ext("", model.DispatchExact)
 	case "rust":
-		inUnit, err := r.qualifiedRust(caller, q, name, yield)
-		if err != nil || inUnit {
+		bound := false
+		inUnit, err := r.qualifiedRust(caller, q, name, func(e entry) error {
+			bound = true
+			return yield(e)
+		})
+		if err != nil || bound {
+			return err
+		}
+		if inUnit {
+			// A module's tuple struct's constructor (rustValue).
+			_, err = r.rustConstruct(caller, q+"::"+name, out)
 			return err
 		}
 		return out.ext("", model.DispatchExact)
@@ -634,6 +668,11 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 // for Go and Java, over the declared type of the field it reads (fieldGo,
 // fieldJava).
 func (r *staticFile) member(caller int32, recv wire.Type, method string, out siteOut) error {
+	if r.fc.family == "rust" {
+		if found, err := r.rustReceiver(caller, recv, method, out); err != nil || found {
+			return err
+		}
+	}
 	switch recv.Kind {
 	case wire.TypeNamed:
 		return r.named(r.fc, recv.Name, method, recv.Index == wire.ExactObject, out)

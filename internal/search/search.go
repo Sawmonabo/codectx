@@ -39,8 +39,14 @@ type Options struct {
 	// is the app stack's one pagination.Leases over the same store, passed in
 	// rather than built here so search and graph cannot drift into two wrappers
 	// with two TTLs.
-	Leases    *pagination.Leases
-	Content   ContentReader
+	Leases  *pagination.Leases
+	Content ContentReader
+	// Spools holds the exact phase's continuation state: a continuation inside
+	// the exact tiers sorts the hits after its position once and spools them,
+	// so later pages read their own records instead of walking the tiers.
+	// Without it (nil) every exact continuation walks from its position, which
+	// serves the same hits.
+	Spools    *pagination.Spools
 	Resources config.Resources
 	CursorTTL time.Duration
 	Now       func() time.Time
@@ -57,7 +63,11 @@ type Service struct {
 	signer  *pagination.Signer
 	leases  *pagination.Leases
 	content ContentReader
-	maxPage int
+	spools  *pagination.Spools
+	// queryMemory is resources.query_memory_bytes, whose sort share bounds
+	// the exact phase's sort.
+	queryMemory int64
+	maxPage     int
 	// maxTerms is resources.max_query_terms; unlimited (zero) scores every
 	// term of a query.
 	maxTerms config.Limit
@@ -113,18 +123,20 @@ func New(o Options) (*Service, error) {
 		logger = slog.Default()
 	}
 	return &Service{
-		store:    o.Store,
-		repo:     o.Repo,
-		signer:   o.Signer,
-		leases:   o.Leases,
-		content:  o.Content,
-		maxPage:  o.Resources.MaxPageItems,
-		maxTerms: o.Resources.MaxQueryTerms,
-		rule:     lengthRule(),
-		timeout:  o.Resources.QueryTimeout.Std(),
-		ttl:      ttl,
-		now:      now,
-		log:      logger,
+		store:       o.Store,
+		repo:        o.Repo,
+		signer:      o.Signer,
+		leases:      o.Leases,
+		content:     o.Content,
+		spools:      o.Spools,
+		maxPage:     o.Resources.MaxPageItems,
+		queryMemory: o.Resources.QueryMemoryBytes,
+		maxTerms:    o.Resources.MaxQueryTerms,
+		rule:        lengthRule(),
+		timeout:     o.Resources.QueryTimeout.Std(),
+		ttl:         ttl,
+		now:         now,
+		log:         logger,
 	}, nil
 }
 
@@ -199,17 +211,20 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 
 	resumed := req.Page.Cursor != ""
 	generation := req.GenerationID
-	var cursor pagination.Cursor
+	var token searchToken
 	var pos searchPosition
 	if resumed {
-		if cursor, err = decodeCursor(s.signer, req.Page.Cursor, endpointSearch, now); err != nil {
+		if token, err = decodeSearchToken(s.signer, req.Page.Cursor, now); err != nil {
 			return empty, err
 		}
-		if pos, err = parseSearchPosition(cursor.LastKey); err != nil {
+		if at := token.Exact; at != nil {
+			pos = searchPosition{phase: phaseExact, rank: at.Rank, node: at.Node}
+		} else if pos, err = parseSearchPosition(token.LastKey); err != nil {
 			return empty, err
 		}
-		generation = cursor.GenerationID
+		generation = token.GenerationID
 	}
+	cursor := token.Cursor
 	reader, err := s.store.PinGeneration(ctx, s.repo, generation, s.ttl)
 	if err != nil {
 		return empty, resumePinFailure(resumed, err)
@@ -236,8 +251,15 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	// has a live context to serve its page with, and a caller who stopped
 	// asking still stops all of it.
 	searchCtx, searchCancel := model.QueryDeadline(ctx, s.timeout)
-	ans, err := s.collect(searchCtx, reader, req, filter, pos, limit, pageBound{})
+	src := exactSource{sort: s.spools != nil, now: now}
+	if token.Exact != nil && s.spools != nil {
+		src.spool = &token
+	}
+	ans, err := s.collect(searchCtx, reader, req, filter, pos, limit, pageBound{}, src)
 	searchCancel()
+	if ans.rest != nil {
+		defer ans.rest.run.Close()
+	}
 	if err == nil {
 		err = filter.tag.Err()
 	}
@@ -259,9 +281,29 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}
+	// keepState is set when the next cursor goes on reading the presented
+	// cursor's spool under its lease, which must then outlive this page.
+	keepState := false
 	if ans.next != nil && !ans.deadline {
-		if meta.NextCursor, err = s.keysetNext(ctx, reader, endpointSearch, binding, hash, now, ans.next.lastKey()); err != nil {
-			return empty, err
+		switch {
+		case ans.spooled != nil && ans.spooled.Remaining > 0:
+			if meta.NextCursor, err = s.spoolContinue(ctx, token, *ans.spooled, now); err != nil {
+				return empty, err
+			}
+			keepState = true
+		case ans.rest != nil:
+			var ok bool
+			if meta.NextCursor, ok, err = s.spoolNext(ctx, reader, binding, hash, now, *ans.rest, *ans.next); err != nil {
+				return empty, err
+			}
+			if ok {
+				break
+			}
+			fallthrough
+		default:
+			if meta.NextCursor, err = s.keysetNext(ctx, reader, endpointSearch, binding, hash, now, ans.next.lastKey()); err != nil {
+				return empty, err
+			}
 		}
 	}
 	page := model.Page[model.SearchHit]{Meta: meta, Items: hits}
@@ -273,7 +315,10 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 	}
-	if resumed {
+	if resumed && !keepState {
+		if cursor.SpoolID != "" && s.spools != nil {
+			s.releaseSpool(cursor.SpoolID)
+		}
 		s.consumed(ctx, cursor)
 	}
 	attrs := []any{"component", "search", "generation_id", int64(binding.GenerationID),
@@ -298,6 +343,11 @@ type searchAnswer struct {
 	next     *searchPosition
 	deadline bool
 	lexical  *textindex.Page
+	// rest is the sorted remainder of a page drawn from a fresh sort of the
+	// exact phase, for the caller to spool; spooled is where a page read from
+	// a spool left it.
+	rest    *exactRest
+	spooled *exactSpoolPos
 }
 
 // add appends one hit and its span.
@@ -317,7 +367,7 @@ func (a *searchAnswer) add(hit model.SearchHit, span *model.ByteRange) {
 // continuation's key is the last SERVED result's, so the result past the page
 // is read again, and filtered again, by the next page.
 func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
-	filter hitFilter, pos searchPosition, limit int, bound pageBound) (searchAnswer, error) {
+	filter hitFilter, pos searchPosition, limit int, bound pageBound, src exactSource) (searchAnswer, error) {
 	var ans searchAnswer
 	// One rule serves the whole page: the exact walk, the position it resumes
 	// from and the lexical fold all ask it, so the file the query names is read
@@ -331,18 +381,15 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 	if pos.phase == phaseLexical {
 		after = pos.after
 	} else {
-		held, err := s.exactPhase(ctx, reader, rule, filter, pos, limit)
-		for i, e := range held {
-			if i == limit {
-				break
-			}
+		held, more, err := s.exactPage(ctx, reader, rule, filter, pos, limit, src, &ans)
+		for _, e := range held {
 			ans.add(e.served())
 		}
 		if err != nil {
 			return ended(ctx, ans, err)
 		}
-		if len(held) > limit {
-			last := held[limit-1]
+		if more {
+			last := held[len(held)-1]
 			ans.next = &searchPosition{phase: phaseExact, rank: last.Tier.Rank(), node: last.Node.Node.ID}
 			return ans, nil
 		}
@@ -520,6 +567,60 @@ func (h *exactHeap) sorted() []exactEntry {
 	copy(out, h.items)
 	slices.SortFunc(out, cmpExact)
 	return out
+}
+
+// exactSource says where a page's exact hits may come from beyond a walk: the
+// presented cursor's spool, and whether a continuation may sort the hits after
+// its position for a spool of its own. now is the request's clock, which a
+// spool's liveness is read against.
+type exactSource struct {
+	spool *searchToken
+	sort  bool
+	now   time.Time
+}
+
+// exactPage answers a page's exact hits, at most limit of them, and whether
+// more exact hits follow them. A page continuing a spool reads its records
+// (ans.spooled says where it stopped); a page whose spool is gone, or a
+// positional continuation that may sort, sorts the hits after its position
+// once and serves the head of the run (ans.rest holds the remainder for a
+// spool); a first page, and a continuation that may not sort, walks with a
+// heap of limit+1 hits.
+func (s *Service) exactPage(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter,
+	pos searchPosition, limit int, src exactSource, ans *searchAnswer) ([]exactEntry, bool, error) {
+	if t := src.spool; t != nil {
+		entries, next, gone, err := s.spooledPage(ctx, t.Cursor, *t.Exact, limit, src.now)
+		if err != nil {
+			return nil, false, err
+		}
+		if !gone {
+			at := exactSpoolPos{Offset: next, Remaining: t.Exact.Remaining - int64(len(entries))}
+			if len(entries) > 0 {
+				last := entries[len(entries)-1]
+				at.Rank, at.Node = last.Tier.Rank(), last.Node.Node.ID
+			}
+			ans.spooled = &at
+			return entries, at.Remaining > 0, nil
+		}
+	}
+	if pos.phase == phaseExact && src.sort {
+		run, err := s.sortedAfter(ctx, reader, rule, filter, pos)
+		if err != nil {
+			return nil, false, err
+		}
+		head, err := headOf(run, limit)
+		if err != nil || run.Len() <= int64(limit) {
+			run.Close()
+			return head, false, err
+		}
+		ans.rest = &exactRest{run: run, skip: limit}
+		return head, true, nil
+	}
+	held, err := s.exactPhase(ctx, reader, rule, filter, pos, limit)
+	if len(held) > limit {
+		return held[:limit], true, err
+	}
+	return held, false, err
 }
 
 // exactPhase walks the exact tiers from the cursor's position and answers the

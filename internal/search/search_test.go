@@ -355,10 +355,11 @@ func legCursorRejections(t *testing.T, f *fixture) {
 	if err != nil {
 		t.Fatalf("EncodeCursor: %v", err)
 	}
-	back, err := decodeCursor(signer, token, endpointSearch, now)
+	decoded, err := decodeSearchToken(signer, token, now)
 	if err != nil {
-		t.Fatalf("decodeCursor: %v", err)
+		t.Fatalf("decodeSearchToken: %v", err)
 	}
+	back := decoded.Cursor
 	if back.GenerationID != f.binding.GenerationID || back.AnalysisKey != f.binding.AnalysisKey || back.QueryHash != qh {
 		t.Fatalf("round trip lost the binding: %+v", back)
 	}
@@ -393,7 +394,7 @@ func legCursorRejections(t *testing.T, f *fixture) {
 		{"cross_endpoint", symbolToken},
 		{"malformed", "not-a-token"},
 	} {
-		_, err := decodeCursor(signer, c.token, endpointSearch, now)
+		_, err := decodeSearchToken(signer, c.token, now)
 		assertCode(t, c.name, err, model.CodeCursorInvalid)
 	}
 
