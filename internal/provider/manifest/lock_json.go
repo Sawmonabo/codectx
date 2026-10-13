@@ -431,8 +431,11 @@ func (u *unit) bunPackages(dec *json.Decoder, data []byte, t *npmTree, keys *[]s
 					_, e.version = yarnSplit(s)
 				case j == 1 && s != "":
 					e.source = s
-				case j == len(tuple)-1 && j >= 2:
+				case j >= 2 && strings.HasPrefix(s, "sha") && strings.Contains(s, "-"):
 					e.integrity = s
+				case j >= 2:
+					// A git package's resolved commit.
+					e.source = strings.TrimPrefix(e.source+"#"+s, "#")
 				}
 			case len(raw) > 0 && raw[0] == '{':
 				if err := json.Unmarshal(raw, &info); err != nil {

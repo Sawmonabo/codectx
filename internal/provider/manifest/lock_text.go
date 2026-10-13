@@ -287,6 +287,12 @@ func (u *unit) pnpmLock(ctx context.Context) error {
 			if i := strings.IndexByte(ver, '('); i > 0 {
 				ver = ver[:i]
 			}
+			if pnpmBefore6(version) {
+				// Before format 6 a peer suffix follows `_`.
+				if i := strings.IndexByte(ver, '_'); i > 0 {
+					ver = ver[:i]
+				}
+			}
 			dep := lockDep{name: name, version: ver, kind: kind}
 			for _, have := range e.deps {
 				if have == dep {
@@ -314,8 +320,7 @@ func pnpmSplit(key, format string) (name, version string) {
 	if i := strings.IndexByte(key, '('); i > 0 {
 		key = key[:i]
 	}
-	major, _, _ := strings.Cut(format, ".")
-	if n, err := strconv.Atoi(major); err == nil && n < 6 {
+	if pnpmBefore6(format) {
 		if i := strings.LastIndexByte(key, '/'); i > 0 {
 			name, version = key[:i], key[i+1:]
 			if j := strings.IndexByte(version, '_'); j > 0 {
@@ -339,4 +344,12 @@ func pnpmFlow(s string) map[string]string {
 		}
 	}
 	return out
+}
+
+// pnpmBefore6 reports a lock format version before 6, which spells package
+// keys `/name/version` and peer suffixes after `_`.
+func pnpmBefore6(format string) bool {
+	major, _, _ := strings.Cut(format, ".")
+	n, err := strconv.Atoi(major)
+	return err == nil && n < 6
 }

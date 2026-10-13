@@ -99,6 +99,8 @@ func wantLines(t *testing.T, name string, got, want []string) {
 //   - pnpm-lock.yaml v9: reading dependencies from `packages` alone (the
 //     `snapshots` graph is lost) or keeping the peer suffix in the key (the
 //     react-dom snapshot would be a second package);
+//   - pnpm-lock.yaml v5: splitting a `/name/version` key at its `@` (the
+//     scoped name would be cut) or keeping the `_peer` suffix;
 //   - bun.lock: failing on its trailing commas, or resolving a nested copy
 //     as the top-level one (other -> js-tokens would be 4.0.0);
 //   - uv.lock: dropping optional-dependencies or the marker, or counting
@@ -502,6 +504,29 @@ snapshots:
 				"npm:react-dom -> npm:react kind=runtime resolved_version=18.2.0 version=18.2.0 ranged",
 				"npm:react-dom -> npm:scheduler kind=runtime resolved_version=0.23.0 version=18.2.0 ranged",
 				"npm:react -> npm:loose-envify kind=runtime resolved_version=1.4.0 version=18.2.0 ranged",
+			},
+		},
+		{
+			name: "pnpm-lock.yaml v5",
+			path: "pnpm-lock.yaml",
+			body: `lockfileVersion: 5.4
+
+packages:
+
+  /@babel/core/7.17.9:
+    resolution: {integrity: sha512-5ug}
+    dependencies:
+      '@babel/helper-compilation-targets': 7.17.7_@babel+core@7.17.9
+    dev: true
+
+  /@babel/helper-compilation-targets/7.17.7_@babel+core@7.17.9:
+    resolution: {integrity: sha512-UFz}
+    dev: true
+`,
+			want: []string{
+				"npm:lock:pnpm-lock.yaml -> npm:@babel/core integrity=sha512-5ug kind=locked resolved_version=7.17.9 set_size=1 ranged",
+				"npm:lock:pnpm-lock.yaml -> npm:@babel/helper-compilation-targets integrity=sha512-UFz kind=locked resolved_version=7.17.7 set_size=1 ranged",
+				"npm:@babel/core -> npm:@babel/helper-compilation-targets kind=runtime resolved_version=7.17.7 version=7.17.9 ranged",
 			},
 		},
 		{

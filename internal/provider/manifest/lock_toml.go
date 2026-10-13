@@ -226,8 +226,8 @@ func sdistHash(files []pyFile) string {
 
 // poetryLock reads poetry.lock: `[[package]]` with name, version, its files
 // and their hashes, its source and `[package.dependencies]`, whose values
-// are a requirement, a table with a `version`, or a list of such tables for
-// requirements that differ by marker.
+// are a requirement, a table with a `version` (an `optional` one is an
+// extra's), or a list of such tables for requirements that differ by marker.
 func (u *unit) poetryLock(ctx context.Context) error {
 	return u.tomlLock(ctx, "package", "metadata", "lock-version", ecosystemPyPI, languagePython, func(seg []byte) (lockEntry, bool) {
 		var doc struct {
@@ -262,7 +262,11 @@ func (u *unit) poetryLock(ctx context.Context) error {
 			e.local = s.Type == "directory" || s.Type == "file"
 		}
 		for _, n := range sortedKeys(p.Dependencies) {
-			e.deps = append(e.deps, lockDep{name: normalizePyPI(n), requirement: poetryRequirement(p.Dependencies[n])})
+			kind := KindRuntime
+			if m, ok := p.Dependencies[n].(map[string]any); ok && m["optional"] == true {
+				kind = KindOptional
+			}
+			e.deps = append(e.deps, lockDep{name: normalizePyPI(n), requirement: poetryRequirement(p.Dependencies[n]), kind: kind})
 		}
 		return e, true
 	})
