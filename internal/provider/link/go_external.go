@@ -84,6 +84,11 @@ type goExternal struct {
 	// qualified names by Ref.Index.
 	refs  map[string]Ref
 	names []string
+	// interfaces are, for a name that is a defined type in some builds
+	// and an interface in others, its interface declarations' entities,
+	// each with its condition: what an interface embedding the name
+	// embeds (interfaceDecls).
+	interfaces map[string][]goExtVariant
 	// read and unavailable count the packages read and those with no
 	// readable source.
 	read, unavailable int
@@ -1081,11 +1086,23 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 			return err
 		}
 	}
+	mixed := map[string]bool{}
+	for _, n := range all {
+		if !n.iface && n.t.conflict {
+			mixed[n.q] = true
+		}
+	}
 	for _, n := range all {
 		if n.iface && !check(n.key, 0) {
 			continue
 		}
-		ref(n.key, n.q)
+		r := ref(n.key, n.q)
+		if n.variant && mixed[n.q] {
+			if x.interfaces == nil {
+				x.interfaces = map[string][]goExtVariant{}
+			}
+			x.interfaces[n.q] = append(x.interfaces[n.q], goExtVariant{r, n.cond})
+		}
 	}
 	for _, n := range all {
 		r, ok := x.refs[n.key]
@@ -1194,6 +1211,21 @@ func (x *goExternal) methodKeys(ctx context.Context, pkg *goExtPackage, methods 
 		}
 	}
 	return out, nil
+}
+
+// goExtVariant is an interface declaration's entity and its condition.
+type goExtVariant struct {
+	ref  Ref
+	cond goCond
+}
+
+// interfaceDecls are the interface declarations' entities of q when q is a
+// defined type in some builds and an interface in others, none otherwise.
+func (x *goExternal) interfaceDecls(q string) []goExtVariant {
+	if x == nil {
+		return nil
+	}
+	return x.interfaces[q]
 }
 
 // goKeyed is a method's name and method-set key, and the build condition

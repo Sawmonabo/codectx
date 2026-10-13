@@ -355,11 +355,14 @@ type Sizer interface{ Size() int } // @isizer
 type Wider interface{ Wide() } // @iwider
 
 type Arear interface{ Area() int } // @iarear
+
+type AreaI interface{ arch.Shape } // @iareai
 `,
 		},
 		// Checked with go vet per GOARCH: arch.Shape is an interface (Area) on 386 and a struct embedding Hi
 		// (Wide) with a method Size on amd64. So ES implements Sizer and Wider (amd64) and Arear and
 		// arch.Shape (386, its embedded interface promoting Area); Q implements arch.Shape and Arear (386).
+		// AreaI embeds arch.Shape, an interface on 386 (a constraint elsewhere), so Q and ES implement it.
 		want: []string{},
 		facts: []string{
 			"tes ES implements isizer Sizer",
@@ -370,10 +373,14 @@ type Arear interface{ Area() int } // @iarear
 			"tq Q implements external example.com/arch.Shape",
 			"qarea Area overrides iarear Area",
 			"qarea Area overrides external example.com/arch.Shape.Area",
+			"tq Q implements iareai AreaI",
+			"tes ES implements iareai AreaI",
+			"iareai AreaI extends external example.com/arch.Shape",
 		},
 		// Mutation: a name that is a struct in some builds and an interface in others read as its interface
 		// declarations alone -> ES implements neither Sizer nor Wider. Mutation: the receiver's methods read
-		// as the interface's -> arch.Shape needs Size and Q implements no arch.Shape.
+		// as the interface's -> arch.Shape needs Size and Q implements no arch.Shape. Mutation: an interface
+		// embedding the name reads its defined type's entity -> AreaI promotes nothing and Q implements no AreaI.
 		fails: "a type outside the unit that is a struct in some builds and an interface in others losing either kind's members",
 	},
 	{

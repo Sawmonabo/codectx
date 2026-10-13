@@ -131,6 +131,23 @@ func (h *hierarchy) goEmbeddings(methodSets *pagination.ExternalSort[entry], fc 
 				return err
 			}
 			if ok {
+				// An interface embedding a name outside the unit that is an
+				// interface in some builds and a defined type in others
+				// embeds its interface declarations, each in its own builds.
+				if sub.Ref.File == fc.file && t.Decls[sub.Ref.Index].Kind == model.NodeInterface {
+					if variants := h.goExt.interfaceDecls(external); variants != nil {
+						for _, v := range variants {
+							c := h.goConds.and(cond, v.cond)
+							if !h.goConds.holds(c) {
+								continue
+							}
+							if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: v.ref, MaxArgs: c}); err != nil {
+								return err
+							}
+						}
+						return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goExternalRecord, Aux: external, MaxArgs: cond})
+					}
+				}
 				// A type outside the unit whose method set the build read
 				// promotes its methods as one of the unit's does.
 				if ext, found := h.goExt.materialized(external); found {
