@@ -97,7 +97,19 @@ func (s *stack) overlayCalls(ctx context.Context, req model.GraphRequest) (model
 		}
 		// One answer is labeled with one server, and a server is rooted at
 		// one project, so every seed must belong to the same project.
-		seedRoot, err := route.profile.ProjectRoot(ctx, route.view, stored.Path)
+		// The stored path is written with the fact ('' only for a node with
+		// no file); a row without one reads the path from the snapshot, as
+		// attachServer does, rather than root the server at the workspace.
+		path := stored.Path
+		if path == "" {
+			rc, fv, err := route.view.Open(ctx, stored.Node.FileID)
+			if err != nil {
+				return model.GraphResult{}, err
+			}
+			rc.Close()
+			path = fv.Path
+		}
+		seedRoot, err := route.profile.ProjectRoot(ctx, route.view, path)
 		if err != nil {
 			return model.GraphResult{}, err
 		}
