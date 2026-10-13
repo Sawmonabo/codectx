@@ -172,9 +172,9 @@ var contributionsByFrom = codec[contribution]{put: contributionCodec.put, get: c
 
 // inputs answers a run of the region excluded holds the stored
 // contributions of every node outside it (flowInputs): into each variable
-// the run reads, one key range each, and every callable's returns, one
-// range, read from the contributions translated to this build's ordinals
-// once per refresh (ordSeek). release ends it.
+// asked, a callable's returns included, one key range each, read from the
+// contributions translated to this build's ordinals once per refresh
+// (ordSeek). release ends it.
 func (fr *flowRefresh) inputs(excluded *pagination.SortedRun[flowNode]) (in flowInputs, release func(), err error) {
 	dir := fr.u.dir
 	ex, err := fr.ordinals(excluded)
@@ -183,14 +183,7 @@ func (fr *flowRefresh) inputs(excluded *pagination.SortedRun[flowNode]) (in flow
 	}
 	in = func(wants *pagination.SortedRun[variable]) (*pagination.SortedRun[contribution], error) {
 		hits, err := collect(dir, contributionsByFrom, nil, func(add func(contribution) error) error {
-			err := fr.ordSeek.span(func(c contribution) int { return cmp.Compare(c.Entry.Kind, varReturn) }, add)
-			if err != nil {
-				return err
-			}
 			return wants.Each(func(v variable) error {
-				if v.Kind == varReturn {
-					return nil
-				}
 				return fr.ordSeek.span(func(c contribution) int { return cmpVar(c.Entry, v) }, add)
 			})
 		})

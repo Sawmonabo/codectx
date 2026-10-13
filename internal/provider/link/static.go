@@ -594,7 +594,9 @@ func joinFlows(site *Site, call idBinding, file model.FileID, params []boundPara
 // predecessor's hierarchy and groups exactly, since the hierarchy is a
 // function of the members' interfaces and the manifest fields alone: it
 // reads them from the state and reads no table but those of the members that
-// re-run. Any other build builds the hierarchy from every table.
+// re-run. Any other refresh builds the hierarchy again from the projections
+// the predecessor stored for the members whose digest held and the tables of
+// the others (rf.held), and a full build from every table, each read once.
 func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestField) (*resolution, error) {
 	res := &resolution{}
 	ok := false
@@ -621,8 +623,12 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 	} else if reuse {
 		res.h, res.groups = rf.prev.h, rf.prev.groups
 	} else {
-		var err error
-		if res.h, err = buildHierarchy(ctx, u); err != nil {
+		held, release, err := rf.held()
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		if res.h, err = buildHierarchy(ctx, u, held); err != nil {
 			return nil, err
 		}
 		if res.groups, err = indexGroups(u.dir, res.h, fields); err != nil {

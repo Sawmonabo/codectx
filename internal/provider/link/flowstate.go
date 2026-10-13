@@ -449,7 +449,8 @@ const (
 
 // buildModules writes a flow unit's module index: for Python, every
 // member's declarations and module under each dotted module name its path
-// can be imported as (indexPythonDecls), which reads every table; for
+// can be imported as (indexPythonDecls), read from the hierarchy's member
+// projections (projection.go), which reads no table; for
 // ECMAScript, every member file under each module path an import may name
 // it by, from the hierarchy's file contexts, which reads no table.
 func buildModules(ctx context.Context, u *unit, h *hierarchy) (*index, error) {
@@ -459,7 +460,7 @@ func buildModules(ctx context.Context, u *unit, h *hierarchy) (*index, error) {
 	}
 	defer s.Close()
 	if u.family == FamilyPython {
-		err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
+		err = h.projected(func(file int32, t *Table) error {
 			if err := indexPythonRouting(file, t, s.Add); err != nil {
 				return err
 			}

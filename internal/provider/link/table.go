@@ -64,6 +64,11 @@ type Table struct {
 	// worker. They are dropped, never fatal to the unit, and make the file's
 	// `calls` partial.
 	Dropped int `json:"dropped,omitempty"`
+	// anonymous, in a projection (project), is the offset of every Java
+	// anonymous body name the table carried that no declaration has, those
+	// of the parts the projection drops included, which anonymousNames
+	// ranks with the names the projection keeps.
+	anonymous []uint64
 }
 
 // Import is one name an import introduces into the file. Path is what the

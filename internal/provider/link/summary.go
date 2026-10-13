@@ -101,7 +101,8 @@ const (
 // module identity (path, language, package, module node and the unions its
 // types name), each import, declaration (its node identity, kind, names,
 // parent, signature, flags, argument counts and returned type), supertype
-// row, Go conversion (a proven subtype relation), re-export, and each value
+// row, Go conversion (a proven subtype relation), re-export, its routing with
+// the argument each mount passes, and each value
 // it stores: a function taken as a value or written to a field, which the
 // address-taken cross-product and field-based resolution read, and the values
 // the flow-based inference starts from.
@@ -154,7 +155,18 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		add(EntryInferred, caller, i, v)
 	}
 	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings) > 0 {
-		add(EntryRouting, "", 0, r)
+		// The argument each mount passes is read with the routing
+		// (mountKey), though it is written in a site.
+		args := make([]*wire.Type, len(r.Mounts))
+		for i := range r.Mounts {
+			if a, ok := mountArgument(t, &r.Mounts[i]); ok {
+				args[i] = &a
+			}
+		}
+		add(EntryRouting, "", 0, struct {
+			Routing
+			Arguments []*wire.Type
+		}{r, args})
 	}
 	if err != nil {
 		return nil, err

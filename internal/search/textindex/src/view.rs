@@ -133,9 +133,10 @@ impl View {
     pub fn open(index: Arc<Index>, generation: u64, visible: &[u8]) -> Result<View> {
         index.reader.reload()?;
         let searcher = index.reader.searcher();
+        let summaries = index.summaries_of(&searcher);
         let mut segs = Vec::with_capacity(searcher.segment_readers().len());
         let (mut docs, mut total, mut weighted) = (0u64, 0u64, 0u64);
-        for seg in searcher.segment_readers() {
+        for (seg, summary) in searcher.segment_readers().iter().zip(summaries) {
             let key = (generation, seg.segment_id(), seg.delete_opstamp());
             let cached = lock(&index.alive).get(&key);
             let alive = match cached {
@@ -149,7 +150,7 @@ impl View {
             docs += alive.docs;
             total = total.saturating_add(alive.total);
             weighted = weighted.saturating_add(alive.weighted);
-            segs.push(SegView { alive, summary: index.summary(seg) });
+            segs.push(SegView { alive, summary });
         }
         Ok(View { index, searcher, segs, docs, total, weighted })
     }

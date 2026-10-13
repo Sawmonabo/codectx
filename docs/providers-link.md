@@ -455,7 +455,7 @@ site's index is valid across builds because a member whose bytes did not change 
 whose bytes changed re-resolves whole. For Go, Java, Rust, C and C++ the state also holds what the refresh re-runs
 from: a hash of each hierarchy index key's entries, the reverse index from every key a file's resolution read to that
 file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
-identities their positions denote. For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
+identities their positions denote and each member's projection (`projection.go`). For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
 identity table, a module index (each Python declaration and module under every dotted name its file can be imported
 as; each ECMAScript file under its module path, its path without extension) with the hash of each of its keys'
 entries, and, for every node of the value-flow fixed point (a site, or a file's node owning its callables' returns,
@@ -496,12 +496,17 @@ What re-resolves:
   indirect sites read a signature whose set of taken functions changed. A file re-runs whole, since its sites read
   each other's results. When the layout holds (the same members, the same fields but those saying where a Go package outside the unit is read from, and every member whose table moved
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
-  and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
+  and republishes; otherwise it rebuilds the hierarchy and diffs it group by group. The rebuild reads the tables of
+  the members whose digest moved and of the added members only: for every other member it reads the projection the
+  state keeps (`internal/provider/link/projection.go`), the table without its sites, values, handlers and dynamic
+  imports but with each routing mount's argument and the Java anonymous bodies' offsets, which is everything the
+  hierarchy is built from. A full build reads each table once and builds its second pass from the projections.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
   value flow and binding, decomposed into nodes (each site, and each file's node), which a refresh maintains by
   deleting and re-deriving at the granularity of nodes (Gupta, Mumick and Subrahmanian, "Maintaining Views
   Incrementally", 1993). When the layout holds the refresh reuses the stored hierarchy and module index; otherwise it
-  rebuilds both from every table and diffs them group by group. It then re-derives a region of nodes, starting from
+  rebuilds both from the stored projections and the tables of the members whose digest moved or that are added,
+  and diffs them group by group. It then re-derives a region of nodes, starting from
   every node of each member whose table moved, that is added or that is removed, and every node that looked up a key
   whose group changed (a declaration, export, parameter or module added, removed or changed under it, so an added
   file's names re-run exactly the sites whose lookups now see them). Until the region settles:
@@ -524,7 +529,8 @@ What re-resolves:
 
   The stored contributions and reads are written once per refresh to block-indexed files, by node, by entry and by
   this build's ordinals (`flow_seek.go`), and each iteration reads them by key range: the region's nodes, the entries
-  those touch, the variables its run reads and the callables' returns. A node whose stored contribution names a
+  those touch, the variables its run reads and the returns of each callable a round of the run binds, read when it
+  binds it. A node whose stored contribution names a
   member or declaration that is gone joins the first region. No iteration passes over the unit's stored state; only
   carrying the untouched nodes' state into the new one does, once.
 

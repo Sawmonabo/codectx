@@ -14,7 +14,7 @@ use tantivy::indexer::LogMergePolicy;
 use tantivy::query::{RangeQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::tokenizer::TextAnalyzer;
-use tantivy::{Executor, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Executor, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term};
 
 use crate::codec::Reader;
 use crate::error::{Error, Result, CX_INVALID};
@@ -49,7 +49,7 @@ pub struct Index {
     pub executor: Executor,
     opts: Options,
     writer: Mutex<Option<IndexWriter<TantivyDocument>>>,
-    summaries: Mutex<HashMap<SegmentId, Arc<Summary>>>,
+    summaries: Arc<Summaries>,
     pub alive: Mutex<AliveCache>,
 }
 
@@ -64,6 +64,28 @@ fn worker_failure(w: &mut IndexWriter<TantivyDocument>, sent: tantivy::TantivyEr
     match w.prepare_commit() {
         Err(own) => Error::from(own),
         Ok(_) => Error::from(sent),
+    }
+}
+
+/// The summaries of an index's segments, each loaded once.
+struct Summaries {
+    dir: PathBuf,
+    map: Mutex<HashMap<SegmentId, Arc<Summary>>>,
+    /// Held while the summaries of a searcher are built, so concurrent views
+    /// of one index build each segment's summary once.
+    building: Mutex<()>,
+}
+
+impl Summaries {
+    /// The summary of a segment: cached, else loaded from its file. None when
+    /// the segment has no current summary.
+    fn get(&self, seg: &tantivy::SegmentReader) -> Option<Arc<Summary>> {
+        if let Some(s) = lock(&self.map).get(&seg.segment_id()) {
+            return Some(s.clone());
+        }
+        let s = Arc::new(Summary::load(&self.dir, seg)?);
+        lock(&self.map).insert(seg.segment_id(), s.clone());
+        Some(s)
     }
 }
 
@@ -94,6 +116,8 @@ impl Index {
         };
         index.tokenizers().register(CODE_TOKENIZER, TextAnalyzer::from(Code));
         let fields = Fields::resolve(&index.schema())?;
+        let summaries =
+            Arc::new(Summaries { dir: dir.to_path_buf(), map: Mutex::new(HashMap::new()), building: Mutex::new(()) });
         let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
         let executor = if opts.search_threads > 1 {
             Executor::multi_thread(opts.search_threads as usize, "cx-search-")?
@@ -108,7 +132,7 @@ impl Index {
             executor,
             opts,
             writer: Mutex::new(None),
-            summaries: Mutex::new(HashMap::new()),
+            summaries,
             alive: Mutex::new(AliveCache::new(opts.view_cache_bytes)),
         })
     }
@@ -297,12 +321,36 @@ impl Index {
     /// The summary of a segment: cached, else loaded from its file. None when
     /// the segment has no current summary.
     pub fn summary(&self, seg: &tantivy::SegmentReader) -> Option<Arc<Summary>> {
-        if let Some(s) = lock(&self.summaries).get(&seg.segment_id()) {
-            return Some(s.clone());
+        self.summaries.get(seg)
+    }
+
+    /// The summary of every segment of a searcher, in its order, building
+    /// first each one a segment lacks or holds in an earlier format, so no
+    /// page scores a segment without one, whatever brought the segment in: a
+    /// commit, a merge the writer ran in the background and published on its
+    /// own, another process, an index written before the current format. The
+    /// build writes only a summary file, never the index, so a read-only open
+    /// builds too. A segment whose build fails (a read-only directory, a full
+    /// disk) is scored exhaustively, which is exact, and counted per page as a
+    /// segment without a summary; a writer's next commit builds it again and
+    /// fails on the error. Summaries of segments the searcher no longer holds
+    /// are dropped from the cache (a view still holding one keeps its map).
+    pub fn summaries_of(&self, searcher: &Searcher) -> Vec<Option<Arc<Summary>>> {
+        let segs = searcher.segment_readers();
+        let mut out: Vec<Option<Arc<Summary>>> = segs.iter().map(|seg| self.summaries.get(seg)).collect();
+        if out.iter().any(Option::is_none) {
+            let _building = lock(&self.summaries.building);
+            for (seg, s) in segs.iter().zip(out.iter_mut()) {
+                if s.is_none() && self.summaries.get(seg).is_none() {
+                    let _ = summary::build(&self.dir, seg, &self.fields);
+                }
+                if s.is_none() {
+                    *s = self.summaries.get(seg);
+                }
+            }
         }
-        let s = Arc::new(Summary::load(&self.dir, seg)?);
-        lock(&self.summaries).insert(seg.segment_id(), s.clone());
-        Some(s)
+        lock(&self.summaries.map).retain(|id, _| segs.iter().any(|seg| seg.segment_id() == *id));
+        out
     }
 
     /// Builds the summary of every searchable segment that has none.
@@ -325,7 +373,7 @@ impl Index {
 
     fn remove_orphans(&self) -> Result<()> {
         let live = self.index.searchable_segment_ids()?;
-        lock(&self.summaries).retain(|id, _| live.contains(id));
+        lock(&self.summaries.map).retain(|id, _| live.contains(id));
         summary::remove_orphans(&self.dir, &live);
         Ok(())
     }

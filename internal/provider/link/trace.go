@@ -513,7 +513,9 @@ func (ids *idTable) groups(ix *index, scope string, out *pagination.ExternalSort
 
 // The hierarchy as the state keeps it, for a later build whose layout is the
 // same (refresh.layout): its module path and root, its two indexes and its
-// identity table, each written as it is on disk.
+// identity table, each written as it is on disk, and its members'
+// projections, which a later build whose layout broke reads in place of the
+// tables that held their digest (projection.go).
 
 // writeTo writes h to w.
 func (h *hierarchy) writeTo(w *bufio.Writer) error {
@@ -526,7 +528,10 @@ func (h *hierarchy) writeTo(w *bufio.Writer) error {
 	if err := h.links.writeTo(w); err != nil {
 		return err
 	}
-	return h.ids.writeTo(w)
+	if err := h.ids.writeTo(w); err != nil {
+		return err
+	}
+	return writeSection(w, h.members, encodeProjection)
 }
 
 // readHierarchy reads a hierarchy writeTo wrote into files of dir's arena.
@@ -552,6 +557,17 @@ func readHierarchy(dir string, s stateReader) (*hierarchy, error) {
 		return nil, err
 	}
 	if h.ids, err = readIDTable(dir, s); err != nil {
+		return nil, err
+	}
+	members, err := newProjectionSort(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer members.Close()
+	if err := readSection(s, "member projections", decodeProjection, compareProjection, true, members.Add); err != nil {
+		return nil, err
+	}
+	if h.members, err = members.Sorted(); err != nil {
 		return nil, err
 	}
 	ok = true
@@ -708,7 +724,8 @@ func skipHierarchy(s stateReader) error {
 	if m, err := io.CopyN(io.Discard, s.br, n); err != nil || m != n {
 		return stateCorrupt("its identity table is short")
 	}
-	return nil
+	return readSection(s, "member projections", decodeProjection, compareProjection, true,
+		func(projection) error { return nil })
 }
 
 // skipIndex reads an index writeTo wrote through, checking each entry.

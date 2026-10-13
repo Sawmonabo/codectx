@@ -285,7 +285,12 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   head's path and node are read ahead by sorted passes of growing size (at most 64 entries per segment and column),
   so a tied run's entries, which are in path order, decode each dictionary block once. The merge stops at the cut or
   at depth + 1 groups. Of each group met the merge reads only its fold key, from one column (two for a result without a node), and
-  none when one segment alone holds runs and marks, since no other segment can hold its group. Strings are read only
+  none when one segment alone holds runs and marks, since no other segment can hold its group. The key is looked up
+  (a search of the column's dictionary for its ordinal) only in the other segments that marked groups, never in its
+  own (a segment's run holds none of the groups it marked), and only where that segment's key filter accepts it. A
+  key the filter rejects is in neither dictionary, so the skipped lookup changes no answer; a false positive costs
+  one lookup. The filter answers in three memory reads where a dictionary search decodes a block, so a resumed page
+  over many segments no longer pays a lookup per key and segment. Strings are read only
   for the results served, one sorted dictionary pass per column and segment, the segments in parallel; the cut (a
   truncated segment's worst entry) keeps its document, its strings are read only when a head ties it, and its own
   segment never compares with it: a sorted pass decodes each dictionary block once for all the ordinals it holds,
@@ -347,11 +352,23 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   tiers are not ranked, and their continuation state is spooled (below).
 - **Block summaries.** Each segment has one summary file, `<segment id>.cxsum`, in the index directory. For every token
   of the five columns it holds the token's df over the segment's documents and, per block holding the token, the
-  maximum weighted term frequency and the minimum document length under both length forms. Deleted documents stay in
-  it; they only loosen a bound. A header names the segment and its document count; a mismatched or unreadable file
+  maximum weighted term frequency and the minimum document length under both length forms. It also holds the
+  segment's key filter: a binary fuse filter with 8-bit fingerprints over every value of the node and path columns
+  (each hashed with its column's tag), read in place from the memory map; about 9 to 12 bits a key and a 0.4%
+  false-positive rate (1 in 256), so 1 million keys take 1.2 to 1.4 MB. Deleted documents stay in
+  it; they only loosen a bound or admit a key. A header names the segment and its document count; a mismatched or unreadable file
   is no summary, and that segment is scored exhaustively, so a stale summary is never read. A summary is built for
-  every searchable segment that lacks one at each commit, after each merge (a writer release waits for merges), and
-  by a forced merge; the summaries of segments no longer present are removed.
+  every segment that lacks one, or holds one of an earlier format, before any page can score it: a view reloads the
+  reader and builds the missing summaries of the searcher it loaded before it scores, so a segment a background
+  merge published, or another process committed, is summarized by the first view that sees it (Lucene's
+  merged-segment warmer serves the same end, warming a merged segment before the merge commits). The search
+  library's own reader warmer is not used: it starts a collection thread for every reader that registers one, and a
+  thread per open index multiplies the address space a process reserves (its stack and its own malloc arena).
+  Concurrent views of one index build a segment's summary once. Read-only readers build too: the file is derived, written under a name of its own and renamed into
+  place, so builds in several processes at once agree. A reader that cannot write the directory scores those
+  segments exhaustively, exact and counted per page as segments without a summary; a commit builds what is still
+  missing and fails if it cannot. The summaries of segments no longer present are removed; a temporary file of a
+  live segment may be another process's build and is left.
 - **Bounds.** Ties are settled by the heap and the content comparator. A summary is read through a memory map with a
   binary-searched term table, so nothing per segment stays in the heap, and the scoring scratch is per block (128
   documents by the query's terms), never per segment. The writer's memory, its merge and search threads and the
@@ -543,6 +560,25 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
   by search-after over a point in time, re-running the query per page, and scroll's held search context is no longer
   recommended, https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html; the seek
   method needs an index in the sort order, https://use-the-index-luke.com/sql/partial-results/fetch-next-page.
+- The key filter (the Merge and Block summaries bullets of decision 5):
+  - binary fuse filters, within 13% of the space bound against 23% for xor and 44% for Bloom filters, with three
+    memory reads per query, Graf and Lemire, "Binary Fuse Filters: Fast and Smaller Than Xor Filters", ACM Journal of
+    Experimental Algorithmics 27 (2022), https://arxiv.org/abs/2201.01174;
+  - xor filters, Graf and Lemire (2020), https://arxiv.org/abs/1912.08258;
+  - a cache-local Bloom filter at 10 bits a key has about a 0.95% false-positive rate, and a Ribbon filter saves
+    about 30% of its space for 3 to 4 times its build CPU and more build memory,
+    https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter;
+  - Ribbon filters, Dillinger and Walzer (2021), https://arxiv.org/abs/2103.02515;
+  - the implementation, `BinaryFuse8` and its zero-copy `BinaryFuse8Ref`, https://docs.rs/xorf/0.13.0/xorf/;
+  - the search library keeps no term membership filter; its dictionary answers membership by a block search,
+    `Dictionary::term_ord` in https://github.com/quickwit-oss/tantivy/blob/0.26.0/sstable/src/dictionary.rs.
+- Summaries built before a page scores a segment (decision 5, Block summaries): the search library's `Warmer` runs in
+  `create_searcher` before `reload` stores the searcher and starts a `tantivy-warm-gc` thread per reader that has a
+  warmer, https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/reader/mod.rs and `src/reader/warming.rs` at the
+  same tag; its merges publish the merged segment from `end_merge` with no hook of their own, `src/indexer/segment_updater.rs`
+  at the same tag; Lucene's `IndexWriter.IndexReaderWarmer` warms "the newly merged segment, before the merge
+  commits",
+  https://lucene.apache.org/core/10_3_0/core/org/apache/lucene/index/IndexWriter.IndexReaderWarmer.html.
 - The search library's fix for its pruned disjunction-max scoring, https://github.com/quickwit-oss/tantivy/pull/3022
   (decision 5).
 - The Rust 1.81 release notes, https://blog.rust-lang.org/2024/09/05/Rust-1.81.0/: an uncaught unwind across a C ABI
