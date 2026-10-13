@@ -279,6 +279,36 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   read's results after the position. The prefix of the ranking is still scored on every page, to mark the groups
   it served; what a page no longer pays for its depth is the heap, the string resolution, the buffer and the
   service's filtering of every result before it.
+- **Merge.** A scored segment's heap becomes a run: its groups in comparator order, each a score, a count, a document
+  and a flag (24 bytes), with no strings; the heap is freed. The runs are merged k ways, comparing heads by score
+  alone and reading two heads' strings only when their scores tie, and the merge stops at the cut or at depth + 1
+  groups. Of each group met the merge reads only its fold key, from one column (two for a result without a node), and
+  none when one segment alone holds runs and marks, since no other segment can hold its group. Strings are read only
+  for the results served and for each truncated segment's worst entry, one sorted dictionary pass per column and
+  segment, the segments in parallel: a sorted pass decodes each dictionary block once for all the ordinals it holds,
+  where a lookup of one ordinal decodes its block (about 4 KB of deltas) from the start (see Sources). A page thus
+  resolves at most depth ordinals per column where a resolution of every heap resolved depth + 1 per segment; the
+  key reads are the only lookups a block can see twice, one column's, and only when several segments hold runs. The occurrence counts sum each run's entry of a served group,
+  each segment counted in parallel. This is the
+  query-then-fetch shape of the major engines: each shard returns sort keys, a k-way merge of the sorted per-shard
+  lists picks the winners, and only the winners are fetched (see Sources). Resolving every segment's heap to strings
+  before a hash fold would cost each segment place about 2.2 KB plus three copies of its strings. A shared minimum
+  competitive score across segments is not used: it saves scoring but not memory, since a segment can still hold k
+  places above it, and it lowers the occurrence counts a page serves. Exact counts cannot be kept beside it: an exact
+  count needs every matching document visited, so the major engines turn block skipping off when an exact total is
+  asked for, give a disjunction no sublinear count, and visit every match in every grouping collector (see Sources).
+  One heap shared by every segment, as a single-slice search keeps, would score segments one at a time and lose the
+  parallel scoring. A request may carry a byte bound: the library charges the heaps being scored, every run entry, the
+  marked groups and each served result with the caller's copy of it, sizes the heap to fit beside the marked groups'
+  bound (never below two places), doubles it on a rescoring only while it fits (or while no result is known), and ends
+  the merge before a result that would pass the bound, so a bounded page is an exact prefix that says more. A bounded
+  page reads its results' strings by the sorted pass, charging each string as it is read, and gives the pass up the
+  moment the charges pass the bound; only then does the merge run again reading each result's strings as it meets it,
+  so the page stops exactly where the bound falls and the pass never holds more than the bound. A key's charge is
+  never more than its result's, so when the pass fits, the merge that reads every string would take the same results
+  and stop no later. A page
+  reports a bound on the groups the next position marks: its marked groups plus the run entries it took up to its last
+  result, each of which sorts at or before that result.
 - **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
   skips every document that cannot enter the top k. A block is skipped only when its bound, widened by a relative and
   an absolute margin of 10⁻⁹ against rounding, is strictly below the heap's (depth + 1)-th score. A phrase term takes
@@ -348,9 +378,19 @@ The tokenizer reproduces today's rules:
 
 Every library tokenizer with a silent length cut is avoided. The library's default analyzer drops tokens of 40 bytes or
 more. One cut remains below the tokenizer: the library's postings writer does not index a single token longer than
-65 530 bytes. Our tokenizer still counts such a token in the document's length, so the length is exact, but a query
-for it cannot match. No identifier or word of source text reaches that size; the bound is the indexer's, and is stated
-here so that no record claims there is none.
+65 530 bytes (2^16 - 1 - 5, the width of its indexing hash map's key length). Our tokenizer never cuts a token and
+still counts such a token in the document's length, so the length is exact; a query for it could not match.
+
+No token reaches that size, and the proof is two bounds:
+- **The column bound.** A token is a run of one column's text, so it is no longer than the column. The longest column
+  is the body: the unit writer validates every search document before indexing it and rejects a body over 32 768 bytes
+  (`MaxSearchBodyBytes`), and a filesystem chunk is exactly that size. Path is rejected over 4 096 bytes; name,
+  qualified name and signature are cut by their producers to 512, 2 048 and 4 096 bytes.
+- **The fold growth bound.** Folding maps one codepoint to at most one codepoint, or drops it; camelCase parts are
+  substrings of the folded token. Over the 1 243 entries of the fold table the widest UTF-8 growth is 1.5 times:
+  U+023A (2 bytes) folds to U+2C65 (3 bytes). ASCII never grows.
+
+So the longest token any column can produce is 32 768 x 1.5 = 49 152 bytes, under 65 530.
 
 **The code-aware form is adopted.** This form emits the whole identifier, and also its camelCase and snake_case parts at
 the same position. For example, `NewController` is indexed as `newcontroller`, `new` and `controller`. Under the
@@ -443,6 +483,35 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
   - the collector trait (`src/collector/mod.rs`);
   - the garbage collection of superseded commits (`src/indexer/segment_updater.rs`);
   - the silent caps named in decisions 6 and 7.
+- Deep top-k across segments and shards (the Merge bullet of decision 5):
+  - per-slice top-k collectors merged at the end, and one collector for every segment without an executor,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/TopScoreDocCollectorManager.java
+    and `IndexSearcher.java` at the same tag;
+  - the k-way merge of sorted per-shard lists, `TopDocs.merge`,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/TopDocs.java;
+  - the shared minimum competitive score, built only when hit counts need not be exact,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/MaxScoreAccumulator.java;
+  - per-segment string ordinals compared within a segment and term bytes across segments,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/comparators/TermOrdValComparator.java;
+  - the search library's per-segment top-n buffers, all held and pushed again through one buffer at merge,
+    https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/collector/top_score_collector.rs and
+    `src/collector/sort_key_top_collector.rs` at the same tag;
+  - exact counts turn skipping off: the collector asks for complete scoring and builds no shared minimum score
+    when the hit-count threshold is unlimited,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/TopScoreDocCollector.java
+    (`scoreMode`, `updateMinCompetitiveScore`); a disjunction has no sublinear count, `BooleanWeight.count` at the
+    same tag; every grouping collector asks for complete scoring,
+    https://github.com/apache/lucene/tree/releases/lucene/10.3.0/lucene/grouping/src/java/org/apache/lucene/search/grouping;
+    an exact total "can't be computed accurately without visiting all matches" and disables the max-score
+    optimization, https://www.elastic.co/docs/solutions/search/the-search-api (`track_total_hits`);
+  - a dictionary lookup of one ordinal decodes its block from the block's first term, and a sorted pass over many
+    ordinals decodes each block once, `Dictionary::ord_to_term` and `Dictionary::sorted_ords_to_term_cb`,
+    https://github.com/quickwit-oss/tantivy/blob/0.26.0/sstable/src/dictionary.rs, with blocks cut at 4,000 bytes,
+    `BLOCK_LEN` in `sstable/src/delta.rs` at the same tag;
+  - query-then-fetch: the coordinator merges each shard's top keys and fetches only the winning documents,
+    https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/action/search/SearchPhaseController.java
+    and `FetchSearchPhase.java` at the same tag; deep pages cost memory and time in from + size,
+    https://www.elastic.co/docs/reference/elasticsearch/index-settings/index-modules.
 - The search library's fix for its pruned disjunction-max scoring, https://github.com/quickwit-oss/tantivy/pull/3022
   (decision 5).
 - The Rust 1.81 release notes, https://blog.rust-lang.org/2024/09/05/Rust-1.81.0/: an uncaught unwind across a C ABI

@@ -655,7 +655,7 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 //
 // They are what makes the worker count a concurrency FIGURE and not a resident
 // cost: a worker process costs ~18 MiB of resident set before it has parsed
-// anything (the binary's mapped pages dominate), and the count is now one per
+// anything (the binary's mapped pages dominate), and the count is one per
 // core, so a pool that spawned its ceiling eagerly, or held workers after the
 // work, would charge cores x 18 MiB -- about 320 MB on a sixteen-core host --
 // to every process holding a provider, for as long as it held them. A timer

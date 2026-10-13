@@ -171,3 +171,22 @@ func graphLimits(cfg config.Config) graph.Limits {
 		FrontierBytes:  cfg.Resources.QueryMemoryBytes,
 	}
 }
+
+// NodeMetadata pages the metadata rows of one node field: the elements of a
+// field the node's metadata names with a "<field>_rows" marker because they
+// did not fit the node row (model.SplitMetadata).
+func (s *Services) NodeMetadata(ctx context.Context, req model.NodeMetadataRequest) (model.Page[model.MetadataRow], error) {
+	if err := req.Validate(); err != nil {
+		return model.Page[model.MetadataRow]{}, err
+	}
+	var page model.Page[model.MetadataRow]
+	err := s.withEngine(ctx, req.GenerationID, func(e *graph.Engine) error {
+		var err error
+		page, err = e.NodeMetadata(ctx, req)
+		return err
+	})
+	if err != nil {
+		return model.Page[model.MetadataRow]{}, s.fail("node_metadata", err)
+	}
+	return page, nil
+}

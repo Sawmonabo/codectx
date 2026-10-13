@@ -235,8 +235,8 @@ func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 	}()
 
 	// The connect is the first assertion: it starts the server process and
-	// completes the protocol handshake, which the old composition could not
-	// reach at all while another process held the workspace.
+	// completes the protocol handshake while another process holds the
+	// workspace.
 	session, _, closeSession := s.mcpServer(t, ctx)
 	t.Cleanup(closeSession)
 

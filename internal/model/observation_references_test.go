@@ -8,14 +8,14 @@ import (
 // TestObservationReferencesCarryNoModelCeiling protects the rule that the model
 // refuses no attestation for the SIZE of what it cites.
 //
-// ObservationRequest, ScopeReviewEntry and ObservationReference each used to
-// reject a list longer than a hard-coded 64. An actor that read 200 files and
-// cited every one of them had its observation refused with no key to raise, and
-// a stored observation over that count could not be read back at all. The only
-// ceiling now is the caller's workflow.max_observation_references, unlimited by
-// default and reported with its own name when an operator does set it.
+// Mutation: ObservationRequest, ScopeReviewEntry or ObservationReference
+// rejecting a list longer than a hard-coded 64. An actor that read 200 files
+// and cited every one of them would have its observation refused with no key to
+// raise, and a stored observation over that count could not be read back. The
+// only ceiling is the caller's workflow.max_observation_references, unlimited
+// by default and reported with its own name when an operator does set it.
 func TestObservationReferencesCarryNoModelCeiling(t *testing.T) {
-	const count = 512 // comfortably past the 64 that used to refuse
+	const count = 512 // comfortably past a hard-coded 64
 	id := strings.Repeat("a", IDHexLen)
 	refs := make([]ClaimReference, count)
 	for i := range refs {

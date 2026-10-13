@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tantivy::collector::Count;
 use tantivy::index::SegmentId;
+use tantivy::indexer::IndexWriterOptions;
 use tantivy::indexer::LogMergePolicy;
 use tantivy::query::{RangeQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
 use tantivy::tokenizer::TextAnalyzer;
-use tantivy::indexer::IndexWriterOptions;
 use tantivy::{Executor, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::codec::Reader;
@@ -61,6 +61,11 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Index {
+    /// How many segments one search scores at once.
+    pub fn search_threads(&self) -> u64 {
+        u64::from(self.opts.search_threads.max(1))
+    }
+
     pub fn open(dir: &Path, opts: Options) -> Result<Index> {
         let exists = dir.join("meta.json").exists();
         let index = if exists {
@@ -152,7 +157,8 @@ impl Index {
                 d.add_text(f.text[i], c);
                 d.add_u64(f.lens[i], tokenizer::code_token_count(c));
             }
-            for (i, v) in [path, kind, name, qualified_name, signature, node_id, search_key, file_id].iter().enumerate() {
+            for (i, v) in [path, kind, name, qualified_name, signature, node_id, search_key, file_id].iter().enumerate()
+            {
                 d.add_text(f.strs[i], v);
             }
             d.add_text(f.unit, unit);

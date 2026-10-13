@@ -51,6 +51,10 @@ type Table struct {
 	// that does not fold to a constant (wire.DynamicImport); one that folds
 	// is an ordinary entry of Imports.
 	DynamicImports []DynamicImport `json:"dynamic_imports,omitempty"`
+	// Conversions are the file's values converted to a declared named type
+	// (wire.Conversion), Go's compile-time proofs that a type implements an
+	// interface.
+	Conversions []wire.Conversion `json:"conversions,omitempty"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the
@@ -154,6 +158,16 @@ type Decl struct {
 	// Property reports an ECMAScript function stored under a property path
 	// (wire.Export.Property): no bare name denotes it.
 	Property bool `json:"property,omitempty"`
+	// Return is the callable's return node as the structural provider
+	// resolved it: the variable node that stands for the value the callable
+	// returns, keyed by the callable's identity like its parameters, into
+	// which every value its returning nodes read flows. It is nil
+	// for a declaration no analysed function is the callable of.
+	Return *Endpoint `json:"return,omitempty"`
+	// Identity is a Go method's or alias's identity form
+	// (wire.Export.Identity), which the linker resolves to the packages
+	// declaring its types (goIdentity).
+	Identity string `json:"identity,omitempty"`
 	// Visibility is, for a C or C++ object-like macro, the visibility its
 	// replacement states (wire.Export.Visibility).
 	Visibility string `json:"visibility,omitempty"`
@@ -177,6 +191,10 @@ type Parameter struct {
 	Index       uint32 `json:"index"`
 	Variadic    bool   `json:"variadic,omitempty"`
 	KeywordOnly bool   `json:"keyword_only,omitempty"`
+	// Returned reports a parameter whose value reaches a return of its
+	// callable: the callable's return summary, by which a bound call site's
+	// argument flows into the site's result.
+	Returned bool `json:"returned,omitempty"`
 }
 
 // Visible reports that declaration cand can be named by a bare name in code
@@ -244,6 +262,14 @@ type Site struct {
 	// Candidates are the declarations of this file the callee name can
 	// mean, the structural provider's own in-file targets.
 	Candidates []int32 `json:"candidates,omitempty"`
+	// Results are the variable nodes the call's value is written into: the
+	// variables the innermost node evaluating the call defines, when no
+	// other call between them consumes the value first.
+	Results []Endpoint `json:"results,omitempty"`
+	// Into, when not 0, is one more than the index in Decls of the callable
+	// whose return the call's value reaches directly (`return f()`): the
+	// callee's return node flows into that callable's (Decl.Return).
+	Into int32 `json:"into,omitempty"`
 }
 
 // Argument is one argument of a call site (wire.Argument): where it is,

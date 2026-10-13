@@ -463,8 +463,8 @@ func TestPathResumesAcrossPagesWithTheSameAnswer(t *testing.T) {
 // deadline ends the PAGE, not the answer. The first page is given a deadline it
 // cannot finish under, and the continuation it mints must complete the search.
 //
-// Mutation (end the answer on the deadline instead of retaining the state --
-// the behaviour before this change) makes this FAIL at the missing cursor.
+// Mutation (end the answer on the deadline instead of retaining the state)
+// makes this FAIL at the missing cursor.
 func TestPathDeadlineMintsAResumableCursor(t *testing.T) {
 	g := pathProofGraph(64)
 	from, to := g.node("s"), g.node("t")
@@ -691,7 +691,8 @@ func (b busyPathGraph) Neighbours(ctx context.Context, refs []NodeRef, dir model
 	return b.MemoryGraph.Neighbours(ctx, refs, dir, kinds, from, fn)
 }
 
-// TestRetryableFailureLeavesAPathContinuationAdoptable is the SK3/A15 proof.
+// TestRetryableFailureLeavesAPathContinuationAdoptable proves a retryable
+// failure keeps the path continuation it was given.
 // ShortestPath releases the continuation it consumed on the way out. The
 // failure mode: releasing it on EVERY exit, so one transient
 // CTX_WORKSPACE_BUSY on one page turns the next presentation of that same
@@ -930,10 +931,9 @@ func pathSurfaces(t *testing.T, dir string) map[string]int64 {
 // pooled.
 //
 // A shortest-path search holds its settled set, its parent edges and its cost
-// buckets in a database on disk, and it used to create that database per query
-// and remove it when the page ended. A store answering path queries therefore
-// handed the filesystem one search's worth of deallocation per query, for
-// ever. On a host that discards freed blocks under a sparse virtual disk that
+// buckets in a database on disk. Creating that database per query and removing
+// it when the page ends would hand the filesystem one search's worth of
+// deallocation per query, for ever. On a host that discards freed blocks under a sparse virtual disk that
 // stalls every writer on the machine for about a minute, a minute later.
 //
 // The surface is taken from the store's pool and given back at its length.

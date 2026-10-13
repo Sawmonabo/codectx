@@ -939,8 +939,8 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 	// the overrun target is stated in, and the drift says by how much the
 	// worst file missed -- below zero when every file fitted.
 	for _, c := range r.NeedClasses {
-		fmt.Fprintf(tw, "    need %s %s build %q size class %d\tobservations %d, overruns %d, max drift %d bytes\n",
-			c.Language, shortDigest(c.Fingerprint), c.Build, c.SizeClass, c.Observations, c.Overruns, c.MaxDriftBytes)
+		fmt.Fprintf(tw, "    need %s %s %s build %q size class %d\tobservations %d, overruns %d, max drift %d bytes\n",
+			c.Kind, c.Subject, shortDigest(c.Fingerprint), c.Build, c.SizeClass, c.Observations, c.Overruns, c.MaxDriftBytes)
 	}
 	if r.NeedClassesOmitted > 0 {
 		fmt.Fprintf(tw, "    need %d more %s\t\n", r.NeedClassesOmitted,

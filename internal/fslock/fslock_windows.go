@@ -24,6 +24,22 @@ func TryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
+// TryLockShared takes a shared byte-range lock on the first byte of f
+// without blocking. Shared locks of any number of handles overlap; it reports
+// false while another handle holds the exclusive lock, and an exclusive
+// TryLock reports false while any handle holds this one.
+func TryLockShared(f *os.File) (bool, error) {
+	var ol windows.Overlapped
+	err := windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ol)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) || errors.Is(err, windows.ERROR_IO_PENDING) {
+		return false, nil
+	}
+	return false, err
+}
+
 // Lock takes an exclusive byte-range lock on the first byte of f, waiting for
 // whichever handle holds it to let it go.
 func Lock(f *os.File) error {
@@ -31,7 +47,7 @@ func Lock(f *os.File) error {
 	return windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ol)
 }
 
-// Unlock releases the lock TryLock took.
+// Unlock releases the lock TryLock or TryLockShared took.
 func Unlock(f *os.File) error {
 	var ol windows.Overlapped
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &ol)

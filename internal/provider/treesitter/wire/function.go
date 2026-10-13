@@ -47,6 +47,18 @@ type Function struct {
 	// when the definition is a may-definition.
 	Reads  []Access
 	Writes []Access
+	// Returns are the nodes whose evaluation is the value the callable
+	// returns: each return statement's node, and, for a callable whose body
+	// is an expression (an arrow or lambda with an expression body, a Rust
+	// block with a tail), the nodes that yield the body's value. Each is an
+	// index into Nodes, ascending.
+	Returns []uint32
+	// Returned holds Var whose value reaches Node, a node of Returns, or
+	// decides whether Node runs: each variable of Src(Node) and of Src(c) for
+	// each node c Node control-depends on, directly or through other such
+	// nodes (docs/providers-treesitter.md, Projection), by node, then
+	// variable.
+	Returned []Access
 }
 
 // Span is a byte range [Start, End) of the source. The binary encodings
@@ -87,6 +99,8 @@ const (
 //	            flows   n × (from, to, node)
 //	            reads   n × (var, node)
 //	            writes  n × (var, node, may as one byte 0 or 1)
+//	            returns n × node
+//	            returned n × (var, node)
 func AppendFunction(dst []byte, f *Function) []byte {
 	dst = binary.BigEndian.AppendUint32(dst, f.Span.Start)
 	dst = binary.BigEndian.AppendUint32(dst, f.Span.End)
@@ -127,6 +141,15 @@ func AppendFunction(dst []byte, f *Function) []byte {
 		}
 		dst = append(dst, may)
 	}
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(f.Returns)))
+	for _, n := range f.Returns {
+		dst = binary.BigEndian.AppendUint32(dst, n)
+	}
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(f.Returned)))
+	for _, a := range f.Returned {
+		dst = binary.BigEndian.AppendUint32(dst, a.Var)
+		dst = binary.BigEndian.AppendUint32(dst, a.Node)
+	}
 	return dst
 }
 
@@ -161,6 +184,8 @@ func DecodeFunction(payload []byte) (Function, error) {
 		f.Flows = d.pairs(len(f.Vars), len(f.Nodes))
 		f.Reads = d.accesses(len(f.Vars), len(f.Nodes), false)
 		f.Writes = d.accesses(len(f.Vars), len(f.Nodes), true)
+		f.Returns = d.indices(len(f.Nodes))
+		f.Returned = d.accesses(len(f.Vars), len(f.Nodes), false)
 	default:
 		d.fail("an unknown status byte")
 	}
@@ -270,6 +295,16 @@ func (d *decoder) accesses(vars, nodes int, may bool) []Access {
 			}
 		}
 		out = append(out, a)
+	}
+	return out
+}
+
+// indices reads a list of indices into a list of bound entries.
+func (d *decoder) indices(bound int) []uint32 {
+	n := d.count(4)
+	out := make([]uint32, 0, n)
+	for range n {
+		out = append(out, d.index(d.u32(), bound))
 	}
 	return out
 }

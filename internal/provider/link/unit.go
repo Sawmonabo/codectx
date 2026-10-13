@@ -99,11 +99,23 @@ const (
 	// FactOverrides: the method declaration Site directly overrides or
 	// implements the method Target, or the external method External names.
 	FactOverrides Fact = 7
+	// FactSummary: argument Arg of call site Site binds parameter Param of
+	// the declaration Target the site is bound to, and that parameter's
+	// value reaches Target's return (Parameter.Returned, the callee's return
+	// summary), so the argument flows into the site's result (Site.Results).
+	// Position is the parameter's Parameter.Index. Every FactSummary has the
+	// FactFlow of the same argument and parameter beside it.
+	FactSummary Fact = 8
+	// FactReturn: the return node of the declaration Target the call site
+	// Site is bound to (Decl.Return) flows into the site's result: its
+	// Results, and the return node of the callable its value is returned
+	// from (Site.Into). Only a bound site with a result has one.
+	FactReturn Fact = 9
 	// FactVisibility: the C or C++ declaration Site is written with a macro
 	// whose definition Target (an object-like macro the declaration's file
 	// sees) states the visibility its Detail names (visibilityDetail). A
 	// macro defined in several `#if` arms has one fact per definition.
-	FactVisibility Fact = 8
+	FactVisibility Fact = 10
 )
 
 // Binding is one fact a resolver found. Site names the entry of a member's
@@ -117,8 +129,9 @@ const (
 // names each by identity and publishes one occurrence per fact. A call site
 // with no call fact publishes an open-site node and the caller's `calls` edge
 // to it, unless a FactExternalSite says it is a proven external call. A
-// FactFlow into a parameter the structural provider minted no node for is
-// not a fact and is dropped.
+// FactFlow or FactSummary into a parameter the structural provider minted no
+// node for, and a FactReturn from a declaration with no return node, are not
+// facts and are dropped.
 type Binding struct {
 	Kind   Fact
 	Site   Ref
@@ -128,9 +141,12 @@ type Binding struct {
 	// Dispatch is a FactCall's per-occurrence dispatch, empty for every
 	// other kind.
 	Dispatch model.Dispatch
-	// Arg and Param are a FactFlow's argument index at the site and
-	// parameter index in the target's Decl.Parameters.
+	// Arg and Param are a FactFlow's or FactSummary's argument index at the
+	// site and parameter index in the target's Decl.Parameters.
 	Arg, Param int32
+	// Position is a FactSummary's parameter position, the parameter's
+	// Parameter.Index, which its published evidence names.
+	Position int32
 	// External is the external type or method a FactCall, FactExtends,
 	// FactImplements or FactOverrides targets (externalType,
 	// externalMethod); Target is then unused.

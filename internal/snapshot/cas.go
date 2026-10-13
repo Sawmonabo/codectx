@@ -24,19 +24,21 @@ import (
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
-// CAS is the local content-addressed store of Section 10.3: raw immutable blob
-// files named by their validated SHA-256, published atomically and never
-// replaced. Integrity metadata (block digests, line checkpoints) is not stored
-// here; it is persisted through storage and handed back to Open and ReadRange,
-// which verify the bytes they expose against it.
+// CAS is the local content-addressed store of Section 10.3: immutable blob
+// objects named by the validated SHA-256 of their plaintext, published
+// atomically and never replaced. Each object holds the blob's 64-KiB blocks as
+// independently compressed frames under a frame index (cas_frames.go), so a
+// range read decodes only the frames it covers. Integrity metadata (block
+// digests, line checkpoints) is not stored here; it is persisted through
+// storage and handed back to Open and ReadRange, which verify the plaintext
+// they expose against it.
 type CAS struct {
 	dir string
 	// arena is where a put's temporary comes from. A capture streams every
 	// file in the workspace through one of these before it can know whether
-	// the store already holds that content, so a re-index of an unchanged
-	// repository used to write the whole repository into temporaries and then
-	// free every one of them. Taking the temporary from the pool instead
-	// makes that pass free nothing at all.
+	// the store already holds that content. The temporary is a pooled
+	// surface, so a re-index of an unchanged repository writes into surfaces
+	// it reuses and frees nothing at all.
 	arena *scratch.Arena
 	// readOnly is a store opened by a process that answers questions and
 	// changes nothing. It creates no directory and every entry point that
@@ -199,7 +201,10 @@ type staged struct {
 	f     *os.File
 	final string
 	hash  string
+	// size is the published object's length: the frames and their index,
+	// not the blob's plaintext size, which is plain.
 	size  int64
+	plain int64
 }
 
 // NewBatch opens a batch against the store, sized from the machine.
@@ -235,7 +240,7 @@ func (b *Batch) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) 
 
 // put stages one blob, flushing the group first when the window is full.
 func (b *Batch) put(ctx context.Context, r io.Reader, want string) (model.BlobRecord, error) {
-	rec, lease, tmp, final, err := b.c.stage(ctx, r, want)
+	rec, lease, tmp, final, objSize, err := b.c.stage(ctx, r, want)
 	if err != nil {
 		return model.BlobRecord{}, err
 	}
@@ -266,7 +271,7 @@ func (b *Batch) put(ctx context.Context, r io.Reader, want string) (model.BlobRe
 		}
 		b.dirty[dir] = struct{}{}
 	}
-	b.open = append(b.open, staged{lease: lease, f: tmp, final: final, hash: rec.Hash, size: rec.Size})
+	b.open = append(b.open, staged{lease: lease, f: tmp, final: final, hash: rec.Hash, size: objSize, plain: rec.Size})
 	b.pending[rec.Hash] = struct{}{}
 	if len(b.open) >= b.window {
 		if err := b.flush(ctx); err != nil {
@@ -384,7 +389,7 @@ func (b *Batch) flush(ctx context.Context) error {
 		if err := s.f.Close(); err != nil {
 			return ioError("CAS close", err)
 		}
-		if err := b.c.publish(s.f.Name(), s.final, s.size); err != nil {
+		if err := b.c.publish(s.f.Name(), s.final, s.plain, s.hash); err != nil {
 			return err
 		}
 		published[i] = true
@@ -396,81 +401,97 @@ func (b *Batch) flush(ctx context.Context) error {
 }
 
 // stage streams r into a surface of the store's scratch pool while computing
-// the whole-file
-// digest, the 64-KiB block digests and the sparse line checkpoints in one pass
-// digests and the sparse line checkpoints in one pass (source.BuildIndex).
-// When want is set, content hashing to anything else is discarded unpublished
-// and reported as an integrity failure. Content already published under the
-// same digest is durable by construction, so the surface goes straight back
-// to the pool and a nil file is returned: the caller has nothing to sync and
-// nothing was freed. The returned record is what the caller persists with
-// storage.PutBlob before any manifest names it.
-func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRecord, *scratch.Lease, *os.File, string, error) {
+// the whole-file digest, the 64-KiB block digests and the sparse line
+// checkpoints in one pass (source.BuildIndex). When want is set, content
+// hashing to anything else is discarded unpublished and reported as an
+// integrity failure. Content already published under the same digest is
+// durable by construction, so the surface goes straight back to the pool and a
+// nil file is returned: the caller has nothing to sync and nothing was freed.
+// Only new content is then compressed into the object layout, so a re-index
+// of unchanged content pays the digests and never the compressor.
+// The returned record is what the caller persists with storage.PutBlob before
+// any manifest names it; the returned surface holds the object and the
+// returned length is the object's.
+func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRecord, *scratch.Lease, *os.File, string, int64, error) {
 	// Every blob that reaches this store passes here, whether it came through
 	// Put or through a batch, so this is the one place a read-only store has
 	// to refuse for none of them to be written.
 	if c.readOnly {
-		return model.BlobRecord{}, nil, nil, "", c.refuseWrite("store content")
+		return model.BlobRecord{}, nil, nil, "", 0, c.refuseWrite("store content")
 	}
 	if err := ctx.Err(); err != nil {
-		return model.BlobRecord{}, nil, nil, "", model.Canceled(err)
+		return model.BlobRecord{}, nil, nil, "", 0, model.Canceled(err)
 	}
 	lease, tmp, err := c.arena.TakeFile(scratch.ContentTemp)
 	if err != nil {
-		return model.BlobRecord{}, nil, nil, "", ioError("CAS temporary file", err)
+		return model.BlobRecord{}, nil, nil, "", 0, ioError("CAS temporary file", err)
 	}
-	keep := false
+	// The plaintext surface never leaves this function: published content
+	// needs nothing from it, and new content is compressed out of it into a
+	// surface of its own.
 	defer func() {
-		if !keep {
-			tmp.Close()
-			lease.Release()
-		}
+		tmp.Close()
+		lease.Release()
 	}()
 
 	idx, err := source.BuildIndex(io.TeeReader(r, tmp))
 	if err != nil {
-		return model.BlobRecord{}, nil, nil, "", ioError("CAS write", err)
+		return model.BlobRecord{}, nil, nil, "", 0, ioError("CAS write", err)
 	}
 	if want != "" && idx.ContentHash != want {
-		return model.BlobRecord{}, nil, nil, "", integrity("reconstructed content hashes to a different digest than the manifest records")
+		return model.BlobRecord{}, nil, nil, "", 0, integrity("reconstructed content hashes to a different digest than the manifest records")
 	}
 	rec := recordOf(idx)
 	final, err := c.path(rec.Hash)
 	if err != nil {
-		return model.BlobRecord{}, nil, nil, "", err
+		return model.BlobRecord{}, nil, nil, "", 0, err
 	}
 	if _, err := os.Lstat(final); err == nil {
-		if err := c.checkExisting(final, rec.Size); err != nil {
-			return model.BlobRecord{}, nil, nil, "", err
+		if err := c.checkExisting(final, rec.Size, rec.Hash); err != nil {
+			return model.BlobRecord{}, nil, nil, "", 0, err
 		}
-		return rec, nil, nil, final, nil
+		return rec, nil, nil, final, 0, nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return model.BlobRecord{}, nil, nil, "", ioError("CAS stat", err)
+		return model.BlobRecord{}, nil, nil, "", 0, ioError("CAS stat", err)
 	}
-	keep = true
-	return rec, lease, tmp, final, nil
+	// The object is written into a second surface rather than over the
+	// plaintext in place: compressing in place would leave the surface's
+	// plaintext tail to be freed before publication, on every new blob, and
+	// a pooled surface exists precisely so that capture frees nothing. The
+	// plaintext surface goes back to the pool at its length.
+	objLease, obj, err := c.arena.TakeFile(scratch.ContentTemp)
+	if err != nil {
+		return model.BlobRecord{}, nil, nil, "", 0, ioError("CAS temporary file", err)
+	}
+	objSize, err := encodeFrames(tmp, obj, rec.Size)
+	if err != nil {
+		obj.Close()
+		objLease.Release()
+		return model.BlobRecord{}, nil, nil, "", 0, ioError("CAS compress", err)
+	}
+	return rec, objLease, obj, final, objSize, nil
 }
 
 // publish links tmp to final atomically. An existing final is the same
-// content by construction of the name, so it is kept and only its size is
-// checked. A filesystem without hard links falls back to a rename, attempted
-// only while final is absent; a publisher racing into that window replaces
-// the object with byte-identical content, which changes nothing a reader can
-// observe.
+// content by construction of the name, so it is kept once it proves to be a
+// whole object for a blob of size plaintext bytes. A filesystem without hard
+// links falls back to a rename, attempted only while final is absent; a
+// publisher racing into that window replaces the object with one holding the
+// same plaintext, which changes nothing a reader can observe.
 //
 // tmp is a surface of the store's scratch pool. Nothing sweeps that pool, so
-// unlike the private temporary this replaced, it cannot be taken away between
-// the write and the link.
-func (c *CAS) publish(tmp, final string, size int64) error {
+// unlike a private temporary, it cannot be taken away between the write and
+// the link.
+func (c *CAS) publish(tmp, final string, size int64, hash string) error {
 	err := os.Link(tmp, final)
 	if err == nil {
 		return nil
 	}
 	if errors.Is(err, fs.ErrExist) {
-		return c.checkExisting(final, size)
+		return c.checkExisting(final, size, hash)
 	}
 	if _, statErr := os.Lstat(final); statErr == nil {
-		return c.checkExisting(final, size)
+		return c.checkExisting(final, size, hash)
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		return ioError("CAS publish", err)
@@ -478,13 +499,29 @@ func (c *CAS) publish(tmp, final string, size int64) error {
 	return nil
 }
 
-func (c *CAS) checkExisting(final string, size int64) error {
-	info, err := os.Lstat(final)
+// checkExisting proves that the object already published at final is whole
+// for a blob of size plaintext bytes: a regular file that ends in a frame
+// index whose frames account for every byte before it. The object is not
+// compared byte for byte with what this put would have written, because the
+// compressor owes no identical output from one build to the next; its
+// plaintext is what every read verifies against the block digests. A file
+// cut short by a lost write fails here, at publication, rather than at every
+// later read.
+func (c *CAS) checkExisting(final string, size int64, hash string) error {
+	f, err := os.Open(final)
+	if err != nil {
+		return ioError("CAS open", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return ioError("CAS stat", err)
 	}
-	if !info.Mode().IsRegular() || info.Size() != size {
+	if !info.Mode().IsRegular() {
 		return integrity("a different object is already published under this content hash")
+	}
+	if _, err := parseFrames(f, info.Size(), size, hash); err != nil {
+		return integrity("a different object is already published under this content hash").WithDetail("content_hash", hash)
 	}
 	return nil
 }
@@ -716,10 +753,10 @@ func (c *CAS) sweepBucket(ctx context.Context, dir string, known func(context.Co
 	return removed, errors.Join(errs...), false
 }
 
-// Open streams the blob described by rec, verifying each 64-KiB block digest
-// as it passes and the whole-file digest and size at end of file. A mismatch
-// is CTX_SOURCE_INTEGRITY at the offending block, before any later byte is
-// exposed. Memory is one block.
+// Open streams the blob described by rec, decoding one frame at a time and
+// verifying each 64-KiB block digest as it passes and the whole-file digest
+// at end of file. A mismatch is CTX_SOURCE_INTEGRITY at the offending block,
+// before any later byte is exposed. Memory is one block and one frame.
 func (c *CAS) Open(ctx context.Context, rec model.BlobRecord) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, model.Canceled(err)
@@ -749,14 +786,18 @@ func (c *CAS) open(hash string) (*os.File, error) {
 	return f, nil
 }
 
-// verifyingReader serves a blob one verified block at a time.
+// verifyingReader serves a blob one verified block at a time. The frame
+// index is read with the first block, so an object whose index is damaged
+// fails on the first Read, like any other damage.
 type verifyingReader struct {
 	f      *os.File
 	rec    model.BlobRecord
+	frames *frames
 	whole  hash.Hash
 	block  int
 	buf    []byte
 	pos    int
+	stored []byte
 	buffer [source.BlockBytes]byte
 	done   bool
 }
@@ -775,17 +816,22 @@ func (r *verifyingReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// fill reads and verifies the next block, or finishes the whole-file check
-// when every block has been served.
+// fill decodes and verifies the next block, or finishes the whole-file check
+// when every block has been served. The frames are contiguous from byte zero,
+// so they are read in order from the file's own position.
 func (r *verifyingReader) fill() error {
-	if r.block == len(r.rec.BlockDigests) {
-		// Every recorded block is verified. The file must end exactly here and
-		// the aggregate digest must match; extra bytes or a different whole
-		// digest mean the blocks and the object disagree.
-		var probe [1]byte
-		if n, err := r.f.Read(probe[:]); n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
-			return integrity("blob is longer than its recorded size").WithDetail("content_hash", r.rec.Hash)
+	if r.frames == nil {
+		fr, err := readFrames(r.f, r.rec.Size, r.rec.Hash)
+		if err != nil {
+			return err
 		}
+		r.frames = &fr
+	}
+	if r.block == len(r.rec.BlockDigests) {
+		// Every recorded block is verified, and the frame index already
+		// proved the object holds nothing past its frames but the index. The
+		// aggregate digest must match; a different one means the blocks and
+		// the object disagree.
 		if hex.EncodeToString(r.whole.Sum(nil)) != r.rec.Hash {
 			return integrity("blob content does not match its content hash").WithDetail("content_hash", r.rec.Hash)
 		}
@@ -793,19 +839,27 @@ func (r *verifyingReader) fill() error {
 		r.buf, r.pos = nil, 0
 		return nil
 	}
-	want := blockLen(r.rec.Size, r.block)
-	n, err := io.ReadFull(r.f, r.buffer[:want])
-	if err != nil {
+	i := r.block
+	length := int(r.frames.off[i+1] - r.frames.off[i])
+	if cap(r.stored) < length {
+		r.stored = make([]byte, length, source.BlockBytes)
+	}
+	if _, err := io.ReadFull(r.f, r.stored[:length]); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 			return integrity("blob is shorter than its recorded size").WithDetail("content_hash", r.rec.Hash)
 		}
 		return ioError("CAS read", err)
 	}
-	if err := verifyBlock(r.buffer[:n], r.rec, r.block); err != nil {
+	want := blockLen(r.rec.Size, i)
+	data, err := r.frames.decodeFrame(r.stored[:length], r.buffer[:0:want], i, r.rec.Hash)
+	if err != nil {
 		return err
 	}
-	r.whole.Write(r.buffer[:n])
-	r.buf, r.pos = r.buffer[:n], 0
+	if err := verifyBlock(data, r.rec, i); err != nil {
+		return err
+	}
+	r.whole.Write(data)
+	r.buf, r.pos = data, 0
 	r.block++
 	return nil
 }
@@ -830,11 +884,12 @@ func verifyBlock(data []byte, rec model.BlobRecord, i int) error {
 	return nil
 }
 
-// ReadRange returns the bytes [r.Start, r.End) of the blob, verifying exactly
-// the blocks that cover the interval against rec and nothing else: it never
-// rehashes the file and makes no claim about blocks it did not read. The
-// interval is bounded by model.MaxRawChunkBytes, so one call reads at most
-// that plus two partial blocks.
+// ReadRange returns the bytes [r.Start, r.End) of the blob, decoding and
+// verifying exactly the blocks that cover the interval against rec and
+// nothing else: it reads the frame index and the covering frames in two
+// positioned reads, never rehashes the file and makes no claim about blocks
+// it did not read. The interval is bounded by model.MaxRawChunkBytes, so one
+// call decodes at most that plus two partial blocks.
 func (c *CAS) ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, model.Canceled(err)
@@ -863,18 +918,29 @@ func (c *CAS) ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteR
 		return nil, err
 	}
 	defer f.Close()
-	start := int64(first) * source.BlockBytes
-	end := min(int64(last)*source.BlockBytes, rec.Size)
-	buf := make([]byte, end-start)
-	if _, err := f.ReadAt(buf, start); err != nil {
+	fr, err := readFrames(f, rec.Size, rec.Hash)
+	if err != nil {
+		return nil, err
+	}
+	stored := make([]byte, fr.off[last]-fr.off[first])
+	if _, err := f.ReadAt(stored, fr.off[first]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil, integrity("blob is shorter than its recorded size").WithDetail("content_hash", rec.Hash)
 		}
 		return nil, ioError("CAS read", err)
 	}
+	start := int64(first) * source.BlockBytes
+	end := min(int64(last)*source.BlockBytes, rec.Size)
+	buf := make([]byte, end-start)
 	for i := first; i < last; i++ {
 		off := int64(i-first) * source.BlockBytes
-		if err := verifyBlock(buf[off:off+int64(blockLen(rec.Size, i))], rec, i); err != nil {
+		want := int64(blockLen(rec.Size, i))
+		frame := stored[fr.off[i]-fr.off[first] : fr.off[i+1]-fr.off[first]]
+		data, err := fr.decodeFrame(frame, buf[off:off:off+want], i, rec.Hash)
+		if err != nil {
+			return nil, err
+		}
+		if err := verifyBlock(data, rec, i); err != nil {
 			return nil, err
 		}
 	}

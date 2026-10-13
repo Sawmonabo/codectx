@@ -58,7 +58,22 @@ the same name is invisible to the index.
   `@Override`, C++ `override` or `final`, TypeScript `override`, a Rust trait `impl` item, Python `typing.override`,
   or a Go method that satisfies an external interface's method set. An unmarked method of a class with an external
   supertype publishes no `overrides` edge, and its callers answer says that calls through the external supertype are
-  found only for marked overrides.
+  found only for marked overrides. A mark proves what its language says and no more, so the edges follow it: a Java
+  or C++ mark proves at least one overridden method and a method overrides every supertype's of its signature, so
+  each external supertype that may declare it (along paths no type of the project declares it on) is an edge with
+  detail `supertype_candidate` and the set size n, "at least one of n", published beside any override in the
+  project; a TypeScript `override` proves the extended class's member; a Python `typing.override` proves the first
+  definer along the method resolution order, one of the external bases when no class of the project defines it, a
+  set of their number.
+- **A Go interface outside the project.** Go satisfaction is structural and the source never names the interface,
+  so the linker reads the interface from its package's source as the go command finds it (the toolchain's standard
+  library, the workspace and local replacements in the snapshot, the module cache at the required version) and
+  compares method sets by type identity: each type named by its package's import path, aliases followed, an
+  unexported name qualified by its package. It does not type-check: `go/types` without every import's source
+  reports a type built from a missing import identical to any other, which would publish edges the compiler
+  rejects, and holding every imported package's types resident costs memory the size of the dependency closure. A
+  form it cannot decide matches nothing. A conversion `var _ I = (*T)(nil)` proves `T` implements `I` without `I`'s
+  source. Each unit's capability rows count the packages read and those with no readable source.
 - **Callers of `m`.** Calls into `m`; then, for every method `b` that `m` overrides at any depth, the calls into `b`
   whose `dispatch` is `virtual`, each row marked "through `b`" with `b`'s override count. The answer counts `direct`
   and `through_base` apart and includes the `overrides` relations it used, so the route
@@ -168,6 +183,15 @@ ranked, paged and counted.
   — callers through a base flagged "may or may not actually call".
 - *jdt-ui-dev thread*, https://www.eclipse.org/lists/jdt-ui-dev/msg01526.html — callers of an override include calls
   to the parent; no certainty that a static call never reaches the override.
+- *The Go Programming Language Specification*, https://go.dev/ref/spec — "Type identity", "Method sets",
+  "Uniqueness of identifiers", "Assignability", "Interface types".
+- *Go Modules Reference*, https://go.dev/ref/mod — module cache layout, `replace`, workspaces, vendoring.
+- *Go Toolchains*, https://go.dev/doc/toolchain — the toolchain a `go.mod` selects.
+- *Scaling gopls for the growing Go ecosystem*, https://go.dev/blog/gopls-scalability — per-package type checking
+  with export data spilled to disk.
+- *The Java Language Specification*, https://docs.oracle.com/javase/specs/jls/se21/html/ — §8.4.8.1 (overriding),
+  §9.6.4.4 (`@Override`).
+- *PEP 698*, https://peps.python.org/pep-0698/ — `typing.override`.
 - *callgraph/cha*, https://pkg.go.dev/golang.org/x/tools/go/callgraph/cha — class-hierarchy analysis and its spurious
   edges.
 - Salis et al., *PyCG: Practical Call Graph Generation in Python*, ICSE 2021 — precision and recall of a careful

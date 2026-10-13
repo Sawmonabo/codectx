@@ -27,6 +27,14 @@ const SchemaVersion = 1
 // but never raise it past this value.
 const MaxSourceWireCeilingBytes = 7340032
 
+// MinBatchBytes is the smallest index.batch_bytes that holds one node fact
+// carrying one metadata row piece: a piece of model.MaxMetadataPieceBytes
+// renders as a detail of at most twice that, and the node beside it carries
+// up to model.MaxMetadataBytes of metadata. A fact past the batch is split
+// into runs of its evidence by the sink, so this is the only width one batch
+// must hold.
+const MinBatchBytes = 4 * model.MaxMetadataPieceBytes
+
 // Enablement is the tri-state of an optional external analyzer. `auto` means
 // "use an already approved profile when one is available", never "execute
 // whatever is found on PATH" (Section 20.2).

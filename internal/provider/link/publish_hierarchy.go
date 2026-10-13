@@ -40,6 +40,9 @@ func (f *filePublication) hierarchy(d *Decl, group []idBinding) error {
 			return err
 		}
 		f.node(occurrenceOf(f.fv, f.t, d.Endpoint))
+		if b.Kind != FactVisibility {
+			set = externalOverrideSet(group, b)
+		}
 		f.relation(d.Node, kind, target, located(d.Range), "", b.Detail, "", set)
 	}
 	return nil

@@ -180,7 +180,7 @@ the analysis config hash.
 |---|---|---|
 | `workers` | `0` | Indexing workers; `0` chooses from available CPUs and memory reservations. |
 | `batch_records` | `1000` | Records per provider batch. |
-| `batch_bytes` | `4194304` | Bytes per provider batch. Must fit `index.queue_bytes`. |
+| `batch_bytes` | `4194304` | Bytes per provider batch. At least `131072` (one node with one stored metadata piece) and must fit `index.queue_bytes`. |
 | `queue_bytes` | `16777216` | Reserved bytes for the staging queue. |
 | `watch_pending_paths` | `10000` | Pending watch events before coalescing. |
 | `watch_pending_bytes` | `2097152` | Reserved bytes for pending watch events. |
@@ -487,8 +487,11 @@ unread match can rank above the packed files
 matches read fill more than the plan's file budget with files that each fit one
 slice, at a score margin derived from the ranking's boost constants, and a
 later round reads every match inside the files the plan keeps (decision 5). The
-manifest says when the read stopped and at which score. Every read is one page
-at a time. A value you do set is disclosed where it bites: the step that stopped
+manifest says when the read stopped and at which score. The working-tree and
+declaration reads are one page at a time; the lexical read is in process,
+starting at one page and doubling its depth while a step fits its share of
+`resources.query_memory_bytes`, and it serves the same matches in the same order
+whatever the depth. A value you do set is disclosed where it bites: the step that stopped
 is named in the manifest's exclusions, with the key and the value that stopped
 it, and the scope is reported incomplete.
 
@@ -514,14 +517,11 @@ than a silent reuse.
 
 ### No remaining default cap
 
-Sealing a capsule was the last place in this build where a built-in cap could
-still refuse work. It is closed. The two constants that bounded it — 250 000
-coverage or waiver files per capsule, and 1 000 records per capsule list — are
-gone, replaced by the two configuration keys above:
-`context.max_capsule_records_per_list` and
+No built-in cap refuses to seal a capsule. Its two bounds are the configuration
+keys above, `context.max_capsule_records_per_list` and
 `context.max_capsule_coverage_files`. Both default to unlimited, and the
-capsule's records are now durable rows read one page at a time rather than a
-list held whole.
+capsule's records are durable rows read one page at a time rather than a list
+held whole.
 
 On stock configuration nothing refuses a seal for its size, at any repository
 size. A value *you* set refuses the seal with `CTX_RESOURCE_LIMIT`, naming the
@@ -579,6 +579,10 @@ relationships that must hold:
 - `resources.max_provider_record_bytes` ≤ `index.batch_bytes` ≤ `index.queue_bytes`,
   the first pairing only when you set a record bound at all.
   One record must fit one batch, and one batch must fit the queue reservation.
+  `index.batch_bytes` is at least 128 KiB: a fact whose evidence passes one
+  batch is written as several batches of the same fact, and a metadata element
+  longer than 32 KiB is stored as ordered pieces the readers rejoin, so the
+  widest thing one batch must hold is one node with one such piece.
   There is no separate ceiling on a record beyond that: `index.batch_bytes` is
   the real constraint, and inventing a second one would refuse a configuration
   that is internally consistent.

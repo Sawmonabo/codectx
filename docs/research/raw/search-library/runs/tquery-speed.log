@@ -1,4 +1,4 @@
-=== tquery 20:28:35 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed
 tantivy-library/speed "vendor": hits 253589, page 200, cold 35.521 ms, warm median 1.240 ms
 tantivy-library/speed "func": hits 201750, page 200, cold 31.886 ms, warm median 1.485 ms
 tantivy-library/speed "src": hits 169436, page 200, cold 21.946 ms, warm median 0.861 ms
@@ -29,8 +29,8 @@ tantivy-library/speed "\"garbage collector\"": hits 851, page 200, cold 7.599 ms
 tantivy-library/speed "\"service account\"": hits 1052, page 200, cold 5.341 ms, warm median 0.263 ms
 tantivy-library/speed "\"node name\"": hits 936, page 200, cold 6.875 ms, warm median 1.182 ms
 tantivy-library/speed "\"admission controller\"": hits 309, page 200, cold 5.205 ms, warm median 0.345 ms
-rc=0 20:28:35
-=== tquery 20:28:35 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed-kind --kind function --kind method
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed-kind --kind function --kind method
 tantivy-library/speed-kind "vendor": hits 65823, page 200, cold 10.530 ms, warm median 3.234 ms
 tantivy-library/speed-kind "func": hits 167364, page 200, cold 6.648 ms, warm median 3.774 ms
 tantivy-library/speed-kind "src": hits 68325, page 200, cold 5.510 ms, warm median 3.205 ms
@@ -61,8 +61,8 @@ tantivy-library/speed-kind "\"garbage collector\"": hits 51, page 51, cold 1.464
 tantivy-library/speed-kind "\"service account\"": hits 69, page 69, cold 1.853 ms, warm median 0.413 ms
 tantivy-library/speed-kind "\"node name\"": hits 78, page 78, cold 2.712 ms, warm median 1.194 ms
 tantivy-library/speed-kind "\"admission controller\"": hits 26, page 26, cold 1.444 ms, warm median 0.353 ms
-rc=0 20:28:36
-=== tquery 20:28:36 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed-path --path-prefix pkg
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed-path --path-prefix pkg
 tantivy-library/speed-path "vendor": hits 40, page 40, cold 5.656 ms, warm median 3.677 ms
 tantivy-library/speed-path "func": hits 41923, page 200, cold 7.409 ms, warm median 5.624 ms
 tantivy-library/speed-path "src": hits 65, page 65, cold 5.085 ms, warm median 3.715 ms
@@ -93,8 +93,8 @@ tantivy-library/speed-path "\"garbage collector\"": hits 49, page 49, cold 3.731
 tantivy-library/speed-path "\"service account\"": hits 216, page 200, cold 5.643 ms, warm median 2.982 ms
 tantivy-library/speed-path "\"node name\"": hits 271, page 200, cold 5.995 ms, warm median 3.949 ms
 tantivy-library/speed-path "\"admission controller\"": hits 21, page 21, cold 3.509 ms, warm median 2.968 ms
-rc=0 20:28:37
-=== tquery 20:28:37 <bench>/idx/t16-default-end <bench>/queries.txt 5 library --phase speed-11seg
+rc=0
+=== tquery <bench>/idx/t16-default-end <bench>/queries.txt 5 library --phase speed-11seg
 tantivy-library/speed-11seg "vendor": hits 253589, page 200, cold 57.268 ms, warm median 1.332 ms
 tantivy-library/speed-11seg "func": hits 201750, page 200, cold 34.340 ms, warm median 1.861 ms
 tantivy-library/speed-11seg "src": hits 169436, page 200, cold 17.542 ms, warm median 1.030 ms
@@ -125,8 +125,8 @@ tantivy-library/speed-11seg "\"garbage collector\"": hits 851, page 200, cold 6.
 tantivy-library/speed-11seg "\"service account\"": hits 1052, page 200, cold 5.162 ms, warm median 0.366 ms
 tantivy-library/speed-11seg "\"node name\"": hits 936, page 200, cold 7.632 ms, warm median 1.239 ms
 tantivy-library/speed-11seg "\"admission controller\"": hits 309, page 200, cold 5.361 ms, warm median 0.457 ms
-rc=0 20:28:38
-=== tquery 20:28:38 <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed
 tantivy-library-all/speed "vendor": hits 253589, page 200, cold 58.199 ms, warm median 32.545 ms
 tantivy-library-all/speed "func": hits 201750, page 200, cold 31.537 ms, warm median 26.851 ms
 tantivy-library-all/speed "src": hits 169436, page 200, cold 23.903 ms, warm median 10.566 ms
@@ -157,8 +157,8 @@ tantivy-library-all/speed "\"garbage collector\"": hits 851, page 200, cold 2.18
 tantivy-library-all/speed "\"service account\"": hits 1052, page 200, cold 2.218 ms, warm median 1.192 ms
 tantivy-library-all/speed "\"node name\"": hits 936, page 200, cold 3.367 ms, warm median 1.998 ms
 tantivy-library-all/speed "\"admission controller\"": hits 309, page 200, cold 2.218 ms, warm median 1.233 ms
-rc=0 20:28:39
-=== tquery 20:28:39 <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed-kind --kind function --kind method
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed-kind --kind function --kind method
 tantivy-library-all/speed-kind "vendor": hits 65823, page 200, cold 37.776 ms, warm median 33.711 ms
 tantivy-library-all/speed-kind "func": hits 167364, page 200, cold 36.240 ms, warm median 28.824 ms
 tantivy-library-all/speed-kind "src": hits 68325, page 200, cold 18.051 ms, warm median 6.890 ms
@@ -189,8 +189,8 @@ tantivy-library-all/speed-kind "\"garbage collector\"": hits 51, page 51, cold 1
 tantivy-library-all/speed-kind "\"service account\"": hits 69, page 69, cold 1.321 ms, warm median 0.753 ms
 tantivy-library-all/speed-kind "\"node name\"": hits 78, page 78, cold 2.202 ms, warm median 1.523 ms
 tantivy-library-all/speed-kind "\"admission controller\"": hits 26, page 26, cold 0.955 ms, warm median 0.525 ms
-rc=0 20:28:40
-=== tquery 20:28:40 <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed-path --path-prefix pkg
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed-path --path-prefix pkg
 tantivy-library-all/speed-path "vendor": hits 40, page 40, cold 5.694 ms, warm median 3.777 ms
 tantivy-library-all/speed-path "func": hits 41923, page 200, cold 12.554 ms, warm median 12.557 ms
 tantivy-library-all/speed-path "src": hits 65, page 65, cold 4.430 ms, warm median 3.875 ms
@@ -221,8 +221,8 @@ tantivy-library-all/speed-path "\"garbage collector\"": hits 49, page 49, cold 3
 tantivy-library-all/speed-path "\"service account\"": hits 216, page 200, cold 4.624 ms, warm median 3.558 ms
 tantivy-library-all/speed-path "\"node name\"": hits 271, page 200, cold 5.235 ms, warm median 4.450 ms
 tantivy-library-all/speed-path "\"admission controller\"": hits 21, page 21, cold 3.671 ms, warm median 2.892 ms
-rc=0 20:28:41
-=== tquery 20:28:41 <bench>/idx/t16-default-end <bench>/queries.txt 5 library-all --phase speed-11seg
+rc=0
+=== tquery <bench>/idx/t16-default-end <bench>/queries.txt 5 library-all --phase speed-11seg
 tantivy-library-all/speed-11seg "vendor": hits 253589, page 200, cold 64.377 ms, warm median 39.694 ms
 tantivy-library-all/speed-11seg "func": hits 201750, page 200, cold 38.594 ms, warm median 25.838 ms
 tantivy-library-all/speed-11seg "src": hits 169436, page 200, cold 25.079 ms, warm median 10.550 ms
@@ -253,8 +253,8 @@ tantivy-library-all/speed-11seg "\"garbage collector\"": hits 851, page 200, col
 tantivy-library-all/speed-11seg "\"service account\"": hits 1052, page 200, cold 2.834 ms, warm median 1.465 ms
 tantivy-library-all/speed-11seg "\"node name\"": hits 936, page 200, cold 3.668 ms, warm median 2.104 ms
 tantivy-library-all/speed-11seg "\"admission controller\"": hits 309, page 200, cold 3.476 ms, warm median 1.338 ms
-rc=0 20:28:42
-=== tquery 20:28:42 <bench>/idx/t16-large-end <bench>/queries.txt 5 product --phase speed
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 product --phase speed
   product "vendor": 253589 candidate documents, 252683 hits
   product "vendor": 253589 candidate documents, 252683 hits
   product "vendor": 253589 candidate documents, 252683 hits
@@ -435,8 +435,8 @@ tantivy-product/speed "\"node name\"": hits 784, page 200, cold 18.981 ms, warm 
   product "\"admission controller\"": 309 candidate documents, 261 hits
   product "\"admission controller\"": 309 candidate documents, 261 hits
 tantivy-product/speed "\"admission controller\"": hits 261, page 200, cold 9.993 ms, warm median 5.266 ms
-rc=0 20:29:07
-=== tquery 20:29:07 <bench>/idx/t16-large-end <bench>/queries.txt 5 product --phase speed-kind --kind function --kind method
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 product --phase speed-kind --kind function --kind method
   product "vendor": 65823 candidate documents, 65823 hits
   product "vendor": 65823 candidate documents, 65823 hits
   product "vendor": 65823 candidate documents, 65823 hits
@@ -617,8 +617,8 @@ tantivy-product/speed-kind "\"node name\"": hits 78, page 78, cold 8.647 ms, war
   product "\"admission controller\"": 26 candidate documents, 26 hits
   product "\"admission controller\"": 26 candidate documents, 26 hits
 tantivy-product/speed-kind "\"admission controller\"": hits 26, page 26, cold 4.987 ms, warm median 1.369 ms
-rc=0 20:29:20
-=== tquery 20:29:20 <bench>/idx/t16-large-end <bench>/queries.txt 5 product --phase speed-path --path-prefix pkg
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 product --phase speed-path --path-prefix pkg
   product "vendor": 40 candidate documents, 21 hits
   product "vendor": 40 candidate documents, 21 hits
   product "vendor": 40 candidate documents, 21 hits
@@ -799,8 +799,8 @@ tantivy-product/speed-path "\"node name\"": hits 220, page 200, cold 9.798 ms, w
   product "\"admission controller\"": 21 candidate documents, 17 hits
   product "\"admission controller\"": 21 candidate documents, 17 hits
 tantivy-product/speed-path "\"admission controller\"": hits 17, page 17, cold 5.570 ms, warm median 1.224 ms
-rc=0 20:29:25
-=== tquery 20:29:25 <bench>/idx/t16-default-end <bench>/queries.txt 5 product --phase speed-11seg
+rc=0
+=== tquery <bench>/idx/t16-default-end <bench>/queries.txt 5 product --phase speed-11seg
   product "vendor": 253589 candidate documents, 252683 hits
   product "vendor": 253589 candidate documents, 252683 hits
   product "vendor": 253589 candidate documents, 252683 hits
@@ -981,8 +981,8 @@ tantivy-product/speed-11seg "\"node name\"": hits 784, page 200, cold 21.621 ms,
   product "\"admission controller\"": 309 candidate documents, 261 hits
   product "\"admission controller\"": 309 candidate documents, 261 hits
 tantivy-product/speed-11seg "\"admission controller\"": hits 261, page 200, cold 11.217 ms, warm median 6.250 ms
-rc=0 20:29:51
-=== tquery 20:29:51 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed-t16 --search-threads 16
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase speed-t16 --search-threads 16
 tantivy-library/speed-t16 "vendor": hits 253589, page 200, cold 3.045 ms, warm median 0.749 ms
 tantivy-library/speed-t16 "func": hits 201750, page 200, cold 2.764 ms, warm median 0.829 ms
 tantivy-library/speed-t16 "src": hits 169436, page 200, cold 2.721 ms, warm median 0.580 ms
@@ -1013,8 +1013,8 @@ tantivy-library/speed-t16 "\"garbage collector\"": hits 851, page 200, cold 1.99
 tantivy-library/speed-t16 "\"service account\"": hits 1052, page 200, cold 2.303 ms, warm median 0.255 ms
 tantivy-library/speed-t16 "\"node name\"": hits 936, page 200, cold 2.422 ms, warm median 0.683 ms
 tantivy-library/speed-t16 "\"admission controller\"": hits 309, page 200, cold 2.343 ms, warm median 0.277 ms
-rc=0 20:29:51
-=== tquery 20:29:51 <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed-t16 --search-threads 16
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library-all --phase speed-t16 --search-threads 16
 tantivy-library-all/speed-t16 "vendor": hits 253589, page 200, cold 30.261 ms, warm median 20.356 ms
 tantivy-library-all/speed-t16 "func": hits 201750, page 200, cold 26.369 ms, warm median 13.512 ms
 tantivy-library-all/speed-t16 "src": hits 169436, page 200, cold 19.992 ms, warm median 10.424 ms
@@ -1045,8 +1045,8 @@ tantivy-library-all/speed-t16 "\"garbage collector\"": hits 851, page 200, cold 
 tantivy-library-all/speed-t16 "\"service account\"": hits 1052, page 200, cold 1.936 ms, warm median 1.265 ms
 tantivy-library-all/speed-t16 "\"node name\"": hits 936, page 200, cold 2.322 ms, warm median 1.573 ms
 tantivy-library-all/speed-t16 "\"admission controller\"": hits 309, page 200, cold 2.680 ms, warm median 1.195 ms
-rc=0 20:29:52
-=== tquery 20:29:52 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page1 --page 1
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page1 --page 1
 tantivy-library/page1 "vendor": hits 253589, page 200, cold 3.112 ms, warm median 1.152 ms
 tantivy-library/page1 "func": hits 201750, page 200, cold 4.328 ms, warm median 1.383 ms
 tantivy-library/page1 "src": hits 169436, page 200, cold 3.194 ms, warm median 0.829 ms
@@ -1077,8 +1077,8 @@ tantivy-library/page1 "\"garbage collector\"": hits 851, page 200, cold 2.218 ms
 tantivy-library/page1 "\"service account\"": hits 1052, page 200, cold 2.546 ms, warm median 0.269 ms
 tantivy-library/page1 "\"node name\"": hits 936, page 200, cold 3.261 ms, warm median 1.104 ms
 tantivy-library/page1 "\"admission controller\"": hits 309, page 200, cold 2.836 ms, warm median 0.331 ms
-rc=0 20:29:52
-=== tquery 20:29:52 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page2 --page 2
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page2 --page 2
 tantivy-library/page2 "vendor": hits 253589, page 200, cold 2.895 ms, warm median 1.250 ms
 tantivy-library/page2 "func": hits 201750, page 200, cold 3.574 ms, warm median 1.804 ms
 tantivy-library/page2 "src": hits 169436, page 200, cold 2.996 ms, warm median 0.893 ms
@@ -1109,8 +1109,8 @@ tantivy-library/page2 "\"garbage collector\"": hits 851, page 200, cold 1.217 ms
 tantivy-library/page2 "\"service account\"": hits 1052, page 200, cold 2.769 ms, warm median 0.277 ms
 tantivy-library/page2 "\"node name\"": hits 936, page 200, cold 3.119 ms, warm median 1.095 ms
 tantivy-library/page2 "\"admission controller\"": hits 309, page 109, cold 1.419 ms, warm median 0.255 ms
-rc=0 20:29:52
-=== tquery 20:29:52 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page3 --page 3
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page3 --page 3
 tantivy-library/page3 "vendor": hits 253589, page 200, cold 3.724 ms, warm median 1.327 ms
 tantivy-library/page3 "func": hits 201750, page 200, cold 4.092 ms, warm median 1.360 ms
 tantivy-library/page3 "src": hits 169436, page 200, cold 3.213 ms, warm median 1.096 ms
@@ -1141,8 +1141,8 @@ tantivy-library/page3 "\"garbage collector\"": hits 851, page 200, cold 1.243 ms
 tantivy-library/page3 "\"service account\"": hits 1052, page 200, cold 2.246 ms, warm median 0.273 ms
 tantivy-library/page3 "\"node name\"": hits 936, page 200, cold 2.647 ms, warm median 1.056 ms
 tantivy-library/page3 "\"admission controller\"": hits 309, page 0, cold 0.749 ms, warm median 0.209 ms
-rc=0 20:29:53
-=== tquery 20:29:53 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page5 --page 5
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page5 --page 5
 tantivy-library/page5 "vendor": hits 253589, page 200, cold 5.040 ms, warm median 1.154 ms
 tantivy-library/page5 "func": hits 201750, page 200, cold 3.436 ms, warm median 2.253 ms
 tantivy-library/page5 "src": hits 169436, page 200, cold 3.493 ms, warm median 0.941 ms
@@ -1173,8 +1173,8 @@ tantivy-library/page5 "\"garbage collector\"": hits 851, page 51, cold 0.948 ms,
 tantivy-library/page5 "\"service account\"": hits 1052, page 200, cold 1.485 ms, warm median 0.288 ms
 tantivy-library/page5 "\"node name\"": hits 936, page 136, cold 2.058 ms, warm median 1.076 ms
 tantivy-library/page5 "\"admission controller\"": hits 309, page 0, cold 0.689 ms, warm median 0.218 ms
-rc=0 20:29:53
-=== tquery 20:29:53 <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page10 --page 10
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 5 library --phase page10 --page 10
 tantivy-library/page10 "vendor": hits 253589, page 200, cold 2.145 ms, warm median 1.446 ms
 tantivy-library/page10 "func": hits 201750, page 200, cold 3.870 ms, warm median 2.850 ms
 tantivy-library/page10 "src": hits 169436, page 200, cold 3.079 ms, warm median 1.105 ms
@@ -1205,8 +1205,8 @@ tantivy-library/page10 "\"garbage collector\"": hits 851, page 0, cold 0.763 ms,
 tantivy-library/page10 "\"service account\"": hits 1052, page 0, cold 0.808 ms, warm median 0.195 ms
 tantivy-library/page10 "\"node name\"": hits 936, page 0, cold 1.989 ms, warm median 1.004 ms
 tantivy-library/page10 "\"admission controller\"": hits 309, page 0, cold 1.595 ms, warm median 0.212 ms
-rc=0 20:29:53
-=== tquery 20:29:53 <bench>/idx/t16-large-end <bench>/queries.txt 1 library --phase explain --explain 10
+rc=0
+=== tquery <bench>/idx/t16-large-end <bench>/queries.txt 1 library --phase explain --explain 10
 tantivy-library/explain "vendor": hits 253589, page 200, cold 2.947 ms, warm median 2.677 ms
 tantivy-library/explain "func": hits 201750, page 200, cold 3.465 ms, warm median 3.717 ms
 tantivy-library/explain "src": hits 169436, page 200, cold 3.286 ms, warm median 1.724 ms
@@ -1237,8 +1237,8 @@ tantivy-library/explain "\"garbage collector\"": hits 851, page 200, cold 1.972 
 tantivy-library/explain "\"service account\"": hits 1052, page 200, cold 2.798 ms, warm median 1.112 ms
 tantivy-library/explain "\"node name\"": hits 936, page 200, cold 2.919 ms, warm median 1.648 ms
 tantivy-library/explain "\"admission controller\"": hits 309, page 200, cold 3.590 ms, warm median 1.123 ms
-rc=0 20:29:54
-=== ttopk 20:29:54 <bench>/idx/t16-large-end <bench>/queries.txt
+rc=0
+=== ttopk <bench>/idx/t16-large-end <bench>/queries.txt
 ttopk on <bench>/idx/t16-large-end: 2 segments, 546613 live documents, 0 deleted, tokenizer unicode61, search threads 1
 "vendor": 253589 matches; vs (score, address): set same order same; vs library-all (score, id): set DIFFERS order DIFFERS
   vs library-all: the sets differ only among documents tied at the 200th score Some(21.944267)
@@ -1296,8 +1296,8 @@ ttopk on <bench>/idx/t16-large-end: 2 segments, 546613 live documents, 0 deleted
 "\"admission controller\"": 309 matches; vs (score, address): set same order same; vs library-all (score, id): set same order DIFFERS
   vs library-all: same set, order differs only among equal scores (address vs id tie rule)
 ttopk: 30 queries; pruned == exhaustive (score, address) on 30; == library-all page on 5, tie order only on 11, boundary ties only on 14; true misses 0; page scores differing between the scorer paths 0 (max 0 ulp)
-rc=0 20:30:00
-=== ttopk 20:30:00 <bench>/idx/t16-default-end <bench>/queries.txt
+rc=0
+=== ttopk <bench>/idx/t16-default-end <bench>/queries.txt
 ttopk on <bench>/idx/t16-default-end: 11 segments, 546613 live documents, 0 deleted, tokenizer unicode61, search threads 1
 "vendor": 253589 matches; vs (score, address): set same order same; vs library-all (score, id): set DIFFERS order DIFFERS
   vs library-all: the sets differ only among documents tied at the 200th score Some(21.944267)
@@ -1355,8 +1355,8 @@ ttopk on <bench>/idx/t16-default-end: 11 segments, 546613 live documents, 0 dele
 "\"admission controller\"": 309 matches; vs (score, address): set same order same; vs library-all (score, id): set same order DIFFERS
   vs library-all: same set, order differs only among equal scores (address vs id tie rule)
 ttopk: 30 queries; pruned == exhaustive (score, address) on 30; == library-all page on 5, tie order only on 11, boundary ties only on 14; true misses 0; page scores differing between the scorer paths 0 (max 0 ulp)
-rc=0 20:30:07
-=== ttopk 20:30:07 <bench>/idx/t16-default-end <bench>/qual/queries-name.txt
+rc=0
+=== ttopk <bench>/idx/t16-default-end <bench>/qual/queries-name.txt
 ttopk on <bench>/idx/t16-default-end: 11 segments, 546613 live documents, 0 deleted, tokenizer unicode61, search threads 1
 "withHealthStatus": 4 matches; vs (score, address): set same order same; vs library-all (score, id): set same order same
 "checkNodeAllocatableTest": 2 matches; vs (score, address): set same order same; vs library-all (score, id): set same order same
@@ -3031,4 +3031,4 @@ ttopk on <bench>/idx/t16-default-end: 11 segments, 546613 live documents, 0 dele
 "yaml_parser_parse_document_content": 21956 matches; vs (score, address): set same order same; vs library-all (score, id): set DIFFERS order DIFFERS
   vs library-all: the sets differ only among documents tied at the 200th score Some(141.07704)
 ttopk: 1000 queries; pruned == exhaustive (score, address) on 1000; == library-all page on 328, tie order only on 410, boundary ties only on 262; true misses 0; page scores differing between the scorer paths 0 (max 0 ulp)
-rc=0 20:30:56
+rc=0

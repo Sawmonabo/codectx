@@ -222,11 +222,30 @@ func TestReadOutsideASession(t *testing.T) {
 	}
 
 	// A path the snapshot does not hold is "not in this generation", though
-	// the first two exist on disk: nothing is opened on a path.
-	for _, path := range []string{"../outside.txt", "svc/link.go", "svc/missing.go"} {
+	// the first exists on disk: nothing is opened on a path.
+	for _, path := range []string{"svc/link.go", "svc/missing.go"} {
 		_, err := svc.Read(ctx, model.ReadChunkRequest{Path: path})
 		// Mutation caught: read the working tree.
 		wantNotInGeneration(t, err, path)
+	}
+	// Another spelling of a stored path names the same file, and a path that
+	// climbs out of the repository names none of its files and is refused as
+	// an argument, though the file exists on disk.
+	for _, path := range []string{"./svc/a.go", "svc/../svc/a.go", "svc//a.go"} {
+		// Mutation caught: hash the path as given (each is a file id the
+		// manifest has no row for, and is refused as not in the generation).
+		if got := string(joined(t, readAll(t, svc, model.ReadChunkRequest{Path: path}, 0))); got != sourceV2 {
+			t.Fatalf("path read of %q = %q, want svc/a.go's bytes %q", path, got, sourceV2)
+		}
+	}
+	for _, path := range []string{"../outside.txt", "svc/../../outside.txt", "/etc/hosts", "."} {
+		_, err := svc.Read(ctx, model.ReadChunkRequest{Path: path})
+		// Mutation caught: accept a path outside the repository (it is hashed
+		// and refused as not in this generation instead).
+		var typed *model.Error
+		if !errors.As(err, &typed) || typed.Code != model.CodeArgumentInvalid {
+			t.Fatalf("path read of %q = %v, want CTX_ARGUMENT_INVALID", path, err)
+		}
 	}
 
 	// A session over the active generation, to show that a read outside a

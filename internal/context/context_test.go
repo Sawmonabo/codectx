@@ -587,7 +587,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					id := model.NewUnitID(model.UnitSpec{ProviderID: fixtureProviderID,
 						ProviderVersion: fixtureProviderVersion, ScopeKey: fv.Path,
 						InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}, fixtureConfigHash)
-					if err := fx.Store.AttachUnit(fx.ctx, fx.Gen, id); err != nil {
+					if _, err := fx.Store.AttachUnit(fx.ctx, fx.Gen, id); err != nil {
 						t.Fatalf("AttachUnit(%s): %v", fv.Path, err)
 					}
 				}

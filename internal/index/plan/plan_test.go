@@ -177,9 +177,9 @@ func unitAt(i int) fileUnitRecord {
 }
 
 // The plan's units must never be materialised whole. A file-invalidated
-// provider plans one unit per snapshot file, so an in-heap []Unit made peak
-// RSS a function of repository size -- the one property the product may not
-// have. Plan.Units is now a sequence over the planner's merged run, and this
+// provider plans one unit per snapshot file, so an in-heap []Unit would make
+// peak RSS a function of repository size -- the one property the product may
+// not have. Plan.Units is a sequence over the planner's merged run, and this
 // holds a 200 000-unit plan against a 30 000-unit one: the live set the sort
 // ever held must stay inside ONE run batch, and the heap held midway through
 // the executor's walk must not carry the unit count with it.
