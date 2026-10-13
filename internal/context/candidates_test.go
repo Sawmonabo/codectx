@@ -13,6 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // The open-call-site fixture: `Run` calls `Helper` precisely, `Helper` calls
@@ -50,10 +51,55 @@ func openSiteScope(fx *contextFixture) []model.Relation {
 	}
 }
 
+// declaredMemoryGraph is the fixture's packed reader with the declaration seam
+// name-only candidates are read through. The seam is the store's own reader on
+// the fixture's generation, so names, kinds, paths, units and paging are the
+// production lookup's; each node it answers is the fixture's in-memory node,
+// which carries the OpenSiteMetadata the published facts do not.
+type declaredMemoryGraph struct {
+	*graph.MemoryGraph
+	store graph.DeclarationReader
+	nodes map[model.NodeID]model.Node
+}
+
+var _ graph.DeclarationReader = declaredMemoryGraph{}
+
+func (g declaredMemoryGraph) overlay(decls []graph.Declaration) []graph.Declaration {
+	for i := range decls {
+		if n, ok := g.nodes[decls[i].Node.ID]; ok {
+			decls[i].Node = n
+		}
+	}
+	return decls
+}
+
+func (g declaredMemoryGraph) Declarations(ctx stdcontext.Context, name string, kinds []model.NodeKind,
+	after model.NodeID, limit int) ([]graph.Declaration, model.NodeID, error) {
+	page, next, err := g.store.Declarations(ctx, name, kinds, after, limit)
+	return g.overlay(page), next, err
+}
+
+func (g declaredMemoryGraph) Declared(ctx stdcontext.Context, ids []model.NodeID) ([]graph.Declaration, error) {
+	decls, err := g.store.Declared(ctx, ids)
+	return g.overlay(decls), err
+}
+
+func (g declaredMemoryGraph) SnapshotFiles(ctx stdcontext.Context, after model.FileID,
+	limit int) ([]model.FileVersion, model.FileID, error) {
+	return g.store.SnapshotFiles(ctx, after, limit)
+}
+
+func (g declaredMemoryGraph) FileNodes(ctx stdcontext.Context,
+	files []model.FileVersion) (map[model.FileID]model.NodeID, error) {
+	return g.store.FileNodes(ctx, files)
+}
+
 // openSiteEngine is scopeEngine with node metadata: the open-site node carries
 // the OpenSiteMetadata the compile identifies it by. scopeEngine builds its
-// nodes from the file table alone, which holds no metadata.
-func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) *graph.Engine {
+// nodes from the file table alone, which holds no metadata. Its reader looks
+// declarations up by name (declaredMemoryGraph); the returned close releases
+// the generation pin that lookup reads through.
+func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) (*graph.Engine, func() error) {
 	fx.t.Helper()
 	adj := &scopeAdjacency{binding: fx.Binding, nodes: map[model.NodeID]model.Node{},
 		relations: append([]model.Relation(nil), fx.Rels...), caps: fixtureCapabilities}
@@ -75,7 +121,22 @@ func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) *
 	if err != nil {
 		fx.t.Fatalf("NewSpools: %v", err)
 	}
-	eng, err := graph.New(graph.Options{Adjacency: adj, Reader: scopeMemoryGraph(adj),
+	pinned, err := fx.Store.PinGeneration(fx.ctx, fx.Repo, fx.Gen, fx.Cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		fx.t.Fatalf("PinGeneration: %v", err)
+	}
+	packed, err := store.NewGraphReader(fx.ctx, pinned)
+	if err != nil {
+		pinned.Close()
+		fx.t.Fatalf("NewGraphReader: %v", err)
+	}
+	declarations, ok := packed.(graph.DeclarationReader)
+	if !ok {
+		pinned.Close()
+		fx.t.Fatalf("the store's graph reader does not look declarations up by name")
+	}
+	reader := declaredMemoryGraph{MemoryGraph: scopeMemoryGraph(adj), store: declarations, nodes: adj.nodes}
+	eng, err := graph.New(graph.Options{Adjacency: adj, Reader: reader,
 		Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{
@@ -89,9 +150,10 @@ func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) *
 			FrontierBytes:  fx.Cfg.Resources.QueryMemoryBytes,
 		}})
 	if err != nil {
+		pinned.Close()
 		fx.t.Fatalf("graph.New: %v", err)
 	}
-	return eng
+	return eng, pinned.Close
 }
 
 // TestNameOnlyCandidatesAreNeverRequiredAndPackAfterEveryPreciseEntry pins the
@@ -99,13 +161,14 @@ func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) *
 // site joins the plan as optional context, after every precise entry, never as
 // required scope, and the manifest says so.
 //
-// Mutation it catches: add `may_call` to scopeRelations. The walk then crosses
-// the candidate edge as a precise boundary, the candidate takes a precise
-// requirement from its depth, and it is ordered among the precise entries.
+// Mutations it catches: admit the candidate as a precise record (Possible
+// unset), and the manifest no longer counts it as a name-only candidate; admit
+// it recommended, and the compile refuses a recommended entry packed after
+// the optional precise ones; add `may_call` to scopeRelations, and the walk
+// refuses a relation that is not precise.
 //
-// It runs against the real candidate lookup, with no stand-in, so it exercises
-// the tier once that lookup answers; while the lookup answers unavailable it
-// fails naming the unavailable notice.
+// It runs against the real candidate lookup over the store's declarations, so
+// a lookup that answers unavailable fails it naming the unavailable notice.
 func TestNameOnlyCandidatesAreNeverRequiredAndPackAfterEveryPreciseEntry(t *testing.T) {
 	fx := newFixtureFrom(t, openSiteSpecs(), openSiteScope)
 	site, err := json.Marshal(model.OpenSiteMetadata{Resolution: model.ResolutionUnresolved,
@@ -120,7 +183,8 @@ func TestNameOnlyCandidatesAreNeverRequiredAndPackAfterEveryPreciseEntry(t *test
 			if gen != fx.Gen {
 				t.Fatalf("the graph factory was asked for generation %d, want the pinned %d", gen, fx.Gen)
 			}
-			return openSiteEngine(fx, meta), func() error { return nil }, nil
+			eng, release := openSiteEngine(fx, meta)
+			return eng, release, nil
 		},
 		Config: fx.Cfg, Now: fx.Now, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		SortDir: t.TempDir(),
