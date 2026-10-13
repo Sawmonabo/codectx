@@ -139,7 +139,7 @@ type inputFact = model.RequestInput
 // no special type, else a body for a model or a dataclass, a file for an
 // UploadFile and a query for any other class. A request, a response or
 // other special type, and a class the walk cannot decide, publish nothing.
-func emitPythonInputs(file int32, t *Table, mods *index, emit func(Binding) error) error {
+func emitPythonInputs(file int32, t *Table, h *hierarchy, mods *index, emit func(Binding) error) error {
 	handlers := pyHandlerCheck{mods: mods, file: file, t: t, named: map[pyNamedKey]bool{}}
 	for i := range t.Inputs {
 		p := &t.Inputs[i]
@@ -158,7 +158,7 @@ func emitPythonInputs(file int32, t *Table, mods *index, emit func(Binding) erro
 		if p.Rule != "" {
 			continue
 		}
-		kind, err := classOf(mods, t.Path, p.Class, nil)
+		kind, err := classOf(h, mods, t.Path, p.Class, nil)
 		if err != nil {
 			return err
 		}
@@ -193,8 +193,10 @@ func emitPythonInputs(file int32, t *Table, mods *index, emit func(Binding) erro
 // declarations the import's lookup keeps, each its own kind or, for an open
 // class, the kind its bases give (a body, file, request or special type
 // when any base is one; unknown when any base is unknown or two disagree).
-// way holds the classes the walk is inside, so a cycle ends it.
-func classOf(mods *index, from, ref string, way []Ref) (uint8, error) {
+// A module that declares no class of the name may bind it by an import
+// (reexportedClass). way holds the classes and modules the walk is inside,
+// so a cycle ends it.
+func classOf(h *hierarchy, mods *index, from, ref string, way []Ref) (uint8, error) {
 	mod, name, ok := strings.Cut(ref, "\x00")
 	if !ok || name == "" {
 		return classUnknown, nil
@@ -219,6 +221,9 @@ func classOf(mods *index, from, ref string, way []Ref) (uint8, error) {
 	if err != nil {
 		return classUnknown, err
 	}
+	if len(hits) == 0 {
+		return reexportedClass(h, mods, from, mod, name, exact, way)
+	}
 	out, found := classUnknown, false
 	for _, e := range hits {
 		if !(hitNear(from, e.Aux, exact) || !near && !exact) {
@@ -237,7 +242,7 @@ func classOf(mods *index, from, ref string, way []Ref) (uint8, error) {
 		if kind == ClassOpen {
 			next := append(append([]Ref(nil), way...), e.Ref)
 			for _, b := range p.Bases {
-				k, err := classOf(mods, p.Path, b, next)
+				k, err := classOf(h, mods, p.Path, b, next)
 				if err != nil {
 					return classUnknown, err
 				}

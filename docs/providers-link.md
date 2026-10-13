@@ -363,7 +363,13 @@ imports from other modules, which decide the rest. A class with a base the file 
 
 The classes are indexed under each dotted name their file can be imported as (`keyPyClass`). For each pending input
 the linker looks the class up as an import's lookup does (the nearest source root), follows its imported bases
-through further files, a class already on the walk's way ending it, and decides the source by FastAPI's own rule
+through further files, a class already on the walk's way ending it. A module that declares no class of the name may
+bind it by an import of its own, as a package's `__init__.py` re-exports `from .user import User`
+(`internal/provider/link/route_input_reexport.go`): FastAPI reads the module's attribute, which that import binds
+(Python Language Reference, The import statement), so the walk follows the one module-level import that binds the
+name, or, when none does, the one `from m import *` whose module declares it; a module that declares the name itself,
+binds it by several imports or by a whole-module import, or whose star imports supply it from several modules or
+none, decides nothing. The walk then decides the source by FastAPI's own rule
 (`fastapi/dependencies/utils.py` `analyze_param`): a name the route writes is a path read unless the class is a
 special type; else a body for a model or a dataclass, a file for an `UploadFile`, a query for any other class. A
 request subclass, a special type, a class no member declares, several declarations that disagree and bases of
@@ -371,7 +377,12 @@ different kinds publish nothing. The read is one `variable` node in the file's s
 `input:<owner's qualified name>#<parameter>`, located at the parameter, with the `input` metadata the structural
 provider's reads carry (key the parameter's name), and its owner `reads` it (detail `request_input`). The pending
 inputs and the classes are part of the interface summary beside the routing, and every class lookup is traced on the
-handler's file, so an edit to a model or to a base of it in another file re-resolves the parameters it types.
+handler's file, so an edit to a model, to a base of it or to a re-export of it in another file re-resolves the
+parameters it types. A class a library declares that FastAPI's own table does not name (any base outside the unit
+other than Pydantic's, `typing`'s, `abc`'s, `enum`'s, FastAPI's and Starlette's) is undecidable from the project:
+`analyze_param` reads it as a body only when it subclasses `BaseModel`, a mapping or `UploadFile`, or is a sequence or
+a dataclass (`fastapi/_compat/shared.py` `field_annotation_is_complex`), which the library's own source decides, so it publishes
+nothing.
 
 A Spring handler parameter that no binding annotation marks and that no resolver Spring runs before the project's own
 decides is a pending input under the rule `spring` (`internal/provider/link/route_input_spring.go`). Spring resolves
