@@ -71,10 +71,13 @@ func candidatesUnavailable() error {
 // compatible definitions first" orders nothing inside one answer; closeness
 // and the node id are the whole order.
 //
-// The cursor is a position in that order -- the generation, the closeness
-// step and the node id of the last candidate served -- and needs no
-// signature: it names nothing a caller could not ask for directly, and it is
-// refused on any generation but the one it was minted on.
+// The cursor is a position in that order -- the generation, the query's hash
+// (the site, or the name, shape, argument count and language of a direct
+// lookup), the closeness step and the node id of the last candidate served.
+// It is refused on any generation but the one it was minted on and on any
+// other query, so one site's position never resumes another site's list. It
+// is not signed: it names nothing a caller could not ask for directly, and it
+// never leaves the process (the context compiler pages it to exhaustion).
 func Candidates(ctx context.Context, r GraphReader, req model.CandidateRequest) (model.CandidatePage, error) {
 	if err := req.Validate(); err != nil {
 		return model.CandidatePage{}, err
@@ -117,7 +120,8 @@ func Candidates(ctx context.Context, r GraphReader, req model.CandidateRequest) 
 	if err != nil {
 		return model.CandidatePage{}, err
 	}
-	after, err := parseCandidateCursor(req.Page.Cursor, gen)
+	query := candidateQueryHash(req)
+	after, err := parseCandidateCursor(req.Page.Cursor, gen, query)
 	if err != nil {
 		return model.CandidatePage{}, err
 	}
@@ -140,7 +144,7 @@ func Candidates(ctx context.Context, r GraphReader, req model.CandidateRequest) 
 			Closeness: closenessSteps[c.Step]})
 	}
 	if end < len(ranked) {
-		page.Cursor = candidateCursor(gen, ranked[end-1])
+		page.Cursor = candidateCursor(gen, query, ranked[end-1])
 	}
 	if err := page.Validate(); err != nil {
 		return model.CandidatePage{}, err
@@ -196,30 +200,49 @@ func rankCandidates(ctx context.Context, dr DeclarationReader, site callSite) ([
 	return out, nil
 }
 
+// candidateQueryHashDomain is the hash domain of the query a candidate
+// cursor is bound to.
+const candidateQueryHashDomain = "graph.candidates.query"
+
+// candidateQueryHash is the identity of one candidate query: the site, or
+// the direct lookup's name, shape, argument count and language.
+func candidateQueryHash(req model.CandidateRequest) string {
+	h := model.NewHasher(candidateQueryHashDomain)
+	h.AddString(string(req.Site))
+	h.AddString(req.Name)
+	h.AddString(string(req.Shape))
+	h.AddString(strconv.FormatInt(req.Arguments, 10))
+	h.AddString(req.Language)
+	return h.Sum()
+}
+
 // candidateCursor renders a position in a candidate ranking.
-func candidateCursor(gen model.GenerationID, c rankedCandidate) string {
-	return strconv.FormatInt(int64(gen), 10) + "." + strconv.Itoa(c.Step) + "." + string(c.ID)
+func candidateCursor(gen model.GenerationID, query string, c rankedCandidate) string {
+	return strconv.FormatInt(int64(gen), 10) + "." + query + "." + strconv.Itoa(c.Step) + "." + string(c.ID)
 }
 
 // parseCandidateCursor reads a position back, refusing one minted on another
-// generation or not minted here at all.
-func parseCandidateCursor(token string, gen model.GenerationID) (*rankedCandidate, error) {
+// generation, for another query, or not minted here at all.
+func parseCandidateCursor(token string, gen model.GenerationID, query string) (*rankedCandidate, error) {
 	if token == "" {
 		return nil, nil
 	}
 	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
+	if len(parts) != 4 {
 		return nil, cursorInvalid("candidate cursor is not a position in a candidate ranking")
 	}
 	g, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || model.GenerationID(g) != gen {
 		return nil, cursorInvalid("candidate cursor was minted on another generation")
 	}
-	step, err := strconv.Atoi(parts[1])
-	if err != nil || step < 0 || step >= len(closenessSteps) || !model.ValidHexID(parts[2]) {
+	if parts[1] != query {
+		return nil, cursorInvalid("candidate cursor was minted for another site or lookup")
+	}
+	step, err := strconv.Atoi(parts[2])
+	if err != nil || step < 0 || step >= len(closenessSteps) || !model.ValidHexID(parts[3]) {
 		return nil, cursorInvalid("candidate cursor is not a position in a candidate ranking")
 	}
-	return &rankedCandidate{Step: step, ID: model.NodeID(parts[2])}, nil
+	return &rankedCandidate{Step: step, ID: model.NodeID(parts[3])}, nil
 }
 
 // callSite is what a candidate is matched against: an open call site's
