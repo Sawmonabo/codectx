@@ -1,0 +1,4 @@
+internal/provider/treesitter/gogrammar/parser.c linguist-generated
+internal/provider/treesitter/gogrammar/grammar.json linguist-generated
+internal/provider/treesitter/gogrammar/node-types.json linguist-generated
+internal/provider/treesitter/gogrammar/tree_sitter/*.h linguist-generated

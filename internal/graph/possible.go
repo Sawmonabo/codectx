@@ -1104,10 +1104,14 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 // scratch ends with that request. A deadline that lands inside it ends the
 // expansion and the answer is marked truncated (impactPhaseError), exactly as
 // before; there is no partial expansion for a continuation to resume.
+//
+// A reader without the declaration seam cannot list any open site's
+// candidates, so the expansion answers what Candidates answers on that reader:
+// unavailable, never an empty expansion that reads as "no possible callers".
 func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.ImpactRequest, maxDepth config.Limit,
 	retain *retainedWalk) (err error) {
 	if declarationReader(r) == nil {
-		return nil
+		return candidatesUnavailable()
 	}
 	var modes []tailMode
 	switch req.Direction {

@@ -22,7 +22,9 @@ import (
 // # What routes through the hook
 //
 // Verified in the sources of the module lang.BindingModule pins and of each
-// grammar module lang.All pins (paths relative to each module's root):
+// grammar lang.All names: a pinned module, or for go the grammar source
+// carried in internal/provider/treesitter/gogrammar (paths relative to each
+// module's root or to that directory):
 //
 //   - The core library routes every allocation. src/lib.c compiles the whole
 //     library in one unit; its internal allocation header defines the

@@ -186,7 +186,7 @@ func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFix
 	t.Cleanup(func() { s.Close() })
 
 	fx := &contextFixture{t: t, ctx: ctx, Store: s, DBPath: dbPath, Cfg: config.Defaults(),
-		Repo:  model.RepositoryID(model.H("codectx.test.repo", "task-15")),
+		Repo:  model.RepositoryID(model.H("codectx.test.repo", "context-fixture")),
 		Files: map[string]model.FileVersion{}, Now: fixtureNow, Specs: specs}
 	if err := s.EnsureRepository(ctx, fx.Repo, "/repo"); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
@@ -209,7 +209,7 @@ func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFix
 		declared = append(declared, []fixtureFileSpec{f})
 		sourceBytes += uint64(len(f.content))
 	}
-	manifest := model.H("codectx.test.manifest", "task-15")
+	manifest := model.H("codectx.test.manifest", "context-fixture")
 	policy := model.H("codectx.test.source-policy")
 	snap := model.Snapshot{
 		ID:                 model.NewSnapshotID(fx.Repo, "", policy, manifest),
@@ -540,7 +540,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					versions = append(versions, fx.putBlob(path, body, false))
 					sourceBytes += uint64(len(body))
 				}
-				manifest := model.H("codectx.test.manifest", "task-15-ambiguous")
+				manifest := model.H("codectx.test.manifest", "context-fixture-ambiguous")
 				policy := model.H("codectx.test.source-policy")
 				snap := model.Snapshot{
 					ID:                 model.NewSnapshotID(fx.Repo, "", policy, manifest),

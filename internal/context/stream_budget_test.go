@@ -42,8 +42,8 @@ func (c *planCollector) Exclude(e model.ExcludedContextEntry) error {
 // streamPlan runs P-G, P-H and P-I over the same inputs buildPlan takes. It
 // stands in for the passes that produce their inputs: P-A's ingest sequence,
 // P-B's hydration (both path fields and the snapshot-absent flag, exactly as
-// hydrateFiles and buildPlan write them today), P-D's route streams and P-F's
-// ranked sort.
+// hydrateFiles and buildPlan write them today), P-A's reason stream, P-D's
+// route streams and P-F's ranked sort.
 func streamPlan(t *testing.T, cands []candidate, files []model.FileVersion, b resolvedBudget) (plan, error) {
 	t.Helper()
 	sorts, err := newCompileSorts(config.Config{}, t.TempDir())
@@ -68,6 +68,12 @@ func streamPlan(t *testing.T, cands []candidate, files []model.FileVersion, b re
 	if err != nil {
 		t.Fatalf("hop sort: %v", err)
 	}
+	// A candidate's reasons travel as their own stream keyed by Seq, the way
+	// P-A writes the reasons it admits; P-G re-keys them and P-I attaches them.
+	reasonSort, err := newSort(sorts, "reasons", lessReasonSeq, sizeOfReason)
+	if err != nil {
+		t.Fatalf("reason sort: %v", err)
+	}
 	byID := map[model.FileID]model.FileVersion{}
 	for _, fv := range files {
 		byID[fv.ID] = fv
@@ -88,6 +94,12 @@ func streamPlan(t *testing.T, cands []candidate, files []model.FileVersion, b re
 				if r.PathAtRank == "" {
 					r.PathAtRank = fv.Path
 				}
+			}
+		}
+		for i, text := range c.Reasons {
+			if err := reasonSort.Add(reasonRec{Seq: int64(seq), Phase: reasonAdmitted, Idx: int32(i),
+				Text: text}); err != nil {
+				t.Fatalf("reason add: %v", err)
 			}
 		}
 		for pi, p := range c.Paths {
@@ -118,10 +130,15 @@ func streamPlan(t *testing.T, cands []candidate, files []model.FileVersion, b re
 	if err != nil {
 		t.Fatalf("hops sorted: %v", err)
 	}
+	reasonRun, err := sortedRun(sorts, reasonSort)
+	if err != nil {
+		t.Fatalf("reasons sorted: %v", err)
+	}
 
 	ctx := context.Background()
 	c := &Compiler{}
-	measured, err := c.passGMeasure(ctx, sorts, rankedStreams{Ranked: rankedRun, Paths: pathRun, Hops: hopRun})
+	measured, err := c.passGMeasure(ctx, sorts, rankedStreams{Ranked: rankedRun, Paths: pathRun, Hops: hopRun,
+		Admitted: reasonRun})
 	if err != nil {
 		return plan{}, err
 	}
@@ -147,6 +164,9 @@ func fileVersion(id, path string, size int64) model.FileVersion {
 	return model.FileVersion{ID: model.FileID(id), Path: path, Size: size, Status: model.FileTracked}
 }
 
+// Mutation caught (among the order and size ones the cases name): P-G's
+// re-key leaving out the admitted reason stream, so a selected entry is served
+// without the reason its candidate was admitted with.
 func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 	files := []model.FileVersion{
 		// The file IDs deliberately sort AGAINST the rank order, so a walk in

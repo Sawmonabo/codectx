@@ -152,8 +152,7 @@ inserted overload keeps every existing overload's identity.
 - The traces and reverse indexes take disk space proportional to the sites and the keys each reads; their size is
   measured in the scale proofs.
 - The structural provider must supply the descriptor path and the disambiguator for every declaration it emits.
-- The republication of every calling file on a length-changing edit (Context) is removed once identity no longer
-  moves.
+- A length-changing edit does not republish every calling file (Context): identity does not move with bytes.
 
 ## Sources
 

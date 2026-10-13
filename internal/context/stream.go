@@ -703,6 +703,10 @@ type compileSorts struct {
 	// number of sorts a compile opens, which is a constant of the pipeline and
 	// not a function of the repository.
 	observed []sortObservation
+	// runRecords is the run buffer's record count each sort is opened with;
+	// zero takes the primitive's default, and runBytes is then the bound that
+	// spills first. Only a test sets it (Compiler.runRecords).
+	runRecords int
 }
 
 // sortObservation is what one sort reports about its own memory behaviour.
@@ -799,15 +803,16 @@ func (s *compileSorts) releaseRound() error { return s.Close() }
 // sizeOf and registered for release. It is a free function and not a method
 // because Go methods carry no type parameters of their own.
 //
-// The record buffer count is left at the primitive's default: runBytes is the
-// bound that means something here, since these records vary in size, and the
-// count is the secondary guard the primitive already applies.
+// The record buffer count is the primitive's default unless a test set
+// runRecords: runBytes is the bound that means something here, since these
+// records vary in size, and the count is the secondary guard the primitive
+// already applies.
 func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 	sizeOf func(T) int64) (*pagination.ExternalSort[T], error) {
 	if s == nil {
 		return nil, argumentInvalid("a context compile sort requires an open sort area")
 	}
-	sorter, err := pagination.NewExternalSort(s.dir, 0,
+	sorter, err := pagination.NewExternalSort(s.dir, s.runRecords,
 		encodeRecord[T], decodeRecord[T], compare)
 	if err != nil {
 		return nil, err

@@ -26,8 +26,11 @@ func emitOne(t *testing.T, fields map[string]any) model.NodeFact {
 	fv := h.File(t, "package.json")
 	e := filesystem.NewEmitter(u.Request, rec, fv, 0)
 	e.Capability(filesystem.CapabilityStructure, model.CapabilityFresh, "")
-	cand := model.NodeCandidate{ProviderID: "filesystem", ScopeKey: filesystem.ScopeKey("package.json"),
-		NativeKey: "package.json", Kind: model.NodeFile, Name: "package.json", FileID: fv.ID, ContentHash: fv.ContentHash}
+	// The file node is minted the way the providers mint it, by path: a
+	// candidate with no qualified name, range or descriptor resolves to a
+	// provider-local unresolved entity, and its metadata then carries
+	// resolution=unresolved beside the fields under test.
+	cand := filesystem.PathCandidate("filesystem", model.NodeFile, "package.json")
 	if _, err := e.Node(context.Background(), cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Metadata: fields}); err != nil {
 		t.Fatalf("Node: %v", err)
 	}

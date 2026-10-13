@@ -298,29 +298,34 @@ const (
 // visibilityFacts emits, for each C or C++ declaration of the file written
 // with macros among its specifiers (Decl.Macros), a FactVisibility to each
 // definition of each macro that states a visibility and that the file sees:
-// its own, and those of a header it includes (includes), as aliasC reads a
-// macro. A one-identifier replacement is followed to the definitions of the
-// macro it names, never to one already replaced along the expansion
-// ([cpp.rescan]). Every definition reached is a fact, so a macro defined in
-// several `#if` arms publishes each arm's visibility; a macro the file sees
-// no definition of publishes nothing. What a macro reaches is read once per
-// file.
+// its own, and those of every header in its include closure (cClosure), the
+// headers the preprocessor reads for it. A one-identifier replacement is
+// followed to the definitions of the macro it names, never to one already
+// replaced along the expansion ([cpp.rescan]). Every definition reached is a
+// fact, so a macro defined in several `#if` arms publishes each arm's
+// visibility; a macro the file sees no definition of publishes nothing.
+// What a macro reaches is read once per file, and the closure is read only
+// as far as the definitions it is asked about need.
 func (r *staticFile) visibilityFacts() error {
 	if r.fc.family != "c" {
 		return nil
 	}
 	reached := map[string][]Binding{}
+	var closure *cClosure
 	for i := range r.t.Decls {
 		d := &r.t.Decls[i]
 		if d.Macros == "" {
 			continue
+		}
+		if closure == nil {
+			closure = newCClosure(r)
 		}
 		site := Ref{File: r.file, Index: int32(i)}
 		for _, m := range strings.Fields(d.Macros) {
 			facts, ok := reached[m]
 			if !ok {
 				var err error
-				if facts, err = r.macroVisibility(m, map[string]bool{}, nil); err != nil {
+				if facts, err = r.macroVisibility(m, closure, map[string]bool{}, nil); err != nil {
 					return err
 				}
 				reached[m] = facts
@@ -337,35 +342,51 @@ func (r *staticFile) visibilityFacts() error {
 }
 
 // macroVisibility appends to out the FactVisibility facts, with no site, of
-// the definitions the macro name reaches (visibilityFacts); seen holds the
-// names already read along the expansion.
-func (r *staticFile) macroVisibility(name string, seen map[string]bool, out []Binding) ([]Binding, error) {
+// the definitions the macro name reaches (visibilityFacts) in the files of
+// closure; seen holds the names already read along the expansion.
+func (r *staticFile) macroVisibility(name string, closure *cClosure, seen map[string]bool, out []Binding) ([]Binding, error) {
 	if seen[name] {
 		return out, nil
 	}
 	seen[name] = true
-	sees := func(e entry) bool { return e.Ref.File == r.file || r.includes(e.Aux) }
+	var defs, aliases []entry
 	err := r.h.decls.lookup(keyMacroVisibility+name, func(e entry) error {
-		if detail, ok := visibilityDetail(e.Sig); ok && sees(e) {
+		if _, ok := visibilityDetail(e.Sig); ok {
+			defs = append(defs, e)
+		}
+		return nil
+	})
+	if err != nil {
+		return out, err
+	}
+	if err := r.h.decls.lookup(keyMacro+name, func(e entry) error {
+		aliases = append(aliases, e)
+		return nil
+	}); err != nil {
+		return out, err
+	}
+	for _, e := range defs {
+		ok, err := closure.sees(e)
+		if err != nil {
+			return out, err
+		}
+		if ok {
+			detail, _ := visibilityDetail(e.Sig)
 			out = append(out, Binding{Kind: FactVisibility, Target: e.Ref, Detail: detail})
 		}
-		return nil
-	})
-	if err != nil {
-		return out, err
 	}
 	var names []string
-	err = r.h.decls.lookup(keyMacro+name, func(e entry) error {
-		if sees(e) && !slices.Contains(names, e.Sig) {
+	for _, e := range aliases {
+		ok, err := closure.sees(e)
+		if err != nil {
+			return out, err
+		}
+		if ok && !slices.Contains(names, e.Sig) {
 			names = append(names, e.Sig)
 		}
-		return nil
-	})
-	if err != nil {
-		return out, err
 	}
 	for _, n := range names {
-		if out, err = r.macroVisibility(n, seen, out); err != nil {
+		if out, err = r.macroVisibility(n, closure, seen, out); err != nil {
 			return out, err
 		}
 	}

@@ -412,6 +412,104 @@ func (Ints) Len() int { return 0 }
 		fails: "a method set compared by spelling instead of type identity: an alias, byte/uint8, any/interface{}, a dot import or a renamed import missing its implements; a type of another package of the same name, or an unexported method of another package, taken as the interface's",
 	},
 	{
+		name:   "method-sets-by-literal-and-constant-identity",
+		anchor: "The Go Programming Language Specification, \"Type identity\" (struct fields, tags and embedding; interface method sets; array lengths), \"Array types\", \"Constant expressions\", \"Iota\", \"Import declarations\", \"Declarations and scope\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n",
+			"a/a.go": `package a
+
+type T = int
+
+const (
+	Base = iota + 2
+	Size = Base << 3
+)
+
+type Sized interface { // @isized
+	Put(k [Size]byte, v struct{ N T ` + "`json:\"n\"`" + ` }) // @iput
+	Get(x interface { // @iget
+		Close() error
+		Name() string
+	}) T
+}
+`,
+			"b/b.go": `package b
+
+type T struct{}
+
+type W struct{} // @tw
+
+func (W) Put(k [0x10]byte, v struct{ N int ` + "`json:\"n\"`" + ` }) {} // @wput
+
+func (W) Get(x interface { // @wget
+	Name() string
+	Close() error
+}) int {
+	return 0
+}
+
+type X struct{}
+
+func (X) Put(k [16]byte, v struct{ N T ` + "`json:\"n\"`" + ` }) {}
+
+func (X) Get(x interface {
+	Name() string
+	Close() error
+}) T {
+	return T{}
+}
+
+type Y struct{}
+
+func (Y) Put(k [16]byte, v struct{ N int ` + "`json:\"m\"`" + ` }) {}
+
+func (Y) Get(x interface {
+	Name() string
+	Close() error
+}) int {
+	return 0
+}
+`,
+			"c/c.go": `package c
+
+import "example.com/ext/go-yaml"
+
+type Doc interface { // @idoc
+	Load(n yaml.Node) error // @iload
+}
+`,
+			"d/d.go": `package d
+
+import "example.com/ext/go-yaml"
+
+type R struct{} // @tr
+
+func (R) Load(n yaml.Node) error { return nil } // @rload
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind; the two agree on every fact.
+		// a.Size is (0+2)<<3 = 16, so W's [0x10]byte has Sized's length; W's struct literal has the same
+		// field, type (a.T is int) and tag, and its interface literal the same method set in another order.
+		// X names b's own T, a different type; Y's tag differs. go-yaml's source is not read, so its clause
+		// is unknown: the one import of each file without a name whose clause is unread is the package that
+		// `yaml` names.
+		want: []string{},
+		facts: []string{
+			"tw W implements isized Sized",
+			"wput Put overrides iput Put",
+			"wget Get overrides iget Get",
+			"tr R implements idoc Doc",
+			"rload Load overrides iload Load",
+		},
+		// Mutation: make a struct or interface literal with members unknown -> W implements nothing.
+		// Mutation: keep an interface literal's methods in written order -> W's Get misses. Mutation: drop
+		// struct tags -> Y implements Sized. Mutation: spell a constant length without folding, or fold
+		// iota as 0 -> W's Put misses. Mutation: memoize a type lookup by name alone -> a.T's alias answers
+		// b.T and X implements Sized (or W misses). Mutation: leave an unbound qualifier unknown (no
+		// bijection) -> R implements nothing.
+		fails: "a method set compared without literal or constant identity: a struct or interface literal, a constant array length or an import whose clause is unread making the signature match nothing; a field tag, a type of the same name in another package, or a constant of another value taken as identical",
+	},
+	{
 		name:   "external-interfaces-by-method-set",
 		anchor: "The Go Programming Language Specification, \"Interface types\", \"Method sets\", \"Struct types\" (promoted methods), \"Type identity\"; Go Modules Reference, \"Module cache\"",
 		files: map[string]string{
@@ -481,6 +579,56 @@ var _ old.Pinger
 		// Mutation: materialize an interface with an unexported method -> F implements io.RuneScanner.
 		// Mutation: unify rune with uint8 -> S implements io.Reader.
 		fails: "an interface outside the unit left without its implementations and overrides; one read from a module version the go.mod does not require; an interface only its own package can implement taken as satisfied",
+	},
+	{
+		name:   "external-interfaces-per-build-branch",
+		anchor: "The Go Programming Language Specification, \"Interface types\", \"Method sets\"; Go command documentation, \"Build constraints\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire example.com/plat v1.0.0\n",
+			"p.go": `package p
+
+import "example.com/plat"
+
+type U struct{} // @tu
+
+func (U) Fd() uintptr { return 0 } // @ufd
+
+type W struct{} // @tw
+
+func (W) Fd() int { return 0 } // @wfd
+
+type X struct{}
+
+func (X) Fd() string { return "" }
+
+type M struct{} // @tm
+
+func (M) Marshal() ([]byte, error) { return nil, nil } // @mmarshal
+
+var _ plat.Handle
+`,
+		},
+		// Derived twice from the source and the anchor, the second time blind; the two agree on every fact.
+		// plat declares Handle once for unix and once for windows: U satisfies the unix declaration and W
+		// the windows one, each a declaration of plat.Handle; X satisfies neither. Marshaler is an
+		// interface without the plat.v2 tag and an alias of Encoder with it: M satisfies the interface
+		// declaration (and Encoder, its own interface).
+		want: []string{},
+		facts: []string{
+			"tu U implements external example.com/plat.Handle",
+			"ufd Fd overrides external example.com/plat.Handle.Fd",
+			"tw W implements external example.com/plat.Handle",
+			"wfd Fd overrides external example.com/plat.Handle.Fd",
+			"tm M implements external example.com/plat.Encoder",
+			"tm M implements external example.com/plat.Marshaler",
+			"mmarshal Marshal overrides external example.com/plat.Encoder.Marshal",
+			"mmarshal Marshal overrides external example.com/plat.Marshaler.Marshal",
+		},
+		// Mutation: drop a name two files declare differently (the union with conflicts dropped) -> U, W and
+		// M implement no Handle or Marshaler. Mutation: merge the declarations' methods into one method set
+		// -> X or W misses, or each needs both Fd signatures. Mutation: emit one override per satisfied
+		// declaration -> a declaration's override repeats when both match.
+		fails: "an interface declared per platform or build tag left without its implementations, or its declarations merged into one method set no build has",
 	},
 	{
 		name:   "conversions-prove-external-interfaces",

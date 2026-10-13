@@ -117,9 +117,9 @@ type scaleObservation struct {
 // scale claim: peak memory follows the run budget, not the repository.
 //
 // Two compiles over the same topology at two sizes. What is ASSERTED is the
-// structural invariant: every sort of the larger compile peaks at exactly the
-// record count the smaller one peaked at, so the compile's live working set is
-// the run buffer and nothing else, and the answer still doubles. What is
+// structural invariant: no sort of the larger compile peaks above the record
+// count the smaller one peaked at (beyond one rounding), so the compile's live
+// working set is the run buffer and nothing else, and the answer still grows. What is
 // RECORDED, and reported in docs/performance.md rather than asserted, is wall
 // clock: a latency ratio asserted inside a package that also runs under -race
 // is a flake, and the claim the numbers support -- no per-page cost
@@ -162,14 +162,20 @@ func TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale(t *testing.T) {
 			t.Errorf("the %d-leaf compile opened sort %q and the %d-leaf one did not", small.leaves, name, large.leaves)
 			continue
 		}
-		// Not exact equality. The budget these sorts hold is a BYTE budget, so
-		// the record at which a run spills depends on the widths of the records
-		// before it, and two compiles whose entries carry different-length
-		// identifiers spill one record apart. What the claim forbids is a peak
-		// that TRACKS the input: over a doubling of the repository the peak must
-		// not move by more than a rounding of one run's worth of records.
+		// One-sided, in records. The budget these sorts hold is a BYTE budget,
+		// so a run spills at the record that fills it, and records that carry
+		// wider numbers in the larger repository (a count past another digit)
+		// fill it a few records sooner: a 256 KiB run of 214-byte records holds
+		// 1226 of them, of 215-byte records 1220. A peak that falls is the same
+		// byte budget over wider records. What the claim forbids is a peak
+		// that TRACKS the input, which grows with it: over a several-fold
+		// larger repository the peak must not rise by more than a rounding of
+		// one run's worth of records.
+		//
+		// Mutation caught: a sort opened without the byte budget (or holding
+		// its input whole), whose peak grows with the repository.
 		const slack = 4
-		if d := got - want; d < -slack || d > slack {
+		if got-want > slack {
 			t.Errorf("sort %q peaked at %d records over %d leaves and %d records over %d leaves: the "+
 				"compile's live working set tracks the repository, not the run budget",
 				name, want, small.leaves, got, large.leaves)

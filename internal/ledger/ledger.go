@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -259,12 +260,8 @@ func (l *Ledger) Attach(ctx context.Context) error {
 	if err := ensureDir(path); err != nil {
 		return err
 	}
-	db, err := openPool(path, writerPragmas(), "immediate", writerConnections, false)
+	db, err := openWriter(ctx, path)
 	if err != nil {
-		return err
-	}
-	if err := initSchema(ctx, db, path); err != nil {
-		db.Close()
 		return err
 	}
 	c := &collector{l: l, db: db, bus: make(chan event, busDepth),
@@ -272,6 +269,37 @@ func (l *Ledger) Attach(ctx context.Context) error {
 	l.cur = c
 	go c.collect()
 	return nil
+}
+
+// openWriter opens the ledger file for writing with this binary's schema. A
+// file another schema wrote is replaced: it is closed, removed with its
+// write-ahead log, reported in one log line, and opened again empty. The
+// caller holds the workspace lock (Attach's contract), so no other writer can
+// be using it; a reader in another process that still has the old file open
+// keeps reading the unlinked file until it closes it.
+func openWriter(ctx context.Context, path string) (*sql.DB, error) {
+	for attempt := 0; ; attempt++ {
+		db, err := openPool(path, writerPragmas(), "immediate", writerConnections, false)
+		if err != nil {
+			return nil, err
+		}
+		foreign, err := initSchema(ctx, db)
+		if err == nil && foreign == "" {
+			return db, nil
+		}
+		db.Close()
+		if err != nil {
+			return nil, err
+		}
+		if attempt > 0 {
+			return nil, internal("the run ledger recreated at " + path + " still records another schema")
+		}
+		if err := removeLedgerFiles(path); err != nil {
+			return nil, err
+		}
+		slog.Default().Warn("the run ledger was written by another schema and was replaced by an empty one; its runs and learned needs belonged to another build",
+			"component", "ledger", "path", path, "found_fingerprint", foreign, "fingerprint", Fingerprint)
+	}
 }
 
 // Detach finishes this handle's collector and closes the ledger file: it
