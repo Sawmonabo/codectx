@@ -384,6 +384,113 @@ type AreaI interface{ arch.Shape } // @iareai
 		fails: "a type outside the unit that is a struct in some builds and an interface in others losing either kind's members",
 	},
 	{
+		name:   "alias-spelled-alike-with-a-different-import-per-build",
+		anchor: "The Go Programming Language Specification, \"Declarations and scope\" (an import's name is in its file's block), \"Import declarations\", \"Alias declarations\", \"Method sets\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod":     "module example.com/m\n\ngo 1.27\n",
+			"u32/u.go":   "package u32\n\ntype T = uint32\n",
+			"u64/u.go":   "package u64\n\ntype T = uint64\n",
+			"w_386.go":   "package p\n\nimport foo \"example.com/m/u32\"\n\ntype Word = foo.T\n\nfunc (S) L() {} // @tl\n",
+			"w_amd64.go": "package p\n\nimport foo \"example.com/m/u64\"\n\ntype Word = foo.T\n",
+			"t.go": `package p
+
+type S struct{} // @ts
+
+func (S) R() Word { return 0 } // @tr
+
+type A32 interface{ R() uint32 } // @a32
+
+type A64 interface{ R() uint64 } // @a64
+
+type A32L interface { // @a32l
+	R() uint32 // @a32lr
+	L() // @a32ll
+}
+
+type A64L interface { // @a64l
+	R() uint64 // @a64lr
+	L() // @a64ll
+}
+`,
+		},
+		// Checked with go vet per GOARCH: Word is u32.T (uint32) on 386, where S also has L, and u64.T
+		// (uint64) on amd64. So S implements A32 and A32L (386) and A64 (amd64), never A64L.
+		want: []string{},
+		facts: []string{
+			"ts S implements a32 A32",
+			"ts S implements a64 A64",
+			"ts S implements a32l A32L",
+			"tr R overrides a32 R",
+			"tr R overrides a64 R",
+			"tr R overrides a32lr R",
+			"tl L overrides a32ll L",
+		},
+		// Mutation: declarations spelled alike joined whatever their qualifier imports -> Word is one file's
+		// u64.T in both builds, so S implements A64L and neither A32 nor A32L. Mutation: the two declarations
+		// kept, each under both files' condition -> ts S implements a64l A64L.
+		fails: "declarations spelled alike joined though their qualifier names a different import in each file",
+	},
+	{
+		name:   "external-declarations-spelled-alike-with-a-different-import-per-build",
+		anchor: "The Go Programming Language Specification, \"Declarations and scope\" (an import's name is in its file's block), \"Import declarations\", \"Alias declarations\", \"Struct types\" (promoted methods), \"Constant declarations\", \"Method sets\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire example.com/qual v1.0.0\n",
+			"t.go": `package p
+
+import "example.com/qual"
+
+type S struct{} // @ts
+
+func (S) Size() uint64 { return 0 } // @ssize
+
+func (S) Get() uint64 { return 0 } // @sget
+
+func (S) Bytes() [8]byte { return [8]byte{} } // @sbytes
+
+type ER struct{ qual.Regs } // @ter
+
+type Lo interface{ Lo() } // @ilo
+
+type Hi interface{ Hi() } // @ihi
+
+type V32 interface{ Value() uint32 } // @iv32
+
+type V64 interface{ Value() uint64 } // @iv64
+
+type LoV64 interface { // @ilov64
+	Lo()
+	Value() uint64
+}
+
+func use(qual.Sized, qual.Getter, qual.Buf) {}
+`,
+		},
+		// Checked with go vet per GOARCH: qual's word_386.go imports example.com/qual/a as foo and
+		// word_amd64.go example.com/qual/b, each writing Word = foo.T, Regs struct{ foo.Base }, Value()
+		// foo.T, Getter's Get() foo.T and N = foo.K alike. On amd64 Word and Value's result are uint64, N is
+		// 8 and Regs embeds b.Base (Hi); on 386 they are uint32 and 4 and Regs embeds a.Base (Lo). So S
+		// implements Sized, Getter and Buf (amd64); ER implements Lo and V32 (386), Hi and V64 (amd64),
+		// never LoV64.
+		want: []string{},
+		facts: []string{
+			"ts S implements external example.com/qual.Sized",
+			"ts S implements external example.com/qual.Getter",
+			"ts S implements external example.com/qual.Buf",
+			"ssize Size overrides external example.com/qual.Sized.Size",
+			"sget Get overrides external example.com/qual.Getter.Get",
+			"sbytes Bytes overrides external example.com/qual.Buf.Bytes",
+			"ter ER implements ilo Lo",
+			"ter ER implements iv32 V32",
+			"ter ER implements ihi Hi",
+			"ter ER implements iv64 V64",
+		},
+		// Mutation: declarations, receiver methods and constants spelled alike joined whatever their
+		// qualifier imports -> every one read as 386's, so S implements none of Sized, Getter and Buf and ER
+		// neither Hi nor V64. Mutation: the split declarations under both files' condition -> ER implements
+		// LoV64.
+		fails: "external declarations spelled alike joined though their qualifier names a different import in each file",
+	},
+	{
 		name:   "many-free-tags-decided-exactly",
 		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\"",
 		files:  manyTagsFiles(),

@@ -300,7 +300,10 @@ from every non-test file, whatever its build constraints, and cached on disk by 
 project's own conditional declarations are, and a type satisfying one implements it. Declarations are compared by
 their canonical spellings, not as written: `type Num = Count` (with `Count = int`) for unix and `type Num = int` for
 windows are one alias of `int`, `const Width = 4` and `2 + 2` one value, `Sum() [16]byte` and `Sum() [Size]byte` (with
-`Size = 16`) one method, and interface declarations that spell one method set are one interface.
+`Size = 16`) one method, and interface declarations that spell one method set are one interface. Declarations
+written alike are one only where they mean the same in each file: an import's name is declared in its own file's
+block, so `type Word = foo.T` in a 386 file whose `foo` imports one package and in an amd64 file whose `foo` imports
+another are two aliases, each under its own file's condition, in the project and outside it alike.
 
 Go method sets are decided per build (`go_build.go`). Every Go file, of the project (the worker sends its leading
 `//go:build` or `// +build` lines) and of the packages outside it, belongs to the builds its constraint and its

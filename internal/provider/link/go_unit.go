@@ -87,10 +87,11 @@ func (t goUnitTypes) read(p, name string) (goTypeAnswer, bool, error) {
 		}
 		// An alias declared once per platform or build tag is each of its
 		// distinctly written declarations (goTypeAnswer.others).
-		var aliases [][]entry
+		var aliases []goWritten
 		err := h.decls.lookup(keyGoAlias+scope+"\x00"+name, func(e entry) error {
-			aliases = addWritten(aliases, e)
-			return nil
+			var err error
+			aliases, err = t.addWritten(aliases, e)
+			return err
 		})
 		if err != nil {
 			return goTypeAnswer{}, false, err
@@ -146,14 +147,15 @@ func (t goUnitTypes) readConstant(p, name string) ([]goDecl, error) {
 		}
 		return h.goExt.constant(p, name), nil
 	}
-	var cs [][]entry
+	var cs []goWritten
 	for _, scope := range scopes {
 		if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
 			continue
 		}
 		err := h.decls.lookup(keyGoConst+scope+"\x00"+name, func(e entry) error {
-			cs = addWritten(cs, e)
-			return nil
+			var err error
+			cs, err = t.addWritten(cs, e)
+			return err
 		})
 		if err != nil {
 			return nil, err
@@ -162,36 +164,75 @@ func (t goUnitTypes) readConstant(p, name string) ([]goDecl, error) {
 	return t.decls(cs)
 }
 
-// addWritten adds the declaration e to written, the declarations of one
-// name grouped by their written form (Sig).
-func addWritten(written [][]entry, e entry) [][]entry {
-	for i, w := range written {
-		if w[0].Sig == e.Sig {
-			written[i] = append(w, e)
-			return written
-		}
-	}
-	return append(written, []entry{e})
+// goWritten is one distinct declaration of a name: the entries of the
+// files that write it alike, read in the first one's file (names, found
+// false when that file cannot be read).
+type goWritten struct {
+	es    []entry
+	names goUnitNames
+	found bool
 }
 
-// decls are the distinctly written forms (Sig) of the declarations
-// written, each read in the file of the first declaration that writes it,
-// under the disjunction of the conditions of the files of all that do; a
-// form whose file cannot be read is unknown.
-func (t goUnitTypes) decls(written [][]entry) ([]goDecl, error) {
-	var out []goDecl
-	for _, es := range written {
-		fc, found, err := t.h.fileContext(es[0].Ref.File)
-		if err != nil {
+// addWritten adds the declaration e to written, the declarations of one
+// name grouped by what they mean: the same form (Sig) naming the same
+// declarations in each file that writes it (goSameMeaning), so a form
+// spelled alike in two files whose import of its qualifier is another
+// package is two declarations.
+func (t goUnitTypes) addWritten(written []goWritten, e entry) ([]goWritten, error) {
+	var names goUnitNames
+	loaded, found := false, false
+	load := func() error {
+		fc, ok, err := t.h.fileContext(e.Ref.File)
+		names, found, loaded = goUnitNames{h: t.h, fc: fc}, ok, true
+		return err
+	}
+	scoped := goFileScoped(e.Sig)
+	for i, w := range written {
+		if w.es[0].Sig != e.Sig {
+			continue
+		}
+		if scoped {
+			if !loaded {
+				if err := load(); err != nil {
+					return nil, err
+				}
+			}
+			if !found || !w.found {
+				continue
+			}
+			same, err := goSameMeaning(w.names, names, e.Sig)
+			if err != nil {
+				return nil, err
+			}
+			if !same {
+				continue
+			}
+		}
+		written[i].es = append(w.es, e)
+		return written, nil
+	}
+	if !loaded {
+		if err := load(); err != nil {
 			return nil, err
 		}
-		d := goDecl{form: es[0].Sig, names: goUnitNames{h: t.h, fc: fc}}
-		if !found {
+	}
+	return append(written, goWritten{es: []entry{e}, names: names, found: found}), nil
+}
+
+// decls are the distinct declarations written, each read in the file of
+// the first declaration that writes it, under the disjunction of the
+// conditions of the files of all that do; a form whose file cannot be read
+// is unknown.
+func (t goUnitTypes) decls(written []goWritten) ([]goDecl, error) {
+	var out []goDecl
+	for _, w := range written {
+		d := goDecl{form: w.es[0].Sig, names: w.names}
+		if !w.found {
 			d.form = goIdentityUnknown
 		}
 		if c := t.h.goConds; c != nil {
 			d.cond = goCondNone
-			for _, e := range es {
+			for _, e := range w.es {
 				f, err := t.h.goFileCond(e.Ref.File)
 				if err != nil {
 					return nil, err

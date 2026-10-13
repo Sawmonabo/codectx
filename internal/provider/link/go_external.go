@@ -43,7 +43,9 @@ import (
 // read: every non-test file, whatever its build constraints, each with the
 // build condition its constraint and name state (gobuild.File,
 // go_build.go), and a declaration, method or constant several files write
-// alike is in the builds of any of them (goExtType.also, goExtMethod.also).
+// alike, naming the same declarations in each (goSameMeaning: each file
+// binds its own imports), is in the builds of any of them (goExtType.also,
+// goExtMethod.also).
 // A name two files declare differently (per platform or build tag,
 // goExtType.variants) is each of its declarations: an interface declared so
 // is one entity per declaration, under its condition, as the unit's
@@ -138,7 +140,8 @@ type goExtType struct {
 	conflict bool
 	variants []*goExtType
 	// also are the other files declaring this same declaration (one per
-	// platform or build tag that writes it alike).
+	// platform or build tag that writes it alike and means the same by it,
+	// regroup).
 	also []int
 	// methods are an interface declaration's methods. recv, on a name's
 	// first declaration, are the methods declared with the name as their
@@ -152,7 +155,8 @@ type goExtType struct {
 
 // goExtMethod is one method (name and form), constant (name and form) or
 // embedded type (form), with the file its form is written in and the other
-// files that declare it alike (one per platform or build tag).
+// files that declare it alike and mean the same by it (one per platform or
+// build tag, regroup).
 type goExtMethod struct {
 	name, form string
 	file       int
@@ -871,8 +875,157 @@ func (x *goExternal) renameImports() error {
 			}
 			f.imports = renamed
 		}
+		if err := pkg.regroup(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// regroup parts, now that every file's imports are bound, each type
+// declaration, receiver method and constant several files write alike
+// into those that mean the same in each of them (goSameMeaning): a form
+// spelled alike in a file whose import of its qualifier is another package
+// names other declarations, so it is a declaration of its own (a variant,
+// or another entry of the name), under its own files' conditions.
+func (p *goExtPackage) regroup() error {
+	for _, t := range p.types {
+		if t.file >= 0 {
+			n := len(t.variants)
+			for i := -1; i < n; i++ {
+				d := t
+				if i >= 0 {
+					d = t.variants[i]
+				}
+				if len(d.also) == 0 {
+					continue
+				}
+				split, err := p.splitDecl(d)
+				if err != nil {
+					return err
+				}
+				if len(split) > 0 {
+					t.conflict = true
+					t.variants = append(t.variants, split...)
+				}
+			}
+		}
+		recv, err := p.splitMembers(t.recv)
+		if err != nil {
+			return err
+		}
+		t.recv = recv
+	}
+	for name, cs := range p.consts {
+		cs, err := p.splitMembers(cs)
+		if err != nil {
+			return err
+		}
+		p.consts[name] = cs
+	}
+	return nil
+}
+
+// splitDecl keeps in d.also the files whose declaration means the same as
+// d's file's, and returns a declaration for each other meaning, its files
+// those of d.also that mean it.
+func (p *goExtPackage) splitDecl(d *goExtType) ([]*goExtType, error) {
+	var out []*goExtType
+	kept := d.also[:0]
+	for _, f := range d.also {
+		same, err := p.sameDeclIn(d, d.file, f)
+		if err != nil {
+			return nil, err
+		}
+		if same {
+			kept = append(kept, f)
+			continue
+		}
+		placed := false
+		for _, v := range out {
+			if placed, err = p.sameDeclIn(d, v.file, f); err != nil {
+				return nil, err
+			} else if placed {
+				v.also = append(v.also, f)
+				break
+			}
+		}
+		if !placed {
+			out = append(out, &goExtType{file: f, alias: d.alias, form: d.form, iface: d.iface, ineligible: d.ineligible,
+				methods: membersIn(d.methods, f), embeds: membersIn(d.embeds, f)})
+		}
+	}
+	d.also = kept
+	return out, nil
+}
+
+// sameDeclIn reports the declaration d, written alike in pkg's files a and
+// b, meaning the same in both: its form, embedded types and methods.
+func (p *goExtPackage) sameDeclIn(d *goExtType, a, b int) (bool, error) {
+	na, nb := p.names(a), p.names(b)
+	if same, err := goSameMeaning(na, nb, d.form); err != nil || !same {
+		return false, err
+	}
+	for _, ms := range [][]goExtMethod{d.embeds, d.methods} {
+		for _, m := range ms {
+			if same, err := goSameMeaning(na, nb, m.form); err != nil || !same {
+				return false, err
+			}
+		}
+	}
+	return true, nil
+}
+
+// membersIn are the members ms written in the file f.
+func membersIn(ms []goExtMethod, f int) []goExtMethod {
+	if ms == nil {
+		return nil
+	}
+	out := make([]goExtMethod, len(ms))
+	for i, m := range ms {
+		out[i] = goExtMethod{name: m.name, form: m.form, file: f}
+	}
+	return out
+}
+
+// splitMembers is ms with each member's files parted by meaning, as
+// splitDecl parts a declaration's: another meaning is another entry of
+// the name.
+func (p *goExtPackage) splitMembers(ms []goExtMethod) ([]goExtMethod, error) {
+	n := len(ms)
+	for i := range n {
+		if len(ms[i].also) == 0 {
+			continue
+		}
+		m := ms[i]
+		var heads []int
+		kept := m.also[:0]
+		for _, f := range m.also {
+			same, err := goSameMeaning(p.names(m.file), p.names(f), m.form)
+			if err != nil {
+				return nil, err
+			}
+			if same {
+				kept = append(kept, f)
+				continue
+			}
+			placed := false
+			for _, h := range heads {
+				if placed, err = goSameMeaning(p.names(ms[h].file), p.names(f), m.form); err != nil {
+					return nil, err
+				} else if placed {
+					ms[h].also = append(ms[h].also, f)
+					break
+				}
+			}
+			if !placed {
+				heads = append(heads, len(ms))
+				ms = append(ms, goExtMethod{name: m.name, form: m.form, file: f})
+			}
+		}
+		ms[i].also = kept
+	}
+	return ms, nil
 }
 
 // lookup is goPackageTypes over the packages read.

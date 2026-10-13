@@ -696,6 +696,104 @@ func goUnboundQualifier(n goNames, q, name string) (string, bool, error) {
 	return "?" + strings.Join(cands, "|") + ":" + q + "." + name, true, nil
 }
 
+// goSameMeaning reports whether form, written alike in the files a and b of
+// one package, names the same declarations in both, as goIdentity reads it.
+// The files share their package's block; what one file's names denote
+// apart from the other's is its imports, declared in its own file block
+// ("Declarations and scope", "Import declarations"). So each qualifier must
+// bind the same import in both, or, bound by none, have the same candidates
+// (goUnboundQualifier); and an exported name written unqualified, which a
+// dot import may declare, needs the same dot imports in both. Files whose
+// dot imports differ are read as meaning differently even where the
+// package's own declaration decides the name: such declarations stay
+// apart, and every reader compares them by their canonical spellings.
+func goSameMeaning(a, b goNames, form string) (bool, error) {
+	dots := false
+	for rest := form; rest != ""; {
+		var tok string
+		tok, rest, _ = strings.Cut(rest, " ")
+		switch {
+		case strings.HasPrefix(tok, ":"):
+			q, _, ok := strings.Cut(tok[1:], ".")
+			if !ok {
+				continue
+			}
+			same, err := goSameQualifier(a, b, q)
+			if err != nil || !same {
+				return false, err
+			}
+		case !dots && len(tok) > 1 && tok[0] == '.' && token.IsExported(tok[1:]):
+			dots = true
+			da, err := a.dots()
+			if err != nil {
+				return false, err
+			}
+			db, err := b.dots()
+			if err != nil {
+				return false, err
+			}
+			if !goSameSet(da, db) {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+// goSameQualifier reports a qualifier that denotes the same package in the
+// files a and b (goCanonicalTokens' reading of `:q.Name`).
+func goSameQualifier(a, b goNames, q string) (bool, error) {
+	pa, oka, err := a.imported(q)
+	if err != nil {
+		return false, err
+	}
+	pb, okb, err := b.imported(q)
+	if err != nil {
+		return false, err
+	}
+	if oka || okb {
+		return oka == okb && pa == pb, nil
+	}
+	ua, err := a.unresolved()
+	if err != nil {
+		return false, err
+	}
+	ub, err := b.unresolved()
+	if err != nil {
+		return false, err
+	}
+	return slices.Equal(ua, ub), nil
+}
+
+// goSameSet reports two lists of import paths that hold the same paths.
+func goSameSet(a, b []string) bool {
+	for _, p := range a {
+		if !slices.Contains(b, p) {
+			return false
+		}
+	}
+	for _, p := range b {
+		if !slices.Contains(a, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// goFileScoped reports a form whose meaning goSameMeaning can find to
+// differ between two files: one that names a qualifier or an exported name
+// written unqualified.
+func goFileScoped(form string) bool {
+	for rest := form; rest != ""; {
+		var tok string
+		tok, rest, _ = strings.Cut(rest, " ")
+		if strings.HasPrefix(tok, ":") || len(tok) > 1 && tok[0] == '.' && token.IsExported(tok[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
 // goUnresolvedIdentity reports a canonical spelling that names a type by
 // its unresolved spelling (goUnboundQualifier, goUnqualified).
 func goUnresolvedIdentity(identity string) bool {
