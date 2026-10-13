@@ -112,7 +112,8 @@ func TestResolveServesANodeOnceAtItsEarliestTier(t *testing.T) {
 	f := newRowsFixture(t, rowsDecls)
 	s := newService(t, f.opts)
 	for _, limit := range []int{1, 10} {
-		req := model.SymbolRequest{Query: "Twice", Operation: model.SymbolResolve, Page: model.PageRequest{Limit: limit}}
+		req := model.SymbolRequest{Query: "Twice", Operation: model.SymbolResolve, SemanticSource: model.SemanticCanonical,
+			Page: model.PageRequest{Limit: limit}}
 		seen := map[model.NodeID]int{}
 		for page := 1; ; page++ {
 			if page > 20 {
