@@ -92,9 +92,9 @@ func TestGoIdentityResolvesEveryName(t *testing.T) {
 	}, pkgs: map[string]map[string]string{
 		"example.com/m/store": {"ID": "", "Item": "", "Key": ".ID", "error": "", "Vec": "$$1 [ ] $0",
 			"Pair": "$$2 map [ $0 ] $1"},
-		"example.com/m/mem":   {"Local": ""},
-		"example.com/a":       {"T": ""},
-		"example.com/b":       {"T": ""},
+		"example.com/m/mem": {"Local": ""},
+		"example.com/a":     {"T": ""},
+		"example.com/b":     {"T": ""},
 	}, aliasIn: store}
 	mem := fakeNames{path: "example.com/m/mem", imports: map[string][]string{"s": {"example.com/m/store"},
 		"x": {"example.com/x", "example.com/y"}}}
