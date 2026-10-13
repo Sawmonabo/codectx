@@ -404,6 +404,13 @@ func (b *builder) inputOwner(at wire.Span) model.NodeID {
 	return b.module.Node.ID
 }
 
+// holdsCallable reports that the bytes n hold the whole innermost function,
+// method or test around at.
+func (b *builder) holdsCallable(n, at wire.Span) bool {
+	d := b.innermostCallable(at)
+	return d >= 0 && n.Start <= b.decls[d].Start && b.decls[d].End <= n.End
+}
+
 // innermostCallable is the innermost function, method or test of the file
 // whose range contains at, or -1.
 func (b *builder) innermostCallable(at wire.Span) int {
@@ -433,9 +440,10 @@ func (b *builder) inputFlows(f *wire.Function, ids []model.NodeID, nodes []*mode
 		k, _ := slices.BinarySearchFunc(b.inputs, n.Start, func(r inputRead, at uint32) int { return cmp.Compare(r.at.Start, at) })
 		for ; k < len(b.inputs) && b.inputs[k].at.Start < n.End; k++ {
 			r := b.inputs[k]
-			// A definition whose node holds a whole nested function (a
-			// `def` statement defining its name) is not the read's.
-			if r.at.End <= n.End && b.innermostCallable(n) == b.innermostCallable(r.at) {
+			// A definition whose node holds the whole function the read is
+			// in (a `def` statement defining its name, decorated or not) is
+			// not the read's: the read runs when the function is called.
+			if r.at.End <= n.End && b.innermostCallable(n) == b.innermostCallable(r.at) && !b.holdsCallable(n, r.at) {
 				b.dependsOn(r.node, model.RelDataFlowsTo, ids[a.Var], nodes[a.Node], b.rangeKey("input:", r.at.Start, r.at.End), detailFlow)
 			}
 		}

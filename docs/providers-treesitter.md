@@ -469,7 +469,10 @@ source writes it as a literal (`request.args.get("id")`, `req.query.id`,
 whose node holds the read, in the read's own function, gets `data_flows_to`
 from the read to the variable it defines (`uid = request.args.get("uid")`
 flows to `uid`), so the file's def-use facts carry the read to every use of the
-alias. Each table is gated on the framework's import, and a member it does not
+alias; a `def` statement, decorated or not, defines its function without running
+the body, so a read inside never flows to the function. A read a return of its
+own function evaluates flows to that function's return node, as a variable the
+return reads does. Each table is gated on the framework's import, and a member it does not
 name publishes nothing:
 
 | Framework | Request object | Members read |

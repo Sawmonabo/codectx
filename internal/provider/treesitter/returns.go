@@ -94,8 +94,34 @@ func (b *builder) returnFlows(vars map[wire.Span]fileVar, byStart []int) error {
 			publish(d)
 			b.putRelation(dependence, from.Node, model.RelDataFlowsTo, ret.ep.Node, rng, ownerKey, detailFlow)
 		}
+		if err := b.returnedInputs(f, d, ret, ownerKey, publish); err != nil {
+			return err
+		}
 	}
 	return b.siteResults(spans, callable, rets, endpoint, publish)
+}
+
+// returnedInputs publishes, for function f, the body of callable d, a
+// data_flows_to from each request-input read a return of d evaluates to d's
+// return node, as a variable a return reads flows to it.
+func (b *builder) returnedInputs(f *wire.Function, d int32, ret returnNode, ownerKey string, publish func(int32)) error {
+	for _, k := range f.Returns {
+		n := f.Nodes[k]
+		at, _ := slices.BinarySearchFunc(b.inputs, n.Start, func(r inputRead, s uint32) int { return cmp.Compare(r.at.Start, s) })
+		for ; at < len(b.inputs) && b.inputs[at].at.Start < n.End; at++ {
+			r := b.inputs[at]
+			if r.at.End > n.End || b.innermostCallable(r.at) != int(d) {
+				continue
+			}
+			rng, err := b.rangeOf(n.Start, n.End)
+			if err != nil {
+				return err
+			}
+			publish(d)
+			b.putRelation(dependence, r.node, model.RelDataFlowsTo, ret.ep.Node, rng, ownerKey, detailFlow)
+		}
+	}
+	return nil
 }
 
 // callableOf is the declaration whose callable function i is, or -1: the

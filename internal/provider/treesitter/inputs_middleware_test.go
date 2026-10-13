@@ -53,9 +53,9 @@ app.use((err, req, res, next) => {
 		"check express query token | rq.query.token",
 		"listed express header  | req.hostname",
 		"app.js express url  | req.path",
-		"req.cookies.sid -> auth",
-		"req.hostname -> listed",
-		"rq.query.token -> check",
+		"req.cookies.sid -> return",
+		"req.hostname -> return",
+		"rq.query.token -> return",
 	})
 }
 
@@ -102,6 +102,7 @@ func list(c echo.Context) error {
 		"show gin path id | c.Param(\"id\")",
 		"c.Param(\"id\") -> id",
 		"c.ShouldBindJSON(&in) -> in",
+		"c.Bind(nil) -> return",
 	})
 }
 
@@ -154,9 +155,11 @@ class Plain:
 		"get_queryset djangorestframework query q | self.request.query_params[\"q\"]",
 		"list djangorestframework query page | request.query_params.get(\"page\")",
 		"recent djangorestframework cookie sid | request.COOKIES[\"sid\"]",
-		"request.META[\"HTTP_X\"] -> get",
-		"request.query_params.get(\"page\") -> list",
-		"self.request.query_params[\"q\"] -> get_queryset",
+		"request.META[\"HTTP_X\"] -> return",
+		"request.COOKIES[\"sid\"] -> return",
+		"request.data[\"name\"] -> return",
+		"request.query_params.get(\"page\") -> return",
+		"self.request.query_params[\"q\"] -> return",
 	})
 }
 
@@ -173,7 +176,7 @@ class Home(TemplateView):
         return {"q": self.request.GET["q"]}
 `, []string{
 		"get_context_data django query q | self.request.GET[\"q\"]",
-		"self.request.GET[\"q\"] -> get_context_data",
+		"self.request.GET[\"q\"] -> return",
 	})
 }
 
