@@ -720,17 +720,19 @@ Freeing is the expensive act, so the working files a store writes for its own
 later reading are not freed at all. They are taken from a **scratch pool** under
 the directory they belong to and given back to it: an external sort's runs and
 its merged output, the surface a blob is
-streamed into while it is hashed, a shortest-path search's state, an index
+streamed into while it is hashed and the one its compressed object is written
+into, a shortest-path search's state, an index
 import's symbol spool, and the database engine's own temporaries. `Take` hands out an existing file of the asked-for
 purpose, opened for overwrite at offset zero, or creates one; `Release` returns
 it for the next taker. **Nothing truncates a surface to reuse it**: a file
 keeps whatever length its largest tenant gave it, and re-indexing an unchanged
 repository or answering a second query of the same shape therefore frees
 nothing at all. The one truncation in the pool is the content store's, which
-trims a staged blob to the length its record states *before* the object is
-published -- the published object is that file, and a reader proves an object
-by its length ([snapshots.md](snapshots.md#the-content-addressed-store)) -- and
-that trim is windowed and charged to the same budget as every other free.
+trims a staged object to the length its frames and frame index occupy *before*
+the object is published -- the published object is that file, and a reader
+proves an object by its frame index, which must end exactly at the file's end
+([snapshots.md](snapshots.md#the-content-addressed-store)) -- and that trim is
+windowed and charged to the same budget as every other free.
 
 A surface the pool cannot open is not handed out. `Take` opens the file it is
 about to lease, and one it cannot open leaves the pool *and* the disk: the pool
@@ -743,8 +745,8 @@ way.
 Because nothing truncates, **the file's length is not the data's length**. Every
 tenant carries its own logical length — a header, a record count, a byte count
 it recorded when it wrote — and never learns it from the file: a sort run is
-read through a limited reader over the byte count it recorded, a staged blob is
-trimmed to the length its record states before it is published, and a database
+read through a limited reader over the byte count it recorded, a staged object is
+trimmed to the length its encoder wrote before it is published, and a database
 surface is emptied by dropping its tables, which returns their pages to the
 database's own free list without giving the filesystem anything back.
 
@@ -784,7 +786,7 @@ at the same rate as the reclaimer's own and through the same turn.
 | An indexer's index file | Removal | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
 | A materialized source tree | Removal | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
 | A published blob a retention sweep collected, and an orphan the sweep found | Removal | The object is content the store no longer names | — |
-| The trim of a staged blob before it is published | In place | The published object is that file and a reader proves it by its length, so it must be that length before the publication, not after | — |
+| The trim of a staged object before it is published | In place | The published object is that file and a reader proves it by a frame index that must end at the file's end, so it must be that length before the publication, not after | — |
 | The staging name of a blob that has just been published | In place, freeing nothing | Two names of one object; the object stays and the unlink gives no blocks back | — |
 | A walk's retained level files and its retained directory | Removal | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
 | A retained level cut back to the byte count a resumed cursor carried | In place | The file goes on being appended to, so there is nothing to rename away | — |

@@ -1,6 +1,6 @@
 # ADR-0003 — Storage tier 2: the lexical and provenance tiers, and the gate
 
-- **Status:** Partially accepted — §2.1 and §2.3 implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.4, §2.5 still proposed. Its lexical tier — §2.1, its place in the §2.6 sequence and its §3 consequences for indexing throughput and recovery — is superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08
+- **Status:** Partially accepted — §2.1, §2.3 and §2.4 implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.5 is a measurement gate, not code. Its lexical tier — §2.1, its place in the §2.6 sequence and its §3 consequences for indexing throughput and recovery — is superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08
 - **Date:** 2026-09-15
 - **Follows:** [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md), which removed
   identity width as the amplifier and left the lexical and provenance tiers as the remaining cost
@@ -125,14 +125,58 @@ net ≈30 MB saving rather than the ≈38 MB claimed above. A narrower digest (f
 the same detection) would keep the saving at both ends and is the obvious follow-up; it is not
 adopted here because it was not the option this record decided.
 
-### 2.4 The content store compresses its blocks, under an explicit block index
+### 2.4 The content store compresses its blocks, under a frame index in the object
 
-Each 64 KiB block becomes an independently compressed frame. `model.BlobRecord` gains an explicit
-per-block compressed-offset array; block-range arithmetic stays in the plaintext domain and every
-digest stays over **plaintext**, so integrity, per-block error attribution and the one-block memory
-bound are unchanged. The index costs 4–8 B a block — ≈0.01 % of the blob. Independent frames plus a
-frame index is the published seekable framing [S9] and the block-gzip precedent for indexed random
-access into compressed data [S10].
+Each 64 KiB block becomes an independently compressed frame, or stays plaintext when it does not
+shrink, and the object ends in a frame index: one 32-bit word per block (the frame's stored length,
+the top bit marking a plaintext frame) and a four-byte mark. Block-range arithmetic stays in the
+plaintext domain and every digest stays over **plaintext**, so integrity, per-block error
+attribution and the one-block memory bound are unchanged. The index costs 4 B a block, ≈0.006 % of
+the blob. Independent frames plus a frame index is the published seekable framing [S9] and the
+block-gzip precedent for indexed random access into compressed data [S10]. The codec is Zstandard
+at its default level with frame checksums off (every decoded block is checked against its SHA-256
+anyway) [S19], one encoder and one decoder shared by the process [S17]; the decoder writes into one block's
+capacity and no further.
+
+**Where the index lives.** In the object, not in `blob_blocks`. Both cost the same bytes and the
+record is loaded whole on every read, so the database form would save the index read (≈2 µs, one
+positioned read). It is refused on exactness: an object already published under a hash is kept
+without re-encoding the new put, and the compressor owes identical output only from the same
+build, so an index recorded for this put's frames could disagree with the object on disk (an
+orphan re-adopted after an upgrade) and every read of it would fail. In the object, the index and
+its frames are one write; "is this object whole" is answered from the object alone — the mark is
+present and the frames end exactly where the index begins — which is also what refuses a file a
+lost write cut short, at publication rather than at every read.
+
+**Only new content is compressed.** A put hashes the plaintext into a pooled surface first; content
+already published stops there, so re-indexing unchanged content never runs the compressor. New
+content is encoded from that surface into a second pooled surface, not in place, because in place
+the plaintext's tail would be freed before every publication and the pool exists so that capture
+frees nothing.
+
+**Codec chosen by measurement.** On a 9.5 MB fixture of Go, C, JavaScript and Python source cut
+into 64 KiB blocks per file (1 160 frames, 4 threads), every codec round-tripped exactly:
+
+| codec (block API) | stored / plaintext | encode MB/s | decode MB/s | decode µs / frame |
+|---|---|---|---|---|
+| Zstandard fastest | 29.5 % | 295 | 1 000 | 8.2 |
+| **Zstandard default** | **27.5 %** | **235** | **984** | **8.3** |
+| Zstandard better | 26.6 % | 183 | 980 | 8.4 |
+| Zstandard best | 25.4 % | 38 | 952 | 8.6 |
+| S2 default | 39.1 % | 755 | 1 992 | 4.1 |
+| S2 better | 35.1 % | 259 | 1 775 | 4.6 |
+| DEFLATE level 1 / 6 | 30.1 % / 26.0 % | 60 / 55 | 255 | 32 |
+
+Decode cost does not move with the Zstandard level [S15], so the level is chosen on encode speed
+against size, and encode is paid once per new content: the default level is the knee (7 % smaller
+than fastest for 20 % slower encode; the next level costs 22 % more encode for 3 % less). DEFLATE
+is as small but four times slower to decode and allocates per call. S2 decodes in half the time and
+is 1.3–1.4× larger [S18]. Through the store itself on the same fixture (warm cache, 20 000 random range
+reads of up to 4 KiB): raw objects 8.4 µs a read and 101.9 % of plaintext; Zstandard framing
+16.2 µs and 29.6 %; S2 11.2 µs and 41.2 %; S2 better 12.1 µs and 37.2 %. The 7.8 µs a read
+Zstandard adds is the index read plus one frame's decode; the 2.4× smaller object is also 2.4× less
+page cache and 2.4× less disk read on a cold store, where a read costs a device access rather than
+microseconds.
 
 **Alternatives steel-manned.** *Compress the database instead* is not available: there is no page
 compression in the public-domain engine build, only a separately licensed extension [S11]. *Raise
@@ -142,12 +186,13 @@ saving. *Train a dictionary* adds a documented ~10 % at 64 KiB inputs [S13] and 
 the dictionary becomes a retention invariant the collector cannot express: it must outlive every
 blob that references it.
 
-**Why this wins.** It is the only change that moves the content tier below its 1.0× floor, and at
-level 3 a mixed corpus compresses 3.05× at 344 MB/s with decompression ~1.2–1.5 GB/s at every level
-[S14][S15]; 2.5× is the conservative planning figure for 64 KiB frames.
+**Why this wins.** It is the only change that moves the content tier below its 1.0× floor, to
+≈0.3× on source, with exact plaintext on every read.
 
-**Trade-off accepted.** Every range read decompresses one frame; the store's on-disk objects stop
-being byte-identical to the source file.
+**Trade-off accepted.** Every range read reads the index and decodes the frames it covers (≈8 µs a
+read on the fixture, warm); the store's on-disk objects stop being byte-identical to the source
+file; the already-published check opens the object and reads its index (one open and one
+positioned read per unchanged file on a re-index) instead of one `lstat`.
 
 ### 2.5 The gate becomes three budgets, one per tier
 
@@ -273,11 +318,26 @@ https://github.com/inikep/lzbench/blob/master/README.md — Silesia corpus: leve
 https://swtch.com/~rsc/regexp/regexp4.html — a lexical index at ~20 % of the indexed sources (77 MB
 over 420 MB); the external reference point for the lexical-tier budget.
 
+[S17] *Go Zstandard implementation, README* —
+https://github.com/klauspost/compress/blob/master/zstd/README.md — the encoder "can be assumed to
+produce the same output from the exact same code version" (and no stronger promise), `EncodeAll`
+and `DecodeAll` are safe for concurrent use, and the decoder runs without allocations once warm; the
+basis of the shared codec and of keeping the frame index in the object (§2.4).
+
+[S18] *S2 compression, README* — https://github.com/klauspost/compress/blob/master/s2/README.md —
+S2 against Zstandard on mixed content (73.6 % against 80.2 % reduction, ≈4× the encode speed) and on
+the first 64 KB of each Go source file (44.8 % default, 39.4 % better); the faster, larger
+alternative measured in §2.4.
+
+[S19] *Zstandard Compression and the 'application/zstd' Media Type* (RFC 8878) —
+https://www.rfc-editor.org/rfc/rfc8878 — the frame format: a frame is self-contained, and its
+content checksum is optional, which is why §2.4 turns it off under the per-block SHA-256.
+
 ---
 
 *Every figure in this record is quoted from the verification run's per-b-tree attribution or
 derived in [`docs/research/16-storage-tier2.md`](../research/16-storage-tier2.md), where the
-arithmetic is shown. §2.1 has been implemented; §2.2–§2.5 have not.*
+arithmetic is shown, except §2.4's codec table, which was measured on the fixture it names.*
 
 **Implementation note on §2.1.** The record says `body`'s only database readers are the insert and
 the two paths that feed the index a delete. There is a third: the delta carry-over copies a previous
