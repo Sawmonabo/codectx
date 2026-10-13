@@ -766,19 +766,6 @@ func writeNodeTable(b *strings.Builder, nodes []model.Node) {
 	}
 }
 
-// writeRelationTable renders the edges an answer admitted, in the keyset order
-// the engine returned them.
-func writeRelationTable(b *strings.Builder, relations []model.Relation) {
-	if len(relations) == 0 {
-		b.WriteString("relations   none\n")
-		return
-	}
-	fmt.Fprintf(b, "relations   %d\n", len(relations))
-	for _, r := range relations {
-		fmt.Fprintf(b, "  %s  %-18s %s -> %s\n", r.ID, clip(string(r.Kind), 18), r.From, r.To)
-	}
-}
-
 // writeCallAnswer renders a callers or callees answer as a call hierarchy:
 // each node with where it is, each relation with how it may run -- through a
 // base method, an override a call may dispatch to, one of n targets, a call

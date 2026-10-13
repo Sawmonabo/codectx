@@ -32,15 +32,6 @@ type Reading struct {
 	Anon *uint64
 }
 
-// figure is a reported count of bytes as a Reading field: absent where it
-// does not fit int64, which no real resident figure exceeds.
-func figure(bytes uint64) *uint64 {
-	if bytes > math.MaxInt64 {
-		return nil
-	}
-	return &bytes
-}
-
 // Parse reads VmHWM, VmRSS and RssAnon, which the kernel states in kB
 // (kibibytes), from the text of a per-process status file. A line that is
 // missing, malformed, in another unit or too large for int64 bytes leaves its

@@ -175,12 +175,12 @@ export function %[2]sRun%[1]s(): string {
 	goPkg := corpusPrefix + "Go"
 	fanout.WriteString("package " + goPkg + "fanout\n\nimport (\n")
 	for p := range spec.Packages {
-		fanout.WriteString(fmt.Sprintf("\t\"example.com/ctxbench/src/go/%s%02d\"\n", goPkg, p))
+		fmt.Fprintf(&fanout, "\t\"example.com/ctxbench/src/go/%s%02d\"\n", goPkg, p)
 	}
 	fanout.WriteString(")\n\n// " + corpusPrefix + "GoFanOut calls every generated package.\nfunc " +
 		corpusPrefix + "GoFanOut() []string {\n\treturn []string{\n")
 	for p := range spec.Packages {
-		fanout.WriteString(fmt.Sprintf("\t\t%[1]s%[2]02d.%[1]sRun%[2]02d(),\n", goPkg, p))
+		fmt.Fprintf(&fanout, "\t\t%[1]s%02[2]d.%[1]sRun%02[2]d(),\n", goPkg, p)
 	}
 	fanout.WriteString("\t}\n}\n")
 	write(filepath.Join("src", "go", goPkg+"fanout", "fanout.go"), fanout.String())

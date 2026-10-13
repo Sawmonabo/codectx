@@ -110,13 +110,13 @@ func documentRecord(path, language string, encoding uint64, occurrences ...[]byt
 	for _, o := range occurrences {
 		d = appendBytes(d, 2, o)
 	}
-	return appendVarint(d, 6<<3|0, encoding)
+	return appendVarint(d, 6, encoding)
 }
 
 func occurrenceRecord(symbol string, roles uint64, vals ...int32) []byte {
 	o := appendBytes(appendBytes(nil, 1, packed(vals...)), 2, []byte(symbol))
 	if roles != 0 {
-		o = appendVarint(o, 3<<3|0, roles)
+		o = appendVarint(o, 3, roles)
 	}
 	return o
 }
@@ -129,8 +129,8 @@ func packed(vals ...int32) []byte {
 	return out
 }
 
-func appendVarint(b []byte, tag uint64, v uint64) []byte {
-	return binary.AppendUvarint(binary.AppendUvarint(b, tag), v)
+func appendVarint(b []byte, field int, v uint64) []byte {
+	return binary.AppendUvarint(binary.AppendUvarint(b, uint64(field)<<3), v)
 }
 
 func appendBytes(b []byte, field int, payload []byte) []byte {

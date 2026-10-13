@@ -306,12 +306,6 @@ func (c *countedTables) Table(ctx context.Context, gen model.GenerationID, fv mo
 	return c.StoredTables.Table(ctx, gen, fv)
 }
 
-func (c *countedTables) read(path string) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.reads[path]
-}
-
 func (c *countedTables) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

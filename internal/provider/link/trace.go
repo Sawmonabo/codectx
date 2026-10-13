@@ -620,7 +620,7 @@ func readIndex(dir string, s stateReader) (*index, error) {
 			ix.off = append(ix.off, ix.size)
 		}
 		head := binary.AppendUvarint(nil, n)
-		if _, err := w.Write(head); err == nil {
+		if _, err = w.Write(head); err == nil {
 			_, err = w.Write(buf)
 		}
 		if err != nil {

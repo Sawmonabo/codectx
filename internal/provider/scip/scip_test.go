@@ -451,15 +451,15 @@ func bigIndex(textBytes, n int) []byte {
 	doc = appendBytes(doc, 1, []byte("big.go"))
 	doc = appendBytes(doc, 4, []byte("go"))
 	def := appendBytes(appendBytes(nil, 1, packed(2, 5, 6)), 2, []byte("scip-go gomod example.com/big . big/F()."))
-	def = appendVarint(def, 3<<3|0, 1)
+	def = appendVarint(def, 3, 1)
 	doc = appendBytes(doc, 2, def)
 	ref := appendBytes(appendBytes(nil, 1, packed(2, 11, 12)), 2, []byte("scip-go gomod example.com/big . big/G()."))
 	for i := 0; i < n; i++ {
 		doc = appendBytes(doc, 2, ref)
 	}
-	doc = appendBytes(doc, 3, appendVarint(appendBytes(nil, 1, []byte("scip-go gomod example.com/big . big/F().")), 5<<3|0, 17))
+	doc = appendBytes(doc, 3, appendVarint(appendBytes(nil, 1, []byte("scip-go gomod example.com/big . big/F().")), 5, 17))
 	doc = appendBytes(doc, 5, []byte(strings.Repeat("x", textBytes)))
-	doc = appendVarint(doc, 6<<3|0, 1)
+	doc = appendVarint(doc, 6, 1)
 	meta := appendBytes(nil, 2, appendBytes(appendBytes(nil, 1, []byte("fixture")), 2, []byte("0")))
 	return appendBytes(appendBytes(nil, 1, meta), 2, doc)
 }
@@ -472,8 +472,8 @@ func packed(vals ...int32) []byte {
 	return out
 }
 
-func appendVarint(b []byte, tag uint64, v uint64) []byte {
-	return binary.AppendUvarint(binary.AppendUvarint(b, tag), v)
+func appendVarint(b []byte, field int, v uint64) []byte {
+	return binary.AppendUvarint(binary.AppendUvarint(b, uint64(field)<<3), v)
 }
 
 func appendBytes(b []byte, field int, payload []byte) []byte {
@@ -722,13 +722,13 @@ func documentRecord(path, language string, encoding uint64, occurrences ...[]byt
 	for _, o := range occurrences {
 		d = appendBytes(d, 2, o)
 	}
-	return appendVarint(d, 6<<3|0, encoding)
+	return appendVarint(d, 6, encoding)
 }
 
 func occurrenceRecord(symbol string, roles uint64, vals ...int32) []byte {
 	o := appendBytes(appendBytes(nil, 1, packed(vals...)), 2, []byte(symbol))
 	if roles != 0 {
-		o = appendVarint(o, 3<<3|0, roles)
+		o = appendVarint(o, 3, roles)
 	}
 	return o
 }

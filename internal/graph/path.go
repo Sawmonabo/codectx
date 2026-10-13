@@ -1661,28 +1661,6 @@ func (w *pathWalk) markReach(to model.NodeID) error {
 		) SELECT n FROM back`, string(to))
 }
 
-// admitted returns the edges out of n that lie on a shortest route to the
-// target, in RelationID order. The (frm, rel) index answers it directly, so
-// enumeration never scans the DAG. The slice is materialized before the caller
-// recurses: the scratch holds ONE connection, and a nested query under an open
-// row set would wait on it forever.
-func (w *pathWalk) admitted(n model.NodeID) ([]model.Relation, error) {
-	var out []model.Relation
-	err := w.sc.each(w.scCtx, `SELECT p.node, p.rel, p.kind FROM parent p
-		WHERE p.frm = ? AND EXISTS(SELECT 1 FROM reach r WHERE r.node = p.node)
-		ORDER BY p.rel`, []any{string(n)},
-		func(scan func(...any) error) error {
-			var node, rel, kind string
-			if err := scan(&node, &rel, &kind); err != nil {
-				return internalErr("path scratch read: " + err.Error())
-			}
-			out = append(out, model.Relation{ID: model.RelationID(rel), From: n,
-				To: model.NodeID(node), Kind: model.RelationKind(kind)})
-			return nil
-		})
-	return out, err
-}
-
 // routeStep is one edge of the shortest-path graph out of a state, keyed for
 // the enumeration by (relation, state): one relation reaches a method and its
 // dispatch state both.
