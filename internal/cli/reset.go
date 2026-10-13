@@ -41,12 +41,12 @@ func newResetCommand(build model.BuildInfo) *cobra.Command {
 			"The database is never opened, so a store that is corrupt or of another schema is " +
 			"removed like any other. The workspace lock is taken first and held until everything " +
 			"is gone; a running index, refresh or watch beat holding it is named in the " +
-			"CTX_WORKSPACE_BUSY refusal and nothing is removed. A watch or MCP server that is idle " +
-			"holds no lock, so stop it before resetting.\n\n" +
+			"CTX_WORKSPACE_BUSY refusal and nothing is removed. A watch or MCP server open on the " +
+			"workspace refuses the reset the same way, idle or not: stop it, then reset.\n\n" +
 			"Only the resolved data directory is emptied. A symbolic link inside it is removed as " +
 			"a link and its target is left alone, and a data directory that is, or holds, the " +
-			"repository, the home directory or the filesystem root is refused. The lock file " +
-			"itself stays, empty, for the next holder to take. A cache `codectx index --rebuild` " +
+			"repository, the home directory or the filesystem root is refused. The two lock files " +
+			"stay, empty, for the next holders to take. A cache `codectx index --rebuild` " +
 			"made beside the data directory is not the data directory and is not touched.\n\n" +
 			resetNotice + "\n\n" +
 			"--reindex runs a full index straight afterwards; when that index fails, what was removed " +

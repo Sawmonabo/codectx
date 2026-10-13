@@ -406,8 +406,13 @@ type stack struct {
 	// lock file for whoever is refused while it is held, and builds records
 	// whether this composition may take it at all -- a report or a query
 	// composition never does.
-	lock      *snapshot.WorkspaceLock
-	lockMu    sync.Mutex
+	lock   *snapshot.WorkspaceLock
+	lockMu sync.Mutex
+	// serving is the presence lock a session that stays open -- the server, a
+	// watch -- holds shared for its whole life, so a reset, which takes it
+	// exclusive, sees the session even while it is idle and holds no
+	// workspace lock. Nil in every other composition.
+	serving   *snapshot.ServingLock
 	operation string
 	builds    bool
 	// onWaiting is the caller's waiting line, told about the process holding
@@ -578,6 +583,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			if err = os.MkdirAll(dir, 0o700); err != nil {
 				return nil, dataDirNotWritable(dir, err)
 			}
+		}
+	}
+	// A session that stays open says so before it opens anything else, and a
+	// reset emptying the directory refuses it here rather than leaving it
+	// serving files that are being removed.
+	if o.mode == modeServe || o.mode == modeWatch {
+		if s.serving, err = snapshot.HoldServing(s.dataDir); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1865,6 +1878,9 @@ func (s *stack) Close() error {
 		s.lock = nil
 	}
 	s.lockMu.Unlock()
+	// Last of the workspace's own files: the session is no longer open on it.
+	errs = append(errs, s.serving.Close())
+	s.serving = nil
 	errs = append(errs, s.root.Close())
 	// The engine temp directory this composition fell back to is this
 	// process's own, so it goes with the process rather than being left for

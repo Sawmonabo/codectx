@@ -40,18 +40,19 @@ type ResetOptions struct {
 //
 // It opens no store. The database may be the very thing that is corrupt or of
 // a schema this build cannot read, and a reset that needed to open it could
-// not recover from either. What it takes is the workspace lock, and only that:
-// once, without waiting, so a running index, refresh or watch beat is refused
-// with the CTX_WORKSPACE_BUSY that names it rather than having its files taken
-// out from under it. A session that is idle between the things it builds -- a
-// watch, an MCP server -- holds no lock and cannot be seen here; it has to be
-// stopped first.
+// not recover from either. What it takes are the two locks, each once and
+// without waiting: the workspace lock, so a running index, refresh or watch
+// beat is refused with the CTX_WORKSPACE_BUSY that names it rather than having
+// its files taken out from under it; then the serving lock exclusive, so a
+// session that stays open on the workspace -- an MCP server or a watch, which
+// holds that lock shared for its whole life even while it is idle and holds no
+// workspace lock -- refuses the reset with CTX_WORKSPACE_BUSY too.
 //
-// The lock file lives inside the directory it guards, and it is the one entry
-// left behind. Unlinking it while holding it would let the next process create
-// a second lock file beside a waiter still holding the first, and the two would
-// both believe they own the workspace. Left in place it is an empty file the
-// next holder takes, which costs the next index nothing.
+// The two lock files live inside the directory they guard, and they are the
+// entries left behind. Unlinking one while holding it would let the next
+// process create a second lock file beside a waiter still holding the first,
+// and the two would both believe they own the workspace. Left in place each is
+// an empty file the next holder takes, which costs the next index nothing.
 //
 // Every removal is paced: freed a window at a time with a wait between
 // windows, because a burst of frees stalls the host this product runs on. This
@@ -154,8 +155,8 @@ func holds(dir, path string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-// emptyDataDir removes every entry of dataDir but its lock file, under that
-// lock, and reports each entry with the bytes its removal gave back.
+// emptyDataDir removes every entry of dataDir but its two lock files, under
+// those locks, and reports each entry with the bytes its removal gave back.
 //
 // An entry that cannot be removed does not stop the others: everything that
 // can go goes, and the first failure is returned once the directory has been
@@ -169,17 +170,23 @@ func emptyDataDir(ctx context.Context, dataDir string) ([]model.RemovedEntry, ui
 	// Released last, after every entry has gone, so no process can take the
 	// workspace while any of it is still on the disk.
 	defer lock.Close()
+	serving, err := snapshot.LockServingExclusive(dataDir)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer serving.Close()
 
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		return nil, 0, dataDirNotWritable(dataDir, err)
 	}
-	lockName := filepath.Base(snapshot.LockPath(dataDir))
+	kept := map[string]bool{filepath.Base(snapshot.LockPath(dataDir)): true,
+		filepath.Base(snapshot.ServingLockPath(dataDir)): true}
 	removed := []model.RemovedEntry{}
 	var freed uint64
 	var first error
 	for _, e := range entries {
-		if e.Name() == lockName {
+		if kept[e.Name()] {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
