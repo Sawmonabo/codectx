@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1130,9 +1129,8 @@ func requestSpanKey(repo model.RepositoryID, req model.ReadChunkRequest) (spanKe
 // the root itself or climbs above it names no file of the repository and is
 // CTX_ARGUMENT_INVALID.
 func repositoryPath(p string) (string, error) {
-	clean := path.Clean(filepath.ToSlash(p))
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "../") ||
-		filepath.IsAbs(p) {
+	clean, ok := model.CleanRepoPath(filepath.ToSlash(p))
+	if !ok || filepath.IsAbs(p) {
 		return "", &model.Error{Code: model.CodeArgumentInvalid,
 			Message:     "read_chunk.path " + strconv.Quote(p) + " is not a file path inside the repository",
 			Remediation: "name the file relative to the repository root, with no \"..\" segment that leaves it"}

@@ -826,8 +826,8 @@ func normalizeSeedPath(tok string) string {
 	if !strings.Contains(tok, "/") && path.Ext(tok) == "" {
 		return ""
 	}
-	p := path.Clean(strings.TrimPrefix(strings.ReplaceAll(tok, "\\", "/"), "/"))
-	if p == "." || p == ".." || strings.HasPrefix(p, "../") || len(p) > model.MaxPathBytes {
+	p, ok := model.CleanRepoPath(strings.TrimPrefix(strings.ReplaceAll(tok, "\\", "/"), "/"))
+	if !ok {
 		return ""
 	}
 	return p
