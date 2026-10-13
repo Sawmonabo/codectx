@@ -61,7 +61,6 @@ type CapabilityStateValue string
 const (
 	CapabilityFresh       CapabilityStateValue = "fresh"
 	CapabilityPartial     CapabilityStateValue = "partial"
-	CapabilityStale       CapabilityStateValue = "stale"
 	CapabilityUnavailable CapabilityStateValue = "unavailable"
 	CapabilityFailed      CapabilityStateValue = "failed"
 )
@@ -69,7 +68,7 @@ const (
 // Valid reports whether s is a known wire spelling.
 func (s CapabilityStateValue) Valid() bool {
 	switch s {
-	case CapabilityFresh, CapabilityPartial, CapabilityStale, CapabilityUnavailable, CapabilityFailed:
+	case CapabilityFresh, CapabilityPartial, CapabilityUnavailable, CapabilityFailed:
 		return true
 	}
 	return false

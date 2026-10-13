@@ -1335,14 +1335,14 @@ func (g *generation) coveredProviders() (covered map[string]bool, failed map[str
 }
 
 // healthOf is Section 13.3's whole-generation health. An unavailable optional
-// capability leaves a base generation fresh; anything partial, stale or failed
+// capability leaves a base generation fresh; anything partial or failed
 // makes it degraded. A generation with no coverage at all is not published:
 // storage refuses a generation with no members.
 func healthOf(states []model.CapabilityState) model.GenerationHealth {
 	health := model.HealthFresh
 	for _, s := range states {
 		switch s.State {
-		case model.CapabilityPartial, model.CapabilityStale, model.CapabilityFailed:
+		case model.CapabilityPartial, model.CapabilityFailed:
 			health = model.HealthDegraded
 		}
 	}

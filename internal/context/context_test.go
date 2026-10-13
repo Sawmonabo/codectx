@@ -840,17 +840,17 @@ func TestContextCompilerScenario(t *testing.T) {
 					t.Fatal("an edge-budget truncation reported complete scope")
 				}
 
-				stale := []model.CapabilityState{{ProviderID: "treesitter", Capability: "structure",
-					Scope: "workspace", State: model.CapabilityStale}}
-				res, err = expandScope(fx.ctx, fx.scopeEngine(rels, stale), fx.Gen, fx.Cfg.Context,
-					[]candidate{fx.seedOf(impl)}, stale)
+				partial := []model.CapabilityState{{ProviderID: "treesitter", Capability: "structure",
+					Scope: "workspace", State: model.CapabilityPartial}}
+				res, err = expandScope(fx.ctx, fx.scopeEngine(rels, partial), fx.Gen, fx.Cfg.Context,
+					[]candidate{fx.seedOf(impl)}, partial)
 				if err != nil {
 					t.Fatalf("expandScope: %v", err)
 				}
 				if res.ScopeComplete {
-					t.Fatal("a stale capability reported complete scope")
+					t.Fatal("a partial capability reported complete scope")
 				}
-				if len(res.Completeness) != 1 || res.Completeness[0].State != model.CapabilityStale {
+				if len(res.Completeness) != 1 || res.Completeness[0].State != model.CapabilityPartial {
 					t.Fatalf("the manifest header lost the capability row behind the verdict: %+v", res.Completeness)
 				}
 			},
