@@ -487,8 +487,11 @@ unread match can rank above the packed files
 matches read fill more than the plan's file budget with files that each fit one
 slice, at a score margin derived from the ranking's boost constants, and a
 later round reads every match inside the files the plan keeps (decision 5). The
-manifest says when the read stopped and at which score. Every read is one page
-at a time. A value you do set is disclosed where it bites: the step that stopped
+manifest says when the read stopped and at which score. The working-tree and
+declaration reads are one page at a time; the lexical read is in process,
+starting at one page and doubling its depth while a step fits its share of
+`resources.query_memory_bytes`, and it serves the same matches in the same order
+whatever the depth. A value you do set is disclosed where it bites: the step that stopped
 is named in the manifest's exclusions, with the key and the value that stopped
 it, and the scope is reported incomplete.
 

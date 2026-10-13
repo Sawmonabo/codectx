@@ -1077,8 +1077,9 @@ func initFrom(hits []pyHit, file int32) bool {
 }
 
 // pythonFlows reads the tables of the members e.only selects a site of a
-// second time and emits the argument flows of every call fact of a
-// selected site to a declaration of the unit (emitFlows), the sites asked in
+// second time and emits the argument and return flows of every call fact of
+// a selected site with arguments or a result to a declaration of the unit
+// (emitFlows), the sites asked in
 // ascending order against calls, sorted by site, each site's parameter
 // lookups recorded for it.
 func pythonFlows(ctx context.Context, u *unit, e *flowEmit, calls *pagination.ExternalSort[pyCall]) error {
@@ -1100,7 +1101,7 @@ func pythonFlows(ctx context.Context, u *unit, e *flowEmit, calls *pagination.Ex
 		}
 		for i := range tab.Sites {
 			s := &tab.Sites[i]
-			if len(s.Arguments) == 0 || !sel.has(int32(i)) {
+			if (len(s.Arguments) == 0 && !hasResult(s)) || !sel.has(int32(i)) {
 				continue
 			}
 			site := Ref{File: file, Index: int32(i)}

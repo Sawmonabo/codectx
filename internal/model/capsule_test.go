@@ -31,7 +31,7 @@ func TestCapsuleCanonicalHashIsByteIdentical(t *testing.T) {
 		fixture capsuleFixture
 		pinned  string
 	}{
-		{"full", fullCapsuleFixture(), "2b4713c79a05fa2e3505dfb0798794222b362975a4bb466065e800d74bad8ad3"},
+		{"full", fullCapsuleFixture(), "752b510d4720793352ff891d87486b060122d511bebd876dd8e6291db850f41a"},
 		{"empty", emptyCapsuleFixture(), "242426dc7242401052de1a49aa9552584c555026ad939e4ff135178e8cfcacbc"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -225,7 +225,7 @@ func fullCapsuleFixture() capsuleFixture {
 	f.scope = []CapsuleScopeNode{{NodeID: NodeID(capsuleTestID("5f"))}, {NodeID: NodeID(capsuleTestID("60"))}}
 	f.accepted = []FactReference{{
 		RelationID:    RelationID(capsuleTestID("71")),
-		EvidenceIDs:   []EvidenceID{EvidenceID(capsuleTestID("82"))},
+		EvidenceIDs:   []EvidenceID{EvidenceID(capsuleTestID("82")[:EvidenceIDHexLen])},
 		ObservationID: ObservationID(capsuleTestID("93")),
 	}}
 	f.contradictions = []ObservationReference{{

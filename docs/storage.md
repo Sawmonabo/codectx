@@ -28,6 +28,18 @@ unique only in combination, through `UNIQUE(kind, canonical_key)` — and neithe
 `repository_id` column, because one store is one repository.
 (`snapshots` and `generations` still carry theirs.)
 
+Evidence keeps its identity in the row: `evidence.id` is `BLOB PRIMARY KEY`
+under `CHECK(length(id) = 16)`, the first 16 bytes of the occurrence's SHA-256
+derivation (`model.EvidenceIDBytes`, ADR-0003 §2.2), and the same 32 hex
+characters are `model.EvidenceID` on the wire. It is not a surrogate: the id is
+a pure function of the occurrence, so `ON CONFLICT(id) DO NOTHING` is what makes
+a republished occurrence idempotent, evidence pages are keyset on it, and the
+evidence clip keeps the lowest ids of a fact -- a prefix keeps the full
+digest's order, so each of these is the order the full digest would give. The
+width is paid three times, in the record, in the primary key's automatic index
+and in `idx_evidence_unit(unit_id, id)`; the other evidence indexes carry the
+rowid.
+
 The two wide text keys are interned the same way. `scope_keys(id, key)` and
 `native_keys(id, key)` hold each distinct string once; `native_aliases` is
 all-integer — `(unit_id, scope_key_id, native_key_id, node_id)` — and evidence
@@ -250,6 +262,26 @@ child tables per deleted row, which is what would make the dictionary
 uncollectable in practice. The native-key pass carries a rows-examined budget
 as a safety bound: it defers, never skips, so a key a run does not reach is
 still unreferenced on the next one.
+
+Files rows are collected the same way, after the snapshot step. A file is
+unreferenced when no `snapshot_files`, `unit_inputs` or `context_entries` row
+names it; those are the only tables that name a file directly. `node_facts`,
+`evidence` and `search_units` name one only through their foreign key onto
+`unit_inputs(unit_id, file_id)`, and `session_files` (and through it the
+session tables below it) only through its foreign key onto `snapshot_files`, so
+each is implied and asking it again would be a scan of the largest tables per
+candidate. Each probe is an index lookup, `idx_snapshot_files_file` among them.
+
+Every foreign-key child key has an index that leads with one of its columns.
+With foreign keys enforced on every connection, deleting a parent row first
+proves no child row names it, and an unindexed child key makes that proof a
+scan of the child table per deleted row, invisible in the deleting statement's
+own plan: a blob deletion scanned `unit_inputs` and `snapshot_files`, a snapshot
+deletion `retention_leases` and, through its cascade, `session_files`, a
+generation deletion `retention_leases`, `provider_runs` and
+`context_manifests`, and the provider-run sweep `units` per run. The indexes
+that close these are listed with their reasons in `schema.sql`, and a test holds
+every foreign key of the schema to the rule.
 
 ## What a delta names
 
@@ -720,17 +752,19 @@ Freeing is the expensive act, so the working files a store writes for its own
 later reading are not freed at all. They are taken from a **scratch pool** under
 the directory they belong to and given back to it: an external sort's runs and
 its merged output, the surface a blob is
-streamed into while it is hashed, a shortest-path search's state, an index
+streamed into while it is hashed and the one its compressed object is written
+into, a shortest-path search's state, an index
 import's symbol spool, and the database engine's own temporaries. `Take` hands out an existing file of the asked-for
 purpose, opened for overwrite at offset zero, or creates one; `Release` returns
 it for the next taker. **Nothing truncates a surface to reuse it**: a file
 keeps whatever length its largest tenant gave it, and re-indexing an unchanged
 repository or answering a second query of the same shape therefore frees
 nothing at all. The one truncation in the pool is the content store's, which
-trims a staged blob to the length its record states *before* the object is
-published -- the published object is that file, and a reader proves an object
-by its length ([snapshots.md](snapshots.md#the-content-addressed-store)) -- and
-that trim is windowed and charged to the same budget as every other free.
+trims a staged object to the length its frames and frame index occupy *before*
+the object is published -- the published object is that file, and a reader
+proves an object by its frame index, which must end exactly at the file's end
+([snapshots.md](snapshots.md#the-content-addressed-store)) -- and that trim is
+windowed and charged to the same budget as every other free.
 
 A surface the pool cannot open is not handed out. `Take` opens the file it is
 about to lease, and one it cannot open leaves the pool *and* the disk: the pool
@@ -743,8 +777,8 @@ way.
 Because nothing truncates, **the file's length is not the data's length**. Every
 tenant carries its own logical length — a header, a record count, a byte count
 it recorded when it wrote — and never learns it from the file: a sort run is
-read through a limited reader over the byte count it recorded, a staged blob is
-trimmed to the length its record states before it is published, and a database
+read through a limited reader over the byte count it recorded, a staged object is
+trimmed to the length its encoder wrote before it is published, and a database
 surface is emptied by dropping its tables, which returns their pages to the
 database's own free list without giving the filesystem anything back.
 
@@ -784,7 +818,7 @@ at the same rate as the reclaimer's own and through the same turn.
 | An indexer's index file | Removal | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
 | A materialized source tree | Removal | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
 | A published blob a retention sweep collected, and an orphan the sweep found | Removal | The object is content the store no longer names | — |
-| The trim of a staged blob before it is published | In place | The published object is that file and a reader proves it by its length, so it must be that length before the publication, not after | — |
+| The trim of a staged object before it is published | In place | The published object is that file and a reader proves it by a frame index that must end at the file's end, so it must be that length before the publication, not after | — |
 | The staging name of a blob that has just been published | In place, freeing nothing | Two names of one object; the object stays and the unlink gives no blocks back | — |
 | A walk's retained level files and its retained directory | Removal | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
 | A retained level cut back to the byte count a resumed cursor carried | In place | The file goes on being appended to, so there is nothing to rename away | — |

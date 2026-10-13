@@ -1,6 +1,6 @@
 # ADR-0003 — Storage tier 2: the lexical and provenance tiers, and the gate
 
-- **Status:** Partially accepted — §2.1 and §2.3 implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.4, §2.5 still proposed. Its lexical tier — §2.1, its place in the §2.6 sequence and its §3 consequences for indexing throughput and recovery — is superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08
+- **Status:** Partially accepted — §2.1, §2.2, §2.3 and §2.4 implemented (§2.2 narrows the public evidence identity to 16 bytes and moves the pinned capsule digest; §2.4 compresses the content store under a frame index in each object); §2.5 is a measurement gate, not code. Its lexical tier — §2.1, its place in the §2.6 sequence and its §3 consequences for indexing throughput and recovery — is superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08
 - **Date:** 2026-09-15
 - **Follows:** [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md), which removed
   identity width as the amplifier and left the lexical and provenance tiers as the remaining cost
@@ -73,25 +73,50 @@ reading every body back out to feed a delete.
 
 ### 2.2 Evidence rows carry a 16-byte identity
 
-`evidence.id` is narrowed from a 32-byte digest to the first 16 bytes of the same digest, halving
-both the record field and its automatic index key [S1].
+`evidence.id` is the first 16 bytes of the occurrence's SHA-256 derivation instead of all 32, and
+the public `EvidenceID` is the same value, 32 hex characters. The record field, the primary key's
+automatic index key and `idx_evidence_unit(unit_id, id)` each halve [S1]; the other three evidence
+indexes carry the rowid and do not change.
 
-**Alternatives steel-manned.** *Drop the stored identity for an integer row key* is worth roughly
-twice as much — an integer primary key is the row key and costs no payload [S7], removing the field,
-the automatic index and 24 bytes from every secondary entry, ~50 MB on the large Python repository. It is not adopted
-**yet** because the 32-byte value reaches the wire and would have to be recomputed on read, and the
-derivation hashes the canonical string forms of unit, node, relation and file-content identities
-that the schema now stores as surrogates: three to four joins per hydrated row, an unmeasured
-latency cost on the hottest read path. *Pack evidence into a per-file blob* is refused outright: the
-four secondary indexes exist because evidence is queried by unit, node, relation and native key, and
-a blob answers none of those without a scan.
+**Measured.** 200 000 evidence rows of the store's own shape (a third node subjects, two thirds
+relation subjects, all six b-trees, vacuumed): 47 915 008 B at 32 bytes, 38 002 688 B at 16 —
+**49.6 B a row, 20.7 % of the evidence family**: the table 22 167 552 → 18 669 568 B, the automatic
+index 8 212 480 → 5 005 312 B, `idx_evidence_unit` 8 810 496 → 5 603 328 B. Nothing on the read path
+changes but the bytes compared: every evidence read already selects `e.id` and hex-encodes it.
 
-**Why this wins.** At 643 025 rows a 128-bit digest's collision probability is ~10⁻²⁸ and the upsert
-that depends on the uniqueness is unchanged, so the saving is free of both risk and joins.
+**What it does to the product surfaces.** The wire `evidence_id` (reference occurrences, relation
+occurrences, fact references, row marks, path evidence) narrows from 64 to 32 hex characters, and
+every validator of an evidence identity takes that width and refuses the full one. The pinned
+capsule digest moves, because a fact reference hashes its evidence identities: the model test's
+full fixture pins `752b510d…f41a` where it pinned `2b4713c7…8ad3`. Both are format changes with
+no consumer to migrate.
 
-**Trade-off accepted.** The wire identity narrows to 16 bytes, which is a visible format change, and
-it forecloses nothing: the integer-key variant remains available once the recomputation cost is
-measured.
+**Exactness.** The identity is still a pure function of the occurrence, so the upsert that makes a
+republished occurrence idempotent, the keyset order of evidence pages and the clip that keeps a
+fact's lowest ids are unchanged in kind, and a prefix keeps the digest's order, so each is the
+order the full digest would give. Two distinct occurrences in one store collide with probability
+about n²/2¹²⁹: ≈10⁻²⁵ at ten million rows. A truncated SHA-256 keeps collision resistance of half
+its length, 64 bits against a deliberate search [S20]; a collision would drop one occurrence of a
+fact that has others, and producing one means a 2⁶⁴-work search over occurrence fields a
+repository author controls only in part.
+
+**Alternatives steel-manned.** *Drop the stored identity for an integer row key* removes the field
+and the automatic index outright [S7] and is refused on exactness, not deferred. The upsert needs a
+unique key, and the occurrence's natural key — unit, subject, precision, native key, file, range,
+detail, dispatch, set size — is far wider than 16 bytes as an index. The clip and the keyset pages
+order by the id, so a row key would make the retained set and the page boundaries a function of
+insertion order, which a delta changes; and a rowid on the wire is what the identity model forbids
+(Section 9.1). Recomputing the digest on read to avoid that costs three to four joins per row on
+the hottest read path and still leaves the ordering problem. *Key the table by a 63-bit digest
+prefix with collision detection*, as §2.3 does for native keys, is smaller still but a detected
+collision probes to the next free id, so an occurrence's identity would depend on which colliding
+row was written first — identity stops being a function of content. *Keep 32 bytes* gives up
+49.6 B a row for a collision margin that is already beyond any row count a store reaches.
+
+**Why this wins.** It is the smallest form that keeps the identity a pure function of the
+occurrence and every ordering over it exact.
+
+**Trade-off accepted.** A visible narrowing of the wire identity and a moved capsule digest.
 
 ### 2.3 The key dictionary becomes hash-keyed
 
@@ -125,14 +150,58 @@ net ≈30 MB saving rather than the ≈38 MB claimed above. A narrower digest (f
 the same detection) would keep the saving at both ends and is the obvious follow-up; it is not
 adopted here because it was not the option this record decided.
 
-### 2.4 The content store compresses its blocks, under an explicit block index
+### 2.4 The content store compresses its blocks, under a frame index in the object
 
-Each 64 KiB block becomes an independently compressed frame. `model.BlobRecord` gains an explicit
-per-block compressed-offset array; block-range arithmetic stays in the plaintext domain and every
-digest stays over **plaintext**, so integrity, per-block error attribution and the one-block memory
-bound are unchanged. The index costs 4–8 B a block — ≈0.01 % of the blob. Independent frames plus a
-frame index is the published seekable framing [S9] and the block-gzip precedent for indexed random
-access into compressed data [S10].
+Each 64 KiB block becomes an independently compressed frame, or stays plaintext when it does not
+shrink, and the object ends in a frame index: one 32-bit word per block (the frame's stored length,
+the top bit marking a plaintext frame) and a four-byte mark. Block-range arithmetic stays in the
+plaintext domain and every digest stays over **plaintext**, so integrity, per-block error
+attribution and the one-block memory bound are unchanged. The index costs 4 B a block, ≈0.006 % of
+the blob. Independent frames plus a frame index is the published seekable framing [S9] and the
+block-gzip precedent for indexed random access into compressed data [S10]. The codec is Zstandard
+at its default level with frame checksums off (every decoded block is checked against its SHA-256
+anyway) [S19], one encoder and one decoder shared by the process [S17]; the decoder writes into one block's
+capacity and no further.
+
+**Where the index lives.** In the object, not in `blob_blocks`. Both cost the same bytes and the
+record is loaded whole on every read, so the database form would save the index read (≈2 µs, one
+positioned read). It is refused on exactness: an object already published under a hash is kept
+without re-encoding the new put, and the compressor owes identical output only from the same
+build, so an index recorded for this put's frames could disagree with the object on disk (an
+orphan re-adopted after an upgrade) and every read of it would fail. In the object, the index and
+its frames are one write; "is this object whole" is answered from the object alone — the mark is
+present and the frames end exactly where the index begins — which is also what refuses a file a
+lost write cut short, at publication rather than at every read.
+
+**Only new content is compressed.** A put hashes the plaintext into a pooled surface first; content
+already published stops there, so re-indexing unchanged content never runs the compressor. New
+content is encoded from that surface into a second pooled surface, not in place, because in place
+the plaintext's tail would be freed before every publication and the pool exists so that capture
+frees nothing.
+
+**Codec chosen by measurement.** On a 9.5 MB fixture of Go, C, JavaScript and Python source cut
+into 64 KiB blocks per file (1 160 frames, 4 threads), every codec round-tripped exactly:
+
+| codec (block API) | stored / plaintext | encode MB/s | decode MB/s | decode µs / frame |
+|---|---|---|---|---|
+| Zstandard fastest | 29.5 % | 295 | 1 000 | 8.2 |
+| **Zstandard default** | **27.5 %** | **235** | **984** | **8.3** |
+| Zstandard better | 26.6 % | 183 | 980 | 8.4 |
+| Zstandard best | 25.4 % | 38 | 952 | 8.6 |
+| S2 default | 39.1 % | 755 | 1 992 | 4.1 |
+| S2 better | 35.1 % | 259 | 1 775 | 4.6 |
+| DEFLATE level 1 / 6 | 30.1 % / 26.0 % | 60 / 55 | 255 | 32 |
+
+Decode cost does not move with the Zstandard level [S15], so the level is chosen on encode speed
+against size, and encode is paid once per new content: the default level is the knee (7 % smaller
+than fastest for 20 % slower encode; the next level costs 22 % more encode for 3 % less). DEFLATE
+is as small but four times slower to decode and allocates per call. S2 decodes in half the time and
+is 1.3–1.4× larger [S18]. Through the store itself on the same fixture (warm cache, 20 000 random range
+reads of up to 4 KiB): raw objects 8.4 µs a read and 101.9 % of plaintext; Zstandard framing
+16.2 µs and 29.6 %; S2 11.2 µs and 41.2 %; S2 better 12.1 µs and 37.2 %. The 7.8 µs a read
+Zstandard adds is the index read plus one frame's decode; the 2.4× smaller object is also 2.4× less
+page cache and 2.4× less disk read on a cold store, where a read costs a device access rather than
+microseconds.
 
 **Alternatives steel-manned.** *Compress the database instead* is not available: there is no page
 compression in the public-domain engine build, only a separately licensed extension [S11]. *Raise
@@ -142,12 +211,13 @@ saving. *Train a dictionary* adds a documented ~10 % at 64 KiB inputs [S13] and 
 the dictionary becomes a retention invariant the collector cannot express: it must outlive every
 blob that references it.
 
-**Why this wins.** It is the only change that moves the content tier below its 1.0× floor, and at
-level 3 a mixed corpus compresses 3.05× at 344 MB/s with decompression ~1.2–1.5 GB/s at every level
-[S14][S15]; 2.5× is the conservative planning figure for 64 KiB frames.
+**Why this wins.** It is the only change that moves the content tier below its 1.0× floor, to
+≈0.3× on source, with exact plaintext on every read.
 
-**Trade-off accepted.** Every range read decompresses one frame; the store's on-disk objects stop
-being byte-identical to the source file.
+**Trade-off accepted.** Every range read reads the index and decodes the frames it covers (≈8 µs a
+read on the fixture, warm); the store's on-disk objects stop being byte-identical to the source
+file; the already-published check opens the object and reads its index (one open and one
+positioned read per unchanged file on a re-index) instead of one `lstat`.
 
 ### 2.5 The gate becomes three budgets, one per tier
 
@@ -176,7 +246,7 @@ and is ~14× the number it replaces because that number was never derived at all
 
 ### 2.6 Sequence
 
-1. **Precondition.** The content-store read ceiling that verification finding SV2 records — `byte
+1. **Precondition.** The content-store read ceiling a verification run recorded — `byte
    range spans 4292608 bytes, over the 1048576-byte read ceiling`, a bound no user set, which takes
    the whole answer down instead of truncating and flagging — becomes a user-set bound that is
    unlimited by default, and the integrity check is reimplemented. §2.1 must not land first:
@@ -273,11 +343,32 @@ https://github.com/inikep/lzbench/blob/master/README.md — Silesia corpus: leve
 https://swtch.com/~rsc/regexp/regexp4.html — a lexical index at ~20 % of the indexed sources (77 MB
 over 420 MB); the external reference point for the lexical-tier budget.
 
+[S17] *Go Zstandard implementation, README* —
+https://github.com/klauspost/compress/blob/master/zstd/README.md — the encoder "can be assumed to
+produce the same output from the exact same code version" (and no stronger promise), `EncodeAll`
+and `DecodeAll` are safe for concurrent use, and the decoder runs without allocations once warm; the
+basis of the shared codec and of keeping the frame index in the object (§2.4).
+
+[S18] *S2 compression, README* — https://github.com/klauspost/compress/blob/master/s2/README.md —
+S2 against Zstandard on mixed content (73.6 % against 80.2 % reduction, ≈4× the encode speed) and on
+the first 64 KB of each Go source file (44.8 % default, 39.4 % better); the faster, larger
+alternative measured in §2.4.
+
+[S19] *Zstandard Compression and the 'application/zstd' Media Type* (RFC 8878) —
+https://www.rfc-editor.org/rfc/rfc8878 — the frame format: a frame is self-contained, and its
+content checksum is optional, which is why §2.4 turns it off under the per-block SHA-256.
+
+[S20] *NIST SP 800-107 Rev. 1, Recommendation for Applications Using Approved Hash Algorithms*
+(§4.1, §5.1) — https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-107r1.pdf —
+"the expected collision-resistance strength of a hash function is half the length of the hash
+value"; a truncated digest takes "the λ left-most bits" and needs λ ≥ 2s for collision resistance
+s. The basis of §2.2's adversarial margin and of keeping the prefix rather than any other 16 bytes.
+
 ---
 
 *Every figure in this record is quoted from the verification run's per-b-tree attribution or
 derived in [`docs/research/16-storage-tier2.md`](../research/16-storage-tier2.md), where the
-arithmetic is shown. §2.1 has been implemented; §2.2–§2.5 have not.*
+arithmetic is shown, except §2.2's and §2.4's measurements, which were taken on the fixtures they name.*
 
 **Implementation note on §2.1.** The record says `body`'s only database readers are the insert and
 the two paths that feed the index a delete. There is a third: the delta carry-over copies a previous

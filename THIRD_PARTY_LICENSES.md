@@ -23,7 +23,7 @@ GOOS=windows go list -deps -f '{{with .Module}}{{.Path}} {{.Version}}{{end}}' ./
 | github.com/mattn/go-pointer | v0.0.1 | MIT (`LICENSE`) | Binding dependency. Yasuhiro Matsumoto. |
 | github.com/tree-sitter/tree-sitter-c | v0.24.2 | MIT (`LICENSE`) | Grammar; native parser source compiled in. |
 | github.com/tree-sitter/tree-sitter-cpp | v0.23.4 | MIT (`LICENSE`) | Grammar. |
-| github.com/tree-sitter/tree-sitter-go | v0.25.0 | MIT (`LICENSE`) | Grammar. |
+| github.com/tree-sitter/tree-sitter-go | v0.25.0 | MIT (`internal/provider/treesitter/gogrammar/LICENSE`) | Grammar, carried as source in `internal/provider/treesitter/gogrammar` with the Go 1.27 method type parameters and the Go 1.26 expression operand of `new` added, so `go list -deps` reports it as part of codectx rather than as a module. Max Brunsfeld, Amaan Qureshi and tree-sitter contributors. |
 | github.com/tree-sitter/tree-sitter-java | v0.23.5 | MIT (`LICENSE`) | Grammar. |
 | github.com/tree-sitter/tree-sitter-javascript | v0.25.0 | MIT (`LICENSE`) | Grammar. |
 | github.com/tree-sitter/tree-sitter-python | v0.25.0 | MIT (`LICENSE`) | Grammar. |

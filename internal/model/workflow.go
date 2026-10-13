@@ -614,7 +614,7 @@ func (r FactReference) Validate() error {
 		return err
 	}
 	for i, id := range r.EvidenceIDs {
-		if err := requireID(indexed("fact_reference.evidence_ids", i), string(id)); err != nil {
+		if err := requireEvidenceID(indexed("fact_reference.evidence_ids", i), id); err != nil {
 			return err
 		}
 	}

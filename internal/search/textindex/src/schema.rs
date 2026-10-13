@@ -2,9 +2,7 @@
 //! columns, and the exact per-column lengths. Nothing is stored in the
 //! library's document store: every field a page serves is a fast column.
 
-use tantivy::schema::{
-    Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions,
-};
+use tantivy::schema::{Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions};
 
 use crate::error::{Error, Result};
 use crate::tokenizer::CODE_TOKENIZER;
@@ -14,7 +12,8 @@ pub const TEXT: [&str; 5] = ["name", "qualified_name", "signature", "path", "bod
 /// Each text column's exact code-token count.
 pub const LENS: [&str; 5] = ["len_name", "len_qualified_name", "len_signature", "len_path", "len_body"];
 /// The string fast columns, in the order a hit resolves them.
-pub const STRS: [&str; 8] = ["path_s", "kind", "name_s", "qualified_name_s", "signature_s", "node_id", "search_key", "file_id"];
+pub const STRS: [&str; 8] =
+    ["path_s", "kind", "name_s", "qualified_name_s", "signature_s", "node_id", "search_key", "file_id"];
 pub const S_PATH: usize = 0;
 pub const S_KIND: usize = 1;
 pub const S_NODE: usize = 5;

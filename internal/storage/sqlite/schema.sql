@@ -250,9 +250,12 @@ CREATE TABLE relation_facts (
 -- clipEvidence clips surplus evidence BY id value. The id is a pure function of the evidence
 -- fields (model.NewEvidenceID), so this uniqueness is a derived invariant, not
 -- an arbitrary surrogate, and the value reaches the wire as
--- ReferenceOccurrence.evidence_id and FactReference.evidence_ids.
+-- ReferenceOccurrence.evidence_id and FactReference.evidence_ids. It is the
+-- first 16 bytes of that derivation (model.EvidenceIDBytes, ADR-0003 SS2.2):
+-- the width is paid in the record, in the primary key's automatic index and
+-- in idx_evidence_unit, the three b-trees that carry it.
 CREATE TABLE evidence (
-    id BLOB PRIMARY KEY CHECK(length(id) = 32),
+    id BLOB PRIMARY KEY CHECK(length(id) = 16),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     node_id INTEGER,
     relation_id INTEGER,
@@ -614,6 +617,39 @@ CREATE UNIQUE INDEX idx_lease_owner ON retention_leases(owner_kind, owner_ref) W
 -- The grace pass asks for the trashed blobs whose window has elapsed; without
 -- this index that question is a full scan of blobs on every collection pass.
 CREATE INDEX idx_blob_trash ON blobs(state, trashed_at);
+-- Foreign-key child keys. Every connection runs with foreign_keys=ON, so a
+-- DELETE of a parent row first proves no child row still names it, and with
+-- the child column unindexed that proof is a full scan of the child table PER
+-- DELETED ROW -- invisible to the statement's own plan. The same columns are
+-- what the collector's reachability probes ask about. Each index below turns
+-- one such scan into a lookup:
+--   snapshot_files(file_id)        the orphan-file sweep and every files delete
+--   snapshot_files(content_hash)   blob reachability and every blobs delete
+--   unit_inputs(content_hash)      the same, for the unit side
+--   session_files(snapshot_id, file_id, content_hash)
+--                                  the snapshot_files cascade of a snapshot delete
+--   retention_leases(snapshot_id), retention_leases(generation_id)
+--                                  every snapshot and generation delete
+--   provider_runs(generation_id)   the ON DELETE SET NULL of a generation delete
+--   units(origin_run_id)           the provider-run sweep and every run delete
+--   context_manifests(generation_id, snapshot_id)
+--                                  every generation delete
+--   read_sessions(manifest_id, generation_id, snapshot_id), session_manifests(manifest_id)
+--                                  every context-manifest delete
+-- The write cost is one key per child row, the largest being unit_inputs and
+-- snapshot_files: about 70 bytes per file per unit input or per retained
+-- snapshot, against a scan of the whole table per deletion without it.
+CREATE INDEX idx_snapshot_files_file ON snapshot_files(file_id);
+CREATE INDEX idx_snapshot_files_blob ON snapshot_files(content_hash);
+CREATE INDEX idx_unit_input_blob ON unit_inputs(content_hash);
+CREATE INDEX idx_session_files_snapshot ON session_files(snapshot_id, file_id, content_hash);
+CREATE INDEX idx_lease_snapshot ON retention_leases(snapshot_id);
+CREATE INDEX idx_lease_generation ON retention_leases(generation_id);
+CREATE INDEX idx_provider_runs_generation ON provider_runs(generation_id);
+CREATE INDEX idx_units_origin_run ON units(origin_run_id);
+CREATE INDEX idx_context_manifests_generation ON context_manifests(generation_id, snapshot_id);
+CREATE INDEX idx_read_sessions_manifest ON read_sessions(manifest_id, generation_id, snapshot_id);
+CREATE INDEX idx_session_manifests_manifest ON session_manifests(manifest_id);
 -- The supplied `--scip-index` paths one generation was built with, recorded
 -- whether or not the path resolved to anything. An unresolved path leaves no
 -- unit behind, so the absence of a unit is precisely the observation this table

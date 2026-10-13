@@ -156,3 +156,17 @@ func (c *refCache) reset() {
 }
 
 func (c *refCache) len() int { return c.order.Len() }
+
+// optionalEvidenceBlob decodes an evidence identity that may be absent,
+// yielding NULL. Evidence identities are narrower than every other public
+// identity (model.EvidenceIDBytes), so they have their own decoder.
+func optionalEvidenceBlob(field string, id model.EvidenceID) (any, error) {
+	if id == "" {
+		return nil, nil
+	}
+	raw, err := model.DecodeEvidenceID(id)
+	if err != nil {
+		return nil, invalid("%s: %v", field, err)
+	}
+	return raw, nil
+}
