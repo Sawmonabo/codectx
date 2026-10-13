@@ -184,7 +184,7 @@ func (e *extraction) dispatch(caps map[string][]ts.Node) {
 			return
 		case name == "scope":
 			if len(caps["scope.name"]) > 0 {
-				e.scopes = append(e.scopes, scopeNode{span{nodes[0].StartByte(), nodes[0].EndByte()}, caps["scope.name"][0].Utf8Text(e.src)})
+				e.scopes = append(e.scopes, scopeNode{span{nodes[0].StartByte(), nodes[0].EndByte()}, e.name(&caps["scope.name"][0])})
 			}
 			return
 		case name == "package":
@@ -223,10 +223,10 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 	switch {
 	case len(caps["name"]) > 0:
 		n := caps["name"][0]
-		d.name, d.nameStart, d.nameEnd = n.Utf8Text(e.src), n.StartByte(), n.EndByte()
+		d.name, d.nameStart, d.nameEnd = e.name(&n), n.StartByte(), n.EndByte()
 		switch {
 		case len(caps["name.scope"]) > 0:
-			d.prefix = collapseSpace(caps["name.scope"][0].Utf8Text(e.src))
+			d.prefix = collapseSpace(e.name(&caps["name.scope"][0]))
 		case node.KindId() == e.k.pair:
 			d.prefix = e.pairPath(node)
 		}
@@ -480,7 +480,7 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 		e.imports[key] = rec
 	}
 	if p := caps["import.path"]; len(p) > 0 && rec.path == "" {
-		switch raw := p[0].Utf8Text(e.src); e.l.Name {
+		switch raw := e.name(&p[0]); e.l.Name {
 		case "javascript", "typescript", "tsx":
 			// A module specifier is the string literal's value.
 			rec.path = jsString(raw)
@@ -492,10 +492,10 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	// the same match as its alias.
 	original := ""
 	if o := caps["import.original"]; len(o) > 0 {
-		original = o[0].Utf8Text(e.src)
+		original = e.name(&o[0])
 	}
 	for _, n := range caps["import.name"] {
-		rec.addAs(n.Utf8Text(e.src), original)
+		rec.addAs(e.name(&n), original)
 	}
 	if len(caps["import.fn"]) > 0 {
 		e.requireBindings(node, rec)
@@ -715,11 +715,21 @@ func hasToken[N clauseNode[N]](n N, id uint16) bool {
 	return false
 }
 
+// name is the text of n, a name, path or type as written: in Rust without
+// the `r#` of its raw identifiers (rawPath).
+func (e *extraction) name(n *ts.Node) string {
+	s := n.Utf8Text(e.src)
+	if e.l.Name == "rust" {
+		s = rawPath(s)
+	}
+	return s
+}
+
 func (e *extraction) addRef(kind string, node ts.Node, name []ts.Node, qualifier []ts.Node) {
 	if len(name) == 0 {
 		return
 	}
-	r := refRec{span: span{node.StartByte(), node.EndByte()}, kind: kind, name: name[0].Utf8Text(e.src),
+	r := refRec{span: span{node.StartByte(), node.EndByte()}, kind: kind, name: e.name(&name[0]),
 		nameSpan: span{name[0].StartByte(), name[0].EndByte()}}
 	if len(qualifier) > 0 {
 		r.qualifier = &qualifier[0]
@@ -928,7 +938,7 @@ func (e *extraction) emit(out *emitter) error {
 			NameStart: uint32(r.nameSpan.start), NameEnd: uint32(r.nameSpan.end),
 			Name: r.name, Scope: enclosing(wireDecls, scopes, r.span)}
 		if r.qualifier != nil {
-			q := r.qualifier.Utf8Text(e.src)
+			q := e.name(r.qualifier)
 			// The import decision is made on the receiver as written; only
 			// the reported copy is bounded, so a call through an import is
 			// still recognized however long the receiver expression is.

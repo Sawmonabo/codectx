@@ -462,7 +462,7 @@ func (r *rsLower) children(n Node, named bool) (int, []Node) {
 
 func (r *rsLower) done(mark int) { r.buf = r.buf[:mark] }
 
-func (r *rsLower) text(n Node) []byte { return textOf(r.src, n) }
+func (r *rsLower) text(n Node) []byte { return rawIdent(textOf(r.src, n)) }
 
 // declare binds name, the declaring identifier (or `self`), in the innermost
 // scope: a new variable named by name's span, or -1 inside a nested callable.
@@ -523,7 +523,7 @@ func (r *rsLower) frameOf(label string) int {
 		f := r.frames[i]
 		var name string
 		if f.to > f.from {
-			name = view(r.src[f.from:f.to])
+			name = view(rawIdent(r.src[f.from:f.to]))
 		} else if !f.loop {
 			name = rsTryLabel
 		}
