@@ -28,13 +28,19 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	if err := req.Validate(); err != nil {
 		return model.ImpactResult{}, err
 	}
+	// Settled with the request, before the gate and the walk: a reader that
+	// cannot answer what the request names refuses it at no cost.
+	kinds := impactAllowlist(req.Relations)
+	seamNotice, err := e.openSiteSeam(kinds)
+	if err != nil {
+		return model.ImpactResult{}, err
+	}
 	ctx, deadline, done, err := beginImpactQuery(ctx, e)
 	if err != nil {
 		return model.ImpactResult{}, err
 	}
 	defer done()
 
-	kinds := impactAllowlist(req.Relations)
 	maxDepth, depthNotice := resolveLimit("max_depth", req.MaxDepth, e.limits.Depth())
 	limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
 	// The page limit is part of the normalized query a continuation is bound
@@ -49,7 +55,7 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	}
 
 	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: answer.Completeness,
-		Notices:    appendNotice(append([]string(nil), answer.Notices...), depthNotice),
+		Notices:    appendNotice(appendNotice(append([]string(nil), answer.Notices...), depthNotice), seamNotice),
 		NextCursor: nextCursor}
 	if answer.Truncated {
 		markTruncated(&meta, answer.Reason)
