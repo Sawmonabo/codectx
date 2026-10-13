@@ -322,8 +322,10 @@ valid builds: every port, compiler and architecture feature level, a feature tag
 its architecture with every lower level of its chain, `cgo` on any port, and each release above the module's go line
 only where the lower ones hold. The `-tags` flag is taken to add only tags of no fixed meaning (an operating system,
 architecture, compiler, release or feature tag is fixed by the build), and a feature tag the toolchain does not define
-holds in no build. No count of tags bounds a decision. Two embedding paths at one depth stay
-ambiguous whatever their conditions (a miss, never a false edge), and a type declared with a different structure per
+holds in no build. No count of tags bounds a decision. The selector rule is applied per build: a name two embedding paths reach at one
+depth (two embedded types, or one embedded type reached twice) promotes nothing in the builds both paths exist in and
+hides the name deeper there, an embedded type declared once per build is one path in each, and a type a shallower depth
+reached in some builds is walked deeper in the others. A type declared with a different structure per
 build is each of its declarations in the unit; outside it, it is one type in the builds of any of its declarations, each
 declaration's embedded types under that declaration's condition (`unix.PtraceRegs`, declared once per architecture,
 keeps the `PC` of every architecture that declares one). A Go type implements an interface
@@ -824,7 +826,7 @@ The members' language family picks the resolver:
   `go.mod` binds no import path (`hierarchy.goPackages`, `internal/provider/link/hierarchy_go.go`). A Go type's method
   set is its own methods and, depth by depth, those its embedded fields and embedded interfaces promote. A name a
   shallower depth declares, as a method or as a named or embedded field, is not promoted; a name a struct reaches at
-  one depth along two embedding paths, or as a field, promotes nothing. Embedding is promotion, never subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
+  one depth along two embedding paths in a build, or as a field, promotes nothing in that build ("Selectors"). Embedding is promotion, never subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
   under the embedding type, and implicit interface satisfaction compares whole method sets (`hierarchy.satisfy`). A Go
   member site on a field (`x.cfg.Load()`) is typed by the declared type of the field that selector denotes on the
   owner's type, its own or promoted, read in the file that declares it, and a chain (`x.a.b.Load()`) step by

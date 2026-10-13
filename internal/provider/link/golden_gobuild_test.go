@@ -127,6 +127,215 @@ type WN interface {
 		fails: "an external type read as its first declaration, or its declarations' structures merged across builds",
 	},
 	{
+		name:   "embedded-type-declared-per-build-is-one-path",
+		anchor: "The Go Programming Language Specification, \"Selectors\", \"Struct types\" (promoted methods), \"Method sets\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod":       "module example.com/m\n\ngo 1.27\n",
+			"a_linux.go":   "package p\n\ntype A struct{} // @al\n\nfunc (A) M() {} // @ml\n",
+			"a_windows.go": "package p\n\ntype A struct{} // @aw\n\nfunc (A) M() {} // @mw\n",
+			"s.go":         "package p\n\ntype S struct{ A } // @ts\n\ntype I interface{ M() } // @ii\n",
+		},
+		// Checked with go vet: S compiles and implements I with GOOS=linux and GOOS=windows; each build has
+		// one A, so S reaches M along one path.
+		want: []string{},
+		facts: []string{
+			"al A implements ii I",
+			"aw A implements ii I",
+			"ml M overrides ii M",
+			"mw M overrides ii M",
+			"ts S implements ii I",
+		},
+		// Mutation: embedding paths counted per declaration in every build -> the two A declarations are
+		// two paths, M is ambiguous and S implements no I.
+		fails: "an embedded type declared once per build counted as two embedding paths",
+	},
+	{
+		name:   "same-depth-paths-per-build",
+		anchor: "The Go Programming Language Specification, \"Selectors\", \"Struct types\" (promoted methods), \"Method sets\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n",
+			"a.go":   "package p\n\ntype A struct{} // @ta\n\nfunc (A) M() {} // @am\n\ntype I interface{ M() } // @ii\n",
+			"t_linux.go": `package p
+
+type X struct{ A } // @xl
+
+type Y struct{} // @yl
+
+func (Y) M() {} // @ym
+
+type T struct { // @tl
+	X
+	Y
+}
+`,
+			"t_other.go": `//go:build !linux
+
+package p
+
+type X struct{ A } // @xo
+
+type Y struct{ A } // @yo
+
+type T struct { // @to
+	X
+	Y
+}
+`,
+		},
+		// Checked with go vet: on linux T reaches Y.M at depth 1 (A.M through X is deeper) and implements I;
+		// elsewhere X and Y both embed A, so M is at depth 2 along two paths and T implements no I.
+		want: []string{},
+		facts: []string{
+			"ta A implements ii I",
+			"am M overrides ii M",
+			"xl X implements ii I",
+			"xo X implements ii I",
+			"yl Y implements ii I",
+			"ym M overrides ii M",
+			"yo Y implements ii I",
+			"tl T implements ii I",
+		},
+		// Mutation: a struct's same-depth names admitted from several paths, as an interface's are -> to T
+		// implements ii I.
+		fails: "a name two embedding paths reach at one depth promoted from either",
+	},
+	{
+		name:   "same-type-reached-twice-in-some-builds",
+		anchor: "The Go Programming Language Specification, \"Selectors\", \"Struct types\" (promoted methods), \"Method sets\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n",
+			"s.go": `package p
+
+type X struct{ C } // @tx
+
+type C struct{} // @tc
+
+func (C) M() {} // @cm
+
+type S struct { // @ts
+	X
+	Y
+}
+
+type I interface{ M() } // @ii
+
+type I2 interface { // @ii2
+	M()
+	L()
+}
+`,
+			"y_linux.go":   "package p\n\ntype Y struct{ C } // @yl\n\nfunc (S) L() {} // @sl\n",
+			"y_windows.go": "package p\n\ntype Y struct{} // @yw\n",
+		},
+		// Checked with go vet: on windows only X reaches C, so S implements I; on linux X and Y both do, M is
+		// ambiguous, and S, which has L only on linux, implements no I2 in any build.
+		want: []string{},
+		facts: []string{
+			"tc C implements ii I",
+			"cm M overrides ii M",
+			"tx X implements ii I",
+			"yl Y implements ii I",
+			"ts S implements ii I",
+		},
+		// Mutation: the path count kept without conditions -> C is reached twice in every build and S
+		// implements no I. Mutation: only the builds of one path kept, not of two -> ts S implements ii2 I2.
+		fails: "a type reached along two paths in some builds judged ambiguous in all of them, or in none",
+	},
+	{
+		name:   "seen-per-build",
+		anchor: "The Go Programming Language Specification, \"Selectors\", \"Struct types\" (promoted methods), \"Method sets\"; go/build, \"Build Constraints\"",
+		files: map[string]string{
+			"go.mod":       "module example.com/m\n\ngo 1.27\n",
+			"a_linux.go":   "package p\n\ntype A struct{ C } // @al\n",
+			"a_windows.go": "package p\n\ntype A struct{} // @aw\n\nfunc (A) W() {} // @w\n",
+			"s.go": `package p
+
+type X struct{ Z } // @tx
+
+type Z struct{ C } // @tz
+
+type C struct{} // @tc
+
+func (C) M() {} // @cm
+
+type S struct { // @ts
+	A
+	X
+}
+
+type I interface { // @ii
+	M()
+	W()
+}
+`,
+		},
+		// Checked with go vet: on windows A embeds no C, so C.M is at depth 3 through X and Z, and W at depth
+		// 1: S implements I. On linux A has no W.
+		want: []string{},
+		facts: []string{
+			"ts S implements ii I",
+		},
+		// Mutation: a type reached at a shallower depth in some build skipped deeper in every build -> C,
+		// reached at depth 2 through A on linux, is never walked at depth 3, and S implements no I.
+		fails: "a type skipped at a deeper depth in builds no shallower depth reached it in",
+	},
+	{
+		name:   "same-depth-ambiguity",
+		anchor: "The Go Programming Language Specification, \"Selectors\", \"Struct types\" (promoted methods), \"Method sets\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n",
+			"p.go": `package p
+
+type C struct{} // @tc
+
+func (C) M() {} // @cm
+
+type A struct{ C } // @ta
+
+type B struct{ C } // @tb
+
+type P struct{ *C } // @tp
+
+type D struct{} // @td
+
+func (D) M() {} // @dm
+
+type S struct { // @ts
+	A
+	B
+}
+
+type S2 struct { // @ts2
+	A
+	P
+}
+
+type S3 struct { // @ts3
+	S
+	D
+}
+
+type I interface{ M() } // @ii
+`,
+		},
+		// Checked with go vet: S (C through A and B) and *S2 (C through A and *C through P) have an ambiguous
+		// selector M; S3 reaches D.M at depth 1, shallower than the tie inside S.
+		want: []string{},
+		facts: []string{
+			"tc C implements ii I",
+			"cm M overrides ii M",
+			"ta A implements ii I",
+			"tb B implements ii I",
+			"tp P implements ii I",
+			"td D implements ii I",
+			"dm M overrides ii M",
+			"ts3 S3 implements ii I",
+		},
+		// Mutation: one embedded type reached along two paths counted once (go/types' consolidateMultiples
+		// not mirrored) -> ts S implements ii I and ts2 S2 implements ii I.
+		fails: "one type reached along two embedding paths at one depth taken as one path",
+	},
+	{
 		name:   "many-free-tags-decided-exactly",
 		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\"",
 		files:  manyTagsFiles(),
