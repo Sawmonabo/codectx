@@ -72,7 +72,10 @@ when they were actually measured. One entry is recorded today:
 ### 1.2 Corpus shapes actually exercised by Section 3
 
 Most of Section 3 runs on `corpusSmallReal`: **124 files**, 40 packages, seed
-2101, 65 152 eligible source bytes, 248 indexing units. The context-plan scope
+2101, 65 152 eligible source bytes, 251 indexing units (one filesystem unit per
+file, 124; one tree-sitter unit per parsed source file, 121; one manifest unit
+each for `go.mod`, `package.json` and `README.md`; one link unit each for the Go,
+JavaScript and Python package families). The context-plan scope
 walk over it from 64 seeds visits **966 nodes across 2 090 edges** at the
 default, unlimited bounds (Section 3.2).
 
