@@ -234,7 +234,7 @@ func (x *goExternal) indexDirs(ctx context.Context, dir string) error {
 		d := path.Dir(fv.Path)
 		for _, r := range roots {
 			if _, ok := relDir(r, d); ok {
-				return s.Add(entry{Key: d, Aux: path.Base(fv.Path), Sig: string(fv.ID)})
+				return s.Add(entry{Key: d, Aux: path.Base(fv.Path), Sig: string(fv.ID), Returns: fv.ContentHash})
 			}
 		}
 		return nil
@@ -244,6 +244,16 @@ func (x *goExternal) indexDirs(ctx context.Context, dir string) error {
 	}
 	x.dirs, err = writeIndex(dir, s)
 	return err
+}
+
+// eachEntry calls yield with each entry of es in order.
+func eachEntry(es []entry, yield func(entry) error) error {
+	for _, e := range es {
+		if err := yield(e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // goSourceFile reports a file name the go command builds into a package:
@@ -303,7 +313,31 @@ func (x *goExternal) load(ctx context.Context, p string) (*goExtPackage, error) 
 			if x.dirs == nil {
 				return nil, nil
 			}
-			err := x.dirs.lookup(path.Clean(src.dir), func(e entry) error {
+			// A snapshot package is cached by its files' names and content
+			// hashes, so every unit of the build that reaches it parses it
+			// once.
+			var listed []entry
+			if err := x.dirs.lookup(path.Clean(src.dir), func(e entry) error {
+				listed = append(listed, e)
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+			var key strings.Builder
+			key.WriteString("snap\x00" + p)
+			for _, e := range listed {
+				if e.Returns == "" {
+					key.Reset()
+					break
+				}
+				key.WriteString("\x00" + e.Aux + "\x00" + e.Returns)
+			}
+			if id = key.String(); id != "" {
+				if pkg, ok := readGoDecls(id, p); ok {
+					return pkg, nil
+				}
+			}
+			err := eachEntry(listed, func(e entry) error {
 				rc, fv, err := x.content.Open(ctx, model.FileID(e.Sig))
 				if err != nil {
 					return err
@@ -407,7 +441,10 @@ func (p *goExtPackage) addFile(af *ast.File, std bool) {
 				}
 			}
 		case *ast.FuncDecl:
-			if d.Recv == nil || len(d.Recv.List) != 1 || !d.Name.IsExported() {
+			// A method with type parameters of its own satisfies no
+			// interface (Go 1.27 release notes: interface methods are never
+			// implemented by generic methods).
+			if d.Recv == nil || len(d.Recv.List) != 1 || !d.Name.IsExported() || d.Type.TypeParams != nil {
 				continue
 			}
 			base, params := goReceiverBase(d.Recv.List[0].Type)

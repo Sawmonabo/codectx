@@ -14,11 +14,11 @@ import (
 // module cache are a function of its source alone, and that source never
 // changes under its identity: a module cache directory is read-only and
 // named by its exact version ("Module cache"), a GOROOT's standard library
-// by its release. So they are kept, once read, in the user cache under the
+// by its release, a package of the snapshot by its files' names and content
+// hashes. So they are kept, once read, in the user cache under the
 // product's directory (paced.ProductDirName, the location every process of
-// the user agrees on), keyed by that identity, and every later build of
-// every unit reads them from there instead of parsing the package again. A
-// package of the snapshot is read from the snapshot every time. A cache
+// the user agrees on), keyed by that identity, and every later unit and
+// build reads them from there instead of parsing the package again. A cache
 // entry that cannot be read or written costs only the parse; nothing in it
 // is ever needed for correctness.
 
