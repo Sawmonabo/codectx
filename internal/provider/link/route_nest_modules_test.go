@@ -178,13 +178,17 @@ export class AppModule {}
 }
 
 // TestNestRouterModuleUndecidedLeavesRoutesUnresolved: with RouterModule in
-// use, a controller no module lists, a route tree another file holds, a
+// use, a controller no module lists, a route tree that is no literal in
+// place or imported, a
 // module whose controllers are no literal list, and two registrations
 // giving one module different paths leave the routes they decide
 // unpublished; a controller of a decided module still publishes.
 // Mutation: a controller no module lists served with no module path ->
 // /cats for "no module".
-// Mutation: an imported tree read as empty -> /cats for "imported tree".
+// Mutation: an imported tree read as empty -> /cats for "imported tree
+// not a literal".
+// Mutation: a tree that is no literal read as empty -> /cats for "tree not
+// a literal".
 // Mutation: an unreadable module ignored -> /cats for "unreadable module".
 // Mutation: the first registration kept -> /a/cats for "two
 // registrations".
@@ -212,7 +216,7 @@ export class AppModule {}
 			"src/app.module.ts":  register(`[{ path: "d", module: DogsModule }]`),
 			"src/cats.module.ts": nestModule("", "CatsModule", ""),
 		}, []string{`src/dogs.controller.ts GET "" /d/dogs -> bark`}},
-		{"imported tree", map[string]string{
+		{"imported tree not a literal", map[string]string{
 			"src/app.module.ts": `import { Module } from "@nestjs/common";
 import { RouterModule } from "@nestjs/core";
 import { routes } from "./routes";
@@ -220,7 +224,10 @@ import { routes } from "./routes";
 @Module({ imports: [RouterModule.register(routes)] })
 export class AppModule {}
 `,
-			"src/routes.ts": "export const routes = [];\n",
+			"src/routes.ts": "import { build } from \"./build\";\nexport const routes = build();\n",
+		}, nil},
+		{"tree not a literal", map[string]string{
+			"src/app.module.ts": register(`build()`),
 		}, nil},
 		{"unreadable module", map[string]string{
 			"src/app.module.ts": register(`[{ path: "d", module: DogsModule }]`),
@@ -253,4 +260,50 @@ export class AdminModule {}
 			checkMounted(t, files, c.want)
 		})
 	}
+}
+
+// TestNestRouterModuleTreeImportedAndControllerRenamed is the layout that
+// keeps the route tree in a file of its own: AppModule imports `routes`
+// through a barrel from routes.ts, which imports nothing of NestJS, and the
+// tree's modules resolve from routes.ts's own imports. DogsModule lists
+// its controller by the name a barrel renames it to.
+// Mutation: the imported tree not followed -> nothing published.
+// Mutation: the barrel's re-export of the tree not followed -> nothing
+// published.
+// Mutation: the tree's modules resolved from the importing file -> nothing
+// published.
+// Mutation: a file importing no NestJS not scanned for trees -> nothing
+// published.
+// Mutation: the rename not followed -> no dogs route.
+func TestNestRouterModuleTreeImportedAndControllerRenamed(t *testing.T) {
+	checkMounted(t, map[string]string{
+		"package.json": `{"name":"app"}`,
+		"src/main.ts":  nestMain(""),
+		"src/app.module.ts": `import { Module } from "@nestjs/common";
+import { RouterModule } from "@nestjs/core";
+import { routes } from "./routing";
+
+@Module({ imports: [RouterModule.register(routes)] })
+export class AppModule {}
+`,
+		"src/routing/index.ts": `export { routes } from "./routes";` + "\n",
+		"src/routing/routes.ts": `import { CatsModule } from "../cats.module";
+import { DogsModule } from "../dogs.module";
+
+export const routes = [
+  { path: "felines", module: CatsModule },
+  { path: "canines", module: DogsModule },
+];
+`,
+		"src/cats.controller.ts": nestCtrl("CatsController", "cats", "", "findAll"),
+		"src/cats.module.ts": nestModule(`import { CatsController } from "./cats.controller";
+`, "CatsModule", "CatsController"),
+		"src/dogs.controller.ts": nestCtrl("DogsController", "dogs", "", "bark"),
+		"src/pets.ts":            `export { DogsController as Hounds } from "./dogs.controller";` + "\n",
+		"src/dogs.module.ts": nestModule(`import { Hounds } from "./pets";
+`, "DogsModule", "Hounds"),
+	}, []string{
+		`src/cats.controller.ts GET "" /felines/cats -> findAll`,
+		`src/dogs.controller.ts GET "" /canines/dogs -> bark`,
+	})
 }
