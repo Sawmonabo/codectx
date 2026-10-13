@@ -371,10 +371,12 @@ func (e *Emitter) appendRow(list []model.Evidence, ev model.Evidence) []model.Ev
 }
 
 // AddMetadataRow publishes one metadata row on node, a node fact this unit
-// already queued, as an evidence row located at rng. It is for a list the
-// producer always stores as rows because each element has its own source
-// range (model.MetaUnresolvedLines).
-func (e *Emitter) AddMetadataRow(node model.NodeID, precision model.Precision, rng *model.SourceRange, row model.MetadataRow) error {
+// already queued, as an evidence row located at rng in file: the unit's own
+// file when file is nil, or another of the unit's input files (a requirements
+// file's include). It is for a list the producer always stores as rows because
+// each element has its own source range (model.MetaUnresolvedLines). The node
+// is not resolved again: it is the fact already queued.
+func (e *Emitter) AddMetadataRow(node model.NodeID, precision model.Precision, file *model.FileVersion, rng *model.SourceRange, row model.MetadataRow) error {
 	if e.nodesFlushed {
 		return &model.Error{Code: model.CodeInternal, Message: "a metadata row was queued after the unit's nodes were flushed"}
 	}
@@ -389,7 +391,12 @@ func (e *Emitter) AddMetadataRow(node model.NodeID, precision model.Precision, r
 	if err != nil {
 		return &model.Error{Code: model.CodeInternal, Message: "a metadata row cannot be encoded: " + err.Error()}
 	}
-	e.nodes[i].Evidence = e.appendRow(e.nodes[i].Evidence, e.evidence(node, "", Attrs{Precision: precision, Range: rng, Detail: detail}))
+	ev := e.evidence(node, "", Attrs{Precision: precision, Range: rng, Detail: detail})
+	if file != nil {
+		ev.FileID, ev.ContentHash = file.ID, file.ContentHash
+		ev.ID = model.NewEvidenceID(ev)
+	}
+	e.nodes[i].Evidence = e.appendRow(e.nodes[i].Evidence, ev)
 	return nil
 }
 
