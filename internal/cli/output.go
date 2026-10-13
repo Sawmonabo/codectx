@@ -44,6 +44,19 @@ func failureEnvelope(schemaVersion, command string, err *model.Error) Envelope[a
 	}
 }
 
+// failedWithData is a failure that comes after the command already produced
+// data the operator must not lose -- a reset whose removal happened and whose
+// index then failed. Execute renders it as the one failure envelope with that
+// data in it, so --json still emits exactly one envelope. The text path prints
+// the data itself before returning.
+type failedWithData struct {
+	err  *model.Error
+	data any
+}
+
+func (f *failedWithData) Error() string { return f.err.Error() }
+func (f *failedWithData) Unwrap() error { return f.err }
+
 // writeEnvelope emits one envelope. A write failure fails the command rather
 // than being reported as success: Section 18.2 requires that a broken stdout
 // pipe fail the command, because the only thing standing between "bytes we

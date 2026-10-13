@@ -86,7 +86,12 @@ func Execute(ctx context.Context, build model.BuildInfo, root *cobra.Command, ar
 		typed = &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	}
 	if jsonRequested(cmd, args) {
-		if writeErr := writeEnvelope(root.OutOrStdout(), failureEnvelope(build.SchemaVersion, commandName(cmd), typed)); writeErr != nil {
+		env := failureEnvelope(build.SchemaVersion, commandName(cmd), typed)
+		var produced *failedWithData
+		if errors.As(err, &produced) {
+			env.Data = produced.data
+		}
+		if writeErr := writeEnvelope(root.OutOrStdout(), env); writeErr != nil {
 			return writeErr
 		}
 		return typed

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -48,7 +49,8 @@ func newResetCommand(build model.BuildInfo) *cobra.Command {
 			"itself stays, empty, for the next holder to take. A cache `codectx index --rebuild` " +
 			"made beside the data directory is not the data directory and is not touched.\n\n" +
 			resetNotice + "\n\n" +
-			"--reindex runs a full index straight afterwards. --json prints every entry removed " +
+			"--reindex runs a full index straight afterwards; when that index fails, what was removed " +
+			"is still reported, then the failure. --json prints every entry removed " +
 			"with the bytes its removal gave back. The repository is named as a positional path, " +
 			"or with --repo, and naming it both ways is refused.",
 		Args:          cobra.MaximumNArgs(1),
@@ -79,10 +81,26 @@ func runReset(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 		opts.OnWaiting = waitingForHolder(cmd, args)
 	}
 	report, err := app.ResetWorkspace(cmd.Context(), repo, opts)
+	out := cmd.OutOrStdout()
+	if err != nil && report.Removed != nil {
+		// The removal happened and the index after it failed: what went is
+		// reported, then the failure.
+		failure := queryFailure(err)
+		var typed *model.Error
+		if !errors.As(failure, &typed) {
+			return failure
+		}
+		if jsonRequested(cmd, args) {
+			return &failedWithData{err: typed, data: report}
+		}
+		if werr := writeResetReport(out, report); werr != nil {
+			return werr
+		}
+		return failure
+	}
 	if err != nil {
 		return queryFailure(err)
 	}
-	out := cmd.OutOrStdout()
 	if jsonRequested(cmd, args) {
 		return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), report, resetNotice))
 	}

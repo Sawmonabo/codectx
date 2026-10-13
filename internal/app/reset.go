@@ -32,7 +32,9 @@ type ResetOptions struct {
 }
 
 // ResetWorkspace empties the workspace's data directory, so the next index
-// builds from nothing. Everything there -- the database and its side files,
+// builds from nothing. When the index a reset was asked to follow with fails,
+// the report of what was removed is returned beside that failure; every other
+// failure returns no report, because nothing it would describe is certain. Everything there -- the database and its side files,
 // the search index, the content store, spools, scratch pools and the run
 // ledger -- is derived from the repository, which is the only source of truth.
 //
@@ -86,7 +88,10 @@ func ResetWorkspace(ctx context.Context, repo string, o ResetOptions) (model.Wor
 	if o.Reindex {
 		result, err := reindex(ctx, repo, o.OnWaiting)
 		if err != nil {
-			return model.WorkspaceReset{}, err
+			// The removal happened and is reported whole beside the failure:
+			// the operator is told what went as well as why the index did not
+			// follow.
+			return out, err
 		}
 		out.Index = &result
 	}
