@@ -522,6 +522,12 @@ What re-resolves:
   only through other files re-runs the cycle's readers of what the edit removed, which is conservative and never
   unsound.
 
+  The stored contributions and reads are written once per refresh to block-indexed files, by node, by entry and by
+  this build's ordinals (`flow_seek.go`), and each iteration reads them by key range: the region's nodes, the entries
+  those touch, the variables its run reads and the callables' returns. A node whose stored contribution names a
+  member or declaration that is gone joins the first region. No iteration passes over the unit's stored state; only
+  carrying the untouched nodes' state into the new one does, once.
+
 What is republished (`refresh.diff`): the members whose bytes changed, the added members, the members whose bindings
 changed, and the members whose set of targeted declarations changed (a target's occurrence node is published in its
 own file's facts, so a declaration that becomes or stops being a target republishes its file). Those and the removed
