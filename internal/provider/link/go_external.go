@@ -953,16 +953,17 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 		if err := methodSets.Add(e); err != nil {
 			return err
 		}
-		if n.t.conflict && !n.t.iface {
-			continue
-		}
-		keys, err := x.methodKeys(ctx, n.pkg, n.t, r)
-		if err != nil {
-			return err
-		}
-		for _, m := range keys {
-			if err := methodSets.Add(entry{Key: refKey(r), Tag: goMethodRecord, Ref: r, Aux: m.name, Returns: m.form}); err != nil {
+		// A defined type declared differently in another file (an alias or
+		// an interface there) has no one method set; its embedded types stay.
+		if !n.t.conflict || n.t.iface {
+			keys, err := x.methodKeys(ctx, n.pkg, n.t, r)
+			if err != nil {
 				return err
+			}
+			for _, m := range keys {
+				if err := methodSets.Add(entry{Key: refKey(r), Tag: goMethodRecord, Ref: r, Aux: m.name, Returns: m.form}); err != nil {
+					return err
+				}
 			}
 		}
 		for _, c := range embeds[n.key] {
