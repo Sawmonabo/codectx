@@ -30,7 +30,10 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
 	}
-	os.Exit(m.Run())
+	done := goTestHost()
+	code := m.Run()
+	done()
+	os.Exit(code)
 }
 
 // linkCases is one source per grammar. Each holds one indirect site, a call

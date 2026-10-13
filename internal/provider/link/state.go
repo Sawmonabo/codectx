@@ -63,7 +63,7 @@ const stateTag = "link.resolution.nodes\n"
 // site), is last.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
 	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
-	DetailSummary, DetailReturn, ""}
+	DetailSummary, DetailReturn, DetailSupertypeCandidate, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {

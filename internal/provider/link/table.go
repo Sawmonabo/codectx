@@ -51,6 +51,10 @@ type Table struct {
 	// that does not fold to a constant (wire.DynamicImport); one that folds
 	// is an ordinary entry of Imports.
 	DynamicImports []DynamicImport `json:"dynamic_imports,omitempty"`
+	// Conversions are the file's values converted to a declared named type
+	// (wire.Conversion), Go's compile-time proofs that a type implements an
+	// interface.
+	Conversions []wire.Conversion `json:"conversions,omitempty"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the
@@ -160,6 +164,10 @@ type Decl struct {
 	// which every value its returning nodes read flows. It is nil
 	// for a declaration no analysed function is the callable of.
 	Return *Endpoint `json:"return,omitempty"`
+	// Identity is a Go method's or alias's identity form
+	// (wire.Export.Identity), which the linker resolves to the packages
+	// declaring its types (goIdentity).
+	Identity string `json:"identity,omitempty"`
 }
 
 // Parameter is one declared parameter of a callable. Endpoint is the
