@@ -332,7 +332,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 			for _, tab := range tc.tables {
 				tab.Language = "python"
 			}
-			u := &unit{tables: pyTables(tc.tables), dir: t.TempDir(),
+			// The unit is a Python project's, as PlanUnits makes it: the
+			// module index is built for the Python family alone.
+			u := &unit{tables: pyTables(tc.tables), dir: t.TempDir(), family: FamilyPython,
 				members: func(yield func(model.FileVersion) error) error {
 					for i, tab := range tc.tables {
 						if err := yield(model.FileVersion{ID: model.FileID("f" + strconv.Itoa(i)), Path: tab.Path, Language: "python"}); err != nil {
@@ -385,7 +387,7 @@ func TestResolvePythonImports(t *testing.T) {
 			{Name: "c", Path: "a.b", Scope: -1},
 		}},
 	}
-	u := &unit{tables: pyTables(tables), dir: t.TempDir(),
+	u := &unit{tables: pyTables(tables), dir: t.TempDir(), family: FamilyPython,
 		members: func(yield func(model.FileVersion) error) error {
 			for i, tab := range tables {
 				tab.Language = "python"
