@@ -159,7 +159,7 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			return wrap("context_entries", err)
 		}
 		defer entry.Close()
-		route, err := tx.PrepareContext(ctx, `INSERT INTO context_entry_routes(manifest_id, ordinal, route_index, relations_json) VALUES(?, ?, ?, ?)`)
+		route, err := tx.PrepareContext(ctx, `INSERT INTO context_entry_routes(manifest_id, ordinal, route_index, relations) VALUES(?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("context_entry_routes", err)
 		}

@@ -410,7 +410,7 @@ CREATE TABLE context_entry_routes (
     manifest_id BLOB NOT NULL,
     ordinal INTEGER NOT NULL,
     route_index INTEGER NOT NULL CHECK(route_index >= 0),
-    relations_json TEXT NOT NULL,
+    relations BLOB NOT NULL CHECK(length(relations) > 0 AND length(relations) % 32 = 0),
     PRIMARY KEY(manifest_id, ordinal, route_index),
     FOREIGN KEY(manifest_id, ordinal) REFERENCES context_entries(manifest_id, ordinal) ON DELETE CASCADE
 ) WITHOUT ROWID;
