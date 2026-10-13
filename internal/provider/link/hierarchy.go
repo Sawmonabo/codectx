@@ -293,8 +293,9 @@ type fileCtx struct {
 	// anonymous maps, for a Java file, the byte offset of the name token of
 	// each anonymous class body's declaration (a class named `new T`, or the
 	// enum constant whose body it is) to its index in decls
-	// (anonymousType).
-	anonymous map[uint64]int32
+	// (anonymousType), and synthetic the offset of each body name with no
+	// such declaration to its rank (javaAnonymous).
+	anonymous, synthetic map[uint64]int32
 }
 
 // closedState caches a file's closedImports answer.
@@ -311,15 +312,8 @@ func contextOf(file int32, t *Table) fileCtx {
 		fc.scopes = []string{path.Dir(t.Path) + "\x00" + t.Package}
 	case "java":
 		fc.scopes = []string{t.Package}
-		for i := range t.Decls {
-			d := &t.Decls[i]
-			if d.NameRange != nil && (d.Kind == model.NodeConstant || anonymousClass(d)) {
-				if fc.anonymous == nil {
-					fc.anonymous = map[uint64]int32{}
-				}
-				fc.anonymous[d.NameRange.Start.Byte] = int32(i)
-			}
-		}
+		a := anonymousNames(t)
+		fc.anonymous, fc.synthetic = a.decl, a.rank
 	case "c":
 		fc.scopes = []string{""}
 		add := func(ns string) {
@@ -1046,7 +1040,9 @@ func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yie
 // instantiates (JLS §15.9.5), so a call on that type dispatches into them
 // and a call on any other subtype does not. A body with no such declaration
 // (a creation the structural query does not capture) is a synthetic type of
-// the hierarchy alone: its Ref's Index is -2-n, below the module's -1.
+// the hierarchy alone: its Ref's Index is -2-k, below the module's -1, k its
+// rank among the file's bodies with none (javaAnonymous), so an edit that
+// moves the body keeps its Ref.
 func anonymousType(fc fileCtx, name string) (Ref, bool) {
 	digits, ok := strings.CutPrefix(name, "#")
 	if !ok {
@@ -1059,7 +1055,12 @@ func anonymousType(fc fileCtx, name string) (Ref, bool) {
 	if i, ok := fc.anonymous[n]; ok {
 		return Ref{File: fc.file, Index: i}, true
 	}
-	return Ref{File: fc.file, Index: int32(-2 - int64(n))}, true
+	if k, ok := fc.synthetic[n]; ok {
+		return Ref{File: fc.file, Index: -2 - k}, true
+	}
+	// A name no type name of the table carries: no method or supertype row
+	// is written under it, so it denotes a type with nothing in it.
+	return Ref{File: fc.file, Index: int32(-2 - len(fc.synthetic))}, true
 }
 
 // anonymousClass reports the declaration of a Java anonymous class body: a
