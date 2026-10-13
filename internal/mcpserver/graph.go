@@ -127,7 +127,12 @@ func (h *handlers) graph(ctx context.Context, in graphInput, direction model.Dir
 		MaxDepth:     in.MaxDepth,
 		MaxVisited:   in.MaxVisited,
 		MaxEdges:     in.MaxEdges,
-		Page:         in.Page,
+		// Passed through untouched, as find_symbol passes its own: the facade
+		// routes the source, and an lsp request it cannot answer is its typed
+		// unavailable answer, never a canonical one.
+		SemanticSource: in.SemanticSource,
+		Profile:        in.Profile,
+		Page:           in.Page,
 	}
 	if err := req.Validate(); err != nil {
 		return nil, zero, toolFailure(h.log, err)

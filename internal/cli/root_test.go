@@ -116,6 +116,13 @@ func TestCommandEnvelope(t *testing.T) {
 		// this row pins is that the command never reaches an empty page on the
 		// lsp route.
 		{name: "symbol on the lsp overlay without a profile", args: []string{"symbol", "writeSymbolTable", "--semantic-source", "lsp", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "symbol", errCode: "CTX_ARGUMENT_INVALID"},
+		// The call hierarchy takes the same selector through the same screen:
+		// `callers --semantic-source lsp` is a route, not a refusal, so a
+		// missing profile is the caller's input (exit 2) before any workspace
+		// is opened. Mutation caught: callers refusing the lsp source as a
+		// missing capability (exit 5), or not screening the selector before
+		// the open (exit 3 on the missing repository).
+		{name: "callers on the lsp overlay without a profile", args: []string{"callers", "writeSymbolTable", "--semantic-source", "lsp", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "callers", errCode: "CTX_ARGUMENT_INVALID"},
 		// `context advance` is the guarded transition of Section 17.1, and the
 		// guard is the version the caller presents. An omitted --expected-version
 		// arrives as zero, which is not "the configured default" the budget flags

@@ -101,14 +101,21 @@ type symbolInfoOutput struct {
 // commands do: a call hierarchy is the answer both tools are named for, and
 // the engine's wider default would return containment and data-flow edges
 // beside the calls.
+//
+// SemanticSource and Profile are the CLI's --semantic-source and --profile:
+// omitted, the walk is canonical (Section 11.6's default); `lsp` with a
+// profile answers one level of that language server's call hierarchy as a
+// labeled overlay, in the result's `calls`.
 type graphInput struct {
-	GenerationID model.GenerationID   `json:"generation_id,omitempty"`
-	Start        []model.NodeID       `json:"start"`
-	Relations    []model.RelationKind `json:"relations,omitempty"`
-	MaxDepth     int                  `json:"max_depth,omitempty"`
-	MaxVisited   int                  `json:"max_visited,omitempty"`
-	MaxEdges     int                  `json:"max_edges,omitempty"`
-	Page         model.PageRequest    `json:"page,omitempty"`
+	GenerationID   model.GenerationID   `json:"generation_id,omitempty"`
+	Start          []model.NodeID       `json:"start"`
+	Relations      []model.RelationKind `json:"relations,omitempty"`
+	MaxDepth       int                  `json:"max_depth,omitempty"`
+	MaxVisited     int                  `json:"max_visited,omitempty"`
+	MaxEdges       int                  `json:"max_edges,omitempty"`
+	SemanticSource model.SemanticSource `json:"semantic_source,omitempty"`
+	Profile        string               `json:"profile,omitempty"`
+	Page           model.PageRequest    `json:"page,omitempty"`
 }
 
 // planOutput shows the manifest and the opened session's status together, so
