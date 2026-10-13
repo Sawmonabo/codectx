@@ -931,7 +931,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 				}
 				reached = append(reached, e.ImpactEntry)
 			}
-			if err := c.admitCandidates(ctx, eng, gen, reached, in); err != nil {
+			if err := c.admitCandidates(ctx, eng, gen, reached, in, nil); err != nil {
 				return nil, false, err
 			}
 			if halt {

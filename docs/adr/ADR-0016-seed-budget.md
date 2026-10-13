@@ -127,7 +127,10 @@ keys, not on pages.
   over the scope relations are walked, and every lexical match inside those components becomes a root. A class's
   methods hang off it by `contains`, which the scope walk does not follow (`internal/context/scope.go:27-40`), so a
   method reachable only from an unread match in another file is otherwise missing. These components are disjoint
-  from the first walk by construction.
+  from the first walk by construction. The callers of the open call sites, in any file, that may call an unreached
+  node by name (ADR-0015 decision 3) start the component walk too (a caller and its site share a component over
+  `calls`), so a site that only an unread match reaches is walked from that match, and the name-only candidates it
+  lends to the kept files join the plan as they would in the full read.
 - **Order.** Pack, close, walk from the new roots, pack again, check the certificate. The closure adds entries only to
   kept files, all keyed at or below (`recommended`, τ(next)), so it cannot reorder the head above the stop. It can push
   a witness past a slice, which the certificate catches. The order above the stop is fixed and drops are permanent,
