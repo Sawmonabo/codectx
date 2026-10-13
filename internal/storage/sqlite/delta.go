@@ -388,7 +388,7 @@ func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64
 	}
 	defer ins.Close()
 	hashes := map[string]string{}
-	after := make([]byte, 0, 32)
+	after := make([]byte, 0, model.EvidenceIDBytes)
 	for {
 		page, err := w.readEvidencePage(ctx, tx, prevRow, replaceIndexLevel, after)
 		if err != nil {
@@ -412,7 +412,7 @@ func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64
 				e.ContentHash = hash
 			}
 			e.ID = model.NewEvidenceID(e)
-			idRaw, _ := model.DecodeID(string(e.ID))
+			idRaw, _ := model.DecodeEvidenceID(e.ID)
 			fileRaw, _ := optionalBlob("evidence.file_id", string(e.FileID))
 			start, end := rangeBytes(e.Range)
 			// The surrogates are rebound as read: node_ids, relation_ids and

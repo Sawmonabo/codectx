@@ -28,6 +28,18 @@ unique only in combination, through `UNIQUE(kind, canonical_key)` — and neithe
 `repository_id` column, because one store is one repository.
 (`snapshots` and `generations` still carry theirs.)
 
+Evidence keeps its identity in the row: `evidence.id` is `BLOB PRIMARY KEY`
+under `CHECK(length(id) = 16)`, the first 16 bytes of the occurrence's SHA-256
+derivation (`model.EvidenceIDBytes`, ADR-0003 §2.2), and the same 32 hex
+characters are `model.EvidenceID` on the wire. It is not a surrogate: the id is
+a pure function of the occurrence, so `ON CONFLICT(id) DO NOTHING` is what makes
+a republished occurrence idempotent, evidence pages are keyset on it, and the
+evidence clip keeps the lowest ids of a fact -- a prefix keeps the full
+digest's order, so each of these is the order the full digest would give. The
+width is paid three times, in the record, in the primary key's automatic index
+and in `idx_evidence_unit(unit_id, id)`; the other evidence indexes carry the
+rowid.
+
 The two wide text keys are interned the same way. `scope_keys(id, key)` and
 `native_keys(id, key)` hold each distinct string once; `native_aliases` is
 all-integer — `(unit_id, scope_key_id, native_key_id, node_id)` — and evidence

@@ -1,6 +1,6 @@
 # ADR-0003 — Storage tier 2: the lexical and provenance tiers, and the gate
 
-- **Status:** Partially accepted — §2.1, §2.3 and §2.4 implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.5 is a measurement gate, not code. Its lexical tier — §2.1, its place in the §2.6 sequence and its §3 consequences for indexing throughput and recovery — is superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08
+- **Status:** Partially accepted — §2.1, §2.2, §2.3 and §2.4 implemented (§2.2 narrows the public evidence identity to 16 bytes and moves the pinned capsule digest; §2.4 compresses the content store under a frame index in each object); §2.5 is a measurement gate, not code. Its lexical tier — §2.1, its place in the §2.6 sequence and its §3 consequences for indexing throughput and recovery — is superseded by [ADR-0013](ADR-0013-search-index.md), 2026-10-08
 - **Date:** 2026-09-15
 - **Follows:** [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md), which removed
   identity width as the amplifier and left the lexical and provenance tiers as the remaining cost
@@ -73,25 +73,50 @@ reading every body back out to feed a delete.
 
 ### 2.2 Evidence rows carry a 16-byte identity
 
-`evidence.id` is narrowed from a 32-byte digest to the first 16 bytes of the same digest, halving
-both the record field and its automatic index key [S1].
+`evidence.id` is the first 16 bytes of the occurrence's SHA-256 derivation instead of all 32, and
+the public `EvidenceID` is the same value, 32 hex characters. The record field, the primary key's
+automatic index key and `idx_evidence_unit(unit_id, id)` each halve [S1]; the other three evidence
+indexes carry the rowid and do not change.
 
-**Alternatives steel-manned.** *Drop the stored identity for an integer row key* is worth roughly
-twice as much — an integer primary key is the row key and costs no payload [S7], removing the field,
-the automatic index and 24 bytes from every secondary entry, ~50 MB on the large Python repository. It is not adopted
-**yet** because the 32-byte value reaches the wire and would have to be recomputed on read, and the
-derivation hashes the canonical string forms of unit, node, relation and file-content identities
-that the schema now stores as surrogates: three to four joins per hydrated row, an unmeasured
-latency cost on the hottest read path. *Pack evidence into a per-file blob* is refused outright: the
-four secondary indexes exist because evidence is queried by unit, node, relation and native key, and
-a blob answers none of those without a scan.
+**Measured.** 200 000 evidence rows of the store's own shape (a third node subjects, two thirds
+relation subjects, all six b-trees, vacuumed): 47 915 008 B at 32 bytes, 38 002 688 B at 16 —
+**49.6 B a row, 20.7 % of the evidence family**: the table 22 167 552 → 18 669 568 B, the automatic
+index 8 212 480 → 5 005 312 B, `idx_evidence_unit` 8 810 496 → 5 603 328 B. Nothing on the read path
+changes but the bytes compared: every evidence read already selects `e.id` and hex-encodes it.
 
-**Why this wins.** At 643 025 rows a 128-bit digest's collision probability is ~10⁻²⁸ and the upsert
-that depends on the uniqueness is unchanged, so the saving is free of both risk and joins.
+**What it does to the product surfaces.** The wire `evidence_id` (reference occurrences, relation
+occurrences, fact references, row marks, path evidence) narrows from 64 to 32 hex characters, and
+every validator of an evidence identity takes that width and refuses the full one. The pinned
+capsule digest moves, because a fact reference hashes its evidence identities: the model test's
+full fixture pins `752b510d…f41a` where it pinned `2b4713c7…8ad3`. Both are format changes with
+no consumer to migrate.
 
-**Trade-off accepted.** The wire identity narrows to 16 bytes, which is a visible format change, and
-it forecloses nothing: the integer-key variant remains available once the recomputation cost is
-measured.
+**Exactness.** The identity is still a pure function of the occurrence, so the upsert that makes a
+republished occurrence idempotent, the keyset order of evidence pages and the clip that keeps a
+fact's lowest ids are unchanged in kind, and a prefix keeps the digest's order, so each is the
+order the full digest would give. Two distinct occurrences in one store collide with probability
+about n²/2¹²⁹: ≈10⁻²⁵ at ten million rows. A truncated SHA-256 keeps collision resistance of half
+its length, 64 bits against a deliberate search [S20]; a collision would drop one occurrence of a
+fact that has others, and producing one means a 2⁶⁴-work search over occurrence fields a
+repository author controls only in part.
+
+**Alternatives steel-manned.** *Drop the stored identity for an integer row key* removes the field
+and the automatic index outright [S7] and is refused on exactness, not deferred. The upsert needs a
+unique key, and the occurrence's natural key — unit, subject, precision, native key, file, range,
+detail, dispatch, set size — is far wider than 16 bytes as an index. The clip and the keyset pages
+order by the id, so a row key would make the retained set and the page boundaries a function of
+insertion order, which a delta changes; and a rowid on the wire is what the identity model forbids
+(Section 9.1). Recomputing the digest on read to avoid that costs three to four joins per row on
+the hottest read path and still leaves the ordering problem. *Key the table by a 63-bit digest
+prefix with collision detection*, as §2.3 does for native keys, is smaller still but a detected
+collision probes to the next free id, so an occurrence's identity would depend on which colliding
+row was written first — identity stops being a function of content. *Keep 32 bytes* gives up
+49.6 B a row for a collision margin that is already beyond any row count a store reaches.
+
+**Why this wins.** It is the smallest form that keeps the identity a pure function of the
+occurrence and every ordering over it exact.
+
+**Trade-off accepted.** A visible narrowing of the wire identity and a moved capsule digest.
 
 ### 2.3 The key dictionary becomes hash-keyed
 
@@ -333,11 +358,17 @@ alternative measured in §2.4.
 https://www.rfc-editor.org/rfc/rfc8878 — the frame format: a frame is self-contained, and its
 content checksum is optional, which is why §2.4 turns it off under the per-block SHA-256.
 
+[S20] *NIST SP 800-107 Rev. 1, Recommendation for Applications Using Approved Hash Algorithms*
+(§4.1, §5.1) — https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-107r1.pdf —
+"the expected collision-resistance strength of a hash function is half the length of the hash
+value"; a truncated digest takes "the λ left-most bits" and needs λ ≥ 2s for collision resistance
+s. The basis of §2.2's adversarial margin and of keeping the prefix rather than any other 16 bytes.
+
 ---
 
 *Every figure in this record is quoted from the verification run's per-b-tree attribution or
 derived in [`docs/research/16-storage-tier2.md`](../research/16-storage-tier2.md), where the
-arithmetic is shown, except §2.4's codec table, which was measured on the fixture it names.*
+arithmetic is shown, except §2.2's and §2.4's measurements, which were taken on the fixtures they name.*
 
 **Implementation note on §2.1.** The record says `body`'s only database readers are the insert and
 the two paths that feed the index a delete. There is a third: the delta carry-over copies a previous

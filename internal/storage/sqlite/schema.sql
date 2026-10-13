@@ -250,9 +250,12 @@ CREATE TABLE relation_facts (
 -- clipEvidence clips surplus evidence BY id value. The id is a pure function of the evidence
 -- fields (model.NewEvidenceID), so this uniqueness is a derived invariant, not
 -- an arbitrary surrogate, and the value reaches the wire as
--- ReferenceOccurrence.evidence_id and FactReference.evidence_ids.
+-- ReferenceOccurrence.evidence_id and FactReference.evidence_ids. It is the
+-- first 16 bytes of that derivation (model.EvidenceIDBytes, ADR-0003 SS2.2):
+-- the width is paid in the record, in the primary key's automatic index and
+-- in idx_evidence_unit, the three b-trees that carry it.
 CREATE TABLE evidence (
-    id BLOB PRIMARY KEY CHECK(length(id) = 32),
+    id BLOB PRIMARY KEY CHECK(length(id) = 16),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     node_id INTEGER,
     relation_id INTEGER,
