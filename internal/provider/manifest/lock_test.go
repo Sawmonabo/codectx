@@ -119,7 +119,9 @@ func wantLines(t *testing.T, name string, got, want []string) {
 //   - bun.lock alias: naming the package by its install path instead of the
 //     tuple's `name@version`;
 //   - yarn.lock alias: naming the block by the alias of its descriptor, or
-//     resolving a dependency to the alias name;
+//     resolving a dependency to the alias name; an alias with no range
+//     (`lodash@npm:awesome-lodash`) named without its `resolved` URL, or
+//     with the URL's path prefix (api/npm/remote/awesome-lodash);
 //   - pnpm-lock.yaml v9 and v6 alias: reading a dependency path value as a
 //     version (other -> js-yaml would publish resolved_version
 //     @zkochan/js-yaml@0.0.6 on npm:js-yaml), or reading tslib's plain
@@ -796,9 +798,14 @@ other@^1.0.0:
   version "1.0.0"
   dependencies:
     js-yaml "npm:@zkochan/js-yaml@0.0.6"
+
+lodash@npm:awesome-lodash:
+  version "1.2.0"
+  resolved "https://npm.example.com/api/npm/remote/awesome-lodash/-/awesome-lodash-1.2.0.tgz#abc"
 `,
 			want: []string{
 				"npm:lock:yarn.lock -> npm:@zkochan/js-yaml alias=js-yaml integrity=sha512-zk kind=locked resolved_version=0.0.6 set_size=1 source=https://registry.yarnpkg.com/@zkochan/js-yaml/-/js-yaml-0.0.6.tgz#abc ranged",
+				"npm:lock:yarn.lock -> npm:awesome-lodash alias=lodash kind=locked resolved_version=1.2.0 set_size=1 source=https://npm.example.com/api/npm/remote/awesome-lodash/-/awesome-lodash-1.2.0.tgz#abc ranged",
 				"npm:lock:yarn.lock -> npm:other kind=locked resolved_version=1.0.0 set_size=1 ranged",
 				"npm:other -> npm:@zkochan/js-yaml alias=js-yaml kind=runtime requirement=npm:@zkochan/js-yaml@0.0.6 resolved_version=0.0.6 version=1.0.0 ranged",
 			},
