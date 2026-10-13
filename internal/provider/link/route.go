@@ -130,11 +130,8 @@ func mountKey(t *Table, m *RouteMount) (string, bool, bool) {
 	if m.Module != "" {
 		return m.Module + "\x00" + djangoURLConf, false, true
 	}
-	if m.Site < 0 || int(m.Site) >= len(t.Sites) || m.Arg < 0 || int(m.Arg) >= len(t.Sites[m.Site].Args) {
-		return "", false, false
-	}
-	ty := t.Sites[m.Site].Args[m.Arg]
-	if ty.Kind != wire.TypeModule || ty.Name == "" {
+	ty, ok := mountArgument(t, m)
+	if !ok || ty.Kind != wire.TypeModule || ty.Name == "" {
 		return "", false, false
 	}
 	name := ty.Name
@@ -158,6 +155,15 @@ func mountKey(t *Table, m *RouteMount) (string, bool, bool) {
 		}
 	}
 	return mod + "\x00" + attr, exact, true
+}
+
+// mountArgument is the type of the argument a mount passes (its argument Arg
+// of site Site), false when the mount names no argument of t.
+func mountArgument(t *Table, m *RouteMount) (wire.Type, bool) {
+	if m.Module != "" || m.Site < 0 || int(m.Site) >= len(t.Sites) || m.Arg < 0 || int(m.Arg) >= len(t.Sites[m.Site].Args) {
+		return wire.Type{}, false
+	}
+	return t.Sites[m.Site].Args[m.Arg], true
 }
 
 // indexPythonRouting adds a Python member's routing to the module index:

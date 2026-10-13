@@ -44,6 +44,11 @@ func anonymousNames(t *Table) javaAnonymous {
 		}
 	}
 	var open []uint64
+	for _, n := range t.anonymous {
+		if _, ok := a.decl[n]; !ok {
+			open = append(open, n)
+		}
+	}
 	t.eachTypeName(func(s *string) {
 		eachAnonymous(*s, func(n uint64) {
 			if _, ok := a.decl[n]; !ok {

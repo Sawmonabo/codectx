@@ -496,12 +496,17 @@ What re-resolves:
   indirect sites read a signature whose set of taken functions changed. A file re-runs whole, since its sites read
   each other's results. When the layout holds (the same members, the same fields but those saying where a Go package outside the unit is read from, and every member whose table moved
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
-  and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
+  and republishes; otherwise it rebuilds the hierarchy and diffs it group by group. The rebuild reads the tables of
+  the members whose digest moved and of the added members only: for every other member it reads the projection the
+  state keeps (`internal/provider/link/projection.go`), the table without its sites, values, handlers and dynamic
+  imports but with each routing mount's argument and the Java anonymous bodies' offsets, which is everything the
+  hierarchy is built from. A full build reads each table once and builds its second pass from the projections.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
   value flow and binding, decomposed into nodes (each site, and each file's node), which a refresh maintains by
   deleting and re-deriving at the granularity of nodes (Gupta, Mumick and Subrahmanian, "Maintaining Views
   Incrementally", 1993). When the layout holds the refresh reuses the stored hierarchy and module index; otherwise it
-  rebuilds both from every table and diffs them group by group. It then re-derives a region of nodes, starting from
+  rebuilds both from the stored projections and the tables of the members whose digest moved or that are added,
+  and diffs them group by group. It then re-derives a region of nodes, starting from
   every node of each member whose table moved, that is added or that is removed, and every node that looked up a key
   whose group changed (a declaration, export, parameter or module added, removed or changed under it, so an added
   file's names re-run exactly the sites whose lookups now see them). Until the region settles:

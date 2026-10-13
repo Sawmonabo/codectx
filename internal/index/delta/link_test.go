@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 
@@ -101,6 +102,61 @@ func TestLinkBodyEditRelinksNothing(t *testing.T) {
 	moved := s.only(s.advance(files))
 	s.check("module path change", []linkBuild{moved})
 	s.wantRepublished("module path change", moved, []string{"d.go", "util/u.go"}, "a.go", "b.go", "c.go", "e.go")
+}
+
+// TestLayoutBreakReadsOnlyMovedTables adds a file to a Go unit and to a
+// Python unit, then removes one from the Go unit, and compares each refresh
+// with a full build of the same tree (session.check). A layout break
+// rebuilds the hierarchy (and the Python module index) from the projections
+// the predecessor stored for the members whose digest held, and from the
+// tables of the members that are new: f.go, which nothing calls, is the one
+// Go table read, and extra.py the one Python table. Removing e.go unbinds
+// nothing but its call of Other, so only a.go, whose Other is no longer a
+// target, is read again (to re-run and to republish it).
+//
+// Mutations that fail it: build the hierarchy again from every table on a
+// layout break (buildHierarchy ignoring the held projections: every member's
+// table is read); read the Python module index from the tables (every
+// Python table is read).
+func TestLayoutBreakReadsOnlyMovedTables(t *testing.T) {
+	onlyRead := func(step string, b linkBuild, want ...string) {
+		t.Helper()
+		for p, n := range b.reads {
+			if n != 0 && !slices.Contains(want, p) {
+				t.Errorf("%s read %s's table %d times: its digest held", step, p, n)
+			}
+		}
+		for _, p := range want {
+			if b.reads[p] == 0 {
+				t.Errorf("%s never read %s's table", step, p)
+			}
+		}
+	}
+	s := newSession(t)
+	files := relinkBase
+	s.check("base", []linkBuild{s.only(s.advance(files))})
+
+	files = edit{name: "add", write: map[string]string{"f.go": "package app\n\nfunc Fresh() int { return 3 }\n"}}.apply(t, files)
+	added := s.only(s.advance(files))
+	s.check("file added", []linkBuild{added})
+	onlyRead("the added file", added, "f.go")
+
+	files = edit{name: "remove", remove: []string{"e.go"}}.apply(t, files)
+	removed := s.only(s.advance(files))
+	s.check("file removed", []linkBuild{removed})
+	onlyRead("the removed file", removed, "a.go")
+
+	py := newSession(t)
+	pyFiles := map[string]string{
+		"leaf.py": "def other():\n    return 2\n\n\ndef helper():\n    return 1\n",
+		"pets.py": "class Dog:\n    def speak(self):\n        return \"woof\"\n",
+		"main.py": "from leaf import helper\nfrom pets import Dog\n\n\ndef main():\n    helper()\n    Dog().speak()\n",
+	}
+	py.check("python base", []linkBuild{py.only(py.advance(pyFiles))})
+	pyFiles = edit{name: "python add", write: map[string]string{"extra.py": "def extra():\n    return 3\n"}}.apply(t, pyFiles)
+	pyAdded := py.only(py.advance(pyFiles))
+	py.check("python file added", []linkBuild{pyAdded})
+	onlyRead("the added Python file", pyAdded, "extra.py")
 }
 
 // TestLinkRenameRepublishesOnlyTheSitesThatNamedIt renames Run in a.go and
