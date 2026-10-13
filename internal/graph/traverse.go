@@ -1409,7 +1409,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	}
 	// A continuation is offered for EVERY stop that left a frontier standing --
 	// a full page, a spent per-page visited or edge budget, a level the frontier
-	// byte ceiling spilled. All three are now per-page budgets, so the resumed
+	// byte ceiling spilled. All three are per-page budgets, so the resumed
 	// page makes progress rather than stopping at once.
 	//
 	// The depth bound is the single exception, and DepthLimited on walkState

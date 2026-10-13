@@ -47,7 +47,7 @@ driver-plus-server tree, overstating by ~15 MB): cold pyright 1.02 s / **90** / 
 completeness gap does not appear because the queried class sits in the opened file's own import
 closure — the condition that fails on the large Python repository.
 ```
-Amended 2026-09-15: the implementation lane could not reproduce the `+15 s` pyright row — 2
+Amended 2026-09-15: the implementation could not reproduce the `+15 s` pyright row — 2
 locations cold and still 2 after 15, 40 and 60 s — so the cold gap is **wider** than the table shows.
 
 ## Consequence for the post-MVP design

@@ -33,7 +33,7 @@ import (
 var (
 	flagRepo     = flag.String("repo", "Sawmonabo/codectx", "GitHub repository owning the payload release")
 	flagTag      = flag.String("tag", "tools-v1", "payload release tag")
-	flagWork     = flag.String("work", ".agents/tmp/toollock", "scratch directory for downloads and trees")
+	flagWork     = flag.String("work", "", "scratch directory for downloads, trees and resumable state (default: toollock under the user cache directory's codectx folder)")
 	flagOut      = flag.String("out", "internal/toolchain/tools.lock.json", "lock file to write")
 	flagLicenses = flag.String("licenses", "", "optional path to write the redistributed-payload license table")
 	flagTools    = flag.String("tools", "", "comma-separated subset of tool names (default: every tool)")
@@ -53,7 +53,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var err error
+	work, err := workDir()
+	if err != nil {
+		log.Fatalf("toollock: %v", err)
+	}
+	*flagWork = work
+	logf("scratch directory %s", work)
 	if *flagCheck {
 		err = runCheck(ctx)
 	} else {
@@ -77,12 +82,26 @@ func selectedTools() (map[string]bool, bool) {
 	return m, true
 }
 
+// workDir is the absolute scratch directory: -work when given, else toollock under the
+// user cache directory's product folder. The cache directory is on disk and
+// survives a reboot, so a generation's per-platform state resumes there; the
+// temp directory is RAM-backed on many hosts and is cleared, which would put
+// gigabytes of payloads in memory and lose the state. A host with no user
+// cache directory is told to name one rather than given a different place.
+func workDir() (string, error) {
+	if *flagWork != "" {
+		return filepath.Abs(*flagWork)
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("no user cache directory for the scratch tree (%v); pass -work <dir>", err)
+	}
+	return filepath.Join(cache, paced.ProductDirName, "toollock"), nil
+}
+
 func runGenerate(ctx context.Context) error {
 	only, filtered := selectedTools()
-	work, err := filepath.Abs(*flagWork)
-	if err != nil {
-		return err
-	}
+	work := *flagWork
 	for _, d := range []string{"dl", "tree", "out", "state", "npm", "gopath"} {
 		if err := os.MkdirAll(filepath.Join(work, d), dirMode); err != nil {
 			return err
