@@ -113,6 +113,9 @@ type checkpointScalars struct {
 	// state that can bound how often that token is handed back: without it the
 	// bound would restart at zero on every continuation.
 	Stalls int `json:"walk_stalls,omitempty"`
+	// ClosureRetried records that the deadline cut the round's closure once,
+	// so the continuation runs it without halting on a second cut.
+	ClosureRetried bool `json:"closure_retried,omitempty"`
 
 	// Stop, Candidates and CandidatesUnavailable are scopeResult's fields of
 	// the same names.
@@ -763,6 +766,7 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 		scalars.Walked = st.ingest.walked
 		scalars.Seq = st.ingest.seq
 		scalars.Stalls = st.ingest.stalls
+		scalars.ClosureRetried = st.ingest.closureRetried
 	}
 	state := checkpointState{
 		Pass:        st.pass,
@@ -829,15 +833,17 @@ func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) 
 // an unresolved seed or a cut the first leg disclosed still narrows the plan.
 func (c *Compiler) resumedIngest(s *compileSorts, sc checkpointScalars) *seedIngest {
 	return &seedIngest{
-		sorts:   s,
-		cfg:     c.cfg.Context,
-		seq:     sc.Seq,
-		roots:   sc.WalkRoots,
-		walked:  sc.Walked,
-		cursor:  sc.WalkCursor,
-		stalls:  sc.Stalls,
-		started: true,
-		scope:   scalarScope(sc),
+		sorts:  s,
+		cfg:    c.cfg.Context,
+		seq:    sc.Seq,
+		roots:  sc.WalkRoots,
+		walked: sc.Walked,
+		cursor: sc.WalkCursor,
+		stalls: sc.Stalls,
+		// A cut closure is run again once, on any later leg.
+		closureRetried: sc.ClosureRetried,
+		started:        true,
+		scope:          scalarScope(sc),
 		// The same rule that built the closure on the interrupted leg, over
 		// the same scalars; its reached set is restored as a stream.
 		closure: keptClosureOf(sc.Inputs, sc.Stop),

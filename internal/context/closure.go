@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -52,6 +53,9 @@ type keptClosure struct {
 	keptIDs []model.FileID
 	stop    seedStop
 	reached *pagination.ExternalSort[idRec]
+	// reachedRun is reached once the closure has ended it, so a closure the
+	// deadline cuts reopens it from the run (reopenReached).
+	reachedRun *pagination.SortedRun[idRec]
 	// reader and query are this call's pinned reader and the clipped task
 	// text, set by P-A on every leg; neither is carried by a checkpoint.
 	reader *sqlite.PinnedReader
@@ -254,15 +258,10 @@ func (c *Compiler) filePaths(ctx context.Context, reader *sqlite.PinnedReader, i
 // Every closure record's key is at most (recommended, Tau), so the closure can
 // add and raise entries only below the stop, inside the kept files.
 //
-// It never halts mid-way: P-A asks its halt question before the closure starts
-// and not inside it, because what the closure has admitted cannot be taken back
-// out of the candidate spool and so cannot be replayed on a continuation. A
-// deadline inside it shows up as a truncated walk or search, which leaves the
-// scope incomplete, or as a failed read, which fails the compile, as it does in
-// the seed reads. That is the cost of not halting here: on a paged compile a
-// deadline that lands inside the closure gives a plan whose scope reads
-// incomplete where the uninterrupted compile's would not, which the main walk
-// avoids by halting on a deadline-cut page instead of narrowing on it.
+// It runs as one unit (closeKeptFilesUnit): what it admits is staged, and a
+// deadline that lands inside it on a paged compile discards the stage and ends
+// the pass before the closure, so the continuation runs it again whole and
+// the plan is the one an uninterrupted compile makes.
 //
 // Memory: the kept files' nodes, C's nodes, C's files and the hits go through
 // external sorts. U and R are held, as every walk's start list is, because
@@ -270,7 +269,8 @@ func (c *Compiler) filePaths(ctx context.Context, reader *sqlite.PinnedReader, i
 // nodes. A start list wider than the walk request admits is walked in several
 // walks: their union is the same component set, and for R an entity several of
 // them reach keeps its best record after ranking, as for any two walks.
-func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID) error {
+func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
+	haltable bool) error {
 	cl := in.closure
 	if cl == nil {
 		return nil
@@ -285,6 +285,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 	if err != nil {
 		return err
 	}
+	cl.reachedRun = reached
 	keptNodes, err := c.keptFileNodes(ctx, s, cl)
 	if err != nil {
 		return err
@@ -318,7 +319,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 			return err
 		}
 	}
-	if err := c.closureWalk(ctx, in, eng, gen, unreached, func(entries []model.ImpactEntry) error {
+	if err := c.closureWalk(ctx, in, eng, gen, unreached, haltable, func(entries []model.ImpactEntry) error {
 		for _, e := range entries {
 			if err := compNodes.Add(idRec{ID: string(e.NodeID)}); err != nil {
 				return err
@@ -357,7 +358,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 	}
 
 	weight := cl.stop.NextContribution
-	return c.closureWalk(ctx, in, eng, gen, roots, func(entries []model.ImpactEntry) error {
+	return c.closureWalk(ctx, in, eng, gen, roots, haltable, func(entries []model.ImpactEntry) error {
 		admitted := make([]model.ImpactEntry, 0, len(entries))
 		for _, e := range entries {
 			if e.FileID == "" || !cl.kept[e.FileID] {
@@ -501,13 +502,14 @@ func (c *Compiler) searchComponents(ctx context.Context, s *compileSorts, cl *ke
 // user's bounds, every walk read to exhaustion, handing each page's entries to
 // each. A start list wider than model.MaxStartNodes is walked in several walks.
 //
-// No page halts here (closeKeptFiles says why), so a truncated page, the
-// deadline's own included, leaves the scope incomplete, and a page that stalls
-// without advancing ends its walk incomplete rather than being re-issued. The
-// capability rows each page discloses fold into the scope verdict as the main
-// walk's do.
+// A page the deadline truncated ends the walk with errClosureCut when the
+// closure may halt (closeKeptFilesUnit runs it again on the continuation);
+// otherwise a truncated page, the deadline's own included, leaves the scope
+// incomplete, and a page that stalls without advancing ends its walk
+// incomplete rather than being re-issued. The capability rows each page
+// discloses fold into the scope verdict as the main walk's do.
 func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
-	start []string, each func([]model.ImpactEntry) error,
+	start []string, haltable bool, each func([]model.ImpactEntry) error,
 ) error {
 	cfg := in.cfg
 	depth := cfg.MaxGraphDepth.Int()
@@ -533,6 +535,9 @@ func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.E
 				return contextErr(ctx, err)
 			}
 			if impact.Meta.Truncated {
+				if haltable && strings.HasPrefix(impact.Meta.TruncationReason, walkDeadlineReason) {
+					return errClosureCut
+				}
 				in.scope.ScopeComplete = false
 			}
 			if rows := impact.Meta.Completeness; len(rows) > 0 {

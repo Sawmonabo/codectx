@@ -335,6 +335,10 @@ type seedIngest struct {
 	// request arrived with, so a bound kept only in a local would restart at
 	// zero on every continuation and never fire.
 	stalls int
+	// closureRetried records that the deadline cut the round's closure once
+	// and the pass halted to run it again (closeKeptFilesUnit). Carried for the
+	// reason stalls is: a second cut must not halt again.
+	closureRetried bool
 	// closure is the round's kept-file closure (closure.go), nil in a round
 	// that runs none. The walk loop marks the kept-file nodes it reaches on
 	// it, and the closure walk runs from the ones it did not reach after the
@@ -762,8 +766,15 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 	// round's walk, on every path that ends the pass, so its
 	// entries and its disclosures are on the spool and the verdict below.
 	finish := func() (*ingested, bool, error) {
-		if err := c.closeKeptFiles(ctx, in, eng, gen); err != nil {
+		halted, err := c.closeKeptFilesUnit(ctx, in, eng, gen, stop)
+		if err != nil {
 			return nil, false, err
+		}
+		if halted {
+			// The deadline cut the closure: the pass ends with the walk done
+			// and the closure still to run, the carry a halt after the walk's
+			// last page leaves.
+			return nil, true, nil
 		}
 		out.Scope = in.scope
 		done, err := finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort)

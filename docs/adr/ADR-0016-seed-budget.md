@@ -132,6 +132,11 @@ keys, not on pages.
   kept files, all keyed at or below (`recommended`, τ(next)), so it cannot reorder the head above the stop. It can push
   a witness past a slice, which the certificate catches. The order above the stop is fixed and drops are permanent,
   so the loop ends.
+- **A deadline inside the closure.** The closure runs as one unit: what it admits is staged and joins the plan when it
+  finishes. On a compile that answers continuations, a query deadline that lands inside it discards the stage and
+  ends the call before the closure, so the continuation runs the closure whole and the plan is the uninterrupted
+  compile's. A closure the deadline cuts on two legs in a row cannot fit one call; its second run narrows the scope
+  on the cut, as a walk page that stalls twice does.
 
 **Alternative.** Lexical matches as leaves, never roots: trivially exact and the cheapest exact rule, but it drops the
 only graph expansion a plain-language task gets; an agent localization study lost 5.5 points of function accuracy at
