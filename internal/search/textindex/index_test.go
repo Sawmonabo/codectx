@@ -217,9 +217,14 @@ var engineQueries = []string{"hot", "kalo", "mika pune", "hot rasi", "kaloMika",
 
 // TestPrunedPagesEqualExhaustiveScoring compares every pruned page with the
 // exhaustive reference (IgnoreSummaries) on a fixture of several segments,
-// for both length rules, pages 1 to 5, with kind and path filters, with
-// hidden units, at one and four search threads, and checks that pruning
-// actually skipped blocks so the comparison is not vacuous.
+// for both length rules, pages 1 to 5 of 10 and of 200 results, with kind and
+// path filters, with hidden units, at one and four search threads, and checks
+// that pruning skipped blocks under every thread count, view and length rule,
+// so no part of the comparison is vacuous. A block is skipped only once a
+// segment's heap is full and the block's bound falls below the heap's worst
+// score: on this fixture that happens on the pages of 10, while the pages of
+// 200 fill their heaps late and every remaining block's bound still beats the
+// worst score.
 //
 // Mutation caught: a block bound computed with the other length rule's
 // minimum length (the bound then undercuts true scores and a page loses or
@@ -237,7 +242,6 @@ func TestPrunedPagesEqualExhaustiveScoring(t *testing.T) {
 		{prefixes: []string{"pkg1", "pkg3/sub2"}},
 		{kinds: []model.NodeKind{model.NodeFile}, prefixes: []string{"pkg2"}},
 	}
-	skipped := false
 	for _, threads := range []int{1, 4} {
 		x := openReadOnly(t, dir, threads)
 		for gen, hide := range []int{0, 4} {
@@ -246,31 +250,36 @@ func TestPrunedPagesEqualExhaustiveScoring(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
+				skipped := false
 				for _, q := range engineQueries {
 					for fi, f := range filters {
-						for pageNo := 1; pageNo <= 5; pageNo++ {
-							r := Request{Query: q, Kinds: f.kinds, PathPrefixes: f.prefixes, Depth: 200 * pageNo, LengthRule: rule}
-							pruned := search(t, v, r)
-							r.IgnoreSummaries = true
-							full := search(t, v, r)
-							if err := samePage(pruned, full); err != nil {
-								t.Fatalf("threads %d hide %d rule %d query %q filter %d page %d: %v", threads, hide, rule, q, fi, pageNo, err)
-							}
-							if pruned.Stats.SegmentsWithoutSummary != 0 {
-								t.Fatalf("a committed segment has no summary: %+v", pruned.Stats)
-							}
-							if pruned.Stats.BlocksScored < pruned.Stats.BlocksTotal {
-								skipped = true
+						for _, size := range []int{10, 200} {
+							for pageNo := 1; pageNo <= 5; pageNo++ {
+								r := Request{Query: q, Kinds: f.kinds, PathPrefixes: f.prefixes, Depth: size * pageNo, LengthRule: rule}
+								pruned := search(t, v, r)
+								r.IgnoreSummaries = true
+								full := search(t, v, r)
+								if err := samePage(pruned, full); err != nil {
+									t.Fatalf("threads %d hide %d rule %d query %q filter %d depth %d: %v",
+										threads, hide, rule, q, fi, r.Depth, err)
+								}
+								if pruned.Stats.SegmentsWithoutSummary != 0 {
+									t.Fatalf("a committed segment has no summary: %+v", pruned.Stats)
+								}
+								if pruned.Stats.BlocksScored < pruned.Stats.BlocksTotal {
+									skipped = true
+								}
 							}
 						}
 					}
 				}
+				if !skipped {
+					t.Fatalf("threads %d hide %d rule %d: no search skipped a block, so the comparison proves nothing about pruning",
+						threads, hide, rule)
+				}
 			}
 			v.Close()
 		}
-	}
-	if !skipped {
-		t.Fatal("no search skipped a block: the comparison proves nothing about pruning")
 	}
 }
 
