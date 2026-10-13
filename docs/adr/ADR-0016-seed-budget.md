@@ -173,13 +173,12 @@ only graph expansion a plain-language task gets; an agent localization study los
   match outside the kept files, is still packed (mutations: skip the kept-file read; skip the closure walk).
 - **Weak roots.** A lexical root never makes an entry required.
 - **Budget monotonicity.** For a plan bound by its file budget, raising the budget never removes a function, and the
-  plan is the same for any page size. An entry is charged as the entries view serves it: its fixed fields, its reasons
-  and its route count spelled at its widest, never its routes. The routes are stored in full, one row each, and paged
-  by reference through the `routes` view in (entry, route) order; the entry's count says how many to read. So how many
-  routes reach an entry never changes whether its file fits (mutation: measure the entry with its routes). Reasons
-  stay in the charge: they are bounded per entry (`MaxReasonsPerEntry` reasons of `MaxReasonBytes` each) and come from
-  the route that wins the entry, so when the byte budget binds, a root that changes an entry's winning route can still
-  move its group's size by at most that bound, and the property is stated exactly for file-budget-bound plans.
+  plan is the same for any page size. An entry is charged as the entries view serves it: its fixed fields and its
+  reason and route counts spelled at their widest, never its reasons or its routes. Both are stored in full, one row
+  each, and paged by reference through the `reasons` and `routes` views in (entry, index) order; the entry's counts
+  say how many to read. So how an entry is explained never changes whether its file fits (mutations: measure the
+  entry with its routes, or with its reasons), and the property holds for byte-bound plans along the "more roots"
+  axis too.
 
 ## Consequences
 
@@ -201,7 +200,7 @@ only graph expansion a plain-language task gets; an agent localization study los
   and routes alone.
 - The compiler's policy version changes, so existing manifests are recompiled, not reused.
 - Explanations list routes from the matches read; the notice says so.
-- A plan's routes are a paged projection of their own, as the exclusions are. Agent context packers fill one budget
+- A plan's routes and reasons are paged projections of their own, as the exclusions are. Agent context packers fill one budget
   [S3], so the routes are not free; they are served by reference, as a protocol-level resource link serves a large
   result [S12], and an entry costs a fixed header for them. A per-token knapsack would fit more routes but its
   selections are not nested as the budget grows, which breaks the rank order this record rests on.

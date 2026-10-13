@@ -208,15 +208,22 @@ func (r PlanRequest) Validate() error {
 // slice's real cost; reading one sibling entry's value as "the bytes needed to
 // serve this entry" does not.
 type ContextEntry struct {
-	Ordinal         int            `json:"ordinal"`
-	NodeID          NodeID         `json:"node_id,omitempty"`
-	FileID          FileID         `json:"file_id,omitempty"`
-	Requirement     Requirement    `json:"requirement"`
-	ScoreMicros     int64          `json:"score_micros"`
-	EstimatedBytes  int64          `json:"estimated_bytes"`
-	EstimatedTokens int64          `json:"estimated_tokens"`
-	Reasons         []string       `json:"reasons"`
-	EvidencePaths   [][]RelationID `json:"evidence_paths,omitempty"`
+	Ordinal         int         `json:"ordinal"`
+	NodeID          NodeID      `json:"node_id,omitempty"`
+	FileID          FileID      `json:"file_id,omitempty"`
+	Requirement     Requirement `json:"requirement"`
+	ScoreMicros     int64       `json:"score_micros"`
+	EstimatedBytes  int64       `json:"estimated_bytes"`
+	EstimatedTokens int64       `json:"estimated_tokens"`
+	// Reasons and EvidencePaths are the entry's explanation as the compile
+	// made it. A manifest stores them in full beside the entry and serves them
+	// by reference (the reasons and routes views), so an entry read back from
+	// a manifest carries only their counts.
+	Reasons       []string       `json:"reasons,omitempty"`
+	EvidencePaths [][]RelationID `json:"evidence_paths,omitempty"`
+	// ReasonCount is how many reasons the entry has, served a page at a time
+	// through the reasons view (ContextReason).
+	ReasonCount int64 `json:"reason_count"`
 	// RouteCount is how many evidence routes the entry has. The routes are
 	// stored in full and served by reference, a page at a time, through the
 	// routes view (ContextRoute); an entry served by the entries view carries
@@ -250,6 +257,9 @@ func (e ContextEntry) Validate() error {
 		return err
 	}
 	if err := boundStrings("context_entry.reasons", e.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
+	}
+	if err := requireNonNegative("context_entry.reason_count", e.ReasonCount); err != nil {
 		return err
 	}
 	if err := requireNonNegative("context_entry.route_count", e.RouteCount); err != nil {
@@ -531,12 +541,15 @@ const (
 	// ViewRoutes pages every entry's evidence routes, in (entry ordinal,
 	// route index) order (ContextRoute).
 	ViewRoutes ContextView = "routes"
+	// ViewReasons pages every entry's reasons, in (entry ordinal, reason
+	// index) order (ContextReason).
+	ViewReasons ContextView = "reasons"
 )
 
 // Valid reports whether v is a known wire spelling.
 func (v ContextView) Valid() bool {
 	switch v {
-	case ViewEntries, ViewSlices, ViewExcluded, ViewRoutes:
+	case ViewEntries, ViewSlices, ViewExcluded, ViewRoutes, ViewReasons:
 		return true
 	}
 	return false
@@ -668,6 +681,7 @@ type ContextPage struct {
 	Slices     []ContextSlice         `json:"slices,omitempty"`
 	Excluded   []ExcludedContextEntry `json:"excluded,omitempty"`
 	Routes     []ContextRoute         `json:"routes,omitempty"`
+	Reasons    []ContextReason        `json:"reasons,omitempty"`
 }
 
 // Validate enforces the page shape and its per-page item bound. A page carries
@@ -694,6 +708,7 @@ func (p ContextPage) Validate() error {
 		{ViewSlices, len(p.Slices)},
 		{ViewExcluded, len(p.Excluded)},
 		{ViewRoutes, len(p.Routes)},
+		{ViewReasons, len(p.Reasons)},
 	}
 	items := 0
 	for _, l := range lists {
@@ -722,6 +737,11 @@ func (p ContextPage) Validate() error {
 		}
 	}
 	for _, r := range p.Routes {
+		if err := r.Validate(); err != nil {
+			return err
+		}
+	}
+	for _, r := range p.Reasons {
 		if err := r.Validate(); err != nil {
 			return err
 		}

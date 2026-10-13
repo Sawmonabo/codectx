@@ -72,3 +72,45 @@ func (s *Store) ManifestRoutes(ctx context.Context, id model.ManifestID, afterEn
 	})
 	return out, err
 }
+
+// putEntryReasons writes every reason of one manifest entry as its own row,
+// in reason order, inside PutManifest's transaction; the entry itself keeps
+// only the count.
+func putEntryReasons(ctx context.Context, stmt *sql.Stmt, manifest []byte, e model.ContextEntry) error {
+	for i, text := range e.Reasons {
+		if _, err := stmt.ExecContext(ctx, manifest, e.Ordinal, i, text); err != nil {
+			return wrap("context_entry_reasons", err)
+		}
+	}
+	return nil
+}
+
+// ManifestReasons pages a manifest's entry reasons in (entry ordinal, reason
+// index) order, after the reason (afterEntry, afterIndex); afterEntry -1
+// starts before the first. The keyset is the reasons table's primary key.
+func (s *Store) ManifestReasons(ctx context.Context, id model.ManifestID, afterEntry, afterIndex, limit int) ([]model.ContextReason, error) {
+	raw, err := idBlob("manifest_id", string(id))
+	if err != nil {
+		return nil, err
+	}
+	limit = pageLimit(ctx, limit)
+	var out []model.ContextReason
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT ordinal, reason_index, reason FROM context_entry_reasons
+			WHERE manifest_id = ? AND (ordinal, reason_index) > (?, ?) ORDER BY ordinal, reason_index LIMIT ?`,
+			raw, afterEntry, afterIndex, limit)
+		if err != nil {
+			return wrap("context_entry_reasons", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r model.ContextReason
+			if err := rows.Scan(&r.Entry, &r.Index, &r.Reason); err != nil {
+				return wrap("context_entry_reasons", err)
+			}
+			out = append(out, r)
+		}
+		return wrap("context_entry_reasons", rows.Err())
+	})
+	return out, err
+}

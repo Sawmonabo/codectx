@@ -401,7 +401,7 @@ CREATE TABLE context_entries (
     score_micros INTEGER NOT NULL,
     estimated_bytes INTEGER NOT NULL CHECK(estimated_bytes >= 0),
     estimated_tokens INTEGER NOT NULL CHECK(estimated_tokens >= 0),
-    reasons_json TEXT NOT NULL,
+    reason_count INTEGER NOT NULL CHECK(reason_count >= 0),
     route_count INTEGER NOT NULL CHECK(route_count >= 0),
     PRIMARY KEY(manifest_id, ordinal),
     CHECK(node_id IS NOT NULL OR file_id IS NOT NULL)
@@ -412,6 +412,14 @@ CREATE TABLE context_entry_routes (
     route_index INTEGER NOT NULL CHECK(route_index >= 0),
     relations BLOB NOT NULL CHECK(length(relations) > 0 AND length(relations) % 32 = 0),
     PRIMARY KEY(manifest_id, ordinal, route_index),
+    FOREIGN KEY(manifest_id, ordinal) REFERENCES context_entries(manifest_id, ordinal) ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE TABLE context_entry_reasons (
+    manifest_id BLOB NOT NULL,
+    ordinal INTEGER NOT NULL,
+    reason_index INTEGER NOT NULL CHECK(reason_index >= 0),
+    reason TEXT NOT NULL CHECK(length(reason) > 0),
+    PRIMARY KEY(manifest_id, ordinal, reason_index),
     FOREIGN KEY(manifest_id, ordinal) REFERENCES context_entries(manifest_id, ordinal) ON DELETE CASCADE
 ) WITHOUT ROWID;
 CREATE TABLE context_slices (

@@ -1400,7 +1400,46 @@ func readBackManifest(t *testing.T, fx *contextFixture, id model.ManifestID) (
 		return fx.Store.ManifestExcluded(fx.ctx, id, after, 0)
 	}, func(e model.ExcludedContextEntry) int { return e.Ordinal })
 	attachRoutes(t, fx, id, entries)
+	attachReasons(t, fx, id, entries)
 	return entries, slices, excluded
+}
+
+// attachReasons reads every reason of the manifest through the reasons view's
+// keyset and puts each entry's reasons back on it, in reason order, as
+// attachRoutes does for routes.
+func attachReasons(t *testing.T, fx *contextFixture, id model.ManifestID, entries []model.ContextEntry) {
+	t.Helper()
+	at := map[int]int{}
+	for i, e := range entries {
+		at[e.Ordinal] = i
+	}
+	afterEntry, afterIndex := -1, -1
+	for {
+		page, err := fx.Store.ManifestReasons(fx.ctx, id, afterEntry, afterIndex, 0)
+		if err != nil {
+			t.Fatalf("ManifestReasons: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, r := range page {
+			i, ok := at[r.Entry]
+			if !ok {
+				t.Fatalf("reason %d names entry %d, which the manifest does not hold", r.Index, r.Entry)
+			}
+			if r.Index != len(entries[i].Reasons) {
+				t.Fatalf("entry %d's reason %d arrived after %d reasons", r.Entry, r.Index, len(entries[i].Reasons))
+			}
+			entries[i].Reasons = append(entries[i].Reasons, r.Reason)
+		}
+		last := page[len(page)-1]
+		afterEntry, afterIndex = last.Entry, last.Index
+	}
+	for _, e := range entries {
+		if e.ReasonCount != int64(len(e.Reasons)) {
+			t.Fatalf("entry %d counts %d reasons and %d were read", e.Ordinal, e.ReasonCount, len(e.Reasons))
+		}
+	}
 }
 
 // attachRoutes reads every route of the manifest through the routes view's

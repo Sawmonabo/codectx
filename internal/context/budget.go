@@ -122,12 +122,13 @@ const sizeIterations = 8
 // the plan actually needs. Summing the entries of a file therefore yields the
 // file's real cost, which is what groupByFile and sliceOrdinals both do.
 //
-// The entry is charged as the entries view serves it: its fixed fields, its
-// reasons and a route count, never its routes. The routes are stored in full
-// and paged by reference (model.ContextRoute), so how many routes reach an
-// entry never changes whether its file fits (ADR-0016 decision 7). The count
-// is charged at its widest spelling (routeCountCharge), so the charge does not
-// move with the count either.
+// The entry is charged as the entries view serves it: its fixed fields and a
+// reason count and a route count, never its reasons or its routes. Both are
+// stored in full and paged by reference (model.ContextReason,
+// model.ContextRoute), so how an entry is explained never changes whether its
+// file fits (ADR-0016 decision 7). Each count is charged at its widest
+// spelling (explanationCountCharge), so the charge does not move with the
+// count either.
 //
 // Source bytes are never loaded; model.FileVersion.Size is the only input.
 func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEntry, error) {
@@ -147,11 +148,13 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 		ScoreMicros:   c.ScoreMicros,
 		Reasons:       c.Reasons,
 		EvidencePaths: paths,
+		ReasonCount:   int64(len(c.Reasons)),
 		RouteCount:    int64(len(paths)),
 	}
 	for i := 0; i < sizeIterations; i++ {
 		served := e
-		served.EvidencePaths, served.RouteCount = nil, routeCountCharge
+		served.Reasons, served.EvidencePaths = nil, nil
+		served.ReasonCount, served.RouteCount = explanationCountCharge, explanationCountCharge
 		meta, err := serializedBytes(served)
 		if err != nil {
 			return model.ContextEntry{}, err
@@ -170,9 +173,10 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 		Message: "the measured entry size did not settle; it would be a guess rather than a measurement"}
 }
 
-// routeCountCharge is the route count an entry is measured with: the widest
-// count its JSON field can spell, so the charge is the same whatever the count.
-const routeCountCharge = math.MaxInt64
+// explanationCountCharge is the reason and route count an entry is measured
+// with: the widest count its JSON field can spell, so the charge is the same
+// whatever the count.
+const explanationCountCharge = math.MaxInt64
 
 // evidencePaths projects the ranking pass's explanation paths onto the stored
 // relation-id lists, each whole: a route is stored as long as the walk found

@@ -13,6 +13,30 @@ type ContextRoute struct {
 	Relations []RelationID `json:"relations"`
 }
 
+// ContextReason is one reason of one manifest entry: why the compile selected
+// it, in the order the compile gave. A manifest stores every reason of every
+// entry; the reasons view pages them in (Entry, Index) order, and an entry
+// names how many it has (ContextEntry.ReasonCount).
+type ContextReason struct {
+	// Entry is the ordinal of the entry the reason explains.
+	Entry int `json:"entry"`
+	// Index is the reason's position among the entry's reasons, from zero.
+	Index  int    `json:"index"`
+	Reason string `json:"reason"`
+}
+
+// Validate enforces the context_entry_reasons constraints: a non-empty reason
+// within the one-reason byte bound.
+func (r ContextReason) Validate() error {
+	if err := requireNonNegative("context_reason.entry", int64(r.Entry)); err != nil {
+		return err
+	}
+	if err := requireNonNegative("context_reason.index", int64(r.Index)); err != nil {
+		return err
+	}
+	return requireField("context_reason.reason", r.Reason, MaxReasonBytes)
+}
+
 // Validate enforces the context_entry_routes constraints: a route names at
 // least one relation, each a canonical id, and no bound on how many: a route
 // is stored as long as the walk found it.
