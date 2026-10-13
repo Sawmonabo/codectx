@@ -39,6 +39,9 @@ type RouteObject struct {
 	Framework string `json:"framework"`
 	Own       string `json:"own,omitempty"`
 	OwnKnown  bool   `json:"own_known,omitempty"`
+	// Root reports an ASGI application root, which only an ASGI mount
+	// (Mount, `app.mount`) mounts below another application.
+	Root bool `json:"root,omitempty"`
 }
 
 // RouteEntry is one route registered, inside the file, on Objects[Object]:
@@ -84,6 +87,18 @@ type RouteMount struct {
 	Base        string            `json:"base,omitempty"`
 	BaseKnown   bool              `json:"base_known,omitempty"`
 	Range       model.SourceRange `json:"range"`
+	// ASGI reports an ASGI mount (Starlette's Mount, `app.mount`), which
+	// mounts an application, a router or a route list of either ASGI
+	// framework; RootObject is one more than the exported application root
+	// (Objects) a mount anchored at a root is made on, 0 for none, so a
+	// file that mounts that application walks on through it.
+	ASGI       bool  `json:"asgi,omitempty"`
+	RootObject int32 `json:"root_object,omitempty"`
+	// Target is, for a mount whose argument the worker typed by no
+	// position (a keyword argument, `Mount(path, routes=users.routes)`),
+	// the module as the import writes it and the attribute it names,
+	// NUL-joined; Site is then -1.
+	Target string `json:"target,omitempty"`
 }
 
 // djangoURLConf is the binding a Django urlconf module holds its routes in:
@@ -130,18 +145,24 @@ func mountKey(t *Table, m *RouteMount) (string, bool, bool) {
 	if m.Module != "" {
 		return m.Module + "\x00" + djangoURLConf, false, true
 	}
-	ty, ok := mountArgument(t, m)
-	if !ok || ty.Kind != wire.TypeModule || ty.Name == "" {
-		return "", false, false
+	var mod, attr string
+	if m.Target != "" {
+		mod, attr, _ = strings.Cut(m.Target, "\x00")
+	} else {
+		ty, ok := mountArgument(t, m)
+		if !ok || ty.Kind != wire.TypeModule || ty.Name == "" {
+			return "", false, false
+		}
+		name := ty.Name
+		dots := len(name) - len(strings.TrimLeft(name, "."))
+		rest := name[dots:]
+		j := strings.LastIndexByte(rest, '.')
+		mod, attr = name[:dots], rest
+		if j >= 0 {
+			mod, attr = name[:dots]+rest[:j], rest[j+1:]
+		}
 	}
-	name := ty.Name
-	dots := len(name) - len(strings.TrimLeft(name, "."))
-	rest := name[dots:]
-	j := strings.LastIndexByte(rest, '.')
-	mod, attr := name[:dots], rest
-	if j >= 0 {
-		mod, attr = name[:dots]+rest[:j], rest[j+1:]
-	}
+	dots := len(mod) - len(strings.TrimLeft(mod, "."))
 	if attr == "" || mod == "" {
 		return "", false, false
 	}
@@ -193,7 +214,7 @@ func indexPythonRouting(file int32, t *Table, add func(entry) error) error {
 		}
 		for k := range rt.Mounts {
 			m := &rt.Mounts[k]
-			if m.Object != int32(i) || m.Root {
+			if (m.Object != int32(i) && m.RootObject != int32(i)+1) || m.Root {
 				continue
 			}
 			key, exact, ok := mountKey(t, m)
@@ -353,7 +374,7 @@ func (w *routeWalk) mount(from string, m payloadMount, base string, known bool, 
 		if err := json.Unmarshal([]byte(e.Sig), &p); err != nil {
 			return internalErr("routing payload: " + err.Error())
 		}
-		if p.Object.Framework != m.Framework {
+		if !mountable(m.RouteMount, p.Object) {
 			continue
 		}
 		pre, preKnown := joinPrefix(m.Prefix, p.Object.Own), m.PrefixKnown && p.Object.OwnKnown
@@ -576,3 +597,16 @@ func (r Routing) summary() Routing {
 	}
 	return r
 }
+
+// mountable reports that mount m can mount object o: an ASGI mount any
+// object of either ASGI framework, a FastAPI application being a Starlette
+// one; any other mount only a router or blueprint of its own framework.
+func mountable(m RouteMount, o RouteObject) bool {
+	if m.ASGI {
+		return asgiFramework(m.Framework) && asgiFramework(o.Framework)
+	}
+	return o.Framework == m.Framework && !o.Root
+}
+
+// asgiFramework reports a framework whose objects an ASGI mount mounts.
+func asgiFramework(fw string) bool { return fw == "fastapi" || fw == "starlette" }

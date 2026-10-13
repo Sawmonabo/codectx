@@ -141,7 +141,7 @@ func (s *routeScan) starletteEntries(mounts bool) {
 		rt := s.routeOf(path)
 		owner, known := s.listOwner(refSpan(r))
 		if target == "starlette.routing.Mount" {
-			s.starletteMount(site, args, s.objs[i], rt, owner, known)
+			s.starletteMount(r, site, i, args, s.objs[i], rt, owner, known)
 			return
 		}
 		endpoint, ok := argument(args, 1, "endpoint")
@@ -166,13 +166,21 @@ func (s *routeScan) starletteEntries(mounts bool) {
 }
 
 // starletteMount attaches a Mount to the list that holds it, at its path,
-// and the object it passes as `app` (position 1) under it.
-func (s *routeScan) starletteMount(site *wire.Site, args []routeArg, o *routeObj, rt routeText, owner *routeObj, known bool) {
+// and the object it passes as `app` (position 1) under it; an `app` or a
+// `routes` (position 2) that names another module's object is a mount the
+// linker resolves.
+func (s *routeScan) starletteMount(r *wire.Ref, site *wire.Site, i int, args []routeArg, o *routeObj, rt routeText,
+	owner *routeObj, known bool) {
 	if o == nil {
 		return
 	}
 	if known {
 		o.atts = append(o.atts, routeAttach{parent: owner, prefix: rt.value, known: owner != nil && rt.literal})
+	}
+	for _, at := range []int{s.argAt(site, 1, "app"), s.argAt(site, 2, "routes")} {
+		if at >= 0 {
+			s.recordASGIMount(r, site, i, at, fwStarlette, o, "", true)
+		}
 	}
 	n := 0
 	for k, a := range args {
@@ -208,4 +216,60 @@ func (s *routeScan) functionHandler(h handler) bool {
 		return k == model.NodeFunction
 	}
 	return false
+}
+
+// argAt is the index among a site's arguments of the one at position pos
+// or keyword kw, -1 when the call writes neither or its arguments are not
+// known.
+func (s *routeScan) argAt(site *wire.Site, pos int, kw string) int {
+	n := 0
+	for k, a := range s.siteArgs(site) {
+		switch {
+		case a.kw == "*":
+			return -1
+		case a.kw == kw:
+			return k
+		case a.kw == "":
+			if n == pos {
+				return k
+			}
+			n++
+		}
+	}
+	return -1
+}
+
+// starletteLists makes each module-level binding that holds a list of
+// Starlette route entries and that no list this file passes holds an
+// object of its own (a route list another file mounts with
+// `Mount(path, routes=module.routes)`), whose entries are mounted on it.
+func (s *routeScan) starletteLists() {
+	var entries []wire.Span
+	s.calls(func(r *wire.Ref, site *wire.Site, i int) {
+		switch s.pyTarget(site, i) {
+		case "starlette.routing.Route", "starlette.routing.WebSocketRoute", "starlette.routing.Mount":
+			entries = append(entries, refSpan(r))
+		}
+	})
+	for i := range s.b.decls {
+		d := &s.b.decls[i]
+		if d.Parent >= 0 || d.kind != model.NodeVariable || d.NameEnd > d.End {
+			continue
+		}
+		value, ok := strings.CutPrefix(strings.TrimSpace(string(s.b.src[d.NameEnd:d.End])), "=")
+		if v := strings.TrimSpace(value); !ok || !strings.HasPrefix(v, "[") && !strings.HasPrefix(v, "(") {
+			continue
+		}
+		at := wire.Span{Start: d.Start, End: d.End}
+		if _, held := s.listOwner(at); held {
+			continue
+		}
+		for _, e := range entries {
+			if at.Start <= e.Start && e.End <= at.End {
+				o := &routeObj{fw: fwStarlette, ownKnown: true, bound: i + 1}
+				s.lists = append(s.lists, routeList{at: at, obj: o})
+				break
+			}
+		}
+	}
 }

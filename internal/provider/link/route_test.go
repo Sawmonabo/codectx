@@ -273,3 +273,67 @@ urlpatterns = [
 `,
 	}, []string{"mysite/settings.py post/<int:pk>/ /blog/post/<int:pk>/ -> detail"})
 }
+
+// TestASGIMountsAcrossFiles is Starlette's Mount and FastAPI's `mount`
+// across files: a FastAPI application mounted under a path with
+// `app.mount`, a Starlette route list another module binds mounted with
+// `Mount(path, routes=...)`, and a Starlette application mounted with
+// `Mount(path, app=...)`; each route below reaches its full path, and an
+// application the sub-application itself mounts from a further file is
+// walked through it. A router `include_router` names cannot be an
+// application. Mutations caught: the ASGI frameworks not one family (the
+// Starlette application under the FastAPI one not mounted, no /deep path),
+// application roots not
+// exported (no /sub path), the root's own mounts left out of its payload
+// (no /sub/deep path), the route list not an object (no /users path), and
+// include_router allowed to mount an application (a /wrong path).
+func TestASGIMountsAcrossFiles(t *testing.T) {
+	checkMounted(t, map[string]string{
+		"sub.py": `from fastapi import FastAPI
+
+import deep
+
+app = FastAPI()
+app.mount("/deep", deep.app)
+
+
+@app.get("/x")
+def sub_x():
+    return {}
+`,
+		"deep.py": `from starlette.applications import Starlette
+from starlette.routing import Route
+
+
+def deep_y(request):
+    return None
+
+
+app = Starlette(routes=[Route("/y", deep_y)])
+`,
+		"users.py": `from starlette.routing import Route
+
+
+def users_list(request):
+    return None
+
+
+routes = [Route("/", users_list)]
+`,
+		"main.py": `from fastapi import FastAPI
+from starlette.routing import Mount
+
+import sub
+import users
+
+app = FastAPI(routes=[Mount("/users", routes=users.routes)])
+app.mount("/sub", sub.app)
+app.include_router(sub.app, prefix="/wrong")
+`,
+	}, []string{
+		"main.py GET / /users/ -> users_list",
+		"main.py GET /x /sub/x -> sub_x",
+		"main.py GET /y /sub/deep/y -> deep_y",
+		"sub.py GET /y /deep/y -> deep_y",
+	})
+}

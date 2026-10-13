@@ -303,8 +303,17 @@ the number of paths the walks of the file's root mounts gave that route. A hop w
 route's file and object instead of a path; it is still counted in the set. A mount whose argument names no indexed
 object publishes nothing. Every lookup is traced on the mount's file, so a refresh that changes a router, a route or a
 settings module republishes the endpoints that reach it, and the routing is part of the interface summary, so a
-change to it rebuilds the index. Not walked: JavaScript and Go mounts across files, a Starlette `Mount` across files,
-and an application mounted as a child of another (`app.mount("/sub", sub_app)` with `sub_app` in another file).
+change to it rebuilds the index.
+
+An ASGI mount (Starlette's `Mount(path, app=…, routes=…)` and FastAPI's or Starlette's `app.mount(path, app)`) mounts
+any object of either ASGI framework, a FastAPI application being a Starlette application: an application root, a
+router, or a route list a module binds (`routes = [Route(…), Mount(…)]`), which the structural provider records as an
+object of its own when no list the file passes holds it. Every FastAPI and Starlette application root bound at module
+level is indexed as an object too, with its routes below it and the mounts made on it, so a file mounting it walks on
+through the mounts the application itself makes. Only an ASGI mount mounts an application; `include_router` and
+`register_blueprint` mount only routers and blueprints of their own framework. A keyword argument, which the worker
+types by no position, is read as written: a dotted name whose head an import binds names that module's attribute
+(`RouteMount.Target`).
 
 ## Request inputs across files
 

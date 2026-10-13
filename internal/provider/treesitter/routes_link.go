@@ -31,7 +31,13 @@ type pendingMount struct {
 	prefix    string
 	known     bool
 	override  bool
-	at        wire.Span
+	// asgi reports an ASGI mount (Starlette's Mount, `app.mount`), which
+	// mounts any ASGI application, router or route list.
+	asgi bool
+	// target is, for a mount whose argument the file reads as written,
+	// the module and attribute it names, NUL-joined; site is then -1.
+	target string
+	at     wire.Span
 }
 
 // routeChain is one way an object reaches the top of its chain inside the
@@ -41,6 +47,9 @@ type routeChain struct {
 	top    *routeObj
 	prefix string
 	known  bool
+	// root is the application root a chain with no top is anchored at,
+	// nil when the program serves it.
+	root *routeObj
 }
 
 // chains are the ways o reaches the top of its in-file chain: an open
@@ -56,7 +65,7 @@ func (s *routeScan) chains(o *routeObj, way []*routeObj) (routeChain, bool) {
 	switch len(o.atts) {
 	case 0:
 		if o.root {
-			return routeChain{prefix: o.own, known: o.ownKnown}, true
+			return routeChain{prefix: o.own, known: o.ownKnown, root: o}, true
 		}
 		return routeChain{top: o, known: true}, true
 	case 1:
@@ -75,7 +84,7 @@ func (s *routeScan) chains(o *routeObj, way []*routeObj) (routeChain, bool) {
 	if !ok {
 		return routeChain{}, false
 	}
-	return routeChain{top: up.top, prefix: joinPrefix(up.prefix, pre), known: up.known && known}, true
+	return routeChain{top: up.top, root: up.root, prefix: joinPrefix(up.prefix, pre), known: up.known && known}, true
 }
 
 // linkRoutes builds the file's open routing: each open object a
@@ -90,32 +99,43 @@ func (s *routeScan) linkRoutes() *routeLinks {
 		if i, ok := index[o]; ok {
 			return i, true
 		}
-		i, ok := s.objSite(o)
-		if !ok {
-			return -1, false
-		}
-		r := s.siteRef(i)
-		if r == nil {
-			return -1, false
-		}
-		d := s.binding(refSpan(r))
+		d := o.bound - 1
 		if d < 0 {
-			return -1, false
+			i, ok := s.objSite(o)
+			if !ok {
+				return -1, false
+			}
+			r := s.siteRef(i)
+			if r == nil {
+				return -1, false
+			}
+			if d = s.binding(refSpan(r)); d < 0 {
+				return -1, false
+			}
 		}
 		out.routing.Objects = append(out.routing.Objects, link.RouteObject{Decl: int32(d), Framework: o.fw, Own: o.own,
-			OwnKnown: o.ownKnown})
+			OwnKnown: o.ownKnown, Root: o.root})
 		index[o] = int32(len(out.routing.Objects) - 1)
 		return index[o], true
 	}
 	for _, f := range s.out {
-		if f.obj == nil || f.meta.Prefix == model.PrefixResolved {
+		if f.obj == nil {
 			continue
 		}
 		c, ok := s.chains(f.obj, nil)
-		if !ok || c.top == nil {
+		if !ok {
 			continue
 		}
-		oi, ok := open(c.top)
+		top := c.top
+		switch {
+		case top == nil && asgiRoot(c.root):
+			// An ASGI application another file may mount: its routes
+			// are kept below it, beside the paths this file resolves.
+			top = c.root
+		case top == nil || f.meta.Prefix == model.PrefixResolved:
+			continue
+		}
+		oi, ok := open(top)
 		if !ok {
 			continue
 		}
@@ -130,13 +150,17 @@ func (s *routeScan) linkRoutes() *routeLinks {
 			continue
 		}
 		mount := link.RouteMount{Site: -1, Arg: int32(m.arg), Framework: m.fw, Prefix: m.prefix, PrefixKnown: m.known,
-			Override: m.override, Object: -1, Base: c.prefix, BaseKnown: c.known}
+			Override: m.override, Object: -1, Base: c.prefix, BaseKnown: c.known, ASGI: m.asgi, Target: m.target}
 		if c.top != nil {
 			oi, ok := open(c.top)
 			if !ok {
 				continue
 			}
 			mount.Object = oi
+		} else if asgiRoot(c.root) {
+			if oi, ok := open(c.root); ok {
+				mount.RootObject = oi + 1
+			}
 		}
 		rng, err := s.b.rangeOf(m.at.Start, m.at.End)
 		if err != nil {
@@ -253,6 +277,45 @@ func (s *routeScan) recordMount(r *wire.Ref, site *wire.Site, i, arg int, fw str
 	s.pending = append(s.pending, pendingMount{site: i, arg: arg, fw: fw, parent: parent, prefix: prefix, known: known,
 		override: override, at: refSpan(r)})
 }
+
+// recordASGIMount is recordMount for an ASGI mount. A keyword argument,
+// which the worker types by no position, is read as written: a dotted name
+// whose head an import binds names that module's attribute.
+func (s *routeScan) recordASGIMount(r *wire.Ref, site *wire.Site, i, arg int, fw string, parent *routeObj, prefix string,
+	known bool) {
+	n := len(s.pending)
+	s.recordMount(r, site, i, arg, fw, parent, prefix, known, false)
+	if len(s.pending) > n {
+		s.pending[n].asgi = true
+		return
+	}
+	args := s.siteArgs(site)
+	if parent == nil || arg < 0 || arg >= len(args) || args[arg].kw == "" || args[arg].kw == "*" {
+		return
+	}
+	parts := strings.Split(args[arg].text, ".")
+	for _, p := range parts {
+		if !pyName(p) {
+			return
+		}
+	}
+	target, ok := (&inputScan{b: s.b, rs: s}).importedName(parts)
+	if !ok {
+		return
+	}
+	s.pending = append(s.pending, pendingMount{site: -1, arg: -1, fw: fw, parent: parent, prefix: prefix, known: known,
+		asgi: true, target: target, at: refSpan(r)})
+}
+
+// asgiRoot reports an ASGI application root (FastAPI's or Starlette's),
+// which another file may mount under a path.
+func asgiRoot(o *routeObj) bool {
+	return o != nil && o.root && asgiFramework(o.fw)
+}
+
+// asgiFramework reports an ASGI framework: a FastAPI application is a
+// Starlette application, and either mounts the other's objects.
+func asgiFramework(fw string) bool { return fw == fwFastAPI || fw == fwStarlette }
 
 // djangoContainer is a list of Django urlconf entries: the module's
 // `urlpatterns` (top), or a list an entry includes in place

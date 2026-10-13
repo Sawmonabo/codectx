@@ -308,6 +308,9 @@ type routeObj struct {
 	// atts are the places this file attaches the object: mounts on a parent
 	// object, or serving it.
 	atts []routeAttach
+	// bound is one more than the module-level binding that is the object
+	// itself (a Starlette route list), 0 for an object a site builds.
+	bound int
 	// state 1 is being resolved, 2 resolved, with prefix and ok.
 	state  uint8
 	prefix string
