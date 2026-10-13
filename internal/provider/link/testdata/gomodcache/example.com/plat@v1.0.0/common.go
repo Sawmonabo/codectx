@@ -13,3 +13,5 @@ type Grid interface {
 }
 
 type Tag struct{}
+
+type Regs struct{}

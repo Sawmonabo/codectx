@@ -76,7 +76,7 @@ func (b *builder) linkTable() error {
 		return err
 	}
 	t := &link.Table{Path: b.fv.Path, Language: b.lang.Name, Package: b.ex.done.Package, Imports: imports,
-		Supertypes: wl.Supertypes, Conversions: wl.Conversions, Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
+		Supertypes: wl.Supertypes, Conversions: wl.Conversions, Constraint: wl.Constraint, Module: link.Endpoint{Node: b.module.Node.ID, CanonicalKey: b.module.CanonicalKey, Kind: b.module.Node.Kind,
 			Name: b.module.Node.Name, Qualified: b.module.Node.QualifiedName, Range: *b.fileRng}}
 	for i := range b.ex.functions {
 		if b.ex.functions[i].Failed {

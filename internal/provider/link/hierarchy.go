@@ -61,6 +61,9 @@ type hierarchy struct {
 	goSpellings [3]uint32
 	// goMemo remembers Go lookups while the hierarchy is built (goMemo).
 	goMemo goMemos
+	// goConds, while a Go unit's hierarchy is built, interns the build
+	// conditions its method-set records carry (go_build.go).
+	goConds *goConds
 	// members is every member's projection with a table, by FileID
 	// (projection.go).
 	members *pagination.SortedRun[projection]
@@ -97,7 +100,8 @@ func (h *hierarchy) record(note func(TraceKey) error) {
 const (
 	// keyFile + refKey(file, 0): the file's language and path (Aux, joined
 	// by a NUL) and its scopes (Sig, joined by "\n"), the context a name
-	// written in it is read in.
+	// written in it is read in; a Go file's build constraint in Returns
+	// (Table.Constraint).
 	keyFile = "f\x00"
 	// keyImport + refKey(file, 0) + name: the declaration the import is
 	// written in (Ref.Index, -1 the module), the path a name the file's
@@ -163,7 +167,8 @@ const (
 	// namespace and its file's path, joined by a NUL.
 	keyFuncInternal = "ui\x00"
 	// keyMethod + refKey(type) + name: a method or constructor the type
-	// declares, its signature in Sig.
+	// declares, its signature in Sig; for a Go method whose keys are
+	// recorded, its method-set keys in Aux (goMethodKeysAux).
 	keyMethod = "m\x00"
 	// keySub + refKey(type): a declared or satisfied direct subtype.
 	keySub = "d\x00"
@@ -501,6 +506,7 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 		return nil, err
 	}
 	if u.family == FamilyGo {
+		h.goConds = newGoConds(h.goInfo.goVersion)
 		if h.goExt, err = newGoExternal(ctx, h, u); err != nil {
 			return nil, err
 		}
@@ -511,6 +517,7 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 			h.goExt.close()
 			h.goExt = nil
 			h.goMemo = goMemos{}
+			h.goConds = nil
 		}()
 	}
 
@@ -593,7 +600,8 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 	}
 	fc := contextOf(file, t)
 	fileKey := refKey(Ref{File: file})
-	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
+	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n"),
+		Returns: t.Constraint}); err != nil {
 		return err
 	}
 	if err := addCIncludes(s, file, t, fc); err != nil {
@@ -869,23 +877,65 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		counted := false
 		add := func(typ Ref) error {
 			e.Key = keyMethod + refKey(typ) + d.Name
-			if err := links.Add(e); err != nil {
-				return err
-			}
 			if fc.family != "go" {
-				return nil
+				return links.Add(e)
 			}
-			key, spelling, err := goMethodKey(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref)
+			// The method is part of the builds that hold both its file and
+			// the receiver type's declaration (go_build.go).
+			cond, err := h.goFileCond(file)
 			if err != nil {
 				return err
 			}
-			if !counted {
+			declared, err := h.goFileCond(typ.File)
+			if err != nil {
+				return err
+			}
+			cond = h.goConds.and(cond, declared)
+			type keyed struct {
+				key  string
+				cond goCond
+			}
+			var keys []keyed
+			worst := goSpellingExact
+			if h.goConds.holds(cond) {
+				err = h.goMethodKeys(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref,
+					func(key string, spelling goSpelling, keyCond goCond) error {
+						worst = max(worst, spelling)
+						if c := h.goConds.and(cond, keyCond); h.goConds.holds(c) {
+							keys = append(keys, keyed{key, c})
+						}
+						return nil
+					})
+				if err != nil {
+					return err
+				}
+			}
+			// A method of an interface, or one that only some builds hold or
+			// that has a key per build, records its keys (goMethodKeysAux),
+			// so its overrides pair it only with methods of one of them.
+			e.Aux = ""
+			if cond != 0 || len(keys) != 1 || keys[0].cond != 0 || d.Parent >= 0 && t.Decls[d.Parent].Kind == model.NodeInterface {
+				ks := make([]string, len(keys))
+				for i, k := range keys {
+					ks[i] = k.key
+				}
+				e.Aux = goMethodKeysAux(ks)
+			}
+			if err := links.Add(e); err != nil {
+				return err
+			}
+			for _, k := range keys {
+				if err := addGoMethod(methodSets, typ, d.Name, k.key, k.cond, e); err != nil {
+					return err
+				}
+			}
+			if !counted && len(keys) > 0 {
 				// A method is counted once, whatever types its receiver
 				// names.
-				h.goSpellings[spelling]++
+				h.goSpellings[worst]++
 				counted = true
 			}
-			return addGoMethod(methodSets, typ, d.Name, key, e)
+			return nil
 		}
 		// A Java anonymous class body's method is its synthetic type's,
 		// whatever declaration encloses it (an initializer block's is its
@@ -2595,12 +2645,18 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 		switch fc.family {
 		case "go":
 			detail = DetailMethodSet
-			err := h.links.lookup(keySuper+refKey(owner), func(iface entry) error {
+			own, err := h.goOwnKeys(owner, ref, d.Name)
+			if err != nil {
+				return err
+			}
+			err = h.links.lookup(keySuper+refKey(owner), func(iface entry) error {
 				if iface.Aux != "" || iface.Ref == owner {
 					return nil
 				}
 				return h.methods(iface.Ref, d.Name, func(e entry) error {
-					add(e)
+					if goKeysMeet(own, e.Aux) {
+						add(e)
+					}
 					return nil
 				})
 			})
@@ -2674,7 +2730,11 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 			}
 		}
 		if fc.family == "go" {
-			return h.goExternalOverrides(fc, owner, ref, d, emit)
+			own, err := h.goOwnKeys(owner, ref, d.Name)
+			if err != nil {
+				return err
+			}
+			return h.goExternalOverrides(fc, owner, ref, d, own, emit)
 		}
 		return h.externalOverrides(fc, owner, ref, d, len(targets) > 0, emit)
 	})

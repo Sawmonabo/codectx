@@ -102,7 +102,8 @@ func (t goUnitTypes) read(p, name string) (goTypeAnswer, bool, error) {
 			if err != nil {
 				return goTypeAnswer{}, false, err
 			}
-			return goTypeAnswer{found: true, alias: true, form: decls[0].form, names: decls[0].names, others: decls[1:]}, true, nil
+			return goTypeAnswer{found: true, alias: true, form: decls[0].form, names: decls[0].names, cond: decls[0].cond,
+				others: decls[1:]}, true, nil
 		}
 		err = h.decls.lookup(keyType+"go\x00"+scope+"\x00"+name, func(entry) error {
 			answer.found = true
@@ -177,6 +178,11 @@ func (t goUnitTypes) decls(es []entry) ([]goDecl, error) {
 		d := goDecl{form: e.Sig, names: goUnitNames{h: t.h, fc: fc}}
 		if !found {
 			d.form = goIdentityUnknown
+		}
+		if t.h.goConds != nil {
+			if d.cond, err = t.h.goFileCond(e.Ref.File); err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, d)
 	}

@@ -85,21 +85,24 @@ type goNames interface {
 
 // goTypeAnswer is what a package declares under one type name: nothing
 // (found false), a defined type, or an alias of the type whose form is
-// form, written in the file names; others are the alias's further
-// declarations whose forms are written differently (one per platform or
-// build tag), which denote the same type exactly when every one spells it
-// canonically the same.
+// form, written in the file names under the build condition cond; others
+// are the alias's further declarations whose forms are written differently
+// (one per platform or build tag), which denote the same type in every
+// build exactly when every one spells it canonically the same.
 type goTypeAnswer struct {
 	found, alias bool
 	form         string
 	names        goNames
+	cond         goCond
 	others       []goDecl
 }
 
-// goDecl is one declaration's form, written in the file names.
+// goDecl is one declaration's form, written in the file names, whose build
+// condition is cond (0 outside a hierarchy build).
 type goDecl struct {
 	form  string
 	names goNames
+	cond  goCond
 }
 
 // goPackageTypes answers which type a package declares under a name.
@@ -515,7 +518,7 @@ func goGenericAlias(form string) (int, string, bool) {
 // build.
 func goAliasSpelling(ctx context.Context, types goPackageTypes, a goTypeAnswer, args []string, arity, depth int) (string, bool, error) {
 	spelled := ""
-	for i, d := range append([]goDecl{{form: a.form, names: a.names}}, a.others...) {
+	for i, d := range append([]goDecl{{form: a.form, names: a.names, cond: a.cond}}, a.others...) {
 		n, form, generic := goGenericAlias(d.form)
 		if generic != (arity > 0) || n != arity {
 			return "", false, nil

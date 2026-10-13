@@ -298,9 +298,24 @@ from every non-test file, whatever its build constraints, and cached on disk by 
 project's own conditional declarations are, and a type satisfying one implements it. Declarations are compared by
 their canonical spellings, not as written: `type Num = Count` (with `Count = int`) for unix and `type Num = int` for
 windows are one alias of `int`, `const Width = 4` and `2 + 2` one value, `Sum() [16]byte` and `Sum() [Size]byte` (with
-`Size = 16`) one method, and interface declarations that spell one method set are one interface; an alias, constant or
-method whose declarations spell different types or values makes a form naming it unknown, in the project's own
-packages as in packages outside it. A Go type implements an interface
+`Size = 16`) one method, and interface declarations that spell one method set are one interface.
+
+Go method sets are decided per build (`go_build.go`). Every Go file, of the project (the worker sends its leading
+`//go:build` or `// +build` lines) and of the packages outside it, belongs to the builds its constraint and its
+`_GOOS`/`_GOARCH` name admit, by the go command's rules (`internal/gobuild`: the header rule of go/build's
+`parseFileHeader`, the file-name rule of `goodOSArchFile`, the tags of `matchTag` with `unix`, android=>linux,
+illumos=>solaris and ios=>darwin, the toolchain's ports from `go tool dist list`, releases from the module's go line).
+Each method-set record carries the condition of the builds holding it: a method's file and its type's declaration, an
+embedding's path, a promoted member a shallower one hides only where that one exists. A method declared per build is
+each of its signatures under its own condition, and a signature naming an alias or constant declared per build with
+different types or values (`const PtrSize = 4` for 386 and `8` for amd64) is one key per choice of declaration,
+under their conditions. A type implements an interface when some build holds, for every method name, a key of it in
+both: `Regs` with `PC() uint32` in `regs_386.go` and `PC() uint64` in `regs_amd64.go` implements `interface{ PC()
+uint64; SetPC(uint64) }` and never `interface{ PC() uint64; SetPC(uint32) }`, and its `PC` overrides only the
+interface method of its own key. Only the tags a condition names are enumerated; past 16 free tags (custom tags,
+`amd64.v2`-style tool tags, taken as independent) a condition counts as met. Two embedding paths at one depth stay
+ambiguous whatever their conditions (a miss, never a false edge), and a type declared with a different structure per
+build is each of its declarations, as before. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
