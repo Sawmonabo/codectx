@@ -97,7 +97,7 @@ func (x *goExternal) surface() string {
 			for _, t := range append([]*goExtType{pkg.types[n]}, pkg.types[n].variants...) {
 				parts = append(parts, n, strconv.Itoa(t.file), goFilesString(t.also), t.form,
 					flagString(t.alias, t.iface, t.ineligible, t.conflict))
-				for _, ms := range [][]goExtMethod{t.methods, t.embeds} {
+				for _, ms := range [][]goExtMethod{t.methods, t.recv, t.embeds} {
 					parts = append(parts, strconv.Itoa(len(ms)))
 					for _, m := range ms {
 						parts = append(parts, m.name, m.form, strconv.Itoa(m.file), goFilesString(m.also))

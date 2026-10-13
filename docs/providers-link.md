@@ -325,10 +325,14 @@ architecture, compiler, release or feature tag is fixed by the build), and a fea
 holds in no build. No count of tags bounds a decision. The selector rule is applied per build: a name two embedding paths reach at one
 depth (two embedded types, or one embedded type reached twice) promotes nothing in the builds both paths exist in and
 hides the name deeper there, an embedded type declared once per build is one path in each, and a type a shallower depth
-reached in some builds is walked deeper in the others. A type declared with a different structure per
+reached in some builds is walked deeper in the others. "T implements I" means the method set of `*T` (one node per type,
+as an implementation finder that widens T to `*T` reads it), so embedding `C` or `*C` never filters a promoted method;
+the two count as one type reached twice when both are at one depth. A type declared with a different structure per
 build is each of its declarations in the unit; outside it, it is one type in the builds of any of its declarations, each
 declaration's embedded types under that declaration's condition (`unix.PtraceRegs`, declared once per architecture,
-keeps the `PC` of every architecture that declares one). A Go type implements an interface
+keeps the `PC` of every architecture that declares one). A name that is a struct in some builds and an interface in
+others is, embedded, each kind's members in that kind's builds, and each interface declaration is implemented on its
+own. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its

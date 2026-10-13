@@ -135,10 +135,13 @@ type goExtType struct {
 	// also are the other files declaring this same declaration (one per
 	// platform or build tag that writes it alike).
 	also []int
-	// methods are an interface's methods, or a defined type's methods with
-	// each distinctly written signature of a name declared once per
-	// platform or build tag (several entries of that name).
+	// methods are an interface declaration's methods. recv, on a name's
+	// first declaration, are the methods declared with the name as their
+	// receiver's base type, each distinctly written signature of a name
+	// declared once per platform or build tag (several entries of that
+	// name): a defined type's in the builds it is one.
 	methods []goExtMethod
+	recv    []goExtMethod
 	embeds  []goExtMethod
 }
 
@@ -543,7 +546,7 @@ func (p *goExtPackage) addFile(af *ast.File, std bool, constraint string) {
 			}
 			t := p.typeNamed(base)
 			form := goASTSignature(d.Type, params)
-			t.methods = addExtMember(t.methods, goExtMethod{name: d.Name.Name, form: form, file: fi})
+			t.recv = addExtMember(t.recv, goExtMethod{name: d.Name.Name, form: form, file: fi})
 		}
 	}
 }
@@ -728,7 +731,7 @@ func (p *goExtPackage) addType(ts *ast.TypeSpec, fi int) {
 		p.types[ts.Name.Name] = &n
 	case old.file < 0:
 		// Methods read before the declaration: keep them.
-		n.methods = append(n.methods, old.methods...)
+		n.recv = old.recv
 		*old = n
 	case sameExtDecl(old, &n):
 		old.also = append(old.also, fi)
@@ -919,9 +922,15 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 		pkg             *goExtPackage
 		t               *goExtType
 		variant, merged bool
+		// iface marks an interface entity; decls are the declarations
+		// whose members it holds, each under its own condition.
+		iface bool
+		decls []*goExtType
 		// cond is the build condition of the declaration (of any of
-		// them, merged).
-		cond goCond
+		// them, merged), and defined that of the defined type's
+		// declarations, whose receiver methods it holds (none, 1, for
+		// an interface entity or a name some build declares as an alias).
+		cond, defined goCond
 	}
 	var all []named
 	for _, pkg := range x.pkgs {
@@ -933,10 +942,13 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 				continue
 			}
 			q := pkg.path + "." + name
-			if t.conflict && t.iface || t.conflict && t.alias {
+			decls := append([]*goExtType{t}, t.variants...)
+			alias := slices.ContainsFunc(decls, func(d *goExtType) bool { return d.alias })
+			iface := slices.ContainsFunc(decls, func(d *goExtType) bool { return d.iface })
+			if t.conflict && (iface || alias) {
 				var seen []string
 				var distinct []named
-				for i, d := range append([]*goExtType{t}, t.variants...) {
+				for i, d := range decls {
 					if !d.iface || d.alias {
 						continue
 					}
@@ -947,20 +959,47 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 					if !spelled || !slices.Contains(seen, set) {
 						seen = append(seen, set)
 						distinct = append(distinct, named{q: q, key: q + "\x00" + itoaInt(i), pkg: pkg, t: d, variant: true,
-							cond: x.declCond(pkg, d)})
+							iface: true, decls: []*goExtType{d}, cond: x.declCond(pkg, d), defined: goCondNone})
 					}
 				}
-				if len(distinct) == 1 && !slices.ContainsFunc(t.variants, func(v *goExtType) bool { return v.alias || !v.iface }) && !t.alias {
+				if len(distinct) == 1 && !slices.ContainsFunc(decls, func(d *goExtType) bool { return d.alias || !d.iface }) {
 					distinct[0].key, distinct[0].variant, distinct[0].merged = q, false, true
 					for _, v := range t.variants {
 						distinct[0].cond = x.h.goConds.or(distinct[0].cond, x.declCond(pkg, v))
 					}
 				}
 				all = append(all, distinct...)
+				if !slices.ContainsFunc(decls, func(d *goExtType) bool { return !d.iface && !d.alias }) {
+					continue
+				}
+				// A name that is a defined type in some builds and an
+				// interface in others is, under q, the type a use of it
+				// names in each build: the defined type's receiver methods
+				// and embedded types in the builds of its declarations,
+				// the interface's methods and embedded interfaces in those
+				// of each interface declaration. Each interface
+				// declaration is also an entity of its own, which types
+				// implement. A name some build declares as an alias has no
+				// one method set: only its embedded types stay.
+				cond, defined := goCondNone, goCondNone
+				var held []*goExtType
+				for _, d := range decls {
+					if d.alias {
+						continue
+					}
+					cond = x.h.goConds.or(cond, x.declCond(pkg, d))
+					if !d.iface {
+						defined = x.h.goConds.or(defined, x.declCond(pkg, d))
+					}
+					held = append(held, d)
+				}
+				if alias {
+					defined = goCondNone
+				}
+				all = append(all, named{q: q, key: q, pkg: pkg, t: t, decls: held, cond: cond, defined: defined})
 				continue
 			}
-			decls := append([]*goExtType{t}, t.variants...)
-			if t.alias || !t.iface && len(t.methods) == 0 && !slices.ContainsFunc(decls, func(d *goExtType) bool { return len(d.embeds) > 0 }) {
+			if t.alias || !t.iface && len(t.recv) == 0 && !slices.ContainsFunc(decls, func(d *goExtType) bool { return len(d.embeds) > 0 }) {
 				continue
 			}
 			// A defined type declared with a different structure per build
@@ -970,7 +1009,11 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 			for _, d := range decls {
 				cond = x.h.goConds.or(cond, x.declCond(pkg, d))
 			}
-			all = append(all, named{q: q, key: q, pkg: pkg, t: t, cond: cond})
+			n := named{q: q, key: q, pkg: pkg, t: t, iface: t.iface, decls: decls, cond: cond, defined: cond}
+			if t.iface {
+				n.decls, n.defined = []*goExtType{t}, goCondNone
+			}
+			all = append(all, n)
 		}
 	}
 	slices.SortFunc(all, func(a, b named) int { return strings.Compare(a.key, b.key) })
@@ -986,15 +1029,9 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 	byName := map[string]named{}
 	for _, n := range all {
 		byName[n.key] = n
-		decls := []*goExtType{n.t}
-		for _, v := range n.t.variants {
-			if !n.t.iface && !v.iface && !v.alias {
-				decls = append(decls, v)
-			}
-		}
-		for _, d := range decls {
+		for _, d := range n.decls {
 			cond := n.cond
-			if !n.t.iface {
+			if len(n.decls) > 1 {
 				cond = x.declCond(n.pkg, d)
 			}
 			for _, e := range d.embeds {
@@ -1013,7 +1050,7 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 			return ok
 		}
 		n, found := byName[key]
-		if !found || !n.t.iface || n.t.ineligible || n.t.conflict && !n.variant && !n.merged || depth > goAliasDepth {
+		if !found || !n.iface || n.t.ineligible || n.t.conflict && !n.variant && !n.merged || depth > goAliasDepth {
 			return false
 		}
 		eligible[key] = false
@@ -1045,7 +1082,7 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 		}
 	}
 	for _, n := range all {
-		if n.t.iface && !check(n.key, 0) {
+		if n.iface && !check(n.key, 0) {
 			continue
 		}
 		ref(n.key, n.q)
@@ -1056,26 +1093,43 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 			continue
 		}
 		e := entry{Key: refKey(r), Tag: goTypeRecord, Aux: n.q}
-		if n.t.iface {
+		if n.iface {
 			e.Flags = flagAbstract
 		}
 		if err := methodSets.Add(e); err != nil {
 			return err
 		}
-		// A defined type declared as an alias or an interface in another
-		// file has no one method set; its embedded types stay. Its methods
-		// attach by receiver name, so a type declared per build with
-		// different structures has them in the builds of any declaration.
-		if n.t.iface || !slices.ContainsFunc(n.t.variants, func(v *goExtType) bool { return v.alias || v.iface }) {
-			keys, err := x.methodKeys(ctx, n.pkg, n.t, r, n.cond)
+		// A defined type's methods attach by receiver name, so a type
+		// declared per build with different structures has them in the
+		// builds of any of its declarations; a defined type declared as an
+		// alias in another file has no one method set (defined none).
+		// An interface declaration's are its own, under its condition.
+		var keys []goKeyed
+		if n.defined != goCondNone {
+			ks, err := x.methodKeys(ctx, n.pkg, n.t.recv, true, r, n.defined)
 			if err != nil {
 				return err
 			}
-			for _, m := range keys {
-				err := methodSets.Add(entry{Key: refKey(r), Tag: goMethodRecord, Ref: r, Aux: m.name, Returns: m.key, MaxArgs: m.cond})
-				if err != nil {
-					return err
-				}
+			keys = append(keys, ks...)
+		}
+		for _, d := range n.decls {
+			if !d.iface {
+				continue
+			}
+			cond := n.cond
+			if len(n.decls) > 1 {
+				cond = x.declCond(n.pkg, d)
+			}
+			ks, err := x.methodKeys(ctx, n.pkg, d.methods, false, r, cond)
+			if err != nil {
+				return err
+			}
+			keys = append(keys, ks...)
+		}
+		for _, m := range keys {
+			err := methodSets.Add(entry{Key: refKey(r), Tag: goMethodRecord, Ref: r, Aux: m.name, Returns: m.key, MaxArgs: m.cond})
+			if err != nil {
+				return err
 			}
 		}
 		for _, e := range embeds[n.key] {
@@ -1089,24 +1143,25 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 	return nil
 }
 
-// methodKeys are the method-set keys (goMethodKeys) of t's methods at r,
-// in declaration order, each with the build condition of the builds it is
-// part of: the declaration's, cond, and for a defined type's method its own
+// methodKeys are the method-set keys (goMethodKeys) of methods, a defined
+// type's receiver methods or an interface declaration's methods, at r, in
+// declaration order, each with the build condition of the builds it is part
+// of: the declaration's, cond, and for a defined type's method its own
 // file's. A method declared once per platform or build tag is each of its
 // keys under the conditions of the declarations that spell it, and a key no
 // build holds is dropped.
-func (x *goExternal) methodKeys(ctx context.Context, pkg *goExtPackage, t *goExtType, r Ref, cond goCond) ([]goKeyed, error) {
+func (x *goExternal) methodKeys(ctx context.Context, pkg *goExtPackage, methods []goExtMethod, defined bool, r Ref, cond goCond) ([]goKeyed, error) {
 	c := x.h.goConds
-	out := make([]goKeyed, 0, len(t.methods))
+	out := make([]goKeyed, 0, len(methods))
 	// at indexes out by name and key once a type has more methods than a
 	// scan of out costs less than a map's upkeep.
 	var at map[[2]string]int
-	if len(t.methods) > 32 {
-		at = make(map[[2]string]int, len(t.methods))
+	if len(methods) > 32 {
+		at = make(map[[2]string]int, len(methods))
 	}
-	for _, m := range t.methods {
+	for _, m := range methods {
 		base := cond
-		if !t.iface {
+		if defined {
 			base = c.and(cond, x.memberCond(pkg, m))
 			if !c.holds(base) {
 				continue

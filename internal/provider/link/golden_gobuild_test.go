@@ -336,6 +336,47 @@ type I interface{ M() } // @ii
 		fails: "one type reached along two embedding paths at one depth taken as one path",
 	},
 	{
+		name:   "external-name-struct-in-some-builds-interface-in-others",
+		anchor: "go/build, \"Build Constraints\" (_GOARCH file names); The Go Programming Language Specification, \"Struct types\" (promoted methods), \"Interface types\", \"Method sets\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire example.com/arch v1.0.0\n",
+			"t.go": `package p
+
+import "example.com/arch"
+
+type ES struct{ arch.Shape } // @tes
+
+type Q struct{} // @tq
+
+func (Q) Area() int { return 0 } // @qarea
+
+type Sizer interface{ Size() int } // @isizer
+
+type Wider interface{ Wide() } // @iwider
+
+type Arear interface{ Area() int } // @iarear
+`,
+		},
+		// Checked with go vet per GOARCH: arch.Shape is an interface (Area) on 386 and a struct embedding Hi
+		// (Wide) with a method Size on amd64. So ES implements Sizer and Wider (amd64) and Arear and
+		// arch.Shape (386, its embedded interface promoting Area); Q implements arch.Shape and Arear (386).
+		want: []string{},
+		facts: []string{
+			"tes ES implements isizer Sizer",
+			"tes ES implements iwider Wider",
+			"tes ES implements iarear Arear",
+			"tes ES implements external example.com/arch.Shape",
+			"tq Q implements iarear Arear",
+			"tq Q implements external example.com/arch.Shape",
+			"qarea Area overrides iarear Area",
+			"qarea Area overrides external example.com/arch.Shape.Area",
+		},
+		// Mutation: a name that is a struct in some builds and an interface in others read as its interface
+		// declarations alone -> ES implements neither Sizer nor Wider. Mutation: the receiver's methods read
+		// as the interface's -> arch.Shape needs Size and Q implements no arch.Shape.
+		fails: "a type outside the unit that is a struct in some builds and an interface in others losing either kind's members",
+	},
+	{
 		name:   "many-free-tags-decided-exactly",
 		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\"",
 		files:  manyTagsFiles(),

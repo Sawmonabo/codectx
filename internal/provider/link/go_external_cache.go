@@ -25,7 +25,7 @@ import (
 
 // goDeclarationsFormat names the encoding of a cache entry, so an entry
 // written in another encoding is never decoded as this one.
-const goDeclarationsFormat = "go-declarations\x00name files(constraint imports dot unnamed) types(name file also alias form iface ineligible conflict methods embeds variants) consts(name form file also) members(each-declaring-file) forms(struct interface array-constant generic-alias) declarations(each-distinct-method each-distinct-const)"
+const goDeclarationsFormat = "go-declarations\x00name files(constraint imports dot unnamed) types(name file also alias form iface ineligible conflict methods receiver-methods embeds variants) consts(name form file also) members(each-declaring-file) forms(struct interface array-constant generic-alias) declarations(each-distinct-method each-distinct-const)"
 
 type goDeclPackage struct {
 	Name   string
@@ -47,7 +47,7 @@ type goDeclType struct {
 	Also                               []int
 	Alias, Iface, Ineligible, Conflict bool
 	Form                               string
-	Methods, Embeds                    []goDeclMethod
+	Methods, Recv, Embeds              []goDeclMethod
 	Variants                           []goDeclType
 }
 
@@ -119,7 +119,7 @@ func readGoDecls(id, p string) (*goExtPackage, bool) {
 			return nil, false
 		}
 		et := &goExtType{file: t.File, also: t.Also, alias: t.Alias, form: t.Form, iface: t.Iface,
-			ineligible: t.Ineligible, conflict: t.Conflict, methods: methods(t.Methods), embeds: methods(t.Embeds)}
+			ineligible: t.Ineligible, conflict: t.Conflict, methods: methods(t.Methods), recv: methods(t.Recv), embeds: methods(t.Embeds)}
 		for _, v := range t.Variants {
 			ev, ok := decode(v)
 			if !ok {
@@ -165,7 +165,7 @@ func writeGoDecls(id string, pkg *goExtPackage) {
 	var encode func(name string, t *goExtType) goDeclType
 	encode = func(name string, t *goExtType) goDeclType {
 		dt := goDeclType{Name: name, File: t.file, Also: t.also, Alias: t.alias, Form: t.form, Iface: t.iface,
-			Ineligible: t.ineligible, Conflict: t.conflict, Methods: methods(t.methods), Embeds: methods(t.embeds)}
+			Ineligible: t.ineligible, Conflict: t.conflict, Methods: methods(t.methods), Recv: methods(t.recv), Embeds: methods(t.embeds)}
 		for _, v := range t.variants {
 			dt.Variants = append(dt.Variants, encode(name, v))
 		}
