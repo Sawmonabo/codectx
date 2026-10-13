@@ -103,8 +103,9 @@ func (h *hierarchy) javaMainAlong(typ Ref, noArgs *Ref, onPath map[Ref]bool, yie
 // itself (its file, the descriptor `main` and the class's qualified name as
 // its disambiguator, or its range when either is over its bound), so the
 // endpoint is one node whichever provider decides it. It is located at the
-// class, defined by the file's module and routed to each method, with the
-// set size when several candidates hold.
+// class, carries the structural provider's search document, is defined by
+// the file's module and routed to each method, with the set size when
+// several candidates hold.
 func (f *filePublication) javaMain(d *Decl, group []idBinding) error {
 	var set int64
 	for _, b := range group {
@@ -128,6 +129,7 @@ func (f *filePublication) javaMain(d *Decl, group []idBinding) error {
 	if err != nil {
 		return err
 	}
+	f.endpointDocument(n, "main", "main", d.Range, model.EndpointMetadata{})
 	f.node(occurrenceOf(f.fv, f.t, f.t.Module))
 	f.relation(f.t.Module.Node, model.RelDefines, n, located(d.Range), "", "", "", 0)
 	for _, b := range group {
