@@ -792,7 +792,9 @@ func (s *routeScan) handlerAt(a routeArg) []handler {
 		// Any other call builds the handler: the request runs what the
 		// function it calls returns, so the endpoint routes to it.
 		if r, ok := s.nameRef(callee.text, callee.at); ok {
-			return []handler{refHandler(r)}
+			h := refHandler(r)
+			h.built = true
+			return []handler{h}
 		}
 	}
 	return nil

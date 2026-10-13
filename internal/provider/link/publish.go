@@ -427,6 +427,18 @@ func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pa
 		if err := past(4, 1); err != nil {
 			return err
 		}
+		for in(5) && cur.Site < int32(len(t.Inputs)) {
+			i := cur.Site
+			if err := groupOf(5, i); err != nil {
+				return err
+			}
+			if err := f.inputs(&t.Inputs[i], group); err != nil {
+				return err
+			}
+		}
+		if err := past(5, len(t.Inputs)); err != nil {
+			return err
+		}
 		rec.Counts = f.counts
 		if err := p.put(f.nodes, f.rels); err != nil {
 			return err

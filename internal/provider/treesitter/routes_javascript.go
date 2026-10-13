@@ -105,18 +105,30 @@ func (s *routeScan) expressRoute(r *wire.Ref, site *wire.Site, i int) {
 		}
 		ref := s.siteRef(chain)
 		obj := s.objOf(chained.Receiver)
+		n := len(s.out)
 		for _, route := range s.expressPaths(cargs[0]) {
 			if obj == nil && !route.literal {
 				continue
 			}
 			s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(args[len(args)-1]), refQualifier(ref))
 		}
+		if len(s.out) > n {
+			s.expressMiddleware(site, args, 0)
+		}
 		return
+	}
+	obj := s.objOf(site.Receiver)
+	if r.Name == "use" {
+		// Every function `use` passes is middleware (Express reads a
+		// first argument that is no function as the path), on an object
+		// this file builds or at a literal path.
+		if _, path := stringLiteral(s.b.lang.Name, args[0].text); obj != nil || path {
+			s.expressMiddleware(site, args, 0)
+		}
 	}
 	if len(args) < 2 {
 		return
 	}
-	obj := s.objOf(site.Receiver)
 	last := args[len(args)-1]
 	if r.Name == "use" {
 		// `use` mounts a router or an application when it passes one, and
@@ -129,11 +141,16 @@ func (s *routeScan) expressRoute(r *wire.Ref, site *wire.Site, i int) {
 			return
 		}
 	}
+	n := len(s.out)
 	for _, route := range s.expressPaths(args[0]) {
 		if !route.literal && (obj == nil || r.Name == "use") {
 			continue
 		}
 		s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(last), r.Qualifier)
+	}
+	if r.Name != "use" && len(s.out) > n {
+		// The functions before the handler are the route's middleware.
+		s.expressMiddleware(site, args, 1)
 	}
 }
 
@@ -181,4 +198,40 @@ func refQualifier(r *wire.Ref) string {
 		return ""
 	}
 	return r.Qualifier
+}
+
+// expressMiddleware records as middleware each function a call passes from
+// argument position from on: a function literal, a name or a wrapper call
+// handlerAt reads, an array literal's elements each (Express flattens
+// arrays of handlers); a router, an application or an imported module is
+// mounted, not run as middleware.
+func (s *routeScan) expressMiddleware(site *wire.Site, args []routeArg, from int) {
+	for k := from; k < len(args); k++ {
+		if s.objOf(argType(site, k)) != nil || argType(site, k).Kind == wire.TypeModule {
+			continue
+		}
+		for _, a := range argItems(args[k]) {
+			s.b.middleware = append(s.b.middleware, s.handlerAt(a)...)
+		}
+	}
+}
+
+// argItems are the elements of an array literal argument, each with its
+// span, or the argument alone when it is not one.
+func argItems(a routeArg) []routeArg {
+	text := a.text
+	if len(text) < 2 || text[0] != '[' || text[len(text)-1] != ']' || uint32(len(text)) != a.at.End-a.at.Start {
+		return []routeArg{a}
+	}
+	var out []routeArg
+	off := 1
+	for _, e := range splitTop(text[1 : len(text)-1]) {
+		lead := len(e) - len(strings.TrimLeft(e, " \t\n\r"))
+		if v := strings.TrimSpace(e); v != "" {
+			start := a.at.Start + uint32(off+lead)
+			out = append(out, routeArg{at: wire.Span{Start: start, End: start + uint32(len(v))}, text: v})
+		}
+		off += len(e) + 1
+	}
+	return out
 }

@@ -111,6 +111,14 @@ const (
 // its list, because a binding names a declaration and a site by index into
 // the table: an inserted declaration changes the hashes of those after it.
 func (t *Table) Interface() ([]SummaryEntry, error) {
+	// The argument each mount passes is read from t itself: the copy
+	// clears the site indices that locate it.
+	args := make([]*wire.Type, len(t.Routing.Mounts))
+	for i := range t.Routing.Mounts {
+		if a, ok := mountArgument(t, &t.Routing.Mounts[i]); ok {
+			args[i] = &a
+		}
+	}
 	t = t.positionless()
 	var out []SummaryEntry
 	var err error
@@ -154,19 +162,17 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		}
 		add(EntryInferred, caller, i, v)
 	}
-	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings) > 0 {
+	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings)+len(t.Inputs)+len(t.Classes) > 0 || t.ArgumentResolvers {
 		// The argument each mount passes is read with the routing
-		// (mountKey), though it is written in a site.
-		args := make([]*wire.Type, len(r.Mounts))
-		for i := range r.Mounts {
-			if a, ok := mountArgument(t, &r.Mounts[i]); ok {
-				args[i] = &a
-			}
-		}
+		// (mountKey), though it is written in a site; the pending inputs
+		// and the classes are read with it (route_input.go).
 		add(EntryRouting, "", 0, struct {
 			Routing
 			Arguments []*wire.Type
-		}{r, args})
+			Inputs    []PendingInput
+			Classes   []ClassKind
+			Resolvers bool
+		}{r, args, t.Inputs, t.Classes, t.ArgumentResolvers})
 	}
 	if err != nil {
 		return nil, err
@@ -224,7 +230,7 @@ func (t *Table) SitesDigest() (string, error) {
 // key (which spells a range) of its module, imports, declarations, their
 // returns and parameters, sites, their callee offsets, arguments, the
 // variables those read and the results they write, values, handlers,
-// dynamic imports and routing mounts, and each Java anonymous body's name
+// dynamic imports, routing mounts and pending inputs, and each Java anonymous body's name
 // (javaAnonymous). Both summaries read t through it, so an edit that only
 // moves code changes neither, and a field added to the table with a range
 // in it is cleared here once for both.
@@ -276,6 +282,10 @@ func (t *Table) positionless() *Table {
 		c.DynamicImports[i].Range = model.SourceRange{}
 	}
 	c.Routing = t.Routing.summary()
+	c.Inputs = slices.Clone(t.Inputs)
+	for i := range c.Inputs {
+		c.Inputs[i].Range = model.SourceRange{}
+	}
 	if anon.decl != nil || anon.rank != nil {
 		c.eachTypeName(func(s *string) { *s = anon.stable(*s) })
 	}

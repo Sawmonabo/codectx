@@ -306,6 +306,47 @@ settings module republishes the endpoints that reach it, and the routing is part
 change to it rebuilds the index. Not walked: JavaScript and Go mounts across files, a Starlette `Mount` across files,
 and an application mounted as a child of another (`app.mount("/sub", sub_app)` with `sub_app` in another file).
 
+## Request inputs across files
+
+A request-input read whose source another file decides is published by the linker
+(`internal/provider/link/route_input.go`). The structural provider records it in the file's link table as a pending
+input (`Table.Inputs`): a FastAPI handler parameter typed by a class the file imports (`user: schemas.User`,
+`item: Item | None` after `from .schemas import Item`), or by a class of the file whose bases it imports, with the
+parameter, its range, its owner and whether the route writes its name. Each Python file also records, for every
+module-level class whose name is unique in the file, what the class says by itself (`Table.Classes`): a body for a
+dataclass, a Pydantic model, a `TypedDict` or a `NamedTuple`; the request for FastAPI's and Starlette's `Request`,
+`WebSocket` and `HTTPConnection`; a file for `UploadFile`; a special type for a `*Response`, `BackgroundTasks` or
+`SecurityScopes`; nothing for `Enum`, `Generic`, `Protocol`, `ABC`, `object` and the builtin scalars; and the bases it
+imports from other modules, which decide the rest. A class with a base the file cannot read is not recorded.
+
+The classes are indexed under each dotted name their file can be imported as (`keyPyClass`). For each pending input
+the linker looks the class up as an import's lookup does (the nearest source root), follows its imported bases
+through further files, a class already on the walk's way ending it, and decides the source by FastAPI's own rule
+(`fastapi/dependencies/utils.py` `analyze_param`): a name the route writes is a path read unless the class is a
+special type; else a body for a model or a dataclass, a file for an `UploadFile`, a query for any other class. A
+request subclass, a special type, a class no member declares, several declarations that disagree and bases of
+different kinds publish nothing. The read is one `variable` node in the file's scope, keyed
+`input:<owner's qualified name>#<parameter>`, located at the parameter, with the `input` metadata the structural
+provider's reads carry (key the parameter's name), and its owner `reads` it (detail `request_input`). The pending
+inputs and the classes are part of the interface summary beside the routing, and every class lookup is traced on the
+handler's file, so an edit to a model or to a base of it in another file re-resolves the parameters it types.
+
+A Spring handler parameter that no binding annotation marks and that no resolver Spring runs before the project's own
+decides is a pending input under the rule `spring` (`internal/provider/link/route_input_spring.go`). Spring resolves
+it with the project's own argument resolvers before its catch-all (`RequestMappingHandlerAdapter`
+`getDefaultArgumentResolvers`), and those are code no table answers, so the linker publishes only in a unit where no
+Java file names an argument resolver: every API a project registers one through names one in its types
+(`WebMvcConfigurer.addArgumentResolvers(List<HandlerMethodArgumentResolver>)`, the adapter's setters). Each such file
+is indexed under `keyJavaResolvers`. Each Java type's kind is indexed under `keyJavaKind`: an enum is a simple value
+type, a concrete class a model attribute, an interface, an annotation type and an abstract class nothing. The
+catch-all binds a simple value type (`BeanUtils.isSimpleProperty`: the primitives and their wrappers, `String` and
+`CharSequence`, `Number`, `Class`, the dates and `Temporal` types, `UUID`, `URI`, `URL`, `File`, `Path`, `Charset`,
+`Currency`, `InetAddress`, `Pattern`, enums, and arrays of them) as `@RequestParam`, a combined read keyed by the
+parameter's name, and any other class as `@ModelAttribute`, a combined read with no key. A simple type the handler's
+file decides is resolved there; any other type is looked up as the hierarchy reads a type name, and a type no member
+declares (a library may resolve its own), or declarations that disagree, publish nothing. Both lookups are traced, so
+adding a resolver, or an edit that turns an enum into a class or makes a class abstract, re-resolves the handlers.
+
 ## Declared entry points
 
 The code a project's manifest declares as its entry points is an `endpoint` of the file it resolves to (ADR-0017
