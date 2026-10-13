@@ -849,7 +849,11 @@ const (
 	// MarkMayDispatch is an override of a callee that a virtual call into the
 	// callee may run instead.
 	MarkMayDispatch MarkKind = "may_dispatch"
-	// MarkValueSet is one target of a site bound to several, shown "1 of n".
+	// MarkValueSet is one target of a site bound to several, or to the
+	// values the project's own code gives it (the functions whose address it
+	// takes, the function values that reach it), shown "1 of n": a value
+	// from outside the project may hold another, so even 1 of 1 is not a
+	// direct call.
 	MarkValueSet MarkKind = "value_set"
 	// MarkNameOnly is a `may_call` candidate: same name and shape, no analysis
 	// bound it.
@@ -916,8 +920,8 @@ func (m GraphRowMark) Validate() error {
 	if (m.Kind == MarkValueSet) != (m.SetSize != 0) {
 		return invalid("graph_row_mark.set_size is set exactly on a %s mark", MarkValueSet)
 	}
-	if m.Kind == MarkValueSet && m.SetSize < 2 {
-		return invalid("graph_row_mark.set_size is %d; a several-target site has at least 2", m.SetSize)
+	if m.Kind == MarkValueSet && m.SetSize < 1 {
+		return invalid("graph_row_mark.set_size is %d; a value set has at least 1", m.SetSize)
 	}
 	if err := boundPage("graph_row_mark.occurrences", len(m.Occurrences)); err != nil {
 		return err

@@ -49,7 +49,7 @@ import (
 //     value and names no type at all, every function written to the field
 //     it calls (DetailField);
 //   - an indirect site binds every function its called value holds
-//     (DetailFlow, or DetailField when the value is a field's);
+//     (DetailFunctionValue, or DetailField when the value is a field's);
 //   - a computed site (Site.Computed) binds nothing.
 //
 // Every other binding is exact: a bare name's declaration, a construction's
@@ -148,7 +148,7 @@ func (t *types) functions(site Ref, yield func(target Ref, detail string, receiv
 		}
 		switch r.Role {
 		case roleCalled:
-			return yield(r.X.Ref, DetailFlow, r.X.Kind == valUnbound)
+			return yield(r.X.Ref, DetailFunctionValue, r.X.Kind == valUnbound)
 		case roleField:
 			return yield(r.X.Ref, DetailField, r.X.Kind == valUnbound)
 		}
@@ -308,10 +308,12 @@ type recv struct {
 const (
 	rankDirect byte = iota
 	rankFlow
+	rankValue
 	rankField
 )
 
-var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankField: DetailField}
+var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankValue: DetailFunctionValue,
+	rankField: DetailField}
 
 // binding is one target found for a site. Flow reports that the site's
 // arguments and result connect to the target's parameters and returns (a
@@ -1522,7 +1524,7 @@ func (in *inference) receive(r *round, v recv) error {
 			return r.constructs.Add(construct{Class: v.X.Ref, Ctor: "__init__", Call: c})
 		}
 		if v.X.Kind == valFunction || v.X.Kind == valUnbound {
-			rank := rankFlow
+			rank := rankValue
 			if v.Role == roleField {
 				rank = rankField
 			}

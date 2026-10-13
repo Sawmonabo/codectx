@@ -63,7 +63,7 @@ const stateTag = "link.resolution.nodes\n"
 // site), is last. The visibility details and supertype_anonymous come just
 // before it: none of their facts folds with a fact of another technique, so
 // their place orders nothing.
-var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
+var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailFunctionValue, DetailField,
 	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
 	DetailSummary, DetailReturn, DetailSupertypeCandidate, DetailMacroInput, DetailMacroTranscribes,
 	DetailVisibilityDefault, DetailVisibilityHidden, DetailVisibilityProtected, DetailVisibilityInternal,

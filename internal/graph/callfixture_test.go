@@ -23,6 +23,7 @@ type fixtureOccurrence struct {
 	Bytes    [2]uint64      `json:"bytes"`
 	Dispatch model.Dispatch `json:"dispatch"`
 	SetSize  int64          `json:"set_size"`
+	Detail   string         `json:"detail"`
 }
 
 type fixtureFact struct {
@@ -149,7 +150,7 @@ func newCallFixture(scenario string, sc fixtureScenario) *callFixture {
 				ID:         model.EvidenceID(fixtureID(string(id) + "/" + string(rune('a'+i)))[:model.EvidenceIDHexLen]),
 				RelationID: id, Precision: model.PrecisionStaticAnalysis,
 				FileID: file(r.From), Bytes: &model.ByteRange{Start: o.Bytes[0], End: o.Bytes[1]},
-				Dispatch: o.Dispatch, SetSize: o.SetSize,
+				Dispatch: o.Dispatch, SetSize: o.SetSize, Detail: o.Detail,
 			}
 			f.evidence[id] = append(f.evidence[id], ev)
 		}
@@ -322,7 +323,7 @@ func (g *locatedGraph) RelationOccurrences(ctx context.Context, rel model.Relati
 			continue
 		}
 		out = append(out, model.RelationOccurrence{RelationID: rel, EvidenceID: ev.ID, FileID: ev.FileID,
-			Bytes: *ev.Bytes, Dispatch: ev.Dispatch, SetSize: ev.SetSize})
+			Bytes: *ev.Bytes, Dispatch: ev.Dispatch, SetSize: ev.SetSize, Detail: ev.Detail})
 	}
 	var next model.EvidenceID
 	if len(page) == limit {
@@ -344,6 +345,7 @@ func (g *locatedGraph) RelationDispatch(ctx context.Context, rels []model.Relati
 				out[i].Virtual = true
 			}
 			out[i].SetSize = max(out[i].SetSize, ev.SetSize)
+			out[i].ValueBound = out[i].ValueBound || valueBound(ev.Detail)
 		}
 	}
 	return out, nil

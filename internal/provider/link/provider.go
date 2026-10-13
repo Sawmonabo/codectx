@@ -78,13 +78,17 @@ const (
 	DetailHierarchy = "hierarchy"
 	// DetailAddressTaken: an indirect site joined to an address-taken
 	// function of the same signature.
-	DetailAddressTaken = "address_taken"
+	DetailAddressTaken = graph.CallDetailAddressTaken
 	// DetailFlow: the receiver's type was recovered by flow-based type
 	// inference through assignments, parameters and returns.
 	DetailFlow = "flow"
+	// DetailFunctionValue: the function values that reach the value the
+	// site calls, through assignments, parameters, returns and fields
+	// (flow-based value inference).
+	DetailFunctionValue = graph.CallDetailFunctionValue
 	// DetailField: field-based resolution, a function written to the field
 	// the site calls through.
-	DetailField = "field"
+	DetailField = graph.CallDetailField
 	// DetailImport: an `imports` from a file's module to the module of a
 	// file its import resolves to.
 	DetailImport = "import"

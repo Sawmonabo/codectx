@@ -56,7 +56,9 @@ func (p *callPage) drop(ids map[model.RelationID]bool) {
 // occurrences -- its exact ones (a `super` call, a qualified call) can never
 // run the override, so they are dropped from the answer's occurrences too; a
 // descended override is a method the call may dispatch to; a call whose site
-// was bound to several targets is one of n. Every mark is a possibility
+// was bound to several targets, or bound through the values the project
+// gives it (a function pointer, a function value, a field: RelationDispatch.
+// ValueBound), is one of n, n >= 1. Every mark is a possibility
 // (model.GraphRowMark). It returns the marks and the answer's occurrences.
 func (e *Engine) marks(ctx context.Context, p *callPage, occurrences []model.RelationOccurrence,
 	counts *model.GraphCounts) ([]model.GraphRowMark, []model.RelationOccurrence, error) {
@@ -102,16 +104,19 @@ func (e *Engine) marks(ctx context.Context, p *callPage, occurrences []model.Rel
 		return nil, nil, err
 	}
 	for _, id := range p.calls {
-		if n := sets[id]; n >= 2 {
-			out = append(out, model.GraphRowMark{RelationID: id, Kind: model.MarkValueSet, SetSize: n, Possible: true})
+		if s := sets[id]; s.SetSize >= 2 || s.ValueBound {
+			out = append(out, model.GraphRowMark{RelationID: id, Kind: model.MarkValueSet, SetSize: max(s.SetSize, 1),
+				Possible: true})
 		}
 	}
 	return out, kept, nil
 }
 
-// setSizes reads the largest set size of each relation's occurrences.
-func (e *Engine) setSizes(ctx context.Context, rels []model.RelationID) (map[model.RelationID]int64, error) {
-	out := map[model.RelationID]int64{}
+// setSizes reads the dispatch summary of each relation's occurrences: the
+// largest set size, and whether a technique bound one through the values
+// the project gives its site.
+func (e *Engine) setSizes(ctx context.Context, rels []model.RelationID) (map[model.RelationID]RelationDispatch, error) {
+	out := map[model.RelationID]RelationDispatch{}
 	dr := e.dispatchReader()
 	if dr == nil || len(rels) == 0 {
 		return out, nil
@@ -125,7 +130,7 @@ func (e *Engine) setSizes(ctx context.Context, rels []model.RelationID) (map[mod
 			return nil, internalErr("graph: the reader summarized a different number of relations than it was given")
 		}
 		for i, id := range chunk {
-			out[id] = sums[i].SetSize
+			out[id] = sums[i]
 		}
 	}
 	return out, nil

@@ -846,7 +846,8 @@ func markText(m model.GraphRowMark) string {
 	case model.MarkMayDispatch:
 		return "may dispatch to this override: it may not run"
 	case model.MarkValueSet:
-		return fmt.Sprintf("1 of %d targets bound at the site", m.SetSize)
+		return fmt.Sprintf("1 of %d targets the project's own values give the site: a value from outside it may run another",
+			m.SetSize)
 	case model.MarkNameOnly:
 		return "matched by name only: no analysis bound this call, and it may not run"
 	}
