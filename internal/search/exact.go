@@ -171,12 +171,7 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 	if len(kinds) == 0 {
 		return kind.Symbol()
 	}
-	for _, k := range kinds {
-		if kind == k {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(kinds, kind)
 }
 
 // tierSpan is the inclusive range of exact-tier ranks one walk covers.
