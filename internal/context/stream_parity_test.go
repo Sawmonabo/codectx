@@ -1274,7 +1274,7 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	}
 	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
 		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
-	return packed, scopeComplete, c.manifestNotices(scoped.scopeResult, partsOf(packed)), stored, nil
+	return packed, scopeComplete, c.withPageNotice(planNotices(scoped.scopeResult, partsOf(packed))), stored, nil
 }
 
 // parityRequests are the requests the parity proof compiles through both

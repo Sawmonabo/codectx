@@ -102,7 +102,7 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 	snapRaw, _ := model.DecodeID(string(m.Binding.SnapshotID))
 	keyRaw, _ := model.DecodeID(string(m.Binding.AnalysisKey))
 	header, err := json.Marshal(manifestHeader{Completeness: m.Completeness, ScopeComplete: m.ScopeComplete,
-		EstimateMethod: m.EstimateMethod, Budget: m.Budget})
+		EstimateMethod: m.EstimateMethod, Budget: m.Budget, Notices: m.Notices})
 	if err != nil {
 		return internal("manifest header: " + err.Error())
 	}
@@ -270,6 +270,10 @@ type manifestHeader struct {
 	ScopeComplete  bool                    `json:"scope_complete"`
 	EstimateMethod string                  `json:"estimate_method"`
 	Budget         model.Budget            `json:"budget"`
+	// Notices are the plan's disclosures as the compile that stored it made
+	// them, so a reused manifest tells its caller what the compile told its
+	// own. They are outside the canonical hash.
+	Notices []string `json:"notices,omitempty"`
 }
 
 // Manifest reads one manifest header with its binding, exactly as written.
@@ -302,6 +306,7 @@ func (s *Store) Manifest(ctx context.Context, id model.ManifestID) (model.Contex
 			return corrupt("manifest header is not readable")
 		}
 		m.Completeness, m.ScopeComplete, m.EstimateMethod, m.Budget = h.Completeness, h.ScopeComplete, h.EstimateMethod, h.Budget
+		m.Notices = h.Notices
 		m.CreatedAt, err = parseTime(created)
 		return err
 	})
