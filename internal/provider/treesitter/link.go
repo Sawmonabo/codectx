@@ -398,7 +398,9 @@ func (b *builder) linkImports() ([]link.Import, error) {
 		}
 		// A Python `import a.b as c` binds c to the module a.b itself, which
 		// `from a.b import c` never does: its name denotes the whole module.
-		wholeModule := b.lang.Name == "python" && strings.HasPrefix(strings.TrimSpace(text), "import")
+		// The worker spans a plain import by each name it binds (`a.b as
+		// c`), a from-import by its whole statement.
+		wholeModule := b.lang.Name == "python" && !strings.HasPrefix(strings.TrimSpace(text), "from")
 		for i, n := range names {
 			li := link.Import{Name: n, Path: imp.Path, Scope: scope, Range: *rng, Syntax: syntax}
 			switch {
