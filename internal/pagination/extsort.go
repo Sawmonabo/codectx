@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/scratch"
@@ -877,6 +878,20 @@ type SortedRun[T any] struct {
 	decode func([]byte) (T, error)
 	count  int64
 	closed bool
+	// walks counts the walks Each has begun over this run. It is observation
+	// only, read through Walks: a caller that re-reads a run once per batch
+	// turns a linear pass quadratic, and the count is what a test can hold to
+	// a bound where a clock cannot.
+	walks atomic.Int64
+}
+
+// Walks reports how many walks Each has begun over this run. Reading it never
+// changes the run.
+func (r *SortedRun[T]) Walks() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.walks.Load()
 }
 
 // Len is how many records the run holds.
@@ -901,6 +916,7 @@ func (r *SortedRun[T]) Each(yield func(T) error) error {
 	if r.closed {
 		return internalErr("this sorted run was closed; its records were read after the value that owns it was released")
 	}
+	r.walks.Add(1)
 	if r.path == "" {
 		for _, v := range r.mem {
 			if err := yield(v); err != nil {
