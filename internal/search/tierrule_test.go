@@ -32,6 +32,9 @@ type rowDecl struct {
 	body string
 	// path is the file the unit declares the node in; empty is rowsPath.
 	path string
+	// kind and language are the node's; empty is a Go function.
+	kind     model.NodeKind
+	language string
 }
 
 // rowsPath is the file a rowDecl declares its node in unless it names another.
@@ -49,6 +52,13 @@ type rowsFixture struct {
 
 // newRowsFixture publishes decls, one unit each, and activates the generation.
 func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
+	t.Helper()
+	return newRowsFixtureCounting(t, decls, 0, 0)
+}
+
+// newRowsFixtureCounting is newRowsFixture over a snapshot whose census counts
+// cUnits C and cppUnits C++ translation units.
+func newRowsFixtureCounting(t *testing.T, decls []rowDecl, cUnits, cppUnits uint64) *rowsFixture {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -86,7 +96,7 @@ func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
 	snap := model.Snapshot{ID: model.NewSnapshotID(repo, "", model.H("policy"), manifest), RepositoryID: repo,
 		CaptureConsistency: model.CaptureValidated, SourcePolicyHash: model.H("policy"),
 		FileCount: uint64(len(files)), ManifestHash: manifest, SourceBytes: uint64(len(content) * len(files)),
-		CreatedAt: time.Now().UTC()}
+		CUnits: cUnits, CPPUnits: cppUnits, CreatedAt: time.Now().UTC()}
 	err = st.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error {
 		for _, fv := range files {
 			if err := yield(fv); err != nil {
@@ -111,7 +121,8 @@ func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
 		path := cmp.Or(d.path, rowsPath)
 		fileID := model.NewFileID(repo, path)
 		key := model.CanonicalNodeKey(rowsPath, d.key)
-		nodeID := model.NewNodeID(repo, model.NodeFunction, key)
+		kind := cmp.Or(d.kind, model.NodeFunction)
+		nodeID := model.NewNodeID(repo, kind, key)
 		f.nodes[d.key] = nodeID
 		input := model.UnitInput{FileID: fileID, ContentHash: rec.Hash}
 		h := model.NewUnitInputHasher()
@@ -134,7 +145,7 @@ func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
 			ProviderVersion: fixtureProviderVersion, OriginRunID: run, NodeID: nodeID,
 			Precision: model.PrecisionSyntax, FileID: fileID, ContentHash: rec.Hash, Range: rng}
 		ev.ID = model.NewEvidenceID(ev)
-		node := model.Node{ID: nodeID, Kind: model.NodeFunction, Language: "go", Name: d.name,
+		node := model.Node{ID: nodeID, Kind: kind, Language: cmp.Or(d.language, "go"), Name: d.name,
 			QualifiedName: d.qualifiedName, Signature: "func " + d.name + "()", FileID: fileID,
 			ContentHash: rec.Hash, Range: rng}
 		if err := w.PutNodes(ctx, []model.NodeFact{{Node: node, CanonicalKey: key,
@@ -144,7 +155,7 @@ func newRowsFixture(t *testing.T, decls []rowDecl) *rowsFixture {
 		if d.body != "" {
 			if err := w.PutSearchUnits(ctx, []model.SearchUnit{{
 				ID: model.H("rows-doc", d.scope), NodeID: nodeID, FileID: fileID, Path: path,
-				Kind: model.NodeFunction, Name: d.name, QualifiedName: d.qualifiedName,
+				Kind: kind, Name: d.name, QualifiedName: d.qualifiedName,
 				Signature: node.Signature, Bytes: model.ByteRange{Start: 0, End: 10}, Body: d.body,
 			}}); err != nil {
 				t.Fatalf("PutSearchUnits(%s): %v", d.scope, err)

@@ -222,7 +222,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		}
 	}
 	// Every page filters, so every page reads the snapshot's tagger.
-	if err := filter.pin(ctx, s.store, binding.SnapshotID); err != nil {
+	if err := filter.pin(ctx, s.store, reader, binding.SnapshotID); err != nil {
 		return empty, err
 	}
 	limit, clampNotice := s.pageLimit(req.Page.Limit)
@@ -238,6 +238,9 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	searchCtx, searchCancel := model.QueryDeadline(ctx, s.timeout)
 	ans, err := s.collect(searchCtx, reader, req, filter, pos, limit, pageBound{})
 	searchCancel()
+	if err == nil {
+		err = filter.tag.Err()
+	}
 	if err != nil {
 		return empty, err
 	}
@@ -816,17 +819,21 @@ func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + 
 // Paths are root-relative path PREFIXES: a hit is kept when its file path
 // equals a listed prefix or lies under it. Languages are matched by the pinned
 // snapshot's lang.Tagger, the one place a repository path becomes a language
-// name, so a filter cannot disagree with the language the manifest recorded,
-// a header's included.
+// name, bound to the pinned generation's parses: a header two grammars declare
+// takes the language its kept parse used, so a filter cannot disagree with the
+// language the index served it under.
 type hitFilter struct {
 	prefixes  []string
 	languages map[string]bool
 	tag       lang.Tagger
 }
 
-// pin binds the language filter to the pinned snapshot's tagger. The snapshot
-// header is read only when a language filter is set, since only it tags.
-func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, id model.SnapshotID) error {
+// pin binds the language filter to the pinned snapshot's tagger, and that to
+// the pinned generation's parses, so a header is tagged with the grammar its
+// kept parse used. The snapshot header is read only when a language filter is
+// set, since only it tags. A lookup the bound tagger fails tags its header ""
+// and is reported by tag.Err, which every caller checks before it answers.
+func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, parses lang.Parses, id model.SnapshotID) error {
 	if f.languages == nil {
 		return nil
 	}
@@ -834,7 +841,7 @@ func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, id model.Snaps
 	if err != nil {
 		return err
 	}
-	f.tag = lang.For(snap)
+	f.tag = lang.For(snap).In(ctx, parses)
 	return nil
 }
 
