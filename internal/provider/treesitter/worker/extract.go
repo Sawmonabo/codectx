@@ -360,7 +360,13 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 		e.imports[key] = rec
 	}
 	if p := caps["import.path"]; len(p) > 0 && rec.path == "" {
-		rec.path = strings.Trim(p[0].Utf8Text(e.src), "\"'`")
+		switch raw := p[0].Utf8Text(e.src); e.l.Name {
+		case "javascript", "typescript", "tsx":
+			// A module specifier is the string literal's value.
+			rec.path = jsString(raw)
+		default:
+			rec.path = strings.Trim(raw, "\"'`")
+		}
 	}
 	// An aliased name's original (`from m import a as b`) is captured in
 	// the same match as its alias.

@@ -998,4 +998,33 @@ export function go(c: C) {
 		// nothing; dispatch a private method like any other -> r1 is virtual.
 		fails: "a wrapped or private callee read as computed leaves the six calls unbound; a private method dispatched as overridable makes r1 virtual",
 	},
+	{
+		name:   "escaped-specifiers",
+		anchor: "ECMA-262 (15th edition, 2024) §12.9.4 (String Literals: a string's value decodes its escape sequences); §16.2.2 (Imports)",
+		files: map[string]string{
+			"src/a.js": `export function f() {} // @fa
+`,
+			"src/b.js": `export function g() {} // @gb
+`,
+			"src/main.js": `import { f } from "./\u0061.js";
+const { g } = require('./\x62');
+
+export function run() {
+  f(); // @ra
+  g(); // @rb
+}
+`,
+		},
+		// Derived from the anchor: "./\u0061.js" is "./a.js" and './\x62' is './b'.
+		want: []string{
+			"ra f -> fa f exact",
+			"rb g -> gb g exact",
+		},
+		facts: []string{
+			"src/main.js imports src/a.js",
+			"src/main.js imports src/b.js",
+		},
+		// Mutation: read a specifier as its raw text -> "./\u0061.js" names no file and both calls are unbound.
+		fails: "a specifier's escapes left undecoded name files that do not exist and leave ra and rb unbound",
+	},
 }

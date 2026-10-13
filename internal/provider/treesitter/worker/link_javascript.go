@@ -1154,7 +1154,7 @@ func (k *javaScriptLinker) dynamicImport(out *wire.Link, n Node) {
 					constant = false
 					flush()
 				default:
-					literal(string(textOf(k.src, c)))
+					literal(jsUnescape(string(textOf(k.src, c))))
 				}
 			}
 			return
@@ -1891,12 +1891,12 @@ func (k *javaScriptLinker) importSource(n Node) string {
 	return ""
 }
 
-// unquote is a string literal's contents.
+// unquote is a string literal's value, its escapes decoded (jsString).
 func (k *javaScriptLinker) unquote(s Node) string {
 	if s.IsNull() {
 		return ""
 	}
-	return strings.Trim(string(textOf(k.src, s)), "\"'`")
+	return jsString(string(textOf(k.src, s)))
 }
 
 // spell is n's tokens as written, without whitespace or comments.
