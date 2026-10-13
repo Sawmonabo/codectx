@@ -374,6 +374,70 @@ impl<T: fmt::Debug> Describe for T {
 		fails: "an impl item published as implementing a same-named item of another trait of its self type; an external trait's item dropped when the type implements several; a blanket impl's item left without its trait's",
 	},
 	{
+		name:   "raw-identifiers",
+		anchor: "The Rust Reference, \"Identifiers\" (raw identifiers: the `r#` prefix is not part of the identifier), \"Paths\", \"Modules\" (module source filenames)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "raw"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `pub mod r#async;
+
+pub trait r#Raw { // @traw
+    fn raw(&self); // @rraw
+}
+
+pub trait Plain { // @tplain
+    fn plain(&self); // @pplain
+}
+
+pub struct S; // @ts
+
+impl S {
+    pub fn go(&self) {} // @sgo
+}
+
+impl Raw for S {
+    fn raw(&self) {} // @qraw
+}
+
+impl r#Plain for S {
+    fn plain(&self) {} // @qplain
+}
+
+pub fn r#run() {} // @frun
+
+pub fn caller() { // @fcaller
+    run(); // @c1
+    let r#v: r#S = S;
+    v.go(); // @c2
+    crate::r#async::helper(); // @c3
+    r#caller(); // @c4
+}
+`,
+			"src/async.rs": "pub fn helper() {} // @ahelper\n",
+		},
+		want: []string{
+			"c1 run -> frun run exact",
+			"c2 go -> sgo go exact",
+			"c3 helper -> ahelper helper exact",
+			"c4 r#caller -> fcaller caller exact",
+		},
+		// Derived from the source and the anchor: each raw identifier is the identifier without its
+		// `r#`, so the declarations, the calls, the module path and the trait impls written either way
+		// meet; a site still spells the bytes as written.
+		facts: []string{
+			"ts S implements traw Raw",
+			"ts S implements tplain Plain",
+			"qraw raw overrides rraw raw",
+			"qplain plain overrides pplain plain",
+		},
+		// Mutation: read names as written -> run, caller and helper are not found, v has no type, and
+		// both trait impls name a trait outside the unit.
+		fails: "a raw identifier read with its `r#`, so a declaration and a use spelled the other way never meet",
+	},
+	{
 		name:   "trait-impl-global-path",
 		anchor: "The Rust Reference, \"Paths\" (path qualifiers: a path starting with `::` resolves from the extern prelude, 2018 edition and later), \"Implementations\" (trait implementations), \"Use declarations\" (glob imports)",
 		files: map[string]string{
