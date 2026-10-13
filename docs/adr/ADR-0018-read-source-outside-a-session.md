@@ -89,8 +89,11 @@ replacement characters, through the same chunk planner as a session read.
 
 ### 6. Reads go by file id into the content store, never through a path
 
-A `path` argument is only hashed into a file id and looked up in the generation's manifest; a path that is not a
-member is "not in this generation", and nothing is opened on it. Only files the index captured can be read, never
+A `path` argument is first put in the spelling the capture stores — slash-separated, lexically clean and
+relative to the repository root, so `./pkg/a.go` and `pkg/../pkg/a.go` both name `pkg/a.go` — and a path that is
+absolute or climbs above the root is refused as `CTX_ARGUMENT_INVALID`. The clean path is only hashed into a file
+id and looked up in the generation's manifest; a path that is not a member is "not in this generation", and
+nothing is opened on it. Only files the index captured can be read, never
 anything outside the tree, an ignored file or the data directory. Capture already goes through an `os.Root` handle
 that refuses escapes by `..` and symbolic links (`docs/threat-model.md:35`), and symbolic links are excluded by
 default (`docs/snapshots.md:32`). The CLI reads the same content store, never the working tree. A file server that
