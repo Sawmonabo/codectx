@@ -265,6 +265,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				// The forward slice's orientation and its ranking rule
 				// (impactdependence.go).
 				Dependence: true,
+				Flows:      e.flowReader(),
 			}, func(fs frontierState, edge Edge) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never

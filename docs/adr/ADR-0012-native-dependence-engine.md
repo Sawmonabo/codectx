@@ -320,14 +320,20 @@ Concretely:
   other kind the other way round, so impact walks it against its stored direction: its incoming half reaches the
   values a changed variable flows to and reports them incoming (may need modification), its outgoing half the
   values that flow into it.
-- **Realizable across calls without a call stack.** Across a call the linking provider publishes an argument flow
-  (each variable an argument reads to the parameter it binds), a summary flow from that variable to the call's
-  result when the parameter reaches the callee's return, and a return flow into the call's result only from a
-  callee variable no parameter reaches by data or control dependence. A walk that entered a callee through an
-  argument then reaches no return flow's source, so it cannot leave through another call site, and the slice
-  follows every `data_flows_to` edge. This is the property the two phases of the interprocedural forward slice
-  exist to enforce (Horwitz, Reps and Binkley, TOPLAS 12(1), 1990, section 4.5), carried by the facts instead of by
-  per-path walk state.
+- **Realizable across calls.** Across a call the linking provider publishes an argument flow (each variable an
+  argument reads to the parameter it binds), a summary flow from that variable to the call's result when the
+  parameter reaches the callee's return, and a return flow from the callee's return node to the call's result, each
+  named by its evidence detail (`argument`, `summary:<position>`, `return`). The impact walk keeps the two-phase
+  forward slice of Horwitz, Reps and Binkley (TOPLAS 12(1), 1990, section 4.5) per route: a route that takes an
+  argument flow is marked descended and never takes a return flow, which would leave the callee at every call site;
+  the summary flow at its own site carries what the callee returns. A node first admitted by a descended route is
+  admitted once more when a route that is not descended reaches it, and that admission walks its dependence edges
+  again only to carry the right to leave: they are not served a second time, and only the return flows it may now
+  take are new. So the walk marks exactly the nodes the two phases mark, admitting a node at most twice. Walked
+  against the stored direction the rule swaps the roles: a return flow walked backwards enters the callee and an
+  argument flow walked backwards leaves it. The descent describes one chain of dependence, so an edge of any other
+  kind starts a new one. Each data flow's role is read in one grouped evidence read per batch of the walk, as the
+  dispatch of a call is.
 - **Ranked below call impact, at every depth.** Impact ranks by the lexicographic key (reached through a
   program-dependence hop, cost). The key is one integer: a route that takes a dependence hop carries a fixed high bit
   in its cost (`dependenceTier`, set once, never added), so every comparison by cost puts every node a call, override
@@ -1052,7 +1058,7 @@ code.
   construction of decision 2, which needs no dominance computation.
 - Horwitz, Reps and Binkley, *Interprocedural Slicing Using Dependence Graphs*, ACM TOPLAS 12(1), 1990,
   26-60, https://research.cs.wisc.edu/wpis/abstracts/toplas90.abs.html — the two-phase forward slice (section 4.5)
-  whose realizability the impact walk of decision 3 keeps through the summary and return flows.
+  the impact walk of decision 3 keeps per route.
 - Reps, Horwitz and Sagiv, *Precise Interprocedural Dataflow Analysis via Graph Reachability*, POPL
   1995, https://doi.org/10.1145/199448.199462, and Sagiv, Reps and Horwitz's IDE extension — the
   interprocedural framework decision 2 declines.

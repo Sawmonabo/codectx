@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // dependenceFixture is a graph of the named nodes and the given relations,
@@ -243,5 +244,142 @@ func TestImpactDependenceServesADescendingNodesEdgesOnce(t *testing.T) {
 		Occurrences: []fixtureOccurrence{{Bytes: [2]uint64{61, 63}}}}))
 	if with-without != 1 {
 		t.Errorf("one data flow into Animal.sound added %d admitted edges, want 1", with-without)
+	}
+}
+
+// flowGraph is a fixture reader that also reports call roles, by relation.
+type flowGraph struct {
+	*MemoryGraph
+	roles map[model.RelationID]FlowRole
+}
+
+func (g *flowGraph) RelationFlowRoles(ctx context.Context, rels []model.RelationID) ([]FlowRole, error) {
+	out := make([]FlowRole, len(rels))
+	for i, id := range rels {
+		out[i] = g.roles[id]
+	}
+	return out, nil
+}
+
+// callContextFixture is f(p) called at two sites: a1 at site 1 and a2 at site
+// 2 pass their values to p, and each site's result is r1 and r2. p's value
+// reaches f's return node ret through m, so each site also carries a summary
+// flow from its argument to its result; k, a local of f no parameter reaches,
+// flows to ret too. x, y and z are a chain into m from outside any call.
+// Relation i of the list is fixtureRelationID(i).
+func callContextFixture(t *testing.T) (*graphFixture, *flowGraph) {
+	t.Helper()
+	nodes := map[string]model.NodeKind{}
+	for _, n := range []string{"a1", "a2", "r1", "r2", "p", "m", "ret", "k", "x", "y", "z"} {
+		nodes[n] = model.NodeVariable
+	}
+	flow := string(model.RelDataFlowsTo)
+	rels := [][3]string{
+		{"a1", flow, "p"}, {"a2", flow, "p"}, // 0, 1: argument flows
+		{"a1", flow, "r1"}, {"a2", flow, "r2"}, // 2, 3: summary flows
+		{"ret", flow, "r1"}, {"ret", flow, "r2"}, // 4, 5: return flows
+		{"p", flow, "m"}, {"m", flow, "ret"}, {"k", flow, "ret"}, // inside f
+		{"x", flow, "y"}, {"y", flow, "z"}, {"z", flow, "m"},
+	}
+	f := dependenceFixture(nodes, rels)
+	roles := map[model.RelationID]FlowRole{
+		fixtureRelationID(0): {Argument: true}, fixtureRelationID(1): {Argument: true},
+		fixtureRelationID(4): {Return: true}, fixtureRelationID(5): {Return: true},
+	}
+	return f, &flowGraph{MemoryGraph: memGraphFor(f), roles: roles}
+}
+
+// callContextImpact is the incoming impact of seeds over the call-context
+// fixture, with the call roles reported.
+func callContextImpact(t *testing.T, seeds ...string) (map[string]bool, model.ImpactResult) {
+	t.Helper()
+	f, g := callContextFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 64<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	e, err := New(Options{Adjacency: f, Reader: g, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	start := make([]model.NodeID, 0, len(seeds))
+	for _, s := range seeds {
+		start = append(start, fixtureNodeID(s))
+	}
+	res, err := e.Impact(context.Background(), model.ImpactRequest{GenerationID: 1, Start: start,
+		Direction: model.DirectionIncoming})
+	if err != nil {
+		t.Fatalf("impact of %v: %v", seeds, err)
+	}
+	if res.Meta.Truncated {
+		t.Fatalf("the impact of %v is truncated (%q)", seeds, res.Meta.TruncationReason)
+	}
+	got := map[string]bool{}
+	for _, en := range res.Entries {
+		for name := range map[string]bool{"a1": true, "a2": true, "r1": true, "r2": true, "p": true,
+			"m": true, "ret": true, "k": true, "x": true, "y": true, "z": true} {
+			if en.NodeID == fixtureNodeID(name) {
+				got[name] = true
+			}
+		}
+	}
+	return got, res
+}
+
+// TestImpactNeverLeavesACalleeThroughAnotherSite: a value passed at site 1
+// enters f through p and reaches f's return node, but leaves only through
+// site 1's summary flow: r1 is affected and r2, site 2's result, is not.
+//
+// Mutation caught: the descended flag ignored (settleSlice letting a
+// descended route take a return flow): r2 is reached through ret.
+func TestImpactNeverLeavesACalleeThroughAnotherSite(t *testing.T) {
+	got, _ := callContextImpact(t, "a1")
+	if !got["p"] || !got["ret"] || !got["r1"] {
+		t.Fatalf("impact of a1 = %v: p, ret and r1 (by the summary flow) must be affected", got)
+	}
+	if got["r2"] {
+		t.Errorf("impact of a1 = %v: r2 is another call site's result, an unrealizable path", got)
+	}
+}
+
+// TestImpactLeavesACalleeThroughEverySiteFromInside: a value f creates
+// itself, k, reaches f's return node and leaves through every call site.
+//
+// Mutation caught: return flows blocked for every route (settleSlice
+// dropping every leaving record): neither r1 nor r2 is reached.
+func TestImpactLeavesACalleeThroughEverySiteFromInside(t *testing.T) {
+	got, _ := callContextImpact(t, "k")
+	if !got["r1"] || !got["r2"] {
+		t.Errorf("impact of k = %v: k is returned to both call sites, so r1 and r2 are affected", got)
+	}
+}
+
+// TestImpactLiftsANodeFirstReachedInsideACall: seeded at a1 and x, m is first
+// admitted through p (descended, one level before x's chain reaches it), and
+// ret after it. x's route reaches m not descended, so m is admitted again,
+// re-walks m -> ret only to lift ret, and ret then leaves through both sites:
+// r2 is affected, by x. Every relation is served once: the lifting re-walk of
+// m -> ret serves nothing.
+//
+// Mutations caught: no re-admission (lifts always false): r2 is missing; the
+// re-walk served (no sliceSilent): m -> ret is served twice and the edge count
+// is 10, not 9.
+func TestImpactLiftsANodeFirstReachedInsideACall(t *testing.T) {
+	got, res := callContextImpact(t, "a1", "x")
+	if !got["r2"] {
+		t.Fatalf("impact of a1 and x = %v: x reaches ret outside any call, so r2 is affected", got)
+	}
+	// a1 -> p, a1 -> r1, p -> m, m -> ret, x -> y, y -> z, z -> m, ret -> r1,
+	// ret -> r2.
+	if res.EdgeCount != 9 {
+		t.Errorf("the walk served %d edges, want 9: an edge was served twice or never", res.EdgeCount)
 	}
 }

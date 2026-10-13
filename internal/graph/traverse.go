@@ -438,6 +438,13 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 		if err := w.resolveIDs(ctx, pending); err != nil {
 			return err
 		}
+		if w.dependence.slicing() {
+			kept, err := w.dependence.settleSlice(ctx, w, pending)
+			if err != nil {
+				return err
+			}
+			pending = kept
+		}
 		if w.rule.active() {
 			kept, err := w.rule.settle(ctx, o.Dispatches, pending)
 			if err != nil {
@@ -511,20 +518,9 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 					// attributing it to an arbitrary node would invent a path.
 					return nil
 				}
-				keep, err := w.keepEntry(e)
-				if err != nil || !keep {
-					return err
-				}
 				rec := levelRecord{Owner: owner, Edge: e}
-				if take, decided := w.dependence.orient(o.Direction, w.rule, owner, e); decided {
-					if !take {
-						return nil
-					}
-				} else if w.rule.active() {
-					var take bool
-					if take, rec.Step, rec.check = w.rule.entry(owner, e); !take {
-						return nil
-					}
+				if take, err := w.decideEntry(owner, e, &rec); err != nil || !take {
+					return err
 				}
 				if len(pending) >= levelResolveBatch {
 					// Stopped BEFORE this entry is taken, so the position the
@@ -680,6 +676,12 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 			return errLevelCut
 		}
 		for i, rec := range batch {
+			if rec.Slice&sliceSilent != 0 {
+				// It lifted a node already reached, over an edge already
+				// served (impactdependence.go): nothing is served again.
+				at = ends[i]
+				continue
+			}
 			if w.groupOpen && rec.NodeID != w.groupID {
 				if err := w.closeGroup(); err != nil {
 					return err
