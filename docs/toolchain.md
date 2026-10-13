@@ -493,8 +493,17 @@ go generate ./internal/search/textindex   # cargo build --release --locked
 go build -trimpath -o ./bin/codectx ./cmd/codectx
 ```
 
-The first leaves `_build/release/libcodectx_textindex.a`; the second links it
-through cgo. `go vet` and `go build` of a package that does not link a binary
+The first leaves `_build/release/libcodectx_textindex.a` and writes
+`archive_id.go` beside the package's sources, a generated and ignored file
+holding the archive's SHA-256; the second links the archive through cgo. The go
+command keys its build and test caches on Go sources and flags, never on the
+bytes of an archive a cgo flag names (https://go.dev/issue/29843, a duplicate
+of https://go.dev/issue/24355, open), so without that file a rebuilt archive
+leaves `go test` serving cached results and an existing binary unlinked. With
+it, a changed archive is a changed package, and the same archive builds the
+same file. A library built by `cargo build` alone leaves the file naming the
+previous archive; `TestTheArchiveIDNamesTheLinkedArchive` fails on that.
+`go vet` and `go build` of a package that does not link a binary
 need no archive. A test binary of a package that reaches the index, and every
 binary, does.
 
