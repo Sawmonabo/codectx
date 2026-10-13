@@ -648,11 +648,17 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 		e.Internal = unnamed || k.statics[key]
 	}
 	e.Returns = k.returns(owner, d, c.fn)
-	if _, candidates := k.specifierMacros(owner); len(candidates) > 0 {
+	macros, candidates := k.specifierMacros(owner)
+	if len(candidates) > 0 {
 		// The declaration's type is one of several identifiers its macros
 		// leave undecided (cSpecifierMacros): no single result type, so no
 		// typed signature either.
 		e.Returns, e.Signature = wire.Type{}, ""
+	}
+	// The linker reads each macro's definitions for the declaration's
+	// visibility; a candidate the project defines as a macro is one too.
+	for _, m := range append(macros, candidates...) {
+		e.Macros += m + " "
 	}
 	k.out.Exports = append(k.out.Exports, e)
 	k.parameters(e.Name, c.fn.ChildByFieldId(s.fParameters), a.params)
@@ -812,15 +818,22 @@ func (k *cLinker) macro(n Node) {
 }
 
 // alias appends the Export of the object-like macro n when its replacement
-// list is exactly one identifier: a call of the macro's name calls what that
-// identifier names.
+// list is exactly one identifier, which a call of the macro's name calls and
+// a declaration written with the macro takes its visibility from, or a
+// specifier sequence, whose visibility it carries (cVisibility; an empty
+// replacement states none).
 func (k *cLinker) alias(n Node) {
 	name := n.ChildByFieldId(k.s.fName)
 	if name.IsNull() {
 		return
 	}
-	if _, ident := k.replacement(n); ident != "" {
-		k.out.Exports = append(k.out.Exports, wire.Export{Name: wireSpan(spanOf(name)), Alias: ident})
+	_, ident := k.replacement(n)
+	visibility := wire.VisibilityUnspecified
+	if v := n.ChildByFieldId(k.s.fValue); !v.IsNull() {
+		visibility = cVisibility(k.src, cLex(k.src, int(v.StartByte()), int(v.EndByte())), k.x.keyword)
+	}
+	if ident != "" || visibility != "" {
+		k.out.Exports = append(k.out.Exports, wire.Export{Name: wireSpan(spanOf(name)), Alias: ident, Visibility: visibility})
 	}
 }
 

@@ -194,6 +194,12 @@ type Decl struct {
 	// identifiers that may be the declaration's type and the file defines
 	// none of them, every one of them: the declared type is one of the set.
 	ReturnTypes []string `json:"return_types,omitempty"`
+	// Visibility is, for a C or C++ declaration, the symbol visibility its
+	// own attributes state (`__attribute__((visibility("default")))`,
+	// `__declspec(dllexport)`): one of the Visibility values of the link
+	// encoding, as declared in source, never the binary's export table.
+	// Empty when its attributes state none.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

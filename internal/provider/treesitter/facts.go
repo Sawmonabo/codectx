@@ -497,6 +497,9 @@ func (b *builder) resolveDecls() error {
 		if len(d.ReturnTypes) > 0 {
 			meta["return_types"] = d.ReturnTypes
 		}
+		if d.Visibility != "" {
+			meta["visibility"] = d.Visibility
+		}
 		if len(d.truncated) > 0 {
 			// Index-time field truncation, reported on the fact itself so an
 			// answer built from it says which stored values were cut and how

@@ -15,9 +15,9 @@ import (
 // worker is retired as broken, the structural unit fails and the generation
 // fails with it.
 //
-// Mutation: count exports at 47 bytes instead of 46 in DecodeLink -> the
-// decode fails. After the exports' count, n minimal exports leave 46n bytes
-// plus 32 for the eight empty trailing lists' counts, and 47n exceeds that
+// Mutation: count exports at 55 bytes instead of 54 in DecodeLink -> the
+// decode fails. After the exports' count, n minimal exports leave 54n bytes
+// plus 32 for the eight empty trailing lists' counts, and 55n exceeds that
 // once n is 33 or more, which is why the message carries more than that.
 func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 	var in Link
@@ -39,12 +39,13 @@ func TestLinkOfMinimalExportsRoundTrips(t *testing.T) {
 
 // TestLinkFactsBeyondCallsRoundTrip carries every field the linker's facts
 // beyond calls read through one encode and decode: an export's override mark,
-// alias, property and exported marks, a value's declaration, a supertype's interface mark, an argument's reads, keyword and spread, a dynamic import's
+// alias, property and exported marks, visibility and macros, a value's declaration, a supertype's interface mark, an argument's reads, keyword and spread, a dynamic import's
 // fragments and constant flag, a parameter's marks, and a computed site with
 // its arguments. Each is written after fields that existed before it, so a
 // codec that skips or reorders one shifts every later byte.
 //
-// Mutation: AppendLink drops the alias, the exported mark, a value's
+// Mutation: AppendLink drops the alias, the exported mark, the visibility or
+// the macros, a value's
 // declaration or a supertype's interface mark, or
 // DecodeLink reads a computed site's arguments without their reads -> the
 // decoded message differs (or is refused as malformed).
@@ -55,6 +56,8 @@ func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 			{Name: Span{Start: 9, End: 12}, Alias: "log_impl"},
 			{Name: Span{Start: 13, End: 16}, Exported: true},
 			{Name: Span{Start: 17, End: 19}, Property: true},
+			{Name: Span{Start: 100, End: 103}, Alias: "VIS", Visibility: VisibilityDllexport},
+			{Name: Span{Start: 104, End: 107}, Macros: "API XMLCALL "},
 		},
 		Values: []Value{{At: Span{Start: 81, End: 90}, Field: "run", Type: Type{Kind: TypeFunction, Name: "obj.run"},
 			Declares: Span{Start: 13, End: 16}}},

@@ -152,3 +152,69 @@ func TestCMacroPrefixedDeclarations(t *testing.T) {
 		}
 	}
 }
+
+// TestCVisibilityAsDeclared checks the visibility the worker reads from
+// source: each object-like `#define` carries what its replacement states,
+// one export per definition so each `#if` arm keeps its own value, a
+// one-identifier replacement is followed (Alias) rather than classified, a
+// replacement that is no specifier sequence carries nothing, and a
+// declaration's own attributes, in every position the grammar places them,
+// give its `visibility`. A declaration written with macros sends their
+// names, with the type candidates, for the linker to read.
+//
+// Mutation: classify only the first definition of a name -> the
+// unspecified and dllimport arms of API are lost.
+// Mutation: drop the `__visibility__` spelling (trim no underscores) -> HID
+// carries unspecified.
+// Mutation: classify a one-identifier replacement -> LIB carries
+// unresolved instead of following VIS.
+// Mutation: treat a replacement naming a macro among keywords as
+// unspecified -> EXT claims no visibility where VIS states default.
+// Mutation: emit every macro -> N, whose replacement is a number, is sent.
+// Mutation: read attributes only before the declarator -> q has none.
+// Mutation: drop the candidates from the macros sent -> g_foo sends only
+// what the file proves, and a header's GLIB_AVAILABLE_IN_ALL is never read.
+func TestCVisibilityAsDeclared(t *testing.T) {
+	const macros = "#ifdef BUILDING\n#define API __declspec(dllexport)\n#elif defined(STATIC)\n#define API\n#else\n" +
+		"#define API __declspec(dllimport)\n#endif\n#define VIS __attribute__((visibility(\"default\")))\n" +
+		"#define HID __attribute__ ((__visibility__ (\"hidden\")))\n#define LIB VIS\n#define EXT extern VIS\n" +
+		"#define N 42\n#define G_H\nAPI int f(void);\nLIB int g(void);\n"
+	const attributes = "__attribute__((visibility(\"hidden\"))) int h(void);\n" +
+		"__declspec(dllexport) int d(void){ return 0; }\n[[gnu::visibility(\"protected\")]] int p(void);\n" +
+		"int q(void) __attribute__((visibility(\"internal\")));\nint plain(void);\n"
+	const undecided = "GLIB_AVAILABLE_IN_ALL gboolean g_foo (void);\n"
+	type sent struct{ name, alias, visibility, macros string }
+	for _, language := range []string{"c", "cpp"} {
+		l, _ := linkOf(t, language, "x.h", macros)
+		var got []sent
+		for _, e := range l.Exports {
+			got = append(got, sent{macros[e.Name.Start:e.Name.End], e.Alias, e.Visibility, e.Macros})
+		}
+		want := []sent{
+			{"API", "", wire.VisibilityDllexport, ""},
+			{"API", "", wire.VisibilityUnspecified, ""},
+			{"API", "", wire.VisibilityDllimport, ""},
+			{"VIS", "", wire.VisibilityDefault, ""},
+			{"HID", "", wire.VisibilityHidden, ""},
+			{"LIB", "VIS", "", ""},
+			{"EXT", "", wire.VisibilityUnresolved, ""},
+			{"G_H", "", wire.VisibilityUnspecified, ""},
+			{"f", "", "", "API "},
+			{"g", "", "", "LIB "},
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("%s exports:\n got %+v\nwant %+v", language, got, want)
+		}
+		decls, _ := macroDecls(t, language, attributes)
+		for name, v := range map[string]string{"h": wire.VisibilityHidden, "d": wire.VisibilityDllexport,
+			"p": wire.VisibilityProtected, "q": wire.VisibilityInternal, "plain": ""} {
+			if decls[name].Visibility != v {
+				t.Errorf("%s %s: visibility %q, want %q", language, name, decls[name].Visibility, v)
+			}
+		}
+		l, _ = linkOf(t, language, "x.h", undecided)
+		if len(l.Exports) != 1 || l.Exports[0].Macros != "GLIB_AVAILABLE_IN_ALL gboolean " {
+			t.Errorf("%s g_foo exports %+v, want the macros \"GLIB_AVAILABLE_IN_ALL gboolean \"", language, l.Exports)
+		}
+	}
+}

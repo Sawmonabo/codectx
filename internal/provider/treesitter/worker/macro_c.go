@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
+
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
 // C and C++ declarations written with a macro among their specifiers
@@ -589,15 +591,16 @@ func cSpecifierMacros(src []byte, prev, start uint, spans [][2]uint, typeKind, t
 
 // cDeclMacros is cSpecifierMacros for a declaration the extraction
 // captured: the specifier macros of a C or C++ file-scope declaration or
-// function definition, and its candidate return types when the rule leaves
-// several. Every other declaration has none.
-func cDeclMacros(e *extraction, d *decl) (macros, candidates []string) {
+// function definition, its candidate return types when the rule leaves
+// several, and the visibility its own attributes state
+// (cAttributeVisibility). Every other declaration has none.
+func cDeclMacros(e *extraction, d *decl) (macros, candidates []string, visibility string) {
 	if e.l.Name != "c" && e.l.Name != "cpp" || d.declarator == nil {
-		return nil, nil
+		return nil, nil, ""
 	}
 	n := d.node
 	if k := n.Kind(); k != "declaration" && k != "function_definition" {
-		return nil, nil
+		return nil, nil, ""
 	}
 	prev := n.StartByte()
 	if cMayFollowMacro(e.src, prev) {
@@ -637,7 +640,8 @@ func cDeclMacros(e *extraction, d *decl) (macros, candidates []string) {
 	tl := e.g.tsLanguage()
 	keyword := func(s string) bool { return tl.IdForNodeKind(s, false) != 0 }
 	defined := func(s string) bool { return e.cDefines.defined(s, n.StartByte()) }
-	return cSpecifierMacros(e.src, prev, n.StartByte(), spans, typeKind, typeName, keyword, defined)
+	macros, candidates = cSpecifierMacros(e.src, prev, n.StartByte(), spans, typeKind, typeName, keyword, defined)
+	return macros, candidates, cAttributeVisibility(&n, e.src, keyword)
 }
 
 // collectDefines records every object-like macro directive under n.
@@ -708,4 +712,82 @@ func (p *cMacroScan) define(c *ts.Node) {
 	}
 	n := strings.TrimSpace(cUncommented(a.Utf8Text(p.src)))
 	p.defines[n] = append(p.defines[n], cMacroDef{at: c.StartByte(), undef: true})
+}
+
+// cVisibility is the symbol visibility the C or C++ tokens toks state: the
+// first `visibility("…")` attribute's value (GCC: default, hidden,
+// protected, internal), or the first `dllexport` or `dllimport` storage
+// class (MSVC `__declspec`, GCC's attribute of the same name).
+// Otherwise, when toks are a specifier sequence (keywords, attributes, and
+// literals only inside parentheses), it is VisibilityUnspecified when every
+// word outside parentheses is a keyword or an attribute and
+// VisibilityUnresolved when one is another identifier, a macro the reader
+// does not expand; and empty when toks are anything else (`42`, `a + b`) or
+// exactly one identifier, which names the macro to follow (Alias).
+func cVisibility(src []byte, toks []cTok, keyword func(string) bool) string {
+	text := func(i int) string { return string(src[toks[i].start:toks[i].end]) }
+	for i := range toks {
+		switch w := strings.Trim(text(i), "_"); {
+		case !toks[i].word:
+		case w == "dllexport":
+			return wire.VisibilityDllexport
+		case w == "dllimport":
+			return wire.VisibilityDllimport
+		case w == "visibility" && i+2 < len(toks) && text(i+1) == "(":
+			switch v := strings.Trim(text(i+2), `"`); v {
+			case wire.VisibilityDefault, wire.VisibilityHidden, wire.VisibilityProtected, wire.VisibilityInternal:
+				return v
+			}
+		}
+	}
+	depth, idents, words := 0, 0, 0
+	for i := range toks {
+		t := text(i)
+		switch {
+		case t == "(" || t == "[":
+			depth++
+		case t == ")" || t == "]":
+			depth--
+		case depth > 0:
+		case toks[i].word:
+			words++
+			if !keyword(t) && !cAttributeWords[t] {
+				idents++
+			}
+		case t != "," && t != "::" && t != ":":
+			return ""
+		}
+	}
+	switch {
+	case idents == 1 && words == 1 && len(toks) == 1:
+		return ""
+	case idents > 0:
+		return wire.VisibilityUnresolved
+	}
+	return wire.VisibilityUnspecified
+}
+
+// cAttributeVisibility is the visibility the attributes written on the
+// declaration n state (cVisibility): its attribute specifiers, `__declspec`
+// modifiers and attribute declarations outside its body and parameter
+// lists, the first that states one; empty when none does.
+func cAttributeVisibility(n *ts.Node, src []byte, keyword func(string) bool) string {
+	count := n.ChildCount()
+	for i := uint(0); i < count; i++ {
+		c := n.Child(i)
+		switch c.Kind() {
+		case "attribute_specifier", "ms_declspec_modifier", "attribute_declaration":
+			switch v := cVisibility(src, cLex(src, int(c.StartByte()), int(c.EndByte())), keyword); v {
+			case "", wire.VisibilityUnspecified, wire.VisibilityUnresolved:
+			default:
+				return v
+			}
+		case "compound_statement", "parameter_list", "field_declaration_list", "enumerator_list", "initializer_list":
+		default:
+			if v := cAttributeVisibility(c, src, keyword); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }

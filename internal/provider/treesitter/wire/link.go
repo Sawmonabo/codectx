@@ -130,6 +130,16 @@ type Export struct {
 	// CommonJS export (`module.exports.run = …`, `exports.run = …`, a key of
 	// `module.exports = { run: … }`).
 	Exported bool
+	// Visibility is, for a C or C++ object-like macro, the symbol visibility
+	// its replacement list states (one of the Visibility values); empty when the replacement
+	// is no specifier sequence or is one identifier (Alias).
+	Visibility string
+	// Macros are, for a C or C++ declaration written with macros among its
+	// specifiers (`SQLITE_API int f(void);`), their names in source order,
+	// then the identifiers that may be its type or a macro when the file
+	// alone does not decide (Decl.ReturnTypes), each followed by one space:
+	// an identifier holds none.
+	Macros string
 }
 
 // Supertype is one declared subtype relation of the file: Type extends,
@@ -374,7 +384,7 @@ type Type struct {
 //	exports    n × (name start, end; receiver; signature; params; optional;
 //	                variadic, static, abstract, virtual, final, internal
 //	                flags; returns type; override flag; alias; property,
-//	                exported flags)
+//	                exported flags; visibility; macros)
 //	supertypes n × (type; super; interface flag)
 //	sites      n × (name start, end; shape byte; qualifier; receiver type;
 //	                signature; args n × type; arguments n × (at start, end;
@@ -407,6 +417,8 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.str(x.Alias)
 		e.flag(x.Property)
 		e.flag(x.Exported)
+		e.str(x.Visibility)
+		e.str(x.Macros)
 	}
 	e.u32(uint32(len(l.Supertypes)))
 	for _, s := range l.Supertypes {
@@ -513,13 +525,14 @@ func DecodeLink(payload []byte) (Link, error) {
 	d := decoder{b: payload, malformed: ErrMalformedLink}
 	var l Link
 	// The smallest export is 8 span, 4+4 strings, 4 params, 4 optional, 6
-	// flags, a 9-byte type, 1 flag, 4 alias and 2 flags; a supertype two strings and
+	// flags, a 9-byte type, 1 flag, 4 alias, 2 flags, 4 visibility and 4
+	// macros; a supertype two strings and
 	// 1 flag; a site 8 span, 1 shape, 4 qualifier, 9 type, 4 signature, 4
 	// args and 4 arguments; an argument 8 span, 4 keyword, 1 spread and 4
 	// reads; a read 8 span; a value 8 span, 4 field, 9 type and 8 span; a reexport
 	// three strings; a union its count; a parameter two 8 spans, 4 index and 2 flags; a
 	// dynamic import 8 span, 4 fragments and 1 flag; a fragment its length.
-	l.Exports = make([]Export, 0, d.count(46))
+	l.Exports = make([]Export, 0, d.count(54))
 	for range cap(l.Exports) {
 		x := Export{Name: d.span(), Receiver: d.str(), Signature: d.str(), Params: d.u32(), Optional: d.u32()}
 		x.Variadic, x.Static, x.Abstract = d.flag(), d.flag(), d.flag()
@@ -527,6 +540,7 @@ func DecodeLink(payload []byte) (Link, error) {
 		x.Returns = d.typ()
 		x.Override, x.Alias = d.flag(), d.str()
 		x.Property, x.Exported = d.flag(), d.flag()
+		x.Visibility, x.Macros = d.str(), d.str()
 		l.Exports = append(l.Exports, x)
 	}
 	l.Supertypes = make([]Supertype, 0, d.count(9))
@@ -647,3 +661,19 @@ func (d *decoder) typ() Type {
 	}
 	return Type{Kind: k, Name: d.str(), Index: d.u32()}
 }
+
+// The symbol visibility a C or C++ attribute states: the GCC `visibility`
+// attribute's four values, the MSVC `__declspec` storage classes, none
+// (VisibilityUnspecified), and, for a macro replacement, one that names
+// another macro among other tokens, which is not expanded
+// (VisibilityUnresolved).
+const (
+	VisibilityDefault     = "default"
+	VisibilityHidden      = "hidden"
+	VisibilityProtected   = "protected"
+	VisibilityInternal    = "internal"
+	VisibilityDllexport   = "dllexport"
+	VisibilityDllimport   = "dllimport"
+	VisibilityUnspecified = "unspecified"
+	VisibilityUnresolved  = "unresolved"
+)
