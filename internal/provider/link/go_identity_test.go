@@ -214,7 +214,7 @@ func (s *Set[T]) Iface(x interface {
 		t.Fatal(err)
 	}
 	pkg := &goExtPackage{path: "p", types: map[string]*goExtType{}}
-	pkg.addFile(f, false)
+	pkg.addFile(f, false, "")
 	got := map[string]string{"A": pkg.types["A"].form}
 	for name, cs := range pkg.consts {
 		got[name] = "#" + cs[0].form

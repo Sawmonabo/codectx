@@ -714,6 +714,92 @@ func (L) Get() Local { return 0 } // @lget
 		fails: "declarations of one name written differently per platform or build tag judged different though every build spells one type",
 	},
 	{
+		name:   "method-sets-per-build",
+		anchor: "go/build, \"Build Constraints\" (//go:build lines, _GOOS and _GOARCH file names); The Go Programming Language Specification, \"Method sets\", \"Interface types\", \"Constant expressions\", \"Array types\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire example.com/plat v1.0.0\n",
+			"regs.go": `package p
+
+import "example.com/plat"
+
+type Regs struct{} // @tregs
+
+func (Regs) Raw() [PtrSize]byte { return [PtrSize]byte{} } // @regsraw
+
+type PC64 interface { // @ipc64
+	PC() uint64 // @ipc64pc
+	SetPC(uint64) // @ipc64set
+}
+
+type PC32 interface { // @ipc32
+	PC() uint32 // @ipc32pc
+}
+
+type Mixed interface {
+	PC() uint64
+	SetPC(uint32)
+}
+
+type Raw8 interface { // @iraw8
+	Raw() [8]byte // @iraw8raw
+}
+
+type Raw4 interface { // @iraw4
+	Raw() [4]byte // @iraw4raw
+}
+
+type RawPC interface {
+	Raw() [8]byte
+	PC() uint32
+}
+
+type G struct{} // @tg
+
+func (G) Cells() [Width]int { return [Width]int{} } // @gcells
+
+type Grid interface { // @igrid
+	Cells() [4]int // @igridcells
+}
+
+type ER struct{ plat.Regs } // @ter
+`,
+			"regs_386.go":  "package p\n\nconst PtrSize = 4\n\nfunc (Regs) PC() uint32 { return 0 } // @pc32\n\nfunc (Regs) SetPC(uint32) {} // @set32\n",
+			"regs_wide.go": "//go:build amd64\n\npackage p\n\nconst PtrSize = 2 * 4\n\nfunc (Regs) PC() uint64 { return 0 } // @pc64\n\nfunc (Regs) SetPC(uint64) {} // @set64\n",
+			"width_a.go":   "//go:build linux\n\npackage p\n\nconst Width = 4\n",
+			"width_b.go":   "//go:build !linux\n\npackage p\n\nconst Width = 2 + 2\n",
+		},
+		// Derived from the sources and the anchor, each build checked with the go command (GOARCH=amd64 and
+		// GOARCH=386, GOOS=linux and GOOS=windows, assertions per architecture; Mixed and RawPC rejected in
+		// every build). Regs' PC and SetPC are uint64 on amd64 (a //go:build line) and uint32 on 386 (the file
+		// name), and PtrSize 8 and 4, so Regs implements PC64 and Raw8 (amd64) and PC32 and Raw4 (386), and no build gives it Mixed's
+		// uint64 PC with a uint32 SetPC, or RawPC's [8]byte Raw with a uint32 PC. plat's Regs declares the same
+		// methods under //go:build lines, so ER, embedding it, implements PC64 and PC32 and not Mixed. Width is 4 for
+		// linux and 2 + 2 elsewhere, one value, so G implements Grid.
+		want: []string{},
+		facts: []string{
+			"tregs Regs implements ipc64 PC64",
+			"pc64 PC overrides ipc64pc PC",
+			"set64 SetPC overrides ipc64set SetPC",
+			"tregs Regs implements ipc32 PC32",
+			"pc32 PC overrides ipc32pc PC",
+			"tregs Regs implements iraw8 Raw8",
+			"regsraw Raw overrides iraw8raw Raw",
+			"tregs Regs implements iraw4 Raw4",
+			"regsraw Raw overrides iraw4raw Raw",
+			"ter ER implements ipc64 PC64",
+			"ter ER implements ipc32 PC32",
+			"tg G implements igrid Grid",
+			"gcells Cells overrides igridcells Cells",
+			"tg G implements external example.com/plat.Grid",
+			"gcells Cells overrides external example.com/plat.Grid.Cells",
+		},
+		// Mutation: read every file's declarations as one build (conditions ignored) -> Regs and ER implement
+		// Mixed and Regs RawPC. Mutation: the worker sends no //go:build line -> Regs implements Mixed. Mutation: a constant declared differently per build unknown -> Regs implements
+		// neither Raw8 nor Raw4. Mutation: compare the unit's constant declarations as written -> G implements
+		// no Grid.
+		fails: "a method set judged over declarations no one build holds together, or a per-build constant or method left unknown",
+	},
+	{
 		name:   "conversions-prove-external-interfaces",
 		anchor: "The Go Programming Language Specification, \"Assignability\", \"Variable declarations\", \"Conversions\"; Effective Go, \"Interface checks\"",
 		files: map[string]string{

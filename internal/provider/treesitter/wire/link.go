@@ -49,6 +49,11 @@ type Link struct {
 	// whose own type the value's syntax spells (Conversion). Only Go sends
 	// them.
 	Conversions []Conversion
+	// Constraint is the build constraint a Go file's leading comments state
+	// (gobuild.Header: its `//go:build` line, or its `// +build` lines), as
+	// a constraint expression's text; empty when it states none. Only Go
+	// sends it.
+	Constraint string
 }
 
 // Export describes one declaration of the file that a call may bind to, a
@@ -512,6 +517,7 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.str(c.Type)
 		e.str(c.Interface)
 	}
+	e.str(l.Constraint)
 	return e.b
 }
 
@@ -636,6 +642,7 @@ func DecodeLink(payload []byte) (Link, error) {
 	for range cap(l.Conversions) {
 		l.Conversions = append(l.Conversions, Conversion{Type: d.str(), Interface: d.str()})
 	}
+	l.Constraint = d.str()
 	if d.err == nil && len(d.b) != 0 {
 		d.fail(fmt.Sprintf("%d bytes past the message's end", len(d.b)))
 	}

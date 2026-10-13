@@ -26,7 +26,9 @@ const (
 	goTypeRecord byte = iota
 	// goMethodRecord is a method the type itself declares: its name in Aux,
 	// its signature as written in Sig, its method-set key (goMethodKey, the
-	// name and canonical signature) in Returns, its flags in Flags.
+	// name and canonical signature) in Returns, its flags in Flags. Every
+	// record carries in MaxArgs the build condition (goCond) of the builds
+	// it is part of.
 	goMethodRecord
 	// goFieldRecord is a field the type itself declares, its name in Aux:
 	// a named field, or an embedded field, named by its type's unqualified
@@ -42,10 +44,11 @@ const (
 )
 
 // addGoMethod records that typ itself declares the method e (keyed under
-// typ by name in links), of method-set key key.
-func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name, key string, e entry) error {
+// typ by name in links), of method-set key key, in the builds of condition
+// cond.
+func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name, key string, cond goCond, e entry) error {
 	return methodSets.Add(entry{Key: refKey(typ), Tag: goMethodRecord, Ref: e.Ref, Aux: name, Sig: e.Sig, Flags: e.Flags,
-		Returns: key})
+		MaxArgs: cond, Returns: key})
 }
 
 // goEmbeddings records each type declaration of a Go table, the fields
@@ -58,6 +61,12 @@ func addGoMethod(methodSets *pagination.ExternalSort[entry], typ Ref, name, key 
 // reaches only what its method set holds, never a promoted method a
 // shallower name hides.
 func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.ExternalSort[entry], fc fileCtx, t *Table) error {
+	// Fields and embeddings are written in their type's declaration, part
+	// of the builds of its file.
+	cond, err := h.goFileCond(fc.file)
+	if err != nil {
+		return err
+	}
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		if !isType(d.Kind) {
@@ -77,7 +86,7 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 			continue
 		}
 		f := entry{Key: refKey(Ref{File: fc.file, Index: d.Parent}), Tag: goFieldRecord, Aux: d.Name,
-			Ref: Ref{File: fc.file, Index: int32(i)}}
+			Ref: Ref{File: fc.file, Index: int32(i)}, MaxArgs: cond}
 		if d.Returns.Kind == wire.TypeNamed {
 			f.Sig = d.Returns.Name
 		}
@@ -107,9 +116,17 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 			if slices.Contains(supers, sub.Ref) {
 				return nil
 			}
+			declared, err := h.goFileCond(sub.Ref.File)
+			if err != nil {
+				return err
+			}
+			cond := h.goConds.and(cond, declared)
+			if !h.goConds.holds(cond) {
+				return nil
+			}
 			// The embedded field, named by its type's unqualified name.
 			field := entry{Key: refKey(sub.Ref), Tag: goFieldRecord, Aux: lastComponent(typeName(st.Super), "."),
-				Ref: sub.Ref, Sig: st.Super}
+				Ref: sub.Ref, Sig: st.Super, MaxArgs: cond}
 			if err := methodSets.Add(field); err != nil {
 				return err
 			}
@@ -117,14 +134,14 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 				// A type outside the unit whose method set the build read
 				// promotes its methods as one of the unit's does.
 				if ext, found := h.goExt.materialized(external); found {
-					if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: ext}); err != nil {
+					if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: ext, MaxArgs: cond}); err != nil {
 						return err
 					}
 				}
-				return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goExternalRecord, Aux: external})
+				return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goExternalRecord, Aux: external, MaxArgs: cond})
 			}
 			for _, super := range supers {
-				if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: super}); err != nil {
+				if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: super, MaxArgs: cond}); err != nil {
 					return err
 				}
 			}
@@ -216,7 +233,7 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 		if outside && tag == 1 {
 			return nil
 		}
-		return goSelectors(ix, typ, tag == 0, func(name string, m entry, promoted bool) error {
+		return goSelectors(ix, h.goConds, typ, tag == 0, func(name string, m entry, promoted bool) error {
 			if m.Tag == goExternalRecord {
 				var flags byte
 				if tag == 0 {
@@ -236,10 +253,10 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 				if _, read := h.goExt.materialized(m.Aux); read {
 					return nil
 				}
-				return sets.Add(entry{Key: goExternalKey + m.Aux, Tag: tag, Ref: typ})
+				return sets.Add(entry{Key: goExternalKey + m.Aux, Tag: tag, Ref: typ, MaxArgs: m.MaxArgs})
 			}
 			if outside {
-				return sets.Add(entry{Key: m.Returns, Tag: tag, Ref: typ})
+				return sets.Add(entry{Key: m.Returns, Tag: tag, Ref: typ, MaxArgs: m.MaxArgs})
 			}
 			if m.Tag == goFieldRecord {
 				return links.Add(entry{Key: keyGoField + refKey(typ) + name, Ref: m.Ref, Sig: m.Sig})
@@ -250,13 +267,13 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 					return err
 				}
 			}
-			return sets.Add(entry{Key: m.Returns, Tag: tag, Ref: typ})
+			return sets.Add(entry{Key: m.Returns, Tag: tag, Ref: typ, MaxArgs: m.MaxArgs})
 		})
 	})
 	if err != nil {
 		return err
 	}
-	return pairSatisfied(dir, links, sets, func(sub, iface Ref, keys []string) error {
+	return pairSatisfied(dir, h.goConds, links, sets, func(sub, iface Ref, keys []string) error {
 		q := h.goExt.qualifiedOf(iface)
 		if err := links.Add(entry{Key: keyGoExternalImpl + refKey(sub), Ref: sub, Aux: q, Sig: DetailMethodSet}); err != nil {
 			return err
@@ -266,7 +283,7 @@ func (h *hierarchy) satisfy(dir string, links, methodSets *pagination.ExternalSo
 			if strings.HasPrefix(k, goExternalKey) || !token.IsExported(name) {
 				continue
 			}
-			if err := links.Add(entry{Key: keyGoExternalOverride + refKey(sub) + name, Ref: sub, Aux: q}); err != nil {
+			if err := links.Add(entry{Key: keyGoExternalOverride + refKey(sub) + name, Ref: sub, Aux: q, Sig: k}); err != nil {
 				return err
 			}
 		}
@@ -290,22 +307,43 @@ const goExternalKey = "\x01"
 // interface's method set is the union of its embedded interfaces' and admits
 // a name from several of them. An interface embeds only interfaces. Only
 // typ's own walk is held.
-func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry, promoted bool) error) error {
-	have := map[string]bool{}
-	external := map[string]bool{}
+func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name string, m entry, promoted bool) error) error {
+	// have is each name a shallower depth declares, with the condition of
+	// the builds in which it does: a deeper member of that name is part of
+	// the others alone, and of none when it is 0.
+	have := map[string]goCond{}
+	declare := func(name string, cond goCond) {
+		if old, ok := have[name]; ok {
+			cond = c.or(old, cond)
+		}
+		have[name] = cond
+	}
+	type outside struct {
+		name string
+		cond goCond
+	}
+	external := map[outside]bool{}
 	// level counts the embedding paths reaching each type at the current
-	// depth, two meaning two or more.
+	// depth, two meaning two or more, and paths the condition of the
+	// builds holding one of them.
 	level := map[Ref]int{}
+	paths := map[Ref]goCond{}
+	reach := func(level map[Ref]int, paths map[Ref]goCond, r Ref, n int, cond goCond) {
+		if old, ok := paths[r]; ok {
+			cond = c.or(old, cond)
+		}
+		level[r], paths[r] = min(level[r]+n, 2), cond
+	}
 	err := ix.lookup(refKey(typ), func(e entry) error {
 		switch e.Tag {
 		case goMethodRecord, goFieldRecord:
-			have[e.Aux] = true
+			declare(e.Aux, e.MaxArgs)
 			return yield(e.Aux, e, false)
 		case goExternalRecord:
-			external[e.Aux] = true
+			external[outside{e.Aux, e.MaxArgs}] = true
 			return yield("", e, false)
 		case goEmbedRecord:
-			level[e.Ref] = min(level[e.Ref]+1, 2)
+			reach(level, paths, e.Ref, 1, e.MaxArgs)
 		}
 		return nil
 	})
@@ -317,15 +355,29 @@ func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry
 		for r := range level {
 			visited[r] = true
 		}
-		type reach struct {
+		// members are the records of one name at this depth, and paths
+		// the embedding paths reaching them, each embedded type counted
+		// once however many records of the name it holds (one per build
+		// condition).
+		type members struct {
 			members []entry
 			paths   int
+			last    Ref
 		}
-		byName := map[string]*reach{}
+		byName := map[string]*members{}
 		next := map[Ref]int{}
-		for embedded, paths := range level {
+		nextPaths := map[Ref]goCond{}
+		for embedded, n := range level {
+			via := paths[embedded]
 			skip := false
 			err := ix.lookup(refKey(embedded), func(e entry) error {
+				if e.Tag != goTypeRecord && !skip {
+					// A promoted member is part of the builds holding it
+					// and the path that reaches it.
+					if e.MaxArgs = c.and(e.MaxArgs, via); !c.holds(e.MaxArgs) {
+						return nil
+					}
+				}
 				switch {
 				case e.Tag == goTypeRecord:
 					skip = iface && e.Flags&flagAbstract == 0
@@ -333,15 +385,18 @@ func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry
 				case e.Tag == goMethodRecord || e.Tag == goFieldRecord:
 					r := byName[e.Aux]
 					if r == nil {
-						r = &reach{}
+						r = &members{}
 						byName[e.Aux] = r
 					}
+					if len(r.members) == 0 || r.last != embedded {
+						r.paths = min(r.paths+n, 2)
+						r.last = embedded
+					}
 					r.members = append(r.members, e)
-					r.paths = min(r.paths+paths, 2)
 				case e.Tag == goEmbedRecord && !visited[e.Ref]:
-					next[e.Ref] = min(next[e.Ref]+paths, 2)
-				case e.Tag == goExternalRecord && !external[e.Aux]:
-					external[e.Aux] = true
+					reach(next, nextPaths, e.Ref, n, e.MaxArgs)
+				case e.Tag == goExternalRecord && !external[outside{e.Aux, e.MaxArgs}]:
+					external[outside{e.Aux, e.MaxArgs}] = true
 					return yield("", e, true)
 				}
 				return nil
@@ -351,20 +406,34 @@ func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry
 			}
 		}
 		for name, r := range byName {
-			if have[name] {
+			hidden, shallower := have[name]
+			if shallower && hidden == 0 {
 				continue
 			}
-			have[name] = true
+			var cond goCond
+			for i, m := range r.members {
+				if i == 0 {
+					cond = m.MaxArgs
+				} else {
+					cond = c.or(cond, m.MaxArgs)
+				}
+			}
+			declare(name, cond)
 			if !iface && r.paths > 1 {
 				continue
 			}
 			for _, m := range r.members {
+				if shallower {
+					if m.MaxArgs = c.andNot(m.MaxArgs, hidden); !c.holds(m.MaxArgs) {
+						continue
+					}
+				}
 				if err := yield(name, m, true); err != nil {
 					return err
 				}
 			}
 		}
-		level = next
+		level, paths = next, nextPaths
 	}
 	return nil
 }
@@ -372,9 +441,12 @@ func goSelectors(ix *index, typ Ref, iface bool, yield func(name string, m entry
 // pairSatisfied adds every type whose method set includes an interface's
 // whole method set as that interface's subtype; sets is satisfy's. A pair
 // whose interface is outside the unit (goExternalFile) is handed to external
-// with the interface's method-set keys instead, since no index entry names
-// that interface.
-func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry], external func(sub, iface Ref, keys []string) error) error {
+// with the interface's method-set keys the type matches in a build that
+// satisfies it instead, since no index entry names that interface. A method of a name
+// has a key per build-dependent signature (goMethodKeys); the pair is
+// satisfied when every name is matched and some build holds, for every name,
+// one of its keys in both the interface and the type (go_build.go).
+func pairSatisfied(dir string, c *goConds, links, sets *pagination.ExternalSort[entry], external func(sub, iface Ref, keys []string) error) error {
 	run, err := sets.Sorted()
 	if err != nil {
 		return err
@@ -394,14 +466,13 @@ func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry], exte
 			key, ifaces = e.Key, ifaces[:0]
 		}
 		if e.Tag == 0 {
-			if n := len(ifaces); n > 0 && ifaces[n-1] == e.Ref {
-				return nil
+			if n := len(ifaces); n == 0 || ifaces[n-1] != e.Ref {
+				ifaces = append(ifaces, e.Ref)
 			}
-			ifaces = append(ifaces, e.Ref)
-			return pairs.Add(entry{Key: refKey(e.Ref), Sig: e.Key})
+			return pairs.Add(entry{Key: refKey(e.Ref), Sig: e.Key, MaxArgs: e.MaxArgs})
 		}
 		for _, i := range ifaces {
-			if err := pairs.Add(entry{Key: refKey(i) + refKey(e.Ref), Sig: e.Key}); err != nil {
+			if err := pairs.Add(entry{Key: refKey(i) + refKey(e.Ref), Sig: e.Key, MaxArgs: e.MaxArgs}); err != nil {
 				return err
 			}
 		}
@@ -415,41 +486,123 @@ func pairSatisfied(dir string, links, sets *pagination.ExternalSort[entry], exte
 		return err
 	}
 	defer counted.Close()
-	var iface, pair, method string
-	want, n := 0, 0
-	// keys are the current pair's matched keys, kept only for an interface
-	// outside the unit: its methods, at most.
-	var keys []string
-	return counted.Each(func(e entry) error {
-		if len(e.Key) == len(refKey(Ref{})) {
-			if e.Key != iface {
-				iface, want, method = e.Key, 0, ""
+	// keyed is a key of the current interface or pair, with the condition
+	// of the builds holding it there.
+	type keyed struct {
+		key  string
+		cond goCond
+	}
+	add := func(ks []keyed, k string, cond goCond) []keyed {
+		if n := len(ks); n > 0 && ks[n-1].key == k {
+			ks[n-1].cond = c.or(ks[n-1].cond, cond)
+			return ks
+		}
+		return append(ks, keyed{k, cond})
+	}
+	var iface, pair string
+	// want counts the interface's method names; conditional reports a key
+	// of it or of the pair under a condition some build lacks.
+	want := 0
+	var ifaceKeys, pairKeys []keyed
+	ifaceConditional := false
+	finish := func() error {
+		if pair == "" || pair[:8] != iface {
+			return nil
+		}
+		defer func() { pair, pairKeys = "", pairKeys[:0] }()
+		names := 0
+		conditional := ifaceConditional
+		for i, k := range pairKeys {
+			if i == 0 || goKeyName(k.key) != goKeyName(pairKeys[i-1].key) {
+				names++
 			}
-			if e.Sig != method {
-				method = e.Sig
+			conditional = conditional || k.cond != 0
+		}
+		if names != want {
+			return nil
+		}
+		// met are the keys some build holds in both, all of them unless a
+		// condition says otherwise.
+		met := make([]string, 0, len(pairKeys))
+		if !conditional {
+			for _, k := range pairKeys {
+				met = append(met, k.key)
+			}
+		} else {
+			// Some build holds, for every name, one of its keys in both.
+			var all goCond
+			j := 0
+			for i := 0; i < len(ifaceKeys); {
+				name := goKeyName(ifaceKeys[i].key)
+				var any goCond
+				found := false
+				for ; i < len(ifaceKeys) && goKeyName(ifaceKeys[i].key) == name; i++ {
+					for j < len(pairKeys) && pairKeys[j].key < ifaceKeys[i].key {
+						j++
+					}
+					if j == len(pairKeys) || pairKeys[j].key != ifaceKeys[i].key {
+						continue
+					}
+					term := c.and(ifaceKeys[i].cond, pairKeys[j].cond)
+					if !c.holds(term) {
+						continue
+					}
+					met = append(met, ifaceKeys[i].key)
+					if !found {
+						any, found = term, true
+					} else {
+						any = c.or(any, term)
+					}
+				}
+				if !found {
+					return nil
+				}
+				all = c.and(all, any)
+			}
+			if !c.holds(all) {
+				return nil
+			}
+		}
+		if refOf(pair[:8]).File == goExternalFile {
+			return external(refOf(pair[8:]), refOf(pair[:8]), met)
+		}
+		return addSubtype(links, refOf(pair[8:]), refOf(pair[:8]), flagInterface)
+	}
+	err = counted.Each(func(e entry) error {
+		if len(e.Key) == len(refKey(Ref{})) {
+			if err := finish(); err != nil {
+				return err
+			}
+			if e.Key != iface {
+				iface, want, ifaceKeys, ifaceConditional = e.Key, 0, ifaceKeys[:0], false
+			}
+			if n := len(ifaceKeys); n == 0 || goKeyName(ifaceKeys[n-1].key) != goKeyName(e.Sig) {
 				want++
 			}
+			ifaceKeys = add(ifaceKeys, e.Sig, e.MaxArgs)
+			ifaceConditional = ifaceConditional || e.MaxArgs != 0
 			return nil
 		}
 		if e.Key != pair {
-			pair, n, method, keys = e.Key, 0, "", keys[:0]
+			if err := finish(); err != nil {
+				return err
+			}
+			pair = e.Key
 		}
-		if e.Sig == method {
-			return nil
-		}
-		method = e.Sig
-		outside := refOf(pair[:8]).File == goExternalFile
-		if outside {
-			keys = append(keys, e.Sig)
-		}
-		if n++; pair[:8] != iface || n != want {
-			return nil
-		}
-		if outside {
-			return external(refOf(pair[8:]), refOf(pair[:8]), keys)
-		}
-		return addSubtype(links, refOf(pair[8:]), refOf(pair[:8]), flagInterface)
+		pairKeys = add(pairKeys, e.Sig, e.MaxArgs)
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return finish()
+}
+
+// goKeyName is the method name of a method-set key (goIdentityKey), or the
+// whole key of an embedded type outside the unit (goExternalKey).
+func goKeyName(key string) string {
+	name, _, _ := strings.Cut(key, "\x00")
+	return name
 }
 
 // readGoModule reads the go.mod at the unit's project root, the go.work
