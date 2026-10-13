@@ -55,7 +55,7 @@ func newPairFixture(t *testing.T, edges, pkgs int) (*graphFixture, []model.Relat
 		// sum rather than a copy of PairCount.
 		for n := 0; n <= i%3; n++ {
 			f.evidence[rel.ID] = append(f.evidence[rel.ID], model.Evidence{
-				ID:              model.EvidenceID(fixtureID(fmt.Sprintf("ev-%06d-%d", i, n))),
+				ID:              model.EvidenceID(fixtureID(fmt.Sprintf("ev-%06d-%d", i, n))[:model.EvidenceIDHexLen]),
 				UnitID:          model.UnitID(fixtureID("unit-1")),
 				ProviderID:      "treesitter",
 				ProviderVersion: "0.0.1",
