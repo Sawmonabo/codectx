@@ -247,27 +247,13 @@ func TestImpactDependenceServesADescendingNodesEdgesOnce(t *testing.T) {
 	}
 }
 
-// flowGraph is a fixture reader that also reports call roles, by relation.
-type flowGraph struct {
-	*MemoryGraph
-	roles map[model.RelationID]FlowRole
-}
-
-func (g *flowGraph) RelationFlowRoles(ctx context.Context, rels []model.RelationID) ([]FlowRole, error) {
-	out := make([]FlowRole, len(rels))
-	for i, id := range rels {
-		out[i] = g.roles[id]
-	}
-	return out, nil
-}
-
 // callContextFixture is f(p) called at two sites: a1 at site 1 and a2 at site
 // 2 pass their values to p, and each site's result is r1 and r2. p's value
 // reaches f's return node ret through m, so each site also carries a summary
 // flow from its argument to its result; k, a local of f no parameter reaches,
 // flows to ret too. x, y and z are a chain into m from outside any call.
 // Relation i of the list is fixtureRelationID(i).
-func callContextFixture(t *testing.T) (*graphFixture, *flowGraph) {
+func callContextFixture(t *testing.T) (*graphFixture, *MemoryGraph) {
 	t.Helper()
 	nodes := map[string]model.NodeKind{}
 	for _, n := range []string{"a1", "a2", "r1", "r2", "p", "m", "ret", "k", "x", "y", "z"} {
@@ -286,7 +272,7 @@ func callContextFixture(t *testing.T) (*graphFixture, *flowGraph) {
 		fixtureRelationID(0): {Argument: true}, fixtureRelationID(1): {Argument: true},
 		fixtureRelationID(4): {Return: true}, fixtureRelationID(5): {Return: true},
 	}
-	return f, &flowGraph{MemoryGraph: memGraphFor(f), roles: roles}
+	return f, memGraphFor(f).WithFlowRoles(roles)
 }
 
 // callContextImpact is the incoming impact of seeds over the call-context

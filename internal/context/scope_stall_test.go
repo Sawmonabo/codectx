@@ -22,7 +22,9 @@ import (
 // per SCAN: the opening page still reaches a position before any page after it
 // stalls.
 type stallingReader struct {
-	graph.GraphReader
+	// The concrete reader, not the port, so its optional seams (declarations,
+	// call roles) are the stalling reader's too.
+	*graph.MemoryGraph
 	clock *time.Time
 	calls *int
 	jump  time.Duration
@@ -39,7 +41,7 @@ func (r stallingReader) Neighbours(ctx stdcontext.Context, refs []graph.NodeRef,
 	if *r.calls > r.after {
 		*r.clock = r.clock.Add(r.jump)
 	}
-	return r.GraphReader.Neighbours(ctx, refs, dir, kinds, from, fn)
+	return r.MemoryGraph.Neighbours(ctx, refs, dir, kinds, from, fn)
 }
 
 // TestAStalledWalkPageEndsThePassAndIsReIssuedOnce pins the stalled-page branch
@@ -155,6 +157,7 @@ func stalledScopeEngine(t *testing.T, fx *contextFixture, rels []model.Relation,
 		id := fx.Node(spec.path)
 		inner.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
 			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash}
+		inner.files = append(inner.files, fv)
 	}
 	sort.Slice(inner.relations, func(i, j int) bool { return inner.relations[i].ID < inner.relations[j].ID })
 	dir := t.TempDir()
@@ -169,7 +172,7 @@ func stalledScopeEngine(t *testing.T, fx *contextFixture, rels []model.Relation,
 	}
 	eng, err := graph.New(graph.Options{
 		Adjacency: inner,
-		Reader:    stallingReader{GraphReader: scopeMemoryGraph(inner), clock: clock, calls: calls, jump: 2 * time.Minute, after: after},
+		Reader:    stallingReader{MemoryGraph: scopeMemoryGraph(inner), clock: clock, calls: calls, jump: 2 * time.Minute, after: after},
 		Signer:    signer, Spools: spools,
 		Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{

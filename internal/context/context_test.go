@@ -1721,6 +1721,9 @@ type scopeAdjacency struct {
 	nodes     map[model.NodeID]model.Node
 	relations []model.Relation
 	caps      []model.CapabilityState
+	// files is the snapshot's files, which the packed reader places each
+	// declaration at, as the store's reader does.
+	files []model.FileVersion
 }
 
 func (a *scopeAdjacency) Binding() model.Binding { return a.binding }
@@ -1747,14 +1750,16 @@ func (a *scopeAdjacency) EvidenceFor(stdcontext.Context, []model.RelationID, int
 
 // scopeMemoryGraph is the packed reader the fixture's traversals read
 // structure through, built from the delivery fake's own nodes and relations so
-// the two describe one graph.
+// the two describe one graph. It looks declarations up by name over the
+// fixture's files and reads call roles, as the store's reader does, so the
+// name-only and two-phase rules run in every fixture.
 func scopeMemoryGraph(a *scopeAdjacency) *graph.MemoryGraph {
 	nodes := make([]model.Node, 0, len(a.nodes))
 	for _, n := range a.nodes {
 		nodes = append(nodes, n)
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
-	return graph.NewMemoryGraph(a.binding, nodes, append([]model.Relation(nil), a.relations...))
+	return graph.NewMemoryGraph(a.binding, nodes, append([]model.Relation(nil), a.relations...)).WithFiles(a.files)
 }
 
 // scopeEngine builds an engine over the fixture's nodes and the edges a row
@@ -1768,6 +1773,7 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 		id := f.NodeOf(spec.path, spec.symbol)
 		adj.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
 			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash}
+		adj.files = append(adj.files, fv)
 	}
 	sort.Slice(adj.relations, func(i, j int) bool { return adj.relations[i].ID < adj.relations[j].ID })
 	// The continuation machinery is wired exactly as internal/app wires it
