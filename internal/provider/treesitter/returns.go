@@ -76,6 +76,9 @@ func (b *builder) returnFlows(vars map[wire.Span]fileVar, byStart []int) error {
 	for i := range fns {
 		d := callable[i]
 		ret, ok := rets[d]
+		if d >= 0 && fns[i].Failed {
+			unknownSummaries(&t.Decls[d])
+		}
 		if d < 0 || !ok || fns[i].Failed {
 			continue
 		}

@@ -219,6 +219,13 @@ whatever that callee returns. The summary is part of the callee's interface (`Pa
 `paramReturned` mark of its hierarchy entry): a body edit that changes whether a parameter reaches the return
 changes the entry every bound site's argument flows read, so a refresh re-runs exactly those sites. The return node
 is keyed by the callable's identity and exists for every analysed callable, so its flows do not depend on the body.
+A callable whose analysis failed in the worker has no flows and no parameter nodes, so whether a parameter reaches
+its return is not known: each parameter is marked `Unknown` (`Parameter.Unknown`, the `paramUnknown` mark of its
+entry, traced like `Returned`), and a bound site whose value is written into a variable finds a summary for each
+argument bound to it that is kept with no node, never published and counted on the `data_flows_to` row
+(`facts_without_node`), beside the argument flow into the same parameter. No flow is claimed the callee was not
+shown to carry, and none is lost in silence; an analysis that later succeeds changes the entry and re-runs the
+sites.
 
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
 the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
@@ -875,8 +882,8 @@ The provider publishes one row of each of its six capabilities per unit, at the 
   of these is fatal.
 - `partial`, with `coverage_incomplete`, on the row of each relation a fact was found for whose target the structural
   provider minted no node (`facts_without_node`, counted by `externalsOf`, `state.go`): a call or hierarchy fact into
-  a declaration with no node, or an argument's flow into a parameter with none (one whose key did not fit, a C or C++
-  `...`) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
+  a declaration with no node, or an argument's flow or summary into a parameter with none (one whose key did not fit,
+  a C or C++ `...`, one of a callable whose analysis failed) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
   and no node (`idBinding.unnamed`), so a refresh carries and counts it like any other. A flow into a callable with
   no body (an abstract method, a prototype) and a return flow from a callee with no return node are not facts. A fact
   whose relation is no capability of its own (a route's handler, a declared entry point, a launchable `main`, a

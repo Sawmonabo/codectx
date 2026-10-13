@@ -263,6 +263,11 @@ type Parameter struct {
 	// callable: the callable's return summary, by which a bound call site's
 	// argument flows into the site's result.
 	Returned bool `json:"returned,omitempty"`
+	// Unknown reports a parameter of a callable whose analysis failed in the
+	// worker, so whether its value reaches the return is not known: each
+	// bound site's summary for it is a fact with no node, counted and never
+	// published (unknownSummaries).
+	Unknown bool `json:"unknown,omitempty"`
 }
 
 // Visible reports that declaration cand can be named by a bare name in code

@@ -38,7 +38,7 @@ func flowFacts(s *Site, site, target Ref, params []paramInfo, arg, pos int32, em
 		return nil
 	}
 	for i := range params {
-		if p := &params[i]; p.Pos == pos && p.Returned {
+		if p := &params[i]; p.Pos == pos && (p.Returned || p.Unknown) {
 			return emit(Binding{Kind: FactSummary, Site: site, Target: target, Detail: DetailSummary, Arg: arg, Param: pos,
 				Position: int32(p.Index)})
 		}
