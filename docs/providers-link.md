@@ -1016,7 +1016,7 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 ## Capability states
 
-The provider publishes one row of each of its six capabilities per unit, at the unit's scope:
+The provider publishes one row of each of its seven capabilities (`calls`, `imports`, `data_flows_to`, `extends`, `implements`, `overrides`, `generates`) per unit, at the unit's scope:
 - `fresh` when every member had a table and no table dropped an entry;
 - `partial`, with `coverage_incomplete` (`publisher.capabilities`, `internal/provider/link/provider.go`), when a
   member has no table (`members_without_table`) or a table's `Dropped` is non-zero (`dropped_table_entries`; a
