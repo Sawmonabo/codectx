@@ -163,3 +163,68 @@ func TestAnAnswerOverflowingOneViewIsSpooledAndPagesExactly(t *testing.T) {
 		t.Fatalf("an answer read through all three views left %v behind", left)
 	}
 }
+
+// TestAnAnswerOfPairsAloneServesThemThroughItsEntriesView pins an answer that
+// lists no entity but whose walk crossed more package pairs than a page holds
+// -- every node it reaches is a seed -- asked for through its reasons view. The
+// reasons view has nothing to serve, but the entries view, which the request
+// also reads, still has every pair: the answer is retained, its answer token
+// reads the entries view, which serves every pair once, and the answer is
+// released when that view ends.
+//
+// Mutation caught: serveRankedRun ending such an answer on its first page
+// (the run.Len() == 0 shortcut taken whatever the entries view has left, or
+// spillImpactAnswer minting no answer token for an answer with no entity), so
+// its pairs are never served.
+func TestAnAnswerOfPairsAloneServesThemThroughItsEntriesView(t *testing.T) {
+	const edges, limit = 3, 2
+	f, calls := newPairFixture(t, edges, edges+1)
+	e, root, _, _ := inlineEngine(t, f, limit)
+	var start []model.NodeID
+	for _, c := range calls {
+		start = append(start, c.From, c.To)
+	}
+	req := model.ImpactRequest{GenerationID: 1, Start: start, Direction: model.DirectionOutgoing,
+		Relations: []model.RelationKind{model.RelCalls}, View: model.ImpactViewReasons,
+		Page: model.PageRequest{Limit: limit}}
+	res, err := e.Impact(context.Background(), req)
+	if err != nil {
+		t.Fatalf("reasons view: %v", err)
+	}
+	if len(res.Entries) != 0 || len(res.Reasons) != 0 {
+		t.Fatalf("an answer of seeds alone served %d entries and %d reasons", len(res.Entries), len(res.Reasons))
+	}
+	if res.Answer == "" {
+		t.Fatalf("an answer of %d package pairs on pages of %d minted no answer token: its pairs are unreachable",
+			edges, limit)
+	}
+	r := req
+	r.GenerationID, r.View, r.Page.Cursor = 0, model.ImpactViewEntries, res.Answer
+	seen := map[[2]model.NodeID]bool{}
+	for page := 0; ; page++ {
+		if page > 10 {
+			t.Fatal("the entries view did not end in 10 pages")
+		}
+		got, err := e.Impact(context.Background(), r)
+		if err != nil {
+			t.Fatalf("entries page %d: %v", page, err)
+		}
+		for _, p := range got.Packages {
+			k := [2]model.NodeID{p.FromNodeID, p.ToNodeID}
+			if seen[k] {
+				t.Fatalf("the pair %v was served twice", k)
+			}
+			seen[k] = true
+		}
+		if got.Meta.NextCursor == "" {
+			break
+		}
+		r.Page.Cursor = got.Meta.NextCursor
+	}
+	if len(seen) != edges {
+		t.Fatalf("the entries view served %d package pairs, want %d", len(seen), edges)
+	}
+	if left := spoolEntries(t, root); len(left) != 0 {
+		t.Fatalf("the answer outlived its entries view: %v", left)
+	}
+}
