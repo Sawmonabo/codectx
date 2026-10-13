@@ -80,15 +80,15 @@ import (
 // "m#key"),
 // a function declaration (TypeFunction). A may-definition through a property
 // write, an update or a delete keeps the type the variable already held, so
-// the definitions behind it are read instead; a closure's may-definition
-// says nothing of the value and is unknown. Expressions give TypeNamed for
-// `new C()`, an `as` or `<T>` assertion and an annotation, TypeResult for a
-// call site's value, TypeModule for `require("m")`, TypeField for a property
-// read, and the operand's type through await, `!`, `satisfies`, an
-// assignment, a sequence's last element, and both arms of a conditional or
-// a short-circuit operator. A class declaration's name is TypeClass, the
-// class object itself. Definitions or arms that disagree merge to a
-// TypeUnion of every type they recover (Link.Unions), so every type that
+// the definitions behind it are read instead; a closure's may-definition says
+// nothing of the value and is unknown. Expressions give TypeNamed for
+// `new C()` (wire.ExactObject), an `as` or `<T>` assertion and an annotation,
+// TypeResult for a call site's value, TypeModule for `require("m")`,
+// TypeField for a property read, and the operand's type through await, `!`,
+// `satisfies`, an assignment, a sequence's last element, and both arms of a
+// conditional or a short-circuit operator. A class declaration's name is
+// TypeClass, the class object itself. Definitions or arms that disagree merge
+// to a TypeUnion of every type they recover (Link.Unions), so every type that
 // reaches a receiver or an argument is sent; one that recovers nothing adds
 // nothing to it.
 //
@@ -821,7 +821,10 @@ func (k *javaScriptLinker) typeOf(e Node) wire.Type {
 		return k.thisAt(e)
 	case kk.newExpression:
 		if c := firstNamed(e); jsKindOf(c) == kk.identifier || jsKindOf(c) == kk.memberExpression {
-			return wire.Type{Kind: wire.TypeNamed, Name: k.spell(c)}
+			// The object `new C()` makes is exactly a C (ECMA-262
+			// §13.3.5.1.1 EvaluateNew: its prototype is C.prototype), so a
+			// call on it runs no subclass's override.
+			return wire.Type{Kind: wire.TypeNamed, Name: k.spell(c), Index: wire.ExactObject}
 		}
 	case kk.callExpression:
 		if tok, ok := k.callee(e); ok {

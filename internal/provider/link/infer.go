@@ -1349,6 +1349,12 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 			}
 		}
 	case wire.TypeNamed:
+		// An object of exactly the type (wire.ExactObject: an ECMAScript
+		// `new C()`) is that class's object; any other instance may be a
+		// subclass's.
+		if ty.Index == wire.ExactObject {
+			return f.in.h.types(ctx, f.file, ty.Name, constant(valObject))
+		}
 		return f.in.h.types(ctx, f.file, ty.Name, constant(valInstance))
 	case wire.TypeClass:
 		return f.in.h.types(ctx, f.file, ty.Name, constant(valClass))
