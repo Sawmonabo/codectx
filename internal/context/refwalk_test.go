@@ -23,9 +23,9 @@ import (
 // requirement, through the node's kind) and its route factor (the score, the
 // group's weight being one number). Past depth refDepthClasses every kind is
 // optional, so those depths are one class. A route is kept unless a kept route
-// to the same node is no deeper in class and has a factor at least as large:
-// that one's pair is at least as large for every kind and every boost, and so
-// are its extensions. Routes are taken in factor order, which never rises along
+// to the same node is no deeper in class, has a factor at least as large and a
+// route shape no weaker (refShape): that one's pair is at least as large for
+// every kind and every boost, and so are its extensions. Routes are taken in factor order, which never rises along
 // a route, so a kept route is final; ties go to the shallower route and then to
 // the smaller last relation id.
 //
@@ -88,7 +88,10 @@ func referenceWalks(ctx context.Context, eng *graph.Engine, gen model.Generation
 		if a.group.Named != b.group.Named {
 			return !a.group.Named
 		}
-		return a.group.Weight < b.group.Weight
+		if a.group.Weight != b.group.Weight {
+			return a.group.Weight < b.group.Weight
+		}
+		return a.label.shape.less(b.label.shape)
 	})
 	var reached []model.ImpactEntry
 	for _, rec := range records {
@@ -127,6 +130,55 @@ type refEdge struct {
 	kind  model.RelationKind
 	// from is true when the node is the relation's from-node.
 	from bool
+	// role is a data flow's call role.
+	role graph.FlowRole
+}
+
+// refShape is a route's shape as the walk keeps it: the peer kind its last hop
+// went up, whether it reached a sibling, and whether it entered a callee
+// through an argument.
+type refShape struct {
+	up        model.RelationKind
+	peer      bool
+	descended bool
+}
+
+// noWeaker reports whether a route of shape s may stand for one of shape o.
+func (s refShape) noWeaker(o refShape) bool {
+	return (s.up == "" || s.up == o.up) && (!s.peer || o.peer) && (!s.descended || o.descended)
+}
+
+// less is the walk's serving order over shapes: up, then peer, then descended.
+func (s refShape) less(o refShape) bool {
+	if s.up != o.up {
+		return s.up < o.up
+	}
+	if s.peer != o.peer {
+		return !s.peer
+	}
+	return !s.descended && o.descended
+}
+
+// next is the shape a hop over e lends a route of shape s, and whether the
+// route may take it at all: a descended route never leaves through a call site.
+func (s refShape) next(e refEdge, peer map[model.RelationKind]bool) (refShape, bool) {
+	enters := (e.role.Argument && e.from) || (e.role.Return && !e.from)
+	leaves := (e.role.Return && e.from) || (e.role.Argument && !e.from)
+	if leaves && s.descended {
+		return refShape{}, false
+	}
+	out := refShape{peer: s.peer}
+	if peer[e.kind] {
+		if e.from {
+			out.up = e.kind
+		} else if s.up == e.kind {
+			out.peer = true
+		}
+	}
+	if (e.kind == model.RelDataFlowsTo || e.kind == model.RelControlDependsOn) && (s.descended || enters) {
+		out.descended = true
+	}
+	return out, true
 }
 
 // refLabel is one route: its end, depth and factor, its last hop and the
@@ -139,6 +191,7 @@ type refLabel struct {
 	kind   model.RelationKind
 	// leaves is true when the last hop leaves the parent.
 	leaves bool
+	shape  refShape
 	parent *refLabel
 }
 
@@ -205,12 +258,21 @@ func (w *refWalker) neighbours(n model.NodeID) ([]refEdge, error) {
 			if err != nil {
 				return nil, err
 			}
+			flows, _ := w.r.(graph.FlowRoleReader)
 			for i, e := range edges {
 				kind, ok := w.r.Kinds().Kind(e.Kind)
 				if !ok || otherIDs[i] == "" || relIDs[i] == "" {
 					continue
 				}
-				out = append(out, refEdge{other: otherIDs[i], rel: relIDs[i], kind: kind, from: e.Outgoing})
+				edge := refEdge{other: otherIDs[i], rel: relIDs[i], kind: kind, from: e.Outgoing}
+				if kind == model.RelDataFlowsTo && flows != nil {
+					roles, err := flows.RelationFlowRoles(w.ctx, []model.RelationID{relIDs[i]})
+					if err != nil {
+						return nil, err
+					}
+					edge.role = roles[0]
+				}
+				out = append(out, edge)
 			}
 		}
 	}
@@ -258,7 +320,7 @@ func (w *refWalker) group(g walkGroup) ([]refRecord, error) {
 	for q.Len() > 0 {
 		l := heap.Pop(q).(*refLabel)
 		dominated := slices.ContainsFunc(kept[l.node], func(k *refLabel) bool {
-			return refClass(k.depth) <= refClass(l.depth) && k.factor >= l.factor
+			return refClass(k.depth) <= refClass(l.depth) && k.factor >= l.factor && k.shape.noWeaker(l.shape)
 		})
 		if dominated {
 			continue
@@ -291,6 +353,10 @@ func (w *refWalker) group(g walkGroup) ([]refRecord, error) {
 				break
 			}
 			w.edges++
+			shape, take := l.shape.next(e, w.rule.Peer)
+			if !take {
+				continue
+			}
 			factor, err := mulScaled(l.factor, w.rule.Hop[e.kind])
 			if err != nil {
 				return nil, err
@@ -301,7 +367,7 @@ func (w *refWalker) group(g walkGroup) ([]refRecord, error) {
 				}
 			}
 			heap.Push(q, &refLabel{node: e.other, depth: l.depth + 1, factor: factor, rel: e.rel,
-				kind: e.kind, leaves: e.from, parent: l})
+				kind: e.kind, leaves: e.from, shape: shape, parent: l})
 		}
 		if w.stopped {
 			break
@@ -335,10 +401,7 @@ func (w *refWalker) record(rec refRecord) (candidate, bool, error) {
 		return candidate{}, false, nil
 	}
 	n := nodes[0]
-	requirement := boundaryRequirement(n.Kind, l.depth)
-	if !rec.group.Named && requirementRank(requirement) < requirementRank(model.RequirementRecommended) {
-		requirement = model.RequirementRecommended
-	}
+	requirement := walkRequirement(n.Kind, l.depth, rec.group.Named, l.shape.peer)
 	reasons, err := w.reasons(rec)
 	if err != nil {
 		return candidate{}, false, err
@@ -408,11 +471,18 @@ func (w *refWalker) reasons(rec refRecord) ([]string, error) {
 	return out, nil
 }
 
-// refReason is a walk reason's wording (docs/queries.md): outgoing when the
-// relation leaves the node the walk came from.
+// refReason is a walk reason's wording (docs/queries.md): "this symbol <kind>
+// it" when the relation leaves the node the walk came from, and the reported
+// direction outgoing for every kind but data_flows_to, which is stored
+// dependency first and reports the other direction (an impact entry its value
+// flows to may need modification).
 func refReason(kind model.RelationKind, outgoing bool, depth int) string {
-	if outgoing {
-		return fmt.Sprintf("this symbol %s it (outgoing, depth %d)", kind, depth)
+	dir := "incoming"
+	if outgoing != (kind == model.RelDataFlowsTo) {
+		dir = "outgoing"
 	}
-	return fmt.Sprintf("%s this symbol (incoming, depth %d)", kind, depth)
+	if outgoing {
+		return fmt.Sprintf("this symbol %s it (%s, depth %d)", kind, dir, depth)
+	}
+	return fmt.Sprintf("%s this symbol (%s, depth %d)", kind, dir, depth)
 }

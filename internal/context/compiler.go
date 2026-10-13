@@ -231,24 +231,11 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	if m, ok, err := c.reuseManifest(ctx, id); err != nil {
 		return CompileResult{}, err
 	} else if ok {
-		// Notices are not persisted (model.ContextManifest.Notices says why),
-		// so the reused header carries none. The configuration-derived one is
-		// re-emitted here: it is a fact about THIS request's bounds, and a
-		// caller who hit the reuse path asked for the same page size as the
-		// caller who compiled.
-		m.Notices = c.manifestNotices(scopeResult{}, planParts{})
-		if !m.ScopeComplete {
-			// The reused header knows its scope is partial but not how many
-			// candidates were excluded -- the count lives in the stored
-			// exclusion projection, not in the manifest -- so the pointer is
-			// emitted without a count rather than withheld, and it does not
-			// claim exclusions exist: a scope also goes incomplete with none
-			// (an unreadable evidence route), so the count-less form promises
-			// only the surface, never rows. Without it a caller
-			// who hits the reuse path reads scope_complete=false with nothing
-			// naming the surface that says why.
-			m.Notices = append(m.Notices, excludedViewNotice)
-		}
+		// The stored header carries the plan's own notices, exactly as the
+		// compile that stored it made them; the page-size notice describes
+		// this call's configuration, which the manifest identity does not
+		// fold, so it is re-emitted from it.
+		m.Notices = c.withPageNotice(m.Notices)
 		return CompileResult{Manifest: m}, nil
 	}
 
@@ -313,9 +300,9 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// another round runs with new inputs, and P-I runs once, on the final
 	// round. A resumed call re-enters the recorded round at the recorded pass
 	// and continues the loop from there. A round rebuilds the pipeline from
-	// P-A with fresh sorts in the same sort area, and the area's deferred
-	// release removes every round's runs: a compile's temporary disk is the
-	// sum of its rounds' runs, each round's no larger than a one-round compile
+	// P-A with fresh sorts in the same sort area, and a finished round's runs
+	// are released before the next round opens its own: a compile's temporary
+	// disk is its largest round's runs, each no larger than a one-round compile
 	// of the same inputs. No halt lands between two rounds -- a round that has
 	// not started has no carry to checkpoint -- so the next round's P-A is the
 	// first place the stop is asked again.
@@ -343,6 +330,12 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 		}
 		if done {
 			break
+		}
+		// Every run this round opened, a resumed checkpoint's adopted runs
+		// among them, is dead: the next round takes only next's scalars.
+		if rerr := sorts.releaseRound(); rerr != nil {
+			c.logger().Warn("a context compile could not release a finished round's sort runs",
+				"component", "context", "error", rerr)
 		}
 		st.beginRound(next)
 	}
@@ -387,14 +380,11 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// produced the run: the exclusion run outlives P-I and dies with the
 	// compile, not with the pass.
 	m, err := c.persistManifest(ctx, binding, req, stored, parts, sink.entries, exclRun,
-		scoped.Completeness, scopeComplete)
+		scoped.Completeness, scopeComplete, planNotices(scoped, parts, scopeComplete))
 	if err != nil {
 		return CompileResult{}, err
 	}
-	// Set after persistence, deliberately: the notices describe how THIS
-	// compile was bounded, not what the plan is, and they are neither hashed
-	// nor stored.
-	m.Notices = c.manifestNotices(scoped, parts)
+	m.Notices = c.withPageNotice(m.Notices)
 	c.logger().Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
 		"entries", m.EntryCount, "slices", m.SliceCount, "scope_complete", m.ScopeComplete)
 	return CompileResult{Manifest: m}, nil
@@ -984,23 +974,22 @@ func sizeOfExcluded(x model.ExcludedContextEntry) int64 {
 		recordOverheadBytes
 }
 
-// manifestNotices is every non-fatal disclosure this compile owes the caller:
-// the page size the configuration asked for and could not have, and the counts
-// of the Section 15.3 explanation cuts the expansion and the budget pass
-// applied. Each is a COUNT and not an entry-sized list -- a per-entry
-// disclosure list is repository-sized in heap, which is precisely the shape a
-// manifest header may not have -- and each goes through model.TruncateField so
+// planNotices is every non-fatal disclosure this compile owes the caller about
+// the plan: the counts of the Section 15.3 explanation cuts the expansion and
+// the budget pass applied, the lexical read's stop and the candidate tier.
+// They are stored with the manifest (outside its canonical hash), so a reused
+// manifest answers the notices the compile that stored it made. Each is a
+// COUNT and not an entry-sized list -- a per-entry disclosure list is
+// repository-sized in heap, which is precisely the shape a manifest header may
+// not have -- and each goes through model.TruncateField so
 // ContextManifest.Validate never has to refuse a compile over its own notice.
 //
 // An empty result is the honest answer that nothing was cut, and the field is
 // omitempty, so a compile under no bound reads exactly as it did before.
-func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []string {
+func planNotices(scoped scopeResult, packed planParts, scopeComplete bool) []string {
 	var out []string
 	add := func(format string, args ...any) {
 		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
-		out = append(out, note)
-	}
-	if note := c.pageLimitNotice(); note != "" {
 		out = append(out, note)
 	}
 	if n := scoped.ReasonsDropped; n > 0 {
@@ -1021,6 +1010,12 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []strin
 		// the count-bearing notice keys on the exclusions it counts.
 		add("%d candidate(s) were excluded from this plan, each with a reason; %s",
 			n, excludedViewPointer)
+	} else if !scopeComplete {
+		// A scope also goes incomplete with nothing excluded (an unreadable
+		// evidence route, a degraded capability), so the count-less form
+		// promises only the surface, never rows: an incomplete scope is never
+		// reported without a route to what is missing.
+		out = append(out, excludedViewNotice)
 	}
 	if n := packed.RelationsClipped; n > 0 {
 		add("%d evidence route(s) were stored clipped to the first %d relations; the route reaches further than the manifest records",
@@ -1045,10 +1040,21 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []strin
 	return out
 }
 
+// withPageNotice puts the configuration's page-size notice ahead of a plan's
+// stored notices. It is a fact about this call's resources.max_page_items,
+// which the manifest identity does not fold, so it is never stored.
+func (c *Compiler) withPageNotice(plan []string) []string {
+	note := c.pageLimitNotice()
+	if note == "" {
+		return plan
+	}
+	return append([]string{note}, plan...)
+}
+
 // excludedViewPointer names the projection that pages the exclusions a manifest
-// header only counts, and excludedViewNotice is the count-less form the manifest
-// reuse path emits. One spelling, so the two notices can never name different
-// commands.
+// header only counts, and excludedViewNotice is the count-less form an
+// incomplete scope with no exclusion carries. One spelling, so the two notices
+// can never name different commands.
 const (
 	excludedViewPointer = "page them with `codectx context entries <session-id> --view excluded`"
 	excludedViewNotice  = "this plan's scope is incomplete; any excluded candidates and their reasons are paged there too -- " + excludedViewPointer
@@ -1377,7 +1383,7 @@ func lexicalTau(c int64) (int64, error) {
 // budget.max_manifest_bytes is part of the request hash and the canonical
 // projection because a caller budget that decides whether a plan is admitted is
 // part of a request's identity.
-const compilerPolicyVersion = "codectx.context.v3"
+const compilerPolicyVersion = "codectx.context.v4"
 
 // The model.H domains. Two code paths computing a different preimage would make
 // the Section 15.1 immutable-manifest reuse lookup silently never hit, so the

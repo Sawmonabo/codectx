@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -52,6 +53,9 @@ type keptClosure struct {
 	keptIDs []model.FileID
 	stop    seedStop
 	reached *pagination.ExternalSort[idRec]
+	// reachedRun is reached once the closure has ended it, so a closure the
+	// deadline cuts reopens it from the run (reopenReached).
+	reachedRun *pagination.SortedRun[idRec]
 	// reader and query are this call's pinned reader and the clipped task
 	// text, set by P-A on every leg; neither is carried by a checkpoint.
 	reader *sqlite.PinnedReader
@@ -241,36 +245,38 @@ func (c *Compiler) filePaths(ctx context.Context, reader *sqlite.PinnedReader, i
 //
 //  1. U is the kept files' nodes that are neither a walked root nor a main
 //     walk's entry. A lexical root that was not walked (its derived depth is
-//     zero) is in U: nothing explored its neighbourhood.
-//  2. One walk from U over the scope relations, both ways, under the user's
-//     bounds, gives U's components C.
+//     zero) is in U: nothing explored its neighbourhood. S is the callers, in
+//     any file, of the open call sites that may call a node of U by name (one
+//     `may_call` step into U): a site an unread root reaches lends U's node a
+//     name-only candidate, which the full read admits. A caller and its site
+//     share a component, since `calls` is a scope relation.
+//  2. One walk from U and S over the scope relations, both ways, under the
+//     user's bounds, gives their components C.
 //  3. The task text is searched inside C's files; the hits whose node is in C
 //     or U are the closure roots R.
 //  4. R is walked as one lexical group of weight Stop.NextContribution (not
 //     named, requirement capped at recommended, no derived depth bound), and
 //     only its entries inside a kept file are admitted, with their open call
-//     sites' name-only candidates.
+//     sites' name-only candidates; an open call site it reaches outside the
+//     kept files lends only its candidates inside the kept files.
 //
 // Every closure record's key is at most (recommended, Tau), so the closure can
 // add and raise entries only below the stop, inside the kept files.
 //
-// It never halts mid-way: P-A asks its halt question before the closure starts
-// and not inside it, because what the closure has admitted cannot be taken back
-// out of the candidate spool and so cannot be replayed on a continuation. A
-// deadline inside it shows up as a truncated walk or search, which leaves the
-// scope incomplete, or as a failed read, which fails the compile, as it does in
-// the seed reads. That is the cost of not halting here: on a paged compile a
-// deadline that lands inside the closure gives a plan whose scope reads
-// incomplete where the uninterrupted compile's would not, which the main walk
-// avoids by halting on a deadline-cut page instead of narrowing on it.
+// It runs as one unit (closeKeptFilesUnit): what it admits is staged, and a
+// deadline that lands inside it on a paged compile discards the stage and ends
+// the pass before the closure, so the continuation runs it again whole and
+// the plan is the one an uninterrupted compile makes.
 //
-// Memory: the kept files' nodes, C's nodes, C's files and the hits go through
-// external sorts. U and R are held, as every walk's start list is, because
-// graph.Impact takes its roots as one list; U is bounded by the kept files'
-// nodes. A start list wider than the walk request admits is walked in several
+// Memory: the kept files' nodes, U and S together, C's nodes, C's files and
+// the hits go through external sorts. U and R are held, as every walk's start
+// list is, because graph.Impact takes its roots as one list; U is bounded by
+// the kept files' nodes. U and S are walked a start list at a time, read from
+// their sort. A start list wider than the walk request admits is walked in several
 // walks: their union is the same component set, and for R an entity several of
 // them reach keeps its best record after ranking, as for any two walks.
-func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID) error {
+func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
+	haltable bool) error {
 	cl := in.closure
 	if cl == nil {
 		return nil
@@ -285,6 +291,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 	if err != nil {
 		return err
 	}
+	cl.reachedRun = reached
 	keptNodes, err := c.keptFileNodes(ctx, s, cl)
 	if err != nil {
 		return err
@@ -296,6 +303,10 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 	if len(unreached) == 0 {
 		return nil
 	}
+	starts, err := c.withNamingSites(ctx, in, eng, gen, unreached, haltable)
+	if err != nil {
+		return err
+	}
 
 	compNodes, err := newIDSort(s, "closure-component-node")
 	if err != nil {
@@ -305,10 +316,8 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 	if err != nil {
 		return err
 	}
-	for _, n := range unreached {
-		if err := compNodes.Add(idRec{ID: n}); err != nil {
-			return err
-		}
+	if err := starts.Each(func(r idRec) error { return compNodes.Add(r) }); err != nil {
+		return err
 	}
 	// U's own files are kept files, so every kept file is searched; a hit is
 	// kept only when its node is in C or U, so a kept file U has no node in
@@ -318,7 +327,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 			return err
 		}
 	}
-	if err := c.closureWalk(ctx, in, eng, gen, unreached, func(entries []model.ImpactEntry) error {
+	componentOf := func(entries []model.ImpactEntry) error {
 		for _, e := range entries {
 			if err := compNodes.Add(idRec{ID: string(e.NodeID)}); err != nil {
 				return err
@@ -330,6 +339,9 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 			}
 		}
 		return nil
+	}
+	if err := eachChunk(starts, func(chunk []string) error {
+		return c.closureWalk(ctx, in, eng, gen, chunk, haltable, componentOf)
 	}); err != nil {
 		return err
 	}
@@ -357,21 +369,108 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 	}
 
 	weight := cl.stop.NextContribution
-	return c.closureWalk(ctx, in, eng, gen, roots, func(entries []model.ImpactEntry) error {
+	return c.closureWalk(ctx, in, eng, gen, roots, haltable, func(entries []model.ImpactEntry) error {
 		admitted := make([]model.ImpactEntry, 0, len(entries))
+		var outside []model.ImpactEntry
 		for _, e := range entries {
 			if e.FileID == "" || !cl.kept[e.FileID] {
+				outside = append(outside, e)
 				continue
 			}
-			if err := in.admitEntry(e, weight, false); err != nil {
+			if err := in.admitEntry(e, weight, false, false); err != nil {
 				return err
 			}
 			admitted = append(admitted, e)
 		}
-		// Only the open call sites the closure admits have their candidates
-		// read: a site outside the kept files is not part of the plan.
-		return c.admitCandidates(ctx, eng, gen, admitted, in)
+		if err := c.admitCandidates(ctx, eng, gen, admitted, in, nil); err != nil {
+			return err
+		}
+		// A site outside the kept files is not part of the plan, but the
+		// candidates it lends to the kept files are.
+		return c.admitCandidates(ctx, eng, gen, outside, in, cl.kept)
 	})
+}
+
+// withNamingSites answers unreached together with the callers of the open call
+// sites that may call one of its nodes by name, as one ascending, distinct
+// run: one `may_call` step into unreached, read through the impact walk (which
+// applies ADR-0015's name-only rules in this direction and answers each site's
+// callers) a page at a time, each start list at most the walk request's width.
+func (c *Compiler) withNamingSites(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
+	unreached []string, haltable bool) (*pagination.SortedRun[idRec], error) {
+	all, err := newIDSort(in.sorts, "closure-start")
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range unreached {
+		if err := all.Add(idRec{ID: n}); err != nil {
+			return nil, err
+		}
+	}
+	for lo := 0; lo < len(unreached); lo += model.MaxStartNodes {
+		hi := min(lo+model.MaxStartNodes, len(unreached))
+		start := make([]model.NodeID, 0, hi-lo)
+		for _, id := range unreached[lo:hi] {
+			start = append(start, model.NodeID(id))
+		}
+		cursor := ""
+		for {
+			res, err := eng.Impact(ctx, model.ImpactRequest{
+				GenerationID: pinnedGeneration(gen, cursor),
+				Start:        start,
+				Relations:    []model.RelationKind{model.RelMayCall},
+				Direction:    model.DirectionIncoming,
+				MaxDepth:     1,
+				Page:         model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
+			})
+			if err != nil {
+				return nil, contextErr(ctx, err)
+			}
+			if res.Meta.Truncated {
+				if haltable && strings.HasPrefix(res.Meta.TruncationReason, walkDeadlineReason) {
+					return nil, errClosureCut
+				}
+				in.scope.ScopeComplete = false
+			}
+			for _, e := range res.Entries {
+				if err := all.Add(idRec{ID: string(e.NodeID)}); err != nil {
+					return nil, err
+				}
+			}
+			next := res.Meta.NextCursor
+			if next == "" {
+				break
+			}
+			if next == cursor {
+				in.scope.ScopeComplete = false
+				break
+			}
+			cursor = next
+		}
+	}
+	return sortedRun(in.sorts, all)
+}
+
+// eachChunk hands the identities of run to each in ascending chunks of at most
+// model.MaxStartNodes, the widest start list one walk request takes, so a start
+// set is never held whole.
+func eachChunk(run *pagination.SortedRun[idRec], each func([]string) error) error {
+	chunk := make([]string, 0, 64)
+	if err := run.Each(func(r idRec) error {
+		chunk = append(chunk, r.ID)
+		if len(chunk) < model.MaxStartNodes {
+			return nil
+		}
+		err := each(chunk)
+		chunk = chunk[:0]
+		return err
+	}); err != nil {
+		return err
+	}
+	if len(chunk) == 0 {
+		return nil
+	}
+	return each(chunk)
 }
 
 // keptFileNodes streams every node of the kept files into a deduplicating
@@ -501,13 +600,14 @@ func (c *Compiler) searchComponents(ctx context.Context, s *compileSorts, cl *ke
 // user's bounds, every walk read to exhaustion, handing each page's entries to
 // each. A start list wider than model.MaxStartNodes is walked in several walks.
 //
-// No page halts here (closeKeptFiles says why), so a truncated page, the
-// deadline's own included, leaves the scope incomplete, and a page that stalls
-// without advancing ends its walk incomplete rather than being re-issued. The
-// capability rows each page discloses fold into the scope verdict as the main
-// walk's do.
+// A page the deadline truncated ends the walk with errClosureCut when the
+// closure may halt (closeKeptFilesUnit runs it again on the continuation);
+// otherwise a truncated page, the deadline's own included, leaves the scope
+// incomplete, and a page that stalls without advancing ends its walk
+// incomplete rather than being re-issued. The capability rows each page
+// discloses fold into the scope verdict as the main walk's do.
 func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
-	start []string, each func([]model.ImpactEntry) error,
+	start []string, haltable bool, each func([]model.ImpactEntry) error,
 ) error {
 	cfg := in.cfg
 	depth := cfg.MaxGraphDepth.Int()
@@ -533,6 +633,9 @@ func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.E
 				return contextErr(ctx, err)
 			}
 			if impact.Meta.Truncated {
+				if haltable && strings.HasPrefix(impact.Meta.TruncationReason, walkDeadlineReason) {
+					return errClosureCut
+				}
 				in.scope.ScopeComplete = false
 			}
 			if rows := impact.Meta.Completeness; len(rows) > 0 {

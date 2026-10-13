@@ -187,7 +187,7 @@ func (c *Compiler) reuseManifest(ctx context.Context, id model.ManifestID) (mode
 func (c *Compiler) persistManifest(ctx context.Context, b model.Binding, req model.ContextRequest,
 	budget model.Budget, p planParts, entries []model.ContextEntry,
 	exclusions *pagination.SortedRun[model.ExcludedContextEntry], completeness []model.CapabilityState,
-	scopeComplete bool) (model.ContextManifest, error) {
+	scopeComplete bool, notices []string) (model.ContextManifest, error) {
 	slices := p.Slices
 	// P-I counts what it emitted independently of what the sink collected. A
 	// disagreement means a sink dropped a row, which would persist a manifest
@@ -239,6 +239,10 @@ func (c *Compiler) persistManifest(ctx context.Context, b model.Binding, req mod
 		ScopeComplete:  scopeComplete,
 		EstimateMethod: model.EstimateMethodUTF8Bytes,
 		CreatedAt:      c.now().UTC(),
+		// The plan's own disclosures are stored with it (outside the
+		// canonical hash), so the reuse path answers the ones this compile
+		// made.
+		Notices: notices,
 	}
 	requestJSON, err := json.Marshal(req)
 	if err != nil {
