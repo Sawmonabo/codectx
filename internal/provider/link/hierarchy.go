@@ -973,7 +973,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 	}
 	if fc.family == "go" {
-		if err := h.goEmbeddings(ctx, methodSets, fc, t); err != nil {
+		if err := h.goEmbeddings(methodSets, fc, t); err != nil {
 			return err
 		}
 		return h.goConversions(ctx, links, fc, t)
@@ -989,7 +989,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 		external, ok := "", false
 		if len(supers) == 0 {
-			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil {
+			if external, ok, err = h.externalName(fc, st.Super); err != nil {
 				return err
 			}
 			if !ok {
@@ -1059,13 +1059,13 @@ func refOf(k string) Ref {
 
 // types yields the type declarations a type name as written in a table of
 // the member file may denote, each once.
-func (h *hierarchy) types(ctx context.Context, file int32, name string, yield func(Ref) error) error {
-	return h.typeEntries(ctx, file, name, func(e entry) error { return yield(e.Ref) })
+func (h *hierarchy) types(file int32, name string, yield func(Ref) error) error {
+	return h.typeEntries(file, name, func(e entry) error { return yield(e.Ref) })
 }
 
 // typeEntries is types yielding each type's entry, whose Flags say whether
 // it is an interface.
-func (h *hierarchy) typeEntries(ctx context.Context, file int32, name string, yield func(entry) error) error {
+func (h *hierarchy) typeEntries(file int32, name string, yield func(entry) error) error {
 	fc, found, err := h.fileContext(file)
 	if err != nil || !found {
 		return err
@@ -2196,7 +2196,7 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 //     using-declaration, since any other may be a template parameter.
 //
 // Every read goes through the indexes, so a member's trace records it.
-func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string) (qualified string, ok bool, err error) {
+func (h *hierarchy) externalName(fc fileCtx, written string) (qualified string, ok bool, err error) {
 	name := typeName(written)
 	if name == "" {
 		return "", false, nil
@@ -2474,7 +2474,7 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // file's own reads of the indexes.
 func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
 	fc := contextOf(file, t)
-	if err := h.springInputFacts(ctx, file, t, emit); err != nil {
+	if err := h.springInputFacts(file, t, emit); err != nil {
 		return err
 	}
 	if err := h.goRouteFacts(ctx, file, t, emit); err != nil {
@@ -2495,11 +2495,11 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		var err error
 		switch {
 		case isType(d.Kind) && fc.family == "go":
-			err = h.goSupertypeFacts(ctx, fc, t, ref, d, emit)
+			err = h.goSupertypeFacts(fc, t, ref, d, emit)
 		case isType(d.Kind):
 			err = h.supertypeFacts(fc, ref, d, emit)
 		case isCallable(d.Kind):
-			err = h.overrideFacts(ctx, fc, t, ref, d, emit)
+			err = h.overrideFacts(fc, t, ref, d, emit)
 		}
 		if err == nil {
 			err = h.macroInputFacts(fc, ref, d, emit)
@@ -2547,7 +2547,7 @@ func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Bindi
 // interface extends each interface it embeds, of the unit or outside it, and
 // a type that is no interface implements each interface its method set
 // satisfies.
-func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) goSupertypeFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
 	if d.Kind != model.NodeInterface {
 		err := h.links.lookup(keySuper+refKey(ref), func(e entry) error {
 			if e.Aux != "" {
@@ -2585,7 +2585,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 			}
 			continue
 		}
-		q, ok, err := h.externalName(ctx, fc, st.Super)
+		q, ok, err := h.externalName(fc, st.Super)
 		if err != nil {
 			return err
 		}
@@ -2603,7 +2603,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 // owners yields the types the method d of t, in context fc, is declared on:
 // its enclosing type, a Java anonymous class body's synthetic type, or the
 // types its receiver names.
-func (h *hierarchy) owners(ctx context.Context, fc fileCtx, t *Table, d *Decl, yield func(Ref) error) error {
+func (h *hierarchy) owners(fc fileCtx, t *Table, d *Decl, yield func(Ref) error) error {
 	if p := d.Parent; p >= 0 && int(p) < len(t.Decls) && isType(t.Decls[p].Kind) && !anonymousReceiver(fc, d) {
 		return yield(Ref{File: fc.file, Index: p})
 	}
@@ -2619,14 +2619,14 @@ func (h *hierarchy) owners(ctx context.Context, fc fileCtx, t *Table, d *Decl, y
 
 // overrideFacts emits what the method d at ref directly overrides
 // (hierarchyFacts).
-func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
 	switch {
 	case d.Static && (fc.family == "java" || fc.family == "c"):
 		// A static method hides; it overrides nothing.
 		return nil
 	case fc.family == "rust":
 		// Only an item of a trait's impl implements, and only its trait's.
-		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
+		return h.rustTraitOverrides(fc, ref, d, emit)
 	case fc.family == "js" && strings.HasPrefix(d.Name, "#"):
 		// A private method's name is its class body's alone (ECMA-262
 		// §15.7.1, PrivateName): it overrides nothing.
@@ -2636,7 +2636,7 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 		return nil
 	}
 	sig := declEntry(ref, d).Sig
-	return h.owners(ctx, fc, t, d, func(owner Ref) error {
+	return h.owners(fc, t, d, func(owner Ref) error {
 		var targets []Ref
 		add := func(e entry) {
 			if e.Ref != ref && !slices.Contains(targets, e.Ref) {

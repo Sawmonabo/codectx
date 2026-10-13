@@ -447,7 +447,7 @@ func (r *pySite) resolve(site Ref) error {
 		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, false, r.look, r.hits); err != nil {
 			return err
 		}
-		return r.h.types(r.ctx, site.File, s.Qualifier, func(typ Ref) error {
+		return r.h.types(site.File, s.Qualifier, func(typ Ref) error {
 			return r.class(site, s, typ, DetailDirect)
 		})
 	case wire.ShapeMember:
@@ -477,23 +477,23 @@ func (r *pySite) receiver(site Ref, s *Site) error {
 	switch s.Receiver.Kind {
 	case wire.TypeNamed:
 		found := false
-		err := r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+		err := r.h.types(site.File, s.Receiver.Name, func(typ Ref) error {
 			found = true
 			return r.instance(site, s, typ, DetailHierarchy)
 		})
 		if err != nil || found {
 			return err
 		}
-		_, err = externalReceiver(r.ctx, r.h, r.fc, site, s, []wire.Type{s.Receiver}, r.emit)
+		_, err = externalReceiver(r.h, r.fc, site, s, []wire.Type{s.Receiver}, r.emit)
 		return err
 	case wire.TypeClass:
-		return r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+		return r.h.types(site.File, s.Receiver.Name, func(typ Ref) error {
 			return r.class(site, s, typ, DetailDirect)
 		})
 	case wire.TypeSuper:
 		return r.super(site, s)
 	case wire.TypeUnion:
-		if _, err := externalReceiver(r.ctx, r.h, r.fc, site, s, typeMembers(r.tab, s.Receiver), r.emit); err != nil {
+		if _, err := externalReceiver(r.h, r.fc, site, s, typeMembers(r.tab, s.Receiver), r.emit); err != nil {
 			return err
 		}
 	}

@@ -360,7 +360,7 @@ func (r *staticFile) named(fc fileCtx, written, method string, exact bool, out s
 	if err != nil || found {
 		return err
 	}
-	q, ok, err := r.h.externalName(r.ctx, fc, written)
+	q, ok, err := r.h.externalName(fc, written)
 	if err != nil || !ok {
 		return err
 	}
@@ -483,7 +483,7 @@ func (r *staticFile) construct(written string, out siteOut) error {
 	if err != nil || typed {
 		return err
 	}
-	if _, ok, err := r.h.externalName(r.ctx, r.fc, written); err != nil || !ok {
+	if _, ok, err := r.h.externalName(r.fc, written); err != nil || !ok {
 		return err
 	}
 	return out.ext("", model.DispatchExact)
@@ -654,7 +654,7 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 		}
 		return out.ext("", model.DispatchExact)
 	case "java":
-		external, ok, err := r.h.externalName(r.ctx, r.fc, q)
+		external, ok, err := r.h.externalName(r.fc, q)
 		if err != nil || !ok {
 			return err
 		}
@@ -905,7 +905,7 @@ func (r *staticFile) fieldPath(typ Ref, fields []string, each func(fc fileCtx, w
 			}
 			continue
 		}
-		err := r.h.types(r.ctx, f.Ref.File, f.Sig, func(next Ref) error { return r.fieldPath(next, fields[1:], each) })
+		err := r.h.types(f.Ref.File, f.Sig, func(next Ref) error { return r.fieldPath(next, fields[1:], each) })
 		if err != nil {
 			return err
 		}
@@ -937,7 +937,7 @@ func (r *staticFile) fieldJava(written, method string, out siteOut) error {
 	if len(parts) < 2 {
 		return nil
 	}
-	if _, ok, err := r.h.externalName(r.ctx, r.fc, strings.Join(parts[:len(parts)-1], ".")); err != nil || !ok {
+	if _, ok, err := r.h.externalName(r.fc, strings.Join(parts[:len(parts)-1], ".")); err != nil || !ok {
 		return err
 	}
 	return out.ext("", model.DispatchVirtual)

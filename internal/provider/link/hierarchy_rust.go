@@ -1,7 +1,6 @@
 package link
 
 import (
-	"context"
 	"strings"
 )
 
@@ -19,7 +18,7 @@ import (
 // a block the grammar parses as a trait impl, since the grammar's trait
 // field is a type identifier, a scoped one or a generic type over either,
 // all of which it spells (wire.Export.Trait).
-func (h *hierarchy) rustTraitOverrides(ctx context.Context, fc fileCtx, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) rustTraitOverrides(fc fileCtx, ref Ref, d *Decl, emit func(Binding) error) error {
 	if !d.Override || d.Trait == "" {
 		return nil
 	}
@@ -36,7 +35,7 @@ func (h *hierarchy) rustTraitOverrides(ctx context.Context, fc fileCtx, ref Ref,
 	if err != nil || inUnit {
 		return err
 	}
-	external, ok, err := h.externalName(ctx, fc, d.Trait)
+	external, ok, err := h.externalName(fc, d.Trait)
 	if err != nil || !ok {
 		return err
 	}

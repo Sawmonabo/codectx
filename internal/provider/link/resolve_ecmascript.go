@@ -65,7 +65,7 @@ func emitECMAScript(ctx context.Context, u *unit, e *flowEmit) error {
 			}
 			site := Ref{File: file, Index: int32(i)}
 			e.site(site, tab.Path)
-			if err := resolveECMAScriptSite(ctx, h, e.t, fc, tab, site, emit); err != nil {
+			if err := resolveECMAScriptSite(h, e.t, fc, tab, site, emit); err != nil {
 				return err
 			}
 		}
@@ -81,7 +81,7 @@ func emitECMAScript(ctx context.Context, u *unit, e *flowEmit) error {
 // (externalMember); and, for a site
 // nothing bound, a FactExternalSite when it calls through a package's module
 // or constructs a class outside the project. A computed site binds nothing.
-func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileCtx, tab *Table, site Ref, emit func(Binding) error) error {
+func resolveECMAScriptSite(h *hierarchy, t *types, fc fileCtx, tab *Table, site Ref, emit func(Binding) error) error {
 	s := &tab.Sites[site.Index]
 	if s.Computed {
 		return nil
@@ -103,7 +103,7 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 	members := typeMembers(tab, s.Receiver)
 	external := false
 	if s.Shape == wire.ShapeMember {
-		if external, err = externalReceiver(ctx, h, fc, site, s, members, emit); err != nil {
+		if external, err = externalReceiver(h, fc, site, s, members, emit); err != nil {
 			return err
 		}
 		err = t.seek(site, func(r recv) error {
@@ -125,7 +125,7 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 	if s.Shape == wire.ShapeStatic && s.Qualifier != "" {
 		// `C.m()` on a class of the unit, which the scan bound through the
 		// class itself.
-		err = h.types(ctx, site.File, s.Qualifier, func(typ Ref) error {
+		err = h.types(site.File, s.Qualifier, func(typ Ref) error {
 			ok, err := t.externalMember(h, fc.family, site, typ, s.Callee, emit)
 			external = external || ok
 			return err
@@ -155,7 +155,7 @@ func resolveECMAScriptSite(ctx context.Context, h *hierarchy, t *types, fc fileC
 		}
 	}
 	if s.Shape == wire.ShapeConstructor {
-		_, ok, err := h.externalName(ctx, fc, s.Callee)
+		_, ok, err := h.externalName(fc, s.Callee)
 		if err != nil || !ok {
 			return err
 		}

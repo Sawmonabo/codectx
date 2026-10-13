@@ -548,7 +548,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 			return nil, err
 		}
 		prev := []interface{ Close() error }{in.facts, in.delta, in.edges, in.bound}
-		delta, err := in.step(ctx, r)
+		delta, err := in.step(r)
 		if err != nil {
 			return nil, err
 		}
@@ -568,7 +568,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 			// bound no method now read the functions written to the fields
 			// they call, and the fixed point continues from there.
 			in.early = in.facts
-			if err := in.addFieldWatches(ctx, r); err != nil {
+			if err := in.addFieldWatches(r); err != nil {
 				return nil, err
 			}
 			continue
@@ -727,7 +727,7 @@ func (in *inference) boundaryReads() (*pagination.SortedRun[flowRead], error) {
 // the method or may inherit it from outside the project, decides the call
 // through what it recovered (externalMember), never through a function some
 // other object's field of that name holds.
-func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
+func (in *inference) addFieldWatches(r *round) error {
 	in.fielded = true
 	pending, err := sorted(in, in.fieldWatches)
 	if err != nil {
@@ -1136,7 +1136,7 @@ func (f *fileScan) namesOutside(ctx context.Context, ty wire.Type) (bool, error)
 		case wire.TypeModule:
 			return true, nil
 		case wire.TypeNamed, wire.TypeClass:
-			if err := f.in.h.types(ctx, f.file, m.Name, func(Ref) error { found = true; return nil }); err != nil {
+			if err := f.in.h.types(f.file, m.Name, func(Ref) error { found = true; return nil }); err != nil {
 				return false, err
 			}
 		case wire.TypeSuper:
@@ -1235,7 +1235,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 				}
 			}
 		}
-		if err := in.h.types(ctx, f.file, s.Callee, construct); err != nil {
+		if err := in.h.types(f.file, s.Callee, construct); err != nil {
 			return err
 		}
 		if !constructed && !f.python {
@@ -1253,7 +1253,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 		}
 	case wire.ShapeStatic:
 		if s.Qualifier != "" {
-			err := in.h.types(ctx, f.file, s.Qualifier, func(class Ref) error {
+			err := in.h.types(f.file, s.Qualifier, func(class Ref) error {
 				return r.lookups.Add(lookup{Class: class, Name: s.Callee, Call: c, Rank: rankDirect, Unbound: f.python})
 			})
 			if err != nil {
@@ -1360,7 +1360,7 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 		if ty.Index == wire.ExactObject {
 			found := false
 			object := constant(valObject)
-			err := f.in.h.types(ctx, f.file, ty.Name, func(r Ref) error {
+			err := f.in.h.types(f.file, ty.Name, func(r Ref) error {
 				found = true
 				return object(r)
 			})
@@ -1375,13 +1375,13 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 			}
 			return f.in.h.importedConstructors(fc, ty.Name, func(e entry) error { return object(e.Ref) })
 		}
-		return f.in.h.types(ctx, f.file, ty.Name, constant(valInstance))
+		return f.in.h.types(f.file, ty.Name, constant(valInstance))
 	case wire.TypeClass:
-		return f.in.h.types(ctx, f.file, ty.Name, constant(valClass))
+		return f.in.h.types(f.file, ty.Name, constant(valClass))
 	case wire.TypeSuper:
 		for _, st := range t.Supertypes {
 			if st.Type == ty.Name {
-				if err := f.in.h.types(ctx, f.file, st.Super, constant(valExact)); err != nil {
+				if err := f.in.h.types(f.file, st.Super, constant(valExact)); err != nil {
 					return err
 				}
 			}
@@ -1435,7 +1435,7 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 	case wire.TypeFunction:
 		// A method taken through its class object takes its receiver first
 		// (wire.TypeFunction's Index), unless it is a static or class method.
-		return f.function(ctx, caller, ty.Name, func(r Ref, static bool) error {
+		return f.function(caller, ty.Name, func(r Ref, static bool) error {
 			kind := valFunction
 			if ty.Index > 0 && f.python && !static {
 				kind = valUnbound
@@ -1452,7 +1452,7 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 // never denotes a method. A member name `C.m` or `o.m` is the method m that
 // the class or object C declares in the file; failing one, the method m the
 // type C names declares or inherits.
-func (f *fileScan) function(ctx context.Context, caller int32, name string, yield func(r Ref, static bool) error) error {
+func (f *fileScan) function(caller int32, name string, yield func(r Ref, static bool) error) error {
 	t := f.t
 	if f.callables == nil {
 		f.callables = make(map[string][]int32)
@@ -1485,7 +1485,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 	if found {
 		return nil
 	}
-	return f.in.h.types(ctx, f.file, holder, func(typ Ref) error {
+	return f.in.h.types(f.file, holder, func(typ Ref) error {
 		return f.in.h.declared(typ, member, func(e entry) error { return yield(e.Ref, e.Flags&flagStatic != 0) })
 	})
 }
@@ -1546,7 +1546,7 @@ func (in *inference) receive(r *round, v recv) error {
 // every earlier one, the new bindings' arguments and returns into edges and
 // values, and the values through the edges. It answers the values new this
 // round.
-func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[fact], error) {
+func (in *inference) step(r *round) (*pagination.SortedRun[fact], error) {
 	reqs, err := sorted(in, r.exportReqs)
 	if err != nil {
 		return nil, err
