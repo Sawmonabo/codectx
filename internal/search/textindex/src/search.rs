@@ -50,7 +50,7 @@ use tantivy::{DocId, DocSet, InvertedIndexReader, SegmentReader, Term, TERMINATE
 
 use crate::codec::{put_str, put_uvarint, put_varint, Reader};
 use crate::error::{Error, Result, CX_CANCELED, CX_NO_POSITION, CX_TOO_MANY_TERMS};
-use crate::schema::{Fields, END, START, S_KIND, S_NODE, S_PATH, STRS};
+use crate::schema::{Fields, END, START, STRS, S_KIND, S_NODE, S_PATH};
 use crate::score::{idf, quantize, safe_bound, saturation, WEIGHTS};
 use crate::summary::{Lengths, Summary, BLOCK, BLOCK_BITS, UNBOUNDED_WTF};
 use crate::tokenizer::{parse_query, QueryTerm};
@@ -235,8 +235,7 @@ pub fn search(view: &View, req: &[u8], cancel: Cancel) -> Result<Vec<u8>> {
         // Merge the segments' runs.
         let skipped = fruits.iter().any(|f| f.skipped) || canceled;
         let dropping = fruits.iter().filter(|f| f.dropped).count() as u32;
-        let cut: Option<Hit> =
-            fruits.iter().filter_map(|f| f.boundary.as_ref()).min_by(|x, y| cmp_hits(x, y)).cloned();
+        let cut: Option<Hit> = fruits.iter().filter_map(|f| f.boundary.as_ref()).min_by(|x, y| cmp_hits(x, y)).cloned();
         page.matches = 0;
         page.blocks_total = 0;
         page.marked = 0;
@@ -278,10 +277,8 @@ pub fn search(view: &View, req: &[u8], cancel: Cancel) -> Result<Vec<u8>> {
         page.matches_exact = !skipped;
         page.blocks_scored = blocks_scored;
         page.docs_scored = docs_scored;
-        page.hits = finish(&fruits, merged)?
-            .into_iter()
-            .map(|(h, n, seen)| (h, n, !skipped && seen == dropping))
-            .collect();
+        page.hits =
+            finish(&fruits, merged)?.into_iter().map(|(h, n, seen)| (h, n, !skipped && seen == dropping)).collect();
         return Ok(page.encode(terms.len()));
     }
 }
@@ -530,7 +527,18 @@ impl SegAfter {
 
     /// Whether a document sorts at or before the position.
     fn holds(&self, k: &OrdKey) -> bool {
-        let doc = (Reverse(k.micros.0), 2 * k.path, k.start, k.end, 2 * k.kind, 2 * k.name, 2 * k.qn, 2 * k.sig, 2 * k.node, 2 * k.search_key);
+        let doc = (
+            Reverse(k.micros.0),
+            2 * k.path,
+            k.start,
+            k.end,
+            2 * k.kind,
+            2 * k.name,
+            2 * k.qn,
+            2 * k.sig,
+            2 * k.node,
+            2 * k.search_key,
+        );
         let s = &self.strs;
         let pos = (Reverse(self.micros), s[0], self.start, self.end, s[1], s[2], s[3], s[4], s[5], s[6]);
         doc <= pos
@@ -710,7 +718,9 @@ fn segment_df(seg: &SegmentReader, sv: &SegView, fields: &Fields, terms: &[Query
         // A walk of the term's five lists in doc order, counting alive documents.
         let mut ps: Vec<SegmentPostings> = Vec::new();
         for (fi, inv) in invs.iter().enumerate() {
-            if let Some(p) = inv.read_postings(&Term::from_field_text(fields.text[fi], tok), IndexRecordOption::Basic)? {
+            if let Some(p) =
+                inv.read_postings(&Term::from_field_text(fields.text[fi], tok), IndexRecordOption::Basic)?
+            {
                 ps.push(p);
             }
         }
@@ -737,13 +747,20 @@ fn segment_df(seg: &SegmentReader, sv: &SegView, fields: &Fields, terms: &[Query
 /// A phrase's exact list: per column the start positions where token j sits
 /// at start + j (every position counts), weighted and summed over columns,
 /// alive documents only, doc ids ascending.
-fn phrase_list(invs: &[Arc<InvertedIndexReader>], fields: &Fields, tokens: &[String], sv: &SegView) -> Result<Vec<(DocId, f64)>> {
+fn phrase_list(
+    invs: &[Arc<InvertedIndexReader>],
+    fields: &Fields,
+    tokens: &[String],
+    sv: &SegView,
+) -> Result<Vec<(DocId, f64)>> {
     let mut all: Vec<(DocId, u64)> = Vec::new();
     let mut pos: Vec<Vec<u32>> = vec![Vec::new(); tokens.len()];
     for (fi, inv) in invs.iter().enumerate() {
         let mut ps = Vec::with_capacity(tokens.len());
         for tok in tokens {
-            match inv.read_postings(&Term::from_field_text(fields.text[fi], tok), IndexRecordOption::WithFreqsAndPositions)? {
+            match inv
+                .read_postings(&Term::from_field_text(fields.text[fi], tok), IndexRecordOption::WithFreqsAndPositions)?
+            {
                 Some(p) => ps.push(p),
                 None => break,
             }
@@ -1333,7 +1350,6 @@ fn bounds(ctx: &Ctx, s: &Summary, a: &SegA, dl_of: &impl Fn(DocId) -> u64) -> Ve
     blocks
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,7 +1541,8 @@ mod tests {
             (3, "n3", "p/a3.go", "omega omega"),
             (5, "n5", "p/a5.go", "omega omega omega"),
         ];
-        let b: &[Doc] = &[(2, "n2", "p/a2.go", "omega"), (4, "n4", "p/a4.go", "omega omega"), (6, "n6", "p/a6.go", "omega")];
+        let b: &[Doc] =
+            &[(2, "n2", "p/a2.go", "omega"), (4, "n4", "p/a4.go", "omega omega"), (6, "n6", "p/a6.go", "omega")];
         let f = fixture("bound", &[a, b]);
         let free = walk(&f, 6, 0);
         assert_eq!(free.len(), 6);
