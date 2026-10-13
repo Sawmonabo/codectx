@@ -938,4 +938,26 @@ export function run() {
 		// unbound.
 		fails: "a pnpm workspace with no root package.json planned as one unit per package leaves r unbound",
 	},
+	{
+		name:   "typescript-import-equals-require",
+		anchor: "TypeScript Handbook, Modules (`import x = require(\"m\")` imports the module m)",
+		files: map[string]string{
+			"src/a.ts": `export function f() {} // @f
+`,
+			"src/main.ts": `import a = require("./a");
+
+export function run() {
+  return a;
+}
+`,
+		},
+		// Derived from the anchor: the clause imports src/a.ts.
+		want: []string{},
+		facts: []string{
+			"src/main.ts imports src/a.ts",
+		},
+		// Mutation: drop the import_require_clause pattern from typescript.scm -> the import is no import record
+		// and publishes nothing.
+		fails: "`import x = require()` read as no import loses the import of src/a.ts",
+	},
 }
