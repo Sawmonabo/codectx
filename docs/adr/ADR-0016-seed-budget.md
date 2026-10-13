@@ -41,7 +41,11 @@ the plan. The decisions below are that proposal with each of the six closed.
 ### 1. Each root lends what it reaches a (requirement, score) pair, and the entry takes the largest pair
 
 - The requirement is the node kind and the depth from *that* root, capped by the root's class (a lexical root never
-  makes an entry required). The score is the root's weight times (the route's product plus that route's own
+  makes an entry required) and by the route's shape: a route that goes up `extends`, `implements` or `overrides` from
+  a subtype to its supertype and straight back down the same kind to another subtype reaches a sibling, which is
+  recommended at most whatever its kind. That is the round-trip meta path P P⁻¹ that heterogeneous-graph similarity
+  defines peers by [S9], and the split the language server protocol keeps between supertypes and subtypes [S10]: the
+  route depends on the supertype, not on the sibling. The score is the root's weight times (the route's product plus that route's own
   route-dependent boosts).
 - The entry's rank key is the lexicographic maximum of its origin pair and every root's pair. It is never a minimum
   depth over all roots combined with a maximum score taken separately, and never a sum across routes.
@@ -167,9 +171,15 @@ only graph expansion a plain-language task gets; an agent localization study los
 - A broad task reads matches down to a floor set by the plan's own file budget, not to the end of the index, and
   walks only from them; the walk no longer scales with how many documents hold a common word.
 - Every root, whatever its weight, is walked in one walk. A node keeps each pair no other pair at it beats on every
-  count the ranking can only improve with (depth, class, weight, route product, remaining derived depth), so the
-  largest pair of decision 1 is among the ones it keeps; the walk is best-first on the score, because a heavier root
-  farther away can lend more than a lighter one next to the node.
+  count the ranking can only improve with (depth, class, weight, route product, remaining derived depth, and the
+  route's shape: whether it reached a sibling, whether its last hop went up a hierarchy kind and so may turn, and
+  whether it entered a callee through an argument), so the largest pair of decision 1 is among the ones it keeps; the
+  walk is best-first on the score, because a heavier root farther away can lend more than a lighter one next to the
+  node.
+- The walk crosses data flow across calls as the impact walk does: a route that entered a callee through a call's
+  argument never leaves it through a return flow, which would come out at every call site's result. It is the
+  two-phase slice of Horwitz, Reps and Binkley [S11] kept per route, as a label dimension: a route that has not
+  descended stands for one that has, never the reverse.
 - The read is deeper than a stop at the budget's score level, by the boost margin, and costs a few path-filtered reads
   and one walk over the unreached components; that walk's cost is measured in the scale proofs.
 - Centrality becomes a signal of the named roots' neighbourhood. A task with no named seeds ranks by lexical score
@@ -201,5 +211,14 @@ only graph expansion a plain-language task gets; an agent localization study los
   https://arxiv.org/html/2404.18185v1 — learned truncation shows no clear advantage over a fixed depth.
 - [S8] *LocAgent: Graph-Guided LLM Agents for Code Localization*, https://arxiv.org/abs/2503.09089 — the no-traversal
   ablation (cited through an earlier survey, not re-read).
+- [S9] Sun, Han, Yan, Yu, Wu, *PathSim: Meta Path-Based Top-K Similarity Search in Heterogeneous Information
+  Networks*, VLDB 2011, https://www.vldb.org/pvldb/vol4/p992-sun.pdf — typed, directed relation paths; the inverse
+  relation R⁻¹; peers defined on round-trip meta paths P P⁻¹ (pages 993-994).
+- [S10] *Language Server Protocol 3.17, type hierarchy*,
+  https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareTypeHierarchy
+  — `typeHierarchy/supertypes` and `typeHierarchy/subtypes` are separate requests.
+- [S11] Horwitz, Reps, Binkley, *Interprocedural Slicing Using Dependence Graphs*, TOPLAS 12(1), 1990,
+  https://research.cs.wisc.edu/wpis/papers/toplas90.pdf — section 4.5, forward slicing in two phases: the second
+  phase descends into called procedures and never ascends back out through a call site.
 - [research 25](../research/25-seed-budget.md) and [raw/seed-budget](../research/raw/seed-budget/findings.md) — the
   survey, the six leaks with their code lines, the options and the full source list.

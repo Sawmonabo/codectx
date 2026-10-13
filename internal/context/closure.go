@@ -363,7 +363,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 			if e.FileID == "" || !cl.kept[e.FileID] {
 				continue
 			}
-			if err := in.admitEntry(e, weight, false); err != nil {
+			if err := in.admitEntry(e, weight, false, false); err != nil {
 				return err
 			}
 			admitted = append(admitted, e)

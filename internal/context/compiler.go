@@ -1372,7 +1372,7 @@ func lexicalTau(c int64) (int64, error) {
 // budget.max_manifest_bytes is part of the request hash and the canonical
 // projection because a caller budget that decides whether a plan is admitted is
 // part of a request's identity.
-const compilerPolicyVersion = "codectx.context.v3"
+const compilerPolicyVersion = "codectx.context.v4"
 
 // The model.H domains. Two code paths computing a different preimage would make
 // the Section 15.1 immutable-manifest reuse lookup silently never hit, so the
