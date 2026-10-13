@@ -35,19 +35,28 @@ func dependenceFixture(nodes map[string]model.NodeKind, rels [][3]string) *graph
 }
 
 // incomingImpact is the incoming impact of seed over the default allowlist:
-// the entities a change to seed may need modified.
+// the entities a change to seed may need modified, read through every page
+// (an answer wider than one page continues on its cursor, ADR-0001 row A).
 func incomingImpact(t *testing.T, f *graphFixture, seed string) []model.ImpactEntry {
 	t.Helper()
 	e, _ := probedImpactEngine(t, f)
-	res, err := e.Impact(context.Background(), model.ImpactRequest{GenerationID: 1,
-		Start: []model.NodeID{fixtureNodeID(seed)}, Direction: model.DirectionIncoming})
-	if err != nil {
-		t.Fatalf("impact of %s: %v", seed, err)
+	var out []model.ImpactEntry
+	req := model.ImpactRequest{GenerationID: 1, Start: []model.NodeID{fixtureNodeID(seed)},
+		Direction: model.DirectionIncoming}
+	for {
+		res, err := e.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("impact of %s: %v", seed, err)
+		}
+		if res.Meta.Truncated {
+			t.Fatalf("the impact of %s is truncated (%q); every bound is unlimited here", seed, res.Meta.TruncationReason)
+		}
+		out = append(out, res.Entries...)
+		if res.Meta.NextCursor == "" {
+			return out
+		}
+		req.GenerationID, req.Page.Cursor = 0, res.Meta.NextCursor
 	}
-	if res.Meta.Truncated {
-		t.Fatalf("the impact of %s is truncated (%q); every bound is unlimited here", seed, res.Meta.TruncationReason)
-	}
-	return res.Entries
 }
 
 func entryOf(entries []model.ImpactEntry, name string) (model.ImpactEntry, bool) {

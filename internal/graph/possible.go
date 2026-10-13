@@ -777,7 +777,7 @@ var openSiteHeapEntries = 1 << 16
 const openSiteCountSchema = `
 CREATE TABLE pending(node TEXT PRIMARY KEY) WITHOUT ROWID;
 CREATE TABLE named(name TEXT NOT NULL, node TEXT NOT NULL, kind TEXT NOT NULL, lang TEXT NOT NULL, sig TEXT NOT NULL,
-	PRIMARY KEY(name, node)) WITHOUT ROWID;
+	file TEXT NOT NULL, PRIMARY KEY(name, node)) WITHOUT ROWID;
 CREATE TABLE seen(site TEXT PRIMARY KEY) WITHOUT ROWID;
 `
 
@@ -901,10 +901,12 @@ func (c *openSiteCounter) pendingPage(after model.NodeID, limit int) ([]model.No
 	return out, nil
 }
 
-// namedNodes reads the level's nodes named name, from scratch.
+// namedNodes reads the level's nodes named name, from scratch, with every
+// field a site's fit reads (callSite.fits): a node read back without its file
+// is not a declaration, and no site would fit it.
 func (c *openSiteCounter) namedNodes(name string) ([]model.Node, error) {
 	rows, err := c.sc.tx.QueryContext(context.Background(),
-		`SELECT node, kind, lang, sig FROM named WHERE name = ?1 ORDER BY node`, name)
+		`SELECT node, kind, lang, sig, file FROM named WHERE name = ?1 ORDER BY node`, name)
 	if err != nil {
 		return nil, internalErr("open-site count scratch: " + err.Error())
 	}
@@ -912,11 +914,11 @@ func (c *openSiteCounter) namedNodes(name string) ([]model.Node, error) {
 	var out []model.Node
 	for rows.Next() {
 		n := model.Node{Name: name}
-		var id, kind string
-		if err := rows.Scan(&id, &kind, &n.Language, &n.Signature); err != nil {
+		var id, kind, file string
+		if err := rows.Scan(&id, &kind, &n.Language, &n.Signature, &file); err != nil {
 			return nil, internalErr("open-site count scratch: " + err.Error())
 		}
-		n.ID, n.Kind = model.NodeID(id), model.NodeKind(kind)
+		n.ID, n.Kind, n.FileID = model.NodeID(id), model.NodeKind(kind), model.FileID(file)
 		out = append(out, n)
 	}
 	if err := rows.Err(); err != nil {
@@ -960,8 +962,8 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 				byName[d.Node.Name] = append(byName[d.Node.Name], d.Node)
 				continue
 			}
-			if err := c.exec(`INSERT INTO named(name, node, kind, lang, sig) VALUES(?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING`,
-				d.Node.Name, string(d.Node.ID), string(d.Node.Kind), d.Node.Language, d.Node.Signature); err != nil {
+			if err := c.exec(`INSERT INTO named(name, node, kind, lang, sig, file) VALUES(?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING`,
+				d.Node.Name, string(d.Node.ID), string(d.Node.Kind), d.Node.Language, d.Node.Signature, string(d.Node.FileID)); err != nil {
 				return err
 			}
 		}
