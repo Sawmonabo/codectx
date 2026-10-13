@@ -761,9 +761,21 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		if d.Receiver == "" {
 			continue
 		}
-		err := h.typesIn(ctx, fc, d.Receiver, func(te entry) error { return add(te.Ref) })
+		typed := false
+		err := h.typesIn(ctx, fc, d.Receiver, func(te entry) error {
+			typed = true
+			return add(te.Ref)
+		})
 		if err != nil {
 			return err
+		}
+		if !typed {
+			// A function stored on the prototype of an imported function
+			// (`const C = require("./c"); C.prototype.m = function () {}`)
+			// is a method of that function's objects.
+			if err := h.importedConstructors(fc, d.Receiver, func(fe entry) error { return add(fe.Ref) }); err != nil {
+				return err
+			}
 		}
 	}
 	if fc.family == "go" {
@@ -1109,6 +1121,41 @@ func (h *hierarchy) qualifiedTypes(fc fileCtx, name, head, rest string, yield fu
 		}
 	}
 	return h.decls.lookup(keyTypeQualified+fc.family+"\x00"+name, yield)
+}
+
+// importedConstructors yields the functions an ECMAScript import of fc's
+// file binding local denotes: what the module exports under the name the
+// import names, its whole value for a `require` namespace binding. Every
+// ordinary function is a constructor (ECMA-262 §10.2: a function object
+// with [[Construct]] and a `prototype`), so `new C()` of an imported
+// function makes an object of it and `C.prototype.m = …` in the importing
+// file stores a method of it.
+func (h *hierarchy) importedConstructors(fc fileCtx, local string, yield func(entry) error) error {
+	if fc.family != "js" {
+		return nil
+	}
+	return h.importsAt(fc, local, func(p string, _ int32) error {
+		original, required, err := h.importOriginal(fc, local, p)
+		name := local
+		switch {
+		case err != nil:
+			return err
+		case original == ImportAll && required:
+			name = wire.ExportAssignment
+		case original == ImportAll:
+			return nil
+		case original != "":
+			name = original
+		}
+		return h.modules(fc, p, func(base string) error {
+			return h.moduleExport(base, name, func(e entry) error {
+				if e.Aux != exportFunc {
+					return nil
+				}
+				return yield(e)
+			})
+		})
+	})
 }
 
 // importedType yields the type declarations the path p an import binds the

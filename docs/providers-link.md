@@ -525,10 +525,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   export. A file with an `import` or `export` statement is an ES module and none of these forms is read in it. A
   class expression assigned to a name or property (`module.exports = class { … }`) is a class of that name
   (`exports`), holding its methods, so the whole value is that class; a method of the object `module.exports` is
-  assigned (`{ run() {} }`) is exported under its own name, as a function-valued key is. A function declaration
-  whose prototype the file stores a function under (`C.prototype.run = function () {}`, a method or
-  function-valued key of `C.prototype = { … }`) is a class, a constructor function, and each such function a
-  method of it, as TypeScript's JavaScript checking reads them. A name a pattern binds from a literal
+  assigned (`{ run() {} }`) is exported under its own name, as a function-valued key is. A function declaration,
+  or a variable a function expression initializes (`const C = function () {}`), whose prototype the file stores
+  a function under (`C.prototype.run = function () {}`, a method or function-valued key of `C.prototype = { …
+  }`, the `value`, `get` or `set` function of `Object.defineProperty(C.prototype, "run", { … })`) is a class, a
+  constructor function, and each such function a method of it, as TypeScript's JavaScript checking reads them;
+  a getter and setter so defined are one declaration, the call. A class expression a declarator binds (`const
+  C = class { … }`) is a class of that name. A function stored on the prototype of an imported function (`const
+  C = require("./c"); C.prototype.run = …`) is a method of that function, and `new C()` of an imported function
+  makes an object of it: every ordinary function is a constructor, and every importer shares the one function. A name a pattern binds from a literal
   `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is, and a name a
   `require` call or an `import x = require("./c")` clause binds whole is the module's whole value, so `new x()`
   runs the constructor of the class the module assigns, as it would an imported class's. The object `new C()`

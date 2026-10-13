@@ -1233,7 +1233,9 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			}
 		}
 	case wire.ShapeConstructor:
+		constructed := false
 		construct := func(target Ref) error {
+			constructed = true
 			return in.receive(ctx, r, recv{Call: c, Role: roleConstruct, X: value{Kind: valInstance, Ref: target}})
 		}
 		for _, k := range scoped(t, s.Caller, s.Candidates) {
@@ -1245,6 +1247,19 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 		}
 		if err := in.h.types(ctx, f.file, s.Callee, construct); err != nil {
 			return err
+		}
+		if !constructed && !f.python {
+			// An imported function is a constructor too (importedConstructors).
+			fc, found, err := in.h.fileContext(f.file)
+			if err != nil {
+				return err
+			}
+			if found {
+				err := in.h.importedConstructors(fc, s.Callee, func(e entry) error { return construct(e.Ref) })
+				if err != nil {
+					return err
+				}
+			}
 		}
 	case wire.ShapeStatic:
 		if s.Qualifier != "" {
@@ -1353,7 +1368,22 @@ func (f *fileScan) eval(ctx context.Context, caller int32, ty wire.Type, yield f
 		// `new C()`) is that class's object; any other instance may be a
 		// subclass's.
 		if ty.Index == wire.ExactObject {
-			return f.in.h.types(ctx, f.file, ty.Name, constant(valObject))
+			found := false
+			object := constant(valObject)
+			err := f.in.h.types(ctx, f.file, ty.Name, func(r Ref) error {
+				found = true
+				return object(r)
+			})
+			if err != nil || found || f.python {
+				return err
+			}
+			// `new C()` of an imported function is an object of it
+			// (importedConstructors).
+			fc, ok, err := f.in.h.fileContext(f.file)
+			if err != nil || !ok {
+				return err
+			}
+			return f.in.h.importedConstructors(fc, ty.Name, func(e entry) error { return object(e.Ref) })
 		}
 		return f.in.h.types(ctx, f.file, ty.Name, constant(valInstance))
 	case wire.TypeClass:

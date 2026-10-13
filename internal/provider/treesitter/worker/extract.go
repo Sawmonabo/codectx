@@ -338,21 +338,42 @@ func nextEntry(cur *ts.TreeCursor, first bool) bool {
 	return false
 }
 
-// constructorFunctions declares as a class each function declaration whose
-// prototype the file stores a function under: `C.prototype.m = function
-// () {}`, or a method or function-valued key of an object assigned to
-// `C.prototype`. ECMAScript gives the object `new C()` makes C.prototype as
-// its prototype (EvaluateNew, OrdinaryCreateFromConstructor), and
-// TypeScript's JavaScript checking reads such a function as a class with
-// those methods (AssignmentDeclarationKind PrototypeProperty, Prototype).
+// constructorFunctions declares as a class each function whose prototype
+// the file stores a function under, and names each such function a method
+// of it, as TypeScript's JavaScript checking reads them (the binder's
+// AssignmentDeclarationKind PrototypeProperty, Prototype and
+// ObjectDefinePrototypeProperty; the checker's isJSConstructor): ECMAScript
+// gives the object `new C()` makes C.prototype as its prototype (EvaluateNew,
+// OrdinaryCreateFromConstructor). The forms are `C.prototype.m = function
+// () {}`; a method or function-valued key of an object assigned to
+// `C.prototype`; and `Object.defineProperty(C.prototype, "m", { value:
+// function () {} })` or its `get` and `set` functions, each declared by the
+// name "m". C is a function declaration or a variable a function expression
+// initializes (`const C = function () {}`); an arrow function constructs
+// nothing.
 func constructorFunctions(e *extraction, decls []*decl) {
 	owners := map[string]bool{}
+	defined := map[uint]bool{}
 	for _, d := range decls {
 		p := d.prefix
 		if p == "" && d.node.Kind() == "method_definition" {
 			p = e.pairPath(d.node)
 		}
-		if owner, ok := strings.CutSuffix(p, ".prototype"); ok && owner != "" && !strings.ContainsAny(owner, ".[( ") {
+		if owner, ok := prototypeOwner(p); ok {
+			owners[owner] = true
+		} else if owner, call, name, ok := e.definedOnPrototype(d); ok {
+			// The property is the call that defines it, one declaration
+			// for a getter and a setter together, as TypeScript binds one
+			// property symbol; the first function of the descriptor
+			// describes it and the others declare nothing more.
+			if defined[name.StartByte()] {
+				d.name = ""
+				continue
+			}
+			defined[name.StartByte()] = true
+			d.node = *call
+			d.name, d.nameStart, d.nameEnd = name.Utf8Text(e.src), name.StartByte(), name.EndByte()
+			d.prefix = owner + ".prototype"
 			owners[owner] = true
 		}
 	}
@@ -360,10 +381,69 @@ func constructorFunctions(e *extraction, decls []*decl) {
 		return
 	}
 	for _, d := range decls {
-		if d.kind == "function" && owners[d.name] && d.node.Kind() == "function_declaration" {
+		if d.kind != "function" || !owners[d.name] {
+			continue
+		}
+		switch d.node.Kind() {
+		case "function_declaration":
 			d.kind = "class"
+		case "variable_declarator":
+			if v := d.node.ChildByFieldName("value"); v != nil && v.KindId() == e.k.functionExpression {
+				d.kind = "class"
+			}
 		}
 	}
+}
+
+// definedOnPrototype reports a function d declares as the `value`, `get` or
+// `set` of the descriptor in `Object.defineProperty(C.prototype, "m", {
+// … })`: C, the call, and the string fragment naming m.
+func (e *extraction) definedOnPrototype(d *decl) (string, *ts.Node, *ts.Node, bool) {
+	switch d.name {
+	case "value", "get", "set":
+	default:
+		return "", nil, nil, false
+	}
+	if k := d.node.Kind(); k != "pair" && k != "method_definition" {
+		return "", nil, nil, false
+	}
+	obj := d.node.Parent()
+	if obj == nil || obj.KindId() != e.k.object {
+		return "", nil, nil, false
+	}
+	args := obj.Parent()
+	if args == nil || args.Kind() != "arguments" {
+		return "", nil, nil, false
+	}
+	var a []*ts.Node
+	for i := range args.NamedChildCount() {
+		if c := args.NamedChild(i); !c.IsExtra() {
+			a = append(a, c)
+		}
+	}
+	if len(a) != 3 {
+		return "", nil, nil, false
+	}
+	call := args.Parent()
+	if call == nil || call.Kind() != "call_expression" {
+		return "", nil, nil, false
+	}
+	if f := call.ChildByFieldName("function"); f == nil || collapseSpace(f.Utf8Text(e.src)) != "Object.defineProperty" {
+		return "", nil, nil, false
+	}
+	target, key, desc := a[0], a[1], a[2]
+	if desc.Id() != obj.Id() || key.KindId() != e.k.str {
+		return "", nil, nil, false
+	}
+	owner, ok := prototypeOwner(collapseSpace(target.Utf8Text(e.src)))
+	if !ok || key.NamedChildCount() != 1 {
+		return "", nil, nil, false
+	}
+	name := key.NamedChild(0)
+	if name.Kind() != "string_fragment" || name.StartByte() != key.StartByte()+1 || name.EndByte() != key.EndByte()-1 {
+		return "", nil, nil, false
+	}
+	return owner, call, name, true
 }
 
 // putDecl records d under its declaration range and name position. Two
@@ -651,7 +731,7 @@ func (e *extraction) emit(out *emitter) error {
 	}
 	// Source order: outer before inner, then by name position, so numbering is
 	// a function of the bytes alone.
-	slices.SortFunc(decls, func(a, b *decl) int {
+	sourceOrder := func(a, b *decl) int {
 		if c := cmpUint(a.node.StartByte(), b.node.StartByte()); c != 0 {
 			return c
 		}
@@ -659,12 +739,15 @@ func (e *extraction) emit(out *emitter) error {
 			return c
 		}
 		return cmpUint(a.nameStart, b.nameStart)
-	})
-	slices.SortFunc(e.scopes, func(a, b scopeNode) int { return cmpUint(a.start, b.start) })
+	}
+	slices.SortFunc(decls, sourceOrder)
 	switch e.l.Name {
 	case "javascript", "typescript", "tsx":
+		// It may move a declaration to the call around it.
 		constructorFunctions(e, decls)
+		slices.SortFunc(decls, sourceOrder)
 	}
+	slices.SortFunc(e.scopes, func(a, b scopeNode) int { return cmpUint(a.start, b.start) })
 
 	// Containment via a stack of open declarations; scope nodes take part in
 	// the chain but are never emitted.
