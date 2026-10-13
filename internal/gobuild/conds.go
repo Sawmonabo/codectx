@@ -54,8 +54,10 @@ type Conds struct {
 	// met is each node's satisfiability against domain once decided: 0
 	// not decided, 1 met by some build, 2 by none.
 	met []uint8
-	// vars are the variables by tag, the order of the diagram.
-	vars map[string]int32
+	// vars are the variables by tag, the order of the diagram, and fixed
+	// the count of the base table's (variable).
+	vars  map[string]int32
+	fixed int
 	// releases are the release minors above minor with a variable, sorted.
 	releases []int
 	// domain is the valid builds and the release chain.
@@ -94,6 +96,7 @@ func NewConds(minor int) *Conds {
 		met:    slices.Clone(base.met),
 		vars:   make(map[string]int32, len(base.vars)+16),
 		domain: base.domain,
+		fixed:  len(base.vars),
 		minor:  minor,
 	}
 	for k, v := range base.vars {
@@ -147,8 +150,17 @@ func (c *Conds) tag(tag string) Cond {
 	return c.mk(c.variable(tag), False, True)
 }
 
+// variable allocates tag's variable. The fixed-meaning tags and cgo, the
+// base table's, come first in the order, in their own order, so a walk
+// against the valid builds leaves their support early. Every later
+// variable is placed above the later ones before it: extending a running
+// disjunction or conjunction with a tag first seen then is one new node, not
+// a copy of the whole diagram beneath it.
 func (c *Conds) variable(tag string) int32 {
 	v := int32(len(c.vars))
+	if c.fixed > 0 {
+		v = terminal - 1 - int32(len(c.vars)-c.fixed)
+	}
 	c.vars[tag] = v
 	return v
 }

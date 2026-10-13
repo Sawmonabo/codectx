@@ -223,3 +223,20 @@ func and(a, b string) constraint.Expr {
 	}
 	return x
 }
+
+// BenchmarkOrChain builds the disjunction of 1,000 tags one at a time, as
+// the linker's running disjunctions do: one node per tag, not a text per
+// prefix of the chain.
+func BenchmarkOrChain(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		c := NewConds(27)
+		or := False
+		for i := range 1000 {
+			or = c.Or(or, c.tag("t"+strconv.Itoa(i)))
+		}
+		if !c.Holds(or) {
+			b.Fatal("unmet")
+		}
+	}
+}

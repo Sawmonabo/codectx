@@ -310,8 +310,10 @@ illumos=>solaris and ios=>darwin, the toolchain's ports from `go tool dist list`
 Each method-set record carries the condition of the builds holding it: a method's file and its type's declaration, an
 embedding's path, a promoted member a shallower one hides only where that one exists. A method declared per build is
 each of its signatures under its own condition, and a signature naming an alias or constant declared per build with
-different types or values (`const PtrSize = 4` for 386 and `8` for amd64) is one key per choice of declaration,
-under their conditions. A type implements an interface when some build holds, for every method name, a key of it in
+different types or values (`const PtrSize = 4` for 386 and `8` for amd64) is one key per distinct spelling the
+choices of declaration give, under the disjunction of the conditions of the choices that spell it: declarations
+written differently that spell one type or value are one choice, a choice no build makes is cut as soon as it is made,
+and no count of choices bounds the walk. A type implements an interface when some build holds, for every method name, a key of it in
 both: `Regs` with `PC() uint32` in `regs_386.go` and `PC() uint64` in `regs_amd64.go` implements `interface{ PC()
 uint64; SetPC(uint64) }` and never `interface{ PC() uint64; SetPC(uint32) }`, and its `PC` overrides only the
 interface method of its own key. Each condition is a reduced ordered binary decision diagram (one id per function of

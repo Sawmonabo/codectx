@@ -35,6 +35,57 @@ var goBuildGoldens = []golden{
 		fails: "an override published for a key no build satisfying the interface holds",
 	},
 	{
+		name:   "per-build-constants-without-a-choice-bound",
+		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Constant expressions\", \"Array types\", \"Method sets\"",
+		files:  manyChoicesFiles(),
+		// Checked with go vet: S<i> is 1 << i under t<i> and 0 under !t<i>, so M's length is any of 1..128,
+		// each in the builds of one choice; -tags t0,t2 gives [6]byte, so T implements I6; no build gives
+		// [200]byte; and [6]byte needs t0, where N is missing, so T never implements I6x.
+		want: []string{},
+		facts: []string{
+			"tt T implements i6 I6",
+			"tm M overrides i6 M",
+		},
+		// Mutation: past 64 choices the signature read over every declaration at once -> its key is
+		// unknown and T implements no I6. Mutation: each choice's key under condition 0 rather than the
+		// conjunction of its choices -> tt T implements i6x I6x.
+		fails: "a signature with more build-dependent spellings than a bound left unknown, or a spelling taken as every build's",
+	},
+	{
+		name:   "per-build-names-of-one-dimension-prune",
+		anchor: "go/build, \"Build Constraints\" (_GOARCH file names); The Go Programming Language Specification, \"Constant expressions\", \"Alias declarations\", \"Method sets\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n",
+			"t.go": `package p
+
+type T struct{} // @tt
+
+func (T) R() ([PtrSize]byte, Word) { return [PtrSize]byte{}, 0 } // @tr
+
+type A64 interface{ R() ([8]byte, uint64) } // @a64
+
+type A32 interface{ R() ([4]byte, uint32) } // @a32
+
+type Mix interface{ R() ([8]byte, uint32) } // @mix
+`,
+			"ptr_386.go":   "package p\n\nconst PtrSize = 4\n\ntype Word = uint32\n",
+			"ptr_arm.go":   "package p\n\nconst PtrSize = 4\n\ntype Word = uint32\n",
+			"ptr_amd64.go": "package p\n\nconst PtrSize = 8\n\ntype Word = uint64\n",
+			"ptr_arm64.go": "package p\n\nconst PtrSize = 8\n\ntype Word = uint64\n",
+		},
+		// Checked with go vet per GOARCH: A64 on amd64 and arm64, A32 on 386 and arm, Mix on none: PtrSize
+		// and Word are chosen by one architecture, so no build pairs 8 with uint32.
+		want: []string{},
+		facts: []string{
+			"tt T implements a64 A64",
+			"tt T implements a32 A32",
+			"tr R overrides a64 R",
+			"tr R overrides a32 R",
+		},
+		// Mutation: a choice no build makes kept (no pruning) -> tt T implements mix Mix.
+		fails: "a signature spelled with declarations of two different builds",
+	},
+	{
 		name:   "many-free-tags-decided-exactly",
 		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\"",
 		files:  manyTagsFiles(),
@@ -69,6 +120,25 @@ func manyTagsFiles() map[string]string {
 	}
 	t += "\tN()\n}\n\ntype J interface { // @ij\n\tM0() // @ij0\n\tM1() // @ij1\n}\n"
 	files["t.go"] = t
+	files["n.go"] = "//go:build !t0\n\npackage p\n\nfunc (T) N() {}\n"
+	return files
+}
+
+// manyChoicesFiles is a type T whose method M returns [1+S0+...+S6]byte,
+// each S<i> declared 1 << i under t<i> and 0 under !t<i>, N declared under
+// !t0, I6 naming M of [6]byte, I200 of [200]byte and I6x M of [6]byte and N.
+func manyChoicesFiles() map[string]string {
+	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.27\n"}
+	n := "1"
+	for i := range 7 {
+		k := strconv.Itoa(i)
+		files["s"+k+"_on.go"] = "//go:build t" + k + "\n\npackage p\n\nconst S" + k + " = 1 << " + k + "\n"
+		files["s"+k+"_off.go"] = "//go:build !t" + k + "\n\npackage p\n\nconst S" + k + " = 0\n"
+		n += " + S" + k
+	}
+	files["t.go"] = "package p\n\ntype T struct{} // @tt\n\nfunc (T) M() [" + n + "]byte { return [" + n + "]byte{} } // @tm\n\n" +
+		"type I6 interface{ M() [6]byte } // @i6\n\ntype I200 interface{ M() [200]byte }\n\n" +
+		"type I6x interface { // @i6x\n\tM() [6]byte // @i6m\n\tN()\n}\n"
 	files["n.go"] = "//go:build !t0\n\npackage p\n\nfunc (T) N() {}\n"
 	return files
 }

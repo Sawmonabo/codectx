@@ -87,11 +87,9 @@ func (t goUnitTypes) read(p, name string) (goTypeAnswer, bool, error) {
 		}
 		// An alias declared once per platform or build tag is each of its
 		// distinctly written declarations (goTypeAnswer.others).
-		var aliases []entry
+		var aliases [][]entry
 		err := h.decls.lookup(keyGoAlias+scope+"\x00"+name, func(e entry) error {
-			if !slices.ContainsFunc(aliases, func(a entry) bool { return a.Sig == e.Sig }) {
-				aliases = append(aliases, e)
-			}
+			aliases = addWritten(aliases, e)
 			return nil
 		})
 		if err != nil {
@@ -148,15 +146,13 @@ func (t goUnitTypes) readConstant(p, name string) ([]goDecl, error) {
 		}
 		return h.goExt.constant(p, name), nil
 	}
-	var cs []entry
+	var cs [][]entry
 	for _, scope := range scopes {
 		if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
 			continue
 		}
 		err := h.decls.lookup(keyGoConst+scope+"\x00"+name, func(e entry) error {
-			if !slices.ContainsFunc(cs, func(c entry) bool { return c.Sig == e.Sig }) {
-				cs = append(cs, e)
-			}
+			cs = addWritten(cs, e)
 			return nil
 		})
 		if err != nil {
@@ -166,22 +162,41 @@ func (t goUnitTypes) readConstant(p, name string) ([]goDecl, error) {
 	return t.decls(cs)
 }
 
-// decls are the forms (Sig) of the declarations es, each written in its
-// own file; a form whose file cannot be read is unknown.
-func (t goUnitTypes) decls(es []entry) ([]goDecl, error) {
+// addWritten adds the declaration e to written, the declarations of one
+// name grouped by their written form (Sig).
+func addWritten(written [][]entry, e entry) [][]entry {
+	for i, w := range written {
+		if w[0].Sig == e.Sig {
+			written[i] = append(w, e)
+			return written
+		}
+	}
+	return append(written, []entry{e})
+}
+
+// decls are the distinctly written forms (Sig) of the declarations
+// written, each read in the file of the first declaration that writes it,
+// under the disjunction of the conditions of the files of all that do; a
+// form whose file cannot be read is unknown.
+func (t goUnitTypes) decls(written [][]entry) ([]goDecl, error) {
 	var out []goDecl
-	for _, e := range es {
-		fc, found, err := t.h.fileContext(e.Ref.File)
+	for _, es := range written {
+		fc, found, err := t.h.fileContext(es[0].Ref.File)
 		if err != nil {
 			return nil, err
 		}
-		d := goDecl{form: e.Sig, names: goUnitNames{h: t.h, fc: fc}}
+		d := goDecl{form: es[0].Sig, names: goUnitNames{h: t.h, fc: fc}}
 		if !found {
 			d.form = goIdentityUnknown
 		}
-		if t.h.goConds != nil {
-			if d.cond, err = t.h.goFileCond(e.Ref.File); err != nil {
-				return nil, err
+		if c := t.h.goConds; c != nil {
+			d.cond = goCondNone
+			for _, e := range es {
+				f, err := t.h.goFileCond(e.Ref.File)
+				if err != nil {
+					return nil, err
+				}
+				d.cond = c.or(d.cond, f)
 			}
 		}
 		out = append(out, d)

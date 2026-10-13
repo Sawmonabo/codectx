@@ -32,6 +32,9 @@ import (
 // does; one function of the build's tags has one id however it is written.
 type goCond = gobuild.Cond
 
+// goCondNone is the condition no build meets.
+const goCondNone = gobuild.False
+
 // goConds holds the build conditions of one hierarchy build.
 type goConds struct {
 	*gobuild.Conds
@@ -98,20 +101,15 @@ func (h *hierarchy) goFileCond(file int32) (goCond, error) {
 	return id, nil
 }
 
-// goForkLeaves bounds the builds-dependent spellings one method signature
-// is enumerated into (goMethodKeys); past it the signature is unknown.
-const goForkLeaves = 64
-
 // goMethodKeys yields the method-set keys (goMethodKey) of the method name
 // of signature form written in n, each with the build condition under which
-// it is the method's. A signature that names no alias or constant declared
-// more than once is one key under condition 0. One that does is one key per
-// choice of declaration for each such name, under the conjunction of the
-// chosen declarations' conditions, a choice no build makes dropped; when
-// every choice spells one key, it is that key under the disjunction of
-// their conditions. Past goForkLeaves choices the signature is its key read
-// over every declaration at once (unknown when they differ), under
-// condition 0.
+// it is the method's. A signature that names no alias or constant whose
+// declarations spell different types or values is one key under condition
+// 0. One that does is walked through each choice of spelling for each such
+// name (goChosen), a choice no build makes cut as soon as it is made, and is
+// each distinct key of the choices under the disjunction of the conditions
+// of the choices that spell it: in every build, the key of the one choice
+// that build makes.
 func (h *hierarchy) goMethodKeys(ctx context.Context, types goPackageTypes, n goNames, name, form string, ref Ref,
 	yield func(key string, spelling goSpelling, cond goCond) error) error {
 	if h.goConds == nil {
@@ -121,7 +119,7 @@ func (h *hierarchy) goMethodKeys(ctx context.Context, types goPackageTypes, n go
 		}
 		return yield(key, spelling, 0)
 	}
-	w := &goChosen{inner: types}
+	w := &goChosen{inner: types, conds: h.goConds, groups: map[string][]goGroup{}}
 	key, spelling, err := goMethodKey(ctx, w, n, name, form, ref)
 	if err != nil {
 		return err
@@ -136,52 +134,40 @@ func (h *hierarchy) goMethodKeys(ctx context.Context, types goPackageTypes, n go
 		cond     goCond
 	}
 	var leaves []leaf
-	exceeded := false
+	at := map[string]int{}
 	var walk func(cond goCond) error
 	walk = func(cond goCond) error {
-		if exceeded {
-			return nil
-		}
 		w.forks = w.forks[:0]
 		k, sp, err := goMethodKey(ctx, w, n, name, form, ref)
 		if err != nil {
 			return err
 		}
 		if len(w.forks) == 0 {
-			if len(leaves) == goForkLeaves {
-				exceeded = true
+			if i, ok := at[k]; ok {
+				leaves[i].cond = h.goConds.or(leaves[i].cond, cond)
+				leaves[i].spelling = max(leaves[i].spelling, sp)
 				return nil
 			}
+			at[k] = len(leaves)
 			leaves = append(leaves, leaf{k, sp, cond})
 			return nil
 		}
 		f := w.forks[0]
-		for i, c := range f.conds {
-			next := h.goConds.and(cond, c)
+		for i, g := range w.groups[f] {
+			next := h.goConds.and(cond, g.cond)
 			if !h.goConds.holds(next) {
 				continue
 			}
-			w.choice[f.key] = i
+			w.choice[f] = i
 			if err := walk(next); err != nil {
 				return err
 			}
 		}
-		delete(w.choice, f.key)
+		delete(w.choice, f)
 		return nil
 	}
 	if err := walk(0); err != nil {
 		return err
-	}
-	if exceeded {
-		return yield(key, spelling, 0)
-	}
-	if len(leaves) > 0 && !slices.ContainsFunc(leaves, func(l leaf) bool { return l.key != leaves[0].key }) {
-		// Every choice spells one key: the builds of any of them.
-		cond := leaves[0].cond
-		for _, l := range leaves[1:] {
-			cond = h.goConds.or(cond, l.cond)
-		}
-		return yield(leaves[0].key, leaves[0].spelling, cond)
 	}
 	for _, l := range leaves {
 		if err := yield(l.key, l.spelling, l.cond); err != nil {
@@ -191,28 +177,64 @@ func (h *hierarchy) goMethodKeys(ctx context.Context, types goPackageTypes, n go
 	return nil
 }
 
-// goChosen reads its inner goPackageTypes with one declaration chosen for
-// each alias and constant named in choice (by import path, NUL, name), and
-// lists in forks each one declared more than once that choice does not
-// name, as goMethodKeys enumerates them. It sits outside the lookup memo,
-// so a memoized answer holds every declaration whatever a choice picks.
+// goChosen reads its inner goPackageTypes with one spelling chosen for each
+// alias and constant named in choice (by import path, NUL, name), and lists
+// in forks each one whose declarations spell more than one type or value
+// that choice does not name, as goMethodKeys walks them. A name's
+// declarations are grouped by what each spells (goGroup): declarations
+// written differently that spell one type, or fold to one value, are one
+// choice under the disjunction of their conditions, so they never multiply
+// the walk. A declaration whose spelling depends on another name's choice
+// is a group of its own, and choosing it forks on that name in turn. It
+// sits outside the lookup memo, so a memoized answer holds every
+// declaration whatever a choice picks.
 type goChosen struct {
 	inner  goPackageTypes
+	conds  *goConds
 	choice map[string]int
-	forks  []goFork
+	forks  []string
+	// groups are each name's groups, by its key, once computed.
+	groups map[string][]goGroup
 }
 
-// goFork is a name declared more than once and the conditions of its
-// declarations.
-type goFork struct {
-	key   string
-	conds []goCond
+// goGroup is the declarations of one name that spell one type or value:
+// the first of them, by its index among the name's declarations, and the
+// disjunction of their conditions.
+type goGroup struct {
+	first int
+	cond  goCond
 }
 
-func (w *goChosen) fork(key string, conds []goCond) {
-	if !slices.ContainsFunc(w.forks, func(f goFork) bool { return f.key == key }) {
-		w.forks = append(w.forks, goFork{key, conds})
+func (w *goChosen) fork(key string) {
+	if !slices.Contains(w.forks, key) {
+		w.forks = append(w.forks, key)
 	}
+}
+
+// group is the groups of the declarations decls of the name of key, each
+// spelled by spell: "" for one whose spelling cannot be known apart from
+// any choice, a group of its own.
+func (w *goChosen) group(ctx context.Context, key string, decls []goDecl,
+	spell func(d goDecl) (string, error)) ([]goGroup, error) {
+	if g, ok := w.groups[key]; ok {
+		return g, nil
+	}
+	var groups []goGroup
+	var spellings []string
+	for i, d := range decls {
+		sp, err := spell(d)
+		if err != nil {
+			return nil, err
+		}
+		if j := slices.Index(spellings, sp); sp != "" && j >= 0 {
+			groups[j].cond = w.conds.or(groups[j].cond, d.cond)
+			continue
+		}
+		groups = append(groups, goGroup{first: i, cond: d.cond})
+		spellings = append(spellings, sp)
+	}
+	w.groups[key] = groups
+	return groups, nil
 }
 
 func (w *goChosen) lookup(ctx context.Context, p, name string) (goTypeAnswer, bool, error) {
@@ -221,20 +243,38 @@ func (w *goChosen) lookup(ctx context.Context, p, name string) (goTypeAnswer, bo
 		return a, known, err
 	}
 	key := "t\x00" + p + "\x00" + name
-	i, chosen := w.choice[key]
-	if !chosen {
-		conds := []goCond{a.cond}
-		for _, d := range a.others {
-			conds = append(conds, d.cond)
+	decls := append([]goDecl{{form: a.form, names: a.names, cond: a.cond}}, a.others...)
+	groups, err := w.group(ctx, key, decls, func(d goDecl) (string, error) {
+		// A generic alias is spelled over its parameters, which stand for
+		// any arguments alike.
+		n, form, _ := goGenericAlias(d.form)
+		subst := make([]string, n)
+		for i := range subst {
+			subst[i] = "$" + strconv.Itoa(i)
 		}
-		w.fork(key, conds)
+		if n == 0 {
+			subst = nil
+		}
+		var b strings.Builder
+		if ok, err := goCanonical(ctx, w.inner, d.names, form, subst, 1, &b); err != nil || !ok {
+			return "", err
+		}
+		return strconv.Itoa(n) + " " + b.String(), nil
+	})
+	if err != nil {
+		return goTypeAnswer{}, false, err
+	}
+	i, chosen := w.choice[key]
+	if !chosen && len(groups) > 1 {
+		w.fork(key)
 		return a, known, nil
 	}
-	if i > 0 {
-		d := a.others[i-1]
-		a.form, a.names, a.cond = d.form, d.names, d.cond
+	g := groups[0]
+	if chosen {
+		g = groups[i]
 	}
-	a.others = nil
+	d := decls[g.first]
+	a.form, a.names, a.cond, a.others = d.form, d.names, g.cond, nil
 	return a, known, nil
 }
 
@@ -244,16 +284,31 @@ func (w *goChosen) constant(ctx context.Context, p, name string) ([]goDecl, erro
 		return decls, err
 	}
 	key := "k\x00" + p + "\x00" + name
-	i, chosen := w.choice[key]
-	if !chosen {
-		conds := make([]goCond, len(decls))
-		for j, d := range decls {
-			conds[j] = d.cond
+	groups, err := w.group(ctx, key, decls, func(d goDecl) (string, error) {
+		if d.form == goIdentityUnknown {
+			return "", nil
 		}
-		w.fork(key, conds)
+		v, err := goFold(ctx, w.inner, d.names, strings.Split(d.form, " "), 1)
+		if err != nil || v == nil {
+			return "", err
+		}
+		return v.String(), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	i, chosen := w.choice[key]
+	if !chosen && len(groups) > 1 {
+		w.fork(key)
 		return decls, nil
 	}
-	return decls[i : i+1], nil
+	g := groups[0]
+	if chosen {
+		g = groups[i]
+	}
+	d := decls[g.first]
+	d.cond = g.cond
+	return []goDecl{d}, nil
 }
 
 // goMethodKeysAux is the Aux of a Go method's keyMethod entry that records
