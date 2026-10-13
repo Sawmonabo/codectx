@@ -757,6 +757,14 @@ func (s *compileSorts) Close() error {
 	return err
 }
 
+// releaseRound releases everything opened since the area was created or last
+// released, newest first, as Close does, and leaves the area open for the
+// next round. A finished round's runs have no reader left: the next round
+// rebuilds every stream from P-A and takes only scalars from the round before
+// it (roundInputs), so a compile's temporary disk is its largest round's runs,
+// never their sum.
+func (s *compileSorts) releaseRound() error { return s.Close() }
+
 // newSort opens one external sort in this compile's area, byte-budgeted with
 // sizeOf and registered for release. It is a free function and not a method
 // because Go methods carry no type parameters of their own.

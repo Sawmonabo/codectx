@@ -288,6 +288,12 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 	var owner model.NodeID
 	for _, n := range cap.nodes {
 		switch {
+		case n.Node.Kind == model.NodeReturn:
+			// No source identifier declares a return node, so it carries
+			// no declaration-key alias.
+			if slices.ContainsFunc(cap.aliases, func(a model.NativeAlias) bool { return a.NodeID == n.Node.ID }) {
+				t.Fatalf("%s: the return node of a callable carries an alias", file)
+			}
 		case n.Node.Kind == model.NodeVariable:
 			if prev, ok := vars[n.Node.Name]; ok && prev != n.Node.ID {
 				t.Fatalf("%s: two variable nodes named %s; nodes: %s", file, n.Node.Name, names(cap.nodes))

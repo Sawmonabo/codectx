@@ -51,6 +51,11 @@ type grammar struct {
 	// decorators lists a declaration's decorators, annotations or
 	// attributes in source order, for a language that has them.
 	decorators func(e *extraction, d *decl) []wire.Decorator
+	// parameterDecorators lists the decorators of a declaration's
+	// parameters, and typeAnnotations the annotations on the types of its
+	// signature, for a language that has them.
+	parameterDecorators func(e *extraction, d *decl) []wire.ParameterDecorator
+	typeAnnotations     func(e *extraction, d *decl) []wire.Decorator
 	// blank is the name that declares nothing in the language, or empty
 	// when every name it extracts binds one. A declaration of it is not
 	// extracted, and neither is any declaration nested inside it.
@@ -341,8 +346,8 @@ var grammars = map[string]*grammar{
 		flatFields: goFields,
 	},
 	"javascript": {language: tree_sitter_javascript.Language, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
-	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
-	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, flatFields: jsFields},
+	"typescript": {language: tree_sitter_typescript.LanguageTypescript, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, parameterDecorators: tsParameterDecorators, flatFields: jsFields},
+	"tsx":        {language: tree_sitter_typescript.LanguageTSX, wrappers: jsWrappers, comments: []string{"comment"}, refine: jsRefine, decorators: esDecorators, parameterDecorators: tsParameterDecorators, flatFields: jsFields},
 	"python": {
 		language:   tree_sitter_python.Language,
 		wrappers:   []string{"decorated_definition"},
@@ -384,7 +389,11 @@ var grammars = map[string]*grammar{
 		isTest:      func(d *decl, _ string, _ []byte) bool { return d.test },
 		importNames: func(p string) []string { return []string{lastSegment(p, ".")} },
 		decorators:  javaDecorators,
-		flatFields:  javaFields,
+		// A parameter's annotations are its own; a type-use annotation is
+		// its type's (JLS §9.7.4).
+		parameterDecorators: javaParameterDecorators,
+		typeAnnotations:     javaTypeAnnotations,
+		flatFields:          javaFields,
 	},
 	"rust": {
 		language: tree_sitter_rust.Language,

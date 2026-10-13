@@ -225,7 +225,10 @@ func documentSymbols(ctx context.Context, r exactReader, req model.SymbolRequest
 // symbolTiers serves resolve, workspace-symbols and definition: the
 // qualified-name, prefix and name tiers in ranking order, keyset on node_id
 // within each tier, resuming at the tier the cursor stopped in. A node is
-// emitted by its most specific tier only.
+// emitted once, by the earliest tier that serves it (tierRule): for definition
+// that is the earliest tier whose row for the node is a declaration site, so a
+// node whose qualified-name row is not one and whose name row is is served at
+// exact_name rather than by neither.
 //
 // The page carries a continuation key only when it filled: a short page means
 // every remaining tier was drained, so there is nothing safe to continue to.
@@ -234,6 +237,8 @@ func symbolTiers(ctx context.Context, r exactReader, req model.SymbolRequest, ra
 		return resolvePage{}, &model.Error{Code: model.CodeCursorInvalid, Message: "symbol cursor was not written by a symbol tier"}
 	}
 	declarationsOnly := req.Operation == model.SymbolDefinition
+	rule := newSymbolRule(r, req.Query, declarationsOnly)
+	ids := make([]model.NodeID, 0, limit)
 	var page resolvePage
 	var lastTier model.SearchTier
 	var lastNode model.NodeID
@@ -253,9 +258,17 @@ func symbolTiers(ctx context.Context, r exactReader, req model.SymbolRequest, ra
 			if len(nodes) == 0 {
 				break
 			}
+			ids = ids[:0]
+			for _, n := range nodes {
+				ids = append(ids, n.Node.ID)
+			}
+			owned, err := rule.ownedBefore(ctx, tier, ids)
+			if err != nil {
+				return resolvePage{}, err
+			}
 			for _, n := range nodes {
 				after = n.Node.ID
-				if supersededByLowerTier(tier, n, req.Query) {
+				if owned[n.Node.ID] {
 					continue
 				}
 				if declarationsOnly && !isDeclaration(n) {

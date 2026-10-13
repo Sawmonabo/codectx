@@ -843,6 +843,9 @@ func (s *Services) Entries(ctx context.Context, req model.ContextPageRequest) (m
 	if err != nil {
 		return model.ContextPage{}, s.fail("context entries", err)
 	}
+	if req.View == model.ViewRoutes {
+		return s.routesPage(ctx, req, rec, manifest)
+	}
 	after, err := s.resumeEntries(req, rec)
 	if err != nil {
 		return model.ContextPage{}, s.fail("context entries", err)
@@ -903,7 +906,7 @@ func (s *Services) Entries(ctx context.Context, req model.ContextPageRequest) (m
 			WithDetail("view", string(req.View))
 	}
 	if more {
-		token, why, err := s.entriesCursor(ctx, rec, req.View, last)
+		token, why, err := s.entriesCursor(ctx, rec, req.View, strconv.Itoa(last))
 		if err != nil {
 			return model.ContextPage{}, s.fail("context entries", err)
 		}
@@ -986,7 +989,7 @@ func (s *Services) resumeEntries(req model.ContextPageRequest, rec sqlite.Sessio
 // cursor-owned retention lease and expires with the session, because a page
 // resumed after the session is gone would describe scope nobody holds.
 func (s *Services) entriesCursor(ctx context.Context, rec sqlite.SessionRecord,
-	view model.ContextView, last int) (token, why string, err error) {
+	view model.ContextView, last string) (token, why string, err error) {
 	st := s.w.s
 	if st.leases == nil {
 		return "", "this workspace does not retain context continuations", nil
@@ -1005,7 +1008,7 @@ func (s *Services) entriesCursor(ctx context.Context, rec sqlite.SessionRecord,
 		GenerationID: rec.Binding.GenerationID,
 		AnalysisKey:  rec.Binding.AnalysisKey,
 		QueryHash:    entriesQueryHash(rec, view),
-		LastKey:      strconv.Itoa(last),
+		LastKey:      last,
 		LeaseID:      lease.ID,
 		ExpiresAt:    rec.ExpiresAt,
 	})

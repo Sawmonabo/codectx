@@ -18,13 +18,17 @@ type decoSyntax struct {
 	// Java.
 	modifiers, annotation, markerAnnotation, annotationArguments uint16
 	// ECMAScript (decorator is shared with Python's name).
-	exportStatement, classBody, callExpression, arguments uint16
+	exportStatement, classBody, callExpression, arguments, classExpr uint16
 	// Rust.
 	attributeItem, attribute, tokenTree uint16
 	// C and C++ (attribute and callExpression are shared).
 	attributeSpecifier, attributeDeclaration, argumentList, functionDeclarator, attributedDeclarator uint16
+	typeQualifier, alignasQualifier                                                                  uint16
+	// Parameters: TypeScript's, Java's; Rust's inner attributes.
+	formalParameters, requiredParameter, optionalParameter, formalParameter, spreadParameter uint16
+	innerAttributeItem                                                                       uint16
 	// Fields.
-	fFunction, fArguments, fName, fValue, fDeclarator uint16
+	fFunction, fArguments, fName, fValue, fDeclarator, fParameters, fPattern, fType, fBody, fRight uint16
 }
 
 // decoSyntax is the decorator table of g, the grammar registered as
@@ -51,18 +55,27 @@ func (g *grammar) decoSyntax(language string) *decoSyntax {
 		case "java":
 			s.modifiers, s.annotation, s.markerAnnotation = kind("modifiers"), kind("annotation"), kind("marker_annotation")
 			s.annotationArguments = kind("annotation_argument_list")
-			s.fName, s.fArguments = field("name"), field("arguments")
+			s.formalParameters, s.formalParameter, s.spreadParameter = kind("formal_parameters"), kind("formal_parameter"), kind("spread_parameter")
+			s.fName, s.fArguments, s.fParameters, s.fType = field("name"), field("arguments"), field("parameters"), field("type")
 		case "javascript", "typescript", "tsx":
 			s.decorator, s.exportStatement, s.classBody = kind("decorator"), kind("export_statement"), kind("class_body")
 			s.callExpression, s.arguments = kind("call_expression"), kind("arguments")
-			s.fFunction, s.fArguments = field("function"), field("arguments")
+			s.formalParameters, s.classExpr = kind("formal_parameters"), kind("class")
+			s.fFunction, s.fArguments, s.fValue, s.fRight, s.fParameters = field("function"), field("arguments"), field("value"), field("right"), field("parameters")
+			if language != "javascript" {
+				// A parameter decorator is TypeScript's alone.
+				s.requiredParameter, s.optionalParameter = kind("required_parameter"), kind("optional_parameter")
+				s.fPattern = field("pattern")
+			}
 		case "rust":
 			s.attributeItem, s.attribute, s.tokenTree = kind("attribute_item"), kind("attribute"), kind("token_tree")
-			s.fArguments, s.fValue = field("arguments"), field("value")
+			s.innerAttributeItem = kind("inner_attribute_item")
+			s.fArguments, s.fValue, s.fBody = field("arguments"), field("value"), field("body")
 		case "c", "cpp":
 			s.attributeSpecifier, s.attributeDeclaration, s.attribute = kind("attribute_specifier"), kind("attribute_declaration"), kind("attribute")
 			s.argumentList, s.callExpression = kind("argument_list"), kind("call_expression")
 			s.functionDeclarator, s.attributedDeclarator = kind("function_declarator"), kind("attributed_declarator")
+			s.typeQualifier, s.alignasQualifier = kind("type_qualifier"), kind("alignas_qualifier")
 			s.fFunction, s.fArguments, s.fName, s.fDeclarator = field("function"), field("arguments"), field("name"), field("declarator")
 		}
 	})
@@ -145,20 +158,28 @@ func javaDecorators(e *extraction, d *decl) []wire.Decorator {
 	}
 	var out []wire.Decorator
 	for _, a := range entries(m) {
-		if a.KindId() != s.annotation && a.KindId() != s.markerAnnotation {
-			continue
+		if dec, ok := javaAnnotation(e, s, a); ok {
+			out = append(out, dec)
 		}
-		name := a.ChildByFieldId(s.fName)
-		if name == nil {
-			continue
-		}
-		var args []ts.Node
-		if l := a.ChildByFieldId(s.fArguments); l != nil && l.KindId() == s.annotationArguments {
-			args = entries(l)
-		}
-		out = append(out, decoration(e.src, a, *name, args))
 	}
 	return out
+}
+
+// javaAnnotation is one annotation node as a decorator, and false for any
+// other node.
+func javaAnnotation(e *extraction, s *decoSyntax, a ts.Node) (wire.Decorator, bool) {
+	if a.KindId() != s.annotation && a.KindId() != s.markerAnnotation {
+		return wire.Decorator{}, false
+	}
+	name := a.ChildByFieldId(s.fName)
+	if name == nil {
+		return wire.Decorator{}, false
+	}
+	var args []ts.Node
+	if l := a.ChildByFieldId(s.fArguments); l != nil && l.KindId() == s.annotationArguments {
+		args = entries(l)
+	}
+	return decoration(e.src, a, *name, args), true
 }
 
 // esDecorators are the decorators of an ECMAScript class or class member, in
@@ -193,26 +214,43 @@ func esDecorators(e *extraction, d *decl) []wire.Decorator {
 			nodes = append(nodes, before...)
 		}
 	}
-	for _, c := range entries(&d.node) {
-		if c.KindId() == s.decorator {
-			nodes = append(nodes, c)
+	own := []ts.Node{d.node}
+	// A class expression's decorators are on the class, the value the
+	// declaration's binding or assignment holds (`const C = @d class {}`).
+	for _, f := range []uint16{s.fValue, s.fRight} {
+		if v := d.node.ChildByFieldId(f); v != nil && v.KindId() == s.classExpr {
+			own = append(own, *v)
+		}
+	}
+	for _, n := range own {
+		for _, c := range entries(&n) {
+			if c.KindId() == s.decorator {
+				nodes = append(nodes, c)
+			}
 		}
 	}
 	var out []wire.Decorator
 	for _, c := range nodes {
-		if expr := entries(&c); len(expr) > 0 {
-			out = append(out, callDecoration(e.src, c, expr[0], s.callExpression, s.arguments, s.fFunction, s.fArguments))
-		}
+		out = append(out, esDecoration(e, s, c)...)
 	}
 	return out
+}
+
+// esDecoration is one ECMAScript decorator node as a decorator, or none
+// when it holds no expression.
+func esDecoration(e *extraction, s *decoSyntax, c ts.Node) []wire.Decorator {
+	if expr := entries(&c); len(expr) > 0 {
+		return []wire.Decorator{callDecoration(e.src, c, expr[0], s.callExpression, s.arguments, s.fFunction, s.fArguments)}
+	}
+	return nil
 }
 
 // rustDecorators are the outer attributes of an item, the `#[...]` items
 // that precede it (comments between them skipped), in source order: the
 // attribute's path as written (`derive`, `tokio::main`) and its arguments,
 // the token tree split at its top-level commas, or the value of the
-// `#[name = value]` form as its one argument. An inner attribute (`#![...]`)
-// belongs to the item around it and is not read.
+// `#[name = value]` form as its one argument, then the inner attributes
+// (`#![...]`) its body opens with, which apply to it too.
 func rustDecorators(e *extraction, d *decl) []wire.Decorator {
 	s := e.g.decoSyntax(e.l.Name)
 	var items []ts.Node
@@ -226,25 +264,50 @@ func rustDecorators(e *extraction, d *decl) []wire.Decorator {
 		items = append(items, *p)
 	}
 	slices.Reverse(items)
+	// An inner attribute (`#![...]`) in the item's body applies to the
+	// item, as an outer one does (the Rust Reference, Attributes).
+	if body := d.node.ChildByFieldId(s.fBody); body != nil {
+		items = append(items, innerAttributes(s, *body)...)
+	}
 	var out []wire.Decorator
 	for _, item := range items {
-		attr := childOfKind(item, s.attribute)
-		if attr == nil {
-			continue
+		if dec, ok := rustAttribute(e, s, item); ok {
+			out = append(out, dec)
 		}
-		path := attr.NamedChild(0)
-		if path == nil {
-			continue
-		}
-		dec := decoration(e.src, item, *path, nil)
-		if tt := attr.ChildByFieldId(s.fArguments); tt != nil && tt.KindId() == s.tokenTree {
-			dec.Arguments = splitTokenTree(tt, e.src)
-		} else if v := attr.ChildByFieldId(s.fValue); v != nil {
-			dec.Arguments = []wire.Span{{Start: uint32(v.StartByte()), End: uint32(v.EndByte())}}
-		}
-		out = append(out, dec)
 	}
 	return out
+}
+
+// innerAttributes are the inner attribute items among n's direct children,
+// in source order.
+func innerAttributes(s *decoSyntax, n ts.Node) []ts.Node {
+	var out []ts.Node
+	for _, c := range entries(&n) {
+		if c.KindId() == s.innerAttributeItem {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// rustAttribute is one attribute item, outer or inner, as a decorator: its
+// path as written and its arguments.
+func rustAttribute(e *extraction, s *decoSyntax, item ts.Node) (wire.Decorator, bool) {
+	attr := childOfKind(item, s.attribute)
+	if attr == nil {
+		return wire.Decorator{}, false
+	}
+	path := attr.NamedChild(0)
+	if path == nil {
+		return wire.Decorator{}, false
+	}
+	dec := decoration(e.src, item, *path, nil)
+	if tt := attr.ChildByFieldId(s.fArguments); tt != nil && tt.KindId() == s.tokenTree {
+		dec.Arguments = splitTokenTree(tt, e.src)
+	} else if v := attr.ChildByFieldId(s.fValue); v != nil {
+		dec.Arguments = []wire.Span{{Start: uint32(v.StartByte()), End: uint32(v.EndByte())}}
+	}
+	return dec, true
 }
 
 // splitTokenTree is the arguments of an attribute's delimited token tree:
@@ -321,10 +384,21 @@ func cDecorators(e *extraction, d *decl) []wire.Decorator {
 			n = firstNamedChild(n)
 		}
 	}
+	specs = append(specs, alignasQualifiers(d.node, s)...)
 	slices.SortFunc(specs, func(a, b ts.Node) int { return cmpUint(a.StartByte(), b.StartByte()) })
 	var out []wire.Decorator
 	for _, spec := range specs {
 		switch spec.KindId() {
+		case s.alignasQualifier:
+			// `alignas(16)` and `alignas(T)`: the specifier's keyword as
+			// written (`alignas`, `_Alignas`) and its one operand.
+			kw := spec.Child(0)
+			if kw == nil {
+				continue
+			}
+			dec := decoration(e.src, spec, *kw, nil)
+			dec.Arguments = spans(entries(&spec))
+			out = append(out, dec)
 		case s.attributeDeclaration:
 			for _, a := range entries(&spec) {
 				if a.KindId() != s.attribute {
@@ -346,6 +420,23 @@ func cDecorators(e *extraction, d *decl) []wire.Decorator {
 		case s.attributeSpecifier:
 			for _, a := range entries(childOfKind(spec, s.argumentList)) {
 				out = append(out, callDecoration(e.src, a, a, s.callExpression, s.argumentList, s.fFunction, s.fArguments))
+			}
+		}
+	}
+	return out
+}
+
+// alignasQualifiers are the alignment specifiers among n's direct children,
+// bare (`struct alignas(8) S`) or as a type qualifier (`alignas(16) int x;`).
+func alignasQualifiers(n ts.Node, s *decoSyntax) []ts.Node {
+	var out []ts.Node
+	for _, c := range entries(&n) {
+		switch c.KindId() {
+		case s.alignasQualifier:
+			out = append(out, c)
+		case s.typeQualifier:
+			if a := childOfKind(c, s.alignasQualifier); a != nil {
+				out = append(out, *a)
 			}
 		}
 	}

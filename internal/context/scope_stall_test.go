@@ -43,8 +43,8 @@ func (r stallingReader) Neighbours(ctx stdcontext.Context, refs []graph.NodeRef,
 }
 
 // TestAStalledWalkPageEndsThePassAndIsReIssuedOnce pins the stalled-page branch
-// of P-A's halt (scope.go, `if stalled { next = cursor }`), which an earlier fix shipped
-// reasoned rather than tested and REV-H4a carried as unpinned.
+// of P-A's halt (scope.go, `if stalled { next = cursor }`), a branch no other
+// test reaches.
 //
 // Two things must hold for a page that came back truncated with an empty cursor
 // and no entry. It must NOT read as exhaustion: breaking out of the walk loop

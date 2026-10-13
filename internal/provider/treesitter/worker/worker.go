@@ -234,7 +234,7 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 	defer ex.macros.close()
 	err := ex.run(kept.query, root, em)
 	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated, Header: header,
-		ComputedAll: ex.all.present && ex.all.computed}
+		ComputedAll: ex.all.present && ex.all.computed, ModuleDecorators: moduleDecorators(ex, *root)}
 	if err != nil {
 		kept.tree.Close()
 		return done, nil, err

@@ -340,7 +340,7 @@ func (c *Compiler) persistPlan(ctx context.Context, b model.Binding, req model.C
 	}
 	defer release()
 	return c.persistManifest(ctx, b, req, budget, partsOf(p), p.Entries, run,
-		completeness, scopeComplete)
+		completeness, scopeComplete, nil)
 }
 
 // excludedRun spools a whole-set plan's exclusions into the sorted run

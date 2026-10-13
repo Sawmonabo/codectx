@@ -70,7 +70,7 @@ func (s *Service) ReadAnswer(ctx context.Context, reader *sqlite.PinnedReader, r
 	if err != nil {
 		return end, err
 	}
-	if err := filter.pin(ctx, s.store, reader.Binding().SnapshotID); err != nil {
+	if err := filter.pin(ctx, s.store, reader, reader.Binding().SnapshotID); err != nil {
 		return end, err
 	}
 	var pos searchPosition
@@ -78,9 +78,15 @@ func (s *Service) ReadAnswer(ctx context.Context, reader *sqlite.PinnedReader, r
 	sizer := stepSizer{first: first, budget: budget}
 	for {
 		searchCtx, searchCancel := model.QueryDeadline(ctx, s.timeout)
+		// The in-process read holds no cursor, so it neither reads nor writes a
+		// spool: each step walks the exact tiers from its position, and the
+		// steps double, so the walks cost about N·log(N/first) in all.
 		ans, err := s.collect(searchCtx, reader, req, filter, pos, depth,
-			pageBound{maxBytes: max(budget, 1), markedBound: sizer.shape.marked})
+			pageBound{maxBytes: max(budget, 1), markedBound: sizer.shape.marked}, exactSource{})
 		searchCancel()
+		if err == nil {
+			err = filter.tag.Err()
+		}
 		if err != nil {
 			return end, err
 		}

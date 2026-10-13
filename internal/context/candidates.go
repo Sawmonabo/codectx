@@ -26,8 +26,12 @@ import (
 // the scope verdict and no further site is asked for the rest of the compile:
 // the manifest says candidates are unavailable rather than that there are none.
 // Every other failure ends the compile.
+//
+// only, when set, admits just the candidates declared in those files: the
+// closure reads the candidates its sites outside the kept files lend to the
+// kept files, and no others (closeKeptFiles).
 func (c *Compiler) admitCandidates(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
-	entries []model.ImpactEntry, in *seedIngest) error {
+	entries []model.ImpactEntry, in *seedIngest, only map[model.FileID]bool) error {
 	if len(entries) == 0 || in.scope.CandidatesUnavailable != "" {
 		return nil
 	}
@@ -61,7 +65,7 @@ func (c *Compiler) admitCandidates(ctx context.Context, eng *graph.Engine, gen m
 		if !open {
 			continue
 		}
-		if err := c.admitSiteCandidates(ctx, r, gen, n, in); err != nil {
+		if err := c.admitSiteCandidates(ctx, r, gen, n, in, only); err != nil {
 			return err
 		}
 		if in.scope.CandidatesUnavailable != "" {
@@ -120,7 +124,7 @@ func metadataErr(id model.NodeID, err error) *model.Error {
 // each as a Possible record. A cursor pins the generation, so the generation
 // is named on the first page only.
 func (c *Compiler) admitSiteCandidates(ctx context.Context, r graph.GraphReader, gen model.GenerationID,
-	site model.Node, in *seedIngest) error {
+	site model.Node, in *seedIngest, only map[model.FileID]bool) error {
 	cursor := ""
 	for {
 		page, err := graph.Candidates(ctx, r, model.CandidateRequest{
@@ -141,7 +145,7 @@ func (c *Compiler) admitSiteCandidates(ctx context.Context, r graph.GraphReader,
 			return contextErr(ctx, err)
 		}
 		if len(page.Candidates) > 0 {
-			if err := in.pushCandidates(ctx, r, site, page); err != nil {
+			if err := in.pushCandidates(ctx, r, site, page, only); err != nil {
 				return err
 			}
 		}
@@ -160,9 +164,10 @@ func (c *Compiler) admitSiteCandidates(ctx context.Context, r graph.GraphReader,
 }
 
 // pushCandidates reads one candidate page's nodes in one batch and pushes one
-// record per candidate, in the page's ranked order.
+// record per candidate, in the page's ranked order; with only set, just the
+// candidates declared in those files.
 func (in *seedIngest) pushCandidates(ctx context.Context, r graph.GraphReader, site model.Node,
-	page model.CandidatePage) error {
+	page model.CandidatePage, only map[model.FileID]bool) error {
 	ids := make([]model.NodeID, len(page.Candidates))
 	for i, cd := range page.Candidates {
 		ids[i] = cd.NodeID
@@ -184,6 +189,9 @@ func (in *seedIngest) pushCandidates(ctx context.Context, r graph.GraphReader, s
 				Message: boundReason(fmt.Sprintf("the candidate %s of the open call site %q is not a node of the pinned generation",
 					cd.NodeID, site.Name)),
 				Remediation: "this is a defect in the candidate lookup; report it with the command you ran"}
+		}
+		if only != nil && !only[n.FileID] {
+			continue
 		}
 		closeness, err := closenessOrdinal(cd.Closeness)
 		if err != nil {

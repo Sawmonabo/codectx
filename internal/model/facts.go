@@ -748,6 +748,12 @@ const (
 	// MetaDecorators holds a declaration's decorators and annotations, in
 	// source order ([]Decorator).
 	MetaDecorators = "decorators"
+	// MetaTypeAnnotations holds the annotations written on the types of a
+	// declaration's signature, in source order ([]Decorator): Java type-use
+	// annotations, which annotate a type rather than the declaration. A
+	// parameter's own decorators are on its variable node, under
+	// MetaDecorators.
+	MetaTypeAnnotations = "type_annotations"
 	// MetaUnresolvedLines names the rows of a requirements file's
 	// configuration node that record the lines no requirement interprets, in
 	// source order; each row's value is {"line","reason","via"} and the row is

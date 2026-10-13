@@ -32,7 +32,10 @@ import (
 // What a node keeps is every label no other label of it DOMINATES: label A
 // dominates B when A's depth class is no deeper, A's class is at least as
 // strong (named over unnamed), A's weight and route factor are both at least
-// B's, and A may still walk at least as far as B (its remaining derived depth).
+// B's, A may still walk at least as far as B (its remaining derived depth),
+// and A's route shape is no weaker: A reached no peer where B did not, A is
+// not owed a turn B is not owed, and A did not descend into a callee where B
+// did not (labelShape).
 // Each of those is a quantity a ranking pass can only improve with -- a
 // shallower depth is a requirement no weaker, a larger weight scales every
 // boost no smaller, a larger factor scores no lower -- so the label a ranking
@@ -78,6 +81,13 @@ type LabelRule struct {
 	Decay int64
 	// Classes is the number of depth classes: depths at or past it are one.
 	Classes int
+	// Peer is the hierarchy kinds whose round trip reaches a peer: a route
+	// that takes one of them toward its to-node (from a subtype up to its
+	// supertype) and the same kind straight back from that node to another
+	// from-node (down to a second subtype) ends at a sibling of where it
+	// turned, the round-trip meta path P P^-1 of heterogeneous-graph
+	// similarity. Every label past such a turn is served with Peer set.
+	Peer map[model.RelationKind]bool
 	// Policy names the caller's rule. It is bound into the continuation, so a
 	// cursor minted under one rule is refused under another.
 	Policy string
@@ -102,6 +112,10 @@ type WeightedEntry struct {
 	model.ImpactEntry
 	RootWeight int64
 	Named      bool
+	// Peer is set when the label's route went up a LabelRule.Peer kind and
+	// straight back down it: the entry is a sibling of a node on its route,
+	// not one the route depends on.
+	Peer bool
 }
 
 // WeightedWalkResult is one page of kept labels.
@@ -125,24 +139,26 @@ const reachUnbounded = math.MaxInt32
 // weightedSchema is the walk's state. label holds every label the walk has
 // created: state 0 is queued, 1 settled and owed its expansion, 2 settled and
 // expanded. A queued label is unique on its key (node, class, named, weight,
-// reach), so a better route to the same key replaces it in place; a settled
-// one is never touched again. progress is the resume position and the
+// reach and its route shape), so a better route to the same key replaces it
+// in place; a settled one is never touched again. progress is the resume position and the
 // answer-level disclosures, which must survive the page that met them.
 const weightedSchema = `
 CREATE TABLE label(id INTEGER PRIMARY KEY, node TEXT NOT NULL, depth INTEGER NOT NULL, cls INTEGER NOT NULL,
 	named INTEGER NOT NULL, weight INTEGER NOT NULL, reach INTEGER NOT NULL, route INTEGER NOT NULL,
 	score INTEGER NOT NULL, parent INTEGER NOT NULL, rel TEXT NOT NULL, kind TEXT NOT NULL,
-	outgoing INTEGER NOT NULL, state INTEGER NOT NULL);
-CREATE UNIQUE INDEX label_queued ON label(node, cls, named, weight, reach) WHERE state = 0;
+	outgoing INTEGER NOT NULL, up TEXT NOT NULL, peer INTEGER NOT NULL, descended INTEGER NOT NULL,
+	state INTEGER NOT NULL);
+CREATE UNIQUE INDEX label_queued ON label(node, cls, named, weight, reach, up, peer, descended) WHERE state = 0;
 CREATE INDEX label_queue ON label(state, score DESC, depth, node, named DESC, weight DESC, reach DESC, route DESC, id);
 CREATE INDEX label_pending ON label(state, node, id);
 CREATE INDEX label_node ON label(node, state, cls);
-CREATE INDEX label_serve ON label(node, cls, named, weight, reach) WHERE state > 0 AND depth > 0;
+CREATE INDEX label_serve ON label(node, cls, named, weight, reach, up, peer, descended) WHERE state > 0 AND depth > 0;
 CREATE TABLE progress(k INTEGER PRIMARY KEY, expand_after TEXT NOT NULL, depth_limited INTEGER NOT NULL,
 	edges_hit INTEGER NOT NULL, visited_hit INTEGER NOT NULL, serving INTEGER NOT NULL,
 	after_node TEXT NOT NULL, after_cls INTEGER NOT NULL, after_named INTEGER NOT NULL,
-	after_weight INTEGER NOT NULL, after_reach INTEGER NOT NULL);
-INSERT INTO progress VALUES(0, '', 0, 0, 0, 0, '', 0, 0, 0, 0);
+	after_weight INTEGER NOT NULL, after_reach INTEGER NOT NULL, after_up TEXT NOT NULL,
+	after_peer INTEGER NOT NULL, after_descended INTEGER NOT NULL);
+INSERT INTO progress VALUES(0, '', 0, 0, 0, 0, '', 0, 0, 0, 0, '', 0, 0);
 `
 
 // WeightedWalk answers one page of a weighted walk. The request that mints the
@@ -218,6 +234,10 @@ func (e *Engine) WeightedWalk(ctx context.Context, req WeightedWalkRequest) (res
 		reader: e.reader, rule: req.Rule, codes: codes, absent: absent,
 		direction: req.Direction, maxDepth: maxDepth, maxVisited: maxVisited, maxEdges: maxEdges,
 		frontierBytes: e.limits.FrontierBytes, sc: sc, scCtx: scCtx, deadline: deadline, now: e.now,
+		flows: e.flowReader(), pdg: map[model.RelationKind]bool{},
+	}
+	for _, k := range ProgramDependenceRelations() {
+		w.pdg[k] = true
 	}
 	for _, k := range req.Relations {
 		w.maxHop = max(w.maxHop, req.Rule.Hop[k])
@@ -288,14 +308,25 @@ func (e *Engine) WeightedWalk(ctx context.Context, req WeightedWalkRequest) (res
 // fields the two share, and the rule's arithmetic for the rest: a factor or a
 // weight above Scale would let a longer route score higher than its prefix,
 // which is the one property the batch bound rests on.
+//
+// The root list is screened in windows of model.MaxStartNodes, so every root
+// id and every shared field meets the impact contract while the list itself
+// has no count ceiling: that ceiling bounds an externally supplied wire
+// request, and a weighted walk is only ever an in-process call whose roots its
+// caller already holds (ADR-0016 decision 3). Every root is queued in the
+// walk's on-disk state, never in heap, so a wider list costs disk rows, not
+// memory.
 func (r WeightedWalkRequest) validate() error {
 	start := make([]model.NodeID, len(r.Roots))
 	for i, root := range r.Roots {
 		start[i] = root.Node
 	}
-	if err := (model.ImpactRequest{Start: start, Relations: r.Relations, Direction: r.Direction,
-		MaxDepth: r.MaxDepth, MaxVisited: r.MaxVisited, MaxEdges: r.MaxEdges, Page: r.Page}).Validate(); err != nil {
-		return err
+	for lo := 0; lo == 0 || lo < len(start); lo += model.MaxStartNodes {
+		window := start[lo:min(lo+model.MaxStartNodes, len(start))]
+		if err := (model.ImpactRequest{Start: window, Relations: r.Relations, Direction: r.Direction,
+			MaxDepth: r.MaxDepth, MaxVisited: r.MaxVisited, MaxEdges: r.MaxEdges, Page: r.Page}).Validate(); err != nil {
+			return err
+		}
 	}
 	rule := r.Rule
 	switch {
@@ -351,6 +382,7 @@ func weightedQueryHash(r WeightedWalkRequest, maxDepth, limit int) string {
 	for _, k := range kinds {
 		h.AddString(k)
 		h.AddString(strconv.FormatInt(r.Rule.Hop[model.RelationKind(k)], 10))
+		h.AddString(strconv.FormatBool(r.Rule.Peer[model.RelationKind(k)]))
 	}
 	for _, root := range r.Roots {
 		h.AddString(string(root.Node))
@@ -380,6 +412,11 @@ type weightedWalk struct {
 	maxHop int64
 	sc     *pathScratch
 	scCtx  context.Context
+	// flows reads each data_flows_to relation's call role, nil when the
+	// reader reports none: the walk then keeps no call context.
+	flows FlowRoleReader
+	// pdg is the program-dependence kinds, which carry a route's descent.
+	pdg map[model.RelationKind]bool
 	// deadline is the request's, on the engine clock now reads, zero for a
 	// request with none: the impact walk's clock (checkWalk), so one clock
 	// decides both walks' pages.
@@ -405,6 +442,29 @@ type labelKey struct {
 	named  int
 	weight int64
 	reach  int64
+	labelShape
+}
+
+// labelShape is what a label's route shape lends what it reaches beyond its
+// numbers.
+//
+//   - up is the LabelRule.Peer kind of the route's last hop when that hop went
+//     up it (subtype to supertype), empty otherwise: the turn the next hop may
+//     complete.
+//   - peer is set once the route turned: up a Peer kind and straight back down
+//     the same kind. It is never cleared.
+//   - descended is the two-phase slice's flag (impactdependence.go): the route
+//     entered a callee through a call's argument, so it never leaves through a
+//     call site. A program-dependence hop carries it and every other hop
+//     clears it.
+//
+// A label of shape A dominates one of shape B only when A is no weaker on
+// each: A.peer <= B.peer, A.descended <= B.descended, and A.up empty or equal
+// to B.up, since an owed turn can only turn a later label into a peer.
+type labelShape struct {
+	up        string
+	peer      int
+	descended int
 }
 
 // label is one row of the walk's state as the walk reads it back.
@@ -416,6 +476,7 @@ type label struct {
 	weight int64
 	reach  int64
 	route  int64
+	labelShape
 }
 
 // seed queues one depth-0 label per root. A root lends itself nothing -- a
@@ -429,7 +490,7 @@ func (w *weightedWalk) seed(roots []WeightedRoot) error {
 			reach = int64(root.MaxDepth)
 		}
 		if err := w.queue(string(root.Node), 0, boolInt(root.Named), root.Weight, reach, w.rule.Scale,
-			root.Weight, 0, "", "", false); err != nil {
+			root.Weight, 0, "", "", false, labelShape{}); err != nil {
 			return err
 		}
 	}
@@ -497,7 +558,7 @@ func batchBound(top, maxHop, scale int64) int64 {
 // shallowest labels, which every label created later is deeper than.
 func (w *weightedWalk) readBatch(top int64) ([]label, error) {
 	bound := batchBound(top, w.maxHop, w.rule.Scale)
-	query := `SELECT id, node, depth, named, weight, reach, route FROM label WHERE state = 0 AND score > ?
+	query := `SELECT id, node, depth, named, weight, reach, route, up, peer, descended FROM label WHERE state = 0 AND score > ?
 		ORDER BY score DESC, depth, node, named DESC, weight DESC, reach DESC, route DESC, id LIMIT ?`
 	args := []any{bound, w.batchRows()}
 	if bound >= top {
@@ -506,7 +567,7 @@ func (w *weightedWalk) readBatch(top int64) ([]label, error) {
 			[]any{top}, &depth); err != nil {
 			return nil, err
 		}
-		query = `SELECT id, node, depth, named, weight, reach, route FROM label WHERE state = 0 AND score = ? AND depth = ?
+		query = `SELECT id, node, depth, named, weight, reach, route, up, peer, descended FROM label WHERE state = 0 AND score = ? AND depth = ?
 			ORDER BY node, named DESC, weight DESC, reach DESC, route DESC, id LIMIT ?`
 		args = []any{top, depth, w.batchRows()}
 	}
@@ -514,7 +575,8 @@ func (w *weightedWalk) readBatch(top int64) ([]label, error) {
 	err := w.sc.each(w.scCtx, query, args, func(scan func(...any) error) error {
 		var l label
 		var node string
-		if err := scan(&l.id, &node, &l.depth, &l.named, &l.weight, &l.reach, &l.route); err != nil {
+		if err := scan(&l.id, &node, &l.depth, &l.named, &l.weight, &l.reach, &l.route,
+			&l.up, &l.peer, &l.descended); err != nil {
 			return internalErr("weighted walk read: " + err.Error())
 		}
 		l.node = model.NodeID(node)
@@ -539,7 +601,7 @@ const labelRowBytes = edgeRowOverheadBytes + 64
 // settled at its node dominates it.
 func (w *weightedWalk) settle(l label) error {
 	cls := min(l.depth, w.rule.Classes)
-	dominated, err := w.dominated(string(l.node), cls, l.named, l.weight, l.reach, l.route)
+	dominated, err := w.dominated(string(l.node), cls, l.named, l.weight, l.reach, l.route, l.labelShape)
 	if err != nil {
 		return err
 	}
@@ -569,12 +631,13 @@ func (w *weightedWalk) settle(l label) error {
 
 // dominated reports whether a settled label at node is no deeper in class, of
 // a class at least as strong, of a weight and route factor at least as large,
-// and may walk at least as far as the label described.
-func (w *weightedWalk) dominated(node string, cls, named int, weight, reach, route int64) (bool, error) {
+// may walk at least as far, and has a route shape no weaker than the label
+// described (labelShape).
+func (w *weightedWalk) dominated(node string, cls, named int, weight, reach, route int64, shape labelShape) (bool, error) {
 	var one int
 	return w.sc.row(w.scCtx, `SELECT 1 FROM label WHERE node = ? AND state > 0 AND cls <= ? AND named >= ?
-		AND weight >= ? AND reach >= ? AND route >= ? LIMIT 1`,
-		[]any{node, cls, named, weight, reach, route}, &one)
+		AND weight >= ? AND reach >= ? AND route >= ? AND (up = '' OR up = ?) AND peer <= ? AND descended <= ? LIMIT 1`,
+		[]any{node, cls, named, weight, reach, route, shape.up, shape.peer, shape.descended}, &one)
 }
 
 // drain expands every settled label still owed its expansion, a batch of
@@ -616,11 +679,12 @@ func (w *weightedWalk) drain(ctx context.Context) error {
 func (w *weightedWalk) pending() (map[model.NodeID][]label, error) {
 	out := map[model.NodeID][]label{}
 	var last string
-	err := w.sc.each(w.scCtx, `SELECT id, node, depth, named, weight, reach, route FROM label
+	err := w.sc.each(w.scCtx, `SELECT id, node, depth, named, weight, reach, route, up, peer, descended FROM label
 		WHERE state = 1 ORDER BY node, id`, nil, func(scan func(...any) error) error {
 		var l label
 		var node string
-		if err := scan(&l.id, &node, &l.depth, &l.named, &l.weight, &l.reach, &l.route); err != nil {
+		if err := scan(&l.id, &node, &l.depth, &l.named, &l.weight, &l.reach, &l.route,
+			&l.up, &l.peer, &l.descended); err != nil {
 			return internalErr("weighted walk read: " + err.Error())
 		}
 		if node != last && len(out) == adjacencyBatch {
@@ -765,6 +829,10 @@ func (w *weightedWalk) relax(ctx context.Context, pend []weightedEdge) error {
 	if err != nil {
 		return err
 	}
+	roles, err := w.flowRoles(ctx, pend, relIDs)
+	if err != nil {
+		return err
+	}
 	for i, p := range pend {
 		to, rel := toIDs[i], relIDs[i]
 		if to == "" || rel == "" {
@@ -775,7 +843,18 @@ func (w *weightedWalk) relax(ctx context.Context, pend []weightedEdge) error {
 			continue
 		}
 		hop := w.rule.Hop[kind]
+		role := roles[rel]
+		forward := p.edge.Outgoing
+		enters := (role.Argument && forward) || (role.Return && !forward)
+		leaves := (role.Return && forward) || (role.Argument && !forward)
 		for _, l := range p.labels {
+			if leaves && l.descended != 0 {
+				// The two-phase slice: a route that entered a callee through
+				// an argument never leaves it through a call site, which would
+				// come out at every caller's result.
+				continue
+			}
+			shape := w.next(l.labelShape, kind, forward, enters)
 			if w.maxDepth.Exceeded(int64(l.depth) + 1) {
 				w.depthLimited = true
 				continue
@@ -802,7 +881,7 @@ func (w *weightedWalk) relax(ctx context.Context, pend []weightedEdge) error {
 			}
 			depth := l.depth + 1
 			if err := w.queue(string(to), depth, l.named, l.weight, reach, route, score, l.id,
-				string(rel), string(kind), p.edge.Outgoing); err != nil {
+				string(rel), string(kind), p.edge.Outgoing, shape); err != nil {
 				return err
 			}
 		}
@@ -810,25 +889,78 @@ func (w *weightedWalk) relax(ctx context.Context, pend []weightedEdge) error {
 	return nil
 }
 
+// next is the route shape a hop of kind lends the label it creates from a
+// label of shape from: forward when the owner is the relation's from-node,
+// enters when the hop enters a callee through a call (flowRoles).
+func (w *weightedWalk) next(from labelShape, kind model.RelationKind, forward, enters bool) labelShape {
+	out := labelShape{peer: from.peer}
+	if w.rule.Peer[kind] {
+		if forward {
+			out.up = string(kind)
+		} else if from.up == string(kind) {
+			out.peer = 1
+		}
+	}
+	if w.pdg[kind] && (from.descended != 0 || enters) {
+		out.descended = 1
+	}
+	return out
+}
+
+// flowRoles reads the call role of every data_flows_to relation of one relax
+// batch, in one grouped read per chunk, as the impact walk reads them
+// (dependenceWalk.settleSlice). A walk whose reader reports no roles, or that
+// walks no data flow, reads nothing and every relation has the zero role.
+func (w *weightedWalk) flowRoles(ctx context.Context, pend []weightedEdge, relIDs []model.RelationID) (map[model.RelationID]FlowRole, error) {
+	out := map[model.RelationID]FlowRole{}
+	if w.flows == nil {
+		return out, nil
+	}
+	code, ok := w.reader.Kinds().Code(model.RelDataFlowsTo)
+	if !ok {
+		return out, nil
+	}
+	var ids []model.RelationID
+	for i, p := range pend {
+		if p.edge.Kind == code && relIDs[i] != "" {
+			ids = append(ids, relIDs[i])
+		}
+	}
+	for _, chunk := range impactChunkRelations(dedupeRelations(ids)) {
+		got, err := w.flows.RelationFlowRoles(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		if len(got) != len(chunk) {
+			return nil, internalErr("graph: the reader named a different number of flow roles than it was given")
+		}
+		for i, id := range chunk {
+			out[id] = got[i]
+		}
+	}
+	return out, nil
+}
+
 // queue offers one label. One already settled at its node that dominates it
 // keeps it out; a queued one of its key keeps the better route -- the larger
 // factor, then the shallower depth, then the smaller admitting relation id,
 // which is content-derived, so two builds of one tree keep the same route.
 func (w *weightedWalk) queue(node string, depth, named int, weight, reach, route, score, parent int64,
-	rel, kind string, outgoing bool) error {
+	rel, kind string, outgoing bool, shape labelShape) error {
 	cls := min(depth, w.rule.Classes)
-	dominated, err := w.dominated(node, cls, named, weight, reach, route)
+	dominated, err := w.dominated(node, cls, named, weight, reach, route, shape)
 	if err != nil || dominated {
 		return err
 	}
 	return w.sc.exec(w.scCtx, `INSERT INTO label(node, depth, cls, named, weight, reach, route, score, parent, rel,
-		kind, outgoing, state) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-		ON CONFLICT(node, cls, named, weight, reach) WHERE state = 0 DO UPDATE SET
+		kind, outgoing, up, peer, descended, state) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+		ON CONFLICT(node, cls, named, weight, reach, up, peer, descended) WHERE state = 0 DO UPDATE SET
 			depth = excluded.depth, route = excluded.route, score = excluded.score, parent = excluded.parent,
 			rel = excluded.rel, kind = excluded.kind, outgoing = excluded.outgoing
 		WHERE excluded.route > label.route OR (excluded.route = label.route AND
 			(excluded.depth < label.depth OR (excluded.depth = label.depth AND excluded.rel < label.rel)))`,
-		node, depth, cls, named, weight, reach, route, score, parent, rel, kind, boolInt(outgoing))
+		node, depth, cls, named, weight, reach, route, score, parent, rel, kind, boolInt(outgoing),
+		shape.up, shape.peer, shape.descended)
 }
 
 // stopped reports that the walk ends here: a bound ended it or the deadline
@@ -858,9 +990,11 @@ func (w *weightedWalk) loadProgress() error {
 	var after string
 	var depthLimited, edgesHit, visitedHit, serving int
 	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_limited, edges_hit, visited_hit, serving,
-		after_node, after_cls, after_named, after_weight, after_reach FROM progress WHERE k = 0`, nil,
+		after_node, after_cls, after_named, after_weight, after_reach, after_up, after_peer, after_descended
+		FROM progress WHERE k = 0`, nil,
 		&after, &depthLimited, &edgesHit, &visitedHit, &serving,
-		&w.after.node, &w.after.cls, &w.after.named, &w.after.weight, &w.after.reach); err != nil {
+		&w.after.node, &w.after.cls, &w.after.named, &w.after.weight, &w.after.reach,
+		&w.after.up, &w.after.peer, &w.after.descended); err != nil {
 		return err
 	}
 	pos, err := decodeEdgePos(after)
@@ -876,9 +1010,10 @@ func (w *weightedWalk) loadProgress() error {
 func (w *weightedWalk) saveProgress() error {
 	return w.sc.exec(w.scCtx, `UPDATE progress SET expand_after = ?, depth_limited = ?, edges_hit = ?,
 		visited_hit = ?, serving = ?, after_node = ?, after_cls = ?, after_named = ?, after_weight = ?,
-		after_reach = ? WHERE k = 0`,
+		after_reach = ?, after_up = ?, after_peer = ?, after_descended = ? WHERE k = 0`,
 		encodeEdgePos(w.expandAfter), boolInt(w.depthLimited), boolInt(w.edgesHit), boolInt(w.visitedHit),
-		boolInt(w.serving), w.after.node, w.after.cls, w.after.named, w.after.weight, w.after.reach)
+		boolInt(w.serving), w.after.node, w.after.cls, w.after.named, w.after.weight, w.after.reach,
+		w.after.up, w.after.peer, w.after.descended)
 }
 
 // servedLabel is one kept label as the listing reads it.
@@ -897,14 +1032,16 @@ func (w *weightedWalk) page(limit int) ([]servedLabel, bool, error) {
 	var out []servedLabel
 	more := false
 	a := w.after
-	err := w.sc.each(w.scCtx, `SELECT id, node, cls, named, weight, reach, depth, score, kind, outgoing FROM label
-		WHERE state > 0 AND depth > 0 AND (node, cls, named, weight, reach) > (?, ?, ?, ?, ?)
-		ORDER BY node, cls, named, weight, reach LIMIT ?`,
-		[]any{a.node, a.cls, a.named, a.weight, a.reach, limit + 1}, func(scan func(...any) error) error {
+	err := w.sc.each(w.scCtx, `SELECT id, node, cls, named, weight, reach, up, peer, descended, depth, score, kind,
+		outgoing FROM label
+		WHERE state > 0 AND depth > 0 AND (node, cls, named, weight, reach, up, peer, descended) > (?, ?, ?, ?, ?, ?, ?, ?)
+		ORDER BY node, cls, named, weight, reach, up, peer, descended LIMIT ?`,
+		[]any{a.node, a.cls, a.named, a.weight, a.reach, a.up, a.peer, a.descended, limit + 1},
+		func(scan func(...any) error) error {
 			var s servedLabel
 			var outgoing int
 			if err := scan(&s.id, &s.key.node, &s.key.cls, &s.key.named, &s.key.weight, &s.key.reach,
-				&s.depth, &s.score, &s.kind, &outgoing); err != nil {
+				&s.key.up, &s.key.peer, &s.key.descended, &s.depth, &s.score, &s.kind, &outgoing); err != nil {
 				return internalErr("weighted walk read: " + err.Error())
 			}
 			if len(out) == limit {
@@ -978,14 +1115,15 @@ func (e *Engine) weightedEntries(ctx context.Context, w *weightedWalk, page []se
 			dropped++
 			continue
 		}
-		direction := model.DirectionIncoming
-		if l.outgoing {
-			direction = model.DirectionOutgoing
-		}
+		// The direction an impact entry reports for the hop: a kind stored
+		// dependency first (data_flows_to) reads against its stored direction,
+		// as the impact walk reports it (impactDirection).
+		kind := model.RelationKind(l.kind)
+		direction := impactDirection(kind, l.outgoing)
 		// The label's own last hop explains it when the breadth-first rule
 		// delivers no relation into it from its weight's walk: a route that
 		// rule never takes still needs its reason.
-		reasons := []string{impactReason(model.RelationKind(l.kind), direction, l.depth)}
+		reasons := []string{impactEdgeReason(kind, l.outgoing, direction, l.depth)}
 		if why, ok := explained[l.id]; ok && len(why.reasons) > 0 {
 			reasons, direction = why.reasons, model.DirectionOutgoing
 			if why.incoming {
@@ -1014,7 +1152,8 @@ func (e *Engine) weightedEntries(ctx context.Context, w *weightedWalk, page []se
 	}
 	out := make([]WeightedEntry, len(entries))
 	for i, entry := range entries {
-		out[i] = WeightedEntry{ImpactEntry: entry, RootWeight: kept[i].key.weight, Named: kept[i].key.named != 0}
+		out[i] = WeightedEntry{ImpactEntry: entry, RootWeight: kept[i].key.weight, Named: kept[i].key.named != 0,
+			Peer: kept[i].key.peer != 0}
 	}
 	return out, nil
 }
@@ -1136,12 +1275,9 @@ func (w *weightedWalk) explain(ctx context.Context, page []servedLabel) (map[int
 			if near != far+1 && !(near == far && leaves) {
 				continue
 			}
-			direction := model.DirectionIncoming
-			if leaves {
-				direction = model.DirectionOutgoing
-			}
+			direction := impactDirection(kind, leaves)
 			x := out[l.id]
-			x.reasons = mergeReasons(x.reasons, []string{impactReason(kind, direction, far+1)})
+			x.reasons = mergeReasons(x.reasons, []string{impactEdgeReason(kind, leaves, direction, far+1)})
 			x.incoming = x.incoming || direction == model.DirectionIncoming
 			out[l.id] = x
 		}

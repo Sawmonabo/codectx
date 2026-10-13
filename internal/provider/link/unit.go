@@ -135,10 +135,15 @@ const (
 	// sees) states the visibility its Detail names (visibilityDetail). A
 	// macro defined in several `#if` arms has one fact per definition.
 	FactVisibility Fact = 14
+	// FactMain: the Java class Site, which the structural provider left
+	// its launchable main to the linker for (Decl.MainInherited), is
+	// launched by the method Target it declares or inherits
+	// (javaMainFacts).
+	FactMain Fact = 15
 )
 
 // factLast is the last kind of fact.
-const factLast = FactVisibility
+const factLast = FactMain
 
 // Binding is one fact a resolver found. Site names the entry of a member's
 // table the fact is about (a call site, an import, a declaration, by Kind),

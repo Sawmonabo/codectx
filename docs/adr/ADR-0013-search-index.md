@@ -332,14 +332,16 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   signature, node id and search key. Ties at the k-th entry are settled by it inside the heap of depth + 1 entries,
   never collected in a list.
 - **Paging.** A cursor carries its position as a keyset: in the exact phase, the tier and node of the last exact
-  result served, whose content key the next page reads back from that tier; in the lexical phase, the resume
+  result served, whose content key the next page reads back in one indexed lookup of the row that tier serves for
+  the node (the path tier, from the one file the query names); in the lexical phase, the resume
   position of the last lexical result served (its score and doc id), or the start of the lexical phase. The query
   hash it is bound to covers the query, its filters and the length form, so a cursor made under one never resumes
   under another. Filters the library does not apply (the language filter, and the drop of a lexical result whose
   node an exact tier served) run after the page returns; while the filtered page is short and more results exist,
   the next request resumes after the last result the previous one returned and asks for twice its depth. No request
   reads a result an earlier one returned, and nothing is held between pages.
-- **No spool.** The ranked set is never sorted to disk. ADR-0001 §2.4 is amended to this rule.
+- **No spool.** The ranked lexical set is never sorted to disk. ADR-0001 §2.4 is amended to this rule. The exact
+  tiers are not ranked, and their continuation state is spooled (below).
 - **Block summaries.** Each segment has one summary file, `<segment id>.cxsum`, in the index directory. For every token
   of the five columns it holds the token's df over the segment's documents and, per block holding the token, the
   maximum weighted term frequency and the minimum document length under both length forms. Deleted documents stay in
@@ -360,9 +362,27 @@ served once, at its tier: the earliest exact tier that serves it, that is, whose
 request's kind, path and language filters (a row declared in the file the query names, a qualified name equal to
 the query, a qualified name the query prefixes, a name equal to the query; for the symbol tiers, the row the tier
 lists for the node is the precedence winner among the node's rows matching it). A later tier's walk asks the earlier
-tiers for the node itself. The rule is a function of the generation and
-the query, so it holds across pages with nothing carried between them. A lexical result whose node an exact tier
-served for the same query is dropped from the lexical sequence, by the same rule over every visible row of the node.
+tiers about each read page of its nodes together: one indexed lookup per earlier tier per 200 nodes, driven by the
+node ids. The rule is a function of the generation and the query, so it holds across pages with nothing carried
+between them; one rule serves a request, so the file the query names is read once. A lexical result whose node an
+exact tier served for the same query is dropped from the lexical sequence, by the same rule over every visible row
+of the node, asked for each index page's nodes together. The symbol endpoint applies the same rule to its tiers,
+where a row serves when it is a declaration site for definition, and always otherwise.
+
+**Paging the exact tiers.** No index holds the content key in tier order (the key starts with the path, which the
+fact rows do not carry, and a qualified-name range is ordered by name), so a page cannot seek to its position in
+the tiers. The first page walks them and keeps the least limit + 1 hits in a heap: one walk, nothing on disk, so an
+answer read one page deep pays nothing more. The first continuation inside the exact phase walks them once more,
+sorts every hit after its position with the external sort (its run share of the query memory admission, the rest on
+disk), serves its page from the head of the run, and spools the remainder; its cursor names the spool, the byte
+offset of the next record and the count left. Every later page reads its own records at that offset, so it costs
+its page, not the tiers: an exact phase of N hits read at P per page costs one walk, one N log N sort and N/P page
+reads, where walking from the position on every page cost about N²/P. The spool lives as long as the cursor's lease
+(a process that records no lease binds it to the cursor's stamped expiry, as every spool does), is released when the
+phase is read to its end, and is otherwise reclaimed by the spool store's sweep: nothing to tune. A page whose spool
+is gone, or a spool budget an operator set that cannot hold one, walks from the position the cursor also carries,
+which serves the same hits. A sorted search over a key no index is sorted by visits every match on every page in
+the mature engines too (the search-after form; see Sources); the spool is what lets a page skip that work.
 
 **Alternatives.** *Score every match and keep a heap after a cursor, so every page down to the last match is
 reachable.* It costs a full scoring of every match for every page (4.04 s for the 30 queries, against milliseconds
@@ -512,6 +532,12 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
     https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/action/search/SearchPhaseController.java
     and `FetchSearchPhase.java` at the same tag; deep pages cost memory and time in from + size,
     https://www.elastic.co/docs/reference/elasticsearch/index-settings/index-modules.
+- Paging the exact tiers: a sorted search over a key the index is not sorted by "must visit every document that
+  matches a query", and stops after the first N per segment only under index sorting,
+  https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-index-sorting.html; deep pages page
+  by search-after over a point in time, re-running the query per page, and scroll's held search context is no longer
+  recommended, https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html; the seek
+  method needs an index in the sort order, https://use-the-index-luke.com/sql/partial-results/fetch-next-page.
 - The search library's fix for its pruned disjunction-max scoring, https://github.com/quickwit-oss/tantivy/pull/3022
   (decision 5).
 - The Rust 1.81 release notes, https://blog.rust-lang.org/2024/09/05/Rust-1.81.0/: an uncaught unwind across a C ABI

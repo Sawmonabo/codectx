@@ -39,8 +39,14 @@ type Options struct {
 	// is the app stack's one pagination.Leases over the same store, passed in
 	// rather than built here so search and graph cannot drift into two wrappers
 	// with two TTLs.
-	Leases    *pagination.Leases
-	Content   ContentReader
+	Leases  *pagination.Leases
+	Content ContentReader
+	// Spools holds the exact phase's continuation state: a continuation inside
+	// the exact tiers sorts the hits after its position once and spools them,
+	// so later pages read their own records instead of walking the tiers.
+	// Without it (nil) every exact continuation walks from its position, which
+	// serves the same hits.
+	Spools    *pagination.Spools
 	Resources config.Resources
 	CursorTTL time.Duration
 	Now       func() time.Time
@@ -57,7 +63,11 @@ type Service struct {
 	signer  *pagination.Signer
 	leases  *pagination.Leases
 	content ContentReader
-	maxPage int
+	spools  *pagination.Spools
+	// queryMemory is resources.query_memory_bytes, whose sort share bounds
+	// the exact phase's sort.
+	queryMemory int64
+	maxPage     int
 	// maxTerms is resources.max_query_terms; unlimited (zero) scores every
 	// term of a query.
 	maxTerms config.Limit
@@ -113,18 +123,20 @@ func New(o Options) (*Service, error) {
 		logger = slog.Default()
 	}
 	return &Service{
-		store:    o.Store,
-		repo:     o.Repo,
-		signer:   o.Signer,
-		leases:   o.Leases,
-		content:  o.Content,
-		maxPage:  o.Resources.MaxPageItems,
-		maxTerms: o.Resources.MaxQueryTerms,
-		rule:     lengthRule(),
-		timeout:  o.Resources.QueryTimeout.Std(),
-		ttl:      ttl,
-		now:      now,
-		log:      logger,
+		store:       o.Store,
+		repo:        o.Repo,
+		signer:      o.Signer,
+		leases:      o.Leases,
+		content:     o.Content,
+		spools:      o.Spools,
+		maxPage:     o.Resources.MaxPageItems,
+		queryMemory: o.Resources.QueryMemoryBytes,
+		maxTerms:    o.Resources.MaxQueryTerms,
+		rule:        lengthRule(),
+		timeout:     o.Resources.QueryTimeout.Std(),
+		ttl:         ttl,
+		now:         now,
+		log:         logger,
 	}, nil
 }
 
@@ -199,17 +211,20 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 
 	resumed := req.Page.Cursor != ""
 	generation := req.GenerationID
-	var cursor pagination.Cursor
+	var token searchToken
 	var pos searchPosition
 	if resumed {
-		if cursor, err = decodeCursor(s.signer, req.Page.Cursor, endpointSearch, now); err != nil {
+		if token, err = decodeSearchToken(s.signer, req.Page.Cursor, now); err != nil {
 			return empty, err
 		}
-		if pos, err = parseSearchPosition(cursor.LastKey); err != nil {
+		if at := token.Exact; at != nil {
+			pos = searchPosition{phase: phaseExact, rank: at.Rank, node: at.Node}
+		} else if pos, err = parseSearchPosition(token.LastKey); err != nil {
 			return empty, err
 		}
-		generation = cursor.GenerationID
+		generation = token.GenerationID
 	}
+	cursor := token.Cursor
 	reader, err := s.store.PinGeneration(ctx, s.repo, generation, s.ttl)
 	if err != nil {
 		return empty, resumePinFailure(resumed, err)
@@ -222,7 +237,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		}
 	}
 	// Every page filters, so every page reads the snapshot's tagger.
-	if err := filter.pin(ctx, s.store, binding.SnapshotID); err != nil {
+	if err := filter.pin(ctx, s.store, reader, binding.SnapshotID); err != nil {
 		return empty, err
 	}
 	limit, clampNotice := s.pageLimit(req.Page.Limit)
@@ -236,8 +251,18 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	// has a live context to serve its page with, and a caller who stopped
 	// asking still stops all of it.
 	searchCtx, searchCancel := model.QueryDeadline(ctx, s.timeout)
-	ans, err := s.collect(searchCtx, reader, req, filter, pos, limit, pageBound{})
+	src := exactSource{sort: s.spools != nil, now: now}
+	if token.Exact != nil && s.spools != nil {
+		src.spool = &token
+	}
+	ans, err := s.collect(searchCtx, reader, req, filter, pos, limit, pageBound{}, src)
 	searchCancel()
+	if ans.rest != nil {
+		defer ans.rest.run.Close()
+	}
+	if err == nil {
+		err = filter.tag.Err()
+	}
 	if err != nil {
 		return empty, err
 	}
@@ -256,9 +281,29 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}
+	// keepState is set when the next cursor goes on reading the presented
+	// cursor's spool under its lease, which must then outlive this page.
+	keepState := false
 	if ans.next != nil && !ans.deadline {
-		if meta.NextCursor, err = s.keysetNext(ctx, reader, endpointSearch, binding, hash, now, ans.next.lastKey()); err != nil {
-			return empty, err
+		switch {
+		case ans.spooled != nil && ans.spooled.Remaining > 0:
+			if meta.NextCursor, err = s.spoolContinue(ctx, token, *ans.spooled, now); err != nil {
+				return empty, err
+			}
+			keepState = true
+		case ans.rest != nil:
+			var ok bool
+			if meta.NextCursor, ok, err = s.spoolNext(ctx, reader, binding, hash, now, *ans.rest, *ans.next); err != nil {
+				return empty, err
+			}
+			if ok {
+				break
+			}
+			fallthrough
+		default:
+			if meta.NextCursor, err = s.keysetNext(ctx, reader, endpointSearch, binding, hash, now, ans.next.lastKey()); err != nil {
+				return empty, err
+			}
 		}
 	}
 	page := model.Page[model.SearchHit]{Meta: meta, Items: hits}
@@ -270,7 +315,10 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 	}
-	if resumed {
+	if resumed && !keepState {
+		if cursor.SpoolID != "" && s.spools != nil {
+			s.releaseSpool(cursor.SpoolID)
+		}
 		s.consumed(ctx, cursor)
 	}
 	attrs := []any{"component", "search", "generation_id", int64(binding.GenerationID),
@@ -295,6 +343,11 @@ type searchAnswer struct {
 	next     *searchPosition
 	deadline bool
 	lexical  *textindex.Page
+	// rest is the sorted remainder of a page drawn from a fresh sort of the
+	// exact phase, for the caller to spool; spooled is where a page read from
+	// a spool left it.
+	rest    *exactRest
+	spooled *exactSpoolPos
 }
 
 // add appends one hit and its span.
@@ -314,9 +367,12 @@ func (a *searchAnswer) add(hit model.SearchHit, span *model.ByteRange) {
 // continuation's key is the last SERVED result's, so the result past the page
 // is read again, and filtered again, by the next page.
 func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
-	filter hitFilter, pos searchPosition, limit int, bound pageBound) (searchAnswer, error) {
+	filter hitFilter, pos searchPosition, limit int, bound pageBound, src exactSource) (searchAnswer, error) {
 	var ans searchAnswer
-	normalized, pathFile, err := queryFile(ctx, reader, req.Query)
+	// One rule serves the whole page: the exact walk, the position it resumes
+	// from and the lexical fold all ask it, so the file the query names is read
+	// once.
+	rule, err := newSearchRule(ctx, reader, req.Query, req.Kinds, filter)
 	if err != nil {
 		return ended(ctx, ans, err)
 	}
@@ -325,25 +381,21 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 	if pos.phase == phaseLexical {
 		after = pos.after
 	} else {
-		held, err := s.exactPhase(ctx, reader, req, filter, pos, limit)
-		for i, e := range held {
-			if i == limit {
-				break
-			}
+		held, more, err := s.exactPage(ctx, reader, rule, filter, pos, limit, src, &ans)
+		for _, e := range held {
 			ans.add(e.served())
 		}
 		if err != nil {
 			return ended(ctx, ans, err)
 		}
-		if len(held) > limit {
-			last := held[limit-1]
+		if more {
+			last := held[len(held)-1]
 			ans.next = &searchPosition{phase: phaseExact, rank: last.Tier.Rank(), node: last.Node.Node.ID}
 			return ans, nil
 		}
 		room = limit - len(held)
 	}
-	fold := newExactFold(reader, req, normalized, pathFile, filter)
-	page, kept, err := s.lexicalPhase(ctx, reader, req, filter, fold, after, room, bound)
+	page, kept, err := s.lexicalPhase(ctx, reader, req, filter, rule, after, room, bound)
 	ans.lexical = page
 	if err != nil {
 		return ended(ctx, ans, err)
@@ -517,27 +569,81 @@ func (h *exactHeap) sorted() []exactEntry {
 	return out
 }
 
+// exactSource says where a page's exact hits may come from beyond a walk: the
+// presented cursor's spool, and whether a continuation may sort the hits after
+// its position for a spool of its own. now is the request's clock, which a
+// spool's liveness is read against.
+type exactSource struct {
+	spool *searchToken
+	sort  bool
+	now   time.Time
+}
+
+// exactPage answers a page's exact hits, at most limit of them, and whether
+// more exact hits follow them. A page continuing a spool reads its records
+// (ans.spooled says where it stopped); a page whose spool is gone, or a
+// positional continuation that may sort, sorts the hits after its position
+// once and serves the head of the run (ans.rest holds the remainder for a
+// spool); a first page, and a continuation that may not sort, walks with a
+// heap of limit+1 hits.
+func (s *Service) exactPage(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter,
+	pos searchPosition, limit int, src exactSource, ans *searchAnswer) ([]exactEntry, bool, error) {
+	if t := src.spool; t != nil {
+		entries, next, gone, err := s.spooledPage(ctx, t.Cursor, *t.Exact, limit, src.now)
+		if err != nil {
+			return nil, false, err
+		}
+		if !gone {
+			at := exactSpoolPos{Offset: next, Remaining: t.Exact.Remaining - int64(len(entries))}
+			if len(entries) > 0 {
+				last := entries[len(entries)-1]
+				at.Rank, at.Node = last.Tier.Rank(), last.Node.Node.ID
+			}
+			ans.spooled = &at
+			return entries, at.Remaining > 0, nil
+		}
+	}
+	if pos.phase == phaseExact && src.sort {
+		run, err := s.sortedAfter(ctx, reader, rule, filter, pos)
+		if err != nil {
+			return nil, false, err
+		}
+		head, err := headOf(run, limit)
+		if err != nil || run.Len() <= int64(limit) {
+			run.Close()
+			return head, false, err
+		}
+		ans.rest = &exactRest{run: run, skip: limit}
+		return head, true, nil
+	}
+	held, err := s.exactPhase(ctx, reader, rule, filter, pos, limit)
+	if len(held) > limit {
+		return held[:limit], true, err
+	}
+	return held, false, err
+}
+
 // exactPhase walks the exact tiers from the cursor's position and answers the
 // least limit+1 hits after it, in served order. On an error it still answers
 // what it held, so a deadline can serve them.
 //
 // A position names its last hit by tier and node; the full content key that
-// hit sorted under is read back from that tier first (positionKey), and every
-// later candidate is compared against it.
-func (s *Service) exactPhase(ctx context.Context, reader exactReader, req model.SearchRequest,
+// hit sorted under is read back first (positionKey), and every later candidate
+// is compared against it.
+func (s *Service) exactPhase(ctx context.Context, reader exactReader, rule *tierRule,
 	filter hitFilter, pos searchPosition, limit int) ([]exactEntry, error) {
 	span := allExactTiers
 	var after *exactEntry
 	if pos.phase == phaseExact {
 		span.from = pos.rank
-		key, err := positionKey(ctx, reader, req, filter, pos)
+		key, err := positionKey(ctx, reader, rule, filter, pos)
 		if err != nil {
 			return nil, err
 		}
 		after = &key
 	}
 	h := newExactHeap(limit + 1)
-	err := exactCandidates(ctx, reader, req.Query, req.Kinds, filter, model.MaxPageItems, span, func(e exactHit) error {
+	err := exactCandidates(ctx, reader, rule, model.MaxPageItems, span, func(e exactHit) error {
 		if !servableExact(e, filter) {
 			return nil
 		}
@@ -554,15 +660,32 @@ func (s *Service) exactPhase(ctx context.Context, reader exactReader, req model.
 // errPositionFound stops the walk positionKey runs once it has its hit.
 var errPositionFound = errors.New("search: the continuation's position was found")
 
-// positionKey reads back the hit a continuation's exact position names: the
-// tier the position names is walked until the node appears. Within one tier a
-// node is emitted once, and within one pinned generation the tier answers the
-// same facts every time, so the hit found is the one the previous page served.
-// A position whose hit is not in its tier was not minted for this answer.
-func positionKey(ctx context.Context, reader exactReader, req model.SearchRequest, filter hitFilter,
+// positionKey reads back the hit a continuation's exact position names. Within
+// one tier a node is emitted once, and within one pinned generation the tier
+// answers the same facts every time, so the hit found is the one the previous
+// page served. A symbol tier's hit is one indexed lookup of the row that tier
+// serves for the node (tierRule.tierRow); the exact_path tier's is found by
+// walking the one file the query names. A position whose hit is not in its
+// tier was not minted for this answer.
+func positionKey(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter,
 	pos searchPosition) (exactEntry, error) {
+	if pos.rank != model.TierExactPath.Rank() {
+		for _, tier := range exactTiers {
+			if tier.Rank() != pos.rank {
+				continue
+			}
+			e, ok, err := rule.tierRow(ctx, tier, pos.node)
+			if err != nil {
+				return exactEntry{}, err
+			}
+			if ok && servableExact(e, filter) {
+				return exactEntry{e}, nil
+			}
+		}
+		return exactEntry{}, cursorInvalid("the search cursor names a position that is not in its answer")
+	}
 	var found exactEntry
-	err := exactCandidates(ctx, reader, req.Query, req.Kinds, filter, model.MaxPageItems,
+	err := exactCandidates(ctx, reader, rule, model.MaxPageItems,
 		tierSpan{from: pos.rank, to: pos.rank}, func(e exactHit) error {
 			if e.Node.Node.ID != pos.node || !servableExact(e, filter) {
 				return nil
@@ -585,8 +708,8 @@ func positionKey(ctx context.Context, reader exactReader, req model.SearchReques
 // last index page (nil when none was read) and the kept results, in order.
 //
 // The index applies the kinds and the path prefixes itself; the languages
-// (through the snapshot's tagger) and the exact fold (exactFold) are applied
-// here, so the index can return fewer usable results than it was asked for.
+// (through the snapshot's tagger) and the exact fold (servedExactly) are
+// applied here, so the index can return fewer usable results than it was asked for.
 // The first request asks for room+1 results; while the kept list is short and
 // the index says more exist, the next request resumes after the last result
 // the previous one returned and asks for twice as many. No request re-reads a
@@ -599,7 +722,7 @@ func positionKey(ctx context.Context, reader exactReader, req model.SearchReques
 // the library never holds more than the step admitted; a page it ends early
 // is an exact prefix that says More, and the next request resumes after it.
 func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
-	filter hitFilter, fold exactFold, after *textindex.Position, room int,
+	filter hitFilter, rule *tierRule, after *textindex.Position, room int,
 	bound pageBound) (*textindex.Page, []textindex.Hit, error) {
 	var read *textindex.Page
 	view, err := reader.SearchView(ctx)
@@ -631,7 +754,7 @@ func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader,
 			observeIndexPage(r, page)
 		}
 		read = &page
-		served, err := fold.served(ctx, page.Hits)
+		served, err := servedExactly(ctx, rule, page.Hits)
 		if err != nil {
 			return read, kept, err
 		}
@@ -687,24 +810,14 @@ func (s *Service) lexicalErr(err error) error {
 	return err
 }
 
-// exactFold recognizes a lexical result whose node the exact tiers served for
+// servedExactly answers which of the hits' nodes the exact tiers served for
 // the same request, so the answer serves that node once, at its exact tier. It
 // asks tierRule, the rule the exact walk applies: over every visible row of the
 // node and the request's filters, not over the result's own fields, which are
 // one unit's document, nor over reader.Node, which is one precedence winner.
-type exactFold struct{ rule *tierRule }
-
-// newExactFold builds the fold for one request. Its tier reads are point reads
-// (size 1): a page's nodes are sparse in any one tier.
-func newExactFold(reader exactReader, req model.SearchRequest, normalized string, pathFile model.FileID,
-	filter hitFilter) exactFold {
-	return exactFold{rule: newTierRule(reader, req.Query, req.Kinds, filter, normalized, pathFile, 1)}
-}
-
-// served answers which of the hits' nodes the exact tiers served. The nodes are
-// asked in ascending id order, so each tier's keyset is read forward and a tier
-// that holds none of them costs one read.
-func (f exactFold) served(ctx context.Context, hits []textindex.Hit) (map[model.NodeID]bool, error) {
+// The page's nodes are asked together, a few statements per page and never
+// one read per hit.
+func servedExactly(ctx context.Context, rule *tierRule, hits []textindex.Hit) (map[model.NodeID]bool, error) {
 	ids := make([]model.NodeID, 0, len(hits))
 	for _, h := range hits {
 		if h.NodeID != "" {
@@ -712,16 +825,7 @@ func (f exactFold) served(ctx context.Context, hits []textindex.Hit) (map[model.
 		}
 	}
 	slices.Sort(ids)
-	ids = slices.Compact(ids)
-	out := make(map[model.NodeID]bool, len(ids))
-	for _, id := range ids {
-		owned, err := f.rule.owned(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		out[id] = owned
-	}
-	return out, nil
+	return rule.ownedBefore(ctx, model.TierLexical, slices.Compact(ids))
 }
 
 // hydrated fills the source range of every hit of one page that has a byte
@@ -816,17 +920,21 @@ func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + 
 // Paths are root-relative path PREFIXES: a hit is kept when its file path
 // equals a listed prefix or lies under it. Languages are matched by the pinned
 // snapshot's lang.Tagger, the one place a repository path becomes a language
-// name, so a filter cannot disagree with the language the manifest recorded,
-// a header's included.
+// name, bound to the pinned generation's parses: a header two grammars declare
+// takes the language its kept parse used, so a filter cannot disagree with the
+// language the index served it under.
 type hitFilter struct {
 	prefixes  []string
 	languages map[string]bool
 	tag       lang.Tagger
 }
 
-// pin binds the language filter to the pinned snapshot's tagger. The snapshot
-// header is read only when a language filter is set, since only it tags.
-func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, id model.SnapshotID) error {
+// pin binds the language filter to the pinned snapshot's tagger, and that to
+// the pinned generation's parses, so a header is tagged with the grammar its
+// kept parse used. The snapshot header is read only when a language filter is
+// set, since only it tags. A lookup the bound tagger fails tags its header ""
+// and is reported by tag.Err, which every caller checks before it answers.
+func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, parses lang.Parses, id model.SnapshotID) error {
 	if f.languages == nil {
 		return nil
 	}
@@ -834,7 +942,7 @@ func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, id model.Snaps
 	if err != nil {
 		return err
 	}
-	f.tag = lang.For(snap)
+	f.tag = lang.For(snap).In(ctx, parses)
 	return nil
 }
 

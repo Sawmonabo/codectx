@@ -5,12 +5,10 @@ package search
 // workspace-symbols and definition.
 
 import (
-	"cmp"
 	"container/list"
 	"context"
 	"errors"
 	"path"
-	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -28,6 +26,7 @@ type exactReader interface {
 	NodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	Nodes(ctx context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
+	NodesAmong(ctx context.Context, f sqlite.NodeFilter, ids []model.NodeID) ([]sqlite.StoredNode, error)
 }
 
 var _ exactReader = (*sqlite.PinnedReader)(nil)
@@ -64,23 +63,6 @@ func nodeFilterFor(tier model.SearchTier, query string, kinds []model.NodeKind) 
 		f.Name = query
 	}
 	return f
-}
-
-// supersededByLowerTier reports whether a candidate found at tier also matches
-// a more specific tier for the same query, in which case that tier's page owns
-// it and this one must not emit it again. The test is on the candidate alone,
-// so it holds page by page without carrying state across cursors, and it uses
-// byte comparison — the same basis as the SQL predicates it mirrors.
-func supersededByLowerTier(tier model.SearchTier, n sqlite.StoredNode, query string) bool {
-	switch tier {
-	case model.TierQualifiedNamePrefix:
-		return n.Node.QualifiedName == query
-	case model.TierExactName:
-		// HasPrefix alone: an exact equality is a prefix of itself, so a
-		// separate equality clause stated the same rule twice.
-		return strings.HasPrefix(n.Node.QualifiedName, query)
-	}
-	return false
 }
 
 // normalizeQueryPath reads the query as a root-relative repository path: "/"
@@ -274,12 +256,12 @@ func (s tierSpan) covers(tier model.SearchTier) bool {
 	return tier.Rank() >= s.from && tier.Rank() <= s.to
 }
 
-// exactCandidates runs the non-lexical tiers in span for one search query and
+// exactCandidates runs the non-lexical tiers in span for the rule's query and
 // emits their candidates in tier order, each already carrying its path. A node
-// is emitted once, at its tier (tierRule): the earliest exact tier whose row for
-// it passes the request's filters. A tier outside span is not walked, but the
-// rule is decided whatever the span, so a continuation that resumes at a later
-// tier drops exactly the candidates the first page's walk dropped.
+// is emitted once, at its tier (tierRule): the earliest exact tier that serves
+// it. A tier outside span is not walked, but the rule is decided whatever the
+// span, so a continuation that resumes at a later tier drops exactly the
+// candidates the first page's walk dropped.
 //
 // page is the READ size for one keyset step, not a bound on the answer: every
 // tier is walked to the end of its keyset and nothing is dropped.
@@ -288,26 +270,21 @@ func (s tierSpan) covers(tier model.SearchTier) bool {
 // whose units publish different qualified names can present one row at
 // exact_qualified_name and another at exact_name; the candidate in hand is one
 // row and cannot speak for the node's others. tierRule asks the earlier tiers
-// for the node itself, which is why no set of emitted ids is held: the walk's
-// heap is one read page per tier, plus, when the query names a file, the ids of
-// that one file's declarations (tierRule.inPathFile).
+// for each read page of nodes together, which is why no set of emitted ids is
+// held: the walk's heap is one read page, plus, when the query names a file,
+// the ids of that one file's declarations (tierRule.inPathFile).
 //
 // Kinds are a stored column the node filter applies. The request's path and
 // language filters decide the tier rule here; the caller applies them to the
 // candidates it serves (servableExact), as it does to the lexical tier.
-func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, filter hitFilter,
-	page int, span tierSpan, emit func(exactHit) error) error {
-	normalized, pathFile, err := queryFile(ctx, r, query)
-	if err != nil {
-		return err
-	}
+func exactCandidates(ctx context.Context, r exactReader, rule *tierRule, page int, span tierSpan,
+	emit func(exactHit) error) error {
 	if span.covers(model.TierExactPath) {
-		if err := pathCandidates(ctx, r, normalized, pathFile, kinds, page, emit); err != nil {
+		if err := pathCandidates(ctx, r, rule.normalized, rule.pathFile, rule.kinds, page, emit); err != nil {
 			return err
 		}
 	}
-	paths := newPathResolver(r, page)
-	rule := newTierRule(r, query, kinds, filter, normalized, pathFile, page)
+	ids := make([]model.NodeID, 0, min(page, model.MaxPageItems))
 	for _, tier := range exactTiers {
 		if !span.covers(tier) {
 			continue
@@ -316,7 +293,7 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 		// Nodes applies the Section 9.4 read-time precedence order (verified
 		// source binding, then provider id, then unit key) inside the query
 		// itself. Nothing in this package re-ranks or re-folds provider ids.
-		nodeFilter := nodeFilterFor(tier, query, kinds)
+		nodeFilter := nodeFilterFor(tier, rule.query, rule.kinds)
 		after := model.NodeID("")
 		// The tier is walked on its keyset, not read once. Nodes applies its
 		// SQL LIMIT to node_facts rows and only then collapses the duplicate
@@ -333,16 +310,20 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 			if len(nodes) == 0 {
 				break
 			}
+			after = nodes[len(nodes)-1].Node.ID
+			ids = ids[:0]
 			for _, n := range nodes {
-				after = n.Node.ID
-				earlier, err := rule.earlier(ctx, tier, n)
-				if err != nil {
-					return err
-				}
-				if earlier {
+				ids = append(ids, n.Node.ID)
+			}
+			owned, err := rule.ownedBefore(ctx, tier, ids)
+			if err != nil {
+				return err
+			}
+			for _, n := range nodes {
+				if owned[n.Node.ID] {
 					continue
 				}
-				p, err := paths.path(ctx, n.Node.FileID)
+				p, err := rule.paths.path(ctx, n.Node.FileID)
 				if err != nil {
 					return err
 				}
@@ -357,12 +338,13 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 
 // tierRule decides the one exact tier that owns a node for one request: the
 // earliest exact tier that SERVES the node, that is, whose row for it passes the
-// request's filters. exact_path serves a node with a visible row declared in the
-// file the query names, when that file's path passes the filters;
-// exact_qualified_name, qualified_name_prefix and exact_name serve a node when
-// the row the tier lists for it (the precedence winner among the node's rows
-// matching the tier) passes them (servableExact). The kind filter is a per-node
-// column, so it admits or refuses all of a node's rows together.
+// request's own test (servesRow). exact_path serves a node with a visible row
+// declared in the file the query names, when that file's path passes the
+// filters; exact_qualified_name, qualified_name_prefix and exact_name serve a
+// node when the row the tier lists for it (the precedence winner among the
+// node's rows matching the tier, which is the row that tier's walk serves)
+// passes the test. The kind filter is a per-node column, so it admits or
+// refuses all of a node's rows together.
 //
 // So a node with a qualified-name row under a filtered-out path and a name row
 // inside the filter is served at exact_name: a tier that cannot serve the node
@@ -371,230 +353,216 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 // The rule is a function of the pinned generation and the request alone, never
 // of the page: every page of one answer, and the lexical fold beside them,
 // assigns a node the same tier, so a node is served once across all of an
-// answer's pages without any memory between them.
+// answer's pages without any memory between them. One rule serves a whole
+// request, so the file the query names is read once per request.
 //
-// Each symbol tier is asked through its own keyset (tierRows). The tiers nest:
-// a qualified name equal to the query is also prefixed by it, so a node with no
-// prefix-tier row has no exact-qualified-name row either, and the exact
-// qualified-name tier is read only for a node the prefix tier lists.
+// The tiers nest: a qualified name equal to the query is also prefixed by it,
+// so a node with no prefix-tier row has no exact-qualified-name row either, and
+// the exact qualified-name tier is asked only about nodes the prefix tier
+// lists.
 type tierRule struct {
 	r          exactReader
+	query      string
 	kinds      []model.NodeKind
-	filter     hitFilter
 	normalized string
 	pathFile   model.FileID
-	paths      *pathResolver
+	// pathKept says the exact_path tier can serve anything: the query names a
+	// file and that file's path passes the request's filters.
+	pathKept bool
+	// servesRow is the request's test of one tier row: whether the tier,
+	// listing the node with that row, serves it.
+	servesRow func(ctx context.Context, row sqlite.StoredNode) (bool, error)
+	paths     *pathResolver
 	// inFile holds the nodes with a visible row in pathFile, read on first
 	// use; nil until then.
-	inFile    map[model.NodeID]struct{}
-	qualified *tierRows
-	prefixed  *tierRows
-	named     *tierRows
+	inFile map[model.NodeID]struct{}
 }
 
-// newTierRule builds the rule for one request. size is the read size of each
-// tier's keyset seek: the exact walk passes its read page, so consecutive
-// candidates share one read; the lexical fold passes 1, since its nodes are
-// sparse in a tier and each needs only whether the tier holds it.
-func newTierRule(r exactReader, query string, kinds []model.NodeKind, filter hitFilter, normalized string,
-	pathFile model.FileID, size int) *tierRule {
-	rows := func(tier model.SearchTier) *tierRows {
-		return &tierRows{r: r, filter: nodeFilterFor(tier, query, kinds), size: max(size, 1)}
+// newSearchRule builds the rule of one search request: the query read as a
+// path (queryFile) and as a symbol, under the request's kinds and filters. A
+// tier serves a row that has a file whose path the filters keep, the test the
+// exact phase applies to the same row (servableExact).
+func newSearchRule(ctx context.Context, r exactReader, query string, kinds []model.NodeKind,
+	filter hitFilter) (*tierRule, error) {
+	normalized, pathFile, err := queryFile(ctx, r, query)
+	if err != nil {
+		return nil, err
 	}
-	return &tierRule{r: r, kinds: kinds, filter: filter, normalized: normalized, pathFile: pathFile,
-		paths: newPathResolver(r, size), qualified: rows(model.TierExactQualifiedName),
-		prefixed: rows(model.TierQualifiedNamePrefix), named: rows(model.TierExactName)}
-}
-
-// earlier reports whether a tier ranked before tier serves the candidate n, in
-// which case that tier owns it and tier must not emit it.
-func (t *tierRule) earlier(ctx context.Context, tier model.SearchTier, n sqlite.StoredNode) (bool, error) {
-	if tier == model.TierExactPath {
-		return false, nil
-	}
-	id := n.Node.ID
-	if t.pathServes() {
-		// A row in hand declared in the file is enough: the node is listed
-		// there, and the file passes the filters.
-		if n.Node.FileID == t.pathFile {
-			return true, nil
+	t := &tierRule{r: r, query: query, kinds: kinds, normalized: normalized, pathFile: pathFile,
+		paths: newPathResolver(r, model.MaxPageItems)}
+	t.pathKept = pathFile != "" && normalized != "" && filter.keep(normalized)
+	t.servesRow = func(ctx context.Context, row sqlite.StoredNode) (bool, error) {
+		if row.Node.FileID == "" {
+			return false, nil
 		}
-		in, err := t.inPathFile(ctx, id)
-		if err != nil || in {
-			return in, err
-		}
-	}
-	switch tier {
-	case model.TierQualifiedNamePrefix:
-		return t.serves(ctx, t.qualified, id)
-	case model.TierExactName:
-		_, listed, err := t.prefixed.row(ctx, id)
-		if err != nil || !listed {
+		p, err := t.paths.path(ctx, row.Node.FileID)
+		if err != nil {
 			return false, err
 		}
-		if ok, err := t.serves(ctx, t.prefixed, id); err != nil || ok {
-			return ok, err
-		}
-		return t.serves(ctx, t.qualified, id)
+		return p != "" && filter.keep(p), nil
 	}
-	return false, nil
+	return t, nil
 }
 
-// owned reports whether any exact tier serves node id: whether the lexical
-// fold must drop a result of it.
-func (t *tierRule) owned(ctx context.Context, id model.NodeID) (bool, error) {
-	if t.pathServes() {
-		in, err := t.inPathFile(ctx, id)
-		if err != nil || in {
-			return in, err
+// newSymbolRule builds the rule of one symbol request: the symbol tiers alone,
+// with no kind or path filter. Every row serves, except that a definition
+// serves only declaration sites (isDeclaration).
+func newSymbolRule(r exactReader, query string, declarationsOnly bool) *tierRule {
+	return &tierRule{r: r, query: query, paths: newPathResolver(r, model.MaxPageItems),
+		servesRow: func(_ context.Context, row sqlite.StoredNode) (bool, error) {
+			return !declarationsOnly || isDeclaration(row), nil
+		}}
+}
+
+// ownedBefore answers which of ids an exact tier ranked before tier serves:
+// those the walk of tier must not emit. TierLexical asks every exact tier, which
+// is the lexical fold's question. ids are distinct; each symbol tier is asked
+// about them in one statement per model.MaxPageItems ids (NodesAmong), so a
+// page of candidates costs at most three statements and never one per node.
+func (t *tierRule) ownedBefore(ctx context.Context, tier model.SearchTier,
+	ids []model.NodeID) (map[model.NodeID]bool, error) {
+	owned := map[model.NodeID]bool{}
+	if tier == model.TierExactPath || len(ids) == 0 {
+		return owned, nil
+	}
+	rest := ids
+	if t.pathKept {
+		if err := t.readPathFile(ctx); err != nil {
+			return nil, err
+		}
+		rest = make([]model.NodeID, 0, len(ids))
+		for _, id := range ids {
+			if _, in := t.inFile[id]; in {
+				owned[id] = true
+			} else {
+				rest = append(rest, id)
+			}
 		}
 	}
-	_, listed, err := t.prefixed.row(ctx, id)
+	for from := 0; from < len(rest); from += model.MaxPageItems {
+		if err := t.ownChunk(ctx, tier, rest[from:min(from+model.MaxPageItems, len(rest))], owned); err != nil {
+			return nil, err
+		}
+	}
+	return owned, nil
+}
+
+// ownChunk marks in owned the ids of one chunk that a symbol tier ranked before
+// tier serves.
+func (t *tierRule) ownChunk(ctx context.Context, tier model.SearchTier, ids []model.NodeID,
+	owned map[model.NodeID]bool) error {
+	switch rank := tier.Rank(); {
+	case rank <= model.TierExactQualifiedName.Rank():
+		return nil
+	case rank == model.TierQualifiedNamePrefix.Rank():
+		// Every candidate of the prefix tier is prefix-listed, so the exact
+		// qualified-name tier is asked about all of them.
+		return t.markServed(ctx, model.TierExactQualifiedName, ids, owned)
+	}
+	prefixed, err := t.r.NodesAmong(ctx, nodeFilterFor(model.TierQualifiedNamePrefix, t.query, t.kinds), ids)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if listed {
-		for _, rows := range []*tierRows{t.qualified, t.prefixed} {
-			if ok, err := t.serves(ctx, rows, id); err != nil || ok {
-				return ok, err
-			}
+	if len(prefixed) > 0 {
+		listed := make([]model.NodeID, len(prefixed))
+		for i, row := range prefixed {
+			listed[i] = row.Node.ID
+		}
+		if err := t.markServed(ctx, model.TierExactQualifiedName, listed, owned); err != nil {
+			return err
+		}
+		if err := t.markRows(ctx, prefixed, owned); err != nil {
+			return err
 		}
 	}
-	return t.serves(ctx, t.named, id)
-}
-
-// pathServes reports whether the exact_path tier can serve anything: the query
-// names a file and that file's path passes the request's filters.
-func (t *tierRule) pathServes() bool {
-	return t.pathFile != "" && t.normalized != "" && t.filter.keep(t.normalized)
-}
-
-// serves reports whether the tier rows lists node id with a row that passes the
-// request's filters: the test the exact phase applies to the same row.
-func (t *tierRule) serves(ctx context.Context, rows *tierRows, id model.NodeID) (bool, error) {
-	row, ok, err := rows.row(ctx, id)
-	if err != nil || !ok || row.Node.FileID == "" {
-		return false, err
+	if tier.Rank() <= model.TierExactName.Rank() {
+		return nil
 	}
-	p, err := t.paths.path(ctx, row.Node.FileID)
+	rest := make([]model.NodeID, 0, len(ids))
+	for _, id := range ids {
+		if !owned[id] {
+			rest = append(rest, id)
+		}
+	}
+	return t.markServed(ctx, model.TierExactName, rest, owned)
+}
+
+// markServed marks in owned the ids that tier lists with a row that serves.
+func (t *tierRule) markServed(ctx context.Context, tier model.SearchTier, ids []model.NodeID,
+	owned map[model.NodeID]bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := t.r.NodesAmong(ctx, nodeFilterFor(tier, t.query, t.kinds), ids)
 	if err != nil {
-		return false, err
+		return err
 	}
-	return p != "" && t.filter.keep(p), nil
+	return t.markRows(ctx, rows, owned)
 }
 
-// inPathFile reports whether any visible row of node id is declared in the file
-// the query names. DistinctNodesInFile lists every node with a row in that
-// file, once, so the file's node ids are read on first use and held for the
-// rest of the request: one file's declarations, never the answer's.
-func (t *tierRule) inPathFile(ctx context.Context, id model.NodeID) (bool, error) {
-	if t.inFile == nil {
-		t.inFile = map[model.NodeID]struct{}{}
-		var afterStart int64
-		var after model.NodeID
-		for {
-			// The file is read whole, so it is read at the storage page bound
-			// whatever size the tier probes use.
-			nodes, err := t.r.DistinctNodesInFile(ctx, t.pathFile, afterStart, after, model.MaxPageItems)
-			if err != nil {
-				t.inFile = nil
-				return false, err
-			}
-			if len(nodes) == 0 {
-				break
-			}
-			for _, n := range nodes {
-				afterStart, after = nodeStartByte(n), n.Node.ID
-				if matchesKinds(n.Node.Kind, t.kinds) {
-					t.inFile[n.Node.ID] = struct{}{}
-				}
+// markRows marks in owned the node of every row that serves.
+func (t *tierRule) markRows(ctx context.Context, rows []sqlite.StoredNode, owned map[model.NodeID]bool) error {
+	for _, row := range rows {
+		if owned[row.Node.ID] {
+			continue
+		}
+		ok, err := t.servesRow(ctx, row)
+		if err != nil {
+			return err
+		}
+		if ok {
+			owned[row.Node.ID] = true
+		}
+	}
+	return nil
+}
+
+// readPathFile reads, on first use, the nodes with a visible row declared in
+// the file the query names. DistinctNodesInFile lists every node with a row in
+// that file, once, so the file's node ids are held for the rest of the
+// request: one file's declarations, never the answer's.
+func (t *tierRule) readPathFile(ctx context.Context) error {
+	if t.inFile != nil {
+		return nil
+	}
+	inFile := map[model.NodeID]struct{}{}
+	var afterStart int64
+	var after model.NodeID
+	for {
+		// The file is read whole, so it is read at the storage page bound.
+		nodes, err := t.r.DistinctNodesInFile(ctx, t.pathFile, afterStart, after, model.MaxPageItems)
+		if err != nil {
+			return err
+		}
+		if len(nodes) == 0 {
+			break
+		}
+		for _, n := range nodes {
+			afterStart, after = nodeStartByte(n), n.Node.ID
+			if matchesKinds(n.Node.Kind, t.kinds) {
+				inFile[n.Node.ID] = struct{}{}
 			}
 		}
 	}
-	_, ok := t.inFile[id]
-	return ok, nil
+	t.inFile = inFile
+	return nil
 }
 
-// tierRows answers, for one symbol tier, the row the tier serves for a node,
-// by seeking the tier's node_id keyset at that node. Nodes filters rows before
-// it collapses them, so the tier lists a node exactly when some visible row of
-// it matches the tier, and the row it lists is the precedence winner among
-// those rows: the row the tier's own walk serves.
-//
-// The last read is kept: it holds every node of the tier in (from, last row],
-// or every node past from when it came back empty, so the next node asked for
-// in that range costs no read. Nodes asked for in ascending order therefore
-// cost at most one read per `size` nodes of the tier, or one read each.
-type tierRows struct {
-	r      exactReader
-	filter sqlite.NodeFilter
-	size   int
-	read   bool
-	// from is the last read's exclusive start; fromStart says it began at the
-	// start of the keyset.
-	from      model.NodeID
-	fromStart bool
-	rows      []sqlite.StoredNode
-}
-
-// row answers the tier's row for node id, and whether the tier lists it.
-func (t *tierRows) row(ctx context.Context, id model.NodeID) (sqlite.StoredNode, bool, error) {
-	if !t.covers(id) {
-		after, ok := predecessor(id)
-		for {
-			rows, err := t.r.Nodes(ctx, t.filter, after, t.size)
-			if err != nil {
-				t.read = false
-				return sqlite.StoredNode{}, false, err
-			}
-			t.read, t.from, t.fromStart, t.rows = true, after, !ok, rows
-			if t.covers(id) {
-				break
-			}
-			// Only a read that began below id and ended below it lands here
-			// (a predecessor-less id reads from the start of the keyset), so
-			// the walk continues after its last node and terminates.
-			after, ok = rows[len(rows)-1].Node.ID, true
-		}
+// tierRow answers the row a symbol tier serves for node id, after the rule:
+// ok is false when the tier does not list the node or an earlier tier owns it.
+// It is one indexed lookup, the row the tier's walk would emit for the node.
+func (t *tierRule) tierRow(ctx context.Context, tier model.SearchTier, id model.NodeID) (exactHit, bool, error) {
+	rows, err := t.r.NodesAmong(ctx, nodeFilterFor(tier, t.query, t.kinds), []model.NodeID{id})
+	if err != nil || len(rows) == 0 {
+		return exactHit{}, false, err
 	}
-	i, found := slices.BinarySearchFunc(t.rows, id, func(n sqlite.StoredNode, id model.NodeID) int {
-		return cmp.Compare(n.Node.ID, id)
-	})
-	if !found {
-		return sqlite.StoredNode{}, false, nil
+	owned, err := t.ownedBefore(ctx, tier, []model.NodeID{id})
+	if err != nil || owned[id] {
+		return exactHit{}, false, err
 	}
-	return t.rows[i], true, nil
-}
-
-// covers reports whether the last read decides whether the tier lists id.
-func (t *tierRows) covers(id model.NodeID) bool {
-	if !t.read || (!t.fromStart && id <= t.from) {
-		return false
+	p, err := t.paths.path(ctx, rows[0].Node.FileID)
+	if err != nil {
+		return exactHit{}, false, err
 	}
-	return len(t.rows) == 0 || id <= t.rows[len(t.rows)-1].Node.ID
-}
-
-// predecessor is the node id immediately below id in the keyset order, so a
-// read whose `after` is exclusive starts AT id. Node ids are fixed-width
-// lowercase hex, compared by storage as the bytes they encode, so the
-// predecessor is the hex decrement. The least id has none, and an id that is
-// not hex has no decrement; both answer false and are read from the start of
-// the keyset.
-func predecessor(id model.NodeID) (model.NodeID, bool) {
-	b := []byte(id)
-	for i := len(b) - 1; i >= 0; i-- {
-		switch c := b[i]; {
-		case c == '0':
-			b[i] = 'f'
-		case c == 'a':
-			b[i] = '9'
-			return model.NodeID(b), true
-		case (c > '0' && c <= '9') || (c > 'a' && c <= 'f'):
-			b[i] = c - 1
-			return model.NodeID(b), true
-		default:
-			return "", false
-		}
-	}
-	return "", false
+	return exactHit{Tier: tier, Path: p, Node: rows[0]}, true, nil
 }
