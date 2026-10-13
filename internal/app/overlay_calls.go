@@ -119,7 +119,7 @@ func (s *stack) overlayCalls(ctx context.Context, req model.GraphRequest) (model
 				WithDetail("node_id", string(id))
 		}
 		root, rooted = seedRoot, true
-		seeds = append(seeds, overlayCallSeed{node: id, at: overlayCallPosition(stored)})
+		seeds = append(seeds, overlayCallSeed{node: id, at: overlayPosition(stored)})
 	}
 	route.profile.Root = root
 	overlay, err := s.lsp.Open(ctx, route.view, route.profile)
@@ -166,12 +166,13 @@ func (s *stack) overlayCalls(ctx context.Context, req model.GraphRequest) (model
 	return res, nil
 }
 
-// overlayCallPosition is where a seed's item is prepared: its name token. A
-// call hierarchy item is resolved for the identifier at the position, and the
-// first byte of a declaration is its keyword (`func`, `def`, `public`), where
-// a server prepares nothing. A node that stores no name token is asked at its
-// first byte. The caller has checked the node has a declaration site.
-func overlayCallPosition(stored sqlite.StoredNode) lsp.At {
+// overlayPosition is where a node is asked about: its name token. A server
+// resolves references, implementations, type definitions and call hierarchy
+// items for the identifier at the position, and the first byte of a
+// declaration is its keyword (`func`, `def`, `public`), where a server answers
+// nothing. A node that stores no name token is asked at its first byte. The
+// caller has checked the node has a declaration site.
+func overlayPosition(stored sqlite.StoredNode) lsp.At {
 	at := lsp.At{File: stored.Node.FileID, Byte: stored.Bytes.Start}
 	if stored.NameBytes != nil {
 		at.Byte = stored.NameBytes.Start

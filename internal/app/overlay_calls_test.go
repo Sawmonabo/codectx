@@ -233,11 +233,11 @@ func TestOverlayCallsPrepareAtTheName(t *testing.T) {
 	file := model.FileID(strings.Repeat("1", 64))
 	stored := sqlite.StoredNode{Node: model.Node{FileID: file},
 		Bytes: &model.ByteRange{Start: 100, End: 180}, NameBytes: &model.ByteRange{Start: 105, End: 108}}
-	if at := overlayCallPosition(stored); at.File != file || at.Byte != 105 {
+	if at := overlayPosition(stored); at.File != file || at.Byte != 105 {
 		t.Errorf("prepared at %+v, want the name token at byte 105", at)
 	}
 	stored.NameBytes = nil
-	if at := overlayCallPosition(stored); at.Byte != 100 {
+	if at := overlayPosition(stored); at.Byte != 100 {
 		t.Errorf("a node with no name token prepared at %+v, want its first byte 100", at)
 	}
 }
