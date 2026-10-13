@@ -24,8 +24,15 @@ const (
 	// that name implements.
 	keyGoExternalOverride = "gy\x00"
 	// keyGoCoverage: the unit's count of packages outside it read
-	// (MinArgs) and of those with no readable source (MaxArgs).
+	// (MinArgs) and of those with no readable source (MaxArgs), Tag 0; and
+	// of its methods whose signature names a type by its unresolved
+	// spelling (MinArgs) and of those whose signature could not be spelled
+	// (MaxArgs), Tag 1.
 	keyGoCoverage = "gc\x00"
+	// goImportList, past keyImport + refKey(file), lists every named import
+	// of a Go file, its path in Aux and its name in Sig; no import's name
+	// is spelled with it.
+	goImportList = "\x01"
 )
 
 // goTypes is goPackageTypes over the unit's packages and the packages
@@ -126,7 +133,11 @@ func (n goUnitNames) imported(name string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	for _, imp := range n.fc.imports {
+	imports, err := n.imports()
+	if err != nil {
+		return "", false, err
+	}
+	for _, imp := range imports {
 		if imp.Name != goPackageName(imp.Path) || imp.Name == name {
 			continue
 		}
@@ -140,6 +151,41 @@ func (n goUnitNames) imported(name string) (string, bool, error) {
 		return "", false, nil
 	}
 	return paths[0], true, nil
+}
+
+// imports are the file's imports: its context's, or, for a context read
+// back from the index (an alias's file), the ones the index lists for the
+// file (keyImport + goImportList).
+func (n goUnitNames) imports() ([]Import, error) {
+	if n.fc.imports != nil {
+		return n.fc.imports, nil
+	}
+	var out []Import
+	err := n.h.decls.lookup(keyImport+refKey(Ref{File: n.fc.file})+goImportList, func(e entry) error {
+		out = append(out, Import{Name: e.Sig, Path: e.Aux})
+		return nil
+	})
+	return out, err
+}
+
+func (n goUnitNames) unresolved() ([]string, error) {
+	imports, err := n.imports()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, imp := range imports {
+		if imp.Path == "C" || imp.Name != goPackageName(imp.Path) || slices.Contains(out, imp.Path) {
+			continue
+		}
+		if _, ok, err := n.h.goClause(imp.Path); err != nil {
+			return nil, err
+		} else if !ok {
+			out = append(out, imp.Path)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
 func (n goUnitNames) dots() ([]string, error) {
@@ -195,14 +241,34 @@ func (h *hierarchy) inUnit(p string) (bool, error) {
 // identity form form, declared at ref in the file n: its canonical
 // signature (goIdentity), and for an unexported name its package's import
 // path, since a non-exported name is unique to its package ("Uniqueness of
-// identifiers").
-func goMethodKey(ctx context.Context, types goPackageTypes, n goNames, name, form string, ref Ref) (string, error) {
+// identifiers"). spelling says how exact the signature is.
+func goMethodKey(ctx context.Context, types goPackageTypes, n goNames, name, form string, ref Ref) (key string, spelling goSpelling, err error) {
 	id, err := goIdentity(ctx, types, n, form)
 	if err != nil {
-		return "", err
+		return "", 0, err
+	}
+	switch {
+	case id == goIdentityUnknown:
+		spelling = goSpellingUnknown
+	case goUnresolvedIdentity(id):
+		spelling = goSpellingUnresolved
 	}
 	if !token.IsExported(name) {
 		name = n.pkg() + "." + name
 	}
-	return goIdentityKey(name, id, ref), nil
+	return goIdentityKey(name, id, ref), spelling, nil
 }
+
+// goSpelling is how exactly a method's canonical signature names its types.
+type goSpelling uint8
+
+const (
+	// goSpellingExact names every type by its package and name.
+	goSpellingExact goSpelling = iota
+	// goSpellingUnresolved names a type by its unresolved spelling
+	// (goUnboundQualifier, goUnqualified).
+	goSpellingUnresolved
+	// goSpellingUnknown is a signature goIdentity could not spell, whose
+	// key matches no other method's.
+	goSpellingUnknown
+)

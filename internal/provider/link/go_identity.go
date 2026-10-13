@@ -2,7 +2,9 @@ package link
 
 import (
 	"context"
+	"go/token"
 	"path"
+	"slices"
 	"strings"
 )
 
@@ -30,9 +32,22 @@ import (
 //   - `$i`, a type parameter by position, and the literal tokens stay as
 //     they are.
 //
-// A name it cannot decide makes the whole spelling goIdentityUnknown and
-// never a guess: a qualifier no import (or more than one) of the file binds,
-// a dot-imported file's name no package it reads declares, an alias chain
+// A qualifier no import of the file binds by its name is one of the file's
+// imports written without a name whose package clause is not read (their
+// table names are only the convention, goPackageName): the file compiles
+// only if exactly one of them declares the qualifier as its clause, since
+// two imports of one name in a file block are a redeclaration. With one such
+// import the qualifier is that import's package; with several the name is
+// spelled unresolved, `?p1|p2:x.Name`, the candidates' paths sorted. A name
+// written unqualified in a file with dot imports whose packages are not read
+// is spelled `?.own|d1|d2.Name` the same way. Either spelling denotes one
+// type in every file it is written in (the clauses and declarations of the
+// packages it lists are the same everywhere in a build), so two methods
+// compare equal on it only when their types are identical; a method whose
+// identity holds one is counted (goUnresolvedIdentity).
+//
+// A form that denotes no type a compiling program can write makes the whole
+// spelling goIdentityUnknown: a qualifier no import can bind, an alias chain
 // deeper than goAliasDepth, a form the worker could not spell. The same
 // rules read the standard library's and dependencies' declarations
 // (goExternal), so a unit's method and an external interface's compare by
@@ -61,6 +76,9 @@ type goNames interface {
 	imported(name string) (string, bool, error)
 	// dots are the import paths the file's dot imports name.
 	dots() ([]string, error)
+	// unresolved are the import paths the file imports without a name
+	// whose package clause is not read, sorted, each once.
+	unresolved() ([]string, error)
 }
 
 // goTypeAnswer is what a package declares under one type name: nothing
@@ -106,6 +124,10 @@ func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form stri
 			if err != nil || !ok {
 				return false, err
 			}
+			if strings.HasPrefix(p, "?") {
+				goWrite(b, p)
+				continue
+			}
 			pkg = p
 		case strings.HasPrefix(tok, ":"):
 			q, nm, ok := strings.Cut(tok[1:], ".")
@@ -113,8 +135,19 @@ func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form stri
 				return false, nil
 			}
 			p, ok, err := n.imported(q)
-			if err != nil || !ok {
+			if err != nil {
 				return false, err
+			}
+			if !ok {
+				spelled, ok, err := goUnboundQualifier(n, q, nm)
+				if err != nil || !ok {
+					return false, err
+				}
+				if strings.HasPrefix(spelled, "?") {
+					goWrite(b, spelled)
+					continue
+				}
+				p = spelled
 			}
 			pkg, name = p, nm
 		default:
@@ -141,8 +174,9 @@ func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form stri
 }
 
 // goUnqualified is the package of the type an unqualified name denotes in
-// the file n, "" for a predeclared type; ok is false when it cannot be
-// decided.
+// the file n, "" for a predeclared type, or the unresolved spelling of the
+// name (`?.own|d1|d2.Name`) when only dot imports whose packages are not
+// read can tell; ok is false when it cannot be decided.
 func goUnqualified(ctx context.Context, types goPackageTypes, n goNames, name string) (pkg string, ok bool, err error) {
 	own := n.pkg()
 	a, known, err := types.lookup(ctx, own, name)
@@ -152,6 +186,16 @@ func goUnqualified(ctx context.Context, types goPackageTypes, n goNames, name st
 	if known && a.found {
 		return own, true, nil
 	}
+	_, universe := goUniverse[name]
+	// A dot import declares only its package's exported names ("Import
+	// declarations"), so a name that is not exported is the universe's or
+	// the package's own.
+	if !token.IsExported(name) {
+		if universe {
+			return "", true, nil
+		}
+		return own, true, nil
+	}
 	dots, err := n.dots()
 	if err != nil {
 		return "", false, err
@@ -159,9 +203,11 @@ func goUnqualified(ctx context.Context, types goPackageTypes, n goNames, name st
 	// A dot import declares its package's exported names in the file block,
 	// inside the universe and outside the package block ("Declarations and
 	// scope"): it shadows a predeclared name, and the package's own name
-	// (decided above) is never one it also declares, which would not
-	// compile.
+	// (decided above) is never one it also declares, nor do two of them
+	// declare one name, which would not compile. So a package read that
+	// declares the name decides it whatever the unread ones hold.
 	from := ""
+	var unread []string
 	for _, d := range dots {
 		da, dk, err := types.lookup(ctx, d, name)
 		if err != nil {
@@ -169,23 +215,45 @@ func goUnqualified(ctx context.Context, types goPackageTypes, n goNames, name st
 		}
 		switch {
 		case !dk:
-			return "", false, nil
+			unread = append(unread, d)
 		case da.found && from != "":
 			return "", false, nil
 		case da.found:
 			from = d
 		}
 	}
-	if from != "" {
+	switch {
+	case from != "":
 		return from, true, nil
-	}
-	if _, universe := goUniverse[name]; universe {
+	case len(unread) > 0:
+		slices.Sort(unread)
+		return "?." + own + "|" + strings.Join(slices.Compact(unread), "|") + "." + name, true, nil
+	case universe:
 		return "", true, nil
 	}
-	if len(dots) > 0 {
-		return "", false, nil
-	}
 	return own, true, nil
+}
+
+// goUnboundQualifier is what the qualifier q of the type q.name denotes in
+// the file n when no import binds q by its name: the one import of the file
+// written without a name whose clause is not read (the only import that can
+// declare q), or, with several, the unresolved spelling `?p1|p2:q.name`;
+// ok is false when the file has none, and q denotes nothing.
+func goUnboundQualifier(n goNames, q, name string) (string, bool, error) {
+	cands, err := n.unresolved()
+	if err != nil || len(cands) == 0 {
+		return "", false, err
+	}
+	if len(cands) == 1 {
+		return cands[0], true, nil
+	}
+	return "?" + strings.Join(cands, "|") + ":" + q + "." + name, true, nil
+}
+
+// goUnresolvedIdentity reports a canonical spelling that names a type by
+// its unresolved spelling (goUnboundQualifier, goUnqualified).
+func goUnresolvedIdentity(identity string) bool {
+	return strings.HasPrefix(identity, "?") && identity != goIdentityUnknown || strings.Contains(identity, " ?")
 }
 
 func goWrite(b *strings.Builder, tok string) {

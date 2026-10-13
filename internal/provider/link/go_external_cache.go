@@ -24,7 +24,7 @@ import (
 
 // goDeclarationsFormat names the encoding of a cache entry, so an entry
 // written in another encoding is never decoded as this one.
-const goDeclarationsFormat = "go-declarations\x00name files(imports dot) types(name file alias form iface ineligible conflict methods embeds)"
+const goDeclarationsFormat = "go-declarations\x00name files(imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds)"
 
 type goDeclPackage struct {
 	Name  string
@@ -35,6 +35,7 @@ type goDeclPackage struct {
 type goDeclFile struct {
 	Imports map[string][]string
 	Dot     []string
+	Unnamed []string
 }
 
 type goDeclType struct {
@@ -82,7 +83,7 @@ func readGoDecls(id, p string) (*goExtPackage, bool) {
 		if imports == nil {
 			imports = map[string][]string{}
 		}
-		pkg.files = append(pkg.files, goExtFile{imports: imports, dot: df.Dot})
+		pkg.files = append(pkg.files, goExtFile{imports: imports, dot: df.Dot, unnamed: df.Unnamed})
 	}
 	methods := func(ms []goDeclMethod) []goExtMethod {
 		var out []goExtMethod
@@ -113,7 +114,7 @@ func writeGoDecls(id string, pkg *goExtPackage) {
 	}
 	d := goDeclPackage{Name: pkg.name}
 	for _, f := range pkg.files {
-		d.Files = append(d.Files, goDeclFile{Imports: f.imports, Dot: f.dot})
+		d.Files = append(d.Files, goDeclFile{Imports: f.imports, Dot: f.dot, Unnamed: f.unnamed})
 	}
 	methods := func(ms []goExtMethod) []goDeclMethod {
 		var out []goDeclMethod

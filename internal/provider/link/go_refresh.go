@@ -76,7 +76,7 @@ func (x *goExternal) surface() string {
 			for _, n := range names {
 				parts = append(parts, n, strings.Join(f.imports[n], "\x00"))
 			}
-			parts = append(parts, "\x01"+strings.Join(f.dot, "\x00"))
+			parts = append(parts, "\x01"+strings.Join(f.dot, "\x00"), "\x02"+strings.Join(f.unnamed, "\x00"))
 		}
 		types := make([]string, 0, len(pkg.types))
 		for n := range pkg.types {

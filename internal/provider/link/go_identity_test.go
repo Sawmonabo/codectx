@@ -14,6 +14,7 @@ type fakeNames struct {
 	path    string
 	imports map[string][]string
 	dot     []string
+	unread  []string
 }
 
 func (n fakeNames) pkg() string { return n.path }
@@ -26,6 +27,8 @@ func (n fakeNames) imported(name string) (string, bool, error) {
 }
 
 func (n fakeNames) dots() ([]string, error) { return n.dot, nil }
+
+func (n fakeNames) unresolved() ([]string, error) { return n.unread, nil }
 
 // fakeTypes is every package's type declarations, by path then name: "" a
 // defined type, any other value an alias's form written in aliasIn.
@@ -61,7 +64,14 @@ func (t fakeTypes) lookup(_ context.Context, p, name string) (goTypeAnswer, bool
 // the first dot import that declares a name -> the ambiguous case resolves.
 // Mutation: resolve an unknown qualifier as written -> it is not "?".
 // Mutation: leave a dot-imported unread package's name to the file's
-// package -> it is not "?".
+// package -> the unread dot import's case is not its unresolved spelling.
+// Mutation: drop the bijection (one unread import) -> the go-yaml case is
+// spelled unresolved. Mutation: spell an unbound qualifier `?yaml.Node`
+// without its candidates -> two files importing different unread packages
+// would compare equal; the several-imports case differs. Mutation: stop at
+// the first unread dot import -> the read one no longer decides. Mutation:
+// let a dot import supply an unexported name -> `local` is spelled
+// unresolved.
 func TestGoIdentityResolvesEveryName(t *testing.T) {
 	ctx := context.Background()
 	store := fakeNames{path: "example.com/m/store"}
@@ -89,7 +99,17 @@ func TestGoIdentityResolvesEveryName(t *testing.T) {
 		{"unknown qualifier", mem, "( :nope.T )", "?"},
 		{"dot import", fakeNames{path: "example.com/m/dot", dot: []string{"example.com/a"}}, "( .T )", "( example.com/a.T )"},
 		{"two dot imports declare it", fakeNames{path: "example.com/m/dot", dot: []string{"example.com/a", "example.com/b"}}, "( .T )", "?"},
-		{"dot import not read", fakeNames{path: "example.com/m/dot", dot: []string{"example.com/unread"}}, "( .T )", "?"},
+		{"dot import not read", fakeNames{path: "example.com/m/dot", dot: []string{"example.com/unread"}}, "( .T )",
+			"( ?.example.com/m/dot|example.com/unread.T )"},
+		{"a read dot import decides past an unread one", fakeNames{path: "example.com/m/dot",
+			dot: []string{"example.com/unread", "example.com/a"}}, "( .T )", "( example.com/a.T )"},
+		{"an unexported name is never a dot import's", fakeNames{path: "example.com/m/dot",
+			dot: []string{"example.com/unread"}}, "( .int , .local )", "( int , example.com/m/dot.local )"},
+		{"one import whose clause is unread binds the unbound qualifier", fakeNames{path: "example.com/m/mem",
+			unread: []string{"example.com/go-yaml"}}, "( :yaml.Node )", "( example.com/go-yaml.Node )"},
+		{"several such imports spell the qualifier unresolved", fakeNames{path: "example.com/m/mem",
+			unread: []string{"example.com/p1", "example.com/p2"}}, "( :yaml.Node , .int )",
+			"( ?example.com/p1|example.com/p2:yaml.Node , int )"},
 		{"type parameter", mem, "( $0 ) ( $1 )", "( $0 ) ( $1 )"},
 		{"unspellable form", mem, "?", "?"},
 	}

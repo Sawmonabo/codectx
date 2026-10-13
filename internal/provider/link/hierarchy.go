@@ -56,6 +56,9 @@ type hierarchy struct {
 	// goSurface is the digest of what the build read from the packages
 	// outside a Go unit (goExternal.surface), empty for any other unit.
 	goSurface string
+	// goSpellings counts the unit's Go methods by how exactly their
+	// method-set keys spell their signatures (goMethodKey).
+	goSpellings [3]uint32
 	// members is every member's projection with a table, by FileID
 	// (projection.go).
 	members *pagination.SortedRun[projection]
@@ -531,6 +534,13 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 	if err != nil {
 		return nil, err
 	}
+	if h.goExt != nil {
+		err := links.Add(entry{Key: keyGoCoverage, Tag: 1, MinArgs: h.goSpellings[goSpellingUnresolved],
+			MaxArgs: h.goSpellings[goSpellingUnknown]})
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := h.satisfy(u.dir, links, methodSets); err != nil {
 		return nil, err
 	}
@@ -582,6 +592,13 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 	for _, imp := range t.Imports {
 		if imp.Name == "" {
 			continue
+		}
+		if fc.family == "go" && imp.Name != ImportAll {
+			// The file's named imports listed together, which a Go
+			// identity read in a context from the index needs (goUnitNames).
+			if err := s.Add(entry{Key: keyImport + fileKey + goImportList, Aux: imp.Path, Sig: imp.Name}); err != nil {
+				return err
+			}
 		}
 		e := entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}
 		if imp.Syntax == ImportRequire {
@@ -839,10 +856,11 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			if fc.family != "go" {
 				return nil
 			}
-			key, err := goMethodKey(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref)
+			key, spelling, err := goMethodKey(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref)
 			if err != nil {
 				return err
 			}
+			h.goSpellings[spelling]++
 			return addGoMethod(methodSets, typ, d.Name, key, e)
 		}
 		// A Java anonymous class body's method is its synthetic type's,

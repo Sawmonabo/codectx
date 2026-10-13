@@ -83,10 +83,14 @@ type goExtPackage struct {
 	types map[string]*goExtType
 }
 
-// goExtFile is one file's imports: by local name, and its dot imports.
+// goExtFile is one file's imports: by local name, and its dot imports;
+// unnamed are the paths it imports without a name, and unresolved those of
+// them whose package clause is not read (renameImports).
 type goExtFile struct {
-	imports map[string][]string
-	dot     []string
+	imports    map[string][]string
+	dot        []string
+	unnamed    []string
+	unresolved []string
 }
 
 // goExtType is one type name a package declares.
@@ -132,6 +136,8 @@ func (n goExtNames) imported(name string) (string, bool, error) {
 }
 
 func (n goExtNames) dots() ([]string, error) { return n.f.dot, nil }
+
+func (n goExtNames) unresolved() ([]string, error) { return n.f.unresolved, nil }
 
 // newGoExternal locates the unit's sources and reads the closure of its
 // imports.
@@ -421,6 +427,9 @@ func (p *goExtPackage) addFile(af *ast.File, std bool) {
 		switch {
 		case spec.Name == nil:
 			f.imports[goPackageName(ip)] = append(f.imports[goPackageName(ip)], ip)
+			if ip != "C" && !slices.Contains(f.unnamed, ip) {
+				f.unnamed = append(f.unnamed, ip)
+			}
 		case spec.Name.Name == ".":
 			f.dot = append(f.dot, ip)
 		case spec.Name.Name == "_":
@@ -604,20 +613,35 @@ func goPackageName(p string) string {
 
 // renameImports rebinds, in every file read, each import written without a
 // name to the name its package's own clause declares, now that the closure
-// is read: the path's last element is only the convention.
-func (x *goExternal) renameImports() {
+// is read: the path's last element is only the convention. The imports
+// whose clause is still not known are the file's unresolved ones.
+func (x *goExternal) renameImports() error {
 	for _, pkg := range x.pkgs {
 		if pkg == nil {
 			continue
 		}
 		for i := range pkg.files {
 			f := &pkg.files[i]
+			clauses := map[string]string{}
+			f.unresolved = f.unresolved[:0]
+			for _, ip := range f.unnamed {
+				clause, ok, err := x.h.goClause(ip)
+				if err != nil {
+					return err
+				}
+				if ok {
+					clauses[ip] = clause
+				} else {
+					f.unresolved = append(f.unresolved, ip)
+				}
+			}
+			slices.Sort(f.unresolved)
 			renamed := map[string][]string{}
 			for name, paths := range f.imports {
 				for _, ip := range paths {
 					n := name
-					if imp := x.pkgs[ip]; imp != nil && name == goPackageName(ip) {
-						n = imp.name
+					if clause, ok := clauses[ip]; ok && name == goPackageName(ip) {
+						n = clause
 					}
 					renamed[n] = append(renamed[n], ip)
 				}
@@ -625,6 +649,7 @@ func (x *goExternal) renameImports() {
 			f.imports = renamed
 		}
 	}
+	return nil
 }
 
 // lookup is goPackageTypes over the packages read.
@@ -652,7 +677,9 @@ func (x *goExternal) lookup(p, name string) (goTypeAnswer, bool) {
 // each under its own Ref (goExternalFile), its methods' keys canonical
 // (goIdentity) and its embedded types those it embeds.
 func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.ExternalSort[entry]) error {
-	x.renameImports()
+	if err := x.renameImports(); err != nil {
+		return err
+	}
 	type named struct {
 		q   string
 		pkg *goExtPackage
@@ -745,7 +772,7 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 			if n.t.conflict && !n.t.iface {
 				continue
 			}
-			key, err := goMethodKey(ctx, x.h.goTypes(), n.pkg.names(m.file), m.name, m.form, r)
+			key, _, err := goMethodKey(ctx, x.h.goTypes(), n.pkg.names(m.file), m.name, m.form, r)
 			if err != nil {
 				return err
 			}
