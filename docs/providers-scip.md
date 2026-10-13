@@ -130,8 +130,10 @@ symbols it contributed stop being answerable the moment that generation becomes
 active. The capability is not reported as degraded either, because from the
 plan's point of view nothing was requested and nothing failed.
 
-Two operational consequences follow. Pass `--scip-index` on **every** run that
-should keep the imported symbols, including plain `codectx refresh`. And if
+Two operational consequences follow. Every run that should keep the imported
+symbols is a `codectx index --scip-index PATH` run, which reuses every unchanged
+unit as a refresh does; `codectx refresh` takes no `--scip-index`, so a refresh
+always builds a generation without the imported symbols. And if
 cross-file symbols disappear after a refresh, run `codectx doctor`: its
 `supplied_index` check reports what the active generation was actually built
 with, which is the one place the difference between "no index was supplied" and

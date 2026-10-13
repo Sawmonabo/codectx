@@ -72,8 +72,11 @@ when they were actually measured. One entry is recorded today:
 ### 1.2 Corpus shapes actually exercised by Section 3
 
 Most of Section 3 runs on `corpusSmallReal`: **124 files**, 40 packages, seed
-2101, 66 032 eligible source bytes, 248 indexing units. The context-plan scope
-walk over it from 64 seeds visits **769 nodes across 1 596 edges** at the
+2101, 65 152 eligible source bytes, 251 indexing units (one filesystem unit per
+file, 124; one tree-sitter unit per parsed source file, 121; one manifest unit
+each for `go.mod`, `package.json` and `README.md`; one link unit each for the Go,
+JavaScript and Python package families). The context-plan scope
+walk over it from 64 seeds visits **966 nodes across 2 090 edges** at the
 default, unlimited bounds (Section 3.2).
 
 Three rows do not. Rows 9 and 13 are defined over the Section 23.1 reference
@@ -128,7 +131,7 @@ workload and were taken by the verification pass on the reference corpus.
 | 3 | Lexical search | 150 ms | not yet measured on the search index | UNMEASURED — recorded from the integrated binary ([ADR-0013](adr/ADR-0013-search-index.md), decision 9); the search index at scale is below |
 | 4 | One-hop caller/callee | 100 ms | p95 **5.72 ms** / 50 | PASS |
 | 5 | Context plan, ≤50k visited nodes | 1 s | p95 **74.8 ms** / 10 | PASS |
-| 6 | Context plan visited nodes | ≤ 50 000 | **769 visited / 1 596 edges** from 64 seeds at the default bounds (Section 3.2) | PASS |
+| 6 | Context plan visited nodes | ≤ 50 000 | **966 visited / 2 090 edges** from 64 seeds at the default bounds (Section 3.2) | PASS |
 | 7 | Ten-file base refresh after debounce | 1.5 s | p95 **144 ms** / 5 | PASS |
 | 8 | No-change refresh: no parser work, no search-index rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
 | 9 | Cold base index of the reference fixture | 3 min | **1 min 32.1 s** over 10 000 files / 1 052 933 lines / 86 064 203 B (the corrected Section 23.1 size); process-tree peak **145.3 MiB** | PASS |
@@ -138,7 +141,7 @@ workload and were taken by the verification pass on the reference corpus.
 | 13 | Base storage vs eligible source bytes | 3.5× | **16.10×** on the corrected reference corpus: 1 385 729 099 stored over 86 064 203 eligible source bytes (db 1 299 664 896 + wal 0 + CAS 86 064 203; **CAS alone = 1.00×**) | **MISS by 4.6×** — Section 4 |
 | 14 | Low-memory profile (Section 23.3): one worker, 2 GiB | same results as the full profile | **fingerprint identical across 10 fact families**; index tree peak **47.9 MiB** | PASS |
 | 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | a **242-file** session with **216 required** files answered a first page of **199 records** and issued a cursor | PASS |
-| 16 | Default context-graph bounds | measurement-driven | `max_graph_depth`, `max_visited_nodes` and `max_graph_edges` default to **unlimited**; the walk ends on its own at depth 4, **769 nodes / 1 596 edges**, 1.5% of row 6's ceiling (Section 3.2) | PASS |
+| 16 | Default context-graph bounds | measurement-driven | `max_graph_depth`, `max_visited_nodes` and `max_graph_edges` default to **unlimited**; the walk ends on its own at depth 4, **966 nodes / 2 090 edges**, 1.9% of row 6's ceiling (Section 3.2) | PASS |
 
 Row 11 measures a RESTING session, which is what "idle" claims. A window opened
 at process start with `mcp.watch` at its default would cover the initial
@@ -186,23 +189,23 @@ declarations in name order, so every run walks from the same declarations.
 line is that line's depth bound:
 
 ```
-default:  visited=769 edges=1596 truncated=false
-depth 1:  visited=265 edges=313  truncated=true (depth)
-depth 2:  visited=605 edges=1217 truncated=true (depth)
-depth 3:  visited=730 edges=1544 truncated=true (depth)
-depth 4:  visited=769 edges=1583 truncated=true (depth)
+default:  visited=966 edges=2090 truncated=false
+depth 1:  visited=256 edges=312  truncated=true (depth)
+depth 2:  visited=704 edges=1414 truncated=true (depth)
+depth 3:  visited=921 edges=1977 truncated=true (depth)
+depth 4:  visited=966 edges=2090 truncated=true (depth)
 ```
 
 The same walk without the two program-dependence relations
-(`data_flows_to`, `control_depends_on`) visits 727 nodes across 1 493 edges:
-dependence reach adds 42 nodes (5.8%) and 103 edges (6.9%) at this scale.
+(`data_flows_to`, `control_depends_on`) visits 885 nodes across 1 890 edges:
+dependence reach adds 81 nodes (9.2%) and 200 edges (10.6%) at this scale.
 Identical across runs.
 
-- **The 50 000-node ceiling holds with room**: the whole walk is 1.5% of it.
+- **The 50 000-node ceiling holds with room**: the whole walk is 1.9% of it.
   50 000 is Section 23.2's context-plan ceiling and is not moved by this
   measurement.
-- **Edges per visited node is 2.08** over the whole walk.
-- **The walk ends on its own**: +340, +125 and +39 nodes for hops 2, 3 and 4,
+- **Edges per visited node is 2.16** over the whole walk.
+- **The walk ends on its own**: +448, +217 and +45 nodes for hops 2, 3 and 4,
   and nothing past depth 4, so no default bound is needed to keep it small
   here; the bounds stay unlimited and a request that wants one names it.
 
