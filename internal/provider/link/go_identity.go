@@ -85,11 +85,21 @@ type goNames interface {
 
 // goTypeAnswer is what a package declares under one type name: nothing
 // (found false), a defined type, or an alias of the type whose form is
-// form, written in the file names.
+// form, written in the file names; others are the alias's further
+// declarations whose forms are written differently (one per platform or
+// build tag), which denote the same type exactly when every one spells it
+// canonically the same.
 type goTypeAnswer struct {
 	found, alias bool
 	form         string
 	names        goNames
+	others       []goDecl
+}
+
+// goDecl is one declaration's form, written in the file names.
+type goDecl struct {
+	form  string
+	names goNames
 }
 
 // goPackageTypes answers which type a package declares under a name.
@@ -98,11 +108,12 @@ type goPackageTypes interface {
 	// known is false when the source of p is not read, so whether it
 	// declares one is not known.
 	lookup(ctx context.Context, p, name string) (answer goTypeAnswer, known bool, err error)
-	// constant is the form of the integer value of the constant the package
-	// at import path p declares under name (wire.Export.Identity past its
-	// "#"), written in the file names; found is false when the package
-	// declares none or its source is not read.
-	constant(ctx context.Context, p, name string) (form string, names goNames, found bool, err error)
+	// constant is each distinctly written form of the integer value of the
+	// constant the package at import path p declares under name
+	// (wire.Export.Identity past its "#", one per platform or build tag that
+	// writes it differently), with the file it is written in; none when the
+	// package declares none or its source is not read.
+	constant(ctx context.Context, p, name string) (decls []goDecl, err error)
 }
 
 // goIdentity is the canonical spelling of form, written in the file n,
@@ -231,8 +242,9 @@ func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, tok
 			return nil, false, err
 		}
 		if known && a.alias {
-			form, args := a.form, []string(nil)
-			if arity, rest, generic := goGenericAlias(form); generic {
+			var args []string
+			arity, _, generic := goGenericAlias(a.form)
+			if generic {
 				// A generic alias is used instantiated ("Alias
 				// declarations"): its form with each `$i` its i-th type
 				// argument, each spelled where the use is written.
@@ -242,11 +254,12 @@ func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, tok
 				if err != nil || !ok {
 					return nil, false, err
 				}
-				form = rest
 			}
-			if ok, err := goCanonical(ctx, types, a.names, form, args, depth+1, b); err != nil || !ok {
+			spelled, ok, err := goAliasSpelling(ctx, types, a, args, arity, depth)
+			if err != nil || !ok {
 				return nil, false, err
 			}
+			goWrite(b, spelled)
 			continue
 		}
 		goWrite(b, pkg+"."+name)
@@ -305,7 +318,7 @@ func goConstName(ctx context.Context, types goPackageTypes, n goNames, tok strin
 		// exported names only.
 		name = tok[1:]
 		own := n.pkg()
-		if _, _, found, err := types.constant(ctx, own, name); err != nil || found || !token.IsExported(name) {
+		if decls, err := types.constant(ctx, own, name); err != nil || len(decls) > 0 || !token.IsExported(name) {
 			return name, own, err == nil, err
 		}
 		dots, err := n.dots()
@@ -314,11 +327,11 @@ func goConstName(ctx context.Context, types goPackageTypes, n goNames, tok strin
 		}
 		var unread []string
 		for _, d := range dots {
-			_, _, found, err := types.constant(ctx, d, name)
+			decls, err := types.constant(ctx, d, name)
 			if err != nil {
 				return "", "", false, err
 			}
-			if found {
+			if len(decls) > 0 {
 				return name, d, true, nil
 			}
 			if _, known, err := types.lookup(ctx, d, name); err != nil {
@@ -410,11 +423,24 @@ func goFold(ctx context.Context, types goPackageTypes, n goNames, expr []string,
 			if err != nil || !ok || p == "" || strings.HasPrefix(p, "?") {
 				return nil, err
 			}
-			form, names, found, err := types.constant(ctx, p, name)
-			if err != nil || !found || form == goIdentityUnknown {
+			decls, err := types.constant(ctx, p, name)
+			if err != nil || len(decls) == 0 {
 				return nil, err
 			}
-			return goFold(ctx, types, names, strings.Split(form, " "), depth+1)
+			// A constant declared once per platform or build tag has a
+			// value exactly when every declaration folds to the same one.
+			var v *big.Int
+			for _, d := range decls {
+				if d.form == goIdentityUnknown {
+					return nil, nil
+				}
+				dv, err := goFold(ctx, types, d.names, strings.Split(d.form, " "), depth+1)
+				if err != nil || dv == nil || v != nil && dv.Cmp(v) != 0 {
+					return nil, err
+				}
+				v = dv
+			}
+			return v, nil
 		}
 		v, ok := new(big.Int).SetString(tok, 10)
 		if !ok {
@@ -480,6 +506,30 @@ func goGenericAlias(form string) (int, string, bool) {
 		return 0, form, false
 	}
 	return n, rest, true
+}
+
+// goAliasSpelling is the canonical spelling of the type the alias a
+// denotes, instantiated with args for a generic alias of arity parameters:
+// the one spelling every declaration of a gives, and ok false when two of
+// them spell different types, since which one a use means depends on the
+// build.
+func goAliasSpelling(ctx context.Context, types goPackageTypes, a goTypeAnswer, args []string, arity, depth int) (string, bool, error) {
+	spelled := ""
+	for i, d := range append([]goDecl{{form: a.form, names: a.names}}, a.others...) {
+		n, form, generic := goGenericAlias(d.form)
+		if generic != (arity > 0) || n != arity {
+			return "", false, nil
+		}
+		var b strings.Builder
+		if ok, err := goCanonical(ctx, types, d.names, form, args, depth+1, &b); err != nil || !ok {
+			return "", false, err
+		}
+		if i > 0 && b.String() != spelled {
+			return "", false, nil
+		}
+		spelled = b.String()
+	}
+	return spelled, true, nil
 }
 
 // goTypeArguments reads, from toks, the type argument list `[ a , b ]` of

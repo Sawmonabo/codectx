@@ -276,8 +276,12 @@ type by its unresolved spelling or could not be spelled (`go_method_signatures_u
 from every non-test file, whatever its build constraints, and cached on disk by its source's identity
 (`go_external_cache.go`). An interface two files declare differently (per platform or build tag: `Handle` with
 `Fd() uintptr` for unix and `Fd() int` for windows) is each of its declarations, one entity per declaration as the
-project's own conditional declarations are, and a type satisfying one implements it; an alias declared differently,
-or a method declared with two signatures, makes a form naming it unknown. A Go type implements an interface
+project's own conditional declarations are, and a type satisfying one implements it. Declarations are compared by
+their canonical spellings, not as written: `type Num = Count` (with `Count = int`) for unix and `type Num = int` for
+windows are one alias of `int`, `const Width = 4` and `2 + 2` one value, `Sum() [16]byte` and `Sum() [Size]byte` (with
+`Size = 16`) one method, and interface declarations that spell one method set are one interface; an alias, constant or
+method whose declarations spell different types or values makes a form naming it unknown, in the project's own
+packages as in packages outside it. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its

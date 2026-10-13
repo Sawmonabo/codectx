@@ -53,9 +53,12 @@ func (t fakeTypes) lookup(_ context.Context, p, name string) (goTypeAnswer, bool
 	return goTypeAnswer{found: true, alias: true, form: form, names: t.aliasIn}, true, nil
 }
 
-func (t fakeTypes) constant(_ context.Context, p, name string) (string, goNames, bool, error) {
+func (t fakeTypes) constant(_ context.Context, p, name string) ([]goDecl, error) {
 	form, ok := t.consts[p][name]
-	return form, t.aliasIn, ok, nil
+	if !ok {
+		return nil, nil
+	}
+	return []goDecl{{form: form, names: t.aliasIn}}, nil
 }
 
 // TestGoIdentityResolvesEveryName protects the canonical spelling method
@@ -213,8 +216,8 @@ func (s *Set[T]) Iface(x interface {
 	pkg := &goExtPackage{path: "p", types: map[string]*goExtType{}}
 	pkg.addFile(f, false)
 	got := map[string]string{"A": pkg.types["A"].form}
-	for name, c := range pkg.consts {
-		got[name] = "#" + c.form
+	for name, cs := range pkg.consts {
+		got[name] = "#" + cs[0].form
 	}
 	for _, m := range pkg.types["I"].methods {
 		got[m.name] = m.form

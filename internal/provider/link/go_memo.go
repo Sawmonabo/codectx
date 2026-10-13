@@ -39,19 +39,13 @@ func (m *goMemo[V]) put(key string, v V) {
 // goMemos are a hierarchy's memos of Go lookups.
 type goMemos struct {
 	types  goMemo[goTypeMemo]
-	consts goMemo[goConstMemo]
+	consts goMemo[[]goDecl]
 	clause goMemo[goClauseMemo]
 }
 
 type goTypeMemo struct {
 	answer goTypeAnswer
 	known  bool
-}
-
-type goConstMemo struct {
-	form  string
-	names goNames
-	found bool
 }
 
 type goClauseMemo struct {
