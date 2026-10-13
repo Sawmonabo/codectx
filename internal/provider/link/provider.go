@@ -98,7 +98,8 @@ const (
 	DetailSummary = "summary"
 	// DetailReturn: a `data_flows_to` from the bound callee's return node to
 	// a variable the call site's result is written into, or to the return
-	// node of the callable that returns the call's value.
+	// node of the callable that returns the call's value. An impact walk that
+	// has taken a DetailArgument edge never takes one (ADR-0017 decision 7).
 	DetailReturn = "return"
 	// DetailSupertype: an `extends`, `implements` or `overrides` the source
 	// declares: a written supertype, and a method of the same name and

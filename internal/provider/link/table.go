@@ -157,7 +157,7 @@ type Decl struct {
 	// Return is the callable's return node as the structural provider
 	// resolved it: the variable node that stands for the value the callable
 	// returns, keyed by the callable's identity like its parameters, into
-	// which the values created inside it that reach a return flow. It is nil
+	// which every value its returning nodes read flows. It is nil
 	// for a declaration no analysed function is the callable of.
 	Return *Endpoint `json:"return,omitempty"`
 }

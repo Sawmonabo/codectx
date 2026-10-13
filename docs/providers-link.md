@@ -160,8 +160,9 @@ Go method expression, a Rust path naming a method, a Java unbound method referen
 receiver parameter, and nothing where the callee declares none (a Java method's receiver). A parameter with no
 node of its own receives no edge.
 
-**Return flows.** A call's value goes back to the caller by summary edges, never by a plain edge from inside the
-callee to the call (ADR-0017 decision 7), for every family that publishes argument flows, the address-taken join
+**Return flows.** A call's value goes back to the caller by labelled edges, a summary per argument and a return
+edge from the callee's return node, never by an unlabelled edge from inside the callee to the call (ADR-0017
+decision 7), for every family that publishes argument flows, the address-taken join
 included (`internal/provider/link/returns.go`). A site's result is where the structural provider found its value
 goes: `Site.Results`, the variables the innermost node evaluating the call defines, and `Site.Into`, the callable
 whose return that node is (`return f()`); a call whose value another call consumes first (`g(f())`, `f().m()`)
@@ -173,16 +174,16 @@ has neither, and a site with neither publishes no return flow. A bound site publ
   return node of the callable `Site.Into` names, at the call expression, detail `return` (`FactReturn`). A callee
   with no return node (a type, a constructor that returns no value) publishes none.
 
-Only the values created inside a callable flow into its return node (docs/providers-treesitter.md, Return flow):
-no variable any parameter reaches, by data flow or by control dependence, is the source of a `return` edge, and
-every effect a parameter has on the result, the choice of which value is returned included, comes back only as its
-summary. So a walk at query time over `data_flows_to` needs no
-call stack to stay on realizable paths (ADR-0017 [S10]): a walk that enters a callee through an argument edge
-reaches only variables a parameter reaches, none of which flows into the return node, so it can leave the callee
-only through an argument edge of a call the callee makes; a walk that reaches a return node started inside the
-callee (or in a callee whose return it returns) and may leave through any site's `return` edge, a partially
-balanced path; a summary edge stays in the caller. What the walk can never do is enter through one call's argument
-and leave through another call's result. A summary is the dependence facts' reach: a call folded into a node passes
+Every value a returning node reads flows into the callable's return node (docs/providers-treesitter.md, Return
+flow), parameter-reached values included, so a value created inside the callee (`k = 1; if p: return k`) reaches
+every bound site's result. Realizability is the walk's: each `data_flows_to` carries its role in its evidence
+detail, `argument`, `return`, `summary:<position>`, or the structural `reaching_def`, and the impact walk follows
+the two-phase rule of interprocedural slicing (ADR-0017 [S10]). A path that has taken an `argument` edge never
+takes a `return` edge; a summary edge stays in the caller and carries what the parameter does to the result. So a
+path that enters a callee through one call's argument never leaves through another call's result, and a path that
+starts inside the callee leaves through every call's `return` edge, a partially balanced path. Only the linker
+publishes `argument` and `return` evidence; a stored relation may join the structural `reaching_def` of a folded
+call and the linker's `summary`, both free. A summary is the dependence facts' reach: a call folded into a node passes
 its arguments' values to what the node defines, so a parameter passed through another call reaches the return
 whatever that callee returns. The summary is part of the callee's interface (`Parameter.Returned`, the
 `paramReturned` mark of its hierarchy entry): a body edit that changes whether a parameter reaches the return

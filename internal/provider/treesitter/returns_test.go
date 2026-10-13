@@ -49,11 +49,8 @@ def choose(p):
 
 // TestReturnFlow pins the structural half of return-value flow on one
 // Python file: which parameters reach their callable's return, which values
-// created inside a callable flow into its return node, and where each call's
-// value goes. The names come from the source; the walk rule they protect is
-// that a value a parameter reaches never flows into the return node, so no
-// walk enters through one call's argument and leaves through another's
-// result.
+// flow into its return node, and where each call's value goes. The names
+// come from the source.
 func TestReturnFlow(t *testing.T) {
 	p := newProvider(t)
 	h := providertest.New(t, map[string]string{"r.py": returnFlowSrc})
@@ -74,20 +71,20 @@ func TestReturnFlow(t *testing.T) {
 	var flows []string
 	for _, r := range c.rels {
 		for _, e := range r.Evidence {
-			if r.Relation.Kind == model.RelDataFlowsTo && e.Detail == "return" {
+			if r.Relation.Kind == model.RelDataFlowsTo && strings.HasSuffix(names[r.Relation.To], ".return") && e.Detail == "reaching_def" {
 				flows = append(flows, names[r.Relation.From]+" -> "+names[r.Relation.To])
 			}
 		}
 	}
 	slices.Sort(flows)
-	// mutation: drop the exclusion of values a parameter reaches (y, which p
-	// reaches, would flow into mix's return node); mutation: drop the
-	// boundary flow into a parameter-reached variable (k would not);
-	// mutation: follow flows only, not control dependence (gate's y, which
-	// p decides, would flow into gate's return node).
-	want := []string{"make.v -> make.return", "mix.k -> mix.return", "use.a -> use.return"}
+	// mutation: leave out a value a parameter reaches (mix's y, which p
+	// reaches); mutation: leave out a deciding node's variables (choose's p,
+	// which picks the return that runs); mutation: send every variable the
+	// function reads (mix's k reaches the return only through y).
+	want := []string{"choose.p -> choose.return", "gate.y -> gate.return", "make.v -> make.return",
+		"mix.y -> mix.return", "use.a -> use.return"}
 	if !slices.Equal(flows, want) {
-		t.Fatalf("created values into return nodes %q, want %q", flows, want)
+		t.Fatalf("values into return nodes %q, want %q", flows, want)
 	}
 
 	decl := func(name string) *link.Decl {

@@ -11,34 +11,20 @@ import (
 	"github.com/Sawmonabo/codectx/internal/reconcile"
 )
 
-// detailReturn is the evidence detail of a value created inside a callable
-// flowing into the callable's return node.
-const detailReturn = "return"
-
 // Return flow (docs/providers-treesitter.md, Return flow). A callable's
-// return node stands for the value it returns. Only values created inside
-// the callable flow into it, so a walk that entered the callable through one
-// call site's argument can never leave through another site's result: the
-// arguments' own way back is the callee's return summary, a parameter that
-// reaches a return (link.Parameter.Returned), which the linker publishes per
-// bound site.
+// return node stands for the value it returns. Every variable of a returning
+// node's Src, and every variable a node deciding whether it runs reads
+// (wire.Function.Returned), flows into it as an ordinary reaching
+// definition, the parameters' values included. The linker sends the return
+// node's value to each bound site's result as a return edge, and a
+// parameter that reaches a return (link.Parameter.Returned) as the summary
+// at the site; the impact walk keeps such paths realizable by never taking a
+// return edge after an argument edge (docs/providers-link.md, Return flows).
 //
-// For each analysed function that is the callable of a declaration of the
-// file (callableOf), with E its entry variables (its parameters and the
-// variables it captures from an enclosing function) and D its dependence
-// edges, each data_flows_to pair and each control_depends_on pair from the
-// controlling variable to the dependent one:
-//   - F is every variable reachable from E over D, B every variable that
-//     reaches a returning node over D (wire.Function.Returned): a parameter
-//     that decides which value is returned reaches the return too;
-//   - a parameter in B is Returned;
-//   - a variable of the function's own outside F that reaches a return
-//     directly, or through an edge of D into a variable of B ∩ F, flows into
-//     the return node, evidenced at that returning node or that edge's node.
-//
-// F follows the same edges an impact walk follows from a parameter, so no
-// variable such a walk reaches is the source of a return flow
-// (docs/providers-link.md, Return flows).
+// A parameter is Returned when it reaches a returning node over the
+// function's data_flows_to pairs and its control_depends_on pairs taken from
+// the controlling variable to the dependent one: a parameter that decides
+// which value is returned reaches the return too.
 //
 // Each call site of the table takes its Results, the variables the
 // innermost node of the innermost function evaluating it defines, and Into,
@@ -46,7 +32,7 @@ const detailReturn = "return"
 // two consumes the site's value first.
 
 // returnFlows publishes every analysed callable's return node and the
-// created values flowing into it, marks each Returned parameter, and fills
+// values flowing into it, marks each Returned parameter, and fills
 // each site's Results and Into. It runs after tableVariables, on the
 // endpoints vars resolved, and does nothing for a file with no link table.
 func (b *builder) returnFlows(vars map[wire.Span]fileVar, byStart []int) error {
@@ -94,9 +80,9 @@ func (b *builder) returnFlows(vars map[wire.Span]fileVar, byStart []int) error {
 			continue
 		}
 		f := &fns[i]
-		created := created(f, &t.Decls[d])
+		markReturned(f, &t.Decls[d])
 		_, ownerKey, _ := b.owner(byStart, f.Span)
-		for _, c := range created {
+		for _, c := range f.Returned {
 			from, ok := endpoint(f.Vars[c.Var])
 			if !ok {
 				continue
@@ -106,7 +92,7 @@ func (b *builder) returnFlows(vars map[wire.Span]fileVar, byStart []int) error {
 				return err
 			}
 			publish(d)
-			b.putRelation(dependence, from.Node, model.RelDataFlowsTo, ret.ep.Node, rng, ownerKey, detailReturn)
+			b.putRelation(dependence, from.Node, model.RelDataFlowsTo, ret.ep.Node, rng, ownerKey, detailFlow)
 		}
 	}
 	return b.siteResults(spans, callable, rets, endpoint, publish)
@@ -202,60 +188,27 @@ func (b *builder) returnNode(d int) (returnNode, error) {
 		Name: name, Qualified: qualified, Range: *rng, NameRange: rng}, res: res, key: key}, nil
 }
 
-// created marks each parameter of decl in f whose value reaches a return
-// Returned, and answers the values created inside f that flow into its
-// return node, each a variable of f and the node evidencing it.
-func created(f *wire.Function, decl *link.Decl) []wire.Access {
+// markReturned marks each parameter of decl in f whose value reaches a
+// return, by data flow or by deciding which return runs, Returned.
+func markReturned(f *wire.Function, decl *link.Decl) {
 	n := len(f.Vars)
-	param := make([]int, n)
-	for v := range param {
-		param[v] = -1
-	}
-	for j, p := range decl.Parameters {
-		s := wire.Span{Start: uint32(p.Range.Start.Byte), End: uint32(p.Range.End.Byte)}
-		if v, ok := slices.BinarySearchFunc(f.Vars, s, cmpSpan); ok {
-			param[v] = j
-		}
-	}
-	own := func(v uint32) bool { s := f.Vars[v]; return s.Start >= f.Span.Start && s.End <= f.Span.End }
-	// fromEntry is F, toReturn is B.
-	fromEntry, toReturn := make([]bool, n), make([]bool, n)
-	var seeds []uint32
-	for v := range uint32(n) {
-		if param[v] >= 0 || !own(v) {
-			seeds = append(seeds, v)
-		}
-	}
-	// D: a data flow From -> To, and a control dependence from the
-	// controlling variable (To) to the dependent one (From).
+	toReturn := make([]bool, n)
 	deps := make([]wire.Pair, 0, len(f.Flows)+len(f.Control))
 	deps = append(deps, f.Flows...)
 	for _, c := range f.Control {
 		deps = append(deps, wire.Pair{From: c.To, To: c.From, Node: c.Node})
 	}
-	reach(deps, seeds, fromEntry, false)
-	seeds = seeds[:0]
+	seeds := make([]uint32, 0, len(f.Returned))
 	for _, a := range f.Returned {
 		seeds = append(seeds, a.Var)
 	}
 	reach(deps, seeds, toReturn, true)
-	for v, j := range param {
-		if j >= 0 && toReturn[v] {
+	for j, p := range decl.Parameters {
+		s := wire.Span{Start: uint32(p.Range.Start.Byte), End: uint32(p.Range.End.Byte)}
+		if v, ok := slices.BinarySearchFunc(f.Vars, s, cmpSpan); ok && toReturn[v] {
 			decl.Parameters[j].Returned = true
 		}
 	}
-	var out []wire.Access
-	for _, a := range f.Returned {
-		if !fromEntry[a.Var] && own(a.Var) {
-			out = append(out, a)
-		}
-	}
-	for _, p := range deps {
-		if toReturn[p.To] && fromEntry[p.To] && !fromEntry[p.From] && own(p.From) {
-			out = append(out, wire.Access{Var: p.From, Node: p.Node})
-		}
-	}
-	return out
 }
 
 // reach marks in seen every variable reachable from seeds over the pairs

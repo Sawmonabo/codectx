@@ -483,7 +483,7 @@ The parent validates every range against the pinned bytes, as it does for every 
 | `data_flows_to` | variable whose value flows | variable the reached node defines | the reached node | `reaching_def` |
 | `reads` | the owning declaration | variable | the reading node | `use` |
 | `writes` | the owning declaration | variable | the defining node | `definition` or `may_definition` |
-| `data_flows_to` | variable created inside a callable | the callable's return node | the returning node, or the flow's node | `return` |
+| `data_flows_to` | variable a returning node reads, or a node deciding whether it runs reads | the callable's return node | the returning node | `reaching_def` |
 
 - **Variable entity.** Each named variable is one node, whichever functions' messages name it. When its declaring
   identifier is a structural declaration's name token (a module or class assignment, an ECMAScript declarator, a Go
@@ -535,16 +535,14 @@ ADR-0017 decision 7; `internal/provider/treesitter/returns.go`):
   (`reconcile.ReturnDisambiguator`), so a call in another file keeps it through a body edit. It carries no
   declaration-key alias: no source identifier declares it. The link table carries it (`Decl.Return`); the node is
   published here when a value flows into it, and by the linker when a flow leaves it.
-- **Created values.** With E the callable's parameters and the variables it captures (declared outside its span),
-  D the message's flows and its control pairs taken from the controlling variable to the dependent one (the
-  direction an impact walk follows `control_depends_on`), F the variables reachable from E over D, and B those that
-  reach a returning node over D: a parameter in B is marked `Returned` (`Parameter.Returned`, the callable's return
-  summary); and a variable of its own outside F that reaches a returning node directly, or through an edge of D into
-  a variable of B ∩ F, flows into the return node, evidenced at the returning node or the edge's node, detail
-  `return`. A value any parameter reaches, by data flow or by control dependence, never flows into it, so no walk
-  enters through one call's argument and leaves through another's result. The cost is precision, never soundness: a
-  created value read only under a parameter's control (`k = 1` then `if p: return k`) is reached by `p` and comes
-  back only through `p`'s summary.
+- **Returned values.** Each variable of the message's `Returned` list (a variable a returning node reads, or a node
+  deciding whether it runs reads) flows into the return node, evidenced at the returning node, detail
+  `reaching_def`: an ordinary intraprocedural flow, a parameter's value included. A parameter is marked `Returned`
+  (`Parameter.Returned`, the callable's return summary) when it reaches a returning node over the message's flows
+  and its control pairs taken from the controlling variable to the dependent one (the direction an impact walk
+  follows `control_depends_on`): a parameter that decides which value is returned is in the summary too. Leaving the
+  callee is the linker's `return` edge, which a walk that entered through an argument never takes
+  (docs/providers-link.md, Return flows).
 - **A call's result.** Each site of the link table takes `Site.Results`, the variables the innermost node of the
   innermost analysed function containing the call defines (killing or may), and `Site.Into`, that function's
   callable when the node is one of its returning nodes; neither when another call site lies between the two (its

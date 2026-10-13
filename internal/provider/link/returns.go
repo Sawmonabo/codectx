@@ -9,17 +9,17 @@ import (
 // Return-value flow by summary edges (ADR-0017 decision 7). A bound call
 // site's result is its Results, the variables the call's value is written
 // into, and its Into, the callable whose return the value reaches directly.
-// The callee gives back two things, neither a plain edge from inside the
-// callee to the site:
+// The callee gives back two things, neither an unlabelled edge from inside
+// the callee to the site:
 //   - its return summary: a parameter whose value reaches its return
 //     (Parameter.Returned) makes each argument bound to it flow into the
 //     site's Results (FactSummary), straight from the caller's variables,
 //     so a walk never enters the callee to come back;
-//   - its return node (Decl.Return), into which only the values created
-//     inside it flow, never one a parameter reaches: it flows into the
-//     site's Results and Into (FactReturn), so a walk that leaves through
-//     any site's return started inside the callee and never entered it
-//     through another site's argument.
+//   - its return node (Decl.Return), into which every value its returning
+//     nodes read flows: it flows into the site's Results and Into
+//     (FactReturn, detail "return"). An impact walk that has taken an
+//     argument edge never takes a return edge, so no path enters through
+//     one site's argument and leaves through another site's result.
 
 // hasResult reports whether site s's value reaches a variable or a return.
 func hasResult(s *Site) bool { return len(s.Results) > 0 || s.Into > 0 }
