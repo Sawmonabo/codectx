@@ -563,6 +563,9 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 				return err
 			}
 		}
+		if err := addRustMacro(s, fc, ref, t, d); err != nil {
+			return err
+		}
 		if fc.family == "c" && d.Alias != "" {
 			if err := s.Add(entry{Key: keyMacro + d.Name, Ref: ref, Aux: t.Path, Sig: d.Alias}); err != nil {
 				return err
@@ -2203,6 +2206,9 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		case isCallable(d.Kind):
 			err = h.overrideFacts(ctx, fc, t, ref, d, emit)
 		}
+		if err == nil {
+			err = h.macroInputFacts(fc, ref, d, emit)
+		}
 		if err != nil {
 			return err
 		}
@@ -2324,6 +2330,8 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 		// A private method's name is its class body's alone (ECMA-262
 		// §15.7.1, PrivateName): it overrides nothing.
 		return nil
+	case fc.family == "rust" && d.Trait != "":
+		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
 	case fc.family == "go" && d.Parent >= 0 && int(d.Parent) < len(t.Decls) && t.Decls[d.Parent].Kind == model.NodeInterface:
 		// An interface's method specification implements nothing.
 		return nil

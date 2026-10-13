@@ -117,6 +117,9 @@ const (
 	// `exports` entry into a build output the snapshot ignores. It is
 	// counted as an open import, never as an external one.
 	FactOpenImport Fact = 10
+	// FactGenerates: the Rust macro_rules Target of another member may
+	// generate the declaration Site, written in its input (macro_rust.go).
+	FactGenerates Fact = 11
 )
 
 // Binding is one fact a resolver found. Site names the entry of a member's
