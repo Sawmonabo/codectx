@@ -72,7 +72,7 @@ Scala pass rides on.
 | `FileCreationPass` | FILE nodes and SOURCE_FILE edges for namespace blocks, type declarations, methods and comments | `linkToSingle` with a create-on-miss callback that invents a FILE for an unknown name | **58** | **0** | **no** — FILE is a known-not-staged node label and `SOURCE_FILE` a known-not-read edge (`scratch.go:60,79`) | nothing. The product owns file identity itself: every node carries `FILENAME`, and `paths` (`scratch.go:508-510`) is built from that column with the owning method's filename as the fallback | none |
 | `NamespaceCreator` | one NAMESPACE node per distinct namespace-block name, with a REF edge from each block | `groupBy(_.name)` then one node and n edges per group | **27** | **0** | **no** — NAMESPACE and NAMESPACE_BLOCK are both known-not-staged | nothing | none |
 | `TypeHierarchyPass` | INHERITS_FROM edges from TYPE_DECL to each TYPE in `inheritsFromTypeFullName` | `linkToMultiple` over the property array, null-guarded | **33** | **40–90** | **no** — `INHERITS_FROM` is a known-not-read edge (`scratch.go:78`) | nothing today. Section 10 argues this is the single cheapest addition available | the array is filled per frontend; the shared pass is language-independent |
-| `AliasLinkerPass` | ALIAS_OF edges (call-graph sub-lane's scope; cited only) | — | **28** | — | **no** — `ALIAS_OF` is known-not-read | — | — |
+| `AliasLinkerPass` | ALIAS_OF edges (call-graph research's scope; cited only) | — | **28** | — | **no** — `ALIAS_OF` is known-not-read | — | — |
 | `FieldAccessLinkerPass` | a REF edge from every field-access CALL to the MEMBER it reads or writes | for a call whose name is `fieldAccess` or `indirectFieldAccess`, takes argument 1 as the base and the `FIELD_IDENTIFIER`'s `canonicalName` as the field, builds `"<base's linked type full name>.<field>"` and looks up that type's member of that name. Warns on a field access with no field identifier or no base node. Overrides `linkToMultiple` **specifically to skip writing the `dstFullNameKey` property**, and only considers calls that have no outgoing REF edge yet. Its `case None if dstNodeMap(dstFullName).isDefined` arm (`:79-80`) is dead: it can only be reached when the preceding `Some` arm did not match, i.e. when the lookup returned `None`, so the guard is never true | **89** | **120–250** | **the edge is staged and never joined** — see section 3 | in principle the precise `writes` target, and `codectx_references` on a field. In practice **nothing**: the product re-derives the same fact by a weaker route | none |
 
 **Aggregates, measured.** `passes/base/` = **590** lines over 10 files, no subdirectories.
@@ -123,7 +123,7 @@ Two consequences for the plan:
 
 ### 3.1 And the product does not use the answer
 
-The brief for this work assumed the precise `writes` branch of `rw.go` depends on the field-access
+The research question assumed the precise `writes` branch of `rw.go` depends on the field-access
 linker. **It does not.** Traced in full:
 
 - `rw.go:279-306` (`fieldOps` branch) takes the base (argument index 1) and the `FIELD_IDENTIFIER`,
@@ -144,7 +144,7 @@ ad-hoc decoration stripping.** The re-derivation is strictly weaker: it fails on
 where the string and the declared full name differ, which is what the recorded gaps
 (a Java static field on a type base, a Go package global on a package base, a Rust `static mut`) are.
 
-**Decision recorded** (the brief's premise did not hold, so this file publishes what the code does):
+**Decision recorded** (the research question's premise did not hold, so this file publishes what the code does):
 a native port should resolve a field access through the **linked** route, not the string route. The
 port already needs a type table to answer `codectx_symbol_info`; joining on a declaration id rather
 than on a decorated string is the same work and strictly more correct. This is a *benefit*, not a

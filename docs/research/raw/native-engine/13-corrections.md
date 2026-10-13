@@ -1,6 +1,6 @@
 # Native-engine research, raw evidence — corrections to the cited research, and two product defects found on the way
 
-Every correction below is a figure this lane re-measured or re-verified, against a claim that is
+Every correction below is a figure this research re-measured or re-verified, against a claim that is
 currently written down somewhere in the repository. Each names what to change.
 
 ## Corrections to `docs/research/05-cfg-cdg-from-treesitter.md`
@@ -14,14 +14,14 @@ currently written down somewhere in the repository. Each names what to change.
 | 5 | §3: `stack-graphs` treated as a live-but-inapplicable project | **Archived 2025-09-09**; crate 0.14.1 last published 2024-12-13; no `cdylib`/`staticlib` in its manifest, so there is no C ABI to cgo against. The verdict ("not applicable — no CFG") is unchanged; the reason is stronger. | `09-native-building-blocks.md` |
 | 6 | §4's per-language estimate anchors the Joern-side upper bound on the v4.0.100 statement creators | Those creators **grew**, unevenly: c2cpg 321→**634**, javasrc2cpg ≈260→**998**, pysrc2cpg 2,349→**3,172**; jssrc2cpg 916→**816** and gosrc2cpg 273→**266** shrank. The Fraunhofer-side anchor (125-line Go delta) did not move. **That spread is the uncertainty** and the estimate must say which anchor each range rests on. | `12-source-anatomy-v4.0.627.md` §A7 |
 
-## Correction to this lane's own brief (and to `docs/providers-dependence.md`'s wording)
+## Correction to this research's own question (and to `docs/providers-dependence.md`'s wording)
 
 | # | Claim | Correct at v4.0.627 | Source |
 |---|---|---|---|
 | 7 | "`--repr=all --format=neo4jcsv` is the **only legal** way to get CDG + REACHING_DEF + CALL in CSV" | **False as stated.** `Format.Neo4jCsv` accepts **two** reprs: `All` and `Cpg` (`JoernExport.scala:144-166`); every other repr throws. `--repr=cpg --format=neo4jcsv` is legal — but **unusable**, for three reasons: it emits one output directory per method (`:152-161`); `MethodSubGraph.edges` filters `if nodes.contains(edge.dst)` (`:230`), dropping every inter-procedural CALL edge; and the node set is `method.ast.toSet` (`:177`), so TYPE_DECL and MEMBER never appear. The correct wording is **"the only usable way"**. | `12-source-anatomy-v4.0.627.md` §A5 |
-| 8 | This research brief §2: the product imports "`REACHING_DEF` edges **with the variable**" | **The product discards the variable.** The export carries it — every fixture header is `:START_ID,:END_ID,:TYPE,VARIABLE:string` — and `putEdge` deliberately keeps only `(label, src, dst)` (`scratch.go:413-420`; the `edge_in` schema at `:172` has no property column). | `10-reaching-defs-and-readswrites.md` Unit 1 (d) |
+| 8 | This research question §2: the product imports "`REACHING_DEF` edges **with the variable**" | **The product discards the variable.** The export carries it — every fixture header is `:START_ID,:END_ID,:TYPE,VARIABLE:string` — and `putEdge` deliberately keeps only `(label, src, dst)` (`scratch.go:413-420`; the `edge_in` schema at `:172` has no property column). | `10-reaching-defs-and-readswrites.md` Unit 1 (d) |
 
-## Two product defects surfaced (for the controller's ledger, not for this plan to fix)
+## Two product defects surfaced (recorded here, not fixed by this plan)
 
 | # | Defect | Evidence |
 |---|---|---|

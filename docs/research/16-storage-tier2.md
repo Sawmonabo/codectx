@@ -10,16 +10,16 @@ bytes per indexed symbol by 37–43 % and removed identity width as the amplifie
 verification re-measured the §3e gate afterwards and it is still missed: reference corpus 5.47×
 eligible source against a 3.5× budget, a large Python repository 4.54×, promptfoo 4.30×, the second corpus (a configured, Python-majority polyglot monorepo) 7.11×, the reference repository (an unconfigured, JavaScript-majority repository with its dependencies committed) 4.16×;
 2 432–3 600 bytes per indexed symbol against the ~158 B the gate implies. No store was indexed for
-this page — the verification lane removed its stores on completion (`rm -rf` on its cache root,
-confirmed absent in its Cleanup section), so every byte figure below is quoted from that lane's
-per-b-tree attribution and from the storage integration report for the same repository, which
+this page — the verification run removed its stores on completion (`rm -rf` on its cache root,
+confirmed absent afterwards), so every byte figure below is quoted from that run's
+per-b-tree attribution and from the storage integration run's measurement of the same repository, which
 reproduce each other to 0.1 %.
 
 ## 1. Where the bytes are
 
-Per-b-tree byte attribution, aggregate mode [S1]. The large Python repository totals 631 648 256 B (verification lane)
-/ 632 266 752 B (integration lane, same corpus, 0.1 % apart — rows the verification lane did not
-itemise come from the integration lane's run, marked `†`).
+Per-b-tree byte attribution, aggregate mode [S1]. The large Python repository totals 631 648 256 B (verification run)
+/ 632 266 752 B (integration run, same corpus, 0.1 % apart — rows the verification run did not
+itemise come from the integration run, marked `†`).
 
 | family | large Python repository B | % of db | reference repository B | % of db |
 |---|---|---|---|---|
@@ -35,7 +35,7 @@ itemise come from the integration lane's run, marked `†`).
 | alias family (table + two indexes) † and relation endpoint index † | 29.9 M | 4.8 | — | — |
 | **residual, unattributed** | **125.3 M** | **19.8** | **812.8 M** | **43.1** |
 
-The residual is real and large — neither lane itemised every b-tree — no option below is costed
+The residual is real and large — neither run itemised every b-tree — no option below is costed
 against it. Three families carry the decision.
 
 - **`search_units` is a second copy of the source.** 73 009 rows hold 197.5 MB on the large Python repository, ≈2.7 KB
