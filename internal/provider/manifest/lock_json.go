@@ -91,41 +91,64 @@ func (u *unit) packageLock(ctx context.Context) error {
 }
 
 // npmTree is the packages of a package-lock.json with the node_modules path
-// each is installed at (keys, parallel to entries) and the version installed
+// each is installed at (keys, parallel to entries) and the entry installed
 // at each path.
 type npmTree struct {
 	entries []lockEntry
 	keys    []string
-	at      map[string]string
+	at      map[string]int
 }
 
 func (t *npmTree) add(key string, e lockEntry) int {
 	if t.at == nil {
-		t.at = map[string]string{}
+		t.at = map[string]int{}
 	}
 	t.entries = append(t.entries, e)
 	t.keys = append(t.keys, key)
 	if strings.Contains(key, "node_modules/") {
-		t.at[key] = e.version
+		t.at[key] = len(t.entries) - 1
 	}
 	return len(t.entries) - 1
 }
 
+// installed is the package and version of the entry at install path key.
+func (t *npmTree) installed(key string) (name, version string, ok bool) {
+	i, ok := t.at[key]
+	if !ok {
+		return "", "", false
+	}
+	return t.entries[i].name, t.entries[i].version, true
+}
+
+// npmAlias splits an npm alias specifier, `npm:<name>@<version>`, into the
+// package's own name and version; ok is false for any other value, among
+// them `npm:<range>`, which names no package (a later yarn's spelling of a
+// plain registry range).
+func npmAlias(v string) (name, version string, ok bool) {
+	rest, ok := strings.CutPrefix(v, "npm:")
+	if !ok || strings.IndexByte(rest[min(1, len(rest)):], '@') < 0 {
+		return "", "", false
+	}
+	name, version = yarnSplit(rest)
+	return name, version, name != ""
+}
+
 // resolve is Node's lookup: from the requiring package's folder, the first
 // `node_modules/<name>` up the chain of enclosing package folders, ending at
-// the root's.
-func (t *npmTree) resolve(i int, dep string) string {
+// the root's. The package found there is named as its entry names it, its
+// own name when dep is an alias.
+func (t *npmTree) resolve(i int, dep string) (string, string) {
 	k := t.keys[i]
 	for {
 		c := "node_modules/" + dep
 		if k != "" {
 			c = k + "/node_modules/" + dep
 		}
-		if v, ok := t.at[c]; ok {
-			return v
+		if name, v, ok := t.installed(c); ok {
+			return name, v
 		}
 		if k == "" {
-			return ""
+			return "", ""
 		}
 		j := strings.LastIndex(k, "node_modules/")
 		if j < 0 {
@@ -140,6 +163,9 @@ func (t *npmTree) resolve(i int, dep string) string {
 // time. The root ("") and a workspace folder (a path outside node_modules)
 // are the repository's own packages; a link entry only points
 // node_modules at such a folder, which is listed itself, so it adds nothing.
+// An entry under node_modules is the package its folder names unless its
+// `name` says otherwise: an aliased package keeps its own name there, and
+// the folder's name is the alias.
 func (u *unit) npmPackages(dec *json.Decoder, t *npmTree) error {
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return malformedJSON(err)
@@ -161,6 +187,9 @@ func (u *unit) npmPackages(dec *json.Decoder, t *npmTree) error {
 		e := lockEntry{version: p.Version, integrity: p.Integrity, source: p.Resolved, start: start, end: int(dec.InputOffset())}
 		if j := strings.LastIndex(key, "node_modules/"); j >= 0 {
 			e.name = key[j+len("node_modules/"):]
+			if p.Name != "" && p.Name != e.name {
+				e.name, e.alias = p.Name, e.name
+			}
 		} else {
 			e.name, e.local = p.Name, true
 			if e.name == "" && key != "" {
@@ -208,8 +237,13 @@ func (u *unit) npmTreeLevel(dec *json.Decoder, t *npmTree, parent string) error 
 			e := &t.entries[i]
 			switch field {
 			case "version":
-				err = dec.Decode(&e.version)
-				t.at[key] = e.version
+				// An aliased package's version is written
+				// `npm:<name>@<version>`.
+				if err = dec.Decode(&e.version); err == nil {
+					if n, v, ok := npmAlias(e.version); ok {
+						e.name, e.alias, e.version = n, e.name, v
+					}
+				}
 			case "resolved":
 				err = dec.Decode(&e.source)
 			case "integrity":
@@ -263,6 +297,9 @@ type pipfileEntry struct {
 	Version string   `json:"version"`
 	Hashes  []string `json:"hashes"`
 	Git     string   `json:"git"`
+	Hg      string   `json:"hg"`
+	Svn     string   `json:"svn"`
+	Bzr     string   `json:"bzr"`
 	Ref     string   `json:"ref"`
 	Path    string   `json:"path"`
 	File    string   `json:"file"`
@@ -272,7 +309,9 @@ type pipfileEntry struct {
 
 // pipfileLock reads Pipfile.lock: the `default` and `develop` sections map
 // each package to its pinned `==` version and the hashes of its
-// distribution files. The format records no dependency graph.
+// distribution files, or to where it comes from: a VCS checkout (a `git`,
+// `hg`, `svn` or `bzr` URL and its `ref`), a path or a file. The format
+// records no dependency graph.
 func (u *unit) pipfileLock(ctx context.Context) error {
 	dec := json.NewDecoder(bytes.NewReader(u.data))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
@@ -327,9 +366,9 @@ func (u *unit) pipfileSection(dec *json.Decoder, section string, entries *[]lock
 		}
 		e := lockEntry{name: normalizePyPI(name), version: strings.TrimLeft(p.Version, "="), hashes: len(p.Hashes), source: p.Index,
 			group: section, start: start, end: int(dec.InputOffset())}
-		switch {
-		case p.Git != "":
-			e.source, e.version = p.Git, p.Ref
+		switch vcs, url := vcsSource("git", p.Git, "hg", p.Hg, "svn", p.Svn, "bzr", p.Bzr); {
+		case url != "":
+			e.source, e.version = vcs+"+"+url, p.Ref
 		case p.Path != "":
 			e.source, e.local = p.Path, true
 		case p.File != "":
@@ -362,7 +401,7 @@ func (u *unit) bunLock(ctx context.Context) error {
 		t       npmTree
 		keys    []string
 	)
-	t.at = map[string]string{}
+	t.at = map[string]int{}
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
@@ -385,18 +424,18 @@ func (u *unit) bunLock(ctx context.Context) error {
 			return nil
 		}
 	}
-	resolve := func(i int, dep string) string {
+	resolve := func(i int, dep string) (string, string) {
 		k := keys[i]
 		for {
 			c := dep
 			if k != "" {
 				c = k + "/" + dep
 			}
-			if v, ok := t.at[c]; ok {
-				return v
+			if name, v, ok := t.installed(c); ok {
+				return name, v
 			}
 			if k == "" {
-				return ""
+				return "", ""
 			}
 			k = bunParent(k)
 		}
@@ -428,7 +467,12 @@ func (u *unit) bunPackages(dec *json.Decoder, data []byte, t *npmTree, keys *[]s
 			case json.Unmarshal(raw, &s) == nil:
 				switch {
 				case j == 0:
-					_, e.version = yarnSplit(s)
+					// The package's own name and version: another name
+					// than the install path's is an alias.
+					var name string
+					if name, e.version = yarnSplit(s); name != "" && name != e.name {
+						e.name, e.alias = name, e.name
+					}
 				case j == 1 && s != "":
 					e.source = s
 				case j >= 2 && strings.HasPrefix(s, "sha") && strings.Contains(s, "-"):
@@ -452,7 +496,7 @@ func (u *unit) bunPackages(dec *json.Decoder, data []byte, t *npmTree, keys *[]s
 		e.deps = npmDeps(info.Dependencies, KindRuntime, info.OptionalDependencies, KindOptional, info.PeerDependencies, KindPeer)
 		t.entries = append(t.entries, e)
 		*keys = append(*keys, key)
-		t.at[key] = e.version
+		t.at[key] = len(t.entries) - 1
 	}
 	_, err := dec.Token()
 	return err
@@ -527,4 +571,15 @@ func jsoncBlank(data []byte) []byte {
 		}
 	}
 	return out
+}
+
+// vcsSource is the first of the alternating VCS names and URLs whose URL is
+// set, as pip spells a VCS requirement's scheme (`hg+<url>`) with its URL.
+func vcsSource(kv ...string) (vcs, url string) {
+	for i := 0; i+1 < len(kv); i += 2 {
+		if kv[i+1] != "" {
+			return kv[i], kv[i+1]
+		}
+	}
+	return "", ""
 }
