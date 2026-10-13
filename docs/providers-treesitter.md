@@ -288,6 +288,31 @@ declared `static`; a tentative definition (`int x;`) is one, a prototype and an
 nothing. This is linkage, not shared-library visibility. C++ publishes no
 `exports`.
 
+**Methods code outside the project may override.** A method that code
+outside the indexed project can override or implement under its language's
+rules carries `extensible: true` metadata (`declOpen`,
+`internal/provider/treesitter/worker/extensible.go`), which a call answer
+reads to say that the overrides it lists for a base may not be all of them
+(docs/queries.md). A type is open when code outside can subtype it, and a
+method only inside an open type: in Java a public or protected (or interface
+member) class that is neither `final` nor `sealed`, and not an enum, record or
+annotation interface, or a public interface that is not `sealed`, whose
+public or protected methods that are not `static`, `private` or `final` are
+open, and in an interface every method not `static` or `private` (JLS
+§8.1.1.2, §8.4.3); in Go the exported methods of an exported interface of a
+package that is not `main` or under an `internal` directory, since any type
+of another package with those methods implements it without naming it (an
+unexported method is closed: another package cannot declare it, and a type
+that embeds the interface to gain it runs a body the project declares); in
+TypeScript and JavaScript the methods of an exported class or interface that
+are not `private`, `#`-named or `static`; in Python a method of a class at
+module or class level, unless the method or its class is decorated `final`
+(PEP 591) or its name is mangled (`__name`); in Rust the methods of a trait
+declared `pub` (not `pub(crate)`, `pub(super)` or `pub(in …)`); in C++ the
+members, not `static` or `final`, of a class that a header declares outside
+an unnamed namespace and that is not `final`. A Go or Rust concrete type's
+method, which nothing overrides, and every C declaration carry none.
+
 **C and C++ visibility as declared.** A declaration's own attributes give its
 `visibility` metadata: the first `visibility("…")` attribute's value
 (`default`, `hidden`, `protected`, `internal`), or `dllexport` or `dllimport`

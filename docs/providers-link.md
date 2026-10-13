@@ -34,7 +34,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 
 | Capability | Relation | From → to | Evidence detail |
 |---|---|---|---|
-| `calls` | `calls` | caller → each bound declaration, or an external method node | `direct`, `hierarchy`, `address_taken`, `flow`, `field` |
+| `calls` | `calls` | caller → each bound declaration, or an external method node | `direct`, `hierarchy`, `address_taken`, `flow`, `function_value`, `field` |
 | `calls` | `calls` | caller → the site's open-site node | none |
 | `imports` | `imports` | file module → each file module the import resolves to | `import` |
 | `imports` | `imports` | file module → the import's open-import-site node | none |
@@ -55,6 +55,8 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 - `hierarchy`: the method the receiver's static type declares or inherits, found by walking its supertypes;
 - `address_taken`: an indirect site joined to an address-taken function of the same signature;
 - `flow`: the receiver's type was recovered by flow-based type inference;
+- `function_value`: a function value that reached the value the site calls, through assignments, parameters,
+  returns and fields (flow-based value inference);
 - `field`: a function written to the field the site calls through;
 - `import`: an import resolved to a file of the unit;
 - `argument`: an argument of a bound call site, matched to its parameter;
@@ -138,7 +140,13 @@ site, named by the callee as written (`call` when there is none), of kind `metho
 - `computed`: the callee is an expression that names nothing (`obj[k]()`);
 - `receiver_untyped`: a member or static call whose receiver has no recovered type;
 - `value_untracked`: a call through a value whose flow the analysis does not follow;
-- `global_unbound`: a bare name or a construction no visible scope declares.
+- `global_unbound`: a bare name or a construction no visible scope declares;
+- `reflective`: a call of a reflection API that runs a method or function chosen at run time (`reflective`,
+  `internal/provider/link/reflective.go`: Java's `java.lang.reflect.Method.invoke`, `Constructor.newInstance`,
+  `java.lang.Class.newInstance` and `java.lang.invoke.MethodHandle`'s `invoke`, `invokeExact` and
+  `invokeWithArguments`; Go's `reflect.Value.Call` and `CallSlice`). Such a site also publishes its `calls` to the
+  API's external method; its open-site node is published beside it, and the site is counted external and
+  reflective.
 
 Its shape is `member`, `value`, `construct` or `bare`, and `arguments` is the number of arguments the site passes.
 The candidates of an open site are computed per query as `may_call`, never stored. A key longer than
@@ -801,8 +809,18 @@ The members' language family picks the resolver:
   `hierarchy.overridable`) and `exact` otherwise; a call on a newly created object (`new Dog().sound()`, no class
   body) binds exactly, the object being exactly its class (JLS §15.9.4). An anonymous class body is a subtype of
   the type it instantiates, read as its declaration (`anonymousType`: the class `new T`, or the enum constant whose
-  body it is), whose methods override that type's. A call of an abstract method (a functional
-  interface's) also joins every method reference of that method's signature. A method reference `T::m` to an
+  body it is), whose methods override that type's. A call of an abstract method binds that method, `virtual`, and
+  beside it every method reference that is an object of the receiver's type (JLS §15.13.3: a method reference
+  evaluates to an instance of a class implementing its target type): one whose target type is that type or a
+  subtype of it, and one whose target type the worker could not read, each of the method's signature, each
+  `exact` with the detail `address_taken`. The worker reads a reference's target type (`wire.Value.Target`) from
+  the declaration of the local, field or constant it initializes, the variable or `this` field it is assigned to,
+  the cast it is the operand of, or the return type of the method whose `return` gives it, through parentheses and
+  either arm of a conditional (JLS §15.13.2); a reference in an argument or a lambda's result has none. A reference
+  of a known target type is joined under the target type's node and each of its supertypes of the unit
+  (`javaTaken`), and a call under its receiver type's node (`javaTargetKey`), so a call never binds a reference of
+  another functional interface; a target type outside the unit joins nothing, since a call joins only through an
+  abstract method of the unit. No argument flows into the abstract method, which has no body. A method reference `T::m` to an
   instance method, `T` a type, is unbound (JLS §15.13.1): its signature is `m`'s with `T` as its first parameter, and
   a call through it passes its first argument to the receiver and the rest to `m`'s parameters in order. A static
   method's, a constructor's and a bound one's (`this::m`) take the arguments as their own parameters. A receiver that is a field of a class,
@@ -823,8 +841,12 @@ The members' language family picks the resolver:
   indirect site joins every function taken as a value whose declared signature equals the site's
   (`wire.Export.Signature`, `wire/link.go`); a Go method expression `T.M` taken as a value has the method's
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
-  cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is not
-  `Final` and that the receiver's type or a supertype declares `virtual` ([class.virtual]). In C++ a bare call inside
+  cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is
+  neither `Final` nor static and that the receiver's type or a supertype declares `virtual`, or may: a type along
+  the climb that has a supertype outside the unit makes the member possibly virtual, since that supertype may
+  declare it virtual and [class.virtual]/2 makes an overrider virtual without saying so (`hierarchy.virtual`). A
+  member of a subclass with the member's name and signature then overrides it (`supertype`), as it overrides a
+  member the unit declares `virtual`. In C++ a bare call inside
   a class walks out to the enclosing classes' static members. A Go method set compares methods by
   name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
   alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
@@ -1034,7 +1056,8 @@ The provider publishes one row of each of its six capabilities per unit, at the 
   visibility macro) is counted on the `calls` row.
 
 The `calls` row always carries the unit's site counts, which add up: `sites` = `bound_sites` + `open_sites` +
-`computed_sites` + `external_sites`. A bound site has at least one target of the unit; an external site reached only
+`computed_sites` + `external_sites`; `reflective_sites` counts the external sites that call a reflection API
+(`reflective`), whose open-site node is published beside their call. A bound site has at least one target of the unit; an external site reached only
 external nodes or was proven to leave the project; a computed site has a callee that names nothing; every other site
 is open. The `imports` row carries `resolved_imports`, the imports resolved to at least one file, and
 `open_import_sites`.

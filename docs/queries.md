@@ -159,7 +159,35 @@ and `callers Animal.sound` never lists `direct`, whose call can only run
 `Dog.sound`. `callees speak` lists `Animal.sound` and then every override of it,
 at any depth, marked `may_dispatch` and counted as `may_dispatch`. A site bound
 by value flow to several classes is marked `value_set` with its set size ("1
-of 2"). `path` and a forward `impact` take the same downward step, a path
+of 2"). A call through a function pointer, a function value or a field is bound
+to the targets the project's own code gives it (the functions of its type whose
+address the project takes, the function values that reach it, the functions
+written to the field), and a value from outside the project may hold another:
+it is marked `value_set` even with one target ("1 of 1"), never shown as a
+direct call. A Java call of an interface's abstract method binds that method,
+`virtual`, and beside it each method reference that is an object of the
+interface: one whose target type, where the declaration, assignment, cast or
+return it is written in states one, is that interface or a subinterface, and
+one whose target type the context does not state.
+
+**Overrides outside the project.** The overrides an answer lists or counts are
+the project's own. When code outside the indexed project can override a base
+method — a method of a type outside the project, or one its language leaves
+open (a public or protected Java method of a public class that is neither
+final nor sealed, or of a public interface; an exported method of an exported
+Go interface of an importable package; a method of an exported TypeScript or
+JavaScript class or interface that is not private or static; a Python method
+unless it or its class is `final` or its name is mangled; a method of a `pub`
+Rust trait; a C++ member of a non-final class a header declares, unless static
+or final) — each `through_base` and `may_dispatch` row through it is marked
+`open`, `counts.open_base` counts them, and a notice names the base. A
+`callees` answer names, the same way, an open method a virtual call reaches
+that no override of the project implements, and `impact` of an open method
+says a change to it also affects the overrides written outside. A final,
+sealed, private, static or unexported base, or one of a package-private,
+internal or `main` package type, is closed and carries none of it.
+
+`path` and a forward `impact` take the same downward step, a path
 only from a call that can dispatch, at that call's cost even when a cheaper
 exact call reaches the same method; `impact` of a method lists the methods
 overriding it; `refs` of a method includes the references of every method in
@@ -188,8 +216,16 @@ Java and Rust, with parameters that take the call's arguments. Each is a
 - `callers` lists, after the precise callers, the callers of every open site
   the symbol is a candidate of, and counts them as `may_call` beside
   `open_sites`; with no caller at all, by analysis or by name, the notice
-  quotes the linker's site counts (sites, bound, open, computed, external)
-  rather than reporting a bare zero.
+  quotes the linker's site counts (sites, bound, open, computed, external,
+  reflective) rather than reporting a bare zero. When the project has
+  reflective call sites, every `callers` answer says how many: a call of a
+  reflection API that runs a method chosen at run time (Java's
+  `Method.invoke`, `Constructor.newInstance`, `Class.newInstance` and the
+  `MethodHandle` invocations, Go's `reflect.Value.Call` and `CallSlice`)
+  calls that API's external method and is also an open site of reason
+  `reflective`, and a method it reaches cannot list it. A reflective site's
+  callee is the API's name, so it has no candidates, as a computed one has
+  none.
 - `callees` lists the open-site node and then its candidates, nearest first:
   the same file, the same directory, a file the call's file imports or is
   imported by, the same unit, then anywhere.
