@@ -58,3 +58,49 @@ app.use((err, req, res, next) => {
 		"rq.query.token -> check",
 	})
 }
+
+// TestGinAndEchoContextReads is each gin `*gin.Context` and echo
+// `echo.Context` parameter read in its function's body: the getters keyed by
+// their literal argument, a bind by the part its name binds, the request
+// through net/http's table, and nothing for the route's own template or the
+// context's store. Mutations caught: the gin table not read (no gin line),
+// the echo pointer form required (the v4 interface parameter reads nothing),
+// the bind suffix ignored (ShouldBindJSON combined), the request's sub-table
+// not followed (`c.Request.Header.Get` lost), and echo's Path, the route's
+// template, modelled as a read.
+func TestGinAndEchoContextReads(t *testing.T) {
+	checkInputs(t, "main.go", `package main
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/labstack/echo/v4"
+)
+
+func show(c *gin.Context) {
+	id := c.Param("id")
+	var in struct{}
+	_ = c.ShouldBindJSON(&in)
+	_ = c.Request.Header.Get("X-Key")
+	_ = c.Request.Context()
+	_ = c.FullPath()
+	c.JSON(200, id)
+}
+
+func list(c echo.Context) error {
+	_ = c.QueryParams().Get("page")
+	_ = c.Request().Header.Get("X-Trace")
+	_ = c.Path()
+	_ = c.Get("user")
+	return c.Bind(nil)
+}
+`, []string{
+		"list echo combined  | c.Bind(nil)",
+		"list echo header X-Trace | c.Request().Header.Get(\"X-Trace\")",
+		"list echo query page | c.QueryParams().Get(\"page\")",
+		"show gin body  | c.ShouldBindJSON(&in)",
+		"show gin header X-Key | c.Request.Header.Get(\"X-Key\")",
+		"show gin path id | c.Param(\"id\")",
+		"c.Param(\"id\") -> id",
+		"c.ShouldBindJSON(&in) -> in",
+	})
+}

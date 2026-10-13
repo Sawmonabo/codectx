@@ -106,7 +106,7 @@ var (
 // inputGetters are the getter methods whose first literal argument is the
 // key a keyed member reads (`request.args.get("id")`, `r.Header.Get("X")`).
 var inputGetters = map[string]bool{"get": true, "getlist": true, "get_all": true, "getall": true, "getAll": true,
-	"Get": true, "Values": true}
+	"Get": true, "Values": true, "ByName": true}
 
 // inputScan is the state of one file's request-input table.
 type inputScan struct {
@@ -139,6 +139,7 @@ func (b *builder) requestInputs() error {
 		s.express()
 	case "go":
 		s.goRequests()
+		s.goContexts()
 	case "java":
 		s.spring()
 	}
@@ -215,7 +216,9 @@ func (s *inputScan) reads(fw string, recv []string, table inputTable, lo, hi int
 			continue
 		}
 		src, key, last, ok := s.member(table, i+n, hi)
-		if !ok {
+		if !ok || src == "" {
+			// A member that only leads to others (gin's Request field)
+			// reads nothing on its own.
 			continue
 		}
 		s.add(fw, src, key, s.toks[i].start, s.toks[last].end)
