@@ -285,7 +285,8 @@ There is no mode that writes product output into expectations, because that is t
   fix round the open cases' full findings and only the held-out aggregates (counts per capability × language),
   never a held-out case id or row. After run 2 they are committed under `internal/eval/testdata/` like the rest.
 - **Renamed copies.** Every authored name in a project is built from invented roots (`zorbel`, `quintac`) that occur
-  nowhere else and are not words of any language, library or framework. Each case file lists its roots. For each
+  nowhere else and are not words of any language, library or framework. Roots are distinct, and none is part of
+  another, so the substitution is unambiguous. Each case file lists its roots. For each
   run the runner draws a fresh seed, maps every root to a new invented root of the same length, and substitutes it
   in every file's contents, in file and directory names, in the refresh edit steps and in the case file, keeping
   each occurrence's letter case (`zorbel`, `Zorbel`, `ZORBEL`) so exported and unexported names keep their meaning. It also inserts a block of comment lines at the top of every
@@ -293,9 +294,12 @@ There is no mode that writes product output into expectations, because that is t
   renamed expectation follows from the original by the same substitution, and the renamed copy is scored like the
   original. Names a language, library or framework gives meaning to (`main`, `__init__`, `Default`, `toString`,
   manifest keys) are never roots.
-  - **Scored on the copy.** Every case, except the byte totals of the repository map and the byte floors of
-    `CTX_MINIMUM_BUDGET`, which the comment block legitimately changes. Order rules are constraints (6.4), so a
-    tie broken by name still holds under new names.
+  - **Scored on the copy.** Every case of the location-matched capabilities: graph answers, structure, symbol
+    resolution, the exact search tiers, dependence, routes, manifests, read source (against the renamed file) and
+    the capability counts. Order rules are constraints (6.4), so a tie broken by name still holds under new names.
+  - **Not scored on the copy,** because the comment block legitimately changes them: lexical ranking, context
+    budgets and slices, byte totals in the repository map and `unanchored` references. The refresh and
+    determinism checks (7.19) run on the original only.
   - **The flag.** A case that is `exact` on the original and not on the copy is flagged `name_dependent` (S1): the
     product answered from something other than the code's meaning.
   - **Why it works.** A fix keyed on a golden name, file or layout fails a copy whose names it has never seen, and
@@ -625,8 +629,8 @@ The expected answer for each construct:
 | Python `getattr(obj, expr)()`, computed name | an open site, `computed`, no candidates | none |
 | C++ ADL, `swap(a, b)` with `a` of type `ns::T` | exact `calls` to `ns::swap`: the compiler's lookup picks one function | 1 |
 | C++ ADL inside a template, argument types depending on `T` | an open site with candidates named `swap`. Recommended contract addition: a reason `dependent` for a name whose meaning waits on a type parameter (also Rust and TS calls on an unbounded generic); until it exists the case expects `global_unbound` | 3 |
-| C function-like macro `#define LOG(x) log_impl(__FILE__, x)`; `LOG(msg)` | exact `calls` from the enclosing function to the macro `LOG`, as the product binds today, plus `calls` from `LOG` to `log_impl`, so callers, paths and impact reach through the macro. A further macro inside the replacement chains the same way | 1 |
-| C11 `_Generic((x), int: iabs, double: dabs)(x)` | exact `calls` to the selected function when `x`'s declared type is known; otherwise one row per listed function with `value_set` and `set_size` n, never `may_call`. Inside a type-generic macro, plus the macro chain above | 1, else 2 |
+| C function-like macro `#define LOG(x) log_impl(__FILE__, x)`; `LOG(msg)` | exact `calls` from the enclosing function to the macro `LOG`, as the contract binds a call of a function-like macro. `LOG` → `log_impl` runs but the contract does not publish calls inside a replacement, so it is a `truth.runs_unlisted` row. Recommended contract addition: publish `calls` from the macro to the calls its replacement makes, so callers, paths and impact reach through it, as macro-aware indexers do | 1 |
+| C11 `_Generic((x), int: iabs, double: dabs)(x)` | exact `calls` to the selected function when `x`'s declared type is known; otherwise one row per listed function with `value_set` and `set_size` n, never `may_call`. Inside a type-generic macro, plus the macro row above | 1, else 2 |
 | Rust `Default::default()` or `T::default()`, concrete type inferred | exact `calls` to that type's `impl Default` `default` | 1 |
 | Rust `T::default()` with `T: Default` generic | `calls` to the trait method, `virtual`, with the project's impls as `may_dispatch` | 2 |
 | Rust `w.m()` through a custom `Deref` | `calls` to `m` on the `Deref` target type. The compiler's implicit `deref` call is not call syntax, so it is recorded in the truth lens (A9) | 1 |
@@ -1041,7 +1045,7 @@ itself when the cases are written.
 | `static` functions with one name in 30 files | each file's call binds to its own (internal linkage); others `prohibited` |
 | `extern` declaration in a header, definition in `a.c`, call in `b.c` | binds to the definition |
 | `#define LOG log_impl` (object-like) | the macro's call calls `log_impl` (`Decl.Alias`) |
-| Function-like `#define LOG(x) log_impl(__FILE__, x)` | `calls` to `LOG`, and `LOG` `calls` `log_impl` (A12, 7.8.1) |
+| Function-like `#define LOG(x) log_impl(__FILE__, x)` | `calls` to `LOG`; `LOG` → `log_impl` in the truth lens until the contract publishes it (A12, 7.8.1) |
 | `_Generic((x), int: iabs, double: dabs)(x)` | exact to the selected function, else the listed set with `set_size` (A12, 7.8.1) |
 | `qsort(a, n, sz, cmp)` | `cmp` is a reference, not a call from the caller |
 | `#include MACRO` with the macro undefined | open import site |
@@ -1384,7 +1388,7 @@ report.
 | A9 | Decorators, properties, operators, JSX elements, TS standard decorators | not calls in the contract; truth lens records them | the contract binds call syntax only; the truth lens shows the cost (`obj()` with `__call__` is call syntax and is bound) |
 | A10 | TS overloads, `.pyi` stubs, C/C++ prototypes | calls bind to the implementation or definition | that is what runs; the signature nodes stay as declarations |
 | A11 | Type-only imports | `imports` row published | it is a module dependency an impact walk needs |
-| A12 | Calls whose target depends on run-time values: `call`, `apply`, `bind`, `getattr`, ADL, function-like macros, `_Generic`, Rust inference and `Deref`, mixins | the per-construct answers of 7.8.1; one contract addition proposed, a `dependent` reason | what code-intelligence systems return and what the call-graph and tool-use research supports (research 30, section 11) |
+| A12 | Calls whose target depends on run-time values: `call`, `apply`, `bind`, `getattr`, ADL, function-like macros, `_Generic`, Rust inference and `Deref`, mixins | the per-construct answers of 7.8.1; two contract additions proposed: a `dependent` reason, and `calls` from a function-like macro to the calls in its replacement | what code-intelligence systems return and what the call-graph and tool-use research supports (research 30, section 11) |
 | A13 | Interface merging and namespace-class merging | one node per declaration site | identity is file plus descriptor path |
 | A14 | The scorer self-consistency guard | kept | it guards the scorer at no cost; it is an assertion inside the run, not a test file |
 | A15 | Times in the report | local time with offset | the reader's clock |
