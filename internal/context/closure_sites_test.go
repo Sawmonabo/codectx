@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -98,5 +99,56 @@ func TestASiteOutsideTheKeptFilesLendsOnlyItsKeptCandidates(t *testing.T) {
 	}
 	if in.scope.CandidatesUnavailable != "" {
 		t.Fatalf("the candidate lookup answered unavailable: %s", in.scope.CandidatesUnavailable)
+	}
+}
+
+// undeclaredReader hides the declaration lookup: embedding the interface
+// alone drops every optional seam of the reader it wraps.
+type undeclaredReader struct{ graph.GraphReader }
+
+// TestAClosureOverAReaderWithoutTheLookupSaysCandidatesAreUnavailable pins the
+// closure's side of the "unavailable, never none" rule: when the reader cannot
+// look declarations up by name, the impact walk that finds the naming sites is
+// refused as unavailable, and the closure starts at the unreached nodes alone
+// and records why, so the plan's notice says the name-only candidates are
+// unavailable instead of the compile failing or the sites silently reading as
+// none.
+//
+// Mutations caught: withNamingSites passing the refusal on as a compile error
+// (the call fails), or swallowing it without recording why (no reason is
+// recorded for the plan's notice).
+func TestAClosureOverAReaderWithoutTheLookupSaysCandidatesAreUnavailable(t *testing.T) {
+	fx := newFixtureFrom(t, openSiteSpecs(), openSiteScope)
+	site, err := json.Marshal(model.OpenSiteMetadata{Resolution: model.ResolutionUnresolved,
+		Reason: model.ReasonReceiverUntyped, Shape: model.CallShapeMember, Arguments: 0})
+	if err != nil {
+		t.Fatalf("marshal open-site metadata: %v", err)
+	}
+	eng, release := openSiteEngineOver(fx, map[model.NodeID]json.RawMessage{fx.Node(siteNode): site},
+		func(r graph.GraphReader) graph.GraphReader { return undeclaredReader{r} })
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Errorf("release the site engine: %v", err)
+		}
+	})
+	c := intCompiler(t, fx, fx.Now)
+	in, err := c.newSeedIngest(openSorts(t, fx.Cfg))
+	if err != nil {
+		t.Fatalf("newSeedIngest: %v", err)
+	}
+	target := fx.Node(siteTarget)
+	run, err := c.withNamingSites(fx.ctx, in, eng, fx.Gen, []string{string(target)}, false)
+	if err != nil {
+		t.Fatalf("withNamingSites over a reader without the lookup: %v", err)
+	}
+	got := map[string]bool{}
+	if err := run.Each(func(r idRec) error { got[r.ID] = true; return nil }); err != nil {
+		t.Fatalf("read the start set: %v", err)
+	}
+	if !got[string(target)] || len(got) != 1 {
+		t.Fatalf("the closure starts at %v, want the unreached node %s alone", got, target)
+	}
+	if in.scope.CandidatesUnavailable == "" {
+		t.Fatal("the closure read no naming site and recorded no reason: the plan would read as having none")
 	}
 }

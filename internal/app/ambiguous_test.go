@@ -14,18 +14,19 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// TestAnAmbiguousNameCountsAndNamesEveryCandidate indexes forty packages that
-// each declare a function of the same name and resolves that name. The
-// rejection must carry the exact number of candidates, forty, and name every
-// one of them: the operator picks from that list, and a list cut at a
-// presentation bound with a fetched-bound-plus-one total misstates both how
-// many there are and which ones exist.
+// TestAnAmbiguousNameCountsAndNamesEveryCandidate indexes more packages than
+// one page holds, each declaring a function of the same name, and resolves
+// that name. The rejection must carry the exact number of candidates and,
+// first, the command that lists every one of them, so the remediation's byte
+// bound can never cut either; it must state how many candidates it names, name
+// exactly those -- the first by node id -- and no other.
 //
-// Mutation that fails it: fetch a fixed number of candidates and one more,
-// as a bounded lookup would (the count reads as that bound plus one and the
-// candidates past it are named nowhere).
+// Mutations that fail it: count by fetching a page bound and one more, as a
+// bounded lookup would (the count reads 201, not 205); place the `codectx
+// symbol` pointer after the names, where the bound cuts it; let the bound cut
+// the list mid-name, or claim more or fewer names than the text holds.
 func TestAnAmbiguousNameCountsAndNamesEveryCandidate(t *testing.T) {
-	const packages = 40
+	const packages = model.MaxPageItems + 5
 	ctx := context.Background()
 	home := t.TempDir()
 	repo := filepath.Join(home, "repo")
@@ -96,9 +97,29 @@ func TestAnAmbiguousNameCountsAndNamesEveryCandidate(t *testing.T) {
 	if got := typed.Details["candidates"]; got != strconv.Itoa(packages) {
 		t.Fatalf("the rejection counts %s candidates, want exactly %d", got, packages)
 	}
-	for _, id := range want {
-		if !strings.Contains(typed.Remediation, string(id)[:12]) {
-			t.Fatalf("candidate %s is named nowhere in the rejection: %s", id, typed.Remediation)
+	lead := strconv.Itoa(packages) + " nodes carry this name; `codectx symbol \"Duplicated\"` lists every match"
+	if !strings.HasPrefix(typed.Remediation, lead) {
+		t.Fatalf("the rejection does not open with the count and the listing command %q: %s", lead, typed.Remediation)
+	}
+	if len(typed.Remediation) > model.MaxDetailBytes {
+		t.Fatalf("the remediation is %d bytes, past the %d-byte bound", len(typed.Remediation), model.MaxDetailBytes)
+	}
+	named, err := strconv.Atoi(typed.Details["candidates_named"])
+	if err != nil || named < 1 || named >= packages {
+		t.Fatalf("candidates_named = %q, want a count of the names shown, at least one and fewer than %d",
+			typed.Details["candidates_named"], packages)
+	}
+	if want := "the first " + strconv.Itoa(named) + " by node id being: "; !strings.Contains(typed.Remediation, want) {
+		t.Fatalf("the rejection does not state that it names the first %d: %s", named, typed.Remediation)
+	}
+	for i, id := range want {
+		shown := strings.Contains(typed.Remediation, string(id)[:12])
+		if i < named && !shown {
+			t.Fatalf("candidate %d (%s) is one of the %d the rejection says it names, and it is named nowhere: %s",
+				i, id, named, typed.Remediation)
+		}
+		if i >= named && shown {
+			t.Fatalf("candidate %d (%s) is named past the %d the rejection says it names: %s", i, id, named, typed.Remediation)
 		}
 	}
 }

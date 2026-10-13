@@ -19,15 +19,18 @@ import (
 // Publication. Every fact names its entry and its target by identity
 // (idBinding), and the members are walked in FileID order, so publication is
 // the external nodes, then two ordered merges of the facts with the members,
-// each reading only the tables of the members it republishes, one at a time:
+// each reading only what it needs of the members it republishes, one at a
+// time:
 //
 //  0. every external node any fact of the unit targets, carried or fresh,
 //     with evidence that names no file: the node is no member's, so the
 //     build replaces the unit's index-level bucket and it is published again
 //     on every run (externalsOf);
 //  1. the nodes the facts target, by target, with the members: a republished
-//     member's targeted declarations, module and parameters are found in its
-//     table by node and their occurrences published;
+//     member's targeted declarations, module and parameters are found by node
+//     among the endpoints the resolution spilled when it read the member's
+//     table (target_spill.go), or else in its table, and their occurrences
+//     published;
 //  2. the facts, by entry, with the members: a republished member's call
 //     sites publish their `calls` (or their open-site node and the caller's
 //     `calls` to it), their argument flows and the occurrences of the
@@ -69,6 +72,9 @@ type publisher struct {
 	// nil publishes every member's facts.
 	republished *pagination.SortedRun[model.FileID]
 	prev        *pagination.SortedRun[record]
+	// spilled is the targetable endpoints the resolution spilled
+	// (target_spill.go), nil when it spilled none.
+	spilled *pagination.SortedRun[spilledEndpoint]
 	// cov is the unit's coverage, summed over the members' records.
 	cov     coverage
 	records uint64
@@ -218,6 +224,11 @@ func (p *publisher) publishTargets(targets *pagination.SortedRun[target]) error 
 		return err
 	}
 	defer stopRep()
+	spilled, err := newSpilledTargets(p.spilled)
+	if err != nil {
+		return err
+	}
+	defer spilled.close()
 	err = p.u.members(func(fv model.FileVersion) error {
 		if ok && cur.File < fv.ID {
 			return notMember("target", cur.File)
@@ -229,17 +240,12 @@ func (p *publisher) publishTargets(targets *pagination.SortedRun[target]) error 
 		if err != nil {
 			return err
 		}
-		var t *Table
 		var byNode map[model.NodeID]Endpoint
+		var language string
 		if publish {
-			var has bool
-			if t, has, err = p.u.tables.Table(p.ctx, p.u.gen, fv); err != nil {
+			if byNode, language, err = p.targetableOf(spilled, fv); err != nil {
 				return err
 			}
-			if !has {
-				return internalErr("a fact targets a node of " + fv.Path + ", which has no link table")
-			}
-			byNode = targetable(t)
 		}
 		var nodes []model.NodeFact
 		for ok && cur.File == fv.ID {
@@ -248,7 +254,7 @@ func (p *publisher) publishTargets(targets *pagination.SortedRun[target]) error 
 				if !found {
 					return internalErr("a fact targets node " + string(cur.Node) + ", which the link table of " + fv.Path + " does not declare")
 				}
-				nodes = append(nodes, p.occurrenceFact(occurrenceOf(fv, t, e)))
+				nodes = append(nodes, p.occurrenceFact(occurrence{Endpoint: e, File: fv.ID, Hash: fv.ContentHash, Language: language}))
 			}
 			if cur, ok, err = next(); err != nil {
 				return err
@@ -446,6 +452,9 @@ func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pa
 		if err := p.put(f.nodes, f.rels); err != nil {
 			return err
 		}
+		if err := p.putSearch(f.search); err != nil {
+			return err
+		}
 		return p.keep(records, rec)
 	})
 	if err != nil {
@@ -481,6 +490,9 @@ type filePublication struct {
 	// (noteNested).
 	nestRets map[int32][]model.NodeID
 	nestOuts map[int32]nestedOut
+	// search are the search documents of the endpoints the file mints
+	// (route_search.go), handed to the sink after its nodes.
+	search []model.SearchUnit
 }
 
 // site publishes the facts of site i, group: one `calls` per distinct

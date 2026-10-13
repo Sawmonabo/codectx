@@ -129,8 +129,8 @@ var (
 	closureMarkers = map[Family][]string{
 		FamilyC:          {"compile_commands.json", "CMakeLists.txt", "Makefile"},
 		FamilyGo:         {"go.sum"},
-		FamilyJava:       {"settings.gradle", "settings.gradle.kts", "gradle.lockfile"},
-		FamilyJavaScript: {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock"},
+		FamilyJava:       {"settings.gradle", "settings.gradle.kts", "gradle.lockfile", "buildscript-gradle.lockfile"},
+		FamilyJavaScript: {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock"},
 		FamilyPython:     {"requirements.txt", "requirements-dev.txt", "poetry.lock", "Pipfile.lock", "uv.lock", "pylock.toml", "pdm.lock"},
 		FamilyRust:       {"Cargo.lock"},
 	}
@@ -381,7 +381,8 @@ func (u Unit) OwnsInput(p string) bool {
 		// referenced tsconfig.app.json) is an input.
 		return true
 	}
-	return slices.Contains(projectMarkers[u.Family], base) || slices.Contains(closureMarkers[u.Family], base)
+	return slices.Contains(projectMarkers[u.Family], base) || slices.Contains(closureMarkers[u.Family], base) ||
+		u.Family == FamilyPython && namedPylock(base)
 }
 
 // ScopeKeyPrefix is what every scope key of a family begins with, and the one

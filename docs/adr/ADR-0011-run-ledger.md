@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-09-16. Amended 2026-10-08: the hosted dependence engine this record governs was deleted under ADR-0012 phase 6.
+Accepted, 2026-09-16. Dependence facts are produced in process by the native engine ([ADR-0012](ADR-0012-native-dependence-engine.md)); the stages below that name a dependence provider describe the context this record was decided in.
 
 ## Context
 
@@ -131,6 +131,14 @@ nothing. A run's account therefore lasts as long as what it built, or any older 
 index run whose generation a deferred publication supersedes on the same ref goes with that
 generation unless an older retained ref's run precedes it, and the deferred run is then the one
 behind the active store.
+
+A ledger file another schema wrote is never migrated, refused or half-read. Its rows are keyed by the build that
+wrote them (`NeedKey.Build`), so no other build could use them: a writer, which holds the workspace lock, removes the
+file with its write-ahead log and shared-memory files, logs one line naming the fingerprint it found, and creates an
+empty ledger of its own schema; a reader, which holds no lock, reads the file as a workspace that has recorded no run.
+A process waiting for the workspace whose holder records into such a file cannot read its progress, so it refuses at
+once with a retryable `CTX_WORKSPACE_BUSY` naming the holder rather than spending the liveness grace. The index store
+is different: its schema refusal stays, because it is expensive to rebuild.
 
 A run whose writer died is read, never rewritten, as the collector would have closed it: the run
 and every span it left running read as interrupted with no wall, and every unit it left planned

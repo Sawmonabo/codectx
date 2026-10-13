@@ -56,6 +56,11 @@ type hierarchy struct {
 	// goSurface is the digest of what the build read from the packages
 	// outside a Go unit (goExternal.surface), empty for any other unit.
 	goSurface string
+	// goSpellings counts the unit's Go methods by how exactly their
+	// method-set keys spell their signatures (goMethodKey).
+	goSpellings [3]uint32
+	// goMemo remembers Go lookups while the hierarchy is built (goMemo).
+	goMemo goMemos
 	// members is every member's projection with a table, by FileID
 	// (projection.go).
 	members *pagination.SortedRun[projection]
@@ -500,9 +505,12 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 			return nil, err
 		}
 		h.goSurface = h.goExt.surface()
+		// The memos answer for this build's indexes and packages alone.
+		h.goMemo = goMemos{}
 		defer func() {
 			h.goExt.close()
 			h.goExt = nil
+			h.goMemo = goMemos{}
 		}()
 	}
 
@@ -532,6 +540,13 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 	})
 	if err != nil {
 		return nil, err
+	}
+	if h.goExt != nil {
+		err := links.Add(entry{Key: keyGoCoverage, Tag: 1, MinArgs: h.goSpellings[goSpellingUnresolved],
+			MaxArgs: h.goSpellings[goSpellingUnknown]})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := h.satisfy(u.dir, links, methodSets); err != nil {
 		return nil, err
@@ -581,9 +596,19 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
 		return err
 	}
+	if err := addCIncludes(s, file, t, fc); err != nil {
+		return err
+	}
 	for _, imp := range t.Imports {
 		if imp.Name == "" {
 			continue
+		}
+		if fc.family == "go" && imp.Name != ImportAll {
+			// The file's named imports listed together, which a Go
+			// identity read in a context from the index needs (goUnitNames).
+			if err := s.Add(entry{Key: keyImport + fileKey + goImportList, Aux: imp.Path, Sig: imp.Name}); err != nil {
+				return err
+			}
 		}
 		e := entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}
 		if imp.Syntax == ImportRequire {
@@ -639,6 +664,11 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 		}
 		if fc.family == "go" && strings.HasPrefix(d.Identity, "=") && isType(d.Kind) {
 			if err := s.Add(entry{Key: keyGoAlias + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
+				return err
+			}
+		}
+		if fc.family == "go" && strings.HasPrefix(d.Identity, "#") && d.Kind == model.NodeConstant {
+			if err := s.Add(entry{Key: keyGoConst + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
 				return err
 			}
 		}
@@ -836,6 +866,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		if p := d.Parent; !d.Described && p >= 0 && t.Decls[p].Kind == model.NodeInterface {
 			e.Flags |= flagAbstract
 		}
+		counted := false
 		add := func(typ Ref) error {
 			e.Key = keyMethod + refKey(typ) + d.Name
 			if err := links.Add(e); err != nil {
@@ -844,9 +875,15 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			if fc.family != "go" {
 				return nil
 			}
-			key, err := goMethodKey(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref)
+			key, spelling, err := goMethodKey(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref)
 			if err != nil {
 				return err
+			}
+			if !counted {
+				// A method is counted once, whatever types its receiver
+				// names.
+				h.goSpellings[spelling]++
+				counted = true
 			}
 			return addGoMethod(methodSets, typ, d.Name, key, e)
 		}
@@ -2571,6 +2608,30 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 				return err
 			}
 		default:
+			full, err := h.pythonFullMRO(owner)
+			if err != nil {
+				return err
+			}
+			if full != nil {
+				// The first class along the order, bases outside the unit
+				// placed, that defines the method (PEP 698); a base outside
+				// the unit ahead of it is externalOverrides'.
+				for _, base := range full[1:] {
+					if base.external != "" {
+						continue
+					}
+					if err := h.methods(base.ref, d.Name, func(e entry) error {
+						add(e)
+						return nil
+					}); err != nil {
+						return err
+					}
+					if len(targets) > 0 {
+						break
+					}
+				}
+				break
+			}
 			order, err := h.pythonMRO(owner)
 			if err != nil {
 				return err

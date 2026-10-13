@@ -154,13 +154,18 @@ func storedList(ctx context.Context, r GraphReader, nodes []model.NodeID, direct
 }
 
 // possibleRows computes a walk's possible rows from its start nodes. With
-// through set the rows' far ends are walked on, up to depth hops.
+// through set the rows' far ends are walked on, up to depth hops. A reader
+// that cannot list candidates is refused, never answered with no rows: the
+// caller decides whether its answer refuses or discloses (nameOnlyUnavailable).
 func (e *Engine) possibleRows(ctx context.Context, r GraphReader, mode tailMode, starts []model.NodeID,
 	through bool, depth int) (possibleList, error) {
 	var list possibleList
-	dr := declarationReader(r)
-	if dr == nil || mode == tailNone {
+	if mode == tailNone {
 		return list, nil
+	}
+	dr := declarationReader(r)
+	if dr == nil {
+		return list, candidatesUnavailable()
 	}
 	repo := r.Binding().RepositoryID
 	at := map[model.RelationID]int{}
@@ -1104,10 +1109,14 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 // scratch ends with that request. A deadline that lands inside it ends the
 // expansion and the answer is marked truncated (impactPhaseError), exactly as
 // before; there is no partial expansion for a continuation to resume.
+//
+// A reader without the declaration seam cannot list any open site's
+// candidates, so the expansion answers what Candidates answers on that reader:
+// unavailable, never an empty expansion that reads as "no possible callers".
 func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.ImpactRequest, maxDepth config.Limit,
 	retain *retainedWalk) (err error) {
 	if declarationReader(r) == nil {
-		return nil
+		return candidatesUnavailable()
 	}
 	var modes []tailMode
 	switch req.Direction {

@@ -101,6 +101,14 @@ func (g declaredMemoryGraph) FileNodes(ctx stdcontext.Context,
 // the generation pin that lookup reads through.
 func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) (*graph.Engine, func() error) {
 	fx.t.Helper()
+	return openSiteEngineOver(fx, meta, func(r graph.GraphReader) graph.GraphReader { return r })
+}
+
+// openSiteEngineOver is openSiteEngine with the packed reader passed through
+// wrap first, so a test can take a seam away from the reader the walk reads.
+func openSiteEngineOver(fx *contextFixture, meta map[model.NodeID]json.RawMessage,
+	wrap func(graph.GraphReader) graph.GraphReader) (*graph.Engine, func() error) {
+	fx.t.Helper()
 	adj := &scopeAdjacency{binding: fx.Binding, nodes: map[model.NodeID]model.Node{},
 		relations: append([]model.Relation(nil), fx.Rels...), caps: fixtureCapabilities}
 	for _, spec := range fx.Specs {
@@ -137,7 +145,7 @@ func openSiteEngine(fx *contextFixture, meta map[model.NodeID]json.RawMessage) (
 		fx.t.Fatalf("the store's graph reader does not look declarations up by name")
 	}
 	reader := declaredMemoryGraph{MemoryGraph: scopeMemoryGraph(adj), store: declarations, nodes: adj.nodes}
-	eng, err := graph.New(graph.Options{Adjacency: adj, Reader: reader,
+	eng, err := graph.New(graph.Options{Adjacency: adj, Reader: wrap(reader),
 		Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{

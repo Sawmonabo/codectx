@@ -175,7 +175,7 @@ func jsonSpans(data []byte, tables []string) (jsonLayout, error) {
 			if inner != nil {
 				out.nested[key] = inner
 			}
-		} else if err := skipValue(dec, 0); err != nil {
+		} else if err := skipValue(dec, 1); err != nil {
 			return out, err
 		}
 		out.top[key] = span{start, int(dec.InputOffset())}
@@ -191,7 +191,7 @@ func innerSpans(dec *json.Decoder, data []byte) (map[string]span, error) {
 	}
 	if tok != json.Delim('{') {
 		if d, ok := tok.(json.Delim); ok && d == '[' {
-			return nil, skipRest(dec, 1)
+			return nil, skipRest(dec, 2)
 		}
 		return nil, nil
 	}
@@ -209,14 +209,16 @@ func innerSpans(dec *json.Decoder, data []byte) (map[string]span, error) {
 			return nil, malformedJSON(nil)
 		}
 		start := keyStart(data, int(dec.InputOffset()))
-		if err := skipValue(dec, 1); err != nil {
+		if err := skipValue(dec, 2); err != nil {
 			return nil, err
 		}
 		out[key] = span{start, int(dec.InputOffset())}
 	}
 }
 
-// skipValue consumes one value of any type at the given nesting depth.
+// skipValue consumes one value of any type. depth is the nesting depth of
+// the object or array holding the value, the document's top-level object
+// being 1.
 func skipValue(dec *json.Decoder, depth int) error {
 	tok, err := dec.Token()
 	if err != nil {
@@ -228,10 +230,12 @@ func skipValue(dec *json.Decoder, depth int) error {
 	return nil
 }
 
-// skipRest consumes tokens until the container opened at depth closes.
+// skipRest consumes tokens until the container just opened closes. depth
+// is that container's nesting depth; the parser bound applies to every
+// container opened inside it.
 func skipRest(dec *json.Decoder, depth int) error {
-	for depth > 0 {
-		if depth > maxJSONDepth {
+	for open := 1; open > 0; {
+		if depth+open-1 > maxJSONDepth {
 			return &model.Error{Code: model.CodeResourceLimit, Message: "the JSON manifest nests deeper than the parser bound"}
 		}
 		tok, err := dec.Token()
@@ -241,9 +245,9 @@ func skipRest(dec *json.Decoder, depth int) error {
 		if d, ok := tok.(json.Delim); ok {
 			switch d {
 			case '{', '[':
-				depth++
+				open++
 			default:
-				depth--
+				open--
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package context
 
 import (
+	"errors"
 	"io/fs"
 	"math/rand"
 	"os"
@@ -426,9 +427,13 @@ func TestCompileSortsReleaseEveryRun(t *testing.T) {
 }
 
 // pooledRunFiles counts the sort-run surfaces the scratch pool under dir holds,
-// across every instance directory in it.
+// across every instance directory in it; a pool nothing has spilled into yet
+// holds none.
 func pooledRunFiles(t *testing.T, dir string) int {
 	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, "scratch")); errors.Is(err, fs.ErrNotExist) {
+		return 0
+	}
 	n := 0
 	err := filepath.WalkDir(filepath.Join(dir, "scratch"), func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

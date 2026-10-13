@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -27,17 +29,22 @@ import (
 //     declared on (its receiver's type arguments, an interface's type
 //     parameter list), counted from 0, so `func (s *Set[T]) Add(v T)` and
 //     `interface[E any]{ Add(E) }` spell their parameter alike;
-//   - the punctuation and keywords of a type literal: `*`, `[`, `]`, an
-//     array's length when it is an integer literal, `map`, `chan`, `<-`,
-//     `func`, `(`, `)`, `,`, `...`, and `struct{}` and `interface{}` for the
-//     empty struct and the empty interface.
+//   - the punctuation and keywords of a type literal: `*`, `[`, `]`, `map`,
+//     `chan`, `<-`, `func`, `(`, `)`, `,`, `...`, `struct{}` and
+//     `interface{}` for the empty struct and the empty interface;
+//   - an array's length as its decimal value for an integer literal, or
+//     `[#` and its constant expression (constForm) `]`;
+//   - a struct or interface literal with members as `struct{` or
+//     `interface{`, its fields or elements separated by `;` (`@name` a
+//     field's or method's name, `^` an embedded one, `#"tag"` a field's
+//     tag), and `}` (structType, interfaceType).
 //
 // A signature is `(` its parameters' types, one per name, joined by `,` `)`
 // then the results the same way: `func(a, b int) error` is
-// `( .int , .int ) ( .error )`. A type the form cannot spell exactly, a
-// struct or interface literal with members or an array whose length is not
-// an integer literal, makes the whole form "?": the linker then counts the
-// method as one no other method matches, never as a guess.
+// `( .int , .int ) ( .error )`. A type the form cannot spell exactly (a
+// length that is no integer constant expression, a constraint's type
+// element) makes the whole form "?": the linker then counts the method as
+// one no other method matches, never as a guess.
 
 // goIdentityUnknown is the form of a signature or type the form cannot spell
 // exactly.
@@ -48,10 +55,11 @@ const goIdentityUnknown = "?"
 // from each child's own record (goChild).
 type goIdentitySyntax struct {
 	typeAlias, sliceType, arrayType, mapType, channelType, intLiteral, typeArguments, typeElem,
-	typeParameterList, typeParameterDeclaration, argumentList, nilLit, implicitLengthArrayType uint16
+	typeParameterList, typeParameterDeclaration, argumentList, nilLit, implicitLengthArrayType, negatedType,
+	binaryExpression, iota uint16
 
 	fTypeParameters, fTypeArguments, fLength, fElement, fKey, fValue, fType, fName, fPackage, fOperand,
-	fFunction, fArguments, fBody uint16
+	fFunction, fArguments, fBody, fTag uint16
 }
 
 var (
@@ -77,11 +85,12 @@ func goIdentitySyntaxOf() *goIdentitySyntax {
 		s.typeArguments, s.typeElem = kind("type_arguments"), kind("type_elem")
 		s.typeParameterList, s.typeParameterDeclaration = kind("type_parameter_list"), kind("type_parameter_declaration")
 		s.argumentList, s.nilLit = kind("argument_list"), kind("nil")
-		s.implicitLengthArrayType = kind("implicit_length_array_type")
+		s.implicitLengthArrayType, s.negatedType = kind("implicit_length_array_type"), kind("negated_type")
+		s.binaryExpression, s.iota = kind("binary_expression"), kind("iota")
 		s.fTypeParameters, s.fTypeArguments = field("type_parameters"), field("type_arguments")
 		s.fLength, s.fElement, s.fKey, s.fValue = field("length"), field("element"), field("key"), field("value")
 		s.fType, s.fName, s.fPackage, s.fOperand = field("type"), field("name"), field("package"), field("operand")
-		s.fFunction, s.fArguments, s.fBody = field("function"), field("arguments"), field("body")
+		s.fFunction, s.fArguments, s.fBody, s.fTag = field("function"), field("arguments"), field("body"), field("tag")
 		goIdentityTable = s
 	})
 	return goIdentityTable
@@ -179,14 +188,7 @@ func (f *goForm) typ(t Node) {
 		f.tok("]")
 		f.typ(goChild(t, s.fElement))
 	case s.arrayType:
-		n := goChild(t, s.fLength)
-		if !x.is(n, s.intLiteral) {
-			f.ok = false
-			return
-		}
-		f.tok("[")
-		f.tok(x.text(n))
-		f.tok("]")
+		f.arrayLength(goChild(t, s.fLength))
 		f.typ(goChild(t, s.fElement))
 	case s.mapType:
 		f.tok("map")
@@ -209,17 +211,9 @@ func (f *goForm) typ(t Node) {
 		f.tok("func")
 		f.signature(t.ChildByFieldId(k.fParameters), t.ChildByFieldId(k.fResult))
 	case k.structType:
-		if l := firstNamed(t); !l.IsNull() && !firstNamed(l).IsNull() {
-			f.ok = false
-			return
-		}
-		f.tok("struct{}")
+		f.structType(t)
 	case k.interfaceType:
-		if !firstNamed(t).IsNull() {
-			f.ok = false
-			return
-		}
-		f.tok("interface{}")
+		f.interfaceType(t)
 	case k.genericType:
 		f.typ(goChild(t, s.fType))
 		args := goChild(t, s.fTypeArguments)
@@ -243,6 +237,306 @@ func (f *goForm) typ(t Node) {
 	default:
 		f.ok = false
 	}
+}
+
+// arrayLength appends an array type's length n: `[ v ]` for an integer
+// literal of value v, written in decimal, and for a constant expression
+// `[#` its form (goConstForm) `]`, which the linker folds to its value
+// when every constant it names is known ("Array types": the length is part
+// of the type and a constant expression).
+func (f *goForm) arrayLength(n Node) {
+	if f.x.is(n, f.s.intLiteral) {
+		v, ok := goIntLiteral(f.x.text(n))
+		if !ok {
+			f.ok = false
+			return
+		}
+		f.tok("[")
+		f.tok(v)
+		f.tok("]")
+		return
+	}
+	expr, ok := f.x.constForm(n, -1)
+	if !ok {
+		f.ok = false
+		return
+	}
+	f.tok("[#")
+	f.b = append(f.b, expr...)
+	f.tok("]")
+}
+
+// goIntLiteral is the decimal spelling of a Go integer literal's value
+// (binary, octal, hex and underscores read as the specification reads
+// them, "Integer literals").
+func goIntLiteral(lit string) (string, bool) {
+	v, ok := new(big.Int).SetString(lit, 0)
+	if !ok {
+		return "", false
+	}
+	return v.String(), true
+}
+
+// constForm is the form of the integer constant expression e: integer
+// literals in decimal, `iota` as iota (when iota is not negative, the
+// value of iota in the constant declaration e is written in), a constant
+// written unqualified as `.N` and qualified as `:pkg.N`, the operators
+// and parentheses as written; ok is false for any other expression, whose
+// value the form cannot spell.
+func (x *goLink) constForm(e Node, iota int) ([]string, bool) {
+	k, s := x.k, goIdentitySyntaxOf()
+	var out []string
+	var walk func(e Node) bool
+	walk = func(e Node) bool {
+		switch {
+		case e.IsNull():
+			return false
+		case x.is(e, s.intLiteral):
+			v, ok := goIntLiteral(x.text(e))
+			out = append(out, v)
+			return ok
+		case x.is(e, s.iota):
+			if iota < 0 {
+				return false
+			}
+			out = append(out, itoa(iota))
+			return true
+		case x.is(e, k.identifier):
+			out = append(out, "."+x.text(e))
+			return true
+		case x.is(e, k.selectorExpression):
+			pkg, field := goChild(e, s.fOperand), goChild(e, k.fField)
+			if !x.is(pkg, k.identifier) || field.IsNull() {
+				return false
+			}
+			out = append(out, ":"+x.text(pkg)+"."+x.text(field))
+			return true
+		case x.is(e, k.parenExpression):
+			out = append(out, "(")
+			if !walk(firstNamed(e)) {
+				return false
+			}
+			out = append(out, ")")
+			return true
+		case x.is(e, k.unaryExpression):
+			op := e.ChildByFieldId(k.fOperator)
+			if op.IsNull() || !goConstUnary[x.text(op)] {
+				return false
+			}
+			out = append(out, "u"+x.text(op))
+			return walk(goChild(e, s.fOperand))
+		case x.is(e, s.binaryExpression):
+			op := e.ChildByFieldId(k.fOperator)
+			if op.IsNull() || !goConstBinary[x.text(op)] {
+				return false
+			}
+			out = append(out, "(")
+			if !walk(e.ChildByFieldId(k.fLeft)) {
+				return false
+			}
+			out = append(out, x.text(op))
+			if !walk(e.ChildByFieldId(k.fRight)) {
+				return false
+			}
+			out = append(out, ")")
+			return true
+		}
+		return false
+	}
+	if !walk(x.unparen(e)) {
+		return nil, false
+	}
+	return out, true
+}
+
+// The operators of an integer constant expression a form spells.
+var (
+	goConstUnary  = map[string]bool{"+": true, "-": true, "^": true}
+	goConstBinary = map[string]bool{"+": true, "-": true, "*": true, "/": true, "%": true, "<<": true, ">>": true,
+		"&": true, "|": true, "^": true, "&^": true}
+)
+
+// constExports appends, for each name the package-level constant spec n
+// declares, an export whose Identity is "#" and the form of its value
+// (constForm), the value list of the nearest spec of its declaration that
+// has one when n has none, with iota the index of n in its declaration
+// ("Constant declarations", "Iota"); "#?" for a value the form cannot spell.
+func (x *goLink) constExports(n Node) {
+	k := x.k
+	decl := n.Parent()
+	if decl.IsNull() {
+		return
+	}
+	index, values := -1, Node{}
+	i := 0
+	goNamed(decl, func(c Node) {
+		if c.KindId() != k.constSpec || index >= 0 {
+			return
+		}
+		if v := c.ChildByFieldId(k.fValue); !v.IsNull() {
+			values = v
+		}
+		if c.Id() == n.Id() {
+			index = i
+		}
+		i++
+	})
+	if index < 0 {
+		return
+	}
+	list := x.list(values)
+	j := 0
+	x.eachName(n, func(id Node) {
+		form := goIdentityUnknown
+		if j < len(list) {
+			if toks, ok := x.constForm(list[j], index); ok {
+				form = strings.Join(toks, " ")
+			}
+		}
+		j++
+		if x.text(id) == "_" {
+			return
+		}
+		x.out.Exports = append(x.out.Exports, wire.Export{Name: goSpan(id), Identity: "#" + form})
+	})
+}
+
+// structType appends the form of a struct type: `struct{}` with no field,
+// else `struct{`, its fields in order separated by `;`, and `}`. A field is
+// `@name` and its type, one per declared name, or, embedded, `^`, `*` for a
+// pointer, and its type; then its tag as `#` and its value quoted
+// (goTagToken). Struct identity is the same fields in the same order, with
+// the same names, types, tags and embedding ("Type identity").
+func (f *goForm) structType(t Node) {
+	x, k := f.x, f.x.k
+	first := true
+	goNamed(t, func(l Node) {
+		if l.KindId() != k.fieldDeclarationList {
+			return
+		}
+		goNamed(l, func(d Node) {
+			if d.KindId() != k.fieldDeclaration {
+				return
+			}
+			typ := d.ChildByFieldId(k.fType)
+			if typ.IsNull() {
+				f.ok = false
+				return
+			}
+			tag := ""
+			if tn := goChild(d, f.s.fTag); !tn.IsNull() {
+				tok, ok := goTagToken(x.text(tn))
+				if !ok {
+					f.ok = false
+					return
+				}
+				tag = tok
+			}
+			field := func(prefix ...string) {
+				if first {
+					f.tok("struct{")
+				} else {
+					f.tok(";")
+				}
+				first = false
+				for _, p := range prefix {
+					f.tok(p)
+				}
+				f.typ(typ)
+				if tag != "" {
+					f.tok(tag)
+				}
+			}
+			named := false
+			x.eachName(d, func(id Node) {
+				named = true
+				field("@" + x.text(id))
+			})
+			if named {
+				return
+			}
+			// An embedded field: its `*` is an anonymous token before the
+			// type.
+			pointer := false
+			for c := d.first(); !c.IsNull(); c = c.next() {
+				if !c.IsNamed() && c.KindId() == k.star {
+					pointer = true
+				}
+			}
+			if pointer {
+				field("^", "*")
+			} else {
+				field("^")
+			}
+		})
+	})
+	if first {
+		f.tok("struct{}")
+		return
+	}
+	f.tok("}")
+}
+
+// interfaceType appends the form of an interface type: `interface{}` with
+// no element, else `interface{`, its elements separated by `;`, and `}`: a
+// method as `@name` and its signature, an embedded interface as `^` and its
+// type. The linker sorts the elements, since an interface is its method set
+// whatever order declares it ("Interface types"). A type element of a
+// constraint (`~T`, `A | B`) is no type a value has: the form is unknown.
+func (f *goForm) interfaceType(t Node) {
+	x, k, s := f.x, f.x.k, f.s
+	first := true
+	sep := func() {
+		if first {
+			f.tok("interface{")
+		} else {
+			f.tok(";")
+		}
+		first = false
+	}
+	goNamed(t, func(e Node) {
+		switch e.KindId() {
+		case k.methodElem:
+			name := goChild(e, s.fName)
+			if name.IsNull() {
+				f.ok = false
+				return
+			}
+			sep()
+			f.tok("@" + x.text(name))
+			f.signature(e.ChildByFieldId(k.fParameters), e.ChildByFieldId(k.fResult))
+		case s.typeElem:
+			var only Node
+			n := 0
+			goNamed(e, func(c Node) { only = c; n++ })
+			if n != 1 || x.is(only, s.negatedType) {
+				f.ok = false
+				return
+			}
+			sep()
+			f.tok("^")
+			f.typ(only)
+		default:
+			f.ok = false
+		}
+	})
+	if first {
+		f.tok("interface{}")
+		return
+	}
+	f.tok("}")
+}
+
+// goTagToken is the token of a struct field's tag written as the string
+// literal lit: `#` and its value quoted, spaces escaped so the token holds
+// none. Two tags are the same when their values are, however each literal
+// is written (raw or interpreted).
+func goTagToken(lit string) (string, bool) {
+	v, err := strconv.Unquote(lit)
+	if err != nil {
+		return "", false
+	}
+	return "#" + strings.ReplaceAll(strconv.Quote(v), " ", `\x20`), true
 }
 
 // itoa is the decimal spelling of a small non-negative int.

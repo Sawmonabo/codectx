@@ -4,6 +4,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -56,5 +57,46 @@ func TestCollapseScopesFoldsEveryScopesDetails(t *testing.T) {
 	}
 	if !maps.Equal(got.Details, backward[0].Details) {
 		t.Errorf("the collapsed details depend on arrival order:\n%v\n%v", got.Details, backward[0].Details)
+	}
+}
+
+// TestAFoldOfFailedScopeSamplesKeepsTheExactSample protects failed_scopes
+// through a merge: two failure rows of one provider capability, each naming
+// the first eight of its own failed scopes, fold into a row that names exactly
+// the first eight of the union -- the sample one provider's own failures
+// publish -- and flags the list as cut, since the union holds more.
+//
+// Mutations it catches: joining the two samples up to the byte bound (sixteen
+// names, more than the sample the key promises), keeping the receiving row's
+// eight unflagged, or cutting the union in arrival order rather than sorted.
+func TestAFoldOfFailedScopeSamplesKeepsTheExactSample(t *testing.T) {
+	sample := func(parity int) string {
+		var keys []string
+		for i := parity; len(keys) < maxFailedScopesNamed; i += 2 {
+			keys = append(keys, "pkg:go:s"+strconv.Itoa(10+i))
+		}
+		return strings.Join(keys, detailSeparator)
+	}
+	row := func(scopes string) model.CapabilityState {
+		return model.CapabilityState{ProviderID: "p", Capability: "references", Scope: "workspace",
+			State: model.CapabilityFailed, DiagnosticCode: model.CodeProviderTimeout,
+			Details: map[string]string{unitsFailedDetail: "8", failedScopesDetail: scopes}}
+	}
+	var want []string
+	for i := range maxFailedScopesNamed {
+		want = append(want, "pkg:go:s"+strconv.Itoa(10+i))
+	}
+	for _, order := range [][2]string{{sample(1), sample(0)}, {sample(0), sample(1)}} {
+		got := mergeDetails(row(order[0]), row(order[1]))
+		if got.Details[failedScopesDetail] != strings.Join(want, detailSeparator) {
+			t.Errorf("failed_scopes = %q, want the first %d of the union %q",
+				got.Details[failedScopesDetail], maxFailedScopesNamed, strings.Join(want, detailSeparator))
+		}
+		if !slices.Contains(strings.Split(got.Details[truncatedDetail], detailSeparator), failedScopesDetail) {
+			t.Errorf("details_truncated = %q, want it to name %s", got.Details[truncatedDetail], failedScopesDetail)
+		}
+		if got.Details[unitsFailedDetail] != "16" {
+			t.Errorf("units_failed = %q, want the exact count 16", got.Details[unitsFailedDetail])
+		}
 	}
 }
