@@ -80,8 +80,11 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
   `visibility_unspecified`: a definition that states none (an empty replacement, keywords only);
   `visibility_unresolved`: one that names another macro among other tokens, which is not expanded. A declaration's
-  macros are read through the definitions its file sees: its own and those of a header it includes directly (the
-  include lookup), following a one-identifier replacement to the macro it names. Each definition reached is one
+  macros are read through the definitions its file sees: its own and those of every header in its include closure,
+  each `#include` of the file and of every header it reaches resolved by the include lookup (a quoted path beside the
+  including file, and either form by its path suffix), each header read once, which ends a cycle as an include guard
+  does, and only as far as a definition asked about needs (`include_c.go` `cClosure`); a one-identifier replacement is
+  followed to the macro it names. Each definition reached is one
   occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
   with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
