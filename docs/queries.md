@@ -229,7 +229,7 @@ so a changed handler marks the endpoints that route to it affected.
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
-| `--view` | `impact` | Which view of the answer a page serves: `entries` (the default), `reasons` or `routes`. Combine it with the `answer` token as `--cursor` to read another view of an answer already walked. |
+| `--view` | `impact` | Which view of the answer a page serves: `entries` (the default), `reasons` or `routes`. Combine it with the `answer` token as `--cursor` to read another view of an answer already walked. An answer that one page of every view holds needs no second read: it is served whole, every view in the one response. |
 | `--direction` | `path` | Which way edges are followed: `outgoing` (the default), `incoming` or `both`. The other traversal commands pin their own direction — a `callers` query asked outgoing would not be a callers query — so only `path` takes it. |
 
 **`path --direction` is the difference between "no route" and "no route that way".**
@@ -249,9 +249,11 @@ reports stay cumulative across the pages of the one walk, so replaying a cursor
 neither resets nor doubles them. `impact` carries a different contract: **its first page pays for the whole
 walk.** The request that mints an impact answer expands until the walk is
 exhausted, streams every admitted edge into a disk-backed sort, ranks the whole
-affected set once, serves the first page and spools the globally ranked
-remainder behind the continuation. Later pages read that spool and walk nothing,
-which is why page 1 is the slow one and every page after it is a file read.
+affected set once and serves the first page. An answer that one page of every
+view holds is served whole in that response, as described below; any longer
+answer spools the globally ranked remainder behind the continuation. Later pages
+read that spool and walk nothing, which is why page 1 is the slow one and every
+page after it is a file read.
 
 What that buys is the contract a single unbounded walk gives, and it is what
 `impact` guarantees: the pages **concatenate** to the single-shot answer —
@@ -288,9 +290,19 @@ entries; a reasons page may end inside one entry's reasons, and the next page
 starts at the reason after it. Nothing is cut: no reason is truncated and no
 route is clipped.
 
-Every page prints an `answer` token beside `next`. Passed as `--cursor` with any
-`--view`, it reads that view of the same ranked answer from its start, so the
-entries read from one view are explained by the others without walking again.
+**An answer that fits one page is served whole, inline.** When one page of
+every view the request reads holds that whole view — at most `--limit` entries
+and package pairs, at most `--limit` reasons, and so at most `--limit` routes —
+the one response carries the entries, every reason and every route, and nothing
+is retained: no spool, no lease, no `answer` token and no `next`. The bound is
+the page bound each view already serves under, so an inline response is never
+larger than the pages a client would otherwise fetch one view at a time. The
+CLI prints the reasons and routes after the entries.
+
+Any longer answer is spooled, and every page prints an `answer` token beside
+`next`. Passed as `--cursor` with any `--view`, it reads that view of the same
+ranked answer from its start, so the entries read from one view are explained
+by the others without walking again.
 A `next` token continues only its own view; presented with another view it is
 `CTX_ARGUMENT_INVALID`. The answer is kept until every view the client reads
 has been served to its end — all three, unless the request's `views` names

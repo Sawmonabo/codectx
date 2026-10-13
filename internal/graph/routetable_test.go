@@ -13,8 +13,8 @@ import (
 
 // explainImpact reads the whole reasons view and routes view of an answer, a
 // page at a time, keyed by entry ordinal: from the answer token when there is
-// one, and otherwise -- an engine with no spool retains no answer -- by asking
-// req afresh for each view.
+// one, and otherwise -- an answer served inline, or an engine with no spool,
+// retains none -- by asking req afresh for each view.
 func explainImpact(t *testing.T, e *Engine, req model.ImpactRequest, answer string) (map[int64][]string,
 	map[int64][]model.ImpactRoute) {
 	t.Helper()
@@ -33,11 +33,16 @@ func explainImpact(t *testing.T, e *Engine, req model.ImpactRequest, answer stri
 			if err != nil {
 				t.Fatalf("%s view page %d: %v", view, page, err)
 			}
-			for _, x := range res.Reasons {
-				reasons[x.Entry] = append(reasons[x.Entry], x.Reason)
-			}
-			for _, x := range res.Routes {
-				routes[x.Entry] = append(routes[x.Entry], x)
+			// Only the view asked for: an answer served inline carries every
+			// view in each response, and taking both here would count it twice.
+			if view == model.ImpactViewReasons {
+				for _, x := range res.Reasons {
+					reasons[x.Entry] = append(reasons[x.Entry], x.Reason)
+				}
+			} else {
+				for _, x := range res.Routes {
+					routes[x.Entry] = append(routes[x.Entry], x)
+				}
 			}
 			if res.Meta.NextCursor == "" {
 				break

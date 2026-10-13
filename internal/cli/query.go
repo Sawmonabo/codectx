@@ -588,6 +588,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				default:
 					writeImpactEntries(b, result.Entries)
 					writePackageEdges(b, result.Packages)
+					writeInlineImpact(b, result)
 				}
 				if result.Answer != "" {
 					fmt.Fprintf(b, "answer      %s\n", result.Answer)

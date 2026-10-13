@@ -659,11 +659,9 @@ func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.E
 			}
 			if explain && len(entries) > 0 {
 				if why == nil {
-					if impact.Answer == "" {
-						return contextErr(ctx, &model.Error{Code: model.CodeInternal,
-							Message: "context: the impact answer was not retained, so its entries cannot be explained"})
+					if why, err = explanationOf(ctx, eng, req, impact); err != nil {
+						return err
 					}
-					why = newExplanation(eng, req, impact.Answer)
 				}
 				if err := why.explain(ctx, in, entries); err != nil {
 					return contextErr(ctx, err)

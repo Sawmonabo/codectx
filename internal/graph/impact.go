@@ -486,7 +486,9 @@ func routesOf(records []impactRecord, base int64, routes *routeReader) ([]model.
 
 // serveRankedRun serves the FIRST page of the requested view off the two
 // freshly ranked runs -- the affected entities and the package pairs the same
-// walk produced -- and spools the WHOLE ranked answer behind it: every view
+// walk produced. An answer one page of each view it is read through holds is
+// served whole in this response and nothing is retained (serveInline).
+// Otherwise it spools the WHOLE ranked answer behind the page: every view
 // reads the same spool, so the answer token this page mints reads any view
 // from its start and the continuation reads on in this one.
 //
@@ -517,6 +519,11 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 		return nil
 	}); err != nil && !errors.Is(err, errStopExpansion) {
 		return impactServed{}, "", err
+	}
+	// An answer one page of every view it is read through holds is served
+	// whole, here, and retains nothing.
+	if served, inline, err := e.serveInline(ctx, run, pairRun, page, retain, req, limit, answer, meta); err != nil || inline {
+		return served, "", err
 	}
 	pairPage := make([]model.PackageEdge, 0, limit)
 	if view == model.ImpactViewEntries {
