@@ -206,7 +206,10 @@ it publishes one open-site node for the call, located at it, named by the
 callee and carrying its shape (`bare`, `member`, `value`, `construct`) and
 argument count; the caller's `calls` edge goes to that node, and it replaces the
 structural `call:<name>` placeholder for the same site, so an open call is one
-row, on whichever page the open site falls. Its candidates are computed per query, never stored: the declarations of
+row, on whichever page the open site falls. A call the linker binds, or proves
+external through an external node, replaces the placeholder the same way, in
+callers, callees and impact alike; a placeholder is served only for a call no
+other edge of its caller stands for at the same bytes. Its candidates are computed per query, never stored: the declarations of
 the same name, of a kind the shape can call (methods for a member call,
 functions for a bare or value call, classes for a construction), in the same
 language family (C with C++, JavaScript with TypeScript), and, in C, C++, Go,

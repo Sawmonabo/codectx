@@ -190,22 +190,28 @@ symbols without rescanning):
   the declaration's final byte lies on, not the half-open end position's. The
   path is the same root-relative slash path the unit's scope key carries.
   Nothing is normalized — no case folding, no qualification, no receiver
-  prefix: the identifier is the token the source spells. Publishing this alias
-  is what merges the two providers' identities for one function instead of
-  leaving two correct but unrelated nodes. A key over `MaxNativeKeyBytes` is
+  prefix: the identifier is the token the source spells. An alias is read only
+  by `reconcile.Resolver`, when a unit that declares this one a dependency
+  resolves a candidate under the same scope and native key and so adopts this
+  declaration's identity; no provider here resolves a candidate by a `decl:`
+  key, so the alias joins nothing by itself. A key over `MaxNativeKeyBytes` is
   omitted rather than truncated (a truncated key would be a different, possibly
   colliding claim); the declaration keeps its own identity and its
   qualified-name alias either way. The omission is counted, so the file's
   capability state becomes `partial` with `CTX_COVERAGE_INCOMPLETE`: a
-  declaration without this key will not merge with the semantic provider's
-  node for the same function, which is missing coverage, not a silent
-  simplification.
+  declaration without this key cannot be resolved by it from a dependent
+  unit, which is missing coverage, not a silent simplification.
 - `("file:"+path, "callsite:"+path+":"+first+"-"+last)` → the callee node of
-  every call site. This is the Section 11.3 call-site join key, computed
+  every call site. This is the Section 11.3 call-site key, computed
   byte-for-byte identically by the SCIP importer for the reference occurrence
-  at the same bytes, so the reconciler merges the syntactic callee with the
-  compiler-resolved symbol and the `calls` relation acquires a precise target
-  while both evidence rows remain:
+  at the same bytes and by the call linker for the site it publishes. No
+  provider resolves a candidate by a `callsite:` key, so the key merges no two
+  nodes: the SCIP symbol and the syntactic callee stay two identities. The
+  linker cites the key in the evidence of its `calls` edge for the site, and
+  the packed adjacency leaves out this provider's placeholder edge wherever
+  the linker's edge from the same caller covers every one of its sites at the
+  same bytes ([storage](storage.md), One edge per call), so a bound call is
+  served as one callee:
 
   ```
   scope key  file:<path>
@@ -223,7 +229,7 @@ symbols without rescanning):
   not a key. A key over `MaxNativeKeyBytes` is omitted rather than truncated
   and the omission is counted, so the file is `partial`. Only `@call.name`
   captures produce this alias; a type reference does not, because only a call
-  site is the join SCIP cannot make on its own (no indexer distinguishes a
+  site is what SCIP cannot identify on its own (no indexer distinguishes a
   call-site reference from a function-value reference).
 - `("pkg:go:"+dir+":"+package, qualified name)` → Go top-level declarations;
   `("pkg:java:"+package, qualified name)` → Java top-level declarations. These
@@ -1207,7 +1213,7 @@ All MIT:
   nested declaration is contained by its outer one, the pool never exceeds
   its bound and every worker has exited after `Close`. The test binary is its
   own worker through `TestMain`. `checkCallsites` extends the same loop with
-  the three call-site join invariants: every `callsite:` key's one-based
+  the three call-site key invariants: every `callsite:` key's one-based
   inclusive range selects exactly its callee node's name in the pinned bytes
   (the Go fixture's non-ASCII `日本語` callee is what separates a byte range
   from a rune range at both ends), a second independent unit over the same

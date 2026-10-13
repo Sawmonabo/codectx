@@ -130,7 +130,8 @@ for `Cat.sound` is then a false zero.
   metadata `resolution: unresolved`, a `reason` (`receiver_untyped`, `value_untracked`, `global_unbound`,
   `computed`, `reflective`), the call `shape` (`bare`, `member`, `value`, `construct`) and the argument count. The
   caller has a `calls` edge to it. In answers this node replaces the structural `call:<name>` placeholder for the
-  same site.
+  same site, as a bound target or an external node does: the packed adjacency leaves out a placeholder edge every
+  site of which another `calls` edge of the caller covers at the same bytes (docs/storage.md, One edge per call).
 - **A reflective call is open too.** A call of a reflection API that runs a method chosen at run time (Java's
   `Method.invoke`, `Constructor.newInstance`, `Class.newInstance`, the `MethodHandle` invocations; Go's
   `reflect.Value.Call` and `CallSlice`) keeps its `calls` to the API's external method and is also an open site of

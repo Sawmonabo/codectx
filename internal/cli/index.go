@@ -1152,7 +1152,7 @@ func writeCapabilities(b *strings.Builder, states []model.CapabilityState) {
 	}
 	parts := make([]string, 0, len(counts))
 	for _, state := range []model.CapabilityStateValue{model.CapabilityFresh, model.CapabilityPartial,
-		model.CapabilityStale, model.CapabilityUnavailable, model.CapabilityFailed} {
+		model.CapabilityUnavailable, model.CapabilityFailed} {
 		if n := counts[string(state)]; n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", n, state))
 		}

@@ -130,8 +130,10 @@ symbols it contributed stop being answerable the moment that generation becomes
 active. The capability is not reported as degraded either, because from the
 plan's point of view nothing was requested and nothing failed.
 
-Two operational consequences follow. Pass `--scip-index` on **every** run that
-should keep the imported symbols, including plain `codectx refresh`. And if
+Two operational consequences follow. Every run that should keep the imported
+symbols is a `codectx index --scip-index PATH` run, which reuses every unchanged
+unit as a refresh does; `codectx refresh` takes no `--scip-index`, so a refresh
+always builds a generation without the imported symbols. And if
 cross-file symbols disappear after a refresh, run `codectx doctor`: its
 `supplied_index` check reports what the active generation was actually built
 with, which is the one place the difference between "no index was supplied" and
@@ -572,10 +574,11 @@ publishing one relation kind from different precisions is the parallel
 implementation policy forbids. A read or write occurrence is a `references`
 edge here, like any other non-definition, non-import occurrence. No indexer
 measured here distinguishes a call-site reference from a reference to a
-function value either; the call identification SCIP cannot do is the
-call-site join below.
+function value either; the call identification SCIP cannot do is left to
+the structural provider and the call linker, which share the call-site key
+below.
 
-## Call-site join (Section 11.3)
+## Call-site key (Section 11.3)
 
 Every non-definition occurrence publishes an alias on the symbol it resolves
 to:
@@ -588,15 +591,20 @@ to:
 The identifier `Bar` occupying zero-based bytes `[34,37)` of `pkg/a.go` is
 therefore scope `file:pkg/a.go`, key `callsite:pkg/a.go:35-37`. The tree-sitter
 provider publishes the identical key on the syntactic callee of every call site
-it finds, so the reconciler merges the two identities wherever the ranges are
-equal and the `calls` relation acquires a compiler-precision target while both
-evidence rows survive. `callsite.go` is the only place this key is spelled.
+it finds. An alias is read only by `reconcile.Resolver`, when a unit that
+declares this one a dependency resolves a candidate under the same scope and
+native key; no provider resolves a candidate by a `callsite:` key, so equal
+keys merge no two nodes, and the SCIP symbol and the syntactic callee stay two
+identities with their own relations. The `calls` edge a call carries comes
+from the call linker, which binds the site itself and cites the same key in
+its evidence ([tree-sitter provider](providers-treesitter.md), Aliases
+published). `callsite.go` is the only place the importer spells this key.
 
 The alias is published for every non-definition occurrence rather than a
 guessed subset, because SCIP cannot tell a call-site reference from a reference
 to a function value — no indexer distinguishes them and none sets a write role.
-An alias at a range where tree-sitter found no call site is inert: the join is
-exact-range equality, so it aliases the symbol to a key nothing else names. A
+An alias at a range where tree-sitter found no call site names a key nothing
+else names, since the key is exact-range spelling. A
 key that would exceed `model.MaxNativeKeyBytes` or a scope key that would
 exceed `model.MaxScopeKeyBytes` is skipped, counted under
 `callsite_aliases_skipped` and degrades the capability with
