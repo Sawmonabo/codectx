@@ -99,7 +99,15 @@ const (
 	// FactOverrides: the method declaration Site directly overrides or
 	// implements the method Target, or the external method External names.
 	FactOverrides Fact = 7
+	// FactRoute: the root mount Site (an index into Table.Routing.Mounts)
+	// reaches a route whose endpoint External spells (routeFact), routed to
+	// the handler declaration Target, or to none when Target.File is -1
+	// (emitPythonRoutes).
+	FactRoute Fact = 8
 )
+
+// factLast is the last kind of fact.
+const factLast = FactRoute
 
 // Binding is one fact a resolver found. Site names the entry of a member's
 // table the fact is about (a call site, an import, a declaration, by Kind),

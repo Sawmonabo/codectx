@@ -41,10 +41,14 @@ const (
 	// EntryFieldWrite is the values the file writes to one field, where
 	// resolution is field-based.
 	EntryFieldWrite EntryKind = 7
+	// EntryRouting is the file's open routing (Routing): its objects, their
+	// routes and mounts, and the settings modules it names, which another
+	// file's route walk reads.
+	EntryRouting EntryKind = 8
 )
 
 // Valid reports whether k is a known entry kind.
-func (k EntryKind) Valid() bool { return k >= EntryDeclaration && k <= EntryFieldWrite }
+func (k EntryKind) Valid() bool { return k >= EntryDeclaration && k <= EntryRouting }
 
 // SummaryEntry is one entry of a file's interface summary. Key is the entry's
 // identity within the file, stable across edits that do not change it (a
@@ -153,6 +157,9 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 			caller = string(t.Decls[v.Caller].Node)
 		}
 		add(EntryInferred, caller, i, v)
+	}
+	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings) > 0 {
+		add(EntryRouting, "", 0, r.summary())
 	}
 	if err != nil {
 		return nil, err

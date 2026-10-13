@@ -31,6 +31,11 @@ import (
 func (b *builder) routeTable() []endpointFact {
 	s := newRouteScan(b)
 	if s == nil {
+		if b.lang.Name == "python" && b.mayNameSettings() {
+			// A settings module imports no framework: its chain is read
+			// alone (djangoSettings).
+			b.links = newRouteScanOf(b).linkRoutes()
+		}
 		return nil
 	}
 	switch b.lang.Name {
@@ -44,6 +49,9 @@ func (b *builder) routeTable() []endpointFact {
 		s.spring()
 	}
 	s.applications()
+	if b.lang.Name == "python" {
+		b.links = s.linkRoutes()
+	}
 	return s.facts()
 }
 
@@ -80,7 +88,11 @@ type routeScan struct {
 	// lists are the Starlette route lists this file passes as `routes=`,
 	// each with the object that holds its entries.
 	lists []routeList
-	out   []routeFact
+	// pending are the mounts of objects this file does not build, and
+	// djangoEntries the file's Django urlconf entries, for linkRoutes.
+	pending       []pendingMount
+	djangoEntries []djangoEntry
+	out           []routeFact
 }
 
 // routeImport is one local name an import binds: the module path as written
@@ -92,6 +104,12 @@ type routeImport struct{ path, original string }
 type routeFact struct {
 	endpointFact
 	receiver string
+	// obj is the object the route is registered on, nil when none this
+	// file builds; value and literal are its route's literal value, which
+	// the linker joins below the object's prefix (linkRoutes).
+	obj     *routeObj
+	value   string
+	literal bool
 }
 
 // newRouteScan indexes the file's sites, call references and imports, or is
@@ -103,6 +121,20 @@ func newRouteScan(b *builder) *routeScan {
 	if len(s.frameworks) == 0 {
 		return nil
 	}
+	return s.index()
+}
+
+// newRouteScanOf is the scan of a file whatever it imports.
+func newRouteScanOf(b *builder) *routeScan {
+	s := &routeScan{b: b, link: b.ex.link, imports: map[string]routeImport{}, frameworks: map[string]bool{},
+		objs: map[int]*routeObj{}}
+	s.routeImports()
+	return s.index()
+}
+
+// index indexes the file's call references and worker sites.
+func (s *routeScan) index() *routeScan {
+	b := s.b
 	s.refAt = make(map[wire.Span]int, len(b.ex.refs))
 	for i, r := range b.ex.refs {
 		if r.Kind != "call" {
@@ -394,7 +426,11 @@ func (s *routeScan) emit(fw string, methods []string, r routeText, obj *routeObj
 	if r.literal {
 		prefix, ok = s.resolve(obj)
 	}
+	n := len(s.out)
 	s.emitPrefixed(fw, methods, r, prefix, ok, at, handlers, receiver)
+	for k := n; k < len(s.out); k++ {
+		s.out[k].obj, s.out[k].value, s.out[k].literal = obj, cmp.Or(r.path, r.value), r.literal
+	}
 }
 
 // emitPrefixed is emit with the prefix already decided.

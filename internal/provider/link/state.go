@@ -101,6 +101,8 @@ func (k Fact) entry() int {
 		return 1
 	case FactExtends, FactImplements, FactOverrides:
 		return 2
+	case FactRoute:
+		return 3
 	}
 	return 0
 }
@@ -132,7 +134,7 @@ func canonical(b Binding) (Binding, error) {
 	bad := func(what string) (Binding, error) {
 		return Binding{}, internalErr("a resolver emitted a fact of kind " + strconv.Itoa(int(b.Kind)) + " " + what)
 	}
-	if b.Kind > FactOverrides {
+	if b.Kind > factLast {
 		return bad("that is not a kind of fact")
 	}
 	if _, ok := detailCode(b.Detail); !ok {
@@ -161,6 +163,15 @@ func canonical(b Binding) (Binding, error) {
 		return bad("with a negative argument or parameter index")
 	}
 	switch {
+	case b.Kind == FactRoute:
+		if b.External == "" {
+			return bad("with no endpoint")
+		}
+		if b.Target.File < 0 {
+			b.Target = Ref{File: -1, Index: -1}
+		} else if b.Target.Index < 0 {
+			return bad("naming a negative table index")
+		}
 	case b.External != "":
 		if !b.Kind.external() {
 			return bad("naming an external target")
@@ -268,7 +279,7 @@ func encodeIDBinding(b idBinding) ([]byte, error) {
 	code, ok := detailCode(b.Detail)
 	dispatch, dok := codeOf(dispatches[:], b.Dispatch)
 	reason, rok := codeOf(reasons[:], b.Reason)
-	if !ok || !dok || !rok || b.Kind > FactOverrides || b.Site < 0 || b.Arg < 0 {
+	if !ok || !dok || !rok || b.Kind > factLast || b.Site < 0 || b.Arg < 0 {
 		return nil, internalErr("a fact named by identity is malformed")
 	}
 	out := appendString([]byte{byte(b.Kind)}, string(b.SiteFile))
@@ -284,7 +295,7 @@ func decodeIDBinding(raw []byte) (idBinding, error) {
 	b := idBinding{Kind: Fact(r.byte()), SiteFile: model.FileID(r.str()), Site: r.index(), Arg: r.index(),
 		TargetFile: model.FileID(r.str()), Target: model.NodeID(r.str()), External: r.str()}
 	code, dispatch, reason := r.byte(), r.byte(), r.byte()
-	if r.err != nil || len(r.b) != 0 || b.Kind > FactOverrides || int(code) >= len(details) ||
+	if r.err != nil || len(r.b) != 0 || b.Kind > factLast || int(code) >= len(details) ||
 		int(dispatch) >= len(dispatches) || int(reason) >= len(reasons) {
 		return idBinding{}, errors.New("a fact is malformed")
 	}
@@ -344,7 +355,7 @@ func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.
 	}
 	defer s.Close()
 	err = run.Each(func(b idBinding) error {
-		if b.External == "" {
+		if b.External == "" || b.Kind == FactRoute {
 			return nil
 		}
 		return s.Add(b.External)

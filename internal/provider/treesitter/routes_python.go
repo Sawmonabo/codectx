@@ -128,6 +128,10 @@ func (s *routeScan) pyMounts() {
 		parent := s.objOf(site.Receiver)
 		switch r.Name {
 		case "register_blueprint":
+			if parent != nil && parent.fw == fwFlask {
+				given, prefix, known := s.mountPrefix(site, -1, "url_prefix")
+				s.recordMount(r, site, i, 0, fwFlask, parent, prefix, known, given)
+			}
 			s.attachArgs(site, func(o *routeObj, at int) (routeAttach, bool) {
 				if at != 0 || o.fw != fwFlask || o.root {
 					return routeAttach{}, false
@@ -136,6 +140,10 @@ func (s *routeScan) pyMounts() {
 				return routeAttach{parent: parent, prefix: prefix, known: known, override: given}, true
 			})
 		case "include_router":
+			if parent != nil && parent.fw == fwFastAPI {
+				_, prefix, known := s.mountPrefix(site, -1, "prefix")
+				s.recordMount(r, site, i, 0, fwFastAPI, parent, prefix, known, false)
+			}
 			s.attachArgs(site, func(o *routeObj, at int) (routeAttach, bool) {
 				if at != 0 || o.fw != fwFastAPI || o.root {
 					return routeAttach{}, false
@@ -288,12 +296,71 @@ func (s *routeScan) django() {
 		if !ok {
 			return
 		}
+		e := djangoEntry{at: refSpan(r), route: s.routeOf(route), regex: cmp.Or(imp.original, r.Name) != "path"}
 		if inc, ok := s.imports[calleeName(view.text)]; ok && frameworkOf("python", inc.path) == fwDjango &&
 			cmp.Or(inc.original, calleeName(view.text)) == "include" {
+			e.include = djangoIncluded(view)
+			s.djangoEntries = append(s.djangoEntries, e)
 			return
 		}
-		s.emitPrefixed(fwDjango, nil, s.routeOf(route), "", false, refSpan(r), s.handlerAt(asView(view)), "")
+		e.handlers = s.handlerAt(asView(view))
+		s.djangoEntries = append(s.djangoEntries, e)
+		s.emitPrefixed(fwDjango, nil, e.route, "", false, e.at, e.handlers, "")
 	})
+}
+
+// djangoEntry is one Django urlconf entry: the `path`, `re_path` or `url`
+// call, its route (a regular expression for re_path and url), and either
+// its view's handlers or what it includes.
+type djangoEntry struct {
+	at       wire.Span
+	route    routeText
+	regex    bool
+	handlers []handler
+	include  *djangoInclude
+}
+
+// djangoInclude is what an `include(...)` names: a dotted module whose
+// urlconf it mounts (`include("blog.urls")`, `include(("blog.urls",
+// "blog"))`), a list written in place (`include([...])`), or a module-level
+// binding holding one (`include(extra_patterns)`). Any other argument names
+// nothing.
+type djangoInclude struct {
+	list    wire.Span
+	binding string
+	module  string
+}
+
+// djangoIncluded reads the first argument of an include call written as
+// view.
+func djangoIncluded(view routeArg) *djangoInclude {
+	open := strings.IndexByte(view.text, '(')
+	if open < 0 || !strings.HasSuffix(view.text, ")") {
+		return &djangoInclude{}
+	}
+	inner := view.text[open+1 : len(view.text)-1]
+	first := splitTop(inner)[0]
+	lead := len(first) - len(strings.TrimLeft(first, " \t\r\n"))
+	arg := strings.TrimSpace(first)
+	inc := &djangoInclude{}
+	switch {
+	case strings.HasPrefix(arg, "["):
+		start := view.at.Start + uint32(open+1+lead)
+		inc.list = wire.Span{Start: start, End: start + uint32(len(arg))}
+	case strings.HasPrefix(arg, "("):
+		if es := elements(arg); len(es) > 0 {
+			if v, ok := stringLiteral("python", es[0]); ok && pyDotted(v) {
+				inc.module = v
+			}
+		}
+	case pyName(arg):
+		inc.binding = arg
+	default:
+		if v, ok := stringLiteral("python", arg); ok && pyDotted(v) {
+			inc.module = v
+		}
+	}
+	return inc
 }
 
 // calleeName is the name a call expression as written calls, `include` for

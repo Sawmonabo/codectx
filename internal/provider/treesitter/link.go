@@ -247,6 +247,7 @@ func (b *builder) linkTable() error {
 			Index:    p.Index, Variadic: p.Variadic, KeywordOnly: p.KeywordOnly})
 	}
 	t.Reexports = wl.Reexports
+	t.Routing = b.linkRouting(siteAt)
 	for _, x := range wl.DynamicImports {
 		rng, err := b.rangeOf(x.At.Start, x.At.End)
 		if err != nil {
