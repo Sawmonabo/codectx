@@ -151,7 +151,10 @@ type Hit struct {
 	OccurrencesExact bool
 }
 
-// Stats is the work one search did.
+// Stats is the work one search did. BlocksTotal, BlocksScored and DocsScored
+// sum over every scoring pass of the page (a page rescores when the groups its
+// resume position marked held heap places), so BlocksScored is below
+// BlocksTotal exactly when some pass skipped a block.
 type Stats struct {
 	Segments               int64
 	SegmentsWithoutSummary int64

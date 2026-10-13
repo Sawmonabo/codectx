@@ -501,6 +501,14 @@ func TestPanicInsideAnExportReturnsAnError(t *testing.T) {
 // Mutation caught: a position applied per document rather than per folded
 // result (a node served before the position comes back through a lower-scoring
 // document of it).
+//
+// Every page's block counts cover the same scoring passes: the exhaustive page
+// scores every block it counts, and the pruned page never scores more than it
+// counts, on pages that rescored (a heap grown past depth+1) as on the rest.
+//
+// Mutation caught: blocks_total counted over the last pass while
+// blocks_scored sums every pass (a rescored exhaustive page then reports more
+// blocks scored than exist).
 func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	c := genCorpus(4, 5000, 100)
 	dir := t.TempDir()
@@ -512,7 +520,7 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	}
 	defer v.Close()
 	rng := rand.New(rand.NewPCG(4, 4))
-	ties := 0
+	ties, rescored := 0, 0
 	for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
 		for _, kinds := range [][]model.NodeKind{nil, {model.NodeFunction, model.NodeFile}} {
 			for _, q := range engineQueries {
@@ -542,10 +550,22 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 						if err := samePage(got, want); err != nil {
 							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d: %v", rule, kinds, q, i, d, err)
 						}
+						if got.Stats.BlocksScored > got.Stats.BlocksTotal {
+							t.Fatalf("query %q after hit %d depth %d: %d blocks scored of %d", q, i, d,
+								got.Stats.BlocksScored, got.Stats.BlocksTotal)
+						}
 						r.IgnoreSummaries = true
-						if err := samePage(search(t, v, r), want); err != nil {
+						full := search(t, v, r)
+						if err := samePage(full, want); err != nil {
 							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d, exhaustive: %v",
 								rule, kinds, q, i, d, err)
+						}
+						if full.Stats.BlocksScored != full.Stats.BlocksTotal {
+							t.Fatalf("query %q after hit %d depth %d, exhaustive: %d blocks scored of %d (cap %d)",
+								q, i, d, full.Stats.BlocksScored, full.Stats.BlocksTotal, full.Stats.Cap)
+						}
+						if full.Stats.Cap > int64(d)+1 {
+							rescored++
 						}
 					}
 				}
@@ -554,6 +574,9 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	}
 	if ties == 0 {
 		t.Fatal("no tied scores in the fixture: the test proves nothing about ties at a page edge")
+	}
+	if rescored == 0 {
+		t.Fatal("no page rescored: the test proves nothing about block counts across passes")
 	}
 
 	// A hidden document is not a position of this view.
