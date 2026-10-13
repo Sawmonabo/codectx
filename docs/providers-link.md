@@ -316,8 +316,10 @@ launchable method with its form (`Decl.Main`, indexed under `keyJavaMain` by its
 class's superclasses through the unit (`keySuper`, the one supertype that is no interface) and chooses the nearest
 `String[]` main, else the nearest main with no parameter; a chain that reaches a class outside the project ends
 there, with what the project declares (`internal/provider/link/java_main.go`). The class's file publishes one
-`endpoint` named `main`, keyed `endpoint:main#<class>` as the structural provider keys a class it resolves itself,
-located at the class, defined by the file's module and routing to the method (detail `hierarchy`). A superclass the
+`endpoint` named `main` with the identity the structural provider gives the main of a class it resolves itself (the
+file, the descriptor `main` and the class's qualified name as disambiguator), so an edit that moves the decision
+between the two providers moves no endpoint. It is located at the class, defined by the file's module and routing to
+the method (detail `hierarchy`); like the linker's other endpoints it carries no search document. A superclass the
 file names ambiguously is a path of its own; when the paths choose several methods each `routes_to` carries their
 number as its set size. The reads are index lookups of the hierarchy, so an edit to a superclass's `main` or to its
 `extends` re-resolves the classes that read it.

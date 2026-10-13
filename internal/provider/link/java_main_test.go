@@ -102,3 +102,42 @@ public class Empty {} // @empty
 		t.Errorf("structural main endpoints at %q, want %q", structural, want)
 	}
 }
+
+// TestJavaMainEndpointIsOneNodeWhicheverProviderDecides links Flip.java
+// twice: declaring a no-parameter main, so the linker resolves its class's
+// main through Base in another file, then a `String[]` main, so the
+// structural provider decides it. The class's main endpoint is one node
+// either way, so an edit that moves the decision between the providers
+// moves no endpoint.
+//
+// Mutation: mint the linker's endpoint without the structural provider's
+// descriptor and disambiguator -> the two node identities differ.
+func TestJavaMainEndpointIsOneNodeWhicheverProviderDecides(t *testing.T) {
+	base := "package p;\npublic class Base {\n    public static void main(String[] args) {}\n}\n"
+	mainIn := func(c *capture, file model.FileID) []model.NodeID {
+		var out []model.NodeID
+		for _, n := range c.nodes {
+			if n.Kind == model.NodeEndpoint && n.Name == "main" && n.FileID == file {
+				out = append(out, n.ID)
+			}
+		}
+		return out
+	}
+	linked := linkSources(t, newStructural(t), map[string]string{"p/Base.java": base,
+		"p/Flip.java": "package p;\npublic class Flip extends Base {\n    void main() {}\n}\n"})
+	flip := linked.h.File(t, "p/Flip.java").ID
+	byLinker := mainIn(linked.out, flip)
+	if len(byLinker) != 1 || len(mainIn(linked.structural, flip)) != 0 {
+		t.Fatalf("Flip's main endpoints: linker %v, structural %v; want the linker's alone", byLinker, mainIn(linked.structural, flip))
+	}
+	own := linkSources(t, newStructural(t), map[string]string{"p/Base.java": base,
+		"p/Flip.java": "package p;\npublic class Flip extends Base {\n    public static void main(String[] a) {}\n}\n"})
+	byStructural := mainIn(own.structural, own.h.File(t, "p/Flip.java").ID)
+	if len(byStructural) != 1 {
+		t.Fatalf("Flip's structural main endpoints %v, want one", byStructural)
+	}
+	if byLinker[0] != byStructural[0] {
+		t.Errorf("Flip's main endpoint is %s when the linker decides it and %s when the structural provider does",
+			byLinker[0], byStructural[0])
+	}
+}

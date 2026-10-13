@@ -149,15 +149,15 @@ func (b *builder) javaMains() []endpointFact {
 		if !ok {
 			continue
 		}
+		if d.Parent >= 0 && b.decls[d.Parent].kind == model.NodeInterface && !m.static {
+			continue
+		}
 		if b.mainForms == nil {
 			b.mainForms = map[int]uint8{}
 		}
 		b.mainForms[i] = link.MainNoArgs
 		if m.args {
 			b.mainForms[i] = link.MainArgs
-		}
-		if d.Parent >= 0 && b.decls[d.Parent].kind == model.NodeInterface && !m.static {
-			continue
 		}
 		own[d.Parent] = append(own[d.Parent], m)
 	}

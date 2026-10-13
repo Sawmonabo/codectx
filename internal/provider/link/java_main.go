@@ -98,11 +98,13 @@ func (h *hierarchy) javaMainAlong(typ Ref, noArgs *Ref, onPath map[Ref]bool, yie
 }
 
 // javaMain publishes the main endpoint of the Java class d from its
-// FactMains, group: one `endpoint` named `main` in the file's scope, keyed
-// by the class's qualified name as the structural provider keys the main of
-// a class it resolves itself, located at the class, defined by the file's
-// module and routed to each method, with the set size when several
-// candidates hold.
+// FactMains, group: one `endpoint` named `main` in the file's scope, with the
+// identity the structural provider gives the main of a class it resolves
+// itself (its file, the descriptor `main` and the class's qualified name as
+// its disambiguator, or its range when either is over its bound), so the
+// endpoint is one node whichever provider decides it. It is located at the
+// class, defined by the file's module and routed to each method, with the
+// set size when several candidates hold.
 func (f *filePublication) javaMain(d *Decl, group []idBinding) error {
 	var set int64
 	for _, b := range group {
@@ -116,9 +118,13 @@ func (f *filePublication) javaMain(d *Decl, group []idBinding) error {
 	if set == 1 {
 		set = 0
 	}
-	n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + f.fv.Path,
-		NativeKey: fitKey("endpoint:main#" + d.Qualified), Kind: model.NodeEndpoint,
-		Language: f.t.Language, Name: "main"}, d.Range, []byte("{}"))
+	c := model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + f.fv.Path,
+		NativeKey: fitKey("endpoint:main#" + d.Qualified), Kind: model.NodeEndpoint, Language: f.t.Language,
+		Name: "main", QualifiedName: "main", FileID: f.fv.ID, ContentHash: f.fv.ContentHash, Range: located(d.Range)}
+	if len(d.Qualified) <= model.MaxQualifiedNameBytes {
+		c.Descriptor, c.Disambiguator = "main", d.Qualified
+	}
+	n, err := f.mint(c, d.Range, []byte("{}"))
 	if err != nil {
 		return err
 	}

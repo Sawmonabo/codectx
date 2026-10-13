@@ -41,7 +41,7 @@ func checkDecorators(t *testing.T, c *capture, kind model.NodeKind, name, key st
 // expression's decorators on the declaration that holds the class.
 // Mutations caught: parameter decorators not read (no decorators on b or
 // x), read onto the method (the method lists Body), and a class
-// expression's decorators not read (C has none).
+// expression's decorators not read (exports has none).
 func TestTypeScriptParameterAndClassExpressionDecorators(t *testing.T) {
 	c := extracted(t, newProvider(t), "api.ts", `class Api {
   @Get()
