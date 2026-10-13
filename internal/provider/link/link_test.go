@@ -3,6 +3,7 @@ package link_test
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -292,6 +293,9 @@ type linked struct {
 	structural *capture
 	// calls is the unit's `calls` capability row.
 	calls model.CapabilityState
+	// lost is each row's facts_without_node count, by capability, for the
+	// rows that have one.
+	lost map[string]string
 }
 
 // linkSources runs the real structural provider over every source file of
@@ -366,9 +370,9 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	if err != nil {
 		t.Fatalf("linking unit: %v", err)
 	}
-	checkCapability(t, result, scope)
+	lost := checkCapability(t, result, scope)
 	checkEndpoints(t, out)
-	l := linked{h: h, files: files, out: out, structural: structOut}
+	l := linked{h: h, files: files, out: out, structural: structOut, lost: lost}
 	for _, c := range result.Capabilities {
 		if c.Capability == string(model.RelCalls) {
 			l.calls = c
@@ -409,13 +413,20 @@ func newStructural(t *testing.T) *treesitter.Provider {
 
 // checkCapability asserts every capability row the linking unit reports is
 // at the unit's scope and fresh (every member of a clean source has its
-// table whole; an open site is disclosed by the counts, never missing), and
-// that the `calls` row is among them with site counts that add up:
-// sites = bound + open + computed + external.
-func checkCapability(t *testing.T, r model.ProviderResult, scope string) {
+// table whole; an open site is disclosed by the counts, never missing), or
+// partial for facts whose target has no node alone, whose counts it answers
+// by capability; and that the `calls` row is among them with site counts
+// that add up: sites = bound + open + computed + external.
+func checkCapability(t *testing.T, r model.ProviderResult, scope string) map[string]string {
 	t.Helper()
 	var calls *model.CapabilityState
+	lost := map[string]string{}
 	for i, c := range r.Capabilities {
+		if n, ok := c.Details["facts_without_node"]; ok && c.State == model.CapabilityPartial &&
+			len(c.Details) == len(onlyLost(c.Details)) {
+			lost[c.Capability] = n
+			c.State = model.CapabilityFresh
+		}
 		if c.Scope != scope || c.State != model.CapabilityFresh {
 			t.Fatalf("the linking unit reported %s %s at %q, want fresh at %q (details %v)", c.Capability, c.State, c.Scope, scope, c.Details)
 		}
@@ -436,6 +447,21 @@ func checkCapability(t *testing.T, r model.ProviderResult, scope string) {
 	if sites, sum := count("sites"), count("bound_sites")+count("open_sites")+count("computed_sites")+count("external_sites"); sites != sum {
 		t.Fatalf("the calls row counts %d sites and %d bound, open, computed and external (details %v)", sites, sum, calls.Details)
 	}
+	return lost
+}
+
+// onlyLost is the details of a row other than its own counts that a row
+// partial for facts without a node alone carries.
+func onlyLost(details map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range details {
+		switch k {
+		case "facts_without_node", "members", "sites", "bound_sites", "open_sites", "computed_sites", "external_sites",
+			"resolved_imports", "open_import_sites":
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // checkEndpoints asserts every relation's endpoints are nodes this unit
@@ -582,6 +608,9 @@ type golden struct {
 	facts   []string
 	returns []string
 	counts  map[string]string
+	// lost is each capability's count of facts whose target has no node
+	// (facts_without_node), none when nil.
+	lost map[string]string
 	// fails names the wrong answer the case catches and the change to the
 	// linker that would produce it.
 	fails string
@@ -611,6 +640,9 @@ func runGoldens(t *testing.T, cases []golden) {
 			}
 			if c.returns != nil {
 				check("returns", l.returns(t), c.returns)
+			}
+			if want := c.lost; !maps.Equal(l.lost, want) && (len(want) > 0 || len(l.lost) > 0) {
+				t.Fatalf("facts without a node by capability: %v, want %v (fails under: %s)", l.lost, want, c.fails)
 			}
 			for k, v := range c.counts {
 				if got := l.calls.Details[k]; got != v {

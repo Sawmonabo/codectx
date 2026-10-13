@@ -346,7 +346,11 @@ func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pa
 		groupOf := func(entry int, i int32) error {
 			group = group[:0]
 			for in(entry) && cur.Site == i {
-				group = append(group, cur)
+				// A fact whose target has no node publishes nothing; the
+				// capability rows count it (externalsOf).
+				if !cur.unnamed() {
+					group = append(group, cur)
+				}
 				if cur, ok, err = next(); err != nil {
 					return err
 				}

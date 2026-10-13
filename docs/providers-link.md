@@ -752,6 +752,14 @@ The provider publishes one row of each of its six capabilities per unit, at the 
   missing). The row then also counts the unit's `members`. A dropped entry is a worker entry the structural provider
   could not join to a declaration or a call reference of the file, or whose range did not fit the pinned bytes. None
   of these is fatal.
+- `partial`, with `coverage_incomplete`, on the row of each relation a fact was found for whose target the structural
+  provider minted no node (`facts_without_node`, counted by `externalsOf`, `state.go`): a call or hierarchy fact into
+  a declaration with no node, or an argument's flow into a parameter with none (one whose key did not fit, a C or C++
+  `...`) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
+  and no node (`idBinding.unnamed`), so a refresh carries and counts it like any other. A flow into a callable with
+  no body (an abstract method, a prototype) and a return flow from a callee with no return node are not facts. A fact
+  whose relation is no capability of its own (a route's handler, a declared entry point, a launchable `main`, a
+  visibility macro) is counted on the `calls` row.
 
 The `calls` row always carries the unit's site counts, which add up: `sites` = `bound_sites` + `open_sites` +
 `computed_sites` + `external_sites`. A bound site has at least one target of the unit; an external site reached only
