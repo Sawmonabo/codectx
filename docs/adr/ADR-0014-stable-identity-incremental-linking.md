@@ -92,7 +92,11 @@ republishes `helpers.go`, and the existing overloads keep their identities.
   `resolvePackageJsonExports`, `resolvePackageJsonImports`, `allowJs`, `files`, `include`, `exclude`,
   `references`) [S11]; a package's `name`, `type`, `exports`, `imports`, `types`/`typings`, `module`, `main` and
   `workspaces`, and a pnpm or Lerna workspace's globs; a crate's name; a Python or Java project root.
-- An unchanged fingerprint reruns nothing: a dependency version bump changes no field the linker reads.
+- An unchanged fingerprint reruns nothing. A Go unit also reads where each package outside it is read from (each
+  requirement's version, each replacement, the governing `go.work`, the vendor manifest, the standard library): a
+  change to those alone reads those packages again and keeps everything when what they declare is what the previous
+  build read (early cutoff [S9]), so a dependency version bump that changes no declaration the unit reads reruns
+  nothing.
 - A changed field reruns only the sites whose traces read it [S12]. For ECMAScript the read is the specifier's
   answer: each import's resolution is an index entry keyed by the importing file and the specifier, so a changed
   config reruns exactly the nodes whose imports now resolve differently, in whichever package they are written.
