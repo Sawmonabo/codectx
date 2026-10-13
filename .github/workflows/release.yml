@@ -161,6 +161,15 @@ jobs:
           fi
           echo "native leg on $host_os/$host_arch"
 
+      # The search index library, built for this leg's own target by the
+      # pinned toolchain before the Go link: the GNU targets on Windows, the
+      # runner's native target everywhere else. The build directory is not
+      # restored from a cache, so the archive is built from the locked sources.
+      - name: Build the search index library
+        uses: ./.github/actions/search-index
+        with:
+          cache-target: "false"
+
       # -trimpath and the two -X values are the whole of the build identity:
       # internal/model/build.go embeds no wall-clock timestamp and none is added
       # here, so the same commit rebuilds byte for byte (Section 24).
@@ -336,11 +345,15 @@ jobs:
       # payloads and their native assets. The lock pins one version per tool
       # across platforms, so one store is the inventory for all of them;
       # unpacking six multi-gigabyte stores would add time and no components.
+      # A Go binary records only Go modules, so the search index library's
+      # crates come from its Cargo.lock, which pins every one of them by version
+      # and checksum.
       - name: Assemble the SBOM scan root
         run: |
           set -eu
           rm -rf sbom-root
-          mkdir -p sbom-root/binaries sbom-root/tool-store
+          mkdir -p sbom-root/binaries sbom-root/tool-store sbom-root/search-index
+          cp internal/search/textindex/Cargo.lock sbom-root/search-index/Cargo.lock
           for a in "dist/codectx_${VERSION}"_*.tar.gz; do
             d="sbom-root/binaries/$(basename "$a" .tar.gz)"
             mkdir -p "$d"
@@ -352,7 +365,7 @@ jobs:
             unzip -q "$a" -d "$d"
           done
           tar -xzf "dist/codectx-bundle_${VERSION}_linux_amd64.tar.gz" -C sbom-root/tool-store ./tools
-          du -sh sbom-root/binaries sbom-root/tool-store
+          du -sh sbom-root/binaries sbom-root/tool-store sbom-root/search-index
 
       # Written outside dist and moved in, so the generator never scans its own
       # output and so the checksums step below still covers it.
