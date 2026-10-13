@@ -294,6 +294,11 @@ type rankedStreams struct {
 	Ranked *pagination.SortedRun[candRec]
 	Paths  *pagination.SortedRun[pathRec]
 	Hops   *pagination.SortedRun[hopRec]
+	// Admitted, Routed and Boosted are the reasons P-A, P-D and P-F gave,
+	// each keyed on Seq (lessReasonSeq). They stay three runs rather than
+	// being copied into one: the phase order is fixed, so the re-key reads a
+	// candidate's admitted reasons, then its routed, then its boosted ones.
+	Admitted, Routed, Boosted *pagination.SortedRun[reasonRec]
 }
 
 // measuredPlan is P-G's output and P-H's and P-I's input.
@@ -311,9 +316,11 @@ type measuredPlan struct {
 	// overwrite happens only on the surviving branch
 	// (stream_parity_test.go:442).
 	Excluded *pagination.SortedRun[candRec]
-	// Paths and Hops are the route streams re-keyed from Seq to Index.
-	Paths *pagination.SortedRun[pathRec]
-	Hops  *pagination.SortedRun[hopRec]
+	// Paths, Hops and Reasons are the route and reason streams re-keyed from
+	// Seq to Index.
+	Paths   *pagination.SortedRun[pathRec]
+	Hops    *pagination.SortedRun[hopRec]
+	Reasons *pagination.SortedRun[reasonRec]
 }
 
 // packedPlan is P-H's output: one verdict per file group, ordered by file so
@@ -397,6 +404,33 @@ func sortedRun[T any](s *compileSorts, sorter *pagination.ExternalSort[T]) (*pag
 		return nil, err
 	}
 	return trackRun(s, run), nil
+}
+
+// reasonCursor reads one candidate's reasons from the Index-keyed reason
+// stream, in the order they were given, under appendReason's rules: trimmed,
+// none empty or past the one-reason byte bound, each text once.
+type reasonCursor struct {
+	run *runCursor[reasonRec]
+}
+
+func newReasonCursor(run *pagination.SortedRun[reasonRec]) *reasonCursor {
+	return &reasonCursor{run: newRunCursor(run)}
+}
+
+func (r *reasonCursor) close() { r.run.stop() }
+
+// take answers the reasons of the candidate at index, stepping over those of
+// candidates the caller skipped.
+func (r *reasonCursor) take(index int64) ([]string, error) {
+	for r.run.ok && r.run.cur.Seq < index {
+		r.run.advance()
+	}
+	var out []string
+	for r.run.ok && r.run.cur.Seq == index {
+		out = appendReason(out, r.run.cur.Text)
+		r.run.advance()
+	}
+	return out, r.run.err()
 }
 
 // routeCursors rebuilds one candidate's model.RelationPath values from the two

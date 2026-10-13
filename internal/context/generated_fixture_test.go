@@ -94,10 +94,20 @@ func generatedSpecs() []fixtureFileSpec {
 // generatedLeaves*len(generatedKinds) distinct relation ids -- far past
 // model.MaxPageItems, which is what the unlimited edge scan must page past.
 // The two routes to `Shared` are the fold's input.
+//
+// An odd leaf hangs off `RootA` by `routes_to` where an even one has
+// `implements`. An entity scores by its best route, and implements outweighs
+// every other kind here while routes_to weighs no more than calls, so the even
+// leaves outrank the odd ones. Leaves of one score tie and fall back to path
+// order, which is file order; two interleaved score levels are what put the
+// rank order and the file order of the drop stream apart.
 func generatedScope(fx *contextFixture) []model.Relation {
 	out := make([]model.Relation, 0, generatedLeaves*len(generatedKinds)+4)
 	for i := range generatedLeaves {
 		for _, k := range generatedKinds {
+			if k == model.RelImplements && i%2 == 1 {
+				k = model.RelRoutesTo
+			}
 			out = append(out, fx.edge(genRootA, k, genLeaf(i)))
 		}
 	}

@@ -214,7 +214,7 @@ func (in *seedIngest) pushCandidates(ctx context.Context, r graph.GraphReader, s
 		}
 		seq := in.seq
 		in.seq++
-		if err := in.entitySort.Add(candRecOf(cand, seq)); err != nil {
+		if err := in.add(in.entitySort, cand, seq); err != nil {
 			return err
 		}
 	}

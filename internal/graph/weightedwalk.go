@@ -1274,7 +1274,7 @@ func (w *weightedWalk) explain(ctx context.Context, page []servedLabel) (map[int
 			}
 			direction := impactDirection(kind, leaves)
 			x := out[l.id]
-			x.reasons = mergeReasons(x.reasons, []string{impactEdgeReason(kind, leaves, direction, far+1)})
+			x.reasons = unionReasons(x.reasons, []string{impactEdgeReason(kind, leaves, direction, far+1)})
 			x.incoming = x.incoming || direction == model.DirectionIncoming
 			out[l.id] = x
 		}

@@ -423,6 +423,9 @@ type compileState struct {
 	// keptPaths and keptHops are the routes P-D retained, read by P-G.
 	keptPaths *pagination.SortedRun[pathRec]
 	keptHops  *pagination.SortedRun[hopRec]
+	// reasons, routedReasons and boostedReasons are the reasons P-A, P-D and
+	// P-F gave, each keyed on Seq and read by P-G's re-key.
+	reasons, routedReasons, boostedReasons *pagination.SortedRun[reasonRec]
 	// edges is the compile's ONE pre-fold carry: P-D has finished writing it,
 	// P-E merges it. It is checkpointed with its runs detached and restored
 	// with foldPkgEdgeDistinct re-attached (resume.go's two-class rule).
@@ -743,7 +746,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 		return nil
 	}
 	st.ingest = nil
-	st.cands, st.paths, st.hops = in.Cands, in.Paths, in.Hops
+	st.cands, st.paths, st.hops, st.reasons = in.Cands, in.Paths, in.Hops, in.Reasons
 	st.scope = in.Scope
 	st.scopeComplete = in.Scope.ScopeComplete
 	return nil
@@ -823,10 +826,17 @@ func (c *Compiler) stageRouteScoring(ctx context.Context, sorts *compileSorts, s
 		return err
 	}
 	edges = edges.WithFold(foldPkgEdgeDistinct)
+	routed, err := newSort(sorts, "routed-reason", lessReasonSeq, sizeOfReason)
+	if err != nil {
+		return err
+	}
 	scored, err := c.passDRouteScoring(ctx, sorts, st.hydrated, st.paths, st.hops,
-		retainedPaths, retainedHops, edges)
+		retainedPaths, retainedHops, routed, edges)
 	if err != nil {
 		return contextErr(ctx, err)
+	}
+	if st.routedReasons, err = sortedRun(sorts, routed); err != nil {
+		return err
 	}
 	if st.keptPaths, err = sortedRun(sorts, retainedPaths); err != nil {
 		return err
@@ -867,8 +877,15 @@ func (c *Compiler) stageBoosts(ctx context.Context, sorts *compileSorts, st *com
 		return err
 	}
 	bestSort = bestSort.WithFold(foldBestRank)
-	if err := c.passFBoosts(ctx, st.scored, st.counts, bestSort); err != nil {
+	boosted, err := newSort(sorts, "boosted-reason", lessReasonSeq, sizeOfReason)
+	if err != nil {
+		return err
+	}
+	if err := c.passFBoosts(ctx, st.scored, st.counts, bestSort, boosted); err != nil {
 		return contextErr(ctx, err)
+	}
+	if st.boostedReasons, err = sortedRun(sorts, boosted); err != nil {
+		return err
 	}
 	best, err := sortedRun(sorts, bestSort)
 	if err != nil {
@@ -900,12 +917,14 @@ func (c *Compiler) stageBoosts(ctx context.Context, sorts *compileSorts, st *com
 // the caller as itself.
 func (c *Compiler) stageMeasure(ctx context.Context, sorts *compileSorts, st *compileState) error {
 	measured, err := c.passGMeasure(ctx, sorts,
-		rankedStreams{Ranked: st.ranked, Paths: st.keptPaths, Hops: st.keptHops})
+		rankedStreams{Ranked: st.ranked, Paths: st.keptPaths, Hops: st.keptHops,
+			Admitted: st.reasons, Routed: st.routedReasons, Boosted: st.boostedReasons})
 	if err != nil {
 		return err
 	}
 	st.measured = measured
 	st.ranked, st.keptPaths, st.keptHops = nil, nil, nil
+	st.reasons, st.routedReasons, st.boostedReasons = nil, nil, nil
 	return nil
 }
 
@@ -991,10 +1010,6 @@ func planNotices(scoped scopeResult, packed planParts, scopeComplete bool) []str
 	add := func(format string, args ...any) {
 		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
 		out = append(out, note)
-	}
-	if n := scoped.ReasonsDropped; n > 0 {
-		add("%d selection reason(s) past the %d-per-entry bound were not stored; the entries they explain are still listed in full",
-			n, model.MaxReasonsPerEntry)
 	}
 	if n := scoped.ReasonsTruncated; n > 0 {
 		add("%d selection reason(s) were truncated to the %d-byte reason bound", n, model.MaxReasonBytes)
@@ -1187,7 +1202,7 @@ type candidate struct {
 	ScoreMicros int64
 	SizeBytes   int64 // model.FileVersion.Size; 0 until sized
 	Status      model.FileStatus
-	Reasons     []string             // <= model.MaxReasonsPerEntry, each <= MaxReasonBytes
+	Reasons     []string             // every reason, each <= MaxReasonBytes
 	Paths       []model.RelationPath // <= cfg.Context.MaxReasonPathsPerEntry
 	MorePaths   int64                // routes not enumerated (Section 15.3)
 	Excluded    string               // non-empty => excluded, with this reason

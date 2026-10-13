@@ -72,7 +72,9 @@ func TestImpactExpandsEveryChunkOfEveryOpenSiteLevel(t *testing.T) {
 // Mutations it catches, in the spilled run: not consulting the counted sites
 // in scratch (siteH counted again at depth 2), losing the level's nodes when
 // they move (depth 1 counts nothing), or reading only the first name of a
-// level from scratch (depth 1 counts one).
+// level from scratch (depth 1 counts one), or reading a level's nodes back
+// from scratch without a field a site's fit reads, such as the file (every
+// depth counts nothing).
 func TestImpactCountsOpenSitesTheSameAfterTheSetsSpill(t *testing.T) {
 	f := newCallFixture("open_site_spill", fixtureScenario{
 		Nodes: []fixtureDecl{

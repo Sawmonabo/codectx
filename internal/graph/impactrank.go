@@ -224,12 +224,21 @@ func compareImpactRoute(x, y impactRecord) int {
 	return cmp.Compare(x.Parent, y.Parent)
 }
 
-// mergeReasons is the deterministic reason merge: the union of both sides,
-// deduplicated, each clipped to model.MaxReasonBytes, sorted, and only then
+// mergeReasons is the deterministic reason merge: unionReasons, and only then
 // cut to model.MaxReasonsPerEntry -- so the surviving set is a function of the
-// reasons alone. Empty reasons are dropped: model.ImpactEntry.Validate rejects
-// them, and an entry must never fail validation because of a fold.
+// reasons alone.
 func mergeReasons(a, b []string) []string {
+	out := unionReasons(a, b)
+	if len(out) > model.MaxReasonsPerEntry {
+		out = out[:model.MaxReasonsPerEntry]
+	}
+	return out
+}
+
+// unionReasons is the union of both sides, deduplicated, each clipped to
+// model.MaxReasonBytes and sorted, with no count cut. Empty reasons are
+// dropped: an entry must never fail validation because of a merge.
+func unionReasons(a, b []string) []string {
 	out := make([]string, 0, len(a)+len(b))
 	for _, side := range [2][]string{a, b} {
 		for _, r := range side {
@@ -243,9 +252,6 @@ func mergeReasons(a, b []string) []string {
 		}
 	}
 	slices.Sort(out)
-	if len(out) > model.MaxReasonsPerEntry {
-		out = out[:model.MaxReasonsPerEntry]
-	}
 	return out
 }
 

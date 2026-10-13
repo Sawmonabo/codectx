@@ -304,7 +304,7 @@ func TestStreamedBudgetRecordRoundTrip(t *testing.T) {
 	cand := candRec{Seq: 7, Index: 3, NodeID: "n1", FileID: "f1", PathAtRank: "a.go",
 		PathFinal: "b.go", Requirement: model.RequirementSymbol, Origin: originExpansion,
 		Depth: 2, StartByte: 40, ScoreMicros: 900_000, SizeBytes: 4096,
-		Status: model.FileTracked, Reasons: []string{"reached by one import"},
+		Status:    model.FileTracked,
 		MorePaths: 2, FileMissing: true}
 	roundTrip(t, "sizedRec", sizedRec{Cand: cand, Charged: true})
 	roundTrip(t, "sizedRec zero", sizedRec{})
