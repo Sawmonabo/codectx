@@ -437,7 +437,10 @@ their need the same way, with no memory figure of any tool:
   payload and build.
 - **Overrun.** While the tool runs, a reading above what it holds raises the holding at once (Adjust), so the next
   admission waits beside the memory the tool really uses; a lower reading never lowers it, since a tool that shrank can
-  grow again. Nothing is refused and nothing is killed. The overrun is recorded with its reservation in the run ledger's
+  grow again. The one exception is a first run: once measured, its holding is lowered from the allocation to what its
+  class now predicts for its work, so a language server that lives on does not hold every other child out. On a
+  platform that reads no tree, nothing is measured and a first run holds the allocation for its life. Nothing is
+  refused and nothing is killed. The overrun is recorded with its reservation in the run ledger's
   need classes, and the next run of the class is planned from it.
 
 **Coexistence, as a mechanism.**

@@ -643,12 +643,13 @@ func TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited(t *testing.T) {
 			}
 			srv := ov.s
 			ov.Close()
-			// The first server of its class is reserved at the whole
-			// allocation (admission.Ledger.HoldChild), so a 6 GiB unit does
-			// not fit beside it.
-			if _, reserved := led.Snapshot(); reserved < 8*giB {
-				t.Fatalf("the first server of its class reserves %d bytes, want the 8 GiB allocation; this test's arithmetic no longer holds", reserved)
+			// The server holds its need-derived room; a unit one byte larger
+			// than what is left does not fit beside it.
+			allocation, reserved := led.Snapshot()
+			if reserved <= 0 {
+				t.Fatal("the running server holds no room; the check below would prove nothing")
 			}
+			unitBytes := allocation - reserved + 1
 			if materializations(t, h.Policy.DataDir) != 1 {
 				t.Fatal("the running server has no materialization; the check below would prove nothing")
 			}
@@ -659,7 +660,7 @@ func TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited(t *testing.T) {
 			var once sync.Once
 			granted := make(chan int, 1)
 			go func() {
-				release, err := led.Reserve(ctx, 6*giB, func() { once.Do(func() { close(queued) }) })
+				release, err := led.Reserve(ctx, unitBytes, func() { once.Do(func() { close(queued) }) })
 				if err != nil {
 					granted <- -1
 					return

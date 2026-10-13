@@ -65,11 +65,13 @@ project directory times what this repository's servers of the same payload and
 work-size class were measured to use per byte — the anonymous resident set of
 the server's process tree once it has answered `initialize` — kept in the run
 ledger's observation store and never more than the allocation. A server of a
-class nothing was measured in yet is reserved at the whole allocation, runs
-alone, and the next server of its class waits for its measurement and is
-planned from it. While a server runs, a reading of its tree above what it holds
-raises its holding at once, so the next child waits beside the memory the
-server really uses; a lower reading never lowers it. No server has a memory
+class nothing was measured in yet is reserved at the whole allocation until it
+answers `initialize`, then holds what its class now predicts; the next server
+of its class waits for that measurement and is planned from it. While a server
+runs, a reading of its tree above what it holds raises its holding at once, so
+the next child waits beside the memory the server really uses; a lower reading
+never lowers it. Where the platform reads no process tree, nothing is measured
+and such a server holds the allocation while it runs. No server has a memory
 figure of its own (ADR-0012 decision 5). That allocation is the whole process's, not this package's — the
 precise indexers' heavy units are admitted from the same ledger and in the same
 first-in-first-out order, so a server never overtakes a unit that asked first.

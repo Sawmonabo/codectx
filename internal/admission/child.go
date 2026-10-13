@@ -228,9 +228,26 @@ func (h *Holding) Need() (ChildNeed, bool) {
 // anonymous resident set its tree was read at -- against the plan it was
 // admitted on. It is recorded once; ok false teaches nothing. A holding that
 // is no external tool's records nothing.
+//
+// A first run, held at the whole allocation, is lowered once measured to what
+// its class now predicts for its work: a language server lives on after its
+// measurement, and holding the allocation for its lifetime would keep every
+// other server and unit from running beside it. A reading above the lowered
+// figure raises it again (FollowResidency).
 func (h *Holding) Observe(needBytes int64, ok bool) {
-	if h.child != nil {
-		h.child.end(needBytes, ok)
+	if h.child == nil {
+		return
+	}
+	h.child.end(needBytes, ok)
+	n := h.child.need
+	if !ok || n.Learned || n.model == nil {
+		return
+	}
+	n.model.mu.Lock()
+	predicted, learned := n.model.h.Predict(n.WorkBytes)
+	n.model.mu.Unlock()
+	if learned && predicted < h.Bytes() {
+		h.Adjust(max(predicted, 1))
 	}
 }
 

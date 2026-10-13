@@ -252,3 +252,34 @@ func TestAProjectsWorkIsItsOwnDirectory(t *testing.T) {
 		t.Fatalf("the workspace root's work is %d bytes, want every live file's 1,000,111", work)
 	}
 }
+
+// TestAMeasuredFirstRunGivesTheAllocationBack protects a long-lived first run:
+// once its need is measured, its holding is lowered from the whole allocation
+// to what its class predicts for its work, so a language server that keeps
+// running does not hold every other child out for its lifetime.
+//
+// Mutation: drop the Adjust in Holding.Observe -> the first run keeps the 16
+// GiB allocation and the 1 GiB reservation beside it waits.
+func TestAMeasuredFirstRunGivesTheAllocationBack(t *testing.T) {
+	l := childLedger(t, 16*childGiB)
+	var needs ChildNeeds
+	h, err := l.HoldChild(context.Background(), &needs, ChildKey{Tool: "server s", Fingerprint: "f"}, 1<<20, 1, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release()
+	if _, reserved := l.Snapshot(); reserved != 16*childGiB {
+		t.Fatalf("a first run reserved %d bytes, want the 16 GiB allocation", reserved)
+	}
+	h.Observe(2*childGiB, true)
+	if b := h.Bytes(); b < 2*childGiB || b >= 3*childGiB {
+		t.Fatalf("a first run measured at 2 GiB holds %d bytes; want its class's prediction for its work", b)
+	}
+	waiting, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	beside, err := l.Hold(waiting, Reservation{MemoryBytes: childGiB}, nil)
+	if err != nil {
+		t.Fatalf("a 1 GiB reservation waited beside a measured 2 GiB first run in a 16 GiB allocation: %v", err)
+	}
+	beside.Release()
+}
