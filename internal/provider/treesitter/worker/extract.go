@@ -877,6 +877,9 @@ func (e *extraction) emit(out *emitter) error {
 		w.MacroInput = macroInput(path)
 		w.MacroLocal, w.MacroExact = e.macroScope(w.MacroInput, start)
 		w.MacroTranscribes = d.macro && e.macroTranscribes(d.node)
+		if e.l.Name == "rust" {
+			w.Constructor = rustConstructor(d.node)
+		}
 		if d.body != nil && d.body.StartByte() > start {
 			w.SigEnd = uint32(d.body.StartByte())
 		}

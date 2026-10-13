@@ -374,6 +374,109 @@ impl<T: fmt::Debug> Describe for T {
 		fails: "an impl item published as implementing a same-named item of another trait of its self type; an external trait's item dropped when the type implements several; a blanket impl's item left without its trait's",
 	},
 	{
+		name:   "unit-and-tuple-constructors",
+		anchor: "The Rust Reference, \"Struct expressions\" (tuple struct and unit-like struct expressions: a call of the constructor, and the path of the constant, in the value namespace), \"Enumerations\" (unit-like and tuple-like variants)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "ctors"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `pub mod m;
+
+pub struct U; // @tu
+impl U {
+    pub fn go(&self) {} // @ugo
+    pub fn again(&self) {
+        let h = Self;
+        h.go(); // @c8
+    }
+}
+
+pub struct T(pub u8); // @tt
+impl T {
+    pub fn go(&self) {} // @tgo
+    pub fn again(&self) {
+        let i = Self(1); // @c9a
+        i.go(); // @c9
+    }
+}
+
+pub enum E {
+    A, // @va
+    B(u8), // @vb
+    C { x: u8 }, // @vc
+}
+impl E {
+    pub fn go(&self) {} // @ego
+    pub fn again(&self) {
+        let j = Self::A;
+        j.go(); // @c10
+    }
+}
+
+pub fn run() {
+    let a = U;
+    a.go(); // @c1
+    let b = T(1); // @c2a
+    b.go(); // @c2
+    let c = E::A;
+    c.go(); // @c3
+    let d = E::B(1); // @c4a
+    d.go(); // @c4
+    let f = m::V;
+    f.go(); // @c5
+    let g = m::W(2); // @c6a
+    g.go(); // @c6
+    let k = E::C { x: 1 };
+    k.go(); // @c7
+    let ctor = T;
+    ctor.go(); // @n1
+    let variant = E::B;
+    variant.go(); // @n2
+}
+`,
+			"src/m.rs": `pub struct V; // @tv
+impl V {
+    pub fn go(&self) {} // @vgo
+}
+pub struct W(pub u8); // @tw
+impl W {
+    pub fn go(&self) {} // @wgo
+}
+`,
+		},
+		want: []string{
+			"c1 go -> ugo go exact",
+			"c10 go -> ego go exact",
+			"c2 go -> tgo go exact",
+			"c2a T -> tt T exact",
+			"c3 go -> ego go exact",
+			"c4 go -> ego go exact",
+			"c4a B -> vb B exact",
+			"c5 go -> vgo go exact",
+			"c6 go -> wgo go exact",
+			"c6a W -> tw W exact",
+			"c7 go -> ego go exact",
+			"c8 go -> ugo go exact",
+			"c9 go -> tgo go exact",
+			"c9a Self -> tt T exact",
+		},
+		// Derived from the source and the anchor: a unit struct's or unit variant's path is a value of its
+		// type, a tuple constructor's call returns one, and a variant's struct expression is the enum's; a
+		// tuple struct's or tuple variant's path not called is its constructor, a function with no `go`.
+		sites: []string{
+			"n1 go open receiver_untyped member 0",
+			"n2 go open receiver_untyped member 0",
+		},
+		// Mutation: take every struct or variant path as a value of its type -> n1 and n2 bind `go`.
+		// Mutation: read struct paths alone -> c3, c4, c4a and c10 stay open, and c7 binds an external
+		// E::C::go.
+		// Mutation: read no `Self` value path -> c8, c9 and c9a stay open.
+		// Mutation: bind no constructor call -> c2a, c4a, c6a and c9a stay open.
+		fails: "a tuple constructor taken as a value of its type; a variant's value or constructor call left untyped; `Self` as a value read as no type; a tuple constructor's call bound to nothing",
+	},
+	{
 		name:   "raw-identifiers",
 		anchor: "The Rust Reference, \"Identifiers\" (raw identifiers: the `r#` prefix is not part of the identifier), \"Paths\", \"Modules\" (module source filenames)",
 		files: map[string]string{
