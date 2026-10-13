@@ -1274,7 +1274,7 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	}
 	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
 		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
-	return packed, scopeComplete, c.manifestNotices(scoped.scopeResult, partsOf(packed)), stored, nil
+	return packed, scopeComplete, c.withPageNotice(planNotices(scoped.scopeResult, partsOf(packed), scopeComplete)), stored, nil
 }
 
 // parityRequests are the requests the parity proof compiles through both
@@ -1406,7 +1406,47 @@ func readBackManifest(t *testing.T, fx *contextFixture, id model.ManifestID) (
 	excluded := readAllPages(t, "ManifestExcluded", func(after int) ([]model.ExcludedContextEntry, error) {
 		return fx.Store.ManifestExcluded(fx.ctx, id, after, 0)
 	}, func(e model.ExcludedContextEntry) int { return e.Ordinal })
+	attachRoutes(t, fx, id, entries)
 	return entries, slices, excluded
+}
+
+// attachRoutes reads every route of the manifest through the routes view's
+// keyset and puts each entry's routes back on it, in route order, so a stored
+// entry compares whole against the plan's. Each entry's count must be the
+// number of routes read for it.
+func attachRoutes(t *testing.T, fx *contextFixture, id model.ManifestID, entries []model.ContextEntry) {
+	t.Helper()
+	at := map[int]int{}
+	for i, e := range entries {
+		at[e.Ordinal] = i
+	}
+	afterEntry, afterIndex := -1, -1
+	for {
+		page, err := fx.Store.ManifestRoutes(fx.ctx, id, afterEntry, afterIndex, 0)
+		if err != nil {
+			t.Fatalf("ManifestRoutes: %v", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, r := range page {
+			i, ok := at[r.Entry]
+			if !ok {
+				t.Fatalf("route %d names entry %d, which the manifest does not hold", r.Index, r.Entry)
+			}
+			if r.Index != len(entries[i].EvidencePaths) {
+				t.Fatalf("entry %d's route %d arrived after %d routes", r.Entry, r.Index, len(entries[i].EvidencePaths))
+			}
+			entries[i].EvidencePaths = append(entries[i].EvidencePaths, r.Relations)
+		}
+		last := page[len(page)-1]
+		afterEntry, afterIndex = last.Entry, last.Index
+	}
+	for _, e := range entries {
+		if e.RouteCount != int64(len(e.EvidencePaths)) {
+			t.Fatalf("entry %d counts %d routes and %d were read", e.Ordinal, e.RouteCount, len(e.EvidencePaths))
+		}
+	}
 }
 
 // readAllPages walks one keyset-paged reader from before its first row to its

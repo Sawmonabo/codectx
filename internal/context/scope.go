@@ -44,6 +44,15 @@ var scopeRelations = []model.RelationKind{
 	model.RelRoutesTo,
 }
 
+// peerRelations is the hierarchy kinds whose round trip reaches a sibling:
+// up one of them from a subtype to its supertype and straight back down the
+// same kind to another subtype (Dog extends Animal, Cat extends Animal). The
+// route depends on the supertype, not on the sibling, so a sibling is
+// recommended reading at most (admitEntry), whatever its kind.
+var peerRelations = map[model.RelationKind]bool{
+	model.RelExtends: true, model.RelImplements: true, model.RelOverrides: true,
+}
+
 // scopeResult is the expansion pass's SCALAR verdict: the capability rows that
 // made the answer less than complete, the ScopeComplete verdict and the two
 // explanation-cut counts. The candidates themselves are not here -- they are
@@ -326,6 +335,10 @@ type seedIngest struct {
 	// request arrived with, so a bound kept only in a local would restart at
 	// zero on every continuation and never fire.
 	stalls int
+	// closureRetried records that the deadline cut the round's closure once
+	// and the pass halted to run it again (closeKeptFilesUnit). Carried for the
+	// reason stalls is: a second cut must not halt again.
+	closureRetried bool
 	// closure is the round's kept-file closure (closure.go), nil in a round
 	// that runs none. The walk loop marks the kept-file nodes it reaches on
 	// it, and the closure walk runs from the ones it did not reach after the
@@ -601,6 +614,7 @@ func scopeLabelRule() (graph.LabelRule, error) {
 	return graph.LabelRule{
 		Scale: scale, Hop: hop, Decay: depthDecay,
 		Classes: requirementRank(model.RequirementOptional) - requirementRank(model.RequirementFull) + 1,
+		Peer:    peerRelations,
 		Policy:  compilerPolicyVersion,
 	}, nil
 }
@@ -752,8 +766,15 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 	// round's walk, on every path that ends the pass, so its
 	// entries and its disclosures are on the spool and the verdict below.
 	finish := func() (*ingested, bool, error) {
-		if err := c.closeKeptFiles(ctx, in, eng, gen); err != nil {
+		halted, err := c.closeKeptFilesUnit(ctx, in, eng, gen, stop)
+		if err != nil {
 			return nil, false, err
+		}
+		if halted {
+			// The deadline cut the closure: the pass ends with the walk done
+			// and the closure still to run, the carry a halt after the walk's
+			// last page leaves.
+			return nil, true, nil
 		}
 		out.Scope = in.scope
 		done, err := finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort)
@@ -899,7 +920,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			reached := make([]model.ImpactEntry, 0, len(walk.Entries))
 			for j := range walk.Entries {
 				e := walk.Entries[j]
-				if err := in.admitEntry(e.ImpactEntry, e.RootWeight, e.Named); err != nil {
+				if err := in.admitEntry(e.ImpactEntry, e.RootWeight, e.Named, e.Peer); err != nil {
 					return nil, false, err
 				}
 				if n := len(reached); n > 0 && reached[n-1].NodeID == e.NodeID {
@@ -910,7 +931,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 				}
 				reached = append(reached, e.ImpactEntry)
 			}
-			if err := c.admitCandidates(ctx, eng, gen, reached, in); err != nil {
+			if err := c.admitCandidates(ctx, eng, gen, reached, in, nil); err != nil {
 				return nil, false, err
 			}
 			if halt {
@@ -945,12 +966,10 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 // root lends it (ADR-0016 decision 1): the root's weight and class, and the
 // requirement of its kind at its depth on that root's route, no stronger than
 // recommended for a lexical root -- a lexical root never makes an entry
-// required. Its routes go to the route sorts under the same seq.
-func (in *seedIngest) admitEntry(e model.ImpactEntry, weight int64, named bool) error {
-	requirement := boundaryRequirement(e.Kind, e.Depth)
-	if !named && requirementRank(requirement) < requirementRank(model.RequirementRecommended) {
-		requirement = model.RequirementRecommended
-	}
+// required -- or for a sibling the route reached up a hierarchy kind and back
+// down it (peerRelations). Its routes go to the route sorts under the same seq.
+func (in *seedIngest) admitEntry(e model.ImpactEntry, weight int64, named, peer bool) error {
+	requirement := walkRequirement(e.Kind, e.Depth, named, peer)
 	cand := candidate{
 		NodeID: e.NodeID,
 		FileID: e.FileID,
@@ -976,6 +995,17 @@ func (in *seedIngest) admitEntry(e model.ImpactEntry, weight int64, named bool) 
 		return err
 	}
 	return in.emitRoutes(seq, e.Paths)
+}
+
+// walkRequirement is the requirement a walk route lends an entry of kind at
+// depth: its kind's at that depth (boundaryRequirement), and no stronger than
+// recommended when its root is not named or its route reached a sibling.
+func walkRequirement(kind model.NodeKind, depth int, named, peer bool) model.Requirement {
+	requirement := boundaryRequirement(kind, depth)
+	if (!named || peer) && requirementRank(requirement) < requirementRank(model.RequirementRecommended) {
+		requirement = model.RequirementRecommended
+	}
+	return requirement
 }
 
 // walkDeadlineReason is the graph walks' truncation reason for a page the

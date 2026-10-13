@@ -217,6 +217,12 @@ type ContextEntry struct {
 	EstimatedTokens int64          `json:"estimated_tokens"`
 	Reasons         []string       `json:"reasons"`
 	EvidencePaths   [][]RelationID `json:"evidence_paths,omitempty"`
+	// RouteCount is how many evidence routes the entry has. The routes are
+	// stored in full and served by reference, a page at a time, through the
+	// routes view (ContextRoute); an entry served by the entries view carries
+	// the count, never the routes, which is why EstimatedBytes does not
+	// charge them.
+	RouteCount int64 `json:"route_count"`
 }
 
 // Validate enforces the context_entries constraints and the bounded explanation
@@ -244,6 +250,9 @@ func (e ContextEntry) Validate() error {
 		return err
 	}
 	if err := boundStrings("context_entry.reasons", e.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
+		return err
+	}
+	if err := requireNonNegative("context_entry.route_count", e.RouteCount); err != nil {
 		return err
 	}
 	// No count bound on evidence_paths. The bound is the configured
@@ -517,12 +526,15 @@ const (
 	ViewEntries  ContextView = "entries"
 	ViewSlices   ContextView = "slices"
 	ViewExcluded ContextView = "excluded"
+	// ViewRoutes pages every entry's evidence routes, in (entry ordinal,
+	// route index) order (ContextRoute).
+	ViewRoutes ContextView = "routes"
 )
 
 // Valid reports whether v is a known wire spelling.
 func (v ContextView) Valid() bool {
 	switch v {
-	case ViewEntries, ViewSlices, ViewExcluded:
+	case ViewEntries, ViewSlices, ViewExcluded, ViewRoutes:
 		return true
 	}
 	return false
@@ -653,6 +665,7 @@ type ContextPage struct {
 	Entries    []ContextEntry         `json:"entries,omitempty"`
 	Slices     []ContextSlice         `json:"slices,omitempty"`
 	Excluded   []ExcludedContextEntry `json:"excluded,omitempty"`
+	Routes     []ContextRoute         `json:"routes,omitempty"`
 }
 
 // Validate enforces the page shape and its per-page item bound. A page carries
@@ -678,6 +691,7 @@ func (p ContextPage) Validate() error {
 		{ViewEntries, len(p.Entries)},
 		{ViewSlices, len(p.Slices)},
 		{ViewExcluded, len(p.Excluded)},
+		{ViewRoutes, len(p.Routes)},
 	}
 	items := 0
 	for _, l := range lists {
@@ -702,6 +716,11 @@ func (p ContextPage) Validate() error {
 	}
 	for _, e := range p.Excluded {
 		if err := e.Validate(); err != nil {
+			return err
+		}
+	}
+	for _, r := range p.Routes {
+		if err := r.Validate(); err != nil {
 			return err
 		}
 	}

@@ -41,7 +41,11 @@ the plan. The decisions below are that proposal with each of the six closed.
 ### 1. Each root lends what it reaches a (requirement, score) pair, and the entry takes the largest pair
 
 - The requirement is the node kind and the depth from *that* root, capped by the root's class (a lexical root never
-  makes an entry required). The score is the root's weight times (the route's product plus that route's own
+  makes an entry required) and by the route's shape: a route that goes up `extends`, `implements` or `overrides` from
+  a subtype to its supertype and straight back down the same kind to another subtype reaches a sibling, which is
+  recommended at most whatever its kind. That is the round-trip meta path P P⁻¹ that heterogeneous-graph similarity
+  defines peers by [S9], and the split the language server protocol keeps between supertypes and subtypes [S10]: the
+  route depends on the supertype, not on the sibling. The score is the root's weight times (the route's product plus that route's own
   route-dependent boosts).
 - The entry's rank key is the lexicographic maximum of its origin pair and every root's pair. It is never a minimum
   depth over all roots combined with a maximum score taken separately, and never a sum across routes.
@@ -123,11 +127,19 @@ keys, not on pages.
   over the scope relations are walked, and every lexical match inside those components becomes a root. A class's
   methods hang off it by `contains`, which the scope walk does not follow (`internal/context/scope.go:27-40`), so a
   method reachable only from an unread match in another file is otherwise missing. These components are disjoint
-  from the first walk by construction.
+  from the first walk by construction. The callers of the open call sites, in any file, that may call an unreached
+  node by name (ADR-0015 decision 3) start the component walk too (a caller and its site share a component over
+  `calls`), so a site that only an unread match reaches is walked from that match, and the name-only candidates it
+  lends to the kept files join the plan as they would in the full read.
 - **Order.** Pack, close, walk from the new roots, pack again, check the certificate. The closure adds entries only to
   kept files, all keyed at or below (`recommended`, τ(next)), so it cannot reorder the head above the stop. It can push
   a witness past a slice, which the certificate catches. The order above the stop is fixed and drops are permanent,
   so the loop ends.
+- **A deadline inside the closure.** The closure runs as one unit: what it admits is staged and joins the plan when it
+  finishes. On a compile that answers continuations, a query deadline that lands inside it discards the stage and
+  ends the call before the closure, so the continuation runs the closure whole and the plan is the uninterrupted
+  compile's. A closure the deadline cuts on two legs in a row cannot fit one call; its second run narrows the scope
+  on the cut, as a walk page that stalls twice does.
 
 **Alternative.** Lexical matches as leaves, never roots: trivially exact and the cheapest exact rule, but it drops the
 only graph expansion a plain-language task gets; an agent localization study lost 5.5 points of function accuracy at
@@ -159,25 +171,38 @@ only graph expansion a plain-language task gets; an agent localization study los
   match outside the kept files, is still packed (mutations: skip the kept-file read; skip the closure walk).
 - **Weak roots.** A lexical root never makes an entry required.
 - **Budget monotonicity.** For a plan bound by its file budget, raising the budget never removes a function, and the
-  plan is the same for any page size. When the byte budget binds, more roots can add explanation bytes, so the
-  property is stated for file-budget-bound plans.
+  plan is the same for any page size. An entry is charged as the entries view serves it: its fixed fields, its reasons
+  and its route count spelled at its widest, never its routes. The routes are stored in full, one row each, and paged
+  by reference through the `routes` view in (entry, route) order; the entry's count says how many to read. So how many
+  routes reach an entry never changes whether its file fits (mutation: measure the entry with its routes). Reasons
+  stay in the charge: they are bounded per entry (`MaxReasonsPerEntry` reasons of `MaxReasonBytes` each) and come from
+  the route that wins the entry, so when the byte budget binds, a root that changes an entry's winning route can still
+  move its group's size by at most that bound, and the property is stated exactly for file-budget-bound plans.
 
 ## Consequences
 
 - A broad task reads matches down to a floor set by the plan's own file budget, not to the end of the index, and
   walks only from them; the walk no longer scales with how many documents hold a common word.
 - Every root, whatever its weight, is walked in one walk. A node keeps each pair no other pair at it beats on every
-  count the ranking can only improve with (depth, class, weight, route product, remaining derived depth), so the
-  largest pair of decision 1 is among the ones it keeps; the walk is best-first on the score, because a heavier root
-  farther away can lend more than a lighter one next to the node.
+  count the ranking can only improve with (depth, class, weight, route product, remaining derived depth, and the
+  route's shape: whether it reached a sibling, whether its last hop went up a hierarchy kind and so may turn, and
+  whether it entered a callee through an argument), so the largest pair of decision 1 is among the ones it keeps; the
+  walk is best-first on the score, because a heavier root farther away can lend more than a lighter one next to the
+  node.
+- The walk crosses data flow across calls as the impact walk does: a route that entered a callee through a call's
+  argument never leaves it through a return flow, which would come out at every call site's result. It is the
+  two-phase slice of Horwitz, Reps and Binkley [S11] kept per route, as a label dimension: a route that has not
+  descended stands for one that has, never the reverse.
 - The read is deeper than a stop at the budget's score level, by the boost margin, and costs a few path-filtered reads
   and one walk over the unreached components; that walk's cost is measured in the scale proofs.
 - Centrality becomes a signal of the named roots' neighbourhood. A task with no named seeds ranks by lexical score
   and routes alone.
 - The compiler's policy version changes, so existing manifests are recompiled, not reused.
 - Explanations list routes from the matches read; the notice says so.
-- Follow-up outside this record: a packer that charges explanation bytes apart from source bytes would remove the
-  coupling between how many routes reach an entry and whether its file fits.
+- A plan's routes are a paged projection of their own, as the exclusions are. Agent context packers fill one budget
+  [S3], so the routes are not free; they are served by reference, as a protocol-level resource link serves a large
+  result [S12], and an entry costs a fixed header for them. A per-token knapsack would fit more routes but its
+  selections are not nested as the budget grows, which breaks the rank order this record rests on.
 
 ## Sources
 
@@ -199,7 +224,19 @@ only graph expansion a plain-language task gets; an agent localization study los
   Adaptive-k*, EMNLP 2025, https://arxiv.org/html/2506.08479v3 — largest-gap cut-off and its recall.
 - [S7] Meng et al., *Ranked List Truncation for Large Language Model-based Re-Ranking*, SIGIR 2024,
   https://arxiv.org/html/2404.18185v1 — learned truncation shows no clear advantage over a fixed depth.
-- [S8] *LocAgent: Graph-Guided LLM Agents for Code Localization*, https://arxiv.org/abs/2503.09089 — the no-traversal
-  ablation (cited through an earlier survey, not re-read).
+- [S8] Chen, Tang, Deng, Wu, Wu, Jiang, Prasanna, Cohan, Wang, *LocAgent: Graph-Guided LLM Agents for Code
+  Localization*, arXiv:2503.09089v2, https://arxiv.org/html/2503.09089 — section 5.6, Table 6: with the fine-tuned
+  Qwen-2.5-7B, removing the graph-traversal tool drops function-level Acc@10 from 71.53 to 66.06.
+- [S12] *Model Context Protocol, tools, 2025-06-18*, https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+  — a tool result may return a `resource_link`, a URI the client fetches or subscribes to for additional context.
+- [S9] Sun, Han, Yan, Yu, Wu, *PathSim: Meta Path-Based Top-K Similarity Search in Heterogeneous Information
+  Networks*, VLDB 2011, https://www.vldb.org/pvldb/vol4/p992-sun.pdf — typed, directed relation paths; the inverse
+  relation R⁻¹; peers defined on round-trip meta paths P P⁻¹ (pages 993-994).
+- [S10] *Language Server Protocol 3.17, type hierarchy*,
+  https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareTypeHierarchy
+  — `typeHierarchy/supertypes` and `typeHierarchy/subtypes` are separate requests.
+- [S11] Horwitz, Reps, Binkley, *Interprocedural Slicing Using Dependence Graphs*, TOPLAS 12(1), 1990,
+  https://research.cs.wisc.edu/wpis/papers/toplas90.pdf — section 4.5, forward slicing in two phases: the second
+  phase descends into called procedures and never ascends back out through a call site.
 - [research 25](../research/25-seed-budget.md) and [raw/seed-budget](../research/raw/seed-budget/findings.md) — the
   survey, the six leaks with their code lines, the options and the full source list.

@@ -187,6 +187,9 @@ type Decl struct {
 	// block's trait as written (wire.Export.Trait): the one trait whose item
 	// of the method's name it implements.
 	Trait string `json:"trait,omitempty"`
+	// Constructor is, for a Rust struct or enum variant, what its name is
+	// as a value (wire.Decl.Constructor): "unit" or "tuple".
+	Constructor string `json:"constructor,omitempty"`
 	// MacroInput is, for a Rust declaration written in an item-position
 	// macro's body, the innermost macro's path as written
 	// (wire.Decl.MacroInput); MacroLocal reports that a macro_rules of the

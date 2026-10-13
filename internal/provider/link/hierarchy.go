@@ -587,6 +587,9 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 		if err := addRustMacro(s, fc, ref, t, d); err != nil {
 			return err
 		}
+		if err := addRustConstructor(s, fc, ref, t, d); err != nil {
+			return err
+		}
 		if fc.family == "c" && d.Alias != "" {
 			if err := s.Add(entry{Key: keyMacro + d.Name, Ref: ref, Aux: t.Path, Sig: d.Alias}); err != nil {
 				return err

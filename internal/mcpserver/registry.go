@@ -156,7 +156,8 @@ var enumSchemas = map[reflect.Type]*jsonschema.Schema{
 		string(model.ReferenceReferences), string(model.ReferenceImplements),
 		string(model.ReferenceTypeDefinition)),
 	reflect.TypeFor[model.ContextView](): stringEnum(
-		string(model.ViewEntries), string(model.ViewSlices), string(model.ViewExcluded)),
+		string(model.ViewEntries), string(model.ViewSlices), string(model.ViewExcluded),
+		string(model.ViewRoutes)),
 	// The capsule view carries one spelling the model type does not: "export"
 	// selects the identity-and-counts projection rather than a page of one list.
 	reflect.TypeFor[model.CapsuleView](): stringEnum(
