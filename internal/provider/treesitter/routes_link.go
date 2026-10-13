@@ -37,7 +37,12 @@ type pendingMount struct {
 	// target is, for a mount whose argument the file reads as written,
 	// the module and attribute it names, NUL-joined; site is then -1.
 	target string
-	at     wire.Span
+	// join is how a Go mount reaches the callable it mounts the routing of
+	// (link.MountJoin); function is a JoinFunction's function value as
+	// written.
+	join     link.MountJoin
+	function string
+	at       wire.Span
 }
 
 // routeChain is one way an object reaches the top of its chain inside the
@@ -520,9 +525,10 @@ func pyDotted(v string) bool {
 }
 
 // linkRouting is the file's open routing as the link table carries it,
-// each mount's worker site mapped to the table's site (siteAt); a mount
-// whose site joined no call reference is dropped.
-func (b *builder) linkRouting(siteAt []int32) link.Routing {
+// each mount's worker site mapped to the table's site (siteAt) and each Go
+// mount given its call (goMountCall); a mount whose site joined no call
+// reference is dropped.
+func (b *builder) linkRouting(siteAt []int32, sites []link.Site) link.Routing {
 	if b.links == nil {
 		return link.Routing{}
 	}
@@ -534,6 +540,9 @@ func (b *builder) linkRouting(siteAt []int32) link.Routing {
 				continue
 			}
 			m.Site = siteAt[w]
+		}
+		if !goMountCall(&m, sites) {
+			continue
 		}
 		mounts = append(mounts, m)
 	}

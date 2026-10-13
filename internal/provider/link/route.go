@@ -42,6 +42,13 @@ type RouteObject struct {
 	// Root reports an ASGI application root, which only an ASGI mount
 	// (Mount, `app.mount`) mounts below another application.
 	Root bool `json:"root,omitempty"`
+	// Param is, for a Go router a callable (Decl) receives, the parameter
+	// it is (wire.Parameter.Index, 1 the first declared parameter), 0 for
+	// any other object; Returned reports a Go router Decl builds and
+	// returns. Either is the object another file's mount reaches through a
+	// call of Decl (MountJoin).
+	Param    uint32 `json:"param,omitempty"`
+	Returned bool   `json:"returned,omitempty"`
 }
 
 // RouteEntry is one route registered, inside the file, on Objects[Object]:
@@ -61,6 +68,10 @@ type RouteEntry struct {
 	Known     bool     `json:"known,omitempty"`
 	Handlers  []int32  `json:"handlers,omitempty"`
 	Imported  []string `json:"imported,omitempty"`
+	// Named are a Go route's handlers the file names but does not declare,
+	// each as written (`handlers.List`, or a function of another file of
+	// the package), which the walk reads in the file's context.
+	Named []string `json:"named,omitempty"`
 }
 
 // RouteMount is one mount of an object the file does not build: the call
@@ -99,7 +110,28 @@ type RouteMount struct {
 	// the module as the import writes it and the attribute it names,
 	// NUL-joined; Site is then -1.
 	Target string `json:"target,omitempty"`
+	// Join, when not JoinNone, is how a Go mount reaches the callable whose
+	// routing it mounts, through Call, the call as written: the object the
+	// file passes as the call's argument Arg is the callable's parameter
+	// (JoinArgument, `users.Register(v1)`), the object the callable returns
+	// is mounted (JoinResult, `r.Mount("/users", users.Routes())`), or the
+	// object chi hands a function value is its first parameter
+	// (JoinFunction, `r.Route("/users", users.Routes)`).
+	Join MountJoin  `json:"join,omitempty"`
+	Call *MountCall `json:"call,omitempty"`
 }
+
+// MountJoin is how a Go mount reaches the callable whose routing it mounts
+// (RouteMount.Join).
+type MountJoin uint8
+
+// The Go mount joins.
+const (
+	JoinNone MountJoin = iota
+	JoinArgument
+	JoinResult
+	JoinFunction
+)
 
 // djangoURLConf is the binding a Django urlconf module holds its routes in:
 // "Django loads that Python module and looks for the variable urlpatterns".
@@ -586,14 +618,21 @@ func (f *filePublication) routes(m *RouteMount, group []idBinding) error {
 // cleared, since no summary covers a byte range, and every mount's site and
 // argument index, which only locate the argument the interface hashes
 // beside the routing (Interface): a call inserted before a mount shifts
-// them and changes nothing another file reads.
+// them and changes nothing another file reads. A Go mount carries its call
+// (MountCall) and keeps its argument index, which is part of what it means.
 func (r Routing) summary() Routing {
 	if len(r.Mounts) == 0 {
 		return r
 	}
 	r.Mounts = slices.Clone(r.Mounts)
 	for i := range r.Mounts {
-		r.Mounts[i].Range, r.Mounts[i].Site, r.Mounts[i].Arg = model.SourceRange{}, 0, 0
+		m := &r.Mounts[i]
+		m.Range, m.Site = model.SourceRange{}, 0
+		if m.Join == JoinNone {
+			// A Go join's argument index says which argument is the
+			// mounted object, which no other part of the mount carries.
+			m.Arg = 0
+		}
 	}
 	return r
 }

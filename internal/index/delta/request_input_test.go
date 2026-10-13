@@ -46,3 +46,34 @@ func TestSpringDefaultResolutionRefreshes(t *testing.T) {
 	files["src/demo/Web.java"] = "package demo;\n\nclass Web {\n    void add(java.util.List<HandlerMethodArgumentResolver> rs) {\n        done();\n    }\n\n    void done() {}\n}\n"
 	s.check("resolver added", []linkBuild{s.only(s.advance(files))})
 }
+
+// TestGoRouteAddedTwoFilesAway is a chi router main.go serves, which passes
+// it to api.Register, which passes it on to admin.Register: a route added
+// in admin.go refreshes to what a full build publishes, the route at its
+// full path on main.go's mount, and republishes main.go; an edit of a file
+// no walk reads republishes no endpoint file. Mutation caught: the Go
+// routing lookup not traced, so the refresh keeps main.go's stale
+// endpoints.
+func TestGoRouteAddedTwoFilesAway(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.22\n",
+		"main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n\n\t\"example.com/app/api\"\n)\n\n" +
+			"func main() {\n\tr := chi.NewRouter()\n\tapi.Register(r)\n\thttp.ListenAndServe(\":8080\", r)\n}\n",
+		"api/api.go": "package api\n\nimport (\n\t\"github.com/go-chi/chi/v5\"\n\n\t\"example.com/app/admin\"\n)\n\n" +
+			"func Register(r chi.Router) {\n\tadmin.Register(r)\n}\n",
+		"admin/admin.go": "package admin\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\n" +
+			"func Register(r chi.Router) {\n\tr.Get(\"/a\", a)\n}\n\nfunc a(w http.ResponseWriter, req *http.Request) {}\n",
+		"util/util.go": "package util\n\nfunc One() int {\n\treturn two()\n}\n\nfunc two() int {\n\treturn 2\n}\n",
+	}
+	s.check("base", []linkBuild{s.only(s.advance(files))})
+	files = edit{name: "route added", replace: []sub{{"admin/admin.go", "\tr.Get(\"/a\", a)\n",
+		"\tr.Get(\"/a\", a)\n\tr.Post(\"/b\", a)\n"}}}.apply(t, files)
+	added := s.only(s.advance(files))
+	s.check("route added", []linkBuild{added})
+	s.wantRepublished("route added", added, []string{"admin/admin.go", "main.go"}, "util/util.go")
+	files = edit{name: "unrelated", replace: []sub{{"util/util.go", "return 2", "return 3"}}}.apply(t, files)
+	unrelated := s.only(s.advance(files))
+	s.check("unrelated edit", []linkBuild{unrelated})
+	s.wantRepublished("unrelated edit", unrelated, []string{"util/util.go"}, "main.go")
+}

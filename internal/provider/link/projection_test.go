@@ -34,7 +34,7 @@ func TestProjectionKeepsWhatTheHierarchyReads(t *testing.T) {
 	tab.Supertypes[0].Super = "#90"
 	tab.Sites[0].Args[0] = wire.Type{Kind: wire.TypeModule, Name: "routes.users.router"}
 	m := &tab.Routing.Mounts[0]
-	m.Site, m.Arg, m.Module, m.Target = 0, 0, "", ""
+	m.Site, m.Arg, m.Module, m.Target, m.Join, m.Call = 0, 0, "", "", JoinNone, nil
 
 	raw, err := tab.project().encodeProjected()
 	if err != nil {

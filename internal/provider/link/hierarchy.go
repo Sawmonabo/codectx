@@ -797,6 +797,9 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 	if err := addSpringLinks(links, file, t); err != nil {
 		return err
 	}
+	if err := addGoRouting(links, file, t); err != nil {
+		return err
+	}
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		if fc.family == "java" && d.Kind == model.NodeField && d.Parent >= 0 && isType(t.Decls[d.Parent].Kind) {
@@ -2364,6 +2367,9 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
 	fc := contextOf(file, t)
 	if err := h.springInputFacts(ctx, file, t, emit); err != nil {
+		return err
+	}
+	if err := h.goRouteFacts(ctx, file, t, emit); err != nil {
 		return err
 	}
 	for i := range t.Decls {

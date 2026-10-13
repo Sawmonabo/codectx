@@ -74,7 +74,8 @@ var goRouterTypes = map[string][]string{
 // goRoutes reads the file's Go routes: `http.Handle` and `http.HandleFunc`
 // on the default mux, an application root; ServeMux, gorilla/mux and chi
 // routers, which resolve when this file serves or mounts them once; gin and
-// echo engines, roots, and their groups.
+// echo engines, roots, and their groups; and the routers that cross files
+// through a call (routes_go_link.go).
 func (s *routeScan) goRoutes() {
 	defaultMux := &routeObj{fw: fwNetHTTP, root: true, ownKnown: true}
 	s.closures = map[wire.Span]*routeObj{}
@@ -93,6 +94,8 @@ func (s *routeScan) goRoutes() {
 	s.goServerLiterals()
 	s.calls(func(r *wire.Ref, site *wire.Site, i int) { s.goRoute(r, site, i, defaultMux) })
 	s.calls(s.gorillaChain)
+	s.goPassed()
+	s.goReturned()
 }
 
 // goImported is the framework the import a qualifier names belongs to.
@@ -188,6 +191,7 @@ func (s *routeScan) goMount(r *wire.Ref, site *wire.Site, defaultMux *routeObj) 
 			}
 			return a, i == 1
 		})
+		s.goMountResult(r, site, parent)
 	case "Handle":
 		s.attachArgs(site, func(_ *routeObj, i int) (routeAttach, bool) {
 			return routeAttach{parent: parent, known: true}, i == 1

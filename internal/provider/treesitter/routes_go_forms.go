@@ -4,19 +4,25 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
 // goRecvObj is the router object a Go call's receiver is: one this file
 // builds, or the router a chi `Route` or `Group` closure receives when the
-// call is written inside that closure on its parameter (closureParam). The
-// innermost such closure whose parameter the receiver names decides.
+// call is written inside that closure on its parameter (closureParam), the
+// innermost such closure whose parameter the receiver names deciding, or
+// else the router the enclosing callable receives as that parameter
+// (goParamObj).
 func (s *routeScan) goRecvObj(r *wire.Ref, site *wire.Site) *routeObj {
 	if o := s.objOf(site.Receiver); o != nil {
 		return o
 	}
-	if !r.Qualified || r.Qualifier == "" || len(s.closures) == 0 {
+	if !r.Qualified || r.Qualifier == "" {
 		return nil
+	}
+	if len(s.closures) == 0 {
+		return s.goParamObj(r.Qualifier, refSpan(r), site.Receiver)
 	}
 	var best wire.Span
 	var found *routeObj
@@ -27,6 +33,9 @@ func (s *routeScan) goRecvObj(r *wire.Ref, site *wire.Site) *routeObj {
 		if found == nil || at.End-at.Start < best.End-best.Start {
 			best, found = at, o
 		}
+	}
+	if found == nil {
+		return s.goParamObj(r.Qualifier, refSpan(r), site.Receiver)
 	}
 	return found
 }
@@ -76,6 +85,12 @@ func (s *routeScan) chiClosure(r *wire.Ref, site *wire.Site, i int, parent *rout
 			s.closures[f.Span] = o
 			return
 		}
+	}
+	if name, ok := s.goFunctionValue(argType(site, fn), args[fn]); ok && len(args) == len(site.Args) {
+		// A function value, `r.Route("/users", users.Routes)`: chi hands
+		// it the router as its first parameter.
+		s.pending = append(s.pending, pendingMount{site: i, arg: fn, fw: fwChi, parent: o, known: true,
+			join: link.JoinFunction, function: name, at: refSpan(r)})
 	}
 }
 

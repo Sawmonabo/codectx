@@ -250,7 +250,7 @@ func (b *builder) linkTable() error {
 			Index:    p.Index, Variadic: p.Variadic, KeywordOnly: p.KeywordOnly})
 	}
 	t.Reexports = wl.Reexports
-	t.Routing = b.linkRouting(siteAt)
+	t.Routing = b.linkRouting(siteAt, t.Sites)
 	t.Inputs, t.Classes = b.pendingInputs, append(b.pyClassKinds(), b.javaClassKinds()...)
 	t.ArgumentResolvers = b.namesArgumentResolver()
 	for _, x := range wl.DynamicImports {

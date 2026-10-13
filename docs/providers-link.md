@@ -315,6 +315,24 @@ through the mounts the application itself makes. Only an ASGI mount mounts an ap
 types by no position, is read as written: a dotted name whose head an import binds names that module's attribute
 (`RouteMount.Target`).
 
+A Go router reaches another file through a call, never a module attribute (`internal/provider/link/route_go.go`). The
+structural provider records, as an object of the callable, a router a function receives as a parameter of a router
+type of a framework the file imports (`func Register(r chi.Router)`, `rg *gin.RouterGroup`), when every use is that
+parameter's value (no local of the name, no assignment to it, not inside a function literal), and a router it builds
+and returns (`r := chi.NewRouter(); …; return r`, every return of it); the routes on each, with the groups and
+closures below them (`v1.Group("/users")`), carry their path below the object. Three Go mounts join them
+(`RouteMount.Join`), each with the call as written and no position (`MountCall`): a router passed as an argument of a
+call that is no framework's own (`users.Register(v1)`) is the callee's parameter the argument binds, by the callee's
+declared parameters (`argumentFlows`); a chi `Mount(prefix, f())` mounts the router `f` returns; a chi
+`Route(prefix, f)` or `Group(f)` with a function value hands `f` the router as its first parameter. Each callable's
+objects are indexed under `keyGoRouting` by the callable. The walk starts at each Go mount anchored at an application
+root or at a router the program serves, resolves the mount's call as the file's own resolution does, in the file's
+context, and descends through the callee's mounts the same way, ending at a callable already on its way; a callee of
+another framework, a call whose receiver is a call's result, a parameter written inside a function literal and
+`http.StripPrefix` around a returned handler publish nothing. A handler the callee's file names but does not declare
+(`handlers.Show`) is resolved in that file's context; a handler written inline gives the endpoint no `routes_to`. Every lookup is traced on the mount's
+file.
+
 ## Request inputs across files
 
 A request-input read whose source another file decides is published by the linker

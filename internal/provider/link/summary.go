@@ -115,8 +115,12 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 	// clears the site indices that locate it.
 	args := make([]*wire.Type, len(t.Routing.Mounts))
 	for i := range t.Routing.Mounts {
-		if a, ok := mountArgument(t, &t.Routing.Mounts[i]); ok {
-			args[i] = &a
+		if m := &t.Routing.Mounts[i]; m.Join == JoinNone {
+			// A Go mount's call (MountCall) is hashed with the routing;
+			// its argument's type names a site by index.
+			if a, ok := mountArgument(t, m); ok {
+				args[i] = &a
+			}
 		}
 	}
 	t = t.positionless()

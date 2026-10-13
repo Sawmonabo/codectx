@@ -50,8 +50,11 @@ func (b *builder) routeTable() []endpointFact {
 		s.spring()
 	}
 	s.applications()
-	if b.lang.Name == "python" {
+	switch b.lang.Name {
+	case "python":
 		b.links = s.linkRoutes()
+	case "go":
+		b.links = s.goLinks()
 	}
 	return s.facts()
 }
@@ -94,6 +97,11 @@ type routeScan struct {
 	pending       []pendingMount
 	djangoEntries []djangoEntry
 	out           []routeFact
+	// params are the Go routers the file's callables receive as
+	// parameters, by callable and parameter (goParamObj); fns is the
+	// file's analysed functions' callables, built on first use (goFns).
+	params map[[2]int]*routeObj
+	fns    *goFns
 }
 
 // routeImport is one local name an import binds: the module path as written
@@ -311,6 +319,12 @@ type routeObj struct {
 	// bound is one more than the module-level binding that is the object
 	// itself (a Starlette route list), 0 for an object a site builds.
 	bound int
+	// callable is one more than the Go callable whose parameter param
+	// (wire.Parameter.Index) the object is, or which builds and returns it
+	// (returned); 0 for any other object (goLinks).
+	callable int
+	param    uint32
+	returned bool
 	// state 1 is being resolved, 2 resolved, with prefix and ok.
 	state  uint8
 	prefix string
