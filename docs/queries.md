@@ -19,9 +19,14 @@ name**.
 
 A name is resolved against the pinned generation: the exact `name` first, the
 exact `qualified_name` second. A name that no node carries, and a name that
-several nodes carry, are both `CTX_ARGUMENT_INVALID`; the ambiguous case names
-up to sixteen candidate ids in its remediation, printed under the error on the
-text path and carried in the `--json` envelope, so the caller can pick one. Nothing is ever resolved to the first
+several nodes carry, are both `CTX_ARGUMENT_INVALID`; the ambiguous case
+carries the exact number of candidates (detail `candidates`) and names every
+one of them by qualified name and id prefix in its remediation, printed under
+the error on the text path and carried in the `--json` envelope, so the caller
+can pick one. A name carried by more nodes than one page holds (the page
+ceiling, `resources.max_page_items`' bound) names the first page by node id and
+points to `codectx symbol <name>`, which lists all of them a page at a time
+with `--cursor`. Nothing is ever resolved to the first
 candidate silently — the candidates are different symbols, and answering about
 the wrong one is a wrong answer the caller cannot detect.
 
@@ -40,7 +45,25 @@ contradict them. `path` uses fixed integer edge costs, so the same two nodes in
 the same generation always produce the same routes in the same order. `impact`
 reports a per-entry direction — **incoming** is *may need modification*,
 **outgoing** is *may need reading* — and every entry carries at least one reason
-naming the relation kind and direction that made it affected. `impact` also
+naming the relation kind and direction that made it affected.
+
+`impact` is also a forward slice over the program dependence graph: its allowlist
+ends with `data_flows_to` and `control_depends_on`. A value a changed variable
+flows to, and a statement whose execution it decides, is reported **incoming**;
+`data_flows_to` is walked against its stored direction for that, because
+`x data_flows_to y` means `y` depends on `x`. Dependence ranks below call impact
+at every depth: the rank key is (reached only through a dependence hop, cost), so
+every entity a call, override or structural route reaches is listed before every
+entity only a dependence route reaches. Across calls the slice is realizable: a
+value passed at one call site enters the callee through its argument flow and
+leaves only through that site's summary flow, never through another site's
+result, while a value the callee creates itself leaves through every call site's
+return flow. A dependence-reached entry's `score_micros` is negative (its plain
+score minus 1 000 001), so the order stays `score_micros` descending; its path's
+`cost_units` is the plain sum of its hop costs. `path` and the traversals walk
+`data_flows_to` at its plain cost.
+
+`impact` also
 carries the package rollup that summarises it: distinct package-to-package pairs
 with their evidence counts, which is a summary and never a precise symbol call.
 
@@ -230,12 +253,14 @@ remainder behind the continuation. Later pages read that spool and walk nothing,
 which is why page 1 is the slow one and every page after it is a file read.
 
 What that buys is the contract a single unbounded walk gives, and it is what
-`impact` now guarantees: the pages **concatenate** to the single-shot answer —
+`impact` guarantees: the pages **concatenate** to the single-shot answer —
 the same entities, in the same global order, each listed exactly once. An entity
 reached again from a later frontier is one record, not two; the cheapest route
 to it wins, and the reasons of every edge that touched it are merged into that
 one entry. The order is `score_micros` descending, then `depth` ascending, then
-`node_id` ascending. **`name` is not a tie-break** — it is known only after
+`node_id` ascending. A `score_micros` below zero marks an entity reached only
+through data or control dependence; every such entity ranks after every entity a
+call, override or structural route reaches. **`name` is not a tie-break** — it is known only after
 hydration, so ranking on it would reorder one page of a globally ordered
 answer.
 
@@ -389,6 +414,9 @@ request is REFUSED with `CTX_RESOURCE_LIMIT` naming `resources.max_temp_bytes`,
 rather than returning a short answer under whichever work-budget reason happened
 to be marked. Retrying frees no bytes: raise the budget, or narrow the query
 with `--depth`, `--visited` or `--edges` so the walk finishes within one page.
+A `search` continuation's exact-tier spool is the one exception: when the
+budget cannot hold it, the cursor carries the position instead and the next
+page walks the tiers from it, so the answer is complete and only slower.
 
 On every command but `path`, the query deadline ends a page and not an answer:
 a walk that runs out of time
@@ -490,7 +518,11 @@ tree indexed at another root, or re-indexed as a delta, answers in the same
 order. A cursor carries the last served position by content, not by document
 address — the tier and node of the last exact result, or the score and stored
 document id of the last lexical result — so it survives the index's background
-merges between pages.
+merges between pages. A continuation inside the exact tiers sorts the hits
+after its position once and spools them; the cursors after it name that spool
+and the offset of their next record, so a deep exact answer costs each page its
+own page. A page whose spool is gone walks from the position instead and
+serves the same hits.
 
 A cursor pins the generation, the analysis key and the query with its filters.
 Resubmitting a continuation with a different query or filter set, or against a

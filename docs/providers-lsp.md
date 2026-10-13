@@ -204,7 +204,7 @@ the same client — including the array-shaped `workspace/configuration` answer
 this client sends — returned **2** locations cold and still **2** after settle
 windows of 15, 40 and 60 seconds, at 265–267 MB, and never advertised
 `implementation`. The two-result disagreement the decision record asked to
-adjudicate (138 versus 136) therefore did not reproduce: the old server never
+adjudicate (138 versus 136) therefore did not reproduce: the replaced server never
 reached its settled count here, so there is no second location set to diff
 against. What did reproduce, more strongly than recorded, is the completeness
 gap that decided the swap.

@@ -1,7 +1,7 @@
 # The `link` provider
 
 `internal/provider/link` is the package-scoped linking provider of ADR-0012 decision 9. It publishes `calls`,
-`imports`, `data_flows_to`, `extends`, `implements` and `overrides` for the nine languages the structural provider
+`imports`, `data_flows_to`, `extends`, `implements`, `overrides` and `generates` for the nine languages the structural provider
 lowers: C, C++, Go, Java, JavaScript, TypeScript, TSX, Python and Rust. It never parses a file. It reads the link
 tables the structural provider stored with each file's unit, binds every call site to the declarations it may call,
 resolves imports to files, follows arguments into the parameters they bind, and reads the class hierarchy, and
@@ -19,7 +19,7 @@ linker cannot bind publishes an open-site node (Open sites, below).
 ```
 ID                link
 Version           1
-Capabilities      calls, imports, data_flows_to, extends, implements, overrides
+Capabilities      calls, imports, data_flows_to, extends, implements, overrides, generates
 DependsOn         treesitter
 InvalidationScope package
 Required          false
@@ -27,7 +27,7 @@ Required          false
 
 `ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go`, and the descriptor is
 `Provider.Descriptor`. The id is not `dependence`, which is never reused (decision 9). The provider is not required:
-a failed link degrades its six capabilities and nothing else. It runs when the structural provider is
+a failed link degrades its seven capabilities and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 
 ## What it publishes
@@ -43,7 +43,8 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `data_flows_to` | `data_flows_to` | the callee's return node → each variable the site's result is written into, and the return node of the callable that returns the call | `return` |
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
-| `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
+| `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set`, `supertype_candidate` |
+| `generates` | `generates` | Rust `macro_rules!` → each declaration written in an item-position invocation of it in another file of the unit | `macro_transcribes`, `macro_input` |
 | none of its own | `defines` | file module → a route endpoint at its full path, a declared entry point, or an inherited Java `main` | none |
 | none of its own | `routes_to` | route endpoint → each handler; declared entry point → its declaration or module | `import` |
 | none of its own | `routes_to` | inherited Java `main` endpoint → the method JLS §12.1.4 launches its class by | `hierarchy` |
@@ -66,6 +67,14 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
   interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
   base list).
+- `supertype_candidate`: an `overrides` into a method of a type outside the project that a Java `@Override` or C++
+  `override` method may override: one of the external supertypes on a path along which no type of the project
+  declares the method, read with its set size as "at least one of n" (several may hold at once), or one published
+  beside an override in the project, which the mark already proves.
+- `macro_transcribes`, `macro_input`: a `generates` from a Rust `macro_rules!` to a declaration written in an
+  invocation's input, `macro_transcribes` when every rule of the definition transcribes its item input once, unchanged (the
+  declaration is exactly an item of the expansion), `macro_input` when it may transcribe it renamed, repeated or not
+  at all (docs/providers-treesitter.md, Rust).
 - `visibility_default`, `visibility_hidden`, `visibility_protected`, `visibility_internal`, `visibility_dllexport`,
   `visibility_dllimport`: the visibility a C or C++ macro definition's replacement states, as declared in source and
   never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
@@ -155,14 +164,19 @@ may supply) is counted external and publishes no edge.
 names: a JavaScript, TypeScript or TSX specifier the module resolution reaches, a Python `import a.b` or
 `from a import b` (to the file that declares `b`, else the submodule `a.b`, else the module `a`), and a quoted C or C++ `#include` (the
 file beside the including one, and every member file whose path ends in the header's at a component boundary). An
-angled include, a package outside the unit, and an import naming no member file publish nothing.
+angled include, a package outside the unit, and an import naming no member file publish nothing. An ECMAScript
+import of a module of the repository that resolves to no member file (a workspace package whose `exports` name an
+unbuilt output no config maps back to its source) publishes nothing either, and is counted in the `imports` row's
+`open_import_sites` (`FactOpenImport`), never as external.
 
 An import whose path does not fold to a constant publishes one open-import-site node and the module's `imports` to it
 (ADR-0015 decision 6): `require(expr)` and `import(expr)` in ECMAScript, `importlib.import_module(expr)` and
 `__import__(expr)` in Python, and `#include MACRO` with the macro undefined in the file. The node is in the file's
 scope, keyed `openimport:<path>:<first byte>-<last byte>`, named `import`, of kind `module`, with metadata
-`{"resolution":"unresolved","reason":"computed","fragments":[…]}`, the literal parts of the path in source order
-(`require("./x/" + name)` gives `["./x/"]`). The files whose paths match the fragments are computed per query as
+`{"resolution":"unresolved","reason":"computed","fragments":[…]}`, every non-empty literal part of the path in source
+order (`require("./x/" + name)` gives `["./x/"]`); none is dropped or cut, and a list too long for the node's metadata
+bound is stored as metadata rows on the site, with `fragments_rows` in place of `fragments`, which the graph reads
+when it computes `may_import` (node metadata rows: docs/providers-filesystem.md, Node metadata). The files whose paths match the fragments are computed per query as
 `may_import`. A `require("./x")` or `import("./x")` of a string literal is an import record of the structural query,
 and a path that folds to a constant (`import("./" + "x")`) is an ordinary import too.
 
@@ -212,7 +226,8 @@ embedded interfaces), and `implements` to each other interface or trait it decla
 method set. A Go struct's embedded types are promotion and no supertype. Each method publishes `overrides` to the
 method it directly overrides along each direct supertype, never a deeper one: in Java one of the same signature that
 is neither static, final nor private; in C++ a virtual one of the same signature; in Python the first along the
-method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name; in Go each
+method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name that is not private (a `#p` method's name is its class body's alone, so it
+overrides nothing and a call of it is `exact`); in Go each
 method of an interface its type satisfies. A supertype outside the project is its external node. A method overrides
 an external one only where the language marks it (Java `@Override`, C++ `override` or `final`, TypeScript
 `override`, a Rust trait impl item, Python `typing.override`), toward what the mark proves
@@ -231,7 +246,8 @@ an external one only where the language marks it (Java `@Override`, C++ `overrid
 - Python: `typing.override` proves the first ancestor along the method resolution order that defines the method.
   When no class of the project along the order defines it, it is one of the external bases of the classes along the
   order, each published (`supertype`) with the set size of their number when there are several.
-- Rust: an impl item reaches its type's external trait when the type has exactly one.
+- Rust: an impl item implements its block's trait's item of its name (`Decl.Trait`), the external trait's method
+  when the trait is outside the project (`hierarchy_rust.go`).
 
 An unmarked method with an external supertype publishes no `overrides`.
 
@@ -405,7 +421,9 @@ Besides the joined declarations, sites and values, the table carries what the re
   bind to, and its `Returned` mark, the callable's return summary;
 - `Decl.Return`: the callable's return node, which return flows leave from;
 - `Decl.Override`: the language marks the method as overriding (`@Override`, `override`, `typing.override`, a trait
-  impl item);
+  impl item); `Decl.Trait`: for a Rust trait impl item, the block's trait, the one trait whose item it implements:
+  the trait's method of that name when the trait is the unit's, else the external trait's method, the self type
+  never consulted, so a blanket impl over a type parameter implements its trait's item too;
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
   macro calls;
 - `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or

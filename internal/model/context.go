@@ -389,12 +389,12 @@ type ContextManifest struct {
 	// compile had to truncate names the count it truncated here rather than
 	// shortening an explanation without saying so.
 	//
-	// They are NOT part of CanonicalHash and are not persisted: the hash
-	// identifies the PLAN, and two compiles of one generation that differ only
-	// in the bounds the operator configured are the same plan. A manifest
-	// re-read from storage therefore carries no notices, and Compile re-emits
-	// the configuration-derived ones on the reuse path so the caller that
-	// asked is still told.
+	// They are NOT part of CanonicalHash: the hash identifies the PLAN. The
+	// plan's own notices are stored in the manifest header, so a manifest
+	// re-read from storage carries the notices its compile made; the one
+	// notice about the caller's resources.max_page_items, which the manifest
+	// identity does not fold, is never stored and Compile re-emits it on
+	// every answer.
 	Notices []string `json:"notices,omitempty"`
 }
 

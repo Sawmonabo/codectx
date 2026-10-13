@@ -80,9 +80,9 @@ func TestPythonServerRunsAsItself(t *testing.T) {
 }
 
 // TestBindingCarriesTheServerReportAndEncoding is the digest invariant the
-// python swap depends on. The new server reports serverInfo and negotiates
-// utf-8 where the old one reported nothing and was used at the utf-16 default,
-// so a cached python answer from before the swap must not be reused. Both the
+// python server depends on. It reports serverInfo and negotiates utf-8, where
+// a server reporting nothing runs at the utf-16 default, so a cached answer
+// from a server bound otherwise must not be reused. Both the
 // reported version and the negotiated encoding therefore have to reach
 // InputDigest -- and the binding must carry the *reported* version rather than
 // the lock's pinned one.

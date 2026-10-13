@@ -184,7 +184,7 @@ const routeCountCharge = math.MaxInt64
 // second clip at 3 would discard routes the operator asked to keep after the
 // pass that honoured the setting had produced them. Only the per-path relation
 // list keeps model.MaxRelationsPerPath, which Validate does still enforce -- and
-// the cut is now counted and returned, so a route the manifest stores shorter
+// the cut is counted and returned, so a route the manifest stores shorter
 // than the route the walk found is disclosed as a manifest notice instead of
 // being a silent edit of the evidence.
 func evidencePaths(paths []model.RelationPath) ([][]model.RelationID, int64) {
