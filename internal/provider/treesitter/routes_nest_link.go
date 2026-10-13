@@ -72,7 +72,8 @@ func mayConfigureNest(b *builder) bool {
 // deployment, is not read;
 // any other receiver is an application the file does not create, which no
 // table ties to one (Open). A file naming RouterModule from `@nestjs/core`
-// is marked, since the module paths it sets are not followed.
+// is marked, with its register calls (nestRouters), and the file's
+// `@Module` classes are recorded with their controllers (nestModules).
 func (s *routeScan) nestAppScan() *link.NestApp {
 	app := &link.NestApp{}
 	factories := map[int]bool{}
@@ -121,7 +122,11 @@ func (s *routeScan) nestAppScan() *link.NestApp {
 			app.RouterModule = true
 		}
 	}
-	if app.Apps == 0 && !app.Open && !app.RouterModule {
+	s.nestModules(app)
+	if app.RouterModule {
+		s.nestRouters(app)
+	}
+	if app.Apps == 0 && !app.Open && !app.RouterModule && len(app.Modules) == 0 && !app.ModulesUnknown {
 		return nil
 	}
 	return app
