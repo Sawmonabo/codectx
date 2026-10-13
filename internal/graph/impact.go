@@ -189,6 +189,9 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return answer, nil, nil, "", err
 		}
 	}
+	// Every state the walk admits names its route by reference into the
+	// walk's route table, which the answer serves its routes from.
+	retain.withRoutes()
 	// Discarded AFTER the continuation below has taken it: a leg that mints a
 	// walk cursor detaches the directory, and this then finds nothing to remove.
 	defer retain.discard()
@@ -384,7 +387,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			Notices: answer.Notices, Completeness: meta.Completeness}
 		return answer, nil, b, next, nil
 	}
-	entries, nextCursor, err := e.serveRankedRun(ctx, ranked, pairs, queryHash, b, limit, &answer, &meta)
+	entries, nextCursor, err := e.serveRankedRun(ctx, ranked, pairs, retain, queryHash, b, limit, &answer, &meta)
 	if err != nil {
 		return answer, nil, nil, "", err
 	}
@@ -404,8 +407,11 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 // result has room for one cursor, and a page that served the whole rollup
 // beside a cut entity list would overrun the record bound the result validates
 // itself against.
+//
+// The page's routes are read from the walk's own route table; the remainder's
+// are read from the same table, which the continuation names beside the spool.
 func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[impactRecord],
-	pairRun *pagination.SortedRun[pairRecord], queryHash string, b *budget, limit int,
+	pairRun *pagination.SortedRun[pairRecord], retain *retainedWalk, queryHash string, b *budget, limit int,
 	answer *impactAnswer, meta *model.QueryMeta) ([]model.ImpactEntry, string, error) {
 	// Delivery, for serveRankedImpact's reason: both runs are ranked and this
 	// reads one page off them and spills the remainder.
@@ -437,7 +443,14 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 		return nil, "", err
 	}
 	answer.Packages = pairPage
-	entries, err := e.impactPage(ctx, page, answer, meta)
+	routes, err := retain.routeReader()
+	if err != nil {
+		return nil, "", err
+	}
+	entries, err := e.impactPage(ctx, page, routes, answer, meta)
+	if cerr := routes.close(); err == nil && cerr != nil {
+		err = internalErr("graph: the route table: " + cerr.Error())
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -449,7 +462,7 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 		PairTotal: pairRun.Len(), PairCount: int(pairRun.Len()) - len(pairPage),
 	}
 	next, err := e.spillRankedCursor(ctx, b, impactEndpoint, queryHash, header,
-		int64(len(page)), int64(len(pairPage)), meta,
+		int64(len(page)), int64(len(pairPage)), retain, meta,
 		rankedRunTail(ctx, run, len(page), encodeImpactRecord),
 		rankedRunTail(ctx, pairRun, len(pairPage), encodePairRecord))
 	return entries, next, err
@@ -478,12 +491,18 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 	ctx = deliverCtx(ctx)
 	defer func() {
 		if terminalOutcome(err) && complete {
+			e.releaseConsumed(ctx, c.RouteID, "")
 			e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 		}
 	}()
 	if e.spools == nil {
 		return answer, nil, nil, "", cursorInvalid("continuation state has expired or was released")
 	}
+	routes, err := e.openRankedRoutes(ctx, c)
+	if err != nil {
+		return answer, nil, nil, "", err
+	}
+	defer routes.close()
 	h, _, read, err := rankedSpoolHeader(ctx, e.spools, c.spoolCursor(), e.now())
 	if err != nil {
 		return answer, nil, nil, "", err
@@ -503,7 +522,7 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 	for _, r := range pairPage {
 		answer.Packages = append(answer.Packages, r.edge())
 	}
-	entries, err := e.impactPage(ctx, page, &answer, &meta)
+	entries, err := e.impactPage(ctx, page, routes, &answer, &meta)
 	if err != nil {
 		return answer, nil, nil, "", err
 	}
@@ -540,16 +559,23 @@ func pageWant(limit int, left int64) int {
 }
 
 // impactPage projects one page of ranked records into served entries and
-// hydrates them. The records arrive in the served order and stay in it.
-func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *impactAnswer,
-	meta *model.QueryMeta) ([]model.ImpactEntry, error) {
+// hydrates them. The records arrive in the served order and stay in it. Each
+// record's route is rebuilt from the route table it names.
+func (e *Engine) impactPage(ctx context.Context, page []impactRecord, routes *routeReader,
+	answer *impactAnswer, meta *model.QueryMeta) ([]model.ImpactEntry, error) {
 	reasonPaths := e.limits.ReasonPaths()
 	entries := make([]model.ImpactEntry, 0, len(page))
 	for _, r := range page {
 		entry := model.ImpactEntry{NodeID: r.NodeID, Direction: r.Direction, Depth: r.Depth,
 			ScoreMicros: r.scoreMicros(), Reasons: r.Reasons}
-		if len(r.Route) > 0 && len(r.Route) <= model.MaxRelationsPerPath && !reasonPaths.Exceeded(1) {
-			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: plainCost(r.Cost), Possible: r.Possible}}
+		if r.Via != "" && !reasonPaths.Exceeded(1) {
+			rels, err := routes.route(r.Adm, r.Via)
+			if err != nil {
+				return nil, err
+			}
+			if len(rels) <= model.MaxRelationsPerPath {
+				entry.Paths = []model.RelationPath{{Relations: rels, CostUnits: plainCost(r.Cost), Possible: r.Possible}}
+			}
 		}
 		entries = append(entries, entry)
 	}
@@ -594,8 +620,13 @@ func deliverCtx(ctx context.Context) context.Context { return context.WithoutCan
 // served is how many records of the whole ranked answer the pages up to and
 // including this one have handed back. Every later page reuses this spool and
 // this lease; only this one creates them.
+//
+// routes is the walk whose route table the remainder's routes are read from,
+// or nil for an answer that serves none. The table is moved into a directory
+// of its own and adopted under the same lease, so the continuation names it
+// beside the spool.
 func (e *Engine) spillRankedCursor(ctx context.Context, b *budget, endpoint, queryHash string,
-	header rankedHeader, served, pairServed int64, meta *model.QueryMeta,
+	header rankedHeader, served, pairServed int64, routes *retainedWalk, meta *model.QueryMeta,
 	tails ...func(func([]byte) error) error) (string, error) {
 	if !e.canContinue(meta) {
 		return "", nil
@@ -626,8 +657,15 @@ func (e *Engine) spillRankedCursor(ctx context.Context, b *budget, endpoint, que
 		return "", e.releaseLease(ctx, leaseID, err)
 	}
 	next.SpoolID, next.RankOffset, next.PairOffset = id, rankOff, pairOff
+	if routes != nil {
+		if next.RouteID, err = e.adoptRoutes(next, routes); err != nil {
+			e.releaseConsumed(ctx, id, "")
+			return "", e.releaseLease(ctx, leaseID, err)
+		}
+	}
 	token, err := e.signRanked(next)
 	if err != nil {
+		e.releaseConsumed(ctx, next.RouteID, "")
 		e.releaseConsumed(ctx, id, "")
 		return "", e.releaseLease(ctx, leaseID, err)
 	}
@@ -1068,17 +1106,21 @@ func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 	// Every identifier on the record is CANONICAL, resolved from this level's
 	// one batched read. That is ADR-0005 Decision 2's whole point: the walk is
 	// free to carry build-dependent surrogates, and the order the answer is
-	// served in is not -- foldImpact's route tie-break reads Via, Route and
-	// Parent, so leaving any of the three a surrogate would let a fresh index
-	// and a delta-built index of the same tree serve different pages.
+	// served in is not -- foldImpact's route tie-break reads Via, the route
+	// hash and Parent, so deriving any of the three from a surrogate would let
+	// a fresh index and a delta-built index of the same tree serve different
+	// pages. The route itself is the owner's admission plus Via: the rows
+	// behind the admission hold canonical ids too.
+	via := a.names.rel(e.Rel)
 	return a.emit(impactRecord{
 		NodeID:    reached,
 		Depth:     depth,
 		Cost:      impactAdd(state.Cost, kind),
 		Direction: direction,
-		Via:       a.names.rel(e.Rel),
+		Via:       via,
 		Parent:    a.names.node(state.Node),
-		Route:     a.names.route(appendRoute(state.Route, e.Rel)),
+		Adm:       state.Adm,
+		Hash:      state.Hash.extend(via),
 		Reasons:   []string{impactEdgeReason(kind, e.Outgoing, direction, depth)},
 	})
 }

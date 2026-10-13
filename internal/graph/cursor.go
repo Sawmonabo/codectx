@@ -128,6 +128,10 @@ type traversalCursor struct {
 	// walk continuation without it is a traversal (neighbours), which ranks
 	// nothing and retains nothing.
 	RetainID string `json:"retain_id,omitempty"`
+	// RouteID names the route table a ranked continuation reads the routes of
+	// its records from (routetable.go), adopted under the same lease as the
+	// spool. It travels on the ranked vocabulary only.
+	RouteID string `json:"route_id,omitempty"`
 	// WalkDone marks the third shape, a mid-rank deadline: the walk is EXHAUSTED
 	// and the ranking is what the deadline cut short. The next request walks
 	// nothing -- there is no frontier to walk -- and re-runs both passes over the
@@ -216,6 +220,9 @@ func (c traversalCursor) validate() error {
 	}
 	if c.SpoolID != "" && !model.ValidHexID(c.SpoolID) {
 		return cursorInvalid("cursor spool id is malformed")
+	}
+	if c.RouteID != "" && (!c.Ranked || !model.ValidHexID(c.RouteID)) {
+		return cursorInvalid("cursor names a malformed route table")
 	}
 	if c.RetainID != "" && !model.ValidHexID(c.RetainID) {
 		return cursorInvalid("cursor retained-input id is malformed")

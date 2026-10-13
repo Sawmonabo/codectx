@@ -1185,6 +1185,25 @@ func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.I
 				if err != nil {
 					return err
 				}
+				// A parent that reaches a site is admitted into the route
+				// table once, so its children name its route by reference
+				// (routetable.go). A seed is no admission: its children's
+				// routes start at it.
+				admitted := make(map[model.NodeID]uint64, len(level))
+				admit := func(p impactRecord) (uint64, error) {
+					if p.Via == "" {
+						return 0, nil
+					}
+					if id, ok := admitted[p.NodeID]; ok {
+						return id, nil
+					}
+					id, err := retain.admitRoute(p.Adm, p.Via)
+					if err != nil {
+						return 0, err
+					}
+					admitted[p.NodeID] = id
+					return id, nil
+				}
 				for _, row := range list.rows {
 					from, to := row.Rel.To, row.Rel.From
 					if mode == tailCallees {
@@ -1194,11 +1213,9 @@ func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.I
 						continue
 					}
 					parent := parents[from]
-					// The route is capped one past the path bound, as
-					// appendRoute caps a walk's.
-					route := slices.Clone(parent.Route)
-					if len(route) <= model.MaxRelationsPerPath {
-						route = append(route, row.Rel.ID)
+					adm, err := admit(parent)
+					if err != nil {
+						return err
 					}
 					rec := impactRecord{
 						NodeID:    to,
@@ -1207,7 +1224,8 @@ func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.I
 						Direction: direction,
 						Via:       row.Rel.ID,
 						Parent:    from,
-						Route:     route,
+						Adm:       adm,
+						Hash:      parent.Hash.extend(row.Rel.ID),
 						Reasons:   []string{impactReason(model.RelMayCall, direction, depth+1)},
 						Possible:  true,
 					}

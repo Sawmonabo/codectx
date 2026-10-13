@@ -74,16 +74,14 @@ type levelRecord struct {
 // surrogate, length-prefixed bytes for the three canonical ids. Signed fields
 // go through their unsigned two's-complement form, which round-trips exactly.
 func encodeLevelRecord(r levelRecord) []byte {
-	buf := make([]byte, 0, 96+len(r.Owner.Route)*binary.MaxVarintLen64)
+	buf := make([]byte, 0, 128)
 	buf = binary.AppendUvarint(buf, uint64(int64(r.Owner.Depth)))
 	buf = binary.AppendUvarint(buf, uint64(r.Owner.Cost))
 	buf = binary.AppendUvarint(buf, uint64(r.Owner.Node))
 	buf = binary.AppendUvarint(buf, uint64(r.Owner.Via))
 	buf = append(buf, byte(r.Owner.Step))
-	buf = binary.AppendUvarint(buf, uint64(len(r.Owner.Route)))
-	for _, rel := range r.Owner.Route {
-		buf = binary.AppendUvarint(buf, uint64(rel))
-	}
+	buf = binary.AppendUvarint(buf, r.Owner.Adm)
+	buf = append(buf, r.Owner.Hash[:]...)
 	buf = binary.AppendUvarint(buf, uint64(r.Edge.Owner))
 	buf = binary.AppendUvarint(buf, uint64(r.Edge.Neighbour))
 	buf = binary.AppendUvarint(buf, uint64(r.Edge.Rel))
@@ -111,19 +109,8 @@ func decodeLevelRecord(b []byte) (levelRecord, error) {
 	r.Owner.Node = NodeRef(d.uvarint())
 	r.Owner.Via = RelRef(d.uvarint())
 	r.Owner.Step = dispatchStep(d.byteAt())
-	routeLen := d.uvarint()
-	if d.err == nil {
-		if routeLen > model.MaxRelationsPerPath+1 {
-			return levelRecord{}, levelCorrupt("a level record carries a route longer than a servable path")
-		}
-		// A routeless state -- the seed level's shape -- comes back with a NIL
-		// route, not an empty one: the two are the same set of relations but
-		// not the same value, and a resumed frontier is compared against one
-		// the walk built in heap.
-		for i := uint64(0); i < routeLen; i++ {
-			r.Owner.Route = append(r.Owner.Route, RelRef(d.uvarint()))
-		}
-	}
+	r.Owner.Adm = d.uvarint()
+	d.hash(&r.Owner.Hash)
 	r.Edge.Owner = NodeRef(d.uvarint())
 	r.Edge.Neighbour = NodeRef(d.uvarint())
 	r.Edge.Rel = RelRef(d.uvarint())
@@ -175,6 +162,19 @@ func (d *recordDecoder) byteAt() byte {
 	v := d.b[0]
 	d.b = d.b[1:]
 	return v
+}
+
+// hash reads a route hash's fixed 16 bytes.
+func (d *recordDecoder) hash(h *routeHash) {
+	if d.err != nil {
+		return
+	}
+	if len(d.b) < len(h) {
+		d.err = levelCorrupt("a level record ends mid-hash")
+		return
+	}
+	copy(h[:], d.b[:len(h)])
+	d.b = d.b[len(h):]
 }
 
 func (d *recordDecoder) text() string {

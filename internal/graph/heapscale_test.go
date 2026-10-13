@@ -30,7 +30,7 @@ var scaleFrontierBytes = config.Defaults().Resources.QueryMemoryBytes
 // things and only two:
 //
 //   - the walk's level-independent structures -- one frontier chunk of 65 536
-//     states, the two paged bitsets' resident pages, the bounded route-name LRU,
+//     states, the two paged bitsets' resident pages, the route table's write buffer,
 //     one levelResolveBatch of records being named, one delivered page, the
 //     external sorts' merge readers; and
 //   - the sampler's float. HeapAlloc is read without forcing a collection, so
@@ -84,16 +84,22 @@ func TestAWalkHoldsAPageNotTheLevel(t *testing.T) {
 	if testing.Short() {
 		t.Skip("the million-edge fixtures are built in memory")
 	}
-	small := measureWideLevel(t, 100_000)
+	small, smallFloat := measureWideLevel(t, 100_000)
 	// The first fixture is unreachable here and the second is about to be
 	// built beside it: without this the two live at once.
 	runtime.GC()
-	large := measureWideLevel(t, 1_000_000)
+	large, largeFloat := measureWideLevel(t, 1_000_000)
 
-	if large > 2*small || small > 2*large {
-		t.Fatalf("a level ten times wider moved the walk's heap from %d MiB to %d MiB: "+
+	// The ratio compares what the WALK holds, so each figure is taken net of
+	// its fixture's sampler float (scaleAllowance's derivation): at GOGC 20 a
+	// fixture of F bytes floats up to F/5 of garbage into every sample, and the
+	// 1 000 000-wide fixture is ten times the other, so the raw figures differ
+	// by the float alone once the walk's own share is small.
+	smallWalk, largeWalk := max(small-smallFloat, 1<<20), max(large-largeFloat, 1<<20)
+	if largeWalk > 2*smallWalk || smallWalk > 2*largeWalk {
+		t.Fatalf("a level ten times wider moved the walk's heap from %d MiB to %d MiB net of the fixture float: "+
 			"the walk is holding something that scales with the level, not with its bounds",
-			small>>20, large>>20)
+			smallWalk>>20, largeWalk>>20)
 	}
 	ceiling := int64(4*scaleFrontierBytes + scaleAllowance)
 	if large > ceiling {
@@ -112,7 +118,10 @@ func TestAWalkHoldsAPageNotTheLevel(t *testing.T) {
 // The fixture is built inside this call and the slices it was built from are
 // dropped before the baseline is taken, so what is reported is the walk's own
 // high-water mark and not the generation it reads.
-func measureWideLevel(t *testing.T, width int) int64 {
+//
+// It also answers the fixture's sampler float bound: a fifth of the baseline,
+// the garbage GOGC 20 lets a sample count.
+func measureWideLevel(t *testing.T, width int) (int64, int64) {
 	t.Helper()
 	nodes, rels := fanFixture(width)
 	nodeCount, edgeCount := int64(len(nodes)), int64(len(rels))
@@ -182,7 +191,7 @@ func measureWideLevel(t *testing.T, width int) int64 {
 		t.Fatalf("the %d-wide walk read %d edges, want the %d the generation carries",
 			width, res.EdgeCount, edgeCount)
 	}
-	return above
+	return above, int64(before.HeapAlloc) / 5
 }
 
 // fanFixture builds a seed and the width children one `calls` relation each

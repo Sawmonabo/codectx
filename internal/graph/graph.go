@@ -250,17 +250,14 @@ type frontierState struct {
 	Cost  int64
 	Node  NodeRef
 	Via   RelRef
-	// Route is the chain of relation surrogates from a seed to this node, Via
-	// last.
-	//
-	// It travels with the frontier because a ranked answer's walk runs to completion
-	// and streams its records into a sort: there is no page-local byNode map
-	// left to walk a parent chain through, and model.ImpactEntry.Paths is not
-	// optional (Section 14.3 rejects an entry whose reason nothing backs). It
-	// is capped at model.MaxRelationsPerPath+1 by appendRoute -- one past the
-	// bound, so a consumer can tell "too long to report" from "exactly at the
-	// bound" -- which is what keeps the frontier's per-node cost bounded.
-	Route []RelRef
+	// Adm is this state's admission in the walk's route table (routetable.go),
+	// and Hash the identity of the route that reached it. A seed has neither:
+	// Adm 0 ends every route, and the zero hash seeds every route's. The route
+	// itself is never carried: it is rebuilt from the table when an entry is
+	// served, so a state costs the same however long its route is. A walk
+	// that serves no routes keeps no table and leaves both zero.
+	Adm  uint64
+	Hash routeHash
 	// Step is how a call walk's dispatch step reached this node
 	// (dispatch.go): directly, up an override to a base method whose virtual
 	// callers are walked, or down a virtual call or an override to a method
@@ -272,22 +269,6 @@ type frontierState struct {
 	// through a call site to a node first admitted without it. Every other
 	// walk leaves it zero.
 	Slice sliceFlags
-}
-
-// appendRoute extends a parent's route with the edge that left it, copying
-// rather than sharing the backing array: two neighbours of one frontier node
-// would otherwise append over each other's last element.
-//
-// It stops one past model.MaxRelationsPerPath. A route at that length is
-// already longer than a servable path, so the elements beyond it would be
-// carried through the whole walk to be discarded at hydration.
-func appendRoute(parent []RelRef, via RelRef) []RelRef {
-	if len(parent) > model.MaxRelationsPerPath {
-		return parent
-	}
-	out := make([]RelRef, len(parent), len(parent)+1)
-	copy(out, parent)
-	return append(out, via)
 }
 
 // levelNames is ONE served BATCH's canonical ids (ADR-0005 Decision 2). The
@@ -322,19 +303,6 @@ func (n *levelNames) rel(ref RelRef) model.RelationID {
 		return ""
 	}
 	return n.rels[ref]
-}
-
-// route names a whole parent chain. It returns nil for an empty route so an
-// entry with no path carries no empty slice into its record.
-func (n *levelNames) route(refs []RelRef) []model.RelationID {
-	if len(refs) == 0 {
-		return nil
-	}
-	out := make([]model.RelationID, 0, len(refs))
-	for _, r := range refs {
-		out = append(out, n.rel(r))
-	}
-	return out
 }
 
 // queryDeadline is the instant one graph query runs under.

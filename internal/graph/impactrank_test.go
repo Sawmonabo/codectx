@@ -21,9 +21,9 @@ func TestRankRecordsRoundTripThroughTheSortCodec(t *testing.T) {
 		{NodeID: "n1"},
 		{NodeID: "n2", Depth: 3, Cost: 7, Direction: model.DirectionIncoming, Via: "r9", Parent: "n1"},
 		{NodeID: "n3", Depth: 1, Cost: 0, Direction: model.DirectionOutgoing,
-			Route: []model.RelationID{"r1", "r2"}, Reasons: []string{"a", "b"}},
+			Adm: 7, Hash: routeHash{}.extend("r1").extend("r2"), Reasons: []string{"a", "b"}},
 		{NodeID: "n4", Depth: 64, Cost: 1 << 40, Direction: model.DirectionBoth,
-			Route: []model.RelationID{"\x00unicode-é"}, Reasons: []string{"quote\"and\\slash"}},
+			Adm: 1 << 40, Hash: routeHash{}.extend("\x00unicode-é"), Reasons: []string{"quote\"and\\slash"}},
 	}
 	for _, want := range impacts {
 		b, err := encodeImpactRecord(want)
@@ -62,13 +62,21 @@ func TestRankRecordsRoundTripThroughTheSortCodec(t *testing.T) {
 
 func TestFoldsDoNotDependOnArrivalOrder(t *testing.T) {
 	cheap := impactRecord{NodeID: "n", Depth: 1, Cost: 2, Direction: model.DirectionOutgoing,
-		Via: "r1", Parent: "seed", Route: []model.RelationID{"r1"}, Reasons: []string{"b", "a"}}
+		Via: "r1", Parent: "seed", Hash: routeHash{}.extend("r1"), Reasons: []string{"b", "a"}}
 	dear := impactRecord{NodeID: "n", Depth: 4, Cost: 9, Direction: model.DirectionIncoming,
-		Via: "r2", Parent: "mid", Route: []model.RelationID{"r7", "r2"}, Reasons: []string{"c"}}
+		Via: "r2", Parent: "mid", Adm: 3, Hash: routeHash{}.extend("r7").extend("r2"), Reasons: []string{"c"}}
 	// Same cost and depth, different admitting edge: the tie-break must still
 	// pick one side, or the fold is not a function of its inputs.
 	twinA := impactRecord{NodeID: "n", Depth: 1, Cost: 2, Via: "r4", Parent: "s1"}
 	twinB := impactRecord{NodeID: "n", Depth: 1, Cost: 2, Via: "r5", Parent: "s2"}
+	// Same cost, depth, admitting edge and parent, two different routes into
+	// that parent: only the route hash tells them apart. Mutation caught: the
+	// route-hash term removed from compareImpactRoute, so the fold keeps
+	// whichever side it was handed first.
+	viaA := impactRecord{NodeID: "n", Depth: 3, Cost: 5, Via: "r9", Parent: "p", Adm: 4,
+		Hash: routeHash{}.extend("r1").extend("r9")}
+	viaB := impactRecord{NodeID: "n", Depth: 3, Cost: 5, Via: "r9", Parent: "p", Adm: 2,
+		Hash: routeHash{}.extend("r2").extend("r9")}
 
 	for _, tc := range []struct {
 		name string
@@ -77,6 +85,7 @@ func TestFoldsDoNotDependOnArrivalOrder(t *testing.T) {
 		{"cheaper_route_wins", cheap, dear},
 		{"identical", cheap, cheap},
 		{"tie_on_cost_and_depth", twinA, twinB},
+		{"tie_on_everything_but_the_route", viaA, viaB},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ab, err := foldImpact(tc.a, tc.b)
@@ -101,7 +110,7 @@ func TestFoldsDoNotDependOnArrivalOrder(t *testing.T) {
 		t.Fatalf("folding: %v", err)
 	}
 	if got.Cost != cheap.Cost || got.Depth != cheap.Depth || got.Via != cheap.Via ||
-		got.Parent != cheap.Parent || !reflect.DeepEqual(got.Route, cheap.Route) {
+		got.Parent != cheap.Parent || got.Adm != cheap.Adm || got.Hash != cheap.Hash {
 		t.Fatalf("the fold did not take the whole route from the cheapest side: %+v", got)
 	}
 	// The incoming upgrade is sticky whichever side carried it.

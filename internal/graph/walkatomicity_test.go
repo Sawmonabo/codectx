@@ -28,9 +28,9 @@ import "testing"
 // nodes where the set holds 4.
 func TestALevelCutBetweenTheAdmittedFileAndItsBitsLosesNothingAndAdmitsNothingTwice(t *testing.T) {
 	level := []frontierState{
-		{Depth: 1, Cost: 1, Node: 4, Via: 9, Route: []RelRef{9}},
-		{Depth: 1, Cost: 1, Node: 7, Via: 3, Route: []RelRef{3}},
-		{Depth: 1, Cost: 2, Node: 12, Via: 5, Route: []RelRef{1, 5}},
+		{Depth: 1, Cost: 1, Node: 4, Via: 9, Adm: 1, Hash: routeHash{}.extend("rel-9")},
+		{Depth: 1, Cost: 1, Node: 7, Via: 3, Adm: 2, Hash: routeHash{}.extend("rel-3")},
+		{Depth: 1, Cost: 2, Node: 12, Via: 5, Adm: 3, Hash: routeHash{}.extend("rel-1").extend("rel-5")},
 	}
 	dir := t.TempDir()
 	w, err := openRetainedWalk(dir, walkBounds{Node: 64}, &heapProbe{})
