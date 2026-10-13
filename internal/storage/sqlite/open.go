@@ -871,7 +871,7 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 			// The savepoint could not be unwound: the group is no longer a
 			// state the run can build on, so it ends here.
 			s.abandonGroup()
-			return errors.Join(err, wrap("rollback to savepoint", rbErr))
+			return errors.Join(err, savepointLost(rbErr))
 		}
 		if _, relErr := tx.ExecContext(context.WithoutCancel(ctx), `RELEASE ingest`); relErr != nil {
 			s.abandonGroup()
@@ -887,6 +887,24 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 		return wrap("release savepoint", err)
 	}
 	return s.commitGroupIfDue(commit)
+}
+
+// savepointLost is the error of a ROLLBACK TO the ingest savepoint that
+// failed after fn's error. The statement is fixed and the savepoint was taken
+// just before fn ran, so a logic error (SQLITE_ERROR, "no such savepoint")
+// means SQLite itself rolled the whole transaction back in response to fn's
+// error, which it may do after an out-of-memory, disk-full, I/O or interrupt
+// error (https://www.sqlite.org/lang_transaction.html, "Response To Errors
+// Within A Transaction"). That is reported as what happened, beside fn's own
+// error, rather than as a failed rollback; any other failure is the
+// rollback's own.
+func savepointLost(rbErr error) error {
+	var se *sqlite.Error
+	if errors.As(rbErr, &se) && se.Code() == sqlite3.SQLITE_ERROR {
+		return internal("SQLite rolled back the ingestion group's transaction in response to the error above; " +
+			"the group is abandoned and none of its units is stored")
+	}
+	return wrap("rollback to savepoint", rbErr)
 }
 
 // commitGroupIfDue commits the open group when the caller asks for it or when

@@ -112,6 +112,7 @@ cargo metadata --locked --offline --format-version 1
 | itoa | 1.0.18 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | levenshtein_automata | 0.2.1 | MIT | `LICENSE` |
 | libc | 0.2.190 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| libm | 0.2.16 | MIT | `LICENSE.txt` |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-Apache-2.0_WITH_LLVM-exception`, `LICENSE-MIT` |
 | log | 0.4.34 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | lru | 0.16.4 | MIT | `LICENSE` |
@@ -168,6 +169,7 @@ cargo metadata --locked --offline --format-version 1
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
 | windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
 | windows_x86_64_gnu | 0.52.6 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
+| xorf | 0.13.0 | MIT | `LICENSE` |
 | zmij | 1.0.23 | MIT | `LICENSE-MIT` |
 
 The platform crates differ by target; every other row is linked on all six:

@@ -142,6 +142,9 @@ void cx_view_close(cx_view *v);
  *   u8      matches_exact (1: every match was visited)
  *   uvarint segments, uvarint segments_without_summary,
  *   uvarint blocks_total, uvarint blocks_scored, uvarint docs_scored
+ *   uvarint key_skips     (segments the served-group check skipped on their
+ *                          key filter)
+ *   uvarint key_lookups   (dictionary lookups the served-group check made)
  *   uvarint heaps         (segments scored at once)
  *   uvarint cap           (heap places per segment, after any rescoring)
  *   uvarint marked        (groups the resume position marked as served)
