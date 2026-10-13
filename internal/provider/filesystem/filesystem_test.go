@@ -118,9 +118,9 @@ func assertCovered(t *testing.T, docs []model.SearchUnit, size uint64) {
 // larger than one chunk, the shape found on a real repository) and a file that
 // is one line far longer than a chunk are both indexed whole, with the search
 // capability fresh and any substitution disclosed in its detail. Failure mode:
-// the chunker used to drop every chunk that was not valid UTF-8 and mark the
-// capability partial, so ~32 KiB of that document's text was searchable
-// nowhere and the whole index read as degraded under default settings.
+// a chunker that drops every chunk that is not valid UTF-8 and marks the
+// capability partial leaves ~32 KiB of that document's text searchable nowhere
+// and the whole index reading as degraded under default settings.
 func TestSearchCoversEveryByte(t *testing.T) {
 	var doc strings.Builder
 	doc.WriteString("<html><body>\n")
@@ -134,9 +134,9 @@ func TestSearchCoversEveryByte(t *testing.T) {
 	// boundary off a rune boundary: an invalid byte early on (so a
 	// validity-gated trim gives up), and at byte 32768 either a multi-byte
 	// rune straddling the edge or a run of bare continuation bytes longer
-	// than any well-formed sequence. Both used to end the chunk mid-sequence
-	// and fail the next call with "offset 32768 is inside a UTF-8 sequence",
-	// losing the whole unit.
+	// than any well-formed sequence. A chunker that ends the chunk mid-sequence
+	// fails the next call on either with "offset 32768 is inside a UTF-8
+	// sequence", losing the whole unit.
 	straddle := func(at []byte) string {
 		raw := []byte(strings.Repeat("x", 70<<10))
 		raw[100] = 0xa0 // invalid UTF-8, as in the document above
@@ -145,8 +145,8 @@ func TestSearchCoversEveryByte(t *testing.T) {
 	}
 	// Three files whose chunk boundaries land on a stray continuation byte,
 	// one that belongs to no well-formed sequence and is therefore a legal
-	// boundary. Each used to fail the unit with "offset N is inside a UTF-8
-	// sequence"; the mutation that fails them is a start guard that rejects
+	// boundary. A guard that misreads them fails the unit with "offset N is
+	// inside a UTF-8 sequence"; the mutation that fails them is a start guard that rejects
 	// every continuation byte rather than only one inside a well-formed
 	// sequence. A text head keeps each out of the binary sniff.
 	files := map[string]string{
@@ -201,8 +201,8 @@ func pngBytes(n int) string {
 
 // TestBinaryDecisionIsAProportion protects the no-skip rule against the binary
 // sniff: a text file is judged by how much of its head is not text at all, not
-// by whether a single NUL appears in it. Failure mode: one stray NUL byte in a
-// source file used to leave that file with no lexical index at all under
+// by whether a single NUL appears in it. Failure mode: a sniff that fails on
+// one stray NUL byte leaves that source file with no lexical index at all under
 // default settings -- state unavailable, its whole content searchable nowhere
 // -- while the file is plainly text a caller expects to find.
 func TestBinaryDecisionIsAProportion(t *testing.T) {

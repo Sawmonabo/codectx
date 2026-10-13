@@ -1056,7 +1056,6 @@ func TestGraphScenarios(t *testing.T) {
 			},
 		},
 
-		// FX-C14c-PROOF row
 		{
 			// The last two keyset loops that ask for adjacencyBatch (256)
 			// rows: rollup.go's containsEdges and
