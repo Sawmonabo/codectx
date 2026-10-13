@@ -80,6 +80,10 @@ type SpoolHeader struct {
 	AnalysisKey  model.AnalysisKey  `json:"analysis_key"`
 	QueryHash    string             `json:"query_hash"`
 	ExpiresAt    time.Time          `json:"expires_at"`
+	// Boot is the identity of the boot that wrote the entry (thisBoot). An
+	// entry of another boot is expired (live), so nothing a power loss tore
+	// is read after the restart.
+	Boot string `json:"boot,omitempty"`
 }
 
 const (
@@ -98,8 +102,8 @@ const (
 	frameLengthMask = frameContinues - 1
 	// headerlessGrace is how long a spool file may exist without a readable
 	// header before a sweep treats it as a crashed Create. A live Create
-	// syncs its header before returning, so this covers only the window
-	// between the file's creation and that sync.
+	// flushes its header before returning, so this covers only the window
+	// between the file's creation and that flush.
 	headerlessGrace = time.Minute
 )
 
@@ -262,10 +266,10 @@ type Spool struct {
 // It is not synced. A spool is continuation state that lives at most one
 // cursor lease and is swept after it, like a database's temporary files,
 // which take no fsync either: a process crash loses nothing the page cache
-// holds, and a power loss that tears the file leaves a spool whose header is
-// missing or short, which Open answers as expired continuation state (re-run
-// from the first page) and the sweep removes once headerlessGrace has passed.
-// The sync cost one flush to stable storage on every spooled page.
+// holds, and after a power loss the header names another boot, so the spool
+// is expired (boot.go). A header the power loss left missing or short is
+// answered the same way, and the sweep removes it once headerlessGrace has
+// passed. The sync cost one flush to stable storage on every spooled answer.
 func (s *Spools) Create(c Cursor) (*Spool, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -275,7 +279,7 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 		return nil, err
 	}
 	h := SpoolHeader{Version: spoolVersion, SpoolID: id, LeaseID: c.LeaseID, GenerationID: c.GenerationID,
-		AnalysisKey: c.AnalysisKey, QueryHash: c.QueryHash, ExpiresAt: c.ExpiresAt.UTC()}
+		AnalysisKey: c.AnalysisKey, QueryHash: c.QueryHash, ExpiresAt: c.ExpiresAt.UTC(), Boot: thisBoot()}
 	head, err := json.Marshal(h)
 	if err != nil {
 		return nil, internalErr("spool header: " + err.Error())
@@ -733,7 +737,11 @@ func (s *Spools) spoolHeader(path string) (SpoolHeader, bool) {
 // carries, which is the expiry of the cursor that created it. That predicate
 // touches no database, so the spool is reclaimed by the next sweep in any
 // process rather than depending on the one that wrote it ever running again.
+// An entry another boot wrote is never live, whatever its lease (boot.go).
 func (s *Spools) live(ctx context.Context, h SpoolHeader, now time.Time) (bool, error) {
+	if h.Boot != thisBoot() {
+		return false, nil
+	}
 	if h.LeaseID == "" {
 		return now.Before(h.ExpiresAt), nil
 	}

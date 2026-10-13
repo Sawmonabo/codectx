@@ -458,6 +458,13 @@ A `search` continuation's exact-tier spool is the one exception: when the
 budget cannot hold it, the cursor carries the position instead and the next
 page walks the tiers from it, so the answer is complete and only slower.
 
+**Continuation state does not outlive a restart of the host.** It is written
+for the cursor's lifetime and never forced to stable storage, so on Linux and
+macOS every spool and retained walk records the boot that wrote it, and after
+a reboot a cursor issued before it answers `CTX_CURSOR_INVALID`: re-run from
+the first page. Whatever a power loss left of those files is never read as an
+answer; the next `gc` or `index` removes it.
+
 On every command but `path`, the query deadline ends a page and not an answer:
 a walk that runs out of time
 returns what it has, reports `query deadline reached` and hands back a cursor the
