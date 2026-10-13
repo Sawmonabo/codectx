@@ -443,6 +443,9 @@ func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pa
 		if err := p.put(f.nodes, f.rels); err != nil {
 			return err
 		}
+		if err := p.putSearch(f.search); err != nil {
+			return err
+		}
 		return p.keep(records, rec)
 	})
 	if err != nil {
@@ -474,6 +477,9 @@ type filePublication struct {
 	nodes  []model.NodeFact
 	rels   []model.RelationFact
 	counts counts
+	// search are the search documents of the endpoints the file mints
+	// (route_search.go), handed to the sink after its nodes.
+	search []model.SearchUnit
 }
 
 // site publishes the facts of site i, group: one `calls` per distinct

@@ -294,8 +294,10 @@ and descends into the mounts recorded on that object; a binding already on the h
 routers including each other ends. The walk is bounded by the mounts the unit holds, never by a depth. Each route
 reached becomes one `endpoint` in the scope of the file the root mount is in, located at that mount, keyed
 `endpoint:<method route>@<full path>`, with the endpoint metadata `framework`, `method`, `route`, `prefix: resolved`
-and `path`, defined by the file's module and routing to each handler (`routes_to`, detail `import`). A handler the
-route's file imports is resolved through the module index to its declaration.
+and `path`, defined by the file's module and routing to each handler (`routes_to`, detail `import`). Like every endpoint of
+the linker (`internal/provider/link/route_search.go`), it carries the search document the structural provider gives an
+endpoint: its framework, method, route and path as its body, located at the endpoint, so a kind filter on endpoints
+finds it. A handler the route's file imports is resolved through the module index to its declaration.
 
 A route several mounts reach is several endpoints, one per path, and every `routes_to` of each carries `set_size`,
 the number of paths the walks of the file's root mounts gave that route. A hop whose prefix is not a literal (an
@@ -414,9 +416,10 @@ decision 8, `internal/provider/link/route_entry.go`). The linker reads the manif
 | `Cargo.toml` | `[[bin]]` with its `path`, else `src/bin/<name>.rs` or `src/bin/<name>/main.rs` | the file's top-level `fn main`, else its module |
 
 Each is keyed `endpoint:declared:<group>:<name>@<manifest>` (the group alone when it is the name, as for `main`),
-located at its target, defined by the file's module and routing to the target (detail `import`). A name several member files can supply
-publishes one endpoint in each, each with the set size; a value that names no member publishes nothing. The entries
-are manifest fields of the unit, so a change to one re-resolves the unit.
+located at its target, with a search document of its descriptor, defined by the file's module and routing to the target
+(detail `import`). A name several member files can supply publishes one endpoint in each, each with the set size; a
+value that names no member publishes nothing. The entries are manifest fields of the unit, so a change to one
+re-resolves the unit.
 
 ## Inherited Java `main`
 
@@ -431,9 +434,9 @@ there, with what the project declares (`internal/provider/link/java_main.go`). T
 `endpoint` named `main` with the identity the structural provider gives the main of a class it resolves itself (the
 file, the descriptor `main` and the class's qualified name as disambiguator), so an edit that moves the decision
 between the two providers moves no endpoint. It is located at the class, defined by the file's module and routing to
-the method (detail `hierarchy`); like the linker's other endpoints it carries no search document. A superclass the
-file names ambiguously is a path of its own; when the paths choose several methods each `routes_to` carries their
-number as its set size. The reads are index lookups of the hierarchy, so an edit to a superclass's `main` or to its
+the method (detail `hierarchy`), and carries the search document the structural provider gives that endpoint (the same
+document identity, body `main`, located at the class). A superclass the file names ambiguously is a path of its own; when the paths choose several
+methods each `routes_to` carries their number as its set size. The reads are index lookups of the hierarchy, so an edit to a superclass's `main` or to its
 `extends` re-resolves the classes that read it.
 
 ## Endpoint identity per family

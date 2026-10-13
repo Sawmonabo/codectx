@@ -538,8 +538,9 @@ func emitRoutes(file int32, found []routeFound, emit func(Binding) error) error 
 // one `endpoint` node per distinct route fact, in this file's scope,
 // located at the mount, keyed by its descriptor and its identity (its full
 // path, or for an unresolved one the route's file and object), with the
-// route's metadata, defined by the file's module and routing to each
-// handler, with the set size when the route reached several paths.
+// route's metadata and search document, defined by the file's module and
+// routing to each handler, with the set size when the route reached several
+// paths.
 func (f *filePublication) routes(m *RouteMount, group []idBinding) error {
 	var order []string
 	handlers := map[string][]idBinding{}
@@ -581,6 +582,7 @@ func (f *filePublication) routes(m *RouteMount, group []idBinding) error {
 		if err != nil {
 			return err
 		}
+		f.endpointDocument(n, nodeName(descriptor, "endpoint"), "", m.Range, meta)
 		f.node(occurrenceOf(f.fv, f.t, f.t.Module))
 		f.relation(f.t.Module.Node, model.RelDefines, n, located(m.Range), "", "", "", 0)
 		for _, b := range handlers[raw] {
