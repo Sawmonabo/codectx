@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,14 +119,16 @@ func TestReadAnswerDoublesItsDepth(t *testing.T) {
 	}
 }
 
-// TestReadAnswerHoldsToItsBudget proves the memory bound: a budget too small
-// for any growth keeps every step at the first depth, and the read still hands
-// over the paged answer; and stepSizer admits the largest doubling that fits,
-// keeping the depth there rather than falling back to the first.
+// TestReadAnswerHoldsToItsBudget proves the step sizing: under a budget too
+// small for any growth every index request carries the bound, the read still
+// hands over the paged answer, and stepSizer admits the largest doubling that
+// fits, keeping the depth there rather than falling back to the first, and
+// counts the marked-group bound.
 //
-// Mutation: ignore the budget, and the one-byte read asks for depth 5.
-// Mutation: fall back to the first depth when a doubling does not fit, and
-// next(4) answers 2.
+// Mutation: let the sizer ignore the budget, and next(4) under a one-byte
+// budget answers 8. Mutation: fall back to the first depth when a doubling
+// does not fit, and next(4) answers 2. Mutation: drop the marked groups from
+// stepBytes.
 func TestReadAnswerHoldsToItsBudget(t *testing.T) {
 	f := newFixtureOf(t, pagingDocs())
 	s := newService(t, f.opts)
@@ -136,9 +139,8 @@ func TestReadAnswerHoldsToItsBudget(t *testing.T) {
 			len(got), len(paged))
 	}
 	for i, r := range reqs {
-		if r.Depth != 3 {
-			t.Fatalf("under a one-byte budget request %d asks for %d results; every step stays at the first depth 2",
-				i, r.Depth)
+		if r.MaxBytes != 1 {
+			t.Fatalf("under a one-byte budget request %d carries a bound of %d", i, r.MaxBytes)
 		}
 	}
 
@@ -154,29 +156,69 @@ func TestReadAnswerHoldsToItsBudget(t *testing.T) {
 	if n := z.next(4); n != 2 {
 		t.Fatalf("next(4) = %d under a one-byte budget, want the first depth 2", n)
 	}
+	marked := shape
+	marked.marked = 1 << 20
+	if stepBytes(marked, 4) <= stepBytes(shape, 4) {
+		t.Fatal("a million marked groups add nothing to a step's admitted bytes")
+	}
 }
 
-// TestStepBytesCountsRescoringAndMarks proves the admission covers the two
-// library allocations that do not follow the depth asked: a step whose heaps
-// were doubled by rescoring, and the groups the resume position marks, which
-// grow with the results served. Either one alone must make a step that fits
-// without it not fit.
-//
-// Mutation: drop the rescoring ratio, or the marked groups, from stepBytes.
-func TestStepBytesCountsRescoringAndMarks(t *testing.T) {
-	base := stepShape{segments: 4, heaps: 2, strBytes: 200}
-	budget := stepBytes(base, 64)
-	rescored := base
-	rescored.capNum, rescored.capDen = 4*66, 66
-	if stepBytes(rescored, 64) <= budget {
-		t.Fatalf("a step whose heaps were rescored at four times the depth costs %d, no more than %d",
-			stepBytes(rescored, 64), budget)
+// burstDocs is a corpus whose groups each hold several documents of one
+// score, so every position deep in the answer marks a burst of groups at once,
+// and whose bodies are long enough that a small bound holds a few results.
+func burstDocs() []doc {
+	var out []doc
+	for i := range 40 {
+		name := fmt.Sprintf("Burst%02d", i)
+		out = append(out, doc{path: fmt.Sprintf("pkg/b%02d.go", i), name: name,
+			qualifiedName: "pkg.burst." + name, signature: "func " + name + "(ctx context.Context) error",
+			body: "func " + name + "() { " + strings.Repeat("omega ", 1+i%3) + "}", occurrences: 4})
 	}
-	marked := base
-	marked.markedNum, marked.markedDen, marked.served = 3, 1, 1<<20
-	if stepBytes(marked, 64) <= budget {
-		t.Fatalf("a step after a million results with three marked groups each costs %d, no more than %d",
-			stepBytes(marked, 64), budget)
+	return out
+}
+
+// TestReadAnswerHoldsTheLibraryToItsBound proves the bound is enforced by the
+// library, not estimated: under a bound that holds only a few results, every
+// index page charges at most the bytes its request allowed -- the marked
+// groups of a deep position and any rescoring included -- and the pages ended
+// early by the bound still hand over exactly the paged answer.
+//
+// Mutation: let the library ignore max_bytes (size the heap and the merge
+// from the depth alone), and a page charges more than its request allowed.
+func TestReadAnswerHoldsTheLibraryToItsBound(t *testing.T) {
+	f := newFixtureOf(t, burstDocs())
+	s := newService(t, f.opts)
+	paged, _ := pagedReads(t, f.ctx, s, "omega", 2)
+	if len(paged) != 40 {
+		t.Fatalf("the pages served %d hits, want the 40 groups", len(paged))
+	}
+	const bound = 16 << 10
+	var over []string
+	stopped := 0
+	prev := observeIndexPage
+	observeIndexPage = func(r textindex.Request, p textindex.Page) {
+		if r.MaxBytes <= 0 {
+			over = append(over, "a request of the bounded read carries no bound")
+			return
+		}
+		if p.Stats.Bytes > r.MaxBytes {
+			over = append(over, fmt.Sprintf("a page charged %d bytes against a bound of %d (marked %d, cap %d)",
+				p.Stats.Bytes, r.MaxBytes, p.Stats.Marked, p.Stats.Cap))
+		}
+		if p.More && len(p.Hits) < r.Depth {
+			stopped++
+		}
+	}
+	defer func() { observeIndexPage = prev }()
+	got, _ := readAll(t, f, s, "omega", 2, bound)
+	if len(over) > 0 {
+		t.Fatal(strings.Join(over, "; "))
+	}
+	if stopped == 0 {
+		t.Fatal("no page ended early at the bound; the test proves nothing about it")
+	}
+	if !reflect.DeepEqual(got, paged) {
+		t.Fatalf("under the bound the read handed over %d hits, the pages %d, or another order", len(got), len(paged))
 	}
 }
 

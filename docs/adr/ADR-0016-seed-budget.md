@@ -76,9 +76,12 @@ condition that an entry's grade depends only on its own routes, and no margin re
   computed from the library's and the service's structures, must fit the query memory admission
   (`resources.query_memory_bytes`) less the compile's sort share. When a doubling does not fit, the read keeps the
   largest depth that does, never less than one page, so a small admission costs more steps and never a refusal or a
-  different answer. The step's memory counts every segment's 24-byte run entries, the heaps of the segments scored at
-  once, the served results, the rescoring a marked group forced on the last step and the groups the resume position
-  marks, all as the index reported them for that step. The hits are handed over and hydrated a page at a time, so a
+  different answer. The bound is enforced, not estimated: every index request of a step carries the bytes the step may
+  still hold, and the library charges every allocation that grows with depth or position (the heaps of the segments
+  scored at once, every segment's 24-byte run entries, the marked groups, any rescoring and each served result with
+  the caller's copy), fits its heap to the bound beside the marked groups' bound, and ends a page early, with an exact
+  prefix that says more, rather than hold more. The marked-group bound is exact: every group a later position marks
+  is marked already or is a run entry the page before took. The hits are handed over and hydrated a page at a time, so a
   stop mid-step reads nothing from storage past its page. A query deadline that ends the read leaves the scope
   incomplete and names the step in the exclusions. Nothing is spooled.
 - τ(next) is the largest final score anything derived from the next unread match could reach: its origin

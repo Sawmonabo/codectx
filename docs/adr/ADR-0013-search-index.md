@@ -288,9 +288,16 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   lists picks the winners, and only the winners are fetched (see Sources). Resolving every segment's heap to strings
   before a hash fold would cost each segment place about 2.2 KB plus three copies of its strings. A shared minimum
   competitive score across segments is not used: it saves scoring but not memory, since a segment can still hold k
-  places above it, and it lowers occurrence counts, which is why a major engine enables it only when exact hit counts
-  are not required. One heap shared by every segment, as a single-slice search keeps, would score segments one at a
-  time and lose the parallel scoring.
+  places above it, and it lowers the occurrence counts a page serves. Exact counts cannot be kept beside it: an exact
+  count needs every matching document visited, so the major engines turn block skipping off when an exact total is
+  asked for, give a disjunction no sublinear count, and visit every match in every grouping collector (see Sources).
+  One heap shared by every segment, as a single-slice search keeps, would score segments one at a time and lose the
+  parallel scoring. A request may carry a byte bound: the library charges the heaps being scored, every run entry, the
+  marked groups and each served result with the caller's copy of it, sizes the heap to fit beside the marked groups'
+  bound (never below two places), doubles it on a rescoring only while it fits (or while no result is known), and ends
+  the merge before a result that would pass the bound, so a bounded page is an exact prefix that says more. A page
+  reports a bound on the groups the next position marks: its marked groups plus the run entries it took up to its last
+  result, each of which sorts at or before that result.
 - **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
   skips every document that cannot enter the top k. A block is skipped only when its bound, widened by a relative and
   an absolute margin of 10⁻⁹ against rounding, is strictly below the heap's (depth + 1)-th score. A phrase term takes
@@ -468,6 +475,14 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
   - the search library's per-segment top-n buffers, all held and pushed again through one buffer at merge,
     https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/collector/top_score_collector.rs and
     `src/collector/sort_key_top_collector.rs` at the same tag;
+  - exact counts turn skipping off: the collector asks for complete scoring and builds no shared minimum score
+    when the hit-count threshold is unlimited,
+    https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/TopScoreDocCollector.java
+    (`scoreMode`, `updateMinCompetitiveScore`); a disjunction has no sublinear count, `BooleanWeight.count` at the
+    same tag; every grouping collector asks for complete scoring,
+    https://github.com/apache/lucene/tree/releases/lucene/10.3.0/lucene/grouping/src/java/org/apache/lucene/search/grouping;
+    an exact total "can't be computed accurately without visiting all matches" and disables the max-score
+    optimization, https://www.elastic.co/docs/solutions/search/the-search-api (`track_total_hits`);
   - query-then-fetch: the coordinator merges each shard's top keys and fetches only the winning documents,
     https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/action/search/SearchPhaseController.java
     and `FetchSearchPhase.java` at the same tag; deep pages cost memory and time in from + size,

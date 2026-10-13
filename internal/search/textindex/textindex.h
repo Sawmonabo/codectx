@@ -116,6 +116,16 @@ void cx_view_close(cx_view *v);
  *   uvarint depth                         (folded results wanted, >= 1)
  *   u8      length_rule                   (0: total, 1: weighted per column)
  *   uvarint max_terms                     (0: unlimited)
+ *   uvarint max_bytes                     (0: unbounded; what the page's growing
+ *                                          allocations may hold, the caller's
+ *                                          copy of each result included; a page
+ *                                          it ends early is an exact prefix and
+ *                                          says more)
+ *   uvarint result_bytes                  (what the caller holds per result
+ *                                          beyond its strings)
+ *   uvarint marked_bound                  (an upper bound on the groups the
+ *                                          resume position marks: new_marks of
+ *                                          the page before, 0 without one)
  *   u8      flags                         (bit 0: ignore every block summary;
  *                                          bit 1: a resume position follows)
  *   [varint score_micros, uvarint doc_id] (with bit 1: the score and doc_id of
@@ -135,6 +145,8 @@ void cx_view_close(cx_view *v);
  *   uvarint heaps         (segments scored at once)
  *   uvarint cap           (heap places per segment, after any rescoring)
  *   uvarint marked        (groups the resume position marked as served)
+ *   uvarint new_marks     (bound on the groups a page after this one marks)
+ *   uvarint bytes         (peak of the growing allocations, as charged)
  *   uvarint hits, hits x { uvarint doc_id, string search_key, string node_id, string file_id,
  *                          string path, string kind, string name,
  *                          string qualified_name, string signature,

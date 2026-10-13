@@ -63,6 +63,9 @@ func encodeRequest(r Request) []byte {
 	b = putUvarint(b, uint64(r.Depth))
 	b = append(b, byte(r.LengthRule))
 	b = putUvarint(b, uint64(max(r.MaxTerms, 0)))
+	b = putUvarint(b, uint64(max(r.MaxBytes, 0)))
+	b = putUvarint(b, uint64(max(r.ResultBytes, 0)))
+	b = putUvarint(b, uint64(max(r.MarkedBound, 0)))
 	var flags byte
 	if r.IgnoreSummaries {
 		flags |= 1
@@ -169,6 +172,8 @@ func decodePage(b []byte) (Page, error) {
 	p.Stats.Heaps = int64(r.uvarint())
 	p.Stats.Cap = int64(r.uvarint())
 	p.Stats.Marked = int64(r.uvarint())
+	p.Stats.NewMarks = int64(r.uvarint())
+	p.Stats.Bytes = int64(r.uvarint())
 	n := r.uvarint()
 	if n > uint64(len(b)) {
 		return Page{}, errMalformed
