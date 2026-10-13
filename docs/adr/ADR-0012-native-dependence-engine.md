@@ -297,7 +297,9 @@ Concretely:
   again only to carry the right to leave: they are not served a second time, and only the return flows it may now
   take are new. So the walk marks exactly the nodes the two phases mark, admitting a node at most twice. Walked
   against the stored direction the rule swaps the roles: a return flow walked backwards enters the callee and an
-  argument flow walked backwards leaves it. The descent describes one chain of dependence, so an edge of any other
+  argument flow walked backwards leaves it. A nested call's value (`g(f())`, `f().m()`) is one relation carrying
+  both roles: it leaves the inner callee and enters the outer one, so the route that takes it is descended into the
+  outer callee. The descent describes one chain of dependence, so an edge of any other
   kind starts a new one. Each data flow's role is read in one grouped evidence read per batch of the walk, as the
   dispatch of a call is.
 - **Ranked below call impact, at every depth.** Impact ranks by the lexicographic key (reached through a
