@@ -143,6 +143,7 @@ func (b *builder) requestInputs() error {
 	case "java":
 		s.spring()
 	}
+	s.handlerCandidates()
 	return b.publishInputs(s.out)
 }
 

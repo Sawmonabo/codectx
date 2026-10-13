@@ -123,6 +123,9 @@ type builder struct {
 	// pendingInputs are the request-input reads whose source the linker
 	// decides, for the link table (inputs_link.go).
 	pendingInputs []link.PendingInput
+	// routeHandlers are the handlers the file's routes name through an
+	// import, for the link table (routeHandlerNames).
+	routeHandlers []link.RouteHandler
 	// parameterDecorators are the decorators of each parameter by its name
 	// token, published on the parameter's variable node (variable), and
 	// placed the ones published there (decorator_targets.go).

@@ -42,11 +42,20 @@ type PendingInput struct {
 	// Kind is, under RuleSpring, ClassSimple when the file decides the type
 	// is a simple value type; Class is then empty, else the type as written.
 	Kind uint8 `json:"kind,omitempty"`
+	// Source and Key are, under RuleHandler, the read itself, which Param
+	// then tells apart from the owner's other reads.
+	Source model.InputSource `json:"source,omitempty"`
+	Key    string            `json:"key,omitempty"`
 }
 
 // RuleSpring is the Rule of a Spring handler parameter left to Spring's
 // default resolution.
 const RuleSpring = "spring"
+
+// RuleHandler is the Rule of a read of a function's first parameter under
+// Framework's request table, which holds only when a route of another file
+// names the function as a handler of that framework (route_handler.go).
+const RuleHandler = "handler"
 
 // ClassKind is what a type of the file says, by itself, about how a
 // framework reads a parameter it types: for a Python class, how FastAPI
@@ -124,14 +133,28 @@ func indexPythonClasses(file int32, t *Table, add func(entry) error) error {
 type inputFact = model.RequestInput
 
 // emitPythonInputs emits one FactInput for each pending input of the
-// member at ordinal file whose class the walk decides, by FastAPI's rule:
+// member at ordinal file that a route of another file makes a handler's
+// read (RuleHandler), and each whose class the walk decides, by FastAPI's rule:
 // a path read when the route writes the parameter's name and the class is
 // no special type, else a body for a model or a dataclass, a file for an
 // UploadFile and a query for any other class. A request, a response or
 // other special type, and a class the walk cannot decide, publish nothing.
 func emitPythonInputs(file int32, t *Table, mods *index, emit func(Binding) error) error {
+	handlers := pyHandlerCheck{mods: mods, file: file, t: t, named: map[pyNamedKey]bool{}}
 	for i := range t.Inputs {
 		p := &t.Inputs[i]
+		if p.Rule == RuleHandler {
+			named, err := handlers.isNamed(p.Owner, p.Framework)
+			if err != nil {
+				return err
+			}
+			if named {
+				if err := emitHandlerInput(file, int32(i), p, emit); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if p.Rule != "" {
 			continue
 		}

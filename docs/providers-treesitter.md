@@ -488,7 +488,9 @@ name publishes nothing:
 The tokens are read with comments and string bodies skipped (`inputs_lex.go`),
 once per file and only when a table's gate passes. A request object that is
 reassigned or passed on is followed only through the def-use facts of the read
-it is assigned from. Not read: a handler named across files.
+it is assigned from. A function no route of its own file names is a handler only
+when a route of another file names it: its reads are left to the linker
+(docs/providers-link.md, Request inputs across files).
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped

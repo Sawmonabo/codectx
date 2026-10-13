@@ -221,10 +221,14 @@ func mountArgument(t *Table, m *RouteMount) (wire.Type, bool) {
 
 // indexPythonRouting adds a Python member's routing to the module index:
 // each open object under every dotted name its file can be imported as,
-// with its payload, each settings module the file names, and each class a
-// request input's annotation may name (indexPythonClasses).
+// with its payload, each settings module the file names, each class a
+// request input's annotation may name (indexPythonClasses), and each
+// handler its routes name through an import (indexPythonHandlers).
 func indexPythonRouting(file int32, t *Table, add func(entry) error) error {
 	if err := indexPythonClasses(file, t, add); err != nil {
+		return err
+	}
+	if err := indexPythonHandlers(file, t, add); err != nil {
 		return err
 	}
 	rt := &t.Routing
@@ -443,37 +447,11 @@ func (w *routeWalk) handlers(file int32, p string, r RouteEntry) ([]Ref, error) 
 		out = append(out, Ref{File: file, Index: h})
 	}
 	for _, raw := range r.Imported {
-		mod, name, ok := strings.Cut(raw, "\x00")
-		if !ok || name == "" {
-			continue
-		}
-		exact := strings.HasPrefix(mod, ".")
-		if exact {
-			if !pythonRelativeFits(p, mod) {
-				continue
-			}
-			mod = absolutePythonModule(p, mod)
-		}
-		if mod == "" {
-			continue
-		}
-		var hits []entry
-		near := false
-		err := w.mods.lookup(keyPyModule+mod+"\x00"+name, func(e entry) error {
-			if e.Ref.Index >= 0 {
-				hits = append(hits, e)
-				near = near || hitNear(p, e.Aux, exact)
-			}
-			return nil
-		})
+		refs, err := pyImportedRefs(w.mods, p, raw)
 		if err != nil {
 			return nil, err
 		}
-		for _, e := range hits {
-			if hitNear(p, e.Aux, exact) || !near && !exact {
-				out = append(out, e.Ref)
-			}
-		}
+		out = append(out, refs...)
 	}
 	slices.SortFunc(out, compareRef)
 	return slices.Compact(out), nil

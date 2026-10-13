@@ -68,6 +68,11 @@ type Table struct {
 	// resolver (route_input_spring.go): a project that registers one of its
 	// own decides what Spring's catch-all would.
 	ArgumentResolvers bool `json:"argument_resolvers,omitempty"`
+	// RouteHandlers are the handlers the file's routes name through an
+	// import, each with its route's framework: what a handler's own file
+	// reads to learn that a route of another file names its function
+	// (route_handler.go).
+	RouteHandlers []RouteHandler `json:"route_handlers,omitempty"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the

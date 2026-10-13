@@ -107,3 +107,23 @@ func TestExpressRouteAddedTwoFilesAway(t *testing.T) {
 	s.check("unrelated edit", []linkBuild{unrelated})
 	s.wantRepublished("unrelated edit", unrelated, []string{"util.js"}, "app.js")
 }
+
+// TestRouteNamingAViewRefreshesItsReads is a Django view module no route
+// names, until an edit of urls.py names its function: the refresh equals a
+// full build, the view's request reads published, and republishes
+// views.py. Mutation caught: the handler lookups not traced, so the
+// refresh never publishes the view's reads.
+func TestRouteNamingAViewRefreshesItsReads(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"site/urls.py":  "from django.urls import path\n\nfrom . import views\n\nurlpatterns = []\n",
+		"site/views.py": "def show(request):\n    return request.GET[\"q\"]\n",
+		"site/other.py": "def one():\n    return 1\n\n\ndef two():\n    return one()\n",
+	}
+	s.check("base", []linkBuild{s.only(s.advance(files))})
+	files = edit{name: "routed", replace: []sub{{"site/urls.py", "urlpatterns = []",
+		"urlpatterns = [path(\"show/\", views.show)]"}}}.apply(t, files)
+	routed := s.only(s.advance(files))
+	s.check("view routed", []linkBuild{routed})
+	s.wantRepublished("view routed", routed, []string{"site/urls.py", "site/views.py"}, "site/other.py")
+}

@@ -387,6 +387,21 @@ file decides is resolved there; any other type is looked up as the hierarchy rea
 declares (a library may resolve its own), or declarations that disagree, publish nothing. Both lookups are traced, so
 adding a resolver, or an edit that turns an enum into a class or makes a class abstract, re-resolves the handlers.
 
+A handler whose own file no route names (a Django view module `urls.py` names, a Starlette endpoint module, an
+Express controller module) is told a handler only by a route of another file
+(`internal/provider/link/route_handler.go`). The structural provider records, for each module-level function of a Python or ECMAScript file,
+the reads of its first parameter under each request table of its language that the file's own scans did not publish
+(Django's and Starlette's, Express's with its error-middleware arity), as pending inputs under the rule `handler`, and
+each route records the handlers it names through an import with its framework (`Table.RouteHandlers`). Each such
+handler is indexed under `keyRouteHandler` by the module it names: a Python import's absolute module, an ECMAScript
+specifier's resolved module. The handler's file looks itself up under every name it can be imported or exported by,
+and a Python entry's import is resolved again from the route's file as the route walk resolves a handler (the
+nearest source root), so a function of the same name in another root is not taken; the reads of a function a route
+of that framework names are published as the FastAPI reads are, keyed `input:<owner's node>#<framework:source:key#n>`.
+The lookups are traced, so naming a function in a route publishes its reads. A handler reached only through a
+re-export, a method, a function written inline in another call, and the `data_flows_to` of the read to the variable
+it defines, which only the structural provider publishes, are not read.
+
 ## Declared entry points
 
 The code a project's manifest declares as its entry points is an `endpoint` of the file it resolves to (ADR-0017

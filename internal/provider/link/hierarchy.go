@@ -571,6 +571,9 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 	if err := es.add(ctx, s, t); err != nil {
 		return err
 	}
+	if err := addJSHandlers(s, file, t, es); err != nil {
+		return err
+	}
 	fc := contextOf(file, t)
 	fileKey := refKey(Ref{File: file})
 	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
@@ -2370,10 +2373,11 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // (externalSupers), none when it has several. Go publishes nothing toward a
 // type outside the unit, whose method set no table holds.
 //
-// The file's request inputs Spring decides by type (springInputFacts) and
-// the routes its Go and Express root mounts reach in other files
-// (goRouteFacts, jsRouteFacts) are emitted here too, on the file's own
-// reads of the links.
+// The file's request inputs Spring decides by type (springInputFacts), the
+// routes its Go and Express root mounts reach in other files (goRouteFacts,
+// jsRouteFacts) and the reads of its functions a route of another file
+// names as Express handlers (jsHandlerInputs) are emitted here too, on the
+// file's own reads of the indexes.
 func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
 	fc := contextOf(file, t)
 	if err := h.springInputFacts(ctx, file, t, emit); err != nil {
@@ -2383,6 +2387,9 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		return err
 	}
 	if err := h.jsRouteFacts(ctx, file, t, emit); err != nil {
+		return err
+	}
+	if err := h.jsHandlerInputs(ctx, file, t, emit); err != nil {
 		return err
 	}
 	for i := range t.Decls {

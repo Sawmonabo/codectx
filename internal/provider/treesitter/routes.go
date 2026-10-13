@@ -53,6 +53,7 @@ func (b *builder) routeTable() []endpointFact {
 	switch b.lang.Name {
 	case "python", "javascript", "typescript", "tsx":
 		b.links = s.linkRoutes()
+		b.routeHandlers = s.routeHandlerNames()
 	case "go":
 		b.links = s.goLinks()
 	}

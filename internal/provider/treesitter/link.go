@@ -253,6 +253,7 @@ func (b *builder) linkTable() error {
 	t.Routing = b.linkRouting(siteAt, t.Sites)
 	t.Inputs, t.Classes = b.pendingInputs, append(b.pyClassKinds(), b.javaClassKinds()...)
 	t.ArgumentResolvers = b.namesArgumentResolver()
+	t.RouteHandlers = b.routeHandlers
 	for _, x := range wl.DynamicImports {
 		rng, err := b.rangeOf(x.At.Start, x.At.End)
 		if err != nil {
