@@ -24,6 +24,9 @@ import (
 //	                                        (a Rust #[cfg_attr(p, cfg(q))],
 //	                                         one element per cfg it applies;
 //	                                         nested cfg_attr predicates in turn)
+//	macro "<path>" | macro "<path>" "<header>"
+//	                                        (a Rust item-position macro's body
+//	                                         or brace group, macro_rust.go)
 //
 // A Rust `#[cfg]` or `#[cfg_attr]` applies to the item, variant, field or
 // match arm it is an outer attribute of (the Rust Reference's "Conditional
@@ -254,6 +257,9 @@ type branchLink struct {
 	text  string
 	up    *branchLink
 	depth int
+	// macro is, on a macro element, the macro path whose input the
+	// declarations under it are written in (macroInput).
+	macro string
 }
 
 func (l *branchLink) push(text string) *branchLink {
@@ -353,7 +359,13 @@ func (w *branchWalk) children(cur *ts.TreeCursor, n ts.Node, up *ts.Node, at *br
 						w.e.branchAt[s] = link
 					}
 				}
-				w.children(cur, *c, &n, link)
+				if bodies := w.e.macroBodiesOf(c); bodies != nil {
+					for _, b := range bodies {
+						w.macroBody(b, link)
+					}
+				} else {
+					w.children(cur, *c, &n, link)
+				}
 			}
 			cfg = cfg[:0]
 		}
@@ -362,6 +374,17 @@ func (w *branchWalk) children(cur *ts.TreeCursor, n ts.Node, up *ts.Node, at *br
 		}
 	}
 	cur.GotoParent()
+}
+
+// macroBody walks the kept re-parse b of a macro invocation's body, whose
+// path is at, under b's macro element: the invocation's own tokens hold no
+// declaration, its re-parse does.
+func (w *branchWalk) macroBody(b macroBody, at *branchLink) {
+	link := at.push(b.element)
+	link.macro = b.path
+	cur := b.root.Walk()
+	defer cur.Close()
+	w.children(cur, b.root, nil, link)
 }
 
 // arm is the element conditional n contributes for its child c in field f,

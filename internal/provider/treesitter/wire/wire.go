@@ -185,6 +185,12 @@ type Decl struct {
 	// no number (ADR-0014 decision 1). A Rust `#[cfg(...)]` attribute is a
 	// branch too. Empty when no conditional encloses the declaration.
 	Branch string `json:"branch,omitempty"`
+	// MacroInput is, for a Rust declaration written inside the body of an
+	// item-position macro invocation, the innermost such macro's path as
+	// written (`cfg_rt`, `cfg_if::cfg_if`): the declaration is the macro's
+	// input as written, which the macro may transcribe once, several times,
+	// renamed or not at all. Empty for every other declaration.
+	MacroInput string `json:"macro_input,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

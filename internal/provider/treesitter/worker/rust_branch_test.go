@@ -16,29 +16,46 @@ import (
 // declarations it sends, in order.
 func rustDecls(t *testing.T, src string) []wire.Decl {
 	t.Helper()
+	decls, _ := rustFacts(t, src)
+	return decls
+}
+
+// rustFacts runs the worker over the Rust source src and answers the
+// declarations and references it sends, in order.
+func rustFacts(t *testing.T, src string) ([]wire.Decl, []wire.Ref) {
+	t.Helper()
 	w := &state{parsers: map[string]*ts.Parser{}, queries: map[string]*ts.Query{}}
 	defer w.close()
 	var out bytes.Buffer
 	if _, fail, err := w.parse(&out, wire.Request{Language: "rust", Path: "lib.rs", SourceBytes: uint64(len(src))}, []byte(src)); err != nil || fail != nil {
 		t.Fatalf("parse: %v, %+v", err, fail)
 	}
-	var decls []wire.Decl
+	var (
+		decls []wire.Decl
+		refs  []wire.Ref
+	)
 	for {
 		kind, payload, err := wire.ReadMessage(&out, 0)
 		if errors.Is(err, io.EOF) {
-			return decls
+			return decls, refs
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		if kind != wire.KindDecl {
-			continue
+		switch kind {
+		case wire.KindDecl:
+			var d wire.Decl
+			if err := json.Unmarshal(payload, &d); err != nil {
+				t.Fatal(err)
+			}
+			decls = append(decls, d)
+		case wire.KindRef:
+			var r wire.Ref
+			if err := json.Unmarshal(payload, &r); err != nil {
+				t.Fatal(err)
+			}
+			refs = append(refs, r)
 		}
-		var d wire.Decl
-		if err := json.Unmarshal(payload, &d); err != nil {
-			t.Fatal(err)
-		}
-		decls = append(decls, d)
 	}
 }
 
