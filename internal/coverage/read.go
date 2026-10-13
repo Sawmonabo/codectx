@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -139,43 +140,9 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
 			"the source returned %d bytes for the %d-byte window [%d,%d)", len(window.Bytes), end-req.Offset, req.Offset, end)}
 	}
-	// PlanChunk owns every boundary rule -- the start inside a well-formed
-	// UTF-8 sequence, the complete line, the over-budget split, the base64
-	// fallback and the zero-length end of file -- and needs exactly [offset,
-	// min(offset+raw, size)) plus the bytes before offset the view's prefix
-	// walk read, which decide whether offset is a boundary.
-	chunk, err := source.PlanChunk(window.Before, window.Bytes, req.Offset, size, raw)
+	chunk, err := CutChunk(window, req.Offset, size, raw)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
-	}
-	// The window begins at the chunk's own start, so its start position is the
-	// chunk's; only the end may fall short of the window and has to be located.
-	start := window.Start
-	stop := window.End
-	if chunk.Range.End != end {
-		cursor, err := source.NewCursorAt(window.Before, window.Bytes, req.Offset, window.Start.Line)
-		if err != nil {
-			return model.ReadChunkResponse{}, err
-		}
-		if stop, err = cursor.PositionAt(chunk.Range.End); err != nil {
-			return model.ReadChunkResponse{}, err
-		}
-		if stop.Line == window.Start.Line {
-			// The cursor counts columns from the window it was handed, which
-			// begins mid-line whenever the offset does; the view already
-			// resolved that offset's real column.
-			stop.Column += window.Start.Column
-		}
-	}
-
-	// window.Bytes aliases the view's own buffer, so nothing that outlives this
-	// call may hold it. Both encodings below copy the bytes into a fresh string,
-	// which is why no clone is taken: cloning would spend a second copy, and
-	// keeping the slice would pin the whole window.
-	body := window.Bytes[:chunk.Range.End-chunk.Range.Start]
-	content := string(body)
-	if chunk.Encoding == model.EncodingBase64 {
-		content = base64.StdEncoding.EncodeToString(body)
 	}
 
 	chunkID, err := model.NewRandomID()
@@ -185,7 +152,7 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 	expires := s.now().Add(s.limits.ReceiptTTL)
 	issued := model.IssuedChunk{
 		ID: chunkID, SessionID: rec.ID, ActorID: rec.ActorID, FileID: req.FileID,
-		ContentHash: cov.ContentHash, Bytes: chunk.Range, ExpiresAt: expires,
+		ContentHash: cov.ContentHash, Bytes: chunk.Plan.Range, ExpiresAt: expires,
 	}
 	// IssueChunk is also the scope check: it refuses a file or hash outside the
 	// pinned scope and a chunk past the stored size, so neither is repeated here.
@@ -195,7 +162,7 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 	receipt, err := s.encodeReceipt(receiptPayload{
 		SessionID: rec.ID, ActorID: rec.ActorID, SnapshotID: rec.Binding.SnapshotID,
 		FileID: req.FileID, ContentHash: cov.ContentHash,
-		Start: chunk.Range.Start, End: chunk.Range.End, ChunkID: chunkID,
+		Start: chunk.Plan.Range.Start, End: chunk.Plan.Range.End, ChunkID: chunkID,
 	}, expires)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
@@ -205,18 +172,75 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 		Binding:     rec.Binding,
 		FileID:      req.FileID,
 		ContentHash: cov.ContentHash,
-		ByteRange:   chunk.Range,
-		LineRange:   model.SourceRange{Start: start, End: stop},
-		Encoding:    chunk.Encoding,
-		Content:     content,
-		PartialLine: chunk.PartialLine,
-		NextOffset:  chunk.NextOffset,
+		ByteRange:   chunk.Plan.Range,
+		LineRange:   chunk.Lines,
+		Encoding:    chunk.Plan.Encoding,
+		Content:     chunk.Content,
+		PartialLine: chunk.Plan.PartialLine,
+		NextOffset:  chunk.Plan.NextOffset,
 		Session:     &model.ReadSession{Receipt: receipt, Coverage: cov.State},
 	}
 	if err := resp.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err
 	}
 	return resp, nil
+}
+
+// Chunk is one chunk cut from a window of verified source: the boundary
+// plan, the whole-file lines and columns it covers, and its content as the
+// wire carries it.
+type Chunk struct {
+	Plan    source.Chunk
+	Lines   model.SourceRange
+	Content string
+}
+
+// CutChunk cuts the chunk that begins at at from window, which the snapshot
+// view read as exactly [at, min(at+raw, end)) with the whole-file position of
+// each end; end is the end of input the planner is handed -- the file's size,
+// or a node's last byte, so a node's last chunk ends there rather than at a
+// line break. It is the one cut a session read and a read outside a session
+// share, so a chunk is the same in both.
+//
+// source.PlanChunk owns every boundary rule -- the start inside a well-formed
+// UTF-8 sequence, the complete line, the over-budget split, the base64
+// fallback and the zero-length end of input -- and needs the window plus the
+// bytes before at that the view's prefix walk read, which decide whether at
+// is a boundary. The window begins at the chunk's own start, so its start
+// position is the chunk's; only the end may fall short of the window, and a
+// line cursor over the window locates it without rescanning from byte zero.
+//
+// window.Bytes aliases the view's own buffer, so nothing that outlives the
+// call may hold it. Both encodings copy the bytes into a fresh string, which
+// is why no clone is taken: cloning would spend a second copy, and keeping
+// the slice would pin the whole window.
+func CutChunk(window snapshot.Range, at, end uint64, raw uint32) (Chunk, error) {
+	plan, err := source.PlanChunk(window.Before, window.Bytes, at, end, raw)
+	if err != nil {
+		return Chunk{}, err
+	}
+	start, stop := window.Start, window.End
+	if plan.Range.End != at+uint64(len(window.Bytes)) {
+		cursor, err := source.NewCursorAt(window.Before, window.Bytes, at, window.Start.Line)
+		if err != nil {
+			return Chunk{}, err
+		}
+		if stop, err = cursor.PositionAt(plan.Range.End); err != nil {
+			return Chunk{}, err
+		}
+		if stop.Line == window.Start.Line {
+			// The cursor counts columns from the window it was handed, which
+			// begins mid-line whenever at does; the view already resolved
+			// at's real column.
+			stop.Column += window.Start.Column
+		}
+	}
+	body := window.Bytes[:plan.Range.End-plan.Range.Start]
+	content := string(body)
+	if plan.Encoding == model.EncodingBase64 {
+		content = base64.StdEncoding.EncodeToString(body)
+	}
+	return Chunk{Plan: plan, Lines: model.SourceRange{Start: start, End: stop}, Content: content}, nil
 }
 
 // coverageFor returns this actor's coverage record for one file in a single
