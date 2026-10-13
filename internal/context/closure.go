@@ -396,6 +396,9 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 // run: one `may_call` step into unreached, read through the impact walk (which
 // applies ADR-0015's name-only rules in this direction and answers each site's
 // callers) a page at a time, each start list at most the walk request's width.
+// A reader that cannot list name-only candidates has no naming sites to
+// offer: the start set is unreached alone and the plan says the candidates are
+// unavailable.
 func (c *Compiler) withNamingSites(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
 	unreached []string, haltable bool) (*pagination.SortedRun[idRec], error) {
 	all, err := newIDSort(in.sorts, "closure-start")
@@ -425,6 +428,10 @@ func (c *Compiler) withNamingSites(ctx context.Context, in *seedIngest, eng *gra
 				Page:         model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
 			})
 			if err != nil {
+				if why, ok := candidatesUnavailableReason(err); ok {
+					in.scope.CandidatesUnavailable = why
+					return sortedRun(in.sorts, all)
+				}
 				return nil, contextErr(ctx, err)
 			}
 			if res.Meta.Truncated {
