@@ -104,7 +104,9 @@ time [S11][S12]; the stored hop is the same match made once per bound site.
   argument.
 - **Program entry points** are `endpoint` nodes with `routes_to` to the entry function: a Python `__main__` guard; Go
   `package main` with `func main`; every Java `main` form the language specification defines, instance and
-  parameterless forms and inherited candidates included [S13]; and a script with a shebang.
+  parameterless forms and inherited candidates included [S13]; a script with a shebang; and an application object a
+  module binds (a Flask, FastAPI, Starlette or Express application, Django's WSGI or ASGI application), found by its
+  constructor call and never by the file's name, since neither PEP 3333 nor ASGI names a file.
 - **Framework routes** come from a per-framework table over those facts and the call sites, for Flask, FastAPI,
   Django, Express, Spring and Go `net/http` with its common routers. Each publishes an `endpoint` node with
   `routes_to` to the handler and the metadata `framework`, `method`, `route` as written, and `prefix`: `resolved` or

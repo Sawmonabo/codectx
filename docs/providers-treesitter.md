@@ -306,10 +306,11 @@ published and is counted, so the file reports partial.
 | every Java `main` of JLS SE 25 §12.1.4, per class: `static` or instance, one `String[]`/`String...` parameter or none, not `private`, `void`; a class of the file that inherits one from a superclass of the same file (a superclass in another file is not visible here) | `main`, disambiguated by the class's qualified name | the method |
 | a top-level Rust `fn main`; a file-scope C or C++ `main` definition that is not `static` | `main` | the function |
 | a file starting with `#!` (not Rust's `#![`) | `script` | the file's module |
+| a module-level binding whose value is exactly a call building an application: `Flask(…)`, `FastAPI(…)`, `Starlette(…)`, `express()`, or Django's `get_wsgi_application()` / `get_asgi_application()` imported from `django.core.wsgi` / `django.core.asgi` (PEP 3333 and ASGI name no file, so the file's name is never read) | `application`, disambiguated by the binding's name when a file binds two | the binding's declaration |
 
 **Framework routes.** The provider reads routes from decorators, annotations
 and registration calls, only in a file that imports the framework (Python
-`flask`, `fastapi`, `django.urls` or `django.conf.urls`; JavaScript and
+`flask`, `fastapi`, `starlette`, `django.urls` or `django.conf.urls`; JavaScript and
 TypeScript `express`; Go `net/http`, `github.com/gorilla/mux`,
 `github.com/go-chi/chi`, `github.com/gin-gonic/gin`, `github.com/labstack/echo`;
 Java `org.springframework.web.bind.annotation`). Each method and route is one
@@ -318,14 +319,15 @@ it (the link table's site result type).
 
 | Framework | Routes and method | Handler | Prefix resolves through |
 |---|---|---|---|
-| Flask | `@x.route(rule, methods=[…])` (no `methods`: `GET`, Flask's default), `@x.get`/`post`/`put`/`delete`/`patch` | the decorated function | `Flask()` is a root; a `Blueprint(url_prefix=…)` through exactly one `register_blueprint(bp, url_prefix=…)` in the file, whose prefix overrides the blueprint's own |
-| FastAPI | `@x.get` … `@x.trace`, `@x.api_route(path, methods=…)` (default `GET`) | the decorated function | `FastAPI()` is a root; an `APIRouter(prefix=…)` through exactly one `include_router(r, prefix=…)`, whose prefix adds to the router's own; `mount(path, app)` |
+| Flask | `@x.route(rule, methods=[…])` (no `methods`: `GET`, Flask's default), `@x.get`/`post`/`put`/`delete`/`patch`; `x.add_url_rule(rule, endpoint, view_func, methods=[…])`, whose default is the view's own `methods` when it is `View.as_view(…)` (no method) and `GET` otherwise | the decorated function; `view_func`, `X.as_view(…)` naming `X` | `Flask()` is a root; a `Blueprint(url_prefix=…)` through exactly one `register_blueprint(bp, url_prefix=…)` in the file, whose prefix overrides the blueprint's own |
+| FastAPI | `@x.get` … `@x.trace`, `@x.api_route(path, methods=…)` (default `GET`), `@x.websocket(path)` (method `WEBSOCKET`); `x.add_api_route(path, endpoint, methods=…)` (default `GET`), `x.add_api_websocket_route(path, endpoint)` | the decorated function; `endpoint` | `FastAPI()` is a root; an `APIRouter(prefix=…)` through exactly one `include_router(r, prefix=…)`, whose prefix adds to the router's own; `mount(path, app)` |
 | Django | `path`, `re_path`, `url` imported from Django; no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never: the including urlconf is chosen by settings, so every Django route is `unresolved` |
-| Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()` through exactly one `use([path,] router)` |
+| Starlette | `Route(path, endpoint, methods=[…])` (none: `GET` for a function endpoint, every method for a class, Starlette's own rule; an endpoint not declared here as a function names no method), `WebSocketRoute(path, endpoint)` (`WEBSOCKET`), each an entry of a route list | `endpoint` | `Starlette(routes=…)` (and a FastAPI application's `routes=`) is a root; `Router(routes=…)` and `Mount(path, routes=…)` hold lists; an entry is mounted on the object whose list, written in place or held by one module binding, is innermost around it; `Mount(path, app=x)` mounts `x` |
+| Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains; a path array is one endpoint per element | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()` through exactly one `use([path,] router)` |
 | Spring | `@GetMapping` … `@PatchMapping`, `@RequestMapping(method = RequestMethod.X)` (none: no method); `value`, `path` or positional, arrays | the annotated method | the class-level `@RequestMapping` literal is the only prefix, none means no prefix; several or a non-literal one leave the class's routes `unresolved` |
 | Go `net/http` | `http.Handle`/`HandleFunc` on the default mux, a `ServeMux`'s `Handle`/`HandleFunc`; a Go 1.22 pattern `"GET /x"` gives the method and the route `/x` | the second argument | the default mux is a root; `NewServeMux()` when the file serves it once (`ListenAndServe[TLS]`, `Serve[TLS]`) or another router handles it once |
-| gorilla/mux | `Handle`/`HandleFunc`, methods from `.Methods(…)` on the registration | the second argument | `NewRouter()` served or handled once; `PathPrefix(p).Subrouter()` a child |
-| chi | `Get` … `Trace`, `Handle`/`HandleFunc` (any method), `Method`/`MethodFunc(m, p, h)` | the second argument (third for `Method`) | `NewRouter()`/`NewMux()` served once or `Mount(p, r)` once; routes inside a `Route` or `Group` closure are on a parameter and stay `unresolved` |
+| gorilla/mux | `Handle`/`HandleFunc`, methods from `.Methods(…)` on the registration; a matcher chain closed by `Handler(h)`/`HandlerFunc(h)` (`PathPrefix(p).Handler(h)`, `Methods(m).Path(p).HandlerFunc(h)`, from the router or `NewRoute()`) whose one `Path` or `PathPrefix` is the route | the second argument; the closing call's argument | `NewRouter()` served or handled once; `PathPrefix(p).Subrouter()` a child |
+| chi | `Get` … `Trace`, `Handle`/`HandleFunc` (any method), `Method`/`MethodFunc(m, p, h)` | the second argument (third for `Method`) | `NewRouter()`/`NewMux()` served once or `Mount(p, r)` once; the router a `Route(p, func(r chi.Router) {…})` closure receives is the parent's prefix plus `p`, a `Group(func(r chi.Router) {…})` closure's exactly the parent's; a call inside the closure on its parameter (the innermost closure whose parameter it names) is on that router |
 | gin | `GET` … `OPTIONS`, `Any`, `Handle(m, p, …)` | the last argument | `gin.New()`/`gin.Default()` are roots; `Group(p)` a child |
 | echo | `GET` … `TRACE`, `Any`, `Add(m, p, h)` | the second argument (third for `Add`) | `echo.New()` is a root; `Group(p)` a child |
 
@@ -342,9 +344,11 @@ the source text, so a file whose link pass did not run publishes no
 call-registered route; a route on a receiver the file does not build is read only
 when the route is a string literal. A handler written as anything other than a
 name, a dotted name or a function literal (a wrapper call such as
-`http.HandlerFunc(f)`) gives the endpoint no `routes_to`. Not read: Flask
-`add_url_rule`, FastAPI `add_api_route` and websocket routes, Express array routes
-and `const { Router } = require("express")`, gorilla `PathPrefix(…).Handler(…)`,
+`http.HandlerFunc(f)`) gives the endpoint no `routes_to`. A WebSocket route
+carries the method `WEBSOCKET`: its connection is an ASGI scope of type
+`websocket`, routed apart from the HTTP routes of its path, so it and an HTTP
+`GET` on the same path are two endpoints. Not read: FastAPI and Starlette
+`add_route`/`add_websocket_route`, `const { Router } = require("express")`,
 mounts through `http.Server{Handler: …}` or `StripPrefix`, echo `Match`, a
 class-level `@RequestMapping(method = …)`, a qualified Django `urls.path(…)`.
 
