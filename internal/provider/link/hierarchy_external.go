@@ -27,10 +27,8 @@ import (
 //     with no override of the unit and one candidate, that one is proven;
 //     otherwise each candidate is published as one (DetailSupertypeCandidate,
 //     "at least one of n"), so a call on any of them reaches d.
-//   - Rust: an impl item implements its impl's trait (rustTraitOverrides);
-//     only an item whose trait path the worker could not spell
-//     (Decl.Trait empty) falls back to the self type's single external
-//     trait, when the type has exactly one.
+//   - Rust: an impl item implements its impl's own trait, read by
+//     rustTraitOverrides and never here.
 //
 // A method with no mark gets nothing: the mark is the only proof that a
 // type outside the unit has the member.
@@ -95,14 +93,7 @@ func (h *hierarchy) externalOverrides(fc fileCtx, owner, ref Ref, d *Decl, found
 		}
 		return publish(candidates, DetailSupertypeCandidate)
 	}
-	if found {
-		return nil
-	}
-	external, err := h.externalSupers(fc.family, owner, d.Name)
-	if err != nil || len(external) != 1 {
-		return err
-	}
-	return publish(external, DetailSupertype)
+	return nil
 }
 
 // externalCandidates is every supertype outside the unit of typ that may

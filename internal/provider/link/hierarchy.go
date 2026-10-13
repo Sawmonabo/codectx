@@ -806,8 +806,13 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 		external, ok := "", false
 		if len(supers) == 0 {
-			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil || !ok {
+			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil {
 				return err
+			}
+			if !ok {
+				// A supertype that names nothing the unit or the language
+				// knows leaves the file's other rows linked.
+				continue
 			}
 		}
 		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
@@ -1955,9 +1960,10 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 //     (`builtins.list`), unless a star import may supply it;
 //   - ECMAScript: as written, a global (`Error`);
 //   - Rust: a qualified name as written unless it starts in the crate
-//     (`crate`, `self`, `super`, a crate of the unit); a simple name as
-//     written (the prelude's), unless a glob of a path outside the crate may
-//     supply it;
+//     (`crate`, `self`, `super`, a crate of the unit); a global path
+//     (`::std::fmt::Display`) without its leading `::` unless its crate is
+//     the unit's (rustGlobalExternal); a simple name as written (the
+//     prelude's), unless a glob of a path outside the crate may supply it;
 //   - C and C++: a qualified name as written; a simple name only through a
 //     using-declaration, since any other may be a template parameter.
 //
@@ -1983,6 +1989,9 @@ func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string
 			return nil
 		})
 	}
+	if global, ok := strings.CutPrefix(name, "::"); ok && fc.family == "rust" {
+		return h.rustGlobalExternal(global)
+	}
 	if head, rest, isQualified := strings.Cut(name, fc.sep); isQualified {
 		if err := collect(head); err != nil {
 			return "", false, err
@@ -1997,7 +2006,7 @@ func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string
 		case "go":
 			return "", false, nil
 		case "rust":
-			if head == "crate" || head == "self" || head == "super" || head == "" {
+			if head == "crate" || head == "self" || head == "super" {
 				return "", false, nil
 			}
 			crate := false
@@ -2366,15 +2375,13 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 	case d.Static && (fc.family == "java" || fc.family == "c"):
 		// A static method hides; it overrides nothing.
 		return nil
-	case fc.family == "rust" && !d.Override:
-		// Only an item of a trait's impl implements the trait's.
-		return nil
+	case fc.family == "rust":
+		// Only an item of a trait's impl implements, and only its trait's.
+		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
 	case fc.family == "js" && strings.HasPrefix(d.Name, "#"):
 		// A private method's name is its class body's alone (ECMA-262
 		// §15.7.1, PrivateName): it overrides nothing.
 		return nil
-	case fc.family == "rust" && d.Trait != "":
-		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
 	case fc.family == "go" && d.Parent >= 0 && int(d.Parent) < len(t.Decls) && t.Decls[d.Parent].Kind == model.NodeInterface:
 		// An interface's method specification implements nothing.
 		return nil
