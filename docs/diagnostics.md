@@ -78,8 +78,13 @@ Overlay runs are collected as soon as the process that opened them is gone.
 
 An index run opens these at its top level: `capture` (with `walk` beneath it),
 `plan`, `attach_reused`, `build`, `structural_parse` (the
-run's total for the parser pool), `coverage`, `activation`, `adjacency`,
+run's total for the parser pool), `coverage`, `activation`,
 `retention`, `collection` and `reclaim`.
+
+Beneath `activation` sit the two steps of publication that cost on their own:
+`search_commit`, the search index's commit of every document the run added
+(its `out` count is those documents), and `adjacency`, the packed graph the
+generation is read through.
 
 Under `build`, one span per planned unit, whose stage is the **provider's own
 id** -- `filesystem`, `treesitter`, `manifest` and the rest -- and whose scope
@@ -128,7 +133,7 @@ per-goroutine processor accounting. A stage that ran beside other work in this
 process therefore reports no processor time and says
 `unavailable (overlapped)` rather than a share of process-wide counters it
 does not own -- `capture`, `walk`, `plan`, `attach_reused`,
-`build`, `coverage`, `seal`, `activation`, `adjacency`, `retention`,
+`build`, `coverage`, `seal`, `activation`, `search_commit`, `adjacency`, `retention`,
 `collection`, `reclaim`, the in-process
 `import` steps and every UNIT span all read this way. A unit span reads this way
 even where the unit ran a child: it brackets the whole unit, of which the child

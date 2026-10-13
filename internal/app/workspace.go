@@ -357,12 +357,6 @@ func (w *Workspace) Close() error {
 	return w.s.Close()
 }
 
-// maxAmbiguousCandidates bounds the candidate list an ambiguous name is
-// rejected with. It is an app-internal presentation bound, not a protocol
-// limit: the answer is the rejection, and a list long enough to
-// flood a terminal would not help the operator disambiguate.
-const maxAmbiguousCandidates = 16
-
 // ResolveNodes turns the `<name-or-id>` arguments of a query command into
 // resolved NodeIDs against one pinned generation.
 //
@@ -374,10 +368,10 @@ const maxAmbiguousCandidates = 16
 // unqualified spelling wins where it is unique and a fully qualified spelling
 // still resolves when the short name is not.
 //
-// More than one candidate is CTX_ARGUMENT_INVALID naming at most
-// maxAmbiguousCandidates of them. Picking the first silently is the one thing
-// this must never do: the candidates are different symbols, and answering about
-// the wrong one is a wrong answer the caller cannot detect.
+// More than one candidate is CTX_ARGUMENT_INVALID carrying the exact number
+// of candidates and naming them (ambiguousName). Picking the first silently is
+// the one thing this must never do: the candidates are different symbols, and
+// answering about the wrong one is a wrong answer the caller cannot detect.
 func (w *Workspace) ResolveNodes(ctx context.Context, gen model.GenerationID, names []string) ([]model.NodeID, error) {
 	if len(names) == 0 {
 		return nil, nil
@@ -412,47 +406,70 @@ func (w *Workspace) ResolveNodes(ctx context.Context, gen model.GenerationID, na
 	return resolved, nil
 }
 
-// resolveOneName resolves a single name against the pinned reader. It asks for
-// one more candidate than it will list, so "exactly the bound" and "more than
-// the bound" are distinguishable and the rejection can say which.
+// resolveOneName resolves a single name against the pinned reader: the nodes
+// whose exact name it is, or, when none, whose exact qualified name it is.
 func resolveOneName(ctx context.Context, reader *sqlite.PinnedReader, name string) (model.NodeID, error) {
-	candidates, err := reader.Nodes(ctx, sqlite.NodeFilter{Name: name}, "", maxAmbiguousCandidates+1)
+	first, total, err := nameCandidates(ctx, reader, sqlite.NodeFilter{Name: name})
 	if err != nil {
 		return "", err
 	}
-	if len(candidates) == 0 {
-		candidates, err = reader.Nodes(ctx, sqlite.NodeFilter{QualifiedName: name}, "", maxAmbiguousCandidates+1)
-		if err != nil {
+	if total == 0 {
+		if first, total, err = nameCandidates(ctx, reader, sqlite.NodeFilter{QualifiedName: name}); err != nil {
 			return "", err
 		}
 	}
-	switch {
-	case len(candidates) == 0:
+	switch total {
+	case 0:
 		return "", (&model.Error{Code: model.CodeArgumentInvalid,
 			Message: "no node in this generation carries that name"}).
 			WithDetail("name", name).
 			WithRemediation("run `codectx symbol` to find the symbol, or pass its resolved node id")
-	case len(candidates) == 1:
-		return candidates[0].Node.ID, nil
+	case 1:
+		return first[0].Node.ID, nil
 	}
-	return "", ambiguousName(name, candidates)
+	return "", ambiguousName(name, first, total)
 }
 
-// ambiguousName builds the rejection for a name several nodes carry. The
-// candidates ride in the remediation text rather than in the details map
-// because they are what the operator reads to choose one, and each is rendered
-// as its qualified name plus a short id prefix -- enough to tell the candidates
-// apart and to paste back, without printing sixteen 64-character ids.
-func ambiguousName(name string, candidates []sqlite.StoredNode) error {
-	shown := candidates
-	more := false
-	if len(shown) > maxAmbiguousCandidates {
-		shown, more = shown[:maxAmbiguousCandidates], true
+// nameCandidates counts every node the filter selects, exactly, and returns
+// the first page of them. It walks the store's keyset pages by node id, so it
+// holds one page at a time however many nodes carry the name, and a page the
+// store returns short -- it collapses duplicate fact rows of one node after
+// its limit -- is not taken for the end: only an empty page ends the walk.
+func nameCandidates(ctx context.Context, reader *sqlite.PinnedReader, f sqlite.NodeFilter) ([]sqlite.StoredNode, int64, error) {
+	var first []sqlite.StoredNode
+	var total int64
+	after := model.NodeID("")
+	for {
+		page, err := reader.Nodes(ctx, f, after, 0)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(page) == 0 {
+			return first, total, nil
+		}
+		if first == nil {
+			first = page
+		}
+		total += int64(len(page))
+		after = page[len(page)-1].Node.ID
 	}
+}
+
+// ambiguousName builds the rejection for a name several nodes carry. It states
+// the exact number of candidates and names the first page of them -- every one
+// when they fit a page, which is how an ambiguous abbreviated object name is
+// answered by version control, so the operator can pick without a second
+// command. The candidates ride in the remediation text rather than in the
+// details map because they are what the operator reads to choose one, and each
+// is rendered as its qualified name plus a short id prefix -- enough to tell
+// the candidates apart and to paste back. When more candidates exist than one
+// page holds, the rest are listed by `codectx symbol`, a page at a time with
+// its --cursor, from the same exact-name lookup.
+func ambiguousName(name string, shown []sqlite.StoredNode, total int64) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d nodes carry this name", len(candidates))
-	if more {
-		fmt.Fprintf(&b, " (showing the first %d)", maxAmbiguousCandidates)
+	fmt.Fprintf(&b, "%d nodes carry this name", total)
+	if int64(len(shown)) < total {
+		fmt.Fprintf(&b, "; the first %d by node id", len(shown))
 	}
 	b.WriteString("; pass one of these node ids: ")
 	for i, c := range shown {
@@ -465,10 +482,13 @@ func ambiguousName(name string, candidates []sqlite.StoredNode) error {
 		}
 		fmt.Fprintf(&b, "%s %s…", label, string(c.Node.ID)[:12])
 	}
+	if int64(len(shown)) < total {
+		fmt.Fprintf(&b, ". `codectx symbol %s` lists all %d, a page at a time with --cursor", strconv.Quote(name), total)
+	}
 	return (&model.Error{Code: model.CodeArgumentInvalid,
 		Message: "this name resolves to more than one node"}).
 		WithDetail("name", name).
-		WithDetail("candidates", strconv.Itoa(len(candidates))).
+		WithDetail("candidates", strconv.FormatInt(total, 10)).
 		WithRemediation(b.String())
 }
 

@@ -3,6 +3,8 @@ package graph
 import (
 	"cmp"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"path"
 	"slices"
@@ -319,8 +321,10 @@ func candidatesOfSites(ctx context.Context, r GraphReader, dr DeclarationReader,
 			if err != nil {
 				return err
 			}
-			for _, cand := range ranked {
-				emit(start, cand.ID, c.Rel)
+			for _, ids := range ranked {
+				for _, cand := range ids {
+					emit(start, cand, c.Rel)
+				}
 			}
 		}
 	}
@@ -360,9 +364,14 @@ func (e *Engine) filesOfImportSites(ctx context.Context, r GraphReader, dr Decla
 			if !ok {
 				continue
 			}
-			fragments, ok := openImportFragments(d.Node)
+			fragments, rows, ok := openImportFragments(d.Node)
 			if !ok {
 				continue
+			}
+			if rows > 0 {
+				if fragments, err = rowFragments(ctx, dr, d.Node.ID, rows); err != nil {
+					return err
+				}
 			}
 			sites[c.Other] = true
 			if !loaded {
@@ -739,16 +748,49 @@ func (e *Engine) dropPlaceholders(ctx context.Context, r GraphReader, nodes []mo
 // ascending, so a level is counted when the first record of the next one
 // arrives, and the last one by flush. A site is counted once, at the first
 // depth it names a reached node.
+//
+// Its sets -- the level's reached nodes, their names, and every site counted
+// so far -- start in heap and move to a scratch database (openScratch, under
+// the path searches' fixed page cache) once they hold openSiteHeapEntries
+// between them, so the common impact pays nothing for the scratch and a walk
+// over a monorepo's affected set holds a bounded working set. The count is the
+// same either way: the sets are exact in both, and each level is read in node
+// order and counted in name order.
 type openSiteCounter struct {
-	dr      DeclarationReader
-	b       *budget
-	depth   int
-	pending map[model.NodeID]bool
-	seen    map[model.NodeID]bool
+	dr         DeclarationReader
+	b          *budget
+	depth      int
+	scratchDir string
+	pending    map[model.NodeID]bool
+	seen       map[model.NodeID]bool
+	// sc holds the sets once they spilled, and is nil until then.
+	sc *pathScratch
 }
 
-func newOpenSiteCounter(dr DeclarationReader, b *budget) *openSiteCounter {
-	return &openSiteCounter{dr: dr, b: b, pending: map[model.NodeID]bool{}, seen: map[model.NodeID]bool{}}
+// openSiteHeapEntries is how many nodes and sites the counter holds in heap
+// before it moves its sets to scratch. It sizes a working set, never a count:
+// every site is counted either way. It is a variable only so a test can make
+// the counter spill.
+var openSiteHeapEntries = 1 << 16
+
+// openSiteCountSchema is the counter's scratch once it spills.
+const openSiteCountSchema = `
+CREATE TABLE pending(node TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE named(name TEXT NOT NULL, node TEXT NOT NULL, kind TEXT NOT NULL, lang TEXT NOT NULL, sig TEXT NOT NULL,
+	PRIMARY KEY(name, node)) WITHOUT ROWID;
+CREATE TABLE seen(site TEXT PRIMARY KEY) WITHOUT ROWID;
+`
+
+func newOpenSiteCounter(dr DeclarationReader, b *budget, scratchDir string) *openSiteCounter {
+	return &openSiteCounter{dr: dr, b: b, scratchDir: scratchDir, pending: map[model.NodeID]bool{}, seen: map[model.NodeID]bool{}}
+}
+
+// close releases the scratch, if the sets spilled into one.
+func (c *openSiteCounter) close() {
+	if c.sc != nil {
+		c.sc.close()
+		c.sc = nil
+	}
 }
 
 // note records one affected node.
@@ -762,40 +804,234 @@ func (c *openSiteCounter) note(ctx context.Context, rec impactRecord) error {
 		}
 		c.depth = rec.Depth
 	}
+	if c.sc != nil {
+		return c.exec(`INSERT INTO pending(node) VALUES(?1) ON CONFLICT DO NOTHING`, string(rec.NodeID))
+	}
 	c.pending[rec.NodeID] = true
+	return c.spillIfFull()
+}
+
+// spillIfFull moves the heap sets to scratch once they reach the bound.
+func (c *openSiteCounter) spillIfFull() error {
+	if c.sc != nil || len(c.pending)+len(c.seen) < openSiteHeapEntries {
+		return nil
+	}
+	sc, err := openScratch(context.Background(), c.scratchDir, openSiteCountSchema)
+	if err != nil {
+		return err
+	}
+	c.sc = sc
+	for id := range c.pending {
+		if err := c.exec(`INSERT INTO pending(node) VALUES(?1)`, string(id)); err != nil {
+			return err
+		}
+	}
+	for id := range c.seen {
+		if err := c.exec(`INSERT INTO seen(site) VALUES(?1)`, string(id)); err != nil {
+			return err
+		}
+	}
+	c.pending, c.seen = nil, nil
 	return nil
+}
+
+// exec runs one scratch statement. The scratch is a local file the count must
+// leave consistent, so it runs outside the request's cancellation.
+func (c *openSiteCounter) exec(query string, args ...any) error {
+	if _, err := c.sc.tx.ExecContext(context.Background(), query, args...); err != nil {
+		return internalErr("open-site count scratch: " + err.Error())
+	}
+	return nil
+}
+
+// countSite marks site counted and reports whether it was not counted before.
+func (c *openSiteCounter) countSite(site model.NodeID) (bool, error) {
+	if c.sc == nil {
+		if c.seen[site] {
+			return false, nil
+		}
+		c.seen[site] = true
+		return true, c.spillIfFull()
+	}
+	res, err := c.sc.tx.ExecContext(context.Background(),
+		`INSERT INTO seen(site) VALUES(?1) ON CONFLICT DO NOTHING`, string(site))
+	if err != nil {
+		return false, internalErr("open-site count scratch: " + err.Error())
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, internalErr("open-site count scratch: " + err.Error())
+	}
+	return n == 1, nil
+}
+
+// counted reports whether site was already counted.
+func (c *openSiteCounter) counted(site model.NodeID) (bool, error) {
+	if c.sc == nil {
+		return c.seen[site], nil
+	}
+	var held bool
+	if err := c.sc.tx.QueryRowContext(context.Background(),
+		`SELECT EXISTS(SELECT 1 FROM seen WHERE site = ?1)`, string(site)).Scan(&held); err != nil {
+		return false, internalErr("open-site count scratch: " + err.Error())
+	}
+	return held, nil
+}
+
+// pendingPage reads up to limit of the level's nodes after after, in node
+// order.
+func (c *openSiteCounter) pendingPage(after model.NodeID, limit int) ([]model.NodeID, error) {
+	rows, err := c.sc.tx.QueryContext(context.Background(),
+		`SELECT node FROM pending WHERE node > ?1 ORDER BY node LIMIT ?2`, string(after), limit)
+	if err != nil {
+		return nil, internalErr("open-site count scratch: " + err.Error())
+	}
+	defer rows.Close()
+	var out []model.NodeID
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, internalErr("open-site count scratch: " + err.Error())
+		}
+		out = append(out, model.NodeID(id))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalErr("open-site count scratch: " + err.Error())
+	}
+	return out, nil
+}
+
+// namedNodes reads the level's nodes named name, from scratch.
+func (c *openSiteCounter) namedNodes(name string) ([]model.Node, error) {
+	rows, err := c.sc.tx.QueryContext(context.Background(),
+		`SELECT node, kind, lang, sig FROM named WHERE name = ?1 ORDER BY node`, name)
+	if err != nil {
+		return nil, internalErr("open-site count scratch: " + err.Error())
+	}
+	defer rows.Close()
+	var out []model.Node
+	for rows.Next() {
+		n := model.Node{Name: name}
+		var id, kind string
+		if err := rows.Scan(&id, &kind, &n.Language, &n.Signature); err != nil {
+			return nil, internalErr("open-site count scratch: " + err.Error())
+		}
+		n.ID, n.Kind = model.NodeID(id), model.NodeKind(kind)
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalErr("open-site count scratch: " + err.Error())
+	}
+	return out, nil
+}
+
+// nextName reads the first name of the level after after, "" at the end.
+func (c *openSiteCounter) nextName(after string) (string, error) {
+	var name string
+	err := c.sc.tx.QueryRowContext(context.Background(),
+		`SELECT name FROM named WHERE name > ?1 ORDER BY name LIMIT 1`, after).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", internalErr("open-site count scratch: " + err.Error())
+	}
+	return name, nil
 }
 
 // flush counts the pending level.
 func (c *openSiteCounter) flush(ctx context.Context) error {
-	if c.dr == nil || len(c.pending) == 0 || c.depth < 1 {
+	if c.dr == nil || c.depth < 1 || (c.sc == nil && len(c.pending) == 0) {
 		return nil
 	}
-	ids := make([]model.NodeID, 0, len(c.pending))
-	for id := range c.pending {
-		ids = append(ids, id)
-	}
-	clear(c.pending)
-	slices.Sort(ids)
-	byName := map[string][]model.Node{}
-	for start := 0; start < len(ids); start += model.MaxPageItems {
-		decls, err := c.dr.Declared(ctx, ids[start:min(start+model.MaxPageItems, len(ids))])
+	// The level's declared nodes, grouped by name: in heap, or in the
+	// scratch's named table once the sets spilled.
+	var byName map[string][]model.Node
+	declare := func(ids []model.NodeID) error {
+		decls, err := c.dr.Declared(ctx, ids)
 		if err != nil {
 			return err
 		}
 		for _, d := range decls {
-			if isDeclared(d.Node) && d.Node.Name != "" {
+			if !isDeclared(d.Node) || d.Node.Name == "" {
+				continue
+			}
+			if c.sc == nil {
 				byName[d.Node.Name] = append(byName[d.Node.Name], d.Node)
+				continue
+			}
+			if err := c.exec(`INSERT INTO named(name, node, kind, lang, sig) VALUES(?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING`,
+				d.Node.Name, string(d.Node.ID), string(d.Node.Kind), d.Node.Language, d.Node.Signature); err != nil {
+				return err
 			}
 		}
+		return nil
 	}
-	names := make([]string, 0, len(byName))
-	for n := range byName {
-		names = append(names, n)
+	var names []string
+	if c.sc == nil {
+		byName = map[string][]model.Node{}
+		ids := make([]model.NodeID, 0, len(c.pending))
+		for id := range c.pending {
+			ids = append(ids, id)
+		}
+		clear(c.pending)
+		slices.Sort(ids)
+		for start := 0; start < len(ids); start += model.MaxPageItems {
+			if err := declare(ids[start:min(start+model.MaxPageItems, len(ids))]); err != nil {
+				return err
+			}
+		}
+		names = make([]string, 0, len(byName))
+		for n := range byName {
+			names = append(names, n)
+		}
+		slices.Sort(names)
+	} else {
+		var after model.NodeID
+		for {
+			ids, err := c.pendingPage(after, model.MaxPageItems)
+			if err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				break
+			}
+			if err := declare(ids); err != nil {
+				return err
+			}
+			after = ids[len(ids)-1]
+		}
+		if err := c.exec(`DELETE FROM pending`); err != nil {
+			return err
+		}
 	}
-	slices.Sort(names)
+	// Names in order: from the heap list, or one keyset step at a time from
+	// the scratch. A spill during the count leaves the level where it was
+	// grouped; only the counted sites move.
+	spilled := c.sc != nil
 	var count int64
-	for _, name := range names {
+	var lastName string
+	for i := 0; ; i++ {
+		var name string
+		var nodes []model.Node
+		if !spilled {
+			if i == len(names) {
+				break
+			}
+			name, nodes = names[i], byName[names[i]]
+		} else {
+			var err error
+			if name, err = c.nextName(lastName); err != nil {
+				return err
+			}
+			if name == "" {
+				break
+			}
+			if nodes, err = c.namedNodes(name); err != nil {
+				return err
+			}
+			lastName = name
+		}
 		var after model.NodeID
 		for {
 			page, next, err := c.dr.Declarations(ctx, name, nil, after, model.MaxPageItems)
@@ -804,13 +1040,25 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 			}
 			for _, d := range page {
 				site, ok := openCallSite(d)
-				if !ok || site.Reason == model.ReasonComputed || c.seen[d.Node.ID] {
+				if !ok || site.Reason == model.ReasonComputed {
 					continue
 				}
-				for _, n := range byName[name] {
+				done, err := c.counted(d.Node.ID)
+				if err != nil {
+					return err
+				}
+				if done {
+					continue
+				}
+				for _, n := range nodes {
 					if site.fits(n) {
-						c.seen[d.Node.ID] = true
-						count++
+						fresh, err := c.countSite(d.Node.ID)
+						if err != nil {
+							return err
+						}
+						if fresh {
+							count++
+						}
 						break
 					}
 				}
@@ -819,6 +1067,11 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 				break
 			}
 			after = next
+		}
+	}
+	if spilled {
+		if err := c.exec(`DELETE FROM named`); err != nil {
+			return err
 		}
 	}
 	for len(c.b.openSites) < c.depth {
@@ -837,10 +1090,20 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 // orders it with the precise records.
 //
 // The walk's records are read back once to find each affected node's best
-// depth, cost and route; that map is the size of the affected set, the price
-// of a request that asks to walk through name-only calls.
+// depth, cost and route. That table is the size of the affected set, so it
+// lives in a scratch database under a fixed page cache (openScratch), never in
+// heap: one keyed upsert per record, then each level read back in node order
+// a chunk at a time, one point lookup per row for its parent's record and one
+// conditional insert per reached node. A level is expanded a chunk of starts
+// at a time; possibleRows emits a start's rows together and in start order,
+// so the chunks concatenated are the level's rows in the level's order.
+//
+// The expansion runs inside the one request that finished the walk and its
+// scratch ends with that request. A deadline that lands inside it ends the
+// expansion and the answer is marked truncated (impactPhaseError), exactly as
+// before; there is no partial expansion for a continuation to resume.
 func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.ImpactRequest, maxDepth config.Limit,
-	retain *retainedWalk) error {
+	retain *retainedWalk) (err error) {
 	if declarationReader(r) == nil {
 		return nil
 	}
@@ -853,78 +1116,218 @@ func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.I
 	default:
 		modes = []tailMode{tailCallers, tailCallees}
 	}
-	best := map[model.NodeID]impactRecord{}
+	// The scratch is a local file the expansion must leave consistent, so its
+	// statements run outside the request's cancellation, as the path
+	// searches' do; the deadline is honoured by the graph reads between them.
+	scCtx := context.WithoutCancel(ctx)
+	sc, err := openScratch(scCtx, e.scratchDir(), openSiteScratchSchema)
+	if err != nil {
+		return err
+	}
+	defer sc.close()
+	best := &bestTable{tx: sc.tx}
+	if err := best.prepare(scCtx); err != nil {
+		return err
+	}
+	defer best.closeStatements()
 	seed := map[model.NodeID]bool{}
 	for _, s := range req.Start {
 		seed[s] = true
-		best[s] = impactRecord{NodeID: s}
+		if err := best.offer(scCtx, impactRecord{NodeID: s}); err != nil {
+			return err
+		}
 	}
 	if err := retain.eachEntry(func(rec impactRecord) error {
-		if cur, ok := best[rec.NodeID]; !ok || rec.Depth < cur.Depth || (rec.Depth == cur.Depth && rec.Cost < cur.Cost) {
-			if !seed[rec.NodeID] {
-				best[rec.NodeID] = rec
-			}
+		if seed[rec.NodeID] {
+			return nil
 		}
-		return nil
+		return best.offer(scCtx, rec)
 	}); err != nil {
 		return err
 	}
-	byDepth := map[int][]model.NodeID{}
-	deepest := 0
-	for id, rec := range best {
-		byDepth[rec.Depth] = append(byDepth[rec.Depth], id)
-		deepest = max(deepest, rec.Depth)
-	}
-	for depth := 0; depth <= deepest; depth++ {
-		level := sortedNodes(byDepth[depth])
-		if len(level) == 0 || atBound(maxDepth, depth) {
+	for depth := 0; ; depth++ {
+		more, err := best.hasLevel(scCtx, depth)
+		if err != nil {
+			return err
+		}
+		if !more {
+			return nil
+		}
+		if atBound(maxDepth, depth) {
 			continue
 		}
 		for _, mode := range modes {
-			list, err := e.possibleRows(ctx, r, mode, level, false, 0)
-			if err != nil {
-				return err
-			}
 			direction := model.DirectionIncoming
 			if mode == tailCallees {
 				direction = model.DirectionOutgoing
 			}
-			for _, row := range list.rows {
-				from, to := row.Rel.To, row.Rel.From
-				if mode == tailCallees {
-					from, to = row.Rel.From, row.Rel.To
-				}
-				if seed[to] {
-					continue
-				}
-				parent := best[from]
-				// The route is capped one past the path bound, as
-				// appendRoute caps a walk's.
-				route := slices.Clone(parent.Route)
-				if len(route) <= model.MaxRelationsPerPath {
-					route = append(route, row.Rel.ID)
-				}
-				rec := impactRecord{
-					NodeID:    to,
-					Depth:     depth + 1,
-					Cost:      parent.Cost + Cost(model.RelMayCall),
-					Direction: direction,
-					Via:       row.Rel.ID,
-					Parent:    from,
-					Route:     route,
-					Reasons:   []string{impactReason(model.RelMayCall, direction, depth+1)},
-					Possible:  true,
-				}
-				if err := retain.addEntry(rec); err != nil {
+			var after model.NodeID
+			for {
+				if err := ctx.Err(); err != nil {
 					return err
 				}
-				if _, ok := best[to]; !ok {
-					best[to] = rec
-					byDepth[depth+1] = append(byDepth[depth+1], to)
-					deepest = max(deepest, depth+1)
+				level, err := best.level(scCtx, depth, after, openSiteChunk)
+				if err != nil {
+					return err
+				}
+				if len(level) == 0 {
+					break
+				}
+				after = level[len(level)-1].NodeID
+				parents := make(map[model.NodeID]impactRecord, len(level))
+				starts := make([]model.NodeID, len(level))
+				for i, rec := range level {
+					parents[rec.NodeID], starts[i] = rec, rec.NodeID
+				}
+				list, err := e.possibleRows(ctx, r, mode, starts, false, 0)
+				if err != nil {
+					return err
+				}
+				for _, row := range list.rows {
+					from, to := row.Rel.To, row.Rel.From
+					if mode == tailCallees {
+						from, to = row.Rel.From, row.Rel.To
+					}
+					if seed[to] {
+						continue
+					}
+					parent := parents[from]
+					// The route is capped one past the path bound, as
+					// appendRoute caps a walk's.
+					route := slices.Clone(parent.Route)
+					if len(route) <= model.MaxRelationsPerPath {
+						route = append(route, row.Rel.ID)
+					}
+					rec := impactRecord{
+						NodeID:    to,
+						Depth:     depth + 1,
+						Cost:      parent.Cost + Cost(model.RelMayCall),
+						Direction: direction,
+						Via:       row.Rel.ID,
+						Parent:    from,
+						Route:     route,
+						Reasons:   []string{impactReason(model.RelMayCall, direction, depth+1)},
+						Possible:  true,
+					}
+					if err := retain.addEntry(rec); err != nil {
+						return err
+					}
+					if err := best.reach(scCtx, rec); err != nil {
+						return err
+					}
+				}
+				if len(level) < openSiteChunk {
+					break
 				}
 			}
 		}
 	}
+}
+
+// openSiteChunk is how many nodes of one level expandOpenSites holds at once.
+// It sizes a working set, never an answer: every node of the level is
+// expanded, a chunk at a time. It is a variable only so a test can make a
+// level span several chunks.
+var openSiteChunk = 4096
+
+// openSiteScratchSchema is expandOpenSites' scratch: each affected node's
+// best record, keyed by node, with the level index the expansion reads.
+const openSiteScratchSchema = `
+CREATE TABLE best(node TEXT PRIMARY KEY, depth INTEGER NOT NULL, cost INTEGER NOT NULL, rec BLOB NOT NULL) WITHOUT ROWID;
+CREATE INDEX best_level ON best(depth, node);
+`
+
+// bestTable is the best record of each affected node, in the scratch.
+type bestTable struct {
+	tx                   *sql.Tx
+	offerStmt, reachStmt *sql.Stmt
+	levelStmt, hasStmt   *sql.Stmt
+}
+
+func (b *bestTable) prepare(ctx context.Context) error {
+	var err error
+	// A record replaces the one held when it is shallower, or as deep and
+	// cheaper; the first of two equal ones stays, as a fold in arrival order
+	// keeps it.
+	if b.offerStmt, err = b.tx.PrepareContext(ctx, `INSERT INTO best(node, depth, cost, rec) VALUES(?1, ?2, ?3, ?4)
+		ON CONFLICT(node) DO UPDATE SET depth = excluded.depth, cost = excluded.cost, rec = excluded.rec
+		WHERE excluded.depth < best.depth OR (excluded.depth = best.depth AND excluded.cost < best.cost)`); err != nil {
+		return internalErr("open-site scratch: " + err.Error())
+	}
+	// A node the expansion reaches is recorded only the first time: the one
+	// already held is at most as deep.
+	if b.reachStmt, err = b.tx.PrepareContext(ctx, `INSERT INTO best(node, depth, cost, rec) VALUES(?1, ?2, ?3, ?4)
+		ON CONFLICT(node) DO NOTHING`); err != nil {
+		return internalErr("open-site scratch: " + err.Error())
+	}
+	if b.levelStmt, err = b.tx.PrepareContext(ctx, `SELECT rec FROM best WHERE depth = ?1 AND node > ?2 ORDER BY node LIMIT ?3`); err != nil {
+		return internalErr("open-site scratch: " + err.Error())
+	}
+	if b.hasStmt, err = b.tx.PrepareContext(ctx, `SELECT EXISTS(SELECT 1 FROM best WHERE depth >= ?1)`); err != nil {
+		return internalErr("open-site scratch: " + err.Error())
+	}
 	return nil
+}
+
+func (b *bestTable) closeStatements() {
+	for _, s := range []*sql.Stmt{b.offerStmt, b.reachStmt, b.levelStmt, b.hasStmt} {
+		if s != nil {
+			s.Close()
+		}
+	}
+}
+
+func (b *bestTable) put(ctx context.Context, stmt *sql.Stmt, rec impactRecord) error {
+	raw, err := encodeImpactRecord(rec)
+	if err != nil {
+		return err
+	}
+	if _, err := stmt.ExecContext(ctx, string(rec.NodeID), rec.Depth, int64(rec.Cost), raw); err != nil {
+		return internalErr("open-site scratch: " + err.Error())
+	}
+	return nil
+}
+
+// offer folds one walk record into the table.
+func (b *bestTable) offer(ctx context.Context, rec impactRecord) error {
+	return b.put(ctx, b.offerStmt, rec)
+}
+
+// reach records a node the expansion reached, unless it is already held.
+func (b *bestTable) reach(ctx context.Context, rec impactRecord) error {
+	return b.put(ctx, b.reachStmt, rec)
+}
+
+// hasLevel reports whether any node is held at depth or deeper.
+func (b *bestTable) hasLevel(ctx context.Context, depth int) (bool, error) {
+	var held bool
+	if err := b.hasStmt.QueryRowContext(ctx, depth).Scan(&held); err != nil {
+		return false, internalErr("open-site scratch: " + err.Error())
+	}
+	return held, nil
+}
+
+// level reads up to limit records of depth after node after, in node order.
+func (b *bestTable) level(ctx context.Context, depth int, after model.NodeID, limit int) ([]impactRecord, error) {
+	rows, err := b.levelStmt.QueryContext(ctx, depth, string(after), limit)
+	if err != nil {
+		return nil, internalErr("open-site scratch: " + err.Error())
+	}
+	defer rows.Close()
+	var out []impactRecord
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, internalErr("open-site scratch: " + err.Error())
+		}
+		rec, err := decodeImpactRecord(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalErr("open-site scratch: " + err.Error())
+	}
+	return out, nil
 }

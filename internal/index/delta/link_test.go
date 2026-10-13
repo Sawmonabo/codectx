@@ -238,7 +238,7 @@ func (f *fixture) structural(p provider.Provider, tr *tree, gen model.Generation
 // whose bytes did not move.
 func (f *fixture) attach(gen model.GenerationID, unit model.UnitID) {
 	f.t.Helper()
-	if err := f.store.AttachUnit(f.ctx, gen, unit); err != nil {
+	if _, err := f.store.AttachUnit(f.ctx, gen, unit); err != nil {
 		f.t.Fatalf("AttachUnit: %v", err)
 	}
 }

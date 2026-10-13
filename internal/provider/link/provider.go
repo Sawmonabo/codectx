@@ -37,6 +37,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/Sawmonabo/codectx/internal/graph"
 	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
@@ -88,8 +89,9 @@ const (
 	// file its import resolves to.
 	DetailImport = "import"
 	// DetailArgument: a `data_flows_to` from a variable an argument reads to
-	// the parameter the argument binds at a bound call site.
-	DetailArgument = "argument"
+	// the parameter the argument binds at a bound call site. It is the role
+	// an impact walk reads (graph.FlowDetailArgument), so the two cannot drift.
+	DetailArgument = graph.FlowDetailArgument
 	// DetailSummary: a `data_flows_to` from a variable an argument reads to a
 	// variable the bound call site's result is written into, through the
 	// callee's parameter whose value reaches its return (the callee's return
@@ -99,8 +101,9 @@ const (
 	// DetailReturn: a `data_flows_to` from the bound callee's return node to
 	// a variable the call site's result is written into, or to the return
 	// node of the callable that returns the call's value. An impact walk that
-	// has taken a DetailArgument edge never takes one (ADR-0017 decision 7).
-	DetailReturn = "return"
+	// has taken a DetailArgument edge never takes one (ADR-0017 decision 7);
+	// it is the role that walk reads (graph.FlowDetailReturn).
+	DetailReturn = graph.FlowDetailReturn
 	// DetailSupertype: an `extends`, `implements` or `overrides` the source
 	// declares: a written supertype, and a method of the same name and
 	// signature along the written supertypes.

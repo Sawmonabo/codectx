@@ -1614,7 +1614,7 @@ func TestSearchContinuationOverACollectedGeneration(t *testing.T) {
 	// The sealed unit of the first generation is reused rather than rebuilt,
 	// which is what an incremental run does: the second generation differs from
 	// the first only in the membership it publishes.
-	if err := st.AttachUnit(f.ctx, gen2, f.unitOf(fixtureDocs[0])); err != nil {
+	if _, err := st.AttachUnit(f.ctx, gen2, f.unitOf(fixtureDocs[0])); err != nil {
 		t.Fatalf("AttachUnit: %v", err)
 	}
 	if _, err := st.Activate(f.ctx, gen2, f.gen, model.HealthFresh, nil, "norm-v1"); err != nil {

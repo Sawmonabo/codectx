@@ -838,7 +838,7 @@ type CapsuleRequest struct {
 	SessionID SessionID   `json:"session_id"`
 	ActorID   string      `json:"actor_id"`
 	View      CapsuleView `json:"view"`
-	Page      PageRequest `json:"page"`
+	Page      PageRequest `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape. There is no generation on it for the
