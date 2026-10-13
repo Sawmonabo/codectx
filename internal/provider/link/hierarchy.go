@@ -794,6 +794,9 @@ func flagsOf(d *Decl) byte {
 // promotion, not subtyping (goEmbeddings).
 func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.ExternalSort[entry], file int32, t *Table) error {
 	fc := contextOf(file, t)
+	if err := addSpringLinks(links, file, t); err != nil {
+		return err
+	}
 	for i := range t.Decls {
 		d := &t.Decls[i]
 		if fc.family == "java" && d.Kind == model.NodeField && d.Parent >= 0 && isType(t.Decls[d.Parent].Kind) {
@@ -2360,6 +2363,9 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // type outside the unit, whose method set no table holds.
 func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
 	fc := contextOf(file, t)
+	if err := h.springInputFacts(ctx, file, t, emit); err != nil {
+		return err
+	}
 	for i := range t.Decls {
 		if err := ctx.Err(); err != nil {
 			return err

@@ -745,17 +745,25 @@ func (s *inputScan) spring() {
 			continue
 		}
 		open := s.openAfter(d.NameEnd, d.SigEnd)
+		handler := s.springHandler(i)
 		for _, p := range s.paramList(open) {
-			s.springParam(p)
+			s.springParam(i, p, handler)
 		}
 	}
 }
 
-// springParam publishes the read one annotated parameter makes.
-func (s *inputScan) springParam(p paramRange) {
+// springParam publishes the read one annotated parameter makes, and leaves
+// a parameter of a handler that no annotation but a validation one marks to
+// Spring's default resolution (springDefault).
+func (s *inputScan) springParam(owner int, p paramRange, handler bool) {
 	src, key, found, named := model.InputSource(""), "", false, false
+	other := false
 	k := p.lo
-	for k < p.hi && s.punct(k, '@') && s.ident(k+1) {
+	for k < p.hi && (s.punct(k, '@') && s.ident(k+1) || s.ident(k) && s.text(k) == "final" && k+1 < p.hi-1) {
+		if !s.punct(k, '@') {
+			k++
+			continue
+		}
 		k++
 		first := k
 		for s.punct(k+1, '.') && s.ident(k+2) {
@@ -769,13 +777,18 @@ func (s *inputScan) springParam(p paramRange) {
 			open, k = k, int(s.match[k])+1
 		}
 		as, ok := springParams[ann]
+		if !ok && !s.springValidation(qualified) {
+			other = true
+		}
 		if !ok || found {
 			continue
 		}
 		if imp, imported := s.rs.imports[ann]; imported && imp.path != springAnnotations+"."+ann && qualified == ann {
+			other = true
 			continue
 		}
 		if qualified != ann && qualified != springAnnotations+"."+ann {
+			other = true
 			continue
 		}
 		src, found, named = as, true, ann != "RequestBody" && ann != "ModelAttribute"
@@ -789,6 +802,10 @@ func (s *inputScan) springParam(p paramRange) {
 				}
 			}
 		}
+	}
+	if !found && !other && handler {
+		s.springDefault(owner, p, k)
+		return
 	}
 	if !found || p.hi-1 <= k || !s.ident(p.hi-1) {
 		return

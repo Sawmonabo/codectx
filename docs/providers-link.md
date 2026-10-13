@@ -331,6 +331,22 @@ provider's reads carry (key the parameter's name), and its owner `reads` it (det
 inputs and the classes are part of the interface summary beside the routing, and every class lookup is traced on the
 handler's file, so an edit to a model or to a base of it in another file re-resolves the parameters it types.
 
+A Spring handler parameter that no binding annotation marks and that no resolver Spring runs before the project's own
+decides is a pending input under the rule `spring` (`internal/provider/link/route_input_spring.go`). Spring resolves
+it with the project's own argument resolvers before its catch-all (`RequestMappingHandlerAdapter`
+`getDefaultArgumentResolvers`), and those are code no table answers, so the linker publishes only in a unit where no
+Java file names an argument resolver: every API a project registers one through names one in its types
+(`WebMvcConfigurer.addArgumentResolvers(List<HandlerMethodArgumentResolver>)`, the adapter's setters). Each such file
+is indexed under `keyJavaResolvers`. Each Java type's kind is indexed under `keyJavaKind`: an enum is a simple value
+type, a concrete class a model attribute, an interface, an annotation type and an abstract class nothing. The
+catch-all binds a simple value type (`BeanUtils.isSimpleProperty`: the primitives and their wrappers, `String` and
+`CharSequence`, `Number`, `Class`, the dates and `Temporal` types, `UUID`, `URI`, `URL`, `File`, `Path`, `Charset`,
+`Currency`, `InetAddress`, `Pattern`, enums, and arrays of them) as `@RequestParam`, a combined read keyed by the
+parameter's name, and any other class as `@ModelAttribute`, a combined read with no key. A simple type the handler's
+file decides is resolved there; any other type is looked up as the hierarchy reads a type name, and a type no member
+declares (a library may resolve its own), or declarations that disagree, publish nothing. Both lookups are traced, so
+adding a resolver, or an edit that turns an enum into a class or makes a class abstract, re-resolves the handlers.
+
 ## Declared entry points
 
 The code a project's manifest declares as its entry points is an `endpoint` of the file it resolves to (ADR-0017

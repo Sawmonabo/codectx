@@ -113,3 +113,50 @@ def create(item_id: Color, user: schemas.User, admin: Admin | None, point: Point
 		t.Fatalf("linked request inputs\ngot  %q\nwant %q", got, want)
 	}
 }
+
+// TestSpringDefaultResolutionAcrossFiles is Spring's catch-all for a
+// handler parameter no binding annotation marks, decided across the unit:
+// a simple type and an enum of another file bind as a request parameter
+// keyed by the name, a class of another file as a model attribute (no key),
+// and an interface, an abstract class and a type no member declares
+// publish nothing; once any file names an argument resolver, which the
+// project's own resolvers run before the catch-all, nothing is published.
+// Mutations caught: the enum read as a model attribute, an interface or an
+// abstract class published, an undeclared type guessed, and the resolver
+// gate dropped (the second unit publishes).
+func TestSpringDefaultResolutionAcrossFiles(t *testing.T) {
+	files := map[string]string{
+		"src/demo/Color.java":  "package demo;\n\npublic enum Color { RED }\n",
+		"src/demo/Filter.java": "package demo;\n\npublic class Filter {\n    String q;\n}\n",
+		"src/demo/Shape.java":  "package demo;\n\npublic interface Shape {}\n",
+		"src/demo/Base.java":   "package demo;\n\npublic abstract class Base {}\n",
+		"src/demo/Api.java": `package demo;
+
+import com.example.Page;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+class Api {
+    @GetMapping("/x")
+    String list(String q, int size, Color color, Filter filter, Shape shape, Base base, Page page) {
+        return q;
+    }
+}
+`,
+	}
+	got := linkSources(t, newStructural(t), files).linkedInputs(t)
+	want := []string{
+		"src/demo/Api.java list spring combined  | Filter filter",
+		"src/demo/Api.java list spring combined color | Color color",
+		"src/demo/Api.java list spring combined q | String q",
+		"src/demo/Api.java list spring combined size | int size",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("linked request inputs\ngot  %q\nwant %q", got, want)
+	}
+	files["src/demo/Web.java"] = "package demo;\n\nclass Web {\n    void addArgumentResolvers(java.util.List<HandlerMethodArgumentResolver> rs) {\n        done();\n    }\n\n    void done() {}\n}\n"
+	if got := linkSources(t, newStructural(t), files).linkedInputs(t); len(got) != 0 {
+		t.Fatalf("with an argument resolver named, linked request inputs %q, want none", got)
+	}
+}

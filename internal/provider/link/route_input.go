@@ -10,11 +10,14 @@ import (
 
 // PendingInput is one request-input read the structural provider found but
 // whose source another file decides, which the linker resolves through the
-// unit's module index and publishes (FactInput): a FastAPI handler
-// parameter typed by a class the file imports, whose source follows that
-// class (FastAPI's analyze_param: a model or a dataclass is a body, an
-// UploadFile a file, a Request the request object, any other class a
-// scalar), unless the route writes the parameter's name (a path read).
+// unit's indexes and publishes (FactInput): a FastAPI handler parameter
+// typed by a class the file imports, whose source follows that class
+// (FastAPI's analyze_param: a model or a dataclass is a body, an UploadFile
+// a file, a Request the request object, any other class a scalar), unless
+// the route writes the parameter's name (a path read); or, under Rule
+// RuleSpring, a Spring handler parameter no binding annotation marks, which
+// reaches Spring's catch-all only when the project registers no argument
+// resolver of its own (route_input_spring.go).
 type PendingInput struct {
 	// Owner is the declaration the read is made from, an index of Decls.
 	Owner int32 `json:"owner"`
@@ -32,13 +35,25 @@ type PendingInput struct {
 	// Class is the annotation's class, as the import that binds it writes
 	// it: the module (a relative one keeps its dots) and the name in it,
 	// joined by a NUL.
-	Class string `json:"class"`
+	Class string `json:"class,omitempty"`
+	// Rule is the framework rule that decides the read: empty for
+	// FastAPI's, RuleSpring for Spring's default resolution.
+	Rule string `json:"rule,omitempty"`
+	// Kind is, under RuleSpring, ClassSimple when the file decides the type
+	// is a simple value type; Class is then empty, else the type as written.
+	Kind uint8 `json:"kind,omitempty"`
 }
 
-// ClassKind is what a Python class of the file says, by itself, about how
-// FastAPI reads a parameter it types (Kind), and the bases it imports from
-// another module that decide the rest (Bases, each a module as the import
-// writes it and a name in it, joined by a NUL).
+// RuleSpring is the Rule of a Spring handler parameter left to Spring's
+// default resolution.
+const RuleSpring = "spring"
+
+// ClassKind is what a type of the file says, by itself, about how a
+// framework reads a parameter it types: for a Python class, how FastAPI
+// does (Kind), and the bases it imports from another module that decide the
+// rest (Bases, each a module as the import writes it and a name in it,
+// joined by a NUL); for a Java type, how Spring's catch-all binds one
+// (ClassSimple, ClassBody or ClassSkip).
 type ClassKind struct {
 	Decl  int32    `json:"decl"`
 	Kind  uint8    `json:"kind"`
@@ -57,6 +72,9 @@ const (
 	// classUnknown is a class the walk cannot decide (a base no member
 	// declares, several declarations that disagree); never stored.
 	classUnknown
+	// ClassSimple is a Spring simple value type (BeanUtils
+	// .isSimpleProperty), which the catch-all binds as a request parameter.
+	ClassSimple
 )
 
 // keyPyClass + a dotted module name + NUL + a class's qualified name: the
@@ -114,6 +132,9 @@ type inputFact = model.RequestInput
 func emitPythonInputs(file int32, t *Table, mods *index, emit func(Binding) error) error {
 	for i := range t.Inputs {
 		p := &t.Inputs[i]
+		if p.Rule != "" {
+			continue
+		}
 		kind, err := classOf(mods, t.Path, p.Class, nil)
 		if err != nil {
 			return err

@@ -59,10 +59,15 @@ type Table struct {
 	// (route.go).
 	Routing Routing `json:"routing,omitzero"`
 	// Inputs are the request-input reads whose source another file
-	// decides, and Classes what each Python class says of how a parameter
-	// it types is read (route_input.go).
+	// decides, and Classes what each Python class says of how FastAPI reads
+	// a parameter it types, or each Java type of how Spring's catch-all
+	// binds one (route_input.go, route_input_spring.go).
 	Inputs  []PendingInput `json:"inputs,omitempty"`
 	Classes []ClassKind    `json:"classes,omitempty"`
+	// ArgumentResolvers reports a Java file that names an argument
+	// resolver (route_input_spring.go): a project that registers one of its
+	// own decides what Spring's catch-all would.
+	ArgumentResolvers bool `json:"argument_resolvers,omitempty"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the

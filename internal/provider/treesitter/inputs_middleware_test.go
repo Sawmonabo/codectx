@@ -176,3 +176,50 @@ class Home(TemplateView):
 		"self.request.GET[\"q\"] -> get_context_data",
 	})
 }
+
+// TestSpringTypeResolvedParameters is a Spring handler's parameter that no
+// binding annotation marks and that a resolver Spring runs before the
+// project's own decides by its type: a multipart file is a file read keyed
+// by its name, the servlet request the request object, an InputStream the
+// raw body, an HttpEntity the body, and the response, the model or a Map
+// nothing; a parameter another annotation marks and a method of no
+// controller read nothing. Mutations caught: the multipart rule dropped
+// (no file read), the type-based inputs dropped (no request, raw or body
+// read), a skipped type published, the controller gate dropped (helper's
+// parameter read), and a foreign annotation ignored (the @CurrentUser
+// parameter left to the default).
+func TestSpringTypeResolvedParameters(t *testing.T) {
+	checkInputs(t, "Upload.java", `package demo;
+
+import java.io.InputStream;
+import java.util.Map;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.http.HttpEntity;
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.multipart.MultipartFile;
+
+@Controller
+class Upload {
+    @PostMapping("/u")
+    String save(MultipartFile file, HttpServletRequest req, HttpServletResponse res, InputStream in,
+                HttpEntity<String> entity, Model model, Map<String, String> map, @CurrentUser HttpServletRequest who) {
+        return "";
+    }
+}
+
+class Helper {
+    @PostMapping("/h")
+    String help(MultipartFile file) {
+        return "";
+    }
+}
+`, []string{
+		"save spring body  | HttpEntity<String> entity",
+		"save spring file file | MultipartFile file",
+		"save spring raw  | InputStream in",
+		"save spring request  | HttpServletRequest req",
+	})
+}

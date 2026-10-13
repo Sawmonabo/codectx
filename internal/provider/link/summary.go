@@ -162,7 +162,7 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		}
 		add(EntryInferred, caller, i, v)
 	}
-	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings)+len(t.Inputs)+len(t.Classes) > 0 {
+	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings)+len(t.Inputs)+len(t.Classes) > 0 || t.ArgumentResolvers {
 		// The argument each mount passes is read with the routing
 		// (mountKey), though it is written in a site; the pending inputs
 		// and the classes are read with it (route_input.go).
@@ -171,7 +171,8 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 			Arguments []*wire.Type
 			Inputs    []PendingInput
 			Classes   []ClassKind
-		}{r, args, t.Inputs, t.Classes})
+			Resolvers bool
+		}{r, args, t.Inputs, t.Classes, t.ArgumentResolvers})
 	}
 	if err != nil {
 		return nil, err
