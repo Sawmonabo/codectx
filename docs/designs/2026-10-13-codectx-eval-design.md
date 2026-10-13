@@ -1,13 +1,13 @@
 # codectx evaluation: the golden set and its runner
 
-This document is the design of codectx's evaluation: a frozen golden set and one runner that score every answer the
+This document is the design of codectx's evaluation: a git-tracked golden set and one runner that score every answer the
 product serves. The survey of other tools, papers and benchmarks behind each choice, the oracle tools used before the
-freeze, and the licence texts are in [research 30](../research/30-evaluation-golden-set.md). Contract references
+first run, and the licence texts are in [research 30](../research/30-evaluation-golden-set.md). Contract references
 point to the product documents in `docs/`.
 
 ## 1. What this is for
 
-**Intended outcome.** A frozen, committed golden set plus one runner, both in the repository. The runner measures
+**Intended outcome.** A committed golden set plus one runner, both in the repository. The runner measures
 whether every answer codectx gives is **accurate** (the right facts) and **clear** (each fact says how certain it is,
 and the answer says what it could not do). It covers every capability the product serves, in every language where
 the capability applies. Cases are built to be extremely hard.
@@ -15,11 +15,11 @@ the capability applies. Cases are built to be extremely hard.
 **When it runs.** Only in the final test phase, after all code is in. It never runs during development or in CI.
 The phase holds three full runs (section 5.6):
 1. a measurement run;
-2. after the one fix round, a run that measures generalisation on the sealed split;
-3. after the sealed findings are fixed, the certification run.
+2. after the fix round, the generalisation run: the first look at the held-out cases and at a fresh renaming of
+   every case;
+3. after the held-out findings are fixed, a regression run over every case, with another fresh renaming.
 
-"Runs once" is read as "once the code is complete", not "one execution" (assumption A17). Where one execution is
-wanted, the sealed split is dropped and the phase is one run, the fix round and one verification run.
+"Runs once" is read as "once the code is complete", not "one execution" (A17).
 
 **Who reads the result.** The maintainers, to decide whether the product is ready, and the fix round, as a list
 of findings.
@@ -30,12 +30,12 @@ of findings.
    graphs.
 3. Each answer is scored in two ways. **Contract**: what codectx's own documentation promises. **Truth**: what the
    language actually does.
-4. The set is frozen, and nothing can be tuned to it without the change showing.
+4. The product cannot be tuned to the set: the overfitting guardrails (section 13) keep product code general.
 5. The harness has no tests of its own, yet every score can be checked by hand from the report.
-6. Tracked files obey the repository rules (section 13).
+6. Tracked files obey the repository rules (section 14).
 
 **Defaults.** Where the product's documents leave a choice open, the design takes a default, listed in
-section 16 with its reason.
+section 17 with its reason.
 
 **Out of scope.**
 - **Performance and memory proofs** stay in the separate live proofs. The report records wall time and peak RSS per
@@ -69,12 +69,12 @@ section 16 with its reason.
 
 | | Approach | Verdict |
 |---|---|---|
-| **A** | Self-written extreme-difficulty projects per language, committed. Spec-anchored expectations derived twice (the second blind) and cross-checked against compiler-grade and runtime oracles, in an uncommitted copy, before the freeze. Bulk clutter (hub names, vendor copies, generated code) comes from a seeded generator whose output hash is frozen. | **Recommended** |
-| B | Pinned slices of real repositories copied into the tree. | Rejected. One of the large public corpora is licensed under terms that do not permit excerpts in an Apache-2.0 repository, and Apache-2.0 or MIT excerpts carry notice duties (research 30, section 8). A slice also loses the cross-module context that makes real code hard. Scale realism on real code is the separate relevance benchmark's job (section 14). |
+| **A** | Self-written extreme-difficulty projects per language, committed. Spec-anchored expectations derived twice (the second blind) and cross-checked against compiler-grade and runtime oracles, in an uncommitted copy, before the first run. Bulk clutter (hub names, vendor copies, generated code) comes from a seeded, deterministic generator. | **Recommended** |
+| B | Pinned slices of real repositories copied into the tree. | Rejected. One of the large public corpora is licensed under terms that do not permit excerpts in an Apache-2.0 repository, and Apache-2.0 or MIT excerpts carry notice duties (research 30, section 8). A slice also loses the cross-module context that makes real code hard. Scale realism on real code is the separate relevance benchmark's job (section 15). |
 | C | Run other analyzers (language servers, precise indexers) as live oracles at evaluation time and diff against them. | Rejected. Research 24's six-server probe found the analyzers disagree with each other and with codectx's own semantics: some list `direct(d: Dog)` among `Animal.sound`'s callers, none marks a call through a base, and two list no through-base caller at all (research 30, section 3). The runs are heavy, nondeterministic and need network, and the scores would measure the analyzers' drift. |
 
-Approach A makes truth a property of the frozen data, not of tools at run time. The oracles still do their job: they
-catch the authors' mistakes before the freeze (section 5.4).
+Approach A makes truth a property of the committed data, not of tools at run time. The oracles still do their job:
+they catch the authors' mistakes before the first run (section 5.4).
 
 ## 4. Capability inventory
 
@@ -169,6 +169,7 @@ surface is the MCP tool, because agents read the product through it; the CLI is 
 {
   "project": "go/hierarchy",
   "split": "open",
+  "roots": ["puppy", "animal", "walk", "speak", "direct"],
   "cases": [{
     "id": "go/hierarchy/callers-puppy-sound",
     "capability": "callers",
@@ -200,6 +201,8 @@ surface is the MCP tool, because agents read the product through it; the CLI is 
 }
 ```
 
+- **`split`** is `open` or `held_out`. **`roots`** lists the invented roots the renamed copy replaces (5.6). This
+  example uses plain English names for readability; real cases use invented roots.
 - **`args`.** Arguments are passed to the tool as written, except that `token@tag` references are first resolved to
   node ids by location.
 - **`expect` is the complete answer** (closed world). A returned row that is not listed is an extra row. Rows are a
@@ -217,7 +220,7 @@ surface is the MCP tool, because agents read the product through it; the CLI is 
 ### 5.4 How expected answers are produced
 
 Expectations are derived from the language specification and codectx's documented contract. They are never derived
-from codectx output. No author runs codectx on a golden project before the freeze.
+from codectx output. No author runs codectx on a golden project before run 1.
 
 The runner itself is built against throwaway projects copied into scratch from existing unit-test fixtures (the link
 goldens' programs). Those are never golden projects and never committed under `internal/eval/testdata`. Run 1 is the
@@ -227,7 +230,7 @@ first time codectx sees a golden project.
 2. **Blind second derivation.** A second author derives every expectation again from the sources, the anchors and
    the contract documents alone, without seeing the first. The two must agree on every row and mark. The repository
    already works this way: Section 30 requires goldens "derived twice, the second blind".
-3. **Oracle cross-check, before the freeze.** An uncommitted copy of every project is checked by tools that never appear
+3. **Oracle cross-check, before run 1.** An uncommitted copy of every project is checked by tools that never appear
    in tracked code. Research 30, section 4 names each tool and how it is driven.
 
    | Language | Static oracle (binding and hierarchy) | Second static oracle | Runtime oracle (what actually runs) |
@@ -246,7 +249,7 @@ first time codectx sees a golden project.
    - **Structure.** The compilers' syntax trees and the language servers' document symbols, for names, nesting and
      name ranges.
 
-4. **Agreement rule.** A row is frozen when the two derivations agree **and** no oracle contradicts it. An oracle can
+4. **Agreement rule.** A row is committed when the two derivations agree **and** no oracle contradicts it. An oracle can
    contradict only within its competence. A static oracle speaks to binding and hierarchy. A runtime trace speaks to
    what runs: every traced edge must appear in `expect` or `truth`, and a decoy that is never traced confirms a
    negative. Any disagreement is adjudicated against the language specification by a third person, and the case
@@ -267,48 +270,52 @@ first time codectx sees a golden project.
   - vendor copies of a project package;
   - generated-code directories;
   - deep nested-module trees.
-- **Freezing.** The runner materialises the output into scratch, never into the tree, and checks its digest against
-  the manifest before indexing. A recipe also emits its own expectations: exact counts, and the ordered head under
+- **Output.** The runner materialises the output into scratch, never into the tree. The same recipe and seed give
+  the same bytes, so a change shows only as a change to a committed recipe. A recipe also emits its own expectations: exact counts, and the ordered head under
   the documented closeness order.
 
-### 5.6 Freezing and contamination control
+### 5.6 Held-out cases, renamed copies and the three runs
 
-- **Manifest.** `MANIFEST.sha256` lists one SHA-256 per file: every project file, case file, recipe, edit script,
-  and each generator output's digest. The root digest is the SHA-256 of the manifest. The runner refuses to score if
-  any file differs, with exit 2 and the differing paths. There is no regenerate mode and no `-update` flag. Go's
-  golden convention writes actual output into expectations, and that is exactly tuning to the set.
-- **Pre-registration.** At the freeze, the root digest and the per-split digests are recorded in research 30
-  before the first scored run. Any later change to the set is then visible.
-- **Two splits.** `open` is about 70% and `sealed` about 30%, stratified by language × capability × tier. Every split
-  holds every capability and language.
-  - Run 1 scores both.
-  - The fix round sees the open split's findings in full and the sealed split's aggregates only.
-  - Run 2 scores both. If the open split improves and the sealed split does not, the fixes overfit, and the report
-    says so.
-  - The sealed split's findings are then released and fixed in a final round, so every finding is fixed.
-  - Run 3 is the certification run.
-- **Where the sealed split lives.** Its files are committed only after run 2. Before that they are kept outside the
-  repository, and their hashes are in the pre-registered manifest. This is a commit-reveal: the set provably existed
-  before the fixes.
-  - **How the runner reaches it.** Sealed files keep the same relative layout under a separate root, which the
-    runner is given with `--sealed-dir`. The manifest lists their entries under a `sealed/` prefix.
-  - **Without the flag** (and before the reveal, in any clone), the runner verifies and scores the open split only.
-    It marks the report "open split only", and it never treats the missing sealed files as an integrity failure.
-  - **After the reveal,** the files are committed under `internal/eval/testdata/sealed/`, keeping the same relative
-    paths. Their manifest keys (`sealed/…`) and the pre-registered root digest are therefore unchanged, and the flag
-    is no longer needed.
-  - **Withholding.** With `--sealed-dir` and without `--reveal`, the runner writes two output trees:
-    - `out/open/`: the report, raw answers and findings of the open split, plus sealed aggregates only (counts per
-      table cell, no case ids, no rows). This tree goes to the fix round.
-    - `out/sealed/`: per-case sealed findings and raw answers. It is withheld from the fix round until the reveal.
+The golden set is tracked like any other file, and git is its record. The runner never edits an expected answer.
+There is no mode that writes product output into expectations, because that is tuning to the set.
 
-    With `--reveal`, one tree holds everything.
-- **Errata.** An expectation found wrong after the freeze changes only through an erratum: `ERRATA.md` gets the case
-  id, the old and new rows, the spec text that proves the old one wrong, and two reviewers who did not write the fix.
-  The manifest is then re-cut. Product output alone is never grounds for an erratum.
+- **Held-out cases.** About 30% of the hand-written cases, stratified by language × capability × tier, are written
+  by authors who take no part in the fix rounds. They stay outside the repository until after run 2, in the same
+  layout, and the runner reads them from `--held-out <dir>`. Before then, the person who runs the harness gives the
+  fix round the open cases' full findings and only the held-out aggregates (counts per capability × language),
+  never a held-out case id or row. After run 2 they are committed under `internal/eval/testdata/` like the rest.
+- **Renamed copies.** Every authored name in a project is built from invented roots (`zorbel`, `quintac`) that occur
+  nowhere else and are not words of any language, library or framework. Each case file lists its roots. For each
+  run the runner draws a fresh seed, maps every root to a new invented root of the same length, and substitutes it
+  in every file's contents, in file and directory names, in the refresh edit steps and in the case file, keeping
+  each occurrence's letter case (`zorbel`, `Zorbel`, `ZORBEL`) so exported and unexported names keep their meaning. It also inserts a block of comment lines at the top of every
+  source file, after any shebang or encoding line. Both changes preserve meaning in all nine languages, so every
+  renamed expectation follows from the original by the same substitution, and the renamed copy is scored like the
+  original. Names a language, library or framework gives meaning to (`main`, `__init__`, `Default`, `toString`,
+  manifest keys) are never roots.
+  - **Scored on the copy.** Every case, except the byte totals of the repository map and the byte floors of
+    `CTX_MINIMUM_BUDGET`, which the comment block legitimately changes. Order rules are constraints (6.4), so a
+    tie broken by name still holds under new names.
+  - **The flag.** A case that is `exact` on the original and not on the copy is flagged `name_dependent` (S1): the
+    product answered from something other than the code's meaning.
+  - **Why it works.** A fix keyed on a golden name, file or layout fails a copy whose names it has never seen, and
+    the seed changes every run (research 30, section 10).
+- **The three runs.**
+  1. **Run 1** scores the open cases, the held-out cases and a renamed copy. The fix round works from the open
+     findings only.
+  2. **Run 2** is the generalisation run. The product was built without seeing the held-out cases or this run's
+     names, so its scores on them are an honest estimate of how it does on unseen code. Its two gaps are the
+     headline numbers: open against held-out, and original against renamed. A gap of more than a few points means
+     the fixes fit the set rather than the language. The held-out cases are then committed, and their findings are
+     fixed.
+  3. **Run 3** is a regression run: every known case must pass. It cannot measure generalisation on the held-out
+     cases, which the fixes have now seen, so its unseen part is another fresh renaming.
+
+  More looks at the held-out cases before run 2 would wear out their independence (research 30, section 10), so
+  the fix round gets aggregates only and there is no extra run in between.
 - **No overlap with development fixtures.** No golden source file may be byte-identical to a fixture the unit tests
-  use, and the freeze step checks this. The cases are new programs, so a fix that passes the existing
-  goldens says nothing about them.
+  use, and the runner checks this at startup. The cases are new programs, so a fix that passes the existing goldens
+  says nothing about them.
 
 ## 6. The scoring rule all capabilities share
 
@@ -355,6 +362,7 @@ first time codectx sees a golden project.
 | `order` | A contract order rule (section 6.4) is violated. | **S4** |
 | `disclosed_miss` | An expected row is absent, but an open site or notice discloses the gap with the right reason. | **S5** |
 | `error` | The tool failed, or a different error code came back than `expect.error`. | **S1** |
+| `name_dependent` | The case is `exact` on the original and not on the renamed copy (5.6). | **S1** |
 
 - **Headline verdict.** A case's headline verdict is its most severe flag. The report lists every flag, never just
   the worst.
@@ -362,12 +370,8 @@ first time codectx sees a golden project.
   - A certain-looking wrong fact (S1) is the worst outcome: an agent acts on it.
   - A silent gap (S2) is next: an agent concludes "nothing there".
   - A gap that is disclosed (S5) is the product working as designed when analysis cannot decide.
-- **Verdict styles.** The per-case verdicts of call-graph suites map onto this table (research 30, section 1):
-  - Unsound (an expected edge missing) = `silent_miss`;
-  - Imprecise (a prohibited or wrong edge present) = `extra_possible`, `prohibited` or `false_row`.
-
-  Some suites' "complete" (no false positive) and "sound" (no false negative) are the same two axes under other
-  names. This design avoids both words.
+- **Verdict styles.** A call-graph suite's "unsound" verdict is `silent_miss` here, and its "imprecise" verdict is
+  `extra_possible`, `prohibited` or `false_row` (research 30, section 1).
 
 ### 6.3 Contract lens and truth lens
 
@@ -382,16 +386,16 @@ first time codectx sees a golden project.
   - **Truth precision and recall** over what runs.
   - **Documented limitations**: rows that run but are absent, where the contract says so.
   - **Silent divergences**: rows that run but are absent, where nothing says so. These are findings against the
-    contract itself, each settled before the next freeze.
+    contract itself, each settled before run 1.
   - **Over-approximation**: possible rows that never run. This is the class-hierarchy price ADR-0015 accepts.
-- **Truth figures are bounds.** "What runs" comes from the frozen runtime trace of each project's driver plus the
+- **Truth figures are bounds.** "What runs" comes from the recorded runtime trace of each project's driver plus the
   static oracles. Precision measured against a trace is a lower bound on true precision, and recall against it is
   bounded, not exact (research 30, section 1).
   The report prints them as bounds.
 
 ### 6.4 Order rules
 
-Each rule is checked as a constraint, never as one frozen permutation, so ties the contract leaves open are not
+Each rule is checked as a constraint, never as one fixed permutation, so ties the contract leaves open are not
 scored:
 
 | Capability | Order rule |
@@ -418,7 +422,7 @@ scored:
 | Precision by class | P over rows whose evidence carries each precision class (`compiler`, `language_server`, `static_analysis`, `syntax`, `heuristic`). A `compiler` row is a claim of certainty, so its P is reported first. |
 | `may_call` candidate recall | open sites whose true target is among the candidates ÷ open sites with a true target in the project |
 | `may_call` MRR | mean of 1/rank of the true target, 0 when it is absent; ranks follow the served order |
-| Search | Success@1, Success@10, MRR@10, nDCG@10 over graded judgments (2 = the answer, 1 = acceptable, 0 = not relevant). Judgments are exhaustive: every document of the project that contains a query token or token part is judged, so Judged@10 (research 30, section 5) must be 100%. An unjudged hit still counts as 0, and it is listed as an integrity note for the next erratum. The exact tiers are set-and-order equality. |
+| Search | Success@1, Success@10, MRR@10, nDCG@10 over graded judgments (2 = the answer, 1 = acceptable, 0 = not relevant). Judgments are exhaustive: every document of the project that contains a query token or token part is judged, so Judged@10 (research 30, section 5) must be 100%. An unjudged hit still counts as 0 and is listed as an integrity note. The exact tiers are set-and-order equality. |
 | Context | land rate (every evidence group lands in a slice of the packed plan) ÷ cases; group recall; required-decoy rate (a prohibited file marked `required_*`); floor exactness for `CTX_MINIMUM_BUDGET` |
 | Refresh | divergent answers after refresh ÷ answers compared; must be 0 |
 | Truth lens | truth P, truth R, documented limitations, silent divergences, over-approximation count |
@@ -588,6 +592,46 @@ The product has **two contracts**, and cases cover both:
   - A name-only binding returned as `calls` is S1 `overclaim`.
   - The candidate set must equal the contract's rule over the project, and the head must satisfy the closeness order.
   - Candidate recall and MRR are reported per language, which is ADR-0015 §7's measurement.
+
+### 7.8.1 Calls whose target depends on run-time values (A12)
+
+Code-intelligence systems and the call-graph literature agree on one shape (research 30, section 11):
+- **Three kinds of answer, never mixed.**
+  1. One target the compiler would pick: an exact row.
+  2. A closed set the code or the type system fixes: the declared target marked `virtual` with its overrides, or
+     the set's rows with `set_size`. Every member is listed and marked possible.
+  3. Only a name: an open site with its reason, plus ranked `may_call` candidates and their exact total.
+
+  Systems label each answer by where it came from, and they keep closed sets apart from name matches. Calling a
+  closed set name-only understates it, and calling a name match a set overstates it.
+- **No name means no candidates.** For a computed callee every system examined returns nothing. A tool for IDE
+  navigation was found to do better with no target than with many false ones, and irrelevant context measurably
+  hurts language models.
+- **A named reason, not a number.** Named failure causes help a reader more than raw confidence scores, and the
+  soundness literature asks for each unsound choice to be named. codectx's `reason` and precision class already do
+  this.
+- **Precise first, candidates after, with an exact total.** People tolerate about 10–20% false positives before they
+  stop trusting a tool, and agents do worse with long unranked lists. ADR-0015's order and its count with a ranked
+  first page match this.
+
+The expected answer for each construct:
+
+| Construct | Expected answer | Kind |
+|---|---|---|
+| JS `f.call(o, …)` | `calls` to what `f` names, as if `f(…)` were written with receiver `o`; never a call to the built-in `call`. When `f` is not resolved, an open site for `f` (`value_untracked`) with candidates named like `f` | 1, else 3 |
+| JS `f.apply(o, args)` | as `f.call`, except that candidates are not filtered by argument count, because the arguments arrive as one array | 1, else 3 |
+| JS `const g = f.bind(o); g()` | `calls` to `f`'s target at `g()` when the bound function reaches `g` through local flow; the bound arguments count toward the arity check. Otherwise an open site (`value_untracked`) | 1, else 3 |
+| Python `getattr(obj, "name")()`, constant name | the same answer as `obj.name()`: bound when `obj`'s type is known, else an open member site (`receiver_untyped`) with candidates named `name` | 1 or 2, else 3 |
+| Python `getattr(obj, expr)()`, computed name | an open site, `computed`, no candidates | none |
+| C++ ADL, `swap(a, b)` with `a` of type `ns::T` | exact `calls` to `ns::swap`: the compiler's lookup picks one function | 1 |
+| C++ ADL inside a template, argument types depending on `T` | an open site with candidates named `swap`. Recommended contract addition: a reason `dependent` for a name whose meaning waits on a type parameter (also Rust and TS calls on an unbounded generic); until it exists the case expects `global_unbound` | 3 |
+| C function-like macro `#define LOG(x) log_impl(__FILE__, x)`; `LOG(msg)` | exact `calls` from the enclosing function to the macro `LOG`, as the product binds today, plus `calls` from `LOG` to `log_impl`, so callers, paths and impact reach through the macro. A further macro inside the replacement chains the same way | 1 |
+| C11 `_Generic((x), int: iabs, double: dabs)(x)` | exact `calls` to the selected function when `x`'s declared type is known; otherwise one row per listed function with `value_set` and `set_size` n, never `may_call`. Inside a type-generic macro, plus the macro chain above | 1, else 2 |
+| Rust `Default::default()` or `T::default()`, concrete type inferred | exact `calls` to that type's `impl Default` `default` | 1 |
+| Rust `T::default()` with `T: Default` generic | `calls` to the trait method, `virtual`, with the project's impls as `may_dispatch` | 2 |
+| Rust `w.m()` through a custom `Deref` | `calls` to `m` on the `Deref` target type. The compiler's implicit `deref` call is not call syntax, so it is recorded in the truth lens (A9) | 1 |
+| JS `Object.assign(Foo.prototype, Mixin)` with `Mixin` a literal object or class in the code; `new Foo().mixed()` | exact `calls` to `Mixin.mixed`: copying the properties is a fixed step. With a source that is not statically known, an open site (`receiver_untyped`) whose candidates rank the mixin's member first by closeness | 1, else 3 |
+| TS `function M<T extends Ctor>(B: T) { return class extends B { m() {} } }`; `class C extends M(Base)` | `extends` from `C` to the class expression; `c.m()` to `m` in the class expression; `c.baseMethod()` to `Base.baseMethod` (`virtual`), because the checker types `M(Base)` structurally. Inside `M`, `super.x()` binds to the constraint's member when the constraint declares it, else an open site | 1 or 2, else 3 |
 
 ### 7.9 References
 
@@ -830,16 +874,8 @@ The product has **two contracts**, and cases cover both:
     the served answers, which is where query-time steps (through-base climbing, candidates) could still diverge.
 - **Determinism.** One project per language is indexed at two different roots. Normalised answers must be equal,
   because the order is a pure function of content.
-- **Shifted variant.** The same project is indexed with a block of comment lines inserted at the top of every source
-  file, after any shebang or encoding line, a change that preserves meaning in every language.
-  - **Compared.** The tag-normalised answers of the location-matched capabilities must be equal: graph answers,
-    structure (names, kinds, nesting, name tokens), symbol resolution, the exact search tiers, dependence, routes,
-    manifests, and the capability counts.
-  - **Not compared.** Lexical ranking (document lengths and terms change), context budgets and slices, read-source
-    bytes, byte totals in the repository map, and `unanchored` references all legitimately change with the bytes. This catches
-  answers that depend on byte offsets or line numbers rather than on the code. It is the fresh-variant defence
-  against tailoring to a fixed suite
-  (research 30, section 1). The variant is produced in scratch and never committed.
+- **Renamed copy.** Section 5.6: every case is scored again on a copy with fresh names and shifted lines, which
+  catches answers that depend on names, byte offsets or line numbers rather than on the code.
 - **Adapter parity.** One case each of callers, callees, refs, search, symbol and source per language through the
   CLI `--json`. Normalised data must equal the MCP answer. This is kept small on purpose: the test policy warns
   against duplicate goldens through adapters, and this is a metamorphic check with no golden.
@@ -848,7 +884,7 @@ The product has **two contracts**, and cases cover both:
 
 Each row gives the construct, codectx's documented answer, and why. "Truth" marks where runtime behaviour differs
 from the contract (scored in the truth lens, 6.3). "Rule" marks a contract question with a default, listed in
-section 16 and settled before the freeze. Spec anchors are named once per language; their URLs are in research 30, section 9.
+section 17 and settled before run 1. Spec anchors are named once per language; their URLs are in research 30, section 9.
 
 ### 8.1 Go
 
@@ -917,6 +953,7 @@ importlib.import_module.
 | Relative imports and a namespace package (no `__init__.py`) | resolved to files |
 | `importlib.import_module(f"plugins.{n}")` | open import site with fragment `plugins.`; `may_import` lists `plugins/*.py` |
 | Module `__getattr__` (PEP 562) | computed |
+| `getattr(obj, "name")()` and `getattr(obj, key)()` | the first as `obj.name()`; the second an open site, `computed`, no candidates (A12, 7.8.1) |
 | `obj()` with `__call__` | `obj()` is call syntax, so it calls `Cls.__call__` when `obj`'s class is recovered, else it is open (`value_untracked`) |
 | `a + b` with `__add__` | no `calls` (contract). **Truth:** `__add__` runs |
 | A Protocol satisfied structurally | no `implements` (contract) |
@@ -983,7 +1020,7 @@ expr.mptr.oper.
 | `Derived::f(int)` hiding `Base::f(double)`, then `using Base::f` | without `using`: `d.f(1.0)` calls `Derived::f`; with it: `Base::f` |
 | A non-virtual `Base::g` hidden by `Derived::g`; `Base* b; b->g()` | `exact` to `Base::g` |
 | A dependent call `t.run()` in a template, and CRTP `static_cast<D*>(this)->impl()` | open sites (ADR-0015's template row) |
-| ADL: unqualified `swap(a, b)` finds `ns::swap` | **Rule (A12):** default is open |
+| ADL: unqualified `swap(a, b)` finds `ns::swap`, and the same call in a template on `T` | exact to `ns::swap`; in the template, an open site with candidates (A12, 7.8.1) |
 | Out-of-line `void C::m()` definitions in `.cpp` with declarations in headers; reopened and inline namespaces | the declaration and definition are one method family; a call binds to the definition. **Rule (A10):** default is the definition |
 | `(obj.*pmf)()`, a `std::function` member, captured lambdas | field or flow sets, else open |
 | `Dog d; d.sound()`, `Dog& r; r.sound()`, `Dog make(); make().sound()` | `exact`, `virtual`, `exact` |
@@ -1004,8 +1041,8 @@ itself when the cases are written.
 | `static` functions with one name in 30 files | each file's call binds to its own (internal linkage); others `prohibited` |
 | `extern` declaration in a header, definition in `a.c`, call in `b.c` | binds to the definition |
 | `#define LOG log_impl` (object-like) | the macro's call calls `log_impl` (`Decl.Alias`) |
-| Function-like `#define LOG(x) log_impl(__FILE__, x)` | **Rule (A12):** default is open |
-| `_Generic((x), int: iabs, double: dabs)(x)` | **Rule (A12):** default is open |
+| Function-like `#define LOG(x) log_impl(__FILE__, x)` | `calls` to `LOG`, and `LOG` `calls` `log_impl` (A12, 7.8.1) |
+| `_Generic((x), int: iabs, double: dabs)(x)` | exact to the selected function, else the listed set with `set_size` (A12, 7.8.1) |
 | `qsort(a, n, sz, cmp)` | `cmp` is a reference, not a call from the caller |
 | `#include MACRO` with the macro undefined | open import site |
 | Two headers with one name under different `-I` roots | `imports` set with `set_size` |
@@ -1029,7 +1066,7 @@ renaming dependencies.
 | A trait default method overridden in one impl; called through `T: Trait` and through a concrete type | `Trait::m`, `virtual`; on the concrete type, the impl's method, `exact` |
 | Blanket `impl<T: Display> Describe for T`; `5.describe()` | the blanket impl's item (`Decl.Trait`), which implements `Describe::describe` |
 | An inherent and a trait method of one name | the inherent method wins (candidate order) |
-| `Box<Rc<T>>` auto-deref and a custom `Deref` | **Rule (A12):** default is open |
+| `Box<Rc<T>>` auto-deref and a custom `Deref` | the method on the dereferenced type; the implicit `deref` call is truth lens only (A12, 7.8.1) |
 | `<T as Trait>::m(x)` and `Trait::m(&x)` | `exact` to `Trait::m`'s impl when `T` is concrete, else `Trait::m` |
 | `Vec<Box<dyn Shape>>`, `s.area()` | `Shape::area`, `virtual`, `may_dispatch` to every impl |
 | Supertrait `B: A`; `a_method` called on `T: B` | `A::a_method`, `virtual` |
@@ -1038,7 +1075,7 @@ renaming dependencies.
 | `#[cfg(unix)] fn open()` and `#[cfg(windows)] fn open()` | two nodes. **Rule (A8):** default is that a call binds to the set |
 | A workspace member renamed in `Cargo.toml` (`package =`) | calls resolve through the local name |
 | `let f: fn() = a; f()`; `impl Fn` passed to a generic | flow or address-taken set |
-| `T::default()` and `Default::default()` chosen by inference | **Rule (A12):** default is open |
+| `T::default()` and `Default::default()` chosen by inference | exact to the inferred type's impl; on a generic `T: Default`, `virtual` to the trait method (A12, 7.8.1) |
 | `#[path = "x.rs"] mod y` and `mod.rs` against `y.rs` | resolved files |
 | Fifteen modules with `fn handle`; `use a::*; use b::handle;` | `b::handle` |
 
@@ -1063,9 +1100,9 @@ subpath imports.
 | `exports` conditions (`import` against `require`), `imports` `#internal` | the condition the importing syntax selects |
 | `Foo.prototype.bar = function(){}`; `new Foo().bar()` | `bar` is a declaration (ADR-0017 §3); a construct-site call is `exact` |
 | `class B extends A` with `super.m()` and a private `#m` | `exact` both |
-| `f.call(o)`, `const g = f.bind(o); g()` | **Rule (A12):** default is open |
+| `f.call(o)`, `f.apply(o, a)`, `const g = f.bind(o); g()` | `calls` to `f`'s target, else an open site for `f` (A12, 7.8.1) |
 | `` import(`./plugins/${n}.js`) `` and `require(expr)` | open import site with fragments |
-| `Object.assign(Foo.prototype, Mixin)` | **Rule (A12):** default is that calls of mixed-in methods are open |
+| `Object.assign(Foo.prototype, Mixin)` | exact to the mixin's member when the source is known, else an open site (A12, 7.8.1) |
 | `arr.map(fn)`, `emitter.on('x', h)` | references; the callers of `fn` and `h` are not the module |
 | Twenty files exporting `handle`; `obj[k]()` | `computed` open site, no candidates |
 
@@ -1084,7 +1121,7 @@ JSX.
 | A class implementing an interface from another workspace package through `paths` and project references | `implements`; methods `overrides` |
 | An abstract chain with `override`, and an external base with `override` | `overrides`, with `supertype` to the extended class only, never to an `implements` interface |
 | An interface merged across two files; a namespace merged with a class | **Rule (A13):** default is one node per declaration site |
-| Mixin `function Timestamped<T extends Ctor>(B: T) { return class extends B {} }` | the supertype is a parameter. **Rule (A12):** default is no `extends`, and calls of inherited members are open |
+| Mixin `function Timestamped<T extends Ctor>(B: T) { return class extends B {} }` | `extends` to the class expression; inherited members bind through the structural type (A12, 7.8.1) |
 | Overload signatures plus one implementation | **Rule (A10):** default is the implementation declaration |
 | `import type { X }` | **Rule (A11):** default is that it is an `imports` row |
 | An object literal satisfying an interface without `implements` | no `implements` (contract) |
@@ -1133,9 +1170,8 @@ verification packages in the Section 28 map.
 
 ```text
 internal/eval/
-  doc.go            what it measures, how to run it, the freeze rule, why there is no regenerate mode
+  doc.go            what it measures, how to run it, why the runner never edits expectations
   main.go           flags, startup checks, one project at a time
-  manifest.go       verify MANIFEST.sha256 and generator digests; refuse on any mismatch
   anchors.go        read @tag anchors; resolve token@tag to path + byte range
   cases.go          load and validate case files (every reference resolves, every tag is used)
   materialize.go    copy a project to scratch, run its recipe, git init and commit, write the C/C++ compile database
@@ -1145,8 +1181,6 @@ internal/eval/
   report.go         report.json, report.md, raw/
   generate.go       seeded clutter generator
   testdata/
-    MANIFEST.sha256
-    ERRATA.md
     projects/<language>/<project>/...     one repository root each
     cases/<language>/<project>.json       expectations, outside the trees they score
     edits/<language>/<project>/NN-<step>.archive   refresh steps: whole files plus a delete/move header
@@ -1178,9 +1212,9 @@ go run ./internal/eval --binary ./bin/codectx --out ../codectx-eval-run-1
   - `--scratch` defaults to a directory under `--out`, never `/tmp`, which is RAM-backed on some hosts.
   - `--only` takes a capability, language, project or case id, for reproducing one finding. A run with `--only` is
     never a certification run, and its report says so.
-  - `--split open|sealed|all`, default `all`.
-  - `--sealed-dir` is the sealed split's root before its reveal, and `--reveal` merges the sealed details into the
-    shared report (section 5.6).
+  - `--held-out` is the held-out cases' directory before they are committed. Their per-case findings go to
+    `out/held-out/`, apart from the shared report, which carries their aggregates only (section 5.6).
+  - `--seed` replays a renamed copy; by default each run draws a fresh one and records it.
 - **Environment.** The run uses the product default: every provider on, the tool store prefetched
   (`codectx tools prefetch --all` beforehand), offline after that (`[tools] offline = true` in the run's own XDG
   config). The host toolchains `go`, `cargo` and `python3` must be present. Status rows prove what ran. A provider
@@ -1191,19 +1225,19 @@ go run ./internal/eval --binary ./bin/codectx --out ../codectx-eval-run-1
 - **Memory.** The runner caps its own heap (`GOMEMLIMIT=1GiB` set in `main.go`). It does not cap codectx: answers must
   not depend on memory, and capping the product is not how a user runs it. A host that wants a safety net runs the command
   inside a memory-limited control group. Tripping that limit is a finding.
-- **Exit codes.** 0 when scored, whatever the scores. 2 for an integrity failure (manifest, anchors, case schema).
+- **Exit codes.** 0 when scored, whatever the scores. 2 for an integrity failure (anchors, case schema).
   3 for an environment failure (binary or toolchain missing). The scores are the result; they are never a pass/fail
   gate inside the runner.
 
 **Report** (in `--out`, never tracked):
 - **`report.json`.**
-  - Run identity: binary version and commit, manifest root digest, per-split digests, toolchain lock digest, host OS,
+  - Run identity: binary version and commit, the repository commit and the git tree id of `internal/eval/testdata`, toolchain lock digest, host OS,
     CPU and memory, start and end times as local times with their offset.
   - Per case: flags, matched, missing and extra rows by reference, and the path of its raw answer.
   - Every aggregate table of 6.5.
 - **`report.md`.**
   - Headline tables per capability × language: cases, exact %, P, R, F1, mark accuracy, S1–S5.
-  - Per-tier and per-split tables, including the open-against-sealed gap.
+  - Per-tier and per-split tables, with the open-against-held-out and original-against-renamed gaps.
   - The truth-lens table.
   - Refresh divergences with diffs.
   - Every finding sorted by severity, each with its `fails` text, anchor and both answers.
@@ -1212,27 +1246,66 @@ go run ./internal/eval --binary ./bin/codectx --out ../codectx-eval-run-1
 
 ## 12. Trustworthy without tests of the harness
 
-1. **Frozen inputs.** The manifest is checked on every run, and there is no regenerate mode. Changes go through
-   errata reviewed by two people who are not the fixers. The digests are pre-registered before run 1.
+1. **The runner never edits expectations,** and it has no regenerate mode. The set is tracked like any file.
 2. **Expectations do not come from the product.** They are derived twice, the second blind, from specifications and
-   the contract, and cross-checked by independent compiler-grade and runtime oracles before the freeze. Each case
+   the contract, and cross-checked by independent compiler-grade and runtime oracles before run 1. Each case
    records its anchor and derivation.
 3. **Startup integrity checks.** These are refusals, not tests.
    - Every `token@tag` resolves to exactly one token, and every tag is used.
    - Case files validate against the schema in `doc.go`.
    - No search query collides with a tag.
    - No case file lies inside a project tree.
-   - Every generator output matches its digest.
+   - Every root occurs only in golden files (section 13, guardrail 1).
 4. **Re-derivable verdicts.** Raw answers are kept, and matching is by location, the simplest rule that can be
    checked by eye. A reviewer can recompute any row of the report from `raw/` and the case file.
-5. **Deterministic.** The same binary and the same manifest give the same report, apart from times and RSS, and the
+5. **Deterministic.** The same binary, testdata tree and seed give the same report, apart from times and RSS, and the
    determinism slice checks this for the product side.
 6. **Scorer self-consistency guard.** Before scoring codectx, the runner scores each case's own `expect` rendered as
    an answer (must be `exact`) and an empty answer (must flag every expected row). This is an assertion inside the
    run, aborting with exit 2, not a test file. Nothing else depends on it, so it can be removed without
    changing any score (A14).
 
-## 13. Repository rules
+## 13. Keeping the product general
+
+The golden set is small and written for the purpose. A measure that becomes a target stops measuring, suites of
+small synthetic programs overstate how well an analyzer does on production code, and fixes made against one test
+suite pass it while failing elsewhere (research 30, section 10). The product must stay exact and fast on any
+repository, enterprise monorepos included, so these guardrails hold for every fix the evaluation prompts:
+
+1. **No golden identity in product code.** Code outside `internal/eval/` never names a golden project, file, path,
+   symbol or root, never reads `internal/eval/`, and never branches on whether it is being evaluated. The runner
+   checks this at startup: it searches every tracked file outside `internal/eval/testdata/` and `docs/` for each
+   root and each project directory name, and refuses with the hits (exit 2). Because roots are invented, a hit is
+   never an accident.
+2. **Every fix states the general rule it implements.** The commit cites the language specification section or
+   the contract document, in words that hold for every program ("a private Java method overrides nothing"), never
+   in terms of a case.
+3. **Every fix adds a unit test on a different example.** The test lives in the product package that changed, uses
+   a program written for it with different names and a different shape from the golden case, and fails when the
+   fix is reverted.
+4. **Exact answers.** Expectations are closed-world and carry `prohibited` rows (5.3), so a fix that returns more,
+   or less certain, rows cannot pass.
+5. **Renamed copies with a fresh seed every run** (5.6). A fix keyed on what it has seen fails names it has not.
+6. **Held-out cases, seen once before they are fixed** (5.6).
+7. **Metamorphic checks** (7.19): refresh equals fresh, two roots give one answer, and the CLI agrees with MCP.
+   They are properties of every correct answer, whatever the case.
+8. **The counterweight on real code.** The separate live proofs on the seven large public repositories measure
+   speed, memory and completeness at scale. A fix lands only if those proofs stay within their budgets. The harness
+   records time and memory for information only.
+9. **No single score.** The report has no overall number: per capability × language tables with severity counts,
+   so no one figure can be pushed up at the others' cost.
+
+**How a reviewer spots a case-specific fix.**
+- The startup root check fails.
+- The diff holds a literal that matches the set: a name, path, file count, line number or set size.
+- The change keys on a layout or a count ("a directory named …", "exactly three overrides") rather than on a
+  language rule, or the cited rule does not cover the change.
+- The new unit test reuses the golden program, or still passes with the fix reverted.
+- In the report: a case `exact` on the original fails on the renamed copy (`name_dependent`); the open cases improve
+  while the held-out cases do not; a case in another language or capability that was `exact` regresses.
+- The large-repository proofs get slower or use more memory.
+
+## 14. Repository rules
 
 - **No third-party product names in tracked code, comments or doc bodies.**
   - The oracle drivers are never committed.
@@ -1254,10 +1327,10 @@ go run ./internal/eval --binary ./bin/codectx --out ../codectx-eval-run-1
 - **Original material only.** Every golden source is written for the set. Nothing is copied from another repository.
 - **Test policy.** There are no new `_test.go` files.
 
-## 14. Relation to the separate relevance benchmark
+## 15. Relation to the separate relevance benchmark
 
 A relevance benchmark, kept outside the repository, scores search and context on large public repositories with
-frozen questions.
+fixed questions.
 
 **Recommendation: keep it separate. Do not fold it in or replace it. Run both in the final test phase and report them
 side by side, never combined.**
@@ -1275,62 +1348,61 @@ side by side, never combined.**
 
 **What the harness borrows from it:**
 - the evidence-group semantics (AND groups, OR alternatives, line overlap), used by the context cases;
-- the frozen hash list;
 - blind judging with adjudication;
-- the held-out idea, which becomes the sealed split.
+- the held-out idea.
 
 **Outside this design.** Scale realism for graph answers on real code belongs to the relevance benchmark: a
 graph-answer question type on its held-out repositories, which are never tuned on.
 
-## 15. Cost
+## 16. Cost
 
 These are estimates for a 16-core, 47 GB development machine, to be measured on the first run and recorded in the
 report.
 
 | Item | Estimate | Basis |
 |---|---|---|
-| Index operations | ~310: 71 projects, 9 determinism re-indexes, 9 shifted variants, 108 refresh steps × (refresh + fresh) | section 9 |
+| Index operations | ~380 per run: 71 projects, 71 renamed copies, 9 determinism re-indexes, 108 refresh steps × (refresh + fresh) | section 9 |
 | Time per index | 20–120 s on these small projects. JVM startup for the Java indexer, Rust sysroot loading and the TS indexer dominate; tree-sitter and the linker take seconds | the indexers' fixed costs |
 | Query time | 10–30 min for ~1,830 cases, sequential | one MCP session per project |
-| Wall time | 4–7 h per full run, so 12–21 h for the three runs of section 5.6, each a separate sitting | |
+| Wall time | 5–9 h per full run, so 15–27 h for the three runs of section 5.6, each a separate sitting | |
 | Peak RSS | about 2–3 GiB, set by the language tooling (the Rust and Java indexers) rather than codectx on small trees. The hub project (~15,000 generated files) is the largest codectx workload, about 1–2 GiB | small trees |
 | Disk | under 10 GB transient in scratch, freed paced | |
 | Authoring | the dominant cost: ~1,800 cases, each derived twice, plus the oracle cross-check | |
 
-## 16. Defaults and open contract questions (each settled before the freeze)
+## 17. Defaults and open contract questions (each settled before run 1)
 
 | # | Assumption or gap | Default chosen | Why |
 |---|---|---|---|
 | A1 | Scored surface | MCP tools; CLI for index, refresh and status and for the parity slice | agents read through MCP; the test policy discourages a second golden per adapter |
 | A2 | Real repositories | not in the committed set; scale realism stays in the separate relevance benchmark | licensing (research 30, section 8), and real-code ground truth is a separate study |
-| A3 | Oracle tools | used before the freeze only; named only in research 30 | the repository's naming rule; oracle drift must not move scores |
+| A3 | Oracle tools | used before run 1 only; named only in research 30 | the repository's naming rule; oracle drift must not move scores |
 | A4 | Product configuration for the run | product defaults, every provider on, tool store prefetched, offline after prefetch | "works completely by default"; offline makes the run deterministic |
-| A5 | Sealed split | 30%, committed after run 2, then fixed | measures overfitting without leaving findings unfixed |
+| A5 | Held-out cases | 30%, by authors outside the fix rounds, committed after run 2, then fixed | one honest look at unseen cases without leaving findings unfixed |
 | A6 | Range scoring | containment scored; exact bytes informational | languages do not define where a declaration starts |
 | A7 | Go pointer-receiver satisfaction | `implements` from the named type when either `T` or `*T` satisfies, with the truth note naming which | type-level hierarchy is how the contract describes Go |
 | A8 | Build-tag, `#[cfg]` and `#if` variant targets | a call from shared code binds to every variant, as a set with `set_size` | the identity already keeps both; a set discloses the build-dependence |
 | A9 | Decorators, properties, operators, JSX elements, TS standard decorators | not calls in the contract; truth lens records them | the contract binds call syntax only; the truth lens shows the cost (`obj()` with `__call__` is call syntax and is bound) |
 | A10 | TS overloads, `.pyi` stubs, C/C++ prototypes | calls bind to the implementation or definition | that is what runs; the signature nodes stay as declarations |
 | A11 | Type-only imports | `imports` row published | it is a module dependency an impact walk needs |
-| A12 | ADL, `_Generic`, function-like macros, Rust inference (`Default::default()`), `bind`/`call`, `Object.assign` mixins, TS mixin class expressions, Rust auto-deref through custom `Deref` | open sites with the right reason, unless the owner prefers binding | an open site is the documented answer when analysis cannot justify one target |
+| A12 | Calls whose target depends on run-time values: `call`, `apply`, `bind`, `getattr`, ADL, function-like macros, `_Generic`, Rust inference and `Deref`, mixins | the per-construct answers of 7.8.1; one contract addition proposed, a `dependent` reason | what code-intelligence systems return and what the call-graph and tool-use research supports (research 30, section 11) |
 | A13 | Interface merging and namespace-class merging | one node per declaration site | identity is file plus descriptor path |
 | A14 | The scorer self-consistency guard | kept | it guards the scorer at no cost; it is an assertion inside the run, not a test file |
 | A15 | Times in the report | local time with offset | the reader's clock |
-| A17 | "Runs once" | once the code is complete: three full runs inside the final phase (section 5.6) | measures overfitting and still fixes every finding; one run if the sealed split is dropped |
+| A17 | "Runs once" | once the code is complete: three full runs inside the final phase (section 5.6) | run 2 measures generalisation, run 3 confirms every fix; one run cannot do both |
 | A18 | Go overlapping embedded interfaces `I3{I1; I2}` | `i3.M()` is a `value_set` of both declarations | the language gives one method two declarations; a set discloses it |
 | A19 | Python class-level rebinding `m = A.other` | no `overrides`; the call binds by field write | only `def` declares a method |
-| A20 | Named imports of CommonJS exports | bind to statically written export assignments, else open | matches Node's static detection |
+| A20 | Named imports of CommonJS exports | bind to statically written export assignments, else open | matches the runtime's own static detection |
 | A21 | Route projects | real framework imports in source, resolved to in-tree stub APIs written from scratch; the real frameworks only in the uncommitted oracle copy | detection needs the imports; stubs keep every project compiling and every precise provider `fresh` |
 | A23 | LSP routing for call hierarchy | no overlay call-hierarchy cases | the model names the routing, but the MCP callers and callees input has no `semantic_source` field |
 | A22 | Deliberate breakage | confined to one `degraded` project per language, with declared expected states | breakage must not cost other cases their compiler-grade facts |
 
-## 17. Implementation order (for the plan, not done here)
+## 18. Implementation order (for the plan, not done here)
 
-1. **The runner skeleton.** Manifest, anchors, case loader, materialisation, drive and normalise, written against a
+1. **The runner skeleton.** Anchors, case loader, materialisation, drive and normalise, written against a
    throwaway project built from existing unit-test fixtures (section 5.4), never a golden one.
 2. **The scorer and report.** Built over that throwaway project's hand-written cases, which are deleted afterwards.
 3. **Projects and cases per language,** each language in two blind passes, then the oracle cross-check and
-   adjudication.
+   adjudication. The held-out cases are written by authors outside the fix rounds.
 4. **The generator recipes and the polyglot monorepo.**
-5. **The freeze.** Pre-registration commit, the open split committed, the docs and ADR committed.
-6. **Run 1.** Fix round (open split). Run 2. Reveal and fix the sealed split. Run 3, the certification run.
+5. **The docs and ADR.**
+6. **Run 1.** Fix round (open findings). Run 2. Commit and fix the held-out cases. Run 3.

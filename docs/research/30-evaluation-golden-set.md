@@ -1,4 +1,4 @@
-# Evaluation golden set: how other tools and papers build, freeze and score theirs
+# Evaluation golden set: how other tools and papers build and score theirs, and keep them honest
 
 Research behind [the evaluation design](../designs/2026-10-13-codectx-eval-design.md). Gathered on 2026-10-13 from
 primary sources: papers, specifications, official documentation and the benchmark repositories themselves. A source
@@ -82,7 +82,7 @@ https://github.com/vitsalis/PyCG/tree/master/micro-benchmark).
 Analyzers* (https://arxiv.org/abs/1812.05033).
 - Analyzers can be "designed to perform well in such competitions by specifically tailoring their techniques to the
   given benchmarks".
-- Fresh variants generated from seed programs defend against that. The design's shifted variant and sealed split
+- Fresh variants generated from seed programs defend against that. The design's renamed copies and held-out cases
   come from this.
 
 ## 2. Inline markers and golden files
@@ -126,14 +126,14 @@ and an interface case.
 - **The servers disagree with each other.** tsserver and gopls add `direct(d: Dog)` to `Animal.sound`'s callers.
   pyright and rust-analyzer list no caller through the base. Only jdtls gets three levels right. No server marks a
   call through a base.
-- **Reading them as truth would score their drift.** The design therefore uses analyzers only before the freeze, to
+- **Reading them as truth would score their drift.** The design therefore uses analyzers only before the first run, to
   catch the authors' mistakes (section 4), and never as the expected answer.
 
-## 4. The oracles used before the freeze
+## 4. The oracles used before the first run
 
 Each language's static oracle is its reference compiler or type checker. A second static oracle and a runtime trace
-are added beside it. None runs during an evaluation; each runs once, on a private copy of the golden projects,
-before the freeze.
+are added beside it. None runs during an evaluation; each runs once, on an uncommitted copy of the golden projects,
+before the first run.
 
 | Language | Static oracle | Second static oracle | Runtime oracle |
 |---|---|---|---|
@@ -174,7 +174,7 @@ before the freeze.
   `#callHierarchy_outgoingCalls`, `#typeHierarchy_supertypes`, `#textDocument_implementation`). The shared shape
   of these answers: an item, plus `fromRanges` for the call sites.
 
-**What the freeze records here.** The exact version and argv of each tool, and the agreement statistics per language:
+**What is recorded here before the first run.** The exact version and argv of each tool, and the agreement statistics per language:
 rows checked, disagreements, and how each class of disagreement was settled.
 
 ## 5. Other capabilities
@@ -232,12 +232,8 @@ rows checked, disagreements, and how each class of disagreement was settled.
 - *Detecting Call Graph Unsoundness without Ground Truth* (https://arxiv.org/abs/2604.00885): metamorphic partial
   orders.
 
-## 6. Freezing and contamination
+## 6. Contamination
 
-- **Go's dirhash `h1:`** (https://raw.githubusercontent.com/golang/mod/master/sumdb/dirhash/hash.go). One SHA-256
-  over a sorted per-file list of SHA-256 lines: the model for the design's manifest root digest. The `go.sum` line
-  form is at https://go.dev/ref/mod#go-sum-files.
-- **Bazel's lockfile `error` mode** (https://bazel.build/external/lockfile). It verifies and never rewrites.
 - **SWE-bench** (https://arxiv.org/abs/2310.06770) and its human-validated Verified subset
   (https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified). The announcement post returned 403 and was
   not fetched.
@@ -245,8 +241,8 @@ rows checked, disagreements, and how each class of disagreement was settled.
   - *The SWE-Bench Illusion* (https://arxiv.org/abs/2506.12286) found models naming buggy files from the issue text
     alone.
 - **Contamination studies.** Riddell, Ni, Cohan (https://arxiv.org/abs/2403.04811) and LiveCodeBench
-  (https://arxiv.org/abs/2403.07974) show that scores rise on material a model has seen. A held-out split and a
-  pre-registered digest answer this for a fixed set.
+  (https://arxiv.org/abs/2403.07974) show that scores rise on material a model has seen. For a fixed set, the answer is held-out
+  cases and renamed copies (section 10).
 
 ## 7. Metrics, agreement and abstention
 
@@ -316,3 +312,194 @@ These are the primary texts, not legal advice.
   https://www.typescriptlang.org/docs/handbook/2/classes.html;
   https://www.typescriptlang.org/docs/handbook/2/functions.html#function-overloads;
   https://www.typescriptlang.org/docs/handbook/jsx.html
+
+## 10. Overfitting to a benchmark, and the guardrails against it
+
+Fetched on 2026-10-13. Quotes are from the primary text unless marked.
+
+**A measure that becomes a target.**
+- Strathern, "'Improving ratings': audit in the British University system", *European Review* 5(3), 1997, p. 308
+  (https://cambridge.org/core/journals/european-review/article/improving-ratings-audit-in-the-british-university-system/FC2EE640C0C44E3DB87C29FB666E9AAB;
+  scan read at https://www.gwern.net/doc/statistics/decision/1997-strathern.pdf): "When a measure becomes a target,
+  it ceases to be a good measure." This is the usual wording of Goodhart's law. Goodhart's own 1975 text was not
+  found.
+- Campbell, "Assessing the Impact of Planned Social Change", 1976
+  (https://jmde.journals.publicknowledgeproject.org/index.php/jmde_1/article/download/297/292/988): "The more any
+  quantitative social indicator is used for social decisionmaking, the more subject it will be to corruption
+  pressures".
+- Manheim and Garrabrant, "Categorizing Variants of Goodhart's Law" (https://arxiv.org/abs/1803.04585), and Thomas
+  and Uminsky (https://arxiv.org/abs/2002.08512), who propose "using a slate of metrics to get a fuller and more
+  nuanced picture". The design's report therefore has no single score.
+
+**Held-out data and how often it can be looked at.**
+- Dwork, Feldman, Hardt, Pitassi, Reingold, Roth, "Generalization in Adaptive Data Analysis and Holdout Reuse"
+  (https://arxiv.org/abs/1506.02629): "Because the predictor is independent of the holdout dataset, such an estimate
+  is a valid estimate of the true prediction accuracy ... However, in practice the holdout dataset is rarely used
+  only once, and as a result the predictor may not be independent of the holdout set, resulting in overfitting to
+  the holdout set". On data with no signal, reusing a standard holdout reported "accuracy of over 63% for k = 500".
+- Blum and Hardt, "The Ladder" (https://arxiv.org/abs/1502.04585): participants "may begin to overfit to the holdout
+  data that supports the leaderboard". Hardt's post (http://blog.mrtz.org/2015/03/09/competition.html): "the public
+  score is in general no longer an unbiased estimate of the true score".
+- Roelofs et al., "A Meta-Analysis of Overfitting in Machine Learning", NeurIPS 2019
+  (https://papers.nips.cc/paper/9117-a-meta-analysis-of-overfitting-in-machine-learning): competitions rank on "a
+  separate test set used only once", and found "little evidence of substantial overfitting" from the public
+  leaderboard.
+- Recht, Roelofs, Schmidt, Shankar, "Do ImageNet Classifiers Generalize to ImageNet?", ICML 2019
+  (https://proceedings.mlr.press/v97/recht19a.html): accuracy drops of "11% - 14% on ImageNet" on a new test set,
+  "not caused by adaptivity, but by the models' inability to generalize to slightly "harder" images".
+- ARC Prize 2024 Technical Report (https://arxiv.org/html/2412.04604v2): public, semi-private and private evaluation
+  sets; "We consider scores overfit if semi-private and public evaluation set scores exceed ±10% absolute
+  difference"; and "on the order of 10,000 private evaluation set scores have been reported to participants so far
+  ... This presents a significant risk of overfitting."
+
+  **For the design:** run 2 is one look at held-out cases by a product built without them, the case the holdout
+  papers call valid, so its open-against-held-out gap is the headline. Once the held-out cases are fixed against,
+  they no longer measure generalisation, so run 3 is a regression run whose unseen part is a fresh renaming.
+
+**Benchmarks people tune to.**
+- SWE-Bench+ (https://arxiv.org/abs/2410.06992): "31.08% of the passed patches are suspicious patches due to weak
+  test cases". Weak checks let wrong output pass, hence closed-world expectations with prohibited rows.
+- *The SWE-Bench Illusion* (https://arxiv.org/abs/2506.12286): buggy-file identification "up to 76%" on the
+  benchmark's repositories against "up to 53% on tasks from repositories not included". A drop on unseen material is
+  the signature of memorisation.
+- SWE-bench-Live (https://arxiv.org/abs/2505.23419), SWE-rebench (https://arxiv.org/abs/2505.20411) and LiveCodeBench
+  (https://arxiv.org/abs/2403.07974) answer it with fresh tasks over time; the survey of Xu et al.
+  (https://arxiv.org/html/2406.04244) lists private, dynamic and restructured benchmarks as the mitigations.
+- NIST SATE V, SP 500-326 (https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.500-326.pdf): "Synthetic
+  test cases are much smaller and less complex than production software ... tool results ... on synthetic test cases
+  may differ from results on production software", and "recall was higher for the Synthetic test cases". This is
+  why the golden set never certifies scale, and the separate proofs on large real repositories stay the
+  counterweight.
+- SV-COMP 2021 (https://www.sosy-lab.org/research/pub/2021-TACAS.Software_Verification_10th_Comparative_Evaluation_SV-COMP_2021.pdf):
+  "all verification tasks are known before the submission of the participating verifiers". An open set measures
+  capability, not generalisation.
+
+**Renamed and transformed copies.**
+- Chen et al., "Metamorphic Testing: A Review of Challenges and Opportunities", ACM CSUR 2018
+  (https://i.cs.hku.hk/~tse/Papers/2010s/hlmtCSUR.html): metamorphic relations "are necessary properties of the
+  target function or algorithm".
+- Le, Afshari, Su, "Compiler Validation via Equivalence Modulo Inputs", PLDI 2014
+  (https://web.cs.ucdavis.edu/~su/publications/emi.pdf): "EMI can be adapted to validate program transformation and
+  analysis systems in general."
+- Statfier, ESEC/FSE 2023
+  (https://2023.esec-fse.org/details/fse-2023-research-papers/31/Statfier-Automated-Testing-of-Static-Analyzers-via-Semantic-preserving-Program-Trans):
+  static analyzers tested by comparing results on a program and on a semantics-preserving variant.
+- Ramakrishnan et al., "Semantic Robustness of Models of Source Code" (https://arxiv.org/abs/2002.03043), with
+  transforms including "RenameLocalVariables", "RenameParmeters" and "RenameFields"; ReCode
+  (https://arxiv.org/abs/2212.10264) perturbs function and variable names. Both test learned models; applying
+  renaming to a deterministic analyzer, whose answers must change only by the renaming, is the design's own step.
+
+**Fixes that fit the tests.**
+- Smith, Barr, Le Goues, Brun, "Is the Cure Worse Than the Disease? Overfitting in Automated Program Repair", FSE
+  2015 (https://people.cs.umass.edu/~brun/pubs/pubs/Smith15fse.pdf): "Patches that are overly specific to the
+  training tests and fail to generalize to the held-out tests overfit to the training tests", and "novice developers
+  also overfit".
+- Qi, Long, Achour, Rinard, ISSTA 2015 (https://www.cs.toronto.edu/~fanl/papers/kali-issta2015.pdf): of plausible
+  patches, "GenProg produced a correct patch for only 2 of the 105 considered defects"; the authors "developed new
+  test cases that exposed the defects". Hence a unit test on a different example for every fix.
+- Meszaros, *xUnit Test Patterns*, "Test Logic in Production"
+  (http://xunitpatterns.com/Test%20Logic%20in%20Production.html): "A system that behaves one way in the test lab and
+  an entirely different way in production is a recipe for disaster!" Hence the check that product code never names
+  the set.
+- Google Engineering Practices, "What to look for in a code review"
+  (https://google.github.io/eng-practices/review/reviewer/looking-for.html): "Will the tests actually fail when the
+  code is broken?" Hence a fix's test must fail with the fix reverted.
+
+## 11. What to return for a call with several possible targets
+
+Fetched on 2026-10-13, from source code, specifications and papers. Behaviour read from code but not from a test is
+marked as inferred.
+
+**What systems return.**
+- **CodeQL, JavaScript** (https://raw.githubusercontent.com/github/codeql/main/javascript/ql/lib/semmle/javascript/dataflow/Nodes.qll):
+  `getACallee()` "Gets a potential callee of this call site", with an `imprecision` that "is a heuristic measure of
+  how likely it is that `callee` is only suggested as a potential callee due to imprecise analysis of global
+  variables"; `isIndefinite(cause)` names the causes `"await", "call", "eval", "global", "heap", "import",
+  "namespace", "yield"` (DataFlow.qll). `fn.call(x, y)` "gets a call node with `fn` as the callee, `x` as the
+  receiver"; `bind` is a partial call whose result refers to the underlying function; `Object.assign` is an extend
+  step at imprecision 0 (Extend.qll, CallGraphs.qll).
+- **CodeQL, C and C++** (https://raw.githubusercontent.com/github/codeql/main/cpp/ql/lib/semmle/code/cpp/exprs/Call.qll):
+  `getTarget()` is "the statically resolved method"; `isOnlyFoundByADL()` "Holds if the target of this function call
+  was found by argument-dependent lookup". `getAViableTarget` gives a virtual call's possible targets
+  (dispatch/VirtualDispatchPrototype.qll). A macro invocation links to its macro (`MacroInvocation.getMacro()`) and
+  the expanded call stays an ordinary call marked `isInMacroExpansion`
+  (https://codeql.github.com/codeql-standard-libraries/cpp/semmle/code/cpp/Macro.qll/type.Macro$MacroInvocation.html).
+  `C11GenericExpr` keeps every association and the selected one (exprs/Expr.qll).
+- **CodeQL, Java and C#**: `exactVirtualMethod` returns one method only "if we can establish one", and
+  `lowConfidenceDispatchTarget` flags "imprecise open-world type-based dispatch"
+  (https://raw.githubusercontent.com/github/codeql/main/java/ql/lib/semmle/code/java/dispatch/VirtualDispatch.qll);
+  C# keeps `getTarget()` (static) apart from `getARuntimeTarget()` (potential run-time targets)
+  (https://raw.githubusercontent.com/github/codeql/main/csharp/ql/lib/semmle/code/csharp/exprs/Call.qll).
+- **SCIP** (https://raw.githubusercontent.com/sourcegraph/scip/main/scip.proto): one symbol per occurrence and no
+  certainty field; several targets go through symbol relationships (`is_reference`, `is_implementation`,
+  `is_definition`, the last suggested for mixins).
+- **Kythe** (https://kythe.io/docs/schema/): `ref/call`, `ref/call/direct` ("ignores indirect dispatch"),
+  `ref/call/implicit`, and `ref/expands` / `ref/expands/transitive` for macros; a `lookup` node records "a structured
+  name whose resolution cannot be completed without additional context", as for dependent names in C++ templates.
+- **Glean** (https://raw.githubusercontent.com/facebookincubator/Glean/main/glean/schema/source/cxx.angle):
+  `XRefIndirectTarget { via : XRefVia, target }`, "Cross-reference that goes through something (macro or using)".
+- **Sourcegraph** (https://raw.githubusercontent.com/sourcegraph/sourcegraph-public-snapshot/main/cmd/frontend/graphqlbackend/codeintel.codenav.graphql):
+  each usage carries `provenance` `PRECISE` ("doesn't have false positives"), `SYNTACTIC` or `SEARCH_BASED`, and
+  "Results are first grouped by provenance in the order precise, syntactic, then search-based."
+- **LSP 3.17** (https://raw.githubusercontent.com/microsoft/language-server-protocol/gh-pages/_specifications/lsp/3.17/language/definition.md):
+  definition returns "`Location` | `Location`[] | `LocationLink`[] | `null`", with no certainty field; `SymbolTag`
+  has only `Deprecated`.
+- **rust-analyzer** (https://raw.githubusercontent.com/rust-lang/rust-analyzer/master/crates/ide/src/goto_definition.rs):
+  a method call on a concrete type goes to the impl, on a generic `T: Trait` to the trait declaration; a call written
+  inside a macro resolves through the expansion. `Default::default()` with an inferred type resolves to the impl
+  through `lookup_impl_method` (inferred from crates/hir/src/source_analyzer.rs).
+- **clangd** (https://raw.githubusercontent.com/llvm/llvm-project/main/clang-tools-extra/clangd/XRefs.cpp): a macro
+  goes to its `#define`; a pure virtual method jumps "to all overrides"; the textual fallback is ranked, and "If we
+  have more than 5 results, don't return anything, as confidence is too low." Its tests treat a resolved ADL call as
+  an exact reference and leave a template-dependent one unresolved (unittests/XRefsTests.cpp).
+- **TypeScript language service** (https://raw.githubusercontent.com/microsoft/TypeScript/v5.9.3/src/services/goToDefinition.ts):
+  an array of definitions, the resolved signature first; fallback results carry `unverified`. `strictBindCallApply`
+  types `bind`, `call` and `apply` from the function
+  (https://www.typescriptlang.org/docs/handbook/release-notes/typescript-3-2.html).
+- **Python analyzers on `getattr`**: Jedi resolves a constant name and returns nothing for a computed one
+  (https://raw.githubusercontent.com/davidhalter/jedi/master/jedi/plugins/stdlib.py); typeshed declares the result
+  `Any` (https://raw.githubusercontent.com/python/typeshed/main/stdlib/builtins.pyi).
+
+**What the literature says.**
+- Møller and Schwartzbach, *Static Program Analysis* (https://cs.au.dk/~amoeller/spa/spa.pdf): a may analysis
+  "computes an over-approximation"; for call graphs "we usually aim for an over-approximation, meaning that call
+  graphs may contain too many call edges but never too few."
+- Livshits et al., "In Defense of Soundiness: A Manifesto", CACM 2015 (https://yanniss.github.io/Soundiness-CACM.pdf):
+  "We issue a call to the community to identify clearly the nature and extent of unsoundness in static analyses",
+  and an analysis "may pretend that eval does nothing, unless it can precisely resolve its string argument at
+  compile time."
+- Feldthaus, Schäfer, Sridharan, Dolby, Tip, ICSE 2013 (https://www.franktip.org/pubs/icse2013approximate.pdf): "for
+  Jump to Declaration, listing many spurious call targets is perhaps even worse than occasionally missing one"; a
+  useful compromise indicates "call sites where some callees may be missing"; "reflective invocations using call and
+  apply must also be accounted for."
+- PyCG, ICSE 2021 (https://arxiv.org/pdf/2103.00587): "precision (∼99.2%) and adequate recall (∼69.9%)", and "the
+  effects of functions such as getattr and setattr are ignored."
+- Antal et al., SCAM 2018 (https://arxiv.org/pdf/2405.07206v1): static JavaScript call graphs miss "dynamic call
+  edges coming from the non-trivial usages of eval(), bind(), or apply()".
+- Nielsen, Torp, Møller, ISSTA 2021 (https://cs.au.dk/~amoeller/papers/jam/paper.pdf): precision as "the percentage
+  of call sites that have a unique callee", and an explicit list of the sources of unsoundness.
+- Chakraborty, Gnanakumar, Sridharan, Møller, ECOOP 2024
+  (https://drops.dagstuhl.de/storage/00lipics/lipics-vol313-ecoop2024/LIPIcs.ECOOP.2024.10/LIPIcs.ECOOP.2024.10.pdf):
+  per-call-site precision, "the percentage of true ... call targets among those predicted".
+
+**What the consumers tolerate.**
+- Sadowski et al., CACM 2018 (https://storage.googleapis.com/gweb-research2023-media/pubtools/4365.pdf): "Produce
+  less than 10% effective false positives."
+- Christakis and Bird, ASE 2016 (https://mariachris.github.io/Pubs/ASE-2016.pdf): "Developers care much more about
+  too many false positives than about too many false negatives", a false-positive rate "no higher than 15–20%", and
+  "55% of developers preferred to get false positives when they are easy to sift through."
+- Liu et al., "Lost in the Middle" (https://arxiv.org/pdf/2307.03172), and Shi et al., ICML 2023
+  (https://arxiv.org/pdf/2302.00093): "the model performance is dramatically decreased when irrelevant information is
+  included."
+- SWE-agent, NeurIPS 2024 (https://arxiv.org/pdf/2405.15793): "Environment feedback should be informative but
+  concise"; with many search results agents "look through every match exhaustively", doing worse than without the
+  search tool.
+- Sun et al., "Tools Fail" (https://arxiv.org/pdf/2406.19228): models "overtrust tools"; naming the failure modes
+  helps, while "giving the raw confidence scores is not as helpful". These are not code tools, so applying it here is
+  an inference.
+
+**For the design (7.8.1).** One target when the compiler would pick one; a closed set listed whole and marked
+possible; a name match as an open site with a named reason and ranked candidates after every precise row; nothing
+for a computed name. clangd drops a long heuristic list; codectx's exact total with a ranked first page keeps the
+answer complete without flooding the reader. The proposed `dependent` reason follows Kythe's `lookup` node and
+clangd's treatment of dependent names.
