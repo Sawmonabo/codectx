@@ -163,7 +163,7 @@ func publishFacts(t *testing.T, u *unit, unitID string, facts []idBinding, repub
 		t.Fatal(err)
 	}
 	defer targets.Close()
-	externals, err := externalsOf(u.dir, bindings)
+	externals, unnamed, err := externalsOf(u.dir, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func publishFacts(t *testing.T, u *unit, unitID string, facts []idBinding, repub
 	}); err != nil {
 		t.Fatal(err)
 	}
-	out.rows = p.capabilities(records.Len())
+	out.rows = p.capabilities(records.Len(), unnamed)
 	return out
 }
 
@@ -568,5 +568,49 @@ func TestOccurrencesCarryTheNameRange(t *testing.T) {
 		if r := *n.Node.NameRange; r.Start.Byte != c.start || r.End.Byte != c.end {
 			t.Errorf("the occurrence of %s names bytes [%d,%d), want [%d,%d)", c.id, r.Start.Byte, r.End.Byte, c.start, c.end)
 		}
+	}
+}
+
+// TestFactsWithoutNodeAreCounted publishes a site bound to a declaration
+// the structural provider minted no node for, and an argument flow of a
+// bound site into a parameter with no node: neither publishes a relation,
+// the first site counts as open, and the calls and data_flows_to rows are
+// partial with facts_without_node 1 each; the other rows stay fresh.
+//
+// Mutation: drop the fact with no node, as before (the rows are fresh and
+// count nothing); publish it (a relation to an empty node); count it on
+// every row (the extends row is partial).
+func TestFactsWithoutNodeAreCounted(t *testing.T) {
+	param := Parameter{Endpoint: Endpoint{Kind: model.NodeVariable, Name: "rest"}, Index: 1}
+	b := table("b.c", "c", []Decl{declared("f", model.NodeFunction, "f", 0, param), declared("g", model.NodeFunction, "g", 20)}, nil)
+	arg := Argument{Range: span(12, 17)}
+	a := table("a.c", "c", []Decl{declared("main", model.NodeFunction, "main", 0)},
+		[]Site{callAt(0, "f", wire.ShapeBare, 10, arg), callAt(0, "g", wire.ShapeBare, 30)})
+	u := testUnit(t, a, b)
+	got := publishFacts(t, u, "u", []idBinding{
+		callFact("a.c", 0, "b.c", "f", model.DispatchExact),
+		{Kind: FactFlow, SiteFile: "a.c", Site: 0, Arg: 0, TargetFile: "b.c", Detail: DetailArgument},
+		{Kind: FactCall, SiteFile: "a.c", Site: 1, TargetFile: "b.c", Detail: DetailDirect, Dispatch: model.DispatchExact},
+	}, nil, nil)
+	if n := len(got.edges(model.RelDataFlowsTo)); n != 0 {
+		t.Errorf("the flow into a parameter with no node publishes %d relations, want none", n)
+	}
+	for _, r := range got.edges(model.RelCalls) {
+		if r.Relation.To == "" {
+			t.Errorf("a call publishes to an empty node")
+		}
+	}
+	calls := got.row(t, model.RelCalls)
+	if calls.Details["bound_sites"] != "1" || calls.Details["open_sites"] != "1" {
+		t.Errorf("the calls row is %v, want one bound site and the unnamed one open", calls.Details)
+	}
+	for _, c := range []model.RelationKind{model.RelCalls, model.RelDataFlowsTo} {
+		row := got.row(t, c)
+		if row.State != model.CapabilityPartial || row.Details["facts_without_node"] != "1" {
+			t.Errorf("the %s row is %s with %v, want partial with facts_without_node 1", c, row.State, row.Details)
+		}
+	}
+	if row := got.row(t, model.RelExtends); row.State != model.CapabilityFresh {
+		t.Errorf("the extends row is %s with %v, want fresh: no extends fact lost its node", row.State, row.Details)
 	}
 }

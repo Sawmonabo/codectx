@@ -97,6 +97,11 @@ type refresh struct {
 	// is built from. Only the members whose sites moved then re-run, and no
 	// other table is read.
 	layout bool
+	// external reports that the manifest fields moved and only those that
+	// say where a Go package outside the unit is read from (goExternalField):
+	// the layout holds when what those packages declare is what the
+	// predecessor read (sameGoSurface).
+	external bool
 	// changed collects, folded, the FileIDs whose facts are republished
 	// and those of the predecessor's members that are gone: every file the
 	// carry-over names replaced.
@@ -143,7 +148,8 @@ func newFileIDSort(dir string) (*pagination.ExternalSort[model.FileID], error) {
 // each member's stored MemberDigest, empty for a member without a table.
 func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manifestField) error {
 	rf.resolve = !slices.Equal(fields, rf.prev.fields)
-	rf.layout = !rf.resolve
+	rf.layout = slices.Equal(layoutFields(fields), layoutFields(rf.prev.fields))
+	rf.external = rf.resolve && rf.layout
 	next, stop := pull(rf.prev.records)
 	defer stop()
 	old, ok, err := next()
@@ -558,28 +564,13 @@ func (p *flowPass) close() {
 }
 
 // runFlow runs the inference over the nodes only selects (every node when
-// nil), from inputs (stored contributions by ordinal, sorted by entry; none
-// when nil), recording every key a flowNode looks up.
-func runFlow(ctx context.Context, u *unit, h *hierarchy, only *pagination.SortedRun[Ref],
-	inputs *pagination.SortedRun[contribution]) (*flowPass, error) {
+// nil), from in (what the nodes outside them stored; none when nil),
+// recording every key a flowNode looks up.
+func runFlow(ctx context.Context, u *unit, h *hierarchy, only *pagination.SortedRun[Ref], in flowInputs) (*flowPass, error) {
 	p := &flowPass{}
 	var err error
 	if p.traces, err = newSort0(u.dir, ordTraceCodec, keepFirst[ordTrace]); err != nil {
 		return nil, err
-	}
-	var in flowInputs
-	if inputs != nil {
-		in = func(wants *pagination.SortedRun[variable]) (*pagination.SortedRun[contribution], error) {
-			return collect(u.dir, contributionCodec, earliest, func(add func(contribution) error) error {
-				return join(inputs, wants, func(c contribution, v variable) int { return cmpVar(c.Entry, v) },
-					func(c contribution, read []variable) error {
-						if c.Entry.Kind != varReturn && len(read) == 0 {
-							return nil
-						}
-						return add(c)
-					})
-			})
-		}
 	}
 	if p.t, err = inferTypes(ctx, u, h, only, in, p.note); err != nil {
 		p.close()
@@ -589,37 +580,86 @@ func runFlow(ctx context.Context, u *unit, h *hierarchy, only *pagination.Sorted
 }
 
 // flowRefresh is one refresh of a flow-family unit: the predecessor's
-// contributions by contributing node, and the identities of this build's
-// members and declarations with their ordinals.
+// contributions by contributing node (a run, and its seek file), by entry
+// (a seek file) and named by this build's ordinals (a seek file), its reads
+// by entry (a seek file), the nodes
+// whose contributions name a member or declaration this build does not
+// have, and the identities of this build's members and declarations with
+// their ordinals. Each is written once per refresh; every iteration of the
+// region reads them by key range (flow_seek.go).
 type flowRefresh struct {
-	u      *unit
-	rf     *refresh
-	h      *hierarchy
-	byNode *pagination.SortedRun[idContribution]
-	idMap  *pagination.SortedRun[idRef]
+	u         *unit
+	rf        *refresh
+	h         *hierarchy
+	byNode    *pagination.SortedRun[idContribution]
+	nodeSeek  *seekFile[idContribution]
+	entrySeek *seekFile[idContribution]
+	ordSeek   *seekFile[contribution]
+	readSeek  *seekFile[idRead]
+	stale     *pagination.SortedRun[flowNode]
+	idMap     *pagination.SortedRun[idRef]
 }
 
 func newFlowRefresh(u *unit, rf *refresh, h *hierarchy) (*flowRefresh, error) {
 	fr := &flowRefresh{u: u, rf: rf, h: h}
+	ok := false
+	defer func() {
+		if !ok {
+			fr.close()
+		}
+	}()
 	var err error
 	if fr.byNode, err = resort(u.dir, rf.prev.flowContributions, contributionsByNode, contributionsByNode.cmp); err != nil {
 		return nil, err
 	}
-	if fr.idMap, err = idMapOf(u.dir, h.ids); err != nil {
-		fr.close()
+	if fr.nodeSeek, err = writeSeek(u.dir, fr.byNode, contributionsByNode); err != nil {
 		return nil, err
 	}
+	if fr.entrySeek, err = writeSeek(u.dir, rf.prev.flowContributions, idContributionCodec); err != nil {
+		return nil, err
+	}
+	if fr.readSeek, err = writeSeek(u.dir, rf.prev.flowReads, idReadCodec); err != nil {
+		return nil, err
+	}
+	if fr.idMap, err = idMapOf(u.dir, h.ids); err != nil {
+		return nil, err
+	}
+	stale, err := newSort0(u.dir, nodeCodec, keepFirst[flowNode])
+	if err != nil {
+		return nil, err
+	}
+	defer stale.Close()
+	ords, err := ordinalOf(u.dir, fr.idMap, rf.prev.flowContributions, stale.Add)
+	if err != nil {
+		return nil, err
+	}
+	fr.ordSeek, err = writeSeek(u.dir, ords, contributionCodec)
+	ords.Close()
+	if err != nil {
+		return nil, err
+	}
+	if fr.stale, err = stale.Sorted(); err != nil {
+		return nil, err
+	}
+	ok = true
 	return fr, nil
 }
 
 func (fr *flowRefresh) close() {
 	fr.byNode.Close()
+	fr.nodeSeek.close()
+	fr.entrySeek.close()
+	fr.ordSeek.close()
+	fr.readSeek.close()
+	fr.stale.Close()
 	fr.idMap.Close()
 }
 
 // seeds is every node of each member whose table moved, that is new with a
-// table, or that is gone, and every node that looked up one of keys (the
-// changed groups).
+// table, or that is gone, every node that looked up one of keys (the
+// changed groups), and every node a stored contribution of which names a
+// member or declaration this build does not have (stale): what it derived
+// names something that is gone, so it must run again.
 func (fr *flowRefresh) seeds(keys *pagination.ExternalSort[string]) (*pagination.SortedRun[flowNode], error) {
 	changed, err := keys.Sorted()
 	if err != nil {
@@ -637,6 +677,9 @@ func (fr *flowRefresh) seeds(keys *pagination.ExternalSort[string]) (*pagination
 			if err != nil {
 				return err
 			}
+		}
+		if err := fr.stale.Each(add); err != nil {
+			return err
 		}
 		return join(fr.rf.prev.flowTraces, changed, func(t nodeTrace, k string) int { return cmp.Compare(t.Key, k) },
 			func(t nodeTrace, hit []string) error {
@@ -681,23 +724,14 @@ func (fr *flowRefresh) rederive(ctx context.Context, z *pagination.SortedRun[flo
 			u.Close()
 			return fail(err)
 		}
-		iso, stale, err := fr.inputs(withU)
+		iso, release, err := fr.inputs(withU)
 		withU.Close()
 		if err != nil {
 			u.Close()
 			return fail(err)
 		}
-		if grown, err := fr.absorb(z, stale); err != nil || grown != nil {
-			u.Close()
-			iso.Close()
-			if err != nil {
-				return fail(err)
-			}
-			z = grown
-			continue
-		}
 		pass, err := fr.run(ctx, z, iso)
-		iso.Close()
+		release()
 		if err != nil {
 			u.Close()
 			return fail(err)
@@ -741,20 +775,12 @@ func (fr *flowRefresh) rederive(ctx context.Context, z *pagination.SortedRun[flo
 		}
 		if withheld {
 			pass.close()
-			all, stale, err := fr.inputs(z)
+			all, release, err := fr.inputs(z)
 			if err != nil {
 				return fail(err)
 			}
-			if grown, err := fr.absorb(z, stale); err != nil || grown != nil {
-				all.Close()
-				if err != nil {
-					return fail(err)
-				}
-				z = grown
-				continue
-			}
 			pass, err = fr.run(ctx, z, all)
-			all.Close()
+			release()
 			if err != nil {
 				return fail(err)
 			}
@@ -785,15 +811,14 @@ func (fr *flowRefresh) rederive(ctx context.Context, z *pagination.SortedRun[flo
 	}
 }
 
-// run runs the inference over the nodes of z this build has, from inputs.
-func (fr *flowRefresh) run(ctx context.Context, z *pagination.SortedRun[flowNode],
-	inputs *pagination.SortedRun[contribution]) (*flowPass, error) {
+// run runs the inference over the nodes of z this build has, from in.
+func (fr *flowRefresh) run(ctx context.Context, z *pagination.SortedRun[flowNode], in flowInputs) (*flowPass, error) {
 	only, err := fr.ordinals(z)
 	if err != nil {
 		return nil, err
 	}
 	defer only.Close()
-	return runFlow(ctx, fr.u, fr.h, only, inputs)
+	return runFlow(ctx, fr.u, fr.h, only, in)
 }
 
 var refCodec = codec[Ref]{put: func(w *wbuf, r Ref) { w.ref(r) }, get: func(r *rbuf) Ref { return r.ref() }, cmp: compareRef}
@@ -822,52 +847,6 @@ func (fr *flowRefresh) ordinals(z *pagination.SortedRun[flowNode]) (*pagination.
 	})
 }
 
-// inputs is every stored contribution of a flowNode excluded does not hold, by
-// this build's ordinals and sorted by entry, with the nodes whose stored
-// contributions name a member or declaration this build does not have
-// (stale), which must re-run.
-func (fr *flowRefresh) inputs(excluded *pagination.SortedRun[flowNode]) (*pagination.SortedRun[contribution],
-	*pagination.SortedRun[flowNode], error) {
-	dir := fr.u.dir
-	kept, err := collect(dir, idContributionCodec, nil, func(add func(idContribution) error) error {
-		return filterNodes(fr.byNode, excluded, func(c idContribution) flowNode { return c.From }, false, add)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	defer kept.Close()
-	stale, err := newSort0(dir, nodeCodec, keepFirst[flowNode])
-	if err != nil {
-		return nil, nil, err
-	}
-	defer stale.Close()
-	out, err := ordinalOf(dir, fr.idMap, kept, stale.Add)
-	if err != nil {
-		return nil, nil, err
-	}
-	gone, err := stale.Sorted()
-	if err != nil {
-		out.Close()
-		return nil, nil, err
-	}
-	return out, gone, nil
-}
-
-// absorb is z grown by stale when stale holds a flowNode (z and stale then
-// closed), else nil (stale closed).
-func (fr *flowRefresh) absorb(z, stale *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
-	defer stale.Close()
-	if stale.Len() == 0 {
-		return nil, nil
-	}
-	grown, err := unionNodes(fr.u.dir, z, stale)
-	if err != nil {
-		return nil, err
-	}
-	z.Close()
-	return grown, nil
-}
-
 // idEV is one value an entry holds, Early when some contribution sends it
 // in the first stratum.
 type idEV struct {
@@ -889,44 +868,51 @@ func earlyEV(a, b idEV) (idEV, error) {
 
 func evOf(c idContribution) idEV { return idEV{Entry: c.Entry, X: c.X, Early: !c.Late} }
 
-// values is what the stored contributions of the nodes set holds (inside)
-// or does not hold (!inside) put into each entry, with t's contributions
-// when t is set, by entry and value.
-func (fr *flowRefresh) values(set *pagination.SortedRun[flowNode], inside bool, t *types) (*pagination.SortedRun[idEV], error) {
-	return collect(fr.u.dir, idEVCodec, earlyEV, func(add func(idEV) error) error {
-		err := filterNodes(fr.byNode, set, func(c idContribution) flowNode { return c.From }, inside,
-			func(c idContribution) error { return add(evOf(c)) })
-		if err != nil || t == nil {
+// fresh yields t's contributions by identity.
+func (fr *flowRefresh) fresh(t *types, yield func(idContribution) error) error {
+	n := &namer{ids: fr.h.ids}
+	return t.contributions.Each(func(c contribution) error {
+		id, err := n.contribution(c)
+		if err != nil {
 			return err
 		}
-		n := &namer{ids: fr.h.ids}
-		return t.contributions.Each(func(c contribution) error {
-			id, err := n.contribution(c)
-			if err != nil {
-				return err
-			}
-			return add(evOf(id))
-		})
+		return yield(id)
 	})
 }
 
 // removals is every entry a value z contributed before is gone from, or
 // arrives at only in a later stratum, when z's values come from t (an
 // isolated run) and the stored contributions of the nodes neither z nor u
-// holds.
+// holds. Only the entries z contributed to before are read.
 func (fr *flowRefresh) removals(z, u *pagination.SortedRun[flowNode], t *types) (*pagination.SortedRun[idVar], error) {
 	dir := fr.u.dir
-	old, err := fr.values(z, true, nil)
+	old, err := collect(dir, idEVCodec, earlyEV, func(add func(idEV) error) error {
+		return fr.ofNodes(z, func(c idContribution) error { return add(evOf(c)) })
+	})
 	if err != nil {
 		return nil, err
 	}
 	defer old.Close()
+	entries, err := collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
+		return old.Each(func(v idEV) error { return add(v.Entry) })
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer entries.Close()
 	zu, err := unionNodes(dir, z, u)
 	if err != nil {
 		return nil, err
 	}
 	defer zu.Close()
-	now, err := fr.values(zu, false, t)
+	now, err := collect(dir, idEVCodec, earlyEV, func(add func(idEV) error) error {
+		err := fr.outside(zu, func(y func(idContribution) error) error { return fr.ofEntries(entries, y) },
+			func(c idContribution) error { return add(evOf(c)) })
+		if err != nil {
+			return err
+		}
+		return fr.fresh(t, func(c idContribution) error { return add(evOf(c)) })
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -943,17 +929,37 @@ func (fr *flowRefresh) removals(z, u *pagination.SortedRun[flowNode], t *types) 
 
 // changes is every entry whose values, each with its stratum, differ
 // between the stored contributions and those of the nodes z does not hold
-// with t's.
+// with t's. Only an entry z contributed to before or t contributes to can
+// differ, since every other node's contributions are the stored ones, so
+// only those entries are read.
 func (fr *flowRefresh) changes(z *pagination.SortedRun[flowNode], t *types) (*pagination.SortedRun[idVar], error) {
 	dir := fr.u.dir
+	entries, err := collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
+		entry := func(c idContribution) error { return add(c.Entry) }
+		if err := fr.ofNodes(z, entry); err != nil {
+			return err
+		}
+		return fr.fresh(t, entry)
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer entries.Close()
 	old, err := collect(dir, idEVCodec, earlyEV, func(add func(idEV) error) error {
-		return fr.rf.prev.flowContributions.Each(func(c idContribution) error { return add(evOf(c)) })
+		return fr.ofEntries(entries, func(c idContribution) error { return add(evOf(c)) })
 	})
 	if err != nil {
 		return nil, err
 	}
 	defer old.Close()
-	now, err := fr.values(z, false, t)
+	now, err := collect(dir, idEVCodec, earlyEV, func(add func(idEV) error) error {
+		err := fr.outside(z, func(y func(idContribution) error) error { return fr.ofEntries(entries, y) },
+			func(c idContribution) error { return add(evOf(c)) })
+		if err != nil {
+			return err
+		}
+		return fr.fresh(t, func(c idContribution) error { return add(evOf(c)) })
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1018,10 +1024,7 @@ func diffEV(a, b *pagination.SortedRun[idEV], changed func(idVar) error) error {
 // run read, which the isolated run did not hand it.
 func (fr *flowRefresh) withheld(u *pagination.SortedRun[flowNode], t *types) (bool, error) {
 	dir := fr.u.dir
-	sent, err := collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
-		return filterNodes(fr.byNode, u, func(c idContribution) flowNode { return c.From }, true,
-			func(c idContribution) error { return add(c.Entry) })
-	})
+	sent, err := entriesOf(dir, func(y func(idContribution) error) error { return fr.ofNodes(u, y) })
 	if err != nil {
 		return false, err
 	}
@@ -1051,17 +1054,13 @@ func (fr *flowRefresh) withheld(u *pagination.SortedRun[flowNode], t *types) (bo
 	return found, err
 }
 
-// readers yields the nodes the stored reads say read an entry of entries.
+// readers yields the nodes the stored reads say read an entry of entries,
+// one key range of the reads each.
 func (fr *flowRefresh) readers(entries *pagination.SortedRun[idVar], yield func(flowNode) error) error {
-	return join(entries, fr.rf.prev.flowReads, func(v idVar, r idRead) int { return cmpIDVar(v, r.Entry) },
-		func(_ idVar, rs []idRead) error {
-			for _, r := range rs {
-				if err := yield(r.Node); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+	return entries.Each(func(v idVar) error {
+		return fr.readSeek.span(func(r idRead) int { return cmpIDVar(r.Entry, v) },
+			func(r idRead) error { return yield(r.Node) })
+	})
 }
 
 // readersOutside is the readers of entries z does not hold.
@@ -1080,10 +1079,7 @@ func (fr *flowRefresh) readersOutside(entries *pagination.SortedRun[idVar], z *p
 // before.
 func (fr *flowRefresh) forward(frontier *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
 	dir := fr.u.dir
-	entries, err := collect(dir, idVarCodec, keepFirst[idVar], func(add func(idVar) error) error {
-		return filterNodes(fr.byNode, frontier, func(c idContribution) flowNode { return c.From }, true,
-			func(c idContribution) error { return add(c.Entry) })
-	})
+	entries, err := entriesOf(dir, func(y func(idContribution) error) error { return fr.ofNodes(frontier, y) })
 	if err != nil {
 		return nil, err
 	}

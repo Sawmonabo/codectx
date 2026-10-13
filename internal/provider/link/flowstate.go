@@ -302,6 +302,7 @@ type inputRec struct {
 	C     idContribution
 	Entry variable
 	X     value
+	From  Ref
 }
 
 var inputRecCodec = codec[inputRec]{
@@ -309,9 +310,10 @@ var inputRecCodec = codec[inputRec]{
 		idContributionCodec.put(w, x.C)
 		w.variable(x.Entry)
 		w.value(x.X)
+		w.ref(x.From)
 	},
 	get: func(r *rbuf) inputRec {
-		return inputRec{C: idContributionCodec.get(r), Entry: r.variable(), X: r.value()}
+		return inputRec{C: idContributionCodec.get(r), Entry: r.variable(), X: r.value(), From: r.ref()}
 	},
 }
 
@@ -325,6 +327,10 @@ func entryKey(x inputRec) (idRef, bool) {
 	return idRef{}, false
 }
 
+// fromKey is the identity an inputRec's contributing node's member is
+// translated by.
+func fromKey(x inputRec) (idRef, bool) { return idRef{File: x.C.From.File}, true }
+
 func valueKey(x inputRec) (idRef, bool) {
 	if x.C.X.Kind == valModule {
 		return idRef{}, false
@@ -333,9 +339,10 @@ func valueKey(x inputRec) (idRef, bool) {
 }
 
 // ordinalOf is run, stored contributions, named by this build's ordinals
-// (idMap, from idMapOf) and sorted by entry. A contribution naming a member
-// or declaration the build does not have is left out and its node told to
-// stale: what it derived names something that is gone.
+// (idMap, from idMapOf), each with its contributing node's (From), sorted
+// by entry. A contribution naming a member or declaration the build does
+// not have, or made by a node of a member it does not have, is left out and
+// its node told to stale: what it derived names something that is gone.
 func ordinalOf(dir string, idMap *pagination.SortedRun[idRef], run *pagination.SortedRun[idContribution],
 	stale func(flowNode) error) (*pagination.SortedRun[contribution], error) {
 	byKey := func(key func(inputRec) (idRef, bool)) codec[inputRec] {
@@ -370,12 +377,22 @@ func ordinalOf(dir string, idMap *pagination.SortedRun[idRef], run *pagination.S
 		return nil, err
 	}
 	defer second.Close()
-	return collect(dir, contributionCodec, earliest, func(add func(contribution) error) error {
+	third, err := collect(dir, byKey(fromKey), nil, func(add func(inputRec) error) error {
 		return translate(second, idMap, valueKey, func(x inputRec, r Ref) (inputRec, bool) {
 			x.X.Ref = r
 			return x, r.Index != fileNode
+		}, add, stale)
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer third.Close()
+	return collect(dir, contributionCodec, earliest, func(add func(contribution) error) error {
+		return translate(third, idMap, fromKey, func(x inputRec, r Ref) (inputRec, bool) {
+			x.From = Ref{File: r.File, Index: x.C.From.Index}
+			return x, r.Index == fileNode
 		}, func(x inputRec) error {
-			return add(contribution{Entry: x.Entry, X: x.X, Late: x.C.Late})
+			return add(contribution{Entry: x.Entry, X: x.X, From: x.From, Late: x.C.Late})
 		}, stale)
 	})
 }

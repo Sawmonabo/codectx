@@ -296,7 +296,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 		return failed, err
 	}
 	defer targets.Close()
-	externals, err := externalsOf(dir, bindings)
+	externals, unnamed, err := externalsOf(dir, bindings)
 	if err != nil {
 		return failed, err
 	}
@@ -329,7 +329,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 			return failed, err
 		}
 	}
-	rows, err := goExternalCoverage(pub.capabilities(records.Len()), res.h)
+	rows, err := goExternalCoverage(pub.capabilities(records.Len(), unnamed), res.h)
 	if err != nil {
 		return failed, err
 	}
@@ -363,7 +363,7 @@ func emptyOf[T any](s *pagination.ExternalSort[T], err error) (*pagination.Sorte
 // out counted, otherwise. An open site is a fact the rows count, never
 // coverage they lack. The `calls` row always carries the site counts, and
 // the `imports` row the import counts, summed over the members' records.
-func (p *publisher) capabilities(members int64) []model.CapabilityState {
+func (p *publisher) capabilities(members int64, unnamed map[model.RelationKind]int64) []model.CapabilityState {
 	c := p.cov
 	out := make([]model.CapabilityState, 0, len(Capabilities))
 	for _, capability := range Capabilities {
@@ -382,8 +382,12 @@ func (p *publisher) capabilities(members int64) []model.CapabilityState {
 			st = st.WithDetail("resolved_imports", strconv.FormatInt(c.Imports, 10)).
 				WithDetail("open_import_sites", strconv.FormatInt(c.OpenImports, 10))
 		}
-		if c.untabled > 0 || c.dropped > 0 {
+		lost := unnamed[model.RelationKind(capability)]
+		if c.untabled > 0 || c.dropped > 0 || lost > 0 {
 			st.State, st.DiagnosticCode = model.CapabilityPartial, model.CodeCoverageIncomplete
+			if lost > 0 {
+				st = st.WithDetail("facts_without_node", strconv.FormatInt(lost, 10))
+			}
 			if c.untabled > 0 {
 				st = st.WithDetail("members_without_table", strconv.FormatInt(c.untabled, 10))
 			}
