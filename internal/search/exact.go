@@ -8,6 +8,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -26,6 +27,8 @@ type exactReader interface {
 	DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	Nodes(ctx context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	NodesAmong(ctx context.Context, f sqlite.NodeFilter, ids []model.NodeID) ([]sqlite.StoredNode, error)
+	WalkTier(ctx context.Context, f sqlite.NodeFilter, from *sqlite.TierSpan, limit int,
+		yield func([]sqlite.StoredNode) (int, error)) error
 }
 
 var _ exactReader = (*sqlite.PinnedReader)(nil)
@@ -256,7 +259,7 @@ func (s tierSpan) covers(tier model.SearchTier) bool {
 // page is the READ size for one keyset step, not a bound on the answer: every
 // tier is walked to the end of its keyset and nothing is dropped.
 //
-// Nodes picks the precedence-winning row PER TIER's WHERE clause, so a node
+// WalkTier picks the precedence-winning row PER TIER's WHERE clause, so a node
 // whose units publish different qualified names can present one row at
 // exact_qualified_name and another at exact_name; the candidate in hand is one
 // row and cannot speak for the node's others. tierRule asks the earlier tiers
@@ -280,27 +283,12 @@ func exactCandidates(ctx context.Context, r exactReader, rule *tierRule, page in
 			continue
 		}
 		// One row per node: where several units publish the same node fact,
-		// Nodes applies the Section 9.4 read-time precedence order (verified
-		// source binding, then provider id, then unit key) inside the query
-		// itself. Nothing in this package re-ranks or re-folds provider ids.
-		nodeFilter := nodeFilterFor(tier, rule.query, rule.kinds)
-		after := model.NodeID("")
-		// The tier is walked on its keyset, not read once. Nodes applies its
-		// SQL LIMIT to node_facts rows and only then collapses the duplicate
-		// node_id rows the Section 9.4 precedence order leaves behind, so a
-		// full-bound read routinely returns fewer nodes than it asked for while
-		// the keyset still has rows: a deduped count can neither end the walk
-		// nor decide whether the tier had more. Only an EMPTY page ends it, and
-		// `after` advances strictly on every non-empty one, so it terminates.
-		for {
-			nodes, err := r.Nodes(ctx, nodeFilter, after, page)
-			if err != nil {
-				return err
-			}
-			if len(nodes) == 0 {
-				break
-			}
-			after = nodes[len(nodes)-1].Node.ID
+		// WalkTier applies the Section 9.4 read-time precedence order (verified
+		// source binding, then provider id, then unit key) inside its statement.
+		// Nothing in this package re-ranks or re-folds provider ids. The walk
+		// reads the tier once, in its index's order: every consumer of these
+		// candidates orders them itself (a heap of one page, or a sort).
+		err := r.WalkTier(ctx, nodeFilterFor(tier, rule.query, rule.kinds), nil, page, everyPage(func(nodes []sqlite.StoredNode) error {
 			ids = ids[:0]
 			for _, n := range nodes {
 				ids = append(ids, n.Node.ID)
@@ -321,9 +309,98 @@ func exactCandidates(ctx context.Context, r exactReader, rule *tierRule, page in
 					return err
 				}
 			}
+			return nil
+		}))
+		if err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// everyPage adapts a page handler that reads every page at the walk's own
+// bound to WalkTier's yield.
+func everyPage(handle func([]sqlite.StoredNode) error) func([]sqlite.StoredNode) (int, error) {
+	return func(nodes []sqlite.StoredNode) (int, error) { return 0, handle(nodes) }
+}
+
+// seekPageFloor is the smallest storage page a seek asks for after its first:
+// enough rows to close a span in one more statement in the usual case.
+const seekPageFloor = 16
+
+// errTierPageFull stops a seekTier walk once it holds what it wants.
+var errTierPageFull = errors.New("search: the tier read holds its hits")
+
+// seekTier answers the first `want` servable hits of an equality tier
+// (exact_qualified_name or exact_name) after `after` (nil: from the tier's
+// start), in served order, reading the tier from the position by seek: storage
+// returns its rows in the content order the hits are served in (path, start
+// byte, end byte; sqlite.TierSpan), so the read stops a little past `want`
+// hits instead of reading the tier. Rows that share a span are ordered here,
+// by the rest of the served order, once the span is read to its end: the read
+// goes past `want` until the span changes, and a position's own span is read
+// again and the hits up to the position dropped. tierRule decides each read
+// page's ownership together, as the walk does.
+//
+// It may answer more than `want` hits (the rest of the last span). On an error
+// it answers the spans it had read to their end, which are the tier's first
+// hits in served order, so a deadline can serve them.
+func seekTier(ctx context.Context, r exactReader, rule *tierRule, filter hitFilter, tier model.SearchTier,
+	after *exactEntry, want int) ([]exactEntry, error) {
+	var from *sqlite.TierSpan
+	if after != nil {
+		from = &sqlite.TierSpan{Path: after.Path, Start: nodeStartByte(after.Node), End: spanEnd(after.Node.Bytes)}
+	}
+	var out, group []exactEntry
+	var span sqlite.TierSpan
+	flush := func() {
+		slices.SortFunc(group, cmpExact)
+		out = append(out, group...)
+		group = group[:0]
+	}
+	ids := make([]model.NodeID, 0, model.MaxPageItems)
+	err := r.WalkTier(ctx, nodeFilterFor(tier, rule.query, rule.kinds), from, min(want+1, model.MaxPageItems),
+		func(nodes []sqlite.StoredNode) (int, error) {
+			ids = ids[:0]
+			for _, n := range nodes {
+				ids = append(ids, n.Node.ID)
+			}
+			owned, err := rule.ownedBefore(ctx, tier, ids)
+			if err != nil {
+				return 0, err
+			}
+			for _, n := range nodes {
+				p, err := rule.paths.path(ctx, n.Node.FileID)
+				if err != nil {
+					return 0, err
+				}
+				e := exactEntry{exactHit{Tier: tier, Path: p, Node: n}}
+				at := sqlite.TierSpan{Path: p, Start: nodeStartByte(n), End: spanEnd(n.Bytes)}
+				if at != span {
+					flush()
+					if len(out) >= want {
+						return 0, errTierPageFull
+					}
+					span = at
+				}
+				if owned[n.Node.ID] || !servableExact(e.exactHit, filter) || (after != nil && cmpExact(e, *after) <= 0) {
+					continue
+				}
+				group = append(group, e)
+			}
+			// The next storage page reads the hits still wanted and one more,
+			// which closes the last span unless it is wider; a narrower page
+			// than that would cost a statement per few rows.
+			return max(want-len(out)-len(group)+1, seekPageFloor), nil
+		})
+	if errors.Is(err, errTierPageFull) {
+		return out, nil
+	}
+	if err != nil {
+		return out, err
+	}
+	flush()
+	return out, nil
 }
 
 // tierRule decides the one exact tier that owns a node for one request: the
@@ -366,6 +443,9 @@ type tierRule struct {
 	// inFile holds the nodes with a visible row in pathFile, read on first
 	// use; nil until then.
 	inFile map[model.NodeID]struct{}
+	// listsAny remembers, per symbol tier, whether the tier lists any node
+	// for the query (tierListsAny), read on first use.
+	listsAny map[model.SearchTier]bool
 }
 
 // newSearchRule builds the rule of one search request: the query read as a
@@ -449,6 +529,14 @@ func (t *tierRule) ownChunk(ctx context.Context, tier model.SearchTier, ids []mo
 		// qualified-name tier is asked about all of them.
 		return t.markServed(ctx, model.TierExactQualifiedName, ids, owned)
 	}
+	if any, err := t.tierListsAny(ctx, model.TierQualifiedNamePrefix); err != nil || !any {
+		// No node has a prefix-tier row, so none has an exact qualified-name
+		// row either (the tiers nest): only the exact-name tier is left.
+		if err != nil || tier.Rank() <= model.TierExactName.Rank() {
+			return err
+		}
+		return t.markServed(ctx, model.TierExactName, ids, owned)
+	}
 	prefixed, err := t.r.NodesAmong(ctx, nodeFilterFor(model.TierQualifiedNamePrefix, t.query, t.kinds), ids)
 	if err != nil {
 		return err
@@ -483,11 +571,42 @@ func (t *tierRule) markServed(ctx context.Context, tier model.SearchTier, ids []
 	if len(ids) == 0 {
 		return nil
 	}
+	if any, err := t.tierListsAny(ctx, tier); err != nil || !any {
+		return err
+	}
 	rows, err := t.r.NodesAmong(ctx, nodeFilterFor(tier, t.query, t.kinds), ids)
 	if err != nil {
 		return err
 	}
 	return t.markRows(ctx, rows, owned)
+}
+
+// errTierListsOne stops a tier's existence probe at its first node.
+var errTierListsOne = errors.New("search: the tier lists a node")
+
+// tierListsAny reports whether a symbol tier lists any node for the query:
+// one probe of the tier's index per request, remembered. A tier that lists
+// none owns nothing, so the batched lookups that ask it about every page of
+// candidates are skipped; for most queries the exact qualified-name tier, and
+// often the prefix tier, list nothing.
+func (t *tierRule) tierListsAny(ctx context.Context, tier model.SearchTier) (bool, error) {
+	if any, ok := t.listsAny[tier]; ok {
+		return any, nil
+	}
+	any := false
+	err := t.r.WalkTier(ctx, nodeFilterFor(tier, t.query, t.kinds), nil, 1,
+		func([]sqlite.StoredNode) (int, error) {
+			any = true
+			return 0, errTierListsOne
+		})
+	if err != nil && !errors.Is(err, errTierListsOne) {
+		return false, err
+	}
+	if t.listsAny == nil {
+		t.listsAny = map[model.SearchTier]bool{}
+	}
+	t.listsAny[tier] = any
+	return any, nil
 }
 
 // markRows marks in owned the node of every row that serves.
