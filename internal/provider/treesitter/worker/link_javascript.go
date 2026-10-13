@@ -1456,13 +1456,15 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 		case kk.assignmentExpression:
 			k.cjsAssignment(n)
 			if name, fn, holder, member, ok := k.assignedFunction(n); ok {
-				k.export(out, name, fn, "", true, false)
+				owner, method := prototypeOwner(holder)
+				k.export(out, name, fn, owner, !method, false)
 				out.Exports[len(out.Exports)-1].Property = member
 				out.Exports[len(out.Exports)-1].Exported = member && commonJSExport(holder, true)
 			}
 		case x.pair:
 			if name, fn, holder, ok := k.pairFunction(n); ok {
-				k.export(out, name, fn, "", true, false)
+				owner, method := prototypeOwner(holder)
+				k.export(out, name, fn, owner, !method, false)
 				out.Exports[len(out.Exports)-1].Property = true
 				out.Exports[len(out.Exports)-1].Exported = commonJSExport(holder, false)
 			}
@@ -1783,6 +1785,9 @@ func (k *javaScriptLinker) receiverOf(m Node) string {
 				return string(textOf(k.src, name))
 			}
 		}
+		if owner, ok := prototypeOwner(k.objectPath(p)); ok {
+			return owner
+		}
 	case x.interfaceBody, x.objectType:
 		if d := p.Parent(); jsKindOf(d) == x.interfaceDeclaration || jsKindOf(d) == x.typeAliasDeclaration {
 			if name := d.ChildByFieldId(kk.fName); !name.IsNull() {
@@ -1791,6 +1796,18 @@ func (k *javaScriptLinker) receiverOf(m Node) string {
 		}
 	}
 	return ""
+}
+
+// prototypeOwner is the constructor function C a function stored under
+// holder is a method of, when holder is `C.prototype` (`C.prototype.m =
+// function () {}`, `C.prototype = { m() {} }`): the object `new C()` makes
+// inherits it, as an instance inherits a class's method.
+func prototypeOwner(holder string) (string, bool) {
+	owner, ok := strings.CutSuffix(holder, ".prototype")
+	if !ok || owner == "" || strings.ContainsAny(owner, ".[( ") {
+		return "", false
+	}
+	return owner, true
 }
 
 // params is the number of fn's parameters, a TypeScript `this` parameter

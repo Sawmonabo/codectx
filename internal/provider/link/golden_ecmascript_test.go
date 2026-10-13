@@ -1182,6 +1182,74 @@ function go() {
 		fails: "a class expression assigned to `module.exports`, or a method of the object assigned to it, is no export",
 	},
 	{
+		name:   "typescript-import-equals-require-constructed",
+		anchor: "TypeScript Handbook, Modules (`export =` assigns the module's value; `import x = require()` imports it)",
+		files: map[string]string{
+			"src/c.ts": `class C {
+  constructor() {} // @cc
+  hi() {} // @ch
+}
+export = C;
+`,
+			"src/main.ts": `import X = require("./c");
+
+export function go() {
+  new X().hi(); // @nx
+}
+`,
+		},
+		// Derived from the anchor: X is c.ts's whole value, the class C, so `new X()` runs C's constructor and
+		// the object it makes has C's method hi.
+		want: []string{
+			"nx X -> cc constructor exact",
+			"nx hi -> ch hi exact",
+		},
+		// Mutation: record no local name for an `import x = require()` clause -> X denotes no type of the unit:
+		// nx binds no constructor and hi binds an external X.hi.
+		fails: "a class `import x = require()` takes binds neither its constructor nor its method",
+	},
+	{
+		name: "constructor-function-prototype-methods",
+		anchor: "ECMA-262 (15th edition, 2024) §13.3.5.1.1 (EvaluateNew), §10.1.13 (OrdinaryCreateFromConstructor: the " +
+			"object's prototype is the constructor's `prototype`); TypeScript, JavaScript checking (constructor functions are " +
+			"classes; AssignmentDeclarationKind PrototypeProperty `C.prototype.m = …` and Prototype `C.prototype = { … }`)",
+		files: map[string]string{
+			"src/animal.js": `function Animal(name) { this.name = name; } // @an
+Animal.prototype.speak = function () {}; // @sp
+module.exports = Animal;
+`,
+			"src/dog.js": `function Dog() {} // @dg
+Dog.prototype = {
+  bark() {}, // @bk
+  sit: function () {}, // @st
+};
+module.exports = Dog;
+`,
+			"src/main.js": `const Animal = require("./animal");
+const Dog = require("./dog");
+
+function go() {
+  new Animal("a").speak(); // @na
+  new Dog().bark(); // @nb
+  new Dog().sit(); // @ns
+}
+`,
+		},
+		// Derived from the anchors: each module's whole value is a constructor function, which `new` runs, and
+		// the object it makes inherits what the function's prototype holds.
+		want: []string{
+			"na Animal -> an Animal exact",
+			"na speak -> sp speak exact",
+			"nb Dog -> dg Dog exact",
+			"nb bark -> bk bark exact",
+			"ns Dog -> dg Dog exact",
+			"ns sit -> st sit exact",
+		},
+		// Mutation: leave a function whose prototype holds methods a function (no class) -> every row is lost;
+		// give a prototype's function no receiver -> speak, bark and sit are unbound.
+		fails: "a constructor function and the methods its prototype holds are no class and no methods",
+	},
+	{
 		name:   "typescript-export-assignment",
 		anchor: "TypeScript Handbook, Modules (`export =` assigns the module's value; `import x = require()` imports it)",
 		files: map[string]string{
