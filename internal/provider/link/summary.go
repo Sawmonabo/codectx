@@ -110,6 +110,7 @@ const (
 // its list, because a binding names a declaration and a site by index into
 // the table: an inserted declaration changes the hashes of those after it.
 func (t *Table) Interface() ([]SummaryEntry, error) {
+	t = t.positionless()
 	var out []SummaryEntry
 	var err error
 	add := func(kind EntryKind, key string, pos int, v any) {
@@ -125,25 +126,11 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		Path, Language, Package string
 		Module                  Endpoint
 		Unions                  [][]wire.Type
-	}{t.Path, t.Language, t.Package, Endpoint{Node: t.Module.Node, Kind: t.Module.Kind, Name: t.Module.Name,
-		Qualified: t.Module.Qualified}, t.Unions})
+	}{t.Path, t.Language, t.Package, t.Module, t.Unions})
 	for i, imp := range t.Imports {
-		imp.Range = model.SourceRange{}
 		add(EntryImport, imp.Name+"\x00"+imp.Path, i, imp)
 	}
 	for i, d := range t.Decls {
-		d.Range, d.NameRange, d.CanonicalKey = model.SourceRange{}, nil, ""
-		if d.Return != nil {
-			ret := *d.Return
-			ret.Range, ret.NameRange, ret.CanonicalKey = model.SourceRange{}, nil, ""
-			d.Return = &ret
-		}
-		if len(d.Parameters) > 0 {
-			d.Parameters = slices.Clone(d.Parameters)
-			for j := range d.Parameters {
-				d.Parameters[j].Range, d.Parameters[j].NameRange, d.Parameters[j].CanonicalKey = model.SourceRange{}, nil, ""
-			}
-		}
 		add(EntryDeclaration, string(d.Node), i, d)
 	}
 	for i, st := range t.Supertypes {
@@ -156,7 +143,6 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		add(EntryExport, x.Name+"\x00"+x.From, i, x)
 	}
 	for i, v := range t.Values {
-		v.Range = model.SourceRange{}
 		if v.Field != "" {
 			add(EntryFieldWrite, v.Field, i, v)
 			continue
@@ -168,7 +154,7 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		add(EntryInferred, caller, i, v)
 	}
 	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings) > 0 {
-		add(EntryRouting, "", 0, r.summary())
+		add(EntryRouting, "", 0, r)
 	}
 	if err != nil {
 		return nil, err
@@ -203,23 +189,100 @@ func (t *Table) InterfaceDigest() (string, error) {
 // content change republishes. A body edit that adds, removes or rewrites a call changes it;
 // one that only moves code does not.
 func (t *Table) SitesDigest() (string, error) {
-	sites := make([]Site, len(t.Sites))
-	for i, s := range t.Sites {
-		s.Range, s.NameStart, s.NameEnd, s.Results, s.Into = model.SourceRange{}, 0, 0, nil, 0
-		if len(s.Arguments) > 0 {
-			s.Arguments = slices.Clone(s.Arguments)
-			for j := range s.Arguments {
-				s.Arguments[j].Range, s.Arguments[j].Reads = model.SourceRange{}, nil
-			}
+	t = t.positionless()
+	for i := range t.Sites {
+		s := &t.Sites[i]
+		s.Results, s.Into = nil, 0
+		for j := range s.Arguments {
+			s.Arguments[j].Reads = nil
 		}
-		sites[i] = s
 	}
 	b, err := json.Marshal(struct {
 		Sites  []Site
 		Unions [][]wire.Type
-	}{sites, t.Unions})
+	}{t.Sites, t.Unions})
 	if err != nil {
 		return "", err
 	}
 	return model.H(sitesDigestDomain, string(b)), nil
+}
+
+// positionless is a copy of t, sharing nothing t's summaries change, with
+// every byte position in it cleared: each range, name range and canonical
+// key (which spells a range) of its module, imports, declarations, their
+// returns and parameters, sites, their callee offsets, arguments, the
+// variables those read and the results they write, values, handlers,
+// dynamic imports and routing mounts, and each Java anonymous body's name
+// (javaAnonymous). Both summaries read t through it, so an edit that only
+// moves code changes neither, and a field added to the table with a range
+// in it is cleared here once for both.
+func (t *Table) positionless() *Table {
+	c := *t
+	anon := anonymousNames(t)
+	c.Module = c.Module.positionless()
+	c.Imports = slices.Clone(t.Imports)
+	for i := range c.Imports {
+		c.Imports[i].Range = model.SourceRange{}
+	}
+	c.Decls = slices.Clone(t.Decls)
+	for i := range c.Decls {
+		d := &c.Decls[i]
+		d.Endpoint = d.Endpoint.positionless()
+		if d.Return != nil {
+			r := d.Return.positionless()
+			d.Return = &r
+		}
+		d.Parameters = slices.Clone(d.Parameters)
+		for j := range d.Parameters {
+			d.Parameters[j].Endpoint = d.Parameters[j].Endpoint.positionless()
+		}
+	}
+	c.Supertypes = slices.Clone(t.Supertypes)
+	c.Sites = slices.Clone(t.Sites)
+	for i := range c.Sites {
+		s := &c.Sites[i]
+		s.Range, s.NameStart, s.NameEnd = model.SourceRange{}, 0, 0
+		s.Args = slices.Clone(s.Args)
+		s.Results = positionlessEndpoints(s.Results)
+		s.Arguments = slices.Clone(s.Arguments)
+		for j := range s.Arguments {
+			s.Arguments[j].Range = model.SourceRange{}
+			s.Arguments[j].Reads = positionlessEndpoints(s.Arguments[j].Reads)
+		}
+	}
+	c.Values = slices.Clone(t.Values)
+	for i := range c.Values {
+		c.Values[i].Range = model.SourceRange{}
+	}
+	c.Unions = slices.Clone(t.Unions)
+	for i := range c.Unions {
+		c.Unions[i] = slices.Clone(c.Unions[i])
+	}
+	c.Handlers = positionlessEndpoints(t.Handlers)
+	c.DynamicImports = slices.Clone(t.DynamicImports)
+	for i := range c.DynamicImports {
+		c.DynamicImports[i].Range = model.SourceRange{}
+	}
+	c.Routing = t.Routing.summary()
+	if anon.decl != nil || anon.rank != nil {
+		c.eachTypeName(func(s *string) { *s = anon.stable(*s) })
+	}
+	return &c
+}
+
+// positionless is e with its range, name range and canonical key cleared.
+func (e Endpoint) positionless() Endpoint {
+	e.Range, e.NameRange, e.CanonicalKey = model.SourceRange{}, nil, ""
+	return e
+}
+
+func positionlessEndpoints(es []Endpoint) []Endpoint {
+	if es == nil {
+		return nil
+	}
+	out := make([]Endpoint, len(es))
+	for i, e := range es {
+		out[i] = e.positionless()
+	}
+	return out
 }

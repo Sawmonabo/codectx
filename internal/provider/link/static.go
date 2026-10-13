@@ -527,7 +527,7 @@ func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun
 			if err := out.Add(u.Site); err != nil {
 				return err
 			}
-			return joinFlows(&site, u.Site, u.Site.TargetFile, params, false, u.Results, out)
+			return joinFlows(&site, u.Site, u.Site.TargetFile, params, false, u.Results, false, out)
 		}
 		for _, f := range functions {
 			b := u.Site
@@ -542,7 +542,7 @@ func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun
 					return err
 				}
 			}
-			if err := joinFlows(&site, u.Site, f.target.File, f.params, f.receiverFirst, u.Results, out); err != nil {
+			if err := joinFlows(&site, u.Site, f.target.File, f.params, f.receiverFirst, u.Results, f.ret != "", out); err != nil {
 				return err
 			}
 		}
@@ -552,10 +552,12 @@ func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun
 
 // joinFlows adds to out the FactFlow of each argument of site, the call
 // fact call completes by a join, into the parameter it binds among params,
-// the declared parameters of the bound target in file: one per pair whose
-// parameter has a node, with its FactSummary when the parameter returns and
+// the declared parameters of the bound target in file: one per pair, with
+// no target node when the parameter has none and the target has a body
+// (body, its return node), none when it has no body, with its
+// FactSummary when the parameter returns and
 // the site's value is written into a variable (results), as flowFacts does.
-func joinFlows(site *Site, call idBinding, file model.FileID, params []boundParam, receiverFirst, results bool,
+func joinFlows(site *Site, call idBinding, file model.FileID, params []boundParam, receiverFirst, results, body bool,
 	out *pagination.ExternalSort[idBinding]) error {
 	if len(site.Arguments) == 0 || len(params) == 0 {
 		return nil
@@ -567,7 +569,11 @@ func joinFlows(site *Site, call idBinding, file model.FileID, params []boundPara
 	}
 	return argumentFlows(site, info, receiverFirst, func(arg, pos int32) error {
 		p := byPos[pos]
-		if p.Node == "" {
+		// A parameter with no node of a callable with a body keeps the flow
+		// with no target node (idBinding.unnamed), which the capability rows
+		// count; a callable with no body (an abstract method) has nothing
+		// to flow into (identify).
+		if p.Node == "" && !body {
 			return nil
 		}
 		err := out.Add(idBinding{Kind: FactFlow, SiteFile: call.SiteFile, Site: call.Site, Arg: arg, TargetFile: file,
@@ -597,7 +603,22 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 			res.close()
 		}
 	}()
-	if rf.prev != nil && rf.layout && rf.prev.h != nil {
+	reuse := rf.prev != nil && rf.layout && rf.prev.h != nil
+	surface := ""
+	if reuse && rf.external {
+		var err error
+		if surface, reuse, err = sameGoSurface(ctx, u, rf.prev); err != nil {
+			return nil, err
+		}
+	}
+	if reuse && rf.external {
+		// The predecessor's hierarchy under this build's fields.
+		var err error
+		if res.groups, err = withFields(u.dir, rf.prev.groups, rf.prev.fields, fields, surface); err != nil {
+			return nil, err
+		}
+		res.h = rf.prev.h
+	} else if reuse {
 		res.h, res.groups = rf.prev.h, rf.prev.groups
 	} else {
 		var err error
@@ -647,18 +668,8 @@ func indexGroups(dir string, h *hierarchy, fields []manifestField) (*pagination.
 	if err := h.ids.groups(h.links, scopeLinks, groups); err != nil {
 		return nil, err
 	}
-	// fields is sorted by key; two manifests may give one key two values
-	// (two crates of one name), which are one group.
-	for i := 0; i < len(fields); {
-		j := i
-		var values []string
-		for ; j < len(fields) && fields[j].Key == fields[i].Key; j++ {
-			values = append(values, fields[j].Value)
-		}
-		if err := groups.Add(group{Key: manifestKey(fields[i].Key).hash(), Hash: model.H(groupDomain, values...)}); err != nil {
-			return nil, err
-		}
-		i = j
+	if err := fieldGroups(fields, h.goSurface, groups.Add); err != nil {
+		return nil, err
 	}
 	return groups.Sorted()
 }

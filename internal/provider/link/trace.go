@@ -738,9 +738,14 @@ func skipIndex(s stateReader) error {
 // is site, named by identity: its target's node read from the table (a
 // declaration's, the member's module's for a FactImport, the parameter's for
 // a FactFlow or a FactSummary, the callee's return node for a FactReturn). ok
-// is false for a FactFlow or FactSummary into a parameter the structural
-// provider minted no node for, and for a FactReturn from a callee with no
-// return node, which are not facts.
+// is false for a FactReturn from a callee with no return node, and for a
+// FactFlow or FactSummary into a callee with none (no analysed function is
+// its callable, so it has no body for a value to flow into), which are not
+// facts. Any other fact whose
+// target the structural provider minted no node for (a parameter whose key
+// did not fit, a C or C++ `...`, a declaration with no node) is kept with
+// its target's file and no node (idBinding.unnamed): it publishes nothing,
+// and the unit's capability rows count it (facts_without_node).
 func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, error) {
 	b, err := canonical(b)
 	if err != nil {
@@ -761,8 +766,17 @@ func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, err
 	default:
 		to, err = ids.node(b.Target)
 	}
-	if err != nil || to.Node == "" {
+	if err != nil || to.Node == "" && b.Kind == FactReturn {
 		return idBinding{}, false, err
+	}
+	if to.Node == "" && (b.Kind == FactFlow || b.Kind == FactSummary) {
+		// A callable no analysed function is the callable of (an abstract
+		// method, a prototype) has neither a return node nor parameter
+		// nodes: nothing flows into a body it does not have.
+		ret, err := ids.ret(b.Target)
+		if err != nil || ret.Node == "" {
+			return idBinding{}, false, err
+		}
 	}
 	id.TargetFile, id.Target = to.File, to.Node
 	return id, true, nil

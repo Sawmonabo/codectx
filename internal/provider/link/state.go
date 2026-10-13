@@ -254,6 +254,33 @@ type idBinding struct {
 	Reason     model.OpenSiteReason
 }
 
+// unnamed reports a fact whose target is a node of the unit the structural
+// provider minted no node for (identify): it names the target's file alone.
+func (b idBinding) unnamed() bool { return b.TargetFile != "" && b.Target == "" }
+
+// capabilityOf is the capability row that counts an unnamed fact of kind k:
+// the relation the fact would publish, and the calls row for the facts
+// about a callable target whose relation is no capability of their own (a
+// route's handler, a declared entry point, a launchable main, a macro a
+// declaration is written with).
+func capabilityOf(k Fact) model.RelationKind {
+	switch k {
+	case FactImport:
+		return model.RelImports
+	case FactFlow, FactSummary:
+		return model.RelDataFlowsTo
+	case FactExtends:
+		return model.RelExtends
+	case FactImplements:
+		return model.RelImplements
+	case FactOverrides:
+		return model.RelOverrides
+	case FactGenerates:
+		return model.RelGenerates
+	}
+	return model.RelCalls
+}
+
 // target is a node of the unit a fact targets, with its file.
 type target struct {
 	File model.FileID
@@ -363,23 +390,30 @@ func targetsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.So
 }
 
 // externalsOf is the external keys run's facts target, ascending and each
-// once.
-func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.SortedRun[string], error) {
+// once, and the count of its unnamed facts by the capability that counts
+// them (capabilityOf), in the same pass.
+func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.SortedRun[string], map[model.RelationKind]int64, error) {
 	s, err := newKeySort(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer s.Close()
+	unnamed := map[model.RelationKind]int64{}
 	err = run.Each(func(b idBinding) error {
+		if b.unnamed() {
+			unnamed[capabilityOf(b.Kind)]++
+			return nil
+		}
 		if b.External == "" || b.Kind == FactRoute || b.Kind == FactEntry {
 			return nil
 		}
 		return s.Add(b.External)
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return s.Sorted()
+	out, err := s.Sorted()
+	return out, unnamed, err
 }
 
 // counts are one member's share of the counts its unit's capability rows

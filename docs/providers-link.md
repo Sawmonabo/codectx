@@ -470,14 +470,21 @@ The delta build hands `Link` the predecessor's state whenever the predecessor st
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
 classifies every member against its record (unchanged, content changed with the same table, table changed, added,
 removed) and every manifest by the fields the linker reads (`manifestFields`, `refresh.go`): a Go module's `module`
-path; a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
+path, its `go` and `toolchain` lines, each `require` and `replace`, the governing `go.work` and its `use` and
+`replace` directives, the vendor directory's digest, and the host's Go root and the presence of each required module
+version in the module cache (`goManifestFields`, `manifest_go.go`); a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
 resolution and ownership read), each `package.json`'s `name`, `type`, `exports`, `imports`, `types`/`typings`,
 `module`, `main`, `tsconfig` and `workspaces`, and each workspace file's globs (`jsManifestFields`, `js_manifest.go`).
 A changed ECMAScript field rebuilds the hierarchy, whose specifier answers (`keyESSpec`) are diffed key by key like
 every other index group, so only the nodes whose imports now resolve differently re-run, in any file of the unit.
 Nothing else of a manifest is read: the Python and Java project files decide only which unit a file belongs to, so a
-change to them is a change of membership or nothing. A dependency version bump in `go.mod` changes no field, and a new nested `go.mod` moves its
-files out of one unit into another, a removal from one and an addition to the other.
+change to them is a change of membership or nothing. A change to the Go fields other than the `module` path, which only
+say where a package outside the unit is read from, keeps the layout (`goExternalField`, `go_refresh.go`): the packages outside the unit are read
+again over the stored hierarchy, and the hierarchy is kept when the digest of everything they declare
+(`goExternal.surface`, stored as a group) is the predecessor's, an early cutoff, so a dependency bump that changes no
+declaration the unit reads re-runs nothing and reads no table. One that does rebuilds the hierarchy, and only the
+members whose reads changed re-run. A new nested `go.mod` moves its files out of one unit into another, a removal
+from one and an addition to the other.
 
 What re-resolves:
 - **Nothing**, when no table, member or field moved: the predecessor's bindings stand.
@@ -487,7 +494,7 @@ What re-resolves:
   (`internal/provider/link/trace.go`). A refresh re-runs the members whose table moved, the added members, the members
   whose reverse-index keys name a changed index group or a changed manifest field, and then the members whose
   indirect sites read a signature whose set of taken functions changed. A file re-runs whole, since its sites read
-  each other's results. When the layout holds (the same members, the same fields, and every member whose table moved
+  each other's results. When the layout holds (the same members, the same fields but those saying where a Go package outside the unit is read from, and every member whose table moved
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
   and republishes; otherwise it rebuilds the hierarchy from every table and diffs it group by group.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
@@ -514,6 +521,12 @@ What re-resolves:
   parameter list re-runs the sites that read it, not their whole files. A cycle whose values reach the edited file
   only through other files re-runs the cycle's readers of what the edit removed, which is conservative and never
   unsound.
+
+  The stored contributions and reads are written once per refresh to block-indexed files, by node, by entry and by
+  this build's ordinals (`flow_seek.go`), and each iteration reads them by key range: the region's nodes, the entries
+  those touch, the variables its run reads and the callables' returns. A node whose stored contribution names a
+  member or declaration that is gone joins the first region. No iteration passes over the unit's stored state; only
+  carrying the untouched nodes' state into the new one does, once.
 
 What is republished (`refresh.diff`): the members whose bytes changed, the added members, the members whose bindings
 changed, and the members whose set of targeted declarations changed (a target's occurrence node is published in its
@@ -745,6 +758,14 @@ The provider publishes one row of each of its six capabilities per unit, at the 
   missing). The row then also counts the unit's `members`. A dropped entry is a worker entry the structural provider
   could not join to a declaration or a call reference of the file, or whose range did not fit the pinned bytes. None
   of these is fatal.
+- `partial`, with `coverage_incomplete`, on the row of each relation a fact was found for whose target the structural
+  provider minted no node (`facts_without_node`, counted by `externalsOf`, `state.go`): a call or hierarchy fact into
+  a declaration with no node, or an argument's flow into a parameter with none (one whose key did not fit, a C or C++
+  `...`) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
+  and no node (`idBinding.unnamed`), so a refresh carries and counts it like any other. A flow into a callable with
+  no body (an abstract method, a prototype) and a return flow from a callee with no return node are not facts. A fact
+  whose relation is no capability of its own (a route's handler, a declared entry point, a launchable `main`, a
+  visibility macro) is counted on the `calls` row.
 
 The `calls` row always carries the unit's site counts, which add up: `sites` = `bound_sites` + `open_sites` +
 `computed_sites` + `external_sites`. A bound site has at least one target of the unit; an external site reached only

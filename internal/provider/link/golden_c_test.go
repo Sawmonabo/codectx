@@ -216,6 +216,9 @@ int main() {
 			"c4 dot -> dv dot exact",
 			"c5 dot -> dv dot exact",
 		},
+		// The two arguments c5 passes to the ellipsis have no parameter node
+		// to flow into: counted, not dropped.
+		lost:  map[string]string{"data_flows_to": "2"},
 		fails: "an overload family not filtered by argument count, default arguments and ellipsis makes every put call ambiguous",
 	},
 	{

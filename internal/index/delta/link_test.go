@@ -123,6 +123,82 @@ func TestLinkRenameRepublishesOnlyTheSitesThatNamedIt(t *testing.T) {
 	s.wantRepublished("rename", renamed, []string{"a.go", "b.go"}, "c.go", "e.go")
 }
 
+// TestGoDependencyBumpRerunsWhatItRead bumps a requirement the unit imports,
+// whose module the module cache holds at every version, and compares each
+// refresh with a full build of the same tree (session.check). n.go imports
+// example.com/dep and a.go's T has the one method of dep.Namer, so T
+// implements it.
+//
+// A bump to a version that declares the same Namer moves a manifest field
+// and nothing the unit's resolution read: no table is read and nothing is
+// republished. A bump to a version whose Namer gains a method rebuilds the
+// hierarchy (T no longer satisfies it): a.go, whose T held the implements
+// and overrides facts, is republished and b.go, which reads nothing of dep,
+// is carried.
+//
+// Mutations that fail it: let every manifest field break the layout (the
+// identical bump reads every table); keep the predecessor's hierarchy on
+// any bump (the changed Namer's facts differ from the full build's);
+// digest the requirement's version instead of what its packages declare
+// (the identical bump reads every table).
+func TestGoDependencyBumpRerunsWhatItRead(t *testing.T) {
+	cache := t.TempDir()
+	namer := map[string]string{
+		"v1.0.0": "package dep\n\ntype Namer interface {\n\tName() string\n}\n",
+		"v1.1.0": "package dep\n\ntype Namer interface {\n\tName() string\n}\n",
+		"v1.2.0": "package dep\n\ntype Namer interface {\n\tName() string\n\tID() int\n}\n",
+	}
+	for v, src := range namer {
+		dir := filepath.Join(cache, "example.com", "dep@"+v)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for name, b := range map[string]string{"go.mod": "module example.com/dep\n\ngo 1.22\n", "dep.go": src} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(b), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Setenv("GOMODCACHE", cache)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	s := newSession(t)
+	files := map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.22\n\nrequire example.com/dep v1.0.0\n",
+		"a.go":   "package app\n\ntype T struct{}\n\nfunc (T) Name() string { return \"t\" }\n",
+		"n.go":   "package app\n\nimport \"example.com/dep\"\n\nfunc Use(n dep.Namer) string { return n.Name() }\n",
+		"b.go":   "package app\n\nfunc Other() int { return 1 }\n\nfunc Call() int { return Other() }\n",
+	}
+	s.check("base", s.advance(files))
+
+	files = edit{name: "same surface", replace: []sub{{"go.mod", "v1.0.0", "v1.1.0"}}}.apply(t, files)
+	same := s.only(s.advance(files))
+	s.check("bump keeping the surface", []linkBuild{same})
+	s.wantRepublished("bump keeping the surface", same, nil, "a.go", "b.go", "n.go")
+	for p, n := range same.reads {
+		if n != 0 {
+			t.Errorf("the bump keeping what dep declares read %s's table %d times, want none", p, n)
+		}
+	}
+
+	files = edit{name: "changed surface", replace: []sub{{"go.mod", "v1.1.0", "v1.2.0"}}}.apply(t, files)
+	moved := s.only(s.advance(files))
+	s.check("bump changing the surface", []linkBuild{moved})
+	s.wantRepublished("bump changing the surface", moved, []string{"a.go"}, "b.go")
+}
+
+// inputDigest is the member digest unit recorded for its input at path:
+// the digest of the link table it read in place of the file's bytes.
+func (s *session) inputDigest(unit model.UnitID, path string) []byte {
+	s.t.Helper()
+	var d []byte
+	if err := s.db.QueryRow(`SELECT digest FROM unit_inputs WHERE unit_id = ? AND lower(hex(file_id)) = ?`,
+		unitRowID(s.t, s.db, unit), string(model.NewFileID(s.f.repo, path))).Scan(&d); err != nil {
+		s.t.Fatalf("the input %s of unit %s: %v", path, unit, err)
+	}
+	return d
+}
+
 // nodeNamed is the node surrogate of the one node fact named name in unit.
 func (s *session) nodeNamed(unit model.UnitID, name string) int64 {
 	s.t.Helper()
@@ -367,4 +443,41 @@ func (s *session) flows(unit model.UnitID, name string) int {
 		s.t.Fatal(err)
 	}
 	return n
+}
+
+// TestRenamedParameterMovesFlowThroughAValue renames the parameter a of f to
+// b in callee.py, which caller.py takes as a value and calls through it as
+// h(b=x): the call binds f through the value (no name at the site names f),
+// and the keyword names no parameter before the rename and binds f's **kw,
+// then binds b after it. The refresh must equal the full build of the same
+// tree (session.check), and the caller's one argument flow moves from **kw
+// to b.
+//
+// Mutation: keep the stored flows of a site bound through a value when only
+// the callee's parameters moved (re-run nothing of caller.py) -> the
+// refreshed unit still flows into **kw and none into b.
+func TestRenamedParameterMovesFlowThroughAValue(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"callee.py": "def f(a=0, **kw):\n    return a\n",
+		"caller.py": "from callee import f\n\n\ndef g(x):\n    h = f\n    return h(b=x)\n",
+	}
+	base := s.only(s.advance(files))
+	s.check("base", []linkBuild{base})
+	if n := s.flows(base.unit, ""); n != 1 {
+		t.Fatalf("the base unit holds %d argument flows, want the one of h(b=x) into **kw", n)
+	}
+	if n := s.flows(base.unit, "b"); n != 0 {
+		t.Fatalf("the base unit holds %d argument flows into a parameter b, want none: f has no b", n)
+	}
+	files = edit{name: "parameter renamed", replace: []sub{{"callee.py", "def f(a=0, **kw):\n    return a\n",
+		"def f(b=0, **kw):\n    return b\n"}}}.apply(t, files)
+	renamed := s.only(s.advance(files))
+	s.check("parameter renamed", []linkBuild{renamed})
+	if n := s.flows(renamed.unit, "b"); n != 1 {
+		t.Errorf("the refreshed unit holds %d argument flows into the parameter b, want h(b=x)'s", n)
+	}
+	if renamed.sites["caller.py"] == 0 {
+		t.Errorf("the refresh resolved none of caller.py's sites, want h(b=x): the parameter it names moved")
+	}
 }
