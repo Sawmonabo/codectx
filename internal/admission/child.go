@@ -163,10 +163,12 @@ type ChildNeed struct {
 	// predicted written bytes, or at least the whole disk allocation when
 	// nothing is learned yet.
 	DiskBytes int64
-	// Learned reports a prediction from a class a run that succeeded was
-	// measured in; false is a first run, or a run of a class known only from
-	// failed runs, planned one at a time.
-	Learned bool
+	// Learned reports a memory prediction from a class a run that succeeded
+	// was measured in; false is a first run, or a run of a class known only
+	// from failed runs. DiskLearned reports a prediction of what the class
+	// writes. A run missing either is planned one at a time in its class.
+	Learned     bool
+	DiskLearned bool
 	ChildWork
 	memKey, diskKey childModelKey
 	mem, disk       *childModel
@@ -238,8 +240,8 @@ func (c *ChildNeeds) plan(ctx context.Context, l *Ledger, key ChildKey, w ChildW
 		if diskOK {
 			n.DiskBytes = saturatingAdd(w.StagedBytes, written)
 		}
-		if memOK && proven {
-			n.Learned = true
+		n.Learned, n.DiskLearned = memOK && proven, diskOK
+		if n.Learned && n.DiskLearned {
 			return n, nil
 		}
 		c.mu.Lock()
@@ -377,10 +379,10 @@ func (h *Holding) Need() (ChildNeed, bool) {
 // admitted on, once; a holding that is no external tool's records nothing.
 //
 // Written bytes above what the holding holds of disk raise it at once: they
-// are on the disk already. A run planned without a prediction from a class a
-// run that succeeded was measured in -- a first run, held at the whole
-// allocations -- is then lowered to what its class now predicts for its work,
-// in each dimension it was measured in: a language server lives on after its
+// are on the disk already. A run planned without a prediction in a dimension
+// -- a first run, held at the whole allocations, or a run of a class known
+// only from failed runs -- is then lowered in that dimension to what its class
+// now predicts for its work, once it is measured there: a language server lives on after its
 // measurement, and holding the allocations for its lifetime would keep every
 // other child from running beside it. A memory reading above the lowered
 // figure raises it again (FollowResidency).
@@ -395,10 +397,7 @@ func (h *Holding) Observe(got ChildMeasure) {
 			h.AdjustDisk(staged)
 		}
 	}
-	if n.Learned {
-		return
-	}
-	if got.MemoryRead {
+	if got.MemoryRead && !n.Learned {
 		n.mem.mu.Lock()
 		predicted, ok := n.mem.h.Predict(n.WorkBytes)
 		n.mem.mu.Unlock()
@@ -406,7 +405,7 @@ func (h *Holding) Observe(got ChildMeasure) {
 			h.Adjust(max(predicted, 1))
 		}
 	}
-	if got.WrittenRead {
+	if got.WrittenRead && !n.DiskLearned {
 		n.disk.mu.Lock()
 		written, ok := n.disk.h.Predict(n.WorkBytes)
 		n.disk.mu.Unlock()

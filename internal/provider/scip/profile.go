@@ -498,8 +498,8 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	// its run directory beside the copy, are learned for the next run of its
 	// class: from a failed run as lower bounds. The runner's own temporary
 	// disk account, which enforces the operator's resources.max_temp_bytes, is
-	// handed the planned disk, or only the staged copy for a run no
-	// measurement predicts yet. A run admitted on no ledger states no memory.
+	// handed the planned disk, or only the staged copy for a run whose class
+	// has no prediction of what it writes. A run admitted on no ledger states no memory.
 	held := admission.HoldingFrom(ctx)
 	cpu := &process.CPUProgress{}
 	var memory int64
@@ -509,7 +509,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	if held != nil {
 		memory, disk = held.Bytes(), held.DiskBytes()
 		if n, ok := held.Need(); ok {
-			if planned = n; !n.Learned {
+			if planned = n; !n.DiskLearned {
 				disk = n.StagedBytes
 			}
 		}

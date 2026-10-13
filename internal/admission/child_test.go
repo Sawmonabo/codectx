@@ -417,3 +417,41 @@ func TestWrittenBytesAreWhatTheToolAddedToItsDirectory(t *testing.T) {
 		t.Fatal("a directory that does not exist was read as written bytes")
 	}
 }
+
+// TestADimensionWithoutEvidenceIsLearnedOnItsOwn protects the two dimensions'
+// separate evidence: a class whose memory a successful run measured but whose
+// writes were never read still holds the whole disk allocation for its next
+// run, and that run's disk is lowered once its writes are read, although its
+// memory was already predicted.
+//
+// Mutation: skip the lowering for a run whose memory was learned -> the run
+// keeps the 40 GiB disk allocation, and every later run of the class with it.
+func TestADimensionWithoutEvidenceIsLearnedOnItsOwn(t *testing.T) {
+	l, err := NewLedger(64*childGiB, 40*childGiB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var needs ChildNeeds
+	key := ChildKey{Kind: ChildIndexer, Tool: "t", Fingerprint: "f"}
+	work := ChildWork{WorkBytes: 1500, StagedBytes: 10_000, Projects: 1}
+	teachWork := work
+	first, err := l.HoldChild(context.Background(), &needs, key, teachWork, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Observe(ChildMeasure{MemoryBytes: 150_000, MemoryRead: true, Succeeded: true})
+	first.Release()
+	h, err := l.HoldChild(context.Background(), &needs, key, work, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release()
+	if n, _ := h.Need(); !n.Learned || n.DiskLearned || h.DiskBytes() != 40*childGiB {
+		t.Fatalf("a class with no disk evidence planned disk %d (memory learned %v, disk learned %v); want the 40 GiB disk allocation",
+			h.DiskBytes(), n.Learned, n.DiskLearned)
+	}
+	h.Observe(ChildMeasure{MemoryBytes: 150_000, MemoryRead: true, WrittenBytes: 3000, WrittenRead: true, Succeeded: true})
+	if d := h.DiskBytes(); d < 13_000 || d > 14_000 {
+		t.Fatalf("after its writes were read the run holds %d bytes of disk, want its copy plus about the 3,000 it wrote", d)
+	}
+}

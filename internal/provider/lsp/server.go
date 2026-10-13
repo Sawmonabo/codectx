@@ -712,10 +712,11 @@ func isNotFound(err error) bool {
 
 // runnerDisk is the temporary disk a server states to the runner, whose
 // account enforces the operator's resources.max_temp_bytes: the holding's
-// planned figure, or only the snapshot copy it is rooted in for a server no
-// measurement predicts yet, whose holding stands at the whole disk allocation.
+// planned figure, or only the snapshot copy it is rooted in for a server whose
+// class has no prediction of what it writes, whose holding stands at the whole
+// disk allocation.
 func runnerDisk(held *admission.Holding) int64 {
-	if n, ok := held.Need(); ok && !n.Learned {
+	if n, ok := held.Need(); ok && !n.DiskLearned {
 		return n.StagedBytes
 	}
 	return held.DiskBytes()
