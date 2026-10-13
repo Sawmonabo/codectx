@@ -42,21 +42,11 @@ func TestConfiguredReasonPathsSurviveToTheStoredEntry(t *testing.T) {
 			len(kept), more, routes-1)
 	}
 
-	// budget: the projection onto the stored entry does not re-clip the count,
-	// and a route it DOES have to clip is counted rather than shortened in
-	// silence.
-	stored, clipped := evidencePaths(paths)
-	if len(stored) != routes || clipped != 0 {
-		t.Fatalf("evidencePaths stored %d routes and reported %d clipped, want all %d and none clipped: budgeting re-clipped what rank honoured",
-			len(stored), clipped, routes)
-	}
-	long := []model.RelationPath{{Relations: make([]model.RelationID, model.MaxRelationsPerPath+1)}}
-	for i := range long[0].Relations {
-		long[0].Relations[i] = model.RelationID(hexID(byte(i)))
-	}
-	if got, clipped := evidencePaths(long); len(got[0]) != model.MaxRelationsPerPath || clipped != 1 {
-		t.Fatalf("a route of %d relations stored %d relations and reported %d clipped; want %d stored and the cut reported once",
-			model.MaxRelationsPerPath+1, len(got[0]), clipped, model.MaxRelationsPerPath)
+	// budget: the projection onto the stored entry does not re-clip the count.
+	stored := evidencePaths(paths)
+	if len(stored) != routes {
+		t.Fatalf("evidencePaths stored %d routes, want all %d: budgeting re-clipped what rank honoured",
+			len(stored), routes)
 	}
 
 	// model: the persisted entry is not refused for carrying them.
@@ -68,6 +58,52 @@ func TestConfiguredReasonPathsSurviveToTheStoredEntry(t *testing.T) {
 	}
 	if err := entry.Validate(); err != nil {
 		t.Fatalf("ContextEntry.Validate refused %d evidence paths: %v", routes, err)
+	}
+}
+
+// TestARouteIsStoredWholeHoweverLong pins that no length is cut from a route
+// on its way to the stored entry: a route of model.MaxRelationsPerPath+1
+// relations (and one far past it) survives the ranking pass, the projection
+// onto the entry, the entry's validation and the route row's validation with
+// every relation in order.
+//
+// Mutations caught: the ranking pass dropping a route past the old bound;
+// evidencePaths clipping it; ContextEntry.Validate or ContextRoute.Validate
+// refusing it for its length.
+func TestARouteIsStoredWholeHoweverLong(t *testing.T) {
+	for _, n := range []int{model.MaxRelationsPerPath + 1, 4 * model.MaxRelationsPerPath} {
+		rels := make([]model.RelationID, n)
+		relations := make(map[model.RelationID]model.Relation, n)
+		for i := range rels {
+			rels[i] = model.RelationID(hexID(byte(i))[:62] + fmt.Sprintf("%02x", i/256))
+			relations[rels[i]] = model.Relation{ID: rels[i], Kind: model.RelCalls}
+		}
+		cand := candidate{Paths: []model.RelationPath{{Relations: rels}}}
+		routed, err := scoreRoutes(cand, relations, nil, config.Unlimited)
+		if err != nil {
+			t.Fatalf("scoreRoutes(%d relations): %v", n, err)
+		}
+		if len(routed.paths) != 1 || routed.morePaths != 0 {
+			t.Fatalf("the ranking pass kept %d of one %d-relation route and counted %d more; want it kept",
+				len(routed.paths), n, routed.morePaths)
+		}
+		stored := evidencePaths(routed.paths)
+		if len(stored) != 1 || len(stored[0]) != n {
+			t.Fatalf("a %d-relation route was stored with %d relations", n, len(stored[0]))
+		}
+		for i := range rels {
+			if stored[0][i] != rels[i] {
+				t.Fatalf("relation %d of the stored route is %s, want %s", i, stored[0][i], rels[i])
+			}
+		}
+		entry := model.ContextEntry{NodeID: model.NodeID(hexID(0xaa)), Requirement: model.RequirementOptional,
+			EvidencePaths: stored, RouteCount: 1}
+		if err := entry.Validate(); err != nil {
+			t.Fatalf("ContextEntry.Validate refused a %d-relation route: %v", n, err)
+		}
+		if err := (model.ContextRoute{Relations: stored[0]}).Validate(); err != nil {
+			t.Fatalf("ContextRoute.Validate refused a %d-relation route: %v", n, err)
+		}
 	}
 }
 
@@ -102,14 +138,14 @@ func TestBoundedExplanationsReachTheManifestNotices(t *testing.T) {
 	c := &Compiler{}
 	c.cfg.Resources.MaxPageItems = model.MaxPageItems + 500
 	notices := c.withPageNotice(planNotices(scopeResult{ReasonsDropped: dropped, ReasonsTruncated: truncated},
-		planParts{RelationsClipped: 3}, true))
-	if len(notices) != 4 {
+		planParts{}, true))
+	if len(notices) != 3 {
 		t.Fatalf("the compile disclosed %d notices %q, want one per cut", len(notices), notices)
 	}
 	joined := strings.Join(notices, "\n")
 	for _, want := range []string{
 		fmt.Sprintf("requested %d, effective %d", model.MaxPageItems+500, model.MaxPageItems),
-		"2 selection reason(s) past", "1 selection reason(s) were truncated", "3 evidence route(s)",
+		"2 selection reason(s) past", "1 selection reason(s) were truncated",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("the notices %q do not disclose %q", notices, want)

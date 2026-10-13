@@ -135,9 +135,11 @@ keys, not on pages.
   kept files, all keyed at or below (`recommended`, τ(next)), so it cannot reorder the head above the stop. It can push
   a witness past a slice, which the certificate catches. The order above the stop is fixed and drops are permanent,
   so the loop ends.
-- **A deadline inside the closure.** The closure runs as one unit: what it admits is staged and joins the plan when it
-  finishes. On a compile that answers continuations, a query deadline that lands inside it discards the stage and
-  ends the call before the closure, so the continuation runs the closure whole and the plan is the uninterrupted
+- **A deadline inside the closure.** The closure runs as one unit: what it admits goes straight into the plan's
+  spools under a mark, which costs nothing while it is set (a spill that straddles it writes two runs instead of
+  one, so each run lies on one side; the merge breaks ties by run order, so the answer is unchanged). On a compile
+  that answers continuations, a query deadline that lands inside it rolls the spools back to the mark, the way a
+  savepoint is rolled back [S13], and ends the call before the closure, so the continuation runs the closure whole and the plan is the uninterrupted
   compile's. A closure the deadline cuts on two legs in a row cannot fit one call; its second run narrows the scope
   on the cut, as a walk page that stalls twice does.
 
@@ -171,13 +173,12 @@ only graph expansion a plain-language task gets; an agent localization study los
   match outside the kept files, is still packed (mutations: skip the kept-file read; skip the closure walk).
 - **Weak roots.** A lexical root never makes an entry required.
 - **Budget monotonicity.** For a plan bound by its file budget, raising the budget never removes a function, and the
-  plan is the same for any page size. An entry is charged as the entries view serves it: its fixed fields, its reasons
-  and its route count spelled at its widest, never its routes. The routes are stored in full, one row each, and paged
-  by reference through the `routes` view in (entry, route) order; the entry's count says how many to read. So how many
-  routes reach an entry never changes whether its file fits (mutation: measure the entry with its routes). Reasons
-  stay in the charge: they are bounded per entry (`MaxReasonsPerEntry` reasons of `MaxReasonBytes` each) and come from
-  the route that wins the entry, so when the byte budget binds, a root that changes an entry's winning route can still
-  move its group's size by at most that bound, and the property is stated exactly for file-budget-bound plans.
+  plan is the same for any page size. An entry is charged as the entries view serves it: its fixed fields and its
+  reason and route counts spelled at their widest, never its reasons or its routes. Both are stored in full, one row
+  each, and paged by reference through the `reasons` and `routes` views in (entry, index) order; the entry's counts
+  say how many to read. So how an entry is explained never changes whether its file fits (mutations: measure the
+  entry with its routes, or with its reasons), and the property holds for byte-bound plans along the "more roots"
+  axis too.
 
 ## Consequences
 
@@ -199,7 +200,7 @@ only graph expansion a plain-language task gets; an agent localization study los
   and routes alone.
 - The compiler's policy version changes, so existing manifests are recompiled, not reused.
 - Explanations list routes from the matches read; the notice says so.
-- A plan's routes are a paged projection of their own, as the exclusions are. Agent context packers fill one budget
+- A plan's routes and reasons are paged projections of their own, as the exclusions are. Agent context packers fill one budget
   [S3], so the routes are not free; they are served by reference, as a protocol-level resource link serves a large
   result [S12], and an entry costs a fixed header for them. A per-token knapsack would fit more routes but its
   selections are not nested as the budget grows, which breaks the rank order this record rests on.
@@ -228,6 +229,7 @@ only graph expansion a plain-language task gets; an agent localization study los
   Localization*, arXiv:2503.09089v2, https://arxiv.org/html/2503.09089 — section 5.6, Table 6: with the fine-tuned
   Qwen-2.5-7B, removing the graph-traversal tool drops function-level Acc@10 from 71.53 to 66.06.
 - [S12] *Model Context Protocol, tools, 2025-06-18*, https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+- [S13] *SQLite, SAVEPOINT*, https://www.sqlite.org/lang_savepoint.html
   — a tool result may return a `resource_link`, a URI the client fetches or subscribes to for additional context.
 - [S9] Sun, Han, Yan, Yu, Wu, *PathSim: Meta Path-Based Top-K Similarity Search in Heterogeneous Information
   Networks*, VLDB 2011, https://www.vldb.org/pvldb/vol4/p992-sun.pdf — typed, directed relation paths; the inverse

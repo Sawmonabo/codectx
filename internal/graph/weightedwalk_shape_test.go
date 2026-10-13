@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -111,4 +112,54 @@ func TestAWeightedWalkNeverLeavesACalleeThroughAnotherSite(t *testing.T) {
 	if len(both["r2"]) == 0 {
 		t.Errorf("the walk from a1 and x does not reach r2; x reaches f's return outside any call")
 	}
+}
+
+// TestAWeightedWalkServesARouteHoweverLong: a call chain longer than
+// model.MaxRelationsPerPath is walked to its end, and the last node is served
+// with its whole route, every relation in order from the root.
+//
+// Mutation caught: route() serving no route past model.MaxRelationsPerPath
+// (the end of the chain then has no path).
+func TestAWeightedWalkServesARouteHoweverLong(t *testing.T) {
+	const chain = model.MaxRelationsPerPath + 6
+	nodes := map[string]model.NodeKind{}
+	var rels [][3]string
+	name := func(i int) string { return fmt.Sprintf("c%03d", i) }
+	for i := 0; i <= chain; i++ {
+		nodes[name(i)] = model.NodeFunction
+		if i > 0 {
+			rels = append(rels, [3]string{name(i - 1), string(model.RelCalls), name(i)})
+		}
+	}
+	f := dependenceFixture(nodes, rels)
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	res, err := e.WeightedWalk(context.Background(), WeightedWalkRequest{
+		Roots:     []WeightedRoot{{Node: fixtureNodeID(name(0)), Weight: 1_000_000, Named: true}},
+		Relations: []model.RelationKind{model.RelCalls}, Direction: model.DirectionOutgoing,
+		Rule: LabelRule{Scale: 1_000_000, Hop: map[model.RelationKind]int64{model.RelCalls: 1_000_000},
+			Decay: 1_000_000, Classes: 4, Policy: "test"}})
+	if err != nil {
+		t.Fatalf("weighted walk: %v", err)
+	}
+	for _, en := range res.Entries {
+		if en.NodeID != fixtureNodeID(name(chain)) {
+			continue
+		}
+		if len(en.Paths) != 1 || len(en.Paths[0].Relations) != chain {
+			t.Fatalf("the end of a %d-call chain is served with paths %+v, want its whole route", chain, en.Paths)
+		}
+		for i, id := range en.Paths[0].Relations {
+			if want := fixtureRelationID(i); id != want {
+				t.Fatalf("hop %d of the route is %s, want %s", i, id, want)
+			}
+		}
+		return
+	}
+	t.Fatalf("the end of a %d-call chain was not reached (%d entries, truncated %v)", chain, len(res.Entries),
+		res.Meta.Truncated)
 }

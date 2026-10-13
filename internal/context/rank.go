@@ -115,7 +115,6 @@ func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 		contribution int64
 	}
 	admitted := make([]scored, 0, len(cand.Paths))
-	dropped := int64(0)
 	for _, p := range cand.Paths {
 		contribution, kinds, ok, err := scorePath(p, relations, precision)
 		if err != nil {
@@ -131,22 +130,9 @@ func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 			out.kinds[k] = struct{}{}
 		}
 		out.admittedEdges = append(out.admittedEdges, p.Relations...)
-		// A route longer than the stored bound still scores and still counts,
-		// but it cannot be retained: a truncated explanation path would claim a
-		// route the manifest does not actually hold. It is counted as dropped
-		// here, because MorePaths below is otherwise only the tail of what WAS
-		// retainable and would understate the routes that exist.
-		if len(p.Relations) > model.MaxRelationsPerPath {
-			dropped++
-			continue
-		}
 		admitted = append(admitted, scored{path: p, contribution: contribution})
 	}
 	if len(admitted) == 0 {
-		// Every admissible route was too long to store. MorePaths still
-		// discloses that routes exist, so a bounded explanation never reads as
-		// an unexplained selection.
-		out.morePaths = dropped
 		return out, nil
 	}
 	sort.SliceStable(admitted, func(i, j int) bool {
@@ -168,7 +154,7 @@ func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 	for _, s := range admitted[:keep] {
 		out.paths = append(out.paths, s.path)
 	}
-	out.morePaths = dropped + int64(len(admitted)-keep)
+	out.morePaths = int64(len(admitted) - keep)
 	out.reasons = append(out.reasons, routeReason(cand, admitted[0].path, relations, out.best))
 	return out, nil
 }

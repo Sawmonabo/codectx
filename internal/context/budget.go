@@ -122,23 +122,24 @@ const sizeIterations = 8
 // the plan actually needs. Summing the entries of a file therefore yields the
 // file's real cost, which is what groupByFile and sliceOrdinals both do.
 //
-// The entry is charged as the entries view serves it: its fixed fields, its
-// reasons and a route count, never its routes. The routes are stored in full
-// and paged by reference (model.ContextRoute), so how many routes reach an
-// entry never changes whether its file fits (ADR-0016 decision 7). The count
-// is charged at its widest spelling (routeCountCharge), so the charge does not
-// move with the count either.
+// The entry is charged as the entries view serves it: its fixed fields and a
+// reason count and a route count, never its reasons or its routes. Both are
+// stored in full and paged by reference (model.ContextReason,
+// model.ContextRoute), so how an entry is explained never changes whether its
+// file fits (ADR-0016 decision 7). Each count is charged at its widest
+// spelling (explanationCountCharge), so the charge does not move with the
+// count either.
 //
 // Source bytes are never loaded; model.FileVersion.Size is the only input.
-func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEntry, int64, error) {
+func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEntry, error) {
 	var wire int64
 	if chargeSource {
 		var err error
 		if wire, err = wireEncodedBytes(c.SizeBytes); err != nil {
-			return model.ContextEntry{}, 0, err
+			return model.ContextEntry{}, err
 		}
 	}
-	paths, clipped := evidencePaths(c.Paths)
+	paths := evidencePaths(c.Paths)
 	e := model.ContextEntry{
 		Ordinal:       ordinal,
 		NodeID:        c.NodeID,
@@ -147,67 +148,52 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 		ScoreMicros:   c.ScoreMicros,
 		Reasons:       c.Reasons,
 		EvidencePaths: paths,
+		ReasonCount:   int64(len(c.Reasons)),
 		RouteCount:    int64(len(paths)),
 	}
 	for i := 0; i < sizeIterations; i++ {
 		served := e
-		served.EvidencePaths, served.RouteCount = nil, routeCountCharge
+		served.Reasons, served.EvidencePaths = nil, nil
+		served.ReasonCount, served.RouteCount = explanationCountCharge, explanationCountCharge
 		meta, err := serializedBytes(served)
 		if err != nil {
-			return model.ContextEntry{}, 0, err
+			return model.ContextEntry{}, err
 		}
 		bytes := wire + meta
 		tokens, err := estimateTokens(bytes)
 		if err != nil {
-			return model.ContextEntry{}, 0, err
+			return model.ContextEntry{}, err
 		}
 		if e.EstimatedBytes == bytes && e.EstimatedTokens == tokens {
-			return e, clipped, nil
+			return e, nil
 		}
 		e.EstimatedBytes, e.EstimatedTokens = bytes, tokens
 	}
-	return model.ContextEntry{}, 0, &model.Error{Code: model.CodeInternal,
+	return model.ContextEntry{}, &model.Error{Code: model.CodeInternal,
 		Message: "the measured entry size did not settle; it would be a guess rather than a measurement"}
 }
 
-// routeCountCharge is the route count an entry is measured with: the widest
-// count its JSON field can spell, so the charge is the same whatever the count.
-const routeCountCharge = math.MaxInt64
+// explanationCountCharge is the reason and route count an entry is measured
+// with: the widest count its JSON field can spell, so the charge is the same
+// whatever the count.
+const explanationCountCharge = math.MaxInt64
 
 // evidencePaths projects the ranking pass's explanation paths onto the stored
-// relation-id lists.
+// relation-id lists, each whole: a route is stored as long as the walk found
+// it, one row per route, and paged by reference, so no length is cut.
 //
-// The path COUNT is not re-bounded here. The ranking pass already applied
-// context.max_reason_paths_per_entry as written -- including a value above
-// model.MaxReasonPathsPerEntry, and including unlimited -- and
-// model.ContextEntry.Validate does not refuse the entry on that count, so a
-// second clip at 3 would discard routes the operator asked to keep after the
-// pass that honoured the setting had produced them. Only the per-path relation
-// list keeps model.MaxRelationsPerPath, which Validate does still enforce -- and
-// the cut is counted and returned, so a route the manifest stores shorter
-// than the route the walk found is disclosed as a manifest notice instead of
-// being a silent edit of the evidence.
-func evidencePaths(paths []model.RelationPath) ([][]model.RelationID, int64) {
-	if len(paths) == 0 {
-		return nil, 0
-	}
-	var clipped int64
-	out := make([][]model.RelationID, 0, len(paths))
+// The path COUNT is not re-bounded here either. The ranking pass already
+// applied context.max_reason_paths_per_entry as written -- including a value
+// above model.MaxReasonPathsPerEntry, and including unlimited.
+func evidencePaths(paths []model.RelationPath) [][]model.RelationID {
+	var out [][]model.RelationID
 	for _, p := range paths {
 		if len(p.Relations) == 0 {
 			continue
 		}
-		rel := p.Relations
-		if len(rel) > model.MaxRelationsPerPath {
-			rel = rel[:model.MaxRelationsPerPath]
-			clipped++
-		}
-		out = append(out, append([]model.RelationID(nil), rel...))
+		out = append(out, append([]model.RelationID(nil), p.Relations...))
 	}
-	if len(out) == 0 {
-		return nil, clipped
-	}
-	return out, clipped
+	return out
 }
 
 // checkManifestFits enforces the Section 15.4 stored-manifest byte cap over the
@@ -288,10 +274,9 @@ type planSink interface {
 // window) and the three totals the manifest reports. The entries and
 // exclusions themselves went to the sink.
 type planParts struct {
-	Slices           []model.ContextSlice
-	RelationsClipped int64
-	Entries          int64
-	Excluded         int64
+	Slices   []model.ContextSlice
+	Entries  int64
+	Excluded int64
 }
 
 // rankedStreams is what the ranking passes hand the budget passes: the ranked

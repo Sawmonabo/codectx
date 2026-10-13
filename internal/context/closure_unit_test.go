@@ -17,8 +17,9 @@ import (
 //
 // Mutation caught: the closure narrowing the scope on the deadline's cut
 // instead of halting (the first call answers halted=false with the scope
-// incomplete), or its admissions written straight to the sink (a rerun would
-// admit them twice).
+// incomplete), or a sink spool not rolled back to the mark the closure set
+// (a rerun would admit its records twice; that the roll back drops exactly
+// what came after the mark is pinned in pagination).
 func TestADeadlineInsideTheClosureEndsThePassBeforeIt(t *testing.T) {
 	fx := newContextFixture(t)
 	rels := []model.Relation{fx.edge(fx.Specs[0].path, model.RelCalls, fx.Specs[1].path)}
@@ -61,6 +62,14 @@ func TestADeadlineInsideTheClosureEndsThePassBeforeIt(t *testing.T) {
 		t.Fatalf("the cut closure left seq %d (want %d), scope complete %v, %d spooled and %d entity records; "+
 			"it must leave the sink as it found it", in.seq, seq, in.scope.ScopeComplete,
 			in.candSort.Len(), in.entitySort.Len())
+	}
+	// Every spool the closure writes was rolled back to its mark, and the
+	// mark with it: one left set would still hold what the closure added.
+	for i, m := range in.sinkMarks() {
+		if err := m.Mark(); err != nil {
+			t.Fatalf("sink spool %d was not rolled back to the closure's mark: %v", i, err)
+		}
+		m.Keep()
 	}
 	if !in.closureRetried || in.closure.reached == nil || in.closure.reachedRun != nil {
 		t.Fatal("the cut closure did not record its retry or reopen its reached set for the checkpoint")
