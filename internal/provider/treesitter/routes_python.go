@@ -16,23 +16,31 @@ var (
 	flaskVerbs = []string{"route", "get", "post", "put", "delete", "patch"}
 	// fastAPIVerbs are the FastAPI path operation decorators: `api_route`
 	// takes `methods=` and defaults to GET, the others name their own.
-	fastAPIVerbs = []string{"api_route", "get", "post", "put", "delete", "patch", "options", "head", "trace"}
+	fastAPIVerbs = []string{"api_route", "get", "post", "put", "delete", "patch", "options", "head", "trace", "websocket"}
 	// djangoRoutes are the Django urlconf functions that declare one route.
 	djangoRoutes = []string{"path", "re_path", "url"}
 )
 
-// python reads the file's Flask, FastAPI and Django routes.
+// python reads the file's Flask, FastAPI, Starlette and Django routes.
 func (s *routeScan) python() {
-	if s.frameworks[fwFlask] || s.frameworks[fwFastAPI] {
+	if s.frameworks[fwFlask] || s.frameworks[fwFastAPI] || s.frameworks[fwStarlette] {
 		s.pyObjects()
+		if s.frameworks[fwStarlette] {
+			s.starletteObjects()
+		}
 		s.pyMounts()
 		for i := range s.b.decls {
 			for _, d := range s.b.decls[i].Decorators {
 				s.pyDecorator(i, d)
 			}
 		}
+		s.calls(s.pyCallRoute)
+		if s.frameworks[fwStarlette] {
+			s.starletteRoutes()
+		}
 	}
 	if s.frameworks[fwDjango] {
+		s.djangoApplications()
 		s.django()
 	}
 }

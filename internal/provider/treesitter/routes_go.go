@@ -73,6 +73,7 @@ var goRouterTypes = map[string][]string{
 // echo engines, roots, and their groups.
 func (s *routeScan) goRoutes() {
 	defaultMux := &routeObj{fw: fwNetHTTP, root: true, ownKnown: true}
+	s.closures = map[wire.Span]*routeObj{}
 	s.goObjects()
 	s.methodsOn = map[int]int{}
 	s.calls(func(r *wire.Ref, site *wire.Site, i int) {
@@ -86,6 +87,7 @@ func (s *routeScan) goRoutes() {
 	})
 	s.calls(func(r *wire.Ref, site *wire.Site, _ int) { s.goMount(r, site, defaultMux) })
 	s.calls(func(r *wire.Ref, site *wire.Site, i int) { s.goRoute(r, site, i, defaultMux) })
+	s.calls(s.gorillaChain)
 }
 
 // goImported is the framework the import a qualifier names belongs to.
@@ -114,9 +116,16 @@ func (s *routeScan) goObjects() {
 			fw == fwEcho && r.Name == "New":
 			s.objs[i] = &routeObj{fw: fw, root: true, ownKnown: true}
 		case fw != "":
-		case r.Name == "Group":
-			// gin `r.Group("/v1", ...)`, echo `e.Group("/v1", ...)`.
-			if parent := s.objOf(site.Receiver); parent != nil && (parent.fw == fwGin || parent.fw == fwEcho) {
+		case r.Name == "Group" || r.Name == "Route":
+			// gin `r.Group("/v1", ...)`, echo `e.Group("/v1", ...)`; chi
+			// `r.Route("/v1", func(r chi.Router) {...})` and
+			// `r.Group(func(r chi.Router) {...})` (chiClosure).
+			parent := s.goRecvObj(r, site)
+			switch {
+			case parent == nil:
+			case parent.fw == fwChi:
+				s.chiClosure(r, site, i, parent)
+			case r.Name == "Group" && (parent.fw == fwGin || parent.fw == fwEcho):
 				s.objs[i] = s.child(parent, site)
 			}
 		case r.Name == "Subrouter":
@@ -159,7 +168,7 @@ func (s *routeScan) goMount(r *wire.Ref, site *wire.Site, defaultMux *routeObj) 
 		})
 		return
 	}
-	parent := s.objOf(site.Receiver)
+	parent := s.goRecvObj(r, site)
 	if fw == fwNetHTTP {
 		parent = defaultMux
 	} else if fw != "" {
@@ -194,7 +203,7 @@ func (s *routeScan) goRoute(r *wire.Ref, site *wire.Site, i int, defaultMux *rou
 	case fw != "":
 		return
 	default:
-		if obj = s.objOf(site.Receiver); obj != nil {
+		if obj = s.goRecvObj(r, site); obj != nil {
 			fw = obj.fw
 		} else if fw = s.goTypeFramework(site.Receiver); fw == "" {
 			candidates := map[string][]string{}

@@ -43,6 +43,7 @@ func (b *builder) routeTable() []endpointFact {
 	case "java":
 		s.spring()
 	}
+	s.applications()
 	return s.facts()
 }
 
@@ -69,7 +70,17 @@ type routeScan struct {
 	// methodsOn is, for gorilla/mux, the `.Methods(...)` site called on each
 	// site's result, by the worker index of the site it is called on.
 	methodsOn map[int]int
-	out       []routeFact
+	// closures are, for chi, the router each `Route` or `Group` closure
+	// receives as its parameter, by the closure's bytes.
+	closures map[wire.Span]*routeObj
+	// apps are the sites of application factories that build no object the
+	// table mounts routes on (Django's get_wsgi_application), by worker
+	// index; applications publishes them beside the root objects.
+	apps []int
+	// lists are the Starlette route lists this file passes as `routes=`,
+	// each with the object that holds its entries.
+	lists []routeList
+	out   []routeFact
 }
 
 // routeImport is one local name an import binds: the module path as written
@@ -191,13 +202,16 @@ const (
 	fwFlask   = "flask"
 	fwFastAPI = "fastapi"
 	fwDjango  = "django"
-	fwExpress = "express"
-	fwSpring  = "spring"
-	fwNetHTTP = "net/http"
-	fwGorilla = "gorilla/mux"
-	fwChi     = "chi"
-	fwGin     = "gin"
-	fwEcho    = "echo"
+	// fwStarlette is Starlette's route lists (Route, WebSocketRoute and
+	// Mount inside `routes=`), which a FastAPI application may hold too.
+	fwStarlette = "starlette"
+	fwExpress   = "express"
+	fwSpring    = "spring"
+	fwNetHTTP   = "net/http"
+	fwGorilla   = "gorilla/mux"
+	fwChi       = "chi"
+	fwGin       = "gin"
+	fwEcho      = "echo"
 )
 
 // frameworkOf is the framework an import path of language names, or empty.
@@ -209,7 +223,11 @@ func frameworkOf(language, path string) string {
 			return fwFlask
 		case path == "fastapi" || strings.HasPrefix(path, "fastapi."):
 			return fwFastAPI
-		case path == "django.urls" || path == "django.conf.urls":
+		case path == "starlette" || strings.HasPrefix(path, "starlette."):
+			return fwStarlette
+		case path == "django.urls" || path == "django.conf.urls" || path == "django.core.wsgi" || path == "django.core.asgi":
+			// The urlconf functions, and the application factories a
+			// deployment module serves (applications).
 			return fwDjango
 		}
 	case "javascript", "typescript", "tsx":
