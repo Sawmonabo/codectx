@@ -242,7 +242,9 @@ func TestResolvePythonGoldens(t *testing.T) {
 					{Caller: 3, Callee: "super", Shape: wire.ShapeBare},
 					{Caller: 3, Callee: "greet", Shape: wire.ShapeMember, Receiver: wire.Type{Kind: wire.TypeSuper, Name: "B"}},
 				}}},
-			want: []want{{Site: Ref{0, 1}, Target: Ref{0, 1}, Detail: DetailHierarchy, Dispatch: model.DispatchExact}},
+			// `super()` itself calls the builtin, outside the project.
+			want: []want{{Site: Ref{0, 1}, Target: Ref{0, 1}, Detail: DetailHierarchy, Dispatch: model.DispatchExact},
+				{Kind: FactExternalSite, Site: Ref{0, 0}, Detail: DetailDirect}},
 		},
 		{
 			// util.py: def helper(): return 1

@@ -364,6 +364,10 @@ func (k *pythonLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byt
 	}
 	for _, c := range k.others {
 		s := wire.Site{Name: wireSpan(spanOf(c.ChildByFieldId(kn.fFunction))), Shape: wire.ShapeIndirect}
+		if obj, attr, ok := k.getattrConstant(c.ChildByFieldId(kn.fFunction)); ok {
+			s = wire.Site{Name: wireSpan(spanOf(attr))}
+			k.attributeOf(obj, &s)
+		}
 		k.arguments(c, &s)
 		k.computed = append(k.computed, s)
 	}
@@ -879,21 +883,27 @@ func (k *pythonLinker) site(c Node) wire.Site {
 			s.Shape, s.Receiver = wire.ShapeIndirect, v.asValue()
 		}
 	} else {
-		obj := f.ChildByFieldId(kn.fObject)
-		v := k.receiver(obj)
-		switch v.o {
-		case pyModule:
-			s.Shape, s.Qualifier, s.Receiver = wire.ShapeStatic, string(textOf(k.src, obj)), v.t
-		case pyClass:
-			s.Shape, s.Receiver = wire.ShapeMember, v.asValue()
-		case pyFunction:
-			s.Shape = wire.ShapeMember
-		default:
-			s.Shape, s.Receiver = wire.ShapeMember, v.t
-		}
+		k.attributeOf(f.ChildByFieldId(kn.fObject), &s)
 	}
 	k.arguments(c, &s)
 	return s
+}
+
+// attributeOf sets the shape, qualifier and receiver of s, a call of an
+// attribute of obj: static through an imported module, member otherwise,
+// with obj's type.
+func (k *pythonLinker) attributeOf(obj Node, s *wire.Site) {
+	v := k.receiver(obj)
+	switch v.o {
+	case pyModule:
+		s.Shape, s.Qualifier, s.Receiver = wire.ShapeStatic, string(textOf(k.src, obj)), v.t
+	case pyClass:
+		s.Shape, s.Receiver = wire.ShapeMember, v.asValue()
+	case pyFunction:
+		s.Shape = wire.ShapeMember
+	default:
+		s.Shape, s.Receiver = wire.ShapeMember, v.t
+	}
 }
 
 // arguments fills s's Args and Arguments from call c's argument list, one
@@ -1518,6 +1528,79 @@ func (k *pythonLinker) override(d Node) bool {
 		}
 	}
 	return false
+}
+
+// getattrConstant reads f, a callee expression, as the builtin `getattr`'s
+// call `getattr(obj, "name")` or `getattr(obj, "name", default)`, whose
+// value is obj's attribute name (the Python Library Reference, "Built-in
+// Functions: getattr"): obj and the string's content, the attribute name a
+// call of it calls. Any other expression, a name that is not one identifier
+// in one plain string, a keyword or a splat argument, and a `getattr` the
+// file binds, are not.
+func (k *pythonLinker) getattrConstant(f Node) (obj, attr Node, ok bool) {
+	kn, x := k.k, k.x
+	f = pythonLowering.unparen(f)
+	if f.IsNull() || f.KindId() != kn.call {
+		return Node{}, Node{}, false
+	}
+	callee := f.ChildByFieldId(kn.fFunction)
+	if callee.IsNull() || callee.KindId() != kn.identifier || string(textOf(k.src, callee)) != "getattr" {
+		return Node{}, Node{}, false
+	}
+	if v, variable := k.nameOf(callee); v.o != pyUnknown || variable {
+		return Node{}, Node{}, false
+	}
+	args := f.ChildByFieldId(kn.fArguments)
+	if args.IsNull() || pythonLowering.isCallable(args) {
+		return Node{}, Node{}, false
+	}
+	var list []Node
+	for a := args.first(); !a.IsNull(); a = a.next() {
+		if !a.IsNamed() || a.IsExtra() {
+			continue
+		}
+		if a.KindId() == kn.keywordArgument || a.KindId() == kn.listSplat || a.KindId() == kn.dictionarySplat {
+			return Node{}, Node{}, false
+		}
+		list = append(list, a)
+	}
+	if len(list) != 2 && len(list) != 3 {
+		return Node{}, Node{}, false
+	}
+	name := pythonLowering.unparen(list[1])
+	if name.IsNull() || name.KindId() != kn.stringLit {
+		return Node{}, Node{}, false
+	}
+	var content Node
+	for c := name.first(); !c.IsNull(); c = c.next() {
+		switch {
+		case c.KindId() == x.interpolation:
+			return Node{}, Node{}, false
+		case c.KindId() == x.stringContent:
+			if !content.IsNull() {
+				return Node{}, Node{}, false
+			}
+			content = c
+		}
+	}
+	if content.IsNull() || !pyIdentifier(string(textOf(k.src, content))) || strings.ContainsAny(string(textOf(k.src, name)[:1]), "fFbB") {
+		return Node{}, Node{}, false
+	}
+	return list[0], content, true
+}
+
+// pyIdentifier reports an ASCII Python identifier; a name with any other
+// character, or an escape, is not read.
+func pyIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // dynamicImport records call c, a site, as a dynamic import when it imports

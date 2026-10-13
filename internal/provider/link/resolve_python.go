@@ -434,6 +434,9 @@ func (r *pySite) resolve(site Ref) error {
 		// f; f()`, spelled "a.b.f").
 		return lookupPython(site, tab.Path, s.Shape == wire.ShapeBare, s.Receiver.Name, s.Callee, true, r.look, r.hits)
 	}
+	if pythonBuiltinCall(tab, s) {
+		return r.emit(Binding{Kind: FactExternalSite, Site: site, Detail: DetailDirect})
+	}
 	switch s.Shape {
 	case wire.ShapeBare, wire.ShapeConstructor:
 		for _, c := range visibleCandidates(tab, s) {

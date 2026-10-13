@@ -144,7 +144,8 @@ site, named by the callee as written (`call` when there is none), of kind `metho
 - `computed`: the callee is an expression that names nothing (`obj[k]()`);
 - `receiver_untyped`: a member or static call whose receiver has no recovered type;
 - `value_untracked`: a call through a value whose flow the analysis does not follow;
-- `global_unbound`: a bare name or a construction no visible scope declares;
+- `global_unbound`: a bare name or a construction no visible scope declares (a Python builtin, the scope read last,
+  is declared: its call is external);
 - `reflective`: a call of a reflection API that runs a method or function chosen at run time (`reflective`,
   `internal/provider/link/reflective.go`: Java's `java.lang.reflect.Method.invoke`, `Constructor.newInstance`,
   `java.lang.Class.newInstance` and `java.lang.invoke.MethodHandle`'s `invoke`, `invokeExact` and
@@ -1008,7 +1009,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   `keyReexport` beside ECMAScript's, `addPythonReexports`); a name the module declares itself, binds by several
   imports, or several star imports supply, is not followed. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor
-  a function nested in another function. A call of a class is its construction and binds its `__init__` when
+  a function nested in another function. A bare name no scope of the file binds, that no import binds and that no
+  star import may supply, is the builtins module's when it names a builtin (Language Reference §4.2.2;
+  `python_builtins.go`): `print(x)`, `len(xs)`, `ValueError(m)` are calls outside the project, counted external,
+  never open `global_unbound`; any other such name stays `global_unbound`. `getattr(obj, "name")()`, with or without
+  a default, calls obj's attribute `name` as `obj.name()` does (the Library Reference's `getattr`: "`getattr(x,
+  'foobar')` is equivalent to `x.foobar`"): the worker sends it as a member site of that name located at the string,
+  so it binds by obj's types like any member call and, unbound, is an open `receiver_untyped` site with that name's
+  candidates; a name that is not one constant string (`getattr(obj, name)()`) names nothing, and the call is
+  `computed`. A call of a class is its construction and binds its `__init__` when
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance
   receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type of a receiver two
   disagreeing definitions reach included) binds, for each of its types, the first declaration of the method along

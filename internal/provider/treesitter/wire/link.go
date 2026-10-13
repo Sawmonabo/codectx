@@ -43,7 +43,11 @@ type Link struct {
 	// nothing (`obj[k]()`, `f()()`, `(a || b)()`), which no call reference
 	// names: each a Site whose Name is the callee expression, Shape
 	// ShapeIndirect, with its Arguments. Only the ECMAScript family and
-	// Python send them.
+	// Python send them. A Python callee `getattr(obj, "name")` (with or
+	// without a default) is the attribute the constant names: its Site's
+	// Name is the string's content, its Shape, Qualifier and Receiver those
+	// of a call of that attribute of obj (ShapeMember, or ShapeStatic
+	// through an imported module).
 	Computed []Site
 	// Conversions are the file's values converted to a declared named type
 	// whose own type the value's syntax spells (Conversion). Only Go sends
