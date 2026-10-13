@@ -282,7 +282,8 @@ func (b *builder) linkTable() error {
 				t.Dropped++
 				continue
 			}
-			lv := link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type)}
+			lv := link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type),
+				Target: typ(v.Target)}
 			if v.Declares != (wire.Span{}) {
 				// The value is the declaration its expression declares, or,
 				// when that joined nothing, no value to resolve by name.

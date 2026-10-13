@@ -174,22 +174,18 @@ func newTakenSort(dir string, order func(a, b taken) int) (*pagination.ExternalS
 	return s.WithFold(func(a, _ taken) (taken, error) { return a, nil }), nil
 }
 
-// sigUse is a site that joins the address-taken functions of Sig: an
-// indirect site, which binds each of them, exact, or a Java call of an
-// abstract method, which binds the method (Site's target and detail),
-// virtual, when there is none. Site is the call fact the join completes;
-// Args are the site's arguments (argumentShapes), and Params, for a Java
-// call of an abstract method, the method's parameters (encodeParams);
-// Results and Into report a site whose value is written into a variable or
-// returned (Site.Results, Site.Into).
+// sigUse is a site that joins the address-taken functions of Sig, the join
+// key (an indirect site's declared signature; for a Java call of an abstract
+// method, that signature alone or prefixed by javaTargetKey), and binds each
+// of them, exact. Site is the call fact the join completes; Args are the
+// site's arguments (argumentShapes); Results and Into report a site whose
+// value is written into a variable or returned (Site.Results, Site.Into).
 type sigUse struct {
-	Sig      string
-	Abstract bool
-	Site     idBinding
-	Args     string
-	Params   string
-	Results  bool
-	Into     bool
+	Sig     string
+	Site    idBinding
+	Args    string
+	Results bool
+	Into    bool
 }
 
 func encodeSigUse(u sigUse) ([]byte, error) {
@@ -198,31 +194,28 @@ func encodeSigUse(u sigUse) ([]byte, error) {
 		return nil, err
 	}
 	flag := byte(0)
-	if u.Abstract {
+	if u.Results {
 		flag |= 1
 	}
-	if u.Results {
+	if u.Into {
 		flag |= 2
 	}
-	if u.Into {
-		flag |= 4
-	}
-	out := appendString(appendString(appendString(nil, u.Sig), u.Args), u.Params)
+	out := appendString(appendString(nil, u.Sig), u.Args)
 	return append(out, append([]byte{flag}, b...)...), nil
 }
 
 func decodeSigUse(raw []byte) (sigUse, error) {
 	r := byteReader{b: raw}
-	u := sigUse{Sig: r.str(), Args: r.str(), Params: r.str()}
+	u := sigUse{Sig: r.str(), Args: r.str()}
 	flag := r.byte()
-	if r.err != nil || flag > 7 {
+	if r.err != nil || flag > 3 {
 		return sigUse{}, errors.New("a signature join is malformed")
 	}
 	site, err := decodeIDBinding(r.b)
 	if err != nil {
 		return sigUse{}, err
 	}
-	u.Abstract, u.Results, u.Into, u.Site = flag&1 != 0, flag&2 != 0, flag&4 != 0, site
+	u.Results, u.Into, u.Site = flag&1 != 0, flag&2 != 0, site
 	return u, nil
 }
 
@@ -366,25 +359,8 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 		// returned consuming call's summaries carry its nested calls' values
 		// (returns_nested.go).
 		results, into := len(ts.Results) > 0 || ts.Into > 0 && len(ts.Nested) > 0, ts.Into > 0 || ts.Feeds > 0
-		if e.Tag == 1 {
-			return s.uses.Add(sigUse{Sig: e.Key, Args: args, Results: results, Into: into, Site: idBinding{Kind: FactCall,
-				SiteFile: fv.ID, Site: e.Ref.Index, Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
-		}
-		method := refOf(e.Aux)
-		to, err := s.h.ids.node(method)
-		if err != nil {
-			return err
-		}
-		if _, ok := detailCode(e.Sig); !ok {
-			return internalErr("a resolver joined an abstract method with the unknown technique " + strconv.Quote(e.Sig))
-		}
-		params, err := s.boundParams(method)
-		if err != nil {
-			return err
-		}
-		return s.uses.Add(sigUse{Sig: e.Key, Abstract: true, Args: args, Params: encodeParams(params), Results: results,
-			Into: into, Site: idBinding{Kind: FactCall,
-				SiteFile: fv.ID, Site: e.Ref.Index, TargetFile: to.File, Target: to.Node, Detail: e.Sig, Dispatch: model.DispatchVirtual}})
+		return s.uses.Add(sigUse{Sig: e.Key, Args: args, Results: results, Into: into, Site: idBinding{Kind: FactCall,
+			SiteFile: fv.ID, Site: e.Ref.Index, Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
 	}
 	r := staticFile{h: s.h, ctx: s.ctx, file: file, t: t, fc: contextOf(file, t), emit: emit, returns: map[int32][]returned{}}
 	for i := range t.Sites {
@@ -409,6 +385,7 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 				if recv, ok := javaUnbound(v.Type.Name, e); ok {
 					sig, receiverFirst = receiverSignature(recv, sig), true
 				}
+				return r.javaTaken(v.Target, func(key string) error { return take(key+sig, e.Ref, receiverFirst) })
 			}
 			return take(sig, e.Ref, receiverFirst)
 		})
@@ -474,13 +451,12 @@ func (s *staticRun) members(run *pagination.SortedRun[model.FileID]) error {
 
 // crossProduct binds each signature use of uses (by signature) against the
 // address-taken functions of its signature in taken (by signature), into
-// out: an indirect site to every one of them, each a call fact of dispatch
-// exact (the function the value holds is the one that runs), a Java call of
-// an abstract method to that method, virtual, only when there is none. Each
-// bound target also gets the FactFlow of each of the site's arguments into
-// the parameter of the target it binds and its FactSummary (joinFlows), and
-// the FactReturn of a target with a return node when the site has a result,
-// as a direct call's target does. Only one signature's functions are held at a time.
+// out: the site to every one of them, each a call fact of dispatch exact (the
+// function the value holds is the one that runs). Each bound target also
+// gets the FactFlow of each of the site's arguments into the parameter of the
+// target it binds and its FactSummary (joinFlows), and the FactReturn of a
+// target with a return node when the site has a result, as a direct call's
+// target does. Only one signature's functions are held at a time.
 func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun[sigUse], out *pagination.ExternalSort[idBinding]) error {
 	next, stop := pull(taken)
 	defer stop()
@@ -522,19 +498,6 @@ func crossProduct(taken *pagination.SortedRun[taken], uses *pagination.SortedRun
 		site, err := shapedSite(u.Args)
 		if err != nil {
 			return err
-		}
-		if u.Abstract {
-			if len(functions) > 0 {
-				return nil
-			}
-			params, err := decodeParams(u.Params)
-			if err != nil {
-				return err
-			}
-			if err := out.Add(u.Site); err != nil {
-				return err
-			}
-			return joinFlows(&site, u.Site, u.Site.TargetFile, params, false, u.Results, false, out)
 		}
 		for _, f := range functions {
 			b := u.Site

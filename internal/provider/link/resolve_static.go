@@ -11,9 +11,10 @@ import (
 )
 
 // sigSink receives what a site joins the cross-product with (the signature
-// sink of staticRun.member): an indirect site (tag 1) or a Java call of an
-// abstract method (tag 2, the method's Ref in Aux, the detail in Sig), each
-// under its declared signature in Key and the site's Ref in Ref.
+// sink of staticRun.member): an indirect site, or a Java call of an abstract
+// method, under the join key in Key (an indirect site's declared signature,
+// or a Java functional interface's javaTargetKey) and the site's Ref in Ref,
+// Tag 1.
 type sigSink func(entry) error
 
 // staticFile resolves the sites and values of one member table.
@@ -76,22 +77,20 @@ func valueOut(yield func(entry) error) siteOut {
 // into the parameter it binds and its FactSummary (argumentFlows,
 // flowFacts), and a FactCall to an external method or a
 // FactExternalSite for a proven external call. An indirect site with a
-// declared function type also joins bySignature.
-//
-// A Java call of an abstract method binds that declaration only when no
-// method reference of its signature does (crossProduct): a call runs a
-// body, and the abstract method is the target only when no body is known.
+// declared function type, and a Java call of an abstract method, also join
+// bySignature (shape).
 func (r *staticFile) site(i int32, bySignature sigSink) error {
 	ref := Ref{File: r.file, Index: i}
 	s := &r.t.Sites[i]
-	joins := r.fc.language == "java" && s.Shape == wire.ShapeMember && s.Receiver.Kind == wire.TypeNamed
 	out := siteOut{
 		call: func(e entry, detail string, d model.Dispatch) error {
-			if joins && e.Flags&flagAbstract != 0 && e.Sig != "" {
-				return bySignature(entry{Key: e.Sig, Tag: 2, Ref: ref, Aux: refKey(e.Ref), Sig: detail})
-			}
 			if err := r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail, Dispatch: d}); err != nil {
 				return err
+			}
+			if r.fc.language == "java" && e.Flags&flagAbstract != 0 {
+				// A Java abstract method has no body: no argument flows into
+				// it and no value returns from it (joinFlows).
+				return nil
 			}
 			if err := returnFact(s, ref, e.Ref, r.emit); err != nil {
 				return err
@@ -130,6 +129,17 @@ func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
 	return argumentFlows(s, params, r.receiverFirst(s, e), func(arg, pos int32) error {
 		return flowFacts(s, ref, e.Ref, params, arg, pos, r.emit)
 	})
+}
+
+// javaTargetKey is the join-key prefix of the Java type at ref as a method
+// reference's target type: its node, which names it the same in every
+// member, and a NUL no signature holds.
+func (r *staticFile) javaTargetKey(ref Ref) (string, error) {
+	to, err := r.h.ids.node(ref)
+	if err != nil {
+		return "", err
+	}
+	return string(to.Node) + "\x00", nil
 }
 
 // javaUnbound reports a Java method reference written `T::m` that resolved
@@ -229,17 +239,27 @@ func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, out siteOut) e
 		if err != nil || bySignature == nil || r.fc.language != "java" || s.Receiver.Kind != wire.TypeNamed {
 			return err
 		}
-		// A Java call of an abstract method (a functional interface's, on a
-		// field or local holding a method reference) is an indirect call
-		// of that method's signature: it joins every method reference of
-		// that signature, as an indirect site joins the address-taken
-		// functions of its declared type.
+		// A Java call of an abstract method binds the method (member, above),
+		// virtual, and beside it every method reference that is an object of
+		// the receiver's type: one whose target type is that interface or a
+		// subinterface of it (javaTargetKey), and one whose target type the
+		// worker could not read, of the method's signature (JLS §15.13.3: a
+		// method reference evaluates to an instance of a class implementing
+		// its target type).
+		site := Ref{File: r.file, Index: i}
 		return r.h.typesIn(r.fc, s.Receiver.Name, func(typ entry) error {
+			key, err := r.javaTargetKey(typ.Ref)
+			if err != nil {
+				return err
+			}
 			return r.h.declared(typ.Ref, s.Callee, func(e entry) error {
 				if e.Flags&flagAbstract == 0 || e.Sig == "" {
 					return nil
 				}
-				return bySignature(entry{Key: e.Sig, Tag: 1, Ref: Ref{File: r.file, Index: i}})
+				if err := bySignature(entry{Key: key + e.Sig, Tag: 1, Ref: site}); err != nil {
+					return err
+				}
+				return bySignature(entry{Key: e.Sig, Tag: 1, Ref: site})
 			})
 		})
 	case wire.ShapeIndirect:

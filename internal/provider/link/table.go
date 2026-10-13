@@ -379,6 +379,9 @@ type Value struct {
 	// function the value's own expression declares (wire.Value.Declares):
 	// the value is that declaration, whatever its name.
 	Declares int32 `json:"declares,omitempty"`
+	// Target is, for a Java method reference, its target type where the
+	// context writes it (wire.Value.Target), unknown otherwise.
+	Target wire.Type `json:"target"`
 }
 
 // Encode is t's stored form.

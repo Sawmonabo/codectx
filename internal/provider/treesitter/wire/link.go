@@ -321,6 +321,13 @@ type Value struct {
 	// ECMAScript `a.b = () => …` or `{ k: () => … }`), that declaration's
 	// name token, which names the value exactly; empty for any other.
 	Declares Span
+	// Target is, for a Java method reference, its target type where the
+	// context writes it (JLS §15.13.2): the declared type of the variable
+	// or field it initializes or is assigned to, the cast it is the operand
+	// of, or the return type of the method that returns it. Unknown for
+	// every other value, and for a reference in any other context (an
+	// argument, a lambda's result).
+	Target Type
 }
 
 // Shape is a call site's callee expression form.
@@ -477,6 +484,7 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.str(v.Field)
 		e.typ(v.Type)
 		e.span(v.Declares)
+		e.typ(v.Target)
 	}
 	e.u32(uint32(len(l.Reexports)))
 	for _, r := range l.Reexports {
@@ -604,7 +612,7 @@ func DecodeLink(payload []byte) (Link, error) {
 	}
 	l.Values = make([]Value, 0, d.count(29))
 	for range cap(l.Values) {
-		l.Values = append(l.Values, Value{At: d.span(), Field: d.str(), Type: d.typ(), Declares: d.span()})
+		l.Values = append(l.Values, Value{At: d.span(), Field: d.str(), Type: d.typ(), Declares: d.span(), Target: d.typ()})
 	}
 	l.Reexports = make([]Reexport, 0, d.count(12))
 	for range cap(l.Reexports) {

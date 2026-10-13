@@ -178,7 +178,7 @@ func (k *javaLinker) visit(n Node) {
 	case id == j.methodReference:
 		field, _ := k.fieldOf(n)
 		k.out.Values = append(k.out.Values, wire.Value{At: javaSpan(n), Field: field,
-			Type: wire.Type{Kind: wire.TypeFunction, Name: k.compact(n)}})
+			Type: wire.Type{Kind: wire.TypeFunction, Name: k.compact(n)}, Target: k.referenceTarget(n)})
 		k.children(n)
 	case id == j.localVarDecl:
 		k.locals(n)
@@ -936,6 +936,72 @@ func (k *javaLinker) fieldOf(n Node) (string, wire.Type) {
 		}
 	}
 	return "", wire.Type{}
+}
+
+// referenceTarget is the target type of the method reference n where its
+// context writes one (JLS §15.13.2, §5.2, §5.5, §14.17): the declared type
+// of the local, field or constant it initializes, of the variable or `this`
+// field it is assigned to, the type of the cast it is the operand of, or
+// the return type of the method whose `return` gives it, through
+// parentheses and either arm of a conditional. Unknown in every other
+// context (an argument, whose target type is a parameter of the method
+// overload resolution picks; a lambda's result), and for an array type.
+func (k *javaLinker) referenceTarget(n Node) wire.Type {
+	j, x := k.k, k.x
+	for {
+		p := n.Parent()
+		if p.IsNull() {
+			return wire.Type{}
+		}
+		switch p.KindId() {
+		case j.parenthesized:
+			n = p
+			continue
+		case j.ternary:
+			if p.ChildByFieldId(j.fCondition) == n {
+				return wire.Type{}
+			}
+			n = p
+			continue
+		case j.variableDeclarator:
+			g := p.Parent()
+			if p.ChildByFieldId(j.fValue) != n || !x.child(p, x.fDimensions).IsNull() || g.IsNull() {
+				return wire.Type{}
+			}
+			switch g.KindId() {
+			case j.localVarDecl, j.fieldDecl, j.constantDecl:
+				return k.named(x.child(g, x.fType))
+			}
+		case j.assignment:
+			if p.ChildByFieldId(j.fRight) != n {
+				return wire.Type{}
+			}
+			switch left := p.ChildByFieldId(j.fLeft); left.KindId() {
+			case j.identifier:
+				return k.boundType(&k.vars, left)
+			case j.fieldAccess:
+				f := x.child(left, x.fField)
+				if obj := left.ChildByFieldId(j.fObject); !f.IsNull() && !obj.IsNull() && obj.KindId() == j.this {
+					return k.boundType(&k.fields, f)
+				}
+			}
+		case j.cast:
+			return k.named(x.child(p, x.fType))
+		case j.returnStmt:
+			for m := p.Parent(); !m.IsNull(); m = m.Parent() {
+				switch m.KindId() {
+				case j.lambda:
+					return wire.Type{}
+				case j.methodDecl:
+					if !x.child(m, x.fDimensions).IsNull() {
+						return wire.Type{}
+					}
+					return k.named(x.child(m, x.fType))
+				}
+			}
+		}
+		return wire.Type{}
+	}
 }
 
 // exprType is the static type of the expression n as the file declares it,
