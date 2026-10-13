@@ -1800,10 +1800,11 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 //   - Java: one of them is an instance method that is not Final (JLS
 //     §8.4.8): a static method hides and a final or private one, or one of a
 //     final class, has no override;
-//   - C and C++: one of them is not Final, and typ or a supertype declares
-//     the method virtual ([class.virtual]): a member overriding a virtual
-//     one is virtual without saying so, and a non-virtual call runs the
-//     member the static type names;
+//   - C and C++: one of them is neither Final nor static, and typ or a
+//     supertype declares the method virtual, or may (virtual): a member
+//     overriding a virtual one is virtual without saying so
+//     ([class.virtual]/2), and a non-virtual call runs the member the
+//     static type names;
 //   - Go: one of them is an interface's method; a concrete type's method is
 //     promoted into the types embedding it, never overridden;
 //   - ECMAScript: unless the method is private (`#p`), whose name is its
@@ -1823,7 +1824,7 @@ func (h *hierarchy) overridable(family string, typ Ref, method string, found []e
 	case "go":
 		return slices.ContainsFunc(found, func(e entry) bool { return e.Flags&flagAbstract != 0 }), nil
 	case "c":
-		if !slices.ContainsFunc(found, func(e entry) bool { return e.Flags&flagFinal == 0 }) {
+		if !slices.ContainsFunc(found, func(e entry) bool { return e.Flags&(flagFinal|flagStatic) == 0 }) {
 			return false, nil
 		}
 		return h.virtual(typ, method)
@@ -1833,10 +1834,15 @@ func (h *hierarchy) overridable(family string, typ Ref, method string, found []e
 	return true, nil
 }
 
-// virtual reports that typ or one of its supertypes declares method
-// virtual. Every declaration is read, the prototypes a definition replaces
-// included (methods drops them): only the declaration inside the class can
-// say `virtual`, never a definition outside it.
+// virtual reports that the C++ member method of typ is virtual or may be:
+// typ or one of its supertypes declares it virtual, or one of them has a
+// supertype outside the unit (keyExternalSuper), whose declaration of the
+// method the unit cannot read and which makes it virtual when virtual there
+// ([class.virtual]/2: a member with the name and parameter list of a base's
+// virtual member is virtual, whether or not it is so declared). Every
+// declaration is read, the prototypes a definition replaces included
+// (methods drops them): only the declaration inside the class can say
+// `virtual`, never a definition outside it.
 func (h *hierarchy) virtual(typ Ref, method string) (bool, error) {
 	seen := map[Ref]bool{typ: true}
 	queue := []Ref{typ}
@@ -1846,6 +1852,13 @@ func (h *hierarchy) virtual(typ Ref, method string) (bool, error) {
 		found := false
 		err := h.links.lookup(keyMethod+refKey(t)+method, func(e entry) error {
 			found = found || e.Flags&flagVirtual != 0
+			return nil
+		})
+		if err != nil || found {
+			return found, err
+		}
+		err = h.links.lookup(keyExternalSuper+refKey(t), func(entry) error {
+			found = true
 			return nil
 		})
 		if err != nil || found {
