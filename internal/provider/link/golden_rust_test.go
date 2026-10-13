@@ -308,6 +308,70 @@ pub fn run(foo: Foo) -> i32 {
 			"c4 h -> other other exact set=2",
 		},
 		fails: "a pointer result unwrapped before its own methods binds `make().clone()` to Foo::clone; a method path spelled without its self parameter misses the fn(&Foo, i32) sites",
+	}, {
+		name:   "trait-impl-items",
+		anchor: "The Rust Reference, \"Implementations\" (trait implementations: an impl defines its trait's items), \"Traits\" (blanket implementations over a type parameter), \"Paths\" (use declarations)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "traits"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `use std::fmt;
+
+pub trait Shape { // @tshape
+    fn area(&self) -> u32; // @sarea
+}
+
+pub trait Plot { // @tplot
+    fn area(&self) -> u32; // @parea
+}
+
+pub trait Describe { // @tdescribe
+    fn describe(&self); // @sdescribe
+}
+
+pub struct Square; // @tsquare
+
+impl Shape for Square {
+    fn area(&self) -> u32 { 1 } // @qsarea
+}
+
+impl Plot for Square {
+    fn area(&self) -> u32 { 2 } // @qparea
+}
+
+impl fmt::Display for Square {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { Ok(()) } // @qdisplay
+}
+
+impl fmt::Debug for Square {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { Ok(()) } // @qdebug
+}
+
+impl<T: fmt::Debug> Describe for T {
+    fn describe(&self) {} // @bdescribe
+}
+`,
+		},
+		want: []string{},
+		// Derived from the source and the anchor: each impl item implements its own trait's item alone,
+		// the fmt traits' outside the project as the use declaration names them.
+		facts: []string{
+			"tsquare Square implements tshape Shape",
+			"tsquare Square implements tplot Plot",
+			"tsquare Square implements external std::fmt::Display",
+			"tsquare Square implements external std::fmt::Debug",
+			"qsarea area overrides sarea area",
+			"qparea area overrides parea area",
+			"qdisplay fmt overrides external std::fmt::Display::fmt",
+			"qdebug fmt overrides external std::fmt::Debug::fmt",
+			"bdescribe describe overrides sdescribe describe",
+		},
+		// Mutation: read the implemented trait off the self type (its supertypes) -> qsarea also overrides
+		// parea and qparea sarea, the two fmt items override nothing (Square has two external traits),
+		// and the blanket impl's describe, whose self type is a parameter, overrides nothing.
+		fails: "an impl item published as implementing a same-named item of another trait of its self type; an external trait's item dropped when the type implements several; a blanket impl's item left without its trait's",
 	},
 }
 

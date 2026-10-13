@@ -2291,6 +2291,8 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 	case fc.family == "rust" && !d.Override:
 		// Only an item of a trait's impl implements the trait's.
 		return nil
+	case fc.family == "rust" && d.Trait != "":
+		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
 	case fc.family == "go" && d.Parent >= 0 && int(d.Parent) < len(t.Decls) && t.Decls[d.Parent].Kind == model.NodeInterface:
 		// An interface's method specification implements nothing.
 		return nil
