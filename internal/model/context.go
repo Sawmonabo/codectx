@@ -256,8 +256,12 @@ func (e ContextEntry) Validate() error {
 	if err := requireNonNegative("context_entry.estimated_tokens", e.EstimatedTokens); err != nil {
 		return err
 	}
-	if err := boundStrings("context_entry.reasons", e.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
-		return err
+	// No count bound on reasons: an entry's explanation is stored and paged
+	// by reference (ContextReason), and only its count rides on the entry.
+	for i, r := range e.Reasons {
+		if err := requireField(indexed("context_entry.reasons", i), r, MaxReasonBytes); err != nil {
+			return err
+		}
 	}
 	if err := requireNonNegative("context_entry.reason_count", e.ReasonCount); err != nil {
 		return err

@@ -25,7 +25,7 @@ func TestStreamRecordRoundTrip(t *testing.T) {
 		PathAtRank: "pkg/old.go", PathFinal: "pkg/new.go",
 		Requirement: model.RequirementSymbol, Origin: originLexical, Depth: 2,
 		StartByte: 512, ScoreMicros: 640_000, SizeBytes: 4096,
-		Status: model.FileStatus("modified"), Reasons: []string{"first", "second"},
+		Status:    model.FileStatus("modified"),
 		MorePaths: 9, Excluded: "no route", FileMissing: true,
 	})
 	roundTrip(t, "candRec zero", candRec{})
@@ -38,6 +38,8 @@ func TestStreamRecordRoundTrip(t *testing.T) {
 		Kind: model.RelCalls, Multiplier: 900_000,
 	})
 	roundTrip(t, "hopRec zero", hopRec{})
+	roundTrip(t, "reasonRec populated", reasonRec{Seq: 4, Phase: reasonBoosted, Idx: 3, Text: "a boost"})
+	roundTrip(t, "reasonRec zero", reasonRec{})
 	roundTrip(t, "relAttrRec populated", relAttrRec{RelationID: "rel-9", Kind: model.RelTests, Multiplier: 950_000})
 	roundTrip(t, "relAttrRec zero", relAttrRec{})
 	roundTrip(t, "pkgEdgeRec populated", pkgEdgeRec{Pkg: "internal/context", RelationID: "rel-3"})
@@ -332,7 +334,7 @@ func TestCompileSortsReleaseEveryRun(t *testing.T) {
 				NodeID:     model.NodeID("node-" + string(rune('a'+e%26)) + itoa(e)),
 				PathFinal:  "internal/context/" + itoa(e) + ".go",
 				PathAtRank: "internal/context/" + itoa(e) + ".go",
-				Reasons:    []string{"a reason long enough to make the run buffer mean something at all"},
+				Excluded:   "a reason long enough to make the run buffer mean something at all",
 			}
 			if err := sorter.Add(rec); err != nil {
 				t.Fatalf("Add: %v", err)
@@ -399,7 +401,7 @@ func TestCompileSortsReleaseEveryRun(t *testing.T) {
 				NodeID:     model.NodeID("node-" + string(rune('a'+e%26)) + itoa(e)),
 				PathFinal:  "internal/context/" + itoa(e) + ".go",
 				PathAtRank: "internal/context/" + itoa(e) + ".go",
-				Reasons:    []string{"a reason long enough to make the run buffer mean something at all"},
+				Excluded:   "a reason long enough to make the run buffer mean something at all",
 			}
 			if err := resorter.Add(rec); err != nil {
 				t.Fatalf("Add: %v", err)

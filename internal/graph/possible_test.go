@@ -291,6 +291,10 @@ func TestOpenImportSiteListsTheFilesItMayImport(t *testing.T) {
 // page, nearest first, and the pages after it list every other candidate
 // exactly once.
 //
+// The pages are the widest a request may ask for (model.MaxPageItems): a page
+// size with a continuation is the lossless form ADR-0001 keeps (row A), so
+// the list is read through fifteen of them.
+//
 // Mutation caught: a fixed candidate cap (the total or the pages would stop
 // short of 3000).
 func TestCandidatesOfANameWithThousandsOfDefinitions(t *testing.T) {
@@ -312,7 +316,7 @@ func TestCandidatesOfANameWithThousandsOfDefinitions(t *testing.T) {
 	cursor := ""
 	for page := 0; ; page++ {
 		got, err := Candidates(context.Background(), r, model.CandidateRequest{Site: f.id(t, "site"),
-			Page: model.PageRequest{Limit: 250, Cursor: cursor}})
+			Page: model.PageRequest{Limit: model.MaxPageItems, Cursor: cursor}})
 		if err != nil {
 			t.Fatalf("candidates page %d: %v", page, err)
 		}
@@ -320,7 +324,7 @@ func TestCandidatesOfANameWithThousandsOfDefinitions(t *testing.T) {
 			t.Fatalf("candidates total = %d, want %d exactly", got.Total, n)
 		}
 		if page == 0 {
-			if len(got.Candidates) != 250 || got.Candidates[0].NodeID != f.id(t, "handle_here") ||
+			if len(got.Candidates) != model.MaxPageItems || got.Candidates[0].NodeID != f.id(t, "handle_here") ||
 				got.Candidates[0].Closeness != model.ClosenessSameFile {
 				t.Fatalf("first page starts %+v, want the same-file declaration first", got.Candidates[:1])
 			}

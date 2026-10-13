@@ -54,8 +54,9 @@ import (
 // fill the whole run buffer alone. Routes therefore travel as their own sorted
 // streams (pathRec, hopRec) keyed by Seq, and P-D rebuilds one candidate's
 // model.RelationPath values from the contiguous run of hops that carries its
-// Seq. Reasons stay inline: model.MaxReasonsPerEntry x model.MaxReasonBytes is
-// a genuine constant bound the model itself validates.
+// Seq. Reasons travel the same way, as their own stream (reasonRec) keyed by
+// Seq: an entry keeps every reason it was given, so a record's reason list has
+// no count a record may assume either, and nothing before P-I reads them.
 //
 // Seq is the ingest order -- the arrival order that reproduces today's
 // SliceStable -- and Index is the position P-G assigns in the ranked order,
@@ -92,7 +93,6 @@ type candRec struct {
 	ScoreMicros int64             `json:"sc,omitempty"`
 	SizeBytes   int64             `json:"sz,omitempty"`
 	Status      model.FileStatus  `json:"st,omitempty"`
-	Reasons     []string          `json:"rs,omitempty"`
 	MorePaths   int64             `json:"mp,omitempty"`
 	Excluded    string            `json:"x,omitempty"`
 
@@ -144,6 +144,24 @@ type hopRec struct {
 	Kind       model.RelationKind `json:"k,omitempty"`
 	Multiplier int64              `json:"m,omitempty"`
 }
+
+// reasonRec is one reason of one candidate. Phase is the pass that gave it
+// (reasonAdmitted, reasonRouted, reasonBoosted) and Idx its place among that
+// pass's reasons, so (Seq, Phase, Idx) is the order the whole-set pipeline
+// appends them in, and P-I applies appendReason's rules over that order.
+type reasonRec struct {
+	Seq   int64  `json:"q"`
+	Phase int8   `json:"ph,omitempty"`
+	Idx   int32  `json:"x,omitempty"`
+	Text  string `json:"t"`
+}
+
+// The passes that give a candidate reasons, in the order they are appended.
+const (
+	reasonAdmitted int8 = iota
+	reasonRouted
+	reasonBoosted
+)
 
 // relAttrRec is one relation's resolved attributes, the streaming form of the
 // two maps ranking holds today: relationsOnPaths' `out map[RelationID]Relation`
@@ -236,7 +254,7 @@ func candRecOf(c candidate, seq int64) candRec {
 		PathAtRank: c.Path, PathFinal: c.Path,
 		Requirement: c.Requirement, Origin: c.Origin, Depth: c.Depth,
 		StartByte: c.StartByte, ScoreMicros: c.ScoreMicros, SizeBytes: c.SizeBytes,
-		Status: c.Status, Reasons: c.Reasons, MorePaths: c.MorePaths, Excluded: c.Excluded,
+		Status: c.Status, MorePaths: c.MorePaths, Excluded: c.Excluded,
 		RootWeight: c.RootWeight, Named: c.Named, Possible: c.Possible,
 		Closeness: c.Closeness, Compatible: c.Compatible,
 	}
@@ -244,8 +262,9 @@ func candRecOf(c candidate, seq int64) candRec {
 
 // rankCandidate rehydrates the candidate as RANKING sees it: Path is
 // PathAtRank, the value hydrateFiles' conditional overwrite leaves and the one
-// packageOf, the centrality bucket and the boost reason read. Paths is
-// left nil; the caller attaches the routes it rebuilt from the hop stream.
+// packageOf, the centrality bucket and the boost reason read. Paths
+// and Reasons are left nil; the caller attaches the routes it rebuilt from the
+// hop stream, and P-I the reasons from the reason stream.
 func (r candRec) rankCandidate() candidate {
 	c := r.candidate()
 	c.Path = r.PathAtRank
@@ -269,7 +288,7 @@ func (r candRec) candidate() candidate {
 	return candidate{
 		NodeID: r.NodeID, FileID: r.FileID, Requirement: r.Requirement, Origin: r.Origin,
 		Depth: r.Depth, StartByte: r.StartByte, ScoreMicros: r.ScoreMicros,
-		SizeBytes: r.SizeBytes, Status: r.Status, Reasons: r.Reasons, MorePaths: r.MorePaths,
+		SizeBytes: r.SizeBytes, Status: r.Status, MorePaths: r.MorePaths,
 		Excluded: r.Excluded, RootWeight: r.RootWeight, Named: r.Named, Possible: r.Possible,
 		Closeness: r.Closeness, Compatible: r.Compatible,
 	}
@@ -406,6 +425,18 @@ func lessHopSeq(a, b hopRec) int {
 		return c
 	}
 	return cmpInt(int64(a.HopIdx), int64(b.HopIdx))
+}
+
+// lessReasonSeq orders the reason stream by candidate and then in the order
+// the reasons were given.
+func lessReasonSeq(a, b reasonRec) int {
+	if c := cmpInt(a.Seq, b.Seq); c != 0 {
+		return c
+	}
+	if c := cmpInt(int64(a.Phase), int64(b.Phase)); c != 0 {
+		return c
+	}
+	return cmpInt(int64(a.Idx), int64(b.Idx))
 }
 
 // lessPathSeq orders the route stream the same way, so a candidate's routes and
@@ -585,11 +616,10 @@ const recordOverheadBytes = 96
 func sizeOfCand(r candRec) int64 {
 	n := int64(len(r.NodeID) + len(r.FileID) + len(r.PathAtRank) + len(r.PathFinal) +
 		len(r.Requirement) + len(r.Status) + len(r.Excluded))
-	for _, reason := range r.Reasons {
-		n += int64(len(reason)) + 16
-	}
 	return n + recordOverheadBytes
 }
+
+func sizeOfReason(r reasonRec) int64 { return int64(len(r.Text)) + recordOverheadBytes }
 
 func sizeOfPath(r pathRec) int64 {
 	n := int64(0)
@@ -868,6 +898,8 @@ func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
 //     to their retained position, which is the order today's candidate.Paths
 //     holds and therefore the order P-I's EvidencePaths must read. A dropped
 //     route leaves no record; its existence is disclosed by MorePaths.
+//   - routedReasons receives the reasons this pass gives each record (the
+//     unenumerated routes, then the route reason), keyed by its Seq.
 //   - edges receives every admitted (package, relation) pair. It is fed from
 //     routeScore.admittedEdges and NOT from the retained routes: a route past
 //     the path limit is not retained, and it still counts towards its
@@ -878,6 +910,7 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 	hops *pagination.SortedRun[hopRec],
 	retainedPaths *pagination.ExternalSort[pathRec],
 	retainedHops *pagination.ExternalSort[hopRec],
+	routedReasons *pagination.ExternalSort[reasonRec],
 	edges *pagination.ExternalSort[pkgEdgeRec],
 ) (*pagination.SortedRun[scoredRec], error) {
 	scored, err := newSort(s, "scored", lessScoredPkg, sizeOfScored)
@@ -964,11 +997,12 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 		// values the record keeps apart.
 		rec.MorePaths = routed.morePaths
 		// The routes that were not enumerated are disclosed BEFORE the route
-		// reason and before P-F's boost reasons, exactly as rank appends them:
-		// appendReason drops at MaxReasonsPerEntry, so the order decides which
-		// explanation an entry at the bound keeps.
-		for _, reason := range append(morePathsReason(rec.MorePaths), routed.reasons...) {
-			rec.Reasons = appendReason(rec.Reasons, reason)
+		// reason and before P-F's boost reasons, exactly as rank appends them.
+		for i, reason := range append(morePathsReason(rec.MorePaths), routed.reasons...) {
+			if err := routedReasons.Add(reasonRec{Seq: rec.Seq, Phase: reasonRouted, Idx: int32(i),
+				Text: reason}); err != nil {
+				return err
+			}
 		}
 		// The record's own pair (ADR-0016 decision 1): a seed lends its origin
 		// contribution and carries no route, a walk entry lends its group's
@@ -997,12 +1031,13 @@ func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 
 // passFBoosts — pass P-F. Sorts the ranked stream by package,
 // merge-joins it with P-E's counts, applies boostsFor, scales the total by the
-// record's root weight, clamps, appends the reasons in today's order, and adds
-// every record to best, the entity fold stageBoosts drains into the ranked
-// sort.
+// record's root weight, clamps, writes the boost reasons in today's order to
+// boosted, and adds every record to best, the entity fold stageBoosts drains
+// into the ranked sort.
 //
 // scored is P-D's output under lessScoredPkg, counts is P-E's aggregate under
-// lessPkg, and best is the sort under lessEntityFold with foldBestRank.
+// lessPkg, best is the sort under lessEntityFold with foldBestRank, and
+// boosted is the reason sort under lessReasonSeq.
 //
 // The join is LEFT-outer on the package: a package no named walk crossed an edge
 // in has no pkgCountRec, and its candidates take a zero centrality boost rather
@@ -1014,6 +1049,7 @@ func (c *Compiler) passFBoosts(ctx context.Context,
 	scored *pagination.SortedRun[scoredRec],
 	counts *pagination.SortedRun[pkgCountRec],
 	best *pagination.ExternalSort[candRec],
+	boosted *pagination.ExternalSort[reasonRec],
 ) error {
 	nextCount, stopCounts := pullRun(counts)
 	defer stopCounts()
@@ -1054,8 +1090,11 @@ func (c *Compiler) passFBoosts(ctx context.Context,
 		}
 		cand := rec.Cand
 		cand.ScoreMicros = score
-		for _, reason := range reasons {
-			cand.Reasons = appendReason(cand.Reasons, reason)
+		for i, reason := range reasons {
+			if err := boosted.Add(reasonRec{Seq: cand.Seq, Phase: reasonBoosted, Idx: int32(i),
+				Text: reason}); err != nil {
+				return err
+			}
 		}
 		return best.Add(cand)
 	})
@@ -1190,7 +1229,7 @@ func (c *Compiler) passGMeasure(ctx context.Context, s *compileSorts, in rankedS
 		return nil, err
 	}
 
-	paths, hops, err := rekeyRoutes(ctx, s, remap, in)
+	paths, hops, reasons, err := rekeyRoutes(ctx, s, remap, in)
 	if err != nil {
 		return nil, err
 	}
@@ -1256,28 +1295,41 @@ func (c *Compiler) passGMeasure(ctx context.Context, s *compileSorts, in rankedS
 		return nil, err
 	}
 	return &measuredPlan{ByFile: byFileRun, Groups: groups, Excluded: excludedRun,
-		Paths: paths, Hops: hops}, nil
+		Paths: paths, Hops: hops, Reasons: reasons}, nil
 }
 
-// rekeyRoutes re-labels the route streams from the candidate's ingest sequence
-// to its rank position, dropping the routes of candidates the P-G filters
-// excluded. Both sides are ascending in Seq, so it is one merge join holding
-// one record per side, and afterwards every measuring walk -- which runs in
-// Index order -- reads a candidate's routes in one forward step.
+// rekeyRoutes re-labels the route and reason streams from the candidate's
+// ingest sequence to its rank position, dropping the routes and reasons of
+// candidates the P-G filters excluded or the entity fold dropped. Both sides
+// are ascending in Seq, so it is one merge join holding one record per side
+// (the three reason streams read in phase order for each record), and
+// afterwards every measuring walk -- which runs in Index order -- reads a
+// candidate's routes and reasons in one forward step.
 func rekeyRoutes(ctx context.Context, s *compileSorts, remap *pagination.ExternalSort[candRec],
-	in rankedStreams) (*pagination.SortedRun[pathRec], *pagination.SortedRun[hopRec], error) {
+	in rankedStreams) (*pagination.SortedRun[pathRec], *pagination.SortedRun[hopRec], *pagination.SortedRun[reasonRec], error) {
 	remapRun, err := sortedRun(s, remap)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	pathsByIndex, err := newSort(s, "paths-index", lessPathSeq, sizeOfPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	hopsByIndex, err := newSort(s, "hops-index", lessHopSeq, sizeOfHop)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+	reasonsByIndex, err := newSort(s, "reasons-index", lessReasonSeq, sizeOfReason)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	reasonCursors := []*runCursor[reasonRec]{
+		newRunCursor(in.Admitted), newRunCursor(in.Routed), newRunCursor(in.Boosted)}
+	defer func() {
+		for _, c := range reasonCursors {
+			c.stop()
+		}
+	}()
 	pathCursor := newRunCursor(in.Paths)
 	defer pathCursor.stop()
 	hopCursor := newRunCursor(in.Hops)
@@ -1308,22 +1360,42 @@ func rekeyRoutes(ctx context.Context, s *compileSorts, remap *pagination.Externa
 			}
 			hopCursor.advance()
 		}
+		for _, c := range reasonCursors {
+			for c.ok && c.cur.Seq < m.Seq {
+				c.advance()
+			}
+			for c.ok && c.cur.Seq == m.Seq {
+				r := c.cur
+				r.Seq = m.Index
+				if err := reasonsByIndex.Add(r); err != nil {
+					return err
+				}
+				c.advance()
+			}
+			if err := c.err(); err != nil {
+				return err
+			}
+		}
 		if err := pathCursor.err(); err != nil {
 			return err
 		}
 		return hopCursor.err()
 	}); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	paths, err := sortedRun(s, pathsByIndex)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	hops, err := sortedRun(s, hopsByIndex)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return paths, hops, nil
+	reasons, err := sortedRun(s, reasonsByIndex)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return paths, hops, reasons, nil
 }
 
 // passHPack — pass P-H. Walks the group stream ordered by lessGroupIndex
@@ -1404,6 +1476,8 @@ func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPl
 	}
 	routes := newRouteCursors(m.Paths, m.Hops)
 	defer routes.close()
+	reasons := newReasonCursor(m.Reasons)
+	defer reasons.close()
 	var out planParts
 	var members [][]sliceMember
 	// Phase two re-measures the selected entries at their FINAL ordinals, so
@@ -1421,6 +1495,9 @@ func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPl
 			return err
 		}
 		cand.Paths = routed
+		if cand.Reasons, err = reasons.take(r.Cand.Index); err != nil {
+			return err
+		}
 		e, err := measureEntry(cand, ordinal, r.Charged)
 		if err != nil {
 			return err

@@ -81,7 +81,7 @@ type marker interface {
 
 // sinkMarks is the seed sink's spools, every one the closure writes.
 func (in *seedIngest) sinkMarks() []marker {
-	return []marker{in.candSort, in.entitySort, in.pathSort, in.hopSort}
+	return []marker{in.candSort, in.entitySort, in.pathSort, in.hopSort, in.reasonSort}
 }
 
 // reopenReached rebuilds the closure's reached set as an open sort for the

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -1054,8 +1055,10 @@ func TestContextCompilerScenario(t *testing.T) {
 						t.Fatalf("rank[%d] = {path %q node %q score %d}, want {path %q node %q score %d}",
 							i, got.Path, got.NodeID, got.ScoreMicros, w.path, w.id, w.score)
 					}
-					if len(got.Reasons) > model.MaxReasonsPerEntry {
-						t.Fatalf("rank[%d] carries %d reasons, over the bound %d", i, len(got.Reasons), model.MaxReasonsPerEntry)
+					for _, r := range got.Reasons {
+						if r == "" || len(r) > model.MaxReasonBytes {
+							t.Fatalf("rank[%d] carries a %d-byte reason, outside the 1..%d bound", i, len(r), model.MaxReasonBytes)
+						}
 					}
 				}
 				// Three admitted routes, one retained: the two the manifest
@@ -1105,16 +1108,13 @@ func TestContextCompilerScenario(t *testing.T) {
 					if err != nil {
 						t.Fatalf("wireEncodedBytes: %v", err)
 					}
-					raw, err := json.Marshal(e)
-					if err != nil {
-						t.Fatalf("Marshal: %v", err)
-					}
-					// The measured size is a fixed point: the stored entry,
-					// serialized exactly as persisted, plus its worst-case
-					// source encoding, is the number the entry reports.
-					if want := wire + int64(len(raw)); e.EstimatedBytes != want {
+					// The measured size is a fixed point: the entry as the
+					// entries view serves it, plus its worst-case source
+					// encoding, is the number the entry reports.
+					meta := chargedMetadata(t, e)
+					if want := wire + meta; e.EstimatedBytes != want {
 						t.Errorf("entry %d estimated_bytes = %d, want %d (wire %d + measured metadata %d)",
-							e.Ordinal, e.EstimatedBytes, want, wire, len(raw))
+							e.Ordinal, e.EstimatedBytes, want, wire, meta)
 					}
 					tokens, err := model.EstimateTokensUTF8Bytes(e.EstimatedBytes)
 					if err != nil {
@@ -1148,12 +1148,21 @@ func TestContextCompilerScenario(t *testing.T) {
 				if err != nil {
 					t.Fatalf("wireEncodedBytes: %v", err)
 				}
-				// The file costs 676 bytes charged once and 760 charged per
-				// entry, so this cap admits exactly one of the two rules. The
-				// guard below fails the row rather than letting it go vacuous
-				// if the entry metadata ever changes size.
-				const sliceCap = 700
-				b, err := resolveBudget(model.Budget{MaxBytes: sliceCap}, fx.Cfg.Context)
+				// The cap sits halfway between the file charged once and the
+				// file charged per entry, measured from the entries
+				// themselves, so it admits exactly one of the two rules
+				// whatever size the entry metadata has. The guard below
+				// fails the row rather than letting it go vacuous.
+				var once int64
+				for _, c := range cands {
+					c.SizeBytes = fx.File(path).Size
+					e, err := measureEntry(c, 0, once == 0)
+					if err != nil {
+						t.Fatalf("measureEntry: %v", err)
+					}
+					once += e.EstimatedBytes
+				}
+				b, err := resolveBudget(model.Budget{MaxBytes: once + wire/2}, fx.Cfg.Context)
 				if err != nil {
 					t.Fatalf("resolveBudget: %v", err)
 				}
@@ -1166,19 +1175,12 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 				// The first entry of the file carries the source; its sibling
 				// carries its own measured metadata and nothing else.
-				raw0, err := json.Marshal(p.Entries[0])
-				if err != nil {
-					t.Fatalf("Marshal: %v", err)
-				}
-				if want := wire + int64(len(raw0)); p.Entries[0].EstimatedBytes != want {
+				meta0 := chargedMetadata(t, p.Entries[0])
+				if want := wire + meta0; p.Entries[0].EstimatedBytes != want {
 					t.Errorf("entry 0 estimated_bytes = %d, want %d (wire %d + measured metadata %d)",
-						p.Entries[0].EstimatedBytes, want, wire, len(raw0))
+						p.Entries[0].EstimatedBytes, want, wire, meta0)
 				}
-				raw1, err := json.Marshal(p.Entries[1])
-				if err != nil {
-					t.Fatalf("Marshal: %v", err)
-				}
-				if want := int64(len(raw1)); p.Entries[1].EstimatedBytes != want {
+				if want := chargedMetadata(t, p.Entries[1]); p.Entries[1].EstimatedBytes != want {
 					t.Errorf("entry 1 estimated_bytes = %d, want %d (metadata alone: the file's %d wire bytes are already charged to entry 0)",
 						p.Entries[1].EstimatedBytes, want, wire)
 				}
@@ -1303,10 +1305,27 @@ func TestContextCompilerScenario(t *testing.T) {
 					[]string{"docs/order.md", "config/order.toml"}, model.RequirementOptional)
 				cands = append(cands, spare...)
 				files = append(files, spareFiles...)
-				// A byte bound that holds some but not all of the required
+				// A byte bound that holds two but not three of the required
 				// files forces a split at a file boundary; the file bound
-				// admits the four required files and nothing more.
-				b, err := resolveBudget(model.Budget{MaxBytes: 800, MaxFiles: len(paths)}, fx.Cfg.Context)
+				// admits the four required files and nothing more. The bound
+				// is measured from the entries themselves, the larger of the
+				// two pairs in reading order, so it splits the four in two
+				// whatever size the entry metadata has.
+				var sizes []int64
+				for i, c := range cands[:len(paths)] {
+					c.SizeBytes = files[i].Size
+					e, err := measureEntry(c, i, true)
+					if err != nil {
+						t.Fatalf("measureEntry: %v", err)
+					}
+					sizes = append(sizes, e.EstimatedBytes)
+				}
+				maxBytes := max(sizes[0]+sizes[1], sizes[2]+sizes[3])
+				if sizes[0]+sizes[1]+sizes[2] <= maxBytes || sizes[1]+sizes[2]+sizes[3] <= maxBytes {
+					t.Fatalf("the entry sizes %v let three files share one %d-byte slice; the row no longer splits in two",
+						sizes, maxBytes)
+				}
+				b, err := resolveBudget(model.Budget{MaxBytes: maxBytes, MaxFiles: len(paths)}, fx.Cfg.Context)
 				if err != nil {
 					t.Fatalf("resolveBudget: %v", err)
 				}
@@ -1693,6 +1712,21 @@ func budgetRowInput(fx *contextFixture, paths []string, req model.Requirement) (
 		})
 	}
 	return cands, files
+}
+
+// chargedMetadata is an entry's metadata as ADR-0016's budget monotonicity
+// rule charges it: as the entries view serves it, with its reason and route
+// counts spelled at their widest and none of its reasons or routes, which are
+// paged by reference.
+func chargedMetadata(t *testing.T, e model.ContextEntry) int64 {
+	t.Helper()
+	e.Reasons, e.EvidencePaths = nil, nil
+	e.ReasonCount, e.RouteCount = math.MaxInt64, math.MaxInt64
+	raw, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	return int64(len(raw))
 }
 
 // pathOfEntry maps a persisted entry back to the fixture path it covers, so a

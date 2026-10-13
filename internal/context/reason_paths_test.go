@@ -7,6 +7,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // TestConfiguredReasonPathsSurviveToTheStoredEntry pins the chain from the
@@ -114,22 +115,24 @@ func hexID(seed byte) string {
 }
 
 // TestBoundedExplanationsReachTheManifestNotices guards explanation disclosure:
-// the three field cuts the compile applies to an entry's explanation --
-// reasons past the per-entry count, a reason past its byte bound, and the page
-// size a configuration asked for and could not have -- are DISCLOSED on the
-// manifest header rather than applied silently. The cut itself is not the
-// defect (the bounds are wire shapes); a manifest that cannot be told apart
-// from one that cut nothing is.
+// the two field cuts the compile applies to an entry's explanation -- a reason
+// past its byte bound, and the page size a configuration asked for and could
+// not have -- are DISCLOSED on the manifest header rather than applied
+// silently, and no reason is dropped for a count. Mutation caught: a
+// boundReasons that cuts the reasons to a per-entry count again (kept falls
+// short of every reason), or a cut that is no longer counted (the notice goes
+// missing).
 func TestBoundedExplanationsReachTheManifestNotices(t *testing.T) {
-	reasons := make([]string, 0, model.MaxReasonsPerEntry+2)
-	for i := 0; i < model.MaxReasonsPerEntry+2; i++ {
-		reasons = append(reasons, "reason")
+	const n = model.MaxReasonsPerEntry + 2
+	reasons := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		reasons = append(reasons, fmt.Sprintf("reason %d", i))
 	}
 	reasons[0] = strings.Repeat("x", model.MaxReasonBytes+7)
-	kept, dropped, truncated := boundReasons(reasons)
-	if len(kept) != model.MaxReasonsPerEntry || dropped != 2 || truncated != 1 {
-		t.Fatalf("boundReasons kept %d, reported %d dropped and %d truncated; want %d kept, 2 dropped, 1 truncated",
-			len(kept), dropped, truncated, model.MaxReasonsPerEntry)
+	kept, truncated := boundReasons(reasons)
+	if len(kept) != n || truncated != 1 {
+		t.Fatalf("boundReasons kept %d and reported %d truncated; want all %d kept, 1 truncated",
+			len(kept), truncated, n)
 	}
 	if len(kept[0]) != model.MaxReasonBytes {
 		t.Fatalf("the truncated reason is %d bytes, want the %d-byte bound", len(kept[0]), model.MaxReasonBytes)
@@ -137,15 +140,15 @@ func TestBoundedExplanationsReachTheManifestNotices(t *testing.T) {
 
 	c := &Compiler{}
 	c.cfg.Resources.MaxPageItems = model.MaxPageItems + 500
-	notices := c.withPageNotice(planNotices(scopeResult{ReasonsDropped: dropped, ReasonsTruncated: truncated},
+	notices := c.withPageNotice(planNotices(scopeResult{ReasonsTruncated: truncated},
 		planParts{}, true))
-	if len(notices) != 3 {
+	if len(notices) != 2 {
 		t.Fatalf("the compile disclosed %d notices %q, want one per cut", len(notices), notices)
 	}
 	joined := strings.Join(notices, "\n")
 	for _, want := range []string{
 		fmt.Sprintf("requested %d, effective %d", model.MaxPageItems+500, model.MaxPageItems),
-		"2 selection reason(s) past", "1 selection reason(s) were truncated",
+		"1 selection reason(s) were truncated",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("the notices %q do not disclose %q", notices, want)
@@ -161,5 +164,88 @@ func TestBoundedExplanationsReachTheManifestNotices(t *testing.T) {
 	// A compile under no raised bound and no cut discloses nothing.
 	if n := (&Compiler{}).withPageNotice(planNotices(scopeResult{}, planParts{}, true)); len(n) != 0 {
 		t.Fatalf("an unbounded compile disclosed %q", n)
+	}
+}
+
+// TestEveryReasonOfAnEntryIsKeptInPhaseOrder pins the reason stream from the
+// three passes that give reasons to the entry P-I builds: a candidate given
+// more reasons than the old per-entry count keeps every one, in the order the
+// whole-set ranking appends them (admitted, then routed, then boosted, each in
+// its own order), with a repeat kept once; and the reasons of a record the
+// re-key drops reach no entry.
+//
+// Mutation caught: a count cap in appendReason or in the re-key (the entry
+// falls short of 13 reasons), a reason order that ignores the phase (the
+// order differs), or a reason whose record was dropped surviving under another
+// index (the second entry carries it).
+func TestEveryReasonOfAnEntryIsKeptInPhaseOrder(t *testing.T) {
+	sorts, err := newCompileSorts(config.Config{}, t.TempDir())
+	if err != nil {
+		t.Fatalf("newCompileSorts: %v", err)
+	}
+	defer func() {
+		if err := sorts.Close(); err != nil {
+			t.Fatalf("releasing the compile sort area: %v", err)
+		}
+	}()
+	runOf := func(name string, recs ...reasonRec) *pagination.SortedRun[reasonRec] {
+		sorter := mustSort(t, sorts, name, lessReasonSeq, sizeOfReason)
+		for _, r := range recs {
+			mustAdd(t, sorter.Add(r))
+		}
+		return mustSorted(t, sorts, sorter)
+	}
+	var admitted, routed, boosted []reasonRec
+	var want []string
+	for i := range 6 {
+		text := fmt.Sprintf("admitted %d", i)
+		admitted = append(admitted, reasonRec{Seq: 5, Phase: reasonAdmitted, Idx: int32(i), Text: text})
+		want = append(want, text)
+	}
+	for i := range 4 {
+		text := fmt.Sprintf("routed %d", i)
+		routed = append(routed, reasonRec{Seq: 5, Phase: reasonRouted, Idx: int32(i), Text: text})
+		want = append(want, text)
+	}
+	for i := range 3 {
+		text := fmt.Sprintf("boosted %d", i)
+		boosted = append(boosted, reasonRec{Seq: 5, Phase: reasonBoosted, Idx: int32(i), Text: text})
+		want = append(want, text)
+	}
+	// A repeat of an earlier reason, and the reasons of seq 3 and seq 8.
+	boosted = append(boosted, reasonRec{Seq: 5, Phase: reasonBoosted, Idx: 3, Text: "admitted 0"})
+	admitted = append(admitted, reasonRec{Seq: 3, Text: "dropped by the fold"},
+		reasonRec{Seq: 8, Text: "kept at index 1"})
+
+	// Seq 5 ranks first and seq 8 second; seq 3 is not on the remap.
+	remap := mustSort(t, sorts, "remap", lessCandSeq, sizeOfCand)
+	mustAdd(t, remap.Add(candRec{Seq: 5, Index: 0}))
+	mustAdd(t, remap.Add(candRec{Seq: 8, Index: 1}))
+	in := rankedStreams{
+		Paths:    mustSorted(t, sorts, mustSort(t, sorts, "paths", lessPathSeq, sizeOfPath)),
+		Hops:     mustSorted(t, sorts, mustSort(t, sorts, "hops", lessHopSeq, sizeOfHop)),
+		Admitted: runOf("admitted", admitted...),
+		Routed:   runOf("routed", routed...),
+		Boosted:  runOf("boosted", boosted...),
+	}
+	_, _, byIndex, err := rekeyRoutes(t.Context(), sorts, remap, in)
+	if err != nil {
+		t.Fatalf("rekeyRoutes: %v", err)
+	}
+	cursor := newReasonCursor(byIndex)
+	defer cursor.close()
+	first, err := cursor.take(0)
+	if err != nil {
+		t.Fatalf("take(0): %v", err)
+	}
+	if strings.Join(first, "|") != strings.Join(want, "|") {
+		t.Fatalf("the entry carries %d reasons\n %q\nwant all %d in phase order\n %q", len(first), first, len(want), want)
+	}
+	second, err := cursor.take(1)
+	if err != nil {
+		t.Fatalf("take(1): %v", err)
+	}
+	if len(second) != 1 || second[0] != "kept at index 1" {
+		t.Fatalf("the second entry carries %q, want only its own reason", second)
 	}
 }
