@@ -164,14 +164,16 @@ func TestReadAnswerHoldsToItsBudget(t *testing.T) {
 }
 
 // burstDocs is a corpus whose groups each hold several documents of one
-// score, so every position deep in the answer marks a burst of groups at once,
-// and whose bodies are long enough that a small bound holds a few results.
+// score, so every position deep in the answer marks a burst of groups at once.
+// Every signature is padded to about 3,000 bytes, so a result's charge (about
+// 1,095 + 912 + 7 x 3,100 = 25 KB) dominates the heaps and marked groups.
 func burstDocs() []doc {
+	pad := strings.Repeat("p", 3000)
 	var out []doc
 	for i := range 40 {
 		name := fmt.Sprintf("Burst%02d", i)
 		out = append(out, doc{path: fmt.Sprintf("pkg/b%02d.go", i), name: name,
-			qualifiedName: "pkg.burst." + name, signature: "func " + name + "(ctx context.Context) error",
+			qualifiedName: "pkg.burst." + name, signature: "func " + name + "(" + pad + ")",
 			body: "func " + name + "() { " + strings.Repeat("omega ", 1+i%3) + "}", occurrences: 4})
 	}
 	return out
@@ -192,7 +194,11 @@ func TestReadAnswerHoldsTheLibraryToItsBound(t *testing.T) {
 	if len(paged) != 40 {
 		t.Fatalf("the pages served %d hits, want the 40 groups", len(paged))
 	}
-	const bound = 16 << 10
+	// At 60 KiB the first request of a step (depth 3) fits two results and not
+	// three, so its page ends early; the next request, its bound less the 7.5
+	// KB each kept hit holds, fits one; every page stays within its bound; and
+	// the heap fits at four places and the sizer keeps the depth at 2.
+	const bound = 60 << 10
 	var over []string
 	stopped := 0
 	prev := observeIndexPage
