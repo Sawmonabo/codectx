@@ -391,8 +391,8 @@ directions for 477,602 nodes / 739,529 edges — ≈0.8% of that 1.36 GiB store.
 
 **Where it does not.** A per-function CFG has tens to hundreds of nodes and fits in cache. Building
 a CSR over it costs a degree histogram and a prefix sum — two passes to save an indirection on a
-structure small enough that the indirection is free. Sub-lane D owns the per-function
-representation; this note asserts only the boundary.
+structure small enough that the indirection is free. The per-function representation
+is the dataflow note's (`18-algorithms-dominance-and-dataflow.md`); this note asserts only the boundary.
 
 **The handoff, stated precisely:**
 
@@ -441,7 +441,7 @@ byte count, and that — not a policy statement — is what makes "no caps, no s
 | candidate term | does it scale with the repository? | what bounds it |
 |---|---|---|
 | a worker's parse tree | **No — it scales with the largest single source file.** | `M_worker` = 256 MiB — an **admission estimate, not an enforced ceiling** (`internal/process/runner.go:342-357`; no rlimit or cgroup in `internal/process/`). Reference repository mean: 157.2 MB over 4,984 files = **31.5 KB/file**, so the reservation covers ≈8,500× the mean file (ADR-0010; `14-store-counts-reference.md`). What happens when it does not: §3.3 item 2 |
-| a worker's per-function structures | **No — they scale with the largest single function.** Reaching-definition bitsets are \|N\| × \|D\| bits | Arithmetic: a 1,000-node / 1,000-definition function = 1,000,000 bits = **125 KB**; a pathological 10,000 × 10,000 function = **12.5 MB**. Both inside `M_worker`. Sub-lane D owns the exact constant |
+| a worker's per-function structures | **No — they scale with the largest single function.** Reaching-definition bitsets are \|N\| × \|D\| bits | Arithmetic: a 1,000-node / 1,000-definition function = 1,000,000 bits = **125 KB**; a pathological 10,000 × 10,000 function = **12.5 MB**. Both inside `M_worker`. The exact constant is the dataflow note's (`18-algorithms-dominance-and-dataflow.md`) |
 | the CHA hierarchy + method tables (§1) | **Yes, in bytes moved — but on disk, not in heap** | the external merge sort's `A_link` bound; the phase pays repository size in wall clock and temporary disk, never in resident memory |
 | the per-generation CSR | **Yes — and it is built outside any worker**, streamed, heap O(part) | ADR-0005 Decision 1; ≈10.7 MiB at reference scale, ≈107 MiB at 10× (`17-graph-traversal-throughput.md` §3.1) |
 | the walk's visited bitset | **Yes — 1 bit per node, on a sparse file, resident = touched pages** | ADR-0005 Decision 2; 11.9 MiB on disk at 10⁸ nodes (`17` §4) |

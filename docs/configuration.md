@@ -514,14 +514,11 @@ than a silent reuse.
 
 ### No remaining default cap
 
-Sealing a capsule was the last place in this build where a built-in cap could
-still refuse work. It is closed. The two constants that bounded it — 250 000
-coverage or waiver files per capsule, and 1 000 records per capsule list — are
-gone, replaced by the two configuration keys above:
-`context.max_capsule_records_per_list` and
+No built-in cap refuses to seal a capsule. Its two bounds are the configuration
+keys above, `context.max_capsule_records_per_list` and
 `context.max_capsule_coverage_files`. Both default to unlimited, and the
-capsule's records are now durable rows read one page at a time rather than a
-list held whole.
+capsule's records are durable rows read one page at a time rather than a list
+held whole.
 
 On stock configuration nothing refuses a seal for its size, at any repository
 size. A value *you* set refuses the seal with `CTX_RESOURCE_LIMIT`, naming the

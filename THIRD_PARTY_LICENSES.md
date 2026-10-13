@@ -23,7 +23,7 @@ GOOS=windows go list -deps -f '{{with .Module}}{{.Path}} {{.Version}}{{end}}' ./
 | github.com/mattn/go-pointer | v0.0.1 | MIT (`LICENSE`) | Binding dependency. Yasuhiro Matsumoto. |
 | github.com/tree-sitter/tree-sitter-c | v0.24.2 | MIT (`LICENSE`) | Grammar; native parser source compiled in. |
 | github.com/tree-sitter/tree-sitter-cpp | v0.23.4 | MIT (`LICENSE`) | Grammar. |
-| github.com/tree-sitter/tree-sitter-go | v0.25.0 | MIT (`LICENSE`) | Grammar. |
+| github.com/tree-sitter/tree-sitter-go | v0.25.0 | MIT (`internal/provider/treesitter/gogrammar/LICENSE`) | Grammar, carried as source in `internal/provider/treesitter/gogrammar` with the Go 1.27 method type parameters and the Go 1.26 expression operand of `new` added, so `go list -deps` reports it as part of codectx rather than as a module. Max Brunsfeld, Amaan Qureshi and tree-sitter contributors. |
 | github.com/tree-sitter/tree-sitter-java | v0.23.5 | MIT (`LICENSE`) | Grammar. |
 | github.com/tree-sitter/tree-sitter-javascript | v0.25.0 | MIT (`LICENSE`) | Grammar. |
 | github.com/tree-sitter/tree-sitter-python | v0.25.0 | MIT (`LICENSE`) | Grammar. |
@@ -56,15 +56,18 @@ at the versions `Cargo.lock` pins, without the compile-time macro crates, which
 generate code and are not linked. Each license expression is the one the crate
 declares; each license file was read in the registry source at that version.
 None is copyleft. `htmlescape` offers MPL-2.0 only as one of three
-alternatives, and the other two (Apache-2.0, MIT) are permissive. The set is the
-Linux one; the macOS and Windows targets swap the platform crates
-(`linux-raw-sys`, `rustix`) for their own.
+alternatives, and the other two (Apache-2.0, MIT) are permissive. The table is
+the union over the six release targets; the platform crates each target links
+are listed after it.
 
-Regenerate the crate set with:
+Regenerate the crate set of each target with:
 
 ```bash
 cd internal/search/textindex
-cargo tree --locked --offline -e normal,no-proc-macro --prefix none | sort -u
+for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin \
+         aarch64-apple-darwin x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm; do
+  cargo tree --locked --offline --target "$t" -e normal,no-proc-macro --prefix none | sort -u
+done
 cargo metadata --locked --offline --format-version 1
 ```
 
@@ -92,6 +95,7 @@ cargo metadata --locked --offline --format-version 1
 | either | 1.19.0 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
 | erased-serde | 0.4.10 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| errno | 0.3.14 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | fastdivide | 0.4.2 | zlib-acknowledgement OR MIT | `LICENSE.txt` |
 | fastrand | 2.5.0 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
 | fnv | 1.0.7 | Apache-2.0 / MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
@@ -156,7 +160,24 @@ cargo metadata --locked --offline --format-version 1
 | typetag | 0.2.23 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | utf8-ranges | 1.0.5 | Unlicense/MIT | `COPYING`, `LICENSE-MIT`, `UNLICENSE` |
 | uuid | 1.27.0 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| winapi | 0.3.9 | MIT/Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 | none in the package; the manifest declaration |
+| windows-link | 0.2.1 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
+| windows-sys | 0.59.0 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
+| windows-sys | 0.61.2 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
+| windows-targets | 0.52.6 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
+| windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
+| windows_x86_64_gnu | 0.52.6 | MIT OR Apache-2.0 | `license-apache-2.0`, `license-mit` |
 | zmij | 1.0.23 | MIT | `LICENSE-MIT` |
+
+The platform crates differ by target; every other row is linked on all six:
+
+- Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`): `bitflags`, `libc`, `linux-raw-sys` and
+  `rustix`.
+- macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`): `bitflags`, `errno`, `libc` and `rustix`.
+- Windows (`x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnullvm`): `winapi`, `windows-link`, both `windows-sys`
+  versions, `windows-targets`, and the target's import-library crates: `windows_x86_64_gnu` and
+  `winapi-x86_64-pc-windows-gnu` on amd64, `windows_aarch64_gnullvm` on arm64.
 
 ## Pinned analyzer payloads
 

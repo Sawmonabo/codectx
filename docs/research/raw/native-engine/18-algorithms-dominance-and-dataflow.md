@@ -628,7 +628,7 @@ measured generated extreme.
 
 **Where this meets the whole-run model:** the per-worker figure above is one side of it. How many
 workers run, how they are scheduled and how the totals coexist with the rest of the process is the
-adjacent lane's, and the two have to be reconciled by multiplying this bound by the worker count and
+whole-run model's, and the two have to be reconciled by multiplying this bound by the worker count and
 adding the CST residency.
 
 ---

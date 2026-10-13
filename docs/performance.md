@@ -144,12 +144,10 @@ percentile over `n` samples.
 | 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | a **242-file** session with **216 required** files answered a first page of **199 records** and issued a cursor | PASS |
 | 16 | Default context-graph budget re-pin | measurement-driven | **`max_graph_depth` stays 3**: on a real 810-file workspace the walk saturates at depth 2 — **1 030 visited / 1 295 edges**, unchanged at depth 3, 4 and 5 | PASS |
 
-Row 11 measures a RESTING session, which is what "idle" claims. It used to open
-its sampling window at process start with `mcp.watch` at its default, so the
-window covered the initial refresh and its parser workers — a startup peak
-reported under an idle label, and a low default worker count was once
-reverted on the strength of it. The row now starts the session with
-`--watch=false` and samples a 2 s window after a 2 s settle, so the figure is
+Row 11 measures a RESTING session, which is what "idle" claims. A window opened
+at process start with `mcp.watch` at its default would cover the initial
+refresh and its parser workers — a startup peak under an idle label. The row
+therefore starts the session with `--watch=false` and samples a 2 s window after a 2 s settle, so the figure is
 the server at rest: workspace open, no refresh running. The refresh peak is row
 10's subject and is measured there under `index --full`. The 128 MiB target is
 unchanged.
@@ -386,16 +384,16 @@ attributed 0.69 s of the 1.13 s spent in `Engine.walkImpact` to
 and the re-copy — and that share rose with N. Nothing in `internal/context` is
 quadratic.
 
-That continuation is now O(page) per page: the spool is written once, by the
+That continuation is O(page) per page: the spool is written once, by the
 page that settles the order, and every later page seeks to the byte offsets its
 cursor carries and reads only its own page (`pagination.Spools.OpenAt`,
 `RankOffset`/`PairOffset`, cursor payload version 6). Measured on the
 20 101-node deadline-split fixture at 200 rows a page
 (`graph.TestADeadlineSplitWalkAlwaysAdvances`), spool bytes read per page are
 flat at 88 046 on pages 3, 50 and 100 and nothing is written after the spill,
-where the per-page latency used to FALL with the shrinking remainder — 18.9 ms
-at page 3, 10.7 ms at page 50, 1.9 ms at page 100 — and is now ~0.39 ms
-throughout. The exponent above is the "before" figure and has not been
+and the per-page latency is ~0.39 ms throughout, where the copying continuation
+measured above fell with the shrinking remainder — 18.9 ms at page 3, 10.7 ms
+at page 50, 1.9 ms at page 100. The exponent above is the "before" figure and has not been
 re-measured.
 
 **What the fixture costs, and why it is not the product.** Publishing the

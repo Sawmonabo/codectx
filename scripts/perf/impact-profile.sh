@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# GPERF-P: profiling harness for the impact walk on a certification store.
+# Profiling harness for the impact walk on a reference store.
 #
-# Usage: gperf-p-impact.sh <repository> <hub-node-id> <visited>
+# Usage: impact-profile.sh <repository> <hub-node-id> <visited>
 #
 # Read-only. Runs `impact <hub> --depth 0 --edges 0 --visited N` against an
-# ISOLATED copy of the store (never the certification store itself, never a
+# ISOLATED copy of the store (never the reference store itself, never a
 # re-index) with a CPU + heap profile per run, and records wall clock, the
 # counts the answer reports, peak RSS and the bytes the run spooled.
 #
@@ -12,10 +12,10 @@
 # an uncapped walk on this store can take the whole VM down with it.
 set -u
 
-G=${GPERF_ROOT:-$HOME/.cache/codectx-gperf}
-REPO=${1:?usage: gperf-p-impact.sh <repository> <hub-node-id> <visited>}
-HUB=${2:?usage: gperf-p-impact.sh <repository> <hub-node-id> <visited>}
-N=${3:?usage: gperf-p-impact.sh <repository> <hub-node-id> <visited>}
+G=${CODECTX_PERF_ROOT:-$HOME/.cache/codectx-perf}
+REPO=${1:?usage: impact-profile.sh <repository> <hub-node-id> <visited>}
+HUB=${2:?usage: impact-profile.sh <repository> <hub-node-id> <visited>}
+N=${3:?usage: impact-profile.sh <repository> <hub-node-id> <visited>}
 BIN=$G/codectx
 
 PROF=$G/prof/n$N
