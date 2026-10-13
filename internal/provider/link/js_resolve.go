@@ -253,7 +253,7 @@ func (r *esResolver) resolve(ctx context.Context, owners []*tsConfig, from, spec
 	return all, nil
 }
 
-// owners are the configs governing the member at from (tsserver's rule):
+// owners are the configs governing the member at from (TypeScript's editor rule):
 // walking up from its directory to the unit root, the first tsconfig.json or
 // jsconfig.json that includes it, or failing that one its references reach
 // (a solution-style config), every such referenced config when several do;

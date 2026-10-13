@@ -710,4 +710,232 @@ export function main(n) { // @main
 		},
 		fails: "`any`, `unknown` or `object` read as a named type outside the project publishes an external call or external site for each",
 	},
+	{
+		name: "workspace-package-exports-into-build-output",
+		anchor: "Node.js Packages (`exports`, conditional exports in object order); npm Workspaces (a workspace is linked by its `name`); " +
+			"TypeScript Modules Reference (local packages: an outDir target maps back to rootDir)",
+		files: map[string]string{
+			"package.json": `{"name": "root", "private": true, "workspaces": ["packages/*"]}
+`,
+			"packages/util/package.json": `{
+  // JSONC is not valid in package.json, but the reader tolerates it.
+  "name": "@acme/util",
+  "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js"}},
+}
+`,
+			"packages/util/tsconfig.json": `{
+  // The build emits src into dist.
+  "compilerOptions": {"outDir": "dist", "rootDir": "src",},
+}
+`,
+			"packages/util/src/index.ts": `export function helper() {} // @helper
+`,
+			"packages/app/package.json": `{"name": "app"}
+`,
+			"packages/app/src/main.ts": `import { helper } from "@acme/util";
+
+export function run() {
+  helper(); // @r1
+}
+`,
+		},
+		// Derived from the anchors: the import names the workspace package @acme/util, whose "." export's first
+		// matching condition is "types" (always matched) -> ./dist/index.d.ts, not a member; the package's own
+		// tsconfig emits src into dist, so dist/index.d.ts maps back to src/index.ts.
+		want: []string{
+			"r1 helper -> helper helper exact",
+		},
+		facts: []string{
+			"packages/app/src/main.ts imports packages/util/src/index.ts",
+		},
+		// Mutation: drop the outDir -> rootDir remap (or never read the workspace map) -> the import and r1 resolve
+		// to nothing.
+		fails: "a bare workspace specifier treated as a package outside the repository, or an exports target into dist left unmapped, leaves r1 unbound",
+	},
+	{
+		name:   "tsconfig-paths-longest-prefix",
+		anchor: "TypeScript tsconfig reference (`paths`: the longest matching prefix wins; targets resolve against `baseUrl`)",
+		files: map[string]string{
+			"tsconfig.json": `{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"], "@/lib/*": ["lib/*"]}}}
+`,
+			"src/a.ts": `export function a() {} // @a
+`,
+			"lib/b.ts": `export function b() {} // @b
+`,
+			"src/main.ts": `import { a } from "@/a";
+import { b } from "@/lib/b";
+
+export function run() {
+  a(); // @ra
+  b(); // @rb
+}
+`,
+		},
+		// Derived from the anchor: "@/lib/b" matches both keys; "@/lib/*" has the longer prefix, so it names
+		// lib/b.ts, never src/lib/b.
+		want: []string{
+			"ra a -> a a exact",
+			"rb b -> b b exact",
+		},
+		facts: []string{
+			"src/main.ts imports lib/b.ts",
+			"src/main.ts imports src/a.ts",
+		},
+		// Mutation: take the first matching `paths` key instead of the longest prefix -> "@/lib/b" resolves to
+		// src/lib/b, which no member is, and rb is unbound.
+		fails: "a paths alias resolved by the first matching key rather than the longest prefix leaves rb unbound",
+	},
+	{
+		name:   "duplicate-workspace-names",
+		anchor: "npm Workspaces (a workspace is linked by its declared `name`); two packages of one name are the repository's own ambiguity",
+		files: map[string]string{
+			"package.json": `{"name": "root", "workspaces": ["packages/*"]}
+`,
+			"packages/x1/package.json": `{"name": "dup", "main": "index.js"}
+`,
+			"packages/x1/index.js": `export function f() {} // @f1
+`,
+			"packages/x2/package.json": `{"name": "dup", "main": "index.js"}
+`,
+			"packages/x2/index.js": `export function f() {} // @f2
+`,
+			"main.js": `import { f } from "dup";
+
+export function run() {
+  f(); // @r
+}
+`,
+		},
+		// Derived from the anchor: both packages declare "dup", so the import names both, each through its main.
+		want: []string{
+			"r f -> f1 f exact set=2",
+			"r f -> f2 f exact set=2",
+		},
+		facts: []string{
+			"main.js imports packages/x1/index.js set=2",
+			"main.js imports packages/x2/index.js set=2",
+		},
+		// Mutation: keep one directory per package name (the last one read) -> one target and no set size.
+		fails: "two workspace packages of one name resolved by preference publish one target instead of the set",
+	},
+	{
+		name: "nodenext-esm-directory-import",
+		anchor: "TypeScript Modules Reference (node16/nodenext: directory modules and extensionless paths are supported only in require calls; " +
+			"a .ts file is an ES module when its package.json says \"type\": \"module\")",
+		files: map[string]string{
+			"package.json": `{"name": "m", "type": "module"}
+`,
+			"tsconfig.json": `{"compilerOptions": {"module": "nodenext"}}
+`,
+			"src/lib/index.ts": `export function g() {} // @g
+`,
+			"src/main.ts": `import { g } from "./lib";
+import { g as h } from "./lib/index.js";
+
+export function run() {
+  g(); // @r1
+  h(); // @r2
+}
+`,
+		},
+		// Derived from the anchor: under nodenext an ES module's `import "./lib"` names no file; "./lib/index.js"
+		// names src/lib/index.ts by extension substitution.
+		want: []string{
+			"r2 h -> g g exact",
+		},
+		facts: []string{
+			"src/main.ts imports src/lib/index.ts",
+		},
+		// Mutation: add a directory's index form for every import whatever the mode -> r1 binds to g.
+		fails: "the directory index form admitted under nodenext ESM binds r1 to src/lib/index.ts's g",
+	},
+	{
+		name:   "require-condition",
+		anchor: "Node.js Packages (conditional exports: \"require\" matches a require call, \"import\" an import)",
+		files: map[string]string{
+			"package.json": `{"name": "root", "workspaces": ["packages/*"]}
+`,
+			"packages/dual/package.json": `{"name": "dual", "exports": {"import": "./esm.js", "require": "./cjs.js"}}
+`,
+			"packages/dual/esm.js": `export function f() {} // @fe
+`,
+			"packages/dual/cjs.js": `export function f() {} // @fc
+`,
+			"main.js": `const { f } = require("dual");
+
+export function run() {
+  f(); // @r
+}
+`,
+		},
+		// Derived from the anchor: a require call matches the "require" condition, so it names cjs.js alone.
+		want: []string{
+			"r f -> fc f exact",
+		},
+		facts: []string{
+			"main.js imports packages/dual/cjs.js",
+		},
+		// Mutation: ignore the import's form and match "import" for every import -> the require names esm.js.
+		fails: "a require resolved under the import condition binds r to esm.js's f",
+	},
+	{
+		name:   "exports-into-unbuilt-output",
+		anchor: "Node.js Packages (`exports`); an in-repository package whose exports name no member is an open import, not an external one",
+		files: map[string]string{
+			"package.json": `{"name": "root", "workspaces": ["packages/*"]}
+`,
+			"packages/u/package.json": `{"name": "u", "exports": "./dist/u.js"}
+`,
+			"packages/u/src/u.js": `export function x() {} // @x
+`,
+			"main.js": `import { x } from "u";
+
+export function run() {
+  x(); // @r
+}
+`,
+		},
+		// Derived from the anchor: the package is the repository's, its only export target is unbuilt output and
+		// no config maps it back, so the import resolves to no member and the call is open, not external.
+		want: []string{},
+		counts: map[string]string{
+			"sites": "1", "bound_sites": "0", "external_sites": "0", "open_sites": "1",
+		},
+		// Mutation: treat an in-repository import that reaches no member as a package outside the repository ->
+		// external_sites is 1.
+		fails: "an in-repository package whose exports name no member counted as an external call",
+	},
+	{
+		name:   "pnpm-workspace-without-root-package",
+		anchor: "pnpm pnpm-workspace.yaml (`packages` globs declare the workspace; packages link by name)",
+		files: map[string]string{
+			"pnpm-workspace.yaml": `packages:
+  # every library
+  - 'libs/*'
+`,
+			"libs/k/package.json": `{"name": "k", "main": "src/index.js"}
+`,
+			"libs/k/src/index.js": `export function k() {} // @k
+`,
+			"apps/w/package.json": `{"name": "w"}
+`,
+			"apps/w/main.js": `import { k } from "k";
+
+export function run() {
+  k(); // @r
+}
+`,
+		},
+		// Derived from the anchor: the workspace file is the project's root, so libs/k and apps/w are one unit and
+		// "k" names libs/k through its main.
+		want: []string{
+			"r k -> k k exact",
+		},
+		facts: []string{
+			"apps/w/main.js imports libs/k/src/index.js",
+		},
+		// Mutation: drop pnpm-workspace.yaml from the project markers -> apps/w is a unit of its own and r is
+		// unbound.
+		fails: "a pnpm workspace with no root package.json planned as one unit per package leaves r unbound",
+	},
 }

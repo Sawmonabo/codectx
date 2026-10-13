@@ -10,7 +10,7 @@ import (
 // TypeScript and the package managers read one: `*` matches any run of
 // characters within one path component, `?` one character within one, and a
 // `**` component any number of whole components (TypeScript's
-// getFileMatcherPatterns; minimatch's globstar). A pattern is matched
+// getFileMatcherPatterns; the package managers' globstar). A pattern is matched
 // against a root-relative path, component by component, so a match costs
 // time linear in the two lengths times the number of `**` components and
 // allocates nothing beyond the split.
