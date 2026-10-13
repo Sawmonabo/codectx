@@ -244,8 +244,16 @@ an external one only where the language marks it (Java `@Override`, C++ `overrid
   the one candidate is the extended class outside the project when no class of the project along the chain declares
   the member.
 - Python: `typing.override` proves the first ancestor along the method resolution order that defines the method.
-  When no class of the project along the order defines it, it is one of the external bases of the classes along the
-  order, each published (`supertype`) with the set size of their number when there are several.
+  The order is the C3 linearisation with each base outside the project placed as the linearisation of itself
+  (`hierarchy.pythonFullMRO`): the bases outside the project ahead of the first class of the project that defines
+  the method are its candidates, published (`supertype`) with that class's own override as one set whose size counts
+  them all; a base outside the project after it is no candidate. `class C(Base, U)` with `U.run` publishes `C.run`
+  overrides `Base.run` and `U.run`, set size 2; `class D(U, Base)` publishes `U.run` alone. A base outside the
+  project has no declaration read, so its own bases are unknown: they follow it in the true order and a member they
+  define is reached through it, so naming it covers them; only when one base outside the project is an ancestor of
+  another one the hierarchy names can the true order place it later than this order does, which no declaration
+  read can show. Bases that admit no linearisation fall back to the bases outside the project of the classes along
+  the project's own order, published when no class of the project defines the method.
 - Rust: an impl item implements its block's trait's item of its name (`Decl.Trait`), the external trait's method
   when the trait is outside the project (`hierarchy_rust.go`).
 

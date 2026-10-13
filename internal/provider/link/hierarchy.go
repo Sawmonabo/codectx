@@ -2594,6 +2594,30 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 				return err
 			}
 		default:
+			full, err := h.pythonFullMRO(owner)
+			if err != nil {
+				return err
+			}
+			if full != nil {
+				// The first class along the order, bases outside the unit
+				// placed, that defines the method (PEP 698); a base outside
+				// the unit ahead of it is externalOverrides'.
+				for _, base := range full[1:] {
+					if base.external != "" {
+						continue
+					}
+					if err := h.methods(base.ref, d.Name, func(e entry) error {
+						add(e)
+						return nil
+					}); err != nil {
+						return err
+					}
+					if len(targets) > 0 {
+						break
+					}
+				}
+				break
+			}
 			order, err := h.pythonMRO(owner)
 			if err != nil {
 				return err
