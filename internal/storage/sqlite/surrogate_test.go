@@ -10,7 +10,7 @@ import (
 )
 
 // TestSealedUnitRoundTripsCanonicalIdsThroughSurrogates is the one invariant
-// the surrogate redesign can break silently. Every reference column is now an
+// the surrogates can break silently. Every reference column is an
 // INTEGER into a dictionary table, and a reference bound to the WRONG row --
 // the previous insert's rowid from a conflicting upsert, an endpoint resolved
 // against the wrong canonical -- still satisfies every constraint, still seals,

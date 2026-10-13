@@ -397,8 +397,20 @@ parse with fewer error bytes is kept, and the file's capability row discloses
 the choice in its `header_first`, `header_kept` and `header_reason` details
 (with both parses' error bytes when the second parse ran). When
 `tree_sitter.languages` enables only one of `c` and `cpp`, every header is
-parsed with that one, once. The manifest tags a header with the census's first
-grammar, and a census change that moves it rebuilds every header's units.
+parsed with that one, once.
+
+A header has two tags. The manifest row, written at capture before any parse,
+and so the filesystem provider's file node carry the census's first grammar,
+and a census change that moves it rebuilds every header's units. A reader of a
+generation tags a header with the grammar that generation's parse kept
+(`lang.Tagger.In`): the language of the module node the header's structural
+unit published, which is the fallback grammar when the fallback parse was kept
+and the one enabled grammar when `tree_sitter.languages` enables one. The
+search language filter reads that tag, so a header kept as C++ after a C first
+choice matches `cpp` and not `c`. A header the generation holds no parse of
+keeps the census's first grammar. The lookup reads the unit the generation
+already stored, through four index seeks per header path a filter tests, and
+writes nothing; a lookup that fails fails the request.
 
 Every other path is parsed with `FileVersion.Language` from the snapshot
 manifest when it names a pinned language, and otherwise the extension decides

@@ -82,7 +82,7 @@ published.
 
 ### Mirrors
 
-Because the lock now names several hosts, `tools.mirror` replaces the scheme
+Because the lock names several hosts, `tools.mirror` replaces the scheme
 and host of a payload URL and keeps the original host as the first path
 segment:
 
