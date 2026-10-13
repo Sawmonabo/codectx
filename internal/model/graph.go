@@ -15,10 +15,10 @@ type ImpactRequest struct {
 	Start        []NodeID       `json:"start"`
 	Relations    []RelationKind `json:"relations,omitempty"`
 	Direction    Direction      `json:"direction"`
-	MaxDepth     int            `json:"max_depth"`
-	MaxVisited   int            `json:"max_visited"`
-	MaxEdges     int            `json:"max_edges"`
-	Page         PageRequest    `json:"page"`
+	MaxDepth     int            `json:"max_depth,omitempty"`
+	MaxVisited   int            `json:"max_visited,omitempty"`
+	MaxEdges     int            `json:"max_edges,omitempty"`
+	Page         PageRequest    `json:"page,omitempty"`
 }
 
 // Validate enforces bounded seeds, a known relation vocabulary, a known

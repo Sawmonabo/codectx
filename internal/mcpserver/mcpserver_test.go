@@ -362,30 +362,33 @@ func connectWith(t *testing.T, s *mcp.Server, c *mcp.Client, wantClean bool) *mc
 // exactly the silent change a snapshot exists to catch.
 //
 // codectx_refresh_index takes no arguments, and codectx_read_source has two
-// modes whose fields its Validate checks, so they require none.
+// modes whose fields its Validate checks, so they require none. A field whose
+// zero value means "the configured or endpoint default" -- the page and its
+// limit, the walk bounds, the context budget -- is never required: a client
+// that leaves it out asks for the default, as a zero would.
 var toolSchemas = map[string][]string{
 	"codectx_index_status":        {"resources"},
 	"codectx_refresh_index":       nil,
-	"codectx_repo_overview":       {"depth", "page"},
-	"codectx_search":              {"query", "page"},
-	"codectx_find_symbol":         {"query", "operation", "semantic_source", "page"},
-	"codectx_symbol_info":         {"query", "semantic_source", "page"},
-	"codectx_references":          {"node_id", "operation", "semantic_source", "page"},
-	"codectx_callers":             {"start", "max_depth", "max_visited", "max_edges", "page"},
-	"codectx_callees":             {"start", "max_depth", "max_visited", "max_edges", "page"},
-	"codectx_dependency_path":     {"from", "to", "max_depth", "max_visited", "page"},
-	"codectx_impact":              {"start", "direction", "max_depth", "max_visited", "max_edges", "page"},
+	"codectx_repo_overview":       {"depth"},
+	"codectx_search":              {"query"},
+	"codectx_find_symbol":         {"query", "operation", "semantic_source"},
+	"codectx_symbol_info":         {"query", "semantic_source"},
+	"codectx_references":          {"node_id", "operation", "semantic_source"},
+	"codectx_callers":             {"start"},
+	"codectx_callees":             {"start"},
+	"codectx_dependency_path":     {"from", "to"},
+	"codectx_impact":              {"start", "direction"},
 	"codectx_context_plan":        {"context", "actor_id"},
-	"codectx_context_status":      {"session_id", "actor_id", "page"},
+	"codectx_context_status":      {"session_id", "actor_id"},
 	"codectx_context_next":        {"session_id", "actor_id"},
-	"codectx_context_entries":     {"session_id", "actor_id", "view", "page"},
+	"codectx_context_entries":     {"session_id", "actor_id", "view"},
 	"codectx_context_include":     {"session_id", "actor_id", "seeds", "expected_version"},
 	"codectx_read_source":         nil,
 	"codectx_context_acknowledge": {"session_id", "actor_id", "kind"},
 	"codectx_context_waive":       {"session_id", "actor_id", "file_id", "reason"},
 	"codectx_context_record":      {"session_id", "actor_id", "expected_scope_version", "kind", "note"},
 	"codectx_context_advance":     {"session_id", "actor_id", "target", "expected_version"},
-	"codectx_context_capsule":     {"session_id", "actor_id", "view", "page"},
+	"codectx_context_capsule":     {"session_id", "actor_id", "view"},
 	"codectx_context_close":       {"session_id", "actor_id", "expected_version"},
 }
 
