@@ -53,6 +53,20 @@ pub struct Index {
     pub alive: Mutex<AliveCache>,
 }
 
+/// The failure of an indexing worker, as that worker met it. A worker that
+/// fails (a full disk while it writes a segment, say) ends the writer, and the
+/// next document sent answers only "the index writer was killed"; joining the
+/// workers, which preparing a commit does first, hands back the worker's own
+/// error, so a full disk reads as CX_DISK_FULL and not as an internal error.
+/// The commit is never made: the prepared commit, if a join should report
+/// nothing, is dropped and the send's own error answered.
+fn worker_failure(w: &mut IndexWriter<TantivyDocument>, sent: tantivy::TantivyError) -> Error {
+    match w.prepare_commit() {
+        Err(own) => Error::from(own),
+        Ok(_) => Error::from(sent),
+    }
+}
+
 /// Locks a mutex; a poisoned one (a panic while held, caught at the export)
 /// still guards consistent state, because every holder either completes or
 /// leaves the writer closed.
@@ -167,12 +181,20 @@ impl Index {
             docs.push(d);
         }
         r.finish()?;
-        self.with_writer(|w| {
+        let added = self.with_writer(|w| {
             for d in docs {
-                w.add_document(d)?;
+                if let Err(sent) = w.add_document(d) {
+                    return Err(worker_failure(w, sent));
+                }
             }
             Ok(())
-        })
+        });
+        if added.is_err() {
+            // A writer whose worker died stays dead: the next request opens a
+            // new one, and nothing it held was committed.
+            *lock(&self.writer) = None;
+        }
+        added
     }
 
     pub fn delete_docs(&self, ids: &[u64]) -> Result<()> {
@@ -306,5 +328,89 @@ impl Index {
         lock(&self.summaries).retain(|id, _| live.contains(id));
         summary::remove_orphans(&self.dir, &live);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+    use tantivy::directory::{
+        Directory, FileHandle, RamDirectory, WatchCallback, WatchHandle, WritePtr, INDEX_WRITER_LOCK, META_LOCK,
+    };
+    use tantivy::schema::{Schema, TEXT};
+    use tantivy::{doc, IndexWriter, TantivyDocument};
+
+    use super::worker_failure;
+    use crate::error::CX_DISK_FULL;
+
+    /// A directory on a full disk: every file opened for writing fails with
+    /// StorageFull, except the lock files the writer takes before any worker
+    /// runs.
+    #[derive(Clone, Debug, Default)]
+    struct FullDisk(RamDirectory);
+
+    impl Directory for FullDisk {
+        fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+            self.0.get_file_handle(path)
+        }
+        fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+            self.0.delete(path)
+        }
+        fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+            self.0.exists(path)
+        }
+        fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+            if path == INDEX_WRITER_LOCK.filepath.as_path() || path == META_LOCK.filepath.as_path() {
+                return self.0.open_write(path);
+            }
+            Err(OpenWriteError::IoError {
+                io_error: Arc::new(io::Error::from(io::ErrorKind::StorageFull)),
+                filepath: path.to_path_buf(),
+            })
+        }
+        fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+            self.0.atomic_read(path)
+        }
+        fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+            self.0.atomic_write(path, data)
+        }
+        fn sync_directory(&self) -> io::Result<()> {
+            self.0.sync_directory()
+        }
+        fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+            self.0.watch(watch_callback)
+        }
+    }
+
+    /// A worker that cannot write its segment on a full disk ends the writer;
+    /// the document sent after it fails as a killed writer, an internal error,
+    /// and worker_failure answers the worker's own error instead: disk full.
+    ///
+    /// Mutation: answer the send's own error (`Error::from(sent)`) and the
+    /// status is CX_INTERNAL.
+    #[test]
+    fn a_full_disk_in_an_indexing_worker_reads_as_disk_full() {
+        let mut schema = Schema::builder();
+        let body = schema.add_text_field("body", TEXT);
+        let index = tantivy::Index::create(FullDisk::default(), schema.build(), Default::default())
+            .expect("the index is created; its metadata is written atomically");
+        let mut w: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(1, 15_000_000).expect("the writer opens");
+        let mut sent = None;
+        for _ in 0..1_000_000 {
+            if let Err(e) = w.add_document(doc!(body => "full disk")) {
+                sent = Some(e);
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let sent = sent.expect("the worker that could not open its segment ended the writer");
+        assert_eq!(crate::error::Error::from(sent.clone()).status, crate::error::CX_INTERNAL);
+        let got = worker_failure(&mut w, sent);
+        assert_eq!(got.status, CX_DISK_FULL, "{}", got.msg);
     }
 }
