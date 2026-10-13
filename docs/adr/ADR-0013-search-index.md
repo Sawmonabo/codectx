@@ -280,16 +280,21 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   it served; what a page no longer pays for its depth is the heap, the string resolution, the buffer and the
   service's filtering of every result before it.
 - **Merge.** A scored segment's heap becomes a run: its groups in comparator order, each a score, a count, a document
-  and a flag (24 bytes), with no strings; the heap is freed. The runs are merged k ways, comparing heads by score
-  alone and reading two heads' strings only when their scores tie, and the merge stops at the cut or at depth + 1
-  groups. Of each group met the merge reads only its fold key, from one column (two for a result without a node), and
+  and a flag (24 bytes), with no strings; the heap is freed. The runs are merged k ways, comparing heads by score,
+  then, only while they tie, column by column in result order, so a tie reads only the columns that decide it; a
+  head's path and node are read ahead by sorted passes of growing size (at most 64 entries per segment and column),
+  so a tied run's entries, which are in path order, decode each dictionary block once. The merge stops at the cut or
+  at depth + 1 groups. Of each group met the merge reads only its fold key, from one column (two for a result without a node), and
   none when one segment alone holds runs and marks, since no other segment can hold its group. Strings are read only
-  for the results served and for each truncated segment's worst entry, one sorted dictionary pass per column and
-  segment, the segments in parallel: a sorted pass decodes each dictionary block once for all the ordinals it holds,
+  for the results served, one sorted dictionary pass per column and segment, the segments in parallel; the cut (a
+  truncated segment's worst entry) keeps its document, its strings are read only when a head ties it, and its own
+  segment never compares with it: a sorted pass decodes each dictionary block once for all the ordinals it holds,
   where a lookup of one ordinal decodes its block (about 4 KB of deltas) from the start (see Sources). A page thus
   resolves at most depth ordinals per column where a resolution of every heap resolved depth + 1 per segment; the
-  key reads are the only lookups a block can see twice, one column's, and only when several segments hold runs. The occurrence counts sum each run's entry of a served group,
-  each segment counted in parallel. This is the
+  key reads are the only lookups a block can see twice, one column's, and only when several segments hold runs. The occurrence counts sum each run's entry of a served group:
+  each segment matches its run against the served results' fold keys by one sorted pass over the node and path
+  columns, reading its own results' strings in the same job, the segments in parallel, and a single segment's work
+  runs inline. This is the
   query-then-fetch shape of the major engines: each shard returns sort keys, a k-way merge of the sorted per-shard
   lists picks the winners, and only the winners are fetched (see Sources). Resolving every segment's heap to strings
   before a hash fold would cost each segment place about 2.2 KB plus three copies of its strings. A shared minimum
@@ -302,11 +307,9 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   marked groups and each served result with the caller's copy of it, sizes the heap to fit beside the marked groups'
   bound (never below two places), doubles it on a rescoring only while it fits (or while no result is known), and ends
   the merge before a result that would pass the bound, so a bounded page is an exact prefix that says more. A bounded
-  page reads its results' strings by the sorted pass, charging each string as it is read, and gives the pass up the
-  moment the charges pass the bound; only then does the merge run again reading each result's strings as it meets it,
-  so the page stops exactly where the bound falls and the pass never holds more than the bound. A key's charge is
-  never more than its result's, so when the pass fits, the merge that reads every string would take the same results
-  and stop no later. A page
+  page reads its results' full charges as string lengths by sorted passes, never holding the strings, and cuts the
+  keys merge at the first result whose charge would pass the bound, which is where a merge reading every string would
+  stop; the page then stops exactly where the bound falls, and the charges are the same bytes either way. A page
   reports a bound on the groups the next position marks: its marked groups plus the run entries it took up to its last
   result, each of which sorts at or before that result.
 - **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
@@ -513,6 +516,8 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
     https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/MaxScoreAccumulator.java;
   - per-segment string ordinals compared within a segment and term bytes across segments,
     https://github.com/apache/lucene/blob/releases/lucene/10.3.0/lucene/core/src/java/org/apache/lucene/search/comparators/TermOrdValComparator.java;
+  - the fetch phase sorting the documents it fetches by id before reading their stored fields,
+    https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/search/fetch/FetchPhaseDocsIterator.java;
   - the search library's per-segment top-n buffers, all held and pushed again through one buffer at merge,
     https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/collector/top_score_collector.rs and
     `src/collector/sort_key_top_collector.rs` at the same tag;
