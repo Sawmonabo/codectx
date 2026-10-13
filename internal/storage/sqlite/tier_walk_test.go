@@ -15,7 +15,8 @@ import (
 	sqlitedrv "modernc.org/sqlite"
 )
 
-// TestWalkTierReadsEachPageFromItsOwnPosition pins the exact tiers' walk: it
+// TestWalkTierReadsEachPageFromItsOwnPosition pins the exact tiers' walk (and
+// the tier index as the driver of Nodes' statement too): it
 // serves every node of a tier once, as the row Nodes serves for it (the
 // precedence winner among the node's rows in the tier), and each page is a
 // seek into the tier's index that reads its own rows: a page deep in the tier
@@ -34,8 +35,9 @@ import (
 //     value beside the equality or beside the prefix's lower bound: the deep
 //     page reads the tier's index from its start, about a hundred more
 //     b-tree pages than the first page reads;
-//   - plain JOINs instead of CROSS JOIN: with statistics the planner starts
-//     from the generation's units, not from the tier index.
+//   - plain JOINs instead of CROSS JOIN, in WalkTier's statement or in
+//     Nodes': with statistics the planner starts from the generation's units
+//     and reads every fact they hold, not from the tier index.
 func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 	const nodes, units, page = 4000, 3, 200
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
@@ -149,6 +151,15 @@ func TestWalkTierReadsEachPageFromItsOwnPosition(t *testing.T) {
 			if strings.Contains(plan, "TEMP B-TREE") || !strings.HasPrefix(plan, "SEARCH nf USING INDEX "+tc.index) {
 				t.Errorf("%+v %s page does not read %s in its order:\n%s", tc.filter, q.name, tc.index, plan)
 			}
+		}
+		// Nodes, which pages by node id, must sort the tier, but it too reads
+		// the tier through its index rather than the generation's units.
+		nodesQ, nodesArgs, err := store.NodesStatement(r, tc.filter, string(after), page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan := explain(t, db, nodesQ, nodesArgs...); !strings.HasPrefix(plan, "SEARCH nf USING INDEX "+tc.index) {
+			t.Errorf("%+v: Nodes does not start from %s:\n%s", tc.filter, tc.index, plan)
 		}
 		first := pagesTouched(t, f.ctx, db, firstQ, firstArgs...)
 		deep := pagesTouched(t, f.ctx, db, deepQ, deepArgs...)
