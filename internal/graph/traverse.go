@@ -1180,6 +1180,14 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// A continuation of the possible rows follows a finished walk: it walks
 	// nothing and serves the rows from where the page before it stopped.
 	tail := tailFor(dir, kinds)
+	// A request that names the possible rows' kind asks for them: a reader
+	// that cannot list candidates refuses it before any walking, as Candidates
+	// does. One that names only precise kinds is answered, and its possible
+	// rows are disclosed as unavailable below.
+	seamless := declarationReader(reader) == nil
+	if tail != tailNone && seamless && slices.Contains(kinds, tail.kind()) {
+		return model.GraphResult{}, candidatesUnavailable()
+	}
 	inTail := resume != nil && resume.Cursor.Tail
 	var state walkState
 	if !inTail {
@@ -1256,7 +1264,13 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// The possible rows come after every precise row: on the page the walk
 	// finished on, in the room it left, and on the pages after it.
 	tailNext := int64(-1)
-	if tail != tailNone && !state.More && declarationReader(reader) != nil {
+	var unavailable []model.CapabilityState
+	if tail != tailNone && !state.More && seamless {
+		row, notice := nameOnlyUnavailable(tail.kind())
+		unavailable = append(unavailable, row)
+		notices = appendNotice(notices, notice)
+	}
+	if tail != tailNone && !state.More && !seamless {
 		through := slices.Contains(kinds, tail.kind())
 		list, err := e.possibleRows(finish, reader, tail, req.Start, through, maxDepth.Int())
 		if err != nil {
@@ -1372,7 +1386,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	result := model.GraphResult{
 		Meta: model.QueryMeta{
 			Binding:          e.adjacency.Binding(),
-			Completeness:     caps,
+			Completeness:     slices.Concat(caps, unavailable),
 			Truncated:        reason != "",
 			TruncationReason: reason,
 			NextCursor:       nextCursor,
