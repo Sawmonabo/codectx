@@ -290,6 +290,7 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 	} else {
 		res = &rf.prev.resolution
 	}
+	u.es = nil // a resolution that reused its predecessor's hierarchy read no configuration past the fields
 	bindings := res.bindings
 	targets, err := targetsOf(dir, bindings)
 	if err != nil {

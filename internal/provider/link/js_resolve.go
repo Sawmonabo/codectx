@@ -122,10 +122,13 @@ func newESResolver(ctx context.Context, u *unit) (*esResolver, error) {
 	if u.family != FamilyJavaScript {
 		return nil, nil
 	}
-	in, err := readESInputs(ctx, u)
+	in, err := esInputsOf(ctx, u)
 	if err != nil {
 		return nil, err
 	}
+	// The resolver holds the configuration from here; the unit lets it go,
+	// so it is released with the hierarchy.
+	u.es = nil
 	s, err := newEntrySort(u.dir)
 	if err != nil {
 		return nil, err

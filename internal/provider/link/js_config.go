@@ -139,6 +139,20 @@ type esInputs struct {
 	dirConfigs map[string][]string
 }
 
+// esInputsOf is the unit's configuration, read once per link: the manifest
+// fields and then the hierarchy's resolver read the same parse.
+func esInputsOf(ctx context.Context, u *unit) (*esInputs, error) {
+	if u.es != nil {
+		return u.es, nil
+	}
+	in, err := readESInputs(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	u.es = in
+	return in, nil
+}
+
 // readESInputs reads the unit's configuration: one pass over the snapshot's
 // manifest selects the files of the unit (under its root and outside every
 // nested project the plan gives a unit of its own) whose names
