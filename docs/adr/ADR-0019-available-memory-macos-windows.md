@@ -134,7 +134,7 @@ everywhere.
 
 - On macOS and Windows the product admits children against what the host can give, as on Linux: fewer on a small,
   busy laptop, more on a large workstation.
-- The product's own growth no longer throttles it on those platforms.
+- The product's own growth does not throttle it on those platforms.
 - macOS admission depends on cgo, which the release already requires; a build without cgo falls back to the stand-in
   and says so.
 - Platform defects in the readers surface in the macOS and Windows CI legs, not on Linux.
