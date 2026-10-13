@@ -44,8 +44,13 @@ it is [research 26](../research/26-extraction-and-linking-coverage.md).
   names), otherwise every top-level name without a leading underscore [S2]. A module whose `__all__` is computed falls
   back to the underscore rule, and the file's capability row says that `__all__` was not static.
 - **C:** every definition with external linkage, that is, not `static` [S3]. `exports` means linkage, documented as
-  such, not shared-library visibility, which depends on compiler flags and attribute macros a syntactic reader does not
-  evaluate [S4].
+  such, not shared-library visibility.
+- **C and C++ visibility as declared in source:** a declaration's own attributes (`visibility("…")`, `__declspec`
+  `dllexport`/`dllimport`) give its `visibility` metadata; a macro among its specifiers is read by the linker through
+  the definitions its file sees by decision 4's include lookup, following one-identifier replacements, and published as
+  a `references` to each definition with the visibility it states, one per `#if` arm with the set size. It is never
+  claimed as the binary's export table: `-fvisibility` and the toolchain's export lists decide that, and no attribute
+  publishes no visibility [S4]. No macro name is known in advance; the project's own `#define` is read.
 
 ### 3. JavaScript and TypeScript function-valued properties are declarations
 
@@ -72,7 +77,15 @@ included header binds through the include lookup the linker already performs
   format leaves dynamic. The supported subset is stated in the manifest documentation.
 - **`composer.json`:** `require` and `require-dev`, the platform entries `php` and `ext-*` included [S9]. It is read
   although PHP code is not indexed: the dependency facts need no PHP grammar.
-- Lock files are not read, as for every other ecosystem the provider reads.
+- **Lock files** (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `Cargo.lock`, `poetry.lock`,
+  `uv.lock`, `Pipfile.lock`, `pylock.toml`, `pdm.lock`, `gradle.lockfile`) are read, each by its published format,
+  as a stream: JSON tokens with one package decoded at a time, TOML one package table at a time, the text formats
+  line by line [S20][S21]. The lock defines a `configuration` node; each pinned package is a `depends_on`
+  occurrence from it to the dependency node a manifest's requirement of the same name reaches, with
+  `resolved_version`, the package's integrity where the format has one, and `set_size` the number of versions the
+  lock pins for the name; each package's dependencies are `depends_on` occurrences between dependency nodes, with
+  the resolved version where the lock states it. These are evidence detail, because a dependency node is shared by
+  every manifest and lock that names it. `composer.lock` is PHP's and is left out with PHP.
 
 ### 6. The linker publishes file-to-file `imports` for what it resolved
 
@@ -214,8 +227,7 @@ reach those answers without the verification the rest receives.
 - New facts per bound site whose value is used: one return flow, and one summary flow per argument bound to a
   returning parameter; one return node per analysed callable that a used call reaches or whose returning nodes read
   a variable.
-- Follow-ups outside this record: lock files for every ecosystem; C shared-library visibility through export
-  macros.
+- Follow-ups outside this record: lock files of the ecosystems decision 5 does not list.
 
 ## Sources
 
@@ -227,7 +239,10 @@ reach those answers without the verification the rest receives.
 - [S3] *Storage duration and linkage*, https://en.cppreference.com/w/c/language/storage_duration — external linkage
   unless `static`.
 - [S4] *Code Gen Options*, https://gcc.gnu.org/onlinedocs/gcc/Code-Gen-Options.html — `-fvisibility`; and
-  *dllexport, dllimport*, https://learn.microsoft.com/en-us/cpp/cpp/dllexport-dllimport.
+  *dllexport, dllimport*, https://learn.microsoft.com/en-us/cpp/cpp/dllexport-dllimport; *Common Attributes*,
+  https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html — "four supported visibility_type values: `default`,
+  `hidden`, `protected`, or `internal`"; and *Attribute Syntax*, https://gcc.gnu.org/onlinedocs/gcc/Attribute-Syntax.html
+  — attribute names may be written with `__` before and after.
 - [S5] *tags.scm*, https://github.com/tree-sitter/tree-sitter-javascript/blob/master/queries/tags.scm — assignment and
   pair patterns tagged as function definitions.
 - [S6] *Object-like Macros*, https://gcc.gnu.org/onlinedocs/cpp/Object-like-Macros.html; and *Kythe schema*,
@@ -256,6 +271,10 @@ reach those answers without the verification the rest receives.
 - [S18] *Cargo targets*, https://doc.rust-lang.org/cargo/reference/cargo-targets.html — `[[bin]]` and `src/bin`.
 - [S19] *RemoteFlowSource*, https://codeql.github.com/codeql-standard-libraries/python/semmle/python/dataflow/new/RemoteFlowSources.qll/type.RemoteFlowSources$RemoteFlowSource.html
   — a source node with its source type.
+- [S20] *OSV-Scanner, supported lockfiles*, https://google.github.io/osv-scanner/supported-languages-and-lockfiles/ —
+  "prefer a resolved lockfile"; the lock formats per ecosystem.
+- [S21] *pylock.toml specification* (PEP 751), https://packaging.python.org/en/latest/specifications/pylock-toml/ —
+  `[[packages]]` with `name`, `version`, `dependencies` and hashed sources.
 - [research 26](../research/26-extraction-and-linking-coverage.md) and
   [raw/coverage-gaps](../research/raw/coverage-gaps/findings.md) — the gap-by-gap survey, the options and the full
   source list.

@@ -124,8 +124,8 @@ var (
 		FamilyC:          {"compile_commands.json", "CMakeLists.txt", "Makefile"},
 		FamilyGo:         {"go.sum"},
 		FamilyJava:       {"settings.gradle", "settings.gradle.kts", "gradle.lockfile"},
-		FamilyJavaScript: {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"},
-		FamilyPython:     {"requirements.txt", "requirements-dev.txt", "poetry.lock", "Pipfile.lock"},
+		FamilyJavaScript: {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock"},
+		FamilyPython:     {"requirements.txt", "requirements-dev.txt", "poetry.lock", "Pipfile.lock", "uv.lock", "pylock.toml", "pdm.lock"},
 		FamilyRust:       {"Cargo.lock"},
 	}
 	// nestedFamilies own a project per nested marker: a Go module and a Maven

@@ -130,10 +130,15 @@ const (
 	// Target the declaration or the file's module it routes to
 	// (withEntries).
 	FactEntry Fact = 13
+	// FactVisibility: the C or C++ declaration Site is written with a macro
+	// whose definition Target (an object-like macro the declaration's file
+	// sees) states the visibility its Detail names (visibilityDetail). A
+	// macro defined in several `#if` arms has one fact per definition.
+	FactVisibility Fact = 14
 )
 
 // factLast is the last kind of fact.
-const factLast = FactEntry
+const factLast = FactVisibility
 
 // Binding is one fact a resolver found. Site names the entry of a member's
 // table the fact is about (a call site, an import, a declaration, by Kind),
