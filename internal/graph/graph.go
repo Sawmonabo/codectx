@@ -482,6 +482,11 @@ type expandOptions struct {
 	// Dispatches reports, per relation, whether any occurrence is virtual. It
 	// is required when Dispatch is set; a walk without it takes no step.
 	Dispatches DispatchReader
+	// Dependence makes the walk a dependence walk (impactdependence.go): the
+	// program-dependence hops cost impactCost, and a kind stored dependency
+	// first is walked against its stored direction. Every other walk leaves
+	// it unset and walks the relations as they are stored.
+	Dependence bool
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.

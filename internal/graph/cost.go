@@ -1,6 +1,10 @@
 package graph
 
-import "github.com/Sawmonabo/codectx/internal/model"
+import (
+	"slices"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+)
 
 // relationCost is the compile-time traversal cost table. It is deliberately NOT
 // config-derived: a configurable cost would have to enter the AnalysisKey to
@@ -72,7 +76,11 @@ func Cost(k model.RelationKind) int64 {
 // names none. It excludes renamed_from, moved_from and may_refer_to: those are
 // identity-reconciliation edges, not dependency edges, and walking them by
 // default would report a symbol's own former name as something it depends on.
-// The order is the Section 9.2 vocabulary order and is stable.
+// It also excludes may_call and may_import, which are computed per query and
+// walked only when a request names them. `routes_to` is in it: an endpoint
+// depends on the handler it runs, so a walk that names no relation crosses
+// from an endpoint to its handler. The order is the model's vocabulary order
+// and is stable.
 func DefaultRelations() []model.RelationKind {
 	return []model.RelationKind{
 		model.RelContains, model.RelDefines, model.RelReferences, model.RelCalls,
@@ -80,18 +88,69 @@ func DefaultRelations() []model.RelationKind {
 		model.RelOverrides, model.RelReads, model.RelWrites, model.RelDataFlowsTo,
 		model.RelControlDependsOn, model.RelTests, model.RelDependsOn,
 		model.RelBuilds, model.RelGenerates, model.RelDocuments,
-		model.RelConfigures, model.RelOwns,
+		model.RelConfigures, model.RelOwns, model.RelRoutesTo,
 	}
 }
 
 // ImpactRelations is the allowlist an impact query expands over, in the
 // priority order impact ranking assumes: the kinds that most strongly imply a
 // consumer must change come first. `routes_to` is in it so a changed handler
-// marks the endpoints that route to it affected.
+// marks the endpoints that route to it affected, and the program-dependence
+// relation set closes it, so impact is a forward slice over data and control
+// dependence as well as a walk over calls (ADR-0012 decision 3).
 func ImpactRelations() []model.RelationKind {
-	return []model.RelationKind{
+	return append([]model.RelationKind{
 		model.RelImplements, model.RelOverrides, model.RelCalls, model.RelRoutesTo, model.RelReads,
 		model.RelWrites, model.RelTests, model.RelConfigures, model.RelDocuments,
 		model.RelDependsOn, model.RelImports,
+	}, ProgramDependenceRelations()...)
+}
+
+// ProgramDependenceRelations is the program-dependence relation set: data
+// dependence and control dependence, which the structural provider keys by
+// the same variable entities and the linking provider extends across calls
+// (argument flows, and the summary and return flows of a call's result). A
+// walk over the two together is a walk over the program dependence graph
+// (Ferrante, Ottenstein and Warren 1987) without the caller composing it by
+// naming relation kinds.
+func ProgramDependenceRelations() []model.RelationKind {
+	return []model.RelationKind{model.RelDataFlowsTo, model.RelControlDependsOn}
+}
+
+// dependenceHorizon is what an impact walk adds to a program-dependence hop's
+// cost (impactCost). It is the ranking rule that keeps call and override
+// impact visible: a node a route reaches without a program-dependence hop
+// outranks every node whose cheapest route takes one, unless that route costs
+// 998 or more (a chain of 998 calls). Every route stays in the answer; the
+// rule decides only the order.
+//
+// The value is the largest that keeps one program-dependence hop's scores
+// apart. A score is 1_000_000 / (1 + cost), and the scores of costs c and c+1
+// differ while (1+c)(2+c) <= 1_000_000, that is through c = 998: data_flows_to
+// costs 2 + 996 = 998 and scores 1001, control_depends_on 3 + 996 = 999 and
+// scores 1000, so a data dependence still outranks a control dependence, and a
+// dependence reached through one `reads` hop (cost 1001, score 998) outranks
+// one reached through two (cost 1004, score 995).
+const dependenceHorizon int64 = 996
+
+// impactCost is the cost one edge of kind k adds to an impact route: the
+// traversal cost (Cost), plus dependenceHorizon for a program-dependence
+// kind. Every other operation walks the plain table, so a path or a traversal
+// over data flow costs what it always has.
+func impactCost(k model.RelationKind) int64 {
+	if slices.Contains(ProgramDependenceRelations(), k) {
+		return Cost(k) + dependenceHorizon
 	}
+	return Cost(k)
+}
+
+// reversedKinds are the kinds whose stored direction runs from the dependency
+// to the dependent. Every other relation kind is stored dependent first (`a
+// calls b`, `x control_depends_on y`, `f reads v`: the from-node depends on the
+// to-node), but `x data_flows_to y` says y depends on x. An impact walk walks
+// them against their stored direction, so its incoming half still reaches the
+// entities that may need modification and its outgoing half the ones that may
+// need reading.
+func reversedKinds() []model.RelationKind {
+	return []model.RelationKind{model.RelDataFlowsTo}
 }
