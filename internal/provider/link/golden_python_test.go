@@ -594,4 +594,36 @@ def run(obj, n, k, p, q):  # @run
 		},
 		fails: "a method value of a class treated as a bound method flows obj into x and n nowhere; a bound one treated as unbound flows k into self; a static or class method taken through its class treated as unbound flows p and q nowhere or into cls",
 	},
+	{
+		name:   "router-mounted-from-another-file",
+		anchor: "The Python Language Reference §7.11 (The import statement: `from a import b` binds b, an attribute reference on a module reads its global); FastAPI, \"Bigger Applications - Multiple Files\" (`app.include_router(users.router)` in main.py, the router built in routers/users.py)",
+		files: map[string]string{
+			"routers/users.py": `from fastapi import APIRouter
+
+router = APIRouter(prefix="/users")  # @router
+
+
+@router.get("/{user_id}")
+def read_user(user_id):
+    pass
+`,
+			"main.py": `from fastapi import FastAPI
+from routers import users
+
+app = FastAPI()  # @app
+app.include_router(users.router)
+`,
+		},
+		// Derived from the source and the anchors. `users` is the module routers/users.py and `users.router`
+		// its module-level binding `router`, so the mount call's argument is that file's declaration, and the
+		// application `app` mounts it. No call binds a declaration of the unit: every call is FastAPI's.
+		facts: []string{
+			"main.py imports routers/users.py",
+			"app app mounts router router",
+		},
+		// mutation: the mount argument resolved only inside its own file (or a module-level binding left out
+		// of a Python module's exports) publishes no `mounts`, which leaves every route of the router with an
+		// unresolved prefix; the argument resolved by name alone would also mount any other file's `router`.
+		fails: "a mount argument that is another module's attribute left unresolved publishes no `mounts` from app to router",
+	},
 }
