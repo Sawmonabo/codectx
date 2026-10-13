@@ -37,8 +37,14 @@ import (
 //   - Python (PEP 591): a method of a class at module or class level, unless
 //     the class or the method is decorated `final` (`typing.final`) or the
 //     method's name is private by mangling (`__name`).
-//   - Rust: a method of a trait declared `pub`; a method of an impl
-//     implements, and is never overridden.
+//   - Rust: a method of a trait declared `pub` and not sealed; a method of
+//     an impl implements, and is never overridden. A trait is sealed when a
+//     supertrait it lists is one code outside the crate cannot name (the
+//     Reference's "Visibility and privacy"; the Rust API Guidelines'
+//     C-SEALED): a trait of this module that is not `pub`, or a path
+//     through a module of this module that is not `pub` and that no `pub
+//     use` of this module re-exports from. The file is read alone: a `pub
+//     use` of the supertrait in a submodule another file holds is not seen.
 //   - C++ ([class.virtual], [class.pre], [basic.link]): a member of a class
 //     a header declares outside an unnamed namespace and that is not final,
 //     unless static or final itself; a class in a source file or an unnamed
@@ -190,7 +196,94 @@ func rustOpen(d *decl, isType bool, src []byte) bool {
 		return false
 	}
 	v := namedChild(&d.node, "visibility_modifier")
+	return v != nil && v.Utf8Text(src) == "pub" && !rustSealed(&d.node, src)
+}
+
+// rustSealed reports a trait that lists a supertrait code outside the crate
+// cannot name.
+func rustSealed(trait *ts.Node, src []byte) bool {
+	bounds := trait.ChildByFieldName("bounds")
+	scope := trait.Parent()
+	if bounds == nil || scope == nil {
+		return false
+	}
+	for i := uint(0); i < bounds.NamedChildCount(); i++ {
+		b := bounds.NamedChild(i)
+		if b.Kind() == "generic_type" {
+			b = b.ChildByFieldName("type")
+		}
+		if b == nil || b.Kind() != "type_identifier" && b.Kind() != "scoped_type_identifier" {
+			continue
+		}
+		if rustUnnameable(scope, strings.Split(b.Utf8Text(src), "::"), src, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// rustUnnameable reports a path, read in the module whose items are scope's
+// children, that code outside the crate cannot name: its first segment a
+// module of scope that is not `pub` (and that no `pub use` of scope
+// re-exports from) or, as the last segment, a trait of scope that is not
+// `pub`. A path it cannot follow (`crate::`, `super::`, a module another
+// file holds, a name no item of scope declares) is nameable.
+func rustUnnameable(scope *ts.Node, segs []string, src []byte, depth int) bool {
+	for len(segs) > 0 && strings.TrimSpace(segs[0]) == "self" {
+		segs = segs[1:]
+	}
+	if len(segs) == 0 || depth > 8 {
+		return false
+	}
+	head := strings.TrimSpace(segs[0])
+	for i := uint(0); i < scope.NamedChildCount(); i++ {
+		c := scope.NamedChild(i)
+		name := c.ChildByFieldName("name")
+		switch {
+		case c.Kind() == "mod_item" && len(segs) > 1 && name != nil && name.Utf8Text(src) == head:
+			if !rustPub(c, src) {
+				return !rustReexports(scope, head, src)
+			}
+			if body := c.ChildByFieldName("body"); body != nil {
+				return rustUnnameable(body, segs[1:], src, depth+1)
+			}
+			return false
+		case c.Kind() == "trait_item" && len(segs) == 1 && name != nil && name.Utf8Text(src) == head:
+			return !rustPub(c, src)
+		case c.Kind() == "use_declaration" && len(segs) == 1:
+			// `use a::b::T;` names T in scope by the path a::b::T.
+			if arg := c.ChildByFieldName("argument"); arg != nil && arg.Kind() == "scoped_identifier" {
+				if n := arg.ChildByFieldName("name"); n != nil && n.Utf8Text(src) == head {
+					return rustUnnameable(scope, strings.Split(arg.Utf8Text(src), "::"), src, depth+1)
+				}
+			}
+		}
+	}
+	return false
+}
+
+// rustPub reports an item whose visibility is `pub` alone.
+func rustPub(item *ts.Node, src []byte) bool {
+	v := namedChild(item, "visibility_modifier")
 	return v != nil && v.Utf8Text(src) == "pub"
+}
+
+// rustReexports reports a `pub use` of scope whose path runs through the
+// module mod.
+func rustReexports(scope *ts.Node, mod string, src []byte) bool {
+	for i := uint(0); i < scope.NamedChildCount(); i++ {
+		c := scope.NamedChild(i)
+		if c.Kind() != "use_declaration" || !rustPub(c, src) {
+			continue
+		}
+		if arg := c.ChildByFieldName("argument"); arg != nil {
+			path := strings.TrimPrefix(strings.ReplaceAll(arg.Utf8Text(src), " ", ""), "self::")
+			if path == mod || strings.HasPrefix(path, mod+"::") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // cppHeaders are the file extensions a C++ header is written with.

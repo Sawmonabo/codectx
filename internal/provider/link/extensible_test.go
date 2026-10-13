@@ -17,7 +17,9 @@ import (
 // of a final, sealed, enum or record class, of a type outside the language's
 // export rule (a package-private Java class, an unexported Go interface or
 // method, a package main or internal Go package, an unexported ECMAScript
-// class, a Rust trait that is not `pub`, a C++ class in a source file or an
+// class, a Rust trait that is not `pub` or that is sealed (a supertrait code outside
+// the crate cannot name: of a private module, or not `pub`, and not
+// re-exported), a C++ class in a source file or an
 // unnamed namespace), and a type's own method where the language has no
 // overriding of it (a Go or Rust concrete method).
 //
@@ -26,6 +28,9 @@ import (
 // unexported Go method of an exported interface, a C++ final member is
 // marked); ignoring the enclosing type (a method of a final or package-
 // private Java class, of a sealed interface or of a Python @final class is
+// marked); reading a sealed Rust trait as open (Shape::area is marked); sealing
+// through a re-exported or public module (Keyed::keyed, Marked::marked
+// unmarked); taking a `pub(crate) use` for a re-export (Tagged::tagged is
 // marked).
 func TestMethodsSayWhetherCodeOutsideMayOverrideThem(t *testing.T) {
 	structural := newStructural(t)
@@ -79,6 +84,20 @@ func TestMethodsSayWhetherCodeOutsideMayOverrideThem(t *testing.T) {
 		},
 			[]string{"Handler::serve", "Handler::log"},
 			[]string{"Inner::go", "Local::go", "T::serve"}},
+		{"rust-sealed", map[string]string{
+			"Cargo.toml": "[package]\nname = \"r\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+			"src/lib.rs": "mod private { pub trait Sealed {} }\n" +
+				"pub trait Shape: private::Sealed { fn area(&self) -> f64; }\n" +
+				"pub trait Framed: Send + self::private::Sealed { fn frame(&self); }\n" +
+				"pub(crate) trait Hidden {}\npub trait Inward: Hidden { fn inward(&self); }\n" +
+				"use private::Sealed;\npub trait Imported: Sealed { fn imported(&self); }\n" +
+				"pub mod open { pub trait Marker {} }\npub trait Marked: open::Marker { fn marked(&self); }\n" +
+				"mod leaked { pub trait Key {} }\npub use leaked::Key;\npub trait Keyed: leaked::Key { fn keyed(&self); }\n" +
+				"mod inner { pub trait Tag {} }\npub(crate) use inner::Tag;\npub trait Tagged: inner::Tag { fn tagged(&self); }\n" +
+				"pub trait Plain: Send + Clone { fn plain(&self); }\n",
+		},
+			[]string{"Marked::marked", "Keyed::keyed", "Plain::plain"},
+			[]string{"Shape::area", "Framed::frame", "Inward::inward", "Imported::imported", "Tagged::tagged"}},
 		{"cpp", map[string]string{
 			"h.h": "class Handler { public: virtual void serve(); virtual void fixed() final; static void make(); };\n" +
 				"class Closed final { public: virtual void serve(); };\n",

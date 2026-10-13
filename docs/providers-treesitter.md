@@ -322,7 +322,15 @@ TypeScript and JavaScript the methods of an exported class or interface that
 are not `private`, `#`-named or `static`; in Python a method of a class at
 module or class level, unless the method or its class is decorated `final`
 (PEP 591) or its name is mangled (`__name`); in Rust the methods of a trait
-declared `pub` (not `pub(crate)`, `pub(super)` or `pub(in …)`); in C++ the
+declared `pub` (not `pub(crate)`, `pub(super)` or `pub(in …)`) that is not
+sealed: a trait one of whose supertraits code outside the crate cannot name
+is sealed (the Rust API Guidelines' C-SEALED), and that is a trait of its
+module that is not `pub` (`pub trait Inward: Hidden` with `pub(crate) trait
+Hidden`), or a path through a module of its module that is not `pub` and that
+no `pub use` of that module re-exports from (`mod private { pub trait Sealed
+{} }` with `pub trait Shape: private::Sealed`), followed through a `use` of
+the module that names it; the file is read alone, so a `pub use` of the
+supertrait in a submodule another file holds is not seen; in C++ the
 members, not `static` or `final`, of a class that a header declares outside
 an unnamed namespace and that is not `final`. A Go or Rust concrete type's
 method, which nothing overrides, and every C declaration carry none.
