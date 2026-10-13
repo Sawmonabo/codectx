@@ -161,6 +161,11 @@ type Stats struct {
 	BlocksTotal            int64
 	BlocksScored           int64
 	DocsScored             int64
+	// KeySkips counts the segments a resumed page's served-group check
+	// skipped because their key filter holds no value of the result's fold
+	// key; KeyLookups counts the dictionary lookups it made instead.
+	KeySkips   int64
+	KeyLookups int64
 	// Heaps is how many segments were scored at once, each holding a heap of
 	// Cap places (the request's depth plus one, doubled on every rescoring a
 	// marked group forced, and fitted to MaxBytes); Marked is how many groups

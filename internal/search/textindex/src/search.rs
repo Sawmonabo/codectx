@@ -53,7 +53,7 @@ use crate::codec::{put_str, put_uvarint, put_varint, Reader};
 use crate::error::{Error, Result, CX_CANCELED, CX_NO_POSITION, CX_TOO_MANY_TERMS};
 use crate::schema::{Fields, END, START, STRS, S_KIND, S_NODE, S_PATH};
 use crate::score::{idf, quantize, safe_bound, saturation, WEIGHTS};
-use crate::summary::{Lengths, Summary, BLOCK, BLOCK_BITS, UNBOUNDED_WTF};
+use crate::summary::{key_hash, KeyCol, Lengths, Summary, BLOCK, BLOCK_BITS, UNBOUNDED_WTF};
 use crate::tokenizer::{parse_query, QueryTerm};
 use crate::view::{SegView, View};
 
@@ -217,6 +217,11 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
     }
     // The work counts sum over every scoring pass the page made.
     let (mut blocks_total, mut blocks_scored, mut docs_scored) = (0u64, 0u64, 0u64);
+    let (mut key_skips, mut key_lookups) = (0u64, 0u64);
+    // The key filters the served-group check consults; none for the
+    // exhaustive reference, which looks every key up.
+    let filters: Vec<Option<&Summary>> =
+        view.segs.iter().map(|s| if req.ignore_summaries { None } else { s.summary.as_deref() }).collect();
     loop {
         let ctx = Ctx {
             fields: &fields,
@@ -268,7 +273,9 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         let runs_bytes = live.saturating_mul(cap as u64).saturating_mul(RUN_ENTRY_BYTES);
         let scoring_bytes = place.saturating_mul(cap as u64).saturating_add(marked_bytes);
         let budget = if bounded { req.max_bytes.saturating_sub(runs_bytes + marked_bytes) } else { u64::MAX };
-        let mut m = merge(&fruits, cut.as_mut(), req.depth, first, budget, req.result_bytes)?;
+        let mut m = merge(&fruits, &filters, cut.as_mut(), req.depth, first, budget, req.result_bytes)?;
+        key_skips += m.key_skips;
+        key_lookups += m.key_lookups;
         if bounded && first == Read::Keys {
             // A merge reading each result's strings as it meets it (Read::Strings)
             // meets the results in the same order, since the order and the fold
@@ -320,6 +327,8 @@ fn search_reading(view: &View, req: &[u8], cancel: Cancel, first: Read) -> Resul
         page.blocks_total = blocks_total;
         page.blocks_scored = blocks_scored;
         page.docs_scored = docs_scored;
+        page.key_skips = key_skips;
+        page.key_lookups = key_lookups;
         page.hits = hits.into_iter().map(|(h, n, seen)| (h, n, !skipped && seen == dropping)).collect();
         return Ok(page.encode(terms.len()));
     }
@@ -372,6 +381,10 @@ struct Merge {
     out: Vec<Merged>,
     spent: u64,
     stopped: bool,
+    /// Segments the served-group check skipped on their key filter, and the
+    /// dictionary lookups it made.
+    key_skips: u64,
+    key_lookups: u64,
 }
 
 impl Hit {
@@ -407,7 +420,9 @@ enum Read {
 /// charge would pass `budget` (the first result is always taken). A group's
 /// first result met is its best document; a later one of the same group is
 /// skipped, and so is a group some segment marked as served at or before the
-/// resume position.
+/// resume position. That segment is never the result's own, whose run holds
+/// no group it marked; another segment is asked only when its key filter
+/// (`filters`) may hold the fold key, and then by a dictionary lookup.
 ///
 /// Read::Strings reads each result's strings as it is met and charges them
 /// all. Read::Keys reads only the fold key, from one column (the node, or the
@@ -418,6 +433,7 @@ enum Read {
 /// is charged in full.
 fn merge(
     fruits: &[SegFruit],
+    filters: &[Option<&Summary>],
     mut cut: Option<&mut Cut>,
     depth: usize,
     read: Read,
@@ -428,7 +444,7 @@ fn merge(
     let mut at = vec![0usize; fruits.len()];
     let mut heads: Vec<Head> = (0..fruits.len()).map(|_| Head::default()).collect();
     let mut met: HashSet<GlobalKey> = HashSet::new();
-    let mut m = Merge { out: Vec::new(), spent: 0, stopped: false };
+    let mut m = Merge { out: Vec::new(), spent: 0, stopped: false, key_skips: 0, key_lookups: 0 };
     let mut pops = 0u64;
     while m.out.len() <= depth {
         let mut best: Option<usize> = None;
@@ -476,7 +492,23 @@ fn merge(
         }
         let mut served = false;
         if let Some(k) = &key {
-            for f in fruits.iter().filter(|f| !f.marked.is_empty()) {
+            let (col, text) = match k {
+                GlobalKey::Node(n) => (KeyCol::Node, n),
+                GlobalKey::File(p, _) => (KeyCol::Path, p),
+            };
+            let mut hash = None;
+            for (s, f) in fruits.iter().enumerate() {
+                if s == i || f.marked.is_empty() {
+                    continue;
+                }
+                if let Some(sum) = filters[s] {
+                    let h = *hash.get_or_insert_with(|| key_hash(col, text.as_bytes()));
+                    if !sum.may_hold(h) {
+                        m.key_skips += 1;
+                        continue;
+                    }
+                }
+                m.key_lookups += 1;
                 let ranks = &f.cols.as_ref().expect("a segment that marked has its columns").ranks;
                 if local_entity(ranks, k)?.is_some_and(|x| f.marked.contains(&x)) {
                     served = true;
@@ -1006,6 +1038,10 @@ struct Page {
     blocks_total: u64,
     blocks_scored: u64,
     docs_scored: u64,
+    /// Segments the served-group check skipped on their key filter, and the
+    /// dictionary lookups it made.
+    key_skips: u64,
+    key_lookups: u64,
     /// Segments scored at once, the heap places each held, and the groups the
     /// resume position marked: what the page's memory scaled with.
     heaps: u64,
@@ -1034,6 +1070,8 @@ impl Page {
             self.blocks_total,
             self.blocks_scored,
             self.docs_scored,
+            self.key_skips,
+            self.key_lookups,
             self.heaps,
             self.cap,
             self.marked,
@@ -1948,7 +1986,7 @@ mod tests {
         r.byte().expect("canceled");
         r.uvarint().expect("matches");
         r.byte().expect("matches_exact");
-        for _ in 0..10 {
+        for _ in 0..12 {
             r.uvarint().expect("stats");
         }
         let n = r.uvarint().expect("hits");
@@ -2051,6 +2089,49 @@ mod tests {
         assert!(more);
         let bounded = walk(&f, 6, 1);
         assert_eq!(bounded, free);
+    }
+
+    /// Each segment's key filter holds every node and path value of the
+    /// segment, from the smallest key sets (two keys: two documents sharing a
+    /// node and a path; three: three documents sharing a node over two paths)
+    /// to a thousand documents, and rejects values the segment does not hold.
+    /// Mutation: build the filter from one column only, or hash a value under
+    /// the other column's tag, and a held value is rejected.
+    #[test]
+    fn a_key_filter_holds_every_value_of_its_segment() {
+        let names: Vec<(String, String)> = (0..1000).map(|i| (format!("n{i}"), format!("p/{i}.go"))).collect();
+        let big: Vec<Doc> =
+            names.iter().enumerate().map(|(i, (n, p))| (10 + i as u64, n.as_str(), p.as_str(), "omega")).collect();
+        let one: &[Doc] = &[(1, "solo", "p/solo.go", "omega")];
+        let shared: &[Doc] = &[(2, "twin", "p/twin.go", "omega"), (3, "twin", "p/twin.go", "omega omega")];
+        let three: &[Doc] =
+            &[(4, "tri", "p/t1.go", "omega"), (5, "tri", "p/t2.go", "omega"), (6, "tri", "p/t1.go", "omega")];
+        let f = fixture("keyfilter", &[one, shared, three, &big]);
+        // The segments are told apart by their document counts.
+        let seg_of = |n: usize| {
+            let readers = f.view.searcher.segment_readers();
+            let i = readers.iter().position(|r| r.max_doc() as usize == n).expect("a segment of that size");
+            f.view.segs[i].summary.as_deref().expect("a committed segment has a summary")
+        };
+        for docs in [one, shared, three, &big[..]] {
+            let i = docs.len();
+            let sum = seg_of(i);
+            for &(_, node, path, _) in docs.iter() {
+                assert!(
+                    sum.may_hold(key_hash(KeyCol::Node, node.as_bytes())),
+                    "the {i}-document segment rejects node {node}"
+                );
+                assert!(
+                    sum.may_hold(key_hash(KeyCol::Path, path.as_bytes())),
+                    "the {i}-document segment rejects path {path}"
+                );
+            }
+        }
+        let sum = seg_of(big.len());
+        let held =
+            (0..10_000).filter(|i| sum.may_hold(key_hash(KeyCol::Node, format!("absent{i}").as_bytes()))).count();
+        assert!(held < 200, "{held} of 10000 absent values pass the filter");
+        assert!(!sum.may_hold(key_hash(KeyCol::Path, b"n0")), "a node value is not a path");
     }
 
     /// A bounded page reads its results' strings in one sorted pass while

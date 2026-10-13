@@ -506,9 +506,15 @@ func TestPanicInsideAnExportReturnsAnError(t *testing.T) {
 // scores every block it counts, and the pruned page never scores more than it
 // counts, on pages that rescored (a heap grown past depth+1) as on the rest.
 //
+// The pruned pages skip segments on their key filters (KeySkips) where the
+// exhaustive reference looks every key up, and serve the same results.
+//
 // Mutation caught: blocks_total counted over the last pass while
 // blocks_scored sums every pass (a rescored exhaustive page then reports more
 // blocks scored than exist).
+// Mutation caught: a key filter built from or probed with the wrong column's
+// values (it rejects a segment that marked the group, and a group served
+// before the position comes back).
 func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	c := genCorpus(4, 5000, 100)
 	dir := t.TempDir()
@@ -521,6 +527,7 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	defer v.Close()
 	rng := rand.New(rand.NewPCG(4, 4))
 	ties, rescored := 0, 0
+	var skips, lookups int64
 	for _, rule := range []LengthRule{LengthTotal, LengthWeighted} {
 		for _, kinds := range [][]model.NodeKind{nil, {model.NodeFunction, model.NodeFile}} {
 			for _, q := range engineQueries {
@@ -550,6 +557,8 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 						if err := samePage(got, want); err != nil {
 							t.Fatalf("rule %d kinds %v query %q after hit %d depth %d: %v", rule, kinds, q, i, d, err)
 						}
+						skips += got.Stats.KeySkips
+						lookups += got.Stats.KeyLookups
 						if got.Stats.BlocksScored > got.Stats.BlocksTotal {
 							t.Fatalf("query %q after hit %d depth %d: %d blocks scored of %d", q, i, d,
 								got.Stats.BlocksScored, got.Stats.BlocksTotal)
@@ -563,6 +572,10 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 						if full.Stats.BlocksScored != full.Stats.BlocksTotal {
 							t.Fatalf("query %q after hit %d depth %d, exhaustive: %d blocks scored of %d (cap %d)",
 								q, i, d, full.Stats.BlocksScored, full.Stats.BlocksTotal, full.Stats.Cap)
+						}
+						if full.Stats.KeySkips != 0 {
+							t.Fatalf("query %q after hit %d depth %d, exhaustive: %d segments skipped on a key filter",
+								q, i, d, full.Stats.KeySkips)
 						}
 						if full.Stats.Cap > int64(d)+1 {
 							rescored++
@@ -578,6 +591,10 @@ func TestResumedPagesEqualTheDeepReadsSuffix(t *testing.T) {
 	if rescored == 0 {
 		t.Fatal("no page rescored: the test proves nothing about block counts across passes")
 	}
+	if skips == 0 || lookups == 0 {
+		t.Fatalf("key filters skipped %d segments and %d keys were looked up: the test needs both", skips, lookups)
+	}
+	t.Logf("key filters skipped %d segments; %d keys were looked up", skips, lookups)
 
 	// A hidden document is not a position of this view.
 	hidden := c.docs[c.units[0]][0].DocID

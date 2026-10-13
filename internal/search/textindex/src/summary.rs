@@ -5,6 +5,13 @@
 //! largest weighted term frequency and smallest document length under both
 //! length rules. Deleted documents are included; they only loosen a bound.
 //!
+//! The file also holds the segment's key filter: a binary fuse filter (8-bit
+//! fingerprints) over the values of the node and path columns, the two
+//! dictionaries a resumed page looks a served group's fold key up in. A key
+//! the filter rejects is in neither dictionary, so the lookup is skipped; a
+//! key it accepts is looked up, so a false positive costs a lookup and never
+//! an answer.
+//!
 //! The file is read through a memory map: a term is found by binary search
 //! over a sorted table, and nothing per segment is copied onto the heap.
 //!
@@ -14,14 +21,20 @@
 //!   40  max_doc          u32
 //!   44  block_bits       u32
 //!   48  n_terms          u64
-//!   56  n_blocks         u64   (block entries, 16 bytes each, from offset 96)
+//!   56  n_blocks         u64   (block entries, 16 bytes each, from offset 112)
 //!   64  strings_len      u64   (term bytes, after the block entries)
 //!   72  table_off        u64   (n_terms x 24-byte entries, after the strings)
 //!   80  file_len         u64
-//!   88  checksum         u64   (FNV-1a 64 over every byte from offset 96)
-//!   96  block entries    { u32 block, u32 wtf_max, u32 min_len_total, u32 min_len_weighted }
+//!   88  n_keys           u64   (distinct key hashes the filter was built from)
+//!   96  keys_len         u64   (filter bytes, after the table; 0: no filter)
+//!   104 checksum         u64   (FNV-1a 64 over every byte from offset 112)
+//!   112 block entries    { u32 block, u32 wtf_max, u32 min_len_total, u32 min_len_weighted }
 //!       term bytes
 //!       term table       { u64 string offset, u64 first entry, u32 df, u32 entries }
+//!       key filter       descriptor (Descriptor::DMA_LEN bytes), then fingerprints
+//!
+//! A key filter is absent (keys_len 0) when n_keys is 0, which holds every
+//! key out, or when its construction failed, which holds every key in.
 //!
 //! A wtf_max of u32::MAX means "unbounded" (the true value did not fit); a
 //! length that does not fit is stored as u32::MAX, which is below the true
@@ -36,17 +49,19 @@ use tantivy::index::SegmentId;
 use tantivy::postings::Postings;
 use tantivy::schema::IndexRecordOption;
 use tantivy::{DocId, DocSet, SegmentReader, TERMINATED};
+use xorf::{BinaryFuse8, BinaryFuse8Ref, DmaSerializable, Filter, FilterRef};
 
 use crate::error::{Error, Result};
-use crate::schema::Fields;
+use crate::schema::{Fields, STRS, S_NODE, S_PATH};
 use crate::score::WEIGHTS;
 
 pub const BLOCK_BITS: u32 = 7;
 pub const BLOCK: u32 = 1 << BLOCK_BITS;
 pub const UNBOUNDED_WTF: u32 = u32::MAX;
 
-const MAGIC: &[u8; 8] = b"CXBLKSUM";
-const HEADER: usize = 96;
+const MAGIC: &[u8; 8] = b"CXBLKSU2";
+const HEADER: usize = 112;
+const DESCRIPTOR: usize = xorf::Descriptor::DMA_LEN;
 const ENTRY: usize = 16;
 const TERM: usize = 24;
 pub const SUFFIX: &str = ".cxsum";
@@ -78,6 +93,43 @@ pub struct Summary {
     n_terms: u64,
     strings_len: u64,
     table_off: u64,
+    n_keys: u64,
+    /// The key filter's offset in the map and its length (0: none).
+    keys_off: u64,
+    keys_len: u64,
+}
+
+/// The column a fold key is looked up in: its node, or its file's path.
+#[derive(Clone, Copy)]
+pub enum KeyCol {
+    Node,
+    Path,
+}
+
+/// A fold key's hash as the key filter holds it: FNV-1a 64 over a byte naming
+/// the column, then the value's bytes. The filter mixes it further.
+pub fn key_hash(col: KeyCol, value: &[u8]) -> u64 {
+    let tag = match col {
+        KeyCol::Node => 0u8,
+        KeyCol::Path => 1u8,
+    };
+    fnv1a(fnv1a(FNV_OFFSET, &[tag]), value)
+}
+
+/// The key hashes of a segment: every value of its node and path columns,
+/// distinct and sorted.
+fn key_hashes(seg: &SegmentReader) -> Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for (k, col) in [(S_NODE, KeyCol::Node), (S_PATH, KeyCol::Path)] {
+        let Some(c) = seg.fast_fields().str(STRS[k])? else { continue };
+        let mut st = c.dictionary().stream()?;
+        while st.advance() {
+            out.push(key_hash(col, st.key()));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
@@ -211,8 +263,27 @@ pub fn build(dir: &Path, seg: &SegmentReader, fields: &Fields) -> Result<()> {
     w.write_all(&strings)?;
     sum = fnv1a(sum, &table);
     w.write_all(&table)?;
-    let table_off = (HEADER as u64) + n_blocks * ENTRY as u64 + strings.len() as u64;
-    let file_len = table_off + table.len() as u64;
+    let strings_len = strings.len() as u64;
+    drop(strings);
+    drop(table);
+    let keys = key_hashes(seg)?;
+    let n_keys = keys.len() as u64;
+    let mut keys_len = 0u64;
+    if !keys.is_empty() {
+        // A construction that fails leaves the segment without a filter:
+        // every key is then looked up.
+        if let Ok(f) = BinaryFuse8::try_from(&keys) {
+            let mut d = [0u8; DESCRIPTOR];
+            f.dma_copy_descriptor_to(&mut d);
+            sum = fnv1a(sum, &d);
+            w.write_all(&d)?;
+            sum = fnv1a(sum, f.dma_fingerprints());
+            w.write_all(f.dma_fingerprints())?;
+            keys_len = (DESCRIPTOR + f.dma_fingerprints().len()) as u64;
+        }
+    }
+    let table_off = (HEADER as u64) + n_blocks * ENTRY as u64 + strings_len;
+    let file_len = table_off + n_terms * TERM as u64 + keys_len;
     let mut h = Vec::with_capacity(HEADER);
     h.extend_from_slice(MAGIC);
     h.extend_from_slice(seg.segment_id().uuid_string().as_bytes());
@@ -220,9 +291,11 @@ pub fn build(dir: &Path, seg: &SegmentReader, fields: &Fields) -> Result<()> {
     h.extend_from_slice(&BLOCK_BITS.to_le_bytes());
     h.extend_from_slice(&n_terms.to_le_bytes());
     h.extend_from_slice(&n_blocks.to_le_bytes());
-    h.extend_from_slice(&(strings.len() as u64).to_le_bytes());
+    h.extend_from_slice(&strings_len.to_le_bytes());
     h.extend_from_slice(&table_off.to_le_bytes());
     h.extend_from_slice(&file_len.to_le_bytes());
+    h.extend_from_slice(&n_keys.to_le_bytes());
+    h.extend_from_slice(&keys_len.to_le_bytes());
     h.extend_from_slice(&sum.to_le_bytes());
     debug_assert_eq!(h.len(), HEADER);
     w.seek(SeekFrom::Start(0))?;
@@ -281,17 +354,22 @@ impl Summary {
         let strings_len = u64_at(b, 64);
         let table_off = u64_at(b, 72);
         let file_len = u64_at(b, 80);
+        let n_keys = u64_at(b, 88);
+        let keys_len = u64_at(b, 96);
         let blocks_end = (HEADER as u64).checked_add(n_blocks.checked_mul(ENTRY as u64)?)?;
+        let keys_off = table_off.checked_add(n_terms.checked_mul(TERM as u64)?)?;
         if blocks_end.checked_add(strings_len)? != table_off
-            || table_off.checked_add(n_terms.checked_mul(TERM as u64)?)? != file_len
+            || keys_off.checked_add(keys_len)? != file_len
             || file_len != b.len() as u64
+            || (keys_len != 0 && keys_len <= DESCRIPTOR as u64)
+            || (n_keys == 0 && keys_len != 0)
         {
             return None;
         }
-        if fnv1a(FNV_OFFSET, &b[HEADER..]) != u64_at(b, 88) {
+        if fnv1a(FNV_OFFSET, &b[HEADER..]) != u64_at(b, 104) {
             return None;
         }
-        let s = Summary { map, n_terms, strings_len, table_off };
+        let s = Summary { map, n_terms, strings_len, table_off, n_keys, keys_off, keys_len };
         // Every table entry must point inside the file, strings ascending.
         let mut prev_off = 0u64;
         for i in 0..n_terms {
@@ -332,6 +410,21 @@ impl Summary {
             }
         }
         None
+    }
+
+    /// Whether the segment's node (or path) column may hold the value whose
+    /// key_hash is `h`: false only when it holds no such value.
+    pub fn may_hold(&self, h: u64) -> bool {
+        if self.n_keys == 0 {
+            return false;
+        }
+        if self.keys_len == 0 {
+            return true;
+        }
+        let at = self.keys_off as usize;
+        let d = &self.map[at..at + DESCRIPTOR];
+        let fp = &self.map[at + DESCRIPTOR..at + self.keys_len as usize];
+        BinaryFuse8Ref::from_dma(d, fp).contains(&h)
     }
 
     /// The block entries of a term, blocks ascending.

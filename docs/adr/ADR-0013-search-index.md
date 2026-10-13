@@ -283,7 +283,12 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   and a flag (24 bytes), with no strings; the heap is freed. The runs are merged k ways, comparing heads by score
   alone and reading two heads' strings only when their scores tie, and the merge stops at the cut or at depth + 1
   groups. Of each group met the merge reads only its fold key, from one column (two for a result without a node), and
-  none when one segment alone holds runs and marks, since no other segment can hold its group. Strings are read only
+  none when one segment alone holds runs and marks, since no other segment can hold its group. The key is looked up
+  (a search of the column's dictionary for its ordinal) only in the other segments that marked groups, never in its
+  own (a segment's run holds none of the groups it marked), and only where that segment's key filter accepts it. A
+  key the filter rejects is in neither dictionary, so the skipped lookup changes no answer; a false positive costs
+  one lookup. The filter answers in three memory reads where a dictionary search decodes a block, so a resumed page
+  over many segments no longer pays a lookup per key and segment. Strings are read only
   for the results served and for each truncated segment's worst entry, one sorted dictionary pass per column and
   segment, the segments in parallel: a sorted pass decodes each dictionary block once for all the ordinals it holds,
   where a lookup of one ordinal decodes its block (about 4 KB of deltas) from the start (see Sources). A page thus
@@ -342,8 +347,11 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
 - **No spool.** The ranked set is never sorted to disk. ADR-0001 §2.4 is amended to this rule.
 - **Block summaries.** Each segment has one summary file, `<segment id>.cxsum`, in the index directory. For every token
   of the five columns it holds the token's df over the segment's documents and, per block holding the token, the
-  maximum weighted term frequency and the minimum document length under both length forms. Deleted documents stay in
-  it; they only loosen a bound. A header names the segment and its document count; a mismatched or unreadable file
+  maximum weighted term frequency and the minimum document length under both length forms. It also holds the
+  segment's key filter: a binary fuse filter with 8-bit fingerprints over every value of the node and path columns
+  (each hashed with its column's tag), read in place from the memory map; about 9 to 12 bits a key and a 0.4%
+  false-positive rate (1 in 256), so 1 million keys take 1.2 to 1.4 MB. Deleted documents stay in
+  it; they only loosen a bound or admit a key. A header names the segment and its document count; a mismatched or unreadable file
   is no summary, and that segment is scored exhaustively, so a stale summary is never read. A summary is built for
   every searchable segment that lacks one at each commit, after each merge (a writer release waits for merges), and
   by a forced merge; the summaries of segments no longer present are removed.
@@ -502,6 +510,18 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
     https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/action/search/SearchPhaseController.java
     and `FetchSearchPhase.java` at the same tag; deep pages cost memory and time in from + size,
     https://www.elastic.co/docs/reference/elasticsearch/index-settings/index-modules.
+- The key filter (the Merge and Block summaries bullets of decision 5):
+  - binary fuse filters, within 13% of the space bound against 23% for xor and 44% for Bloom filters, with three
+    memory reads per query, Graf and Lemire, "Binary Fuse Filters: Fast and Smaller Than Xor Filters", ACM Journal of
+    Experimental Algorithmics 27 (2022), https://arxiv.org/abs/2201.01174;
+  - xor filters, Graf and Lemire (2020), https://arxiv.org/abs/1912.08258;
+  - a cache-local Bloom filter at 10 bits a key has about a 0.95% false-positive rate, and a Ribbon filter saves
+    about 30% of its space for 3 to 4 times its build CPU and more build memory,
+    https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter;
+  - Ribbon filters, Dillinger and Walzer (2021), https://arxiv.org/abs/2103.02515;
+  - the implementation, `BinaryFuse8` and its zero-copy `BinaryFuse8Ref`, https://docs.rs/xorf/0.13.0/xorf/;
+  - the search library keeps no term membership filter; its dictionary answers membership by a block search,
+    `Dictionary::term_ord` in https://github.com/quickwit-oss/tantivy/blob/0.26.0/sstable/src/dictionary.rs.
 - The search library's fix for its pruned disjunction-max scoring, https://github.com/quickwit-oss/tantivy/pull/3022
   (decision 5).
 - The Rust 1.81 release notes, https://blog.rust-lang.org/2024/09/05/Rust-1.81.0/: an uncaught unwind across a C ABI

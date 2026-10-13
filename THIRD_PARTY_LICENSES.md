@@ -108,6 +108,7 @@ cargo metadata --locked --offline --format-version 1
 | itoa | 1.0.18 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | levenshtein_automata | 0.2.1 | MIT | `LICENSE` |
 | libc | 0.2.190 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
+| libm | 0.2.16 | MIT | `LICENSE.txt` |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-Apache-2.0_WITH_LLVM-exception`, `LICENSE-MIT` |
 | log | 0.4.34 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | lru | 0.16.4 | MIT | `LICENSE` |
@@ -156,6 +157,7 @@ cargo metadata --locked --offline --format-version 1
 | typetag | 0.2.23 | MIT OR Apache-2.0 | `LICENSE-APACHE`, `LICENSE-MIT` |
 | utf8-ranges | 1.0.5 | Unlicense/MIT | `COPYING`, `LICENSE-MIT`, `UNLICENSE` |
 | uuid | 1.27.0 | Apache-2.0 OR MIT | `LICENSE-APACHE`, `LICENSE-MIT` |
+| xorf | 0.13.0 | MIT | `LICENSE` |
 | zmij | 1.0.23 | MIT | `LICENSE-MIT` |
 
 ## Pinned analyzer payloads
