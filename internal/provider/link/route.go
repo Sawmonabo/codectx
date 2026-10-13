@@ -27,6 +27,11 @@ type Routing struct {
 	// DJANGO_SETTINGS_MODULE (`os.environ.setdefault(...)`,
 	// `os.environ[...] = ...`), as dotted names.
 	Settings []string `json:"settings,omitempty"`
+	// Nest are the file's NestJS routes (route_nest.go), each published
+	// on a mount of its own (RouteMount.Nest); NestApp is what the file
+	// sets on the NestJS applications it creates, nil when it names none.
+	Nest    []NestRoute `json:"nest,omitempty"`
+	NestApp *NestApp    `json:"nest_app,omitempty"`
 }
 
 // RouteObject is one object a module-level binding holds (Decl indexes
@@ -119,6 +124,10 @@ type RouteMount struct {
 	// (JoinFunction, `r.Route("/users", users.Routes)`).
 	Join MountJoin  `json:"join,omitempty"`
 	Call *MountCall `json:"call,omitempty"`
+	// Nest is, for a NestJS route's own mount (located at its route
+	// decorator), one more than the route's index in Routing.Nest; 0 for
+	// any other mount.
+	Nest int32 `json:"nest,omitempty"`
 }
 
 // MountJoin is how a Go mount reaches the callable whose routing it mounts

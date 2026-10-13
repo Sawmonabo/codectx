@@ -348,6 +348,41 @@ another framework, a call whose receiver is a call's result, a parameter written
 (`handlers.Show`) is resolved in that file's context; a handler written inline gives the endpoint no `routes_to`. Every lookup is traced on the mount's
 file.
 
+## NestJS paths
+
+A NestJS route's path is joined from three files' worth of facts (`internal/provider/link/route_nest.go`): the
+controller's path and the route decorator's in the controller's file, and the global prefix and versioning the file
+creating the application sets on it (`NestFactory.create`, then `app.setGlobalPrefix(…)`, `app.enableVersioning(…)`).
+The structural provider publishes every NestJS route `unresolved` (docs/providers-treesitter.md, Framework routes) and
+records, in the controller's link table, each route (`Routing.Nest`: method, route, the controller's paths and the
+route's as written in literals, the method's `@Version` and the controller's `version`, the handler) on a mount of its
+own located at the decorator (`RouteMount.Nest`); and, in any ECMAScript file that creates an application or calls
+`setGlobalPrefix` or `enableVersioning`, what it sets (`Routing.NestApp`, indexed under `keyNestApp`). A call is
+attributed by its receiver: one on an application the file creates applies to it, one on a testing application (a
+`createNestApplication` result, or any application in a file importing `@nestjs/testing` that NestFactory did not
+create) is not read, and any other receiver (a helper's parameter) is an application no table ties to one.
+
+The linker builds each path as Nest's `RoutePathFactory.create` does (packages/core/router/route-path-factory.ts):
+the URI version segment (`/` + the versioning's `prefix`, `v` unless it says otherwise or `false`, + the version; the
+method's `@Version`, else the controller's `version`, else the `defaultVersion`; `VERSION_NEUTRAL` adds none; an
+array is one path per version), then the controller's path and the route's, each joined as `stripEndSlash(a) +
+addLeadingSlash(b)` with an array one path per element (`@Controller()` and a route with no path are `/`), then the
+global prefix with its trailing slash removed, and a final leading slash with no trailing one. Only URI versioning
+puts the version in the path; header, media-type and custom versioning leave it out. Each path is one `endpoint` in
+the controller's file, located at the decorator, keyed `endpoint:<method route>@<path>`, with `prefix: resolved`,
+routing to the method (detail `direct`). The paths are computed for every application the unit creates; distinct
+paths are published together, each `routes_to` carrying their number as `set_size`.
+
+Nothing is published, and the structural `unresolved` endpoint stays the route's only one, when the unit creates no
+application (the bootstrap is another unit's); when a setting is made on an application no table ties to one; when a
+file creating several applications sets either; when one file's settings disagree; when a prefix or a versioning
+option is no literal, or `setGlobalPrefix` passes options (its `exclude` list is matched against each route at run
+time); when the route's or the controller's path or the version it needs is no literal; and when any file names
+`RouterModule` from `@nestjs/core`, whose module paths join below the version through the module tree
+`NestFactory.create` starts from, which this design does not follow. Every application is read through one traced
+lookup, and the settings are part of the creating file's interface summary, so an edit to `main.ts` re-resolves every
+NestJS route of the unit.
+
 ## Request inputs across files
 
 A request-input read whose source another file decides is published by the linker
