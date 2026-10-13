@@ -364,7 +364,11 @@ func (k *javaScriptLinker) function(fn Node, g *flow.Graph, du flow.Edges, src [
 			}
 		case k.x.pair:
 			if name, f, holder, ok := k.pairFunction(n); ok {
-				k.declaredValue(f, name, holder, false)
+				// A descriptor's function defines a method of a prototype
+				// (prototypeDescriptor), no value of a field.
+				if _, _, descriptor := k.prototypeDescriptor(n); !descriptor {
+					k.declaredValue(f, name, holder, false)
+				}
 			} else if field := k.propertyName(n.ChildByFieldId(kk.fKey)); field != "" {
 				k.written(n.ChildByFieldId(kk.fValue), field)
 			}
@@ -903,7 +907,13 @@ func (k *javaScriptLinker) className(body Node) string {
 	c := body.Parent()
 	if jsKindOf(c) == kk.class {
 		// A class expression assigned to a name or a property
-		// (`module.exports = class { … }`) is declared by that name.
+		// (`module.exports = class { … }`), or bound by a declarator
+		// (`const C = class { … }`), is declared by that name.
+		if d := c.Parent(); jsKindOf(d) == kk.variableDeclarator && d.ChildByFieldId(kk.fValue) == c {
+			if name := d.ChildByFieldId(kk.fName); jsKindOf(name) == kk.identifier {
+				return string(textOf(k.src, name))
+			}
+		}
 		if a := c.Parent(); jsKindOf(a) == kk.assignmentExpression && a.ChildByFieldId(kk.fRight) == c {
 			switch left := a.ChildByFieldId(kk.fLeft); jsKindOf(left) {
 			case kk.identifier:
@@ -1438,7 +1448,14 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 			// `this.#p()` calls.
 			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == x.propertyIdentifier || jsKindOf(name) == x.privatePropertyIdentifier {
 				abstract := n.KindId() != kk.methodDefinition
-				k.export(out, name, n, k.receiverOf(n), !abstract && hasToken(n, kk.staticKw), abstract)
+				receiver := k.receiverOf(n)
+				if m, o, ok := k.prototypeDescriptor(n); ok {
+					if k.firstDescriptorFunction(n.Parent()) != n {
+						break
+					}
+					name, receiver = m, o
+				}
+				k.export(out, name, n, receiver, !abstract && hasToken(n, kk.staticKw), abstract)
 				out.Exports[len(out.Exports)-1].Override = !kindChild(n, x.overrideModifier).IsNull()
 				if p := n.Parent(); jsKindOf(p) == x.object && commonJSExport(k.objectPath(p), false) {
 					// A method of the object `module.exports` is assigned
@@ -1464,6 +1481,12 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 		case x.pair:
 			if name, fn, holder, ok := k.pairFunction(n); ok {
 				owner, method := prototypeOwner(holder)
+				if m, o, ok := k.prototypeDescriptor(n); ok {
+					if k.firstDescriptorFunction(n.Parent()) != n {
+						break
+					}
+					name, owner, method = m, o, true
+				}
 				k.export(out, name, fn, owner, !method, false)
 				out.Exports[len(out.Exports)-1].Property = true
 				out.Exports[len(out.Exports)-1].Exported = commonJSExport(holder, false)
@@ -1808,6 +1831,76 @@ func prototypeOwner(holder string) (string, bool) {
 		return "", false
 	}
 	return owner, true
+}
+
+// prototypeDescriptor reports a function the pair or method n declares as
+// the `value`, `get` or `set` of the descriptor in
+// `Object.defineProperty(C.prototype, "m", { … })`: the string's contents
+// naming m, which declare it, and C, whose method it is. The property is
+// one declaration, described by the descriptor's first function
+// (firstDescriptorFunction); a later one declares nothing.
+func (k *javaScriptLinker) prototypeDescriptor(n Node) (Node, string, bool) {
+	kk, x := k.k, k.x
+	var key string
+	switch n.KindId() {
+	case x.pair:
+		key = k.propertyName(n.ChildByFieldId(kk.fKey))
+	case kk.methodDefinition:
+		key = string(textOf(k.src, n.ChildByFieldId(kk.fName)))
+	}
+	if key != "value" && key != "get" && key != "set" {
+		return Node{}, "", false
+	}
+	obj := n.Parent()
+	args := obj.Parent()
+	if jsKindOf(obj) != x.object || jsKindOf(args) != x.arguments || jsKindOf(args.Parent()) != kk.callExpression {
+		return Node{}, "", false
+	}
+	if k.spell(args.Parent().ChildByFieldId(kk.fFunction)) != "Object.defineProperty" {
+		return Node{}, "", false
+	}
+	var a []Node
+	for c := args.first(); !c.IsNull(); c = c.next() {
+		if c.IsNamed() && !c.IsExtra() {
+			a = append(a, c)
+		}
+	}
+	if len(a) != 3 || a[2] != obj || jsKindOf(a[1]) != x.str {
+		return Node{}, "", false
+	}
+	owner, ok := prototypeOwner(k.spell(a[0]))
+	frag := firstNamed(a[1])
+	if !ok || frag.IsNull() || !frag.NextNamedSibling().IsNull() || frag.StartByte() != a[1].StartByte()+1 ||
+		frag.EndByte() != a[1].EndByte()-1 {
+		return Node{}, "", false
+	}
+	return frag, owner, true
+}
+
+// firstDescriptorFunction is the first function of the property
+// descriptor obj: a `value`, `get` or `set` key holding a function
+// expression, or a `get` or `set` method.
+func (k *javaScriptLinker) firstDescriptorFunction(obj Node) Node {
+	kk, x := k.k, k.x
+	for c := obj.first(); !c.IsNull(); c = c.next() {
+		switch c.KindId() {
+		case x.pair:
+			if _, _, _, ok := k.pairFunction(c); ok {
+				switch k.propertyName(c.ChildByFieldId(kk.fKey)) {
+				case "value", "get", "set":
+					return c
+				}
+			}
+		case kk.methodDefinition:
+			if name := c.ChildByFieldId(kk.fName); jsKindOf(name) == x.propertyIdentifier {
+				switch string(textOf(k.src, name)) {
+				case "value", "get", "set":
+					return c
+				}
+			}
+		}
+	}
+	return Node{}
 }
 
 // params is the number of fn's parameters, a TypeScript `this` parameter

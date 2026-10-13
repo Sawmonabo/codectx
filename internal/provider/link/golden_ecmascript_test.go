@@ -1250,6 +1250,110 @@ function go() {
 		fails: "a constructor function and the methods its prototype holds are no class and no methods",
 	},
 	{
+		name: "define-property-on-a-prototype",
+		anchor: "TypeScript binder (AssignmentDeclarationKind ObjectDefinePrototypeProperty: `Object.defineProperty(C.prototype, " +
+			"\"m\", { value | get | set })` declares the method or accessor m of C); ECMA-262 (15th edition, 2024) §20.1.2.4 " +
+			"(Object.defineProperty), §10.1.13 (OrdinaryCreateFromConstructor)",
+		files: map[string]string{
+			"src/p.js": `function P() {} // @p
+Object.defineProperty(P.prototype, "run", { value: function () {} }); // @run
+Object.defineProperty(P.prototype, "size", { // @size
+  get() { return 1; },
+  set(v) {},
+});
+class Q extends P { // @q
+  get size() { return 2; } // @qsize
+}
+function go() {
+  new P().run(); // @np
+}
+`,
+		},
+		// Derived from the anchors: run is P's method, so `new P().run()` binds it; the getter and setter are
+		// one accessor size of P (one property, as the binder declares one symbol), which Q's getter overrides.
+		want: []string{
+			"np P -> p P exact",
+			"np run -> run run exact",
+		},
+		facts: []string{
+			"q Q extends p P",
+			"qsize size overrides size size",
+		},
+		// Mutation: leave a descriptor's function named by its key (`value`, `get`, `set`) -> P is no class and
+		// run and size are no members: np binds nothing.
+		fails: "a method or accessor `Object.defineProperty` stores on a prototype is no member of its constructor",
+	},
+	{
+		name: "constructors-bound-by-declarators",
+		anchor: "TypeScript checker isJSConstructor (a variable a function expression initializes is a constructor when " +
+			"its prototype has members); binder isExpandoSymbol (a class expression bound by a declarator); ECMA-262 " +
+			"(15th edition, 2024) §10.1.13 (OrdinaryCreateFromConstructor)",
+		files: map[string]string{
+			"src/v.js": `const A = function () {}; // @a
+A.prototype.hi = function () {}; // @ahi
+let B = class { // @b
+  hi() {} // @bhi
+};
+B.prototype.bye = function () {}; // @bbye
+var V = function () {}; // @v
+V.prototype = {
+  hi() {}, // @vhi
+};
+function go() {
+  new A().hi(); // @na
+  new B().hi(); // @nb
+  new B().bye(); // @nbb
+  new V().hi(); // @nv
+}
+`,
+		},
+		// Derived from the anchors: A and V are constructors whose prototypes hold hi, and B is a class whose
+		// prototype gains bye; each `new` makes an object of exactly that constructor.
+		want: []string{
+			"na A -> a A exact",
+			"na hi -> ahi hi exact",
+			"nb B -> b B exact",
+			"nb hi -> bhi hi exact",
+			"nbb B -> b B exact",
+			"nbb bye -> bbye bye exact",
+			"nv V -> v V exact",
+			"nv hi -> vhi hi exact",
+		},
+		// Mutation: read only function declarations as constructors and drop the class expression a declarator
+		// binds -> no `new` binds and hi and bye bind external placeholders.
+		fails: "a constructor or class a declarator binds is no class, so neither `new` nor its methods bind",
+	},
+	{
+		name: "prototype-of-an-imported-function",
+		anchor: "Node.js Modules: CommonJS modules (`require` returns the one module.exports, so every importer shares the " +
+			"function); ECMA-262 (15th edition, 2024) §10.2 (ECMAScript function objects: [[Construct]] and `prototype`), " +
+			"§10.1.13 (OrdinaryCreateFromConstructor)",
+		files: map[string]string{
+			"src/c.js": `function C() {} // @c
+module.exports = C;
+`,
+			"src/ext.js": `const C = require("./c");
+C.prototype.greet = function () {}; // @g
+`,
+			"src/main.js": `const C = require("./c");
+require("./ext");
+
+function go() {
+  new C().greet(); // @nc
+}
+`,
+		},
+		// Derived from the anchors: ext.js stores greet on the prototype of the one function c.js exports, so the
+		// object `new C()` makes in main.js inherits it.
+		want: []string{
+			"nc C -> c C exact",
+			"nc greet -> g greet exact",
+		},
+		// Mutation: attach a prototype's function only to a class the importing file can name as a type -> greet
+		// is no method of C and nc greet is unbound; construct only types -> both rows are lost.
+		fails: "a method stored on an imported function's prototype is no method of that function's objects",
+	},
+	{
 		name:   "typescript-export-assignment",
 		anchor: "TypeScript Handbook, Modules (`export =` assigns the module's value; `import x = require()` imports it)",
 		files: map[string]string{

@@ -70,7 +70,7 @@ func (s *Service) ReadAnswer(ctx context.Context, reader *sqlite.PinnedReader, r
 	if err != nil {
 		return end, err
 	}
-	if err := filter.pin(ctx, s.store, reader.Binding().SnapshotID); err != nil {
+	if err := filter.pin(ctx, s.store, reader, reader.Binding().SnapshotID); err != nil {
 		return end, err
 	}
 	var pos searchPosition
@@ -81,6 +81,9 @@ func (s *Service) ReadAnswer(ctx context.Context, reader *sqlite.PinnedReader, r
 		ans, err := s.collect(searchCtx, reader, req, filter, pos, depth,
 			pageBound{maxBytes: max(budget, 1), markedBound: sizer.shape.marked})
 		searchCancel()
+		if err == nil {
+			err = filter.tag.Err()
+		}
 		if err != nil {
 			return end, err
 		}

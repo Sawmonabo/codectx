@@ -373,6 +373,50 @@ impl<T: fmt::Debug> Describe for T {
 		// and the blanket impl's describe, whose self type is a parameter, overrides nothing.
 		fails: "an impl item published as implementing a same-named item of another trait of its self type; an external trait's item dropped when the type implements several; a blanket impl's item left without its trait's",
 	},
+	{
+		name:   "trait-impl-global-path",
+		anchor: "The Rust Reference, \"Paths\" (path qualifiers: a path starting with `::` resolves from the extern prelude, 2018 edition and later), \"Implementations\" (trait implementations), \"Use declarations\" (glob imports)",
+		files: map[string]string{
+			"Cargo.toml": `[package]
+name = "global"
+version = "0.1.0"
+edition = "2021"
+`,
+			"src/lib.rs": `use other::*;
+
+pub trait Shape { // @tshape
+    fn area(&self) -> u32; // @sarea
+}
+
+pub struct Square; // @tsquare
+
+impl Hidden for Square {
+    fn hide(&self) {} // @qhide
+}
+
+impl ::std::fmt::Display for Square {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result { Ok(()) } // @qdisplay
+}
+
+impl Shape for Square {
+    fn area(&self) -> u32 { 1 } // @qarea
+}
+`,
+		},
+		// Derived from the source and the anchor: Hidden may come from the glob of a crate outside the
+		// unit, so it names nothing known and publishes nothing, while the rows after it still link;
+		// `::std::fmt::Display` is std's, whatever the file's use declarations bind.
+		want: []string{},
+		facts: []string{
+			"tsquare Square implements external std::fmt::Display",
+			"tsquare Square implements tshape Shape",
+			"qdisplay fmt overrides external std::fmt::Display::fmt",
+			"qarea area overrides sarea area",
+		},
+		// Mutation: stop at a supertype that names nothing known -> Square implements neither Display
+		// nor Shape. Mutation: read a leading `::` as the crate's own -> the Display rows are gone.
+		fails: "a file's supertype rows after one that names nothing known dropped; a global path to a crate outside the unit read as naming nothing",
+	},
 }
 
 // TestRustMacroInputIsGeneratedAcrossFiles protects the crate-wide match of a
