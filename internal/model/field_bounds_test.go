@@ -9,10 +9,10 @@ import (
 // wider than its storage ceiling is shortened and flagged by its producer, not
 // a reason to refuse the fact.
 //
-// boundField used to reject every ceiling alike, so one symbol with a generated
-// signature past 4 KiB failed ProviderResult.Validate and took the whole unit's
-// facts with it -- the repository lost a file's worth of answers over a field
-// nobody could resubmit. The identity fields in the second half must still
+// Mutation: boundField rejecting every ceiling alike. One symbol with a
+// generated signature past 4 KiB then fails ProviderResult.Validate and takes
+// the whole unit's facts with it -- the repository loses a file's worth of
+// answers over a field nobody can resubmit. The identity fields in the second half must still
 // reject: a shortened path or native key names a different thing.
 func TestOversizeStorageFieldsDoNotFailTheUnit(t *testing.T) {
 	id := strings.Repeat("a", IDHexLen)

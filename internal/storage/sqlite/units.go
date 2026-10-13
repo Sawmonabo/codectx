@@ -310,7 +310,7 @@ type UnitWriter struct {
 	done       bool
 
 	// ids resolves a canonical identity or an interned string to the
-	// storage-internal surrogate every reference column now carries (ids.go),
+	// storage-internal surrogate every reference column carries (ids.go),
 	// and nodes caches the lookup-only direction: a node that must ALREADY be
 	// registered -- a relation endpoint, an alias target, a search document's
 	// symbol -- is never minted here, so it is resolved by canonical lookup and
@@ -932,7 +932,7 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 // resolving them again per row would buy nothing. Exactly one of them is
 // valid, which is what the evidence CHECK constraint requires.
 //
-// evidence.id is the canonical 32-byte digest, not a surrogate: the id is a
+// evidence.id is the canonical 16-byte identity, not a surrogate: the id is a
 // pure function of the occurrence's fields and ON CONFLICT(id) DO NOTHING is
 // what makes a republished occurrence idempotent.
 func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence, node nodeRef, rel relRef) error {
@@ -951,7 +951,7 @@ func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []mode
 		defer stmt.Close()
 	}
 	for _, e := range list {
-		idRaw, _ := model.DecodeID(string(e.ID))
+		idRaw, _ := model.DecodeEvidenceID(e.ID)
 		fileRaw, err := w.inputFile(ctx, tx, e.FileID, e.ContentHash)
 		if err != nil {
 			return err
@@ -1608,8 +1608,7 @@ var analyzedTables = [...]string{"node_facts", "generation_units"}
 // runs -- the transaction above committed -- so refusing to return the binding
 // would turn a slower query plan into a failed index. The operator is told
 // instead: a stale plan is a performance fact they can act on, not a silent
-// one. Generations published before this landed keep the old plan until the
-// next activation rewrites the statistics.
+// one; the next activation rewrites the statistics.
 func (s *Store) refreshStatistics(ctx context.Context) {
 	// analysis_limit bounds each index scan instead of walking it end to end,
 	// which is what makes this affordable inside an activation; the statistics

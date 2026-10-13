@@ -8,14 +8,40 @@ import (
 	"errors"
 )
 
-// NeedKey names one learned need model within a repository: the language, the
-// grammar fingerprint the files were parsed under, the build identity of the
-// worker that parsed them, and the file-size class. A worker of a new build
-// learns afresh: what it holds of a file's tree beside the parse -- the
-// flattened array, the lowering's structures -- changes with the build, and a
-// model learned under another would reserve for work the file no longer does.
+// NeedKind is what one need model's observations are runs of: a parsed file's
+// memory, or an external tool's run -- a precise indexer's profile unit or a
+// language server -- in one of the two dimensions the admission ledger holds.
+type NeedKind string
+
+const (
+	NeedParse         NeedKind = "parse"
+	NeedIndexerMemory NeedKind = "indexer memory"
+	NeedIndexerDisk   NeedKind = "indexer disk"
+	NeedServerMemory  NeedKind = "server memory"
+	NeedServerDisk    NeedKind = "server disk"
+)
+
+// Valid reports whether k is one of the kinds the observation store holds.
+func (k NeedKind) Valid() bool {
+	switch k {
+	case NeedParse, NeedIndexerMemory, NeedIndexerDisk, NeedServerMemory, NeedServerDisk:
+		return true
+	}
+	return false
+}
+
+// NeedKey names one learned need model within a repository: its kind; its
+// subject -- the language a parsed file is in, or the tool's name; the
+// fingerprint of what did the work -- the grammar the files were parsed under,
+// or the payload the tool lock pinned; the build identity of this product's
+// binary that ran it; and the size class of the work. A new build learns
+// afresh: what a worker holds of a file's tree beside the parse -- the
+// flattened array, the lowering's structures -- and how a tool is invoked
+// change with the build, and a model learned under another would reserve for
+// work that is no longer done.
 type NeedKey struct {
-	Language    string
+	Kind        NeedKind
+	Subject     string
 	Fingerprint string
 	Build       string
 	SizeClass   int
@@ -50,7 +76,7 @@ func (r *Run) RepositoryID() string {
 // state, which folds in everything before it, supersedes what was lost. The
 // state is copied, so the caller may reuse its buffer at once.
 //
-// An observation the store would refuse -- no language, no fingerprint, no
+// An observation the store would refuse -- an unknown kind, no subject, no fingerprint, no
 // build, no state, a negative class, or a negative figure, which no measurement is -- is
 // counted as dropped too rather than published: written, it would fail the
 // transaction it shares with every other event of the batch and lose them all.
@@ -59,7 +85,7 @@ func (r *Run) ObserveNeed(o NeedObservation) {
 	if r == nil {
 		return
 	}
-	if o.Key.Language == "" || o.Key.Fingerprint == "" || o.Key.Build == "" || o.Key.SizeClass < 0 || len(o.State) == 0 ||
+	if !o.Key.Kind.Valid() || o.Key.Subject == "" || o.Key.Fingerprint == "" || o.Key.Build == "" || o.Key.SizeClass < 0 || len(o.State) == 0 ||
 		o.NeedBytes < 0 || o.ReservedBytes < 0 {
 		if !r.stopped.Load() {
 			r.dropped.Add(1)
@@ -91,8 +117,8 @@ func (r *Run) NeedModel(ctx context.Context, key NeedKey) ([]byte, bool, error) 
 	}
 	var state []byte
 	err := r.c.db.QueryRowContext(ctx, `SELECT state FROM need_models
-		WHERE repository_id = ? AND language = ? AND fingerprint = ? AND build = ? AND size_class = ?`,
-		r.repo, key.Language, key.Fingerprint, key.Build, key.SizeClass).Scan(&state)
+		WHERE repository_id = ? AND kind = ? AND subject = ? AND fingerprint = ? AND build = ? AND size_class = ?`,
+		r.repo, string(key.Kind), key.Subject, key.Fingerprint, key.Build, key.SizeClass).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}

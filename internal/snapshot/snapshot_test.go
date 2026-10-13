@@ -332,8 +332,11 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 	}
 
 	// A corrupt block is detected by the range read that touches it and by a
-	// full stream, while a range in another block still verifies.
+	// full stream, while a range in another block still verifies. Byte 10 of
+	// the object lies inside the first block's frame; corrupt(true) flips it
+	// and corrupt(false) restores the byte it held.
 	longPath := filepath.Join(CASDir(f.dataDir), long.ContentHash[:2], long.ContentHash)
+	var original [1]byte
 	corrupt := func(flip bool) {
 		t.Helper()
 		if err := os.Chmod(longPath, 0o600); err != nil {
@@ -343,9 +346,12 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		v := byte('x')
+		v := original[0]
 		if flip {
-			v = 'y'
+			if _, err := fh.ReadAt(original[:], 10); err != nil {
+				t.Fatal(err)
+			}
+			v = ^original[0]
 		}
 		if _, err := fh.WriteAt([]byte{v}, 10); err != nil {
 			t.Fatal(err)
@@ -409,7 +415,7 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 // keeps changing under the builder is recaptured until the user-set retry
 // budget is spent and the capture then fails with CTX_SNAPSHOT_UNSTABLE,
 // rather than publishing a manifest whose bytes were never validated or
-// retrying forever. The budget is now the caller's (zero is unlimited, bounded
+// retrying forever. The budget is the caller's (zero is unlimited, bounded
 // by RetryDeadline), so the test sets it instead of reading a constant.
 func TestUnstableCaptureIsReported(t *testing.T) {
 	const retries = 4

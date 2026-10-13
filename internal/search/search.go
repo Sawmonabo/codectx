@@ -236,7 +236,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	// has a live context to serve its page with, and a caller who stopped
 	// asking still stops all of it.
 	searchCtx, searchCancel := model.QueryDeadline(ctx, s.timeout)
-	ans, err := s.collect(searchCtx, reader, req, filter, pos, limit)
+	ans, err := s.collect(searchCtx, reader, req, filter, pos, limit, pageBound{})
 	searchCancel()
 	if err != nil {
 		return empty, err
@@ -314,7 +314,7 @@ func (a *searchAnswer) add(hit model.SearchHit, span *model.ByteRange) {
 // continuation's key is the last SERVED result's, so the result past the page
 // is read again, and filtered again, by the next page.
 func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
-	filter hitFilter, pos searchPosition, limit int) (searchAnswer, error) {
+	filter hitFilter, pos searchPosition, limit int, bound pageBound) (searchAnswer, error) {
 	var ans searchAnswer
 	normalized, pathFile, err := queryFile(ctx, reader, req.Query)
 	if err != nil {
@@ -343,7 +343,7 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 		room = limit - len(held)
 	}
 	fold := newExactFold(reader, req, normalized, pathFile, filter)
-	page, kept, err := s.lexicalPhase(ctx, reader, req, filter, fold, after, room)
+	page, kept, err := s.lexicalPhase(ctx, reader, req, filter, fold, after, room, bound)
 	ans.lexical = page
 	if err != nil {
 		return ended(ctx, ans, err)
@@ -592,8 +592,15 @@ func positionKey(ctx context.Context, reader exactReader, req model.SearchReques
 // the previous one returned and asks for twice as many. No request re-reads a
 // result an earlier one returned, so a page costs the results it reads, never
 // the results served before it.
+//
+// Under a bound (an in-process read's step) every request carries the bytes
+// the step may still hold -- the bound less what the kept results already
+// hold -- and the marked-group bound the previous index page reported, so
+// the library never holds more than the step admitted; a page it ends early
+// is an exact prefix that says More, and the next request resumes after it.
 func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
-	filter hitFilter, fold exactFold, after *textindex.Position, room int) (*textindex.Page, []textindex.Hit, error) {
+	filter hitFilter, fold exactFold, after *textindex.Position, room int,
+	bound pageBound) (*textindex.Page, []textindex.Hit, error) {
 	var read *textindex.Page
 	view, err := reader.SearchView(ctx)
 	if err != nil {
@@ -603,15 +610,25 @@ func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader,
 	want := room + 1
 	depth := want
 	var kept []textindex.Hit
+	var held int64
+	marked := bound.markedBound
 	for {
 		r := textindex.Request{Query: req.Query, Kinds: req.Kinds, PathPrefixes: filter.prefixes, Depth: depth,
 			After: after, LengthRule: s.rule, MaxTerms: s.maxTerms.Value()}
+		if bound.maxBytes > 0 {
+			r.MaxBytes = max(bound.maxBytes-held, 1)
+			r.ResultBytes = callerResultBytes()
+			r.MarkedBound = marked
+		}
 		if observeIndexRequest != nil {
 			observeIndexRequest(r)
 		}
 		page, err := view.Search(ctx, r)
 		if err != nil {
 			return read, nil, s.lexicalErr(err)
+		}
+		if observeIndexPage != nil {
+			observeIndexPage(r, page)
 		}
 		read = &page
 		served, err := fold.served(ctx, page.Hits)
@@ -624,8 +641,10 @@ func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader,
 			}
 			if filter.keep(h.Path) && !served[h.NodeID] {
 				kept = append(kept, h)
+				held = addSat(held, callerResultBytes()+callerStringCopies*hitStringBytes(h))
 			}
 		}
+		marked = page.Stats.NewMarks
 		// A canceled page is the best found so far, not the ranking's next
 		// results: it is served as it is, truncated, and ends the read.
 		if page.Canceled || len(kept) == want || !page.More || len(page.Hits) == 0 {
@@ -645,6 +664,11 @@ func (s *Service) lexicalPhase(ctx context.Context, reader *sqlite.PinnedReader,
 // index, before it is sent. It is nil in production: it is the seam a test
 // observes the reads of a page through.
 var observeIndexRequest func(textindex.Request)
+
+// observeIndexPage, when set, sees every page the index answers lexicalPhase,
+// with the request it answers. It is nil in production: it is the seam a test
+// reads a page's charged bytes through.
+var observeIndexPage func(textindex.Request, textindex.Page)
 
 // lexicalErr types an index refusal. A query over resources.max_query_terms is
 // refused rather than scored on its first terms: a query that scores only some

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -119,6 +120,28 @@ func (s *seedSet) notePageEnd(origin originKind, step, cursor string) {
 		Path:     "seed discovery: " + step,
 		Origin:   origin,
 		Excluded: boundReason(reason),
+	})
+}
+
+// noteDeadline records that a query deadline ended a discovery step's read
+// before the step's own end. Like notePageEnd it marks the scope incomplete
+// and names the step in the exclusions, once per step.
+func (s *seedSet) noteDeadline(origin originKind, step string) {
+	s.Unresolved = true
+	if s.cutStages == nil {
+		s.cutStages = map[string]bool{}
+	}
+	key := "deadline:" + step
+	if s.cutStages[key] {
+		return
+	}
+	s.cutStages[key] = true
+	s.Excluded = append(s.Excluded, candidate{
+		Path:   "seed discovery: " + step,
+		Origin: origin,
+		Excluded: boundReason(fmt.Sprintf(
+			"the query time budget (--timeout, or resources.query_timeout) ended the read of %s; matches beyond the ones read were never examined",
+			step)),
 	})
 }
 
@@ -293,9 +316,8 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 
 // freeTermSeeds runs Section 15.2 steps 4 and 5 over the prose the earlier
 // steps did not claim: each remaining identifier-shaped term goes to
-// Search.Resolve for an exact declaration, then the task text goes to
-// Search.Search for lexical hits, read down to the stop (ADR-0016 decision 3)
-// against the resolved budget b and the round's extra witness count. A word
+// Search.Resolve for an exact declaration, then lexicalSeeds reads the task
+// text's lexical matches. A word
 // that answers nothing is prose, not a failed identity, so it leaves no
 // exclusion and does not make the scope incomplete.
 func (c *Compiler) freeTermSeeds(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID, task string,
@@ -325,64 +347,59 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, reader *sqlite.PinnedReade
 			}
 		}
 	}
+	return c.lexicalSeeds(ctx, reader, task, b, round, out)
+}
+
+// lexicalSeeds is Section 15.2 step 5: the task text's lexical matches, read
+// in score order down to the stop (ADR-0016 decision 3) against the resolved
+// budget b and the round's extra witness count.
+func (c *Compiler) lexicalSeeds(ctx context.Context, reader *sqlite.PinnedReader, task string, b resolvedBudget,
+	round roundInputs, out *seedSet) error {
 	out.sink.BeginStep(originLexical, "the lexical matches of the task text")
 	if strings.TrimSpace(task) == "" {
 		return nil
 	}
 
-	// The lexical tier is read in score order on its own keyset cursor, page
-	// by page, until the stop (ADR-0016 decision 3): once F+1 distinct witness
-	// files (F the plan's file budget, plus the round's extra) hold a read
-	// match, the next match is read only while lexicalTau of its contribution
-	// reaches the contribution at which the last of those witnesses appeared.
-	// The first match below that is examined -- on the next page if the page
-	// ran out -- and not admitted, and no unread match can then lend anything
-	// a rank key above the packed files. The decision depends on scores alone,
-	// so matches of equal score are read together whatever the page size, and
-	// the plan does not depend on where a page boundary falls. c.fullRead reads
-	// every match instead. The only count bound on admissions is
-	// context.max_seeds, which is the operator's, is unlimited by default, and
-	// is reported when it cuts.
+	// The lexical tier is read in score order, in process, until the stop
+	// (ADR-0016 decision 3): once F+1 distinct witness files (F the plan's
+	// file budget, plus the round's extra) hold a read match, the next match is
+	// read only while lexicalTau of its contribution reaches the contribution
+	// at which the last of those witnesses appeared. The first match below
+	// that is examined -- on the next page if the page ran out -- and not
+	// admitted, and no unread match can then lend anything a rank key above
+	// the packed files. The decision depends on scores alone, so matches of
+	// equal score are read together whatever the page or step size, and the
+	// plan does not depend on where a boundary falls. c.fullRead reads every match
+	// instead. The only count bound on admissions is context.max_seeds, which
+	// is the operator's, is unlimited by default, and is reported when it cuts.
+	//
+	// The read is the search service's in-process call, not its wire pages:
+	// it starts at pageLimit and doubles its depth while a step fits the
+	// lexical read's share of the query memory admission, so reading N matches
+	// costs the index about 4N document scorings rather than the N²/(2P) that
+	// resuming fixed pages of P costs. The read hands its hits over a page of
+	// pageLimit at a time, hydrated just before, so nothing past the page the
+	// stop falls on is read from storage. The stop's threshold is learned while
+	// reading and is applied here, page by page, rather than by the search.
 	stop := newLexicalStop(c.fullRead, b, round)
 	defer func() { out.Stop = stop.stop }()
-	cursor := ""
-	for {
-		// A continuation names the cursor ALONE: the cursor already pins the
-		// generation it was minted against -- the same gen this compile pinned
-		// -- and naming both is refused as a contradiction. Each page resumes
-		// the lexical ranking after the last match the previous page served,
-		// so reading to the stop costs the matches read, never a re-read of
-		// the ones before. The stop's threshold is learned while reading and
-		// is applied here, page by page, rather than by the search.
-		read := model.SearchRequest{
-			Query: clipUTF8(task, model.MaxQueryTextBytes),
-			Page:  model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
-		}
-		if cursor == "" {
-			read.GenerationID = gen
-		}
-		page, err := c.search.Search(ctx, read)
-		if err != nil {
-			// A bound the lexical tier could not serve within is a capability
-			// reduction, not a failed compile: the weakest discovery step stops
-			// contributing and the scope is reported incomplete (Section 14.4).
-			var typed *model.Error
-			if errors.As(err, &typed) && typed.Code == model.CodeResourceLimit {
-				out.Unresolved = true
-				return nil
-			}
-			return contextErr(ctx, err)
-		}
-		if err := stop.loadPage(ctx, reader, page.Items); err != nil {
+	read := model.SearchRequest{Query: clipUTF8(task, model.MaxQueryTextBytes)}
+	// admitStep is what each step's hits go through. Its own failures are kept
+	// apart from the search's, so only a bound the search met is read as a
+	// capability reduction below; a failure of the stop or the sink fails the
+	// compile as it is.
+	var stepErr error
+	admitStep := func(hits []model.SearchHit) error {
+		if err := stop.loadPage(ctx, reader, hits); err != nil {
 			return err
 		}
-		for _, hit := range page.Items {
+		for _, hit := range hits {
 			weight, ok, err := stop.admit(hit)
 			if err != nil {
 				return err
 			}
 			if !ok {
-				return nil
+				return errStopReached
 			}
 			cnd := candidate{
 				NodeID:      hit.NodeID,
@@ -401,17 +418,55 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, reader *sqlite.PinnedReade
 				return err
 			}
 		}
-		if page.Meta.NextCursor == "" || page.Meta.NextCursor == cursor {
-			// An unchanged cursor is a tier that cannot advance; continuing
-			// would spin the compile forever. Exhaustion and a stuck reader are
-			// distinguished: only the second leaves the scope incomplete.
-			if page.Meta.NextCursor != "" {
-				out.notePageEnd(originLexical, "the lexical matches of the task text", page.Meta.NextCursor)
-			}
+		return nil
+	}
+	end, err := c.search.ReadAnswer(ctx, reader, read, c.pageLimit(), lexicalReadBytes(c.cfg),
+		func(hits []model.SearchHit) (bool, error) {
+			stepErr = admitStep(hits)
+			return stepErr == nil, nil
+		})
+	if stepErr != nil && !errors.Is(stepErr, errStopReached) {
+		return stepErr
+	}
+	if err != nil {
+		// A bound the lexical tier could not serve within is a capability
+		// reduction, not a failed compile: the weakest discovery step stops
+		// contributing and the scope is reported incomplete (Section 14.4).
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Code == model.CodeResourceLimit {
+			out.Unresolved = true
 			return nil
 		}
-		cursor = page.Meta.NextCursor
+		return contextErr(ctx, err)
 	}
+	if end.Truncated {
+		// A deadline ended the read before the stop: matches it never reached
+		// could rank above the packed files, so the scope is incomplete and
+		// the manifest says why.
+		out.noteDeadline(originLexical, "the lexical matches of the task text")
+	}
+	if end.Stuck {
+		// A read that cannot advance would spin the compile forever.
+		// Exhaustion and a stuck reader are distinguished: only the second
+		// leaves the scope incomplete.
+		out.notePageEnd(originLexical, "the lexical matches of the task text", "")
+	}
+	return nil
+}
+
+// errStopReached ends a step of the lexical read at the stop. It never leaves
+// freeTermSeeds.
+var errStopReached = errors.New("the lexical read reached its stop")
+
+// lexicalReadBytes is the bytes one step of the lexical read may hold: the
+// query memory admission (resources.query_memory_bytes) less the share the
+// compile's external sorts take of it (pagination.SortRunBytes), since those
+// sorts are open while discovery pushes into them. It is a share of the one
+// admission rather than a key of its own, so the parts never oversubscribe the
+// whole, and a share too small for any growth reads at pageLimit, never fails.
+func lexicalReadBytes(cfg config.Config) int64 {
+	admission := cfg.Resources.QueryMemoryBytes
+	return max(admission-pagination.SortRunBytes(admission), 0)
 }
 
 // changedFileSeeds is Section 15.2 step 6: the captured working-tree changes,
@@ -535,7 +590,8 @@ func (c *Compiler) snapshotFile(ctx context.Context, reader *sqlite.PinnedReader
 // pageLimit is the Section 20.1 resources.max_page_items bound every bounded
 // read in this package is issued under -- seed batches, the evidence batch
 // behind per-edge precision, and the file and edge hydrations the compile runs
-// once each. One helper, so no two passes can page at different sizes.
+// once each -- and the depth the in-process lexical read starts from before it
+// grows. One helper, so no two passes can page at different sizes.
 func (c *Compiler) pageLimit() int {
 	if n := c.cfg.Resources.MaxPageItems; n > 0 && n <= model.MaxPageItems {
 		return n

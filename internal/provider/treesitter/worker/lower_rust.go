@@ -1715,8 +1715,9 @@ func (r *rsLower) let(n Node) {
 		r.block(alt, -1)
 		r.restore(sure)
 		// The language requires the else block to diverge; a block ending
-		// in a plain panicking-macro node still has a fringe, which returns.
-		r.b.Return()
+		// in a plain panicking-macro node still has a fringe, which leaves
+		// without returning a value.
+		r.b.Diverge()
 		r.b.Restore(p)
 		r.b.Pop(p)
 		r.bindFrom(pat, s, place)

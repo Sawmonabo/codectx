@@ -229,9 +229,9 @@ the same entities, in the same global order, each listed exactly once. An entity
 reached again from a later frontier is one record, not two; the cheapest route
 to it wins, and the reasons of every edge that touched it are merged into that
 one entry. The order is `score_micros` descending, then `depth` ascending, then
-`node_id` ascending. **`name` is no longer a tie-break** — it is known only
-after hydration, so ranking on it would have reordered one page of a globally
-ordered answer.
+`node_id` ascending. **`name` is not a tie-break** — it is known only after
+hydration, so ranking on it would reorder one page of a globally ordered
+answer.
 
 An impact answer carries two ranked lists, the affected entities and the package
 rollup over every edge the walk admitted, and one `next_cursor` pages both: each
@@ -456,7 +456,9 @@ it again. Documents of one node fold into one result, scored by its best
 document. A result an exact tier already served for the same query is dropped,
 and so is one outside the language filter; while that leaves the page short and
 more results exist, the index is asked for twice as many results after the last
-one it returned.
+one it returned. The context compiler reads the same sequence in process rather than by pages:
+each step resumes after the last result served and asks for twice the previous
+depth, past the wire page, while the step fits the query memory admission.
 
 Block-max WAND, over blocks of 128 documents with BM25F upper bounds per block
 of the union postings, skips every block that cannot enter the top k; it
@@ -510,7 +512,7 @@ where the workspace is composed, and handed to it.
 | `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Unlimited by default, so an unbounded walk answers in full. |
 | search slots (this machine's cores) | How many lexical searches the index runs at once; one past them waits for a slot. Derived from the machine, not a setting. |
 | traversal slots (half this machine's cores, at least one) | Process-wide gate on concurrent graph queries; it is derived from the machine and is not a setting. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
-| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills the edges it has collected to the walk's own scratch and carries on reading, so it bounds the memory a level costs and never the edges the answer holds. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For the context compiler it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the compile — a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on these paths is a function of this number rather than of the graph or the candidate count. A ranked `search` holds one top-k heap of as many entries as the depth it asks for, whatever the match count, and the generation's cached alive sets are bounded by this number. |
+| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills the edges it has collected to the walk's own scratch and carries on reading, so it bounds the memory a level costs and never the edges the answer holds. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For the context compiler it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the compile — a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on these paths is a function of this number rather than of the graph or the candidate count. A ranked `search` holds one top-k heap of as many entries as the depth it asks for, whatever the match count, and the generation's cached alive sets are bounded by this number. The context compiler's lexical read grows its depth in process, past the wire page, while one step (the heaps of the segments scored at once, every segment's string-free run, the served results and the groups the resume position marks) fits this number less the sort's quarter, and stays at the largest depth that fits. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
 
 ## Context compilation reads the same facts

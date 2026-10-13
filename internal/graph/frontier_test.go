@@ -522,8 +522,8 @@ func assertPairOrder(t *testing.T, pairs []model.PackageEdge) {
 // carry more package pairs than one result may hold.
 const widePackageCount = model.MaxRecordsPerResult + 284
 
-// TestImpactPagesPastTheResultRecordCap is VF1 and VF2 from the real-repository
-// verification. On a 4019-file repository `impact --depth 0 --visited 0
+// TestImpactPagesPastTheResultRecordCap reproduces a real-repository failure.
+// On a 4019-file repository `impact --depth 0 --visited 0
 // --edges 0` was REFUSED on page 1 -- `impact_result.packages has 1284
 // entries, limit 1000` -- because the whole walk's rollup was built into one
 // result; on another repository the same walk silently stopped at exactly 1000
@@ -792,8 +792,8 @@ func TestFrontierBytesMustBePositive(t *testing.T) {
 	}
 }
 
-// TestImpactRanksAWalkSplitAcrossRequests is the D14 proof, and the one this
-// programme's whole retention design exists for.
+// TestImpactRanksAWalkSplitAcrossRequests is the proof the whole retention
+// design exists for.
 //
 // The query deadline may end a PAGE mid-walk and carry the frontier forward in
 // the `f` cursor, and the answer is ranked globally. Without the retained
@@ -959,7 +959,7 @@ func assertNoRetainedState(t *testing.T, dir string) {
 	}
 }
 
-// TestFrontierCeilingDoesNotShrinkTheImpactAnswer is D15: the blast radius a
+// TestFrontierCeilingDoesNotShrinkTheImpactAnswer: the blast radius a
 // request reports must be a function of the GRAPH, never of the memory ceiling
 // the walk was given. Limits.FrontierBytes is an internal page boundary --
 // runWalkToCompletion chains through it -- so a smaller ceiling may cost more
@@ -1169,7 +1169,7 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 	}
 }
 
-// TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget is SK8. Under a small
+// TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget: under a small
 // shared continuation budget an impact walk split across many deadline pages
 // eventually cannot hand its retained pass-1 input to the spool store. The
 // failure mode: an empty token and a NIL error (`retain` degrading a budget
@@ -1294,10 +1294,10 @@ func (s slowReader) Neighbours(ctx context.Context, refs []NodeRef, dir model.Di
 		}
 		return fn(e)
 	})
-	// The old port charged a SECOND round trip at the end of every chunk: its
-	// keyset loop only knew it was done when a page came back empty. Charging
-	// it here is what keeps these cases' trigger counts meaning the level they
-	// were calibrated to.
+	// A SECOND round trip is charged at the end of every chunk, the one a
+	// keyset loop that ends only on an empty page makes. Charging it here is
+	// what keeps these cases' trigger counts meaning the level they are
+	// calibrated to.
 	s.tick()
 	return pos, err
 }

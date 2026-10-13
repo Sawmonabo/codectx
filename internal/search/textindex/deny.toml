@@ -1,0 +1,47 @@
+# cargo-deny policy for the search index crate: the licenses its linked tree may
+# carry, the advisories and yanked versions it must not carry, and crates.io as
+# its only source. CI runs `cargo deny --locked check` from this directory.
+
+# The six release targets, so platform crates are checked for the targets that
+# link them and for no other.
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-gnu",
+  "aarch64-pc-windows-gnullvm",
+]
+
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+# Permissive licenses only: the set THIRD_PARTY_LICENSES.md records for the
+# linked tree, plus Unicode-3.0, which reaches the graph through unicode-ident, a
+# compile-time macro dependency that is not linked. An expression with
+# alternatives passes when one allowed alternative satisfies it.
+[licenses]
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  "zlib-acknowledgement",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Two versions of one crate are reported, not refused: the duplicates in this
+# tree (windows-sys) come from upstream requirements the crate cannot change.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

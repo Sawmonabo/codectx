@@ -11,11 +11,11 @@ import (
 
 // TestCapabilityReportPublishesEveryRow protects the invariant that a
 // generation's capability report is never refused for its length and never
-// read back short. Two bounds used to break it together: Activate refused a
-// report of more than model.MaxCapabilityStates entries, which made a large
-// repository's index unpublishable, and the read path carried a bare
-// `LIMIT 256`, which silently dropped the tail of the report that
-// QueryMeta.Completeness is derived from -- so every answer over-claimed.
+// read back short. Mutations: Activate refusing a report of more than
+// model.MaxCapabilityStates entries, which makes a large repository's index
+// unpublishable; the read path carrying a bare `LIMIT 256`, which silently
+// drops the tail of the report that QueryMeta.Completeness is derived from --
+// so every answer over-claims.
 //
 // What it proves is exactly publish + one full read: Capabilities has no page
 // API and none is asserted here. The report is bounded on the WRITE side, by

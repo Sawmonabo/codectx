@@ -540,7 +540,6 @@ func (o ReferenceOccurrence) Validate() error {
 		value string
 	}{
 		{"reference_occurrence.relation_id", string(o.RelationID)},
-		{"reference_occurrence.evidence_id", string(o.EvidenceID)},
 		{"reference_occurrence.from_node_id", string(o.FromNodeID)},
 		{"reference_occurrence.to_node_id", string(o.ToNodeID)},
 	} {
@@ -554,6 +553,13 @@ func (o ReferenceOccurrence) Validate() error {
 		if err := check(f.field, f.value); err != nil {
 			return err
 		}
+	}
+	checkEvidence := requireEvidenceID
+	if overlay {
+		checkEvidence = optionalEvidenceID
+	}
+	if err := checkEvidence("reference_occurrence.evidence_id", o.EvidenceID); err != nil {
+		return err
 	}
 	if overlay {
 		// The pinned file and range are then the only thing that makes the
@@ -779,7 +785,7 @@ func (o RelationOccurrence) Validate() error {
 	if err := requireID("relation_occurrence.relation_id", string(o.RelationID)); err != nil {
 		return err
 	}
-	if err := requireID("relation_occurrence.evidence_id", string(o.EvidenceID)); err != nil {
+	if err := requireEvidenceID("relation_occurrence.evidence_id", o.EvidenceID); err != nil {
 		return err
 	}
 	if err := requireID("relation_occurrence.file_id", string(o.FileID)); err != nil {
@@ -907,7 +913,7 @@ func (m GraphRowMark) Validate() error {
 		return err
 	}
 	for i, id := range m.Occurrences {
-		if err := requireID(indexed("graph_row_mark.occurrences", i), string(id)); err != nil {
+		if err := requireEvidenceID(indexed("graph_row_mark.occurrences", i), id); err != nil {
 			return err
 		}
 	}
@@ -1160,7 +1166,7 @@ func (p RelationPath) Validate() error {
 		return err
 	}
 	for i, id := range p.Evidence {
-		if err := requireID(indexed("relation_path.evidence", i), string(id)); err != nil {
+		if err := requireEvidenceID(indexed("relation_path.evidence", i), id); err != nil {
 			return err
 		}
 	}

@@ -1,0 +1,116 @@
+# Builds the search index library, internal/search/textindex's Rust static
+# library, which internal/search/textindex/bridge.go links into every Go test
+# binary and every binary that reaches the index. The archive lives under the
+# ignored _build/ directory, so a job that builds or tests Go code runs this
+# first, after actions/setup-go.
+#
+# Three steps keep the build exact:
+#  1. The toolchain is the one rust-toolchain.toml pins, installed by the
+#     runner's own rustup. On Windows the host is switched to the GNU target
+#     first (docs/toolchain.md): cgo links through MinGW, and bridge.go names
+#     _build/release/, the host target's directory, so the pinned channel has to
+#     resolve to the GNU toolchain rather than be cross-built with --target.
+#  2. `cargo fetch --locked --target host-tuple` is the only step that reaches
+#     the network. It downloads the crates Cargo.lock pins for this runner's own
+#     target, each checked against the lock's checksum.
+#  3. `go generate` runs the crate's own build line with the network switched
+#     off, so the build proves it needed nothing the fetch did not bring.
+name: Build the search index library
+description: Install the pinned Rust toolchain, fetch the locked crates, and build the static library the Go build links.
+
+inputs:
+  cache-target:
+    description: >-
+      Restore and save the crate's _build/ directory between runs. The crate
+      cache is verified against Cargo.lock on use; a build directory is not, so
+      the release leaves this off and builds from source.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Select the GNU host toolchain on Windows
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        set -eu
+        case "$RUNNER_ARCH" in
+          X64)   host=x86_64-pc-windows-gnu ;;
+          ARM64) host=aarch64-pc-windows-gnullvm ;;
+          *)
+            echo "no GNU Rust host is defined for Windows $RUNNER_ARCH" >&2
+            exit 1
+            ;;
+        esac
+        # The default host only completes a toolchain name that carries no
+        # host, which is what rust-toolchain.toml's channel is. The runner's
+        # default toolchain keeps its full name, so cargo outside the crate is
+        # unchanged.
+        rustup set default-host "$host"
+        echo "RUST_EXPECTED_HOST=$host" >> "$GITHUB_ENV"
+
+    - name: Install the pinned Rust toolchain
+      shell: bash
+      working-directory: internal/search/textindex
+      run: |
+        set -eu
+        # Run in the crate, so rustup installs the toolchain rust-toolchain.toml
+        # names, with its profile and components. rustup no longer installs a
+        # missing toolchain on first use, so this is explicit.
+        rustup toolchain install
+        rustc -vV
+        cargo --version
+        host="$(rustc -vV | sed -n 's/^host: //p')"
+        if [ -n "${RUST_EXPECTED_HOST:-}" ] && [ "$host" != "$RUST_EXPECTED_HOST" ]; then
+          echo "the pinned toolchain resolved to host $host, not $RUST_EXPECTED_HOST" >&2
+          exit 1
+        fi
+
+    # The registry index and the downloaded .crate files: what the fetch below
+    # would otherwise download. The extracted sources under registry/src are
+    # rebuilt from these, so they are not stored.
+    - name: Restore the locked crates
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: search-index-crates-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('internal/search/textindex/Cargo.lock') }}
+
+    # Cargo's own fingerprints decide what a restored directory still holds, so
+    # a partial match from restore-keys rebuilds only what changed. The key
+    # covers everything that changes the archive: the lock, the manifest, the
+    # pinned toolchain, the crate's configuration and its sources.
+    - name: Restore the crate's build directory
+      if: inputs.cache-target == 'true'
+      uses: actions/cache@v5
+      with:
+        path: internal/search/textindex/_build/
+        key: search-index-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('internal/search/textindex/rust-toolchain.toml', 'internal/search/textindex/Cargo.lock') }}-${{ hashFiles('internal/search/textindex/Cargo.toml', 'internal/search/textindex/.cargo/config.toml', 'internal/search/textindex/src/**') }}
+        restore-keys: |
+          search-index-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('internal/search/textindex/rust-toolchain.toml', 'internal/search/textindex/Cargo.lock') }}-
+
+    - name: Fetch the locked crates for this target
+      shell: bash
+      working-directory: internal/search/textindex
+      run: cargo fetch --locked --target host-tuple
+
+    - name: Build the library with the network off
+      shell: bash
+      env:
+        CARGO_NET_OFFLINE: "true"
+      run: |
+        set -eu
+        go generate ./internal/search/textindex
+        archive=internal/search/textindex/_build/release/libcodectx_textindex.a
+        if [ ! -f "$archive" ]; then
+          echo "go generate finished without producing $archive" >&2
+          exit 1
+        fi
+        if command -v sha256sum > /dev/null; then
+          sha256sum "$archive"
+        else
+          shasum -a 256 "$archive"
+        fi

@@ -8,15 +8,19 @@
 // to guess, and a path with no entry honestly has no language.
 //
 // One extension, ".h", names a header the C and C++ grammars both declare,
-// whose language is the repository's and not the file name's. A reader that
-// holds the snapshot tags through For, which answers the grammar the
-// snapshot's census parses its headers with first; Of is the answer without a
+// whose language is the repository's and not the file name's. The capture
+// tags through For, which answers the grammar the snapshot's census parses its
+// headers with first: the manifest row is written before any parse. A reader
+// that holds a generation tags through Tagger.In, which answers the grammar
+// that generation's parse of the header kept. Of is the answer without a
 // census, which only a reader indifferent to C against C++ may use.
 package lang
 
 import (
+	"context"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
@@ -108,25 +112,97 @@ func Of(rel string) string {
 	return byExtension[strings.ToLower(path.Ext(base))]
 }
 
-// Tagger tags the paths of one snapshot.
+// Tagger tags the paths of one snapshot, or of one generation when bound by
+// In. Copies share one binding, so a copy reports the error any copy met; the
+// binding's lock also serializes lookups, which a reader makes from one
+// goroutine.
 type Tagger struct {
 	header string
+	kept   *keptParses
 }
 
 // For is the tagger of one snapshot: a header two grammars declare takes the
 // grammar the snapshot's census parses headers with first
 // (tslang.Census.Header), and every other path its Of tag. It is the grammar
-// a header's parse starts from, not the one its kept parse used: the manifest
-// row is written at capture, before any parse.
+// a header's parse starts from: the manifest row is written at capture, before
+// any parse, so the capture tags with it and a generation's reader binds the
+// tagger to its parses with In.
 func For(s model.Snapshot) Tagger {
 	return Tagger{header: tslang.Census{C: s.CUnits, CPP: s.CPPUnits}.Header().First}
 }
 
+// Parses answers the language a provider's parse of one file kept in one
+// generation: the language of the module node the provider's unit at scope
+// published for path. ok is false when the generation holds no such parse.
+type Parses interface {
+	ParsedLanguage(ctx context.Context, provider, scope, path string) (language string, ok bool, err error)
+}
+
+// keptParses is a tagger's binding to one generation. It remembers the last
+// header it answered, since a search reads a file's hits together, and the
+// first error a lookup met; it holds nothing that grows with the repository.
+type keptParses struct {
+	ctx    context.Context
+	parses Parses
+
+	mu       sync.Mutex
+	lastPath string
+	lastTag  string
+	err      error
+}
+
+// In binds the tagger to one generation's parses: a header two grammars
+// declare is then tagged with the grammar that generation's structural parse
+// of it kept (the fallback grammar when the first parse had more error bytes,
+// the only enabled grammar when tree_sitter.languages enables one), and a
+// header the generation holds no parse of keeps the census's first grammar.
+// Every other path is tagged as before. A lookup that fails tags its header
+// "" and is reported by Err, which the reader checks before it answers.
+func (t Tagger) In(ctx context.Context, parses Parses) Tagger {
+	t.kept = &keptParses{ctx: ctx, parses: parses}
+	return t
+}
+
+// Err is the first error a bound tagger's lookup met, or nil.
+func (t Tagger) Err() error {
+	if t.kept == nil {
+		return nil
+	}
+	t.kept.mu.Lock()
+	defer t.kept.mu.Unlock()
+	return t.kept.err
+}
+
 // Of returns the language tag of a root-relative path in the tagger's
-// snapshot.
+// snapshot, or in its generation when bound by In.
 func (t Tagger) Of(rel string) string {
-	if tslang.SharedHeader(rel) {
+	if !tslang.SharedHeader(rel) {
+		return Of(rel)
+	}
+	if t.kept == nil {
 		return t.header
 	}
-	return Of(rel)
+	return t.kept.of(rel, t.header)
+}
+
+// of is a bound tagger's answer for one header.
+func (k *keptParses) of(rel, first string) string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.err != nil {
+		return ""
+	}
+	if k.lastPath == rel {
+		return k.lastTag
+	}
+	got, ok, err := k.parses.ParsedLanguage(k.ctx, tslang.ProviderID, tslang.ScopePrefix+rel, rel)
+	if err != nil {
+		k.err = err
+		return ""
+	}
+	if !ok {
+		got = first
+	}
+	k.lastPath, k.lastTag = rel, got
+	return got
 }

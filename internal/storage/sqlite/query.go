@@ -505,7 +505,7 @@ func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation
 	if (node == "") == (relation == "") {
 		return nil, invalid("evidence lookup needs exactly one of node_id or relation_id")
 	}
-	afterRaw, err := optionalBlob("after", string(after))
+	afterRaw, err := optionalEvidenceBlob("after", after)
 	if err != nil {
 		return nil, err
 	}

@@ -97,11 +97,11 @@ type Unit struct {
 	// It is never a dependency: nothing is reconciled against it and it is
 	// not a row a dependency read could refuse.
 	DependencyKeys []string
-	// Heavy marks a unit that must pass the Scheduler before it runs, and
-	// Admission is what it is admitted against in both dimensions: the memory
-	// and temporary disk an external indexer's profile reserves.
-	Heavy     bool
-	Admission admission.Reservation
+	// Admit is set for a unit that must pass the Scheduler before it runs: an
+	// external indexer's profile, whose provider plans the memory and
+	// temporary disk it reserves when it is admitted. Nil for every other
+	// unit.
+	Admit admission.Admit
 }
 
 // Spec folds the unit's identity. analysisConfigHash is the coordinator's
@@ -639,13 +639,10 @@ func (b *builder) emit(ctx context.Context) error {
 			}
 			u := Unit{ProviderID: s.providerID, ProviderVersion: s.version, ScopeKey: s.scopeKey,
 				InputCount: count, Inputs: inputs, DependencyKeys: s.dependencyKeys}
-			if s.admit != (admission.Reservation{}) {
-				// An external indexer's profile run is a heavy child. Its
-				// figures are the profile's own: it is admitted on the one
-				// ledger beside every other heavy child, in both dimensions.
-				u.Heavy = true
-				u.Admission = s.admit
-			}
+			// An external indexer's profile run is a heavy child, admitted
+			// on the one ledger beside every other heavy child, in both
+			// dimensions, at the figures its provider plans then.
+			u.Admit = s.admit
 			spec, err := u.Spec(b.cfgHash)
 			if err != nil {
 				return err

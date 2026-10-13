@@ -34,6 +34,9 @@ type languageProvider interface {
 // payloads are the provider's private state).
 type scoper interface {
 	Scopes(provider.Detection) []string
+	// ProfileAdmission is a profile scope's admission step over the snapshot
+	// it indexes, and false for a supplied index's scope.
+	ProfileAdmission(view model.SnapshotView, scopeKey string) (admission.Admit, bool)
 }
 
 // fileGate reports whether a file-invalidated provider builds a unit for one
@@ -82,7 +85,7 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			// reserves, are both the scip package's answers: the planner
 			// parses no key. A key with no profile reservation is a supplied
 			// index.
-			mem, disk, isProfile := scip.ProfileReservation(key)
+			admit, isProfile := sc.ProfileAdmission(view, key)
 			if !isProfile {
 				// A supplied index reads exactly one file: the index itself.
 				// It is recognized by rebuilding the scope key from each
@@ -94,10 +97,10 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			// A profile runs an indexer over the whole workspace, which is what
 			// its workspace invalidation scope declares; every retained file is
 			// an input. Its indexer is a heavy child, so the unit carries the
-			// memory and temporary disk the run reserves, for admission on the
-			// process's one ledger.
+			// step that plans the memory and temporary disk the run reserves,
+			// for admission on the process's one ledger.
 			out = append(out, semantic{providerID: d.ID, scopeKey: key, allFiles: true,
-				admit:    admission.Reservation{MemoryBytes: mem, DiskBytes: disk},
+				admit:    admit,
 				contains: func(model.FileVersion) bool { return true }})
 		}
 		return out, nil, nil
@@ -148,10 +151,9 @@ type semantic struct {
 	// family is the linking unit's language family, which decides its
 	// synthetic dependency keys (builder.linkKeys); empty for every other unit.
 	family link.Family
-	// admit is what an external-indexer profile unit reserves in both
-	// dimensions while it runs; it is set only for a profile scope, and zero
-	// for every other unit.
-	admit    admission.Reservation
+	// admit is an external-indexer profile unit's admission step; it is set
+	// only for a profile scope, and nil for every other unit.
+	admit    admission.Admit
 	version  string
 	contains func(model.FileVersion) bool
 	// dependencyKeys are the unit's synthetic dependency keys
