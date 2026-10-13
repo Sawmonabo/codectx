@@ -123,6 +123,10 @@ type macroBodies struct {
 	pending []ts.Node
 	at      map[span][]macroBody
 	trees   []*ts.Tree
+	// rules are the file's macro_rules definitions by name, and exact the
+	// shape check's answer for each one checked (macroExact).
+	rules map[string][]ts.Node
+	exact map[uintptr]bool
 }
 
 // newMacroBodies is the macro body state of a file of language parsed by
@@ -142,7 +146,7 @@ func (m *macroBodies) close() {
 	for _, t := range m.trees {
 		t.Close()
 	}
-	m.trees, m.at, m.pending = nil, nil, nil
+	m.trees, m.at, m.pending, m.rules, m.exact = nil, nil, nil, nil, nil
 }
 
 // macroCandidate records the macro invocation n, which the query matched,

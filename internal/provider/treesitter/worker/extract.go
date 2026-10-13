@@ -730,6 +730,7 @@ func (e *extraction) emit(out *emitter) error {
 			w.Branch = branchText(path, nil)
 		}
 		w.MacroInput = macroInput(path)
+		w.MacroExact = e.macroExact(w.MacroInput, start)
 		if d.body != nil && d.body.StartByte() > start {
 			w.SigEnd = uint32(d.body.StartByte())
 		}

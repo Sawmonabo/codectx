@@ -191,6 +191,11 @@ type Decl struct {
 	// input as written, which the macro may transcribe once, several times,
 	// renamed or not at all. Empty for every other declaration.
 	MacroInput string `json:"macro_input,omitempty"`
+	// MacroExact reports a MacroInput declaration that is exactly an item
+	// of the macro's expansion: the macro is a `macro_rules!` of the same
+	// file, in textual scope, every rule of which transcribes its item input
+	// once, unchanged but for added attributes.
+	MacroExact bool `json:"macro_exact,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

@@ -192,3 +192,34 @@ fn helper(x: u8) -> std::fmt::Result { Ok(()) }
 		t.Fatalf("spawn was not lowered: %+v", fns)
 	}
 }
+
+// TestRustMacroInputIsExactOnlyForAPassThroughMacro protects the shape check
+// that proves a macro's input items are its expansion's: a macro_rules of
+// the file, in textual scope, every rule of which transcribes its item or
+// token-tree input once, at the depth it was bound, inside no group.
+//
+// Mutation: mark every macro input exact -> b, c, e and f are exact.
+// Mutation: accept a use inside a group -> b (wrapped in a module) is exact.
+// Mutation: accept any number of uses -> c (transcribed twice) is exact.
+// Mutation: ignore the definition's module -> f (defined inside m) is exact.
+// Mutation: accept item fragments only -> d (a tt pass-through) is not.
+func TestRustMacroInputIsExactOnlyForAPassThroughMacro(t *testing.T) {
+	src := `macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = "rt")] $item )* } }
+macro_rules! wrap { ($($t:tt)*) => { mod inner { $($t)* } } }
+macro_rules! twice { ($i:item) => { $i $i } }
+macro_rules! pass { ($($t:tt)*) => { $($t)* } }
+cfg_rt! { fn a() {} }
+wrap! { fn b() {} }
+twice! { fn c() {} }
+pass! { fn d() {} }
+other! { fn e() {} }
+mod m { macro_rules! hidden { ($($t:tt)*) => { $($t)* } } }
+hidden! { fn f() {} }
+`
+	decls := rustDecls(t, src)
+	for name, exact := range map[string]bool{"a": true, "b": false, "c": false, "d": true, "e": false, "f": false} {
+		if d := declNamed(t, decls, name, 0); d.MacroInput == "" || d.MacroExact != exact {
+			t.Errorf("%s: macro %q exact %v, want exact %v", name, d.MacroInput, d.MacroExact, exact)
+		}
+	}
+}
