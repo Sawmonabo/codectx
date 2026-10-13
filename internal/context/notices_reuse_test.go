@@ -39,3 +39,19 @@ func TestAReusedManifestCarriesTheNoticesOfItsCompile(t *testing.T) {
 		t.Fatalf("the reused manifest's notices are %q, want the compile's own %q", again.Notices, first.Notices)
 	}
 }
+
+// TestAnIncompleteScopeAlwaysNamesTheExcludedView pins that a plan whose scope
+// is incomplete with nothing excluded still names the surface that says why,
+// on the compile and so on every reuse of its stored notices.
+//
+// Mutation caught: emitting the pointer only with an exclusion count, so an
+// incomplete scope from a degraded capability is reported with no route to
+// what is missing.
+func TestAnIncompleteScopeAlwaysNamesTheExcludedView(t *testing.T) {
+	if got := planNotices(scopeResult{}, planParts{}, false); !slices.Contains(got, excludedViewNotice) {
+		t.Fatalf("an incomplete scope with no exclusion disclosed %q, want the excluded-view pointer", got)
+	}
+	if got := planNotices(scopeResult{}, planParts{}, true); len(got) != 0 {
+		t.Fatalf("a complete scope with nothing cut disclosed %q", got)
+	}
+}

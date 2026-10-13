@@ -154,11 +154,16 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		}
 		defer fileVisible.Close()
 		entry, err := tx.PrepareContext(ctx, `INSERT INTO context_entries(manifest_id, ordinal, node_id, file_id, requirement, score_micros, estimated_bytes,
-			estimated_tokens, reasons_json, evidence_paths_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			estimated_tokens, reasons_json, route_count) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("context_entries", err)
 		}
 		defer entry.Close()
+		route, err := tx.PrepareContext(ctx, `INSERT INTO context_entry_routes(manifest_id, ordinal, route_index, relations_json) VALUES(?, ?, ?, ?)`)
+		if err != nil {
+			return wrap("context_entry_routes", err)
+		}
+		defer route.Close()
 		for _, e := range entries {
 			nodeRaw, _ := optionalBlob("node_id", string(e.NodeID))
 			fileRaw, _ := optionalBlob("file_id", string(e.FileID))
@@ -180,15 +185,18 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 					return wrap("snapshot_files", err)
 				}
 			}
-			reasons, paths := []byte("[]"), []byte("[]")
+			reasons := []byte("[]")
 			if e.Reasons != nil {
 				reasons, _ = json.Marshal(e.Reasons)
 			}
-			if e.EvidencePaths != nil {
-				paths, _ = json.Marshal(e.EvidencePaths)
+			if e.RouteCount != int64(len(e.EvidencePaths)) {
+				return invalid("manifest entry %d counts %d routes and carries %d", e.Ordinal, e.RouteCount, len(e.EvidencePaths))
 			}
-			if _, err := entry.ExecContext(ctx, idRaw, e.Ordinal, nullNode(node), fileRaw, string(e.Requirement), e.ScoreMicros, e.EstimatedBytes, e.EstimatedTokens, string(reasons), string(paths)); err != nil {
+			if _, err := entry.ExecContext(ctx, idRaw, e.Ordinal, nullNode(node), fileRaw, string(e.Requirement), e.ScoreMicros, e.EstimatedBytes, e.EstimatedTokens, string(reasons), e.RouteCount); err != nil {
 				return wrap("context_entries", err)
+			}
+			if err := putEntryRoutes(ctx, route, idRaw, e); err != nil {
+				return err
 			}
 		}
 		slice, err := tx.PrepareContext(ctx, `INSERT INTO context_slices(manifest_id, slice_index, estimated_bytes, estimated_tokens) VALUES(?, ?, ?, ?)`)
@@ -376,7 +384,8 @@ func (s *Store) ManifestScopeNodes(ctx context.Context, id model.ManifestID,
 	return out, err
 }
 
-// ManifestEntries pages a manifest's entries by ordinal.
+// ManifestEntries pages a manifest's entries by ordinal. Each entry carries
+// its route count, never its routes: ManifestRoutes pages those.
 func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterOrdinal int, limit int) ([]model.ContextEntry, error) {
 	raw, err := idBlob("manifest_id", string(id))
 	if err != nil {
@@ -389,7 +398,7 @@ func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterO
 		// leaves this package must name the canonical identity, so the read
 		// hydrates it through the dictionary. LEFT JOIN because an entry that
 		// pulls a whole file in names no node.
-		rows, err := tx.QueryContext(ctx, `SELECT ce.ordinal, ni.canonical, ce.file_id, ce.requirement, ce.score_micros, ce.estimated_bytes, ce.estimated_tokens, ce.reasons_json, ce.evidence_paths_json
+		rows, err := tx.QueryContext(ctx, `SELECT ce.ordinal, ni.canonical, ce.file_id, ce.requirement, ce.score_micros, ce.estimated_bytes, ce.estimated_tokens, ce.reasons_json, ce.route_count
 			FROM context_entries ce LEFT JOIN node_ids ni ON ni.id = ce.node_id
 			WHERE ce.manifest_id = ? AND ce.ordinal > ? ORDER BY ce.ordinal LIMIT ?`, raw, afterOrdinal, limit)
 		if err != nil {
@@ -399,8 +408,8 @@ func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterO
 		for rows.Next() {
 			var e model.ContextEntry
 			var node, file []byte
-			var reasons, paths string
-			if err := rows.Scan(&e.Ordinal, &node, &file, &e.Requirement, &e.ScoreMicros, &e.EstimatedBytes, &e.EstimatedTokens, &reasons, &paths); err != nil {
+			var reasons string
+			if err := rows.Scan(&e.Ordinal, &node, &file, &e.Requirement, &e.ScoreMicros, &e.EstimatedBytes, &e.EstimatedTokens, &reasons, &e.RouteCount); err != nil {
 				return wrap("context_entries", err)
 			}
 			if node != nil {
@@ -409,7 +418,7 @@ func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterO
 			if file != nil {
 				e.FileID = model.FileID(idHex(file))
 			}
-			if json.Unmarshal([]byte(reasons), &e.Reasons) != nil || json.Unmarshal([]byte(paths), &e.EvidencePaths) != nil {
+			if json.Unmarshal([]byte(reasons), &e.Reasons) != nil {
 				return corrupt("manifest entry payload is not readable")
 			}
 			out = append(out, e)

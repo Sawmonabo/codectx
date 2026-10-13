@@ -380,7 +380,7 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// produced the run: the exclusion run outlives P-I and dies with the
 	// compile, not with the pass.
 	m, err := c.persistManifest(ctx, binding, req, stored, parts, sink.entries, exclRun,
-		scoped.Completeness, scopeComplete, planNotices(scoped, parts))
+		scoped.Completeness, scopeComplete, planNotices(scoped, parts, scopeComplete))
 	if err != nil {
 		return CompileResult{}, err
 	}
@@ -986,7 +986,7 @@ func sizeOfExcluded(x model.ExcludedContextEntry) int64 {
 //
 // An empty result is the honest answer that nothing was cut, and the field is
 // omitempty, so a compile under no bound reads exactly as it did before.
-func planNotices(scoped scopeResult, packed planParts) []string {
+func planNotices(scoped scopeResult, packed planParts, scopeComplete bool) []string {
 	var out []string
 	add := func(format string, args ...any) {
 		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
@@ -1010,6 +1010,12 @@ func planNotices(scoped scopeResult, packed planParts) []string {
 		// the count-bearing notice keys on the exclusions it counts.
 		add("%d candidate(s) were excluded from this plan, each with a reason; %s",
 			n, excludedViewPointer)
+	} else if !scopeComplete {
+		// A scope also goes incomplete with nothing excluded (an unreadable
+		// evidence route, a degraded capability), so the count-less form
+		// promises only the surface, never rows: an incomplete scope is never
+		// reported without a route to what is missing.
+		out = append(out, excludedViewNotice)
 	}
 	if n := packed.RelationsClipped; n > 0 {
 		add("%d evidence route(s) were stored clipped to the first %d relations; the route reaches further than the manifest records",
@@ -1046,8 +1052,13 @@ func (c *Compiler) withPageNotice(plan []string) []string {
 }
 
 // excludedViewPointer names the projection that pages the exclusions a manifest
-// header only counts.
-const excludedViewPointer = "page them with `codectx context entries <session-id> --view excluded`"
+// header only counts, and excludedViewNotice is the count-less form an
+// incomplete scope with no exclusion carries. One spelling, so the two notices
+// can never name different commands.
+const (
+	excludedViewPointer = "page them with `codectx context entries <session-id> --view excluded`"
+	excludedViewNotice  = "this plan's scope is incomplete; any excluded candidates and their reasons are paged there too -- " + excludedViewPointer
+)
 
 // Close releases the compiler's own resources. It does not close the injected
 // Store or Search service, which the composition root owns.
