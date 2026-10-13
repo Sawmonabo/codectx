@@ -64,7 +64,8 @@ relocation in decision 7.
 ### What the product does today
 
 The `dependence` provider runs an external analysis engine, a JVM, once per unit for the parse and once
-for the export, under a heap ceiling the provider chooses ([ADR-0010](ADR-0010-engine-memory.md)). It publishes five capabilities — `control_depends_on`,
+for the export, under a heap ceiling the provider chooses ([ADR-0010](ADR-0010-engine-memory.md), the record of that
+engine's memory, which this record supersedes). It publishes five capabilities — `control_depends_on`,
 `data_flows_to`, `reads`, `writes` and `calls` — every fact at `static_analysis` precision with exact
 byte ranges. Those facts are what `codectx_callers`, `codectx_callees`, `codectx_dependency_path` and
 `codectx_impact` walk; `codectx_symbol_info` and `codectx_references` report their precision.
@@ -415,33 +416,52 @@ the next file of that class is reserved from the updated model, and the ledger's
 with the observation it came from. The worker's process-tree spans play no part in it.
 
 **External indexers and language servers.** A precise indexer's profile unit and a language server are reserved from
-their need the same way, with no memory figure of any tool:
+their need the same way, in memory and in temporary disk, with no figure of any tool:
 - **Work.** A run's work is the bytes of the live snapshot files at or under the project directory the tool is pointed
-  at, read from the manifest in one streaming pass when the run is admitted. Nothing is retained but the set of
-  directories holding the tool's project markers, whose count is the half-life.
-- **Need.** A run's need is the highest anonymous resident set its process tree was read at, the figure the allocation
-  adds back. An indexer's is taken over a run that succeeded; a language server's once it has answered `initialize`,
-  its project loaded.
-- **Learn.** The same decaying histogram of need per work byte is keyed per repository, tool, the payload the lock
-  pinned, this binary's build and work-size class, and persisted in the same observation store. The half-life is
-  counted in the repository's own projects of the tool.
+  at, and what it stages is the snapshot copy it runs in (within the operator's materialization bound), both read from
+  the manifest in one streaming pass when the run is admitted. Nothing is retained but the set of directories holding
+  the tool's project markers, whose count is the half-life. A language server's copy is shared by every server of the
+  snapshot and is counted as staged for each, since no one server's room outlives the copy.
+- **Need.** A run's memory need is the highest anonymous resident set its process tree was read at, the figure the
+  allocation adds back. Its disk need is what it stages plus what it wrote: every regular file under its private
+  directory, less the copy. An indexer's readings are taken when it exits; a language server's once it has answered
+  `initialize`, its project loaded, and what it wrote is read again when it exits.
+- **Learn.** The same decaying histogram, of memory and of written bytes per work byte, is kept per repository, kind
+  (an indexer's or a server's memory or disk, beside the parsed files' memory), tool, the payload the lock pinned, this
+  binary's build and work-size class, and persisted in the same observation store. The half-life is counted in the
+  repository's own projects of the tool.
 - **Plan.** The run is planned at the moment it is admitted, not when the generation is planned, so it is reserved from
-  everything learned before it: the learned p99 (the sample maximum below 100 observations) times its work, never more
-  than the allocation re-derived for that admission.
-- **First run.** A class with no observation is reserved at the whole allocation, so it runs alone among the heavy
-  children. The other runs of its class wait for it and are planned from its measurement; one that measured nothing
-  hands the role to the next. No structural prior exists for these tools: every published account of their memory
-  makes it a function of the project, its dependency closure or the machine itself (a managed runtime's default heap
-  ceiling is a share of physical memory; an indexer's workers default to one per core), so a per-tool slope would be a
-  figure fitted to the repositories it was measured on. The cost is one serialized run per class, once per repository,
-  payload and build.
-- **Overrun.** While the tool runs, a reading above what it holds raises the holding at once (Adjust), so the next
-  admission waits beside the memory the tool really uses; a lower reading never lowers it, since a tool that shrank can
-  grow again. The one exception is a first run: once measured, its holding is lowered from the allocation to what its
-  class now predicts for its work, so a language server that lives on does not hold every other child out. On a
-  platform that reads no tree, nothing is measured and a first run holds the allocation for its life. Nothing is
-  refused and nothing is killed. The overrun is recorded with its reservation in the run ledger's
-  need classes, and the next run of the class is planned from it.
+  everything learned before it: the learned p99 (the sample maximum below 100 observations) of memory times its work,
+  never more than the allocation re-derived for that admission, and its staged bytes plus the learned written bytes.
+- **First run.** A class with no observation is reserved at the whole allocation in both dimensions, so it runs alone
+  among the heavy children. The other runs of its class wait for it and are planned from its measurement; one that
+  measured nothing hands the role to the next. No structural prior exists for these tools: every published account of
+  their memory makes it a function of the project, its dependency closure or the machine itself (a managed runtime's
+  default heap ceiling is a share of physical memory; an indexer's workers default to one per core), so a per-tool
+  slope would be a figure fitted to the repositories it was measured on. The cost is one serialized run per class, once
+  per repository, payload and build.
+- **A run that fails.** Its readings are what it used before it ended, so they are learned as lower bounds of its
+  class's need, never discarded and never taken for the need of a run that does its work. A class known only from
+  failed runs is planned from them, not at the allocation, but has one run in flight at a time until a run succeeds.
+  That is safe for the host because the reservation never assumes less than the class was seen to use, at most one
+  run of the class can be under-reserved at once, and that run is raised to its reading as it grows (below); a tool
+  that fails every run then costs one run at a time of its own class, not the whole machine.
+- **Overrun.** While the tool runs, a memory reading above what it holds raises the holding at once (Adjust), so the
+  next admission waits beside the memory the tool really uses; a lower reading never lowers it, since a tool that
+  shrank can grow again. Written bytes above the held disk raise it the same way when they are read. The one exception
+  is a run planned without a successful measurement: once measured, its holding is lowered from the allocations to what
+  its class now predicts for its work, so a language server that lives on does not hold every other child out. Nothing
+  is refused and nothing is killed. The overrun is recorded with its reservation in the run ledger's need classes, and
+  the next run of the class is planned from it.
+- **Idle servers.** A language server that is running but in no use keeps room warm for reuse, as the parser pool's idle
+  workers do, so the server manager registers its idle-release step on the ledger: whenever the head of the queue does
+  not fit, an idle server is stopped and its room returns when its process has exited, whoever the head is.
+- **Where no tree is read.** The running tree is read on Linux, on Windows and on macOS built with cgo; elsewhere (any
+  other operating system, and macOS built without cgo) no tool's need is measured, so every tool run is reserved at the
+  allocation and runs alone. [ADR-0019](ADR-0019-available-memory-macos-windows.md)'s readings are built for exactly
+  the same platforms, so they offer no measure there, and the allocation itself is that record's unobserved stand-in.
+  The exit-time resident peak a waited-for process reports is not used instead: it is the largest single process,
+  not the tree, so it understates a tool that runs workers.
 
 **Coexistence, as a mechanism.**
 - **The allocation.** It is the smaller of two figures: available memory plus the product's own observed residency,
@@ -958,8 +978,9 @@ at all and must be authored from the language reference; and per-language loweri
 every reference implementation surveyed is measurably wrong on something.
 
 Two obligations this record creates. The per-file observation, the learned model and the ledger's adjust and
-forward-progress rules of decision 5 are built, and the disclosure of [ADR-0010](ADR-0010-engine-memory.md) decision 4
-is what makes an overrun of the model visible. And the store changes of decision 5 come before any worker-count gain,
+forward-progress rules of decision 5 are built, and the disclosure of decision 5 -- each overrun with its reservation,
+need and drift, in the parser's resource view and the run ledger's need classes -- is what makes an overrun of the
+model visible. And the store changes of decision 5 come before any worker-count gain,
 because the structural stage measured was serialized on the store's lock; they are built. And the plan still publishes no native throughput target, because none can be measured before something is
 built — what it publishes instead is the instrument and the comparison: phase 2 closes on a lower wall
 *and* a lower tree-summed peak than the engine, on the same unit and the same 250 ms sampler.
@@ -1043,8 +1064,9 @@ code.
 - [ADR-0005](ADR-0005-graph-traversal-layout.md) — the published per-generation adjacency and visited
   set, which a native producer changes the producer of, not the layout.
 - [ADR-0009](ADR-0009-import-staging.md) — the import staging this decision eventually deletes.
-- [ADR-0010](ADR-0010-engine-memory.md) — the heap-from-need rule, the half-the-host allocation and the
-  observed-peak disclosure that decision 5 inherits and adapts.
+- [ADR-0010](ADR-0010-engine-memory.md) — superseded by this record: the heap-from-need rule, the half-the-host
+  allocation and the observed-peak disclosure that decision 5 replaces with the per-file need model. The allocation's
+  reading of available memory on macOS and Windows is [ADR-0019](ADR-0019-available-memory-macos-windows.md).
 - Cooper, Harvey and Kennedy, *A Simple, Fast Dominance Algorithm*, Rice University TR, 2001 — the
   iterative dominator algorithm of decision 2.
 - Lengauer and Tarjan, *A Fast Algorithm for Finding Dominators in a Flowgraph*, ACM TOPLAS 1(1), 1979,
@@ -1091,5 +1113,5 @@ code.
   `x/tools v0.49.0` `go/ssa/{dom,lift}.go` and `go/callgraph/{cha,rta,vta}`; the Go 1.27.1 runtime and
   `math/bits` sources behind the allocation claims of decision 2.
 - Measurement record: the reference repository's indexing runs of 2026-09-16 and the two stores they
-  produced, read with `sqlite3 -readonly`; the cap sweep of 2026-09-16 recorded in
-  [ADR-0010](ADR-0010-engine-memory.md).
+  produced, read with `sqlite3 -readonly`; the cap sweep of 2026-09-16, whose figures are recorded in
+  [ADR-0010](ADR-0010-engine-memory.md), the record this one supersedes.

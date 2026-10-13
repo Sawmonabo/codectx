@@ -745,26 +745,35 @@ runtime.
 Everything is executed through the shared `internal/process` runner with an
 argv array only: no shell anywhere. The run is bounded by the
 smaller of the profile's own timeout and `providers.scip.timeout`, by the
-profile's disk reservation and its memory need, and by 1 MiB of captured output
-per stream.
+memory and temporary disk the run's need predicts, and by 1 MiB of captured
+output per stream.
 
-**Memory is the run's measured need.** No profile carries a memory figure. A
-profile unit is planned when it is admitted (`ProfileAdmission`): the bytes of
-the snapshot files under the project directory the indexer is pointed at,
-times what this repository's runs of the same indexer payload and work-size
-class (the power of two of those bytes) were measured to use per byte, never
-more than the allocation re-derived for the admission. The measurement is the
-highest anonymous resident set the indexer's process tree was read at during a
-run that succeeded, learned in the decaying histogram parser files use and
-kept in the run ledger's observation store, so a repository pays for a cold
-class once per indexer payload and build. A class nothing was measured in is
-reserved at the whole allocation and runs alone; the other units of its class
-wait for it and are planned from it. While the indexer runs, a reading of its
-tree above what the unit holds raises the holding at once, so the next child
-waits beside what the indexer really uses. Every published account of these
-tools' memory makes it a function of the project, its dependency closure or
-the machine itself (a managed runtime's heap ceiling is a share of physical
-memory), which is why no per-tool figure is assumed (ADR-0012 decision 5).
+**Memory and disk are the run's measured need.** No profile carries a memory
+or disk figure. A profile unit is planned when it is admitted
+(`ProfileAdmission`): the bytes of the snapshot files under the project
+directory the indexer is pointed at, times what this repository's runs of the
+same indexer payload and work-size class (the power of two of those bytes)
+were measured to use and to write per byte. Memory is never more than the
+allocation re-derived for the admission; disk is the snapshot copy the run
+stages, within `max_materialize_bytes`, plus the predicted written bytes. The
+measurements are the highest anonymous resident set the indexer's process tree
+was read at and every regular file under the run directory less the copy,
+learned in the decaying histogram parser files use and kept in the run
+ledger's observation store under the kinds `indexer memory` and `indexer
+disk`, so a repository pays for a cold class once per indexer payload and
+build. A class nothing was measured in is reserved at the whole allocations and
+runs alone; the other units of its class wait for it and are planned from it,
+and once measured its holding is lowered to the prediction. A failed run's
+readings are learned as lower bounds: its class is then planned from them, one
+unit in flight at a time, until a unit succeeds. While the indexer runs, a
+reading of its tree above what the unit holds raises the holding at once, so
+the next child waits beside what the indexer really uses. The runner's own
+temporary-disk account, which enforces `resources.max_temp_bytes`, is handed
+the planned disk, or only the staged copy for a class with no measurement.
+Every published account of these tools' memory makes it a function of the
+project, its dependency closure or the machine itself (a managed runtime's heap
+ceiling is a share of physical memory), which is why no per-tool figure is
+assumed (ADR-0012 decision 5).
 
 **`scip-java` compiles the snapshot itself.** Its default mode drives the
 project's own Maven or Gradle build, found on the host `PATH`, which resolves

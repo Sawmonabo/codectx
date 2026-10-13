@@ -64,15 +64,25 @@ room for. The prediction is the bytes of the snapshot under the server's
 project directory times what this repository's servers of the same payload and
 work-size class were measured to use per byte — the anonymous resident set of
 the server's process tree once it has answered `initialize` — kept in the run
-ledger's observation store and never more than the allocation. A server of a
-class nothing was measured in yet is reserved at the whole allocation until it
-answers `initialize`, then holds what its class now predicts; the next server
-of its class waits for that measurement and is planned from it. While a server
-runs, a reading of its tree above what it holds raises its holding at once, so
-the next child waits beside the memory the server really uses; a lower reading
-never lowers it. Where the platform reads no process tree, nothing is measured
-and such a server holds the allocation while it runs. No server has a memory
-figure of its own (ADR-0012 decision 5). That allocation is the whole process's, not this package's — the
+ledger's observation store under the kind `server memory` and never more than
+the allocation. Its temporary disk is planned the same way (`server disk`): the
+snapshot copy it is rooted in, counted for every server because the copy is
+shared, plus what its class was measured to write into its work directory,
+read at `initialize` and again when it exits. A server of a class nothing was
+measured in yet is reserved at the whole allocations until it answers
+`initialize`, then holds what its class now predicts; the next server of its
+class waits for that measurement and is planned from it. A start that fails is
+learned as a lower bound, and its class then starts one server at a time until
+one succeeds. While a server runs, a reading of its tree above what it holds
+raises its holding at once, so the next child waits beside the memory the
+server really uses; a lower reading never lowers it. Where the platform reads
+no process tree (any operating system but Linux, Windows and macOS built with
+cgo), nothing is measured and such a server holds the allocations while it
+runs. An idle server's room is the ledger's to reclaim: the manager registers
+its idle-release step, so any reservation at the head of the queue that does
+not fit — an indexer unit's as well as another server's — stops an idle server
+instead of waiting for its idle TTL. No server has a memory or disk figure of
+its own (ADR-0012 decision 5). That allocation is the whole process's, not this package's — the
 precise indexers' heavy units are admitted from the same ledger and in the same
 first-in-first-out order, so a server never overtakes a unit that asked first.
 When there is no room, an idle server is stopped to make room and otherwise the
@@ -241,7 +251,7 @@ Bounds, all finite:
 
 | Bound | Source | Effect when hit |
 |---|---|---|
-| concurrent servers | the machine-derived allocation, summed over the servers' need-derived reservations, each raised to its live resident set | an idle server is stopped to make room; otherwise the open waits for room |
+| concurrent servers | the machine-derived memory and disk allocations, summed over the servers' need-derived reservations, each raised to its live resident set | an idle server is stopped to make room for any reservation that does not fit; otherwise the open waits for room |
 | in-flight requests per server | `providers.lsp.max_outstanding_requests` (default unlimited: every caller already waits on its own gate) | with a value set, callers wait for a slot under their context |
 | a request making no progress, the `initialize` handshake included | `providers.lsp.stall_timeout` (default 5m, the server consuming no processor time) | `$/cancelRequest` sent, `CTX_UNAVAILABLE` with `reason=stalled`. There is no deadline on an answer: a server computing one is working however long it takes, and where a platform cannot observe a running process tree the connection's byte count stands in. |
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |
