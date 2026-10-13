@@ -58,9 +58,19 @@ The materialization stays whole: the server is rooted inside it, and every URI
 the client sends and resolves is still a snapshot-relative path, so a location
 the server returns from outside its project is mapped and admitted exactly as
 before. Concurrency is the machine's: each server is admitted against the one
-machine-derived allocation by the memory its pinned definition reserves, so a
+machine-derived allocation by the memory its own need predicts, so a
 repository with many projects runs as many servers at once as the machine has
-room for. That allocation is the whole process's, not this package's — the
+room for. The prediction is the bytes of the snapshot under the server's
+project directory times what this repository's servers of the same payload and
+work-size class were measured to use per byte — the anonymous resident set of
+the server's process tree once it has answered `initialize` — kept in the run
+ledger's observation store and never more than the allocation. A server of a
+class nothing was measured in yet is reserved at the whole allocation, runs
+alone, and the next server of its class waits for its measurement and is
+planned from it. While a server runs, a reading of its tree above what it holds
+raises its holding at once, so the next child waits beside the memory the
+server really uses; a lower reading never lowers it. No server has a memory
+figure of its own (ADR-0012 decision 5). That allocation is the whole process's, not this package's — the
 precise indexers' heavy units are admitted from the same ledger and in the same
 first-in-first-out order, so a server never overtakes a unit that asked first.
 When there is no room, an idle server is stopped to make room and otherwise the
@@ -189,14 +199,12 @@ gap that decided the swap.
 
 `typescript-language-server` answers `initialize` with no `serverInfo` object at
 all (measured, both through the product and with a raw `initialize` outside it),
-and since the python row moved to a native binary that reports one it is the
-only pinned server that does. `OverlayBinding.Validate` requires a non-empty
-`ProviderVersion`, so the overlay used to fail for typescript, tsx, javascript
-and, before the swap, python, with
-`CTX_ARGUMENT_INVALID: overlay.provider_version is required`.
-The label now falls back to the version of the payload the lock pinned, which
-is never empty and is the honest identity of a server that declines to name
-itself; the **reported** string keeps feeding the input digest unchanged, so a
+and it is the only pinned server that does: the python server, a native
+binary, reports one. `OverlayBinding.Validate` requires a non-empty
+`ProviderVersion`, which a server that names no version would fail with
+`CTX_ARGUMENT_INVALID: overlay.provider_version is required`. The label falls
+back to the version of the payload the lock pinned, which is never empty and
+is the honest identity of a server that declines to name itself; the **reported** string keeps feeding the input digest unchanged, so a
 payload that starts reporting a version later is still a different question.
 The jdtls version directory in the store is byte-identical before and after a
 start, and `codectx tools verify` exits 0 over it. The protocol itself —
@@ -231,7 +239,7 @@ Bounds, all finite:
 
 | Bound | Source | Effect when hit |
 |---|---|---|
-| concurrent servers | the machine-derived allocation, summed over the definitions' memory reservations | an idle server is stopped to make room; otherwise the open waits for room |
+| concurrent servers | the machine-derived allocation, summed over the servers' need-derived reservations, each raised to its live resident set | an idle server is stopped to make room; otherwise the open waits for room |
 | in-flight requests per server | `providers.lsp.max_outstanding_requests` (default unlimited: every caller already waits on its own gate) | with a value set, callers wait for a slot under their context |
 | a request making no progress, the `initialize` handshake included | `providers.lsp.stall_timeout` (default 5m, the server consuming no processor time) | `$/cancelRequest` sent, `CTX_UNAVAILABLE` with `reason=stalled`. There is no deadline on an answer: a server computing one is working however long it takes, and where a platform cannot observe a running process tree the connection's byte count stands in. |
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |

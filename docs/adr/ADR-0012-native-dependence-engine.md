@@ -396,7 +396,8 @@ replaces the engine's definition cap, whose price is dropping *every* reaching-d
 - The figure depends on the files in flight, not on how many files the repository has.
 
 **The ledger.** Each worker holds its observed base -- its anonymous resident set -- for its lifetime and reserves each
-file's predicted increment before dispatch. The ledger ([ADR-0010](ADR-0010-engine-memory.md), `internal/admission`) gains three obligations:
+file's predicted increment before dispatch. The ledger (`internal/admission`, admitting against the allocation
+[ADR-0019](ADR-0019-available-memory-macos-windows.md) reads) gains three obligations:
 - **Adjust.** `Done` adjusts a holding to what the file used, upward without waiting.
 - **Forward progress.** A per-file increment is granted whenever no parse is in flight. This is the runs-alone rule
   restated per file, so a file larger than the whole allocation still runs, whole.
@@ -408,10 +409,36 @@ changes. A class that misses the target reopens the percentile, never the refusa
 runs.
 
 A file whose need exceeds its prediction does not fail; the overrun is counted and disclosed with its reservation, its
-observed need and the drift between them (ADR-0010 decision 4). The learning loop is closed through the per-file need
+observed need and the drift between them, in the parser's resource view and in the run ledger's need classes. The learning loop is closed through the per-file need
 observation: each file's `Done` carries its measured need, the coordinator folds it into its class's model at once,
 the next file of that class is reserved from the updated model, and the ledger's observation store persists the model
 with the observation it came from. The worker's process-tree spans play no part in it.
+
+**External indexers and language servers.** A precise indexer's profile unit and a language server are reserved from
+their need the same way, with no memory figure of any tool:
+- **Work.** A run's work is the bytes of the live snapshot files at or under the project directory the tool is pointed
+  at, read from the manifest in one streaming pass when the run is admitted. Nothing is retained but the set of
+  directories holding the tool's project markers, whose count is the half-life.
+- **Need.** A run's need is the highest anonymous resident set its process tree was read at, the figure the allocation
+  adds back. An indexer's is taken over a run that succeeded; a language server's once it has answered `initialize`,
+  its project loaded.
+- **Learn.** The same decaying histogram of need per work byte is keyed per repository, tool, the payload the lock
+  pinned, this binary's build and work-size class, and persisted in the same observation store. The half-life is
+  counted in the repository's own projects of the tool.
+- **Plan.** The run is planned at the moment it is admitted, not when the generation is planned, so it is reserved from
+  everything learned before it: the learned p99 (the sample maximum below 100 observations) times its work, never more
+  than the allocation re-derived for that admission.
+- **First run.** A class with no observation is reserved at the whole allocation, so it runs alone among the heavy
+  children. The other runs of its class wait for it and are planned from its measurement; one that measured nothing
+  hands the role to the next. No structural prior exists for these tools: every published account of their memory
+  makes it a function of the project, its dependency closure or the machine itself (a managed runtime's default heap
+  ceiling is a share of physical memory; an indexer's workers default to one per core), so a per-tool slope would be a
+  figure fitted to the repositories it was measured on. The cost is one serialized run per class, once per repository,
+  payload and build.
+- **Overrun.** While the tool runs, a reading above what it holds raises the holding at once (Adjust), so the next
+  admission waits beside the memory the tool really uses; a lower reading never lowers it, since a tool that shrank can
+  grow again. Nothing is refused and nothing is killed. The overrun is recorded with its reservation in the run ledger's
+  need classes, and the next run of the class is planned from it.
 
 **Coexistence, as a mechanism.**
 - **The allocation.** It is the smaller of two figures: available memory plus the product's own observed residency,
