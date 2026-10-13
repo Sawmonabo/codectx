@@ -377,11 +377,14 @@ func (w *branchWalk) children(cur *ts.TreeCursor, n ts.Node, up *ts.Node, at *br
 }
 
 // macroBody walks the kept re-parse b of a macro invocation's body, whose
-// path is at, under b's macro element: the invocation's own tokens hold no
+// path is at, under b's macro elements, outermost first: the invocation's own tokens hold no
 // declaration, its re-parse does.
 func (w *branchWalk) macroBody(b macroBody, at *branchLink) {
-	link := at.push(b.element)
-	link.macro = b.path
+	link := at
+	for _, m := range b.elements {
+		link = link.push(m.text)
+		link.macro = m.path
+	}
 	cur := b.root.Walk()
 	defer cur.Close()
 	w.children(cur, b.root, nil, link)

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"slices"
 	"strconv"
 	"sync"
 
@@ -45,6 +46,9 @@ type rsMacroSyntax struct {
 	sourceFile, declarationList, tokenTree uint16
 	open, close                            uint16
 	fMacro                                 uint16
+	// ident, bang and pathSep are the tokens of a macro path in a token
+	// tree: a name, `!` and `::`.
+	ident, bang, pathSep uint16
 	// items reports, by kind id, a node a clean re-parse may hold at its
 	// top level.
 	items []bool
@@ -83,6 +87,7 @@ func rsMacroSyntaxOf() *rsMacroSyntax {
 		s := &rsMacroSyntax{
 			sourceFile: kind("source_file"), declarationList: kind("declaration_list"), tokenTree: kind("token_tree"),
 			open: mustKind(tl, language, "{", false), close: mustKind(tl, language, "}", false),
+			ident: kind("identifier"), bang: mustKind(tl, language, "!", false), pathSep: mustKind(tl, language, "::", false),
 			fMacro: tl.FieldIdForName("macro"),
 			items:  make([]bool, tl.NodeKindCount()), keywords: make([]bool, tl.NodeKindCount()),
 		}
@@ -103,15 +108,22 @@ func rsMacroSyntaxOf() *rsMacroSyntax {
 // macroBody is one kept re-parse: its tree and root, the branch element
 // its declarations sit in, and the token tree it re-parses.
 type macroBody struct {
-	tree    *ts.Tree
-	root    ts.Node
-	element string
+	tree *ts.Tree
+	root ts.Node
+	// elements are the branch elements its declarations sit in, outermost
+	// first: the invocation's macro, and for a nested invocation found in a
+	// group header each enclosing macro before its own.
+	elements []macroElement
 	// tt is the range of the token tree re-parsed, the invocation's body or
 	// one of its groups, whose tokens the re-parse replaces in the file's
 	// flat array (spliceMacros).
 	tt span
-	// path is the invocation's macro path as written.
-	path string
+}
+
+// macroElement is one macro branch element: its text, `macro "<path>"`
+// with the group's header when it has one, and the macro path as written.
+type macroElement struct {
+	text, path string
 }
 
 // macroBodies is a file's re-parsed macro bodies. pending are the
@@ -226,26 +238,34 @@ func (e *extraction) expandMacros(q *ts.Query, cursor *ts.QueryCursor, names []s
 	}
 }
 
-// reparse is the kept bodies of the item-position invocation n: its whole
-// brace body when that re-parses clean, else each clean brace group
-// directly inside it whose header holds no item keyword.
+// reparse is the kept bodies of the item-position invocation n (bodies).
 func (e *extraction) reparse(n ts.Node, s *rsMacroSyntax) []macroBody {
-	body := bodyOf(n, s)
 	path := ""
 	if p := n.ChildByFieldId(s.fMacro); p != nil {
 		path = collapseSpace(p.Utf8Text(e.src))
 	}
-	head := "macro " + strconv.Quote(path)
-	if b, ok := e.parseBody(body, s, head); ok {
-		b.path = path
+	return e.bodies(bodyOf(n, s), []macroElement{{text: "macro " + strconv.Quote(path), path: path}}, s)
+}
+
+// bodies is the kept bodies of the brace token tree t, a macro's body whose
+// declarations sit in the elements chain: t whole when it re-parses clean,
+// else each clean brace group directly inside it whose header (its tokens
+// since the previous group) holds no item keyword, its header added to the
+// innermost element. A group whose header ends in a macro path and `!` is
+// the body of an invocation the failed body holds: its declarations are that
+// macro's input, inside every enclosing macro, so it is taken as a body of
+// its own, its own groups tried in turn, with the header before the path
+// added to the enclosing element.
+func (e *extraction) bodies(t *ts.Node, chain []macroElement, s *rsMacroSyntax) []macroBody {
+	if b, ok := e.parseBody(t, s, chain); ok {
 		return []macroBody{b}
 	}
 	var out []macroBody
-	k := body.ChildCount()
-	from := body.Child(0).EndByte()
+	k := t.ChildCount()
+	from, first := t.Child(0).EndByte(), uint(1)
 	item := false
 	for i := uint(1); i+1 < k; i++ {
-		c := body.Child(i)
+		c := t.Child(i)
 		if c == nil || c.IsExtra() {
 			continue
 		}
@@ -256,21 +276,71 @@ func (e *extraction) reparse(n ts.Node, s *rsMacroSyntax) []macroBody {
 			continue
 		}
 		if !item {
-			header := collapseSpace(string(e.src[from:c.StartByte()]))
-			if b, ok := e.parseBody(c, s, head+" "+strconv.Quote(header)); ok {
-				b.path = path
+			if path, at, ok := e.invoked(t, first, i, s); ok {
+				outer := chain
+				if prefix := collapseSpace(string(e.src[from:at])); prefix != "" {
+					outer = withHeader(chain, prefix)
+				}
+				nested := append(slices.Clip(outer), macroElement{text: "macro " + strconv.Quote(path), path: path})
+				out = append(out, e.bodies(c, nested, s)...)
+			} else if b, ok := e.parseBody(c, s, withHeader(chain, collapseSpace(string(e.src[from:c.StartByte()])))); ok {
 				out = append(out, b)
 			}
 		}
-		from, item = c.EndByte(), false
+		from, first, item = c.EndByte(), i+1, false
 	}
 	return out
 }
 
+// withHeader is chain with header added, quoted, to its innermost element.
+func withHeader(chain []macroElement, header string) []macroElement {
+	out := slices.Clone(chain)
+	out[len(out)-1].text += " " + strconv.Quote(header)
+	return out
+}
+
+// invoked reports that the children [first, i) of the token tree t, the
+// header of the group at i, end in a macro invocation's path and `!`: a
+// name, or names joined by `::`. It answers the path as written and where
+// it starts.
+func (e *extraction) invoked(t *ts.Node, first, i uint, s *rsMacroSyntax) (string, uint, bool) {
+	prev := func(j uint) (uint, *ts.Node) {
+		for j > first {
+			j--
+			if c := t.Child(j); c != nil && !c.IsExtra() {
+				return j, c
+			}
+		}
+		return 0, nil
+	}
+	j, bang := prev(i)
+	if bang == nil || bang.KindId() != s.bang {
+		return "", 0, false
+	}
+	j, id := prev(j)
+	if id == nil || id.KindId() != s.ident {
+		return "", 0, false
+	}
+	start := id.StartByte()
+	for {
+		k, sep := prev(j)
+		if sep == nil || sep.KindId() != s.pathSep {
+			break
+		}
+		k, id := prev(k)
+		if id == nil || id.KindId() != s.ident {
+			break
+		}
+		j, start = k, id.StartByte()
+	}
+	return collapseSpace(string(e.src[start:bang.StartByte()])), start, true
+}
+
 // parseBody re-parses the interior of the brace token tree t, between its
-// braces, and answers it with the branch element element when it is clean.
+// braces, and answers it with the branch elements elements when it is
+// clean.
 // A tree that is not kept is closed here.
-func (e *extraction) parseBody(t *ts.Node, s *rsMacroSyntax, element string) (macroBody, bool) {
+func (e *extraction) parseBody(t *ts.Node, s *rsMacroSyntax, elements []macroElement) (macroBody, bool) {
 	m := e.macros
 	o, c := t.Child(0), t.Child(t.ChildCount()-1)
 	r := ts.Range{StartByte: o.EndByte(), EndByte: c.StartByte(), StartPoint: o.EndPosition(), EndPoint: c.StartPosition()}
@@ -296,7 +366,7 @@ func (e *extraction) parseBody(t *ts.Node, s *rsMacroSyntax, element string) (ma
 		return macroBody{}, false
 	}
 	m.trees = append(m.trees, tree)
-	return macroBody{tree: tree, root: *root, element: element, tt: span{t.StartByte(), t.EndByte()}}, true
+	return macroBody{tree: tree, root: *root, elements: elements, tt: span{t.StartByte(), t.EndByte()}}, true
 }
 
 // cleanItems reports a re-parse with no error or missing node whose every

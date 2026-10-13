@@ -238,3 +238,41 @@ hidden! { fn f() {} }
 		}
 	}
 }
+
+// TestRustNestedMacroInAFailedBodyIsItsOwnMacro protects the credit of an
+// invocation written inside a body that is no item list: the group after
+// `inner!` (or a path `a::b::inner!`) is that macro's body, so its items are
+// inner's input, inside the enclosing macro's element and then inner's, the
+// header before the path on the enclosing one, and inner's own groups are
+// tried in turn.
+//
+// Mutation: read a nested invocation's group as the enclosing macro's arm
+// -> f is the input of outer, in `macro "outer" "x = 1; inner !"`.
+// Mutation: read only a one-name path -> h is the input of outer.
+// Mutation: no fallback inside the nested body -> m is not declared.
+func TestRustNestedMacroInAFailedBodyIsItsOwnMacro(t *testing.T) {
+	src := `outer! {
+    x = 1;
+    inner! { fn f() {} }
+}
+other! {
+    if #[cfg(unix)] { fn g() {} }
+    a::b::inner! { fn h() {} }
+}
+third! {
+    x = 1;
+    inner! { if #[cfg(a)] { fn m() {} } }
+}
+`
+	decls := rustDecls(t, src)
+	for _, c := range []struct{ name, branch, input string }{
+		{"f", `macro "outer" "x = 1;" / macro "inner"`, "inner"},
+		{"g", `macro "other" "if #[cfg(unix)]"`, "other"},
+		{"h", `macro "other" / macro "a::b::inner"`, "a::b::inner"},
+		{"m", `macro "third" "x = 1;" / macro "inner" "if #[cfg(a)]"`, "inner"},
+	} {
+		if d := declNamed(t, decls, c.name, 0); d.Branch != c.branch || d.MacroInput != c.input {
+			t.Errorf("%s is in %q, the input of %q; want %q, the input of %q", c.name, d.Branch, d.MacroInput, c.branch, c.input)
+		}
+	}
+}
