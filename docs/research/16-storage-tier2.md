@@ -93,7 +93,7 @@ What it costs and what it needs:
   content-versus-index agreement check becomes a row-level check against the range reader.
 - Indexing throughput **improves**: `delta.go:420` and `gc.go:336` stop reading every body back out
   of the database to feed a delete, and the largest column stops being written at all.
-- **Precondition.** The read ceiling in verification finding SV2 (`byte range spans 4292608 bytes,
+- **Precondition.** The content-store read ceiling (`byte range spans 4292608 bytes,
   over the 1048576-byte read ceiling`) is not user-set and takes the whole answer down. Serving
   bodies from the content store puts it on the search path, so it must first become a user-set,
   unlimited-by-default bound per [ADR-0001](../adr/ADR-0001-scale-posture.md).

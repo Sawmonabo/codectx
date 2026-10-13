@@ -691,7 +691,8 @@ func (b busyPathGraph) Neighbours(ctx context.Context, refs []NodeRef, dir model
 	return b.MemoryGraph.Neighbours(ctx, refs, dir, kinds, from, fn)
 }
 
-// TestRetryableFailureLeavesAPathContinuationAdoptable is the SK3/A15 proof.
+// TestRetryableFailureLeavesAPathContinuationAdoptable proves a retryable
+// failure keeps the path continuation it was given.
 // ShortestPath releases the continuation it consumed on the way out. The
 // failure mode: releasing it on EVERY exit, so one transient
 // CTX_WORKSPACE_BUSY on one page turns the next presentation of that same
