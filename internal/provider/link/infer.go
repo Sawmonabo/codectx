@@ -1202,8 +1202,14 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 				continue
 			}
 			spec, name, ok := importedName(m.Name, f.python)
-			if !ok {
+			if !ok && f.python {
 				continue
+			}
+			if !ok {
+				// A call of a whole ECMAScript module (`const f =
+				// require("./m"); f()`) calls the value it assigns
+				// itself (`module.exports = f`, `export = f`).
+				spec, name = m.Name, wire.ExportAssignment
 			}
 			err := in.h.modulesAt(t.Path, f.python, spec, func(base string) error {
 				return r.exportReqs.Add(exportReq{Base: base, Name: name, Call: c})

@@ -165,6 +165,8 @@ type javaScriptLinker struct {
 	// finds a set's index by its canonical spelling.
 	unions  [][]wire.Type
 	unionAt map[string]uint32
+	// cjs are the file's CommonJS exports (js_commonjs.go).
+	cjs cjsExports
 
 	// The callable being analysed: its node, graph, the uses of its named
 	// variables (uses, with ends the running maximum of each name's ends),
@@ -1371,6 +1373,7 @@ func (k *javaScriptLinker) propertyName(key Node) string {
 
 func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 	k.ready(src)
+	k.cjs = cjsExports{}
 	kk, x := k.k, k.x
 	numbered := map[uint32]uint32{}
 	c := root.Walk()
@@ -1401,6 +1404,7 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 			}
 			if n.KindId() == kk.callExpression {
 				k.dynamicImport(out, n)
+				k.cjsDefineProperty(n)
 			}
 		case kk.functionDeclaration, kk.generatorFunctionDeclaration:
 			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == kk.identifier {
@@ -1424,6 +1428,7 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 				k.export(out, name, value, "", true, false)
 			}
 		case kk.assignmentExpression:
+			k.cjsAssignment(n)
 			if name, fn, holder, member, ok := k.assignedFunction(n); ok {
 				k.export(out, name, fn, "", true, false)
 				out.Exports[len(out.Exports)-1].Property = member
@@ -1449,13 +1454,17 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 		case x.interfaceDeclaration:
 			k.supertypes(out, n.ChildByFieldId(kk.fName), kindChild(n, x.extendsTypeClause))
 		case kk.exportStatement:
+			k.cjs.esm = true
 			k.reexports(out, n)
+		case kk.importStatement:
+			k.cjs.esm = true
 		}
 		if c.GotoFirstChild() {
 			continue
 		}
 		for !c.GotoNextSibling() {
 			if !c.GotoParent() {
+				k.cjsFinish(out)
 				k.finish(out, numbered)
 				return
 			}
@@ -1517,6 +1526,15 @@ func (k *javaScriptLinker) reexports(out *wire.Link, n Node) {
 		if name != "" && original != "" {
 			out.Reexports = append(out.Reexports, wire.Reexport{Name: name, Original: original, From: from})
 		}
+	}
+	if hasToken(n, kk.eqTok) {
+		// TypeScript's `export = x` assigns the module's whole value, as
+		// `module.exports = x` does, which a default import also reads.
+		if v := k.l.unparen(firstNamed(n)); jsKindOf(v) == kk.identifier {
+			add(wire.ExportAssignment, string(textOf(k.src, v)), "")
+			add("default", string(textOf(k.src, v)), "")
+		}
+		return
 	}
 	if hasToken(n, x.defaultKw) {
 		if d := n.ChildByFieldId(kk.fDeclaration); !d.IsNull() {

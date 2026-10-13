@@ -1027,4 +1027,102 @@ export function run() {
 		// Mutation: read a specifier as its raw text -> "./\u0061.js" names no file and both calls are unbound.
 		fails: "a specifier's escapes left undecoded name files that do not exist and leave ra and rb unbound",
 	},
+	{
+		name: "commonjs-export-forms",
+		anchor: "Node.js Modules: CommonJS modules (`module.exports`, the `exports` shortcut and its reassignment); " +
+			"TypeScript binder (ModuleExports, ExportsProperty, ObjectDefinePropertyExports; an ES module ignores them)",
+		files: map[string]string{
+			"src/m.js": `module.exports = function () {}; // @mf
+`,
+			"src/lib.js": `function helper() {} // @h
+function other() {} // @o
+module.exports = { helper, run: other };
+`,
+			"src/a.js": `function a() {} // @a
+exports.x = a;
+`,
+			"src/b.js": `function b() {} // @b
+exports.y = b;
+exports = {};
+`,
+			"src/c.js": `function impl() {} // @i
+function def() {} // @d
+Object.defineProperty(exports, "__esModule", { value: true });
+Object.defineProperty(exports, "impl", { enumerable: true, get: function () { return impl; } });
+exports.default = def;
+`,
+			"src/proxy.js": `module.exports = require("./m");
+`,
+			"src/esm.js": `export function q() {}
+function z() {} // @z
+module.exports = z;
+`,
+			"src/main.js": `const f = require("./m");
+const { helper, run } = require("./lib");
+const { x } = require("./a");
+const { y } = require("./b");
+const p = require("./proxy");
+const e = require("./esm");
+
+export function go() {
+  f(); // @rf
+  helper(); // @rh
+  run(); // @rr
+  x(); // @rx
+  y(); // @ry
+  p(); // @rp
+  e(); // @re
+}
+`,
+			"src/esmmain.js": `import d, { impl } from "./c.js";
+import mf from "./m.js";
+
+export function go2() {
+  d(); // @rd
+  impl(); // @ri
+  mf(); // @rm
+}
+`,
+		},
+		// Derived from the anchors: a call of a required module calls its whole value; an object literal's
+		// keys alias the names they hold; `exports = {}` unbinds the shortcut, so y is no export of b.js; a
+		// getter returning impl exports impl; with __esModule, the default import is exports.default; without
+		// it, the whole value; a module re-exporting another's whole value is that value; an ES module's
+		// `module.exports` is no export.
+		want: []string{
+			"rf f -> mf exports exact",
+			"rh helper -> h helper exact",
+			"rr run -> o other exact",
+			"rx x -> a a exact",
+			"rp p -> mf exports exact",
+			"rd d -> d def exact",
+			"ri impl -> i impl exact",
+			"rm mf -> mf exports exact",
+		},
+		// Mutation: read only function values (or drop the whole-value export) -> rf, rh, rr, rx, rp and rm are
+		// unbound; ignore `exports = {}` -> ry binds b; read CommonJS forms in an ES module -> re binds z.
+		fails: "CommonJS whole-value, alias, getter, default and re-export forms unread leave the calls unbound; " +
+			"a rebound `exports` or an ES module's `module.exports` read as exports binds ry or re",
+	},
+	{
+		name:   "typescript-export-assignment",
+		anchor: "TypeScript Handbook, Modules (`export =` assigns the module's value; `import x = require()` imports it)",
+		files: map[string]string{
+			"src/m.ts": `function f() {} // @f
+export = f;
+`,
+			"src/main.ts": `import g = require("./m");
+
+export function run() {
+  g(); // @r
+}
+`,
+		},
+		// Derived from the anchor: `export = f` is m's whole value, which g names.
+		want: []string{
+			"r g -> f f exact",
+		},
+		// Mutation: no `export =` branch in the export reader -> r is unbound.
+		fails: "`export = f` not read as the module's whole value leaves r unbound",
+	},
 }

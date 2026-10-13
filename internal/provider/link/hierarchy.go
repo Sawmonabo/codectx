@@ -1161,7 +1161,7 @@ func (h *hierarchy) resolveExport(base, name string, seen map[string]bool) (res 
 		res, ambiguous = append(res, r...), ambiguous || amb
 		return err
 	})
-	if err != nil || indirect || name == "default" {
+	if err != nil || indirect || name == "default" || name == wire.ExportAssignment {
 		return res, ambiguous, err
 	}
 	err = h.decls.lookup(keyReexport+base+"\x00*", func(e entry) error {

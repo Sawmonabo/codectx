@@ -434,9 +434,22 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   …`, `{ k: () => … }`, `Decl.Property`); `f = () => …` binds the name `f` as a declarator does. A function a
   property assignment or a pair declares is the value written to that property, named by its declaration exactly
   (`Value.Declares`), so field-based resolution reaches that declaration's node. A module's exports follow its
-  `export` statements and its CommonJS exports (`module.exports.run = …`, `exports.run = …`, a key of
-  `module.exports = { run: … }`, each exported under its own name and written to no field); a name a pattern binds
-  from a literal `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is. A
+  `export` statements and its CommonJS exports, each a module export record read by syntax at any depth
+  (`internal/provider/treesitter/worker/js_commonjs.go`): a function stored as `module.exports.run = …`, `exports.run = …` or a key of
+  `module.exports = { run: … }`, exported under its own name and written to no field; `exports.x = v`,
+  `module.exports.x = v`, `exports["x"] = v` and `Object.defineProperty(exports, "x", { value: v })` or
+  `{ get() { return v } }` with v a name, the export x aliasing v; a key of `module.exports = { a, b: c }` whose
+  value is a name; `...require("./x")` in that object and `module.exports = require("./x")`, a re-export of x.
+  `module.exports = v` (the right-most value of a chain such as `module.exports = exports = f`) and TypeScript's
+  `export = v` are the module's whole value (`export=`): a call of the required module itself (`const f =
+  require("./m"); f()`, `import f = require("./m")`) calls it, and an ES module's default import of the module
+  reads it unless the module marks itself `__esModule`, when `exports.default` is the default (the compiler's and
+  bundlers' reading; Node at run time gives the whole value, a documented difference). `exports = …`, or
+  `module.exports = …` outside a chain assigning both, unbinds `exports`, so no `exports.x` of that file is an
+  export. A file with an `import` or `export` statement is an ES module and none of these forms is read in it. A
+  class or object method assigned to `module.exports` declares nothing the structural query names and is not
+  exported. A name a pattern binds from a literal `require("./m")` (`const { run } = require("./m")`) is the
+  module's export, as an import's is. A
   declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
   ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
   re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.
