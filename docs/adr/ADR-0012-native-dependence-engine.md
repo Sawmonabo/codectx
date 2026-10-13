@@ -42,8 +42,8 @@ targets of the measurements section, ≥ 95% on a configured typed repository an
 dynamic-language one, are not gates of phases 4 and 5. They are measured in the proofs after the engine's deletion.
 Decision 9's `calls` keying is amended in place: the linking unit is keyed on its files' content, and the table
 digests decide what a rebuild costs.
-Decisions 1, 2, 4, 5, 8 and 10 stand unchanged. Decision 3 stands and is not yet built: both families are in the default traversal set,
-but impact still excludes them (`internal/graph/cost.go:83-89`) and no program-dependence relation set joins them.
+Decisions 1, 2, 4, 5, 8 and 10 stand unchanged. Decision 3 is built: the program-dependence relation set
+(`graph.ProgramDependenceRelations`) joins both families, and impact walks it as a forward slice (decision 3).
 
 **Amended 2026-10-09.** Decision 9's delta is replaced by
 [ADR-0014](ADR-0014-stable-identity-incremental-linking.md): identity keyed on the name path, two summaries per file,
@@ -314,8 +314,34 @@ This is the one capability the port **adds** rather than preserves.
 
 Concretely:
 - **No new tool.** The surface stays at its 23 tools (`internal/mcpserver/registry.go:94`).
-- **One relation set.** A program-dependence relation set joins control and data dependence by entity pair.
-- **Impact walks it.** Impact includes that set; today it excludes both kinds (`internal/graph/cost.go:83-89`).
+- **One relation set.** A program-dependence relation set joins control and data dependence by entity pair
+  (`graph.ProgramDependenceRelations`: `data_flows_to` and `control_depends_on`).
+- **Impact walks it.** The impact allowlist ends with that set, so impact is a forward slice over data and control
+  dependence as well as a walk over calls. `x data_flows_to y` is stored from the dependency to the dependent, every
+  other kind the other way round, so impact walks it against its stored direction: its incoming half reaches the
+  values a changed variable flows to and reports them incoming (may need modification), its outgoing half the
+  values that flow into it.
+- **Realizable across calls.** Across a call the linking provider publishes an argument flow (each variable an
+  argument reads to the parameter it binds), a summary flow from that variable to the call's result when the
+  parameter reaches the callee's return, and a return flow from the callee's return node to the call's result, each
+  named by its evidence detail (`argument`, `summary:<position>`, `return`). The impact walk keeps the two-phase
+  forward slice of Horwitz, Reps and Binkley (TOPLAS 12(1), 1990, section 4.5) per route: a route that takes an
+  argument flow is marked descended and never takes a return flow, which would leave the callee at every call site;
+  the summary flow at its own site carries what the callee returns. A node first admitted by a descended route is
+  admitted once more when a route that is not descended reaches it, and that admission walks its dependence edges
+  again only to carry the right to leave: they are not served a second time, and only the return flows it may now
+  take are new. So the walk marks exactly the nodes the two phases mark, admitting a node at most twice. Walked
+  against the stored direction the rule swaps the roles: a return flow walked backwards enters the callee and an
+  argument flow walked backwards leaves it. The descent describes one chain of dependence, so an edge of any other
+  kind starts a new one. Each data flow's role is read in one grouped evidence read per batch of the walk, as the
+  dispatch of a call is.
+- **Ranked below call impact, at every depth.** Impact ranks by the lexicographic key (reached through a
+  program-dependence hop, cost). The key is one integer: a route that takes a dependence hop carries a fixed high bit
+  in its cost (`dependenceTier`, set once, never added), so every comparison by cost puts every node a call, override
+  or structural route reaches before every node only a dependence route reaches, and orders each tier by its plain
+  cost. A dependence-reached entry's `score_micros` is its plain score minus 1 000 001, always negative, so the served
+  order is still score descending. Nothing is dropped and no threshold exists. Paths and traversals walk the plain
+  cost table.
 - **Paged evidence.** Evidence ranges are paged per pair, like every other answer.
 - **Anchored on every operand.** Control dependences on operator conditions are anchored at each operand, where the
   engine drops them.
@@ -1082,6 +1108,9 @@ code.
 - Braun, Buchwald, Hack, Leißa, Mallon and Zwinkau, *Simple and Efficient Construction of Static Single
   Assignment Form*, Compiler Construction 2013, https://doi.org/10.1007/978-3-642-37051-9_6 — the SSA
   construction of decision 2, which needs no dominance computation.
+- Horwitz, Reps and Binkley, *Interprocedural Slicing Using Dependence Graphs*, ACM TOPLAS 12(1), 1990,
+  26-60, https://research.cs.wisc.edu/wpis/abstracts/toplas90.abs.html — the two-phase forward slice (section 4.5)
+  the impact walk of decision 3 keeps per route.
 - Reps, Horwitz and Sagiv, *Precise Interprocedural Dataflow Analysis via Graph Reachability*, POPL
   1995, https://doi.org/10.1145/199448.199462, and Sagiv, Reps and Horwitz's IDE extension — the
   interprocedural framework decision 2 declines.

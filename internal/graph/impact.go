@@ -263,6 +263,10 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				Names:      names,
 				Dispatch:   mode,
 				Dispatches: dispatches,
+				// The forward slice's orientation and its ranking rule
+				// (impactdependence.go).
+				Dependence: true,
+				Flows:      e.flowReader(),
 			}, func(fs frontierState, edge Edge) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never
@@ -545,7 +549,7 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 		entry := model.ImpactEntry{NodeID: r.NodeID, Direction: r.Direction, Depth: r.Depth,
 			ScoreMicros: r.scoreMicros(), Reasons: r.Reasons}
 		if len(r.Route) > 0 && len(r.Route) <= model.MaxRelationsPerPath && !reasonPaths.Exceeded(1) {
-			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: r.Cost, Possible: r.Possible}}
+			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: plainCost(r.Cost), Possible: r.Possible}}
 		}
 		entries = append(entries, entry)
 	}
@@ -1052,10 +1056,7 @@ func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 	if a.climbs && kind == model.RelOverrides && e.Outgoing {
 		return nil
 	}
-	direction := model.DirectionOutgoing
-	if !e.Outgoing {
-		direction = model.DirectionIncoming
-	}
+	direction := impactDirection(kind, e.Outgoing)
 	depth := state.Depth + 1
 	// One record per admitted edge, not per node. Two edges reaching the same
 	// node produce two records with the same NodeID, and pass 1 of the sort
@@ -1073,12 +1074,12 @@ func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 	return a.emit(impactRecord{
 		NodeID:    reached,
 		Depth:     depth,
-		Cost:      state.Cost + Cost(kind),
+		Cost:      impactAdd(state.Cost, kind),
 		Direction: direction,
 		Via:       a.names.rel(e.Rel),
 		Parent:    a.names.node(state.Node),
 		Route:     a.names.route(appendRoute(state.Route, e.Rel)),
-		Reasons:   []string{impactReason(kind, direction, depth)},
+		Reasons:   []string{impactEdgeReason(kind, e.Outgoing, direction, depth)},
 	})
 }
 
@@ -1094,10 +1095,7 @@ func (a *impactAccumulator) kindOf(code KindCode) model.RelationKind {
 // kind, the direction and the depth -- never the analysis engine that produced
 // the edge. Section 14.3 rejects an entry with no reason outright.
 func impactReason(kind model.RelationKind, dir model.Direction, depth int) string {
-	if dir == model.DirectionIncoming {
-		return fmt.Sprintf("%s this symbol (incoming, depth %d)", kind, depth)
-	}
-	return fmt.Sprintf("this symbol %s it (outgoing, depth %d)", kind, depth)
+	return impactEdgeReason(kind, dir == model.DirectionOutgoing, dir, depth)
 }
 
 // hydrateImpactEntries fills the kind, file and path an entry reports, in
