@@ -175,31 +175,16 @@ complete.
 
 A put streams a file through `source.BuildIndex`, which computes the
 whole-file SHA-256, one digest per 64-KiB block and sparse line checkpoints in
-the same pass, while the plaintext is written to a pooled surface. Content
-already published under that digest stops there: the object is kept, never
-replaced, once its frame index proves it whole (below), and needs no sync,
-because it is already durable. New content is then written into a second
-pooled surface as the object: each 64-KiB block becomes one independently
-compressed frame — or stays plaintext when it does not shrink — followed by
-a frame index, one little-endian 32-bit word per block (the frame's stored
-length, top bit set for a plaintext frame), and the four-byte mark `cxfi`.
-The block count comes from the blob's recorded size, so the index carries no
-count. The object is fsynced, made read-only and published with `os.Link` to a
-name derived only from the validated digest. Where hard links are unavailable
-a rename is used only while the target is absent; a publisher racing into that
-window replaces the object with one holding the same plaintext, which no
-reader can observe. The bucket directory is fsynced on Unix; on Windows there
-is no directory fsync and NTFS journaling is what makes the new name durable
-— this is the documented platform difference.
-
-An object is self-describing: whether one is whole is answered from the
-object alone — a regular file ending in the mark, whose frames end exactly
-where the index begins. That is what the already-published check proves, and
-it compares nothing with what this put would have written, because the
-compressor owes no identical output from one build to the next; the plaintext
-is what every read verifies. Every digest is over plaintext, so integrity,
-per-block error attribution and the one-block memory bound hold for every
-object.
+the same pass, while the bytes are written to a pooled surface. The object is
+that plaintext, uncompressed: the surface is fsynced, made read-only and
+published with `os.Link` to a name derived only from the validated digest. An
+object already present is kept (it must be a regular file of the blob's
+size), never replaced, and needs no sync, because it is already durable.
+Where hard links are unavailable a rename is used only while the target is
+absent; a publisher racing into that window replaces the object with
+byte-identical content, which no reader can observe. The bucket directory is
+fsynced on Unix; on Windows there is no directory fsync and NTFS journaling is
+what makes the new name durable — this is the documented platform difference.
 
 ### One durability barrier per capture
 
@@ -251,36 +236,32 @@ read-only before it is published, and a surface left at that mode could never
 be opened for writing again.
 
 Nothing truncates a surface to reuse it, so a surface may carry the tail of a
-larger tenant and a published object is proved by its frame index, which must
-end at the file's end. The excess is trimmed a window at a time before the
-object exists — the one truncation of a pooled surface anywhere in the store
-— and it is charged to the same freeing budget as every other free. The
-object is written into a surface of its own rather than over the plaintext in
-place, because compressing in place would leave the plaintext's tail to be
-freed on every new blob; the plaintext surface goes back to the pool at its
-length. There is nothing for `Sweep` to remove: a crashed capture's
-unpublished bytes sit in surfaces the next run writes over.
+larger blob staged into it earlier and a published object is proved by its
+length. The excess is trimmed a window at a time before the object exists —
+the one truncation of a pooled surface anywhere in the store — and it is
+charged to the same freeing budget as every other free, so the only disk a
+capture gives back is the difference between one blob and the largest that
+shared its slot. There is nothing for `Sweep` to remove: a crashed capture's
+unpublished bytes sit in a surface the next run writes over.
 
 The block digests and checkpoints are persisted with `storage.PutBlob` before
 the manifest row that names the blob is written, and `PutSnapshot` refuses a
 manifest row whose blob is not retained. Publication of the snapshot therefore
 cannot precede retention of its bytes. Identical content at several paths is
-one object. Objects are compressed one block per frame; there is no mmap, no
-packing of several blobs into one file and no shared dictionary, so an
-object's lifetime is its own.
+one object. Objects are the plaintext files: no compression, no mmap, no packing of
+several blobs into one file, so an object's lifetime is its own and a read is
+a positioned read of the bytes it serves.
 
 ## Reading
 
 `snapshot.View` implements `model.SnapshotView`:
 
-- `Open` streams the blob one frame at a time, decoding each into one block
-  and verifying its block digest as it passes, and the whole-file digest at end
-  of file. The frame index is read with the first block. Memory is one block
-  and one frame.
-- `ReadRange` reads the frame index and the frames covering the interval in
-  two positioned reads, decodes and verifies exactly those blocks, and claims
-  nothing about blocks it did not read. An interval is bounded by
-  `model.MaxRawChunkBytes` (1 MiB).
+- `Open` streams the blob one block at a time, verifying every block digest as
+  it passes and the whole-file digest and size at end of file. Memory is one
+  block.
+- `ReadRange` reads the blocks covering the interval in one positioned read,
+  verifies exactly those blocks and claims nothing about blocks it did not
+  read. An interval is bounded by `model.MaxRawChunkBytes` (1 MiB).
 - `Read` is `ReadRange` plus one-based line and zero-based byte-column
   positions for both ends, derived from the nearest stored checkpoint at or
   before the interval through `source.NewCursorAt`. The window from that
@@ -289,10 +270,8 @@ object's lifetime is its own.
   touched. A start inside a well-formed UTF-8 sequence is rejected; the last
   three bytes of the prefix, returned as `Range.Before`, decide it.
 
-Reads never fall back to the live checkout or to Git. A missing, truncated or
-corrupt object — one without the mark, whose frames do not end where its index
-begins, or whose frame does not decode to its block's length and digest — is
-`CTX_SOURCE_INTEGRITY`.
+Reads never fall back to the live checkout or to Git. A missing, truncated, oversized or corrupt
+object is `CTX_SOURCE_INTEGRITY`.
 
 Checkpoints are recorded at line starts only, so the prefix before a byte
 inside a single line longer than the read ceiling exceeds that ceiling; walking
