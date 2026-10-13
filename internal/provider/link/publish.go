@@ -395,6 +395,9 @@ func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pa
 				return err
 			}
 			f.generates(&t.Decls[i], group)
+			if err := f.javaMain(&t.Decls[i], group); err != nil {
+				return err
+			}
 		}
 		if err := past(2, len(t.Decls)); err != nil {
 			return err

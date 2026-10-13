@@ -105,7 +105,7 @@ func (k Fact) entry() int {
 	switch k {
 	case FactImport, FactOpenImport:
 		return 1
-	case FactExtends, FactImplements, FactOverrides, FactGenerates, FactVisibility:
+	case FactExtends, FactImplements, FactOverrides, FactGenerates, FactVisibility, FactMain:
 		return 2
 	case FactRoute:
 		return 3

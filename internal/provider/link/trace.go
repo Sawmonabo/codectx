@@ -418,7 +418,7 @@ var refPrefixes = []struct {
 }{
 	{keyFile, true}, {keyImport, true}, {keyMethod, false}, {keySub, false}, {keySuper, false}, {keyGoField, false},
 	{keyExternalSuper, false}, {keyParam, false}, {keyGoExternalImpl, false}, {keyGoExternalOverride, false},
-	{keyRustConstructor, false}, {keyRustVariant, false},
+	{keyRustConstructor, false}, {keyRustVariant, false}, {keyJavaMain, false},
 }
 
 // traceKey is the read of key in the index scope names (scopeDecls,

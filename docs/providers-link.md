@@ -44,8 +44,9 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
-| none of its own | `defines` | file module → a route endpoint at its full path, or a declared entry point | none |
+| none of its own | `defines` | file module → a route endpoint at its full path, a declared entry point, or an inherited Java `main` | none |
 | none of its own | `routes_to` | route endpoint → each handler; declared entry point → its declaration or module | `import` |
+| none of its own | `routes_to` | inherited Java `main` endpoint → the method JLS §12.1.4 launches its class by | `hierarchy` |
 | none | `references` | C or C++ declaration → each definition of a macro among its specifiers that its file sees and that states a visibility | `visibility_<value>` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
@@ -304,6 +305,24 @@ Each is keyed `endpoint:declared:<group>:<name>@<manifest>` (the group alone whe
 located at its target, defined by the file's module and routing to the target (detail `import`). A name several member files can supply
 publishes one endpoint in each, each with the set size; a value that names no member publishes nothing. The entries
 are manifest fields of the unit, so a change to one re-resolves the unit.
+
+## Inherited Java `main`
+
+A Java class is launched by the `main` it declares or inherits (JLS SE 25 §12.1.4): the one with a `String[]`
+parameter before the one with none, a declaration overriding an inherited `main` of the same parameters. The
+structural provider decides every class whose answer its file holds; a class whose superclass chain leaves its file,
+with no `String[]` main declared nearer, it marks for the linker (`Decl.MainInherited`), and it marks every
+launchable method with its form (`Decl.Main`, indexed under `keyJavaMain` by its class). The linker walks the
+class's superclasses through the unit (`keySuper`, the one supertype that is no interface) and chooses the nearest
+`String[]` main, else the nearest main with no parameter; a chain that reaches a class outside the project ends
+there, with what the project declares (`internal/provider/link/java_main.go`). The class's file publishes one
+`endpoint` named `main` with the identity the structural provider gives the main of a class it resolves itself (the
+file, the descriptor `main` and the class's qualified name as disambiguator), so an edit that moves the decision
+between the two providers moves no endpoint. It is located at the class, defined by the file's module and routing to
+the method (detail `hierarchy`); like the linker's other endpoints it carries no search document. A superclass the
+file names ambiguously is a path of its own; when the paths choose several methods each `routes_to` carries their
+number as its set size. The reads are index lookups of the hierarchy, so an edit to a superclass's `main` or to its
+`extends` re-resolves the classes that read it.
 
 ## Endpoint identity per family
 

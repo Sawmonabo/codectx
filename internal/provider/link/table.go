@@ -205,7 +205,24 @@ type Decl struct {
 	// Macros are, for a C or C++ declaration, the macros written among its
 	// specifiers, each followed by one space (wire.Export.Macros).
 	Macros string `json:"macros,omitempty"`
+	// Main is, for a Java method a class can be launched by (JLS SE 25
+	// §12.1.4: named `main`, not `private`, `void`, with a body), its
+	// form: MainArgs for one `String[]` or `String...` parameter,
+	// MainNoArgs for none.
+	Main uint8 `json:"main,omitempty"`
+	// MainInherited reports a Java class whose launchable `main` the
+	// structural provider leaves to the linker: its superclass chain leaves
+	// its file and no `String[]` main is declared nearer, so a superclass
+	// in another file may supply the one JLS §12.1.4 launches
+	// (javaMainFacts).
+	MainInherited bool `json:"main_inherited,omitempty"`
 }
+
+// The forms of a Java launchable main (Decl.Main).
+const (
+	MainNoArgs uint8 = 1
+	MainArgs   uint8 = 2
+)
 
 // Parameter is one declared parameter of a callable. Endpoint is the
 // parameter's variable node as the structural provider resolved it, keyed by

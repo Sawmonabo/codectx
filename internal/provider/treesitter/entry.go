@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
@@ -132,9 +133,11 @@ type javaMain struct {
 // without, whether declared or inherited, and a declared method overrides an
 // inherited one of the same parameters. An interface is launched by a
 // `static main` only, having no instance. A class inherits the `main` of its
-// superclass when that superclass is a class of this file (a superclass
-// declared elsewhere is not visible here); the endpoint is then at the
-// inheriting class and routes to the inherited method.
+// superclass; the endpoint is then at the inheriting class and routes to the
+// inherited method. A class whose superclass chain leaves this file, with no
+// `String[]` main declared nearer, is left to the linker, which reads the
+// superclasses the other files declare (mainInherited, link.FactMain); every
+// launchable form is marked for it (mainForms).
 func (b *builder) javaMains() []endpointFact {
 	own := map[int][]javaMain{}
 	for i := range b.decls {
@@ -148,6 +151,13 @@ func (b *builder) javaMains() []endpointFact {
 		}
 		if d.Parent >= 0 && b.decls[d.Parent].kind == model.NodeInterface && !m.static {
 			continue
+		}
+		if b.mainForms == nil {
+			b.mainForms = map[int]uint8{}
+		}
+		b.mainForms[i] = link.MainNoArgs
+		if m.args {
+			b.mainForms[i] = link.MainArgs
 		}
 		own[d.Parent] = append(own[d.Parent], m)
 	}
@@ -163,13 +173,21 @@ func (b *builder) javaMains() []endpointFact {
 			continue
 		}
 		ms := own[c]
-		for super, seen := b.javaSuperclass(c), map[int]bool{c: true}; super >= 0 && !seen[super]; super = b.javaSuperclass(super) {
+		super, elsewhere := b.javaSuperclass(c)
+		for seen := map[int]bool{c: true}; super >= 0 && !seen[super]; super, elsewhere = b.javaSuperclass(super) {
 			seen[super] = true
 			for _, m := range own[super] {
 				if !declaresForm(ms, m.args) {
 					ms = append(ms, m)
 				}
 			}
+		}
+		if elsewhere && !declaresForm(ms, true) {
+			if b.mainInherited == nil {
+				b.mainInherited = map[int]bool{}
+			}
+			b.mainInherited[c] = true
+			continue
 		}
 		if len(ms) == 0 {
 			continue
@@ -288,10 +306,12 @@ func javaMainParams(s string) (args, ok bool) {
 // type its signature names after `extends` (type parameters skipped), matched
 // to the one class of this file of that simple name, or, when several share
 // it, to the one whose qualified name ends with the name as written.
-func (b *builder) javaSuperclass(c int) int {
+// elsewhere reports a class that extends a type no one class of this file
+// is.
+func (b *builder) javaSuperclass(c int) (super int, elsewhere bool) {
 	d := &b.decls[c]
 	if d.kind != model.NodeClass {
-		return -1
+		return -1, false
 	}
 	s := strings.TrimSpace(stripAnnotations(stripJava(b.blanked(d, d.NameEnd, d.SigEnd))))
 	if strings.HasPrefix(s, "<") {
@@ -306,18 +326,18 @@ func (b *builder) javaSuperclass(c int) int {
 			}
 		}
 		if j >= len(s) {
-			return -1
+			return -1, false
 		}
 		s = strings.TrimSpace(s[j+1:])
 	}
 	rest, ok := strings.CutPrefix(s, "extends")
 	if !ok || rest == "" || !isSpace(rest[0]) {
-		return -1
+		return -1, false
 	}
 	written, _ := qualifiedPrefix(strings.TrimLeft(rest, " \t\r\n"))
 	simple := written[strings.LastIndexByte(written, '.')+1:]
 	if simple == "" {
-		return -1
+		return -1, true
 	}
 	var named, qualified []int
 	for _, j := range b.byName[simple] {
@@ -331,11 +351,11 @@ func (b *builder) javaSuperclass(c int) int {
 	}
 	switch {
 	case len(named) == 1:
-		return named[0]
+		return named[0], false
 	case len(qualified) == 1:
-		return qualified[0]
+		return qualified[0], false
 	}
-	return -1
+	return -1, true
 }
 
 // qualifiedPrefix is the dotted name s opens with, whitespace around its
