@@ -663,7 +663,7 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 		// every candidate including the ones selection drops, so counting both
 		// passes would double every selected entry and count entries the
 		// manifest never carries.
-		e, _, err := measureEntry(c, i, charged[c.FileID] == i)
+		e, err := measureEntry(c, i, charged[c.FileID] == i)
 		if err != nil {
 			return plan{}, err
 		}
@@ -692,11 +692,10 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 			continue
 		}
 		ordinal := len(out.Entries)
-		e, clipped, err := measureEntry(sized[i], ordinal, charged[sized[i].FileID] == i)
+		e, err := measureEntry(sized[i], ordinal, charged[sized[i].FileID] == i)
 		if err != nil {
 			return plan{}, err
 		}
-		out.RelationsClipped += clipped
 		final[i] = ordinal
 		out.Entries = append(out.Entries, e)
 	}
@@ -1167,12 +1166,6 @@ type plan struct {
 	Entries  []model.ContextEntry
 	Slices   []model.ContextSlice
 	Excluded []model.ExcludedContextEntry
-	// RelationsClipped counts the routes whose relation list evidencePaths had
-	// to cut to model.MaxRelationsPerPath across the SELECTED entries. It is a
-	// count, not a per-entry list, for the reason scopeResult's two counters
-	// are: the compiler turns it into one manifest notice, so a shortened route
-	// never reads as the whole route.
-	RelationsClipped int64
 }
 
 // drop records one candidate the packer could not fit, with the reason it is

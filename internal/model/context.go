@@ -262,10 +262,12 @@ func (e ContextEntry) Validate() error {
 	// routes than that constant would fail a persist for obeying the operator's
 	// own setting, and what an entry cannot enumerate is already disclosed by its
 	// MorePaths reason rather than dropped.
+	// No length bound on a route either: a route is stored as long as the walk
+	// found it, one row per route (ContextRoute), so only its shape is checked.
 	for i, path := range e.EvidencePaths {
 		field := indexed("context_entry.evidence_paths", i)
-		if err := boundCount(field, len(path), MaxRelationsPerPath); err != nil {
-			return err
+		if len(path) == 0 {
+			return invalid("%s names no relation", field)
 		}
 		for j, id := range path {
 			if err := requireID(indexed(field, j), string(id)); err != nil {

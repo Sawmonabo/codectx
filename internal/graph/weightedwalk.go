@@ -1062,12 +1062,9 @@ func (w *weightedWalk) page(limit int) ([]servedLabel, bool, error) {
 }
 
 // route reads a label's route back through its parents, root first, with the
-// kind of each hop. A route longer than a path may carry is not read: the
-// entry is served without one, as an impact entry past that bound is.
+// kind of each hop, however long it is: the context plan stores every route
+// whole and pages it by reference.
 func (w *weightedWalk) route(l servedLabel) ([]model.RelationID, int64, error) {
-	if l.depth > model.MaxRelationsPerPath {
-		return nil, 0, nil
-	}
 	rels := make([]model.RelationID, 0, l.depth)
 	var cost int64
 	err := w.sc.each(w.scCtx, `WITH RECURSIVE chain(id, parent, rel, kind, depth) AS (

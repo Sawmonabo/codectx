@@ -12,10 +12,11 @@ const routeIDBytes = model.IDHexLen / 2
 
 // putEntryRoutes writes every evidence route of one manifest entry as its own
 // row, in route order, inside PutManifest's transaction. A route is stored as
-// written and in full, its relation identities packed as raw bytes one after
-// another; the entry itself keeps only the count. Packed, a route of up to
-// five relations stays under one twentieth of a 4 KiB page, the row size a
-// WITHOUT ROWID table is built for.
+// written and in full, however long, its relation identities packed as raw
+// bytes one after another; the entry itself keeps only the count. Packed, a
+// route of up to five relations, the common case, stays under one twentieth
+// of a 4 KiB page, the row size a WITHOUT ROWID table is built for; a longer
+// one spills to overflow pages.
 func putEntryRoutes(ctx context.Context, stmt *sql.Stmt, manifest []byte, e model.ContextEntry) error {
 	for i, path := range e.EvidencePaths {
 		rels := make([]byte, 0, len(path)*routeIDBytes)

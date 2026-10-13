@@ -869,10 +869,9 @@ func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
 //     holds and therefore the order P-I's EvidencePaths must read. A dropped
 //     route leaves no record; its existence is disclosed by MorePaths.
 //   - edges receives every admitted (package, relation) pair. It is fed from
-//     routeScore.admittedEdges and NOT from the retained routes: scoreRoutes
-//     appends the edges of a route that is too long to store before it drops it
-//     (rank.go's MaxRelationsPerPath branch), so an over-long route still counts
-//     towards its package's centrality and towards the test-or-contract boost.
+//     routeScore.admittedEdges and NOT from the retained routes: a route past
+//     the path limit is not retained, and it still counts towards its
+//     package's centrality and towards the test-or-contract boost.
 func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
 	cands *pagination.SortedRun[candRec],
 	routes *pagination.SortedRun[pathRec],
@@ -1222,7 +1221,7 @@ func (c *Compiler) passGMeasure(ctx context.Context, s *compileSorts, in rankedS
 		cand.Paths = routed
 		// The clip count is taken from phase two: phase one measures every
 		// candidate including the ones selection drops.
-		e, _, err := measureEntry(cand, int(r.Cand.Index), r.Charged)
+		e, err := measureEntry(cand, int(r.Cand.Index), r.Charged)
 		if err != nil {
 			return err
 		}
@@ -1353,8 +1352,7 @@ func (c *Compiler) passHPack(ctx context.Context, s *compileSorts, m *measuredPl
 
 // passIEmit — pass P-I. Sorts decisions under lessDecision, merge-joins
 // them with the measured stream, re-sorts the kept candidates by Index to assign
-// the final ordinal, re-measures them (phase two), accumulates RelationsClipped
-// and appends to the streamed Plan.Units. Exclusion ordinals stream the excluded
+// the final ordinal, re-measures them (phase two) and appends to the streamed Plan.Units. Exclusion ordinals stream the excluded
 // spool in P-A order and then the packer's drops in P-H order: the exact
 // sequence buildPlan produces.
 func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPlan,
@@ -1423,11 +1421,10 @@ func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPl
 			return err
 		}
 		cand.Paths = routed
-		e, clipped, err := measureEntry(cand, ordinal, r.Charged)
+		e, err := measureEntry(cand, ordinal, r.Charged)
 		if err != nil {
 			return err
 		}
-		out.RelationsClipped += clipped
 		if err := sink.Entry(e); err != nil {
 			return err
 		}

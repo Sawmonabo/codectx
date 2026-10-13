@@ -25,11 +25,11 @@ func TestAnEntrysChargeDoesNotMoveWithItsRoutes(t *testing.T) {
 	for i := range 50 {
 		many.Paths = append(many.Paths, route(i))
 	}
-	a, _, err := measureEntry(one, 3, true)
+	a, err := measureEntry(one, 3, true)
 	if err != nil {
 		t.Fatalf("measureEntry(one route): %v", err)
 	}
-	b, _, err := measureEntry(many, 3, true)
+	b, err := measureEntry(many, 3, true)
 	if err != nil {
 		t.Fatalf("measureEntry(fifty routes): %v", err)
 	}

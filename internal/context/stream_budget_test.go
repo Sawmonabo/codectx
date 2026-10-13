@@ -135,7 +135,7 @@ func streamPlan(t *testing.T, cands []candidate, files []model.FileVersion, b re
 		return plan{}, err
 	}
 	out := sink.p
-	out.Slices, out.RelationsClipped = parts.Slices, parts.RelationsClipped
+	out.Slices = parts.Slices
 	if parts.Entries != int64(len(out.Entries)) || parts.Excluded != int64(len(out.Excluded)) {
 		t.Fatalf("P-I counted %d entries and %d exclusions, emitted %d and %d",
 			parts.Entries, parts.Excluded, len(out.Entries), len(out.Excluded))
@@ -162,8 +162,8 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 		{Relations: []model.RelationID{"r1", "r2"}, Evidence: []model.EvidenceID{"e1"}, CostUnits: 3},
 		{Relations: []model.RelationID{"r4"}, CostUnits: 1},
 	}
-	// A route longer than model.MaxRelationsPerPath, so RelationsClipped is
-	// exercised on a SELECTED entry and counted in phase two only.
+	// A route longer than model.MaxRelationsPerPath, so a SELECTED entry
+	// carries a route past the old clip and phase two stores it whole.
 	long := make([]model.RelationID, model.MaxRelationsPerPath+2)
 	for i := range long {
 		long[i] = model.RelationID("L" + string(rune('a'+i)))
@@ -285,9 +285,6 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 			if !reflect.DeepEqual(got.Excluded, want.Excluded) {
 				t.Fatalf("exclusions differ:\n streamed %+v\n whole-set %+v", got.Excluded, want.Excluded)
 			}
-			if got.RelationsClipped != want.RelationsClipped {
-				t.Fatalf("streamed RelationsClipped %d, want %d", got.RelationsClipped, want.RelationsClipped)
-			}
 			if len(want.Entries) == 0 || len(want.Excluded) == 0 {
 				t.Fatalf("the fixture proves nothing: %d entries, %d exclusions",
 					len(want.Entries), len(want.Excluded))
@@ -327,7 +324,7 @@ func TestStreamedBudgetRecordRoundTrip(t *testing.T) {
 // pipeline's own tests -- reach the streamed signatures without restating the
 // projection at each call site.
 func partsOf(p plan) planParts {
-	return planParts{Slices: p.Slices, RelationsClipped: p.RelationsClipped,
+	return planParts{Slices: p.Slices,
 		Entries: int64(len(p.Entries)), Excluded: int64(len(p.Excluded))}
 }
 

@@ -14,7 +14,8 @@ type ContextRoute struct {
 }
 
 // Validate enforces the context_entry_routes constraints: a route names at
-// least one relation and at most MaxRelationsPerPath, each a canonical id.
+// least one relation, each a canonical id, and no bound on how many: a route
+// is stored as long as the walk found it.
 func (r ContextRoute) Validate() error {
 	if err := requireNonNegative("context_route.entry", int64(r.Entry)); err != nil {
 		return err
@@ -24,9 +25,6 @@ func (r ContextRoute) Validate() error {
 	}
 	if len(r.Relations) == 0 {
 		return invalid("context_route %d of entry %d names no relation", r.Index, r.Entry)
-	}
-	if err := boundCount("context_route.relations", len(r.Relations), MaxRelationsPerPath); err != nil {
-		return err
 	}
 	for i, id := range r.Relations {
 		if err := requireID(indexed("context_route.relations", i), string(id)); err != nil {
