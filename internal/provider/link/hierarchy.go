@@ -579,6 +579,9 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
 		return err
 	}
+	if err := addCIncludes(s, file, t, fc); err != nil {
+		return err
+	}
 	for _, imp := range t.Imports {
 		if imp.Name == "" {
 			continue

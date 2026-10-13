@@ -120,6 +120,22 @@ func metadataErr(id model.NodeID, err error) *model.Error {
 		Remediation: "this is a defect in the published facts; report it with the command you ran"}
 }
 
+// candidatesUnavailableReason answers why name-only candidates cannot be
+// listed when err is the graph's typed "unavailable" answer (a reader without
+// the declaration lookup), and false for any other error. The plan then says
+// the candidates are unavailable instead of failing or reading as none.
+func candidatesUnavailableReason(err error) (string, bool) {
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeProviderUnavailable {
+		return "", false
+	}
+	why, _ := model.TruncateField(typed.Message, model.MaxReasonBytes)
+	if why == "" {
+		why = "the candidate lookup is unavailable"
+	}
+	return why, true
+}
+
 // admitSiteCandidates pages one site's candidates to exhaustion and pushes
 // each as a Possible record. A cursor pins the generation, so the generation
 // is named on the first page only.
@@ -133,12 +149,7 @@ func (c *Compiler) admitSiteCandidates(ctx context.Context, r graph.GraphReader,
 			Page:         model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
 		})
 		if err != nil {
-			var typed *model.Error
-			if errors.As(err, &typed) && typed.Code == model.CodeProviderUnavailable {
-				why, _ := model.TruncateField(typed.Message, model.MaxReasonBytes)
-				if why == "" {
-					why = "the candidate lookup is unavailable"
-				}
+			if why, ok := candidatesUnavailableReason(err); ok {
 				in.scope.CandidatesUnavailable = why
 				return nil
 			}
