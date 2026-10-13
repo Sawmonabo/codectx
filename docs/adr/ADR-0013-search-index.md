@@ -282,8 +282,13 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
 - **Merge.** A scored segment's heap becomes a run: its groups in comparator order, each a score, a count, a document
   and a flag (24 bytes), with no strings; the heap is freed. The runs are merged k ways, comparing heads by score
   alone and reading two heads' strings only when their scores tie, and the merge stops at the cut or at depth + 1
-  groups. Strings are read, one sorted dictionary pass per column, only for the results served and for each truncated
-  segment's worst entry, and the occurrence counts sum each run's entry of a served group. This is the
+  groups. Of each group met the merge reads only its fold key, from one column (two for a result without a node), and
+  none when one segment alone holds runs and marks, since no other segment can hold its group. Strings are read only
+  for the results served and for each truncated segment's worst entry, one sorted dictionary pass per column and
+  segment, the segments in parallel: a sorted pass decodes each dictionary block once for all the ordinals it holds,
+  where a lookup of one ordinal decodes its block from the start (see Sources), so a page reads no more blocks than a
+  resolution of every heap did, from fewer ordinals. The occurrence counts sum each run's entry of a served group,
+  each segment counted in parallel. This is the
   query-then-fetch shape of the major engines: each shard returns sort keys, a k-way merge of the sorted per-shard
   lists picks the winners, and only the winners are fetched (see Sources). Resolving every segment's heap to strings
   before a hash fold would cost each segment place about 2.2 KB plus three copies of its strings. A shared minimum
@@ -295,7 +300,10 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   parallel scoring. A request may carry a byte bound: the library charges the heaps being scored, every run entry, the
   marked groups and each served result with the caller's copy of it, sizes the heap to fit beside the marked groups'
   bound (never below two places), doubles it on a rescoring only while it fits (or while no result is known), and ends
-  the merge before a result that would pass the bound, so a bounded page is an exact prefix that says more. A page
+  the merge before a result that would pass the bound, so a bounded page is an exact prefix that says more. A bounded
+  page reads its results' strings by the sorted pass, charging each string as it is read, and gives the pass up the
+  moment the charges pass the bound; only then does the merge run again reading each result's strings as it meets it,
+  so the page stops exactly where the bound falls and the pass never holds more than the bound. A page
   reports a bound on the groups the next position marks: its marked groups plus the run entries it took up to its last
   result, each of which sorts at or before that result.
 - **Pruning.** Block-max WAND over blocks of 128 documents, with BM25F upper bounds per block of the union postings,
@@ -483,6 +491,9 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
     https://github.com/apache/lucene/tree/releases/lucene/10.3.0/lucene/grouping/src/java/org/apache/lucene/search/grouping;
     an exact total "can't be computed accurately without visiting all matches" and disables the max-score
     optimization, https://www.elastic.co/docs/solutions/search/the-search-api (`track_total_hits`);
+  - a dictionary lookup of one ordinal decodes its block from the block's first term, and a sorted pass over many
+    ordinals decodes each block once, `Dictionary::ord_to_term` and `Dictionary::sorted_ords_to_term_cb`,
+    https://github.com/quickwit-oss/tantivy/blob/0.26.0/sstable/src/dictionary.rs;
   - query-then-fetch: the coordinator merges each shard's top keys and fetches only the winning documents,
     https://github.com/elastic/elasticsearch/blob/v8.19.0/server/src/main/java/org/elasticsearch/action/search/SearchPhaseController.java
     and `FetchSearchPhase.java` at the same tag; deep pages cost memory and time in from + size,
