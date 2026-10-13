@@ -375,5 +375,9 @@ never replaced by `{"truncated":true}`. An element whose encoded JSON passes
 32 KiB (`model.MaxMetadataPieceBytes`) is stored as ordered piece rows
 (`part`, `parts`, each value a run of the element's JSON as a string), so no
 row passes the storage batch and no element is cut; readers rejoin them, so
-`codectx_node_metadata` always pages whole elements in order. A piece is
-kept or clipped with its siblings, never alone.
+`codectx_node_metadata` always pages whole elements in order. The rows are
+evidence of the node, so they share its per-fact evidence bound
+(`index.max_evidence_per_fact`, unlimited by default, which resolves to the
+record ceiling `model.MaxEvidencePerFact`): a row past it is clipped and
+counted under `evidence_clipped` on the capability row, and a piece is kept or
+clipped with its siblings, never alone.
