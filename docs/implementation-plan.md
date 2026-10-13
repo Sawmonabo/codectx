@@ -1146,7 +1146,7 @@ CREATE TABLE generation_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     -- remediation is what an operator can do about this row, in prose. It is a
     -- column rather than an entry in details_json because details_json is the
@@ -1167,7 +1167,7 @@ CREATE TABLE unit_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     remediation TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
@@ -1850,7 +1850,7 @@ Default debounce is 250 ms and reconciliation interval is 30 seconds. Coalesce p
 <a id="133-capability-freshness"></a>
 ### 13.3 Capability Freshness
 
-Use `fresh`, `partial`, `stale`, `unavailable`, and `failed` per capability/scope, and `fresh`, `degraded`, or `failed` for generation health. Store precise reason codes separately from user-readable remediation. An optional disabled tool can be unavailable while the base generation is fresh. While a unit is refreshing after an edit, the active generation keeps answering from the units it already selected until the new generation is validated and activated. An enabled requested provider that failed makes that capability failed and the active generation degraded if required base coverage still passes.
+Use `fresh`, `partial`, `unavailable`, and `failed` per capability/scope (every unit is keyed by the content of its inputs, so a capability's facts are never older than the snapshot that selected them and no state is needed for that), and `fresh`, `degraded`, or `failed` for generation health. Store precise reason codes separately from user-readable remediation. An optional disabled tool can be unavailable while the base generation is fresh. While a unit is refreshing after an edit, the active generation keeps answering from the units it already selected until the new generation is validated and activated. An enabled requested provider that failed makes that capability failed and the active generation degraded if required base coverage still passes.
 
 An active generation is coherent with its own snapshot even when the worktree is newer. Status distinguishes `snapshot_coherent`, `worktree_changed`, `refresh_pending`, `superseded`, and provider completeness. A valid historical query is not an assertion of current worktree freshness. No `fresh` status is inferred merely because an executable was found or a run emitted some rows.
 
@@ -2533,7 +2533,7 @@ The source-position/path/hash/cursor/process utilities are shared concrete imple
 
 Use `log/slog` with component, repository/snapshot/generation/analysis IDs, provider/unit/run, operation, duration, status and error code. Source bodies, task text, secrets, inherited environment, and raw child stdout/stderr are excluded by default. Sanitize filenames/control characters before human display; JSON escaping is not terminal sanitization.
 
-Run states are consistently lowercase: `running`, `succeeded`, `partial`, `skipped`, `timed_out`, `failed`, `canceled`. Capability states are `fresh`, `partial`, `stale`, `unavailable`, `failed`. Generation health is `fresh`, `degraded`, `failed`. Unknown enum values fail validation; do not maintain competing uppercase wire vocabularies.
+Run states are consistently lowercase: `running`, `succeeded`, `partial`, `skipped`, `timed_out`, `failed`, `canceled`. Capability states are `fresh`, `partial`, `unavailable`, `failed`. Generation health is `fresh`, `degraded`, `failed`. Unknown enum values fail validation; do not maintain competing uppercase wire vocabularies.
 
 Stable error families include:
 
