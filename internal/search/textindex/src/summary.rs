@@ -43,6 +43,7 @@
 use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tantivy::columnar::Column;
 use tantivy::index::SegmentId;
@@ -172,8 +173,37 @@ impl Lengths {
     }
 }
 
-/// Builds the summary of seg and writes it atomically into dir.
+/// Temporary names unique within the process; the process id makes them
+/// unique across processes.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Builds the summary of seg and writes it atomically into dir. Several
+/// processes (or two opens in one) may build the same segment's summary at
+/// once: each writes its own temporary file, the bytes are the same, and a
+/// rename that fails while a valid summary is already in place is no error.
 pub fn build(dir: &Path, seg: &SegmentReader, fields: &Fields) -> Result<()> {
+    let name = file_name(seg.segment_id());
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("{name}.{}-{seq}.tmp", std::process::id()));
+    let written = write(&tmp, seg, fields).and_then(|()| Ok(fs::rename(&tmp, dir.join(&name))?));
+    match written {
+        Ok(()) => {
+            sync_dir(dir);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            if Summary::load(dir, seg).is_some() {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Writes seg's summary into the file tmp.
+fn write(tmp: &Path, seg: &SegmentReader, fields: &Fields) -> Result<()> {
     let lens = Lengths::open(seg)?;
     let invs = fields.text.iter().map(|f| seg.inverted_index(*f)).collect::<tantivy::Result<Vec<_>>>()?;
     let mut streams = Vec::with_capacity(invs.len());
@@ -185,9 +215,7 @@ pub fn build(dir: &Path, seg: &SegmentReader, fields: &Fields) -> Result<()> {
         .map(|s| if s.advance() { Some((s.key().to_vec(), s.value().clone())) } else { None })
         .collect();
 
-    let name = file_name(seg.segment_id());
-    let tmp = dir.join(format!("{name}.tmp"));
-    let file = fs::File::create(&tmp)?;
+    let file = fs::File::create(tmp)?;
     let mut w = BufWriter::new(file);
     w.write_all(&[0u8; HEADER])?;
     let mut sum = FNV_OFFSET;
@@ -302,9 +330,6 @@ pub fn build(dir: &Path, seg: &SegmentReader, fields: &Fields) -> Result<()> {
     w.write_all(&h)?;
     let file = w.into_inner().map_err(|e| Error::from(e.into_error()))?;
     file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, dir.join(&name))?;
-    sync_dir(dir);
     Ok(())
 }
 
@@ -443,14 +468,22 @@ impl Summary {
     }
 }
 
-/// Removes every summary (and leftover temporary) whose segment is not in live.
+/// Removes every summary and temporary file whose segment is not in live. A
+/// live segment's temporary file may be another process's build in progress,
+/// so it is left; one a crash left goes with its segment.
 pub fn remove_orphans(dir: &Path, live: &[SegmentId]) {
     let keep: std::collections::HashSet<String> = live.iter().map(|s| file_name(*s)).collect();
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let ours = name.ends_with(SUFFIX) || name.ends_with(&format!("{SUFFIX}.tmp"));
-        if ours && !keep.contains(&name) {
+        let summary = if name.ends_with(SUFFIX) {
+            Some(name.as_str())
+        } else if name.ends_with(".tmp") {
+            name.find(&format!("{SUFFIX}.")).map(|at| &name[..at + SUFFIX.len()])
+        } else {
+            None
+        };
+        if summary.is_some_and(|s| !keep.contains(s)) {
             // A file still mapped by an open view may refuse removal on some
             // platforms; the next release of the writer removes it.
             let _ = fs::remove_file(PathBuf::from(dir).join(&name));

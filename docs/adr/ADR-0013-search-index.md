@@ -353,8 +353,12 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   false-positive rate (1 in 256), so 1 million keys take 1.2 to 1.4 MB. Deleted documents stay in
   it; they only loosen a bound or admit a key. A header names the segment and its document count; a mismatched or unreadable file
   is no summary, and that segment is scored exhaustively, so a stale summary is never read. A summary is built for
-  every searchable segment that lacks one at each commit, after each merge (a writer release waits for merges), and
-  by a forced merge; the summaries of segments no longer present are removed.
+  every searchable segment that lacks one, or holds one of an earlier format, at every open of the index (read-only
+  opens too: the file is derived, written under a name of its own and renamed into place, so builds in several
+  processes at once agree), at each commit, after each merge (a writer release waits for merges), and by a forced
+  merge. An open that cannot write the directory scores those segments exhaustively, exact and counted per page as
+  segments without a summary. The summaries of segments no longer present are removed; a temporary file of a live
+  segment may be another process's build and is left.
 - **Bounds.** Ties are settled by the heap and the content comparator. A summary is read through a memory map with a
   binary-searched term table, so nothing per segment stays in the heap, and the scoring scratch is per block (128
   documents by the query's terms), never per segment. The writer's memory, its merge and search threads and the

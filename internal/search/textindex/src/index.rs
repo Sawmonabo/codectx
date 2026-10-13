@@ -86,7 +86,7 @@ impl Index {
         } else {
             Executor::single_thread()
         };
-        Ok(Index {
+        let index = Index {
             dir: dir.to_path_buf(),
             index,
             reader,
@@ -96,7 +96,25 @@ impl Index {
             writer: Mutex::new(None),
             summaries: Mutex::new(HashMap::new()),
             alive: Mutex::new(AliveCache::new(opts.view_cache_bytes)),
-        })
+        };
+        index.summarize_at_open();
+        Ok(index)
+    }
+
+    /// Builds the summary of every searchable segment that has none, or one
+    /// this library no longer reads, so no page is scored without one. It
+    /// writes only summary files, never the index, so a read-only open does it
+    /// too. A segment whose build fails (a read-only directory, a full disk)
+    /// is scored exhaustively, which is exact, and counted per page as a
+    /// segment without a summary; a writer's next commit builds it again and
+    /// fails on the error.
+    fn summarize_at_open(&self) {
+        let searcher = self.reader.searcher();
+        for seg in searcher.segment_readers() {
+            if self.summary(seg).is_none() {
+                let _ = summary::build(&self.dir, seg, &self.fields);
+            }
+        }
     }
 
     /// Runs f on the writer, opening it first when it is not open.
