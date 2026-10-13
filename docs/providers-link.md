@@ -295,8 +295,12 @@ type by its unresolved spelling or could not be spelled (`go_method_signatures_u
 from every non-test file, whatever its build constraints, and cached on disk by its source's identity
 (`go_external_cache.go`). An interface two files declare differently (per platform or build tag: `Handle` with
 `Fd() uintptr` for unix and `Fd() int` for windows) is each of its declarations, one entity per declaration as the
-project's own conditional declarations are, and a type satisfying one implements it; an alias declared differently,
-or a method declared with two signatures, makes a form naming it unknown. A Go type implements an interface
+project's own conditional declarations are, and a type satisfying one implements it. Declarations are compared by
+their canonical spellings, not as written: `type Num = Count` (with `Count = int`) for unix and `type Num = int` for
+windows are one alias of `int`, `const Width = 4` and `2 + 2` one value, `Sum() [16]byte` and `Sum() [Size]byte` (with
+`Size = 16`) one method, and interface declarations that spell one method set are one interface; an alias, constant or
+method whose declarations spell different types or values makes a form naming it unknown, in the project's own
+packages as in packages outside it. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
@@ -782,7 +786,8 @@ The members' language family picks the resolver:
   name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
   alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
   however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
-  `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
+  `int32`, `any` `interface{}`, a user alias its type, a generic alias `List[string]` its type with its arguments
+  substituted), and qualifies an unexported method name by its package. Type
   parameters compare by position. A struct literal compares by its fields in order (name, an unexported one
   qualified by its package, type, tag by value, embedding) and an interface literal by its sorted methods and
   embedded interfaces ("Type identity"); an array length by its value, a constant expression folded over the
@@ -930,10 +935,13 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance
   receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type of a receiver two
   disagreeing definitions reach included) binds, for each of its types, the first declaration of the method along
-  that type's C3 linearisation (`hierarchy.pythonMRO`, over the bases in the order each class lists them), never a
-  subclass's override. A class object (`A.make()`, `mod.A.make()`) binds the method `A`
+  that type's C3 linearisation (`hierarchy.pythonUnitOrder`, over the bases in the order each class lists them,
+  the bases outside the project placed as for overrides), never a subclass's override. A base outside the project
+  that the order places ahead of that declaration may hold the method instead, so the call also reaches that base's
+  method, a set counting both (`class C(Base, U)`: `c.run()` reaches `Base.run` and `U.run`, set size 2). A class object (`A.make()`, `mod.A.make()`) binds the method `A`
   declares or inherits alone, never a subclass's override. `super().m()` in class `B` binds, for `B` and each class
-  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached. Field-based
+  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached, and each
+  base outside the project a linearisation places between `B` and that `m` as a candidate beside it. Field-based
   resolution (a function written to the attribute; a method is written to no attribute, so it is reached only through
   a receiver's type) answers an attribute call only when its receiver's type bound nothing and reaches the method
   through no supertype outside the project: `class L(list)` calling `self.append(1)` calls the external

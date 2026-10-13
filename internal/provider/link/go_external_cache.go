@@ -24,7 +24,7 @@ import (
 
 // goDeclarationsFormat names the encoding of a cache entry, so an entry
 // written in another encoding is never decoded as this one.
-const goDeclarationsFormat = "go-declarations\x00name files(imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds variants) consts(name form file) forms(struct interface array-constant)"
+const goDeclarationsFormat = "go-declarations\x00name files(imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds variants) consts(name form file) forms(struct interface array-constant generic-alias) declarations(each-distinct-method each-distinct-const)"
 
 type goDeclPackage struct {
 	Name   string
@@ -102,9 +102,9 @@ func readGoDecls(id, p string) (*goExtPackage, bool) {
 			return nil, false
 		}
 		if pkg.consts == nil {
-			pkg.consts = map[string]goExtMethod{}
+			pkg.consts = map[string][]goExtMethod{}
 		}
-		pkg.consts[c.Name] = goExtMethod{name: c.Name, form: c.Form, file: c.File}
+		pkg.consts[c.Name] = append(pkg.consts[c.Name], goExtMethod{name: c.Name, form: c.Form, file: c.File})
 	}
 	var decode func(t goDeclType) (*goExtType, bool)
 	decode = func(t goDeclType) (*goExtType, bool) {
@@ -150,8 +150,10 @@ func writeGoDecls(id string, pkg *goExtPackage) {
 		}
 		return out
 	}
-	for _, c := range pkg.consts {
-		d.Consts = append(d.Consts, goDeclMethod{Name: c.name, Form: c.form, File: c.file})
+	for _, cs := range pkg.consts {
+		for _, c := range cs {
+			d.Consts = append(d.Consts, goDeclMethod{Name: c.name, Form: c.form, File: c.file})
+		}
 	}
 	var encode func(name string, t *goExtType) goDeclType
 	encode = func(name string, t *goExtType) goDeclType {

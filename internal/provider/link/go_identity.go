@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -84,11 +85,21 @@ type goNames interface {
 
 // goTypeAnswer is what a package declares under one type name: nothing
 // (found false), a defined type, or an alias of the type whose form is
-// form, written in the file names.
+// form, written in the file names; others are the alias's further
+// declarations whose forms are written differently (one per platform or
+// build tag), which denote the same type exactly when every one spells it
+// canonically the same.
 type goTypeAnswer struct {
 	found, alias bool
 	form         string
 	names        goNames
+	others       []goDecl
+}
+
+// goDecl is one declaration's form, written in the file names.
+type goDecl struct {
+	form  string
+	names goNames
 }
 
 // goPackageTypes answers which type a package declares under a name.
@@ -97,30 +108,34 @@ type goPackageTypes interface {
 	// known is false when the source of p is not read, so whether it
 	// declares one is not known.
 	lookup(ctx context.Context, p, name string) (answer goTypeAnswer, known bool, err error)
-	// constant is the form of the integer value of the constant the package
-	// at import path p declares under name (wire.Export.Identity past its
-	// "#"), written in the file names; found is false when the package
-	// declares none or its source is not read.
-	constant(ctx context.Context, p, name string) (form string, names goNames, found bool, err error)
+	// constant is each distinctly written form of the integer value of the
+	// constant the package at import path p declares under name
+	// (wire.Export.Identity past its "#", one per platform or build tag that
+	// writes it differently), with the file it is written in; none when the
+	// package declares none or its source is not read.
+	constant(ctx context.Context, p, name string) (decls []goDecl, err error)
 }
 
 // goIdentity is the canonical spelling of form, written in the file n,
 // with every package's declarations read through types.
 func goIdentity(ctx context.Context, types goPackageTypes, n goNames, form string) (string, error) {
 	var b strings.Builder
-	ok, err := goCanonical(ctx, types, n, form, 0, &b)
+	ok, err := goCanonical(ctx, types, n, form, nil, 0, &b)
 	if err != nil || !ok {
 		return goIdentityUnknown, err
 	}
 	return b.String(), nil
 }
 
-func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form string, depth int, b *strings.Builder) (bool, error) {
+// goCanonical writes the canonical spelling of form, written in the file n;
+// subst, for a generic alias's form, holds the canonical spelling of each of
+// its type arguments, which its `$i` stand for.
+func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form string, subst []string, depth int, b *strings.Builder) (bool, error) {
 	if form == "" || form == goIdentityUnknown || depth > goAliasDepth {
 		return false, nil
 	}
 	toks := strings.Split(form, " ")
-	rest, ok, err := goCanonicalTokens(ctx, types, n, toks, depth, b)
+	rest, ok, err := goCanonicalTokens(ctx, types, n, toks, subst, depth, b)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -133,7 +148,7 @@ func goCanonical(ctx context.Context, types goPackageTypes, n goNames, form stri
 // (goInterfaceElements); a field or method name of a literal (`@name`) that
 // is not exported is qualified by the file's package, since such a name
 // from another package is always different ("Type identity").
-func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, toks []string, depth int, b *strings.Builder) ([]string, bool, error) {
+func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, toks []string, subst []string, depth int, b *strings.Builder) ([]string, bool, error) {
 	for len(toks) > 0 {
 		tok := toks[0]
 		toks = toks[1:]
@@ -146,7 +161,7 @@ func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, tok
 			return toks, true, nil
 		case tok == "struct{":
 			goWrite(b, tok)
-			rest, ok, err := goCanonicalTokens(ctx, types, n, toks, depth, b)
+			rest, ok, err := goCanonicalTokens(ctx, types, n, toks, subst, depth, b)
 			if err != nil || !ok {
 				return nil, false, err
 			}
@@ -163,11 +178,18 @@ func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, tok
 			toks = toks[end+1:]
 			continue
 		case tok == "interface{":
-			rest, ok, err := goInterfaceElements(ctx, types, n, toks, depth, b)
+			rest, ok, err := goInterfaceElements(ctx, types, n, toks, subst, depth, b)
 			if err != nil || !ok {
 				return nil, false, err
 			}
 			toks = rest
+			continue
+		case subst != nil && strings.HasPrefix(tok, "$"):
+			i, err := strconv.Atoi(tok[1:])
+			if err != nil || i < 0 || i >= len(subst) {
+				return nil, false, nil
+			}
+			goWrite(b, subst[i])
 			continue
 		case strings.HasPrefix(tok, "@"):
 			if !token.IsExported(tok[1:]) {
@@ -220,9 +242,24 @@ func goCanonicalTokens(ctx context.Context, types goPackageTypes, n goNames, tok
 			return nil, false, err
 		}
 		if known && a.alias {
-			if ok, err := goCanonical(ctx, types, a.names, a.form, depth+1, b); err != nil || !ok {
+			var args []string
+			arity, _, generic := goGenericAlias(a.form)
+			if generic {
+				// A generic alias is used instantiated ("Alias
+				// declarations"): its form with each `$i` its i-th type
+				// argument, each spelled where the use is written.
+				var ok bool
+				var err error
+				args, toks, ok, err = goTypeArguments(ctx, types, n, toks, subst, depth, arity)
+				if err != nil || !ok {
+					return nil, false, err
+				}
+			}
+			spelled, ok, err := goAliasSpelling(ctx, types, a, args, arity, depth)
+			if err != nil || !ok {
 				return nil, false, err
 			}
+			goWrite(b, spelled)
 			continue
 		}
 		goWrite(b, pkg+"."+name)
@@ -281,7 +318,7 @@ func goConstName(ctx context.Context, types goPackageTypes, n goNames, tok strin
 		// exported names only.
 		name = tok[1:]
 		own := n.pkg()
-		if _, _, found, err := types.constant(ctx, own, name); err != nil || found || !token.IsExported(name) {
+		if decls, err := types.constant(ctx, own, name); err != nil || len(decls) > 0 || !token.IsExported(name) {
 			return name, own, err == nil, err
 		}
 		dots, err := n.dots()
@@ -290,11 +327,11 @@ func goConstName(ctx context.Context, types goPackageTypes, n goNames, tok strin
 		}
 		var unread []string
 		for _, d := range dots {
-			_, _, found, err := types.constant(ctx, d, name)
+			decls, err := types.constant(ctx, d, name)
 			if err != nil {
 				return "", "", false, err
 			}
-			if found {
+			if len(decls) > 0 {
 				return name, d, true, nil
 			}
 			if _, known, err := types.lookup(ctx, d, name); err != nil {
@@ -386,11 +423,24 @@ func goFold(ctx context.Context, types goPackageTypes, n goNames, expr []string,
 			if err != nil || !ok || p == "" || strings.HasPrefix(p, "?") {
 				return nil, err
 			}
-			form, names, found, err := types.constant(ctx, p, name)
-			if err != nil || !found || form == goIdentityUnknown {
+			decls, err := types.constant(ctx, p, name)
+			if err != nil || len(decls) == 0 {
 				return nil, err
 			}
-			return goFold(ctx, types, names, strings.Split(form, " "), depth+1)
+			// A constant declared once per platform or build tag has a
+			// value exactly when every declaration folds to the same one.
+			var v *big.Int
+			for _, d := range decls {
+				if d.form == goIdentityUnknown {
+					return nil, nil
+				}
+				dv, err := goFold(ctx, types, d.names, strings.Split(d.form, " "), depth+1)
+				if err != nil || dv == nil || v != nil && dv.Cmp(v) != 0 {
+					return nil, err
+				}
+				v = dv
+			}
+			return v, nil
 		}
 		v, ok := new(big.Int).SetString(tok, 10)
 		if !ok {
@@ -443,12 +493,86 @@ func goBinary(op string, l, r *big.Int) *big.Int {
 	return nil
 }
 
+// goGenericAlias reads a generic alias's form, `$$n` (its number of type
+// parameters) and the form of the type it denotes with its parameters as
+// `$i`: the arity, that form, and true; false for any other form.
+func goGenericAlias(form string) (int, string, bool) {
+	head, rest, _ := strings.Cut(form, " ")
+	if !strings.HasPrefix(head, "$$") {
+		return 0, form, false
+	}
+	n, err := strconv.Atoi(head[2:])
+	if err != nil || n <= 0 {
+		return 0, form, false
+	}
+	return n, rest, true
+}
+
+// goAliasSpelling is the canonical spelling of the type the alias a
+// denotes, instantiated with args for a generic alias of arity parameters:
+// the one spelling every declaration of a gives, and ok false when two of
+// them spell different types, since which one a use means depends on the
+// build.
+func goAliasSpelling(ctx context.Context, types goPackageTypes, a goTypeAnswer, args []string, arity, depth int) (string, bool, error) {
+	spelled := ""
+	for i, d := range append([]goDecl{{form: a.form, names: a.names}}, a.others...) {
+		n, form, generic := goGenericAlias(d.form)
+		if generic != (arity > 0) || n != arity {
+			return "", false, nil
+		}
+		var b strings.Builder
+		if ok, err := goCanonical(ctx, types, d.names, form, args, depth+1, &b); err != nil || !ok {
+			return "", false, err
+		}
+		if i > 0 && b.String() != spelled {
+			return "", false, nil
+		}
+		spelled = b.String()
+	}
+	return spelled, true, nil
+}
+
+// goTypeArguments reads, from toks, the type argument list `[ a , b ]` of
+// an instantiation of arity arguments: each argument's canonical spelling,
+// written in the file n, and the tokens past the `]`; ok is false for a
+// list of another length or a use without one.
+func goTypeArguments(ctx context.Context, types goPackageTypes, n goNames, toks []string, subst []string, depth, arity int) ([]string, []string, bool, error) {
+	if len(toks) == 0 || toks[0] != "[" {
+		return nil, nil, false, nil
+	}
+	var args []string
+	start, nested := 1, 0
+	for i := 1; i < len(toks); i++ {
+		switch t := toks[i]; {
+		case t == "[" || t == "(" || t == "struct{" || t == "interface{" || t == "[#":
+			nested++
+		case t == ")" || t == "}" || t == "]" && nested > 0:
+			nested--
+		case nested == 0 && (t == "," || t == "]"):
+			var e strings.Builder
+			rest, ok, err := goCanonicalTokens(ctx, types, n, toks[start:i], subst, depth, &e)
+			if err != nil || !ok || len(rest) != 0 || e.Len() == 0 {
+				return nil, nil, false, err
+			}
+			args = append(args, e.String())
+			start = i + 1
+			if t == "]" {
+				if len(args) != arity {
+					return nil, nil, false, nil
+				}
+				return args, toks[i+1:], true, nil
+			}
+		}
+	}
+	return nil, nil, false, nil
+}
+
 // goInterfaceElements writes an interface literal whose `interface{` has
 // been read: its elements, each canonical, sorted and separated by `;`,
 // then `}`; it returns the tokens past the `}`. An interface's identity is
 // its method set ("Type identity"), whatever order its elements are
 // written in.
-func goInterfaceElements(ctx context.Context, types goPackageTypes, n goNames, toks []string, depth int, b *strings.Builder) ([]string, bool, error) {
+func goInterfaceElements(ctx context.Context, types goPackageTypes, n goNames, toks []string, subst []string, depth int, b *strings.Builder) ([]string, bool, error) {
 	var elems []string
 	for {
 		var e strings.Builder
@@ -469,7 +593,7 @@ func goInterfaceElements(ctx context.Context, types goPackageTypes, n goNames, t
 		if end == len(toks) {
 			return nil, false, nil
 		}
-		rest, ok, err := goCanonicalTokens(ctx, types, n, toks[:end], depth, &e)
+		rest, ok, err := goCanonicalTokens(ctx, types, n, toks[:end], subst, depth, &e)
 		if err != nil || !ok || len(rest) != 0 {
 			return nil, false, err
 		}
