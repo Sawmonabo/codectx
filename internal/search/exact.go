@@ -231,10 +231,11 @@ func nodeStartByte(n sqlite.StoredNode) int64 {
 }
 
 // matchesKinds applies a kind filter to a node the storage layer could not
-// filter itself (NodesInFile takes no kinds).
+// filter itself (NodesInFile takes no kinds): no kinds keeps every symbol
+// kind, as NodeFilter does.
 func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 	if len(kinds) == 0 {
-		return true
+		return kind.Symbol()
 	}
 	for _, k := range kinds {
 		if kind == k {

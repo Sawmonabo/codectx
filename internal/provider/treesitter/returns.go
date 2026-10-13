@@ -152,19 +152,19 @@ type returnNode struct {
 	key string
 }
 
-// returnNode resolves declaration d's return node: a variable named
-// "return" at the declaration's name token, keyed by the callable's
-// descriptor path and its disambiguator with the return mark, so a call in
-// another file that reads it keeps the node through a body edit (ADR-0014);
-// a callable without a descriptor path keeps a file-scoped key. It answers
-// an empty endpoint when the key does not fit.
+// returnNode resolves declaration d's return node: a node of the return
+// kind named "return" at the whole declaration, with no name range (no
+// source token names it; the body may hold no return keyword at all, as a
+// Rust tail expression or an arrow's expression body does), keyed by the
+// callable's descriptor path and its disambiguator with the return mark, so
+// a call in another file that reads it keeps the node through a body edit
+// (ADR-0014); a callable without a descriptor path keeps a file-scoped key
+// over its name token. It answers an empty endpoint when the key does not
+// fit.
 func (b *builder) returnNode(d int) (returnNode, error) {
 	decl := &b.decls[d]
 	key := b.rangeKey("ret:", decl.NameStart, decl.NameEnd)
-	rng := decl.nameRng
-	if rng == nil {
-		rng = decl.rng
-	}
+	rng := decl.rng
 	if key == "" || rng == nil {
 		b.dropped[dependence]++
 		return returnNode{}, nil
@@ -174,7 +174,7 @@ func (b *builder) returnNode(d int) (returnNode, error) {
 	if decl.Qualified != "" {
 		qualified = bound(decl.Qualified+b.lang.Separator+name, model.MaxQualifiedNameBytes)
 	}
-	c := model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key, Kind: model.NodeVariable,
+	c := model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key, Kind: model.NodeReturn,
 		Language: b.lang.Name, Name: name, QualifiedName: qualified, FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: rng}
 	if decl.descriptor != "" {
 		c.Descriptor, c.Disambiguator = decl.descriptor, reconcile.ReturnDisambiguator(decl.disambiguator)
@@ -183,9 +183,8 @@ func (b *builder) returnNode(d int) (returnNode, error) {
 	if err != nil {
 		return returnNode{}, err
 	}
-	res.Node.NameRange = rng
-	return returnNode{ep: link.Endpoint{Node: res.Node.ID, CanonicalKey: res.CanonicalKey, Kind: model.NodeVariable,
-		Name: name, Qualified: qualified, Range: *rng, NameRange: rng}, res: res, key: key}, nil
+	return returnNode{ep: link.Endpoint{Node: res.Node.ID, CanonicalKey: res.CanonicalKey, Kind: model.NodeReturn,
+		Name: name, Qualified: qualified, Range: *rng}, res: res, key: key}, nil
 }
 
 // markReturned marks each parameter of decl in f whose value reaches a

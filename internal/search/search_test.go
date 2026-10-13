@@ -1,6 +1,7 @@
 package search
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -46,7 +47,12 @@ type doc struct {
 	signature     string
 	body          string
 	occurrences   int
+	// kind is the node's kind; empty is a function.
+	kind model.NodeKind
 }
+
+// nodeKind is d's node kind.
+func (d doc) nodeKind() model.NodeKind { return cmp.Or(d.kind, model.NodeFunction) }
 
 // fixtureDocs is the corpus. "Handle" and "HandleRequest" share the "pkg.Beta"
 // qualified-name prefix; the third document carries a Unicode identifier and a
@@ -128,7 +134,7 @@ func newFixtureOf(t *testing.T, docs []doc) *fixture {
 		hashes[d.path] = hash
 		id := model.NewFileID(f.repo, d.path)
 		f.files[d.path] = id
-		f.nodes[d.path] = model.NewNodeID(f.repo, model.NodeFunction, model.CanonicalNodeKey(d.path, d.name))
+		f.nodes[d.path] = model.NewNodeID(f.repo, d.nodeKind(), model.CanonicalNodeKey(d.path, d.name))
 		if err := st.PutBlob(ctx, rec); err != nil {
 			t.Fatalf("PutBlob(%s): %v", d.path, err)
 		}
@@ -219,7 +225,7 @@ func (f *fixture) publish(gen model.GenerationID, run model.ProviderRunID, d doc
 		OriginRunID: run, NodeID: nodeID, Precision: model.PrecisionSyntax, FileID: fileID,
 		ContentHash: hash, Range: rng}
 	ev.ID = model.NewEvidenceID(ev)
-	node := model.Node{ID: nodeID, Kind: model.NodeFunction, Language: "go", Name: d.name,
+	node := model.Node{ID: nodeID, Kind: d.nodeKind(), Language: "go", Name: d.name,
 		QualifiedName: d.qualifiedName, Signature: d.signature, FileID: fileID, ContentHash: hash, Range: rng}
 	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node,
 		CanonicalKey: model.CanonicalNodeKey(d.path, d.name), Evidence: []model.Evidence{ev}}}); err != nil {
@@ -230,7 +236,7 @@ func (f *fixture) publish(gen model.GenerationID, run model.ProviderRunID, d doc
 	for i := range d.occurrences {
 		units = append(units, model.SearchUnit{
 			ID: model.H("search-fixture-doc", d.path, hash, string(rune('a'+i))), NodeID: nodeID,
-			FileID: fileID, Path: d.path, Kind: model.NodeFunction, Name: d.name,
+			FileID: fileID, Path: d.path, Kind: d.nodeKind(), Name: d.name,
 			QualifiedName: d.qualifiedName, Signature: d.signature,
 			Bytes: model.ByteRange{Start: 0, End: end}, Body: d.body,
 		})
@@ -1896,5 +1902,63 @@ func TestSearchPagingWalksTheWholeAnswerOnce(t *testing.T) {
 		changed.Page = model.PageRequest{Limit: 1, Cursor: first.Meta.NextCursor}
 		_, err := s.Search(f.ctx, changed)
 		assertCode(t, "a continuation under a changed request", err, model.CodeCursorInvalid)
+	}
+}
+
+// TestReturnNodeIsNoSymbol proves a return node answers no lookup that names
+// no kind: not the qualified-name prefix of its callable, not its name, not
+// its own qualified name, not its file's path and not its file's document
+// symbols. A lookup that names its kind finds it. The return node sits in a
+// file of its own, so the path and document-symbol reads hold it alone.
+//
+// Mutation: drop the default kind predicate from sqlite NodeFilter and the
+// prefix, name and qualified-name queries list it; mutation: keep every kind
+// in matchesKinds and the path query lists it; mutation: list every node in
+// documentSymbols and the file's document symbols list it.
+func TestReturnNodeIsNoSymbol(t *testing.T) {
+	f := newFixtureOf(t, []doc{
+		{path: "p/start.go", name: "Start", qualifiedName: "p.Start", signature: "func Start() int",
+			body: "func Start() int { return 1 }", occurrences: 1},
+		{path: "p/start_return.go", name: "return", qualifiedName: "p.Start.return", kind: model.NodeReturn,
+			body: "func Start() int { return 1 }"},
+	})
+	s := newService(t, f.opts)
+	ret := f.nodes["p/start_return.go"]
+	for _, q := range []string{"p.Start", "return", "p.Start.return", "p/start_return.go"} {
+		page, err := s.Search(f.ctx, model.SearchRequest{Query: q, Page: model.PageRequest{Limit: 10}})
+		if err != nil {
+			t.Fatalf("Search(%q): %v", q, err)
+		}
+		for _, h := range page.Items {
+			if h.NodeID == ret {
+				t.Fatalf("Search(%q) served the return node at tier %s", q, h.Tier)
+			}
+		}
+		res, err := s.Resolve(f.ctx, model.SymbolRequest{Query: q, Operation: model.SymbolResolve,
+			SemanticSource: model.SemanticCanonical})
+		if err != nil {
+			t.Fatalf("Resolve(%q): %v", q, err)
+		}
+		for _, n := range res.Items {
+			if n.ID == ret {
+				t.Fatalf("Resolve(%q) served the return node", q)
+			}
+		}
+	}
+	docs, err := s.Resolve(f.ctx, model.SymbolRequest{Operation: model.SymbolDocumentSymbols,
+		SemanticSource: model.SemanticCanonical, FileID: f.files["p/start_return.go"]})
+	if err != nil {
+		t.Fatalf("document symbols: %v", err)
+	}
+	if len(docs.Items) != 0 || docs.Meta.NextCursor != "" {
+		t.Fatalf("document symbols of the return node's file served %d nodes, cursor %q, want none", len(docs.Items), docs.Meta.NextCursor)
+	}
+	page, err := s.Search(f.ctx, model.SearchRequest{Query: "p.Start", Kinds: []model.NodeKind{model.NodeReturn},
+		Page: model.PageRequest{Limit: 10}})
+	if err != nil {
+		t.Fatalf("Search(kind return): %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].NodeID != ret {
+		t.Fatalf("Search(p.Start, kind return) served %+v, want the return node", page.Items)
 	}
 }

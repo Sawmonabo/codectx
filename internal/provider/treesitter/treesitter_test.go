@@ -2,6 +2,7 @@ package treesitter_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -151,7 +152,7 @@ func TestLanguageFixtures(t *testing.T) {
 			wantFresh(t, result.Capabilities)
 			fv := h.File(t, fx.file)
 			var nested *model.Node
-			var outers []*model.Node
+			var outers, returns []*model.Node
 			for i := range cap.nodes {
 				n := &cap.nodes[i].Node
 				if n.FileID == "" && n.Range == nil {
@@ -165,10 +166,14 @@ func TestLanguageFixtures(t *testing.T) {
 					t.Fatalf("node %q range [%d,%d) does not fit %d bytes", n.Name, r.Start.Byte, r.End.Byte, len(src))
 				}
 				text := string(src[r.Start.Byte:r.End.Byte])
-				// A callable's return node is named `return` and located at
-				// the callable's name token (docs/providers-treesitter.md,
-				// The return node), so its range holds the callable's name.
-				if n.Kind != model.NodeModule && !returnNode(cap.nodes[i]) && !strings.Contains(text, n.Name) {
+				// A module is named by its path, and a return node is the
+				// callable's unnamed formal return, located at the whole
+				// callable (which a Rust tail expression or an arrow body
+				// returns from with no return keyword): neither has a name
+				// in its text. A return node is held to its own rule below.
+				if n.Kind == model.NodeReturn {
+					returns = append(returns, n)
+				} else if n.Kind != model.NodeModule && !strings.Contains(text, n.Name) {
 					t.Fatalf("node %s %q range [%d,%d) selects %q, which does not contain its name", n.Kind, n.Name, r.Start.Byte, r.End.Byte, text)
 				}
 				if got := lineOf(src, r.Start.Byte); got != r.Start.Line {
@@ -198,6 +203,20 @@ func TestLanguageFixtures(t *testing.T) {
 			if !contained {
 				t.Fatalf("nested %q [%d,%d) is not contained by any declaration named %q; nodes: %s", fx.nested,
 					nested.Range.Start.Byte, nested.Range.End.Byte, fx.outer, names(cap.nodes))
+			}
+			// mutation: locate a return node at its callable's name token, or
+			// give it a name range (no token names it), or at anything but the
+			// whole callable it belongs to.
+			for _, ret := range returns {
+				callable := slices.ContainsFunc(cap.nodes, func(f model.NodeFact) bool {
+					c := f.Node
+					return (c.Kind == model.NodeFunction || c.Kind == model.NodeMethod || c.Kind == model.NodeTest) &&
+						c.FileID == ret.FileID && c.Range != nil && *c.Range == *ret.Range
+				})
+				if ret.NameRange != nil || !callable {
+					t.Fatalf("return node %q [%d,%d) has name range %v and lies at a callable %v, want none and true",
+						ret.QualifiedName, ret.Range.Start.Byte, ret.Range.End.Byte, ret.NameRange, callable)
+				}
 			}
 			for _, e := range cap.evidence {
 				if e.Range != nil && (e.Range.End.Byte > uint64(len(src)) || e.FileID != fv.ID) {
@@ -269,7 +288,7 @@ func checkDependence(t *testing.T, p *treesitter.Provider, file, src string) {
 	var owner model.NodeID
 	for _, n := range cap.nodes {
 		switch {
-		case n.Node.Kind == model.NodeVariable && returnNode(n):
+		case n.Node.Kind == model.NodeReturn:
 			// No source identifier declares a return node, so it carries
 			// no declaration-key alias.
 			if slices.ContainsFunc(cap.aliases, func(a model.NativeAlias) bool { return a.NodeID == n.Node.ID }) {
@@ -355,12 +374,6 @@ func TestAnEmptyFileIndexes(t *testing.T) {
 			wantFresh(t, result.Capabilities)
 		})
 	}
-}
-
-// returnNode reports a callable's return node, keyed `ret:` over the
-// callable's name token.
-func returnNode(f model.NodeFact) bool {
-	return f.Node.Kind == model.NodeVariable && len(f.Evidence) > 0 && strings.HasPrefix(f.Evidence[0].NativeKey, "ret:")
 }
 
 // capture records the facts a unit persisted so the test can read the
@@ -594,21 +607,21 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 	switch file {
 	case "sample.js":
 		// `ns` is bound by a namespace import, so `ns.start()` is a call
-		// through that import, although the file declares a method start. A
-		// clause walk that binds nothing resolves it to that method instead.
-		// `new Server().start("x")` is a call of a member on a receiver
-		// value, which binds nothing in the file (the linker binds it by the
-		// receiver's type), so it is the one unresolved placeholder.
+		// through that import, although the file declares a method start;
+		// `new Server().start("x")` is a member of a receiver this provider
+		// does not type, which the linker binds. Mutation: a clause walk that
+		// binds nothing makes the first unresolved too; mutation: binding a
+		// member call to the file's one method start drops the second.
 		wantCallees(t, meta, file, "start", "import", "unresolved")
 		return
 	case "sample.rs":
 		// `use std::io::{self, Write}` binds io, not "self": `io::stdout()`
-		// is a call through the import, and `self.width()` is a call of a
-		// member on a receiver value, which binds nothing in the file (the
-		// linker binds it by the receiver's type): its placeholder is
-		// unresolved. Binding "self" makes it a call through an import.
-		wantCallee(t, meta, file, "stdout", "import")
-		wantCallee(t, meta, file, "width", "unresolved")
+		// is a call through the import, and `self.width()` is a member of a
+		// receiver, which the linker binds. Mutation: binding "self" makes
+		// the second a call through an import; mutation: binding a member
+		// call to the file's one method width publishes no placeholder.
+		wantCallees(t, meta, file, "stdout", "import")
+		wantCallees(t, meta, file, "width", "unresolved")
 		return
 	case "sample.go":
 	default:
@@ -637,46 +650,25 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 	}
 }
 
-// wantCallee asserts the resolution of the callee placeholder a file's call
-// to callee published: resolution "" asserts there is none, because the call
-// resolved to a declaration of the file itself.
-func wantCallee(t *testing.T, meta map[model.NodeID]string, file, callee, resolution string) {
-	t.Helper()
-	var got []string
-	for _, m := range meta {
-		if strings.Contains(m, `"callee":"`+callee+`"`) {
-			got = append(got, m)
-		}
-	}
-	switch {
-	case resolution == "" && len(got) > 0:
-		t.Fatalf("%s: the call to %s published callee placeholders %v; it names the file's own declaration", file, callee, got)
-	case resolution != "" && (len(got) != 1 || !strings.Contains(got[0], `"resolution":"`+resolution+`"`)):
-		t.Fatalf("%s: the call to %s published callee placeholders %v, want one with resolution %s", file, callee, got, resolution)
-	}
-}
-
 // wantCallees asserts the resolutions of the callee placeholders a file's
-// calls to callee published, one per resolution given, in any order.
+// calls to callee published, one per placeholder, in sorted order.
 func wantCallees(t *testing.T, meta map[model.NodeID]string, file, callee string, resolutions ...string) {
 	t.Helper()
 	var got []string
 	for _, m := range meta {
 		if strings.Contains(m, `"callee":"`+callee+`"`) {
-			got = append(got, m)
-		}
-	}
-	missing := slices.Clone(resolutions)
-	for _, m := range got {
-		for i, r := range missing {
-			if strings.Contains(m, `"resolution":"`+r+`"`) {
-				missing = slices.Delete(missing, i, i+1)
-				break
+			var attrs struct {
+				Resolution string `json:"resolution"`
 			}
+			if err := json.Unmarshal([]byte(m), &attrs); err != nil {
+				t.Fatalf("%s: callee placeholder metadata %s: %v", file, m, err)
+			}
+			got = append(got, attrs.Resolution)
 		}
 	}
-	if len(got) != len(resolutions) || len(missing) > 0 {
-		t.Fatalf("%s: the calls to %s published callee placeholders %v, want one each with resolution %v", file, callee, got, resolutions)
+	slices.Sort(got)
+	if !slices.Equal(got, resolutions) {
+		t.Fatalf("%s: the calls to %s published placeholders resolved %q, want %q", file, callee, got, resolutions)
 	}
 }
 

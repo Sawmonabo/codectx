@@ -258,7 +258,8 @@ func (r *PinnedReader) Node(ctx context.Context, id model.NodeID) (StoredNode, e
 }
 
 // NodeFilter selects nodes by exact name, exact qualified name or qualified
-// name prefix (indexed range scan), optionally restricted to kinds.
+// name prefix (indexed range scan), restricted to Kinds, or, when Kinds is
+// empty, to every kind but model.NonSymbolKinds.
 type NodeFilter struct {
 	Name            string
 	QualifiedName   string
@@ -310,6 +311,14 @@ func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.Node
 			args = append(args, string(k))
 		}
 		where = append(where, "ni.kind IN ("+strings.Join(marks, ",")+")")
+	} else {
+		skip := model.NonSymbolKinds()
+		marks := make([]string, len(skip))
+		for i, k := range skip {
+			marks[i] = "?"
+			args = append(args, string(k))
+		}
+		where = append(where, "ni.kind NOT IN ("+strings.Join(marks, ",")+")")
 	}
 	if afterRaw != nil {
 		where = append(where, "ni.canonical > ?")
