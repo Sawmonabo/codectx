@@ -27,6 +27,7 @@ func (s *routeScan) python() {
 		s.pyObjects()
 		if s.frameworks[fwStarlette] {
 			s.starletteObjects()
+			s.starletteLists()
 		}
 		s.pyMounts()
 		for i := range s.b.decls {
@@ -152,8 +153,18 @@ func (s *routeScan) pyMounts() {
 				return routeAttach{parent: parent, prefix: prefix, known: known}, true
 			})
 		case "mount":
+			// mount(path, app, name=None): the application is the second
+			// argument, or `app=`.
+			app := s.argAt(site, 1, "app")
+			if app < 0 && s.siteArgs(site) == nil {
+				app = 1
+			}
+			if parent != nil && asgiFramework(parent.fw) {
+				given, prefix, known := s.mountPrefix(site, 0, "path")
+				s.recordASGIMount(r, site, i, app, parent.fw, parent, prefix, known && given)
+			}
 			s.attachArgs(site, func(o *routeObj, at int) (routeAttach, bool) {
-				if at != 1 || o.fw != fwFastAPI {
+				if at != app || !asgiFramework(o.fw) {
 					return routeAttach{}, false
 				}
 				given, prefix, known := s.mountPrefix(site, 0, "path")

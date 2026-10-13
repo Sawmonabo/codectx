@@ -250,9 +250,10 @@ func (b *builder) linkTable() error {
 			Index:    p.Index, Variadic: p.Variadic, KeywordOnly: p.KeywordOnly})
 	}
 	t.Reexports = wl.Reexports
-	t.Routing = b.linkRouting(siteAt)
+	t.Routing = b.linkRouting(siteAt, t.Sites)
 	t.Inputs, t.Classes = b.pendingInputs, append(b.pyClassKinds(), b.javaClassKinds()...)
 	t.ArgumentResolvers = b.namesArgumentResolver()
+	t.RouteHandlers = b.routeHandlers
 	for _, x := range wl.DynamicImports {
 		rng, err := b.rangeOf(x.At.Start, x.At.End)
 		if err != nil {
@@ -397,7 +398,9 @@ func (b *builder) linkImports() ([]link.Import, error) {
 		}
 		// A Python `import a.b as c` binds c to the module a.b itself, which
 		// `from a.b import c` never does: its name denotes the whole module.
-		wholeModule := b.lang.Name == "python" && strings.HasPrefix(strings.TrimSpace(text), "import")
+		// The worker spans a plain import by each name it binds (`a.b as
+		// c`), a from-import by its whole statement.
+		wholeModule := b.lang.Name == "python" && !strings.HasPrefix(strings.TrimSpace(text), "from")
 		for i, n := range names {
 			li := link.Import{Name: n, Path: imp.Path, Scope: scope, Range: *rng, Syntax: syntax}
 			switch {

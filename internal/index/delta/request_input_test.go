@@ -46,3 +46,84 @@ func TestSpringDefaultResolutionRefreshes(t *testing.T) {
 	files["src/demo/Web.java"] = "package demo;\n\nclass Web {\n    void add(java.util.List<HandlerMethodArgumentResolver> rs) {\n        done();\n    }\n\n    void done() {}\n}\n"
 	s.check("resolver added", []linkBuild{s.only(s.advance(files))})
 }
+
+// TestGoRouteAddedTwoFilesAway is a chi router main.go serves, which passes
+// it to api.Register, which passes it on to admin.Register: a route added
+// in admin.go refreshes to what a full build publishes, the route at its
+// full path on main.go's mount, and republishes main.go; an edit of a file
+// no walk reads republishes no endpoint file. Mutation caught: the Go
+// routing lookup not traced, so the refresh keeps main.go's stale
+// endpoints.
+func TestGoRouteAddedTwoFilesAway(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.22\n",
+		"main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n\n\t\"example.com/app/api\"\n)\n\n" +
+			"func main() {\n\tr := chi.NewRouter()\n\tapi.Register(r)\n\thttp.ListenAndServe(\":8080\", r)\n}\n",
+		"api/api.go": "package api\n\nimport (\n\t\"github.com/go-chi/chi/v5\"\n\n\t\"example.com/app/admin\"\n)\n\n" +
+			"func Register(r chi.Router) {\n\tadmin.Register(r)\n}\n",
+		"admin/admin.go": "package admin\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\n" +
+			"func Register(r chi.Router) {\n\tr.Get(\"/a\", a)\n}\n\nfunc a(w http.ResponseWriter, req *http.Request) {}\n",
+		"util/util.go": "package util\n\nfunc One() int {\n\treturn two()\n}\n\nfunc two() int {\n\treturn 2\n}\n",
+	}
+	s.check("base", []linkBuild{s.only(s.advance(files))})
+	files = edit{name: "route added", replace: []sub{{"admin/admin.go", "\tr.Get(\"/a\", a)\n",
+		"\tr.Get(\"/a\", a)\n\tr.Post(\"/b\", a)\n"}}}.apply(t, files)
+	added := s.only(s.advance(files))
+	s.check("route added", []linkBuild{added})
+	s.wantRepublished("route added", added, []string{"admin/admin.go", "main.go"}, "util/util.go")
+	files = edit{name: "unrelated", replace: []sub{{"util/util.go", "return 2", "return 3"}}}.apply(t, files)
+	unrelated := s.only(s.advance(files))
+	s.check("unrelated edit", []linkBuild{unrelated})
+	s.wantRepublished("unrelated edit", unrelated, []string{"util/util.go"}, "main.go")
+}
+
+// TestExpressRouteAddedTwoFilesAway is an Express application that mounts
+// a router of another module, which mounts a router of a third: a route
+// added in the third refreshes to what a full build publishes and
+// republishes the application's file; an edit of a module no walk reads
+// republishes no endpoint file. Mutation caught: the router lookup not
+// traced, so the refresh keeps the application's stale endpoints.
+func TestExpressRouteAddedTwoFilesAway(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"package.json": "{\"name\":\"app\"}\n",
+		"app.js": "const express = require(\"express\");\nconst posts = require(\"./posts\");\nconst app = express();\n" +
+			"app.use(\"/posts\", posts);\napp.listen(3000);\n",
+		"posts.js": "const express = require(\"express\");\nconst comments = require(\"./comments\");\n" +
+			"const router = express.Router();\nrouter.use(\"/:id/comments\", comments);\nmodule.exports = router;\n",
+		"comments.js": "const express = require(\"express\");\nconst router = express.Router();\n" +
+			"router.get(\"/\", list);\nfunction list(req, res) {}\nmodule.exports = router;\n",
+		"util.js": "function one() {\n  return two();\n}\nfunction two() {\n  return 2;\n}\nmodule.exports = { one };\n",
+	}
+	s.check("base", []linkBuild{s.only(s.advance(files))})
+	files = edit{name: "route added", replace: []sub{{"comments.js", "router.get(\"/\", list);\n",
+		"router.get(\"/\", list);\nrouter.post(\"/\", list);\n"}}}.apply(t, files)
+	added := s.only(s.advance(files))
+	s.check("route added", []linkBuild{added})
+	s.wantRepublished("route added", added, []string{"comments.js", "app.js"}, "util.js")
+	files = edit{name: "unrelated", replace: []sub{{"util.js", "return 2", "return 3"}}}.apply(t, files)
+	unrelated := s.only(s.advance(files))
+	s.check("unrelated edit", []linkBuild{unrelated})
+	s.wantRepublished("unrelated edit", unrelated, []string{"util.js"}, "app.js")
+}
+
+// TestRouteNamingAViewRefreshesItsReads is a Django view module no route
+// names, until an edit of urls.py names its function: the refresh equals a
+// full build, the view's request reads published, and republishes
+// views.py. Mutation caught: the handler lookups not traced, so the
+// refresh never publishes the view's reads.
+func TestRouteNamingAViewRefreshesItsReads(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"site/urls.py":  "from django.urls import path\n\nfrom . import views\n\nurlpatterns = []\n",
+		"site/views.py": "def show(request):\n    return request.GET[\"q\"]\n",
+		"site/other.py": "def one():\n    return 1\n\n\ndef two():\n    return one()\n",
+	}
+	s.check("base", []linkBuild{s.only(s.advance(files))})
+	files = edit{name: "routed", replace: []sub{{"site/urls.py", "urlpatterns = []",
+		"urlpatterns = [path(\"show/\", views.show)]"}}}.apply(t, files)
+	routed := s.only(s.advance(files))
+	s.check("view routed", []linkBuild{routed})
+	s.wantRepublished("view routed", routed, []string{"site/urls.py", "site/views.py"}, "site/other.py")
+}

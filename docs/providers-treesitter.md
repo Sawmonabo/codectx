@@ -436,11 +436,14 @@ with no `path`, never a guessed URL. An application object or router mounted
 from another file is not visible to a per-file provider: the file's link table
 carries its router objects, their routes and its mounts of objects it does not
 build (`link.Routing`), and the linker publishes the full path of each route a
-Python mount reaches (docs/providers-link.md, Route prefixes across files). A route registered by a
-call is read from the call's argument positions in the link table, never from
-the source text, so a file whose link pass did not run publishes no
-call-registered route; a route on a receiver the file does not build is read only
-when the route is a string literal. A handler written as anything other than a
+Python or Express mount reaches, and each route a Go router reaches across a call: a router
+a function receives as a parameter or builds and returns, joined where another
+file passes, mounts or hands it (docs/providers-link.md, Route prefixes across
+files). A route registered by a call is read from the call's argument positions
+in the link table, never from the source text, so a file whose link pass did not
+run publishes no call-registered route; a route on a receiver the file neither
+builds nor receives as a router parameter is read only when the route is a
+string literal. A handler written as anything other than a
 name, a dotted name, a function literal or a call of one name with one
 argument gives the endpoint no `routes_to`. A conversion to net/http's
 `HandlerFunc` or `Handler` is the value it converts (`http.HandlerFunc(show)`
@@ -466,7 +469,10 @@ source writes it as a literal (`request.args.get("id")`, `req.query.id`,
 whose node holds the read, in the read's own function, gets `data_flows_to`
 from the read to the variable it defines (`uid = request.args.get("uid")`
 flows to `uid`), so the file's def-use facts carry the read to every use of the
-alias. Each table is gated on the framework's import, and a member it does not
+alias; a `def` statement, decorated or not, defines its function without running
+the body, so a read inside never flows to the function. A read a return of its
+own function evaluates flows to that function's return node, as a variable the
+return reads does. Each table is gated on the framework's import, and a member it does not
 name publishes nothing:
 
 | Framework | Request object | Members read |
@@ -480,12 +486,14 @@ name publishes nothing:
 | Go `net/http` | every `*http.Request` parameter of a function, method or function literal with a body | `FormValue(k)` and `Form` (combined), `PostFormValue(k)`, `PostForm`, `MultipartForm`, `MultipartReader()` (form), `Cookie(k)`, `Cookies()`, `FormFile(k)`, `Header`, `Trailer`, `Host`, `Referer()`, `UserAgent()`, `BasicAuth()` (header), `Body` (not `Body.Close()`), `URL`, `RequestURI`, `URL.Query()`, `URL.RawQuery` (query), `PathValue(k)` (path); gorilla/mux `mux.Vars(r)[k]` and chi `chi.URLParam(r, k)` are path reads of it |
 | gin | every `*gin.Context` parameter of a function, method or function literal with a body, in a file importing gin | `Param(k)`, `Params` (path), `Query(k)` and the other query getters (query), `PostForm(k)` and the other form getters, `MultipartForm()` (form), `FormFile(k)`, `GetHeader(k)`, `ContentType()`, `ClientIP()` (header), `Cookie(k)`, `GetRawData()` (raw); `Bind()`/`ShouldBind()` (combined: the binding follows the method and content type), `Bind*`/`ShouldBind*` by the binding they name (`JSON`, `XML`, `YAML`, `TOML`, `Plain` and `ShouldBindBodyWith*` body, `Query`, `Header`, `Uri` path); the `Request` field with net/http's members; a bind whose binding is an argument, and `FullPath()`, the route's own template, read nothing |
 | echo | every `echo.Context` (v4) or `*echo.Context` (v5) parameter, likewise | `Param(k)`, `ParamOr(k)`, `ParamValues()`, `PathValues()` (path), `QueryParam(k)`, `QueryParamOr(k)`, `QueryParams()`, `QueryString()` (query), `FormValue(k)` (combined), `FormParams()`, `MultipartForm()` (form), `FormFile(k)`, `Cookie(k)`, `Cookies()`, `RealIP()`, `Scheme()` (header), `Bind()` (combined: path, query, then body); `Request()` with net/http's members; `Path()` and `Get(k)` read nothing |
-| Spring | each method parameter a binding annotation of `org.springframework.web.bind.annotation` marks | `@RequestParam` (combined), `@PathVariable`, `@MatrixVariable` (path), `@RequestHeader`, `@CookieValue`, `@RequestBody`, `@RequestPart` (form), `@ModelAttribute` (combined), keyed by the annotation's literal name (positional, `value =` or `name =`) or else the parameter's name, which Spring binds then; a body or model attribute has no key ; a parameter of a handler (a mapping-annotated method of a `@Controller` or `@RestController` class) that no annotation but `@Valid` or `@Validated` marks, by Spring's own resolver order: a `MultipartFile` or `Part` (or an array, a collection or an `Optional` of one) a file read keyed by its name, `HttpServletRequest`, `ServletRequest`, `WebRequest` and the multipart requests the request object, `InputStream` and `Reader` the raw body, `HttpEntity` and `RequestEntity` the body, the response, session, model, `Map`, `Errors`, locale and the other type-resolved arguments nothing; every other parameter reaches Spring's catch-all only past the project's own argument resolvers and is left to the linker (docs/providers-link.md, Request inputs across files) |
+| Spring | each method parameter a binding annotation of `org.springframework.web.bind.annotation` marks | `@RequestParam` (combined), `@PathVariable`, `@MatrixVariable` (path), `@RequestHeader`, `@CookieValue`, `@RequestBody`, `@RequestPart` (form), `@ModelAttribute` (combined), keyed by the annotation's literal name (positional, `value =` or `name =`) or else the parameter's name, which Spring binds then; a body or model attribute has no key; a parameter of a handler (a mapping-annotated method of a `@Controller` or `@RestController` class) that no annotation but `@Valid` or `@Validated` marks, by Spring's own resolver order: a `MultipartFile` or `Part` (or an array, a collection or an `Optional` of one) a file read keyed by its name, `HttpServletRequest`, `ServletRequest`, `WebRequest` and the multipart requests the request object, `InputStream` and `Reader` the raw body, `HttpEntity` and `RequestEntity` the body, the response, session, model, `Map`, `Errors`, locale and the other type-resolved arguments nothing; every other parameter reaches Spring's catch-all only past the project's own argument resolvers and is left to the linker (docs/providers-link.md, Request inputs across files) |
 
 The tokens are read with comments and string bodies skipped (`inputs_lex.go`),
 once per file and only when a table's gate passes. A request object that is
 reassigned or passed on is followed only through the def-use facts of the read
-it is assigned from. Not read: a handler named across files.
+it is assigned from. A function no route of its own file names is a handler only
+when a route of another file names it: its reads are left to the linker
+(docs/providers-link.md, Request inputs across files).
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped

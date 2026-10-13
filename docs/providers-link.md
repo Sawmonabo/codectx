@@ -303,8 +303,48 @@ the number of paths the walks of the file's root mounts gave that route. A hop w
 route's file and object instead of a path; it is still counted in the set. A mount whose argument names no indexed
 object publishes nothing. Every lookup is traced on the mount's file, so a refresh that changes a router, a route or a
 settings module republishes the endpoints that reach it, and the routing is part of the interface summary, so a
-change to it rebuilds the index. Not walked: JavaScript and Go mounts across files, a Starlette `Mount` across files,
-and an application mounted as a child of another (`app.mount("/sub", sub_app)` with `sub_app` in another file).
+change to it rebuilds the index.
+
+An ASGI mount (Starlette's `Mount(path, app=…, routes=…)` and FastAPI's or Starlette's `app.mount(path, app)`) mounts
+any object of either ASGI framework, a FastAPI application being a Starlette application: an application root, a
+router, or a route list a module binds (`routes = [Route(…), Mount(…)]`), which the structural provider records as an
+object of its own when no list the file passes holds it. Every FastAPI and Starlette application root bound at module
+level is indexed as an object too, with its routes below it and the mounts made on it, so a file mounting it walks on
+through the mounts the application itself makes. Only an ASGI mount mounts an application; `include_router` and
+`register_blueprint` mount only routers and blueprints of their own framework. A keyword argument, which the worker
+types by no position, is read as written: a dotted name whose head an import binds names that module's attribute
+(`RouteMount.Target`).
+
+An Express router reaches another file through an import (`internal/provider/link/route_express.go`): a router a
+module binds at module level and exports, by its own name (`export const admin = Router()`), by a local export
+(`export default router`) or by a CommonJS assignment (`module.exports = router`, `module.exports = { router }`), is
+indexed under `keyJSRouting` by its module and each name it is exported by. A `use([path,] x)` on an object of the
+file whose argument is an import binding records the module as written and the export it reads (`RouteMount.Target`:
+the named or `default` export, or the module's whole value for a `require`), at the literal path, or at an unknown
+prefix when the first argument is no literal (a path or a middleware, which Express tells apart only at run time).
+The walk resolves the module as the file's imports resolve, follows re-exports as ECMA-262's ResolveExport does (an
+`export *` decides only when one module supplies the name), and descends into the router's own `use` mounts. A
+handler the router's file imports is resolved as that file's import resolves. A router a function receives
+(`module.exports = (app) => { app.get(…) }`) in a file that imports no framework is read by no table, and publishes
+nothing.
+
+A Go router reaches another file through a call, never a module attribute (`internal/provider/link/route_go.go`). The
+structural provider records, as an object of the callable, a router a function receives as a parameter of a router
+type of a framework the file imports (`func Register(r chi.Router)`, `rg *gin.RouterGroup`), when every use is that
+parameter's value (no local of the name, no assignment to it, not inside a function literal), and a router it builds
+and returns (`r := chi.NewRouter(); …; return r`, every return of it); the routes on each, with the groups and
+closures below them (`v1.Group("/users")`), carry their path below the object. Three Go mounts join them
+(`RouteMount.Join`), each with the call as written and no position (`MountCall`): a router passed as an argument of a
+call that is no framework's own (`users.Register(v1)`) is the callee's parameter the argument binds, by the callee's
+declared parameters (`argumentFlows`); a chi `Mount(prefix, f())` mounts the router `f` returns; a chi
+`Route(prefix, f)` or `Group(f)` with a function value hands `f` the router as its first parameter. Each callable's
+objects are indexed under `keyGoRouting` by the callable. The walk starts at each Go mount anchored at an application
+root or at a router the program serves, resolves the mount's call as the file's own resolution does, in the file's
+context, and descends through the callee's mounts the same way, ending at a callable already on its way; a callee of
+another framework, a call whose receiver is a call's result, a parameter written inside a function literal and
+`http.StripPrefix` around a returned handler publish nothing. A handler the callee's file names but does not declare
+(`handlers.Show`) is resolved in that file's context; a handler written inline gives the endpoint no `routes_to`. Every lookup is traced on the mount's
+file.
 
 ## Request inputs across files
 
@@ -346,6 +386,21 @@ parameter's name, and any other class as `@ModelAttribute`, a combined read with
 file decides is resolved there; any other type is looked up as the hierarchy reads a type name, and a type no member
 declares (a library may resolve its own), or declarations that disagree, publish nothing. Both lookups are traced, so
 adding a resolver, or an edit that turns an enum into a class or makes a class abstract, re-resolves the handlers.
+
+A handler whose own file no route names (a Django view module `urls.py` names, a Starlette endpoint module, an
+Express controller module) is told a handler only by a route of another file
+(`internal/provider/link/route_handler.go`). The structural provider records, for each module-level function of a Python or ECMAScript file,
+the reads of its first parameter under each request table of its language that the file's own scans did not publish
+(Django's and Starlette's, Express's with its error-middleware arity), as pending inputs under the rule `handler`, and
+each route records the handlers it names through an import with its framework (`Table.RouteHandlers`). Each such
+handler is indexed under `keyRouteHandler` by the module it names: a Python import's absolute module, an ECMAScript
+specifier's resolved module. The handler's file looks itself up under every name it can be imported or exported by,
+and a Python entry's import is resolved again from the route's file as the route walk resolves a handler (the
+nearest source root), so a function of the same name in another root is not taken; the reads of a function a route
+of that framework names are published as the FastAPI reads are, keyed `input:<owner's node>#<framework:source:key#n>`.
+The lookups are traced, so naming a function in a route publishes its reads. A handler reached only through a
+re-export, a method, a function written inline in another call, and the `data_flows_to` of the read to the variable
+it defines, which only the structural provider publishes, are not read.
 
 ## Declared entry points
 

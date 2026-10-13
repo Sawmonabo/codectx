@@ -71,6 +71,11 @@ func (t *Table) project() *Table {
 		c.Routing.Mounts = slices.Clone(t.Routing.Mounts)
 		for i := range c.Routing.Mounts {
 			m := &c.Routing.Mounts[i]
+			if m.Join != JoinNone {
+				// A Go mount is read through its call (MountCall).
+				m.Site = -1
+				continue
+			}
 			arg, ok := mountArgument(t, m)
 			if !ok {
 				if m.Module == "" {

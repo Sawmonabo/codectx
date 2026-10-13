@@ -138,6 +138,7 @@ async def update(
 		"update fastapi body item | item: Item",
 		"update fastapi header user-agent | user_agent: Annotated[str | None, Header()] = None",
 		"update fastapi header x-trace | request.headers[\"x-trace\"]",
+		"request.headers[\"x-trace\"] -> return",
 		"update fastapi path item_id | item_id: int",
 		"update fastapi query item-tag | tag: str = Query(None, alias=\"item-tag\")",
 		"update fastapi query q | q: str | None = None",
@@ -239,10 +240,9 @@ class UserController {
 // TestDjangoViewRequestReads is the request a Django view receives: a
 // function view routed in this file and a class-based view's handler
 // method, each read under its own parameter name; a returned read flows to
-// the function's return, which def-use names by the function. Mutations
-// caught: the
-// class view's `self` taken as the request (nothing read), a method of a
-// class that is not a view read, and the routed view not read.
+// the function's return node. Mutations caught: the class view's `self`
+// taken as the request (nothing read), a method of a class that is not a
+// view read, and the routed view not read.
 func TestDjangoViewRequestReads(t *testing.T) {
 	checkInputs(t, "views.py", `from django.urls import path
 from django.views import View
@@ -266,7 +266,36 @@ urlpatterns = [path("d/<int:pk>/", detail)]
 `, []string{
 		"detail django query page | req.GET.get(\"page\")",
 		"get django cookie sid | request.COOKIES[\"sid\"]",
-		"req.GET.get(\"page\") -> detail",
-		"request.COOKIES[\"sid\"] -> get",
+		"req.GET.get(\"page\") -> return",
+		"request.COOKIES[\"sid\"] -> return",
+	})
+}
+
+// TestReturnedReadFlowsToTheReturnNode is a request read a function
+// returns, decorated or not: it flows to the function's return node, and
+// never to the function itself, which the `def` statement defines without
+// running the body. Mutations caught: "returned reads unpublished"
+// (returnedInputs publishes nothing) loses both return flows; "def
+// statement kept" (holdsCallable never holds) adds the flow to plain.
+func TestReturnedReadFlowsToTheReturnNode(t *testing.T) {
+	checkInputs(t, "app.py", `from flask import request
+
+
+def deco(f):
+    return f
+
+
+@deco
+def decorated():
+    return request.args["x"]
+
+
+def plain():
+    return request.args["y"]
+`, []string{
+		"decorated flask query x | request.args[\"x\"]",
+		"plain flask query y | request.args[\"y\"]",
+		"request.args[\"x\"] -> return",
+		"request.args[\"y\"] -> return",
 	})
 }

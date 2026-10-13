@@ -115,8 +115,12 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 	// clears the site indices that locate it.
 	args := make([]*wire.Type, len(t.Routing.Mounts))
 	for i := range t.Routing.Mounts {
-		if a, ok := mountArgument(t, &t.Routing.Mounts[i]); ok {
-			args[i] = &a
+		if m := &t.Routing.Mounts[i]; m.Join == JoinNone {
+			// A Go mount's call (MountCall) is hashed with the routing;
+			// its argument's type names a site by index.
+			if a, ok := mountArgument(t, m); ok {
+				args[i] = &a
+			}
 		}
 	}
 	t = t.positionless()
@@ -162,17 +166,20 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		}
 		add(EntryInferred, caller, i, v)
 	}
-	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings)+len(t.Inputs)+len(t.Classes) > 0 || t.ArgumentResolvers {
+	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings)+len(t.Inputs)+len(t.Classes)+
+		len(t.RouteHandlers) > 0 || t.ArgumentResolvers {
 		// The argument each mount passes is read with the routing
-		// (mountKey), though it is written in a site; the pending inputs
-		// and the classes are read with it (route_input.go).
+		// (mountKey), though it is written in a site; the pending inputs,
+		// the classes and the handlers named through imports are read with
+		// it (route_input.go, route_handler.go).
 		add(EntryRouting, "", 0, struct {
 			Routing
 			Arguments []*wire.Type
 			Inputs    []PendingInput
 			Classes   []ClassKind
 			Resolvers bool
-		}{r, args, t.Inputs, t.Classes, t.ArgumentResolvers})
+			Handlers  []RouteHandler
+		}{r, args, t.Inputs, t.Classes, t.ArgumentResolvers, t.RouteHandlers})
 	}
 	if err != nil {
 		return nil, err
