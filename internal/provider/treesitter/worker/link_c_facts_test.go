@@ -200,7 +200,9 @@ struct D : B {
 
 // TestCMacroAlias checks that an object-like macro whose replacement list is
 // one identifier exports that identifier as its Alias, and that no other
-// macro does: not a function-like macro, a literal or two identifiers.
+// macro does: not a function-like macro, a literal or two identifiers. A
+// literal sends no export; two identifiers send one for their visibility
+// (cVisibility), with no alias.
 //
 // Mutation: alias a function-like macro -> MAX carries an Alias.
 // Mutation: take the replacement's first identifier -> TWO is aliased.
@@ -218,10 +220,11 @@ func TestCMacroAlias(t *testing.T) {
 	if e := exportNamed(l, cTokenAt(t, src, "MAX", 0, "MAX")); e == nil || e.Alias != "" {
 		t.Fatalf("the function-like MAX exports %+v, want an export with no alias", e)
 	}
-	for _, name := range []string{"LIMIT", "TWO"} {
-		if e := exportNamed(l, cTokenAt(t, src, name, 0, name)); e != nil {
-			t.Fatalf("%s exports %+v, want none", name, e)
-		}
+	if e := exportNamed(l, cTokenAt(t, src, "LIMIT", 0, "LIMIT")); e != nil {
+		t.Fatalf("LIMIT exports %+v, want none", e)
+	}
+	if e := exportNamed(l, cTokenAt(t, src, "TWO", 0, "TWO")); e == nil || e.Alias != "" {
+		t.Fatalf("TWO exports %+v, want an export with no alias", e)
 	}
 }
 
