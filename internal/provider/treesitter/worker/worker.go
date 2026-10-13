@@ -227,9 +227,11 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 		}
 		kept, header = next, &choice
 	}
+	kept = w.cUnmacro(kept, src)
 	root := kept.tree.RootNode()
 	em := &emitter{w: out}
-	ex := &extraction{g: kept.g, l: kept.l, path: req.Path, src: src}
+	ex := &extraction{g: kept.g, l: kept.l, path: req.Path, src: src, macros: newMacroBodies(kept.l.Name, w.parsers[kept.l.Name])}
+	defer ex.macros.close()
 	err := ex.run(kept.query, root, em)
 	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated, Header: header,
 		ComputedAll: ex.all.present && ex.all.computed}
@@ -239,6 +241,10 @@ func (w *state) parse(out io.Writer, req wire.Request, src []byte) (wire.Done, *
 	}
 	flat, ferr := Flatten(kept.tree, kept.l.Name)
 	kept.tree.Close()
+	if ferr == nil {
+		flat, ferr = ex.macros.spliceMacros(flat)
+	}
+	ex.macros.close()
 	if ferr != nil {
 		done.DependenceFailure = ferr.Error()
 		return done, nil, nil

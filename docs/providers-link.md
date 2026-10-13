@@ -44,6 +44,9 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
 | `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set` |
+| none of its own | `defines` | file module → a route endpoint at its full path, or a declared entry point | none |
+| none of its own | `routes_to` | route endpoint → each handler; declared entry point → its declaration or module | `import` |
+| none | `references` | C or C++ declaration → each definition of a macro among its specifiers that its file sees and that states a visibility | `visibility_<value>` |
 
 The details are the `Detail*` constants (`provider.go`). Each one names the technique that found the fact:
 - `direct`: the callee names the declaration by its package, module, import or scope;
@@ -62,6 +65,15 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
   interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
   base list).
+- `visibility_default`, `visibility_hidden`, `visibility_protected`, `visibility_internal`, `visibility_dllexport`,
+  `visibility_dllimport`: the visibility a C or C++ macro definition's replacement states, as declared in source and
+  never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
+  `visibility_unspecified`: a definition that states none (an empty replacement, keywords only);
+  `visibility_unresolved`: one that names another macro among other tokens, which is not expanded. A declaration's
+  macros are read through the definitions its file sees: its own and those of a header it includes directly (the
+  include lookup), following a one-identifier replacement to the macro it names. Each definition reached is one
+  occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
+  with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
 **Caller and target.** The caller is the anonymous route handler a site is written in when the structural provider
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
@@ -126,8 +138,11 @@ a method, the method's name, with metadata `{"resolution":"external"}`. An exter
 never `class` or `interface`: whether it is a class, an interface, a trait or a struct is not known from the
 project's code, and one project can write it both ways (TypeScript lets a class implement a class), so a fixed kind
 keeps one qualified name one node in every unit. Each `extends` or `implements` into it carries the kind its own
-clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body has no node, so it
-publishes no supertype edge; its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
+clause proves as its detail (`supertype_interface`, `supertype_class`). A Java anonymous class body is its own class
+node (`new T`, below); its one supertype edge into a type outside the project is an `extends` with the detail
+`supertype_anonymous`, since the creation proves neither a class nor an interface (JLS §15.9.5: the body extends a
+class, or extends `Object` and implements an interface), and into a type of the unit it is `extends` or `implements`
+by that type's kind. Its methods' overrides reach the external method node like any class's. A call site does not know the parameter types
 an external method declares, so one node stands for all of a type's methods of one name. A Java `@Override` of
 `toString` and `o.toString()` on an `Object` receiver both target `java.lang.Object.toString`. Every run of every
 unit that names an external node republishes it with its own evidence, and the delta build replaces the index-level
@@ -199,9 +214,96 @@ is neither static, final nor private; in C++ a virtual one of the same signature
 method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name; in Go each
 method of an interface its type satisfies. A supertype outside the project is its external node. A method overrides
 an external one only where the language marks it (Java `@Override`, C++ `override` or `final`, TypeScript
-`override`, a Rust trait impl item, Python `typing.override`) and only when its type has exactly one supertype
-outside the project; an unmarked Python method with an external base publishes no `overrides`. Go publishes nothing
-toward a type outside the unit, whose method set no table holds.
+`override`, a Rust trait impl item, Python `typing.override`), toward what the mark proves
+(`hierarchy.externalOverrides`, `internal/provider/link/hierarchy_external.go`):
+- Java and C++: the mark proves at least one overridden method, and a method overrides every supertype's of its
+  signature at once. The candidates are the supertypes outside the project reached along paths on which no type of
+  the project declares the method (and, in Java, `java.lang.Object` for one of its methods when no candidate is a
+  class). With no override in the project and one candidate, that one is published (`supertype`); otherwise each
+  candidate is published with detail `supertype_candidate` and, when there are several, the set size n, read as "at
+  least one of n". A candidate is published beside an override in the project too, so nothing the mark may name is
+  dropped: `class C extends Base implements Task` with `@Override run()`, both outside the project, publishes
+  `C.run` overrides `Base.run` and `Task.run`, each `supertype_candidate` with set size 2.
+- TypeScript: `override` proves a member of the class `extends` names, never of an interface `implements` lists, so
+  the one candidate is the extended class outside the project when no class of the project along the chain declares
+  the member.
+- Python: `typing.override` proves the first ancestor along the method resolution order that defines the method.
+  When no class of the project along the order defines it, it is one of the external bases of the classes along the
+  order, each published (`supertype`) with the set size of their number when there are several.
+- Rust: an impl item reaches its type's external trait when the type has exactly one.
+
+An unmarked method with an external supertype publishes no `overrides`.
+
+A Go type outside the unit is read from its package's source (`goExternal`, `internal/provider/link/go_external.go`):
+the transitive closure of the unit's imports outside it, each package found as the go command finds it without
+running it (`goModuleInfo.source`, `go_module.go`): the standard library of the toolchain the project builds with
+(`GOROOT`, else the `go` on `PATH`, else the toolchain the `go.mod` `toolchain` or `go` line selects in the module
+cache, `go_host.go`); a module of the governing `go.work` or a local `replace` inside the repository from the
+snapshot; a required module, after `replace`, from the module cache at its exact version (`GOMODCACHE`, else the
+first `GOPATH` entry's `pkg/mod`). A package none of these holds (a local `replace` outside the repository, a
+module the cache does not hold) is unavailable, and the `implements` and `overrides` capability rows count both
+(`go_external_packages`, `go_external_packages_unavailable`). Each package's types, aliases and method forms are read
+with `go/parser` from every non-test file (every build variant; a type or method two variants declare differently is
+left out) and cached on disk by its source's identity (`go_external_cache.go`). A Go type implements an interface
+outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
+the interface's of its name; an interface with an unexported method implements only within its own package. A
+conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
+source, and publishes `implements` (`supertype_interface`) and no `overrides` (`go_conversions.go`).
+
+## Route prefixes across files
+
+A route's full path is often made in several files: a router declares its routes in one, and another includes it
+under a prefix (`app.include_router(users.router, prefix="/v1")`, `app.register_blueprint(views.bp)`, Django's
+`path("blog/", include("blog.urls"))`). The structural provider publishes such a route with `prefix: unresolved`
+(docs/providers-treesitter.md, Framework routes), and carries what the linker needs in the file's link table,
+`Table.Routing` (`internal/provider/link/route.go`):
+
+- `Objects`: each router or application object the file binds at module level, its framework and its own prefix
+  (`APIRouter(prefix=…)`, `Blueprint(url_prefix=…)`), or that it is not a literal;
+- `Routes`: each route registered on one of them, its method, its route as written and its literal value below the
+  object, and its handlers, as declarations of the file or as names the file imports;
+- `Mounts`: each mount of an object the file does not build, with the argument as written (`users.router`), the module
+  and name it names, the mount's prefix and whether it replaces the object's own (a Flask registration's
+  `url_prefix=`), the object it is made on, and that object's prefix below an application root when the file knows it.
+  A Django settings module's `ROOT_URLCONF` literal is a mount of the module it names at `/`, anchored by the
+  settings rather than an object.
+
+Every object is indexed in the module index under each dotted name its file can be imported as. The linker walks
+down from each mount anchored at an application root (a mount on a root object of the file, or a settings module's
+`ROOT_URLCONF` when some file names that settings module in `os.environ.setdefault("DJANGO_SETTINGS_MODULE", …)` or
+`os.environ["DJANGO_SETTINGS_MODULE"] = …`). Each hop looks up the module and name the mount names, keeps the hits
+an import's lookup keeps (the nearest source root, as for `imports`), joins the mount's prefix with the object's own,
+and descends into the mounts recorded on that object; a binding already on the hop's way ends it, so a cycle of
+routers including each other ends. The walk is bounded by the mounts the unit holds, never by a depth. Each route
+reached becomes one `endpoint` in the scope of the file the root mount is in, located at that mount, keyed
+`endpoint:<method route>@<full path>`, with the endpoint metadata `framework`, `method`, `route`, `prefix: resolved`
+and `path`, defined by the file's module and routing to each handler (`routes_to`, detail `import`). A handler the
+route's file imports is resolved through the module index to its declaration.
+
+A route several mounts reach is several endpoints, one per path, and every `routes_to` of each carries `set_size`,
+the number of paths the walks of the file's root mounts gave that route. A hop whose prefix is not a literal (an
+`include_router(r, prefix=PREFIX)`) leaves every route below it `prefix: unresolved` with no `path`, keyed by the
+route's file and object instead of a path; it is still counted in the set. A mount whose argument names no indexed
+object publishes nothing. Every lookup is traced on the mount's file, so a refresh that changes a router, a route or a
+settings module republishes the endpoints that reach it, and the routing is part of the interface summary, so a
+change to it rebuilds the index. Not walked: JavaScript and Go mounts across files, a Starlette `Mount` across files,
+and an application mounted as a child of another (`app.mount("/sub", sub_app)` with `sub_app` in another file).
+
+## Declared entry points
+
+The code a project's manifest declares as its entry points is an `endpoint` of the file it resolves to (ADR-0017
+decision 8, `internal/provider/link/route_entry.go`). The linker reads the manifest at the unit's root:
+
+| Manifest | Entries | Resolved to |
+|---|---|---|
+| `pyproject.toml` | `[project.scripts]` (group `console_scripts`), `[project.gui-scripts]` (`gui_scripts`), `[project.entry-points.<group>]`, each `module:attr` or `module` | the declaration `attr` names in the member file the module can be imported as (from the root or `src/`), or that file's module |
+| `package.json` | `bin` (a path, or a map of command name to path), `main` | the member file Node's `require` loads for the path (the path, then `.js`, `.mjs`, `.cjs`, then its `index.js`), its module |
+| `Cargo.toml` | `[[bin]]` with its `path`, else `src/bin/<name>.rs` or `src/bin/<name>/main.rs` | the file's top-level `fn main`, else its module |
+
+Each is keyed `endpoint:declared:<group>:<name>@<manifest>` (the group alone when it is the name, as for `main`),
+located at its target, defined by the file's module and routing to the target (detail `import`). A name several member files can supply
+publishes one endpoint in each, each with the set size; a value that names no member publishes nothing. The entries
+are manifest fields of the unit, so a change to one re-resolves the unit.
 
 ## Endpoint identity per family
 
@@ -221,7 +323,7 @@ toward it stays valid. What a call can bind to differs by family, and so does wh
 
 | Family | Targets | `Receiver` |
 |---|---|---|
-| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#k` for an anonymous class body or an enum constant's body, the k-th in the file in source order, sent as a subtype of the type it instantiates |
+| Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#n` for an anonymous class body or an enum constant's body, n the byte offset of the name token of its declaration (the class `new T`, or the enum constant), sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
 | Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
 | C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds, and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
@@ -240,7 +342,11 @@ A unit is one project of the repository, the scope `link.PlanUnits` derives
 candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as file versions in FileID order
 (`LinkOptions.Members`), so it keeps its members of them and sorts nothing.
 
-The unit's inputs are its member files. The unit's identity is their content, as for every unit: the facts it
+The unit's inputs are its member files and the manifests it owns; an ECMAScript unit also owns every
+`tsconfig*.json` and `jsconfig*.json` (a `tsconfig.base.json`, a referenced `tsconfig.app.json`), `package.json`,
+`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads. A
+`pnpm-workspace.yaml` or `lerna.json` marks a JavaScript project as `package.json` does, so a workspace with no root
+`package.json` is one unit, whose packages import each other by name. The unit's identity is their content, as for every unit: the facts it
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
 is its qualified name, so a unit reused on a match of anything less would serve evidence about bytes that are gone.
 Each input also records `model.UnitInput.Digest`, the member digest of the file's link table (`link.MemberDigest`,
@@ -259,8 +365,10 @@ lowering, or whose dependence or link pass failed, has neither.
 Besides the joined declarations, sites and values, the table carries what the resolvers read a name in
 (`internal/provider/link/table.go`, filled by `internal/provider/treesitter/link.go`):
 - `Package`: the file's package or module clause (`wire.Done.Package`);
-- `Imports`: one `Import{Name, Path, Original}` per name an import introduces, `Path` being what the name denotes as
-  the language writes it and `Original` the name it denotes in that module when the import renames it. A Rust use
+- `Imports`: one `Import{Name, Path, Original, Syntax}` per name an import introduces, `Path` being what the name
+  denotes as the language writes it and `Original` the name it denotes in that module when the import renames it.
+  `Syntax` is an ECMAScript import's form (`require` for `require("m")` and `import x = require("m")`, `dynamic` for
+  `import("m")`, empty for a declaration), which selects a package's `import` or `require` condition. A Rust use
   tree is split into one path per leaf (`use a::{b, c as d}` gives `b → a::b` and `d → a::c`). An import of every
   member of a path (a Go dot import, a Java on-demand import, a C++ using-directive, a Rust glob, a Python
   `from m import *`) is named `ImportAll`. An include or a side-effect import has no name;
@@ -281,6 +389,8 @@ Besides the joined declarations, sites and values, the table carries what the re
   impl item);
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
   macro calls;
+- `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or
+  C++ declaration is written with, which its `references` visibility occurrences read;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
 - `Site.Results` and `Site.Into`: the variables the call's value is written into, and the callable whose return it
   reaches;
@@ -310,7 +420,7 @@ from: a hash of each hierarchy index key's entries, the reverse index from every
 file, the functions each member takes as values by signature, and the hierarchy's two index files with the table of
 identities their positions denote. For Python, JavaScript, TypeScript and TSX it holds the same hierarchy and
 identity table, a module index (each Python declaration and module under every dotted name its file can be imported
-as; each ECMAScript file under every module path an import may name it by) with the hash of each of its keys'
+as; each ECMAScript file under its module path, its path without extension) with the hash of each of its keys'
 entries, and, for every node of the value-flow fixed point (a site, or a file's node owning its callables' returns,
 its field writes, its imports and its hierarchy facts): each value it put into a variable (a parameter, a site's
 result, a callable's returns, a field) with the stratum, before or after field-based resolution, the value arrives at;
@@ -323,9 +433,13 @@ The delta build hands `Link` the predecessor's state whenever the predecessor st
 (`LinkOptions.Previous`, `internal/index/delta/link.go`), with the member digests the structural units stored. `Link`
 classifies every member against its record (unchanged, content changed with the same table, table changed, added,
 removed) and every manifest by the fields the linker reads (`manifestFields`, `refresh.go`): a Go module's `module`
-path and a Cargo manifest's crate names. Nothing else of a manifest is read: `tsconfig.json`, `package.json` and the
-Python and Java project files decide only which unit a file belongs to, so a change to them is a change of
-membership or nothing. A dependency version bump in `go.mod` changes no field, and a new nested `go.mod` moves its
+path; a Cargo manifest's crate names; and an ECMAScript unit's configs after `extends` (every option module
+resolution and ownership read), each `package.json`'s `name`, `type`, `exports`, `imports`, `types`/`typings`,
+`module`, `main`, `tsconfig` and `workspaces`, and each workspace file's globs (`jsManifestFields`, `js_manifest.go`).
+A changed ECMAScript field rebuilds the hierarchy, whose specifier answers (`keyESSpec`) are diffed key by key like
+every other index group, so only the nodes whose imports now resolve differently re-run, in any file of the unit.
+Nothing else of a manifest is read: the Python and Java project files decide only which unit a file belongs to, so a
+change to them is a change of membership or nothing. A dependency version bump in `go.mod` changes no field, and a new nested `go.mod` moves its
 files out of one unit into another, a removal from one and an addition to the other.
 
 What re-resolves:
@@ -397,8 +511,10 @@ The members' language family picks the resolver:
   bare call binds in the innermost enclosing class that has the method, declared or inherited, walking out from an
   inner, local or anonymous class (JLS §15.12.1). A member site binds by its receiver's static type to the one
   method that type declares or inherits, `virtual` when that method can be overridden (not static and not `Final`,
-  `hierarchy.overridable`) and `exact` otherwise. An anonymous class body is a synthetic subtype of the type it
-  instantiates (`anonymousType`), whose methods override that type's. A call of an abstract method (a functional
+  `hierarchy.overridable`) and `exact` otherwise; a call on a newly created object (`new Dog().sound()`, no class
+  body) binds exactly, the object being exactly its class (JLS §15.9.4). An anonymous class body is a subtype of
+  the type it instantiates, read as its declaration (`anonymousType`: the class `new T`, or the enum constant whose
+  body it is), whose methods override that type's. A call of an abstract method (a functional
   interface's) also joins every method reference of that method's signature. A method reference `T::m` to an
   instance method, `T` a type, is unbound (JLS §15.13.1): its signature is `m`'s with `T` as its first parameter, and
   a call through it passes its first argument to the receiver and the rest to `m`'s parameters in order. A static
@@ -422,8 +538,14 @@ The members' language family picks the resolver:
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
   cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is not
   `Final` and that the receiver's type or a supertype declares `virtual` ([class.virtual]). In C++ a bare call inside
-  a class walks out to the enclosing classes' static members. A Go interface embedded from a package outside the
-  unit counts toward its embedder's method set by name. `#define NAME func` makes a call of `NAME` a call of `func`,
+  a class walks out to the enclosing classes' static members. A Go method set compares methods by
+  name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
+  alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
+  however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
+  `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
+  parameters compare by position. A form it cannot decide (a struct or interface literal with members, an alias it
+  cannot follow, a name two dot imports declare) matches nothing, never a guess. A Go interface embedded from a
+  package outside the unit contributes its methods as read from that package (above, Hierarchy). `#define NAME func` makes a call of `NAME` a call of `func`,
   one per definition when `#if` arms define it differently, in the file and in the headers it includes.
 
 In every static family a site binds only a target its arguments fit: at least `Params - Optional` (one fewer for
@@ -462,9 +584,29 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   …`, `{ k: () => … }`, `Decl.Property`); `f = () => …` binds the name `f` as a declarator does. A function a
   property assignment or a pair declares is the value written to that property, named by its declaration exactly
   (`Value.Declares`), so field-based resolution reaches that declaration's node. A module's exports follow its
-  `export` statements and its CommonJS exports (`module.exports.run = …`, `exports.run = …`, a key of
-  `module.exports = { run: … }`, each exported under its own name and written to no field); a name a pattern binds
-  from a literal `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is. A
+  `export` statements and its CommonJS exports, each a module export record read by syntax at any depth
+  (`internal/provider/treesitter/worker/js_commonjs.go`): a function stored as `module.exports.run = …`, `exports.run = …` or a key of
+  `module.exports = { run: … }`, exported under its own name and written to no field; `exports.x = v`,
+  `module.exports.x = v`, `exports["x"] = v` and `Object.defineProperty(exports, "x", { value: v })` or
+  `{ get() { return v } }` with v a name, the export x aliasing v; a key of `module.exports = { a, b: c }` whose
+  value is a name; `...require("./x")` in that object and `module.exports = require("./x")`, a re-export of x.
+  `module.exports = v` (the right-most value of a chain such as `module.exports = exports = f`) and TypeScript's
+  `export = v` are the module's whole value (`export=`): a call of the required module itself (`const f =
+  require("./m"); f()`, `import f = require("./m")`) calls it, and an ES module's default import of the module
+  reads it unless the module marks itself `__esModule`, when `exports.default` is the default (the compiler's and
+  bundlers' reading; Node at run time gives the whole value, a documented difference). `exports = …`, or
+  `module.exports = …` outside a chain assigning both, unbinds `exports`, so no `exports.x` of that file is an
+  export. A file with an `import` or `export` statement is an ES module and none of these forms is read in it. A
+  class expression assigned to a name or property (`module.exports = class { … }`) is a class of that name
+  (`exports`), holding its methods, so the whole value is that class; a method of the object `module.exports` is
+  assigned (`{ run() {} }`) is exported under its own name, as a function-valued key is. A function declaration
+  whose prototype the file stores a function under (`C.prototype.run = function () {}`, a method or
+  function-valued key of `C.prototype = { … }`) is a class, a constructor function, and each such function a
+  method of it, as TypeScript's JavaScript checking reads them. A name a pattern binds from a literal
+  `require("./m")` (`const { run } = require("./m")`) is the module's export, as an import's is, and a name a
+  `require` call or an `import x = require("./c")` clause binds whole is the module's whole value, so `new x()`
+  runs the constructor of the class the module assigns, as it would an imported class's. The object `new C()`
+  makes is exactly a C, so a call on it is `exact`. A
   declaration only `export { a as b }` names is exported as `b` alone, and each imported name is resolved as
   ECMA-262 §16.2.1.6.3 ResolveExport does (`hierarchy.resolveExport`): the module's own export first, then a named
   re-export, then the `export *` modules, which pass on no `default` and nothing two of them resolve differently.
@@ -477,6 +619,45 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   settled; a class's methods are written to no property, so they are reached only through a receiver's type. A
   receiver that reaches the method only through a supertype outside the project calls that supertype's external
   method, and the field-based fallback stays closed for it.
+  **Module resolution** (`esResolver`, `internal/provider/link/js_resolve.go`, `js_config.go`): a specifier resolves
+  as TypeScript resolves it, from the repository's own configuration in the snapshot, never `node_modules`. Every
+  `tsconfig*.json` and `jsconfig*.json` is read as JSONC; `extends` (a path, an array applied in order with the
+  later winning, or a workspace package's `tsconfig` field or `tsconfig.json`) is flattened with `compilerOptions`
+  merged key by key, `files`, `include` and `exclude` replaced whole, every path relative to the config that wrote
+  it, and `references` not inherited. A file's governing configs are those TypeScript's editor service picks: walking up from its directory to the
+  unit root, the first `tsconfig.json` or `jsconfig.json` whose `files`/`include` minus `exclude` covers it (`.js`
+  files only with `allowJs` or in a `jsconfig.json`), else the configs that config's `references` reach that do, all
+  of them; with none covering it, the nearest config by directory; with no config, none. The module mode is the
+  config's `moduleResolution`, else TypeScript's default for its `module` (CommonJS: Node10; node16/nodenext:
+  Node16; preserve: Bundler); a config that sets neither, or no config, resolves under both Bundler and Node16. The
+  order, under each governing config and mode: a relative or absolute path (TypeScript's extension substitution:
+  `./a.js` names `a.ts`; a directory's `index` file except for an ES module's import under Node16, which names its
+  file with its extension; then `rootDirs`); a `#` specifier through the `imports` of the file's package scope; the
+  config's `paths` (an exact key, else the longest prefix, each fallback in order, the first naming a member
+  winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`; the package's own name when it
+  has `exports`; a workspace package by `name` (the `package.json` files the root `workspaces`, a
+  `pnpm-workspace.yaml` or a `lerna.json` declare, every `package.json` of the unit when none does) through
+  `exports` where the mode reads it (an exact subpath key, else Node's `PATTERN_KEY_COMPARE` order; conditions
+  `types`, `default`, `import` or `require` by the import's form and, under Node16, the file's module format, `node`
+  under Node16, `customConditions`, matched in object order; a `null` target excludes the subpath), else `types`
+  or `typings`, `module`, `main`, `index`; otherwise a package outside the repository, whose calls are external. A
+  target that is no member (an `exports` entry into a build output the snapshot ignores) maps back to its source
+  through a config at or above it that emits there: `outDir` or `declarationDir` replaced by `rootDir`, or, with no
+  `rootDir`, by the config's directory and by the common directory of its `include` and `files`. Failing that, every
+  branch of the entry that names a member is the answer, as a set; failing that, the import reaches no member and
+  is counted as an open import (`FactOpenImport`), and a call through it is open, never external. Several
+  governing configs, two workspace packages of one name, both modes: each is resolved and the union of the targets
+  is published, with its size. Each import's answer is computed once per build, while the hierarchy is built, and
+  written to the decls index under `keyESSpec` (the importing file's path and the specifier); the import facts, the
+  export resolution and the inference each look that one key up.
+
+  Limits. Aliases defined in program code (a bundler's alias table, a test runner's module mapper, a compiler plugin)
+  are not data and are not read. A package outside the repository (an ignored `node_modules`, a package manager's
+  own cache) stays external, and an `extends` base inside one leaves the options it may set unknown, so a config
+  that does not set its own mode resolves under both. `typesVersions` and `types@` conditions depend on the TypeScript version and are not
+  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone. An `extends` base under a name
+  other than `tsconfig*.json`/`jsconfig*.json` is read but is not an input of the unit, so an edit to it alone is
+  seen at the unit's next rebuild.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
   `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor

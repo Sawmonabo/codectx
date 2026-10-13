@@ -15,11 +15,14 @@
 ; A module-level `if __name__ == "__main__":` is a program entry point, an
 ; endpoint declaration named by the `__main__` string, whose block is its
 ; body, so the calls it makes are made from it. The query admits either
-; operand order; the worker keeps only a two-operand `==` comparison.
+; operand order, and a parenthesized condition, whose comparison the worker
+; finds inside the parentheses; the worker keeps only a two-operand `==`
+; comparison of `__name__` and the string `__main__`.
 ((module (if_statement condition: (comparison_operator (identifier) @guard.name (string (string_content) @name)) consequence: (block) @body) @def.endpoint)
   (#eq? @guard.name "__name__") (#eq? @name "__main__"))
 ((module (if_statement condition: (comparison_operator (string (string_content) @name) (identifier) @guard.name) consequence: (block) @body) @def.endpoint)
   (#eq? @guard.name "__name__") (#eq? @name "__main__"))
+(module (if_statement condition: (parenthesized_expression) consequence: (block) @body) @def.endpoint)
 
 ; Every statement that binds or changes `__all__`, which the export rule
 ; reads: the static forms are an assignment, `+=`, `.extend`, `.append` and

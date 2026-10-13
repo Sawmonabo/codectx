@@ -51,6 +51,13 @@ type Table struct {
 	// that does not fold to a constant (wire.DynamicImport); one that folds
 	// is an ordinary entry of Imports.
 	DynamicImports []DynamicImport `json:"dynamic_imports,omitempty"`
+	// Conversions are the file's values converted to a declared named type
+	// (wire.Conversion), Go's compile-time proofs that a type implements an
+	// interface.
+	Conversions []wire.Conversion `json:"conversions,omitempty"`
+	// Routing is the framework routing the file's route table left open
+	// (route.go).
+	Routing Routing `json:"routing,omitzero"`
 	// Dropped counts the worker's entries the parent could not join to a
 	// declaration or a call reference of the file, or whose ranges did not
 	// fit the pinned bytes, and each callable whose analysis failed in the
@@ -82,7 +89,19 @@ type Import struct {
 	// Range is the import statement, directive or call, the range of the
 	// evidence of each `imports` it resolves to.
 	Range model.SourceRange `json:"range"`
+	// Syntax is an ECMAScript import's form: ImportRequire, ImportDynamic,
+	// or empty for an import declaration. It selects the `import` or
+	// `require` condition of a package's `exports`.
+	Syntax string `json:"syntax,omitempty"`
 }
+
+// The forms of an ECMAScript import (Import.Syntax).
+const (
+	// ImportRequire is `require("m")` or `import x = require("m")`.
+	ImportRequire = "require"
+	// ImportDynamic is `import("m")`.
+	ImportDynamic = "dynamic"
+)
 
 // DynamicImport is one import whose path is an expression that does not
 // fold to a constant (`require("./x/" + name)`, `import(expr)`,
@@ -160,6 +179,29 @@ type Decl struct {
 	// which every value its returning nodes read flows. It is nil
 	// for a declaration no analysed function is the callable of.
 	Return *Endpoint `json:"return,omitempty"`
+	// Identity is a Go method's or alias's identity form
+	// (wire.Export.Identity), which the linker resolves to the packages
+	// declaring its types (goIdentity).
+	Identity string `json:"identity,omitempty"`
+	// Trait is, for a method of a Rust `impl Trait for Type` block, the
+	// block's trait as written (wire.Export.Trait): the one trait whose item
+	// of the method's name it implements.
+	Trait string `json:"trait,omitempty"`
+	// MacroInput is, for a Rust declaration written in an item-position
+	// macro's body, the innermost macro's path as written
+	// (wire.Decl.MacroInput); MacroLocal reports that a macro_rules of the
+	// same file in scope there is that macro (wire.Decl.MacroLocal).
+	MacroInput string `json:"macro_input,omitempty"`
+	MacroLocal bool   `json:"macro_local,omitempty"`
+	// MacroTranscribes reports a Rust macro_rules that transcribes its item
+	// input unchanged (wire.Decl.MacroTranscribes).
+	MacroTranscribes bool `json:"macro_transcribes,omitempty"`
+	// Visibility is, for a C or C++ object-like macro, the visibility its
+	// replacement states (wire.Export.Visibility).
+	Visibility string `json:"visibility,omitempty"`
+	// Macros are, for a C or C++ declaration, the macros written among its
+	// specifiers, each followed by one space (wire.Export.Macros).
+	Macros string `json:"macros,omitempty"`
 }
 
 // Parameter is one declared parameter of a callable. Endpoint is the

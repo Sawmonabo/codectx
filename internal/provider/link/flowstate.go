@@ -443,6 +443,9 @@ func buildModules(ctx context.Context, u *unit, h *hierarchy) (*index, error) {
 	defer s.Close()
 	if u.family == FamilyPython {
 		err = u.Files(ctx, func(file int32, _ model.FileVersion, t *Table) error {
+			if err := indexPythonRouting(file, t, s.Add); err != nil {
+				return err
+			}
 			return indexPythonDecls(file, t, func(d pyRecord) error { return s.Add(pyModuleEntry(d)) })
 		})
 	} else {

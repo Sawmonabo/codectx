@@ -185,6 +185,42 @@ type Decl struct {
 	// no number (ADR-0014 decision 1). A Rust `#[cfg(...)]` attribute is a
 	// branch too. Empty when no conditional encloses the declaration.
 	Branch string `json:"branch,omitempty"`
+	// MacroInput is, for a Rust declaration written inside the body of an
+	// item-position macro invocation, the innermost such macro's path as
+	// written (`cfg_rt`, `cfg::select`): the declaration is the macro's
+	// input as written, which the macro may transcribe once, several times,
+	// renamed or not at all. Empty for every other declaration.
+	MacroInput string `json:"macro_input,omitempty"`
+	// MacroExact reports a MacroInput declaration that is exactly an item
+	// of the macro's expansion: the macro is a `macro_rules!` of the same
+	// file, in textual scope, every rule of which transcribes its item input
+	// once, unchanged but for added attributes.
+	MacroExact bool `json:"macro_exact,omitempty"`
+	// MacroLocal reports a MacroInput declaration whose macro is a
+	// `macro_rules!` of the same file in textual scope at it, which
+	// MacroExact then judges; one with neither is the linker's to resolve
+	// across the crate.
+	MacroLocal bool `json:"macro_local,omitempty"`
+	// MacroTranscribes reports a Rust `macro_rules!` definition every rule
+	// of which transcribes its item input once, unchanged but for added
+	// attributes: an item written in its input is exactly an item of its
+	// expansion.
+	MacroTranscribes bool `json:"macro_transcribes,omitempty"`
+	// SpecifierMacros are, for a C or C++ declaration written with macros
+	// among its specifiers (`SQLITE_API int f(void);`), each macro's name as
+	// written, in source order: the tokens the worker's second parse
+	// excluded so the declaration parses as the language reads it.
+	SpecifierMacros []string `json:"specifier_macros,omitempty"`
+	// ReturnTypes are, when the language's rule leaves several of those
+	// identifiers that may be the declaration's type and the file defines
+	// none of them, every one of them: the declared type is one of the set.
+	ReturnTypes []string `json:"return_types,omitempty"`
+	// Visibility is, for a C or C++ declaration, the symbol visibility its
+	// own attributes state (`__attribute__((visibility("default")))`,
+	// `__declspec(dllexport)`): one of the Visibility values of the link
+	// encoding, as declared in source, never the binary's export table.
+	// Empty when its attributes state none.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

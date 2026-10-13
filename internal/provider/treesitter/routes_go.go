@@ -19,6 +19,9 @@ type goRouteForm struct {
 	// pattern reports a route whose literal may lead with its method,
 	// Go 1.22's `"GET /x"`.
 	pattern bool
+	// list reports a method argument that is a slice of methods (echo's
+	// Match).
+	list bool
 }
 
 // goForms are each Go framework's registration methods by name.
@@ -42,8 +45,9 @@ var goForms = map[string]map[string]goRouteForm{
 		"Handle": {method: 0, route: 1, handler: -1},
 	}),
 	fwEcho: goVerbForms([]string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"}, 1, map[string]goRouteForm{
-		"Any": {method: -1, handler: 1},
-		"Add": {method: 0, route: 1, handler: 2},
+		"Any":   {method: -1, handler: 1},
+		"Add":   {method: 0, route: 1, handler: 2},
+		"Match": {method: 0, route: 1, handler: 2, list: true},
 	}),
 }
 
@@ -73,6 +77,7 @@ var goRouterTypes = map[string][]string{
 // echo engines, roots, and their groups.
 func (s *routeScan) goRoutes() {
 	defaultMux := &routeObj{fw: fwNetHTTP, root: true, ownKnown: true}
+	s.closures = map[wire.Span]*routeObj{}
 	s.goObjects()
 	s.methodsOn = map[int]int{}
 	s.calls(func(r *wire.Ref, site *wire.Site, i int) {
@@ -85,7 +90,9 @@ func (s *routeScan) goRoutes() {
 		}
 	})
 	s.calls(func(r *wire.Ref, site *wire.Site, _ int) { s.goMount(r, site, defaultMux) })
+	s.goServerLiterals()
 	s.calls(func(r *wire.Ref, site *wire.Site, i int) { s.goRoute(r, site, i, defaultMux) })
+	s.calls(s.gorillaChain)
 }
 
 // goImported is the framework the import a qualifier names belongs to.
@@ -114,9 +121,16 @@ func (s *routeScan) goObjects() {
 			fw == fwEcho && r.Name == "New":
 			s.objs[i] = &routeObj{fw: fw, root: true, ownKnown: true}
 		case fw != "":
-		case r.Name == "Group":
-			// gin `r.Group("/v1", ...)`, echo `e.Group("/v1", ...)`.
-			if parent := s.objOf(site.Receiver); parent != nil && (parent.fw == fwGin || parent.fw == fwEcho) {
+		case r.Name == "Group" || r.Name == "Route":
+			// gin `r.Group("/v1", ...)`, echo `e.Group("/v1", ...)`; chi
+			// `r.Route("/v1", func(r chi.Router) {...})` and
+			// `r.Group(func(r chi.Router) {...})` (chiClosure).
+			parent := s.goRecvObj(r, site)
+			switch {
+			case parent == nil:
+			case parent.fw == fwChi:
+				s.chiClosure(r, site, i, parent)
+			case r.Name == "Group" && (parent.fw == fwGin || parent.fw == fwEcho):
 				s.objs[i] = s.child(parent, site)
 			}
 		case r.Name == "Subrouter":
@@ -159,7 +173,7 @@ func (s *routeScan) goMount(r *wire.Ref, site *wire.Site, defaultMux *routeObj) 
 		})
 		return
 	}
-	parent := s.objOf(site.Receiver)
+	parent := s.goRecvObj(r, site)
 	if fw == fwNetHTTP {
 		parent = defaultMux
 	} else if fw != "" {
@@ -178,6 +192,7 @@ func (s *routeScan) goMount(r *wire.Ref, site *wire.Site, defaultMux *routeObj) 
 		s.attachArgs(site, func(_ *routeObj, i int) (routeAttach, bool) {
 			return routeAttach{parent: parent, known: true}, i == 1
 		})
+		s.stripPrefix(site, parent)
 	}
 }
 
@@ -194,7 +209,7 @@ func (s *routeScan) goRoute(r *wire.Ref, site *wire.Site, i int, defaultMux *rou
 	case fw != "":
 		return
 	default:
-		if obj = s.objOf(site.Receiver); obj != nil {
+		if obj = s.goRecvObj(r, site); obj != nil {
 			fw = obj.fw
 		} else if fw = s.goTypeFramework(site.Receiver); fw == "" {
 			candidates := map[string][]string{}
@@ -224,6 +239,8 @@ func (s *routeScan) goRoute(r *wire.Ref, site *wire.Site, i int, defaultMux *rou
 	switch {
 	case form.verb != "":
 		methods = []string{form.verb}
+	case form.list:
+		methods = s.goMethodList(args[form.method].text)
 	case form.method >= 0:
 		if m, ok := s.goMethod(args[form.method].text); ok {
 			methods = []string{m}

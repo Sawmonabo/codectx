@@ -8,7 +8,7 @@ import (
 )
 
 // goArgsSource calls g with positional, spread, literal, computed and
-// call-result arguments, from a function body and from a closure that reads
+// call-result arguments, k with a map literal keyed by a variable, from a function body and from a closure that reads
 // the enclosing function's local.
 const goArgsSource = `package p
 
@@ -22,8 +22,11 @@ func f(n int, xs []int) int {
 	h := func() int { return g(m) }
 	p := pt{x: m}
 	g(p.x, pt{x: n}.x)
+	k(map[int]int{m: 1})
 	return h()
 }
+
+func k(v map[int]int) {}
 
 type pt struct{ x int }
 
@@ -42,7 +45,10 @@ func (r *T) M(a, b int, c ...string) {}
 // Mutation: Reads from the whole statement instead of the argument -> `n*2`
 // also reads m and xs. Mutation: keep the `...` in the argument's range or
 // drop the spread -> the second argument of `g(m, xs...)` differs. Mutation:
-// descend into a call's arguments -> `len(xs)` reads xs.
+// descend into a call's arguments -> `len(xs)` reads xs. Mutation: skip a
+// keyed element's bare-name key (taking it for a struct field) -> the map
+// literal `map[int]int{m: 1}` reads nothing, although its key is the
+// variable m, which the lowering counts as a use.
 func TestGoArgumentsReadTheirOwnVariables(t *testing.T) {
 	src := goArgsSource
 	l, fns := linkOf(t, "go", "p.go", src)
@@ -61,6 +67,7 @@ func TestGoArgumentsReadTheirOwnVariables(t *testing.T) {
 		{"g(n*2, m, len(xs))", []argWant{{at: "n*2", reads: []wire.Span{n}}, {at: "m", reads: []wire.Span{m}}, {at: "len(xs)"}}},
 		{"g(m) }", []argWant{{at: "m", reads: []wire.Span{m}}}},
 		{"g(p.x, pt{x: n}.x)", []argWant{{at: "p.x", reads: []wire.Span{p}}, {at: "pt{x: n}.x", reads: []wire.Span{n}}}},
+		{"k(map[int]int{m: 1})", []argWant{{at: "map[int]int{m: 1}", reads: []wire.Span{m}}}},
 	}
 	for _, c := range cases {
 		t.Run(c.call, func(t *testing.T) {
@@ -141,5 +148,51 @@ func f() {
 		if s.Shape != wire.ShapeStatic || s.Qualifier != c.qualifier {
 			t.Errorf("%s.%s() is shape %d qualifier %q, want a static site qualified %q", c.qualifier, c.callee, s.Shape, s.Qualifier, c.qualifier)
 		}
+	}
+}
+
+// TestGoNewOfAnExpression protects new's two operands ("Allocation", Go
+// 1.26): new(T) allocates a T, and new(v) of an expression copies v's
+// value, so new(v) has v's type and new(fn) passes the function fn as a
+// value, although the grammar reads each bare operand as a type name.
+//
+// Mutation: skip every operand of new as a type -> new(fn) sends no value.
+// Mutation: name new(v)'s type by its operand's text -> the first argument
+// of g has the type "v". Mutation: read every bare operand as an expression
+// -> new(T) has no type.
+func TestGoNewOfAnExpression(t *testing.T) {
+	src := `package p
+
+type T struct{}
+
+func fn() {}
+
+func g(a any) {}
+
+func f() {
+	v := T{}
+	g(new(v))
+	g(new(T))
+	_ = new(fn)
+}
+`
+	l, _ := linkOf(t, "go", "p.go", src)
+	call := func(needle string) *wire.Site {
+		s := textAt(t, src, needle, 0)
+		s.End = s.Start + 1
+		return siteNamed(l, s)
+	}
+	for needle, want := range map[string]string{"g(new(v))": "T", "g(new(T))": "T"} {
+		s := call(needle)
+		if s == nil || len(s.Args) != 1 || s.Args[0].Kind != wire.TypeNamed || s.Args[0].Name != want {
+			t.Fatalf("%s: argument types %+v, want the named type %s", needle, s, want)
+		}
+	}
+	var values []string
+	for _, v := range l.Values {
+		values = append(values, src[v.At.Start:v.At.End]+" "+v.Type.Name)
+	}
+	if !slices.Equal(values, []string{"fn fn"}) {
+		t.Fatalf("values %q, want new(fn)'s operand fn alone", values)
 	}
 }

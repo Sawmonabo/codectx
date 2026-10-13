@@ -80,15 +80,15 @@ import (
 // "m#key"),
 // a function declaration (TypeFunction). A may-definition through a property
 // write, an update or a delete keeps the type the variable already held, so
-// the definitions behind it are read instead; a closure's may-definition
-// says nothing of the value and is unknown. Expressions give TypeNamed for
-// `new C()`, an `as` or `<T>` assertion and an annotation, TypeResult for a
-// call site's value, TypeModule for `require("m")`, TypeField for a property
-// read, and the operand's type through await, `!`, `satisfies`, an
-// assignment, a sequence's last element, and both arms of a conditional or
-// a short-circuit operator. A class declaration's name is TypeClass, the
-// class object itself. Definitions or arms that disagree merge to a
-// TypeUnion of every type they recover (Link.Unions), so every type that
+// the definitions behind it are read instead; a closure's may-definition says
+// nothing of the value and is unknown. Expressions give TypeNamed for
+// `new C()` (wire.ExactObject), an `as` or `<T>` assertion and an annotation,
+// TypeResult for a call site's value, TypeModule for `require("m")`,
+// TypeField for a property read, and the operand's type through await, `!`,
+// `satisfies`, an assignment, a sequence's last element, and both arms of a
+// conditional or a short-circuit operator. A class declaration's name is
+// TypeClass, the class object itself. Definitions or arms that disagree merge
+// to a TypeUnion of every type they recover (Link.Unions), so every type that
 // reaches a receiver or an argument is sent; one that recovers nothing adds
 // nothing to it.
 //
@@ -165,6 +165,8 @@ type javaScriptLinker struct {
 	// finds a set's index by its canonical spelling.
 	unions  [][]wire.Type
 	unionAt map[string]uint32
+	// cjs are the file's CommonJS exports (js_commonjs.go).
+	cjs cjsExports
 
 	// The callable being analysed: its node, graph, the uses of its named
 	// variables (uses, with ends the running maximum of each name's ends),
@@ -819,7 +821,10 @@ func (k *javaScriptLinker) typeOf(e Node) wire.Type {
 		return k.thisAt(e)
 	case kk.newExpression:
 		if c := firstNamed(e); jsKindOf(c) == kk.identifier || jsKindOf(c) == kk.memberExpression {
-			return wire.Type{Kind: wire.TypeNamed, Name: k.spell(c)}
+			// The object `new C()` makes is exactly a C (ECMA-262
+			// §13.3.5.1.1 EvaluateNew: its prototype is C.prototype), so a
+			// call on it runs no subclass's override.
+			return wire.Type{Kind: wire.TypeNamed, Name: k.spell(c), Index: wire.ExactObject}
 		}
 	case kk.callExpression:
 		if tok, ok := k.callee(e); ok {
@@ -896,6 +901,20 @@ func (k *javaScriptLinker) named(name string) wire.Type {
 func (k *javaScriptLinker) className(body Node) string {
 	kk := k.k
 	c := body.Parent()
+	if jsKindOf(c) == kk.class {
+		// A class expression assigned to a name or a property
+		// (`module.exports = class { … }`) is declared by that name.
+		if a := c.Parent(); jsKindOf(a) == kk.assignmentExpression && a.ChildByFieldId(kk.fRight) == c {
+			switch left := a.ChildByFieldId(kk.fLeft); jsKindOf(left) {
+			case kk.identifier:
+				return string(textOf(k.src, left))
+			case kk.memberExpression:
+				if p := left.ChildByFieldId(kk.fProperty); jsKindOf(p) == k.x.propertyIdentifier {
+					return string(textOf(k.src, p))
+				}
+			}
+		}
+	}
 	switch jsKindOf(c) {
 	case kk.classDeclaration, kk.abstractClassDeclaration, kk.class:
 		if name := c.ChildByFieldId(kk.fName); !name.IsNull() {
@@ -916,12 +935,12 @@ func (k *javaScriptLinker) callee(n Node) (Node, bool) {
 	kk := k.k
 	switch n.KindId() {
 	case kk.callExpression:
-		f := n.ChildByFieldId(kk.fFunction)
+		f := k.calleeExpr(n)
 		switch jsKindOf(f) {
 		case kk.identifier:
 			return f, true
 		case kk.memberExpression:
-			if p := f.ChildByFieldId(kk.fProperty); jsKindOf(p) == k.x.propertyIdentifier {
+			if p := f.ChildByFieldId(kk.fProperty); jsKindOf(p) == k.x.propertyIdentifier || jsKindOf(p) == k.x.privatePropertyIdentifier {
 				return p, true
 			}
 		}
@@ -931,6 +950,27 @@ func (k *javaScriptLinker) callee(n Node) (Node, bool) {
 		}
 	}
 	return Node{}, false
+}
+
+// calleeExpr is the call n's callee expression seen through the wrappers
+// the structural query sees through: one pair of parentheses, then a
+// TypeScript `as`, `satisfies` or non-null assertion; or a non-null
+// assertion alone. `(f as T)()` and `f!()` call f, `(o.m)()` calls m on o.
+func (k *javaScriptLinker) calleeExpr(n Node) Node {
+	kk := k.k
+	f := n.ChildByFieldId(kk.fFunction)
+	if jsKindOf(f) == kk.parenthesizedExpression {
+		f = firstNamed(f)
+		switch jsKindOf(f) {
+		case kk.asExpression, kk.satisfiesExpression, kk.nonNullExpression:
+			return firstNamed(f)
+		}
+		return f
+	}
+	if jsKindOf(f) == kk.nonNullExpression {
+		return firstNamed(f)
+	}
+	return f
 }
 
 // testCall reports a call the extraction reports as a test declaration and
@@ -968,17 +1008,19 @@ func (k *javaScriptLinker) required(call Node) (string, bool) {
 func (k *javaScriptLinker) site(n, tok Node) wire.Site {
 	kk, x := k.k, k.x
 	s := wire.Site{Name: wireSpan(spanOf(tok))}
-	switch f := n.ChildByFieldId(kk.fFunction); {
+	switch f := k.calleeExpr(n); {
 	case n.KindId() == kk.newExpression:
 		s.Shape = wire.ShapeConstructor
 	case f == tok:
 		s.Shape = wire.ShapeBare
 		switch v := k.resolve(tok); {
+		case v.t.Kind == wire.TypeModule:
+			// A call of an import names its module and exported name, a
+			// variable a `require` call assigns (`const f = require("./m");
+			// f()`) as well: the module's whole value.
+			s.Receiver = v.t
 		case v.set && !v.decl:
 			s.Shape, s.Receiver, s.Signature = wire.ShapeIndirect, v.t, v.sig
-		case v.t.Kind == wire.TypeModule:
-			// A call of an import names its module and exported name.
-			s.Receiver = v.t
 		}
 	default:
 		s.Shape = wire.ShapeMember
@@ -1051,9 +1093,10 @@ func (k *javaScriptLinker) readSkip(n Node) bool {
 
 // computedCallee is the callee expression of the call n when it names
 // nothing, so no call reference covers the call (the structural query
-// captures a callee that is an identifier or a member with a property
-// name): a subscript `o[k]()`, a call's result `f()()`, a parenthesized,
-// logical or conditional expression, a function called where it is written.
+// captures a callee that is an identifier or a member with a property or
+// private name, seen through the wrappers calleeExpr removes): a subscript
+// `o[k]()`, a call's result `f()()`, a logical, conditional or sequence
+// expression, a function called where it is written.
 // A dynamic `import(…)` and a `super(…)` constructor call are no such call.
 func (k *javaScriptLinker) computedCallee(n Node) (Node, bool) {
 	if n.KindId() != k.k.callExpression {
@@ -1132,7 +1175,7 @@ func (k *javaScriptLinker) dynamicImport(out *wire.Link, n Node) {
 					constant = false
 					flush()
 				default:
-					literal(string(textOf(k.src, c)))
+					literal(jsUnescape(string(textOf(k.src, c))))
 				}
 			}
 			return
@@ -1349,6 +1392,7 @@ func (k *javaScriptLinker) propertyName(key Node) string {
 
 func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 	k.ready(src)
+	k.cjs = cjsExports{}
 	kk, x := k.k, k.x
 	numbered := map[uint32]uint32{}
 	c := root.Walk()
@@ -1379,6 +1423,7 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 			}
 			if n.KindId() == kk.callExpression {
 				k.dynamicImport(out, n)
+				k.cjsDefineProperty(n)
 			}
 		case kk.functionDeclaration, kk.generatorFunctionDeclaration:
 			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == kk.identifier {
@@ -1389,10 +1434,19 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 				k.export(out, name, n, "", true, false)
 			}
 		case kk.methodDefinition, x.methodSignature, x.abstractMethodSignature:
-			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == x.propertyIdentifier {
+			// A private method (`#p() {}`) is a method of its class too, which
+			// `this.#p()` calls.
+			if name := n.ChildByFieldId(kk.fName); jsKindOf(name) == x.propertyIdentifier || jsKindOf(name) == x.privatePropertyIdentifier {
 				abstract := n.KindId() != kk.methodDefinition
 				k.export(out, name, n, k.receiverOf(n), !abstract && hasToken(n, kk.staticKw), abstract)
 				out.Exports[len(out.Exports)-1].Override = !kindChild(n, x.overrideModifier).IsNull()
+				if p := n.Parent(); jsKindOf(p) == x.object && commonJSExport(k.objectPath(p), false) {
+					// A method of the object `module.exports` is assigned
+					// is exported under its own name, as a function-valued
+					// key is (pairFunction).
+					out.Exports[len(out.Exports)-1].Property = true
+					out.Exports[len(out.Exports)-1].Exported = true
+				}
 			}
 		case kk.variableDeclarator:
 			name, value := n.ChildByFieldId(kk.fName), n.ChildByFieldId(kk.fValue)
@@ -1400,14 +1454,17 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 				k.export(out, name, value, "", true, false)
 			}
 		case kk.assignmentExpression:
+			k.cjsAssignment(n)
 			if name, fn, holder, member, ok := k.assignedFunction(n); ok {
-				k.export(out, name, fn, "", true, false)
+				owner, method := prototypeOwner(holder)
+				k.export(out, name, fn, owner, !method, false)
 				out.Exports[len(out.Exports)-1].Property = member
 				out.Exports[len(out.Exports)-1].Exported = member && commonJSExport(holder, true)
 			}
 		case x.pair:
 			if name, fn, holder, ok := k.pairFunction(n); ok {
-				k.export(out, name, fn, "", true, false)
+				owner, method := prototypeOwner(holder)
+				k.export(out, name, fn, owner, !method, false)
 				out.Exports[len(out.Exports)-1].Property = true
 				out.Exports[len(out.Exports)-1].Exported = commonJSExport(holder, false)
 			}
@@ -1425,13 +1482,17 @@ func (k *javaScriptLinker) file(root Node, src []byte, out *wire.Link) {
 		case x.interfaceDeclaration:
 			k.supertypes(out, n.ChildByFieldId(kk.fName), kindChild(n, x.extendsTypeClause))
 		case kk.exportStatement:
+			k.cjs.esm = true
 			k.reexports(out, n)
+		case kk.importStatement:
+			k.cjs.esm = true
 		}
 		if c.GotoFirstChild() {
 			continue
 		}
 		for !c.GotoNextSibling() {
 			if !c.GotoParent() {
+				k.cjsFinish(out)
 				k.finish(out, numbered)
 				return
 			}
@@ -1493,6 +1554,15 @@ func (k *javaScriptLinker) reexports(out *wire.Link, n Node) {
 		if name != "" && original != "" {
 			out.Reexports = append(out.Reexports, wire.Reexport{Name: name, Original: original, From: from})
 		}
+	}
+	if hasToken(n, kk.eqTok) {
+		// TypeScript's `export = x` assigns the module's whole value, as
+		// `module.exports = x` does, which a default import also reads.
+		if v := k.l.unparen(firstNamed(n)); jsKindOf(v) == kk.identifier {
+			add(wire.ExportAssignment, string(textOf(k.src, v)), "")
+			add("default", string(textOf(k.src, v)), "")
+		}
+		return
 	}
 	if hasToken(n, x.defaultKw) {
 		if d := n.ChildByFieldId(kk.fDeclaration); !d.IsNull() {
@@ -1715,6 +1785,9 @@ func (k *javaScriptLinker) receiverOf(m Node) string {
 				return string(textOf(k.src, name))
 			}
 		}
+		if owner, ok := prototypeOwner(k.objectPath(p)); ok {
+			return owner
+		}
 	case x.interfaceBody, x.objectType:
 		if d := p.Parent(); jsKindOf(d) == x.interfaceDeclaration || jsKindOf(d) == x.typeAliasDeclaration {
 			if name := d.ChildByFieldId(kk.fName); !name.IsNull() {
@@ -1723,6 +1796,18 @@ func (k *javaScriptLinker) receiverOf(m Node) string {
 		}
 	}
 	return ""
+}
+
+// prototypeOwner is the constructor function C a function stored under
+// holder is a method of, when holder is `C.prototype` (`C.prototype.m =
+// function () {}`, `C.prototype = { m() {} }`): the object `new C()` makes
+// inherits it, as an instance inherits a class's method.
+func prototypeOwner(holder string) (string, bool) {
+	owner, ok := strings.CutSuffix(holder, ".prototype")
+	if !ok || owner == "" || strings.ContainsAny(owner, ".[( ") {
+		return "", false
+	}
+	return owner, true
 }
 
 // params is the number of fn's parameters, a TypeScript `this` parameter
@@ -1867,12 +1952,12 @@ func (k *javaScriptLinker) importSource(n Node) string {
 	return ""
 }
 
-// unquote is a string literal's contents.
+// unquote is a string literal's value, its escapes decoded (jsString).
 func (k *javaScriptLinker) unquote(s Node) string {
 	if s.IsNull() {
 		return ""
 	}
-	return strings.Trim(string(textOf(k.src, s)), "\"'`")
+	return jsString(string(textOf(k.src, s)))
 }
 
 // spell is n's tokens as written, without whitespace or comments.
@@ -1934,7 +2019,7 @@ func jsKindOf(n Node) uint16 {
 // named node has, so the construct cannot occur there (the javascript
 // grammar has no TypeScript kind).
 type jsLinkSyntax struct {
-	arguments, formalParameters, propertyIdentifier, this, super, str, pair, object,
+	arguments, formalParameters, propertyIdentifier, privatePropertyIdentifier, this, super, str, pair, object,
 	shorthandPropertyIdentifier, array, returnStatement, arrowFunction, typeAnnotation, assertsAnnotation,
 	typePredicateAnnotation, typeIdentifier, nestedTypeIdentifier, genericType, predefinedType, functionType,
 	implementsClause, extendsTypeClause, interfaceDeclaration, interfaceBody, objectType, typeAliasDeclaration,
@@ -1968,7 +2053,8 @@ func (g *jsLinkGrammar) syntax() *jsLinkSyntax {
 		k := func(name string) uint16 { return tl.IdForNodeKind(name, true) }
 		g.s = jsLinkSyntax{
 			arguments: k("arguments"), formalParameters: k("formal_parameters"),
-			propertyIdentifier: k("property_identifier"), this: k("this"), super: k("super"), str: k("string"),
+			propertyIdentifier: k("property_identifier"), privatePropertyIdentifier: k("private_property_identifier"),
+			this: k("this"), super: k("super"), str: k("string"),
 			pair: k("pair"), object: k("object"), shorthandPropertyIdentifier: k("shorthand_property_identifier"),
 			array: k("array"), returnStatement: k("return_statement"), arrowFunction: k("arrow_function"),
 			typeAnnotation: k("type_annotation"), assertsAnnotation: k("asserts_annotation"),

@@ -47,14 +47,22 @@ const (
 )
 
 // manifestFields is every manifest field the unit's resolution reads, sorted
-// and each once: a Go module's path, and a Rust crate's name and root. No
-// other manifest is read by the linker: the others decide only the planner's
-// membership, which a refresh compares member by member.
+// and each once: a Go module's path; a Rust crate's name and root; an
+// ECMAScript unit's configs after `extends`, its package.json fields and its
+// workspace globs (jsManifestFields). No other manifest is read by the
+// linker: the others decide only the planner's membership, which a refresh
+// compares member by member.
 func manifestFields(ctx context.Context, u *unit) ([]manifestField, error) {
 	var out []manifestField
 	switch u.family {
 	case FamilyGo:
 		fs, err := goManifestFields(ctx, u)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, fs...)
+	case FamilyJavaScript:
+		fs, err := jsManifestFields(ctx, u)
 		if err != nil {
 			return nil, err
 		}
@@ -68,6 +76,11 @@ func manifestFields(ctx context.Context, u *unit) ([]manifestField, error) {
 			return nil, err
 		}
 	}
+	entries, err := entryFields(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, entries...)
 	slices.SortFunc(out, compareField)
 	return slices.Compact(out), nil
 }

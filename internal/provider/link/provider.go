@@ -64,7 +64,7 @@ const (
 // Capabilities are the capabilities the provider declares, one row of each
 // per unit.
 var Capabilities = []string{string(model.RelCalls), string(model.RelImports), string(model.RelDataFlowsTo),
-	string(model.RelExtends), string(model.RelImplements), string(model.RelOverrides)}
+	string(model.RelExtends), string(model.RelImplements), string(model.RelOverrides), string(model.RelGenerates)}
 
 // The evidence detail of a published occurrence names the technique that
 // found its fact.
@@ -121,6 +121,21 @@ const (
 	// outside the project that the source proves a class: a class's
 	// `extends` clause or base list.
 	DetailSupertypeClass = "supertype_class"
+	// DetailSupertypeCandidate: an `overrides` of a method of a type outside
+	// the project that a Java `@Override` or C++ `override` method may
+	// override: one of the external supertypes on a path no type of the
+	// project declares the method along, read with its set size as "at least
+	// one of n" (several may hold at once), or one published beside an
+	// override of the project's own, which the mark already proves.
+	DetailSupertypeCandidate = "supertype_candidate"
+	// DetailMacroInput: a `generates` from a Rust macro_rules to a
+	// declaration written in its input, which it may transcribe renamed,
+	// repeated or not at all.
+	DetailMacroInput = "macro_input"
+	// DetailMacroTranscribes: a `generates` from a Rust macro_rules every
+	// rule of which transcribes its item input once, unchanged: the
+	// declaration is exactly an item of its expansion.
+	DetailMacroTranscribes = "macro_transcribes"
 )
 
 // LinkOptions is what the delta build hands one unit's link.
@@ -263,6 +278,15 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 			return failed, err
 		}
 		defer res.close()
+		resolved := res.bindings
+		defer resolved.Close()
+		var prevFields []manifestField
+		if rf.prev != nil {
+			prevFields = rf.prev.fields
+		}
+		if res.bindings, err = withEntries(ctx, u, resolved, fields, prevFields); err != nil {
+			return failed, err
+		}
 	} else {
 		res = &rf.prev.resolution
 	}
@@ -305,8 +329,12 @@ func (p *Provider) Link(ctx context.Context, req provider.UnitRequest, sink prov
 			return failed, err
 		}
 	}
+	rows, err := goExternalCoverage(pub.capabilities(records.Len()), res.h)
+	if err != nil {
+		return failed, err
+	}
 	return model.ProviderResult{RunID: req.Run, State: model.RunSucceeded, RecordsEmitted: pub.records,
-		Capabilities: pub.capabilities(records.Len())}, nil
+		Capabilities: rows}, nil
 }
 
 // resolve is the unit's resolution by its family's: the static family's

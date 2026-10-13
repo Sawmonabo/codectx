@@ -41,10 +41,14 @@ const (
 	// EntryFieldWrite is the values the file writes to one field, where
 	// resolution is field-based.
 	EntryFieldWrite EntryKind = 7
+	// EntryRouting is the file's open routing (Routing): its objects, their
+	// routes and mounts, and the settings modules it names, which another
+	// file's route walk reads.
+	EntryRouting EntryKind = 8
 )
 
 // Valid reports whether k is a known entry kind.
-func (k EntryKind) Valid() bool { return k >= EntryDeclaration && k <= EntryFieldWrite }
+func (k EntryKind) Valid() bool { return k >= EntryDeclaration && k <= EntryRouting }
 
 // SummaryEntry is one entry of a file's interface summary. Key is the entry's
 // identity within the file, stable across edits that do not change it (a
@@ -97,9 +101,10 @@ const (
 // module identity (path, language, package, module node and the unions its
 // types name), each import, declaration (its node identity, kind, names,
 // parent, signature, flags, argument counts and returned type), supertype
-// row, re-export, and each value it stores: a function taken as a value or
-// written to a field, which the address-taken cross-product and field-based
-// resolution read, and the values the flow-based inference starts from.
+// row, Go conversion (a proven subtype relation), re-export, and each value
+// it stores: a function taken as a value or written to a field, which the
+// address-taken cross-product and field-based resolution read, and the values
+// the flow-based inference starts from.
 //
 // No byte range is in it. Each entry's hash includes the entry's position in
 // its list, because a binding names a declaration and a site by index into
@@ -144,6 +149,9 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 	for i, st := range t.Supertypes {
 		add(EntrySupertype, st.Type+"\x00"+st.Super, i, st)
 	}
+	for i, c := range t.Conversions {
+		add(EntrySupertype, "\x00"+c.Type+"\x00"+c.Interface, i, c)
+	}
 	for i, x := range t.Reexports {
 		add(EntryExport, x.Name+"\x00"+x.From, i, x)
 	}
@@ -158,6 +166,9 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 			caller = string(t.Decls[v.Caller].Node)
 		}
 		add(EntryInferred, caller, i, v)
+	}
+	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings) > 0 {
+		add(EntryRouting, "", 0, r.summary())
 	}
 	if err != nil {
 		return nil, err

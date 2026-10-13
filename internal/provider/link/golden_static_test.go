@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -16,9 +17,13 @@ import (
 func TestStaticDispatchGoldens(t *testing.T) { runGoldens(t, staticGoldens) }
 
 // fixture is every file under testdata/dir, by its path relative to it: a
-// case's sources kept as files, so a compiler checks them as written.
+// case's sources kept as files, so a compiler checks them as written. The
+// directory is found from this source file, since the test binary also runs
+// as the parser worker, whose working directory is a temporary one, and
+// initializes this package there too.
 func fixture(dir string) map[string]string {
-	root := filepath.Join("testdata", dir)
+	_, self, _, _ := runtime.Caller(0)
+	root := filepath.Join(filepath.Dir(self), "testdata", dir)
 	files := map[string]string{}
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -498,9 +503,11 @@ func use(r ReadCloser) {
 `,
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
-		// the binding rules alone); the two agree on every fact. io.Reader's method set is in no table, so a
-		// type satisfies ReadCloser only by embedding io.Reader too. Checked against the pinned grammar's
-		// tree: ReadCloser's Close is a method_elem, sent abstract.
+		// the binding rules alone); the two agree on every fact. io's interfaces are read from the
+		// standard library (the package's GOROOT fixture), so ReadCloser's method set is Read and Close,
+		// File's is its own Close and the Read its embedded io.Reader promotes, and each type implements
+		// every io interface its method set covers. Checked against the pinned grammar's tree:
+		// ReadCloser's Close is a method_elem, sent abstract.
 		want: []string{
 			"u1 Read -> external io.Reader.Read virtual",
 			"u2 Close -> rcclose Close virtual",
@@ -509,11 +516,19 @@ func use(r ReadCloser) {
 			"rc ReadCloser extends external io.Reader",
 			"file File implements rc ReadCloser",
 			"fclose Close overrides rcclose Close",
+			"file File implements external io.Reader",
+			"file File implements external io.Closer",
+			"file File implements external io.ReadCloser",
+			"plain Plain implements external io.Closer",
+			"fclose Close overrides external io.Closer.Close",
+			"fclose Close overrides external io.ReadCloser.Close",
+			"pclose Close overrides external io.Closer.Close",
 		},
-		// Mutation: satisfy an interface by its known methods alone -> Plain implements ReadCloser and its
-		// Close overrides ReadCloser's.
-		// Mutation: leave the external embedding out of the method set -> `r.Read(nil)` is open.
-		fails: "a type that lacks the embedded external interface taken to satisfy ReadCloser; a call of the external interface's method left open",
+		// Mutation: satisfy an interface by part of its method set -> Plain implements ReadCloser and its
+		// Close overrides ReadCloser's. Mutation: leave the external embedding out of the method set ->
+		// `r.Read(nil)` is open. Mutation: leave out the methods an external interface promotes -> File
+		// implements neither io.Reader nor io.ReadCloser.
+		fails: "a type that lacks the embedded external interface taken to satisfy ReadCloser; a call of the external interface's method left open; a type satisfying an external interface by its method set left without its implements",
 	},
 	{
 		name:   "java-field-receivers",
@@ -780,15 +795,17 @@ class B extends Base {}
 
 // TestAnonymousClassOfExternalInterface links, in one file, a class that
 // implements java.lang.Runnable and an anonymous class of it (JLS §15.9.5).
-// The anonymous body has no node of its own, so it publishes no supertype
-// edge; its run override and A's reach one external method node, and A's
-// `implements` reaches the one java.lang.Runnable node, of kind type: the
-// anonymous body's supertype row, which proves no kind, mints no second
-// node.
+// The anonymous body is its own class node, `new Runnable`, whose one
+// `extends` to java.lang.Runnable carries supertype_anonymous: the creation
+// proves neither a class nor an interface. Its run override and A's reach
+// one external method node, and both supertype edges reach the one
+// java.lang.Runnable node, of kind type.
 //
 // Mutation: mint the external type node with the kind its row proves ->
 // java.lang.Runnable is an interface node, not one of kind type. Mutation:
-// publish a supertype edge from the anonymous body's row -> a second edge.
+// read the anonymous body's external supertype as a class -> its edge
+// carries supertype_class. Mutation: keep the body a synthetic type with no
+// node -> it publishes no edge.
 func TestAnonymousClassOfExternalInterface(t *testing.T) {
 	l := linkSources(t, newStructural(t), map[string]string{
 		"Tasks.java": `class A implements Runnable {
@@ -805,8 +822,13 @@ class Main {
 `,
 	})
 	edges := externalSupertypeEdges(t, l)
-	if len(edges) != 1 {
-		t.Fatalf("the external supertype edges are %v, want A's alone", edges)
+	if len(edges) != 2 {
+		t.Fatalf("the external supertype edges are %v, want A's and the anonymous body's", edges)
+	}
+	if anon := edges["new Runnable"]; anon.kind != model.RelExtends || anon.detail != link.DetailSupertypeAnonymous ||
+		anon.to.ID != edges["A"].to.ID {
+		t.Errorf("the anonymous body publishes %s (%s) into %s, want extends (%s) into A's java.lang.Runnable node",
+			anon.kind, anon.detail, anon.to.QualifiedName, link.DetailSupertypeAnonymous)
 	}
 	a := edges["A"]
 	if a.kind != model.RelImplements || a.detail != link.DetailSupertypeInterface || a.to.Kind != model.NodeType ||

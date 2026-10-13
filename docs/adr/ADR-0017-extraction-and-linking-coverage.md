@@ -44,8 +44,13 @@ it is [research 26](../research/26-extraction-and-linking-coverage.md).
   names), otherwise every top-level name without a leading underscore [S2]. A module whose `__all__` is computed falls
   back to the underscore rule, and the file's capability row says that `__all__` was not static.
 - **C:** every definition with external linkage, that is, not `static` [S3]. `exports` means linkage, documented as
-  such, not shared-library visibility, which depends on compiler flags and attribute macros a syntactic reader does not
-  evaluate [S4].
+  such, not shared-library visibility.
+- **C and C++ visibility as declared in source:** a declaration's own attributes (`visibility("…")`, `__declspec`
+  `dllexport`/`dllimport`) give its `visibility` metadata; a macro among its specifiers is read by the linker through
+  the definitions its file sees by decision 4's include lookup, following one-identifier replacements, and published as
+  a `references` to each definition with the visibility it states, one per `#if` arm with the set size. It is never
+  claimed as the binary's export table: `-fvisibility` and the toolchain's export lists decide that, and no attribute
+  publishes no visibility [S4]. No macro name is known in advance; the project's own `#define` is read.
 
 ### 3. JavaScript and TypeScript function-valued properties are declarations
 
@@ -72,7 +77,15 @@ included header binds through the include lookup the linker already performs
   format leaves dynamic. The supported subset is stated in the manifest documentation.
 - **`composer.json`:** `require` and `require-dev`, the platform entries `php` and `ext-*` included [S9]. It is read
   although PHP code is not indexed: the dependency facts need no PHP grammar.
-- Lock files are not read, as for every other ecosystem the provider reads.
+- **Lock files** (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `Cargo.lock`, `poetry.lock`,
+  `uv.lock`, `Pipfile.lock`, `pylock.toml`, `pdm.lock`, `gradle.lockfile`) are read, each by its published format,
+  as a stream: JSON tokens with one package decoded at a time, TOML one package table at a time, the text formats
+  line by line [S20][S21]. The lock defines a `configuration` node; each pinned package is a `depends_on`
+  occurrence from it to the dependency node a manifest's requirement of the same name reaches, with
+  `resolved_version`, the package's integrity where the format has one, and `set_size` the number of versions the
+  lock pins for the name; each package's dependencies are `depends_on` occurrences between dependency nodes, with
+  the resolved version where the lock states it. These are evidence detail, because a dependency node is shared by
+  every manifest and lock that names it. `composer.lock` is PHP's and is left out with PHP.
 
 ### 6. The linker publishes file-to-file `imports` for what it resolved
 
@@ -127,7 +140,9 @@ call-site matching a query-time library keeps [S12].
   argument.
 - **Program entry points** are `endpoint` nodes with `routes_to` to the entry function: a Python `__main__` guard; Go
   `package main` with `func main`; every Java `main` form the language specification defines, instance and
-  parameterless forms and inherited candidates included [S13]; and a script with a shebang.
+  parameterless forms and inherited candidates included [S13]; a script with a shebang; and an application object a
+  module binds (a Flask, FastAPI, Starlette or Express application, Django's WSGI or ASGI application), found by its
+  constructor call and never by the file's name, since neither PEP 3333 nor ASGI names a file.
 - **Framework routes** come from a per-framework table over those facts and the call sites, for Flask, FastAPI,
   Django, Express, Spring and Go `net/http` with its common routers. Each publishes an `endpoint` node with
   `routes_to` to the handler and the metadata `framework`, `method`, `route` as written, and `prefix`: `resolved` or
@@ -136,10 +151,36 @@ call-site matching a query-time library keeps [S12].
   as empty and never guessed.
 - An endpoint's identity is its file, kind and descriptor (the method and the route as written, or `__main__` /
   `main`), never its range.
+- **Prefixes across files** are joined by the linker, never by the per-file provider. Each Python file's link table
+  carries its router objects, the routes registered on each (the route's literal value below the object), and its
+  mounts of objects it does not build (`include_router`, `register_blueprint`, Django `include()`). The linker resolves
+  a mount's argument through the import to the binding it names, joins the prefixes (a Flask registration's
+  `url_prefix=` replaces the blueprint's own), and walks down from each mount anchored at an application root,
+  publishing one `endpoint` per route reached on the mount's file, at its full path. A Django urlconf is a root only
+  when the settings module some file names in `DJANGO_SETTINGS_MODULE` names it in `ROOT_URLCONF` [S15]. A route
+  several mounts reach is published once per path, each with the set size; a hop whose prefix is not a literal
+  leaves the route `unresolved` with no path; the walk ends where a binding repeats on its way and is bounded by the
+  mounts the unit holds. The linker is where this happens because only it sees every file of the unit and already
+  resolves imports to bindings; the per-file provider would need every other file's routers to do it.
+- **Declared entry points** are the ones a project's manifest declares: `[project.scripts]`, `[project.gui-scripts]`
+  and `[project.entry-points.*]` of `pyproject.toml` [S16], `bin` and `main` of `package.json` [S17], `[[bin]]` and the
+  `src/bin` defaults of `Cargo.toml` [S18]. The linker reads the manifest at the unit's root and publishes an
+  `endpoint` at the declaration each names (the function of an object reference, the module of a JavaScript file,
+  a Rust binary's `fn main`), because resolving a dotted module or a file path to a declaration needs the whole
+  unit's module index.
+- **Request inputs** are facts on the reading expression: a `variable` node with the framework, the part of the
+  request read and its literal key, which the enclosing function `reads`, and a read assigned to a variable flows to
+  it, so an alias reaches its uses through def-use. This is the shape of a remote-flow source with its source type
+  [S19] and of a tag on a graph node [S11]: a node a query starts from, not a relation of its own. Each table is
+  gated on the framework's import; a read it does not model publishes nothing.
 
 **Alternatives.** Publishing the guessed full path: prefixes live in other files and are often computed, and the
 best-known route models say so themselves ("relative paths of subrouters are not modeled") [S14]. Routes from the
-running application's OpenAPI document: needs the application to run, which the index never does.
+running application's OpenAPI document: needs the application to run, which the index never does. Joining
+cross-file prefixes in the per-file provider: every other file's routers would have to be read into each file's run.
+A request input as a relation from the function to a synthetic request node: one node per request would join every
+handler's reads into one node, and the expression's range, key and source would ride on edge evidence that a query
+cannot filter on.
 
 ### 9. All eight are one change
 
@@ -186,8 +227,7 @@ reach those answers without the verification the rest receives.
 - New facts per bound site whose value is used: one return flow, and one summary flow per argument bound to a
   returning parameter; one return node per analysed callable that a used call reaches or whose returning nodes read
   a variable.
-- Follow-ups outside this record: lock files for every ecosystem; C shared-library visibility through export
-  macros.
+- Follow-ups outside this record: lock files of the ecosystems decision 5 does not list.
 
 ## Sources
 
@@ -199,7 +239,10 @@ reach those answers without the verification the rest receives.
 - [S3] *Storage duration and linkage*, https://en.cppreference.com/w/c/language/storage_duration — external linkage
   unless `static`.
 - [S4] *Code Gen Options*, https://gcc.gnu.org/onlinedocs/gcc/Code-Gen-Options.html — `-fvisibility`; and
-  *dllexport, dllimport*, https://learn.microsoft.com/en-us/cpp/cpp/dllexport-dllimport.
+  *dllexport, dllimport*, https://learn.microsoft.com/en-us/cpp/cpp/dllexport-dllimport; *Common Attributes*,
+  https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html — "four supported visibility_type values: `default`,
+  `hidden`, `protected`, or `internal`"; and *Attribute Syntax*, https://gcc.gnu.org/onlinedocs/gcc/Attribute-Syntax.html
+  — attribute names may be written with `__` before and after.
 - [S5] *tags.scm*, https://github.com/tree-sitter/tree-sitter-javascript/blob/master/queries/tags.scm — assignment and
   pair patterns tagged as function definitions.
 - [S6] *Object-like Macros*, https://gcc.gnu.org/onlinedocs/cpp/Object-like-Macros.html; and *Kythe schema*,
@@ -219,6 +262,19 @@ reach those answers without the verification the rest receives.
   — the `main` method forms.
 - [S14] *Express.qll*, https://github.com/github/codeql/blob/main/javascript/ql/lib/semmle/javascript/frameworks/Express.qll
   — "relative paths of subrouters are not modeled".
+- [S15] *Django settings: ROOT_URLCONF; Designating the settings*, https://docs.djangoproject.com/en/stable/ref/settings/#root-urlconf
+  and https://docs.djangoproject.com/en/stable/topics/settings/#designating-the-settings — the urlconf a request
+  starts from, named by the settings module `DJANGO_SETTINGS_MODULE` names.
+- [S16] *Entry points specification*, https://packaging.python.org/en/latest/specifications/entry-points/ — an object
+  reference `module:attr`, console and GUI scripts.
+- [S17] *package.json*, https://docs.npmjs.com/cli/v10/configuring-npm/package-json — `bin` and `main`.
+- [S18] *Cargo targets*, https://doc.rust-lang.org/cargo/reference/cargo-targets.html — `[[bin]]` and `src/bin`.
+- [S19] *RemoteFlowSource*, https://codeql.github.com/codeql-standard-libraries/python/semmle/python/dataflow/new/RemoteFlowSources.qll/type.RemoteFlowSources$RemoteFlowSource.html
+  — a source node with its source type.
+- [S20] *OSV-Scanner, supported lockfiles*, https://google.github.io/osv-scanner/supported-languages-and-lockfiles/ —
+  "prefer a resolved lockfile"; the lock formats per ecosystem.
+- [S21] *pylock.toml specification* (PEP 751), https://packaging.python.org/en/latest/specifications/pylock-toml/ —
+  `[[packages]]` with `name`, `version`, `dependencies` and hashed sources.
 - [research 26](../research/26-extraction-and-linking-coverage.md) and
   [raw/coverage-gaps](../research/raw/coverage-gaps/findings.md) — the gap-by-gap survey, the options and the full
   source list.

@@ -6,11 +6,26 @@ import (
 
 // hierarchy publishes declaration d's `extends`, `implements` and
 // `overrides`, group, each to its target's node or its external node,
-// located at the declaration.
+// located at the declaration, and its visibility facts, each a
+// `references` to the macro definition, its detail the visibility and, when
+// the declaration's macros reach several definitions, its set size their
+// number.
 func (f *filePublication) hierarchy(d *Decl, group []idBinding) error {
+	definitions := int64(0)
+	for _, b := range group {
+		if b.Kind == FactVisibility {
+			definitions++
+		}
+	}
+	if definitions < 2 {
+		definitions = 0
+	}
 	for _, b := range group {
 		var kind model.RelationKind
+		set := int64(0)
 		switch b.Kind {
+		case FactVisibility:
+			kind, set = model.RelReferences, definitions
 		case FactExtends:
 			kind = model.RelExtends
 		case FactImplements:
@@ -25,7 +40,10 @@ func (f *filePublication) hierarchy(d *Decl, group []idBinding) error {
 			return err
 		}
 		f.node(occurrenceOf(f.fv, f.t, d.Endpoint))
-		f.relation(d.Node, kind, target, located(d.Range), "", b.Detail, "", 0)
+		if b.Kind != FactVisibility {
+			set = externalOverrideSet(group, b)
+		}
+		f.relation(d.Node, kind, target, located(d.Range), "", b.Detail, "", set)
 	}
 	return nil
 }

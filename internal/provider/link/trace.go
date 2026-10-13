@@ -417,7 +417,7 @@ var refPrefixes = []struct {
 	file   bool
 }{
 	{keyFile, true}, {keyImport, true}, {keyMethod, false}, {keySub, false}, {keySuper, false}, {keyGoField, false},
-	{keyExternalSuper, false}, {keyParam, false},
+	{keyExternalSuper, false}, {keyParam, false}, {keyGoExternalImpl, false}, {keyGoExternalOverride, false},
 }
 
 // traceKey is the read of key in the index scope names (scopeDecls,
@@ -453,11 +453,13 @@ func (ids *idTable) stableKey(key string) (string, error) {
 // entryRef is the stable spelling of e's Ref under key: a declaration, a
 // scope (an import's), a file (a path's), or nothing for the keys whose
 // entries name no declaration (a file's context, a Go directory, a Rust
-// module or crate, a re-export, a module exported as a namespace).
+// module or crate, a re-export, a module exported as a namespace, an
+// ECMAScript specifier's answer, a Go unit's external coverage).
 func (ids *idTable) entryRef(key string, e entry) (string, error) {
 	switch {
 	case strings.HasPrefix(key, keyFile), strings.HasPrefix(key, keyGoDir), strings.HasPrefix(key, keyRustModule),
-		strings.HasPrefix(key, keyRustCrate), strings.HasPrefix(key, keyReexport),
+		strings.HasPrefix(key, keyRustCrate), strings.HasPrefix(key, keyReexport), strings.HasPrefix(key, keyESSpec),
+		key == keyGoCoverage,
 		strings.HasPrefix(key, keyExport) && e.Aux == exportModule:
 		return "", nil
 	case strings.HasPrefix(key, keyPath):
@@ -744,7 +746,7 @@ func (ids *idTable) identify(site model.FileID, b Binding) (idBinding, bool, err
 		return idBinding{}, false, err
 	}
 	id := unnamed(site, b)
-	if b.External != "" || !b.Kind.hasTarget() {
+	if b.Kind == FactRoute && b.Target.File < 0 || b.Kind != FactRoute && (b.External != "" || !b.Kind.hasTarget()) {
 		return id, true, nil
 	}
 	var to target
