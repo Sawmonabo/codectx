@@ -240,11 +240,10 @@ func scaleEngine(t *testing.T, reader GraphReader) *Engine {
 		Spools:    spools,
 		Leases:    pagination.NewLeases(store, time.Hour),
 		Limits: Limits{
-			MaxPageItems:   model.MaxPageItems,
-			MaxReasonPaths: 1,
-			QueryTimeout:   0,
-			CursorTTL:      time.Hour,
-			FrontierBytes:  scaleFrontierBytes,
+			MaxPageItems:  model.MaxPageItems,
+			QueryTimeout:  0,
+			CursorTTL:     time.Hour,
+			FrontierBytes: scaleFrontierBytes,
 		},
 	})
 	if err != nil {

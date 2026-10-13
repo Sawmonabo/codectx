@@ -11,6 +11,43 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
+// explainImpact reads the whole reasons view and routes view of an answer, a
+// page at a time, keyed by entry ordinal: from the answer token when there is
+// one, and otherwise -- an engine with no spool retains no answer -- by asking
+// req afresh for each view.
+func explainImpact(t *testing.T, e *Engine, req model.ImpactRequest, answer string) (map[int64][]string,
+	map[int64][]model.ImpactRoute) {
+	t.Helper()
+	reasons, routes := map[int64][]string{}, map[int64][]model.ImpactRoute{}
+	for _, view := range []model.ImpactView{model.ImpactViewReasons, model.ImpactViewRoutes} {
+		r := req
+		r.View, r.Page.Cursor = view, answer
+		if answer != "" {
+			r.GenerationID = 0
+		}
+		for page := 0; ; page++ {
+			if page > 10_000 {
+				t.Fatalf("the %s view did not end in 10000 pages", view)
+			}
+			res, err := e.Impact(context.Background(), r)
+			if err != nil {
+				t.Fatalf("%s view page %d: %v", view, page, err)
+			}
+			for _, x := range res.Reasons {
+				reasons[x.Entry] = append(reasons[x.Entry], x.Reason)
+			}
+			for _, x := range res.Routes {
+				routes[x.Entry] = append(routes[x.Entry], x)
+			}
+			if res.Meta.NextCursor == "" {
+				break
+			}
+			r.Page.Cursor = res.Meta.NextCursor
+		}
+	}
+	return reasons, routes
+}
+
 // newChainFixture is a seed and hops nodes after it, each calling the next, so
 // the node at depth d is reached by exactly one route: the first d relations.
 func newChainFixture(hops int) (*graphFixture, []model.NodeID) {
@@ -42,48 +79,26 @@ func newChainFixture(hops int) (*graphFixture, []model.NodeID) {
 // TestARouteSplitAcrossRequestsIsRebuiltExactly pins the route table across
 // the two boundaries a route crosses: a deadline that splits the walk over
 // several requests, so one route's admissions are written by different legs,
-// and a ranked answer served over several pages, so a later page reads its
-// routes from the table the continuation names rather than from the walk.
-// Every entry's served route must be exactly the chain prefix that reached it.
+// and a routes view served over several pages, so a later page reads its
+// routes from the table the answer names rather than from the walk. Every
+// entry's served route must be exactly the chain prefix that reached it.
 //
 // Mutations caught: the table reopened by a later leg without counting the rows
 // an earlier leg wrote (routeTable.open setting rows to 0), so a later
 // admission takes an id that already names another row and its route is
-// rebuilt through the wrong parents; and the table not handed to the ranked
-// continuation (adoptRoutes answering ""), so the second page cannot read the
-// routes of its records.
+// rebuilt through the wrong parents; the table not handed to the answer
+// (adoptRoutes answering ""), so a routes page cannot read the routes of its
+// records; and the answer token left at the continuation's offset
+// (traversalCursor.answer not resetting RankOffset to RankStart), so the
+// routes view does not start at the answer's first record.
 func TestARouteSplitAcrossRequestsIsRebuiltExactly(t *testing.T) {
 	const hops = 12
 	f, chain := newChainFixture(hops)
-	signer, err := pagination.OpenSigner(t.TempDir())
-	if err != nil {
-		t.Fatalf("open signer: %v", err)
-	}
-	store := newFixtureLeases()
-	spools, err := pagination.NewSpools(t.TempDir(), 0, store)
-	if err != nil {
-		t.Fatalf("new spools: %v", err)
-	}
-	limits := fixtureLimits()
-	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
-	limits.MaxPageItems = 4
-	limits.QueryTimeout = time.Minute
-	limits.CursorTTL = time.Hour
-
-	clock := time.Now()
-	calls, fired := 0, false
-	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
-		jump: 2 * time.Minute, fired: &fired, every: 2}
-	e, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
-		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
-		Now: func() time.Time { return clock }})
-	if err != nil {
-		t.Fatalf("new engine: %v", err)
-	}
+	e, _ := chainEngine(t, f, 4, 2)
 	req := model.ImpactRequest{GenerationID: 1, Start: chain[:1], Direction: model.DirectionOutgoing,
 		Relations: []model.RelationKind{model.RelCalls}}
-	walkPages, rankedPages := 0, 0
-	got := map[model.NodeID][]model.RelationID{}
+	walkPages, answer := 0, ""
+	ordinals := map[int64]model.NodeID{}
 	for page := 1; ; page++ {
 		if page > 200 {
 			t.Fatal("the answer did not end in 200 pages")
@@ -94,14 +109,15 @@ func TestARouteSplitAcrossRequestsIsRebuiltExactly(t *testing.T) {
 		}
 		if len(res.Entries) == 0 {
 			walkPages++
-		} else {
-			rankedPages++
+		}
+		if answer == "" {
+			answer = res.Answer
 		}
 		for _, en := range res.Entries {
-			if len(en.Paths) != 1 {
-				t.Fatalf("page %d: %s carries %d routes, want its one", page, en.Name, len(en.Paths))
+			ordinals[en.Ordinal] = en.NodeID
+			if en.RouteCount != 1 {
+				t.Fatalf("page %d: %s names %d routes, want its one", page, en.Name, en.RouteCount)
 			}
-			got[en.NodeID] = en.Paths[0].Relations
 		}
 		if res.Meta.NextCursor == "" {
 			if res.Meta.Truncated {
@@ -113,12 +129,19 @@ func TestARouteSplitAcrossRequestsIsRebuiltExactly(t *testing.T) {
 			Relations: []model.RelationKind{model.RelCalls},
 			Page:      model.PageRequest{Cursor: res.Meta.NextCursor}}
 	}
-	if walkPages < 2 || rankedPages < 2 {
-		t.Fatalf("the walk took %d deadline-split requests and %d ranked pages; the case needs at least two of each",
-			walkPages, rankedPages)
+	if walkPages < 2 {
+		t.Fatalf("the walk took %d deadline-split requests; the case needs at least two", walkPages)
 	}
-	if len(got) != hops {
-		t.Fatalf("the answer served %d entities, want the %d nodes after the seed", len(got), hops)
+	if len(ordinals) != hops {
+		t.Fatalf("the answer served %d entities, want the %d nodes after the seed", len(ordinals), hops)
+	}
+	_, routes := explainImpact(t, e, req, answer)
+	got := map[model.NodeID][]model.RelationID{}
+	for ord, rs := range routes {
+		if len(rs) != 1 {
+			t.Fatalf("entry %d was served %d routes, want its one", ord, len(rs))
+		}
+		got[ordinals[ord]] = rs[0].Relations
 	}
 	for d := 1; d <= hops; d++ {
 		want := make([]model.RelationID, 0, d)
@@ -129,4 +152,43 @@ func TestARouteSplitAcrossRequestsIsRebuiltExactly(t *testing.T) {
 			t.Fatalf("the node at depth %d was served the route %v, want %v", d, got[chain[d]], want)
 		}
 	}
+}
+
+// chainEngine is an engine over f with spools, a signer and leases, pages of
+// limit items, and -- when every is positive -- a clock that jumps past the
+// query deadline on every every-th adjacency read, so the walk splits across
+// requests. It answers the engine and its spool root.
+func chainEngine(t *testing.T, f *graphFixture, limit, every int) (*Engine, string) {
+	t.Helper()
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	root := t.TempDir()
+	spools, err := pagination.NewSpools(root, 0, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = limit
+	limits.QueryTimeout = time.Minute
+	limits.CursorTTL = time.Hour
+	clock := time.Now()
+	var adj Adjacency = f
+	var reader GraphReader = memGraphFor(f)
+	if every > 0 {
+		calls, fired := 0, false
+		slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+			jump: 2 * time.Minute, fired: &fired, every: every}
+		adj, reader = slow, slow.reader(reader)
+	}
+	e, err := New(Options{Adjacency: adj, Reader: reader, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	return e, root
 }

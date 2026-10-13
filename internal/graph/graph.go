@@ -87,7 +87,7 @@ type Options struct {
 
 // Limits is the resolved budget list for one request.
 //
-// MaxDepth, MaxVisited, MaxEdges and MaxReasonPaths carry the config.Limit
+// MaxDepth, MaxVisited and MaxEdges carry the config.Limit
 // convention verbatim: 0 is UNLIMITED, and only a negative value is a wiring
 // defect. FrontierBytes does NOT: it is a memory ceiling and must be positive. They are stored as plain integers because that is what
 // the composition root hands over (config.Limit.Int()), and every comparison
@@ -99,10 +99,6 @@ type Options struct {
 // walk resumes on the next page. The cumulative counts are still carried by the
 // cursor and reported, so a caller sees the total the walk has spent.
 //
-// MaxReasonPaths is context.max_reason_paths_per_entry: whether an impact
-// entry carries the route that admitted it. It does not bound a path answer,
-// which lists every equal-cost route a page at a time.
-//
 // MaxPageItems, CursorTTL and FrontierBytes stay strictly positive: a page with
 // no item ceiling is a wire-security bound (class B), not a scale bound, and a
 // frontier with no byte ceiling has no heap bound at all. QueryTimeout does
@@ -110,8 +106,8 @@ type Options struct {
 // is exactly the kind of shipped bound that refuses a large repository for
 // being large.
 type Limits struct {
-	MaxDepth, MaxVisited, MaxEdges, MaxPageItems, MaxReasonPaths int
-	QueryTimeout, CursorTTL                                      time.Duration
+	MaxDepth, MaxVisited, MaxEdges, MaxPageItems int
+	QueryTimeout, CursorTTL                      time.Duration
 	// FrontierBytes caps the edges one frontier level may hold at once,
 	// estimated by edgeRowBytes. A level that reaches it SPILLS: the walk stops
 	// that level, the frontier goes to the continuation spool and the next page
@@ -120,14 +116,13 @@ type Limits struct {
 	FrontierBytes int64
 }
 
-// Depth, Visited, Edges and ReasonPaths are the unlimited-capable count bounds
+// Depth, Visited and Edges are the unlimited-capable count bounds
 // read through config.Limit, which owns the 0-means-unlimited semantics. Every
 // consumer must go through them: reading the int field directly turns an
 // unlimited bound into a zero-sized budget that stops the walk immediately.
-func (l Limits) Depth() config.Limit       { return config.Limit(l.MaxDepth) }
-func (l Limits) Visited() config.Limit     { return config.Limit(l.MaxVisited) }
-func (l Limits) Edges() config.Limit       { return config.Limit(l.MaxEdges) }
-func (l Limits) ReasonPaths() config.Limit { return config.Limit(l.MaxReasonPaths) }
+func (l Limits) Depth() config.Limit   { return config.Limit(l.MaxDepth) }
+func (l Limits) Visited() config.Limit { return config.Limit(l.MaxVisited) }
+func (l Limits) Edges() config.Limit   { return config.Limit(l.MaxEdges) }
 
 // Engine answers graph queries against one pinned generation. One Engine is
 // built per request, which is why the concurrency Gate is passed in rather than
@@ -180,7 +175,6 @@ func New(o Options) (*Engine, error) {
 		{"max_depth", int64(o.Limits.MaxDepth)},
 		{"max_visited", int64(o.Limits.MaxVisited)},
 		{"max_edges", int64(o.Limits.MaxEdges)},
-		{"max_reason_paths", int64(o.Limits.MaxReasonPaths)},
 	} {
 		if b.value < 0 {
 			return nil, (&model.Error{Code: model.CodeArgumentInvalid,

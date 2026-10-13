@@ -449,20 +449,24 @@ func TestImpactWalksOpenSitesWhenAsked(t *testing.T) {
 			{From: "run", Kind: model.RelCalls, To: "site", Occurrences: site(20)},
 		},
 	})
-	res, err := f.engine(t).Impact(context.Background(), model.ImpactRequest{
+	e := f.engine(t)
+	req := model.ImpactRequest{
 		Start: []model.NodeID{f.id(t, "base")}, Direction: model.DirectionIncoming,
-		Relations: []model.RelationKind{model.RelCalls, model.RelMayCall}})
+		Relations: []model.RelationKind{model.RelCalls, model.RelMayCall}}
+	res, err := e.Impact(context.Background(), req)
 	if err != nil {
 		t.Fatalf("impact(base): %v", err)
 	}
+	_, routes := explainImpact(t, e, req, res.Answer)
 	var found bool
 	for _, en := range res.Entries {
 		if en.NodeID != f.id(t, "run") {
 			continue
 		}
 		found = true
-		if en.Depth != 2 || len(en.Paths) != 1 || !en.Paths[0].Possible {
-			t.Errorf("run is affected at depth %d with paths %+v, want depth 2 on a possible route", en.Depth, en.Paths)
+		paths := routes[en.Ordinal]
+		if en.Depth != 2 || len(paths) != 1 || !paths[0].Possible {
+			t.Errorf("run is affected at depth %d with routes %+v, want depth 2 on a possible route", en.Depth, paths)
 		}
 	}
 	if !found {

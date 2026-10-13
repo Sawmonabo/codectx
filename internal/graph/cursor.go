@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"time"
@@ -132,6 +133,15 @@ type traversalCursor struct {
 	// its records from (routetable.go), adopted under the same lease as the
 	// spool. It travels on the ranked vocabulary only.
 	RouteID string `json:"route_id,omitempty"`
+	// View is the impact view a ranked continuation continues, and empty on
+	// the ANSWER token, which names the whole answer and starts any view.
+	// ItemSkip is how many reasons of the record at RankOffset the reasons view
+	// already served. RankStart and PairStart are where the spool's two
+	// sections begin, which is where the answer token starts every view.
+	View      string `json:"view,omitempty"`
+	ItemSkip  int64  `json:"item_skip,omitempty"`
+	RankStart int64  `json:"rank_start,omitempty"`
+	PairStart int64  `json:"pair_start,omitempty"`
 	// WalkDone marks the third shape, a mid-rank deadline: the walk is EXHAUSTED
 	// and the ranking is what the deadline cut short. The next request walks
 	// nothing -- there is no frontier to walk -- and re-runs both passes over the
@@ -223,6 +233,10 @@ func (c traversalCursor) validate() error {
 	}
 	if c.RouteID != "" && (!c.Ranked || !model.ValidHexID(c.RouteID)) {
 		return cursorInvalid("cursor names a malformed route table")
+	}
+	if !model.ImpactView(c.View).Valid() || c.ItemSkip < 0 || c.RankStart < 0 || c.PairStart < 0 ||
+		(c.View != "" && !c.Ranked) || (c.ItemSkip > 0 && c.View != string(model.ImpactViewReasons)) {
+		return cursorInvalid("cursor carries a malformed view position")
 	}
 	if c.RetainID != "" && !model.ValidHexID(c.RetainID) {
 		return cursorInvalid("cursor retained-input id is malformed")
@@ -404,6 +418,47 @@ func (c traversalCursor) spoolCursor() pagination.Cursor {
 		LeaseID:      c.LeaseID,
 		ExpiresAt:    c.ExpiresAt,
 	}
+}
+
+// answer is the answer token of the ranked answer c reads: the same spool,
+// route table and lease, with no view and every section at its start.
+func (c traversalCursor) answer() traversalCursor {
+	a := c
+	a.View, a.ItemSkip = "", 0
+	a.RankOffset, a.RankServed = c.RankStart, 0
+	a.PairOffset, a.PairServed = c.PairStart, 0
+	return a
+}
+
+// at is the continuation of one view of the answer c reads, standing at pos,
+// with the two sections' byte offsets.
+func (c traversalCursor) at(pos rankedPos, rankOff, pairOff int64) traversalCursor {
+	n := c
+	n.View, n.ItemSkip = string(pos.view), pos.skip
+	n.RankServed, n.RankOffset = pos.served, rankOff
+	n.PairServed, n.PairOffset = pos.pairServed, pairOff
+	return n
+}
+
+// position is where a page of view resumes in the answer c reads, and the two
+// sections' byte offsets it reads from. The answer token starts any view; a
+// continuation continues only its own, and presented with another view it is
+// refused rather than read as that view's position.
+func (c traversalCursor) position(view model.ImpactView) (rankedPos, int64, int64, error) {
+	if c.View == "" {
+		pos := rankedPos{view: view}
+		if view != model.ImpactViewEntries {
+			pos.pairServed = c.PairTotal
+		}
+		return pos, c.RankStart, c.PairStart, nil
+	}
+	if model.ImpactView(c.View) != view {
+		return rankedPos{}, 0, 0, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: fmt.Sprintf("the cursor continues the %s view; ask for that view, or present the answer token to read the %s view",
+				c.View, view)}
+	}
+	return rankedPos{view: view, served: c.RankServed, skip: c.ItemSkip, pairServed: c.PairServed},
+		c.RankOffset, c.PairOffset, nil
 }
 
 // retainCursor is the same projection for the RETAINED pass-1 input: the spool

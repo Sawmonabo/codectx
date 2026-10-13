@@ -184,7 +184,7 @@ func sizeOfPairRecord(v pairRecord) int64 {
 //   - DirectionIncoming is sticky: a node reachable both ways under
 //     DirectionBoth is reported as incoming, because "may need modification"
 //     is the stronger claim. Taking it from either side makes it commutative.
-//   - the reasons of both sides survive, deduplicated and ordered (mergeReasons).
+//   - the reasons of both sides survive, deduplicated and ordered (unionReasons), every one of them.
 //
 // It cannot fail; the error is the signature ExternalSort.WithFold takes.
 func foldImpact(a, b impactRecord) (impactRecord, error) {
@@ -195,7 +195,7 @@ func foldImpact(a, b impactRecord) (impactRecord, error) {
 	if a.Direction == model.DirectionIncoming || b.Direction == model.DirectionIncoming {
 		keep.Direction = model.DirectionIncoming
 	}
-	keep.Reasons = mergeReasons(a.Reasons, b.Reasons)
+	keep.Reasons = unionReasons(a.Reasons, b.Reasons)
 	return keep, nil
 }
 
@@ -219,17 +219,6 @@ func compareImpactRoute(x, y impactRecord) int {
 		return c
 	}
 	return cmp.Compare(x.Parent, y.Parent)
-}
-
-// mergeReasons is the deterministic reason merge: unionReasons, and only then
-// cut to model.MaxReasonsPerEntry -- so the surviving set is a function of the
-// reasons alone.
-func mergeReasons(a, b []string) []string {
-	out := unionReasons(a, b)
-	if len(out) > model.MaxReasonsPerEntry {
-		out = out[:model.MaxReasonsPerEntry]
-	}
-	return out
 }
 
 // unionReasons is the union of both sides, deduplicated, each clipped to

@@ -327,7 +327,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 			return err
 		}
 	}
-	componentOf := func(entries []model.ImpactEntry) error {
+	componentOf := func(entries []walkEntry) error {
 		for _, e := range entries {
 			if err := compNodes.Add(idRec{ID: string(e.NodeID)}); err != nil {
 				return err
@@ -341,7 +341,7 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 		return nil
 	}
 	if err := eachChunk(starts, func(chunk []string) error {
-		return c.closureWalk(ctx, in, eng, gen, chunk, haltable, componentOf)
+		return c.closureWalk(ctx, in, eng, gen, chunk, haltable, false, componentOf)
 	}); err != nil {
 		return err
 	}
@@ -369,18 +369,18 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 	}
 
 	weight := cl.stop.NextContribution
-	return c.closureWalk(ctx, in, eng, gen, roots, haltable, func(entries []model.ImpactEntry) error {
+	return c.closureWalk(ctx, in, eng, gen, roots, haltable, true, func(entries []walkEntry) error {
 		admitted := make([]model.ImpactEntry, 0, len(entries))
 		var outside []model.ImpactEntry
 		for _, e := range entries {
 			if e.FileID == "" || !cl.kept[e.FileID] {
-				outside = append(outside, e)
+				outside = append(outside, e.ImpactEntry)
 				continue
 			}
 			if err := in.admitEntry(e, weight, false, false); err != nil {
 				return err
 			}
-			admitted = append(admitted, e)
+			admitted = append(admitted, e.ImpactEntry)
 		}
 		if err := c.admitCandidates(ctx, eng, gen, admitted, in, nil); err != nil {
 			return err
@@ -421,6 +421,7 @@ func (c *Compiler) withNamingSites(ctx context.Context, in *seedIngest, eng *gra
 				Relations:    []model.RelationKind{model.RelMayCall},
 				Direction:    model.DirectionIncoming,
 				MaxDepth:     1,
+				Views:        []model.ImpactView{model.ImpactViewEntries},
 				Page:         model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
 			})
 			if err != nil {
@@ -607,28 +608,36 @@ func (c *Compiler) searchComponents(ctx context.Context, s *compileSorts, cl *ke
 // incomplete rather than being re-issued. The capability rows each page
 // discloses fold into the scope verdict as the main walk's do.
 func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
-	start []string, haltable bool, each func([]model.ImpactEntry) error,
+	start []string, haltable, explain bool, each func([]walkEntry) error,
 ) error {
 	cfg := in.cfg
 	depth := cfg.MaxGraphDepth.Int()
+	views := []model.ImpactView{model.ImpactViewEntries}
+	if explain {
+		views = model.ImpactViews
+	}
 	for lo := 0; lo < len(start); lo += model.MaxStartNodes {
 		hi := min(lo+model.MaxStartNodes, len(start))
 		roots := make([]model.NodeID, 0, hi-lo)
 		for _, id := range start[lo:hi] {
 			roots = append(roots, model.NodeID(id))
 		}
+		req := model.ImpactRequest{
+			Start:      roots,
+			Relations:  scopeRelations,
+			Direction:  model.DirectionBoth,
+			MaxDepth:   depth,
+			MaxVisited: cfg.MaxVisitedNodes.Int(),
+			MaxEdges:   cfg.MaxGraphEdges.Int(),
+			Views:      views,
+			Page:       model.PageRequest{Limit: c.pageLimit()},
+		}
+		var why *explanation
 		cursor := ""
 		for {
-			impact, err := eng.Impact(ctx, model.ImpactRequest{
-				GenerationID: pinnedGeneration(gen, cursor),
-				Start:        roots,
-				Relations:    scopeRelations,
-				Direction:    model.DirectionBoth,
-				MaxDepth:     depth,
-				MaxVisited:   cfg.MaxVisitedNodes.Int(),
-				MaxEdges:     cfg.MaxGraphEdges.Int(),
-				Page:         model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
-			})
+			req.GenerationID = pinnedGeneration(gen, cursor)
+			req.Page.Cursor = cursor
+			impact, err := eng.Impact(ctx, req)
 			if err != nil {
 				return contextErr(ctx, err)
 			}
@@ -644,7 +653,23 @@ func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.E
 					in.scope.ScopeComplete = false
 				}
 			}
-			if err := each(impact.Entries); err != nil {
+			entries := make([]walkEntry, len(impact.Entries))
+			for i, e := range impact.Entries {
+				entries[i].ImpactEntry = e
+			}
+			if explain && len(entries) > 0 {
+				if why == nil {
+					if impact.Answer == "" {
+						return contextErr(ctx, &model.Error{Code: model.CodeInternal,
+							Message: "context: the impact answer was not retained, so its entries cannot be explained"})
+					}
+					why = newExplanation(eng, req, impact.Answer)
+				}
+				if err := why.explain(ctx, in, entries); err != nil {
+					return contextErr(ctx, err)
+				}
+			}
+			if err := each(entries); err != nil {
 				return err
 			}
 			next := impact.Meta.NextCursor
@@ -661,6 +686,114 @@ func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.E
 		}
 	}
 	return nil
+}
+
+// walkEntry is one walk entry with everything that explains it: its reasons
+// and its routes.
+type walkEntry struct {
+	model.ImpactEntry
+	Reasons []string
+	Paths   []model.RelationPath
+}
+
+// explanation reads the reasons and routes views of one impact answer beside
+// its entries view. Each view is ordered by entry ordinal, as the entries are,
+// so the three merge as they stream: a page of entries takes the items of its
+// ordinals, and the views hold one page each however long the answer runs.
+type explanation struct {
+	reasons viewStream[model.ImpactReason]
+	routes  viewStream[model.ImpactRoute]
+}
+
+func newExplanation(eng *graph.Engine, req model.ImpactRequest, answer string) *explanation {
+	return &explanation{
+		reasons: viewStream[model.ImpactReason]{eng: eng, req: req, view: model.ImpactViewReasons, cursor: answer,
+			items: func(r model.ImpactResult) []model.ImpactReason { return r.Reasons },
+			entry: func(x model.ImpactReason) int64 { return x.Entry }},
+		routes: viewStream[model.ImpactRoute]{eng: eng, req: req, view: model.ImpactViewRoutes, cursor: answer,
+			items: func(r model.ImpactResult) []model.ImpactRoute { return r.Routes },
+			entry: func(x model.ImpactRoute) int64 { return x.Entry }},
+	}
+}
+
+// explain fills the reasons and routes of a page of entries, which arrive in
+// ordinal order, and checks each entry received exactly the counts it names.
+func (x *explanation) explain(ctx context.Context, in *seedIngest, entries []walkEntry) error {
+	at := make(map[int64]int, len(entries))
+	for i, e := range entries {
+		at[e.Ordinal] = i
+	}
+	last := entries[len(entries)-1].Ordinal
+	if err := x.reasons.upTo(ctx, in, last, func(r model.ImpactReason) {
+		if i, ok := at[r.Entry]; ok {
+			entries[i].Reasons = append(entries[i].Reasons, r.Reason)
+		}
+	}); err != nil {
+		return err
+	}
+	if err := x.routes.upTo(ctx, in, last, func(r model.ImpactRoute) {
+		if i, ok := at[r.Entry]; ok {
+			entries[i].Paths = append(entries[i].Paths, model.RelationPath{Relations: r.Relations,
+				Evidence: r.Evidence, CostUnits: r.CostUnits, Possible: r.Possible})
+		}
+	}); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if int64(len(e.Reasons)) != e.ReasonCount || int64(len(e.Paths)) != e.RouteCount {
+			return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
+				"context: impact entry %d names %d reasons and %d routes; its views served %d and %d",
+				e.Ordinal, e.ReasonCount, e.RouteCount, len(e.Reasons), len(e.Paths))}
+		}
+	}
+	return nil
+}
+
+// viewStream pages one view of an impact answer from the answer token on,
+// holding one page.
+type viewStream[T any] struct {
+	eng    *graph.Engine
+	req    model.ImpactRequest
+	view   model.ImpactView
+	cursor string
+	items  func(model.ImpactResult) []T
+	entry  func(T) int64
+	buf    []T
+	pos    int
+	done   bool
+}
+
+// upTo hands each every item of the view whose entry ordinal is at most last.
+func (s *viewStream[T]) upTo(ctx context.Context, in *seedIngest, last int64, each func(T)) error {
+	for {
+		for ; s.pos < len(s.buf); s.pos++ {
+			if s.entry(s.buf[s.pos]) > last {
+				return nil
+			}
+			each(s.buf[s.pos])
+		}
+		if s.done {
+			return nil
+		}
+		req := s.req
+		req.GenerationID, req.View, req.Page.Cursor = 0, s.view, s.cursor
+		res, err := s.eng.Impact(ctx, req)
+		if err != nil {
+			return err
+		}
+		if res.Meta.Truncated {
+			in.scope.ScopeComplete = false
+		}
+		s.buf, s.pos = s.items(res), 0
+		next := res.Meta.NextCursor
+		if next == "" || next == s.cursor {
+			if next != "" {
+				in.scope.ScopeComplete = false
+			}
+			s.done = true
+		}
+		s.cursor = next
+	}
 }
 
 // joinIDs merge-joins two ascending identity runs and answers the ids of left

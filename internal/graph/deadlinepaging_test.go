@@ -91,7 +91,8 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 
 	base := model.ImpactRequest{GenerationID: 1,
 		Start:     []model.NodeID{fixtureNodeID("bound-seed")},
-		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+		Views: entriesOnly}
 
 	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})

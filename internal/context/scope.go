@@ -935,7 +935,12 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			reached := make([]model.ImpactEntry, 0, len(walk.Entries))
 			for j := range walk.Entries {
 				e := walk.Entries[j]
-				if err := in.admitEntry(e.ImpactEntry, e.RootWeight, e.Named, e.Peer); err != nil {
+				we := walkEntry{ImpactEntry: e.ImpactEntry, Reasons: e.Reasons}
+				if e.Route != nil {
+					we.Paths = []model.RelationPath{{Relations: e.Route.Relations, Evidence: e.Route.Evidence,
+						CostUnits: e.Route.CostUnits, Possible: e.Route.Possible}}
+				}
+				if err := in.admitEntry(we, e.RootWeight, e.Named, e.Peer); err != nil {
 					return nil, false, err
 				}
 				if n := len(reached); n > 0 && reached[n-1].NodeID == e.NodeID {
@@ -983,7 +988,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 // recommended for a lexical root -- a lexical root never makes an entry
 // required -- or for a sibling the route reached up a hierarchy kind and back
 // down it (peerRelations). Its routes go to the route sorts under the same seq.
-func (in *seedIngest) admitEntry(e model.ImpactEntry, weight int64, named, peer bool) error {
+func (in *seedIngest) admitEntry(e walkEntry, weight int64, named, peer bool) error {
 	requirement := walkRequirement(e.Kind, e.Depth, named, peer)
 	cand := candidate{
 		NodeID: e.NodeID,

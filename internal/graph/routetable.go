@@ -281,20 +281,13 @@ func (r *routeReader) route(adm uint64, via model.RelationID) ([]model.RelationI
 }
 
 // adoptRoutes moves the walk's route table into a directory of its own and
-// adopts it under next's lease, so a ranked continuation can read the routes of
-// the records it serves after the walk's own state is gone. It answers the id
-// the continuation names, or "" for a walk that admitted no route.
-func (e *Engine) adoptRoutes(next traversalCursor, w *retainedWalk) (string, error) {
-	if w.routes == nil || !w.home.exists() {
-		return "", nil
-	}
-	if err := w.routes.close(); err != nil {
-		return "", err
-	}
-	from := routeTablePath(w.home.path)
-	if _, err := os.Stat(from); errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
+// adopts it under next's lease, so the answer's later pages can read the routes
+// of the records they serve after the walk's own state is gone. The directory
+// is the answer's: it also records which views have been served whole
+// (finishView), so finished names the views the minting page completed. A walk
+// whose every record left a seed directly wrote no row, and its directory holds
+// no table.
+func (e *Engine) adoptRoutes(next traversalCursor, w *retainedWalk, finished []model.ImpactView) (string, error) {
 	home, err := pendingDir(e.walkScratchDir())
 	if err != nil {
 		return "", err
@@ -303,17 +296,69 @@ func (e *Engine) adoptRoutes(next traversalCursor, w *retainedWalk) (string, err
 	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(from, routeTablePath(dir)); err != nil {
-		_ = paced.RemoveAll(dir)
-		return "", internalErr("graph: the route table: " + err.Error())
-	}
-	rc := next.spoolCursor()
-	id, err := e.spools.AdoptDir(rc, dir)
-	if err != nil {
+	fail := func(err error) (string, error) {
 		_ = paced.RemoveAll(dir)
 		return "", err
 	}
+	if w.routes != nil && w.home.exists() {
+		if err := w.routes.close(); err != nil {
+			return fail(err)
+		}
+		from := routeTablePath(w.home.path)
+		if err := os.Rename(from, routeTablePath(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fail(internalErr("graph: the route table: " + err.Error()))
+		}
+	}
+	for _, v := range finished {
+		if err := markViewDone(dir, v); err != nil {
+			return fail(err)
+		}
+	}
+	id, err := e.spools.AdoptDir(next.spoolCursor(), dir)
+	if err != nil {
+		return fail(err)
+	}
 	return id, nil
+}
+
+func viewDonePath(dir string, v model.ImpactView) string {
+	return filepath.Join(dir, "done-"+string(v))
+}
+
+func markViewDone(dir string, v model.ImpactView) error {
+	f, err := os.OpenFile(viewDonePath(dir, v), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return internalErr("graph: the answer state: " + err.Error())
+	}
+	return f.Close()
+}
+
+// finishView records that view of the answer c reads has been served whole, and
+// releases the answer -- its spool, its route table and its lease -- once every
+// view has been. An answer whose client reads only some views is reclaimed by
+// its lease's expiry instead, as an answer paged only part of the way is.
+func (e *Engine) finishView(ctx context.Context, c traversalCursor, view model.ImpactView) {
+	if c.RouteID == "" {
+		// The answer listed no entity: its only view is the entries view.
+		e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
+		return
+	}
+	rc := c.spoolCursor()
+	rc.SpoolID = c.RouteID
+	dir, err := e.spools.OpenDir(ctx, rc, e.now())
+	if err != nil {
+		return
+	}
+	if markViewDone(dir, view) != nil {
+		return
+	}
+	for _, v := range model.ImpactViews {
+		if _, err := os.Stat(viewDonePath(dir, v)); err != nil {
+			return
+		}
+	}
+	e.releaseConsumed(ctx, c.RouteID, "")
+	e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 }
 
 // openRankedRoutes opens the route table a ranked continuation names. A

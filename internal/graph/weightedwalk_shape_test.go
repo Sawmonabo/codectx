@@ -150,10 +150,10 @@ func TestAWeightedWalkServesARouteHoweverLong(t *testing.T) {
 		if en.NodeID != fixtureNodeID(name(chain)) {
 			continue
 		}
-		if len(en.Paths) != 1 || len(en.Paths[0].Relations) != chain {
-			t.Fatalf("the end of a %d-call chain is served with paths %+v, want its whole route", chain, en.Paths)
+		if en.Route == nil || len(en.Route.Relations) != chain {
+			t.Fatalf("the end of a %d-call chain is served with route %+v, want its whole route", chain, en.Route)
 		}
-		for i, id := range en.Paths[0].Relations {
+		for i, id := range en.Route.Relations {
 			if want := fixtureRelationID(i); id != want {
 				t.Fatalf("hop %d of the route is %s, want %s", i, id, want)
 			}

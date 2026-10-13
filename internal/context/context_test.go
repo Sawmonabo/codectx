@@ -1839,14 +1839,13 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 		Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(f.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{
-			MaxDepth:       f.Cfg.Context.MaxGraphDepth.Int(),
-			MaxVisited:     f.Cfg.Context.MaxVisitedNodes.Int(),
-			MaxEdges:       f.Cfg.Context.MaxGraphEdges.Int(),
-			MaxPageItems:   f.Cfg.Resources.MaxPageItems,
-			MaxReasonPaths: f.Cfg.Context.MaxReasonPathsPerEntry.Int(),
-			QueryTimeout:   f.Cfg.Resources.QueryTimeout.Std(),
-			CursorTTL:      f.Cfg.Storage.QueryCursorTTL.Std(),
-			FrontierBytes:  f.Cfg.Resources.QueryMemoryBytes,
+			MaxDepth:      f.Cfg.Context.MaxGraphDepth.Int(),
+			MaxVisited:    f.Cfg.Context.MaxVisitedNodes.Int(),
+			MaxEdges:      f.Cfg.Context.MaxGraphEdges.Int(),
+			MaxPageItems:  f.Cfg.Resources.MaxPageItems,
+			QueryTimeout:  f.Cfg.Resources.QueryTimeout.Std(),
+			CursorTTL:     f.Cfg.Storage.QueryCursorTTL.Std(),
+			FrontierBytes: f.Cfg.Resources.QueryMemoryBytes,
 			// Deliberately the real clock, not the fixture's frozen one: the engine
 			// derives a context deadline from it, and a frozen instant in the past
 			// would expire every walk before its first edge.
