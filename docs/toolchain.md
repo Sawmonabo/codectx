@@ -482,6 +482,7 @@ package of the same name that calls it:
 | `Cargo.toml` | the crate, built as a static library, its exact dependency versions and the release profile |
 | `Cargo.lock` | every crate in the tree, with its version and checksum |
 | `rust-toolchain.toml` | the one Rust toolchain version the crate builds with, and the components it needs |
+| `rustfmt.toml` | the crate's formatting: 120 columns, the width the source is written to |
 | `.cargo/config.toml` | the target directory, `_build/`, which Go's `./...` patterns skip |
 
 **The build is two steps.**
