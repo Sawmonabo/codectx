@@ -31,7 +31,7 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	// Settled with the request, before the gate and the walk: a reader that
 	// cannot answer what the request names refuses it at no cost.
 	kinds := impactAllowlist(req.Relations)
-	seamNotice, err := e.openSiteSeam(kinds)
+	seamRows, seamNotice, err := e.openSiteSeam(kinds)
 	if err != nil {
 		return model.ImpactResult{}, err
 	}
@@ -54,7 +54,7 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		return model.ImpactResult{}, err
 	}
 
-	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: answer.Completeness,
+	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: slices.Concat(answer.Completeness, seamRows),
 		Notices:    appendNotice(appendNotice(append([]string(nil), answer.Notices...), depthNotice), seamNotice),
 		NextCursor: nextCursor}
 	if answer.Truncated {

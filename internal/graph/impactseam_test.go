@@ -14,12 +14,13 @@ import (
 // declarations up by name. A request naming may_call is refused with the
 // candidates answer before any walk runs (the probe sees no edge), not after
 // the precise walk was paid for. A request that does not name it is answered,
-// with the notice that its open-site counts are absent rather than zero.
+// with an unavailable may_call completeness row and the notice that its
+// open-site counts are absent rather than zero.
 //
 // Mutations caught: openSiteSeam not refusing may_call (the refusal then comes
 // from expandOpenSites after the walk, and the probe sees its edges); the
-// notice left off (the answer's missing open_sites_by_depth reads as no open
-// sites).
+// notice or the completeness row left off (the answer's missing
+// open_sites_by_depth reads as no open sites).
 func TestAnImpactOnAReaderWithoutTheDeclarationLookupSaysWhatItCannotAnswer(t *testing.T) {
 	f := newCallFixture("impact_seam", fixtureScenario{
 		Nodes: []fixtureDecl{
@@ -53,6 +54,13 @@ func TestAnImpactOnAReaderWithoutTheDeclarationLookupSaysWhatItCannotAnswer(t *t
 	if len(res.OpenSitesByDepth) != 0 || !slices.Contains(res.Meta.Notices, openSitesUncounted) {
 		t.Fatalf("the precise impact answered open sites %v with notices %q, want none counted and the notice saying so",
 			res.OpenSitesByDepth, res.Meta.Notices)
+	}
+	row, _ := nameOnlyUnavailable(model.RelMayCall)
+	if !slices.ContainsFunc(res.Meta.Completeness, func(c model.CapabilityState) bool {
+		return c.ProviderID == row.ProviderID && c.Capability == row.Capability && c.Scope == row.Scope &&
+			c.State == model.CapabilityUnavailable
+	}) {
+		t.Fatalf("the precise impact's completeness %+v carries no unavailable may_call row", res.Meta.Completeness)
 	}
 
 	e.probe = &heapProbe{}
