@@ -1802,9 +1802,21 @@ func scopeMemoryGraph(a *scopeAdjacency) *graph.MemoryGraph {
 func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.CapabilityState) *graph.Engine {
 	f.t.Helper()
 	adj := &scopeAdjacency{binding: f.Binding, nodes: map[model.NodeID]model.Node{}, relations: rels, caps: caps}
+	// The node of a (path, symbol) is NodeOf's: the FIRST spec that names it.
+	// Resolved through one map built here rather than NodeOf's scan per spec,
+	// which made building this engine quadratic in the fixture and charged
+	// that to every timed compile over a generated fixture.
+	type pathSymbol struct{ path, symbol string }
+	first := make(map[pathSymbol]fixtureFileSpec, len(f.Specs))
+	for _, spec := range f.Specs {
+		if _, ok := first[pathSymbol{spec.path, spec.symbol}]; !ok {
+			first[pathSymbol{spec.path, spec.symbol}] = spec
+		}
+	}
 	for _, spec := range f.Specs {
 		fv := f.File(spec.path)
-		id := f.NodeOf(spec.path, spec.symbol)
+		named := first[pathSymbol{spec.path, spec.symbol}]
+		id := model.NewNodeID(f.Repo, named.kind, model.CanonicalNodeKey(spec.path, named.symbol))
 		adj.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
 			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash}
 		adj.files = append(adj.files, fv)

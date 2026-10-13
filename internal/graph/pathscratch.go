@@ -62,6 +62,16 @@ type pathScratch struct {
 	dir string
 	db  *sql.DB
 	tx  *sql.Tx
+	// stmts holds every statement the search has run, prepared once on tx and
+	// reused for the transaction's life, keyed by its text. The searches run
+	// a fixed set of statement texts per edge and per label, and preparing one
+	// is a full parse and plan, so preparing per call made the statement
+	// compiler the largest single cost of a walk. The statements belong to tx
+	// and close with it (database/sql closes a transaction's statements at
+	// commit and rollback); endTx forgets them.
+	stmts map[string]*sql.Stmt
+	// prepared counts the statements prepared over the scratch's life.
+	prepared int
 	// retained marks state reopened from a previous page's retention. The
 	// engine reads it to decide whether the search is being seeded or resumed.
 	retained bool
@@ -298,7 +308,23 @@ func (s *pathScratch) begin(ctx context.Context) error {
 		return internalErr("path scratch transaction: " + err.Error())
 	}
 	s.tx = tx
+	s.stmts = map[string]*sql.Stmt{}
 	return nil
+}
+
+// stmt is query's statement on the search's transaction, prepared the first
+// time the text is run.
+func (s *pathScratch) stmt(ctx context.Context, query string) (*sql.Stmt, error) {
+	if st, ok := s.stmts[query]; ok {
+		return st, nil
+	}
+	st, err := s.tx.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	s.stmts[query] = st
+	s.prepared++
+	return st, nil
 }
 
 // detach COMMITS the page's writes and hands the caller a directory holding
@@ -318,7 +344,7 @@ func (s *pathScratch) begin(ctx context.Context) error {
 func (s *pathScratch) detach() (string, error) {
 	if s.tx != nil {
 		err := s.tx.Commit()
-		s.tx = nil
+		s.tx, s.stmts = nil, nil
 		if err != nil {
 			return "", internalErr("path scratch commit: " + err.Error())
 		}
@@ -377,7 +403,7 @@ func (s *pathScratch) retain() error {
 	var rollback error
 	if s.tx != nil {
 		rollback = s.tx.Rollback()
-		s.tx = nil
+		s.tx, s.stmts = nil, nil
 	}
 	if s.db != nil {
 		if err := s.db.Close(); err != nil && rollback == nil {
@@ -412,7 +438,7 @@ func (s *pathScratch) close() error {
 	}
 	if s.tx != nil {
 		s.tx.Rollback()
-		s.tx = nil
+		s.tx, s.stmts = nil, nil
 	}
 	if s.db != nil {
 		s.db.Close()
@@ -443,7 +469,11 @@ func (s *pathScratch) close() error {
 }
 
 func (s *pathScratch) exec(ctx context.Context, query string, args ...any) error {
-	if _, err := s.tx.ExecContext(ctx, query, args...); err != nil {
+	st, err := s.stmt(ctx, query)
+	if err != nil {
+		return internalErr("path scratch write: " + err.Error())
+	}
+	if _, err := st.ExecContext(ctx, args...); err != nil {
 		return internalErr("path scratch write: " + err.Error())
 	}
 	return nil
@@ -451,7 +481,11 @@ func (s *pathScratch) exec(ctx context.Context, query string, args ...any) error
 
 // row runs a single-row query; found is false when there is no row.
 func (s *pathScratch) row(ctx context.Context, query string, args []any, dest ...any) (bool, error) {
-	err := s.tx.QueryRowContext(ctx, query, args...).Scan(dest...)
+	st, err := s.stmt(ctx, query)
+	if err != nil {
+		return false, internalErr("path scratch read: " + err.Error())
+	}
+	err = st.QueryRowContext(ctx, args...).Scan(dest...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -469,7 +503,11 @@ func (s *pathScratch) row(ctx context.Context, query string, args []any, dest ..
 // a scratch read is never the thing that ends a path search.
 func (s *pathScratch) each(ctx context.Context, query string, args []any,
 	fn func(scan func(dest ...any) error) error) error {
-	rows, err := s.tx.QueryContext(ctx, query, args...)
+	st, err := s.stmt(ctx, query)
+	if err != nil {
+		return internalErr("path scratch read: " + err.Error())
+	}
+	rows, err := st.QueryContext(ctx, args...)
 	if err != nil {
 		return internalErr("path scratch read: " + err.Error())
 	}

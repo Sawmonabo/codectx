@@ -92,7 +92,7 @@ func emitPython(ctx context.Context, u *unit, e *flowEmit) error {
 			if err := emitPythonRoutes(file, tab, e.mods, emit); err != nil {
 				return err
 			}
-			if err := emitPythonInputs(file, tab, e.mods, emit); err != nil {
+			if err := emitPythonInputs(file, tab, e.h, e.mods, emit); err != nil {
 				return err
 			}
 		}
