@@ -393,7 +393,7 @@ type NodeMetadataRequest struct {
 	// Field is the metadata field, the marker's key without its "_rows"
 	// suffix (`decorators`, `fragments`, `unresolved_lines`, `scripts`, ...).
 	Field string      `json:"field"`
-	Page  PageRequest `json:"page"`
+	Page  PageRequest `json:"page,omitempty"`
 }
 
 // Validate enforces the request shape.

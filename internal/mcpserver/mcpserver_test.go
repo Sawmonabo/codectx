@@ -379,7 +379,7 @@ var toolSchemas = map[string][]string{
 	"codectx_find_symbol":         {"query", "operation", "semantic_source", "page"},
 	"codectx_symbol_info":         {"query", "semantic_source", "page"},
 	"codectx_references":          {"node_id", "operation", "semantic_source", "page"},
-	"codectx_node_metadata":       {"node_id", "field", "page"},
+	"codectx_node_metadata":       {"node_id", "field"},
 	"codectx_callers":             {"start", "max_depth", "max_visited", "max_edges", "page"},
 	"codectx_callees":             {"start", "max_depth", "max_visited", "max_edges", "page"},
 	"codectx_dependency_path":     {"from", "to", "max_depth", "max_visited", "page"},
