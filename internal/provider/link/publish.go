@@ -394,6 +394,7 @@ func (p *publisher) publishSites(bindings *pagination.SortedRun[idBinding]) (*pa
 			if err := f.hierarchy(&t.Decls[i], group); err != nil {
 				return err
 			}
+			f.generates(&t.Decls[i], group)
 		}
 		if err := past(2, len(t.Decls)); err != nil {
 			return err

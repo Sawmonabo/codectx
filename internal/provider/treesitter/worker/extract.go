@@ -114,6 +114,9 @@ type extraction struct {
 	branchAt map[span]*branchLink
 	// all is a Python module's `__all__` (pyAll).
 	all pyAll
+	// macros are the file's re-parsed Rust macro bodies (macro_rust.go),
+	// nil for every other language.
+	macros *macroBodies
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -149,6 +152,7 @@ func (e *extraction) run(q *ts.Query, root *ts.Node, emit *emitter) error {
 	if cursor.DidExceedMatchLimit() {
 		e.truncated = true
 	}
+	e.expandMacros(q, cursor, names, caps)
 	e.settleAll()
 	e.branches(root)
 	return e.emit(emit)
@@ -168,6 +172,7 @@ func (e *extraction) dispatch(caps map[string][]ts.Node) {
 			return
 		case name == "ref.macro":
 			e.addRef("macro", nodes[0], caps["ref.macro.name"], nil)
+			e.macroCandidate(nodes[0])
 			return
 		case name == "ref.type":
 			for _, n := range nodes {
@@ -769,6 +774,9 @@ func (e *extraction) emit(out *emitter) error {
 		} else {
 			w.Branch = branchText(path, nil)
 		}
+		w.MacroInput = macroInput(path)
+		w.MacroLocal, w.MacroExact = e.macroScope(w.MacroInput, start)
+		w.MacroTranscribes = d.macro && e.macroTranscribes(d.node)
 		if d.body != nil && d.body.StartByte() > start {
 			w.SigEnd = uint32(d.body.StartByte())
 		}

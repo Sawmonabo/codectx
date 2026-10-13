@@ -63,7 +63,7 @@ const stateTag = "link.resolution.nodes\n"
 // site), is last.
 var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
 	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
-	DetailSummary, DetailReturn, DetailSupertypeCandidate, ""}
+	DetailSummary, DetailReturn, DetailSupertypeCandidate, DetailMacroInput, DetailMacroTranscribes, ""}
 
 // detailCode is the stored byte of a fact's technique.
 func detailCode(d string) (byte, bool) {
@@ -100,7 +100,7 @@ func (k Fact) entry() int {
 	switch k {
 	case FactImport, FactOpenImport:
 		return 1
-	case FactExtends, FactImplements, FactOverrides:
+	case FactExtends, FactImplements, FactOverrides, FactGenerates:
 		return 2
 	case FactRoute:
 		return 3

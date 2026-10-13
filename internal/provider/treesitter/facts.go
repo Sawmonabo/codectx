@@ -469,6 +469,7 @@ func (b *builder) resolveDecls() error {
 		if d.Impl != "" {
 			meta["receiver"] = d.Impl
 		}
+		macroOrigin(meta, d.MacroInput, d.MacroExact)
 		if len(d.truncated) > 0 {
 			// Index-time field truncation, reported on the fact itself so an
 			// answer built from it says which stored values were cut and how

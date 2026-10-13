@@ -117,16 +117,19 @@ const (
 	// `exports` entry into a build output the snapshot ignores. It is
 	// counted as an open import, never as an external one.
 	FactOpenImport Fact = 10
+	// FactGenerates: the Rust macro_rules Target of another member may
+	// generate the declaration Site, written in its input (macro_rust.go).
+	FactGenerates Fact = 11
 	// FactRoute: the root mount Site (an index into Table.Routing.Mounts)
 	// reaches a route whose endpoint External spells (routeFact), routed to
 	// the handler declaration Target, or to none when Target.File is -1
 	// (emitPythonRoutes).
-	FactRoute Fact = 11
+	FactRoute Fact = 12
 	// FactEntry: the member Site.File holds the target of an entry point
 	// its unit's manifest declares, External its payload (entryPayload),
 	// Target the declaration or the file's module it routes to
 	// (withEntries).
-	FactEntry Fact = 12
+	FactEntry Fact = 13
 )
 
 // factLast is the last kind of fact.

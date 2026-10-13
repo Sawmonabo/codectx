@@ -287,7 +287,6 @@ func set(kinds ...string) map[string]bool {
 
 var (
 	goTestName   = regexp.MustCompile(`^(Test|Benchmark|Example|Fuzz)`)
-	rustTestAttr = regexp.MustCompile(`\btest\b`)
 	javaTestAnno = regexp.MustCompile(`@(org\.junit\.(jupiter\.api\.)?)?Test\b`)
 )
 
@@ -400,7 +399,7 @@ var grammars = map[string]*grammar{
 				return false
 			}
 			for p := d.node.PrevNamedSibling(); p != nil && p.KindId() == d.ex.k.attributeItem; p = p.PrevNamedSibling() {
-				if rustTestAttr.MatchString(p.Utf8Text(src)) {
+				if rustTestAttribute(p, d.ex.g.tsLanguage(), src) {
 					return true
 				}
 			}
