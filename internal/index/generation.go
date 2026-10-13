@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -914,8 +915,8 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 	if err != nil {
 		return err
 	}
-	if u.Heavy {
-		release, admitErr := g.c.sched.Admit(ctx, u.Admission)
+	if u.Admit != nil {
+		held, admitErr := g.c.sched.Admit(ctx, u.Admit)
 		if admitErr != nil {
 			// The admission gate refused or was cancelled, so the unit never
 			// reached its work: unavailable with that reason, not a failure of
@@ -923,7 +924,8 @@ func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (
 			span.End(ledger.OutcomeUnavailable, notAdmitted(provider.CodeOf(admitErr)), nil)
 			return admitErr
 		}
-		defer release()
+		defer held.Release()
+		ctx = admission.WithHolding(ctx, held)
 	}
 	// A unit whose key is already sealed is the same bytes under the same
 	// configuration by construction, so it is attached rather than rebuilt.

@@ -629,9 +629,6 @@ func TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited(t *testing.T) {
 			}
 			profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
 			const giB int64 = 1 << 30
-			if profile.MemoryBudgetBytes != 4*giB {
-				t.Fatalf("the server reserves %d bytes, want %d; this test's arithmetic no longer holds", profile.MemoryBudgetBytes, 4*giB)
-			}
 			led := testAdmission(t, 8*giB)
 			// The idle timer is kept out of the way: every case stops the server itself.
 			mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, Admission: led, IdleTTL: time.Hour,
@@ -646,6 +643,12 @@ func TestAStoppedServersRoomIsGrantedOnlyOnceItsProcessHasExited(t *testing.T) {
 			}
 			srv := ov.s
 			ov.Close()
+			// The first server of its class is reserved at the whole
+			// allocation (admission.Ledger.HoldChild), so a 6 GiB unit does
+			// not fit beside it.
+			if _, reserved := led.Snapshot(); reserved < 8*giB {
+				t.Fatalf("the first server of its class reserves %d bytes, want the 8 GiB allocation; this test's arithmetic no longer holds", reserved)
+			}
 			if materializations(t, h.Policy.DataDir) != 1 {
 				t.Fatal("the running server has no materialization; the check below would prove nothing")
 			}

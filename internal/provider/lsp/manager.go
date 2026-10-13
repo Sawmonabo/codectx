@@ -140,6 +140,8 @@ type Manager struct {
 	// stops, and stopping would then write one row per process that never
 	// started a server -- the row this run exists to avoid leaving behind.
 	overlay *ledger.Run
+	// needs are the servers' learned need models (reserve).
+	needs admission.ChildNeeds
 }
 
 // materialization is one snapshot's shared tree: ready is closed once the fill
@@ -253,15 +255,14 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 	// stopping between being found and being acquired. A wait on a start that
 	// was abandoned before it had room is not an attempt: nothing was found.
 	for attempt := 0; ; {
-		e, room, err := m.slot(ctx, key, admission.Reservation{
-			MemoryBytes: profile.MemoryBudgetBytes,
-			DiskBytes:   profile.DiskBudgetBytes,
+		e, held, err := m.slot(ctx, key, func(ctx context.Context) (*admission.Holding, error) {
+			return m.reserve(ctx, view, profile)
 		})
 		if err != nil {
 			return nil, err
 		}
-		if room != nil {
-			srv, err := startServer(ctx, m, view, profile, room)
+		if held != nil {
+			srv, err := startServer(ctx, m, view, profile, held)
 			m.mu.Lock()
 			e.srv, e.err = srv, err
 			// A server that failed between starting and being recorded has
@@ -313,9 +314,10 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 // against the process's admission ledger. The reservation carries both
 // dimensions: a server holds memory while it runs and disk while it indexes,
 // and the two are granted in one act so no server holds half of what another
-// needs. A non-nil room means the caller is the starter: it must start the
-// server, hand room to it and complete the entry. Otherwise the caller waits
-// on the entry it was given.
+// needs. reserve plans and holds that room (Manager.reserve). A non-nil
+// holding means the
+// caller is the starter: it must start the server, hand the holding to it and
+// complete the entry. Otherwise the caller waits on the entry it was given.
 //
 // The entry is published BEFORE the room is asked for, so one server is one
 // reservation however many opens ask for it at once: a second open that
@@ -325,7 +327,7 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 // long, and the ledger calls stopIdle back, which takes that mutex. A wait
 // that ends without room removes the entry and wakes its waiters, so none of
 // them is left waiting on it.
-func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reservation) (*entry, func(), error) {
+func (m *Manager) slot(ctx context.Context, key serverKey, reserve func(context.Context) (*admission.Holding, error)) (*entry, *admission.Holding, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -345,7 +347,7 @@ func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reserva
 	// may still do, when it reaches the head and does not fit, is stop a server
 	// nobody is using: another project's server already running is never an
 	// answer of CTX_RESOURCE_LIMIT.
-	room, err := m.opts.Admission.ReserveWith(reserving, res, m.stopIdle)
+	held, err := reserve(reserving)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -355,7 +357,7 @@ func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reserva
 		// Close removed the entry and ended the wait, or the room was granted
 		// just as it closed; either way no server starts.
 		if err == nil {
-			room()
+			held.Release()
 		}
 		err = unavailable("the lsp manager is closed")
 	} else if err != nil {
@@ -369,7 +371,27 @@ func (m *Manager) slot(ctx context.Context, key serverKey, res admission.Reserva
 		close(e.ready)
 		return nil, nil, err
 	}
-	return e, room, nil
+	return e, held, nil
+}
+
+// reserve plans and holds one server's room. Its memory is planned from its
+// need (admission.Ledger.HoldChild): the bytes of the snapshot under the
+// project directory it is rooted at, times what this repository's servers of
+// the same payload and work-size class were measured to use per byte, within
+// the allocation; the first server of a class is reserved at the allocation.
+// When it reaches the head of the queue and does not fit, an idle server is
+// stopped to make room (stopIdle). The plan reads what this
+// repository's servers taught through the process's overlay run, which a
+// server start belongs to (overlayContext); the work is read from the
+// snapshot only here, by the one open that starts the server.
+func (m *Manager) reserve(ctx context.Context, view model.SnapshotView, profile Profile) (*admission.Holding, error) {
+	work, projects, err := admission.ProjectWork(ctx, view, profile.Root, profile.RootMarkers)
+	if err != nil {
+		return nil, err
+	}
+	key := admission.ChildKey{Tool: "server " + profile.Name, Fingerprint: profile.Tool.Fingerprint()}
+	return m.opts.Admission.HoldChild(m.overlayContext(ctx, string(view.Header().RepositoryID)), &m.needs, key,
+		work, projects, profile.DiskBudgetBytes, m.stopIdle)
 }
 
 // stopIdle stops one server nobody is using, which gives its room back to the

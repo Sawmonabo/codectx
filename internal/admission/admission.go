@@ -397,6 +397,9 @@ func (l *Ledger) release(w *waiter) {
 type Holding struct {
 	l *Ledger
 	w *waiter
+	// child is the plan an external tool's holding was admitted on
+	// (HoldChild), and nil for every other holding.
+	child *childHold
 }
 
 // Hold blocks until r may be held and returns the admitted holding. It is the
@@ -492,8 +495,14 @@ func (h *Holding) Adjust(memoryBytes int64) {
 	}
 }
 
-// Release returns the holding, once, however often it is called.
-func (h *Holding) Release() { h.l.release(h.w) }
+// Release returns the holding, once, however often it is called. An external
+// tool's holding also ends the plan it was admitted on (HoldChild).
+func (h *Holding) Release() {
+	h.l.release(h.w)
+	if h.child != nil {
+		h.child.end(0, false)
+	}
+}
 
 // SetAllocation replaces the memory allocation with a re-derived figure and
 // pumps the queue: a raised figure admits the waiters that now fit, and a
