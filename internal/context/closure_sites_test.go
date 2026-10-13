@@ -27,7 +27,12 @@ func TestTheClosureStartsAtTheSitesThatNameAnUnreachedNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal open-site metadata: %v", err)
 	}
-	eng := openSiteEngine(fx, map[model.NodeID]json.RawMessage{fx.Node(siteNode): site})
+	eng, release := openSiteEngine(fx, map[model.NodeID]json.RawMessage{fx.Node(siteNode): site})
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Errorf("release the site engine: %v", err)
+		}
+	})
 	c := intCompiler(t, fx, fx.Now)
 	in, err := c.newSeedIngest(openSorts(t, fx.Cfg))
 	if err != nil {
@@ -66,7 +71,12 @@ func TestASiteOutsideTheKeptFilesLendsOnlyItsKeptCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal open-site metadata: %v", err)
 	}
-	eng := openSiteEngine(fx, map[model.NodeID]json.RawMessage{fx.Node(siteNode): site})
+	eng, release := openSiteEngine(fx, map[model.NodeID]json.RawMessage{fx.Node(siteNode): site})
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Errorf("release the site engine: %v", err)
+		}
+	})
 	c := intCompiler(t, fx, fx.Now)
 	in, err := c.newSeedIngest(openSorts(t, fx.Cfg))
 	if err != nil {
