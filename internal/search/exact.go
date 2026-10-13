@@ -8,7 +8,6 @@ import (
 	"container/list"
 	"context"
 	"errors"
-	"path"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -76,16 +75,7 @@ func normalizeQueryPath(query string) (string, bool) {
 	}
 	q = strings.ReplaceAll(q, `\`, "/")
 	q = strings.TrimPrefix(q, "./")
-	if strings.HasPrefix(q, "/") || strings.Contains(q, "//") {
-		return "", false
-	}
-	for _, seg := range strings.Split(q, "/") {
-		if seg == "." || seg == ".." || seg == "" {
-			return "", false
-		}
-	}
-	cleaned := path.Clean(q)
-	if cleaned != q || len(q) > model.MaxPathBytes {
+	if !model.IsRepoPath(q) {
 		return "", false
 	}
 	return q, true
