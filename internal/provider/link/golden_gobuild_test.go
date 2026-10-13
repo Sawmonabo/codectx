@@ -86,6 +86,47 @@ type Mix interface{ R() ([8]byte, uint32) } // @mix
 		fails: "a signature spelled with declarations of two different builds",
 	},
 	{
+		name:   "external-type-structure-per-build",
+		anchor: "go/build, \"Build Constraints\" (_GOARCH file names); The Go Programming Language Specification, \"Struct types\" (promoted methods), \"Method sets\"",
+		files: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.27\n\nrequire example.com/arch v1.0.0\n",
+			"t.go": `package p
+
+import "example.com/arch"
+
+type ER struct{ arch.Regs } // @ter
+
+type EP struct{ arch.Ptrace } // @tep
+
+type PC64 interface{ PC() uint64 } // @ipc
+
+type W interface{ Wide() } // @iw
+
+type N interface{ Narrow() } // @in
+
+type WN interface {
+	Wide()
+	Narrow()
+}
+`,
+		},
+		// Checked with go vet per GOARCH: arch.Regs embeds Lo (Narrow) on 386 and Hi (Wide) on amd64 and has
+		// PC on amd64; arch.Ptrace is declared alike on 386, amd64 and arm64 and has PC on amd64 and arm64.
+		// So ER implements N (386), PC64 and W (amd64), never WN; EP implements PC64 (amd64, arm64).
+		want: []string{},
+		facts: []string{
+			"ter ER implements ipc PC64",
+			"ter ER implements iw W",
+			"ter ER implements in N",
+			"tep EP implements ipc PC64",
+		},
+		// Mutation: an external type's condition its first declaration's (386) -> neither ER nor EP
+		// implements PC64. Mutation: struct declarations judged the same whatever they embed -> Hi's Wide
+		// lost, ER implements no W. Mutation: every declaration's embedded types under condition 0 -> ter ER
+		// implements WN.
+		fails: "an external type read as its first declaration, or its declarations' structures merged across builds",
+	},
+	{
 		name:   "many-free-tags-decided-exactly",
 		anchor: "go/build, \"Build Constraints\"; The Go Programming Language Specification, \"Method sets\", \"Interface types\"",
 		files:  manyTagsFiles(),

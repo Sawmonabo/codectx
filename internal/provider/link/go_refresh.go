@@ -85,7 +85,7 @@ func (x *goExternal) surface() string {
 		slices.Sort(consts)
 		for _, n := range consts {
 			for _, c := range pkg.consts[n] {
-				parts = append(parts, "\x03"+n, c.form, strconv.Itoa(c.file))
+				parts = append(parts, "\x03"+n, c.form, strconv.Itoa(c.file), goFilesString(c.also))
 			}
 		}
 		types := make([]string, 0, len(pkg.types))
@@ -95,17 +95,28 @@ func (x *goExternal) surface() string {
 		slices.Sort(types)
 		for _, n := range types {
 			for _, t := range append([]*goExtType{pkg.types[n]}, pkg.types[n].variants...) {
-				parts = append(parts, n, strconv.Itoa(t.file), t.form, flagString(t.alias, t.iface, t.ineligible, t.conflict))
+				parts = append(parts, n, strconv.Itoa(t.file), goFilesString(t.also), t.form,
+					flagString(t.alias, t.iface, t.ineligible, t.conflict))
 				for _, ms := range [][]goExtMethod{t.methods, t.embeds} {
 					parts = append(parts, strconv.Itoa(len(ms)))
 					for _, m := range ms {
-						parts = append(parts, m.name, m.form, strconv.Itoa(m.file))
+						parts = append(parts, m.name, m.form, strconv.Itoa(m.file), goFilesString(m.also))
 					}
 				}
 			}
 		}
 	}
 	return model.H(groupDomain, parts...)
+}
+
+// goFilesString is the file ordinals fs, in order.
+func goFilesString(fs []int) string {
+	var b strings.Builder
+	for _, f := range fs {
+		b.WriteString(strconv.Itoa(f))
+		b.WriteByte(',')
+	}
+	return b.String()
 }
 
 func flagString(flags ...bool) string {

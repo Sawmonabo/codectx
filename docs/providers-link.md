@@ -324,7 +324,9 @@ only where the lower ones hold. The `-tags` flag is taken to add only tags of no
 architecture, compiler, release or feature tag is fixed by the build), and a feature tag the toolchain does not define
 holds in no build. No count of tags bounds a decision. Two embedding paths at one depth stay
 ambiguous whatever their conditions (a miss, never a false edge), and a type declared with a different structure per
-build is each of its declarations, as before. A Go type implements an interface
+build is each of its declarations in the unit; outside it, it is one type in the builds of any of its declarations, each
+declaration's embedded types under that declaration's condition (`unix.PtraceRegs`, declared once per architecture,
+keeps the `PC` of every architecture that declares one). A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its

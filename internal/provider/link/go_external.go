@@ -42,10 +42,14 @@ import (
 // A package's files are parsed with go/parser and only their declarations
 // read: every non-test file, whatever its build constraints, each with the
 // build condition its constraint and name state (gobuild.File,
-// go_build.go). A name two files declare differently (per platform or build
-// tag, goExtType.variants) is each of its declarations: an interface
-// declared so is one entity per declaration, under its file's condition, as
-// the unit's conditional declarations are. Declarations written
+// go_build.go), and a declaration, method or constant several files write
+// alike is in the builds of any of them (goExtType.also, goExtMethod.also).
+// A name two files declare differently (per platform or build tag,
+// goExtType.variants) is each of its declarations: an interface declared so
+// is one entity per declaration, under its condition, as the unit's
+// conditional declarations are; a defined type declared so is one entity in
+// the builds of any of its declarations, each declaration's embedded types
+// under that declaration's condition and each method under its own file's. Declarations written
 // differently are compared by their canonical spellings: an interface whose
 // declarations spell one method set is that one, under any of their
 // conditions; a method declared per build is each of its keys, under the
@@ -128,6 +132,9 @@ type goExtType struct {
 	// before them (a declaration per platform or build tag).
 	conflict bool
 	variants []*goExtType
+	// also are the other files declaring this same declaration (one per
+	// platform or build tag that writes it alike).
+	also []int
 	// methods are an interface's methods, or a defined type's methods with
 	// each distinctly written signature of a name declared once per
 	// platform or build tag (several entries of that name).
@@ -135,11 +142,13 @@ type goExtType struct {
 	embeds  []goExtMethod
 }
 
-// goExtMethod is one method (name and form) or embedded type (form), with
-// the file its form is written in.
+// goExtMethod is one method (name and form), constant (name and form) or
+// embedded type (form), with the file its form is written in and the other
+// files that declare it alike (one per platform or build tag).
 type goExtMethod struct {
 	name, form string
 	file       int
+	also       []int
 }
 
 // fileCond is the build condition of pkg's file i, 0 outside a hierarchy
@@ -156,6 +165,26 @@ func (x *goExternal) fileCond(pkg *goExtPackage, i int) goCond {
 	id := c.parse(f.constraint)
 	x.conds[f] = id
 	return id
+}
+
+// declCond is the build condition of the type declaration t: the
+// disjunction of the conditions of every file that declares it.
+func (x *goExternal) declCond(pkg *goExtPackage, t *goExtType) goCond {
+	return x.filesCond(pkg, t.file, t.also)
+}
+
+// memberCond is the build condition of the method, constant or embedded
+// type m: the disjunction of the conditions of every file that declares it.
+func (x *goExternal) memberCond(pkg *goExtPackage, m goExtMethod) goCond {
+	return x.filesCond(pkg, m.file, m.also)
+}
+
+func (x *goExternal) filesCond(pkg *goExtPackage, file int, also []int) goCond {
+	cond := x.fileCond(pkg, file)
+	for _, f := range also {
+		cond = x.h.goConds.or(cond, x.fileCond(pkg, f))
+	}
+	return cond
 }
 
 // names is the goNames of the package's file i.
@@ -514,9 +543,7 @@ func (p *goExtPackage) addFile(af *ast.File, std bool, constraint string) {
 			}
 			t := p.typeNamed(base)
 			form := goASTSignature(d.Type, params)
-			if !slices.ContainsFunc(t.methods, func(m goExtMethod) bool { return m.name == d.Name.Name && m.form == form }) {
-				t.methods = append(t.methods, goExtMethod{name: d.Name.Name, form: form, file: fi})
-			}
+			t.methods = addExtMember(t.methods, goExtMethod{name: d.Name.Name, form: form, file: fi})
 		}
 	}
 }
@@ -549,9 +576,7 @@ func (p *goExtPackage) addConsts(d *ast.GenDecl, fi int) {
 			if p.consts == nil {
 				p.consts = map[string][]goExtMethod{}
 			}
-			if !slices.ContainsFunc(p.consts[id.Name], func(c goExtMethod) bool { return c.form == form }) {
-				p.consts[id.Name] = append(p.consts[id.Name], goExtMethod{name: id.Name, form: form, file: fi})
-			}
+			p.consts[id.Name] = addExtMember(p.consts[id.Name], goExtMethod{name: id.Name, form: form, file: fi})
 		}
 	}
 }
@@ -629,7 +654,7 @@ func (x *goExternal) constant(p, name string) []goDecl {
 	}
 	var decls []goDecl
 	for _, c := range pkg.consts[name] {
-		decls = append(decls, goDecl{form: c.form, names: pkg.names(c.file), cond: x.fileCond(pkg, c.file)})
+		decls = append(decls, goDecl{form: c.form, names: pkg.names(c.file), cond: x.memberCond(pkg, c)})
 	}
 	return decls
 }
@@ -705,18 +730,38 @@ func (p *goExtPackage) addType(ts *ast.TypeSpec, fi int) {
 		// Methods read before the declaration: keep them.
 		n.methods = append(n.methods, old.methods...)
 		*old = n
-	case !sameExtDecl(old, &n) && !slices.ContainsFunc(old.variants, func(v *goExtType) bool { return sameExtDecl(v, &n) }):
+	case sameExtDecl(old, &n):
+		old.also = append(old.also, fi)
+	default:
+		if i := slices.IndexFunc(old.variants, func(v *goExtType) bool { return sameExtDecl(v, &n) }); i >= 0 {
+			old.variants[i].also = append(old.variants[i].also, fi)
+			return
+		}
 		old.conflict = true
 		old.variants = append(old.variants, &n)
 	}
 }
 
+// addExtMember adds m to ms, or, when one of ms has its name and form, m's
+// file to that one's.
+func addExtMember(ms []goExtMethod, m goExtMethod) []goExtMethod {
+	i := slices.IndexFunc(ms, func(o goExtMethod) bool { return sameExtMethod(o, m) })
+	if i < 0 {
+		return append(ms, m)
+	}
+	if ms[i].file != m.file && !slices.Contains(ms[i].also, m.file) {
+		ms[i].also = append(ms[i].also, m.file)
+	}
+	return ms
+}
+
 // sameExtDecl reports two declarations of one type name that declare the
-// same type: alias or not, the same form, and for an interface the same
-// methods and embedded interfaces.
+// same type as far as method sets go: alias or not, the same form, the same
+// embedded types as written, and for an interface the same methods.
 func sameExtDecl(a, b *goExtType) bool {
 	return a.alias == b.alias && a.iface == b.iface && a.form == b.form &&
-		(!b.iface || slices.Equal(a.embeds, b.embeds) && slices.EqualFunc(a.methods, b.methods, sameExtMethod))
+		slices.EqualFunc(a.embeds, b.embeds, sameExtMethod) &&
+		(!b.iface || slices.EqualFunc(a.methods, b.methods, sameExtMethod))
 }
 
 func sameExtMethod(a, b goExtMethod) bool { return a.name == b.name && a.form == b.form }
@@ -833,13 +878,13 @@ func (x *goExternal) lookup(p, name string) (goTypeAnswer, bool) {
 		return goTypeAnswer{}, true
 	}
 	if t.alias {
-		a := goTypeAnswer{found: true, alias: true, form: t.form, names: pkg.names(t.file), cond: x.fileCond(pkg, t.file)}
+		a := goTypeAnswer{found: true, alias: true, form: t.form, names: pkg.names(t.file), cond: x.declCond(pkg, t)}
 		for _, v := range t.variants {
 			if !v.alias {
 				// An alias in one build and a defined type in another.
 				return goTypeAnswer{found: true, alias: true, form: goIdentityUnknown, names: pkg.names(t.file)}, true
 			}
-			a.others = append(a.others, goDecl{form: v.form, names: pkg.names(v.file), cond: x.fileCond(pkg, v.file)})
+			a.others = append(a.others, goDecl{form: v.form, names: pkg.names(v.file), cond: x.declCond(pkg, v)})
 		}
 		return a, true
 	}
@@ -902,37 +947,63 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 					if !spelled || !slices.Contains(seen, set) {
 						seen = append(seen, set)
 						distinct = append(distinct, named{q: q, key: q + "\x00" + itoaInt(i), pkg: pkg, t: d, variant: true,
-							cond: x.fileCond(pkg, d.file)})
+							cond: x.declCond(pkg, d)})
 					}
 				}
 				if len(distinct) == 1 && !slices.ContainsFunc(t.variants, func(v *goExtType) bool { return v.alias || !v.iface }) && !t.alias {
 					distinct[0].key, distinct[0].variant, distinct[0].merged = q, false, true
 					for _, v := range t.variants {
-						distinct[0].cond = x.h.goConds.or(distinct[0].cond, x.fileCond(pkg, v.file))
+						distinct[0].cond = x.h.goConds.or(distinct[0].cond, x.declCond(pkg, v))
 					}
 				}
 				all = append(all, distinct...)
 				continue
 			}
-			if t.alias || !t.iface && len(t.methods) == 0 && len(t.embeds) == 0 {
+			decls := append([]*goExtType{t}, t.variants...)
+			if t.alias || !t.iface && len(t.methods) == 0 && !slices.ContainsFunc(decls, func(d *goExtType) bool { return len(d.embeds) > 0 }) {
 				continue
 			}
-			all = append(all, named{q: q, key: q, pkg: pkg, t: t, cond: x.fileCond(pkg, t.file)})
+			// A defined type declared with a different structure per build
+			// (each declaration's embedded types its own) is one type in
+			// the builds of any of its declarations.
+			cond := goCondNone
+			for _, d := range decls {
+				cond = x.h.goConds.or(cond, x.declCond(pkg, d))
+			}
+			all = append(all, named{q: q, key: q, pkg: pkg, t: t, cond: cond})
 		}
 	}
 	slices.SortFunc(all, func(a, b named) int { return strings.Compare(a.key, b.key) })
 	// Canonical embedded types first, so each interface's eligibility can
-	// follow its embedded interfaces.
-	embeds := map[string][]string{}
+	// follow its embedded interfaces. A struct's are each declaration's,
+	// under that declaration's condition; an interface's are its one
+	// declaration's (each variant an entity of its own), under its.
+	type embedded struct {
+		canonical string
+		cond      goCond
+	}
+	embeds := map[string][]embedded{}
 	byName := map[string]named{}
 	for _, n := range all {
 		byName[n.key] = n
-		for _, e := range n.t.embeds {
-			c, err := goIdentity(ctx, x.h.goTypes(), n.pkg.names(e.file), e.form)
-			if err != nil {
-				return err
+		decls := []*goExtType{n.t}
+		for _, v := range n.t.variants {
+			if !n.t.iface && !v.iface && !v.alias {
+				decls = append(decls, v)
 			}
-			embeds[n.key] = append(embeds[n.key], c)
+		}
+		for _, d := range decls {
+			cond := n.cond
+			if !n.t.iface {
+				cond = x.declCond(n.pkg, d)
+			}
+			for _, e := range d.embeds {
+				c, err := goIdentity(ctx, x.h.goTypes(), n.pkg.names(e.file), e.form)
+				if err != nil {
+					return err
+				}
+				embeds[n.key] = append(embeds[n.key], embedded{c, cond})
+			}
 		}
 	}
 	eligible := map[string]bool{"error": true}
@@ -947,7 +1018,7 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 		}
 		eligible[key] = false
 		for _, e := range embeds[key] {
-			if !check(e, depth+1) {
+			if !check(e.canonical, depth+1) {
 				return false
 			}
 		}
@@ -991,9 +1062,11 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 		if err := methodSets.Add(e); err != nil {
 			return err
 		}
-		// A defined type declared differently in another file (an alias or
-		// an interface there) has no one method set; its embedded types stay.
-		if !n.t.conflict || n.t.iface {
+		// A defined type declared as an alias or an interface in another
+		// file has no one method set; its embedded types stay. Its methods
+		// attach by receiver name, so a type declared per build with
+		// different structures has them in the builds of any declaration.
+		if n.t.iface || !slices.ContainsFunc(n.t.variants, func(v *goExtType) bool { return v.alias || v.iface }) {
 			keys, err := x.methodKeys(ctx, n.pkg, n.t, r, n.cond)
 			if err != nil {
 				return err
@@ -1005,9 +1078,9 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 				}
 			}
 		}
-		for _, c := range embeds[n.key] {
-			if er, ok := x.refs[c]; ok {
-				if err := methodSets.Add(entry{Key: refKey(r), Tag: goEmbedRecord, Ref: er, MaxArgs: n.cond}); err != nil {
+		for _, e := range embeds[n.key] {
+			if er, ok := x.refs[e.canonical]; ok {
+				if err := methodSets.Add(entry{Key: refKey(r), Tag: goEmbedRecord, Ref: er, MaxArgs: e.cond}); err != nil {
 					return err
 				}
 			}
@@ -1034,7 +1107,7 @@ func (x *goExternal) methodKeys(ctx context.Context, pkg *goExtPackage, t *goExt
 	for _, m := range t.methods {
 		base := cond
 		if !t.iface {
-			base = c.and(cond, x.fileCond(pkg, m.file))
+			base = c.and(cond, x.memberCond(pkg, m))
 			if !c.holds(base) {
 				continue
 			}
