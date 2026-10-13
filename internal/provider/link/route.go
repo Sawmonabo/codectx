@@ -229,8 +229,10 @@ type routeFact struct {
 	Set       int64  `json:"n,omitempty"`
 }
 
-// routeFound is one route the walk reached, before its set is counted.
+// routeFound is one route the walk reached from the root mount mount,
+// before its set is counted.
 type routeFound struct {
+	mount    int32
 	file     int32
 	path     string
 	object   string
@@ -262,6 +264,9 @@ func emitPythonRoutes(file int32, t *Table, mods *index, emit func(Binding) erro
 		return nil
 	}
 	live := false
+	// found holds the routes every root mount of the file reaches, so a
+	// route two mounts reach carries the size of the whole set.
+	var found []routeFound
 	for i := range rt.Mounts {
 		m := &rt.Mounts[i]
 		if m.Object >= 0 {
@@ -281,16 +286,16 @@ func emitPythonRoutes(file int32, t *Table, mods *index, emit func(Binding) erro
 		if !ok {
 			continue
 		}
-		var found []routeFound
+		n := len(found)
 		w := routeWalk{mods: mods, found: &found}
 		if err := w.mount(t.Path, payloadMount{RouteMount: *m, Key: key, Exact: exact}, m.Base, m.BaseKnown, nil); err != nil {
 			return err
 		}
-		if err := emitRoutes(file, int32(i), found, emit); err != nil {
-			return err
+		for k := n; k < len(found); k++ {
+			found[k].mount = int32(i)
 		}
 	}
-	return nil
+	return emitRoutes(file, found, emit)
 }
 
 // settingsNamed reports that some member names the module of the file at p
@@ -438,10 +443,11 @@ func joinRoute(prefix, route string) string {
 	return joinPrefix(prefix, route)
 }
 
-// emitRoutes emits the FactRoutes of one root mount: one per route reached
-// and handler (one with no target for a route with no handler), each with
-// its set, the number of paths the walk gave the same route.
-func emitRoutes(file, mount int32, found []routeFound, emit func(Binding) error) error {
+// emitRoutes emits the FactRoutes of the file's root mounts, each on the
+// mount it was reached from: one per route reached and handler (one with no
+// target for a route with no handler), each with its set, the number of
+// paths the walks gave the same route.
+func emitRoutes(file int32, found []routeFound, emit func(Binding) error) error {
 	type routeKey struct {
 		file   int32
 		object string
@@ -466,7 +472,7 @@ func emitRoutes(file, mount int32, found []routeFound, emit func(Binding) error)
 		if err != nil {
 			return internalErr("route fact: " + err.Error())
 		}
-		b := Binding{Kind: FactRoute, Site: Ref{File: file, Index: mount}, Target: Ref{File: -1, Index: -1},
+		b := Binding{Kind: FactRoute, Site: Ref{File: file, Index: f.mount}, Target: Ref{File: -1, Index: -1},
 			Detail: DetailImport, External: string(raw)}
 		if len(f.handlers) == 0 {
 			if err := emit(b); err != nil {

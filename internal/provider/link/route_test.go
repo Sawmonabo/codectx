@@ -18,7 +18,9 @@ func (l linked) mountedEndpoints(t *testing.T) []string {
 	paths := l.paths(t)
 	var out []string
 	for _, n := range l.out.nodes {
-		if n.Kind != model.NodeEndpoint {
+		if n.Kind != model.NodeEndpoint || len(n.Metadata) == 0 {
+			// A structural endpoint the linker republishes as the owner of
+			// a site it binds (a `__main__` guard) carries no metadata.
 			continue
 		}
 		var m model.EndpointMetadata

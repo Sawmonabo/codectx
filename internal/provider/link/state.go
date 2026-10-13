@@ -357,7 +357,7 @@ func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.
 	}
 	defer s.Close()
 	err = run.Each(func(b idBinding) error {
-		if b.External == "" || b.Kind == FactRoute {
+		if b.External == "" || b.Kind == FactRoute || b.Kind == FactEntry {
 			return nil
 		}
 		return s.Add(b.External)

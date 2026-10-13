@@ -105,12 +105,28 @@ func (s *routeScan) listOwner(at wire.Span) (owner *routeObj, known bool) {
 // its endpoint is a function and every method when it is a class (an ASGI
 // application), so an endpoint this file does not declare as a function
 // names no method. A Mount attaches the object it passes as `app` under its
-// own path.
+// own path. Every Mount is attached before any route is read, since a list
+// bound to a name is written before the Mount that holds it.
 func (s *routeScan) starletteRoutes() {
+	for _, mounts := range []bool{true, false} {
+		s.starletteEntries(mounts)
+	}
+}
+
+// starletteEntries reads the file's Mount entries, or its Route and
+// WebSocketRoute entries.
+func (s *routeScan) starletteEntries(mounts bool) {
 	s.calls(func(r *wire.Ref, site *wire.Site, i int) {
 		target := s.pyTarget(site, i)
 		switch target {
-		case "starlette.routing.Route", "starlette.routing.WebSocketRoute", "starlette.routing.Mount":
+		case "starlette.routing.Route", "starlette.routing.WebSocketRoute":
+			if mounts {
+				return
+			}
+		case "starlette.routing.Mount":
+			if !mounts {
+				return
+			}
 		default:
 			return
 		}
