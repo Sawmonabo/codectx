@@ -26,7 +26,7 @@ func (u *unit) markdown(ctx context.Context) error {
 	// this unit's fact carries the same identity so the heading documents,
 	// whose node reference is checked within the unit, can name it.
 	doc, err := u.e.Node(ctx, filesystem.PathCandidate(ID, model.NodeDocument, rel),
-		filesystem.Attrs{Precision: model.PrecisionSyntax, Located: true, Metadata: filesystem.Metadata(map[string]any{"format": cls.Format})})
+		filesystem.Attrs{Precision: model.PrecisionSyntax, Located: true, Metadata: map[string]any{"format": cls.Format}})
 	if err != nil {
 		return err
 	}

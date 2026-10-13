@@ -9,9 +9,9 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// handlers carries everything the 23 tool handlers need.
+// handlers carries everything the 24 tool handlers need.
 //
-// It holds the THREE NARROW FACADE INTERFACES the 23 tools of Section 19.2
+// It holds the THREE NARROW FACADE INTERFACES the 24 tools of Section 19.2
 // actually call, and never *app.Services. *app.Services is a concrete struct
 // and therefore cannot be faked, while app.IndexService, app.ExploreService and
 // app.ContextService exist for exactly this ("The four narrow interfaces below
@@ -21,7 +21,7 @@ import (
 // to each field.
 //
 // app.DiagnoseService is deliberately absent: Section 19.2 lists no doctor tool
-// (toolCount = 23), so a diagnose field here would be a dependency no handler
+// (toolCount = 24), so a diagnose field here would be a dependency no handler
 // reads. `codectx doctor` is the consumer of that facade method.
 //
 // log writes to STDERR. stdout belongs to the SDK's framing (see doc.go).
@@ -69,7 +69,7 @@ type handlers struct {
 //
 // Every other tool's In is the landed model request type VERBATIM: they already
 // carry complete lowercase JSON tags and no internal-only field, and
-// hand-declaring 23 twins is the parallel implementation Section 5.1 forbids.
+// hand-declaring 24 twins is the parallel implementation Section 5.1 forbids.
 // The types below are the only new ones.
 
 // emptyInput is the argument type of a tool that takes none. The SDK infers

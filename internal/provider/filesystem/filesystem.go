@@ -180,7 +180,7 @@ func (p *Provider) structure(ctx context.Context, e *Emitter, cls Classification
 	candidate := PathCandidate(ID, model.NodeFile, fv.Path)
 	candidate.Language = fv.Language
 	file, err := e.Node(ctx, candidate, Attrs{Precision: model.PrecisionSyntax, Located: true,
-		Detail: Detail("size", strconv.FormatInt(fv.Size, 10)), Metadata: Metadata(meta)})
+		Detail: Detail("size", strconv.FormatInt(fv.Size, 10)), Metadata: meta})
 	if err != nil {
 		return model.Node{}, err
 	}
@@ -194,7 +194,7 @@ func (p *Provider) structure(ctx context.Context, e *Emitter, cls Classification
 	// of it; the precision says so.
 	heuristic := Attrs{Precision: model.PrecisionHeuristic}
 	defined, err := e.Node(ctx, PathCandidate(ID, cls.Node, fv.Path), Attrs{Precision: model.PrecisionHeuristic, Located: true,
-		Metadata: Metadata(map[string]any{"format": cls.Format})})
+		Metadata: map[string]any{"format": cls.Format}})
 	if err != nil {
 		return model.Node{}, err
 	}

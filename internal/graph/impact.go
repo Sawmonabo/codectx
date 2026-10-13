@@ -206,7 +206,8 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// Every affected node is also counted, per depth, by the open call
 		// sites it is a candidate of: possibly affected through a call no
 		// analysis bound, counted and not walked.
-		sites := newOpenSiteCounter(declarationReader(reader), b)
+		sites := newOpenSiteCounter(declarationReader(reader), b, e.scratchDir())
+		defer sites.close()
 		emit := func(rec impactRecord) error {
 			if err := sites.note(ctx, rec); err != nil {
 				return err

@@ -14,7 +14,7 @@ import (
 // command by the request's tool name, error by the tool-error content — so
 // reusing it would ship three dead fields, and this package may not import
 // internal/cli anyway. Declaring the wrapper once is also what keeps
-// schema_version and warnings from being repeated 23 times.
+// schema_version and warnings from being repeated 24 times.
 //
 // Warnings is tagged without omitempty on purpose: the SDK validates every
 // output against the schema it infers from this type, and a nil slice marshals

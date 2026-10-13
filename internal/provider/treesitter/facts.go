@@ -2,7 +2,6 @@ package treesitter
 
 import (
 	"context"
-	"encoding/json"
 	"path"
 	"strconv"
 	"strings"
@@ -398,35 +397,6 @@ func (b *builder) validateDecorators(d *declFact) error {
 	return nil
 }
 
-// fitDecorators sets meta's decorators to the longest prefix of decorators,
-// in source order, whose metadata still fits model.MaxMetadataBytes, and
-// returns how many that is. The serialized size grows with every decorator
-// added, so the longest fitting prefix is found by bisection.
-func fitDecorators(meta map[string]any, decorators []model.Decorator) int {
-	fits := func(n int) bool {
-		if n == 0 {
-			delete(meta, model.MetaDecorators)
-		} else {
-			meta[model.MetaDecorators] = decorators[:n]
-		}
-		raw, err := json.Marshal(meta)
-		return err == nil && len(raw) <= model.MaxMetadataBytes
-	}
-	if fits(len(decorators)) {
-		return len(decorators)
-	}
-	lo, hi := 0, len(decorators)
-	for hi-lo > 1 {
-		if mid := (lo + hi) / 2; fits(mid) {
-			lo = mid
-		} else {
-			hi = mid
-		}
-	}
-	fits(lo)
-	return lo
-}
-
 // resolveModule mints the file's module node: the container every top-level
 // declaration is defined by and the subject of imports and exports.
 func (b *builder) resolveModule() error {
@@ -497,11 +467,10 @@ func (b *builder) resolveDecls() error {
 			// long they were. Distinct from result truncation by name.
 			meta["truncated_fields"] = d.truncated
 		}
-		if _, seen := b.nodeAt[res.Node.ID]; !seen && len(d.decorators) > 0 {
-			// Only the first occurrence's metadata is published, so only its
-			// decorators are fitted to the bound; the ones past it are
-			// counted, never dropped in silence.
-			b.dropped[structure] += len(d.decorators) - fitDecorators(meta, d.decorators)
+		if len(d.decorators) > 0 {
+			// Every decorator is published: inline while the node's metadata
+			// fits its bound, as metadata rows when it does not (putNode).
+			meta[model.MetaDecorators] = d.decorators
 		}
 		first := b.putNode(structure, res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)
@@ -1098,23 +1067,45 @@ func (b *builder) evidence(fam family, node model.NodeID, rel model.RelationID, 
 // and reports true, or, when this builder already published a node with that
 // identity, adds the occurrence to it and reports false: a unit publishes one
 // node per identity, and the first occurrence's metadata stands.
+//
+// The metadata is rendered by model.SplitMetadata: inline while it fits
+// model.MaxMetadataBytes, and otherwise with its largest fields (a long
+// decorator list, in practice) stored as metadata rows on the node, one
+// evidence row per element. A row the evidence clip cuts is counted.
 func (b *builder) putNode(fam family, res model.Resolution, rng *model.SourceRange, nativeKey string, meta map[string]any) bool {
 	if _, ok := b.nodeAt[res.Node.ID]; ok {
 		b.addEvidence(fam, res.Node.ID, rng, nativeKey)
 		return false
 	}
 	node := res.Node
+	evidence := []model.Evidence{b.evidence(fam, node.ID, "", rng, nativeKey, "")}
 	if len(meta) > 0 {
-		if raw, err := json.Marshal(meta); err == nil && len(raw) <= model.MaxMetadataBytes {
-			node.Metadata = raw
-		} else {
-			// Metadata that does not fit its bound is not published, and
-			// the loss is counted so the file reports partial.
+		raw, rows, err := model.SplitMetadata(meta)
+		if err != nil {
+			// Metadata whose row-count markers alone pass the bound is not
+			// published, and the loss is counted so the file reports partial.
 			b.dropped[fam]++
+		} else {
+			node.Metadata = raw
+			for _, row := range rows {
+				details, err := row.Details()
+				if err != nil {
+					b.dropped[fam]++
+					continue
+				}
+				// A long element's pieces are kept or clipped together: a
+				// piece without its siblings is no element at all.
+				if b.evidenceFull(len(evidence) + len(details) - 1) {
+					b.clipped[fam]++
+					continue
+				}
+				for _, detail := range details {
+					evidence = append(evidence, b.evidence(fam, node.ID, "", nil, nativeKey, detail))
+				}
+			}
 		}
 	}
-	b.nodes = append(b.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey,
-		Evidence: []model.Evidence{b.evidence(fam, node.ID, "", rng, nativeKey, "")}})
+	b.nodes = append(b.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey, Evidence: evidence})
 	// The index makes a repeat occurrence of an identity a map lookup. Without
 	// it a file whose every call is unresolved rescans the published facts per
 	// occurrence, which is quadratic in the file's references.

@@ -120,6 +120,20 @@ func (h *handlers) findSymbol(ctx context.Context, _ *mcp.CallToolRequest, in mo
 	return nil, ok(h, page), nil
 }
 
+// nodeMetadata answers codectx_node_metadata: one page of the rows of a node
+// metadata field too long for the node row, in ordinal order.
+func (h *handlers) nodeMetadata(ctx context.Context, _ *mcp.CallToolRequest, in model.NodeMetadataRequest) (*mcp.CallToolResult, result[model.Page[model.MetadataRow]], error) {
+	var zero result[model.Page[model.MetadataRow]]
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	page, err := h.explore.NodeMetadata(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, page), nil
+}
+
 // references answers codectx_references. Like findSymbol it passes
 // SemanticSource and Profile through untouched.
 func (h *handlers) references(ctx context.Context, _ *mcp.CallToolRequest, in model.ReferenceRequest) (*mcp.CallToolResult, result[model.Page[model.ReferenceOccurrence]], error) {
