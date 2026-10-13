@@ -516,7 +516,7 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 					return err
 				}
 				rec := levelRecord{Owner: owner, Edge: e}
-				if take, decided := w.dependence.orient(o.Direction, w.rule, e); decided {
+				if take, decided := w.dependence.orient(o.Direction, w.rule, owner, e); decided {
 					if !take {
 						return nil
 					}

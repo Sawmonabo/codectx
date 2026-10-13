@@ -146,3 +146,93 @@ func TestImpactRanksCallImpactAboveDependence(t *testing.T) {
 		}
 	}
 }
+
+// dispatchDependenceFixture is a call scenario whose reader reports dispatch,
+// so a one-direction impact over it takes the dispatch step beside the
+// dependence rules. extra relations are appended to the scenario's own.
+func dispatchDependenceFixture(extra ...fixtureFact) *callFixture {
+	decl := func(name string, kind model.NodeKind, at uint64) fixtureDecl {
+		return fixtureDecl{Name: name, Kind: kind, File: "zoo.py", Bytes: [2]uint64{at, at + 5}}
+	}
+	call := func(from, to string, d model.Dispatch, at uint64) fixtureFact {
+		return fixtureFact{From: from, Kind: model.RelCalls, To: to,
+			Occurrences: []fixtureOccurrence{{Bytes: [2]uint64{at, at + 3}, Dispatch: d}}}
+	}
+	sc := fixtureScenario{
+		Nodes: []fixtureDecl{
+			decl("Animal.sound", model.NodeMethod, 0), decl("Dog.sound", model.NodeMethod, 10),
+			decl("speak", model.NodeFunction, 20), decl("r", model.NodeFunction, 30),
+			decl("m", model.NodeFunction, 40), decl("h", model.NodeVariable, 50),
+			decl("src", model.NodeVariable, 60),
+		},
+		Relations: append([]fixtureFact{
+			{From: "Dog.sound", Kind: model.RelOverrides, To: "Animal.sound",
+				Occurrences: []fixtureOccurrence{{Bytes: [2]uint64{10, 15}}}},
+			call("speak", "Animal.sound", model.DispatchVirtual, 21),
+			call("r", "Animal.sound", model.DispatchExact, 31),
+			call("r", "m", model.DispatchExact, 34),
+			call("m", "Animal.sound", model.DispatchVirtual, 41),
+		}, extra...),
+	}
+	return newCallFixture("dependence_dispatch", sc)
+}
+
+// TestImpactDependenceSkipsTheBaseOfACallersClimb: an incoming impact of an
+// override climbs to its base only to list the base's virtual callers; the
+// base is a route, not an affected entity, so what the base's value flows to
+// is not affected either.
+//
+// Mutation caught: orient taking a reversed kind's entry from a stepBase
+// owner (h, which Animal.sound's value flows to, is listed).
+func TestImpactDependenceSkipsTheBaseOfACallersClimb(t *testing.T) {
+	f := dispatchDependenceFixture(fixtureFact{From: "Animal.sound", Kind: model.RelDataFlowsTo, To: "h",
+		Occurrences: []fixtureOccurrence{{Bytes: [2]uint64{2, 4}}}})
+	res, err := f.engine(t).Impact(context.Background(), model.ImpactRequest{
+		Start: []model.NodeID{f.id(t, "Dog.sound")}, Direction: model.DirectionIncoming})
+	if err != nil {
+		t.Fatalf("impact(Dog.sound): %v", err)
+	}
+	got := map[string]bool{}
+	for _, en := range res.Entries {
+		got[f.name(en.NodeID)] = true
+	}
+	if !got["speak"] {
+		t.Fatalf("impact(Dog.sound) = %v: speak, a virtual caller through the base, is missing, so the climb did not run", got)
+	}
+	if got["h"] || got["Animal.sound"] {
+		t.Errorf("impact(Dog.sound) = %v: the base and what its value flows to are routes, not affected", got)
+	}
+}
+
+// TestImpactDependenceServesADescendingNodesEdgesOnce: an outgoing impact
+// admits Animal.sound first as an exact call's target and again, through m's
+// virtual call, only to descend to its overrides. The one data flow into it
+// is walked at the first admission; the second must not walk it again, so
+// adding that one relation adds exactly one admitted edge.
+//
+// Mutation caught: orient taking a reversed kind's entry from a stepDescend
+// owner (the flow is served twice and the edge count grows by two).
+func TestImpactDependenceServesADescendingNodesEdgesOnce(t *testing.T) {
+	edges := func(f *callFixture) int64 {
+		t.Helper()
+		res, err := f.engine(t).Impact(context.Background(), model.ImpactRequest{
+			Start: []model.NodeID{f.id(t, "r")}, Direction: model.DirectionOutgoing})
+		if err != nil {
+			t.Fatalf("impact(r): %v", err)
+		}
+		descended := false
+		for _, en := range res.Entries {
+			descended = descended || f.name(en.NodeID) == "Dog.sound"
+		}
+		if !descended {
+			t.Fatalf("impact(r) never descended to Dog.sound, so the re-admission this test is about did not happen")
+		}
+		return res.EdgeCount
+	}
+	without := edges(dispatchDependenceFixture())
+	with := edges(dispatchDependenceFixture(fixtureFact{From: "src", Kind: model.RelDataFlowsTo, To: "Animal.sound",
+		Occurrences: []fixtureOccurrence{{Bytes: [2]uint64{61, 63}}}}))
+	if with-without != 1 {
+		t.Errorf("one data flow into Animal.sound added %d admitted edges, want 1", with-without)
+	}
+}

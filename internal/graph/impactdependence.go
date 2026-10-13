@@ -90,12 +90,21 @@ func (d dependenceWalk) scanDirection(walk model.Direction, rule dispatchRule) m
 // the walk's own list. decided is false when the walk reads as stored (a
 // `both` walk, or no reversed kind) or when the dispatch rule decides the
 // entry.
-func (d dependenceWalk) orient(walk model.Direction, rule dispatchRule, e Edge) (take, decided bool) {
+//
+// Under the dispatch rule, an owner admitted as a climb's base method is a
+// route to its virtual callers, not an affected entity, and an owner admitted
+// again only to descend to its overrides had its own edges walked when it was
+// first admitted: neither takes a reversed kind's entry, which would walk the
+// base's dependents or serve the descending node's edges a second time.
+func (d dependenceWalk) orient(walk model.Direction, rule dispatchRule, owner frontierState, e Edge) (take, decided bool) {
 	if !d.active() || walk == model.DirectionBoth {
 		return false, false
 	}
 	outgoing := walk == model.DirectionOutgoing
 	if d.reversed[e.Kind] {
+		if rule.active() && (owner.Step == stepBase || owner.Step == stepDescend) {
+			return false, true
+		}
 		return e.Outgoing != outgoing, true
 	}
 	if rule.active() {
