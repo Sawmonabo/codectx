@@ -80,8 +80,11 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
   `visibility_unspecified`: a definition that states none (an empty replacement, keywords only);
   `visibility_unresolved`: one that names another macro among other tokens, which is not expanded. A declaration's
-  macros are read through the definitions its file sees: its own and those of a header it includes directly (the
-  include lookup), following a one-identifier replacement to the macro it names. Each definition reached is one
+  macros are read through the definitions its file sees: its own and those of every header in its include closure,
+  each `#include` of the file and of every header it reaches resolved by the include lookup (a quoted path beside the
+  including file, and either form by its path suffix), each header read once, which ends a cycle as an include guard
+  does, and only as far as a definition asked about needs (`include_c.go` `cClosure`); a one-identifier replacement is
+  followed to the macro it names. Each definition reached is one
   occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
   with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
@@ -244,8 +247,16 @@ an external one only where the language marks it (Java `@Override`, C++ `overrid
   the one candidate is the extended class outside the project when no class of the project along the chain declares
   the member.
 - Python: `typing.override` proves the first ancestor along the method resolution order that defines the method.
-  When no class of the project along the order defines it, it is one of the external bases of the classes along the
-  order, each published (`supertype`) with the set size of their number when there are several.
+  The order is the C3 linearisation with each base outside the project placed as the linearisation of itself
+  (`hierarchy.pythonFullMRO`): the bases outside the project ahead of the first class of the project that defines
+  the method are its candidates, published (`supertype`) with that class's own override as one set whose size counts
+  them all; a base outside the project after it is no candidate. `class C(Base, U)` with `U.run` publishes `C.run`
+  overrides `Base.run` and `U.run`, set size 2; `class D(U, Base)` publishes `U.run` alone. A base outside the
+  project has no declaration read, so its own bases are unknown: they follow it in the true order and a member they
+  define is reached through it, so naming it covers them; only when one base outside the project is an ancestor of
+  another one the hierarchy names can the true order place it later than this order does, which no declaration
+  read can show. Bases that admit no linearisation fall back to the bases outside the project of the classes along
+  the project's own order, published when no class of the project defines the method.
 - Rust: an impl item implements its block's trait's item of its name (`Decl.Trait`), the external trait's method
   when the trait is outside the project (`hierarchy_rust.go`).
 
@@ -259,9 +270,14 @@ cache, `go_host.go`); a module of the governing `go.work` or a local `replace` i
 snapshot; a required module, after `replace`, from the module cache at its exact version (`GOMODCACHE`, else the
 first `GOPATH` entry's `pkg/mod`). A package none of these holds (a local `replace` outside the repository, a
 module the cache does not hold) is unavailable, and the `implements` and `overrides` capability rows count both
-(`go_external_packages`, `go_external_packages_unavailable`). Each package's types, aliases and method forms are read
-with `go/parser` from every non-test file (every build variant; a type or method two variants declare differently is
-left out) and cached on disk by its source's identity (`go_external_cache.go`). A Go type implements an interface
+(`go_external_packages`, `go_external_packages_unavailable`), and the methods of the unit whose signature names a
+type by its unresolved spelling or could not be spelled (`go_method_signatures_unresolved`,
+`go_method_signatures_unknown`). Each package's types, aliases, constants and method forms are read with `go/parser`
+from every non-test file, whatever its build constraints, and cached on disk by its source's identity
+(`go_external_cache.go`). An interface two files declare differently (per platform or build tag: `Handle` with
+`Fd() uintptr` for unix and `Fd() int` for windows) is each of its declarations, one entity per declaration as the
+project's own conditional declarations are, and a type satisfying one implements it; an alias declared differently,
+or a method declared with two signatures, makes a form naming it unknown. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
@@ -744,8 +760,16 @@ The members' language family picks the resolver:
   alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
   however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
   `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
-  parameters compare by position. A form it cannot decide (a struct or interface literal with members, an alias it
-  cannot follow, a name two dot imports declare) matches nothing, never a guess. A Go interface embedded from a
+  parameters compare by position. A struct literal compares by its fields in order (name, an unexported one
+  qualified by its package, type, tag by value, embedding) and an interface literal by its sorted methods and
+  embedded interfaces ("Type identity"); an array length by its value, a constant expression folded over the
+  constants of the unit and of the packages read (`iota` and implicit repetition included, exact big-integer
+  arithmetic), else spelled with each constant named by its package. A qualifier no import binds by name is the
+  file's one unnamed import whose package clause is not read; with several such imports, and for a name only dot
+  imports not read can supply, the type is spelled unresolved with its candidates (`?p1|p2:yaml.Node`), which
+  denotes one type wherever it is written and matches only the same spelling. A form it cannot decide (an alias it
+  cannot follow, a name two dot imports declare, a length that is no integer constant expression) matches nothing,
+  never a guess. A Go interface embedded from a
   package outside the unit contributes its methods as read from that package (above, Hierarchy). `#define NAME func` makes a call of `NAME` a call of `func`,
   one per definition when `#if` arms define it differently, in the file and in the headers it includes.
 

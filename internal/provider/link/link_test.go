@@ -292,8 +292,9 @@ type linked struct {
 	out   *capture
 	// structural is what the structural units handed their outputs.
 	structural *capture
-	// calls is the unit's `calls` capability row.
+	// calls is the unit's `calls` capability row, and rows every row.
 	calls model.CapabilityState
+	rows  []model.CapabilityState
 	// lost is each row's facts_without_node count, by capability, for the
 	// rows that have one.
 	lost map[string]string
@@ -373,7 +374,7 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	}
 	lost := checkCapability(t, result, scope)
 	checkEndpoints(t, out)
-	l := linked{h: h, files: files, out: out, structural: structOut, lost: lost}
+	l := linked{h: h, files: files, out: out, structural: structOut, lost: lost, rows: result.Capabilities}
 	for _, c := range result.Capabilities {
 		if c.Capability == string(model.RelCalls) {
 			l.calls = c

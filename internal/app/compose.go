@@ -1463,8 +1463,9 @@ func (s *stack) release() error {
 //
 // A holder that is a reset is judged by the lock alone (see the probe).
 //
-// One open failure is not that, and it is the one this probe answers with an
-// error instead: a ledger whose schema fingerprint is not this binary's. The
+// One absent reading is not that, and it is the one this probe answers with an
+// error instead: a ledger whose schema fingerprint is not this binary's, which
+// the reader reads as no run recorded. The
 // holder is then a DIFFERENT BUILD of this product, its stamps are unreadable
 // here however long anyone waits, and reporting "no progress" would spend the
 // whole grace and then call a perfectly healthy holder stalled. The diagnosis
@@ -1490,7 +1491,7 @@ func ledgerProgress(dataDir string) (snapshot.HolderProbe, func()) {
 		if reader == nil {
 			r, ok, err := ledger.OpenReader(ctx, dataDir)
 			if err != nil || !ok {
-				return "", false, foreignHolder(err, holder)
+				return "", false, foreignHolder(ctx, dataDir, holder)
 			}
 			reader = r
 		}
@@ -1507,31 +1508,31 @@ func ledgerProgress(dataDir string) (snapshot.HolderProbe, func()) {
 	}
 }
 
-// foreignHolder turns the one open failure that must end a wait into the
-// answer the waiter reports, and every other one into nil -- no progress, which
-// the grace above absorbs.
+// foreignHolder is the answer a waiter gives at once when the holder's run
+// ledger was written by another build's schema, and nil otherwise -- no
+// progress, which the grace above absorbs.
 //
-// The holder is named the way the busy refusal names it, under the same detail
-// keys, so the process an operator watched themselves wait for and the process
-// this error names are the same words. A holder that recorded nothing is said
-// to have recorded nothing rather than reported as process zero.
-//
-// It is not retryable: the ledger carrying the foreign fingerprint is still
-// there after the holder exits, so the repair is the operator's, not another
-// attempt.
-func foreignHolder(err error, holder snapshot.WaitingHolder) error {
-	var typed *model.Error
-	if !errors.As(err, &typed) || typed.Code != model.CodeSchemaMismatch {
+// This build reads such a ledger as absent, so it can never see the holder
+// progress; waiting out the grace would then call a healthy holder of another
+// build stalled. The holder is named the way the busy refusal names it, under
+// the same detail keys, so the process an operator watched themselves wait for
+// and the process this error names are the same words. A holder that recorded
+// nothing is said to have recorded nothing rather than reported as process
+// zero. It is retryable, like every busy refusal: once the holder exits, the
+// next process to hold the workspace replaces the ledger with its own schema's.
+func foreignHolder(ctx context.Context, dataDir string, holder snapshot.WaitingHolder) error {
+	if foreign, err := ledger.WrittenByAnotherSchema(ctx, dataDir); err != nil || !foreign {
 		return nil
 	}
 	who := "another codectx process, which did not record which process it is,"
 	if holder.PID > 0 {
 		who = "the " + holder.Operation + " running in process " + strconv.Itoa(holder.PID)
 	}
-	out := &model.Error{Code: model.CodeSchemaMismatch,
-		Message: who + " holds the workspace indexing lock and its run ledger was written by another schema: " + typed.Message,
-		Remediation: "the two processes are different builds of this product: let the holder finish, or stop it. " +
-			"Then delete the run ledger beside the index cache, or run `codectx reset --reindex`"}
+	out := &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		Message: who + " holds the workspace indexing lock, and its run ledger was written by another build's schema, " +
+			"so this build cannot read whether it is progressing",
+		Remediation: "the two processes are different builds of this product: let the holder finish, or stop it, " +
+			"and run this again; the run ledger is replaced with this build's when it next holds the workspace"}
 	if holder.PID > 0 {
 		out.WithDetail(snapshot.DetailHolderPID, strconv.Itoa(holder.PID)).
 			WithDetail(snapshot.DetailHolderOperation, holder.Operation)

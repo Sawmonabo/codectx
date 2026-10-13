@@ -76,6 +76,11 @@ var byBasename = map[string]Classification{
 	"pdm.lock":          {Format: FormatPDMLock},
 	"gradle.lockfile":   {Format: FormatGradleLock},
 
+	// The same formats under another name: npm's publishable lock and the
+	// lock of a Gradle build script's own classpath.
+	"npm-shrinkwrap.json":         {Format: FormatPackageLock},
+	"buildscript-gradle.lockfile": {Format: FormatGradleLock},
+
 	"Dockerfile":              {Format: "dockerfile", Node: model.NodeBuildTarget},
 	"Jenkinsfile":             {Format: "jenkins", Node: model.NodeConfiguration},
 	".gitlab-ci.yml":          {Format: "gitlab-ci", Node: model.NodeConfiguration},

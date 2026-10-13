@@ -26,7 +26,7 @@ func ScopeKey(rel string) string { return scopePrefix + rel }
 // not a file scope is a coordinator error, not provider input.
 func PathFromScope(scopeKey string) (string, error) {
 	rel, ok := strings.CutPrefix(scopeKey, scopePrefix)
-	if !ok || rel == "" || rel != path.Clean(rel) || strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "../") || rel == ".." {
+	if !ok || !model.IsRepoPath(rel) {
 		return "", &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "unit scope is not a normalized file scope", Details: map[string]string{"scope_key": scopeKey}}
 	}

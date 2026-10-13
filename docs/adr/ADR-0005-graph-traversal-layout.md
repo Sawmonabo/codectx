@@ -119,10 +119,6 @@ and written through a bounded cache of 4 KiB pages; level candidates are sorted 
 tests so page touches cluster. The Bloom filter, the sorted runs and the merge-join fallback are
 deleted with the in-heap "added" set.
 
-**Atomicity of a page.** A level's bits are applied only after that level's frontier records are
-spooled, and the continuation is minted after both; adoption re-applies the last spooled level's
-refs (idempotent), so a page cut between the two writes loses no node and admits none twice.
-
 **Alternatives considered.**
 
 1. *Keep the append-only runs plus a frozen Bloom filter* (ADR-0001 §3.3). Rejected: the filter's
@@ -151,14 +147,12 @@ records keep the content-derived canonical node id as their total tie-break key 
 B10; the search identity defect of the same day was exactly a root-dependent tie-break), so a fresh
 index and a delta-built index of the same tree serve byte-identical pages.
 
-## Decision 2, amended — a level moves through collect, commit and serve, and the walk holds one page
+## Decision 2a — a level moves through collect, commit and serve, and the walk holds one page
 
-This amendment replaces the "Atomicity of a page" paragraph above and the per-level structures it
-implied (a spooled frontier level plus a cumulative emitted-relation bitset). Measuring the first
-build of Decision 2 on synthetic wide levels showed heap proportional to the level, not the page:
-the frontier level was held whole while its neighbours were ordered, and an emitted-relation bitset
-grew with the walk. The walk is now a pipeline with exactly two cursor states per level and every
-per-level structure bounded by the page or by `FrontierBytes`.
+The walk is a pipeline with exactly two cursor states per level and every per-level structure
+bounded by the page or by `FrontierBytes`. A spooled frontier level held whole while its neighbours
+are ordered, with a cumulative emitted-relation bitset, was measured on synthetic wide levels and
+holds heap proportional to the level, not the page; that shape is refused.
 
 **Collecting.** The frontier of level *n* is streamed from `admitted.<n-1>` in ascending chunks of
 65 536 surrogates; each chunk is one batched `Neighbours` scan from the reader-reported position of

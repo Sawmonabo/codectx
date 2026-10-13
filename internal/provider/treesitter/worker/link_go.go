@@ -592,6 +592,9 @@ func (x *goLink) enter(n Node) {
 		x.fieldExports(n)
 	case k.varSpec, k.constSpec:
 		x.eachName(n, func(id Node) { x.blankDecl(n, id) })
+		if n.KindId() == k.constSpec && x.packageLevel(n) {
+			x.constExports(n)
+		}
 		if n.KindId() == k.varSpec {
 			x.values(n.ChildByFieldId(k.fValue), func(int) string { return "" })
 			x.conversions(n)
