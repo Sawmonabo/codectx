@@ -223,12 +223,16 @@ CREATE TABLE node_facts (
     -- and sort_start and sort_end the byte interval with a missing one read as
     -- (0, -1): the content key the exact search tiers serve a tier in (path,
     -- start byte, end byte), so the two name indexes below hold each equality
-    -- tier in that order and a page of it is one seek.
+    -- tier in that order and a page of it is one seek. They are written
+    -- columns, not generated ones: a query that names a generated column
+    -- counts every column of the table as used, so no index covers it, and a
+    -- tier window would read each fact row besides its index entry.
     path TEXT NOT NULL DEFAULT '',
-    sort_start INTEGER GENERATED ALWAYS AS (ifnull(start_byte, 0)) VIRTUAL,
-    sort_end INTEGER GENERATED ALWAYS AS (ifnull(end_byte, -1)) VIRTUAL,
+    sort_start INTEGER NOT NULL,
+    sort_end INTEGER NOT NULL,
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
+    CHECK(sort_start = ifnull(start_byte, 0) AND sort_end = ifnull(end_byte, -1)),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte)),

@@ -5,7 +5,6 @@ package search
 // workspace-symbols and definition.
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"slices"
@@ -22,7 +21,6 @@ import (
 type exactReader interface {
 	Node(ctx context.Context, id model.NodeID) (sqlite.StoredNode, error)
 	FileByPath(ctx context.Context, path string) (model.FileID, error)
-	File(ctx context.Context, id model.FileID) (model.FileVersion, error)
 	NodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	Nodes(ctx context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
@@ -82,63 +80,6 @@ func normalizeQueryPath(query string) (string, bool) {
 		return "", false
 	}
 	return q, true
-}
-
-// pathResolver caches file paths for one request: tiers 1-3 return nodes that
-// carry a FileID but no path, and one page can hold many nodes from one file.
-//
-// The cache holds at most one entry per file of ONE READ PAGE, least recently
-// used evicted first, so the heap it costs is a function of the page and not of
-// the answer. A request whose answer spans more files than that still answers
-// every one of them: an evicted entry costs one more r.File read and nothing
-// else. That is why the bound is not a limit in the sense the scale posture
-// makes user-configurable -- it rejects no work, drops no candidate and
-// truncates no answer; it is a read-amplification knob whose only observable
-// effect is how many times a path is fetched.
-type pathResolver struct {
-	r exactReader
-	// cap is the entry bound, order the LRU chain with the most recently used
-	// at the front, and paths the index into it.
-	cap   int
-	order *list.List
-	paths map[model.FileID]*list.Element
-}
-
-// cachedPath is one chain entry. It carries its own key so eviction can drop
-// the index entry without searching the map.
-type cachedPath struct {
-	file model.FileID
-	path string
-}
-
-// newPathResolver sizes the cache from the read page already in scope: a page
-// cannot hold candidates from more files than it holds candidates, so a page
-// whose nodes all come from distinct files still resolves each path once.
-func newPathResolver(r exactReader, page int) *pathResolver {
-	return &pathResolver{r: r, cap: max(page, 1), order: list.New(), paths: map[model.FileID]*list.Element{}}
-}
-
-// path returns the normalized path of file. A node with no file (a manifest
-// dependency, say) has no path and is not an error.
-func (p *pathResolver) path(ctx context.Context, file model.FileID) (string, error) {
-	if file == "" {
-		return "", nil
-	}
-	if e, ok := p.paths[file]; ok {
-		p.order.MoveToFront(e)
-		return e.Value.(*cachedPath).path, nil
-	}
-	fv, err := p.r.File(ctx, file)
-	if err != nil {
-		return "", err
-	}
-	if p.order.Len() >= p.cap {
-		oldest := p.order.Back()
-		delete(p.paths, oldest.Value.(*cachedPath).file)
-		p.order.Remove(oldest)
-	}
-	p.paths[file] = p.order.PushFront(&cachedPath{file: file, path: fv.Path})
-	return fv.Path, nil
 }
 
 // queryFile reads the query as a root-relative path and resolves it to a
@@ -301,11 +242,7 @@ func exactCandidates(ctx context.Context, r exactReader, rule *tierRule, page in
 				if owned[n.Node.ID] {
 					continue
 				}
-				p, err := rule.paths.path(ctx, n.Node.FileID)
-				if err != nil {
-					return err
-				}
-				if err := emit(exactHit{Tier: tier, Path: p, Node: n}); err != nil {
+				if err := emit(exactHit{Tier: tier, Path: n.Path, Node: n}); err != nil {
 					return err
 				}
 			}
@@ -370,12 +307,8 @@ func seekTier(ctx context.Context, r exactReader, rule *tierRule, filter hitFilt
 				return 0, err
 			}
 			for _, n := range nodes {
-				p, err := rule.paths.path(ctx, n.Node.FileID)
-				if err != nil {
-					return 0, err
-				}
-				e := exactEntry{exactHit{Tier: tier, Path: p, Node: n}}
-				at := sqlite.TierSpan{Path: p, Start: nodeStartByte(n), End: spanEnd(n.Bytes)}
+				e := exactEntry{exactHit{Tier: tier, Path: n.Path, Node: n}}
+				at := sqlite.TierSpan{Path: n.Path, Start: nodeStartByte(n), End: spanEnd(n.Bytes)}
 				if at != span {
 					flush()
 					if len(out) >= want {
@@ -438,8 +371,7 @@ type tierRule struct {
 	pathKept bool
 	// servesRow is the request's test of one tier row: whether the tier,
 	// listing the node with that row, serves it.
-	servesRow func(ctx context.Context, row sqlite.StoredNode) (bool, error)
-	paths     *pathResolver
+	servesRow func(row sqlite.StoredNode) bool
 	// inFile holds the nodes with a visible row in pathFile, read on first
 	// use; nil until then.
 	inFile map[model.NodeID]struct{}
@@ -458,18 +390,10 @@ func newSearchRule(ctx context.Context, r exactReader, query string, kinds []mod
 	if err != nil {
 		return nil, err
 	}
-	t := &tierRule{r: r, query: query, kinds: kinds, normalized: normalized, pathFile: pathFile,
-		paths: newPathResolver(r, model.MaxPageItems)}
+	t := &tierRule{r: r, query: query, kinds: kinds, normalized: normalized, pathFile: pathFile}
 	t.pathKept = pathFile != "" && normalized != "" && filter.keep(normalized)
-	t.servesRow = func(ctx context.Context, row sqlite.StoredNode) (bool, error) {
-		if row.Node.FileID == "" {
-			return false, nil
-		}
-		p, err := t.paths.path(ctx, row.Node.FileID)
-		if err != nil {
-			return false, err
-		}
-		return p != "" && filter.keep(p), nil
+	t.servesRow = func(row sqlite.StoredNode) bool {
+		return row.Node.FileID != "" && row.Path != "" && filter.keep(row.Path)
 	}
 	return t, nil
 }
@@ -478,9 +402,9 @@ func newSearchRule(ctx context.Context, r exactReader, query string, kinds []mod
 // with no kind or path filter. Every row serves, except that a definition
 // serves only declaration sites (isDeclaration).
 func newSymbolRule(r exactReader, query string, declarationsOnly bool) *tierRule {
-	return &tierRule{r: r, query: query, paths: newPathResolver(r, model.MaxPageItems),
-		servesRow: func(_ context.Context, row sqlite.StoredNode) (bool, error) {
-			return !declarationsOnly || isDeclaration(row), nil
+	return &tierRule{r: r, query: query,
+		servesRow: func(row sqlite.StoredNode) bool {
+			return !declarationsOnly || isDeclaration(row)
 		}}
 }
 
@@ -549,9 +473,7 @@ func (t *tierRule) ownChunk(ctx context.Context, tier model.SearchTier, ids []mo
 		if err := t.markServed(ctx, model.TierExactQualifiedName, listed, owned); err != nil {
 			return err
 		}
-		if err := t.markRows(ctx, prefixed, owned); err != nil {
-			return err
-		}
+		t.markRows(prefixed, owned)
 	}
 	if tier.Rank() <= model.TierExactName.Rank() {
 		return nil
@@ -578,7 +500,8 @@ func (t *tierRule) markServed(ctx context.Context, tier model.SearchTier, ids []
 	if err != nil {
 		return err
 	}
-	return t.markRows(ctx, rows, owned)
+	t.markRows(rows, owned)
+	return nil
 }
 
 // errTierListsOne stops a tier's existence probe at its first node.
@@ -610,20 +533,12 @@ func (t *tierRule) tierListsAny(ctx context.Context, tier model.SearchTier) (boo
 }
 
 // markRows marks in owned the node of every row that serves.
-func (t *tierRule) markRows(ctx context.Context, rows []sqlite.StoredNode, owned map[model.NodeID]bool) error {
+func (t *tierRule) markRows(rows []sqlite.StoredNode, owned map[model.NodeID]bool) {
 	for _, row := range rows {
-		if owned[row.Node.ID] {
-			continue
-		}
-		ok, err := t.servesRow(ctx, row)
-		if err != nil {
-			return err
-		}
-		if ok {
+		if !owned[row.Node.ID] && t.servesRow(row) {
 			owned[row.Node.ID] = true
 		}
 	}
-	return nil
 }
 
 // readPathFile reads, on first use, the nodes with a visible row declared in
@@ -669,9 +584,5 @@ func (t *tierRule) tierRow(ctx context.Context, tier model.SearchTier, id model.
 	if err != nil || owned[id] {
 		return exactHit{}, false, err
 	}
-	p, err := t.paths.path(ctx, rows[0].Node.FileID)
-	if err != nil {
-		return exactHit{}, false, err
-	}
-	return exactHit{Tier: tier, Path: p, Node: rows[0]}, true, nil
+	return exactHit{Tier: tier, Path: rows[0].Path, Node: rows[0]}, true, nil
 }

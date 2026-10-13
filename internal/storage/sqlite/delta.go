@@ -298,9 +298,10 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 	// Nodes first: relations, aliases, search documents and evidence all
 	// reference the node facts of this unit through a foreign key.
 	n, err := exec("node_facts", `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature,
-		file_id, start_byte, end_byte, name_start_byte, name_end_byte, metadata_json, path)
+		file_id, start_byte, end_byte, name_start_byte, name_end_byte, metadata_json, path, sort_start, sort_end)
 		SELECT ?3, nf.node_id, nf.language, nf.name, nf.qualified_name, nf.signature,
-			nf.file_id, nf.start_byte, nf.end_byte, nf.name_start_byte, nf.name_end_byte, nf.metadata_json, nf.path
+			nf.file_id, nf.start_byte, nf.end_byte, nf.name_start_byte, nf.name_end_byte, nf.metadata_json, nf.path,
+			nf.sort_start, nf.sort_end
 		FROM node_facts nf WHERE nf.unit_id = ?1
 			AND `+fmt.Sprintf(bucketSurvives, "nf")+`
 		ON CONFLICT(unit_id, node_id) DO NOTHING`, prevRow, indexArg, w.rowID)

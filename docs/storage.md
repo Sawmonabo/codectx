@@ -90,8 +90,12 @@ sources are in
 [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md).
 
 A node fact also carries its file's root-relative `path` (`''` for a node with
-no file) and two generated sort columns, `sort_start` and `sort_end`, the byte
-interval with a missing one read as 0 and -1. `idx_nodes_name` and
+no file) and two sort columns, `sort_start` and `sort_end`, the byte interval
+with a missing one read as 0 and -1 (a CHECK holds them to the byte columns).
+They are written by the insert rather than generated: SQLite counts every
+column of a table as used by a query that names a generated column
+(`sqlite3ExprColUsed`, src/resolve.c), so no index would cover a tier window
+and each entry would cost a read of its fact row. `idx_nodes_name` and
 `idx_nodes_qname` are `(name or qualified_name, path, sort_start, sort_end)`,
 with the primary key `(unit_id, node_id)` after them, so an exact name or exact
 qualified name is held in the order search serves it (path, start byte, end
