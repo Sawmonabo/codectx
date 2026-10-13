@@ -661,7 +661,10 @@ What re-resolves:
   the members whose digest moved and of the added members only: for every other member it reads the projection the
   state keeps (`internal/provider/link/projection.go`), the table without its sites, values, handlers and dynamic
   imports but with each routing mount's argument and the Java anonymous bodies' offsets, which is everything the
-  hierarchy is built from. A full build reads each table once and builds its second pass from the projections.
+  hierarchy is built from, stored as the table's own JSON. The hierarchy reads each table once on a full build and
+  builds its second pass from the projections. Publication reads a republished member's table once more, for its
+  sites: the targeted nodes it publishes first come from the endpoints the resolution spilled when it read the table
+  (`target_spill.go`), so publication reads each republished table once.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
   value flow and binding, decomposed into nodes (each site, and each file's node), which a refresh maintains by
   deleting and re-deriving at the granularity of nodes (Gupta, Mumick and Subrahmanian, "Maintaining Views
