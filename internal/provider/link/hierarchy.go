@@ -158,8 +158,8 @@ const (
 	// keyFuncInternal + scope + name, and + scope + each qualified suffix of
 	// two or more components: a C or C++ function with internal linkage,
 	// which no other translation unit names. The scope is its file's path,
-	// and, for a function a header declares, also "" (every file that
-	// includes the header, which no table says transitively); Aux is its
+	// and, for a function a header declares, also "" (every file whose
+	// include closure reaches the header, cClosure); Aux is its
 	// namespace and its file's path, joined by a NUL.
 	keyFuncInternal = "ui\x00"
 	// keyMethod + refKey(type) + name: a method or constructor the type

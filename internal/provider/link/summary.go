@@ -167,7 +167,7 @@ func (t *Table) Interface() ([]SummaryEntry, error) {
 		add(EntryInferred, caller, i, v)
 	}
 	if r := t.Routing; len(r.Objects)+len(r.Routes)+len(r.Mounts)+len(r.Settings)+len(t.Inputs)+len(t.Classes)+
-		len(t.RouteHandlers) > 0 || t.ArgumentResolvers {
+		len(t.RouteHandlers)+len(r.Nest) > 0 || t.ArgumentResolvers || r.NestApp != nil {
 		// The argument each mount passes is read with the routing
 		// (mountKey), though it is written in a site; the pending inputs,
 		// the classes and the handlers named through imports are read with

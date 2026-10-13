@@ -486,8 +486,14 @@ func checkEndpoints(t *testing.T, out *capture) {
 // capture records what the linking unit hands its output.
 type capture struct {
 	provider.UnitOutput
-	nodes map[model.NodeID]model.Node
-	rels  []model.RelationFact
+	nodes  map[model.NodeID]model.Node
+	rels   []model.RelationFact
+	search []model.SearchUnit
+}
+
+func (c *capture) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
+	c.search = append(c.search, docs...)
+	return c.UnitOutput.PutSearchUnits(ctx, docs)
 }
 
 func (c *capture) PutNodes(ctx context.Context, facts []model.NodeFact) error {
