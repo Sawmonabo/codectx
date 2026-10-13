@@ -54,7 +54,8 @@ import (
 //     (readName, readSkip).
 //   - DynamicImports: every `#include NAME` whose path is a macro name: a
 //     constant one when every object-like definition of NAME before the
-//     directive replaces it with the same string literal or header name,
+//     directive replaces it with the same string literal or header name and
+//     no `#undef NAME` precedes it,
 //     spelled as the structural import record spells a literal include's
 //     path (`"a.h"` is a.h, `<a.h>` keeps its brackets), otherwise an open one
 //     with no fragments.
@@ -130,12 +131,89 @@ type cLinker struct {
 	buf   []byte
 }
 
-// cDefine is one object-like macro definition: where it starts and the
-// include path its replacement list is, empty when it is no string literal
-// or header name.
+// cDefine is one object-like macro definition, or one `#undef` of the name:
+// where it starts and the include path its replacement list is, empty when
+// it is no string literal or header name, and for an `#undef`.
 type cDefine struct {
 	start uint32
 	path  string
+	undef bool
+}
+
+// undef is the macro name an `#undef` directive n removes, or "" when n is
+// another directive. The directive token may be spelled with spaces after
+// its `#` (ISO C 6.10p2).
+func (k *cLinker) undef(n Node) string {
+	d := cField(n, k.x.fDirective)
+	if d.IsNull() || strings.Join(strings.Fields(strings.TrimPrefix(k.text(d), "#")), "") != "undef" {
+		return ""
+	}
+	a := cField(n, k.x.fArgument)
+	if a.IsNull() {
+		return ""
+	}
+	return strings.TrimSpace(cUncommented(k.text(a)))
+}
+
+// cField is n's first child in field id, read from the child's own record,
+// so a field the registry does not list is read too.
+func cField(n Node, id uint16) Node {
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		if uint16(c.rec().field) == id {
+			return c
+		}
+	}
+	return Node{}
+}
+
+// specifierMacros is cSpecifierMacros for the declaration or function
+// definition owner: the macros written among its specifiers, which the kept
+// parse excluded, and its candidate types when the rule leaves several. A
+// macro the file defines before owner, as an object-like macro, is no
+// candidate.
+func (k *cLinker) specifierMacros(owner Node) (macros, candidates []string) {
+	if owner.KindId() != k.s.declaration && owner.KindId() != k.x.functionDefinition {
+		return nil, nil
+	}
+	prev := owner.StartByte()
+	if cMayFollowMacro(k.src, prev) {
+		switch p, parent := owner.PrevSibling(), owner.Parent(); {
+		case !p.IsNull():
+			prev = p.EndByte()
+		case !parent.IsNull() && !parent.Parent().IsNull():
+			prev = parent.StartByte()
+		default:
+			// The root begins at the first byte the parse included.
+			prev = 0
+		}
+	}
+	body := owner.ChildByFieldId(k.s.fBody)
+	var spans [][2]uint
+	for c := owner.first(); !c.IsNull(); c = c.next() {
+		if !body.IsNull() && c.Id() == body.Id() {
+			break
+		}
+		spans = append(spans, [2]uint{c.StartByte(), c.EndByte()})
+	}
+	kind, name := "", ""
+	if t := owner.ChildByFieldId(k.s.fType); !t.IsNull() {
+		if t.KindId() == k.s.typeIdentifier {
+			kind = "type_identifier"
+		}
+		name = k.text(t)
+	}
+	// The last directive before owner decides: an `#undef` after a
+	// definition leaves the name undefined.
+	defined := func(s string) bool {
+		on, at := false, uint32(0)
+		for _, d := range k.defines[s] {
+			if d.start < uint32(owner.StartByte()) && d.start >= at {
+				on, at = !d.undef, d.start
+			}
+		}
+		return on
+	}
+	return cSpecifierMacros(k.src, prev, owner.StartByte(), spans, kind, name, k.x.keyword, defined)
 }
 
 // cDecl is one declarator and the declaration that owns its specifiers: a
@@ -236,6 +314,13 @@ func (k *cLinker) declare(n Node) {
 	case id == x.namespaceDefinition:
 		if name := n.ChildByFieldId(s.fName); !name.IsNull() {
 			k.namespaces[k.typeName(name)] = true
+		}
+	case id == x.preprocCall:
+		// `#undef NAME` ends the definition before it: an include of NAME
+		// after it folds to no path (include), as one after a definition
+		// that is no path does.
+		if name := k.undef(n); name != "" {
+			k.defines[name] = append(k.defines[name], cDefine{start: uint32(n.StartByte()), undef: true})
 		}
 	case id == x.enumerator || id == x.preprocDef:
 		if name := n.ChildByFieldId(s.fName); !name.IsNull() {
@@ -563,6 +648,18 @@ func (k *cLinker) export(owner, d Node, receiver string) {
 		e.Internal = unnamed || k.statics[key]
 	}
 	e.Returns = k.returns(owner, d, c.fn)
+	macros, candidates := k.specifierMacros(owner)
+	if len(candidates) > 0 {
+		// The declaration's type is one of several identifiers its macros
+		// leave undecided (cSpecifierMacros): no single result type, so no
+		// typed signature either.
+		e.Returns, e.Signature = wire.Type{}, ""
+	}
+	// The linker reads each macro's definitions for the declaration's
+	// visibility; a candidate the project defines as a macro is one too.
+	for _, m := range append(macros, candidates...) {
+		e.Macros += m + " "
+	}
 	k.out.Exports = append(k.out.Exports, e)
 	k.parameters(e.Name, c.fn.ChildByFieldId(s.fParameters), a.params)
 }
@@ -721,15 +818,22 @@ func (k *cLinker) macro(n Node) {
 }
 
 // alias appends the Export of the object-like macro n when its replacement
-// list is exactly one identifier: a call of the macro's name calls what that
-// identifier names.
+// list is exactly one identifier, which a call of the macro's name calls and
+// a declaration written with the macro takes its visibility from, or a
+// specifier sequence, whose visibility it carries (cVisibility; an empty
+// replacement states none).
 func (k *cLinker) alias(n Node) {
 	name := n.ChildByFieldId(k.s.fName)
 	if name.IsNull() {
 		return
 	}
-	if _, ident := k.replacement(n); ident != "" {
-		k.out.Exports = append(k.out.Exports, wire.Export{Name: wireSpan(spanOf(name)), Alias: ident})
+	_, ident := k.replacement(n)
+	visibility := wire.VisibilityUnspecified
+	if v := n.ChildByFieldId(k.s.fValue); !v.IsNull() {
+		visibility = cVisibility(k.src, cLex(k.src, int(v.StartByte()), int(v.EndByte())), k.x.keyword)
+	}
+	if ident != "" || visibility != "" {
+		k.out.Exports = append(k.out.Exports, wire.Export{Name: wireSpan(spanOf(name)), Alias: ident, Visibility: visibility})
 	}
 }
 
@@ -786,9 +890,10 @@ func cUncommented(text string) string {
 // include appends the DynamicImport of the directive n when its path is a
 // macro name: constant when every object-like definition of the name before
 // the directive replaces it with one and the same include path, and open,
-// with no fragments, otherwise.
+// with no fragments, otherwise, which includes an `#undef` of the name
+// before the directive.
 func (k *cLinker) include(n Node) {
-	p := n.ChildByFieldId(k.x.fPath)
+	p := cField(n, k.x.fPath)
 	if cKind(p) != k.s.identifier {
 		return
 	}
@@ -1674,11 +1779,15 @@ type cLinkSyntax struct {
 	translationUnit, functionDefinition, fieldDeclaration, fieldDeclarationList, typeDefinition,
 	structSpecifier, unionSpecifier, enumerator, preprocFunctionDef, preprocDef, parameterDeclaration,
 	variadicParameter, argumentList, fieldDesignator, abstractFunctionDeclarator, paren, ellipsis,
-	linkageSpecification, declarationList, preprocInclude uint16
-	// fPath is the field of an include directive's path, read from the
-	// grammar directly: the grammar table holds cRefine, so this table may
-	// not consult it (cLinkSyntaxIn).
-	fPath uint16
+	linkageSpecification, declarationList, preprocInclude, preprocCall uint16
+	// fPath is the field of an include directive's path, and fDirective and
+	// fArgument those of any other directive (`#undef NAME`), resolved from
+	// the grammar directly: the grammar table holds cRefine, so this table
+	// may not consult it (cLinkSyntaxIn). They are outside the field
+	// registry, so they are read through cField.
+	fPath, fDirective, fArgument uint16
+	// tl is the grammar, whose anonymous tokens are its keywords (keyword).
+	tl *ts.Language
 
 	// C++ only.
 	classSpecifier, baseClassClause, templateType, trailingReturnType, placeholderTypeSpecifier,
@@ -1709,6 +1818,10 @@ func (x *cLinkSyntax) fileScope(id uint16) bool {
 	return id == x.translationUnit || id == x.linkageSpecification || id == x.declarationList ||
 		x.classSpecifier != 0 && id == x.fieldDeclarationList
 }
+
+// keyword reports a word the grammar spells as one of its tokens: a
+// keyword, never an identifier.
+func (x *cLinkSyntax) keyword(s string) bool { return x.tl.IdForNodeKind(s, false) != 0 }
 
 // in reports whether id is marked in set.
 func (x *cLinkSyntax) in(set []bool, id uint16) bool { return int(id) < len(set) && set[id] }
@@ -1756,14 +1869,18 @@ func resolveCLinkSyntax(language string, tl *ts.Language) *cLinkSyntax {
 		linkageSpecification:       kind("linkage_specification"),
 		declarationList:            kind("declaration_list"),
 		preprocInclude:             kind("preproc_include"),
+		preprocCall:                kind("preproc_call"),
 		fPath:                      tl.FieldIdForName("path"),
+		fDirective:                 tl.FieldIdForName("directive"),
+		fArgument:                  tl.FieldIdForName("argument"),
+		tl:                         tl,
 		declaration:                kind("declaration"),
 		object:                     make([]bool, tl.NodeKindCount()),
 		conditional:                make([]bool, tl.NodeKindCount()),
 		clause:                     make([]bool, tl.NodeKindCount()),
 	}
-	if x.fPath == 0 {
-		panic("worker: the " + language + " grammar has no field path")
+	if x.fPath == 0 || x.fDirective == 0 || x.fArgument == 0 {
+		panic("worker: the " + language + " grammar has no field path, directive or argument")
 	}
 	x.object[kind("pointer_declarator")], x.object[kind("array_declarator")] = true, true
 	for _, name := range []string{"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef"} {

@@ -112,6 +112,7 @@ minted key basis, per node kind:
 | Declaration | function, method, class, interface, struct, enum, field, variable, constant, test, module, namespace, endpoint (a Python `__main__` guard) | `file:<path>` | qualified name | the qualified name | yes, exact declaration range | `qualified_signature` (file, kind, descriptor path, disambiguator) |
 | Endpoint | `endpoint` | `file:<path>` | `endpoint:<descriptor>`, `#<disambiguator>` appended when it has one | the method and the route as written (`GET /users`, or `/users` for a route that names no method), or `main` / `script` | yes, the decorator, annotation, registration call, entry function or shebang line | `qualified_signature` |
 | Route handler literal | `function` | `file:<path>` | `fn:<path>:<first byte>-<last byte>` | none | yes, the function literal | `source_location` |
+| Request input | `variable` | `file:<path>` | `input:<path>:<first byte>-<last byte>` | none | yes, the reading expression | `source_location` |
 | Import target | `module` | `provider.ScopeWorkspace` | `import:<lang>:<import path>` | none | no; qualified name = import path | `structural_key` (same import path from any file mints the same node) |
 | Callee reference | function (bare call) or method (qualified call) | `file:<path>` | `call:<name>` or `call:<qualifier>.<name>` | none | no | `unresolved`; metadata `{"resolution":…,"candidates":…,"callee":…}` |
 
@@ -244,6 +245,8 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `defines` | file module → endpoint | every program entry point and framework route the file declares (a `__main__` guard is a declaration and is defined like one) |
 | `routes_to` | endpoint → handler | the entry function or route handler: a declaration of this file, the callee reference a call of the handler's name would name (with the call-site alias on its token), the file's module for a script, or a route handler literal |
 | `defines` / `contains` | file module or innermost enclosing declaration → route handler literal | a function literal a route registers in place, published as an anonymous `function` node keyed by its range; the calls in its body are made from it, so a walk from the endpoint reaches what the handler calls |
+| `reads` | innermost function, method or test (or route handler literal inside it, or file module) → request input | a read of the request a framework hands its handler (Request inputs); detail `request_input` |
+| `data_flows_to` | request input → variable | a definition of the read's own function whose node holds the read defines the variable (dependence evidence, detail `reaching_def`) |
 
 **Function-valued properties.** In JavaScript, TypeScript and TSX a function or
 arrow function stored under a name is a function declaration named by that
@@ -279,9 +282,62 @@ declaration inside a `__main__` guard is not exported.
 (C17 6.2.2): a function definition and a file-scope object definition, not
 declared `static`; a tentative definition (`int x;`) is one, a prototype and an
 `extern` declaration without an initializer are not, since they define
-nothing. This is linkage, not shared-library visibility, which compiler flags
-(`-fvisibility`) and attribute macros decide and a syntactic reader does not
-evaluate. C++ publishes no `exports`.
+nothing. This is linkage, not shared-library visibility. C++ publishes no
+`exports`.
+
+**C and C++ visibility as declared.** A declaration's own attributes give its
+`visibility` metadata: the first `visibility("…")` attribute's value
+(`default`, `hidden`, `protected`, `internal`), or `dllexport` or `dllimport`
+from `__declspec` or the attribute of that name, in an attribute specifier,
+a `__declspec` modifier or a `[[…]]` attribute declaration anywhere outside
+its body and parameter lists. A visibility written through a macro
+(`API int f(void);`) is read by the linker from the macro's definitions
+through the file's includes and published as `references` occurrences to
+them, one per definition and so per `#if` arm, with the visibility as their
+detail (docs/providers-link.md). Both are visibility as declared in source,
+never the binary's export table: a build flag (`-fvisibility=hidden`) decides
+what a symbol with no attribute gets, so no attribute is no claim at all.
+
+**Java anonymous class bodies.** A creation with a class body
+(`new Runnable() { … }`) is a `class` node (JLS §15.9.5: an anonymous class is
+a class) named `new T`, T the created type's last simple name, the token the
+creation's call reference takes (`new Comparator` for
+`new java.util.Comparator<String>() { … }`). Its descriptor path is the
+enclosing declaration's path and that name (`Sample.start.new Runnable`), and
+its methods are its members (`Sample.start.new Runnable.run`), so a body
+inserted elsewhere in the file moves no identity; two bodies of one type in one
+declaration are duplicates at one level, settled as every duplicate is
+(content digest, then order). An enum constant's body is the constant's own:
+its methods are the constant's members (`Color.RED.m`). The node's range is
+the creation; its name is not written as one token, so for a qualified or
+spaced creation the range's text does not contain it.
+
+**C and C++ macro-prefixed declarations.** The grammars have no preprocessor,
+so a declaration written with a macro among its specifiers
+(`SQLITE_API int f(void);`, `XMLPUBFUN xmlNodePtr XMLCALL xmlNewNode(int);`,
+`void f(void) G_GNUC_CONST;`) misparses: the macro is read as the type, the
+real type lands in an error, or, in C++, `M T f(void)` reads as `T::f` with
+the `::` missing. The worker reads such a misparse from the tree alone (an
+error or missing token among a file-scope declaration's specifiers or on its
+declarator's path, a file-scope error or expression statement, or a typedef
+name combined with `signed`, `unsigned`, `short` or `long`), never from a list
+of macro names. It then classifies the identifiers before the name by the
+language's rule (C17 6.7.2p2): a typedef name never combines with another
+type specifier, so beside a keyword type or a `struct`, `union` or `enum`
+specifier every other bare identifier is a macro; otherwise exactly one is the
+type, and a name the file defines as an object-like macro before the
+declaration (the last `#define` or `#undef` decides) is not. A function-like
+macro call before the specifiers and an identifier after the parameter list
+are attribute macros. The file is parsed a second time with those tokens
+excluded (the parser's included ranges, so every offset stays the file's),
+and the second tree is kept when it has no more error bytes than the first.
+The declaration then publishes its own name, kind and return type, and the
+macros it was written with under the `specifier_macros` metadata key, in
+source order. When the rule leaves several identifiers that may be the type
+and the file defines none of them (`GLIB_AVAILABLE_IN_ALL gboolean g(void);`
+in a file that does not define the macro), all of them are published under
+`return_types` as the set the declared type is one of, they are not counted
+as macros, and the export carries no single return type or typed signature.
 
 **Decorator facts.** Every declaration publishes its decorators, annotations
 and attributes under the `decorators` metadata key, in source order, each as
@@ -321,16 +377,17 @@ published and is counted, so the file reports partial.
 
 | Entry point | Descriptor | Routes to |
 |---|---|---|
-| a module-level Python `if __name__ == "__main__":` (`==`, either operand order) | `__main__` | each function its block calls directly; the guard is a declaration, so its block's calls are made from it. It is a scope but no container: a function defined in it is a declaration of the module under its own name, told apart from one outside the guard by the branch it sits in (its disambiguator), and is not exported |
+| a module-level Python `if __name__ == "__main__":` (`==`, either operand order, inside any parentheses) | `__main__` | each function its block calls directly; the guard is a declaration, so its block's calls are made from it. It is a scope but no container: a function defined in it is a declaration of the module under its own name, told apart from one outside the guard by the branch it sits in (its disambiguator), and is not exported |
 | Go `func main` in `package main` | `main` | the function |
 | every Java `main` of JLS SE 25 §12.1.4, per class: `static` or instance, one `String[]`/`String...` parameter or none, not `private`, `void`; a class of the file that inherits one from a superclass of the same file (a superclass in another file is not visible here) | `main`, disambiguated by the class's qualified name | the method |
 | a top-level Rust `fn main`; a file-scope C or C++ `main` definition that is not `static` | `main` | the function |
 | a file starting with `#!` (not Rust's `#![`) | `script` | the file's module |
+| a module-level binding whose value is exactly a call building an application: `Flask(…)`, `FastAPI(…)`, `Starlette(…)`, `express()`, or Django's `get_wsgi_application()` / `get_asgi_application()` imported from `django.core.wsgi` / `django.core.asgi` (PEP 3333 and ASGI name no file, so the file's name is never read) | `application`, disambiguated by the binding's name when a file binds two | the binding's declaration |
 
 **Framework routes.** The provider reads routes from decorators, annotations
 and registration calls, only in a file that imports the framework (Python
-`flask`, `fastapi`, `django.urls` or `django.conf.urls`; JavaScript and
-TypeScript `express`; Go `net/http`, `github.com/gorilla/mux`,
+`flask`, `fastapi`, `starlette`, `django.urls` or `django.conf.urls`; JavaScript and
+TypeScript `express` and `@nestjs/common`; Go `net/http`, `github.com/gorilla/mux`,
 `github.com/go-chi/chi`, `github.com/gin-gonic/gin`, `github.com/labstack/echo`;
 Java `org.springframework.web.bind.annotation`). Each method and route is one
 endpoint with `routes_to` its handler. A receiver is known by the call that built
@@ -338,16 +395,18 @@ it (the link table's site result type).
 
 | Framework | Routes and method | Handler | Prefix resolves through |
 |---|---|---|---|
-| Flask | `@x.route(rule, methods=[…])` (no `methods`: `GET`, Flask's default), `@x.get`/`post`/`put`/`delete`/`patch` | the decorated function | `Flask()` is a root; a `Blueprint(url_prefix=…)` through exactly one `register_blueprint(bp, url_prefix=…)` in the file, whose prefix overrides the blueprint's own |
-| FastAPI | `@x.get` … `@x.trace`, `@x.api_route(path, methods=…)` (default `GET`) | the decorated function | `FastAPI()` is a root; an `APIRouter(prefix=…)` through exactly one `include_router(r, prefix=…)`, whose prefix adds to the router's own; `mount(path, app)` |
-| Django | `path`, `re_path`, `url` imported from Django; no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never: the including urlconf is chosen by settings, so every Django route is `unresolved` |
-| Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()` through exactly one `use([path,] router)` |
-| Spring | `@GetMapping` … `@PatchMapping`, `@RequestMapping(method = RequestMethod.X)` (none: no method); `value`, `path` or positional, arrays | the annotated method | the class-level `@RequestMapping` literal is the only prefix, none means no prefix; several or a non-literal one leave the class's routes `unresolved` |
-| Go `net/http` | `http.Handle`/`HandleFunc` on the default mux, a `ServeMux`'s `Handle`/`HandleFunc`; a Go 1.22 pattern `"GET /x"` gives the method and the route `/x` | the second argument | the default mux is a root; `NewServeMux()` when the file serves it once (`ListenAndServe[TLS]`, `Serve[TLS]`) or another router handles it once |
-| gorilla/mux | `Handle`/`HandleFunc`, methods from `.Methods(…)` on the registration | the second argument | `NewRouter()` served or handled once; `PathPrefix(p).Subrouter()` a child |
-| chi | `Get` … `Trace`, `Handle`/`HandleFunc` (any method), `Method`/`MethodFunc(m, p, h)` | the second argument (third for `Method`) | `NewRouter()`/`NewMux()` served once or `Mount(p, r)` once; routes inside a `Route` or `Group` closure are on a parameter and stay `unresolved` |
+| Flask | `@x.route(rule, methods=[…])` (no `methods`: `GET`, Flask's default), `@x.get`/`post`/`put`/`delete`/`patch`; `x.add_url_rule(rule, endpoint, view_func, methods=[…])`, whose default is the view's own `methods` when it is `View.as_view(…)` (no method) and `GET` otherwise | the decorated function; `view_func`, `X.as_view(…)` naming `X` | `Flask()` is a root; a `Blueprint(url_prefix=…)` through exactly one `register_blueprint(bp, url_prefix=…)` in the file, whose prefix overrides the blueprint's own |
+| FastAPI | `@x.get` … `@x.trace`, `@x.api_route(path, methods=…)` (default `GET`), `@x.websocket(path)` (method `WEBSOCKET`); `x.add_api_route(path, endpoint, methods=…)` (default `GET`), `x.add_api_websocket_route(path, endpoint)` | the decorated function; `endpoint` | `FastAPI()` is a root; an `APIRouter(prefix=…)` through exactly one `include_router(r, prefix=…)`, whose prefix adds to the router's own; `mount(path, app)` |
+| Django | `path`, `re_path`, `url` imported from `django.urls` or `django.conf.urls`, or called through that module (`from django import urls` then `urls.path(…)`, `import django.urls`); no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never in the file: the including urlconf is chosen by settings, so every Django route is `unresolved` here; the linker joins the settings chain and the `include()` prefixes (docs/providers-link.md, Route prefixes across files) |
+| Starlette | `Route(path, endpoint, methods=[…])` (none: `GET` for a function endpoint, every method for a class, Starlette's own rule; an endpoint not declared here as a function names no method), `WebSocketRoute(path, endpoint)` (`WEBSOCKET`), each an entry of a route list | `endpoint` | `Starlette(routes=…)` (and a FastAPI application's `routes=`) is a root; `Router(routes=…)` and `Mount(path, routes=…)` hold lists; an entry is mounted on the object whose list, written in place or held by one module binding, is innermost around it; `Mount(path, app=x)` mounts `x` |
+| Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains; a path array is one endpoint per element | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()`, or `Router()` imported or destructured from `require("express")`, through exactly one `use([path,] router)` |
+| NestJS | `@Get` … `@Head`, `@QueryMethod` (`QUERY`), `@All` (no method), imported from `@nestjs/common`, on a method of a `@Controller` class; a string, an array (one endpoint per element) or none (written `""`, the controller's own path) | the decorated method | never in the file: Nest joins the controller's path, the application's `setGlobalPrefix` and `RouterModule` paths, which another file sets, so every NestJS route is `unresolved` |
+| Spring | `@GetMapping` … `@PatchMapping`, `@RequestMapping(method = RequestMethod.X)` (none: no method); `value`, `path` or positional, arrays | the annotated method | the class-level `@RequestMapping` is the only prefix, none means no prefix; each literal route it names is a prefix, every method route mapped below each (Spring combines the patterns pairwise); a non-literal one leaves the class's routes `unresolved`. Its `method =` adds to each method mapping's own methods, a union as Spring combines them, and a mapping naming none takes the class's |
+| Go `net/http` | `http.Handle`/`HandleFunc` on the default mux, a `ServeMux`'s `Handle`/`HandleFunc`; a Go 1.22 pattern `"GET /x"` gives the method and the route `/x` | the second argument | the default mux is a root; `NewServeMux()` when the file serves it once (`ListenAndServe[TLS]`, `Serve[TLS]`, or the `Handler` of an `http.Server{…}` literal, written as the router's construction or a name the file assigns exactly one router to) or another router handles it once; a router `Handle(p, http.StripPrefix(prefix, r))` passes sits below the stripped literal prefix |
+| gorilla/mux | `Handle`/`HandleFunc`, methods from `.Methods(…)` on the registration; a matcher chain closed by `Handler(h)`/`HandlerFunc(h)` (`PathPrefix(p).Handler(h)`, `Methods(m).Path(p).HandlerFunc(h)`, from the router or `NewRoute()`) whose one `Path` or `PathPrefix` is the route | the second argument; the closing call's argument | `NewRouter()` served or handled once; `PathPrefix(p).Subrouter()` a child |
+| chi | `Get` … `Trace`, `Handle`/`HandleFunc` (any method), `Method`/`MethodFunc(m, p, h)` | the second argument (third for `Method`) | `NewRouter()`/`NewMux()` served once or `Mount(p, r)` once; the router a `Route(p, func(r chi.Router) {…})` closure receives is the parent's prefix plus `p`, a `Group(func(r chi.Router) {…})` closure's exactly the parent's; a call inside the closure on its parameter (the innermost closure whose parameter it names) is on that router |
 | gin | `GET` … `OPTIONS`, `Any`, `Handle(m, p, …)` | the last argument | `gin.New()`/`gin.Default()` are roots; `Group(p)` a child |
-| echo | `GET` … `TRACE`, `Any`, `Add(m, p, h)` | the second argument (third for `Add`) | `echo.New()` is a root; `Group(p)` a child |
+| echo | `GET` … `TRACE`, `Any`, `Add(m, p, h)`, `Match(methods, p, h)` with a slice literal of methods | the second argument (third for `Add` and `Match`) | `echo.New()` is a root; `Group(p)` a child |
 
 Method constants (`http.MethodGet`, `RequestMethod.GET`) count as literal
 methods; methods not written as literals give one endpoint with no method. The
@@ -356,17 +415,60 @@ expression as written when it is not one, which is then `unresolved`. `prefix`
 is `resolved`, with the full `path`, only when every prefix between the route and
 an application root is a literal in the same file; anything else is `unresolved`
 with no `path`, never a guessed URL. An application object or router mounted
-from another file is not visible to a per-file provider. A route registered by a
+from another file is not visible to a per-file provider: the file's link table
+carries its router objects, their routes and its mounts of objects it does not
+build (`link.Routing`), and the linker publishes the full path of each route a
+Python mount reaches (docs/providers-link.md, Route prefixes across files). A route registered by a
 call is read from the call's argument positions in the link table, never from
 the source text, so a file whose link pass did not run publishes no
 call-registered route; a route on a receiver the file does not build is read only
 when the route is a string literal. A handler written as anything other than a
-name, a dotted name or a function literal (a wrapper call such as
-`http.HandlerFunc(f)`) gives the endpoint no `routes_to`. Not read: Flask
-`add_url_rule`, FastAPI `add_api_route` and websocket routes, Express array routes
-and `const { Router } = require("express")`, gorilla `PathPrefix(…).Handler(…)`,
-mounts through `http.Server{Handler: …}` or `StripPrefix`, echo `Match`, a
-class-level `@RequestMapping(method = …)`, a qualified Django `urls.path(…)`.
+name, a dotted name, a function literal or a call of one name with one
+argument gives the endpoint no `routes_to`. A conversion to net/http's
+`HandlerFunc` or `Handler` is the value it converts (`http.HandlerFunc(show)`
+routes to `show`); any other such call builds the handler, so the endpoint
+routes to the function it calls (`auth(show)` routes to `auth`, whose returned
+handler serves the request). A WebSocket route
+carries the method `WEBSOCKET`: its connection is an ASGI scope of type
+`websocket`, routed apart from the HTTP routes of its path, so it and an HTTP
+`GET` on the same path are two endpoints. Not read: FastAPI and Starlette
+`add_route`/`add_websocket_route`.
+
+**Request inputs.** A read of the network request a framework hands its
+handler is a `variable` node at the reading expression, keyed
+`input:<path>:<first byte>-<last byte>`, with metadata
+`{"input":{"framework":…,"source":…,"key":…}}` (`model.RequestInput`), and the
+function it is made from (the innermost function, method or test around it, a
+route handler literal inside that, or the file's module) `reads` it, detail
+`request_input`. `source` is the part of the request read: `query`, `body`,
+`path`, `header`, `cookie`, `form`, `file`, `url`, `raw`, or `combined` for a
+read the framework answers from several parts at once; `key` is the key when the
+source writes it as a literal (`request.args.get("id")`, `req.query.id`,
+`r.Header.Get("X-Key")`, `@RequestParam("id")`), else empty. A definition
+whose node holds the read, in the read's own function, gets `data_flows_to`
+from the read to the variable it defines (`uid = request.args.get("uid")`
+flows to `uid`), so the file's def-use facts carry the read to every use of the
+alias. Each table is gated on the framework's import, and a member it does not
+name publishes nothing:
+
+| Framework | Request object | Members read |
+|---|---|---|
+| Flask | `request` imported from `flask` (or `flask.request`), anywhere in the file | `args`, `form`, `values` (combined), `files`, `cookies`, `headers`, `json`, `get_json()`, `data`, `get_data()`, `stream`, `view_args` (path), `query_string`, `path`, `full_path`, `url`, `base_url`, `authorization`, `user_agent` |
+| Django | the request parameter of a view: a function a route of the file names, a function a decorator imported from `django.*` decorates, and the `get`/`post`/…/`dispatch`/`setup` methods of a class extending, directly or through classes of the file, a class a `django.*views*` module exports | `GET` (query), `POST` (form), `COOKIES`, `FILES`, `META` and `headers` (header), `body`, `read()`, `readline(s)()` (raw), `path`, `path_info`, `get_full_path()`, `build_absolute_uri()` (url), `get_host()`, `get_signed_cookie(k)` |
+| FastAPI | each parameter of a route handler, by FastAPI's own rule: a marker (`Path`, `Query`, `Header`, `Cookie`, `Body`, `Form`, `File`, as a default or in `Annotated`) names the source, its `alias=` the key, a `Header` key with its underscores as hyphens unless `convert_underscores=False`; else a name the route writes is a path read, `UploadFile` a file, a model, dataclass, sequence or mapping a body, a scalar or no annotation a query; a `Depends`/`Security` parameter, a `Response`, `BackgroundTasks` or `SecurityScopes`, and a class this file does not declare publish nothing | the parameter, keyed by its name or alias; a `Request`, `WebSocket` or `HTTPConnection` parameter is the request object, read with Starlette's members |
+| Starlette | a route handler's first parameter | `query_params`, `path_params`, `headers`, `cookies`, `url`, `base_url`, `json()`, `body()`, `form()`, `stream()`, and a WebSocket's `receive_*()`/`iter_*()` |
+| Express | each route handler's first parameter, under its own name | `query`, `params` (path), `body`, `cookies`, `signedCookies`, `headers`, `get(k)`/`header(k)` (header), `param(k)` (combined), `originalUrl`, `url`, `path`, `baseUrl`, `hostname`; a property after a keyed member is its key |
+| Go `net/http` | every `*http.Request` parameter of a function, method or function literal with a body | `FormValue(k)` and `Form` (combined), `PostFormValue(k)`, `PostForm`, `MultipartForm`, `MultipartReader()` (form), `Cookie(k)`, `Cookies()`, `FormFile(k)`, `Header`, `Trailer`, `Host`, `Referer()`, `UserAgent()`, `BasicAuth()` (header), `Body` (not `Body.Close()`), `URL`, `RequestURI`, `URL.Query()`, `URL.RawQuery` (query), `PathValue(k)` (path); gorilla/mux `mux.Vars(r)[k]` and chi `chi.URLParam(r, k)` are path reads of it |
+| Spring | each method parameter a binding annotation of `org.springframework.web.bind.annotation` marks | `@RequestParam` (combined), `@PathVariable`, `@MatrixVariable` (path), `@RequestHeader`, `@CookieValue`, `@RequestBody`, `@RequestPart` (form), `@ModelAttribute` (combined), keyed by the annotation's literal name (positional, `value =` or `name =`) or else the parameter's name, which Spring binds then; a body or model attribute has no key |
+
+The tokens are read with comments and string bodies skipped (`inputs_lex.go`),
+once per file and only when a table's gate passes. A request object that is
+reassigned or passed on is followed only through the def-use facts of the read
+it is assigned from. Not read: a FastAPI parameter typed by a class another file
+declares (whether it is a model or a scalar is in that file), a handler named
+across files, an Express middleware registered with `use`, a Spring parameter
+with no binding annotation, gin and echo contexts, and Django REST framework's
+`Request`.
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped
@@ -978,6 +1080,17 @@ All MIT:
   properties are declarations with their stored path; Python (`__all__`, static
   and computed) and C (external linkage) exports; a name defined twenty times
   keeps all twenty candidates and a member call publishes none.
+- `internal/provider/treesitter/worker/macro_c_test.go`: C and C++
+  declarations written with export, attribute and calling-convention macros
+  keep their name, kind and return type and publish their macros; an
+  undecidable type is published as its candidate set; a file's own `#define`
+  and `#undef` decide whether a name is a macro. Each `#define` sends the
+  visibility its replacement states, one per definition, and a declaration's
+  own attributes its `visibility`.
+- `internal/provider/link/visibility_c_test.go`: a declaration written with a
+  macro references each definition its file sees through its includes, with
+  the definition's visibility and the arms' set size; through an alias, and
+  through a header for a name the file alone cannot tell from its type.
 - `internal/provider/treesitter/entry_points_test.go`: decorators with their
   argument ranges; the `__main__` guard, Go `main`, the Java `main` forms and a
   shebang script as endpoints.

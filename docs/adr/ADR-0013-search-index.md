@@ -332,7 +332,8 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   signature, node id and search key. Ties at the k-th entry are settled by it inside the heap of depth + 1 entries,
   never collected in a list.
 - **Paging.** A cursor carries its position as a keyset: in the exact phase, the tier and node of the last exact
-  result served, whose content key the next page reads back from that tier; in the lexical phase, the resume
+  result served, whose content key the next page reads back in one indexed lookup of the row that tier serves for
+  the node (the path tier, from the one file the query names); in the lexical phase, the resume
   position of the last lexical result served (its score and doc id), or the start of the lexical phase. The query
   hash it is bound to covers the query, its filters and the length form, so a cursor made under one never resumes
   under another. Filters the library does not apply (the language filter, and the drop of a lexical result whose
@@ -360,9 +361,12 @@ served once, at its tier: the earliest exact tier that serves it, that is, whose
 request's kind, path and language filters (a row declared in the file the query names, a qualified name equal to
 the query, a qualified name the query prefixes, a name equal to the query; for the symbol tiers, the row the tier
 lists for the node is the precedence winner among the node's rows matching it). A later tier's walk asks the earlier
-tiers for the node itself. The rule is a function of the generation and
-the query, so it holds across pages with nothing carried between them. A lexical result whose node an exact tier
-served for the same query is dropped from the lexical sequence, by the same rule over every visible row of the node.
+tiers about each read page of its nodes together: one indexed lookup per earlier tier per 200 nodes, driven by the
+node ids. The rule is a function of the generation and the query, so it holds across pages with nothing carried
+between them; one rule serves a request, so the file the query names is read once. A lexical result whose node an
+exact tier served for the same query is dropped from the lexical sequence, by the same rule over every visible row
+of the node, asked for each index page's nodes together. The symbol endpoint applies the same rule to its tiers,
+where a row serves when it is a declaration site for definition, and always otherwise.
 
 **Alternatives.** *Score every match and keep a heap after a cursor, so every page down to the last match is
 reachable.* It costs a full scoring of every match for every page (4.04 s for the 30 queries, against milliseconds

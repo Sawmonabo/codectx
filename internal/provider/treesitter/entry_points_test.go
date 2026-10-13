@@ -104,17 +104,21 @@ class Widget {
 }
 
 // TestMainGuardIsAnEndpointThatRoutesToWhatItCalls asserts a module-level
-// `if __name__ == "__main__":`, in either operand order, is one endpoint
+// `if __name__ == "__main__":`, in either operand order and inside any
+// parentheses, is one endpoint
 // that routes_to the function its block calls and is where that call comes
 // from, while a comparison of `__name__` with another string, or by another
 // operator, is no endpoint.
 //
-// Mutation it catches: treat any `if` on `__name__` as a guard -> the
-// `"other"` and `!=` files publish an endpoint.
+// Mutations it catches: treat any `if` on `__name__` as a guard -> the
+// `"other"` and `!=` files publish an endpoint; read the parenthesized
+// condition's operands by kind alone -> the swapped identifier and string
+// publish one; skip the parentheses -> the parenthesized guards publish none.
 func TestMainGuardIsAnEndpointThatRoutesToWhatItCalls(t *testing.T) {
 	p := newProvider(t)
 	const defs = "def main():\n    pass\n\ndef other():\n    pass\n\n"
-	for _, cond := range []string{`__name__ == "__main__"`, `"__main__" == __name__`} {
+	for _, cond := range []string{`__name__ == "__main__"`, `"__main__" == __name__`, `(__name__ == "__main__")`,
+		`(("__main__" == __name__))`} {
 		t.Run(cond, func(t *testing.T) {
 			c := extracted(t, p, "app.py", defs+"if "+cond+":\n    main()\n")
 			eps := c.endpoints()
@@ -132,7 +136,8 @@ func TestMainGuardIsAnEndpointThatRoutesToWhatItCalls(t *testing.T) {
 			}
 		})
 	}
-	for _, cond := range []string{`__name__ == "other"`, `__name__ != "__main__"`} {
+	for _, cond := range []string{`__name__ == "other"`, `__name__ != "__main__"`, `(__name__ == "other")`,
+		`(__main__ == "__name__")`, `(ready)`} {
 		t.Run(cond, func(t *testing.T) {
 			c := extracted(t, p, "app.py", defs+"if "+cond+":\n    main()\n")
 			if eps := c.endpoints(); len(eps) != 0 {

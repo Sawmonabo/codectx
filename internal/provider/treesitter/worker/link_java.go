@@ -60,9 +60,6 @@ type javaLinker struct {
 	// siteAt maps a call node to its index in out.Sites, which a later
 	// site's TypeResult names.
 	siteAt map[uintptr]uint32
-	// anonymousBodies counts the file's anonymous class bodies walked so
-	// far, which names the next one.
-	anonymousBodies int
 }
 
 // javaBound is what a name in scope is known to hold.
@@ -76,10 +73,12 @@ type javaBound struct {
 
 // javaFrame is one enclosing type body: name is the type `this` denotes,
 // named false for an anonymous class body or an enum constant's body, whose
-// type has no name in the source and is sent under the name `#k`, k its
-// one-based ordinal among the file's anonymous bodies in source order: a
-// name no Java identifier can spell (JLS §3.8), declared a subtype of the
-// type it instantiates (JLS §15.9.5, §8.9.1).
+// type has no name in the source and is sent under the name `#n`, n the
+// byte offset of the token its structural declaration is named by (the
+// created type's last simple name, `new T`, or the enum constant's name): a
+// name no Java identifier can spell (JLS §3.8), which the linker reads as
+// that declaration, declared a subtype of the type it instantiates (JLS
+// §15.9.5, §8.9.1).
 type javaFrame struct {
 	name  string
 	named bool
@@ -553,11 +552,39 @@ func (k *javaLinker) invocation(n Node) {
 	default:
 		if q, ok := k.qualifier(obj); ok {
 			s.Shape, s.Qualifier = wire.ShapeStatic, q
+		} else if i, ok := k.constructed(obj); ok {
+			s.Shape, s.Receiver = wire.ShapeMember, wire.Type{Kind: wire.TypeResult, Index: i}
 		} else {
 			s.Shape, s.Receiver = wire.ShapeMember, k.exprType(obj)
 		}
 	}
 	k.addSite(n, s)
+}
+
+// constructed is the constructor site of the receiver n when n, inside any
+// parentheses, creates an object of a named class with no class body
+// (`new Dog().sound()`): that object is exactly the class it creates
+// (JLS §15.9.4), so the linker binds the call exactly (its TypeResult names
+// a ShapeConstructor site). An anonymous class body creates an object of a
+// subclass, which may override the method, and a variable's type is never
+// read this way, since a later assignment may give it any subtype.
+func (k *javaLinker) constructed(n Node) (uint32, bool) {
+	j := k.k
+	for n.KindId() == j.parenthesized {
+		if n = firstNamed(n); n.IsNull() {
+			return 0, false
+		}
+	}
+	if n.KindId() != j.objectCreation {
+		return 0, false
+	}
+	for c := n.first(); !c.IsNull(); c = c.next() {
+		if c.KindId() == j.classBody {
+			return 0, false
+		}
+	}
+	i, ok := k.siteAt[n.Id()]
+	return i, ok
 }
 
 // qualifiedSuper reports `X.super.m()`: a `super` child beside the object.
@@ -654,7 +681,11 @@ func (k *javaLinker) creation(n Node) {
 		k.addSite(n, s)
 	}
 	if !body.IsNull() {
-		k.anonymous(k.erased(t), body)
+		at := n.StartByte()
+		if name := k.createdName(t); !name.IsNull() {
+			at = name.StartByte()
+		}
+		k.anonymous(k.erased(t), body, at)
 	}
 }
 
@@ -720,18 +751,22 @@ func (k *javaLinker) enumConstant(n Node) {
 		}
 	}
 	if !body.IsNull() {
-		k.anonymous(k.thisType().Name, body)
+		at := n.StartByte()
+		if name := n.ChildByFieldId(k.k.fName); !name.IsNull() {
+			at = name.StartByte()
+		}
+		k.anonymous(k.thisType().Name, body, at)
 	}
 }
 
 // anonymous walks the body of an anonymous class of the type super, under
-// the name `#k` (javaFrame), sent as a subtype of super: the methods it
-// declares are its own, which a call on super may reach as overrides and a
-// call on another subtype of super never does.
-func (k *javaLinker) anonymous(super string, body Node) {
+// the name `#at` (javaFrame), at the offset of the token its declaration is
+// named by, sent as a subtype of super: the methods it declares are its own,
+// which a call on super may reach as overrides and a call on another
+// subtype of super never does.
+func (k *javaLinker) anonymous(super string, body Node, at uint) {
 	m := k.mark()
-	k.anonymousBodies++
-	name := "#" + strconv.Itoa(k.anonymousBodies)
+	name := "#" + strconv.FormatUint(uint64(at), 10)
 	if super != "" {
 		k.out.Supertypes = append(k.out.Supertypes, wire.Supertype{Type: name, Super: super})
 	}

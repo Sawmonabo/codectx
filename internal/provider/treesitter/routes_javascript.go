@@ -105,34 +105,53 @@ func (s *routeScan) expressRoute(r *wire.Ref, site *wire.Site, i int) {
 		}
 		ref := s.siteRef(chain)
 		obj := s.objOf(chained.Receiver)
-		route := s.routeOf(cargs[0])
-		if obj == nil && !route.literal {
-			return
+		for _, route := range s.expressPaths(cargs[0]) {
+			if obj == nil && !route.literal {
+				continue
+			}
+			s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(args[len(args)-1]), refQualifier(ref))
 		}
-		s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(args[len(args)-1]), refQualifier(ref))
 		return
 	}
 	if len(args) < 2 {
 		return
 	}
 	obj := s.objOf(site.Receiver)
-	route := s.routeOf(args[0])
 	last := args[len(args)-1]
 	if r.Name == "use" {
 		// `use` mounts a router or an application when it passes one, and
 		// otherwise registers middleware at a path: an endpoint only when the
 		// path is a literal and the handler is not an imported module.
-		if !route.literal || s.objOf(argType(site, len(args)-1)) != nil || argType(site, len(args)-1).Kind == wire.TypeModule {
+		if s.objOf(argType(site, len(args)-1)) != nil || argType(site, len(args)-1).Kind == wire.TypeModule {
 			return
 		}
 		if _, imported := s.imports[last.text]; imported {
 			return
 		}
 	}
-	if obj == nil && !route.literal {
-		return
+	for _, route := range s.expressPaths(args[0]) {
+		if !route.literal && (obj == nil || r.Name == "use") {
+			continue
+		}
+		s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(last), r.Qualifier)
 	}
-	s.emit(fwExpress, methods, route, obj, refSpan(r), s.handlerAt(last), r.Qualifier)
+}
+
+// expressPaths are the routes a path argument names: one per element of an
+// array literal (Express takes "an array of combinations" of strings,
+// patterns and regular expressions, each matched on its own), else the
+// argument itself.
+func (s *routeScan) expressPaths(a routeArg) []routeText {
+	if !strings.HasPrefix(a.text, "[") {
+		return []routeText{s.routeOf(a)}
+	}
+	es := elements(a.text)
+	out := make([]routeText, 0, len(es))
+	for _, e := range es {
+		v, ok := stringLiteral(s.b.lang.Name, e)
+		out = append(out, routeText{written: e, value: v, literal: ok})
+	}
+	return out
 }
 
 // routeChain is the `route(path)` site a chain of Express verbs hangs from,
