@@ -277,6 +277,9 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) (err error) {
 		SELECT unit_id FROM generation_units WHERE generation_id = ?`, gen); err != nil {
 		return wrap("tmp_graph_unit", err)
 	}
+	if err := supersedeCoveredPlaceholders(ctx, tx); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_graph_node(id INTEGER PRIMARY KEY)`); err != nil {
 		return wrap("tmp_graph_node", err)
 	}
@@ -365,8 +368,8 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) (err error) {
 }
 
 func dropGraphTemp(ctx context.Context, tx *sql.Tx) error {
-	for _, name := range []string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit",
-		"tmp_graph_file_container", "tmp_graph_node_container"} {
+	for _, name := range append([]string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit",
+		"tmp_graph_file_container", "tmp_graph_node_container"}, placeholderTemps...) {
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+name); err != nil {
 			return wrap(name, err)
 		}

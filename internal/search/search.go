@@ -211,7 +211,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	resumed := req.Page.Cursor != ""
 	generation := req.GenerationID
 	var token searchToken
-	var pos searchPosition
+	pos := searchPosition{phase: phaseStart}
 	if resumed {
 		if token, err = decodeSearchToken(s.signer, req.Page.Cursor, now); err != nil {
 			return empty, err
@@ -437,8 +437,7 @@ func ended(ctx context.Context, ans searchAnswer, err error) (searchAnswer, erro
 		ans.deadline, ans.next = true, nil
 		return ans, nil
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return searchAnswer{}, err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -843,8 +842,7 @@ func (s *Service) lexicalErr(err error) error {
 	if errors.Is(err, textindex.ErrUnknownPosition) {
 		return cursorInvalid("the search cursor names a position that is not in its answer")
 	}
-	var many *textindex.TooManyTerms
-	if errors.As(err, &many) {
+	if many, ok := errors.AsType[*textindex.TooManyTerms](err); ok {
 		return &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the query carries " + strconv.FormatInt(many.Terms, 10) +
 				" terms, more than the resources.max_query_terms limit of " + s.maxTerms.String(),
