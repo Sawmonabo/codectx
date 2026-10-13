@@ -288,12 +288,16 @@ const (
 	// with it, none of which needs the lock or the writer. So the read-only
 	// handle opens first, the store is opened LazyWriter, and the lock, the
 	// startup recovery and the collection pass are taken at the first
-	// operation that needs them: the refresh tool, or a watch pass.
+	// operation that needs them: the refresh tool, or a watch pass. The one
+	// lock it does take at its open is the serving lock, shared
+	// (snapshot.ServingLockPath): it blocks no index, and it is what lets a
+	// reset see a server that is idle.
 	modeServe
 	// modeWatch composes for a command whose whole life is a watch: `codectx
 	// watch`, and `codectx index --watch` once its base generation is built.
 	// It BUILDS, so it is one of the Section 13.2 owners, but like the server
-	// it does not take the workspace at its open.
+	// it does not take the workspace at its open; like the server, it holds
+	// the serving lock shared from its open to its close.
 	//
 	// The reason is the same one and so is the mechanism. A watch is idle
 	// between its beats, and a session that owned the workspace while it was

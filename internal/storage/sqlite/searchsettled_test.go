@@ -2,6 +2,8 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -101,5 +103,62 @@ func TestRetentionCountsTheUnitCapabilityRows(t *testing.T) {
 	if with-without < int64(len(remediation)) {
 		t.Fatalf("a swept unit's capability row added %d reclaimed bytes, want at least its %d-byte remediation",
 			with-without, len(remediation))
+	}
+}
+
+// TestACollectionNeverCommitsOverAnUnfinishedActivation stops an activation
+// after the search index committed generation 2, as a failed or interrupted
+// activation leaves it, then collects that generation's unit in the same
+// process before any recovery. The collection queues the unit's document
+// deletes and must leave them queued: committing them with the active
+// generation as payload would lower the library's payload from 2 back to 1,
+// and the payload ahead of SQLite is the one durable mark that the library
+// may hold documents of an ingestion group SQLite lost. With it erased, the
+// next Recover would find the index settled and keep them.
+//
+// Mutation that fails it: drop the searchAhead guard from commitSweepDeletes
+// (the payload reads 1 after the collection).
+func TestACollectionNeverCommitsOverAnUnfinishedActivation(t *testing.T) {
+	dbPath := t.TempDir() + "/codectx.db"
+	f := newFixture(t, dbPath)
+	a1 := f.file("pkg/a.go", "package pkg\nfunc F() { zqxone() }\n")
+	gen1, err := f.s.BeginGeneration(f.ctx, f.repo, f.snapshot("one", a1).ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.unit(gen1, f.run(gen1), a1)
+	f.activate(gen1, 0)
+
+	a2 := f.file("pkg/a.go", "package pkg\nfunc F() { zqxtwo() }\n")
+	gen2, err := f.s.BeginGeneration(f.ctx, f.repo, f.snapshot("two", a2).ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.unit(gen2, f.run(gen2), a2)
+	restore := store.StopAfterSearchCommit()
+	_, err = f.s.Activate(f.ctx, gen2, gen1, model.HealthFresh, fixtureCaps, "norm-v1")
+	restore()
+	if err == nil {
+		t.Fatal("the stopped activation succeeded")
+	}
+	if err := f.s.Abort(f.ctx, gen2); err != nil {
+		t.Fatalf("Abort(%d): %v", gen2, err)
+	}
+	if err := f.s.DeleteGeneration(f.ctx, gen2); err != nil {
+		t.Fatalf("DeleteGeneration(%d): %v", gen2, err)
+	}
+	// The collection did queue deletes, so a commit was due and declined.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var queued int64
+	if err := db.QueryRowContext(f.ctx, `SELECT count(*) FROM search_doc_deletes`).Scan(&queued); err != nil || queued == 0 {
+		t.Fatalf("the collection queued %d search document deletes (%v), want the collected unit's", queued, err)
+	}
+	if payload, err := f.s.SearchCommitted(); err != nil || payload != strconv.FormatInt(int64(gen2), 10) {
+		t.Fatalf("after the collection the search index's last commit is %q (%v), want generation %d kept for recovery",
+			payload, err, gen2)
 	}
 }

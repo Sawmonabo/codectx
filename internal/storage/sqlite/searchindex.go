@@ -134,6 +134,34 @@ func (s *Store) searchHolds(gen int64) error {
 	return nil
 }
 
+// committedGeneration is the generation the library's last commit carries as
+// its payload: zero for an index never committed, and unknown (ok false) for a
+// payload that is not a generation id, which searchHolds reports as corrupt.
+func (s *Store) committedGeneration() (gen int64, ok bool, err error) {
+	payload, committed, err := s.text.Committed()
+	if err != nil || !committed {
+		return 0, err == nil, err
+	}
+	gen, perr := strconv.ParseInt(payload, 10, 64)
+	return gen, perr == nil, nil
+}
+
+// searchAhead reports whether the library's last commit is ahead of the
+// active generation: an activation committed the library and SQLite never
+// activated it, because the process died or the activation failed after it.
+// Its commit may carry documents of an ingestion group SQLite then lost, and
+// only Recover reconciles them (reconcileSearch). A commit made before then
+// with the active generation as payload would lower the payload back and
+// erase the one durable mark of that state, so the collection's and the
+// close's commits are skipped while it holds.
+func (s *Store) searchAhead(active int64) (bool, error) {
+	committed, ok, err := s.committedGeneration()
+	if err != nil {
+		return false, err
+	}
+	return ok && committed > active, nil
+}
+
 // activeGenerationID is the store's active generation, zero when none is
 // published. One store is one repository, so there is at most one row.
 func (s *Store) activeGenerationID(ctx context.Context) (int64, error) {
@@ -298,7 +326,8 @@ func writeGenerationSearch(ctx context.Context, tx *sql.Tx, gen, applied int64) 
 // the active generation as payload, its writer is released and the applied
 // rows go. An index that does not hold the active generation is left as it is
 // -- a commit would stamp it with a generation it lacks and hide the loss
-// searchHolds reports -- and the deletes wait in the queue.
+// searchHolds reports -- and so is one whose last commit is ahead of it
+// (searchAhead); the deletes wait in the queue.
 func (s *Store) commitSweepDeletes(ctx context.Context) error {
 	var queued bool
 	if err := s.readOwn(ctx, func(tx *sql.Tx) error {
@@ -314,6 +343,12 @@ func (s *Store) commitSweepDeletes(ctx context.Context) error {
 	if err := s.searchHolds(active); err != nil {
 		slog.Warn("collected search documents stay queued: the search index does not hold the active generation", "error", err)
 		return nil
+	}
+	if ahead, err := s.searchAhead(active); err != nil || ahead {
+		if ahead {
+			slog.Warn("collected search documents stay queued: the search index holds a commit no activation finished, which the next recovery reconciles")
+		}
+		return err
 	}
 	applied, err := s.applyQueuedDeletes(ctx)
 	if err == nil {
@@ -346,8 +381,9 @@ func (s *Store) commitSweepDeletes(ctx context.Context) error {
 // every doc id they carry is durably allocated; the documents stay invisible
 // until a generation that selects their units activates, and the next run can
 // reuse those units instead of rebuilding them. The payload stays the active
-// generation, and an index that does not hold it is left uncommitted, so the
-// loss searchHolds reports is never hidden.
+// generation, and an index that does not hold it, or whose last commit is
+// ahead of it (searchAhead), is left uncommitted, so neither the loss
+// searchHolds reports nor the state Recover reconciles is ever hidden.
 func (s *Store) commitSearchOnClose() error {
 	if s.text == nil || s.opts.ReadOnly || !s.text.Writing() {
 		return nil
@@ -364,6 +400,12 @@ func (s *Store) commitSearchOnClose() error {
 	}
 	if err := s.searchHolds(active); err != nil {
 		return s.releaseSearchWriter()
+	}
+	// A payload ahead of the active generation is Recover's to reconcile
+	// (searchAhead); the writer's documents are given up uncommitted, so their
+	// units fail the reconcile's document check and are rebuilt.
+	if ahead, err := s.searchAhead(active); err != nil || ahead {
+		return errors.Join(err, s.releaseSearchWriter())
 	}
 	if err := s.text.Commit(ctx, strconv.FormatInt(active, 10)); err != nil {
 		return errors.Join(err, s.releaseSearchWriter())
@@ -429,7 +471,9 @@ func (s *Store) reconcileSearch(ctx context.Context) error {
 //     activates it. Every other commit -- a collection's (sweep commits the
 //     group first), the close's (after the group committed) and this
 //     reconcile's own -- carries the active generation and only allocated
-//     documents, and a lost group discards the writer's adds (abandonGroup);
+//     documents, a lost group discards the writer's adds (abandonGroup), and
+//     the collection and the close never commit over a payload that is ahead
+//     (searchAhead), so that mark survives until a Recover reconciles it;
 //   - no unit is marked pending, so no unit's documents can differ from its
 //     mark;
 //   - the delete queue is empty.
@@ -437,18 +481,9 @@ func (s *Store) reconcileSearch(ctx context.Context) error {
 // The pending probe stops at the first marked unit; on a settled store it
 // reads the units table once, which the full reconcile would read too.
 func (s *Store) searchSettled(ctx context.Context, active int64) (bool, error) {
-	payload, ok, err := s.text.Committed()
-	if err != nil {
+	committed, ok, err := s.committedGeneration()
+	if err != nil || !ok || committed != active {
 		return false, err
-	}
-	committed := int64(0)
-	if ok {
-		if committed, err = strconv.ParseInt(payload, 10, 64); err != nil {
-			return false, nil
-		}
-	}
-	if committed != active {
-		return false, nil
 	}
 	var unsettled bool
 	err = s.readOwn(ctx, func(tx *sql.Tx) error {
