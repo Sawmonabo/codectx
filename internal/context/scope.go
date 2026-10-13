@@ -125,9 +125,12 @@ func baseRequirement(kind model.NodeKind) model.Requirement {
 		// contract is a misreading of it, and Section 15.4 forbids serving a
 		// partial artifact as if it were complete.
 		return model.RequirementFull
-	case model.NodeFunction, model.NodeMethod, model.NodeField, model.NodeVariable,
+	case model.NodeFunction, model.NodeMethod, model.NodeField, model.NodeVariable, model.NodeReturn,
 		model.NodeConstant, model.NodeEndpoint, model.NodeDatabaseEntity:
 		// A caller, a callee or a state owner is required, at its own symbol.
+		// A return node is a callable's returned value, located at the whole
+		// callable, so its symbol is the callable's span: read as the
+		// callable is.
 		return model.RequirementSymbol
 	case model.NodeDocument, model.NodeSection, model.NodePackage, model.NodeModule,
 		model.NodeNamespace, model.NodeDependency, model.NodeBuildTarget:
