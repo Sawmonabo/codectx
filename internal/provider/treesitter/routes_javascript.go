@@ -29,7 +29,7 @@ func (s *routeScan) express() {
 	})
 	s.calls(func(r *wire.Ref, site *wire.Site, _ int) {
 		if r.Qualified && r.Name == "use" {
-			s.expressMount(site)
+			s.expressMount(r, site)
 		}
 	})
 	s.calls(s.expressRoute)
@@ -63,8 +63,11 @@ func (s *routeScan) jsTarget(site *wire.Site, i int) string {
 
 // expressMount records `parent.use([path,] ..., router)`: each argument that
 // is an object this file builds is mounted at the path, the root when the
-// call names none.
-func (s *routeScan) expressMount(site *wire.Site) {
+// call names none; each argument that is an import binding (`require(…)`,
+// a default or named import) is left to the linker, mounted at that path
+// (pendingMount.target, the module as written and the export it names,
+// wire.ExportAssignment for a `require`).
+func (s *routeScan) expressMount(r *wire.Ref, site *wire.Site) {
 	parent := s.objOf(site.Receiver)
 	s.attachArgs(site, func(o *routeObj, at int) (routeAttach, bool) {
 		if at == 0 {
@@ -77,6 +80,31 @@ func (s *routeScan) expressMount(site *wire.Site) {
 		v, ok := stringLiteral(s.b.lang.Name, args[0].text)
 		return routeAttach{parent: parent, prefix: v, known: ok}, true
 	})
+	args := s.siteArgs(site)
+	if parent == nil || len(args) != len(site.Args) {
+		return
+	}
+	prefix, known := "", true
+	for i, t := range site.Args {
+		if i == 0 && t.Kind != wire.TypeModule {
+			// A path that is no literal, or a middleware function, which
+			// Express tells apart only when the call runs.
+			prefix, known = stringLiteral(s.b.lang.Name, args[0].text)
+			continue
+		}
+		if t.Kind != wire.TypeModule || t.Name == "" || args[i].kw != "" {
+			continue
+		}
+		spec, name, named := strings.Cut(t.Name, "#")
+		if !named {
+			name = wire.ExportAssignment
+		}
+		if spec == "" || name == "" {
+			continue
+		}
+		s.pending = append(s.pending, pendingMount{site: -1, arg: -1, fw: fwExpress, parent: parent, prefix: prefix,
+			known: known, target: spec + "\x00" + name, at: refSpan(r)})
+	}
 }
 
 // expressRoute reads one call as an Express route: `x.get(path, ...,

@@ -315,6 +315,19 @@ through the mounts the application itself makes. Only an ASGI mount mounts an ap
 types by no position, is read as written: a dotted name whose head an import binds names that module's attribute
 (`RouteMount.Target`).
 
+An Express router reaches another file through an import (`internal/provider/link/route_express.go`): a router a
+module binds at module level and exports, by its own name (`export const admin = Router()`), by a local export
+(`export default router`) or by a CommonJS assignment (`module.exports = router`, `module.exports = { router }`), is
+indexed under `keyJSRouting` by its module and each name it is exported by. A `use([path,] x)` on an object of the
+file whose argument is an import binding records the module as written and the export it reads (`RouteMount.Target`:
+the named or `default` export, or the module's whole value for a `require`), at the literal path, or at an unknown
+prefix when the first argument is no literal (a path or a middleware, which Express tells apart only at run time).
+The walk resolves the module as the file's imports resolve, follows re-exports as ECMA-262's ResolveExport does (an
+`export *` decides only when one module supplies the name), and descends into the router's own `use` mounts. A
+handler the router's file imports is resolved as that file's import resolves. A router a function receives
+(`module.exports = (app) => { app.get(…) }`) in a file that imports no framework is read by no table, and publishes
+nothing.
+
 A Go router reaches another file through a call, never a module attribute (`internal/provider/link/route_go.go`). The
 structural provider records, as an object of the callable, a router a function receives as a parameter of a router
 type of a framework the file imports (`func Register(r chi.Router)`, `rg *gin.RouterGroup`), when every use is that

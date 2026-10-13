@@ -436,7 +436,7 @@ with no `path`, never a guessed URL. An application object or router mounted
 from another file is not visible to a per-file provider: the file's link table
 carries its router objects, their routes and its mounts of objects it does not
 build (`link.Routing`), and the linker publishes the full path of each route a
-Python mount reaches, and each route a Go router reaches across a call: a router
+Python or Express mount reaches, and each route a Go router reaches across a call: a router
 a function receives as a parameter or builds and returns, joined where another
 file passes, mounts or hands it (docs/providers-link.md, Route prefixes across
 files). A route registered by a call is read from the call's argument positions

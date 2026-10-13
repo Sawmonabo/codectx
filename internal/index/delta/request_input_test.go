@@ -77,3 +77,33 @@ func TestGoRouteAddedTwoFilesAway(t *testing.T) {
 	s.check("unrelated edit", []linkBuild{unrelated})
 	s.wantRepublished("unrelated edit", unrelated, []string{"util/util.go"}, "main.go")
 }
+
+// TestExpressRouteAddedTwoFilesAway is an Express application that mounts
+// a router of another module, which mounts a router of a third: a route
+// added in the third refreshes to what a full build publishes and
+// republishes the application's file; an edit of a module no walk reads
+// republishes no endpoint file. Mutation caught: the router lookup not
+// traced, so the refresh keeps the application's stale endpoints.
+func TestExpressRouteAddedTwoFilesAway(t *testing.T) {
+	s := newSession(t)
+	files := map[string]string{
+		"package.json": "{\"name\":\"app\"}\n",
+		"app.js": "const express = require(\"express\");\nconst posts = require(\"./posts\");\nconst app = express();\n" +
+			"app.use(\"/posts\", posts);\napp.listen(3000);\n",
+		"posts.js": "const express = require(\"express\");\nconst comments = require(\"./comments\");\n" +
+			"const router = express.Router();\nrouter.use(\"/:id/comments\", comments);\nmodule.exports = router;\n",
+		"comments.js": "const express = require(\"express\");\nconst router = express.Router();\n" +
+			"router.get(\"/\", list);\nfunction list(req, res) {}\nmodule.exports = router;\n",
+		"util.js": "function one() {\n  return two();\n}\nfunction two() {\n  return 2;\n}\nmodule.exports = { one };\n",
+	}
+	s.check("base", []linkBuild{s.only(s.advance(files))})
+	files = edit{name: "route added", replace: []sub{{"comments.js", "router.get(\"/\", list);\n",
+		"router.get(\"/\", list);\nrouter.post(\"/\", list);\n"}}}.apply(t, files)
+	added := s.only(s.advance(files))
+	s.check("route added", []linkBuild{added})
+	s.wantRepublished("route added", added, []string{"comments.js", "app.js"}, "util.js")
+	files = edit{name: "unrelated", replace: []sub{{"util.js", "return 2", "return 3"}}}.apply(t, files)
+	unrelated := s.only(s.advance(files))
+	s.check("unrelated edit", []linkBuild{unrelated})
+	s.wantRepublished("unrelated edit", unrelated, []string{"util.js"}, "app.js")
+}
