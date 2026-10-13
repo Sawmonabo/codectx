@@ -1294,10 +1294,10 @@ func (s slowReader) Neighbours(ctx context.Context, refs []NodeRef, dir model.Di
 		}
 		return fn(e)
 	})
-	// The old port charged a SECOND round trip at the end of every chunk: its
-	// keyset loop only knew it was done when a page came back empty. Charging
-	// it here is what keeps these cases' trigger counts meaning the level they
-	// were calibrated to.
+	// A SECOND round trip is charged at the end of every chunk, the one a
+	// keyset loop that ends only on an empty page makes. Charging it here is
+	// what keeps these cases' trigger counts meaning the level they are
+	// calibrated to.
 	s.tick()
 	return pos, err
 }

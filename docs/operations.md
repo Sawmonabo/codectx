@@ -285,9 +285,9 @@ handle beside it, opened after the writer so there is a schema to verify by
 reading. Every tool that only asks a question -- search, the repository
 overview, symbol lookup, references, the graph walks, and the index status
 report -- is served through the read-only handle. They pin no generation on the
-writer, so a tool call no longer commits the session's own refresh mid-group nor
-queues behind it; the run commits the same ingestion groups it would have
-committed with nobody reading.
+writer, so a tool call neither commits the session's own refresh mid-group nor
+queues behind it; the run commits the same ingestion groups it commits with
+nobody reading.
 
 What an agent sees for it:
 
