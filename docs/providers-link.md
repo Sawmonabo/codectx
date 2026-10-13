@@ -199,9 +199,41 @@ is neither static, final nor private; in C++ a virtual one of the same signature
 method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name; in Go each
 method of an interface its type satisfies. A supertype outside the project is its external node. A method overrides
 an external one only where the language marks it (Java `@Override`, C++ `override` or `final`, TypeScript
-`override`, a Rust trait impl item, Python `typing.override`) and only when its type has exactly one supertype
-outside the project; an unmarked Python method with an external base publishes no `overrides`. Go publishes nothing
-toward a type outside the unit, whose method set no table holds.
+`override`, a Rust trait impl item, Python `typing.override`), toward what the mark proves
+(`hierarchy.externalOverrides`, `internal/provider/link/hierarchy_external.go`):
+- Java and C++: the mark proves at least one overridden method, and a method overrides every supertype's of its
+  signature at once. The candidates are the supertypes outside the project reached along paths on which no type of
+  the project declares the method (and, in Java, `java.lang.Object` for one of its methods when no candidate is a
+  class). With no override in the project and one candidate, that one is published (`supertype`); otherwise each
+  candidate is published with detail `supertype_candidate` and, when there are several, the set size n, read as "at
+  least one of n". A candidate is published beside an override in the project too, so nothing the mark may name is
+  dropped: `class C extends Base implements Task` with `@Override run()`, both outside the project, publishes
+  `C.run` overrides `Base.run` and `Task.run`, each `supertype_candidate` with set size 2.
+- TypeScript: `override` proves a member of the class `extends` names, never of an interface `implements` lists, so
+  the one candidate is the extended class outside the project when no class of the project along the chain declares
+  the member.
+- Python: `typing.override` proves the first ancestor along the method resolution order that defines the method.
+  When no class of the project along the order defines it, it is one of the external bases of the classes along the
+  order, each published (`supertype`) with the set size of their number when there are several.
+- Rust: an impl item reaches its type's external trait when the type has exactly one.
+
+An unmarked method with an external supertype publishes no `overrides`.
+
+A Go type outside the unit is read from its package's source (`goExternal`, `internal/provider/link/go_external.go`):
+the transitive closure of the unit's imports outside it, each package found as the go command finds it without
+running it (`goModuleInfo.source`, `go_module.go`): the standard library of the toolchain the project builds with
+(`GOROOT`, else the `go` on `PATH`, else the toolchain the `go.mod` `toolchain` or `go` line selects in the module
+cache, `go_host.go`); a module of the governing `go.work` or a local `replace` inside the repository from the
+snapshot; a required module, after `replace`, from the module cache at its exact version (`GOMODCACHE`, else the
+first `GOPATH` entry's `pkg/mod`). A package none of these holds (a local `replace` outside the repository, a
+module the cache does not hold) is unavailable, and the `implements` and `overrides` capability rows count both
+(`go_external_packages`, `go_external_packages_unavailable`). Each package's types, aliases and method forms are read
+with `go/parser` from every non-test file (every build variant; a type or method two variants declare differently is
+left out) and cached on disk by its source's identity (`go_external_cache.go`). A Go type implements an interface
+outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
+the interface's of its name; an interface with an unexported method implements only within its own package. A
+conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
+source, and publishes `implements` (`supertype_interface`) and no `overrides` (`go_conversions.go`).
 
 ## Endpoint identity per family
 
@@ -422,8 +454,14 @@ The members' language family picks the resolver:
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
   cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is not
   `Final` and that the receiver's type or a supertype declares `virtual` ([class.virtual]). In C++ a bare call inside
-  a class walks out to the enclosing classes' static members. A Go interface embedded from a package outside the
-  unit counts toward its embedder's method set by name. `#define NAME func` makes a call of `NAME` a call of `func`,
+  a class walks out to the enclosing classes' static members. A Go method set compares methods by
+  name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
+  alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
+  however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
+  `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
+  parameters compare by position. A form it cannot decide (a struct or interface literal with members, an alias it
+  cannot follow, a name two dot imports declare) matches nothing, never a guess. A Go interface embedded from a
+  package outside the unit contributes its methods as read from that package (above, Hierarchy). `#define NAME func` makes a call of `NAME` a call of `func`,
   one per definition when `#if` arms define it differently, in the file and in the headers it includes.
 
 In every static family a site binds only a target its arguments fit: at least `Params - Optional` (one fewer for
