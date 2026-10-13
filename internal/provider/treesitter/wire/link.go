@@ -377,7 +377,8 @@ const (
 // type, so a virtual call on it runs that type's function ([class.virtual]:
 // the call is virtual only through a pointer or reference). The result of
 // a function that returns the type by value (Export.Returns) is one too.
-// Only the C++ worker sends it.
+// The ECMAScript worker sends it for the value of `new C()`, whose dynamic
+// type is exactly C.
 const ExactObject uint32 = 1
 
 // Type is a value's type as the worker recovered it inside the file: a name
