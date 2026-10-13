@@ -37,8 +37,9 @@ func (b *builder) routeTable() []endpointFact {
 			// alone (djangoSettings).
 			b.links = newRouteScanOf(b).linkRoutes()
 		case mayConfigureNest(b):
-			// A helper that sets a NestJS application's prefix need not
-			// import NestJS (nestAppScan).
+			// A helper that sets a NestJS application's prefix, or a file
+			// exporting a RouterModule route tree, need not import NestJS
+			// (nestAppScan).
 			b.links = newRouteScanOf(b).nestOnly()
 		}
 		return nil
