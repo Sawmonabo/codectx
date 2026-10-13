@@ -54,7 +54,8 @@ import (
 //     (readName, readSkip).
 //   - DynamicImports: every `#include NAME` whose path is a macro name: a
 //     constant one when every object-like definition of NAME before the
-//     directive replaces it with the same string literal or header name,
+//     directive replaces it with the same string literal or header name and
+//     no `#undef NAME` precedes it,
 //     spelled as the structural import record spells a literal include's
 //     path (`"a.h"` is a.h, `<a.h>` keeps its brackets), otherwise an open one
 //     with no fragments.
@@ -130,12 +131,27 @@ type cLinker struct {
 	buf   []byte
 }
 
-// cDefine is one object-like macro definition: where it starts and the
-// include path its replacement list is, empty when it is no string literal
-// or header name.
+// cDefine is one object-like macro definition, or one `#undef` of the name:
+// where it starts and the include path its replacement list is, empty when
+// it is no string literal or header name, and for an `#undef`.
 type cDefine struct {
 	start uint32
 	path  string
+}
+
+// undef is the macro name an `#undef` directive n removes, or "" when n is
+// another directive. The directive token may be spelled with spaces after
+// its `#` (ISO C 6.10p2).
+func (k *cLinker) undef(n Node) string {
+	d := n.ChildByFieldId(k.x.fDirective)
+	if d.IsNull() || strings.Join(strings.Fields(strings.TrimPrefix(k.text(d), "#")), "") != "undef" {
+		return ""
+	}
+	a := n.ChildByFieldId(k.x.fArgument)
+	if a.IsNull() {
+		return ""
+	}
+	return strings.TrimSpace(cUncommented(k.text(a)))
 }
 
 // cDecl is one declarator and the declaration that owns its specifiers: a
@@ -236,6 +252,13 @@ func (k *cLinker) declare(n Node) {
 	case id == x.namespaceDefinition:
 		if name := n.ChildByFieldId(s.fName); !name.IsNull() {
 			k.namespaces[k.typeName(name)] = true
+		}
+	case id == x.preprocCall:
+		// `#undef NAME` ends the definition before it: an include of NAME
+		// after it folds to no path (include), as one after a definition
+		// that is no path does.
+		if name := k.undef(n); name != "" {
+			k.defines[name] = append(k.defines[name], cDefine{start: uint32(n.StartByte())})
 		}
 	case id == x.enumerator || id == x.preprocDef:
 		if name := n.ChildByFieldId(s.fName); !name.IsNull() {
@@ -786,7 +809,8 @@ func cUncommented(text string) string {
 // include appends the DynamicImport of the directive n when its path is a
 // macro name: constant when every object-like definition of the name before
 // the directive replaces it with one and the same include path, and open,
-// with no fragments, otherwise.
+// with no fragments, otherwise, which includes an `#undef` of the name
+// before the directive.
 func (k *cLinker) include(n Node) {
 	p := n.ChildByFieldId(k.x.fPath)
 	if cKind(p) != k.s.identifier {
@@ -1674,11 +1698,12 @@ type cLinkSyntax struct {
 	translationUnit, functionDefinition, fieldDeclaration, fieldDeclarationList, typeDefinition,
 	structSpecifier, unionSpecifier, enumerator, preprocFunctionDef, preprocDef, parameterDeclaration,
 	variadicParameter, argumentList, fieldDesignator, abstractFunctionDeclarator, paren, ellipsis,
-	linkageSpecification, declarationList, preprocInclude uint16
-	// fPath is the field of an include directive's path, read from the
+	linkageSpecification, declarationList, preprocInclude, preprocCall uint16
+	// fPath is the field of an include directive's path, and fDirective and
+	// fArgument those of any other directive (`#undef NAME`), read from the
 	// grammar directly: the grammar table holds cRefine, so this table may
 	// not consult it (cLinkSyntaxIn).
-	fPath uint16
+	fPath, fDirective, fArgument uint16
 
 	// C++ only.
 	classSpecifier, baseClassClause, templateType, trailingReturnType, placeholderTypeSpecifier,
@@ -1756,14 +1781,17 @@ func resolveCLinkSyntax(language string, tl *ts.Language) *cLinkSyntax {
 		linkageSpecification:       kind("linkage_specification"),
 		declarationList:            kind("declaration_list"),
 		preprocInclude:             kind("preproc_include"),
+		preprocCall:                kind("preproc_call"),
 		fPath:                      tl.FieldIdForName("path"),
+		fDirective:                 tl.FieldIdForName("directive"),
+		fArgument:                  tl.FieldIdForName("argument"),
 		declaration:                kind("declaration"),
 		object:                     make([]bool, tl.NodeKindCount()),
 		conditional:                make([]bool, tl.NodeKindCount()),
 		clause:                     make([]bool, tl.NodeKindCount()),
 	}
-	if x.fPath == 0 {
-		panic("worker: the " + language + " grammar has no field path")
+	if x.fPath == 0 || x.fDirective == 0 || x.fArgument == 0 {
+		panic("worker: the " + language + " grammar has no field path, directive or argument")
 	}
 	x.object[kind("pointer_declarator")], x.object[kind("array_declarator")] = true, true
 	for _, name := range []string{"preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef"} {

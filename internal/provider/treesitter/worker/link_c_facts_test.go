@@ -115,6 +115,8 @@ func TestCVariadicParameterIsSent(t *testing.T) {
 // not Constant.
 // Mutation: fold an undefined name to itself -> the undefined one is
 // Constant.
+// Mutation: ignore `#undef` -> the name defined and then undefined folds to
+// "a.h" and is Constant.
 func TestCIncludeOfAMacro(t *testing.T) {
 	cases := []struct {
 		name, src, directive string
@@ -126,6 +128,8 @@ func TestCIncludeOfAMacro(t *testing.T) {
 		{name: "a header name", src: "#define SYS <stddef.h>\n#include SYS\n", directive: "#include SYS",
 			constant: true, fragments: []string{"<stddef.h>"}},
 		{name: "an undefined name", src: "#include HEADER\nint x;\n", directive: "#include HEADER"},
+		{name: "a name undefined after its definition", src: "#define HEADER \"a.h\"\n#undef HEADER\n#include HEADER\n",
+			directive: "#include HEADER"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
