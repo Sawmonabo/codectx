@@ -19,14 +19,16 @@ name**.
 
 A name is resolved against the pinned generation: the exact `name` first, the
 exact `qualified_name` second. A name that no node carries, and a name that
-several nodes carry, are both `CTX_ARGUMENT_INVALID`; the ambiguous case
-carries the exact number of candidates (detail `candidates`) and names every
-one of them by qualified name and id prefix in its remediation, printed under
-the error on the text path and carried in the `--json` envelope, so the caller
-can pick one. A name carried by more nodes than one page holds (the page
-ceiling, `resources.max_page_items`' bound) names the first page by node id and
-points to `codectx symbol <name>`, which lists all of them a page at a time
-with `--cursor`. Nothing is ever resolved to the first
+several nodes carry, are both `CTX_ARGUMENT_INVALID`. The ambiguous case
+carries the exact number of candidates (detail `candidates`), counted in one
+statement. Its remediation, printed under the error on the text path and
+carried in the `--json` envelope, opens with that count and with
+`codectx symbol "<name>"`, which lists every match a page at a time with
+`--cursor`; then it names, by qualified name and id prefix, as many
+candidates of the first page in node-id order as fit whole in the
+remediation's 1,024-byte bound, every one when they fit, and says how many it
+names (detail `candidates_named`). The bound can shorten that list and never
+cuts a name, the count or the command. Nothing is ever resolved to the first
 candidate silently — the candidates are different symbols, and answering about
 the wrong one is a wrong answer the caller cannot detect.
 
