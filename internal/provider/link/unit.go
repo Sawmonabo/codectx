@@ -99,6 +99,12 @@ const (
 	// FactOverrides: the method declaration Site directly overrides or
 	// implements the method Target, or the external method External names.
 	FactOverrides Fact = 7
+	// FactOpenImport: the import Site (an index into Table.Imports) names
+	// a module of the repository (a workspace package, the file's own
+	// package, a `#` import) that resolves to no member file, such as an
+	// `exports` entry into a build output the snapshot ignores. It is
+	// counted as an open import, never as an external one.
+	FactOpenImport Fact = 8
 )
 
 // Binding is one fact a resolver found. Site names the entry of a member's

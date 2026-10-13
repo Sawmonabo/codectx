@@ -432,11 +432,12 @@ func (ids *idTable) stableKey(key string) (string, error) {
 // entryRef is the stable spelling of e's Ref under key: a declaration, a
 // scope (an import's), a file (a path's), or nothing for the keys whose
 // entries name no declaration (a file's context, a Go directory, a Rust
-// module or crate, a re-export, a module exported as a namespace).
+// module or crate, a re-export, a module exported as a namespace, an
+// ECMAScript specifier's answer).
 func (ids *idTable) entryRef(key string, e entry) (string, error) {
 	switch {
 	case strings.HasPrefix(key, keyFile), strings.HasPrefix(key, keyGoDir), strings.HasPrefix(key, keyRustModule),
-		strings.HasPrefix(key, keyRustCrate), strings.HasPrefix(key, keyReexport),
+		strings.HasPrefix(key, keyRustCrate), strings.HasPrefix(key, keyReexport), strings.HasPrefix(key, keyESSpec),
 		strings.HasPrefix(key, keyExport) && e.Aux == exportModule:
 		return "", nil
 	case strings.HasPrefix(key, keyPath):

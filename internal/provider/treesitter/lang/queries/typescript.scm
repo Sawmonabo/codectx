@@ -1,6 +1,10 @@
 ; TypeScript additions, appended to ecmascript.scm for both the typescript and
 ; tsx grammars.
 
+; `import x = require("m")` imports m as plainly as a `require` call does; the
+; clause is the import, so its form reads as a require.
+(import_require_clause source: (string) @import.path) @import
+
 (interface_declaration name: (type_identifier) @name body: (_) @body) @def.interface
 (type_alias_declaration name: (type_identifier) @name) @def.class
 (enum_declaration name: (identifier) @name body: (_) @body) @def.enum

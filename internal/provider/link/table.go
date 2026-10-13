@@ -82,7 +82,19 @@ type Import struct {
 	// Range is the import statement, directive or call, the range of the
 	// evidence of each `imports` it resolves to.
 	Range model.SourceRange `json:"range"`
+	// Syntax is an ECMAScript import's form: ImportRequire, ImportDynamic,
+	// or empty for an import declaration. It selects the `import` or
+	// `require` condition of a package's `exports`.
+	Syntax string `json:"syntax,omitempty"`
 }
+
+// The forms of an ECMAScript import (Import.Syntax).
+const (
+	// ImportRequire is `require("m")` or `import x = require("m")`.
+	ImportRequire = "require"
+	// ImportDynamic is `import("m")`.
+	ImportDynamic = "dynamic"
+)
 
 // DynamicImport is one import whose path is an expression that does not
 // fold to a constant (`require("./x/" + name)`, `import(expr)`,

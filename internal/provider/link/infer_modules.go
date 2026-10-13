@@ -9,12 +9,14 @@ import (
 
 // ecmaScriptExtensions are the extensions an ECMAScript import may leave
 // out, so a module's path is compared without them.
-var ecmaScriptExtensions = []string{".d.ts", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"}
+var ecmaScriptExtensions = []string{".d.ts", ".d.mts", ".d.cts", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"}
 
 // moduleBases are the module paths, without extension, an import may name
-// the member file p by: ECMAScript's file path and, for an index file, its
-// directory; Python's dotted module path as a path, from every directory
-// that may be a source root, and for a package's `__init__.py` the package.
+// the member file p by: ECMAScript's file path (a directory's index file is
+// reached through the directory only where the importing file's module mode
+// allows it, which the resolution decides, esResolver.probe); Python's
+// dotted module path as a path, from every directory that may be a source
+// root, and for a package's `__init__.py` the package.
 func moduleBases(p string, python bool) []string {
 	var base string
 	if python {
@@ -32,16 +34,13 @@ func moduleBases(p string, python bool) []string {
 			s = s[i+1:]
 		}
 	}
-	base = stripExtension(p)
-	if path.Base(base) == "index" {
-		return []string{base, path.Dir(base)}
-	}
-	return []string{base}
+	return []string{stripExtension(p)}
 }
 
 // moduleBase is the module path, without extension, the import spec written
-// in the file at p denotes, and false for a spec no member file can be: an
-// ECMAScript package specifier.
+// in the file at p denotes as a path alone, and false for a spec no member
+// file can be by its path: an ECMAScript bare specifier, which the
+// configuration-aware resolution answers instead (esResolver).
 func moduleBase(p, spec string, python bool) (string, bool) {
 	dir := path.Dir(p)
 	if python {

@@ -390,6 +390,11 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	if h.ids, err = newIDTable(u.dir); err != nil {
 		return nil, err
 	}
+	es, err := newESResolver(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	defer es.close()
 	var file int32 = -1
 	err = u.members(func(fv model.FileVersion) error {
 		file++
@@ -406,7 +411,7 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 		if t == nil {
 			return nil
 		}
-		return addDecls(decls, file, t)
+		return addDecls(ctx, decls, file, t, es)
 	})
 	if err == nil {
 		err = h.ids.finish()
@@ -452,8 +457,12 @@ func buildHierarchy(ctx context.Context, u *unit) (*hierarchy, error) {
 	return h, nil
 }
 
-// addDecls adds t's file context, type declarations and free functions.
-func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
+// addDecls adds t's file context, type declarations and free functions,
+// and, through es, what an ECMAScript file's specifiers resolve to.
+func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32, t *Table, es *esResolver) error {
+	if err := es.add(ctx, s, t); err != nil {
+		return err
+	}
 	fc := contextOf(file, t)
 	fileKey := refKey(Ref{File: file})
 	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
@@ -564,7 +573,7 @@ func addDecls(s *pagination.ExternalSort[entry], file int32, t *Table) error {
 		}
 	}
 	if len(bases) > 0 {
-		return addExports(s, file, t, bases, fc.family == "python")
+		return addExports(s, file, t, bases, fc.family == "python", es)
 	}
 	return nil
 }
@@ -1099,15 +1108,13 @@ func (h *hierarchy) memberType(fc fileCtx, p string, scope int32, name string, y
 // ECMAScript or Python import spec written in fc's file names, following
 // the module's re-exports.
 func (h *hierarchy) moduleType(fc fileCtx, spec, name string, yield func(entry) error) error {
-	base, ok := moduleBase(fc.path, spec, fc.family == "python")
-	if !ok {
-		return nil
-	}
-	return h.moduleExport(base, name, func(e entry) error {
-		if e.Aux != exportType {
-			return nil
-		}
-		return yield(e)
+	return h.modules(fc, spec, func(base string) error {
+		return h.moduleExport(base, name, func(e entry) error {
+			if e.Aux != exportType {
+				return nil
+			}
+			return yield(e)
+		})
 	})
 }
 
@@ -1200,7 +1207,7 @@ func sameExports(a, b []entry) bool {
 // `export { a as b }`), a module as a namespace (`export * as ns from`),
 // and re-exports another module's name (`export { x } from`, `export *
 // from`, a local export of an import binding).
-func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases []string, python bool) error {
+func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases []string, python bool, es *esResolver) error {
 	add := func(prefix, name string, e entry) error {
 		for _, b := range bases {
 			e.Key = prefix + b + "\x00" + name
@@ -1232,14 +1239,18 @@ func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases [
 		return nil
 	}
 	from := func(name, spec, original string) error {
-		target, ok := moduleBase(t.Path, spec, false)
-		switch {
-		case !ok:
-			return nil
-		case original == "*" && name != "*":
-			return add(keyExport, name, entry{Aux: exportModule, Sig: target})
+		for _, target := range es.targets(t.Path, spec) {
+			var err error
+			if original == "*" && name != "*" {
+				err = add(keyExport, name, entry{Aux: exportModule, Sig: target})
+			} else {
+				err = add(keyReexport, name, entry{Aux: target, Sig: original})
+			}
+			if err != nil {
+				return err
+			}
 		}
-		return add(keyReexport, name, entry{Aux: target, Sig: original})
+		return nil
 	}
 	for _, x := range t.Reexports {
 		if x.From != "" {
@@ -1988,8 +1999,8 @@ func (h *hierarchy) externalImported(fc fileCtx, p, original, local, rest string
 		// `from m import sub`, a submodule: its names are m.sub's.
 		return join(p, local, rest), true, nil
 	case "js":
-		if strings.HasPrefix(p, ".") || strings.HasPrefix(p, "/") {
-			return "", false, nil
+		if outside, err := h.esOutside(fc.path, p); err != nil || !outside {
+			return "", false, err
 		}
 		switch original {
 		case "*":
