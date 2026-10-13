@@ -70,9 +70,9 @@ func (s *routeScan) nest() {
 					paths = []string{r.value}
 				}
 				for _, m := range append(methods[:len(methods):len(methods)], nestAny(methods)...) {
-					s.nestOut = append(s.nestOut, nestRoute{at: at, NestRoute: link.NestRoute{Method: m, Route: r.route(),
+					s.nestOut = append(s.nestOut, nestRoute{at: at, Method: m, Route: r.route(),
 						Controllers: ctrl.paths, Paths: paths, Known: r.literal && ctrl.known, Version: version,
-						Controller: ctrl.version, Handler: int32(i)}})
+						Controller: ctrl.version, Handler: int32(i)})
 				}
 			}
 		}

@@ -141,7 +141,7 @@ func inferTypes(ctx context.Context, u *unit, h *hierarchy, only *pagination.Sor
 // calls through, each once with the technique that found it and whether the
 // call passes the method's receiver first (valUnbound). Sites asked in
 // ascending order are answered by one forward pass.
-func (t *types) functions(ctx context.Context, site Ref, yield func(target Ref, detail string, receiverFirst bool) error) error {
+func (t *types) functions(site Ref, yield func(target Ref, detail string, receiverFirst bool) error) error {
 	return t.seek(site, func(r recv) error {
 		if r.X.Kind != valFunction && r.X.Kind != valUnbound {
 			return nil
@@ -578,7 +578,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		err = join(delta, in.watches, func(f fact, w watch) int { return cmpVar(f.V, w.V) },
 			func(f fact, ws []watch) error {
 				for _, w := range ws {
-					if err := in.receive(ctx, r, recv{Call: w.Call, Role: w.Role, X: f.X}); err != nil {
+					if err := in.receive(r, recv{Call: w.Call, Role: w.Role, X: f.X}); err != nil {
 						return err
 					}
 				}
@@ -775,7 +775,7 @@ func (in *inference) addFieldWatches(ctx context.Context, r *round) error {
 	}
 	err = join(in.facts, added, func(f fact, w watch) int { return cmpVar(f.V, w.V) }, func(f fact, ws []watch) error {
 		for _, w := range ws {
-			if err := in.receive(ctx, r, recv{Call: w.Call, Role: w.Role, X: f.X}); err != nil {
+			if err := in.receive(r, recv{Call: w.Call, Role: w.Role, X: f.X}); err != nil {
 				return err
 			}
 		}
@@ -1179,7 +1179,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			if op.IsVar {
 				return watches.Add(watch{V: op.V, Role: role, Call: c})
 			}
-			return in.receive(ctx, r, recv{Call: c, Role: role, X: op.X})
+			return in.receive(r, recv{Call: c, Role: role, X: op.X})
 		})
 	}
 	switch s.Shape {
@@ -1213,7 +1213,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 			target := Ref{File: f.file, Index: k}
 			switch {
 			case isType(d.Kind):
-				if err := in.receive(ctx, r, recv{Call: c, Role: roleConstruct, X: value{Kind: valInstance, Ref: target}}); err != nil {
+				if err := in.receive(r, recv{Call: c, Role: roleConstruct, X: value{Kind: valInstance, Ref: target}}); err != nil {
 					return err
 				}
 			case isCallable(d.Kind):
@@ -1226,7 +1226,7 @@ func (f *fileScan) site(ctx context.Context, r *round, watches *pagination.Exter
 		constructed := false
 		construct := func(target Ref) error {
 			constructed = true
-			return in.receive(ctx, r, recv{Call: c, Role: roleConstruct, X: value{Kind: valInstance, Ref: target}})
+			return in.receive(r, recv{Call: c, Role: roleConstruct, X: value{Kind: valInstance, Ref: target}})
 		}
 		for _, k := range scoped(t, s.Caller, s.Candidates) {
 			if isType(t.Decls[k].Kind) {
@@ -1492,7 +1492,7 @@ func (f *fileScan) function(ctx context.Context, caller int32, name string, yiel
 
 // receive turns one value playing a role at a site into what the round
 // joins: a binding, a method lookup, an export request or a construction.
-func (in *inference) receive(ctx context.Context, r *round, v recv) error {
+func (in *inference) receive(r *round, v recv) error {
 	if err := in.recvLog.Add(v); err != nil {
 		return err
 	}
@@ -1556,7 +1556,7 @@ func (in *inference) step(ctx context.Context, r *round) (*pagination.SortedRun[
 		return in.h.moduleExport(q.Base, q.Name, func(e entry) error {
 			switch e.Aux {
 			case exportType:
-				return in.receive(ctx, r, recv{Call: q.Call, Role: roleConstruct, X: value{Kind: valInstance, Ref: e.Ref}})
+				return in.receive(r, recv{Call: q.Call, Role: roleConstruct, X: value{Kind: valInstance, Ref: e.Ref}})
 			case exportFunc:
 				return r.bindings.Add(binding{Site: q.Call.Site, Target: e.Ref, Rank: rankDirect, Flow: true})
 			}

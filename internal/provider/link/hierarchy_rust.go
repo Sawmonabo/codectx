@@ -24,7 +24,7 @@ func (h *hierarchy) rustTraitOverrides(ctx context.Context, fc fileCtx, ref Ref,
 		return nil
 	}
 	inUnit := false
-	err := h.typesIn(ctx, fc, d.Trait, func(trait entry) error {
+	err := h.typesIn(fc, d.Trait, func(trait entry) error {
 		inUnit = true
 		return h.methods(trait.Ref, d.Name, func(e entry) error {
 			if e.Ref == ref {

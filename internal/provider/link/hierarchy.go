@@ -956,7 +956,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			continue
 		}
 		typed := false
-		err := h.typesIn(ctx, fc, d.Receiver, func(te entry) error {
+		err := h.typesIn(fc, d.Receiver, func(te entry) error {
 			typed = true
 			return add(te.Ref)
 		})
@@ -980,7 +980,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 	}
 	for i, st := range t.Supertypes {
 		var supers []entry
-		err := h.typesIn(ctx, fc, st.Super, func(super entry) error {
+		err := h.typesIn(fc, st.Super, func(super entry) error {
 			supers = append(supers, super)
 			return nil
 		})
@@ -998,7 +998,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 				continue
 			}
 		}
-		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
+		err = h.typesIn(fc, st.Type, func(sub entry) error {
 			if ok {
 				var flags byte
 				if st.Interface || externalInterface(fc.family, sub.Flags) {
@@ -1070,7 +1070,7 @@ func (h *hierarchy) typeEntries(ctx context.Context, file int32, name string, yi
 	if err != nil || !found {
 		return err
 	}
-	return h.typesIn(ctx, fc, name, yield)
+	return h.typesIn(fc, name, yield)
 }
 
 // fileContext is the context of the member file at ordinal file as the
@@ -1110,7 +1110,7 @@ func (h *hierarchy) fileContext(file int32) (fc fileCtx, found bool, err error) 
 // path, a Rust path by its module, an ECMAScript or Python module by its
 // path, a Java or C++ name by the import's qualified name. Any other
 // qualified name is the declarations whose qualified name ends in it.
-func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yield func(entry) error) error {
+func (h *hierarchy) typesIn(fc fileCtx, written string, yield func(entry) error) error {
 	name := typeName(written)
 	if name == "" {
 		return nil
@@ -2202,7 +2202,7 @@ func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string
 		return "", false, nil
 	}
 	inUnit := false
-	if err := h.typesIn(ctx, fc, name, func(entry) error {
+	if err := h.typesIn(fc, name, func(entry) error {
 		inUnit = true
 		return nil
 	}); err != nil || inUnit {
@@ -2562,7 +2562,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 	}
 	for _, st := range t.Supertypes {
 		sub := false
-		if err := h.typesIn(ctx, fc, st.Type, func(e entry) error {
+		if err := h.typesIn(fc, st.Type, func(e entry) error {
 			sub = sub || e.Ref == ref
 			return nil
 		}); err != nil {
@@ -2572,7 +2572,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 			continue
 		}
 		found := false
-		err := h.typesIn(ctx, fc, st.Super, func(e entry) error {
+		err := h.typesIn(fc, st.Super, func(e entry) error {
 			found = true
 			if e.Ref == ref || e.Flags&flagInterface == 0 {
 				return nil
@@ -2614,7 +2614,7 @@ func (h *hierarchy) owners(ctx context.Context, fc fileCtx, t *Table, d *Decl, y
 	if d.Receiver == "" {
 		return nil
 	}
-	return h.typesIn(ctx, fc, d.Receiver, func(e entry) error { return yield(e.Ref) })
+	return h.typesIn(fc, d.Receiver, func(e entry) error { return yield(e.Ref) })
 }
 
 // overrideFacts emits what the method d at ref directly overrides

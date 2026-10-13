@@ -96,7 +96,7 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 	}
 	for _, st := range t.Supertypes {
 		var supers []Ref
-		err := h.typesIn(ctx, fc, st.Super, func(super entry) error {
+		err := h.typesIn(fc, st.Super, func(super entry) error {
 			supers = append(supers, super.Ref)
 			return nil
 		})
@@ -112,7 +112,7 @@ func (h *hierarchy) goEmbeddings(ctx context.Context, methodSets *pagination.Ext
 		if len(supers) == 0 && !ok {
 			continue
 		}
-		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
+		err = h.typesIn(fc, st.Type, func(sub entry) error {
 			if slices.Contains(supers, sub.Ref) {
 				return nil
 			}

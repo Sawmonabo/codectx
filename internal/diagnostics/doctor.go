@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -750,11 +751,7 @@ func failure(name string, err error) model.DoctorCheck {
 // the configuration or the generation that produced them, and the detail is
 // bounded again by model.MaxDetailBytes in DoctorCheck.Validate.
 func joinNames(names []string) string {
-	out := names[0]
-	for _, p := range names[1:] {
-		out += ", " + p
-	}
-	return out
+	return strings.Join(names, ", ")
 }
 
 // bytesPhrase renders a byte count for a human detail. It stays a plain decimal

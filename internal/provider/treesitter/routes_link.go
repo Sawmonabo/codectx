@@ -364,7 +364,7 @@ func (s *routeScan) djangoLinks(out *routeLinks) {
 		if e.include == nil {
 			continue
 		}
-		pre, known := e.route.value, e.route.literal && e.regex == false
+		pre, known := e.route.value, e.route.literal && !e.regex
 		switch {
 		case e.include.list.End > 0:
 			containers = append(containers, djangoContainer{at: e.include.list, including: e.at, prefix: pre, known: known})
@@ -516,7 +516,7 @@ func pyDotted(v string) bool {
 	if v == "" {
 		return false
 	}
-	for _, p := range strings.Split(v, ".") {
+	for p := range strings.SplitSeq(v, ".") {
 		if !pyName(p) {
 			return false
 		}

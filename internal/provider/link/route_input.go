@@ -2,6 +2,7 @@ package link
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -229,10 +230,8 @@ func classOf(h *hierarchy, mods *index, from, ref string, way []Ref) (uint8, err
 		if !(hitNear(from, e.Aux, exact) || !near && !exact) {
 			continue
 		}
-		for _, w := range way {
-			if w == e.Ref {
-				return classUnknown, nil
-			}
+		if slices.Contains(way, e.Ref) {
+			return classUnknown, nil
 		}
 		var p classPayload
 		if err := json.Unmarshal([]byte(e.Sig), &p); err != nil {

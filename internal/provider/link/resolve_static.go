@@ -234,7 +234,7 @@ func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, out siteOut) e
 		// of that method's signature: it joins every method reference of
 		// that signature, as an indirect site joins the address-taken
 		// functions of its declared type.
-		return r.h.typesIn(r.ctx, r.fc, s.Receiver.Name, func(typ entry) error {
+		return r.h.typesIn(r.fc, s.Receiver.Name, func(typ entry) error {
 			return r.h.declared(typ.Ref, s.Callee, func(e entry) error {
 				if e.Flags&flagAbstract == 0 || e.Sig == "" {
 					return nil
@@ -353,7 +353,7 @@ func (r *staticFile) inherited(typ Ref, method string, d model.Dispatch, out sit
 // method, `virtual`.
 func (r *staticFile) named(fc fileCtx, written, method string, exact bool, out siteOut) error {
 	found := false
-	err := r.h.typesIn(r.ctx, fc, written, func(typ entry) error {
+	err := r.h.typesIn(fc, written, func(typ entry) error {
 		found = true
 		return r.onType(typ, method, exact, out)
 	})
@@ -453,7 +453,7 @@ func (r *staticFile) bare(caller int32, callee string, out siteOut) error {
 // isType reports that written names a type of the unit in the member.
 func (r *staticFile) isType(written string) (bool, error) {
 	typed := false
-	err := r.h.typesIn(r.ctx, r.fc, written, func(entry) error {
+	err := r.h.typesIn(r.fc, written, func(entry) error {
 		typed = true
 		return nil
 	})
@@ -468,7 +468,7 @@ func (r *staticFile) isType(written string) (bool, error) {
 func (r *staticFile) construct(written string, out siteOut) error {
 	ctor := lastComponent(typeName(written), r.fc.sep)
 	typed := false
-	err := r.h.typesIn(r.ctx, r.fc, written, func(typ entry) error {
+	err := r.h.typesIn(r.fc, written, func(typ entry) error {
 		typed = true
 		found := false
 		err := r.h.methods(typ.Ref, ctor, func(e entry) error {
@@ -598,7 +598,7 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 		}
 	}
 	found, typed := false, false
-	err := r.h.typesIn(r.ctx, r.fc, q, func(typ entry) error {
+	err := r.h.typesIn(r.fc, q, func(typ entry) error {
 		typed = true
 		var members []entry
 		if err := r.h.declared(typ.Ref, name, func(e entry) error {
@@ -609,7 +609,6 @@ func (r *staticFile) qualified(caller int32, q, name string, out siteOut) error 
 		}
 		if len(members) == 0 {
 			if r.fc.family == "rust" {
-				// A tuple variant's constructor (rustValue).
 				variant, err := r.rustConstruct(caller, q+"::"+name, out)
 				if err != nil || variant {
 					found = variant
@@ -693,7 +692,7 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, out sit
 			return r.named(fc, written, method, exact, out)
 		})
 	case wire.TypeSuper:
-		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
+		return r.h.typesIn(r.fc, recv.Name, func(typ entry) error {
 			found := false
 			err := r.h.links.lookup(keySuper+refKey(typ.Ref), func(super entry) error {
 				return r.h.declared(super.Ref, method, func(e entry) error {
@@ -709,7 +708,7 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, out sit
 	case wire.TypeModule:
 		return r.qualified(caller, recv.Name, method, out)
 	case wire.TypeClass:
-		return r.h.typesIn(r.ctx, r.fc, recv.Name, func(typ entry) error {
+		return r.h.typesIn(r.fc, recv.Name, func(typ entry) error {
 			return r.onType(typ, method, true, out)
 		})
 	case wire.TypeField:
@@ -803,7 +802,7 @@ func (r *staticFile) enclosingTypes(caller int32, level func([]Ref) (bool, error
 			types = []Ref{{File: r.file, Index: i}}
 		case d.Receiver != "" && (d.Parent < 0 || int(d.Parent) >= len(r.t.Decls) || !isType(r.t.Decls[d.Parent].Kind) ||
 			anonymousReceiver(r.fc, d)):
-			err := r.h.typesIn(r.ctx, r.fc, d.Receiver, func(e entry) error {
+			err := r.h.typesIn(r.fc, d.Receiver, func(e entry) error {
 				types = append(types, e.Ref)
 				return nil
 			})
@@ -925,7 +924,7 @@ func (r *staticFile) fieldJava(written, method string, out siteOut) error {
 	parts := strings.Split(written, ".")
 	for k := len(parts) - 1; k >= 1; k-- {
 		found := false
-		err := r.h.typesIn(r.ctx, r.fc, strings.Join(parts[:k], "."), func(typ entry) error {
+		err := r.h.typesIn(r.fc, strings.Join(parts[:k], "."), func(typ entry) error {
 			found = true
 			return r.fieldPath(typ.Ref, parts[k:], func(fc fileCtx, written string) error {
 				return r.named(fc, written, method, false, out)

@@ -1,6 +1,9 @@
 package link_test
 
-import "testing"
+import (
+	"maps"
+	"testing"
+)
 
 // nestCtrl is a controller file: one class at path serving GET at route.
 func nestCtrl(class, path, route, handler string) string {
@@ -254,9 +257,7 @@ export class AdminModule {}
 				"src/cats.controller.ts": nestCtrl("CatsController", "cats", "", "findAll"),
 				"src/dogs.controller.ts": nestCtrl("DogsController", "dogs", "", "bark"),
 				"src/cats.module.ts":     catsModule, "src/dogs.module.ts": dogsModule}
-			for p, src := range c.files {
-				files[p] = src
-			}
+			maps.Copy(files, c.files)
 			checkMounted(t, files, c.want)
 		})
 	}

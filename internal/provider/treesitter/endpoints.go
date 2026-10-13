@@ -123,7 +123,7 @@ func (b *builder) routeDecl(f *endpointFact) error {
 	}
 	d := &b.decls[f.decl]
 	for _, h := range f.handlers {
-		to, ok, err := b.handlerNode(h, d.Name, d.rng)
+		to, ok, err := b.handlerNode(h)
 		if err != nil {
 			return err
 		}
@@ -186,7 +186,7 @@ func (b *builder) publishEndpoint(f *endpointFact) error {
 	first := b.putNode(structure, res, rng, key, meta)
 	b.putRelation(structure, b.module.Node.ID, model.RelDefines, res.Node.ID, rng, key, "")
 	for _, h := range f.handlers {
-		to, ok, err := b.handlerNode(h, f.descriptor, rng)
+		to, ok, err := b.handlerNode(h)
 		if err != nil {
 			return err
 		}
@@ -212,7 +212,7 @@ func (b *builder) publishEndpoint(f *endpointFact) error {
 // handlerNode is the node one handler names, minting it when it is a name
 // this file does not declare exactly once or a function literal, and false
 // when a bound kept it out (counted).
-func (b *builder) handlerNode(h handler, descriptor string, at *model.SourceRange) (model.NodeID, bool, error) {
+func (b *builder) handlerNode(h handler) (model.NodeID, bool, error) {
 	switch {
 	case h.decl >= 0:
 		if h.decl >= len(b.decls) {

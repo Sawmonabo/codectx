@@ -173,7 +173,7 @@ export function %[2]sRun%[1]s(): string {
 	// and not only as missing nodes.
 	var fanout strings.Builder
 	goPkg := corpusPrefix + "Go"
-	fanout.WriteString("package " + goPkg + "fanout\n\nimport (\n")
+	fmt.Fprintf(&fanout, "package %sfanout\n\nimport (\n", goPkg)
 	for p := range spec.Packages {
 		fmt.Fprintf(&fanout, "\t\"example.com/ctxbench/src/go/%s%02d\"\n", goPkg, p)
 	}

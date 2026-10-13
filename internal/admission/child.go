@@ -222,8 +222,8 @@ func (c *ChildNeeds) plan(ctx context.Context, l *Ledger, key ChildKey, w ChildW
 	memKind, diskKind, _ := key.Kind.kinds()
 	run := ledger.RunFromContext(ctx)
 	n := ChildNeed{ChildWork: w, run: run}
-	n.memKey = childModelKey{repository: run.RepositoryID(), NeedKey: ledger.NeedKey{Kind: memKind, Subject: key.Tool,
-		Fingerprint: key.Fingerprint, Build: childBuild(), SizeClass: SizeClassOf(w.WorkBytes)}}
+	n.memKey = childModelKey{repository: run.RepositoryID(), Kind: memKind, Subject: key.Tool,
+		Fingerprint: key.Fingerprint, Build: childBuild(), SizeClass: SizeClassOf(w.WorkBytes)}
 	n.diskKey = n.memKey
 	n.diskKey.Kind = diskKind
 	n.mem, n.disk = c.model(n.memKey), c.model(n.diskKey)

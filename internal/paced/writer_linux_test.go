@@ -34,6 +34,9 @@ func procIO(t *testing.T, field string) int64 {
 			return n
 		}
 	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("/proc/self/io: %v", err)
+	}
 	t.Fatalf("/proc/self/io has no %s line", field)
 	return 0
 }
