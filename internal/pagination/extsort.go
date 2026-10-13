@@ -142,7 +142,18 @@ type ExternalSort[T any] struct {
 	// volume (which scales with the input even for a perfect external sort)
 	// cannot show.
 	peakRecords int
-	err         error
+	// mark is the point Mark set, nil when none is set.
+	mark *sortMark
+	err  error
+}
+
+// sortMark is a point in a sort's arrivals: the runs spilled before it, and
+// the buffered records and their bytes that arrived before it.
+type sortMark struct {
+	runs     int
+	buf      int
+	bufBytes int64
+	count    int64
 }
 
 // NewExternalSort opens a sort whose runs are taken from the scratch arena of
@@ -368,7 +379,54 @@ func (s *ExternalSort[T]) Add(v T) error {
 // whole answer is SortedRun.Len, which the merge counts after the fold.
 func (s *ExternalSort[T]) Len() int64 { return s.count }
 
-// spill sorts the run buffer and writes it out as one sorted run.
+// Mark sets a point RollBack returns the sort to; Keep forgets it. It costs
+// nothing while it is set: records go on arriving in the buffer, and a spill
+// that holds records from both sides of the mark writes them as two runs, the
+// earlier first, so every run lies wholly on one side. Run order is arrival
+// order and the merge breaks ties by run index, so the two runs answer exactly
+// what one run of the same records would, and an answer read with the mark
+// kept is the answer of a sort that never had one.
+//
+// It exists for a producer that must be able to take back what one unit of
+// its work added: the unit's records go straight into the sort, and only a
+// unit that is abandoned pays anything, by dropping its runs. One mark is set
+// at a time.
+func (s *ExternalSort[T]) Mark() error {
+	if s.err != nil {
+		return s.err
+	}
+	if s.mark != nil {
+		return internalErr("external sort: a mark is already set")
+	}
+	s.mark = &sortMark{runs: len(s.runs), buf: len(s.buf), bufBytes: s.bufBytes, count: s.count}
+	return nil
+}
+
+// Keep forgets the mark: what arrived since it stays.
+func (s *ExternalSort[T]) Keep() { s.mark = nil }
+
+// RollBack drops every record added since the mark, and the mark with them:
+// the runs spilled after it go back to the pool, and the buffer is cut to what
+// it held before it.
+func (s *ExternalSort[T]) RollBack() error {
+	if s.err != nil {
+		return s.err
+	}
+	m := s.mark
+	if m == nil {
+		return internalErr("external sort: roll back with no mark set")
+	}
+	for _, r := range s.runs[m.runs:] {
+		releaseRun(r)
+	}
+	s.runs = s.runs[:m.runs]
+	clear(s.buf[m.buf:])
+	s.buf, s.bufBytes, s.count, s.mark = s.buf[:m.buf], m.bufBytes, m.count, nil
+	return nil
+}
+
+// spill sorts the run buffer and writes it out as one sorted run, or as two
+// when a mark falls inside it (Mark).
 //
 // The sort is stable so that the merge below, which breaks ties by run order
 // and then by position within a run, reproduces exactly the order a single
@@ -379,14 +437,36 @@ func (s *ExternalSort[T]) spill() error {
 	if len(s.buf) == 0 {
 		return nil
 	}
-	slices.SortStableFunc(s.buf, s.compare)
+	if m := s.mark; m != nil && m.buf > 0 {
+		if m.buf < len(s.buf) {
+			if err := s.writeRun(s.buf[:m.buf]); err != nil {
+				return err
+			}
+			if err := s.writeRun(s.buf[m.buf:]); err != nil {
+				return err
+			}
+		} else if err := s.writeRun(s.buf); err != nil {
+			return err
+		}
+		// Everything before the mark is now in runs ahead of it.
+		m.runs, m.buf, m.bufBytes = m.runs+1, 0, 0
+	} else if err := s.writeRun(s.buf); err != nil {
+		return err
+	}
+	s.buf, s.bufBytes = s.buf[:0], 0
+	return nil
+}
+
+// writeRun sorts buf and writes it out as one run.
+func (s *ExternalSort[T]) writeRun(buf []T) error {
+	slices.SortStableFunc(buf, s.compare)
 	lease, f, err := s.arena.TakeFile(scratch.SortRun)
 	if err != nil {
 		s.err = internalErr("external sort run: " + err.Error())
 		return s.err
 	}
 	w := bufio.NewWriterSize(paced.NewWriter(f), mergeBlockBytes)
-	for _, v := range s.buf {
+	for _, v := range buf {
 		if err := s.writeRecord(w, v); err != nil {
 			lease.Release()
 			s.err = err
@@ -401,7 +481,6 @@ func (s *ExternalSort[T]) spill() error {
 	}
 	s.runs = append(s.runs, runFile{lease: lease, path: lease.Path(), bytes: n})
 	s.spilled++
-	s.buf, s.bufBytes = s.buf[:0], 0
 	return nil
 }
 
@@ -668,6 +747,7 @@ func releaseRun(r runFile) {
 }
 
 func (s *ExternalSort[T]) releaseRuns() {
+	s.mark = nil
 	for _, r := range s.runs {
 		releaseRun(r)
 	}

@@ -135,9 +135,11 @@ keys, not on pages.
   kept files, all keyed at or below (`recommended`, τ(next)), so it cannot reorder the head above the stop. It can push
   a witness past a slice, which the certificate catches. The order above the stop is fixed and drops are permanent,
   so the loop ends.
-- **A deadline inside the closure.** The closure runs as one unit: what it admits is staged and joins the plan when it
-  finishes. On a compile that answers continuations, a query deadline that lands inside it discards the stage and
-  ends the call before the closure, so the continuation runs the closure whole and the plan is the uninterrupted
+- **A deadline inside the closure.** The closure runs as one unit: what it admits goes straight into the plan's
+  spools under a mark, which costs nothing while it is set (a spill that straddles it writes two runs instead of
+  one, so each run lies on one side; the merge breaks ties by run order, so the answer is unchanged). On a compile
+  that answers continuations, a query deadline that lands inside it rolls the spools back to the mark, the way a
+  savepoint is rolled back [S13], and ends the call before the closure, so the continuation runs the closure whole and the plan is the uninterrupted
   compile's. A closure the deadline cuts on two legs in a row cannot fit one call; its second run narrows the scope
   on the cut, as a walk page that stalls twice does.
 
@@ -228,6 +230,7 @@ only graph expansion a plain-language task gets; an agent localization study los
   Localization*, arXiv:2503.09089v2, https://arxiv.org/html/2503.09089 — section 5.6, Table 6: with the fine-tuned
   Qwen-2.5-7B, removing the graph-traversal tool drops function-level Acc@10 from 71.53 to 66.06.
 - [S12] *Model Context Protocol, tools, 2025-06-18*, https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+- [S13] *SQLite, SAVEPOINT*, https://www.sqlite.org/lang_savepoint.html
   — a tool result may return a `resource_link`, a URI the client fetches or subscribes to for additional context.
 - [S9] Sun, Han, Yan, Yu, Wu, *PathSim: Meta Path-Based Top-K Similarity Search in Heterogeneous Information
   Networks*, VLDB 2011, https://www.vldb.org/pvldb/vol4/p992-sun.pdf — typed, directed relation paths; the inverse
