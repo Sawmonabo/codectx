@@ -27,6 +27,7 @@ type exactReader interface {
 	DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	Nodes(ctx context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	NodesAmong(ctx context.Context, f sqlite.NodeFilter, ids []model.NodeID) ([]sqlite.StoredNode, error)
+	WalkTier(ctx context.Context, f sqlite.NodeFilter, limit int, yield func([]sqlite.StoredNode) error) error
 }
 
 var _ exactReader = (*sqlite.PinnedReader)(nil)
@@ -266,7 +267,7 @@ func (s tierSpan) covers(tier model.SearchTier) bool {
 // page is the READ size for one keyset step, not a bound on the answer: every
 // tier is walked to the end of its keyset and nothing is dropped.
 //
-// Nodes picks the precedence-winning row PER TIER's WHERE clause, so a node
+// WalkTier picks the precedence-winning row PER TIER's WHERE clause, so a node
 // whose units publish different qualified names can present one row at
 // exact_qualified_name and another at exact_name; the candidate in hand is one
 // row and cannot speak for the node's others. tierRule asks the earlier tiers
@@ -290,27 +291,12 @@ func exactCandidates(ctx context.Context, r exactReader, rule *tierRule, page in
 			continue
 		}
 		// One row per node: where several units publish the same node fact,
-		// Nodes applies the Section 9.4 read-time precedence order (verified
-		// source binding, then provider id, then unit key) inside the query
-		// itself. Nothing in this package re-ranks or re-folds provider ids.
-		nodeFilter := nodeFilterFor(tier, rule.query, rule.kinds)
-		after := model.NodeID("")
-		// The tier is walked on its keyset, not read once. Nodes applies its
-		// SQL LIMIT to node_facts rows and only then collapses the duplicate
-		// node_id rows the Section 9.4 precedence order leaves behind, so a
-		// full-bound read routinely returns fewer nodes than it asked for while
-		// the keyset still has rows: a deduped count can neither end the walk
-		// nor decide whether the tier had more. Only an EMPTY page ends it, and
-		// `after` advances strictly on every non-empty one, so it terminates.
-		for {
-			nodes, err := r.Nodes(ctx, nodeFilter, after, page)
-			if err != nil {
-				return err
-			}
-			if len(nodes) == 0 {
-				break
-			}
-			after = nodes[len(nodes)-1].Node.ID
+		// WalkTier applies the Section 9.4 read-time precedence order (verified
+		// source binding, then provider id, then unit key) inside its statement.
+		// Nothing in this package re-ranks or re-folds provider ids. The walk
+		// reads the tier once, in its index's order: every consumer of these
+		// candidates orders them itself (a heap of one page, or a sort).
+		err := r.WalkTier(ctx, nodeFilterFor(tier, rule.query, rule.kinds), page, func(nodes []sqlite.StoredNode) error {
 			ids = ids[:0]
 			for _, n := range nodes {
 				ids = append(ids, n.Node.ID)
@@ -331,6 +317,10 @@ func exactCandidates(ctx context.Context, r exactReader, rule *tierRule, page in
 					return err
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 	return nil

@@ -10,10 +10,20 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// countingExact counts the symbol-tier reads a walk makes through it.
+// countingExact counts the symbol-tier reads a walk makes through it: nodes
+// counts keyset reads of a tier (a Nodes page or a WalkTier page), among the
+// batched lookups.
 type countingExact struct {
 	exactReader
 	nodes, among int
+}
+
+func (c *countingExact) WalkTier(ctx context.Context, f sqlite.NodeFilter, limit int,
+	yield func([]sqlite.StoredNode) error) error {
+	return c.exactReader.WalkTier(ctx, f, limit, func(nodes []sqlite.StoredNode) error {
+		c.nodes++
+		return yield(nodes)
+	})
 }
 
 func (c *countingExact) Nodes(ctx context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error) {

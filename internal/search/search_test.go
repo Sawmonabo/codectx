@@ -880,6 +880,11 @@ func (s *stubExact) NodesAmong(context.Context, sqlite.NodeFilter, []model.NodeI
 	return nil, nil
 }
 
+// WalkTier yields nothing, as Nodes does.
+func (s *stubExact) WalkTier(context.Context, sqlite.NodeFilter, int, func([]sqlite.StoredNode) error) error {
+	return nil
+}
+
 // legPathTierLossless proves the exact_path tier drops nothing: it walks the
 // whole keyset and emits every kept candidate, with the read page size bounding
 // only one round trip. Serving five of eight candidates -- or answering
@@ -1046,6 +1051,29 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 		}
 	}
 	return out, nil
+}
+
+// WalkTier yields the tier a page at a time, in the stub's id order, with
+// storage's page bound. A short page ends the walk, as it does in storage.
+func (s *stubWideExact) WalkTier(ctx context.Context, f sqlite.NodeFilter, limit int,
+	yield func([]sqlite.StoredNode) error) error {
+	limit = min(limit, model.MaxPageItems)
+	after := model.NodeID("")
+	for {
+		nodes, err := s.Nodes(ctx, f, after, limit)
+		if err != nil {
+			return err
+		}
+		if len(nodes) > 0 {
+			if err := yield(nodes); err != nil {
+				return err
+			}
+			after = nodes[len(nodes)-1].Node.ID
+		}
+		if len(nodes) < limit {
+			return nil
+		}
+	}
 }
 
 // legExactTiersHoldOnePage proves the exact tiers carry no candidate-sized heap
@@ -1391,6 +1419,10 @@ func (s *stubFileReader) Nodes(context.Context, sqlite.NodeFilter, model.NodeID,
 
 func (s *stubFileReader) NodesAmong(context.Context, sqlite.NodeFilter, []model.NodeID) ([]sqlite.StoredNode, error) {
 	return nil, errors.New("not used")
+}
+
+func (s *stubFileReader) WalkTier(context.Context, sqlite.NodeFilter, int, func([]sqlite.StoredNode) error) error {
+	return errors.New("not used")
 }
 
 // legPathResolverHoldsOnePage proves the exact tiers' path cache is bounded by
