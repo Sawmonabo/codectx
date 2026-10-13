@@ -316,7 +316,7 @@ func (d Dispatch) Valid() bool {
 // Validate enforces the evidence table constraints: the subject XOR, the
 // precision vocabulary and the mixed-range check.
 func (e Evidence) Validate() error {
-	if err := requireID("evidence.id", string(e.ID)); err != nil {
+	if err := requireEvidenceID("evidence.id", e.ID); err != nil {
 		return err
 	}
 	if err := requireID("evidence.unit_id", string(e.UnitID)); err != nil {

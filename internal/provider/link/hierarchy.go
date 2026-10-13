@@ -170,7 +170,7 @@ const (
 	// keyParam + refKey(callable): one declared parameter of the callable
 	// (Decl.Parameters), its position in Aux (basePosition), its name in
 	// Sig, its Parameter.Index in MinArgs and its marks in Flags
-	// (paramVariadic, paramKeywordOnly).
+	// (paramVariadic, paramKeywordOnly, paramReturned).
 	keyParam = "pa\x00"
 	// keyMacro + name: a C or C++ object-like macro of that name whose
 	// replacement is one identifier (Decl.Alias), its file's path in Aux and
@@ -200,6 +200,10 @@ const (
 const (
 	paramVariadic byte = 1 << iota
 	paramKeywordOnly
+	// paramReturned marks a parameter whose value reaches its callable's
+	// return (Parameter.Returned): a body edit that changes it changes the
+	// entry, so every member whose argument flows read it re-runs.
+	paramReturned
 )
 
 // typeKinds are the declaration kinds a type name denotes; a Rust trait is
@@ -606,6 +610,9 @@ func addParameters(s *pagination.ExternalSort[entry], ref Ref, d *Decl) error {
 		}
 		if p.KeywordOnly {
 			e.Flags |= paramKeywordOnly
+		}
+		if p.Returned {
+			e.Flags |= paramReturned
 		}
 		if err := s.Add(e); err != nil {
 			return err
@@ -1845,7 +1852,8 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 			return errMalformedEntry
 		}
 		return yield(paramInfo{Pos: int32(binary.BigEndian.Uint64([]byte(e.Aux))), Name: e.Sig, Index: e.MinArgs,
-			Variadic: e.Flags&paramVariadic != 0, KeywordOnly: e.Flags&paramKeywordOnly != 0})
+			Variadic: e.Flags&paramVariadic != 0, KeywordOnly: e.Flags&paramKeywordOnly != 0,
+			Returned: e.Flags&paramReturned != 0})
 	})
 }
 

@@ -307,7 +307,7 @@ func (e *Engine) containerAfter(ctx context.Context, ref NodeRef) (model.NodeID,
 // than the request asked for.
 //
 // A containment CYCLE is ended by the per-chain ancestor set, not by the level
-// bound, because the level bound is now unlimited by default and a cycle under
+// bound, because the level bound is unlimited by default and a cycle under
 // an unlimited bound is a hang rather than a short answer. A chain that climbs
 // back to an ancestor it has already passed can never reach a root, so it is
 // dropped exactly as an over-deep one is. The set holds one node identity per

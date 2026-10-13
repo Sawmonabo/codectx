@@ -146,7 +146,7 @@ func newCallFixture(scenario string, sc fixtureScenario) *callFixture {
 		f.relByEnds[r.From+" "+string(r.Kind)+" "+r.To] = id
 		for i, o := range r.Occurrences {
 			ev := model.Evidence{
-				ID:         model.EvidenceID(fixtureID(string(id) + "/" + string(rune('a'+i)))),
+				ID:         model.EvidenceID(fixtureID(string(id) + "/" + string(rune('a'+i)))[:model.EvidenceIDHexLen]),
 				RelationID: id, Precision: model.PrecisionStaticAnalysis,
 				FileID: file(r.From), Bytes: &model.ByteRange{Start: o.Bytes[0], End: o.Bytes[1]},
 				Dispatch: o.Dispatch, SetSize: o.SetSize,

@@ -263,10 +263,10 @@ carries it.
 
 ---
 
-## Two product defects this unit surfaced (for the controller, not for this report to fix)
+## Two product defects this unit surfaced (recorded here, not fixed here)
 
 1. **`docs/providers-dependence.md:22` lists a `global` evidence detail that no code path emits.**
    Globals are reported as `reaching_def capture`. Either the table drops `global` or it says so.
 2. **The product discards the `VARIABLE` property of every `REACHING_DEF` edge** (`scratch.go:413-420`,
-   `edge_in` schema at `:172`). The brief for this lane assumed it was kept. It is not; that is a
+   `edge_in` schema at `:172`). The research question assumed it was kept. It is not; that is a
    deliberate choice, but it means the published `data_flows_to` carries no variable name.

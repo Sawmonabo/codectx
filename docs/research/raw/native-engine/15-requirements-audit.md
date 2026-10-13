@@ -36,7 +36,7 @@ use. The body cites the elided form; this table is where the two meet.
 | the three call linkers | 297 lines (226 + 41 + 30) | 297 — confirmed |
 | the attribution and stub passes | 290 lines (50 + 178 + 62) | 290 — confirmed |
 | the Neo4j-CSV importer package's own source | **4,874** lines (3,446 non-test + 1,428 test) | 4,874 / 3,446 / 1,428 — confirmed |
-| …the same package under this lane's aggregate method | **4,973** lines | not published |
+| …the same package under this research's aggregate method | **4,973** lines | not published |
 
 The two importer figures differ because the aggregate method (`find … -name '*.go' -exec cat {} +`)
 also reaches 99 lines of Go **fixture source** under the package's `testdata/` tree, which the

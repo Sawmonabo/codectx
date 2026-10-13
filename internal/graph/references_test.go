@@ -20,7 +20,7 @@ import (
 // from the end of the answer. The bound is RESOLVED and disclosed, the same way
 // a traversal's bounds are.
 //
-// Mutation (resolvePageItems replaced by the old `if pageLimit <= 0 ||
+// Mutation (resolvePageItems replaced by a silent `if pageLimit <= 0 ||
 // pageLimit > e.limits.MaxPageItems` clamp): Notices is empty and this fails.
 func TestReferencePageBoundIsDisclosedNotClamped(t *testing.T) {
 	f := newGraphFixture(t)
@@ -260,7 +260,7 @@ func addReferences(t *testing.T, f *graphFixture, node string, rows []int) {
 			ID: rel, From: src, Kind: model.RelCalls, To: target})
 		for j := 0; j < n; j++ {
 			row := proto
-			row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-defer-%d-%d", i, j)))
+			row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-defer-%d-%d", i, j))[:model.EvidenceIDHexLen])
 			row.RelationID = rel
 			f.evidence[rel] = append(f.evidence[rel], row)
 		}
@@ -297,7 +297,7 @@ func widenReferences(t *testing.T, f *graphFixture, node string, n int) {
 		f.relations = append(f.relations, model.Relation{
 			ID: rel, From: src, Kind: model.RelCalls, To: target})
 		row := proto
-		row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-page-%d", i)))
+		row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-page-%d", i))[:model.EvidenceIDHexLen])
 		row.RelationID = rel
 		f.evidence[rel] = []model.Evidence{row}
 	}

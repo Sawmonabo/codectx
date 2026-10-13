@@ -9,7 +9,7 @@ import (
 
 // TestBothDirectionWalkEmitsEveryRelationOnce is the direction dedup rule
 // (ADR-0005, docs/queries.md), which is the whole of what keeps a
-// `--direction both` walk from serving one relation twice now that no
+// `--direction both` walk from serving one relation twice, since no
 // cumulative set of served relations exists.
 //
 // A walk that reads both directions meets every relation TWICE: once in the

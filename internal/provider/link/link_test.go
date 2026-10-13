@@ -288,6 +288,8 @@ type linked struct {
 	h     *providertest.Harness
 	files map[string]string
 	out   *capture
+	// structural is what the structural units handed their outputs.
+	structural *capture
 	// calls is the unit's `calls` capability row.
 	calls model.CapabilityState
 }
@@ -313,15 +315,21 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 		t.Fatal("the case has no source file")
 	}
 	var structIDs []model.UnitID
+	structOut := &capture{}
 	for _, p := range sources {
-		res, id, err := h.Run(t, structural, lang.ScopePrefix+p, []string{p})
+		su := h.Plan(t, structural, lang.ScopePrefix+p, []string{p})
+		structOut.UnitOutput = h.Begin(t, su, []string{p})
+		res, err := provider.RunUnit(ctx, structural, su.Request, stateCapture{structOut}, providertest.Limits, h.Pool)
+		if cerr := h.Store.CompleteProviderRun(ctx, res, provider.CodeOf(err)); cerr != nil {
+			t.Fatalf("CompleteProviderRun: %v", cerr)
+		}
 		if err != nil {
 			t.Fatalf("structural unit of %s: %v", p, err)
 		}
 		if res.State != model.RunSucceeded {
 			t.Fatalf("structural unit of %s ran %s", p, res.State)
 		}
-		structIDs = append(structIDs, id)
+		structIDs = append(structIDs, su.Build.Spec.ID)
 	}
 	// Sealing attached the structural units to the staging generation, which
 	// is where the linker reads their tables.
@@ -360,7 +368,7 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	}
 	checkCapability(t, result, scope)
 	checkEndpoints(t, out)
-	l := linked{h: h, files: files, out: out}
+	l := linked{h: h, files: files, out: out, structural: structOut}
 	for _, c := range result.Capabilities {
 		if c.Capability == string(model.RelCalls) {
 			l.calls = c
@@ -469,6 +477,18 @@ func (c *capture) PutRelations(ctx context.Context, facts []model.RelationFact) 
 	return c.UnitOutput.PutRelations(ctx, facts)
 }
 
+// stateCapture is a capture of a structural unit, which stores its link
+// table as provider state beside its facts.
+type stateCapture struct{ *capture }
+
+func (c stateCapture) PutState(ctx context.Context, kind string, payload []byte) error {
+	s, ok := c.UnitOutput.(provider.StateSink)
+	if !ok {
+		return &model.Error{Code: model.CodeInternal, Message: "the captured unit output does not store provider state"}
+	}
+	return s.PutState(ctx, kind, payload)
+}
+
 // calls is the evidence of every `calls` occurrence from a declaration
 // named caller to a declaration named callee (any name when callee is
 // empty), never to an open site or an external node.
@@ -521,7 +541,13 @@ func nodeResolution(n model.Node) model.NameResolution {
 // extends|implements|overrides <label> <name>" (or "external <qualified>"),
 // "<label> <name> flows <label> <name>" for a `data_flows_to` from an
 // argument's variable to a parameter, each with " set=<n>" when it carries a
-// set size. counts, when set, are details the `calls` row must carry.
+// set size. returns, when set, is every return flow: "<label> <name>
+// summary:<position> <label> <name>" for an argument's variable flowing into
+// a variable the site's result is written into through the callee's return
+// summary, and "<label> return return <label> <name>" for a callee's return
+// node flowing into such a variable or into the return node of the callable
+// that returns the call. counts, when set, are details the `calls` row must
+// carry.
 //
 // What the language defines, under ADR-0015 and decision 2's techniques and
 // nothing beyond them (no points-to, no reachability):
@@ -549,12 +575,13 @@ type golden struct {
 	name string
 	// anchor is the language reference, by standard title and section, the
 	// answer is read from.
-	anchor string
-	files  map[string]string
-	want   []string
-	sites  []string
-	facts  []string
-	counts map[string]string
+	anchor  string
+	files   map[string]string
+	want    []string
+	sites   []string
+	facts   []string
+	returns []string
+	counts  map[string]string
 	// fails names the wrong answer the case catches and the change to the
 	// linker that would produce it.
 	fails string
@@ -581,6 +608,9 @@ func runGoldens(t *testing.T, cases []golden) {
 			}
 			if c.facts != nil {
 				check("facts", l.facts(t), c.facts)
+			}
+			if c.returns != nil {
+				check("returns", l.returns(t), c.returns)
 			}
 			for k, v := range c.counts {
 				if got := l.calls.Details[k]; got != v {
@@ -694,9 +724,36 @@ func (l linked) facts(t *testing.T) []string {
 				}
 				add(paths[from.FileID] + " imports " + paths[to.FileID] + setSuffix(e))
 			case model.RelDataFlowsTo:
-				add(l.target(paths, from) + " flows " + l.target(paths, to) + setSuffix(e))
+				if e.Detail == link.DetailArgument {
+					add(l.target(paths, from) + " flows " + l.target(paths, to) + setSuffix(e))
+				}
 			default:
 				add(l.endpoint(paths, from) + " " + string(r.Relation.Kind) + " " + l.endpoint(paths, to) + setSuffix(e))
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// returns is every return flow (`data_flows_to` of the summary and return
+// details), in the golden spelling, sorted and each once.
+func (l linked) returns(t *testing.T) []string {
+	t.Helper()
+	paths := l.paths(t)
+	var out []string
+	for _, r := range l.out.rels {
+		if r.Relation.Kind != model.RelDataFlowsTo {
+			continue
+		}
+		from, to := l.out.nodes[r.Relation.From], l.out.nodes[r.Relation.To]
+		for _, e := range r.Evidence {
+			if e.Detail == link.DetailArgument {
+				continue
+			}
+			f := l.target(paths, from) + " " + e.Detail + " " + l.target(paths, to)
+			if !slices.Contains(out, f) {
+				out = append(out, f)
 			}
 		}
 	}

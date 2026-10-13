@@ -103,6 +103,8 @@ type goLink struct {
 	// walked: the extraction declares nothing inside it, so no export is
 	// sent for what it holds.
 	blankEnd uint
+	// tparams resolves the type names that denote type parameters.
+	tparams goTypeParams
 }
 
 func (x *goLink) text(n Node) string { return view(textOf(x.src, n)) }
@@ -327,7 +329,7 @@ func (x *goLink) baseName(t Node) string {
 		case k.genericType:
 			t = t.ChildByFieldId(k.fType)
 		case k.typeIdentifier, k.identifier:
-			return x.text(t)
+			return x.typeName(t)
 		case k.qualifiedType:
 			var b strings.Builder
 			x.tokens(&b, t)
