@@ -119,7 +119,7 @@ func (t *routeTable) open() error {
 	}
 	whole := st.Size() / routeRowBytes * routeRowBytes
 	if whole != st.Size() {
-		if err := f.Truncate(whole); err != nil {
+		if err := paced.ShrinkFile(f, whole); err != nil {
 			_ = f.Close()
 			return internalErr("graph: the route table: " + err.Error())
 		}

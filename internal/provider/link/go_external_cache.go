@@ -142,6 +142,6 @@ func writeGoDecls(id string, pkg *goExtPackage) {
 		err = os.Rename(tmp.Name(), file)
 	}
 	if err != nil {
-		os.Remove(tmp.Name())
+		_ = paced.Remove(tmp.Name())
 	}
 }
