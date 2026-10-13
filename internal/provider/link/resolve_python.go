@@ -74,7 +74,7 @@ func emitPython(ctx context.Context, u *unit, e *flowEmit) error {
 		}
 		return calls.Add(pyCall{Site: b.Site, Target: b.Target, First: receiverFirst})
 	}
-	look := func(r pyRecord) error { return lookPython(e.mods, r, hits) }
+	look := func(r pyRecord) error { return lookPythonFollowing(e.h, e.mods, r, hits) }
 	e.start()
 	defer e.stop()
 	err = u.filesOf(ctx, e.only, func(file int32, _ model.FileVersion, tab *Table, sel selection) error {
