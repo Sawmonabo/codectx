@@ -93,7 +93,8 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
 the site, else the file's module node (`Site.Caller`, -1 for the module, `internal/provider/link/table.go`). So a
 call inside `app.get("/x", (req, res) => helper())` is a call of the handler, as the structural provider's own
-`calls` are. A target is a declaration of any member file of the unit, a file's module, a parameter, or an external
+`calls` are. The rule is `Table.CallerOf`, which the SCIP importer reads too, so a compiler-resolved call leaves the
+same node. A target is a declaration of any member file of the unit, a file's module, a parameter, or an external
 node.
 
 **Evidence.** Every fact is `static_analysis`. A call publishes one evidence row per edge, at the call expression's

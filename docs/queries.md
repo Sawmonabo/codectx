@@ -199,6 +199,16 @@ request names `overrides`. When a method marks no override and its class extends
 indexed project, the callers answer says that calls through that type are found
 only for overrides the language marks.
 
+**Calls a SCIP index resolved.** With a SCIP index imported, a call whose
+callee token the index resolves has a `calls` relation from the same caller to
+the index's symbol, with a `compiler` occurrence at the callee token keyed by
+the same call-site key as the linker's occurrence; a token the index resolves
+to several symbols gives one relation per symbol, each with its `set_size`.
+The linker's relation for the call stays, so an open site the index resolved
+is listed beside the index's target. The index's symbol is its own node: a
+function the structural provider also declares is listed once per node
+([SCIP provider](providers-scip.md), Call-site join).
+
 **Calls no analysis bound are listed by name, after every precise row.** When
 the linker cannot bind a call — `obj.handle()` with nothing known about `obj` —
 it publishes one open-site node for the call, located at it, named by the

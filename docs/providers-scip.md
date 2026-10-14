@@ -47,7 +47,9 @@ coordinator exists.
   `rust-analyzer` would be reported available, plan `scip-go` only, and say
   nothing anywhere about Rust.
 - `Scopes(detection)` lists the unit scope keys to plan: `import:<path>` for a
-  supplied index, and `profile:<indexer>:<project directory>` for one project
+  supplied index, whose unit reads the whole snapshot (it publishes facts on
+  every file its documents describe; a snapshot without the index file plans
+  no unit), and `profile:<indexer>:<project directory>` for one project
   of one indexer, the empty directory being the workspace root. **One unit per
   triggering directory**, whatever the language and whatever encloses the
   directory. A manifest is the toolchain's own declaration of a boundary, so a
@@ -554,6 +556,7 @@ namespace, `#` class, `().` method under a type else function, `.` variable,
 |---|---|---|---|
 | occurrence with role `Import` | `imports` | innermost definition whose enclosing range contains the occurrence, else the document's file node | the occurrence |
 | any other non-definition occurrence | `references` | same | the occurrence |
+| a non-definition, non-import occurrence over exactly a call site's callee token | `calls`, besides its `references` | the call site's caller, as the call linker names it | the occurrence, native key the call-site key, detail `call`, set size when the index names several symbols at those bytes |
 | relationship `is_implementation` | `implements` | the symbol's definition node | the symbol's definition |
 | relationship `is_reference` or `is_type_definition` | `references` | same | the symbol's definition |
 | relationship `is_definition` | none (it names the symbol's own definition) | | |
@@ -574,42 +577,69 @@ publishing one relation kind from different precisions is the parallel
 implementation policy forbids. A read or write occurrence is a `references`
 edge here, like any other non-definition, non-import occurrence. No indexer
 measured here distinguishes a call-site reference from a reference to a
-function value either; the call identification SCIP cannot do is left to
-the structural provider and the call linker, which share the call-site key
-below.
+function value either; the call identification SCIP cannot do comes from the
+structural provider's call sites, which the call-site join below reads.
 
-## Call-site key (Section 11.3)
+## Call-site join (Section 11.3)
 
-Every non-definition occurrence publishes an alias on the symbol it resolves
-to:
+A call site is a syntax fact: no indexer distinguishes a call-site reference
+from a reference to a function value, and none sets a write role. The
+structural provider stores every call site in its file's link table, with the
+byte range of its callee token and its caller, and the call linker binds the
+site from that table. The importer reads the same table (`Options.Tables`, the
+store's, read for this unit's generation) for each changed document, once per
+document. A non-definition, non-import occurrence whose bytes are exactly a
+site's callee token is the compiler's resolution of that call, and publishes a
+`calls` edge from the site's caller -- the node the linker's `calls` for the
+same call leave, by the linker's own rule (`link.Table.CallerOf`: the route
+handler literal it is made in, else the enclosing declaration, else the
+module) -- to the resolved symbol, beside its `references` edge. The unit
+publishes its own occurrence of the caller node, at the caller's declaration,
+as the linker does. The evidence row is `compiler` precision, detail `call`,
+native key the call-site key:
 
 | | |
 |---|---|
-| scope key | `file:<path>` |
 | native key | `callsite:<path>:<start>-<end>`, the **one-based inclusive** byte range of the occurrence, i.e. `start+1` and `end` of the zero-based half-open `model.SourceRange` |
 
 The identifier `Bar` occupying zero-based bytes `[34,37)` of `pkg/a.go` is
-therefore scope `file:pkg/a.go`, key `callsite:pkg/a.go:35-37`. The tree-sitter
-provider publishes the identical key on the syntactic callee of every call site
-it finds. An alias is read only by `reconcile.Resolver`, when a unit that
-declares this one a dependency resolves a candidate under the same scope and
-native key; no provider resolves a candidate by a `callsite:` key, so equal
-keys merge no two nodes, and the SCIP symbol and the syntactic callee stay two
-identities with their own relations. The `calls` edge a call carries comes
-from the call linker, which binds the site itself and cites the same key in
-its evidence ([tree-sitter provider](providers-treesitter.md), Aliases
-published). `callsite.go` is the only place the importer spells this key.
+therefore `callsite:pkg/a.go:35-37`, byte for byte the key the linker cites on
+its own evidence for the call. So one call carries both rows: when the
+compiler and the linker name the same node it is one relation with a
+`static_analysis` row and a `compiler` row, and when they differ (an open site
+the linker could not bind, a target the linker reads otherwise) it is two
+`calls` relations from one caller at one key. When the index names several
+symbols at one callee token -- scip-clang's overload candidates of a dependent
+call in a template body, or a constructor sharing the token of the function
+whose result it takes -- each is a target: one `calls` per distinct symbol,
+every row carrying the set size, never a primary target with the rest as
+`may_refer_to`.
 
-The alias is published for every non-definition occurrence rather than a
-guessed subset, because SCIP cannot tell a call-site reference from a reference
-to a function value — no indexer distinguishes them and none sets a write role.
-An alias at a range where tree-sitter found no call site names a key nothing
-else names, since the key is exact-range spelling. A
-key that would exceed `model.MaxNativeKeyBytes` or a scope key that would
-exceed `model.MaxScopeKeyBytes` is skipped, counted under
-`callsite_aliases_skipped` and degrades the capability with
-`CTX_RESOURCE_LIMIT`, never truncated into a key that would join the
-wrong range.
+An occurrence over any bytes that are not a callee token joins nothing: the
+table and the index describe the same pinned file. A file with no link table
+(a language with no lowering, or a failed link pass, which the structural unit
+reports) has no call site to join. The SCIP unit's identity folds the
+structural provider's version and the C header census key, as a C linking
+unit's does, because the tables depend on them beyond the files' bytes. A key
+that would exceed `model.MaxNativeKeyBytes` cannot be spelled; the occurrence
+is counted under `callsite_keys_skipped` and degrades the capability with
+`CTX_RESOURCE_LIMIT`, and the call keeps the linker's target alone.
+
+The target is the SCIP symbol's own node: a symbol the index defines is keyed
+by its descriptor path, not by the structural declaration's, so a function
+both providers declare is two nodes, and the compiler's `calls` names the
+SCIP one.
+
+## Symbol spellings
+
+scip-clang 0.4.0 names a class template's constructor at its definition by the
+injected class name with the template's parameters and at a construction by
+the bare name, with one disambiguator: `` Ptr#`Ptr<T>`(ebd0a1552f8ce24f). ``
+and `Ptr#Ptr(ebd0a1552f8ce24f).`. Read as two strings they are two symbols and
+the construction names an unlocated external node. In a `cxx` symbol a method
+descriptor whose escaped name is its enclosing type's name, or that name after
+`~`, followed by a template argument list drops the list, so both spellings
+are one symbol, keyed and published as `Ptr#Ptr(ebd0a1552f8ce24f).`.
 
 ## Bounds
 

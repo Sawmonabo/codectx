@@ -202,12 +202,13 @@ symbols without rescanning):
   declaration without this key cannot be resolved by it from a dependent
   unit, which is missing coverage, not a silent simplification.
 - `("file:"+path, "callsite:"+path+":"+first+"-"+last)` → the callee node of
-  every call site. This is the Section 11.3 call-site key, computed
-  byte-for-byte identically by the SCIP importer for the reference occurrence
-  at the same bytes and by the call linker for the site it publishes. No
-  provider resolves a candidate by a `callsite:` key, so the key merges no two
-  nodes: the SCIP symbol and the syntactic callee stay two identities. The
-  linker cites the key in the evidence of its `calls` edge for the site, and
+  every call site. This is the Section 11.3 call-site key, spelled
+  byte-for-byte identically by the call linker for the site it publishes and
+  by the SCIP importer for the occurrence at the same bytes. No provider reads
+  the alias: the SCIP importer finds call sites in the link table this
+  provider stores ([SCIP provider](providers-scip.md), Call-site join), and
+  the key merges no two nodes. The linker and the SCIP importer cite the key
+  in the evidence of their `calls` edges for the site, and
   the packed adjacency leaves out this provider's placeholder edge wherever
   the linker's edge from the same caller covers every one of its sites at the
   same bytes ([storage](storage.md), One edge per call), so a bound call is
