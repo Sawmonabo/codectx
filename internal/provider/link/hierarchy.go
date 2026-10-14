@@ -70,6 +70,10 @@ type hierarchy struct {
 	// note, while a member's reads are recorded (record), is told each
 	// read by its trace key.
 	note func(TraceKey) error
+	// wide, while a static-family member's reads are recorded by node, has
+	// the reads until the function it returns is called recorded for the
+	// whole member (memberWide).
+	wide func() func()
 }
 
 // record has the indexes report every key looked up, and goPackages every
@@ -1260,6 +1264,7 @@ func (h *hierarchy) closedImports(fc fileCtx) (bool, error) {
 	if fc.closed.asked {
 		return fc.closed.closed, nil
 	}
+	defer h.memberWide()()
 	closed := true
 	for _, imp := range fc.imports {
 		found := false
