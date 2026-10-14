@@ -993,6 +993,19 @@ through `idx_relations_to`, and each such caller's `calls` evidence in caller
 order, holding one caller's sites at a time, so every walk serves one edge per
 call and no query pays for the rule.
 
+An open site the compiler resolved is left out the same way. When an imported
+SCIP index resolves a call the linker left open, the same caller has a `calls`
+edge to the compiler's target with a `compiler` evidence row at the call-site
+key the open-site edge's evidence carries. The build leaves out an open-site
+edge (the edge into a located node whose metadata names a `reason` and a
+`shape`) when every one of its visible evidence rows has such a row on another
+visible `calls` edge of the same caller at the same native key. A linker target
+that differs from the compiler's is not an open site and is packed beside it.
+The pass parses the metadata of located node facts that carry any, reads the
+edges into open sites through `idx_relations_to`, their evidence through
+`idx_evidence_relation`, and the rows sharing each key through
+`idx_evidence_native`.
+
 **The two tables.** `generation_graph` carries one row per generation: the
 largest node and relation surrogate, the node and edge counts, and the
 relation-kind and node-kind dictionaries. `generation_graph_parts`

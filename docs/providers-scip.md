@@ -627,7 +627,9 @@ The identifier `Bar` occupying zero-based bytes `[34,37)` of `pkg/a.go` is
 therefore `callsite:pkg/a.go:35-37`, byte for byte the key the linker cites on
 its own evidence for the call. So one call carries both rows, under one key
 from one caller: one relation when the linker bound the same target, two when
-it bound another target or left an open site. The row carries no `dispatch`: SCIP records which symbol
+it bound another. An open site the linker left for the call is stored, and the
+packed graph leaves its edge out ([storage](storage.md), One edge per call), so
+a walk lists the compiler's target alone. The row carries no `dispatch`: SCIP records which symbol
 a token names, not whether the call can run an override. When the index names several
 symbols at one callee token -- scip-clang's overload candidates of a dependent
 call in a template body, or a constructor sharing the token of the function

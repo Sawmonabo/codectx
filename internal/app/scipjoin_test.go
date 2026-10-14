@@ -428,3 +428,53 @@ func definedAs(t *testing.T, reader *sqlite.PinnedReader, path, name, symbol str
 	t.Fatalf("no node called %s in %s is defined as %s", name, path, symbol)
 	return ""
 }
+
+// TestAnOpenSiteTheIndexResolvedIsLeftOut holds the callees of a call the
+// linker left open and the index resolved to that one target. `a.helper()`
+// with nothing known of `a` is an open site to the linker; the index names
+// D.helper at the callee token, so the call has a compiler-resolved target,
+// and the open site, which says the call's target is unknown, is not listed
+// beside it.
+//
+// Mutation caught: keep an open-site edge whatever the same caller's compiler
+// rows at the same call-site key say (run then lists the open site and
+// helper for one call).
+func TestAnOpenSiteTheIndexResolvedIsLeftOut(t *testing.T) {
+	ctx := context.Background()
+	const path = "py/c.py"
+	const src = "class D:\n    def helper(self):\n        pass\n\n\ndef run(a):\n    a.helper()\n"
+	const (
+		typeD  = "scip-python python py 0.1 c/D#"
+		helper = "scip-python python py 0.1 c/D#helper()."
+		run    = "scip-python python py 0.1 c/run()."
+	)
+	at := func(word string, n int) []int32 { s, e := token(src, word, n); return scipRange(src, s, e) }
+	doc := scipBytes(nil, 1, []byte(path))
+	doc = scipBytes(doc, 4, []byte("python"))
+	for _, o := range [][]byte{
+		scipOccurrence(typeD, 1, at("D", 0), nil),
+		scipOccurrence(helper, 1, at("helper", 0), nil),
+		scipOccurrence(run, 1, at("run", 0), []int32{5, 0, 7, 0}),
+		scipOccurrence(helper, 0, at("helper", 1), nil),
+	} {
+		doc = scipBytes(doc, 2, o)
+	}
+	ws, reader, gen := importIndex(t, map[string]string{path: src, "index.scip": string(joinIndex(scipVarint(doc, 6, 1)))}, "index.scip")
+
+	caller := providerNode(t, reader, path, "run", tslang.ProviderID)
+	target := definedAs(t, reader, path, "helper", helper)
+	answer, err := ws.Services().Graph(ctx, model.GraphRequest{GenerationID: gen, Start: []model.NodeID{caller},
+		Relations: []model.RelationKind{model.RelCalls}, Direction: model.DirectionOutgoing, MaxDepth: 1})
+	if err != nil {
+		t.Fatalf("callees of run: %v", err)
+	}
+	var to []string
+	for _, rel := range answer.Relations {
+		if rel.Kind == model.RelCalls {
+			to = append(to, string(rel.To))
+		}
+	}
+	if len(to) != 1 || to[0] != string(target) {
+		t.Fatalf("the callees of run are %v, want helper %s alone", to, target)
+	}
+}

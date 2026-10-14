@@ -205,8 +205,9 @@ the index's symbol, with a `compiler` occurrence at the callee token keyed by
 the same call-site key as the linker's occurrence and with no `dispatch`; a
 token the index resolves to several symbols gives one relation per symbol, each
 with its `set_size`.
-The linker's relation for the call stays, so an open site the index resolved
-is listed beside the index's target. A function the structural provider also
+The linker's relation for the call stays when it names a target: the same
+target is one relation with both rows, another target a second relation. An
+open site the index resolved is not listed: the call has the index's target. A function the structural provider also
 declares is one node, listed once ([SCIP provider](providers-scip.md),
 Call-site join).
 
