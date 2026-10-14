@@ -637,8 +637,9 @@ log's blocks several times in one run, in the middle of its work. Because a
 rewind writes inside the file the log already holds, its size no longer says
 whether the writer's page cache has begun spilling; the file system shim sees
 every write the engine makes, and the engine names a log in the open flags, so
-the shim counts the bytes written to a log and the store marks that count when a
-group begins. The group's commit and the checkpoint that follows
+the shim counts the bytes written to each log, by the log's path, and the store
+marks its own log's count when a group begins. Another database's log -- the run
+ledger's, flushed four times a second -- does not move it. The group's commit and the checkpoint that follows
 reach the disk as every write of the engine does, through the paced file
 system the process registers as its default: after each 8 MiB window
 written to a file the writer waits for the previous window to reach the
@@ -978,6 +979,20 @@ descent per frontier node and a visibility sub-query per candidate edge, and
 both costs grow with the repository while the answer does not. Resolving
 visibility once, at publication, and scanning a packed array instead turns the
 per-page cost into a sequential read.
+
+**One edge per call.** The structural provider names a call it cannot resolve
+inside its file by a file-less placeholder (`call:<name>`), and the linker then
+publishes, for the same call, the bound target, an open site or an external
+node, from the same caller and with evidence at the same bytes. The build leaves
+out a placeholder's `calls` edge when every one of its visible sites is covered
+that way -- another visible `calls` edge of the same caller with an occurrence at
+exactly the same file and byte range; overlap is not enough, since an inner
+call lies inside its outer call. A placeholder edge with a site nothing else
+covers (a proven external call the linker publishes no edge for) is packed whole.
+The pass reads the file-less node facts once, the edges into the placeholders
+through `idx_relations_to`, and each such caller's `calls` evidence in caller
+order, holding one caller's sites at a time, so every walk serves one edge per
+call and no query pays for the rule.
 
 **The two tables.** `generation_graph` carries one row per generation: the
 largest node and relation surrogate, the node and edge counts, and the

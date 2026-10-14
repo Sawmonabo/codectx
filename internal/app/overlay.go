@@ -402,7 +402,7 @@ func overlayDefinitionNodes(query string, locations []lsp.Location) []model.Node
 // overlay. req.Validate has already run on the facade.
 //
 // The request names a canonical node and the server answers a position, so the
-// node's own declaration site is the position queried. A node with no
+// name token of the node's own declaration site is the position queried. A node with no
 // declaration site in this generation -- a manifest dependency, an unresolved
 // provider-local entity -- has no position to ask about and is refused rather
 // than answered about some other byte.
@@ -430,7 +430,7 @@ func (s *stack) overlayReferences(ctx context.Context, req model.ReferenceReques
 	if err := s.attachServer(ctx, route, stored.Node.FileID); err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
-	at := lsp.At{File: stored.Node.FileID, Byte: stored.Bytes.Start}
+	at := overlayPosition(stored)
 
 	var res lsp.Result[lsp.Location]
 	switch req.Operation {

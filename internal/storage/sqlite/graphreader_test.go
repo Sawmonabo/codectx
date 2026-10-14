@@ -349,7 +349,8 @@ func TestGraphBuildScansUseNoTempBTree(t *testing.T) {
 	if stats == 0 {
 		t.Fatal("three activations left no sqlite_stat1 rows, so this asserts the wrong planner state")
 	}
-	for _, tmp := range []string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit"} {
+	for _, tmp := range []string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit",
+		"tmp_graph_placeholder", "tmp_graph_placeholder_caller"} {
 		if _, err := db.Exec(`CREATE TEMP TABLE ` + tmp + `(id INTEGER PRIMARY KEY)`); err != nil {
 			t.Fatalf("%s: %v", tmp, err)
 		}
@@ -358,16 +359,23 @@ func TestGraphBuildScansUseNoTempBTree(t *testing.T) {
 		node_id INTEGER PRIMARY KEY, container INTEGER NOT NULL, canonical BLOB NOT NULL)`); err != nil {
 		t.Fatalf("tmp_graph_node_container: %v", err)
 	}
+	if _, err := db.Exec(`CREATE TEMP TABLE tmp_graph_placeholder_rel(id INTEGER PRIMARY KEY, caller INTEGER NOT NULL)`); err != nil {
+		t.Fatalf("tmp_graph_placeholder_rel: %v", err)
+	}
 	for _, q := range []struct {
 		name  string
 		query string
+		args  []any
 	}{
-		{"outgoing", store.OutgoingEdgeQuery()},
-		{"incoming", store.IncomingEdgeQuery()},
-		{"evidence", store.EvidenceCountQuery()},
-		{"container", store.ContainerQuery()},
+		{"outgoing", store.OutgoingEdgeQuery(), nil},
+		{"incoming", store.IncomingEdgeQuery(), nil},
+		{"evidence", store.EvidenceCountQuery(), nil},
+		{"container", store.ContainerQuery(), nil},
+		{"placeholder nodes", store.PlaceholderNodesInsert, nil},
+		{"placeholder edges", store.PlaceholderEdgesInsert, []any{string(model.RelCalls)}},
+		{"caller sites", store.CallerSitesQuery(), []any{string(model.RelCalls)}},
 	} {
-		plan := explain(t, db, q.query)
+		plan := explain(t, db, q.query, q.args...)
 		t.Logf("%s plan:\n%s", q.name, plan)
 		if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
 			t.Fatalf("%s scan builds a temporary b-tree over every visible relation:\n%s", q.name, plan)

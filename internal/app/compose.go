@@ -1145,7 +1145,7 @@ func (s *stack) textIndexOptions() textindex.Options {
 			if s.admission == nil {
 				return func() {}, nil
 			}
-			return s.admission.Reserve(ctx, bytes, nil)
+			return s.admission.ReserveWith(ctx, admission.Reservation{MemoryBytes: bytes, Standing: true}, nil)
 		},
 	}
 }

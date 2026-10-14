@@ -1885,6 +1885,8 @@ type GraphRequest struct {
     MaxDepth int `json:"max_depth"`
     MaxVisited int `json:"max_visited"`
     MaxEdges int `json:"max_edges"`
+    SemanticSource SemanticSource `json:"semantic_source,omitempty"` // empty = canonical
+    Profile string `json:"profile,omitempty"`
     Page PageRequest `json:"page"`
 }
 type QueryMeta struct {
@@ -2327,8 +2329,8 @@ Existing SDK compatibility behavior is not a reason to implement or preserve par
 | `codectx_symbol_info` | Definition metadata, signature, scope and paginated evidence. |
 | `codectx_references` | Reference occurrences and implementations, distinguish relations from occurrences. |
 | `codectx_node_metadata` | Paginated elements, in order, of one node metadata field stored as rows: a node whose metadata names `<field>_rows: n` (a field too long for the node row) holds those n elements here. |
-| `codectx_callers` | Bounded incoming graph with reasons. |
-| `codectx_callees` | Bounded outgoing graph with reasons. |
+| `codectx_callers` | Bounded incoming graph with reasons; `semantic_source=lsp` with a `profile` answers one level of that language server's call hierarchy as labeled overlay nodes and `calls`. |
+| `codectx_callees` | Bounded outgoing graph with reasons; `semantic_source=lsp` with a `profile` answers one level of that language server's call hierarchy as labeled overlay nodes and `calls`. |
 | `codectx_dependency_path` | Bounded shortest path with evidence. |
 | `codectx_impact` | Affected scope and required boundaries, with completeness. |
 | `codectx_context_plan` | Compile/reuse manifest and open an actor-specific sweep/verify session. |

@@ -429,8 +429,13 @@ their need the same way, in memory and in temporary disk, with no figure of any 
 - **Plan.** The run is planned at the moment it is admitted, not when the generation is planned, so it is reserved from
   everything learned before it: the learned p99 (the sample maximum below 100 observations) of memory times its work,
   never more than the allocation re-derived for that admission, and its staged bytes plus the learned written bytes.
-- **First run.** A class with no observation is reserved at the whole allocation in both dimensions, so it runs alone
-  among the heavy children. The other runs of its class wait for it and are planned from its measurement; one that
+- **First run.** A class with no observation is reserved at the whole allocation in both dimensions, less what
+  standing holdings hold of it, so it runs alone among the heavy children with the sum at the allocation. A standing
+  holding is one its holder gives back only after work admitted beside it has ended: the search index's writer, taken
+  on a unit's first write and released when the generation is published. Waiting for it is waiting for one's own work,
+  so the runs-alone rule does not count it, and it is taken at once rather than queued, since admitted work asks for
+  it; the sum stands above the allocation by at most the writer's floor, and only beside a run planned before the
+  writer opened. The other runs of its class wait for it and are planned from its measurement; one that
   measured nothing hands the role to the next. No structural prior exists for these tools: every published account of
   their memory makes it a function of the project, its dependency closure or the machine itself (a managed runtime's
   default heap ceiling is a share of physical memory; an indexer's workers default to one per core), so a per-tool

@@ -254,7 +254,7 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			source, profile, err := semanticFlagValues(cmd, false)
+			source, profile, err := semanticFlagValues(cmd)
 			if err != nil {
 				return err
 			}
@@ -292,7 +292,7 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 	addCursorFlag(cmd)
 	cmd.Flags().String(referenceKindFlag, string(model.ReferenceReferences),
 		"evidence to answer: references, implements or type-definition")
-	addSemanticFlags(cmd, false)
+	addSemanticFlags(cmd)
 	return cmd
 }
 
@@ -353,9 +353,14 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 			"page. Continuation state is reclaimed on its own deadline, so a cursor left unused " +
 			"for longer than the configured cursor lifetime is refused and the walk is re-run " +
 			"from the first page.\n\n" +
-			"The walk is answered from sealed canonical facts. --semantic-source is accepted so " +
-			"that asking for the overlay is refused explicitly rather than answered from canonical " +
-			"facts under an lsp label; there is no overlay call hierarchy in this build.\n\n" +
+			"--semantic-source picks where the answer comes from. `canonical` (the default) walks " +
+			"sealed facts. `lsp` asks the managed language server named by --profile for one level " +
+			"of its call hierarchy: each seed's item is prepared at its name, and the answer is that " +
+			"item's direct calls with their call sites, labeled as overlay results bound to their " +
+			"exact input, never persisted and never granting coverage credit. The overlay answers " +
+			"one level and one bounded page with no continuation, so --depth above 1 or --cursor is " +
+			"refused rather than answered from canonical facts, and every seed must belong to one " +
+			"project, which one server answers.\n\n" +
 			nameArgumentHelp,
 		Args:          cobra.RangeArgs(1, model.MaxStartNodes),
 		SilenceErrors: true,
@@ -368,10 +373,8 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 			if err != nil {
 				return err
 			}
-			// Screened for its refusal, not for a value: the call hierarchy has
-			// only the canonical route, so this rejects `--semantic-source lsp`
-			// explicitly instead of answering it from canonical facts.
-			if _, _, err := semanticFlagValues(cmd, true); err != nil {
+			source, profile, err := semanticFlagValues(cmd)
+			if err != nil {
 				return err
 			}
 			var result model.GraphResult
@@ -388,6 +391,8 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				if err != nil {
 					return err
 				}
+				// Both semantic sources are one facade call, as on `refs`.
+				req.SemanticSource, req.Profile = source, profile
 				result, err = svc.Graph(ctx, req)
 				return err
 			}); err != nil {
@@ -405,7 +410,7 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 	addLimitFlag(cmd)
 	addCursorFlag(cmd)
 	addTraversalFlags(cmd, true, true)
-	addSemanticFlags(cmd, true)
+	addSemanticFlags(cmd)
 	return cmd
 }
 
@@ -774,6 +779,10 @@ func writeNodeTable(b *strings.Builder, nodes []model.Node) {
 // answer carries one. Byte ranges are printed as bytes: the answer carries no
 // line numbers, and a byte offset is never presented as one.
 func writeCallAnswer(b *strings.Builder, result model.GraphResult) {
+	if result.Meta.Overlay != nil {
+		writeOverlayCalls(b, result)
+		return
+	}
 	where := map[model.NodeID]model.NodeLocation{}
 	for _, l := range result.Locations {
 		where[l.NodeID] = l
@@ -835,6 +844,40 @@ func writeCallAnswer(b *strings.Builder, result model.GraphResult) {
 	if c != (model.GraphCounts{}) {
 		fmt.Fprintf(b, "counts      direct %d, through base %d, may dispatch %d, may call %d, open sites %d\n",
 			c.Direct, c.ThroughBase, c.MayDispatch, c.MayCall, c.OpenSites)
+	}
+}
+
+// writeOverlayCalls renders a language server call hierarchy answer. Its nodes
+// are overlay nodes with no canonical id, so each is numbered by its place in
+// the answer, which is how the answer's calls name their two ends, and located
+// by the server's own line and column, which an overlay range carries.
+func writeOverlayCalls(b *strings.Builder, result model.GraphResult) {
+	if len(result.Nodes) == 0 {
+		b.WriteString("nodes       none\n")
+	} else {
+		fmt.Fprintf(b, "nodes       %d (language server overlay)\n", len(result.Nodes))
+		for i, n := range result.Nodes {
+			at := ""
+			if n.Range != nil {
+				at = fmt.Sprintf("  %s:%d:%d", shortID(string(n.FileID)), n.Range.Start.Line, n.Range.Start.Column)
+			}
+			fmt.Fprintf(b, "  #%d  %-12s %s%s\n", i, clip(string(n.Kind), 12), tableCell(clip(n.Name, 80)), at)
+		}
+	}
+	if len(result.Calls) == 0 {
+		b.WriteString("calls       none\n")
+		return
+	}
+	fmt.Fprintf(b, "calls       %d\n", len(result.Calls))
+	for _, c := range result.Calls {
+		fmt.Fprintf(b, "  #%d -> #%d  seed %s\n", c.From, c.To, c.Seed)
+		file := tableCell(c.SitePath)
+		if file == "" {
+			file = string(c.SiteFile)
+		}
+		for _, site := range c.Sites {
+			fmt.Fprintf(b, "      site %s:%d:%d\n", clip(file, 100), site.Start.Line, site.Start.Column)
+		}
 	}
 }
 
