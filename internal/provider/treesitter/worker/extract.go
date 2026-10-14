@@ -82,7 +82,7 @@ func (r *importRec) wireOriginals() []string {
 type refRec struct {
 	span
 	// nameSpan is the callee/type identifier token alone, inside span. The
-	// parent builds the Section 11.3 callsite alias from it.
+	// call-site key of Section 11.3 is spelled from it.
 	nameSpan  span
 	kind      string
 	name      string

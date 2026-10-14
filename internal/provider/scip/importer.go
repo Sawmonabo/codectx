@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -95,9 +97,9 @@ type importer struct {
 	indexBytes uint64
 
 	truncatedEdges int64
-	// skippedAliases counts call-site aliases left out because the path makes
-	// the alias scope or native key longer than its bound (callsiteAlias).
-	skippedAliases int64
+	// skippedCallsites counts call-site occurrences whose call-site key the
+	// path makes longer than its bound (callsiteKey), so they join no call.
+	skippedCallsites int64
 	// The documents the index described that this import did not admit, one
 	// account per reason, each keeping the first document's path as its
 	// exemplar: outsideRoot is a path that still escapes the workspace root
@@ -236,9 +238,12 @@ const (
 	// unit. It is informational: that unit publishes those paths, so nothing
 	// is lost and the capability is not degraded for them.
 	detailOtherProjects = "documents_in_other_projects"
-	// detailSkippedAliases counts call-site aliases left out because the
-	// alias scope or native key would exceed its bound (callsiteAlias).
-	detailSkippedAliases = "callsite_aliases_skipped"
+	// detailSkippedCallsites counts call-site occurrences whose call-site key
+	// would exceed its bound (callsiteKey), so they join no call.
+	detailSkippedCallsites = "callsite_keys_skipped"
+	// detailCall is the detail of a `calls` occurrence the call-site join
+	// publishes.
+	detailCall = "call"
 )
 
 // droppedDocs counts documents dropped for one reason and keeps the first
@@ -320,6 +325,11 @@ type docSource struct {
 	// refusing the correct references an aliased import creates. It is bounded
 	// by this document's occurrences and discarded with it.
 	spellings map[string]map[string]struct{}
+	// names are the declarations of the document's file in its link table,
+	// by the bytes of each name token, and language the table's language
+	// (bindTable): what a definition occurrence adopts.
+	names    map[[2]uint64]link.Endpoint
+	language string
 }
 
 // docRow is the scratch record of one document bound to a snapshot file.
@@ -359,6 +369,9 @@ func (im *importer) run(ctx context.Context, open opener) error {
 		im.partialCode = model.CodeSourceBindingUnverified
 	}
 	if err := im.passDefinitions(ctx, open); err != nil {
+		return err
+	}
+	if err := im.settleDocuments(ctx); err != nil {
 		return err
 	}
 	if err := im.passReferences(ctx); err != nil {
@@ -666,7 +679,7 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 		ON CONFLICT(key) DO UPDATE SET kind = CASE WHEN sym.kind = 0 THEN excluded.kind ELSE sym.kind END,
 		name = CASE WHEN sym.name = '' THEN excluded.name ELSE sym.name END,
 		sigcut = CASE WHEN sym.sig = '' THEN excluded.sigcut ELSE sym.sigcut END,
-		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, s.symbol, s.kind, name, s.signature, s.signatureCut); err != nil {
+		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, sym.raw, s.kind, name, s.signature, s.signatureCut); err != nil {
 		return err
 	}
 	for _, rel := range s.relationships {
@@ -759,7 +772,12 @@ func (im *importer) endDocument(d document) error {
 			return im.dropSpool(ctx, d.index)
 		}
 	}
-	hash, err := im.documentHash(ctx, row)
+	tab, err := im.linkTable(ctx, row.file)
+	if err != nil {
+		return err
+	}
+	ds.bindTable(tab)
+	hash, err := im.documentHash(ctx, row, joinDigest(tab))
 	if err != nil {
 		return err
 	}
@@ -776,8 +794,23 @@ func (im *importer) endDocument(d document) error {
 	if err := im.bindSpellings(ctx, ds); err != nil {
 		return err
 	}
-	if err := im.sc.each(ctx, `SELECT seq, symbol, roles, s0, s1, s2, s3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
-		[]any{row.idx, roleDefinition}, func(scan func(...any) error) error {
+	if err := im.defineDocument(ctx, ds, publish); err != nil {
+		return err
+	}
+	if !publish {
+		// Settled once every definition is known (settleDocuments); its
+		// refusals are counted then.
+		return nil
+	}
+	// Its references are refused, if at all, when pass 2 reads them.
+	return im.addRefused(ctx, row.idx, ds.refused)
+}
+
+// defineDocument records every definition occurrence of one document, and
+// publishes them when publish is set.
+func (im *importer) defineDocument(ctx context.Context, ds *docSource, publish bool) error {
+	return im.sc.each(ctx, `SELECT seq, symbol, roles, s0, s1, s2, s3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
+		[]any{ds.doc.idx, roleDefinition}, func(scan func(...any) error) error {
 			var seq int64
 			var symbolText string
 			var roles int32
@@ -794,19 +827,7 @@ func (im *importer) endDocument(d document) error {
 				enclosing = &[4]int32{*e[0], *e[1], *e[2], *e[3]}
 			}
 			return im.defineSymbol(ctx, ds, symbolText, r, enclosing, publish)
-		}); err != nil {
-		return err
-	}
-	if publish {
-		// Its references are refused, if at all, when pass 2 reads them.
-		return im.addRefused(ctx, row.idx, ds.refused)
-	}
-	// An unchanged document emits no reference, so its occurrences are not
-	// read again, and the refusals are the stored ones.
-	if err := im.carryRefusals(ctx, row); err != nil {
-		return err
-	}
-	return im.dropSpool(ctx, row.idx)
+		})
 }
 
 // dropSpool discards the spooled records of a document no later pass reads.
@@ -1112,6 +1133,14 @@ func (ds *docSource) onPinnedBytes(sym symbol, rng *model.SourceRange) string {
 		return ""
 	}
 	if _, spelled := ds.spellings[sym.raw][string(text)]; spelled {
+		return ""
+	}
+	if sym.cxxConstructor() {
+		// scip-clang puts the constructor a declaration runs on the declared
+		// variable's name, which spells the variable, not the type: measured
+		// on 0.4.0, `D d0;`, `D d1(1);` and `D d2{};` each reference their
+		// constructor at d0, d1 and d2. Any one identifier token is a
+		// construction's.
 		return ""
 	}
 	return "the occurrence does not select the identifier its symbol names"
@@ -1437,27 +1466,52 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if len(qualified) <= model.MaxQualifiedNameBytes {
 		descriptor = qualified
 	}
-	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: sym.scopeKey(ds.doc.path), NativeKey: sym.raw, Kind: sym.nodeKind(kind),
-		Language: ds.doc.language, Name: name, QualifiedName: qualified, Signature: sig,
-		FileID: ds.doc.file.ID, ContentHash: ds.doc.file.ContentHash, Range: rng, Descriptor: descriptor}
-	res, err := im.req.Resolver.Resolve(ctx, cand)
-	if err != nil {
-		return err
-	}
-	// A definition occurrence's range is the symbol's name token, and the
-	// node is located at that occurrence, so its name range is its range.
-	res.Node.NameRange = rng
+	scope := sym.scopeKey(ds.doc.path)
 	loc := location{file: ds.doc.file, rng: rng}
-	if publish {
-		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false, sigCut); err != nil {
+	var res model.Resolution
+	if e, ok := ds.adopt(rng); ok {
+		// The structural declaration named at these bytes: one function,
+		// one identity (adopt). The fact is the caller occurrence's own
+		// (structuralNode), with its evidence at this definition.
+		n, err := im.structuralNode(ds.doc.file, ds.language, e)
+		if err != nil {
 			return err
 		}
-		if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: cand.ScopeKey, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
+		res = model.Resolution{Node: n, Basis: model.MatchNativeKey, CanonicalKey: e.CanonicalKey}
+		if err := res.Validate(); err != nil {
+			return err
+		}
+		if publish {
+			ev := im.evidence(n.ID, "", loc, sym.raw, "definition", 0)
+			if err := im.sink.PutNodes(ctx, []model.NodeFact{{Node: n, CanonicalKey: e.CanonicalKey, Evidence: []model.Evidence{ev}}}); err != nil {
+				return err
+			}
+			im.records++
+		}
+	} else {
+		cand := model.NodeCandidate{ProviderID: ID, ScopeKey: scope, NativeKey: sym.raw, Kind: sym.nodeKind(kind),
+			Language: ds.doc.language, Name: name, QualifiedName: qualified, Signature: sig,
+			FileID: ds.doc.file.ID, ContentHash: ds.doc.file.ContentHash, Range: rng, Descriptor: descriptor}
+		if res, err = im.req.Resolver.Resolve(ctx, cand); err != nil {
+			return err
+		}
+		// A definition occurrence's range is the symbol's name token, and
+		// the node is located at that occurrence, so its name range is its
+		// range.
+		res.Node.NameRange = rng
+		if publish {
+			if err := im.putNode(ctx, res, sym.raw, "definition", loc, false, sigCut); err != nil {
+				return err
+			}
+		}
+	}
+	if publish {
+		if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: scope, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
 			return err
 		}
 		im.records++
 		for _, other := range res.Ambiguous {
-			if err := im.addEdge(ctx, res.Node.ID, model.RelMayReferTo, other, loc, sym.raw, "may_refer_to"); err != nil {
+			if err := im.addEdge(ctx, res.Node.ID, model.RelMayReferTo, other, loc, sym.raw, "may_refer_to", 0); err != nil {
 				return err
 			}
 		}
@@ -1512,7 +1566,7 @@ func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey
 		}
 		node.Metadata = raw
 	}
-	ev := im.evidence(node.ID, "", loc, nativeKey, detail)
+	ev := im.evidence(node.ID, "", loc, nativeKey, detail, 0)
 	if err := im.sink.PutNodes(ctx, []model.NodeFact{{Node: node, CanonicalKey: res.CanonicalKey, Evidence: []model.Evidence{ev}}}); err != nil {
 		return err
 	}
@@ -1522,10 +1576,10 @@ func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey
 
 // evidence builds one evidence row for this unit and run with compiler
 // precision, the SCIP precision class of Section 9.3.
-func (im *importer) evidence(node model.NodeID, rel model.RelationID, loc location, nativeKey, detail string) model.Evidence {
+func (im *importer) evidence(node model.NodeID, rel model.RelationID, loc location, nativeKey, detail string, set int64) model.Evidence {
 	e := model.Evidence{UnitID: im.req.Unit.ID, ProviderID: im.req.Unit.ProviderID, ProviderVersion: im.req.Unit.ProviderVersion,
 		OriginRunID: im.req.Run, NodeID: node, RelationID: rel, Precision: model.PrecisionCompiler,
-		FileID: loc.file.ID, ContentHash: loc.file.ContentHash, Range: loc.rng, NativeKey: nativeKey, Detail: detail}
+		FileID: loc.file.ID, ContentHash: loc.file.ContentHash, Range: loc.rng, NativeKey: nativeKey, Detail: detail, SetSize: set}
 	e.ID = model.NewEvidenceID(e)
 	return e
 }
@@ -1533,14 +1587,21 @@ func (im *importer) evidence(node model.NodeID, rel model.RelationID, loc locati
 // addEdge records one occurrence of a canonical edge for grouped emission.
 // The same edge at the same range is recorded once; a distinct range is a
 // distinct occurrence (Section 11.4).
-func (im *importer) addEdge(ctx context.Context, from model.NodeID, kind model.RelationKind, to model.NodeID, loc location, symbolText, detail string) error {
-	if err := im.sc.charge(int64(len(from) + len(to) + len(symbolText) + 192)); err != nil {
+//
+// nativeKey is the evidence row's native key: the SCIP symbol, or for a
+// `calls` occurrence the call-site key it joined on. set is the occurrence's
+// set size, the number of targets its site has when there are several, and 0
+// otherwise.
+func (im *importer) addEdge(ctx context.Context, from model.NodeID, kind model.RelationKind, to model.NodeID, loc location,
+	nativeKey, detail string, set int64) error {
+	if err := im.sc.charge(int64(len(from) + len(to) + len(nativeKey) + 200)); err != nil {
 		return err
 	}
 	rng := loc.rng
-	return im.sc.exec(ctx, `INSERT OR IGNORE INTO edges(frm, kind, dst, file_id, content_hash, start, end, sl, sc, el, ec, symbol, detail) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	return im.sc.exec(ctx, `INSERT OR IGNORE INTO edges(frm, kind, dst, file_id, content_hash, start, end, sl, sc, el, ec, symbol, detail, setsz)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(from), string(kind), string(to), string(loc.file.ID), loc.file.ContentHash, int64(rng.Start.Byte), int64(rng.End.Byte),
-		rng.Start.Line, rng.Start.Column, rng.End.Line, rng.End.Column, symbolText, detail)
+		rng.Start.Line, rng.Start.Column, rng.End.Line, rng.End.Column, nativeKey, detail, set)
 }
 
 // passReferences is pass 2 over the spooled occurrences: every non-definition
@@ -1587,14 +1648,25 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 	if err := im.bindSpellings(ctx, ds); err != nil {
 		return err
 	}
-	if err := im.eachReference(ctx, d, ds); err != nil {
+	sites, err := im.callSites(ctx, d)
+	if err != nil {
+		return err
+	}
+	if err := im.eachReference(ctx, d, ds, sites); err != nil {
 		return err
 	}
 	return im.addRefused(ctx, d.idx, ds.refused)
 }
 
-// eachReference publishes the reference occurrences of one changed document.
-func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource) error {
+// eachReference publishes the reference occurrences of one changed document:
+// each a `references` (or `imports`) edge from its innermost enclosing
+// definition, and, where a call site's callee token occupies exactly the
+// occurrence's bytes, a `calls` edge from that call's caller (joinCall).
+func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource, sites *docSites) error {
+	sets, err := im.rangeSets(ctx, d.idx)
+	if err != nil {
+		return err
+	}
 	return im.sc.each(ctx, `SELECT symbol, roles, s0, s1, s2, s3 FROM occ WHERE doc = ? AND (roles & ?) = 0 ORDER BY seq`,
 		[]any{d.idx, roleDefinition}, func(scan func(...any) error) error {
 			var symbolText string
@@ -1625,9 +1697,6 @@ func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource) 
 			if err != nil {
 				return err
 			}
-			if err := im.putCallsiteAlias(ctx, d.path, rng, to); err != nil {
-				return err
-			}
 			// The read and write occurrence roles are deliberately not
 			// mapped: `reads` and `writes` are the structural provider's
 			// facts (docs/providers-treesitter.md, Dependence facts),
@@ -1638,34 +1707,194 @@ func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource) 
 			kind, detail := model.RelReferences, "reference"
 			if roles&roleImport != 0 {
 				kind, detail = model.RelImports, "import"
+			} else if err := im.joinCall(ctx, d, loc, to, sites, sets[r], sym.cxxConstructor()); err != nil {
+				return err
 			}
-			return im.addEdge(ctx, from, kind, to, loc, sym.raw, detail)
+			return im.addEdge(ctx, from, kind, to, loc, sym.raw, detail, 0)
 		})
 }
 
-// putCallsiteAlias publishes the Section 11.3 call-site alias for one
-// reference occurrence: the compiler-resolved symbol, keyed by the byte range
-// the reference occupies in this file version, in the file's alias scope. The
-// tree-sitter provider publishes the same key on the syntactic callee of every
-// call site it finds, so the reconciler merges the two identities wherever the
-// ranges are equal and the `calls` relation gains a precise target. See
-// callsite.go for the key.
-//
-// A zero-width reference names a position and no identifier, so there is no
-// call site to join and nothing is lost by publishing none. An alias over its
-// bound is a lost precise call target, so it is counted and degrades the
-// capability like any other bound that leaves a fact out.
-func (im *importer) putCallsiteAlias(ctx context.Context, p string, rng *model.SourceRange, to model.NodeID) error {
-	if rng.End.Byte <= rng.Start.Byte {
-		return nil
+// rangeSets is, for one document, the number of distinct symbols its
+// reference occurrences name at each range that names two or more: a call
+// site whose callee the compiler resolved to a set (scip-clang's overload
+// candidates of a dependent call, a constructor and the function whose token
+// it shares), which the join publishes as one `calls` per target, each with
+// that set size. A range with one symbol is absent, so the map holds only the
+// sets.
+func (im *importer) rangeSets(ctx context.Context, doc int64) (map[[4]int32]int64, error) {
+	var out map[[4]int32]int64
+	keys := map[[4]int32]map[string]bool{}
+	err := im.sc.each(ctx, `SELECT o.s0, o.s1, o.s2, o.s3, o.symbol FROM occ o JOIN (
+			SELECT s0, s1, s2, s3 FROM occ WHERE doc = ?1 AND (roles & ?2) = 0 AND symbol != ''
+			GROUP BY s0, s1, s2, s3 HAVING COUNT(DISTINCT symbol) > 1) m
+		ON o.s0 = m.s0 AND o.s1 = m.s1 AND o.s2 = m.s2 AND o.s3 = m.s3
+		WHERE o.doc = ?1 AND (o.roles & ?2) = 0 AND o.symbol != ''`, []any{doc, roleDefinition | roleImport},
+		func(scan func(...any) error) error {
+			var r [4]int32
+			var text string
+			if err := scan(&r[0], &r[1], &r[2], &r[3], &text); err != nil {
+				return internal("scip scratch read: " + err.Error())
+			}
+			sym, err := parseSymbol(text)
+			if err != nil {
+				return err
+			}
+			// Two spellings of one symbol (normalizeSymbol) are one target.
+			if keys[r] == nil {
+				keys[r] = map[string]bool{}
+			}
+			keys[r][symKey(doc, sym)] = true
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
-	scopeKey, nativeKey, ok := callsiteAlias(p, rng)
+	for r, set := range keys {
+		if len(set) < 2 {
+			continue
+		}
+		if out == nil {
+			out = map[[4]int32]int64{}
+		}
+		out[r] = int64(len(set))
+	}
+	return out, nil
+}
+
+// docSites are the call sites of one document's file, by the byte range of
+// each callee token, with the node the site's calls are made from, the
+// callers this import has published an occurrence of, and the file's module
+// and callable declarations, which a construction no site records is made
+// from (constructionCaller).
+type docSites struct {
+	language  string
+	byToken   map[[2]uint64][]link.Endpoint
+	published map[model.NodeID]bool
+	module    link.Endpoint
+	callables []link.Endpoint
+	held      bool
+}
+
+// callSites reads the link table the structural provider stored for the
+// document's file in this generation, with the linker's own caller rule
+// (link.Table.CallerOf). A file with no table (no lowering for its
+// language, or a failed link pass, which that unit reports) has no call site
+// to join, and neither has an import built without tables.
+func (im *importer) callSites(ctx context.Context, d docRow) (*docSites, error) {
+	out := &docSites{}
+	t, err := im.linkTable(ctx, d.file)
+	if err != nil || t == nil {
+		return out, err
+	}
+	out.language, out.byToken, out.published = t.Language, make(map[[2]uint64][]link.Endpoint, len(t.Sites)), map[model.NodeID]bool{}
+	out.module, out.held = t.Module, true
+	for i := range t.Decls {
+		if k := t.Decls[i].Kind; k == model.NodeFunction || k == model.NodeMethod {
+			out.callables = append(out.callables, t.Decls[i].Endpoint)
+		}
+	}
+	for i := range t.Sites {
+		s := &t.Sites[i]
+		if s.Computed || s.NameEnd <= s.NameStart {
+			continue
+		}
+		caller, err := t.CallerOf(s)
+		if err != nil {
+			return nil, err
+		}
+		k := [2]uint64{uint64(s.NameStart), uint64(s.NameEnd)}
+		if !slices.ContainsFunc(out.byToken[k], func(e link.Endpoint) bool { return e.Node == caller.Node }) {
+			out.byToken[k] = append(out.byToken[k], caller)
+		}
+	}
+	return out, nil
+}
+
+// joinCall is the SCIP half of the Section 11.3 call-site join for one
+// reference occurrence. A call site whose callee token occupies exactly the
+// occurrence's bytes is a call written there, and the compiler resolved its
+// callee: the occurrence publishes `calls` from the site's caller, the node
+// the linker's `calls` for the same call leave, to the compiler-resolved
+// target, at compiler precision, its evidence keyed by the call-site key the
+// linker's evidence carries, with set the number of targets the index names
+// at those bytes when there are several. The caller is the structural
+// provider's node; this unit publishes its own occurrence of it, at the
+// caller's declaration, as the linker does, so the edge names a node the unit
+// holds. An occurrence no call site matches is a reference that is not a call
+// (a function value, a type, a variable), which stays a `references` edge
+// alone.
+//
+// A key over its bound cannot be spelled; the linker leaves such a site's
+// evidence without one too. The call keeps the linker's target alone, and the
+// occurrence is counted and degrades the capability like any other bound that
+// leaves a fact out.
+//
+// A reference to a C++ constructor is a construction wherever it is
+// (symbol.cxxConstructor), and most have no call site: the structural
+// provider records `D(3)` but not `D d0;` or `new D(2)`, and scip-clang puts
+// the declaration's on the variable's name. One no site matches is made from
+// the innermost function or method declared around it, else the module
+// (constructionCaller), keyed by its own token, its one target the
+// constructor.
+func (im *importer) joinCall(ctx context.Context, d docRow, loc location, to model.NodeID, sites *docSites, set int64, ctor bool) error {
+	callers := sites.byToken[[2]uint64{loc.rng.Start.Byte, loc.rng.End.Byte}]
+	if len(callers) == 0 {
+		if !ctor || !sites.held {
+			return nil
+		}
+		callers, set = []link.Endpoint{sites.constructionCaller(loc.rng)}, 0
+	}
+	key, ok := callsiteKey(d.path, loc.rng)
 	if !ok {
-		im.skippedAliases++
+		im.skippedCallsites++
 		im.degrade(model.CodeResourceLimit)
 		return nil
 	}
-	if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: scopeKey, NativeKey: nativeKey, NodeID: to}}); err != nil {
+	for _, caller := range callers {
+		if !sites.published[caller.Node] {
+			sites.published[caller.Node] = true
+			if err := im.putCaller(ctx, d, sites.language, caller); err != nil {
+				return err
+			}
+		}
+		if err := im.addEdge(ctx, caller.Node, model.RelCalls, to, loc, key, detailCall, set); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// constructionCaller is the node a construction at rng no call site records
+// is made from: the innermost function or method whose range holds it, else
+// the module.
+func (s *docSites) constructionCaller(rng *model.SourceRange) link.Endpoint {
+	out := s.module
+	found := false
+	for _, e := range s.callables {
+		if e.Range.Start.Byte > rng.Start.Byte || e.Range.End.Byte < rng.End.Byte {
+			continue
+		}
+		if !found || e.Range.End.Byte-e.Range.Start.Byte < out.Range.End.Byte-out.Range.Start.Byte {
+			out, found = e, true
+		}
+	}
+	return out
+}
+
+// putCaller publishes this unit's occurrence of a structural caller
+// (structuralNode), under its canonical key, with an evidence row at its
+// declaration.
+func (im *importer) putCaller(ctx context.Context, d docRow, language string, e link.Endpoint) error {
+	n, err := im.structuralNode(d.file, language, e)
+	if err != nil {
+		return err
+	}
+	key := e.Qualified
+	if len(key) > model.MaxNativeKeyBytes {
+		key = ""
+	}
+	ev := im.evidence(e.Node, "", location{file: d.file, rng: n.Range}, key, "caller", 0)
+	if err := im.sink.PutNodes(ctx, []model.NodeFact{{Node: n, CanonicalKey: e.CanonicalKey, Evidence: []model.Evidence{ev}}}); err != nil {
 		return err
 	}
 	im.records++
@@ -1704,7 +1933,7 @@ func (im *importer) targetNode(ctx context.Context, key string, sym symbol, loc 
 		return "", err
 	}
 	for _, other := range res.Ambiguous {
-		if err := im.addEdge(ctx, res.Node.ID, model.RelMayReferTo, other, loc, sym.raw, "may_refer_to"); err != nil {
+		if err := im.addEdge(ctx, res.Node.ID, model.RelMayReferTo, other, loc, sym.raw, "may_refer_to", 0); err != nil {
 			return "", err
 		}
 	}
@@ -1828,12 +2057,12 @@ func (im *importer) passRelationships(ctx context.Context) error {
 				return err
 			}
 			if r.flags&relImplementation != 0 {
-				if err := im.addEdge(ctx, model.NodeID(r.node), model.RelImplements, to, loc, target.raw, "implementation"); err != nil {
+				if err := im.addEdge(ctx, model.NodeID(r.node), model.RelImplements, to, loc, target.raw, "implementation", 0); err != nil {
 					return err
 				}
 			}
 			if r.flags&(relReference|relTypeDefinition) != 0 {
-				if err := im.addEdge(ctx, model.NodeID(r.node), model.RelReferences, to, loc, target.raw, "relationship"); err != nil {
+				if err := im.addEdge(ctx, model.NodeID(r.node), model.RelReferences, to, loc, target.raw, "relationship", 0); err != nil {
 					return err
 				}
 			}
@@ -1869,12 +2098,13 @@ func (im *importer) emitEdges(ctx context.Context) error {
 		im.records++
 		return nil
 	}
-	err := im.sc.each(ctx, `SELECT frm, kind, dst, symbol, detail, start, end, sl, sc, el, ec, file_id, content_hash
+	err := im.sc.each(ctx, `SELECT frm, kind, dst, symbol, detail, setsz, start, end, sl, sc, el, ec, file_id, content_hash
 		FROM edges ORDER BY frm, kind, dst, file_id, start, end, detail`, nil,
 		func(scan func(...any) error) error {
 			var frm, kind, dst, symbolText, detail, fileID, hash string
+			var set int64
 			var rng model.SourceRange
-			if err := scan(&frm, &kind, &dst, &symbolText, &detail, &rng.Start.Byte, &rng.End.Byte, &rng.Start.Line, &rng.Start.Column, &rng.End.Line, &rng.End.Column, &fileID, &hash); err != nil {
+			if err := scan(&frm, &kind, &dst, &symbolText, &detail, &set, &rng.Start.Byte, &rng.End.Byte, &rng.Start.Line, &rng.Start.Column, &rng.End.Line, &rng.End.Column, &fileID, &hash); err != nil {
 				return internal("scip scratch read: " + err.Error())
 			}
 			rel := model.Relation{From: model.NodeID(frm), Kind: model.RelationKind(kind), To: model.NodeID(dst)}
@@ -1892,7 +2122,7 @@ func (im *importer) emitEdges(ctx context.Context) error {
 				overflow++
 				return nil
 			}
-			current.Evidence = append(current.Evidence, im.evidence("", rel.ID, loc, symbolText, detail))
+			current.Evidence = append(current.Evidence, im.evidence("", rel.ID, loc, symbolText, detail, set))
 			return nil
 		})
 	if err != nil {
@@ -1995,8 +2225,8 @@ func (im *importer) result() model.ProviderResult {
 		if im.otherProjectDocs > 0 {
 			cs = cs.WithDetail(detailOtherProjects, strconv.FormatInt(im.otherProjectDocs, 10))
 		}
-		if im.skippedAliases > 0 {
-			cs = cs.WithDetail(detailSkippedAliases, strconv.FormatInt(im.skippedAliases, 10))
+		if im.skippedCallsites > 0 {
+			cs = cs.WithDetail(detailSkippedCallsites, strconv.FormatInt(im.skippedCallsites, 10))
 		}
 		r.Capabilities = append(r.Capabilities, cs)
 	}

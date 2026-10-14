@@ -183,3 +183,68 @@ func supersedeCoveredPlaceholders(ctx context.Context, tx *sql.Tx) error {
 	}
 	return nil
 }
+
+// A call the linker could not bind is an open site: a node located at the
+// call, whose metadata gives the reason and the call's shape (model
+// OpenSiteMetadata), and the caller's `calls` edge to it, its evidence keyed
+// by the call-site key of Section 11.3. A SCIP index that resolved the same
+// call publishes `calls` from the same caller with a `compiler` row at the
+// same key. Served side by side, the call would be listed twice, once as a
+// call whose target is unknown, beside the target the compiler named.
+//
+// So the packed adjacency leaves out an open-site edge whose every visible
+// evidence row some other visible `calls` edge of the same caller carries a
+// `compiler` row for at the same native key. A linker target that differs
+// from the compiler's is not an open site and stays: two relations for one
+// call, which say the two analyses disagree.
+
+// openSiteNodesInsert collects the generation's open sites: the visible
+// located node facts whose metadata names a reason and a shape. Most node
+// facts carry no metadata, and the empty object is compared before any is
+// parsed.
+const openSiteNodesInsert = `INSERT OR IGNORE INTO tmp_graph_opensite(id)
+	SELECT nf.node_id FROM tmp_graph_unit u
+	CROSS JOIN node_facts nf ON nf.unit_id = u.id
+	WHERE nf.file_id IS NOT NULL AND nf.metadata_json <> '{}'
+	  AND json_type(nf.metadata_json, '$.` + model.MetaReason + `') IS NOT NULL
+	  AND json_type(nf.metadata_json, '$.` + model.MetaShape + `') IS NOT NULL`
+
+// resolvedOpenSitesDelete removes the open-site edges a compiler row
+// resolves. Each step is an index range under the row before it: the open
+// site's incoming `calls` (idx_relations_to), each edge's evidence
+// (idx_evidence_relation), and the rows sharing its native key
+// (idx_evidence_native), whose relation must leave the same caller.
+const resolvedOpenSitesDelete = `DELETE FROM tmp_graph_rel WHERE id IN (
+	SELECT ri.id FROM tmp_graph_opensite o
+	CROSS JOIN relation_ids ri ON ri.to_node_id = o.id AND ri.kind = ?1
+	CROSS JOIN tmp_graph_rel t ON t.id = ri.id
+	WHERE EXISTS (SELECT 1 FROM evidence e CROSS JOIN tmp_graph_unit u ON u.id = e.unit_id WHERE e.relation_id = ri.id)
+	  AND NOT EXISTS (
+		SELECT 1 FROM evidence e CROSS JOIN tmp_graph_unit u ON u.id = e.unit_id
+		WHERE e.relation_id = ri.id AND NOT EXISTS (
+			SELECT 1 FROM evidence c
+			CROSS JOIN tmp_graph_unit cu ON cu.id = c.unit_id
+			CROSS JOIN relation_ids rc ON rc.id = c.relation_id
+			CROSS JOIN tmp_graph_rel ct ON ct.id = rc.id
+			WHERE c.native_key_id = e.native_key_id AND c.precision = ?2
+			  AND rc.from_node_id = ri.from_node_id AND rc.kind = ?1 AND rc.id <> ri.id)))`
+
+// openSiteTemps are the temp tables supersedeResolvedOpenSites creates.
+var openSiteTemps = []string{"tmp_graph_opensite"}
+
+// supersedeResolvedOpenSites removes from tmp_graph_rel every open-site edge
+// a compiler row of the same caller resolves at the same call-site key. It
+// runs after tmp_graph_rel and tmp_graph_unit are filled and before anything
+// is packed.
+func supersedeResolvedOpenSites(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_graph_opensite(id INTEGER PRIMARY KEY)`); err != nil {
+		return wrap("open-site edges", err)
+	}
+	if _, err := tx.ExecContext(ctx, openSiteNodesInsert); err != nil {
+		return wrap("open-site edges", err)
+	}
+	if _, err := tx.ExecContext(ctx, resolvedOpenSitesDelete, string(model.RelCalls), string(model.PrecisionCompiler)); err != nil {
+		return wrap("open-site edges", err)
+	}
+	return nil
+}

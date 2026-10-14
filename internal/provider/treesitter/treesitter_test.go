@@ -223,7 +223,7 @@ func TestLanguageFixtures(t *testing.T) {
 					t.Fatalf("evidence range [%d,%d) is not in the unit's file", e.Range.Start.Byte, e.Range.End.Byte)
 				}
 			}
-			checkCallsites(t, p, files, fx.file, src, cap)
+			checkCallees(t, fx.file, cap)
 			checkDependence(t, p, fx.depFile, fx.dep)
 			if p.Stats().Processes > 2 {
 				t.Fatalf("worker processes = %d, over the pool bound", p.Stats().Processes)
@@ -529,24 +529,11 @@ func names(facts []model.NodeFact) string {
 	return strings.Join(out, " ")
 }
 
-// checkCallsites asserts the three invariants of the Section 11.3 call-site
-// join, the one fact the SCIP importer resolves against.
-//
-// Failure modes it protects, all of which are silent:
-//   - A key whose byte range is not exactly the callee identifier's — counted
-//     in runes, taken from the enclosing call expression, or written
-//     zero-based/half-open instead of the one-based inclusive spelling of
-//     Section 11.3 — joins the wrong SCIP occurrence or none, so a `calls`
-//     relation is served with a target the compiler never resolved, or the
-//     precise target is lost. The multibyte fixture is what separates a byte
-//     range from a rune range at both ends.
-//   - A key that is not reproducible for the same bytes makes the join depend
-//     on which run indexed the file.
-//   - A callee no declaration of the file can be must say so: resolution
-//     unresolved with no candidate, never a guess, and it must still publish
-//     its alias, because a builtin or cross-file callee is exactly the site
-//     the compiler-precise index is there to resolve.
-func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]string, file string, src []byte, cap *capture) {
+// checkCallees asserts what a file's call placeholders say about callees no
+// declaration of the file is: resolution unresolved with no candidate, never
+// a guess, for a builtin or cross-file callee, which is exactly the site the
+// linker and a compiler-precise index are there to resolve.
+func checkCallees(t *testing.T, file string, cap *capture) {
 	t.Helper()
 	names := map[model.NodeID]string{}
 	meta := map[model.NodeID]string{}
@@ -554,56 +541,6 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 		names[cap.nodes[i].Node.ID] = cap.nodes[i].Node.Name
 		meta[cap.nodes[i].Node.ID] = string(cap.nodes[i].Node.Metadata)
 	}
-	prefix := "callsite:" + file + ":"
-	var keys []string
-	seen := map[string]bool{}
-	for _, a := range cap.aliases {
-		if !strings.HasPrefix(a.NativeKey, "callsite:") {
-			continue
-		}
-		if a.ScopeKey != lang.ScopePrefix+file || !strings.HasPrefix(a.NativeKey, prefix) {
-			t.Fatalf("call-site alias %q is published in scope %q, not the file's own", a.NativeKey, a.ScopeKey)
-		}
-		if seen[a.NativeKey] {
-			t.Fatalf("call-site alias %q is published twice; a key that names two identities resolves as ambiguous", a.NativeKey)
-		}
-		seen[a.NativeKey] = true
-		keys = append(keys, a.NativeKey+"\x00"+string(a.NodeID))
-		start, end, ok := strings.Cut(strings.TrimPrefix(a.NativeKey, prefix), "-")
-		s, err1 := strconv.Atoi(start)
-		e, err2 := strconv.Atoi(end)
-		if !ok || err1 != nil || err2 != nil || s < 1 || e > len(src) || s > e {
-			t.Fatalf("call-site alias %q has no one-based inclusive range inside %d bytes", a.NativeKey, len(src))
-		}
-		// One-based inclusive [s,e] is the half-open byte slice [s-1,e).
-		if got, want := string(src[s-1:e]), names[a.NodeID]; got != want {
-			t.Fatalf("call-site alias %q selects %q, but its callee node is named %q", a.NativeKey, got, want)
-		}
-	}
-	if len(keys) == 0 {
-		t.Fatalf("%s published no call-site alias", file)
-	}
-	slices.Sort(keys)
-
-	// Determinism: a second independent unit over the same bytes must publish
-	// the identical keys naming the identical identities.
-	h := providertest.New(t, files)
-	u := h.Plan(t, p, lang.ScopePrefix+file, []string{file})
-	again := &capture{UnitOutput: h.Begin(t, u, []string{file})}
-	if _, err := provider.RunUnit(context.Background(), p, u.Request, again, providertest.Limits, h.Pool); err != nil {
-		t.Fatalf("second RunUnit: %v", err)
-	}
-	var keys2 []string
-	for _, a := range again.aliases {
-		if strings.HasPrefix(a.NativeKey, "callsite:") {
-			keys2 = append(keys2, a.NativeKey+"\x00"+string(a.NodeID))
-		}
-	}
-	slices.Sort(keys2)
-	if !slices.Equal(keys, keys2) {
-		t.Fatalf("%s call-site aliases are not reproducible:\n first %v\nsecond %v", file, keys, keys2)
-	}
-
 	switch file {
 	case "sample.js":
 		// `ns` is bound by a namespace import, so `ns.start()` is a call
@@ -642,12 +579,6 @@ func checkCallsites(t *testing.T, p *treesitter.Provider, files map[string]strin
 	if got := meta[builtin]; !strings.Contains(got, `"resolution":"unresolved"`) || !strings.Contains(got, `"candidates":0`) {
 		t.Fatalf("builtin callee metadata = %s, want resolution unresolved with no candidate", got)
 	}
-	if !seen[prefix+callsiteOf(t, src, "len")] {
-		t.Fatal("the builtin call site published no alias")
-	}
-	if !seen[prefix+callsiteOf(t, src, "日本語")] {
-		t.Fatal("the non-ASCII call site published no alias at its byte range")
-	}
 }
 
 // wantCallees asserts the resolutions of the callee placeholders a file's
@@ -670,17 +601,6 @@ func wantCallees(t *testing.T, meta map[model.NodeID]string, file, callee string
 	if !slices.Equal(got, resolutions) {
 		t.Fatalf("%s: the calls to %s published placeholders resolved %q, want %q", file, callee, got, resolutions)
 	}
-}
-
-// callsiteOf is the one-based inclusive byte range of the call to token in
-// src, computed here from the bytes alone rather than from the provider.
-func callsiteOf(t *testing.T, src []byte, token string) string {
-	t.Helper()
-	i := strings.Index(string(src), token+"(")
-	if i < 0 {
-		t.Fatalf("fixture has no call to %q", token)
-	}
-	return strconv.Itoa(i+1) + "-" + strconv.Itoa(i+len(token))
 }
 
 // TestPoolLazyAndDrainedWhenTheStageEnds pins the two lifetime properties an

@@ -923,6 +923,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		// tree-sitter node of the same run keep the same number of
 		// occurrences.
 		MaxEvidencePerFact: evidenceClip(cfg),
+		// The structural provider's stored link tables: the call sites the
+		// call-site join matches reference occurrences against.
+		Tables: link.StoreTables(s.store),
 		// MaxRecordBytes is deliberately absent: it is the wire reader's
 		// pre-allocation ceiling, product code rather than configuration, and
 		// taking it from an unlimited resources key would silently clamp it.

@@ -3,6 +3,7 @@ package scip
 import (
 	"bufio"
 	"context"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -319,9 +320,16 @@ func symbolDigest(s symbolInfo) string {
 // classified unchanged, and the retained evidence rows would then name content
 // hashes that are not the pinned bytes. That is the one way a delta import can
 // serve wrong source as compiler evidence, so the hash closes it.
-func (im *importer) documentHash(ctx context.Context, d docRow) (string, error) {
+//
+// join is the digest of what the call-site join reads of the file's link
+// table (joinDigest): the structural identities a definition adopts and a
+// call is made from are not in the index or the bytes. This is the
+// document's own hash; settleDocuments adds the identities of the symbols it
+// names once every definition is known.
+func (im *importer) documentHash(ctx context.Context, d docRow, join string) (string, error) {
 	h := model.NewHasher(documentHashDomain)
 	h.AddString(d.path)
+	h.AddString(join)
 	h.AddString(d.language)
 	h.AddString(strconv.FormatInt(int64(d.encoding), 10))
 	h.AddString(d.file.ContentHash)
@@ -343,10 +351,12 @@ func (im *importer) documentHash(ctx context.Context, d docRow) (string, error) 
 	return h.Sum(), nil
 }
 
-// classify records one admitted document in the fresh manifest and decides
-// whether its facts are published. A document whose canonical hash equals the
-// stored unit's is unchanged: the storage writer keeps that path's rows and
-// this run emits nothing for it.
+// classify records one admitted document in the fresh manifest under its own
+// hash and decides whether its facts are published: a full import publishes
+// every document, a refresh every document the stored unit does not hold.
+// Any other document is settled by settleDocuments, because its canonical
+// hash also covers the identities of the symbols it names, which a later
+// document's definition may decide.
 func (im *importer) classify(ctx context.Context, d docRow, hash string) (publish bool, err error) {
 	publish = true
 	if im.previous != nil {
@@ -355,7 +365,7 @@ func (im *importer) classify(ctx context.Context, d docRow, hash string) (publis
 		if err != nil {
 			return false, err
 		}
-		publish = !found || stored != hash
+		publish = !found
 	}
 	if err := im.sc.charge(int64(len(d.path)+len(hash)) + 32); err != nil {
 		return false, err
@@ -365,6 +375,148 @@ func (im *importer) classify(ctx context.Context, d docRow, hash string) (publis
 		flag = 1
 	}
 	return publish, im.sc.exec(ctx, `INSERT OR REPLACE INTO docdelta(path, doc, hash, publish) VALUES(?, ?, ?, ?)`, d.path, d.idx, hash, flag)
+}
+
+// settleDocuments finishes every document's canonical hash with the
+// identities of the global symbols it names (namedIdentities) and classifies
+// the documents classify left open. A document whose canonical hash equals the
+// stored unit's is unchanged: the storage writer keeps that path's rows and
+// this run emits nothing for it. One whose hash moved is changed, and its
+// definitions are published now.
+//
+// The identities are part of the hash because a document's rows name nodes
+// another document decides: a reference's target is its symbol's definition,
+// wherever that is, and a definition that adopts a structural declaration
+// (adopt) takes an identity that moves with the declaration's parameters,
+// which the referencing document does not spell. Without them a call of a
+// function whose parameter list was edited would be kept, unchanged, pointing
+// at an identity no unit publishes any more.
+func (im *importer) settleDocuments(ctx context.Context) error {
+	var after int64 = -1
+	for {
+		type pending struct {
+			d       docRow
+			hash    string
+			publish bool
+		}
+		var page []pending
+		err := im.sc.each(ctx, `SELECT d.idx, d.path, d.lang, d.enc, d.file_id, d.content_hash, d.size, x.hash, x.publish FROM docs d
+			JOIN docdelta x ON x.doc = d.idx WHERE d.idx > ? ORDER BY d.idx LIMIT 256`, []any{after},
+			func(scan func(...any) error) error {
+				var p pending
+				var id, hash string
+				if err := scan(&p.d.idx, &p.d.path, &p.d.language, &p.d.encoding, &id, &hash, &p.d.file.Size, &p.hash, &p.publish); err != nil {
+					return internal("scip scratch read: " + err.Error())
+				}
+				p.d.file.ID, p.d.file.ContentHash, p.d.file.Path = model.FileID(id), hash, p.d.path
+				page = append(page, p)
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		for _, p := range page {
+			after = p.d.idx
+			hash, err := im.namedIdentities(ctx, p.d.idx, p.hash)
+			if err != nil {
+				return err
+			}
+			if err := im.sc.exec(ctx, `UPDATE docdelta SET hash = ? WHERE doc = ?`, hash, p.d.idx); err != nil {
+				return err
+			}
+			if p.publish {
+				continue
+			}
+			var stored string
+			if _, err := im.sc.row(ctx, `SELECT hash FROM prevdoc WHERE path = ?`, []any{p.d.path}, &stored); err != nil {
+				return err
+			}
+			if stored == hash {
+				// An unchanged document emits no reference, so its
+				// occurrences are not read again, and the refusals are the
+				// stored ones.
+				if err := im.carryRefusals(ctx, p.d); err != nil {
+					return err
+				}
+				if err := im.dropSpool(ctx, p.d.idx); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := im.sc.exec(ctx, `UPDATE docdelta SET publish = 1 WHERE doc = ?`, p.d.idx); err != nil {
+				return err
+			}
+			if err := im.publishDefinitions(ctx, p.d); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// publishDefinitions publishes the definitions of a document settleDocuments
+// found changed, read again as endDocument read them.
+func (im *importer) publishDefinitions(ctx context.Context, d docRow) error {
+	ds, err := im.loadSource(ctx, d)
+	if err != nil {
+		return err
+	}
+	tab, err := im.linkTable(ctx, d.file)
+	if err != nil {
+		return err
+	}
+	ds.bindTable(tab)
+	if err := im.bindSpellings(ctx, ds); err != nil {
+		return err
+	}
+	if err := im.defineDocument(ctx, ds, true); err != nil {
+		return err
+	}
+	return im.addRefused(ctx, d.idx, ds.refused)
+}
+
+// namedIdentities is a document's canonical hash: its own hash, then each
+// global symbol its occurrences name with the node that symbol's definition
+// resolved to (none for a symbol this index does not define), in symbol
+// order. A document-scoped symbol is the document's own, which its own hash
+// covers.
+func (im *importer) namedIdentities(ctx context.Context, doc int64, own string) (string, error) {
+	nodes := map[string]string{}
+	err := im.sc.each(ctx, `SELECT DISTINCT symbol FROM occ WHERE doc = ? AND symbol != ''`, []any{doc},
+		func(scan func(...any) error) error {
+			var text string
+			if err := scan(&text); err != nil {
+				return internal("scip scratch read: " + err.Error())
+			}
+			sym, err := parseSymbol(text)
+			if err != nil {
+				return err
+			}
+			if sym.local {
+				return nil
+			}
+			if _, seen := nodes[sym.raw]; seen {
+				return nil
+			}
+			var node string
+			if _, err := im.sc.row(ctx, `SELECT node FROM sym WHERE key = ?`, []any{symKey(doc, sym)}, &node); err != nil {
+				return err
+			}
+			nodes[sym.raw] = node
+			return nil
+		})
+	if err != nil {
+		return "", err
+	}
+	h := model.NewHasher(documentHashDomain)
+	h.AddString(own)
+	for _, raw := range slices.Sorted(maps.Keys(nodes)) {
+		h.AddString(raw)
+		h.AddString(nodes[raw])
+	}
+	return h.Sum(), nil
 }
 
 // writeManifest streams the fresh manifest to a private file under the

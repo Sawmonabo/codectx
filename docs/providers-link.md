@@ -104,20 +104,24 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 publishes that handler as its own function node (`Site.Handler`, `Table.Handlers`), else the declaration enclosing
 the site, else the file's module node (`Site.Caller`, -1 for the module, `internal/provider/link/table.go`). So a
 call inside `app.get("/x", (req, res) => helper())` is a call of the handler, as the structural provider's own
-`calls` are. A target is a declaration of any member file of the unit, a file's module, a parameter, or an external
+`calls` are. The rule is `Table.CallerOf`, which the SCIP importer reads too, so a compiler-resolved call leaves the
+same node. A target is a declaration of any member file of the unit, a file's module, a parameter, or an external
 node.
 
 **Evidence.** Every fact is `static_analysis`. A call publishes one evidence row per edge, at the call expression's
-range (`Site.Range`). Its native key is the call-site key, spelled as the structural provider spells it:
+range (`Site.Range`). Its native key is the Section 11.3 call-site key:
 `callsite:<path>:<first byte>-<last byte>` of the callee token, one-based and inclusive (`Site.NameStart`,
-`Site.NameEnd`). An `imports` edge is located at the import statement, a `data_flows_to` edge at the argument with
+`Site.NameEnd`): a token occupying the half-open UTF-8 byte range `[start,end)` is `start+1` `-` `end`, byte
+offsets, never characters or UTF-16 code units, and the path is the unit's root-relative slash path. The SCIP
+importer spells the same key for an occurrence at the same bytes ([SCIP provider](providers-scip.md), Call-site
+join). A key over `MaxNativeKeyBytes` is left off the row rather than truncated. An `imports` edge is located at the import statement, a `data_flows_to` edge at the argument with
 the site's call-site key, and a hierarchy edge at the declaration that states it.
 
 **Endpoints are the structural nodes.** The linker mints no second identity for a declaration. Each table carries
 an `Endpoint` for each declaration, each parameter, each callable's return node and the module (`table.go`): the node id, canonical key, kind,
 names and range the structural unit resolved. The linker publishes an occurrence of every endpoint an edge names,
 with its own evidence at the declaration's range. So the edge joins the structural node, and through it the
-cross-provider `decl:` key and the call-site key of docs/providers-treesitter.md.
+cross-provider `decl:` key of docs/providers-treesitter.md.
 
 **Several targets.** A site bound to two or more targets publishes one `calls` edge to each, and every one of them
 carries the same `set_size`, the number of targets, read as "1 of n" (ADR-0015 decision 1). That is a value-flow set

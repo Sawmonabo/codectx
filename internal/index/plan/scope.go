@@ -87,11 +87,15 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 			// index.
 			admit, isProfile := sc.ProfileAdmission(view, key)
 			if !isProfile {
-				// A supplied index reads exactly one file: the index itself.
-				// It is recognized by rebuilding the scope key from each
-				// candidate path, for the same reason.
-				out = append(out, semantic{providerID: d.ID, scopeKey: key,
-					contains: func(fv model.FileVersion) bool { return scip.ImportScope(fv.Path) == key }})
+				// A supplied index describes source files, so its unit reads
+				// the whole snapshot: every document it publishes facts for
+				// is an input, and storage refuses a fact on any other file.
+				// The index itself is recognized by rebuilding the scope key
+				// from each candidate path, for the same reason; a snapshot
+				// that does not hold it plans no unit.
+				out = append(out, semantic{providerID: d.ID, scopeKey: key, allFiles: true,
+					anchor:   func(fv model.FileVersion) bool { return scip.ImportScope(fv.Path) == key },
+					contains: func(model.FileVersion) bool { return true }})
 				continue
 			}
 			// A profile runs an indexer over the whole workspace, which is what
@@ -148,6 +152,10 @@ type semantic struct {
 	// allFiles marks a unit whose membership is the whole snapshot, so the
 	// planner can share one sorted input slice rather than copying it per unit.
 	allFiles bool
+	// anchor, when set, is the one file a whole-snapshot unit cannot run
+	// without (a supplied index), and anchored records that the walk saw it.
+	anchor   func(model.FileVersion) bool
+	anchored bool
 	// family is the linking unit's language family, which decides its
 	// synthetic dependency keys (builder.linkKeys); empty for every other unit.
 	family link.Family

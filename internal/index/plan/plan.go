@@ -31,6 +31,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
+	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -395,8 +396,19 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 		}
 		for i := range scopes {
 			scopes[i].version = version
-			if d.ID == link.ProviderID {
+			switch d.ID {
+			case link.ProviderID:
 				keys, err := b.linkKeys(scopes[i].family)
+				if err != nil {
+					return err
+				}
+				scopes[i].dependencyKeys = keys
+			case scip.ID:
+				// The call-site join reads the link tables of every
+				// language's files, the C and C++ ones included, so what
+				// decides a table beyond its file's bytes is part of the
+				// unit's identity exactly as it is a C linking unit's.
+				keys, err := b.linkKeys(link.FamilyC)
 				if err != nil {
 					return err
 				}
@@ -459,6 +471,9 @@ func (b *builder) walk(ctx context.Context) error {
 		}
 		for _, list := range b.semantics {
 			for _, s := range list {
+				if s.anchor != nil && s.anchor(fv) {
+					s.anchored = true
+				}
 				if !s.allFiles && s.contains(fv) {
 					s.inputs = append(s.inputs, in)
 				}
@@ -619,18 +634,22 @@ func (b *builder) emit(ctx context.Context) error {
 			inputs := staticInputs(s.inputs)
 			if s.allFiles {
 				count, inputs = shared.Len(), shared.Each
+				if s.anchor != nil && !s.anchored {
+					count = 0
+				}
 			} else {
 				slices.SortFunc(s.inputs, func(a, c model.UnitInput) int { return compareID(a.FileID, c.FileID) })
 			}
 			if count == 0 {
 				// A unit that declares nothing folds the empty input digest,
 				// which is the same digest whatever the snapshot holds -- an
-				// identity that reuses forever no matter what changed. It is
-				// reachable: a scip `import:` scope whose index file detection
-				// saw in the live checkout is not in the pinned snapshot (the
-				// workspace policy excluded it, or it is over a size bound) is
-				// a member of nothing. Refused and published as a degradation,
-				// never planned with a constant identity.
+				// identity that reuses forever no matter what changed. A unit
+				// whose anchor the snapshot does not hold is refused the same
+				// way: a scip `import:` scope whose index file detection saw
+				// in the live checkout is not in the pinned snapshot (the
+				// workspace policy excluded it, or it is over a size bound).
+				// Refused and published as a degradation, never planned with
+				// a constant identity or without the file it reads.
 				b.plan.Unplanned[unplannedNoInputs+s.providerID]++
 				if _, seen := b.noInputs[s.providerID]; !seen {
 					b.noInputs[s.providerID] = s.scopeKey
