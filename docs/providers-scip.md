@@ -604,11 +604,11 @@ native key the call-site key:
 
 The identifier `Bar` occupying zero-based bytes `[34,37)` of `pkg/a.go` is
 therefore `callsite:pkg/a.go:35-37`, byte for byte the key the linker cites on
-its own evidence for the call. So one call carries both rows: when the
-compiler and the linker name the same node it is one relation with a
-`static_analysis` row and a `compiler` row, and when they differ (an open site
-the linker could not bind, a target the linker reads otherwise) it is two
-`calls` relations from one caller at one key. When the index names several
+its own evidence for the call. So one call carries both rows, under one key
+from one caller. The target is the index's own node (below), so today they are
+two `calls` relations: the linker's to its target or open site, the importer's
+to the index's symbol. The row carries no `dispatch`: SCIP records which symbol
+a token names, not whether the call can run an override. When the index names several
 symbols at one callee token -- scip-clang's overload candidates of a dependent
 call in a template body, or a constructor sharing the token of the function
 whose result it takes -- each is a target: one `calls` per distinct symbol,

@@ -256,3 +256,83 @@ func scipBytes(b []byte, field int, payload []byte) []byte {
 	b = binary.AppendUvarint(b, uint64(len(payload)))
 	return append(b, payload...)
 }
+
+// TestASuppliedIndexTheSnapshotLeavesOutPlansNoUnit holds the refusal of a
+// supplied index's unit when the snapshot does not hold the index: the unit
+// reads every snapshot file, so without its anchor it would be planned over
+// the whole tree with no index to read, under an identity that never names
+// the index. It must be refused and reported, as a scope with no inputs.
+//
+// Mutation caught: plan the whole-snapshot unit whether or not the walk saw
+// its index file (drop the anchored check in emit).
+func TestASuppliedIndexTheSnapshotLeavesOutPlansNoUnit(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repo := filepath.Join(home, "repo")
+	userCfg := filepath.Join(home, "config", "codectx")
+	c := joinCases[0]
+	// A vendor directory is outside the snapshot by the default policy,
+	// while the file is on disk for detection to find.
+	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.27\n", c.path: c.source,
+		"vendor/index.scip": string(joinIndex(c.document(t)))}
+	for path, body := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, path)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(repo, path), []byte(body))
+	}
+	if err := os.MkdirAll(userCfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "[storage]\ndata_dir = \"" + filepath.Join(home, "data") + "\"\n" +
+		"[tools]\noffline = true\n" +
+		"[providers.scip]\nenabled = true\n[providers.lsp]\nenabled = false\n"
+	writeFile(t, filepath.Join(userCfg, "config.toml"), []byte(cfg))
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "share"))
+
+	ws, err := OpenWorkspace(ctx, repo, OpenOptions{Operation: "index", SCIPImport: "vendor/index.scip"})
+	if err != nil {
+		t.Fatalf("open workspace: %v", err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	result, err := ws.Services().Index(ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	reader, err := ws.s.store.PinGeneration(ctx, ws.s.repo, result.Binding.GenerationID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	states, err := reader.Capabilities(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := false
+	for _, s := range states {
+		if s.ProviderID == scip.ID && s.Details["scopes_without_inputs"] == "1" && s.Details["scope_key"] == scip.ImportScope("vendor/index.scip") {
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatalf("no scip capability row reports the import scope without inputs: %+v", states)
+	}
+	nodes, err := reader.Nodes(ctx, sqlite.NodeFilter{Name: "helper"}, "", model.MaxPageItems)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range nodes {
+		rows, err := reader.Evidence(ctx, n.Node.ID, "", "", model.MaxPageItems)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rows {
+			if r.Evidence.ProviderID == scip.ID {
+				t.Fatalf("an index the snapshot does not hold published %s", n.Node.ID)
+			}
+		}
+	}
+}
