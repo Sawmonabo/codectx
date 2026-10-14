@@ -17,8 +17,6 @@ type fakeCallHierarchy struct {
 	prepared map[uint64]lsp.CallItem
 	incoming map[string][]lsp.Call
 	outgoing map[string][]lsp.Call
-	// truncate marks a calls answer as having had more than the limit.
-	truncate bool
 	asked    []string
 }
 
@@ -100,7 +98,7 @@ func TestOverlayCallsAnswerOneLabeledLevel(t *testing.T) {
 	ctx := context.Background()
 	limits := overlayCallLimits{edges: 10, nodes: model.MaxRecordsPerResult}
 
-	fake, seedA, seedB, fileMain, fileUtil := callFixture()
+	fake, seedA, seedB, _, fileUtil := callFixture()
 	in, err := walkOverlayCalls(ctx, fake, []overlayCallSeed{seedA, seedB}, model.DirectionIncoming, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +121,7 @@ func TestOverlayCallsAnswerOneLabeledLevel(t *testing.T) {
 	}
 	checkCalls(t, "callers", in, wantIn)
 
-	fake, seedA, _, fileMain, _ = callFixture()
+	fake, seedA, _, fileMain, _ := callFixture()
 	out, err := walkOverlayCalls(ctx, fake, []overlayCallSeed{seedA}, model.DirectionOutgoing, limits)
 	if err != nil {
 		t.Fatal(err)
