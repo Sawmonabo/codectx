@@ -705,8 +705,10 @@ resolution and ownership read), each `package.json`'s `name`, `type`, `exports`,
 `module`, `main`, `tsconfig` and `workspaces`, and each workspace file's globs (`jsManifestFields`, `js_manifest.go`).
 A changed ECMAScript field rebuilds the hierarchy, whose specifier answers (`keyESSpec`) are diffed key by key like
 every other index group, so only the nodes whose imports now resolve differently re-run, in any file of the unit.
-Nothing else of a manifest is read: the Python and Java project files decide only which unit a file belongs to, so a
-change to them is a change of membership or nothing. A change to the Go fields other than the `module` path, which only
+Beyond these, the declared entry points of a `pyproject.toml`, `package.json` or `Cargo.toml` are read
+(`entryFields`, `route_entry.go`), and nothing else of a manifest: a Python or Java project root is no field the
+linker reads. It decides membership (the unit's scope key) only, so adding or moving a `pyproject.toml`, `setup.py`,
+`setup.cfg`, `pom.xml` or `build.gradle` is a membership change. A change to the Go fields other than the `module` path, which only
 say where a package outside the unit is read from, keeps the layout (`goExternalField`, `go_refresh.go`): the packages outside the unit are read
 again over the stored hierarchy, and the hierarchy is kept when the digest of everything they declare
 (`goExternal.surface`, stored as a group) is the predecessor's, an early cutoff, so a dependency bump that changes no
@@ -719,10 +721,17 @@ What re-resolves:
 - **Go, Java, Rust, C, C++** (`rerunStatic`, `static.go`): every resolution read is recorded at the hierarchy's one
   lookup point (`index.lookup`, lookups that found nothing included), at the Go module path (`goPackages`) and at the
   signature cross-product, as a trace key that names files and declaration nodes, never positions
-  (`internal/provider/link/trace.go`). A refresh re-runs the members whose table moved, the added members, the members
-  whose reverse-index keys name a changed index group or a changed manifest field, and then the members whose
-  indirect sites read a signature whose set of taken functions changed. A file re-runs whole, since its sites read
-  each other's results. When the layout holds (the same members, the same fields but those saying where a Go package outside the unit is read from, and every member whose table moved
+  (`internal/provider/link/trace.go`). A member is resolved as nodes: each site, and its file node (its supertype,
+  override, route, input, include and visibility facts and the functions it takes as values). Each read is recorded
+  with the node that made it, one record per key and member listing its nodes (`static_sites.go`); a read that fills
+  what the member's sites share once computed (whether every import names the unit, `closedImports`; a C or C++
+  member's include closure) is recorded for the whole member. A refresh re-runs every node of the members whose table
+  moved and of the added members, the nodes whose reverse-index keys name a changed index group or a changed manifest
+  field, with every site whose receiver is the result of a re-run site (read from the table), and then the sites that
+  read a signature whose set of taken functions changed. Every other node keeps its facts, reads and taken functions,
+  so a changed export re-runs the sites that read it, not their whole files. When the layout holds (the same members,
+  the same fields but those saying where a Go package outside the unit is read from and the declared entry points,
+  which only their own resolution reads, and every member whose table moved
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
   and republishes; otherwise it rebuilds the hierarchy and diffs it group by group. The rebuild reads the tables of
   the members whose digest moved and of the added members only: for every other member it reads the projection the
