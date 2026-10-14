@@ -9,9 +9,9 @@ decoder.
 | A supplied `.scip` file inside the snapshot (`Options.Import`, the explicit import request field), optionally with an input-hash manifest (`Options.Manifest`) | `import:<root-relative path>` (`scip.ImportScope`) | `verified` only when every document that names a snapshot file proves its bytes; otherwise `unverified` |
 | One of the six managed indexer profiles (`scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer`, `scip-clang`), whose pinned payload codectx runs against a private materialization of the snapshot | `profile:<profile name>:<project directory>` (`scip.ProfileScope`), one unit per triggering directory | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
 
-The descriptor is `scip`, version the digest of the code that maps SCIP records
-to facts (`codectx.Digest` of `internal/provider/scip`, the packages it imports,
-the outside modules they name and the toolchain; never set by hand), capabilities `precise_definitions`,
+The descriptor is `scip`, version the build's own (`model.ToolVersion`: the
+release version, or `dev-` and the executable's SHA-256 for any other build;
+never set by hand), capabilities `precise_definitions`,
 `precise_references`, `precise_implementations`, invalidation scope
 `workspace`, optional. It depends on `filesystem` and `treesitter`, plus
 `manifest` when a profile is configured (profiles read package manifests).

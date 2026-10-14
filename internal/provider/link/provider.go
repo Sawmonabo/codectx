@@ -36,9 +36,7 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"sync"
 
-	"github.com/Sawmonabo/codectx"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -61,19 +59,10 @@ const (
 	ResolutionKind = "link.resolution"
 )
 
-// Version is the descriptor version: the digest of the linker's code
-// (codectx.Digest of this package: every package of the module it is built
-// from, every outside module they import and the toolchain), so a unit, and
-// a predecessor's resolution state, that another build of different code
-// wrote is never reused or read (ErrStateVersion), and one of an unchanged
-// build always is. It is digested once, when first asked.
-var Version = sync.OnceValue(func() string {
-	code, err := codectx.Digest("internal/provider/link")
-	if err != nil {
-		panic("link version: " + err.Error())
-	}
-	return code[:24]
-})
+// Version is the descriptor version: the build's own (model.ToolVersion), so
+// a unit, and a predecessor's resolution state, that another build wrote is
+// never reused or read (ErrStateVersion), and one of the same build always is.
+func Version() string { return model.ToolVersion() }
 
 // Capabilities are the capabilities the provider declares, one row of each
 // per unit.

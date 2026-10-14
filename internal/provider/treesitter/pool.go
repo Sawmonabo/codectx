@@ -340,8 +340,8 @@ func (p *pool) yieldParse() {
 	if p.parseHead() {
 		return
 	}
-	for i := len(p.parseWaits) - 1; i >= 0; i-- {
-		if pw := p.parseWaits[i]; !pw.yielded {
+	for _, pw := range slices.Backward(p.parseWaits) {
+		if !pw.yielded {
 			pw.yielded = true
 			pw.cancel()
 			return
@@ -779,11 +779,9 @@ func (p *pool) drain() {
 	// make the drain take sixteen graces in the worst case.
 	var stopping sync.WaitGroup
 	for _, w := range idle {
-		stopping.Add(1)
-		go func() {
-			defer stopping.Done()
+		stopping.Go(func() {
 			w.stop(false)
-		}()
+		})
 	}
 	stopping.Wait()
 }
@@ -812,11 +810,9 @@ func (p *pool) close() {
 	p.mu.Unlock()
 	var stopping sync.WaitGroup
 	for _, w := range idle {
-		stopping.Add(1)
-		go func() {
-			defer stopping.Done()
+		stopping.Go(func() {
 			w.stop(false)
-		}()
+		})
 	}
 	stopping.Wait()
 	for _, w := range busy {
@@ -898,8 +894,8 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 	if err == nil {
 		if kind != wire.KindHello {
 			err = errors.New("first frame is not a hello")
-		} else if err = json.Unmarshal(payload, &hello); err == nil && hello.Fingerprint != lang.Fingerprint() {
-			err = fmt.Errorf("worker fingerprint %s does not match the provider's %s", short(hello.Fingerprint), short(lang.Fingerprint()))
+		} else if err = json.Unmarshal(payload, &hello); err == nil && (hello.Executable == "" || hello.Executable != wire.Executable()) {
+			err = fmt.Errorf("worker executable %q is not the provider's own %q", bound(hello.Executable, 128), wire.Executable())
 		} else if err == nil && hello.Build != p.build {
 			err = fmt.Errorf("worker build %q does not match the provider's %q", bound(hello.Build, 128), p.build)
 		}
@@ -1153,8 +1149,7 @@ func (p *pool) parse(ctx context.Context, w *worker, req wire.Request, src []byt
 	if err == nil {
 		return ex, nil
 	}
-	var perFile perFileError
-	if errors.As(err, &perFile) {
+	if _, ok := errors.AsType[perFileError](err); ok {
 		return nil, err
 	}
 	if ctx.Err() != nil {
@@ -1470,7 +1465,7 @@ func (p *pool) plan(ctx context.Context, view model.SnapshotView, language strin
 		return nil, err
 	}
 	key := needKey{repository: t.repository,
-		Kind: ledger.NeedParse, Subject: language, Fingerprint: lang.Fingerprint(), Build: p.build, SizeClass: admission.SizeClassOf(size)}
+		Kind: ledger.NeedParse, Subject: language, Fingerprint: lang.Version(), Build: p.build, SizeClass: admission.SizeClassOf(size)}
 	p.mu.Lock()
 	m := p.models[key]
 	if m == nil {
@@ -1715,13 +1710,6 @@ func (p *pool) stats() Stats {
 			continue
 		}
 		s.WorkerRSSBytes += base
-	}
-	return s
-}
-
-func short(s string) string {
-	if len(s) > 12 {
-		return s[:12]
 	}
 	return s
 }

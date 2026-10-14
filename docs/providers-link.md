@@ -26,11 +26,10 @@ Required          false
 ```
 
 `ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go`, and the descriptor is
-`Provider.Descriptor`. `Version` is the first 24 hex digits of `codectx.Digest` (`sources.go` at the module root) of
-the linker's package: the non-test Go files of every package of the module it is built from, the version and sum of
-every outside module they import, and the Go toolchain's version. Any change to the code that links, the stored
-state's codecs included, changes it, so a unit and a stored state of other code are never reused (Refresh); an
-unchanged build reuses both. Nothing is versioned by hand. The id is not `dependence`, which is never reused (decision 9). The provider is not required:
+`Provider.Descriptor`. `Version` is the build's own version (`model.ToolVersion`): the release version a release
+build was stamped with, otherwise `dev-` and the first 24 hex digits of the SHA-256 of the executable. A unit and a
+stored state another build wrote are never reused (Refresh); the same build reuses both. Nothing is versioned by
+hand. The id is not `dependence`, which is never reused (decision 9). The provider is not required:
 a failed link degrades its seven capabilities and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 

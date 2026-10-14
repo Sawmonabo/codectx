@@ -25,31 +25,31 @@ Packages:
 
 ```
 ID                treesitter
-Version           1.<extraction-version>-<fingerprint[:24]>
+Version           <release version> | dev-<sha256(executable)[:24]>
 Capabilities      structure, control_depends_on, data_flows_to, reads, writes
 DependsOn         filesystem
 InvalidationScope file
 Required          true
 ```
 
-`lang.Fingerprint()` folds, with `model.Hasher` under the domain
-`treesitter-fingerprint-v1`: the binding module and version
-(`github.com/tree-sitter/go-tree-sitter@v0.25.0`), the digest of the extraction
-code, and for every language its name, grammar module and version, ABI, grammar
-metadata version and the full text of its composed query pack. The code digest
-is `codectx.Digest` (`sources.go` at the module root) of the provider and its
-parser worker: the module embeds its own Go sources, and the digest folds the
-non-test Go files of every package of the module the two import, transitively
-(read from the embedded files' import lists), the version and sum of every
-outside module those imports name, as the build resolved them, and the Go
-toolchain's version. It is computed once per process, when first asked (about
-10 ms for this digest and the linker's together). A grammar upgrade, an ABI
-change, an edited `.scm` or any change to the code that extracts therefore
-changes `ProviderVersion`, which changes
-every unit key (`NewUnitID` folds the version) and invalidates all sealed
-treesitter units, as Section 11.3 requires. The worker reports the same
-fingerprint in its hello frame and the parent refuses a worker whose value
-differs, so a stale binary can never answer for a newer parent.
+`Version` is the build's own version (`model.ToolVersion`, shared by every
+provider): a release build is the release version it was stamped with
+(`-X .../internal/model.version`), and any other build is `dev-` and the first
+24 hex digits of the SHA-256 of its executable, computed once per process
+(about 0.15 s for an 80 MB binary; a release build reads no file). The
+grammars, their pins, the query packs and the code that extracts are all
+compiled into the binary, so a change to any of them is a new build, which
+changes every unit key (`NewUnitID` folds the version) and invalidates all
+sealed treesitter units, as Section 11.3 requires. An upgrade therefore
+re-parses every file once; this is the practice of the Go build cache (release
+version for releases, the binary's content hash otherwise), gopls (the
+executable's SHA-256) and mypy (its version).
+
+The parent starts its workers from its own executable, and each worker reports
+that file's identity in its hello (size, modification time and, on Unix,
+device and inode, read from `/proc/self/exe` on Linux); the parent refuses a
+worker whose file is not its own, so a binary rebuilt or replaced while the
+parent runs can never answer for it. Workers never compute the version.
 
 ### Pinned grammars
 
@@ -812,9 +812,8 @@ failure stores no table and discloses `link_failure` on its structural capabilit
 
 ### Reuse
 
-The four families are facts of the structural file unit, so a file whose fingerprint matches its sealed unit reuses
-them with its structural facts, and an edited file recomputes all of them. The fingerprint's code digest
-(`lang.Fingerprint`) changes with any change to the code that emits them, and only then.
+The four families are facts of the structural file unit, so an unchanged file reuses them with its structural facts
+under the same build, and an edited file or a new build recomputes all of them.
 
 ## Worker process
 
@@ -950,7 +949,7 @@ expose), in put order, and the builder drops its reference to each group as it
 hands it over, so a unit's output is never held twice.
 
 ```
-worker → parent   Hello{pid, fingerprint, languages}          once, first
+worker → parent   Hello{pid, executable, build, languages}    once, first
 parent → worker   Request{language, path, source_bytes}
 parent → worker   Source<raw bytes>                            exactly source_bytes
 worker → parent   Decl* Import* Ref*                           facts, one record each
@@ -1044,7 +1043,7 @@ function of the file's bytes.
 - A worker that breaks protocol or dies mid-parse is stopped and, after a
   successful hello, the parse is retried exactly once on a fresh worker.
   Startup failures (the runner's trust refusal, admission refusal, a missing
-  hello, a fingerprint mismatch), per-file error frames, cancellation and a
+  hello, an executable or build mismatch), per-file error frames, cancellation and a
   stalled worker are not retried.
 - `Close` closes every idle worker's stdin — concurrently, since each exits on
   EOF within the grace and serial stops would cost one grace after another —

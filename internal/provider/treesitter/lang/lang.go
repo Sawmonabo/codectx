@@ -12,11 +12,8 @@ import (
 	"embed"
 	"path"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
 
-	"github.com/Sawmonabo/codectx"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -154,41 +151,9 @@ var shared = func() map[string]bool {
 	return out
 }()
 
-// Fingerprint is the digest folded into the provider version: binding, the
-// code that extracts (codectx.Digest of the structural provider and its
-// parser worker: every package of the module they are built from, every
-// outside module they import and the toolchain) and, per language, module
-// version, ABI, metadata and the exact query source. Any change to that
-// code, a grammar pin or a query invalidates every unit the provider has
-// sealed, which is what Section 9.4 requires of an analyzer/query version,
-// and an unchanged build reuses them.
-func Fingerprint() string { return fingerprint() }
-
-var fingerprint = sync.OnceValue(func() string {
-	code, err := codectx.Digest(extractorPackages...)
-	if err != nil {
-		panic("treesitter fingerprint: " + err.Error())
-	}
-	h := model.NewHasher("treesitter-fingerprint-v1")
-	h.AddString(BindingModule)
-	h.AddString(code)
-	for _, l := range All {
-		h.AddString(l.Name)
-		h.AddString(l.Module)
-		h.AddString(strconv.FormatUint(uint64(l.ABI), 10))
-		h.AddString(l.Metadata)
-		h.AddString(l.Query)
-	}
-	return h.Sum()
-})
-
-// extractorPackages are the packages whose code produces the structural
-// provider's output: the provider, which turns what the worker sends into
-// facts and link tables, and the parser worker.
-var extractorPackages = []string{"internal/provider/treesitter", "internal/provider/treesitter/worker"}
-
-// Version is the provider version string: the first 24 hex digits of the
-// fingerprint, well inside model.MaxIdentifierBytes.
-func Version() string {
-	return Fingerprint()[:24]
-}
+// Version is the provider version: the build's own (model.ToolVersion). The
+// grammars, their pins and the query packs are compiled into the binary, so a
+// change to any of them, or to the code that extracts, is a new build and
+// invalidates every unit the provider has sealed, which is what Section 9.4
+// requires of an analyzer/query version.
+func Version() string { return model.ToolVersion() }

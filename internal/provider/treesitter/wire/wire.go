@@ -93,14 +93,13 @@ const (
 	MaxQualifierBytes = 512
 )
 
-// Hello is the worker's identity: the PID for accounting, the language
-// fingerprint and the build the parent must match, and the languages it
-// verified.
+// Hello is the worker's identity: the PID for accounting, the executable
+// file and the build the parent must match, and the languages it verified.
 type Hello struct {
-	PID         int      `json:"pid"`
-	Fingerprint string   `json:"fingerprint"`
-	Build       string   `json:"build"`
-	Languages   []string `json:"languages"`
+	PID        int      `json:"pid"`
+	Executable string   `json:"executable"`
+	Build      string   `json:"build"`
+	Languages  []string `json:"languages"`
 	// Memory is the worker's standing memory once it has started and before
 	// its first file: BaseBytes and AnonBytes, never NeedBytes.
 	Memory Memory `json:"memory"`

@@ -34,10 +34,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/Sawmonabo/codectx"
 	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -53,20 +51,10 @@ import (
 // ID identifies the provider.
 const ID = "scip"
 
-// Version is the descriptor version: the digest of the code that maps SCIP
-// records to facts (codectx.Digest of this package: every package of the
-// module it is built from, every outside module they import and the
-// toolchain), so a unit another build of different code sealed is never
-// reused and one of an unchanged build always is. Nothing versions it by
-// hand. A provider with profile payloads appends their identities. It is
-// digested once, when first asked.
-var Version = sync.OnceValue(func() string {
-	code, err := codectx.Digest("internal/provider/scip")
-	if err != nil {
-		panic("scip version: " + err.Error())
-	}
-	return code[:24]
-})
+// Version is the descriptor version: the build's own (model.ToolVersion), so
+// a unit another build sealed is never reused and one of the same build
+// always is. A provider with profile payloads appends their identities.
+func Version() string { return model.ToolVersion() }
 
 // Capabilities this provider offers. Definitions covers symbol nodes and
 // aliases; references covers reference and import occurrences;

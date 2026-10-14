@@ -74,7 +74,7 @@ func Main(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 		names = append(names, l.Name)
 	}
 	// The first boundary has no file before it, so it carries no need.
-	hello := wire.Hello{PID: os.Getpid(), Fingerprint: lang.Fingerprint(), Build: wire.Build(), Languages: names,
+	hello := wire.Hello{PID: os.Getpid(), Executable: wire.Executable(), Build: wire.Build(), Languages: names,
 		Memory: w.meter.boundary()}
 	if err := wire.WriteJSON(out, wire.KindHello, hello); err != nil {
 		return exitBadInput
