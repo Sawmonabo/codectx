@@ -704,7 +704,7 @@ type harness struct {
 func fixtureLimits() Limits {
 	return Limits{
 		ChunkBytes: 64, MaxChunkBytes: 4096,
-		MaxSourceResponseBytes: 1 << 20, MaxMetadataResponseBytes: 1 << 18,
+		MaxSourceResponseBytes: 1 << 20, MaxToolRequestBytes: 1 << 18,
 		MaxReceiptsPerConfirmation:     model.MaxReceiptsPerConfirmation,
 		MaxUnconfirmedChunksPerSession: 4,
 		MaxPageItems:                   3,

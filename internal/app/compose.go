@@ -1784,7 +1784,7 @@ func coverageLimits(cfg config.Config) coverage.Limits {
 		ChunkBytes:                 cfg.Coverage.ChunkBytes,
 		MaxChunkBytes:              cfg.Coverage.MaxChunkBytes,
 		MaxSourceResponseBytes:     cfg.Resources.MaxSourceResponseBytes,
-		MaxMetadataResponseBytes:   cfg.Resources.MaxMetadataResponseBytes,
+		MaxToolRequestBytes:        cfg.Resources.MaxToolRequestBytes,
 		MaxReceiptsPerConfirmation: cfg.Coverage.MaxReceiptsPerConfirmation,
 		// Zero survives as zero on purpose: coverage.Limits reads it as unlimited.
 		MaxUnconfirmedChunksPerSession: cfg.Coverage.MaxUnconfirmedChunksPerSession.Int(),

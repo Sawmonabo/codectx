@@ -31,7 +31,7 @@ type handlers struct {
 	context app.ContextService
 
 	// cfg carries the Section 20 bounds. limitMiddleware reads
-	// resources.max_metadata_response_bytes and query_timeout from it, and the
+	// resources.max_tool_request_bytes and query_timeout from it, and the
 	// two gate sizes from the machine's cores; readSource reads
 	// max_source_response_bytes.
 	cfg   config.Config
@@ -176,7 +176,7 @@ type capsuleOutput struct {
 // capsuleExport is the canonical export METADATA projection and NEVER the
 // capsule body. A sealed capsule's records are rows of their own and there is
 // no bound on how many a session may record, so returning them whole over this
-// tool could never honour the resources.max_metadata_response_bytes ceiling.
+// tool could never honour the resources.max_tool_request_bytes ceiling.
 // Section 19.2's "bounded capsule page or canonical export metadata" is this
 // field set: identity, binding, both hashes, the scope version, the strict-gate
 // flag, per-list counts and the creation time — everything needed to verify or

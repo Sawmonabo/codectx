@@ -39,7 +39,7 @@ func (c Config) validate() error {
 		{"resources.query_memory_bytes", c.Resources.QueryMemoryBytes},
 		{"resources.cache_bytes", c.Resources.CacheBytes},
 		{"resources.min_free_disk_bytes", c.Resources.MinFreeDiskBytes},
-		{"resources.max_metadata_response_bytes", c.Resources.MaxMetadataResponseBytes},
+		{"resources.max_tool_request_bytes", c.Resources.MaxToolRequestBytes},
 		{"resources.max_source_response_bytes", c.Resources.MaxSourceResponseBytes},
 		{"resources.max_query_text_bytes", int64(c.Resources.MaxQueryTextBytes)},
 		{"resources.max_page_items", int64(c.Resources.MaxPageItems)},
@@ -242,9 +242,9 @@ func (c Config) validateBudgets() error {
 		return configInvalid("providers.lsp.max_overlay_bytes %s is smaller than resources.max_source_response_bytes %d; one served source response must fit the overlay",
 			overlay, c.Resources.MaxSourceResponseBytes)
 	}
-	if c.Resources.MaxMetadataResponseBytes >= c.Resources.MaxSourceResponseBytes {
-		return configInvalid("resources.max_metadata_response_bytes %d is not smaller than the source budget %d; generic tools must stay under the smaller metadata limit",
-			c.Resources.MaxMetadataResponseBytes, c.Resources.MaxSourceResponseBytes)
+	if c.Resources.MaxToolRequestBytes >= c.Resources.MaxSourceResponseBytes {
+		return configInvalid("resources.max_tool_request_bytes %d is not smaller than the source budget %d; a tool call larger than the largest answer cannot be served",
+			c.Resources.MaxToolRequestBytes, c.Resources.MaxSourceResponseBytes)
 	}
 	if c.Index.BatchBytes < MinBatchBytes {
 		return configInvalid("index.batch_bytes %d is below %d; one node fact with a metadata row piece must fit one batch",

@@ -133,7 +133,7 @@ func (h *handlers) contextInclude(ctx context.Context, _ *mcp.CallToolRequest, i
 // below.
 //
 // The bound is checked here and not left to the request middleware because the
-// middleware's ceiling is resources.max_metadata_response_bytes, which this one
+// middleware's ceiling is resources.max_tool_request_bytes, which this one
 // response type is exempt from. It bounds the chunk
 // content — the term the ceiling exists for — and not the serialized envelope:
 // the exact wire accounting is the facade's, which sizes every chunk it serves,

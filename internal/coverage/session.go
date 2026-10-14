@@ -91,7 +91,7 @@ func checkLimits(l Limits) error {
 		{"chunk_bytes", l.ChunkBytes},
 		{"max_chunk_bytes", l.MaxChunkBytes},
 		{"max_source_response_bytes", l.MaxSourceResponseBytes},
-		{"max_metadata_response_bytes", l.MaxMetadataResponseBytes},
+		{"max_tool_request_bytes", l.MaxToolRequestBytes},
 		{"max_receipts_per_confirmation", int64(l.MaxReceiptsPerConfirmation)},
 		{"max_page_items", int64(l.MaxPageItems)},
 		{"session_ttl", int64(l.SessionTTL)},

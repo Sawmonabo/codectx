@@ -207,17 +207,17 @@ type Index struct {
 
 // Resources is the memory, concurrency, disk and response policy.
 type Resources struct {
-	QueryMemoryBytes         int64    `toml:"query_memory_bytes"`
-	CacheBytes               int64    `toml:"cache_bytes"`
-	MaxTempBytes             int64    `toml:"max_temp_bytes"`
-	MinFreeDiskBytes         int64    `toml:"min_free_disk_bytes"`
-	MaxMetadataResponseBytes int64    `toml:"max_metadata_response_bytes"`
-	MaxSourceResponseBytes   int64    `toml:"max_source_response_bytes"`
-	QueryTimeout             Duration `toml:"query_timeout"`
-	MaxQueryTextBytes        int      `toml:"max_query_text_bytes"`
-	MaxQueryTerms            Limit    `toml:"max_query_terms"`
-	MaxPageItems             int      `toml:"max_page_items"`
-	MaxProviderRecordBytes   Limit    `toml:"max_provider_record_bytes"`
+	QueryMemoryBytes       int64    `toml:"query_memory_bytes"`
+	CacheBytes             int64    `toml:"cache_bytes"`
+	MaxTempBytes           int64    `toml:"max_temp_bytes"`
+	MinFreeDiskBytes       int64    `toml:"min_free_disk_bytes"`
+	MaxToolRequestBytes    int64    `toml:"max_tool_request_bytes"`
+	MaxSourceResponseBytes int64    `toml:"max_source_response_bytes"`
+	QueryTimeout           Duration `toml:"query_timeout"`
+	MaxQueryTextBytes      int      `toml:"max_query_text_bytes"`
+	MaxQueryTerms          Limit    `toml:"max_query_terms"`
+	MaxPageItems           int      `toml:"max_page_items"`
+	MaxProviderRecordBytes Limit    `toml:"max_provider_record_bytes"`
 }
 
 // The two accepted spellings of storage.synchronous. They are the whole set:
@@ -582,12 +582,12 @@ func Defaults() Config {
 			MaxEvidencePerFact: Unlimited,
 		},
 		Resources: Resources{
-			QueryMemoryBytes:         33554432,
-			CacheBytes:               33554432,
-			MaxTempBytes:             0,
-			MinFreeDiskBytes:         1073741824,
-			MaxMetadataResponseBytes: 262144,
-			MaxSourceResponseBytes:   7340032,
+			QueryMemoryBytes:       33554432,
+			CacheBytes:             33554432,
+			MaxTempBytes:           0,
+			MinFreeDiskBytes:       1073741824,
+			MaxToolRequestBytes:    262144,
+			MaxSourceResponseBytes: 7340032,
 			// QueryTimeout is 0: a call that carries no deadline of its own runs
 			// to the complete answer. Only a user-set value ends a page early,
 			// and then with a cursor, never an error.

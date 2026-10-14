@@ -147,11 +147,11 @@ type Limits struct {
 	// above the ceiling is clamped, not rejected.
 	ChunkBytes, MaxChunkBytes int64
 	// MaxSourceResponseBytes bounds a read response on the wire; only the read
-	// path may spend it. MaxMetadataResponseBytes is the configured bound of
-	// the generic tools (Next, Status and Acknowledge carry no source bytes);
-	// coverage checks only that it is positive and bounds no answer by it.
-	MaxSourceResponseBytes   int64
-	MaxMetadataResponseBytes int64
+	// path may spend it. MaxToolRequestBytes is the configured bound of an
+	// MCP tool-call request; coverage checks only that it is positive and
+	// bounds no answer by it.
+	MaxSourceResponseBytes int64
+	MaxToolRequestBytes    int64
 
 	MaxReceiptsPerConfirmation int
 	// MaxUnconfirmedChunksPerSession carries coverage.max_unconfirmed_chunks_per_session

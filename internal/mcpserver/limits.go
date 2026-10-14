@@ -27,7 +27,7 @@ import (
 // refuse a call the one gate would have admitted.
 type limits struct {
 	// maxParamsBytes caps the RAW tools/call arguments frame, before any
-	// decoding. resources.max_metadata_response_bytes serves as the MCP REQUEST
+	// decoding. resources.max_tool_request_bytes serves as the MCP REQUEST
 	// frame cap: a request larger than the largest answer the server may return
 	// cannot produce a serviceable call.
 	//
@@ -71,7 +71,7 @@ func newLimits(cfg config.Config) (limits, error) {
 		key string
 		v   int64
 	}{
-		{"resources.max_metadata_response_bytes", r.MaxMetadataResponseBytes},
+		{"resources.max_tool_request_bytes", r.MaxToolRequestBytes},
 		{"resources.max_page_items", int64(r.MaxPageItems)},
 		// resources.query_timeout is deliberately absent: zero is its
 		// "unlimited" spelling and its default, and a tool call that carries no
@@ -86,7 +86,7 @@ func newLimits(cfg config.Config) (limits, error) {
 		}
 	}
 	return limits{
-		maxParamsBytes: r.MaxMetadataResponseBytes,
+		maxParamsBytes: r.MaxToolRequestBytes,
 		calls:          make(chan struct{}, config.QuerySlots()),
 		timeout:        r.QueryTimeout.Std(),
 	}, nil

@@ -59,7 +59,7 @@ read never takes part in.)
    `internal/mcpserver/session.go:68-72` and `:115-117`, `internal/model/query.go:319-323`,
    `internal/app/services.go:503-504`, `docs/threat-model.md:43` ("No generic tool returns source
    bodies"). The point of the invariant is that every other answer stays small, metadata only and
-   bounded by `max_metadata_response_bytes`; it does not say source must need a session. Proposal (b)
+   bounded by `max_tool_request_bytes`; it does not say source must need a session. Proposal (b)
    keeps the invariant (still one tool), it only drops the session requirement for a read that claims
    no credit.
 
