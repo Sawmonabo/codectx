@@ -199,6 +199,13 @@ const (
 	// keyJavaMain + refKey(type): a Java method the type declares that a
 	// class can be launched by (Decl.Main), its form in Flags.
 	keyJavaMain = "jm\x00"
+	// keyShape + refKey(type): an instance member of an ECMAScript class or
+	// interface (addShapes), its name in Aux, shapeMethod or shapeField in
+	// Sig and, for a method, the argument counts a call may pass.
+	keyShape = "sm\x00"
+	// keyShapeFirst + name: an ECMAScript interface that declares a method,
+	// the least name of those it declares.
+	keyShapeFirst = "sf\x00"
 )
 
 // The flags of an entry.
@@ -850,6 +857,11 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 	}
 	if err := addJSRouting(links, file, t); err != nil {
 		return err
+	}
+	if fc.family == "js" {
+		if err := addShapes(links, file, t); err != nil {
+			return err
+		}
 	}
 	for i := range t.Decls {
 		d := &t.Decls[i]
@@ -2464,7 +2476,8 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // interface when it is one itself (a Java or TypeScript interface's
 // extended interfaces, a Rust supertrait, a Go interface's embedded
 // interfaces), and implements each other interface or trait it declares, or
-// that a Go type satisfies by its method set (DetailMethodSet). A Go struct's
+// that a Go type satisfies by its method set or a TypeScript class by its
+// members (DetailMethodSet, hierarchy_ts.go). A Go struct's
 // embedded types are promotion and no supertype. A supertype outside the
 // unit is its external type node (externalType).
 //
@@ -2473,8 +2486,9 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // neither static, final nor private, of the same signature; in C++ a virtual
 // one of the same signature; in Python the first along the method
 // resolution order; in Rust a trait's, by a method of the trait's impl
-// (Decl.Override); in ECMAScript one of the same name; in Go each method of
-// an interface its type satisfies. A method that overrides none of the
+// (Decl.Override); in ECMAScript one of the same name, and each method of
+// its name of an interface its class implements by its members; in Go each
+// method of an interface its type satisfies. A method that overrides none of the
 // unit's and that the language marks as overriding (Decl.Override) overrides
 // the method of its name of the one supertype outside the unit its type has
 // (externalSupers), none when it has several. Go publishes nothing toward a
@@ -2487,6 +2501,9 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // file's own reads of the indexes.
 func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
 	fc := contextOf(file, t)
+	// The interfaces each class of the file implements by its members,
+	// read once for its own facts and its methods'.
+	shapes := newStructuralMemo()
 	if err := h.springInputFacts(file, t, emit); err != nil {
 		return err
 	}
@@ -2510,9 +2527,9 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		case isType(d.Kind) && fc.family == "go":
 			err = h.goSupertypeFacts(fc, t, ref, d, emit)
 		case isType(d.Kind):
-			err = h.supertypeFacts(fc, ref, d, emit)
+			err = h.supertypeFacts(fc, ref, d, shapes, emit)
 		case isCallable(d.Kind):
-			err = h.overrideFacts(fc, t, ref, d, emit)
+			err = h.overrideFacts(fc, t, ref, d, shapes, emit)
 		}
 		if err == nil {
 			err = h.macroInputFacts(fc, ref, d, emit)
@@ -2531,7 +2548,7 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 // but Go: its declared supertypes of the unit (keySuper) and outside it
 // (keyExternalSuper), wherever the unit declares them (a Rust impl in another
 // file).
-func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, shapes *structuralMemo, emit func(Binding) error) error {
 	relation := func(super byte) Fact {
 		if super&flagInterface != 0 && d.Kind != model.NodeInterface {
 			return FactImplements
@@ -2543,6 +2560,11 @@ func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Bindi
 	})
 	if err != nil {
 		return err
+	}
+	if fc.family == "js" && d.Kind == model.NodeClass {
+		if err := h.structuralFacts(ref, shapes, emit); err != nil {
+			return err
+		}
 	}
 	return h.links.lookup(keyExternalSuper+refKey(ref), func(e entry) error {
 		detail := DetailSupertypeClass
@@ -2632,7 +2654,7 @@ func (h *hierarchy) owners(fc fileCtx, t *Table, d *Decl, yield func(Ref) error)
 
 // overrideFacts emits what the method d at ref directly overrides
 // (hierarchyFacts).
-func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, shapes *structuralMemo, emit func(Binding) error) error {
 	switch {
 	case d.Static && (fc.family == "java" || fc.family == "c"):
 		// A static method hides; it overrides nothing.
@@ -2742,6 +2764,25 @@ func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit f
 		for _, target := range targets {
 			if err := emit(Binding{Kind: FactOverrides, Site: ref, Target: target, Detail: detail}); err != nil {
 				return err
+			}
+		}
+		if fc.family == "js" && instanceMember(d) && owner.File == fc.file && t.Decls[owner.Index].Kind == model.NodeClass {
+			// The interfaces the class implements by its members alone
+			// (structural).
+			var structural []Ref
+			err := h.structuralOverrides(owner, d.Name, shapes, func(e entry) error {
+				if e.Ref != ref && !slices.Contains(targets, e.Ref) && !slices.Contains(structural, e.Ref) {
+					structural = append(structural, e.Ref)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			for _, target := range structural {
+				if err := emit(Binding{Kind: FactOverrides, Site: ref, Target: target, Detail: DetailMethodSet}); err != nil {
+					return err
+				}
 			}
 		}
 		if fc.family == "go" {

@@ -46,7 +46,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `data_flows_to` | `data_flows_to` | each variable an argument reads → each variable the site's result is written into, when the parameter it binds reaches the callee's return | `summary:<position>` |
 | `data_flows_to` | `data_flows_to` | the callee's return node → each variable the site's result is written into, and the return node of the callable that returns the call | `return` |
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
-| `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
+| `implements` | `implements` | type → an interface or trait it declares, or (Go, TypeScript) satisfies by its members | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set`, `supertype_candidate` |
 | `generates` | `generates` | Rust `macro_rules!` → each declaration written in an item-position invocation of it in another file of the unit | `macro_transcribes`, `macro_input` |
 | none of its own | `defines` | file module → a route endpoint at its full path, a declared entry point, or an inherited Java `main` | none |
@@ -72,7 +72,8 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   parameter at that position (`Parameter.Index`, 0 the receiver), whose value reaches the callee's return;
 - `return`: the bound callee's return node flowing into the site's result;
 - `supertype`: a supertype or an override the source writes;
-- `method_set`: a Go interface a type satisfies by its method set, which the source never writes;
+- `method_set`: a Go interface a type satisfies by its method set, or a TypeScript interface a class has every
+  member of, which the source never writes;
 - `supertype_interface`, `supertype_class`: a supertype the source writes that is outside the project (a node of
   kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
   interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
@@ -272,7 +273,18 @@ sites.
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
 the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
 embedded interfaces), and `implements` to each other interface or trait it declares, or, in Go, satisfies by its
-method set. A Go struct's embedded types are promotion and no supertype. Each method publishes `overrides` to the
+method set. A TypeScript class implements, by its members alone (`method_set`, `internal/provider/link/hierarchy_ts.go`;
+TypeScript Language Specification 1.8 §3.11.4 and §8.2.1), each interface of the project that it neither declares
+nor inherits, that declares a method itself, and whose every member, its own and those of the types it extends, is a
+member of the class of that name, its own or along its superclasses (a static member, a constructor and a `#p` member
+are none): a method of the interface the class has as a method must not require more arguments than the interface's
+declares parameters. Each method of the class of such an interface member's name then `overrides` it (`method_set`),
+so a call through the interface reaches it: `class Dog { name = ""; sound() {} }` implements `interface Animal {
+name: string; sound(): string }`, and a class whose `sound` requires two arguments, or that has no `name`, does not.
+Members are matched by name and arity, never by type; a constructor's parameter properties, an index signature, an
+optional member (read as required) and an accessibility modifier are not read; a member a supertype outside the
+project gives the class is not seen, and one it gives the interface is not required. A Go struct's embedded types are
+promotion and no supertype. Each method publishes `overrides` to the
 method it directly overrides along each direct supertype, never a deeper one: in Java one of the same signature that
 is neither static, final nor private; in C++ a virtual one of the same signature; in Python the first along the
 method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name that is not private (a `#p` method's name is its class body's alone, so it
