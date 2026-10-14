@@ -101,6 +101,7 @@ func (c *cClosure) complete() (open bool, err error) {
 // reaches reports whether file is in the closure, reading the directives
 // of the members still pending until it is reached or none is left.
 func (c *cClosure) reaches(file int32) (bool, error) {
+	defer c.r.h.memberWide()()
 	if !c.started {
 		// The member's own directives, from its table.
 		c.started = true

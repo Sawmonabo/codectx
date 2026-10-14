@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -20,18 +21,20 @@ import (
 // hierarchy's two indexes (each read one key at a time through
 // index.lookup), the address-taken functions of a signature (the
 // cross-product) and the unit's manifest fields (a Go module path; a Rust
-// crate's root is an index entry). Each read is recorded, by the member that
-// made it, under a stable key: the key with every member ordinal and table
-// index in it replaced by the file and declaration identity it denotes, so
-// the key means the same thing in every build. A key is recorded whether or
-// not the read found anything, since a lookup that found nothing changes
-// when something is declared under it.
+// crate's root is an index entry). Each read is recorded, by the node that
+// made it (a site, or the member's own facts and values; static_sites.go),
+// under a stable key: the key with every member ordinal and table index in
+// it replaced by the file and declaration identity it denotes, so the key
+// means the same thing in every build. A key is recorded whether or not the
+// read found anything, since a lookup that found nothing changes when
+// something is declared under it.
 //
 // The state keeps, for every key the indexes hold, the hash of what they hold
 // under it (a group), and the reverse index of the reads: each read key with
-// the members that read it, sorted by key. A refresh diffs the groups of the
-// rebuilt indexes against the predecessor's, joins the changed keys with the
-// reverse index, and re-runs exactly the members whose reads changed.
+// the members and nodes that read it, sorted by key. A refresh diffs the
+// groups of the rebuilt indexes against the predecessor's, joins the changed
+// keys with the reverse index, and re-runs exactly the nodes whose reads
+// changed.
 
 // The hash domains of a trace key and of a group.
 const (
@@ -62,11 +65,18 @@ func manifestKey(field string) TraceKey {
 	return TraceKey{Kind: TraceManifestField, Scope: scopeManifest, Name: field}
 }
 
-// read is one recorded read: the stable key's hash and the member that made
-// it. A refresh reads them sorted by key; their fold keeps one per pair.
+// read is the reads of one key by one member: the stable key's hash, the
+// member, and the nodes of the member that read it, ascending and each once:
+// a site's index, fileNode for the member's own facts and values
+// (static_sites.go), or wholeFile for a read that fills what every node of
+// the member shares (the member's own import closure). One record per key
+// and member keeps the reverse index as long as one per member would; a
+// refresh reads them sorted by key, and their fold unites the nodes of one
+// pair.
 type read struct {
-	Key  string
-	File model.FileID
+	Key   string
+	File  model.FileID
+	Nodes []int32
 }
 
 func compareRead(a, b read) int {
@@ -74,14 +84,37 @@ func compareRead(a, b read) int {
 }
 
 func encodeRead(r read) ([]byte, error) {
-	return appendString(appendString(nil, r.Key), string(r.File)), nil
+	out := binary.AppendUvarint(appendString(appendString(nil, r.Key), string(r.File)), uint64(len(r.Nodes)))
+	for _, n := range r.Nodes {
+		out = binary.AppendVarint(out, int64(n))
+	}
+	return out, nil
 }
+
+var errReadMalformed = errors.New("a recorded read is malformed")
 
 func decodeRead(raw []byte) (read, error) {
 	b := byteReader{b: raw}
 	r := read{Key: b.str(), File: model.FileID(b.str())}
-	if b.err != nil || len(b.b) != 0 {
-		return read{}, errors.New("a recorded read is malformed")
+	bad := errReadMalformed
+	if b.err != nil {
+		return read{}, bad
+	}
+	n, k := binary.Uvarint(b.b)
+	if k <= 0 || n == 0 || n > uint64(len(b.b)) {
+		return read{}, bad
+	}
+	b.b = b.b[k:]
+	r.Nodes = make([]int32, n)
+	for i := range r.Nodes {
+		v, k := binary.Varint(b.b)
+		if k <= 0 || v < math.MinInt32 || v > math.MaxInt32 || i > 0 && int32(v) <= r.Nodes[i-1] {
+			return read{}, bad
+		}
+		r.Nodes[i], b.b = int32(v), b.b[k:]
+	}
+	if len(b.b) != 0 {
+		return read{}, bad
 	}
 	return r, nil
 }
@@ -91,7 +124,26 @@ func newReadSort(dir string, order func(a, b read) int) (*pagination.ExternalSor
 	if err != nil {
 		return nil, err
 	}
-	return s.WithFold(func(a, _ read) (read, error) { return a, nil }), nil
+	return s.WithFold(func(a, b read) (read, error) {
+		a.Nodes = unionNodeIndexes(a.Nodes, b.Nodes)
+		return a, nil
+	}), nil
+}
+
+// unionNodeIndexes is the ascending union of two ascending node lists.
+func unionNodeIndexes(a, b []int32) []int32 {
+	out := make([]int32, 0, len(a)+len(b))
+	for len(a) > 0 || len(b) > 0 {
+		switch {
+		case len(b) == 0 || len(a) > 0 && a[0] < b[0]:
+			out, a = append(out, a[0]), a[1:]
+		case len(a) == 0 || b[0] < a[0]:
+			out, b = append(out, b[0]), b[1:]
+		default:
+			out, a, b = append(out, a[0]), a[1:], b[1:]
+		}
+	}
+	return out
 }
 
 // group is what an index holds under one stable key, hashed: Key is the

@@ -26,7 +26,7 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | [ADR-0011](ADR-0011-run-ledger.md) | The run ledger: a run records what each stage cost, in its own database, read live | Accepted, 2026-09-16 |
 | [ADR-0012](ADR-0012-native-dependence-engine.md) | Dependence is computed in process, and the hosted engine is retired against measured conditions | Accepted, 2026-09-26; implemented; decision 9 identity per ADR-0014 |
 | [ADR-0013](ADR-0013-search-index.md) | The lexical tier is an embedded search index, scored by our own BM25F | Accepted, 2026-10-08 |
-| [ADR-0014](ADR-0014-stable-identity-incremental-linking.md) | A declaration's identity is its name path, and an edit relinks only what read what changed | Accepted, 2026-10-09 |
+| [ADR-0014](ADR-0014-stable-identity-incremental-linking.md) | A declaration's identity is its name path, and an edit relinks only what read what changed | Accepted, 2026-10-09; implemented, reads and reruns by site |
 | [ADR-0015](ADR-0015-open-call-sites-and-dispatch.md) | Unbound calls are open sites with name candidates, and calls through a base class are found at query time | Accepted, 2026-10-09 |
 | [ADR-0016](ADR-0016-seed-budget.md) | The context planner reads lexical matches until no unread match can change what it packs | Accepted, 2026-10-09 |
 | [ADR-0017](ADR-0017-extraction-and-linking-coverage.md) | Eight facts a client derives from source are published by the index, each in a stated exact form | Accepted, 2026-10-09; implemented |

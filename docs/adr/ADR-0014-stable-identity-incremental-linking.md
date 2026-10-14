@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted, 2026-10-09, by the owner's ruling. Not yet implemented. This record amends the identity order of the
+Accepted, 2026-10-09, by the owner's ruling. Implemented: every family records its reads by site and reruns single
+sites, measured against file granularity in decision 4. This record amends the identity order of the
 implementation plan's Section 9.4 and the delta of [ADR-0012](ADR-0012-native-dependence-engine.md) decision 9. The
 survey behind it is [research 23](../research/23-stable-identity-and-incremental-linking.md).
 
@@ -66,19 +67,36 @@ are part of the interface.
 - Every bound or unbound site records a verifying trace: each key its resolution read (a name looked up in a scope,
   an interface entry, an inferred summary, a manifest field) with that key's hash [S9].
 - Reverse indexes map each key to the sites that read it. They are sorted runs on disk, never a repository-sized
-  structure in the heap.
+  structure in the heap. A key's reads by one file are one record listing the file's nodes that read it: each site,
+  the file's node (its own supertype, override, route, input, include and visibility facts and the functions it
+  takes as values), or the whole file for what its sites share once computed (whether all its imports name the
+  unit; a C or C++ file's include closure), so the index has one record per key and file, as a file-granular one
+  would, and grows only by the node list.
+- A site whose receiver is another site's result (`make().speak()`) reads the types that site's targets return; the
+  dependence is read from the table, never stored: a site that reruns reruns every site whose receiver is its
+  result.
 - The stored resolution names sites and targets by identity, not by member ordinal and table index, so an inserted
   declaration renumbers nothing.
 
 ### 4. A refresh reruns only the sites whose reads changed, and stops where a rerun changes nothing
 
 - The edited file's own sites always re-resolve.
-- Its interface is recomputed and diffed entry by entry; only sites whose traces name a changed entry rerun.
+- Its interface is recomputed and diffed entry by entry; only sites whose traces name a changed entry rerun, in
+  every family: of a file whose table held, the other sites keep their facts, reads and taken functions.
 - A rerun that yields the same binding and the same summary stops there. A changed inferred summary propagates to the
   sites that read it, until nothing changes [S9][S10].
 - An added file is a set of interface additions, so the sites whose lookups would now see a new name rerun. A deleted
   file is a set of removals.
 - Only files whose facts changed are republished; every other fact is carried over.
+
+**Alternative.** Recording reads per file and rerunning a file whole whenever one of its reads changed. Measured on
+this repository's link package linked as one Go unit (70 files, 6,801 sites, real pipeline, 9 refreshes per edit,
+alternated between the two builds): a changed signature read by 68 sites across 20 files reran 2,671 sites at file
+granularity and 343 at site granularity (the edited file's 280 included), and the refresh took a median 1.86 s
+against 1.57 s; a second signature read by 84 sites in 16 files, 1.81 s against 1.70 s. A body edit, which reruns
+its own file whole either way, took 1.43 s against 1.45 s, and a full build 2.70 s against 2.75 s (24 builds each,
+a difference under the spread of 0.22 s). Grouping one key's readers in one file into one record keeps the reverse
+index at one record per key and file (7,371 in both builds); the node lists add 37 KB to an 8.8 MB state.
 
 Worked example, as counts from the design: a body edit to `helpers.go`, with or without a new call, republishes
 `helpers.go`; renaming `Parse` republishes `helpers.go` and the files whose sites named `Parse`; inserting an overload
@@ -91,7 +109,15 @@ republishes `helpers.go`, and the existing overloads keep their identities.
   `rootDirs`, `rootDir`, `outDir`, `declarationDir`, `moduleResolution`, `module`, `customConditions`,
   `resolvePackageJsonExports`, `resolvePackageJsonImports`, `allowJs`, `files`, `include`, `exclude`,
   `references`) [S11]; a package's `name`, `type`, `exports`, `imports`, `types`/`typings`, `module`, `main` and
-  `workspaces`, and a pnpm or Lerna workspace's globs; a crate's name; a Python or Java project root.
+  `workspaces`, and a pnpm or Lerna workspace's globs; a crate's name; the entry points a `pyproject.toml`,
+  `package.json` or `Cargo.toml` declares.
+- A Python or Java project root is no field: it decides which unit a file belongs to (its scope key), and no
+  resolution reads it, since a Python module's names come from the file's path alone and a Java type's from its
+  package declaration. Adding, moving or removing a `pyproject.toml`, `setup.py`, `setup.cfg`, `pom.xml` or
+  `build.gradle` is therefore a membership change (below), and an edit to one that keeps the roots reruns nothing,
+  except a change to the entry points, which reruns their resolution alone.
+- The entry points are read by nothing but their own resolution, so a change to them keeps the hierarchy and its
+  groups (only the entry points' groups are replaced) and reruns no site.
 - An unchanged fingerprint reruns nothing. A Go unit also reads where each package outside it is read from (each
   requirement's version, each replacement, the governing `go.work`, the vendor manifest, the standard library): a
   change to those alone reads those packages again and keeps everything when what they declare is what the previous
@@ -141,7 +167,14 @@ The gate is a differential test, for every language: after each scripted edit â€
 declaration; rename; overload inserted before an existing one; conditional redefinition; changed returned value in a
 language whose resolution follows values; moved field write; file added, deleted and renamed; dependency version
 bump; module path change; module-resolution option change; new nested module â€” the incremental generation equals a
-full rebuild, fact for fact. Two further tests fix the cost: a body edit republishes only the edited file, and an
+full rebuild, fact for fact. The manifest edits are scripted for every family that has the manifest: Go `go.mod`
+(version bump, nested `go.mod`, module path); Python `pyproject.toml` and `requirements.txt` (manifest added,
+version bump, entry point, project name, nested project); JavaScript and TSX `package.json` (dependency added and
+bumped, `main` and `bin`, name, nested package); TypeScript `tsconfig.json` (`paths`, `baseUrl`, `moduleResolution`
+with `module`, `include`); Java `pom.xml` and `build.gradle` (build file added, version bumps, artifact rename,
+nested module that takes a package into a unit of its own); Rust `Cargo.toml` (dependency added and bumped,
+`[[bin]]`, crate rename, nested crate); C and C++ `compile_commands.json`, which the linker does not read (added and
+changed, rerunning nothing). Two further tests fix the cost: a body edit republishes only the edited file, and an
 inserted overload keeps every existing overload's identity.
 
 ## Consequences
