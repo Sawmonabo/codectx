@@ -170,7 +170,7 @@ func (c *Collector) grace(ctx context.Context, report Report) (Report, error) {
 
 // orphanSweepPath is the cadence stamp's name under the data directory. It sits
 // beside the CAS and the staging root rather than inside either: snapshot.Sweep
-// reclaims <data>/staging and <data>/cas/tmp by prefix and would not recognize
+// reclaims <data>/staging and <data>/materialize by prefix and would not recognize
 // a file of this package's, and the CAS buckets are exactly what SweepOrphans
 // walks.
 const orphanSweepPath = "last-orphan-sweep"

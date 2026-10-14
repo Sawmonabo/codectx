@@ -232,7 +232,7 @@ memory budget (`resources.query_memory_bytes`).
   next run reuses those units instead of rebuilding them. A store opened read-only never takes the writer.
 - **Commit cadence.** One commit per generation activation, never one per unit. A commit costs one fsync, so a commit
   per unit cost 954 s on kubernetes. Documents added between commits are invisible until their generation activates.
-- **Merging.** The library's background merges replace the lexical merge at activation. Activation no longer touches
+- **Merging.** The library's background merges replace the lexical merge at activation. Activation touches no
   postings.
 - **Crash order.** The library commits first, with the generation's id in decimal as its payload; queued document
   deletes are applied in that commit. The SQLite activation transaction follows: it stores the generation's visible

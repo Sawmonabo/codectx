@@ -21,7 +21,7 @@ Python-majority polyglot monorepo) **7.11×**, the reference repository (an unco
 repository with its dependencies committed) **4.16×**; bytes per indexed symbol **2 432–3 600** against the ~158 B that gate
 implies.
 
-Per-b-tree attribution says where the bytes now are, and it is no longer identity width. On every
+Per-b-tree attribution says where the bytes are, and it is not identity width. On every
 store the two largest families are the same: `search_units` plus the lexical index is **31–44 %** of
 the database, and evidence with its indexes another ~20 %. `search_units` is 73 009 rows and
 197.5 MB on the large Python repository — ≈2.7 KB a row, essentially all of it the `body` column, which holds a second
