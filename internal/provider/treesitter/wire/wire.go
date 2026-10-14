@@ -284,9 +284,9 @@ type Ref struct {
 	Start uint32 `json:"start"`
 	End   uint32 `json:"end"`
 	// NameStart and NameEnd bound the callee/type identifier token alone.
-	// They are what the Section 11.3 callsite alias is built from, and what
-	// a SCIP occurrence covers, so the two providers name the same range;
-	// the enclosing expression's range would not join anything.
+	// They are what the Section 11.3 call-site key is spelled from, and what
+	// a SCIP occurrence covers, so the linker and the SCIP join name the same
+	// range; the enclosing expression's range would not join anything.
 	NameStart uint32 `json:"name_start"`
 	NameEnd   uint32 `json:"name_end"`
 	Name      string `json:"name"`

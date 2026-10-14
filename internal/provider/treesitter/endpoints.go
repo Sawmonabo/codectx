@@ -237,8 +237,7 @@ func (b *builder) handlerNode(h handler) (model.NodeID, bool, error) {
 }
 
 // handlerRef names a handler written as a name the way a call of that name
-// is resolved, and publishes the Section 11.3 call-site alias on its token
-// so a semantic provider's reference occurrence at the same bytes joins it.
+// is resolved.
 func (b *builder) handlerRef(r wire.Ref) (model.NodeID, bool, error) {
 	if r.Name == "" || len(r.Name) > model.MaxNameBytes || len(r.Qualifier) > wire.MaxQualifierBytes {
 		b.dropped[structure]++
@@ -250,15 +249,7 @@ func (b *builder) handlerRef(r wire.Ref) (model.NodeID, bool, error) {
 	}
 	targets := b.callTargets(r, b.targets(r))
 	id, _, ok, err := b.callee(r, targets, rng)
-	if err != nil || !ok {
-		return id, ok, err
-	}
-	if key := b.callsiteKey(r.NameStart, r.NameEnd); key != "" {
-		b.putAlias(b.scope, key, id)
-	} else {
-		b.dropped[structure]++
-	}
-	return id, true, nil
+	return id, ok, err
 }
 
 // literalNode is a route handler written as a function literal, and its

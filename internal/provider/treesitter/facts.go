@@ -860,8 +860,10 @@ func (b *builder) refs() error {
 		// every other offset — rangeOf is what rejects an offset inside a
 		// UTF-8 sequence or past the manifest size — and must name a
 		// non-empty token inside the reference it belongs to, because the
-		// callsite alias is built from it and a range that is not the
-		// callee token joins the wrong SCIP occurrence, or none.
+		// call-site key of Section 11.3 is spelled from it (the linker's
+		// evidence and the SCIP join, through the link table) and a range
+		// that is not the callee token joins the wrong SCIP occurrence, or
+		// none.
 		if r.NameEnd <= r.NameStart || r.NameStart < r.Start || r.NameEnd > r.End {
 			return outputInvalid("reference identifier range [" + strconv.Itoa(int(r.NameStart)) + "," + strconv.Itoa(int(r.NameEnd)) +
 				") is empty or lies outside the reference")
@@ -903,16 +905,6 @@ func (b *builder) refs() error {
 			for _, t := range targets {
 				b.putRelation(structure, from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
 			}
-		}
-		if key := b.callsiteKey(r.NameStart, r.NameEnd); key != "" {
-			b.putAlias(b.scope, key, callee)
-		} else {
-			// The key did not fit and was omitted rather than truncated: a
-			// truncated key is a different, possibly colliding identity
-			// claim. Without it this call site does not join the SCIP
-			// occurrence at the same bytes, so the file's structural
-			// coverage is genuinely incomplete and reports partial.
-			b.dropped[structure]++
 		}
 	}
 	return nil
@@ -1031,26 +1023,8 @@ func calleeResolution(r wire.Ref, targets []int) (string, int) {
 	}
 }
 
-// callsiteKey is the Section 11.3 call-site join key, the one string this
-// provider and the SCIP importer both compute for the same call site:
-//
-//	scope  "file:" + path
-//	key    "callsite:" + path + ":" + <first byte> + "-" + <last byte>
-//
-// The byte range is the callee identifier's, one-based and inclusive, so a
-// callee token occupying the half-open UTF-8 byte range [start,end) is
-// spelled start+1 "-" end. Byte offsets, never characters or UTF-16 code
-// units: the SCIP importer converts its own encoding through internal/source
-// before it builds the same key. The path is the snapshot manifest's
-// root-relative slash path, the same one this unit's scope key carries.
-//
-// A key over MaxNativeKeyBytes is omitted rather than truncated, exactly as
-// declKey is, and the omission is counted by the caller.
-func (b *builder) callsiteKey(start, end uint32) string { return b.rangeKey("callsite:", start, end) }
-
 // rangeKey is prefix + path + ":" + <first byte> + "-" + <last byte> over
-// the half-open byte range [start,end), one-based and inclusive as
-// callsiteKey spells it, or empty when it is over MaxNativeKeyBytes. With the
+// the half-open byte range [start,end), one-based and inclusive, or empty when it is over MaxNativeKeyBytes. With the
 // "var:" prefix it is a variable entity's native key: one declaring
 // identifier is one variable, so no other entity of the file has that key.
 func (b *builder) rangeKey(prefix string, start, end uint32) string {

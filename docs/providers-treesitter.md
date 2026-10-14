@@ -209,37 +209,6 @@ symbols without rescanning):
   capability state becomes `partial` with `CTX_COVERAGE_INCOMPLETE`: a
   declaration without this key cannot be resolved by it from a dependent
   unit, which is missing coverage, not a silent simplification.
-- `("file:"+path, "callsite:"+path+":"+first+"-"+last)` → the callee node of
-  every call site. This is the Section 11.3 call-site key, spelled
-  byte-for-byte identically by the call linker for the site it publishes and
-  by the SCIP importer for the occurrence at the same bytes. No provider reads
-  the alias: the SCIP importer finds call sites in the link table this
-  provider stores ([SCIP provider](providers-scip.md), Call-site join), and
-  the key merges no two nodes. The linker and the SCIP importer cite the key
-  in the evidence of their `calls` edges for the site, and
-  the packed adjacency leaves out this provider's placeholder edge wherever
-  the linker's edge from the same caller covers every one of its sites at the
-  same bytes ([storage](storage.md), One edge per call), so a bound call is
-  served as one callee:
-
-  ```
-  scope key  file:<path>
-  native key callsite:<path>:<first byte>-<last byte>
-  ```
-
-  The range is the **callee identifier token's**, one-based and inclusive: a
-  token occupying the half-open UTF-8 byte range `[start,end)` is spelled
-  `start+1` `-` `end`. Byte offsets, never characters and never UTF-16 code
-  units — the SCIP importer converts its own encoding through
-  `internal/source` before it builds the same key. The path is the same
-  root-relative slash path the unit's scope key carries. The identifier range
-  is validated against the pinned bytes like every other offset, so an offset
-  inside a UTF-8 sequence or outside the call is `CTX_PROVIDER_OUTPUT_INVALID`,
-  not a key. A key over `MaxNativeKeyBytes` is omitted rather than truncated
-  and the omission is counted, so the file is `partial`. Only `@call.name`
-  captures produce this alias; a type reference does not, because only a call
-  site is what SCIP cannot identify on its own (no indexer distinguishes a
-  call-site reference from a function-value reference).
 - `("pkg:go:"+dir+":"+package, qualified name)` → Go top-level declarations;
   `("pkg:java:"+package, qualified name)` → Java top-level declarations. These
   are the two languages where a declared package clause makes members visible
@@ -261,7 +230,7 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `references` | enclosing declaration → type or macro declaration | a type reference to a class/struct/interface/enum declared in this file, or a Rust macro invocation of a `macro_rules!` declared in it; a name this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 | `defines` | file module → endpoint | every program entry point and framework route the file declares (a `__main__` guard is a declaration and is defined like one) |
-| `routes_to` | endpoint → handler | the entry function or route handler: a declaration of this file, the callee reference a call of the handler's name would name (with the call-site alias on its token), the file's module for a script, or a route handler literal |
+| `routes_to` | endpoint → handler | the entry function or route handler: a declaration of this file, the callee reference a call of the handler's name would name, the file's module for a script, or a route handler literal |
 | `defines` / `contains` | file module or innermost enclosing declaration → route handler literal | a function literal a route registers in place, published as an anonymous `function` node keyed by its range; the calls in its body are made from it, so a walk from the endpoint reaches what the handler calls |
 | `reads` | innermost function, method or test (or route handler literal inside it, or file module) → request input | a read of the request a framework hands its handler (Request inputs); detail `request_input` |
 | `data_flows_to` | request input → variable | a definition of the read's own function whose node holds the read defines the variable (dependence evidence, detail `reaching_def`) |
@@ -1125,7 +1094,6 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 | evidence per fact | `index.max_evidence_per_fact`, or the model's record ceiling (65536) when unset | parent |
 | distinct callee reference nodes per file | `providers.tree_sitter.max_callee_references` (unlimited by default) | parent; past a set bound the call is counted, not minted, and the file is `partial` |
 | call qualifier (receiver text) | `wire.MaxQualifierBytes` (512) | worker; a larger receiver expression is reported as an unnamed qualifier, so the key is `call:.<name>` |
-| call-site alias key | `MaxNativeKeyBytes` (2048) | parent; past it the key is omitted, not truncated, and the file is `partial` |
 | cross-provider declaration key | `MaxNativeKeyBytes` (2048) | parent; past it the key is omitted, not truncated, and the file is `partial` |
 | records per sink hand-off | 1000 | parent |
 | documentation body | 8 KiB | parent |
@@ -1196,14 +1164,10 @@ All MIT:
   byte range selects source containing its name, lines match the bytes, the
   nested declaration is contained by its outer one, the pool never exceeds
   its bound and every worker has exited after `Close`. The test binary is its
-  own worker through `TestMain`. `checkCallsites` extends the same loop with
-  the three call-site key invariants: every `callsite:` key's one-based
-  inclusive range selects exactly its callee node's name in the pinned bytes
-  (the Go fixture's non-ASCII `日本語` callee is what separates a byte range
-  from a rune range at both ends), a second independent unit over the same
-  bytes publishes identical keys naming identical identities, and the call to
-  the builtin `len` publishes both its alias and a callee node with
-  `resolution=unresolved`, `candidates=0`.
+  own worker through `TestMain`. `checkCallees` extends the same loop: a call
+  this provider cannot resolve in its file names a placeholder that says so
+  (`resolution=unresolved`, `candidates=0` for the builtin `len`), never a
+  guess.
 - `internal/provider/treesitter/worker` `Test<Language>LoweringGolden`, one
   per lowering (`lower_c_test.go`, `lower_cpp_test.go`, `lower_go_test.go`,
   `lower_java_test.go`, `lower_javascript_test.go`, `lower_python_test.go`,
