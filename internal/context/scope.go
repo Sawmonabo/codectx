@@ -322,15 +322,15 @@ func (c *Compiler) newSeedIngest(s *compileSorts) (*seedIngest, error) {
 	}
 	in := &seedIngest{sorts: s, cfg: c.cfg.Context, scope: scopeResult{ScopeComplete: true}}
 	var err error
-	if in.seedSort, err = newSort[candRec](s, "scope-seed", lessEntityID, sizeOfCand); err != nil {
+	if in.seedSort, err = newSort(s, "scope-seed", lessEntityID, sizeOfCand); err != nil {
 		return nil, err
 	}
 	in.seedSort = in.seedSort.WithFold(foldMinSeq)
-	if in.entitySort, err = newSort[candRec](s, "scope-entity", lessEntityID, sizeOfCand); err != nil {
+	if in.entitySort, err = newSort(s, "scope-entity", lessEntityID, sizeOfCand); err != nil {
 		return nil, err
 	}
 	in.entitySort = in.entitySort.WithFold(foldMinSeq)
-	if in.candSort, err = newSort[candRec](s, "scope-cand", lessCandSeq, sizeOfCand); err != nil {
+	if in.candSort, err = newSort(s, "scope-cand", lessCandSeq, sizeOfCand); err != nil {
 		return nil, err
 	}
 	// The two route sorts are opened here rather than in finishIngest because
@@ -339,10 +339,10 @@ func (c *Compiler) newSeedIngest(s *compileSorts) (*seedIngest, error) {
 	// compile never does. finishIngest keeps them against the candidate
 	// stream's seqs, and P-G's re-key drops the routes of every record the
 	// entity fold after ranking did not keep.
-	if in.pathSort, err = newSort[pathRec](s, "scope-path", lessPathSeq, sizeOfPath); err != nil {
+	if in.pathSort, err = newSort(s, "scope-path", lessPathSeq, sizeOfPath); err != nil {
 		return nil, err
 	}
-	if in.hopSort, err = newSort[hopRec](s, "scope-hop", lessHopSeq, sizeOfHop); err != nil {
+	if in.hopSort, err = newSort(s, "scope-hop", lessHopSeq, sizeOfHop); err != nil {
 		return nil, err
 	}
 	if in.reasonSort, err = newSort(s, "scope-reason", lessReasonSeq, sizeOfReason); err != nil {
@@ -463,7 +463,7 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 		return nil, err
 	}
 	trackRun(s, seedRun)
-	seedSeqSort, err := newSort[candRec](s, "scope-seedseq", lessCandSeq, sizeOfCand)
+	seedSeqSort, err := newSort(s, "scope-seedseq", lessCandSeq, sizeOfCand)
 	if err != nil {
 		return nil, err
 	}
@@ -972,13 +972,13 @@ func (in *seedIngest) admitEntry(e walkEntry, weight int64, named, peer bool) er
 		Depth:       e.Depth,
 		RootWeight:  weight,
 		Named:       named,
+		// Every reason whole: the explanation is stored and paged by reference.
+		Reasons: e.Reasons,
+		// Only the disclosure count is kept on the record; the routes themselves
+		// go to the route sorts, and finishIngest keeps the ones whose candidate
+		// is on the spool.
+		MorePaths: countBoundPaths(e.Paths, in.cfg.MaxReasonPathsPerEntry),
 	}
-	// Every reason whole: the explanation is stored and paged by reference.
-	cand.Reasons = e.Reasons
-	// Only the disclosure count is kept on the record; the routes themselves
-	// go to the route sorts, and finishIngest keeps the ones whose candidate
-	// is on the spool.
-	cand.MorePaths = countBoundPaths(e.Paths, in.cfg.MaxReasonPathsPerEntry)
 	seq := in.seq
 	in.seq++
 	if err := in.add(in.candSort, cand, seq); err != nil {

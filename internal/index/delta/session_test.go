@@ -103,7 +103,10 @@ func (s *session) advance(files map[string]string) []linkBuild {
 		for _, p := range tr.paths {
 			if pu.OwnsInput(p) {
 				owned = append(owned, p)
-				spelled.WriteString(p + "\x00" + tr.files[p].ContentHash + "\x00")
+				spelled.WriteString(p)
+				spelled.WriteString("\x00")
+				spelled.WriteString(tr.files[p].ContentHash)
+				spelled.WriteString("\x00")
 			}
 		}
 		paths[pu.ScopeKey] = owned

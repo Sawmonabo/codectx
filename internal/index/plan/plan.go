@@ -657,11 +657,12 @@ func (b *builder) emit(ctx context.Context) error {
 				continue
 			}
 			u := Unit{ProviderID: s.providerID, ProviderVersion: s.version, ScopeKey: s.scopeKey,
-				InputCount: count, Inputs: inputs, DependencyKeys: s.dependencyKeys}
-			// An external indexer's profile run is a heavy child, admitted
-			// on the one ledger beside every other heavy child, in both
-			// dimensions, at the figures its provider plans then.
-			u.Admit = s.admit
+				InputCount: count, Inputs: inputs, DependencyKeys: s.dependencyKeys,
+				// An external indexer's profile run is a heavy child, admitted
+				// on the one ledger beside every other heavy child, in both
+				// dimensions, at the figures its provider plans then.
+				Admit: s.admit,
+			}
 			spec, err := u.Spec(b.cfgHash)
 			if err != nil {
 				return err

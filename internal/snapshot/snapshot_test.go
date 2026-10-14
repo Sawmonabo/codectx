@@ -596,7 +596,7 @@ func TestEveryBlobIsDurableBeforeTheSnapshotNamesIt(t *testing.T) {
 	f := newFixture(t, true)
 	distinct := 8
 	for i := range distinct {
-		f.write(fmt.Sprintf("pkg/file%d.go", i), []byte(fmt.Sprintf("package p\n\nconst N = %d\n", i)), 0o644)
+		f.write(fmt.Sprintf("pkg/file%d.go", i), fmt.Appendf(nil, "package p\n\nconst N = %d\n", i), 0o644)
 	}
 	// A duplicate of the first file: same content, one blob. It proves the
 	// synced set counts blobs and not paths.

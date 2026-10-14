@@ -143,7 +143,7 @@ func (c *Compiler) passCRelationAttributes(ctx context.Context, s *compileSorts,
 		return relationAttributes{}, argumentInvalid("resolving relation attributes requires a packed adjacency reader")
 	}
 
-	byRelation, err := newSort[hopRec](s, "hop-relid", lessRelID, sizeOfHop)
+	byRelation, err := newSort(s, "hop-relid", lessRelID, sizeOfHop)
 	if err != nil {
 		return relationAttributes{}, err
 	}
@@ -175,7 +175,7 @@ func (c *Compiler) passCRelationAttributes(ctx context.Context, s *compileSorts,
 		return relationAttributes{Hops: hops, Complete: wanted == 0}, nil
 	}
 
-	attrs, err := newSort[relAttrRec](s, "rel-attr", lessRelAttr, sizeOfRelAttr)
+	attrs, err := newSort(s, "rel-attr", lessRelAttr, sizeOfRelAttr)
 	if err != nil {
 		return relationAttributes{}, err
 	}
@@ -217,7 +217,7 @@ func distinctRelationCount(run *pagination.SortedRun[hopRec]) (int64, error) {
 // scanNodes is the candidate node set the edge scan reads from: each node id
 // once, in the order of its first arrival. Two sorts and no map.
 func (c *Compiler) scanNodes(s *compileSorts, cands *pagination.SortedRun[candRec]) (*pagination.SortedRun[nodeRec], error) {
-	distinct, err := newSort[nodeRec](s, "node-id", lessNodeID, sizeOfNode)
+	distinct, err := newSort(s, "node-id", lessNodeID, sizeOfNode)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +236,7 @@ func (c *Compiler) scanNodes(s *compileSorts, cands *pagination.SortedRun[candRe
 	}
 	deduped = trackRun(s, deduped)
 
-	ordered, err := newSort[nodeRec](s, "node-seq", lessNodeSeq, sizeOfNode)
+	ordered, err := newSort(s, "node-seq", lessNodeSeq, sizeOfNode)
 	if err != nil {
 		return nil, err
 	}
@@ -595,7 +595,7 @@ func joinHopAttributes(s *compileSorts, hopsByRelation *pagination.SortedRun[hop
 	}
 	resolved = trackRun(s, resolved)
 
-	ordered, err := newSort[hopRec](s, "hop-seq", lessHopSeq, sizeOfHop)
+	ordered, err := newSort(s, "hop-seq", lessHopSeq, sizeOfHop)
 	if err != nil {
 		return nil, err
 	}
@@ -649,7 +649,7 @@ func (c *Compiler) passECentrality(ctx context.Context, s *compileSorts,
 	}
 	distinct = trackRun(s, distinct)
 
-	counts, err := newSort[pkgCountRec](s, "pkg-count", lessPkg, sizeOfPkgCount)
+	counts, err := newSort(s, "pkg-count", lessPkg, sizeOfPkgCount)
 	if err != nil {
 		return nil, err
 	}

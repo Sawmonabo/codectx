@@ -90,9 +90,9 @@ func rustUse(prefix, p string, yield func(name, path string)) {
 		return a + "::" + b
 	}
 	p = strings.TrimSpace(p)
-	if i := strings.IndexByte(p, '{'); i >= 0 {
-		prefix = join(prefix, strings.TrimSuffix(strings.TrimSpace(p[:i]), "::"))
-		inner := strings.TrimSuffix(strings.TrimSpace(p[i+1:]), "}")
+	if before, after, ok := strings.Cut(p, "{"); ok {
+		prefix = join(prefix, strings.TrimSuffix(strings.TrimSpace(before), "::"))
+		inner := strings.TrimSuffix(strings.TrimSpace(after), "}")
 		depth, from := 0, 0
 		for j := 0; j <= len(inner); j++ {
 			if j < len(inner) {

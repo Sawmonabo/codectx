@@ -568,7 +568,7 @@ func (k *cLinker) bindDecl(owner, d Node) {
 		return
 	}
 	k.names.push(textOf(k.src, c.name), int32(len(k.locals)))
-	k.locals = append(k.locals, cLocal{cDecl: cDecl{owner: owner, decl: d}, fn: c.function})
+	k.locals = append(k.locals, cLocal{owner: owner, decl: d, fn: c.function})
 }
 
 // bindParams brings each named parameter of the parameter list ps into
@@ -1394,12 +1394,12 @@ func (k *cLinker) collectMembers(n Node, ms map[string]cMember) {
 		case id == x.fieldDeclaration || id == s.declaration:
 			k.declarators(c, func(d Node) {
 				if ch := k.chain(d); !ch.name.IsNull() {
-					ms[k.text(ch.name)] = cMember{cDecl: cDecl{owner: c, decl: d}, fn: ch.function}
+					ms[k.text(ch.name)] = cMember{owner: c, decl: d, fn: ch.function}
 				}
 			})
 		case id == x.functionDefinition:
 			if ch := k.chain(c.ChildByFieldId(s.fDeclarator)); !ch.name.IsNull() {
-				ms[k.text(ch.name)] = cMember{cDecl: cDecl{owner: c, decl: c.ChildByFieldId(s.fDeclarator)}, fn: true}
+				ms[k.text(ch.name)] = cMember{owner: c, decl: c.ChildByFieldId(s.fDeclarator), fn: true}
 			}
 		case k.record(c):
 		default:

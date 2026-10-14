@@ -258,7 +258,9 @@ func TestEveryInFileCandidateIsKeptAndMemberCallsPublishNone(t *testing.T) {
 	var src strings.Builder
 	const defs = 20
 	for i := range defs {
-		src.WriteString("def f():\n    return " + strconv.Itoa(i) + "\n\n")
+		src.WriteString("def f():\n    return ")
+		src.WriteString(strconv.Itoa(i))
+		src.WriteString("\n\n")
 	}
 	src.WriteString(`f()
 

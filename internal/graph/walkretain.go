@@ -975,8 +975,8 @@ func (w *retainedWalk) applySteps(file *retainFile) error {
 // stepDirect when this reason was already served and the node is not admitted
 // again.
 func (w *retainedWalk) again(node NodeRef, reached dispatchStep) (dispatchStep, error) {
-	switch {
-	case reached == stepDirect:
+	switch reached {
+	case stepDirect:
 		based, err := w.based.test(uint64(node))
 		if err != nil || !based {
 			return stepDirect, err
@@ -986,7 +986,7 @@ func (w *retainedWalk) again(node NodeRef, reached dispatchStep) (dispatchStep, 
 			return stepDirect, err
 		}
 		return stepRest, nil
-	case reached == stepVirtual || reached == stepOverride:
+	case stepVirtual, stepOverride:
 		dispatched, err := w.dispatched.test(uint64(node))
 		if err != nil || dispatched {
 			return stepDirect, err

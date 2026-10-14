@@ -387,8 +387,8 @@ func TestParseMemory(t *testing.T) {
 	inputs(t, func(lang.Language) bool { return true }, func(in input) {
 		p := ps.get(t, in.language)
 		row := parseRow{Row: "parse", Origin: in.origin, Path: in.path, Language: in.language.Name, SourceBytes: len(in.src),
-			ScannerBytes: scannerBytes(t, in.language.Name)}
-		row.RSSBeforeBytes = resident()
+			ScannerBytes:   scannerBytes(t, in.language.Name),
+			RSSBeforeBytes: resident()}
 		untracked := native.Untracked()
 		base := native.ResetPeak()
 		start := time.Now()

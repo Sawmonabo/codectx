@@ -43,11 +43,11 @@ func (e *evidenceFixture) EvidenceBatch(_ context.Context, relations []model.Rel
 // and the hop run in route order.
 func spoolCandidates(t *testing.T, s *compileSorts, cands []candidate) (*pagination.SortedRun[candRec], *pagination.SortedRun[hopRec]) {
 	t.Helper()
-	candSort, err := newSort[candRec](s, "test-cand", func(a, b candRec) int { return cmpInt(a.Seq, b.Seq) }, sizeOfCand)
+	candSort, err := newSort(s, "test-cand", func(a, b candRec) int { return cmpInt(a.Seq, b.Seq) }, sizeOfCand)
 	if err != nil {
 		t.Fatalf("candidate sort: %v", err)
 	}
-	hopSort, err := newSort[hopRec](s, "test-hop", lessHopSeq, sizeOfHop)
+	hopSort, err := newSort(s, "test-hop", lessHopSeq, sizeOfHop)
 	if err != nil {
 		t.Fatalf("hop sort: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestEdgeScanWalksTheWantedStreamOncePerEpoch(t *testing.T) {
 func TestPassEMatchesCentralityMap(t *testing.T) {
 	ctx := context.Background()
 	s := openSorts(t, config.Config{})
-	edges, err := newSort[pkgEdgeRec](s, "test-pkg-edge", lessPkgEdge, sizeOfPkgEdge)
+	edges, err := newSort(s, "test-pkg-edge", lessPkgEdge, sizeOfPkgEdge)
 	if err != nil {
 		t.Fatalf("edge sort: %v", err)
 	}

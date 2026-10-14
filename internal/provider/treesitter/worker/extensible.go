@@ -141,7 +141,7 @@ func goOpen(d *decl, isType bool, pkg, file string) bool {
 	if pkg == "main" || !exportedName(d.name) {
 		return false
 	}
-	for _, seg := range strings.Split(path.Dir(file), "/") {
+	for seg := range strings.SplitSeq(path.Dir(file), "/") {
 		if seg == "internal" {
 			return false
 		}

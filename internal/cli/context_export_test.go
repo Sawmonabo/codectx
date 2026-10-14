@@ -40,7 +40,7 @@ func TestCapsuleFileCarriesEveryRecord(t *testing.T) {
 			key := fmt.Sprintf("%s-%d", list, ordinal)
 			rows[list] = append(rows[list], model.CapsuleRow{
 				List: list, Ordinal: ordinal, Key: key,
-				JSON: []byte(fmt.Sprintf(`{"list":%q,"key":%q}`, list, key)),
+				JSON: fmt.Appendf(nil, `{"list":%q,"key":%q}`, list, key),
 			})
 		}
 		counts.Set(list, n)

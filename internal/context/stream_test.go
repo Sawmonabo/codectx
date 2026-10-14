@@ -172,12 +172,12 @@ func randomCandRecs(t *testing.T, n int) []candRec {
 			ScoreMicros: int64(rng.Intn(4)) * 100_000,
 			PathFinal:   paths[rng.Intn(len(paths))],
 			StartByte:   int64(rng.Intn(3)) * 64,
+			// PathAtRank is drawn INDEPENDENTLY, not derived from PathFinal: a
+			// derived value with a constant prefix orders identically and would let
+			// a lessRank that read the wrong field pass. The record keeps both
+			// precisely because the two can name different packages.
+			PathAtRank: paths[rng.Intn(len(paths))],
 		}
-		// PathAtRank is drawn INDEPENDENTLY, not derived from PathFinal: a
-		// derived value with a constant prefix orders identically and would let
-		// a lessRank that read the wrong field pass. The record keeps both
-		// precisely because the two can name different packages.
-		r.PathAtRank = paths[rng.Intn(len(paths))]
 		switch rng.Intn(3) {
 		case 0:
 			r.NodeID = model.NodeID(paths[rng.Intn(len(paths))] + "#node")

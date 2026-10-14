@@ -247,7 +247,7 @@ func openSorts(t *testing.T, cfg config.Config) *compileSorts {
 // hands P-B.
 func spoolOf(t *testing.T, sorts *compileSorts, cands []candidate) *pagination.SortedRun[candRec] {
 	t.Helper()
-	sorter, err := newSort[candRec](sorts, "test-spool", lessCandSeq, sizeOfCand)
+	sorter, err := newSort(sorts, "test-spool", lessCandSeq, sizeOfCand)
 	if err != nil {
 		t.Fatalf("newSort: %v", err)
 	}

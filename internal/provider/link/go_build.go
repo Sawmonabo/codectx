@@ -214,7 +214,7 @@ func (w *goChosen) fork(key string) {
 // group is the groups of the declarations decls of the name of key, each
 // spelled by spell: "" for one whose spelling cannot be known apart from
 // any choice, a group of its own.
-func (w *goChosen) group(ctx context.Context, key string, decls []goDecl,
+func (w *goChosen) group(key string, decls []goDecl,
 	spell func(d goDecl) (string, error)) ([]goGroup, error) {
 	if g, ok := w.groups[key]; ok {
 		return g, nil
@@ -244,7 +244,7 @@ func (w *goChosen) lookup(ctx context.Context, p, name string) (goTypeAnswer, bo
 	}
 	key := "t\x00" + p + "\x00" + name
 	decls := append([]goDecl{{form: a.form, names: a.names, cond: a.cond}}, a.others...)
-	groups, err := w.group(ctx, key, decls, func(d goDecl) (string, error) {
+	groups, err := w.group(key, decls, func(d goDecl) (string, error) {
 		// A generic alias is spelled over its parameters, which stand for
 		// any arguments alike.
 		n, form, _ := goGenericAlias(d.form)
@@ -284,7 +284,7 @@ func (w *goChosen) constant(ctx context.Context, p, name string) ([]goDecl, erro
 		return decls, err
 	}
 	key := "k\x00" + p + "\x00" + name
-	groups, err := w.group(ctx, key, decls, func(d goDecl) (string, error) {
+	groups, err := w.group(key, decls, func(d goDecl) (string, error) {
 		if d.form == goIdentityUnknown {
 			return "", nil
 		}

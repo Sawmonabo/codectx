@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -100,10 +101,8 @@ func exportNamed(l wire.Link, name wire.Span) *wire.Export {
 // declared at s, so a read the link message sends joins a variable node.
 func declaredVar(fns []wire.Function, s wire.Span) bool {
 	for _, f := range fns {
-		for _, v := range f.Vars {
-			if v == s {
-				return true
-			}
+		if slices.Contains(f.Vars, s) {
+			return true
 		}
 	}
 	return false

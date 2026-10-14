@@ -26,8 +26,7 @@ func BenchmarkSpanStartEnd(b *testing.B) {
 	}
 	ctx := run.Context(context.Background())
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, span := ledger.Start(ctx, "unit", "scope")
 		span.AddIn(1)
 		span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
@@ -45,7 +44,7 @@ func BenchmarkSpanStartEnd(b *testing.B) {
 // question -- what the recording costs the disk, not the run's goroutines.
 func BenchmarkCollectorRun(b *testing.B) {
 	const spansPerRun = 4000
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		dir := b.TempDir()
 		start := time.Now()
 		l := ledger.New(dir)

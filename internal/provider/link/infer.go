@@ -984,10 +984,10 @@ func (s *selections[F, N]) of(file F) (selection, error) {
 			break
 		}
 		if f == file {
-			switch {
-			case i == wholeFile:
+			switch i {
+			case wholeFile:
 				s.sel.whole = true
-			case i == fileNode:
+			case fileNode:
 				s.sel.file = true
 			default:
 				if s.sel.sites == nil {

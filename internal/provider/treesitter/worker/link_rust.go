@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"slices"
 	"sync"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -716,8 +717,8 @@ func (k *rustLinker) bound(i int, b Node) {
 
 // generic is the index of the innermost type parameter named name, or -1.
 func (k *rustLinker) generic(name string) int {
-	for i := len(k.generics) - 1; i >= 0; i-- {
-		if k.generics[i].name == name {
+	for i, v := range slices.Backward(k.generics) {
+		if v.name == name {
 			return i
 		}
 	}

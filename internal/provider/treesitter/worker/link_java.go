@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -700,8 +701,8 @@ func (k *javaLinker) superOf(f int) wire.Type {
 // method it invokes.
 func (k *javaLinker) outerSuper(obj Node) wire.Type {
 	name := k.compact(obj)
-	for f := len(k.frames) - 1; f >= 0; f-- {
-		if k.frames[f].named && k.frames[f].name == name {
+	for f, v := range slices.Backward(k.frames) {
+		if v.named && v.name == name {
 			return k.superOf(f)
 		}
 	}

@@ -614,8 +614,8 @@ func DecodeLink(payload []byte) (Link, error) {
 	}
 	l.Supertypes = make([]Supertype, 0, d.count(9))
 	for range cap(l.Supertypes) {
-		x := Supertype{Type: d.str(), Super: d.str()}
-		x.Interface = d.flag()
+		x := Supertype{Type: d.str(), Super: d.str(),
+			Interface: d.flag()}
 		l.Supertypes = append(l.Supertypes, x)
 	}
 	l.Sites = make([]Site, 0, d.count(34))
@@ -646,8 +646,8 @@ func DecodeLink(payload []byte) (Link, error) {
 	}
 	l.DynamicImports = make([]DynamicImport, 0, d.count(13))
 	for range cap(l.DynamicImports) {
-		x := DynamicImport{At: d.span()}
-		x.Fragments = make([]string, 0, d.count(4))
+		x := DynamicImport{At: d.span(),
+			Fragments: make([]string, 0, d.count(4))}
 		for range cap(x.Fragments) {
 			x.Fragments = append(x.Fragments, d.str())
 		}
@@ -676,15 +676,15 @@ func (d *decoder) span() Span { return Span{d.u32(), d.u32()} }
 
 // site decodes one site.
 func (d *decoder) site() Site {
-	s := Site{Name: d.span(), Shape: d.shape(), Qualifier: d.str(), Receiver: d.typ(), Signature: d.str()}
-	s.Args = make([]Type, 0, d.count(9))
+	s := Site{Name: d.span(), Shape: d.shape(), Qualifier: d.str(), Receiver: d.typ(), Signature: d.str(),
+		Args: make([]Type, 0, d.count(9))}
 	for range cap(s.Args) {
 		s.Args = append(s.Args, d.typ())
 	}
 	s.Arguments = make([]Argument, 0, d.count(17))
 	for range cap(s.Arguments) {
-		a := Argument{At: d.span(), Keyword: d.str(), Spread: d.spread()}
-		a.Reads = make([]Span, 0, d.count(8))
+		a := Argument{At: d.span(), Keyword: d.str(), Spread: d.spread(),
+			Reads: make([]Span, 0, d.count(8))}
 		for range cap(a.Reads) {
 			a.Reads = append(a.Reads, d.span())
 		}

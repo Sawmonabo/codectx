@@ -127,7 +127,9 @@ func TestSearchCoversEveryByte(t *testing.T) {
 	for i := 0; doc.Len() < 40<<10; i++ {
 		// \xa0 is a non-breaking space in Windows-1252 and is not valid
 		// UTF-8; \x92 is that encoding's right single quote.
-		doc.WriteString("<p>Risk\xa0Management section " + strconv.Itoa(i) + " doesn\x92t stop here.</p>\n")
+		doc.WriteString("<p>Risk\xa0Management section ")
+		doc.WriteString(strconv.Itoa(i))
+		doc.WriteString(" doesn\x92t stop here.</p>\n")
 	}
 	doc.WriteString("</body></html>\n")
 	// A newline-free file longer than one chunk whose bytes force the chunk

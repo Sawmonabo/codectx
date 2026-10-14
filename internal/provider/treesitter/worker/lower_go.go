@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
@@ -1406,10 +1407,8 @@ func (g *goLower) readByOther(i int) bool {
 		if j == i || t.done {
 			continue
 		}
-		for _, u := range g.buf[t.lo:t.hi] {
-			if u == v {
-				return true
-			}
+		if slices.Contains(g.buf[t.lo:t.hi], v) {
+			return true
 		}
 	}
 	return false

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
@@ -836,8 +837,8 @@ func (j *pyLower) scan(n Node) {
 	}
 	id := n.KindId()
 	if j.l.isCallable(n) {
-		switch {
-		case id == k.functionDefinition || id == k.classDefinition || id == k.lambda:
+		switch id {
+		case k.functionDefinition, k.classDefinition, k.lambda:
 			if j.walrusOnly > 0 {
 				return
 			}
@@ -1891,15 +1892,15 @@ func (j *pyLower) withStmt(n Node) {
 		}
 	}
 	j.block(n.ChildByFieldId(k.fBody))
-	for i := len(items) - 1; i >= 0; i-- {
+	for i, item := range slices.Backward(items) {
 		at := kw
 		if i > 0 {
-			at = spanOf(items[i].PrevSibling())
+			at = spanOf(item.PrevSibling())
 		}
 		normal := j.b.EnterFinally(j.fins[base+i], at)
 		j.reset()
 		j.throws++ // __exit__
-		x := j.nodeAt(flow.Stmt, flow.Span{Start: kw.Start, End: uint32(items[i].EndByte())}, 0, 0)
+		x := j.nodeAt(flow.Stmt, flow.Span{Start: kw.Start, End: uint32(item.EndByte())}, 0, 0)
 		j.b.Use(x, j.mgrs[base+i])
 		// __exit__ may suppress an exception that reached it, and then the
 		// statement completes; a break, continue or return that reached it

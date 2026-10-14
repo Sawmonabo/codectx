@@ -810,7 +810,8 @@ func TestARecordAndASourceLongerThanOneFrameArriveWhole(t *testing.T) {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("n" + strconv.Itoa(100000+i))
+		b.WriteString("n")
+		b.WriteString(strconv.Itoa(100000 + i))
 	}
 	b.WriteString(" } from \"./barrel\";\n")
 	src := []byte(b.String())

@@ -710,8 +710,8 @@ func isMajorVersion(s string) bool {
 
 func firstSegment(s, sep string) string {
 	s = strings.Trim(s, "\"'")
-	if i := strings.Index(s, sep); i >= 0 {
-		return s[:i]
+	if before, _, ok := strings.Cut(s, sep); ok {
+		return before
 	}
 	return s
 }

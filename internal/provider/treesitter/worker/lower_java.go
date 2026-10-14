@@ -1686,8 +1686,7 @@ func (j *javaLower) resources(spec, body Node) {
 		j.frames = append(j.frames, j.b.OpenFinally())
 	}
 	j.block(body)
-	for i := len(list) - 1; i >= 0; i-- {
-		r := list[i]
+	for i, r := range slices.Backward(list) {
 		at := spanOf(r)
 		if end := r.NextSibling(); !end.IsNull() {
 			at = spanOf(end)

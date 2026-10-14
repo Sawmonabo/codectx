@@ -72,21 +72,21 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 		FullyRead:     c.FullyRead,
 		Waived:        c.Waived,
 		ScopeComplete: m.ScopeComplete,
-	}
-	// The two counts are carried apart because they answer different
-	// questions. Served is the reported fully_served_files and excludes a
-	// waived file whatever its bytes say -- a waiver is an admission that a
-	// required file was not read, and a fully waived session reporting full
-	// coverage is the claim the waiver exists to deny. Read completeness is the
-	// other question (Section 17.1): a waiver excuses a file from being read,
-	// it does not unread one that was, so it counts FullyRead. The gap between
-	// them is precisely a waived-and-read file, and it stays visible because
-	// precondition 6 below shuts the strict gate on any waiver at all.
-	e.Served = c.Served
-	// Read completeness is the coverage answer with one addition: an incomplete
-	// manifest scope disqualifies the session outright even when the counts
-	// agree.
-	e.ReadComplete = m.ScopeComplete && c.FullyRead == c.Required
+
+		// The two counts are carried apart because they answer different
+		// questions. Served is the reported fully_served_files and excludes a
+		// waived file whatever its bytes say -- a waiver is an admission that a
+		// required file was not read, and a fully waived session reporting full
+		// coverage is the claim the waiver exists to deny. Read completeness is the
+		// other question (Section 17.1): a waiver excuses a file from being read,
+		// it does not unread one that was, so it counts FullyRead. The gap between
+		// them is precisely a waived-and-read file, and it stays visible because
+		// precondition 6 below shuts the strict gate on any waiver at all.
+		Served: c.Served,
+		// Read completeness is the coverage answer with one addition: an incomplete
+		// manifest scope disqualifies the session outright even when the counts
+		// agree.
+		ReadComplete: m.ScopeComplete && c.FullyRead == c.Required}
 
 	var shut []string
 

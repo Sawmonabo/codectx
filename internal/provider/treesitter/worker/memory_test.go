@@ -39,7 +39,7 @@ func TestBoundaryNeedIsUnavailableUnlessMeasurable(t *testing.T) {
 		peakKiB         uint64
 		want            *uint64
 	}{
-		{name: "measured", returns: true, resets: true, peakKiB: 300, want: ptr(uint64(200 * 1024))},
+		{name: "measured", returns: true, resets: true, peakKiB: 300, want: new(uint64(200 * 1024))},
 		{name: "peak not reset", returns: true, resets: false, peakKiB: 300},
 		{name: "heap not returned", returns: false, resets: true, peakKiB: 300},
 		{name: "peak below base", returns: true, resets: true, peakKiB: 50},
@@ -66,5 +66,3 @@ func TestBoundaryNeedIsUnavailableUnlessMeasurable(t *testing.T) {
 		})
 	}
 }
-
-func ptr[T any](v T) *T { return &v }

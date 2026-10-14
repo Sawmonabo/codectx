@@ -127,8 +127,7 @@ func New(o Options) (*Compiler, error) {
 	if o.SortDir == "" && o.Spools != nil {
 		o.SortDir = o.Spools.SortDir()
 	}
-	switch {
-	case o.SortDir == "":
+	if o.SortDir == "" {
 		return nil, argumentInvalid("context compiler requires the workspace sort directory")
 	}
 	log := o.Logger
@@ -1123,7 +1122,7 @@ func (c *Compiler) hydrateStream(ctx context.Context, reader *sqlite.PinnedReade
 	if in == nil {
 		return nil, argumentInvalid("a streamed hydration requires the candidate spool")
 	}
-	out, err := newSort[candRec](s, "hydrate", lessCandSeq, sizeOfCand)
+	out, err := newSort(s, "hydrate", lessCandSeq, sizeOfCand)
 	if err != nil {
 		return nil, err
 	}
