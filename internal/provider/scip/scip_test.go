@@ -1366,3 +1366,60 @@ func TestAProbeLandingOnAnotherWholeTokenDropsTheDocument(t *testing.T) {
 		}
 	}
 }
+
+// TestSeveralSymbolsAtOneCallSiteAreASetOfTargets is the Section 11.3 join for
+// a call site the compiler resolved to more than one symbol: scip-clang names
+// every overload lookup finds for a dependent call in a template body, each
+// as its own occurrence over the same callee token. Each is a target of the
+// call, so the call publishes one `calls` per symbol, every occurrence with
+// the set size, and no primary-plus-alternatives reading of them.
+//
+// Mutations caught: a join that keeps only the first occurrence at a range
+// (one target), one that publishes no set size (two targets each read as the
+// call's one exact target), and one that turns the second symbol into a
+// `may_refer_to` of the first.
+func TestSeveralSymbolsAtOneCallSiteAreASetOfTargets(t *testing.T) {
+	const src = "template <class T> void g(T t) { f(t); }\nvoid f(int) {}\nvoid f(char) {}\n"
+	const (
+		symFInt  = "cxx . . $ f(2c7da2f0d4f3a3a8)."
+		symFChar = "cxx . . $ f(9d1a2b5c0e6f7a81)."
+	)
+	at := func(off int) []int32 {
+		line := int32(strings.Count(src[:off], "\n"))
+		col := int32(off - strings.LastIndexByte(src[:off], '\n') - 1)
+		return []int32{line, col, col + 1}
+	}
+	call, _ := tokenAt(t, src, "f", 0)
+	defInt, _ := tokenAt(t, src, "f", 1)
+	defChar, _ := tokenAt(t, src, "f", 2)
+	files := fixture(t)
+	files["cc/t.cpp"] = src
+	files["set.scip"] = string(miniIndex("scip-clang", "0.4.0", documentRecord("cc/t.cpp", "cpp", 1,
+		occurrenceRecord(symFInt, 1, at(defInt)...), occurrenceRecord(symFChar, 1, at(defChar)...),
+		occurrenceRecord(symFInt, 0, at(call)...), occurrenceRecord(symFChar, 0, at(call)...))))
+	inputs := append([]string{"set.scip", "cc/t.cpp"}, sourcePaths...)
+	p := joinProvider(t, "set.scip", callTables{files: files, tokens: map[string][][2]uint32{"cc/t.cpp": {{uint32(call), uint32(call + 1)}}}})
+	h := providertest.New(t, files)
+	got, _ := run(t, h, p, scip.ImportScope("set.scip"), inputs)
+
+	file := h.File(t, "cc/t.cpp")
+	for _, sym := range []string{symFInt, symFChar} {
+		target := got.byNativeKey(t, sym, file.ID)
+		wantCall(t, got, "cc/t.cpp", src, "f", 0, target.Node.ID)
+		caller := moduleEndpoint("cc/t.cpp", src).Node
+		rel := got.relations[model.NewRelationID(h.Repo, caller, model.RelCalls, target.Node.ID)]
+		for _, e := range rel.Evidence {
+			if e.SetSize != 2 {
+				t.Fatalf("calls -> %s carries set size %d, want 2: one of two targets of the site", sym, e.SetSize)
+			}
+		}
+	}
+	if n := callOccurrences(got); n != 2 {
+		t.Fatalf("%d calls occurrences, want one per target (2)", n)
+	}
+	for _, r := range got.relations {
+		if r.Relation.Kind == model.RelMayReferTo {
+			t.Fatalf("the site's targets publish may_refer_to %s -> %s; a target set is no primary and alternatives", r.Relation.From, r.Relation.To)
+		}
+	}
+}
