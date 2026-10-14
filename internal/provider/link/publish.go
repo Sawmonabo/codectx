@@ -604,25 +604,8 @@ func (f *filePublication) target(b idBinding) (model.NodeID, error) {
 	return n.ID, err
 }
 
-// caller is the node site s's calls are published from: the route handler
-// literal it is made in (Site.Handler), else the declaration Caller, else the
-// file's module.
-func (f *filePublication) caller(s *Site) (Endpoint, error) {
-	if s.Handler > 0 {
-		if int(s.Handler) > len(f.t.Handlers) {
-			return Endpoint{}, internalErr("a link table site of " + f.fv.Path + " names a route handler the table does not hold")
-		}
-		return f.t.Handlers[s.Handler-1], nil
-	}
-	c := s.Caller
-	if c < 0 {
-		return f.t.Module, nil
-	}
-	if c >= int32(len(f.t.Decls)) {
-		return Endpoint{}, internalErr("a link table entry of " + f.fv.Path + " names a caller that is not a declaration of its file")
-	}
-	return f.t.Decls[c].Endpoint, nil
-}
+// caller is the node site s's calls are published from (Table.CallerOf).
+func (f *filePublication) caller(s *Site) (Endpoint, error) { return f.t.CallerOf(s) }
 
 // openReason is the reason a site no fact binds is open, by its form: a
 // computed callee is computed; a member or static call's receiver has no

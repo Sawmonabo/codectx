@@ -296,6 +296,27 @@ func (t *Table) Visible(cand, caller int32) bool {
 	return false
 }
 
+// CallerOf is the node site s's calls are published from: the route handler
+// literal it is made in (Site.Handler), else the declaration Caller, else the
+// file's module. The SCIP importer reads it too, so a compiler-resolved call
+// leaves the same node the linker's does.
+func (t *Table) CallerOf(s *Site) (Endpoint, error) {
+	if s.Handler > 0 {
+		if int(s.Handler) > len(t.Handlers) {
+			return Endpoint{}, internalErr("a link table site of " + t.Path + " names a route handler the table does not hold")
+		}
+		return t.Handlers[s.Handler-1], nil
+	}
+	c := s.Caller
+	if c < 0 {
+		return t.Module, nil
+	}
+	if c >= int32(len(t.Decls)) {
+		return Endpoint{}, internalErr("a link table entry of " + t.Path + " names a caller that is not a declaration of its file")
+	}
+	return t.Decls[c].Endpoint, nil
+}
+
 // Site is one call site: the structural provider's call reference joined to
 // the worker's wire.Site, with the declarations of this file the parent
 // found its callee name could mean.

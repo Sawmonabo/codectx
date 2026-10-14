@@ -23,6 +23,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -252,7 +253,11 @@ func wantRange(t *testing.T, n model.NodeFact, src, needle string, nth int) {
 func TestCanonicalFixture(t *testing.T) {
 	files := fixture(t)
 	inputs := append([]string{"index.scip"}, sourcePaths...)
-	p := newProvider(t, "index.scip")
+	// One call site at each of the two calls of Bar in a.go.
+	first, _ := tokenAt(t, files["pkg/a.go"], "Bar(", 0)
+	second, _ := tokenAt(t, files["pkg/a.go"], "Bar(", 1)
+	p := joinProvider(t, "index.scip", callTables{files: files, tokens: map[string][][2]uint32{
+		"pkg/a.go": {{uint32(first), uint32(first + 3)}, {uint32(second), uint32(second + 3)}}}})
 	providertest.Conform(t, p, files, scip.ImportScope("index.scip"), inputs)
 
 	h := providertest.New(t, files)
@@ -285,7 +290,6 @@ func TestCanonicalFixture(t *testing.T) {
 	if len(refs.Evidence) != 2 {
 		t.Fatalf("Foo -> Bar has %d occurrences, want 2 distinct ranges", len(refs.Evidence))
 	}
-	first, second := strings.Index(files["pkg/a.go"], "Bar("), strings.LastIndex(files["pkg/a.go"], "Bar(")
 	seen := map[uint64]bool{}
 	for _, e := range refs.Evidence {
 		if e.FileID != a.ID || e.Range == nil || e.Range.End.Byte-e.Range.Start.Byte != 3 {
@@ -297,11 +301,10 @@ func TestCanonicalFixture(t *testing.T) {
 		t.Fatalf("occurrence starts %v, want both %d and %d", seen, first, second)
 	}
 
-	// Every reference occurrence publishes the Section 11.3 call-site alias
-	// on the symbol it resolves to, keyed on the bytes it occupies; the
-	// definition of Foo does not.
-	wantCallsiteAlias(t, got, "pkg/a.go", files["pkg/a.go"], "Bar", 0, bar.Node.ID)
-	wantCallsiteAlias(t, got, "pkg/a.go", files["pkg/a.go"], "Bar", 1, bar.Node.ID)
+	// Each reference occurrence at a call site's callee token publishes the
+	// compiler-resolved `calls` from the site's caller (Section 11.3).
+	wantCall(t, got, "pkg/a.go", files["pkg/a.go"], "Bar", 0, bar.Node.ID)
+	wantCall(t, got, "pkg/a.go", files["pkg/a.go"], "Bar", 1, bar.Node.ID)
 
 	// The external symbol exists once, from external_symbols, and is the
 	// target of the reference inside Foo.
@@ -482,17 +485,37 @@ func appendBytes(b []byte, field int, payload []byte) []byte {
 	return append(b, payload...)
 }
 
-// wantCallsiteAlias asserts that the Section 11.3 call-site alias for an
-// occurrence exists, is keyed on the one-based inclusive byte range of the
-// source text needle, and names node.
+// wantCall asserts the Section 11.3 call-site join for the nth occurrence of
+// needle in path: a `calls` relation from the call site's caller (the
+// module, as callTables makes every site) to target, with a compiler
+// evidence row at the token, keyed by its one-based inclusive call-site key.
 //
-// This is the key the tree-sitter provider computes for the same call
-// site with the same formula (`facts.go:callsiteKey`), so a disagreement of
-// one byte or one base silently produces an empty join: the `calls` relation
-// then keeps its syntactic callee and never acquires the compiler-resolved
-// target, and nothing downstream can tell that from a repository with no
-// resolvable calls.
-func wantCallsiteAlias(t *testing.T, got *facts, path, src, needle string, nth int, node model.NodeID) {
+// This is the key the call linker spells for the same call site
+// (`link/publish.go:callsiteKey`), so a disagreement of one byte or one base
+// leaves the call's two evidence rows under two keys, and a range that is not
+// the callee token joins no call site at all: the call keeps the linker's
+// target alone, which nothing downstream can tell from a repository the
+// compiler never resolved.
+func wantCall(t *testing.T, got *facts, path, src, needle string, nth int, target model.NodeID) {
+	t.Helper()
+	start, end := tokenAt(t, src, needle, nth)
+	key := "callsite:" + path + ":" + strconv.Itoa(start+1) + "-" + strconv.Itoa(end)
+	caller := moduleEndpoint(path, src).Node
+	rel, ok := got.relations[model.NewRelationID(model.RepositoryID(model.H("providertest-repo")), caller, model.RelCalls, target)]
+	if !ok {
+		t.Fatalf("no calls %s -> %s for the call site %s", caller, target, key)
+	}
+	for _, e := range rel.Evidence {
+		if e.NativeKey == key && e.Precision == model.PrecisionCompiler && e.Range != nil &&
+			e.Range.Start.Byte == uint64(start) && e.Range.End.Byte == uint64(end) {
+			return
+		}
+	}
+	t.Fatalf("calls %s -> %s has no compiler evidence keyed %s at [%d,%d): %+v", caller, target, key, start, end, rel.Evidence)
+}
+
+// tokenAt is the half-open byte range of the nth occurrence of needle.
+func tokenAt(t *testing.T, src, needle string, nth int) (int, int) {
 	t.Helper()
 	off := -1
 	for i := 0; i <= nth; i++ {
@@ -502,10 +525,47 @@ func wantCallsiteAlias(t *testing.T, got *facts, path, src, needle string, nth i
 		}
 		off += 1 + next
 	}
-	key := "callsite:" + path + ":" + strconv.Itoa(off+1) + "-" + strconv.Itoa(off+len(needle))
-	if id := got.alias(t, "file:"+path, key); id != node {
-		t.Fatalf("call-site alias %q names node %s, want the referenced symbol %s", key, id, node)
+	return off, off + len(needle)
+}
+
+// callTables is a link.Tables holding, for each file it names, one call site
+// at each listed callee token, made from the file's module: the structural
+// provider's call sites the join matches occurrences against, without
+// running that provider.
+type callTables struct {
+	files  map[string]string
+	tokens map[string][][2]uint32
+}
+
+func (c callTables) Table(_ context.Context, _ model.GenerationID, fv model.FileVersion) (*link.Table, bool, error) {
+	tokens, ok := c.tokens[fv.Path]
+	if !ok {
+		return nil, false, nil
 	}
+	t := &link.Table{Path: fv.Path, Language: "test", Module: moduleEndpoint(fv.Path, c.files[fv.Path])}
+	for _, tok := range tokens {
+		t.Sites = append(t.Sites, link.Site{Caller: -1, NameStart: tok[0], NameEnd: tok[1]})
+	}
+	return t, true, nil
+}
+
+// moduleEndpoint is the module node of path as callTables names it.
+func moduleEndpoint(path, src string) link.Endpoint {
+	key := model.H("test-module", path)
+	lines := strings.Count(src, "\n")
+	end := model.Position{Byte: uint64(len(src)), Line: uint32(lines + 1), Column: uint32(len(src) - strings.LastIndexByte(src, '\n') - 1)}
+	return link.Endpoint{Node: model.NewNodeID(model.RepositoryID(model.H("providertest-repo")), model.NodeModule, key), CanonicalKey: key,
+		Kind: model.NodeModule, Name: path, Range: model.SourceRange{Start: model.Position{Line: 1}, End: end}}
+}
+
+// joinProvider is newProvider over callTables.
+func joinProvider(t *testing.T, importPath string, tables callTables) *scip.Provider {
+	t.Helper()
+	p, err := scip.New(context.Background(), scip.Options{Import: importPath, WorkDir: t.TempDir(), Tables: tables})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 // TestCallsiteAliasJoin protects the Section 11.3 call-site join and the
@@ -572,7 +632,8 @@ func TestCallsiteAliasJoin(t *testing.T) {
 			}
 			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentWithText("web/b.ts", "typescript", 0, files["web/b.ts"], occs...)))
 			inputs := append([]string{"utf16.scip"}, sourcePaths...)
-			p := newProvider(t, "utf16.scip")
+			start, end := tokenAt(t, files["web/b.ts"], "Baz", 0)
+			p := joinProvider(t, "utf16.scip", callTables{files: files, tokens: map[string][][2]uint32{"web/b.ts": {{uint32(start), uint32(end)}}}})
 			h := providertest.New(t, files)
 			got, rep := importDelta(t, h, p, scip.ImportScope("utf16.scip"), inputs, nil)
 
@@ -611,14 +672,38 @@ func TestCallsiteAliasJoin(t *testing.T) {
 			}
 			b := h.File(t, "web/b.ts")
 			baz := got.byNativeKey(t, symBaz, b.ID)
-			wantCallsiteAlias(t, got, "web/b.ts", files["web/b.ts"], "Baz", 0, baz.Node.ID)
-			// The definition occurrence at the same range publishes the symbol
-			// alias, never a second call-site alias for its own declaration.
-			if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 1 {
-				t.Fatalf("%d call-site aliases over one reference and one definition, want exactly 1: %v", n, aliasKeys(got))
+			wantCall(t, got, "web/b.ts", files["web/b.ts"], "Baz", 0, baz.Node.ID)
+			// The definition occurrence at the same range is no call: one
+			// `calls` occurrence over one reference and one definition.
+			if n := callOccurrences(got); n != 1 {
+				t.Fatalf("%d calls occurrences over one reference and one definition, want exactly 1", n)
 			}
 		})
 	}
+}
+
+// symbolOccurrences counts the relation evidence rows keyed by symbol.
+func symbolOccurrences(got *facts, symbol string) int {
+	n := 0
+	for _, r := range got.relations {
+		for _, e := range r.Evidence {
+			if e.NativeKey == symbol {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// callOccurrences counts the `calls` evidence rows got holds.
+func callOccurrences(got *facts) int {
+	n := 0
+	for _, r := range got.relations {
+		if r.Relation.Kind == model.RelCalls {
+			n += len(r.Evidence)
+		}
+	}
+	return n
 }
 
 func aliasKeys(got *facts) []string {
@@ -1156,10 +1241,10 @@ func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
 			inputs := append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...)
 			got, rep := importDelta(t, providertest.New(t, files), newProvider(t, "tabs.scip"), scip.ImportScope("tabs.scip"), inputs, nil)
 			// The clean reference after the refusal still published its
-			// call-site alias, which is what separates "one occurrence
-			// refused" from "the document dropped".
-			if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 1 {
-				t.Fatalf("%d call-site aliases, want 1: the clean occurrence after the refused one must still publish (%v)", n, aliasKeys(got))
+			// edge, which is what separates "one occurrence refused" from
+			// "the document dropped".
+			if n := symbolOccurrences(got, symBrowser); n != 1 {
+				t.Fatalf("%d occurrences of %s published, want 1: the clean occurrence after the refused one must still publish", n, symBrowser)
 			}
 			for _, cs := range rep.Result.Capabilities {
 				if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeProviderOutputInvalid {

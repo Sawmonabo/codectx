@@ -43,6 +43,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/link"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -226,6 +227,12 @@ type Options struct {
 	// LookupEnv supplies allowlisted environment values; nil means
 	// os.LookupEnv.
 	LookupEnv func(string) (string, bool)
+	// Tables are the link tables the structural provider stores with each
+	// file's unit: the call sites the call-site join (callsite.go) matches
+	// reference occurrences against, each with its caller. The composition
+	// root passes the store's; nil leaves the join nothing to match, so the
+	// import publishes no `calls`.
+	Tables link.Tables
 }
 
 // Provider is the SCIP provider.
@@ -253,6 +260,7 @@ type Provider struct {
 	// number by New.
 	evidenceClip int
 	lookupEnv    func(string) (string, bool)
+	tables       link.Tables
 	// identities are the payload identity of every kind that can produce
 	// facts (resolveProfiles): what a kind's need model is learned under.
 	identities map[Kind]string
@@ -329,7 +337,7 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
 		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout, stallTimeout: o.StallTimeout,
 		workDir: o.WorkDir, limits: o.Limits, evidenceClip: o.MaxEvidencePerFact, lookupEnv: o.LookupEnv,
-		identities: identities}, nil
+		identities: identities, tables: o.Tables}, nil
 }
 
 // Descriptor declares the provider: optional, workspace-invalidated, on top

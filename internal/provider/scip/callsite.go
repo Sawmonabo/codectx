@@ -11,45 +11,43 @@ import (
 // A call site is a syntax fact. SCIP cannot produce one: no indexer
 // distinguishes a call-site reference from a reference to a function value,
 // and none sets a write role (docs/research/08-scip-empirical-six-indexers.md,
-// confirmed for all six). So the tree-sitter provider publishes each call site
-// with the alias below on its syntactic callee node, this importer publishes
-// the same alias on the compiler-resolved symbol every reference occurrence
-// names, and the reconciler merges the two identities where the byte ranges
-// are equal. The `calls` relation then carries a compiler-precision target
-// while both evidence rows survive.
+// confirmed for all six). The structural provider finds every call site and
+// stores it in its file's link table with the byte range of its callee token
+// and its caller; the call linker binds the site from that table. This
+// importer reads the same table for each changed document (callSites): a
+// reference occurrence whose bytes are exactly a site's callee token is the
+// compiler's resolution of that call, and joinCall publishes `calls` from the
+// site's caller to the resolved symbol at compiler precision, keyed by the
+// call-site key below, beside the occurrence's `references` edge. The
+// linker's `calls` for the same site keeps its own evidence, so the call
+// carries both rows: an equal target is one relation with two rows, a
+// different one two relations from one caller at one key.
 //
-// The join is exact-range equality on one file version, so an alias this
-// provider emits at a range where tree-sitter found no call site is inert: it
-// aliases the symbol node to a key nothing else names. That is why the alias
-// is emitted for every non-definition occurrence rather than for a guessed
-// subset — guessing which reference is a call is exactly what SCIP cannot do.
+// The join is exact-range equality on one file version: the table and the
+// index describe the same pinned bytes, and an occurrence over any other
+// bytes than a callee token joins nothing.
 //
-// callsiteAlias is the one place the key is spelled. Section 11.3 defines the
+// callsiteKey is where this importer spells the key. Section 11.3 defines the
 // range as the **1-based inclusive** byte range of the callee identifier,
 // while model.SourceRange is the zero-based half-open byte range of Section
 // 9.3, so the conversion is start+1 and end. Worked example: the identifier
 // `Bar` occupying zero-based bytes [34,37) of `pkg/a.go` is
 //
-//	scope `file:pkg/a.go`, key `callsite:pkg/a.go:35-37`
+//	callsite:pkg/a.go:35-37
 //
-// Both providers must spell this byte for byte or the join silently produces
-// nothing, so both derive it from the same paragraph of Section 11.3.
+// It must equal the linker's spelling byte for byte, so that both evidence
+// rows of one call carry one key.
 //
-// rng must advance: a zero-width occurrence has no identifier to join on and
-// cannot be expressed as an inclusive range, so the caller never asks for one.
-// ok is false only when the alias does not fit. A path may be up to
-// model.MaxPathBytes long while an alias scope and native key are bounded at
-// model.MaxScopeKeyBytes and model.MaxNativeKeyBytes, so a long path can
-// overflow either bound. An over-long alias would fail
-// model.NativeAlias.Validate and take the whole unit down for one unjoinable
-// key, so the caller skips it and counts it under callsite_aliases_skipped.
-func callsiteAlias(p string, rng *model.SourceRange) (scopeKey, nativeKey string, ok bool) {
-	scopeKey = fileScope(p)
-	nativeKey = "callsite:" + p + ":" + strconv.FormatUint(rng.Start.Byte+1, 10) + "-" + strconv.FormatUint(rng.End.Byte, 10)
-	if len(scopeKey) > model.MaxScopeKeyBytes || len(nativeKey) > model.MaxNativeKeyBytes {
-		return "", "", false
+// ok is false only when the key does not fit: a path may be up to
+// model.MaxPathBytes long while a native key is bounded at
+// model.MaxNativeKeyBytes. The caller then counts the occurrence under
+// callsite_keys_skipped.
+func callsiteKey(p string, rng *model.SourceRange) (string, bool) {
+	key := "callsite:" + p + ":" + strconv.FormatUint(rng.Start.Byte+1, 10) + "-" + strconv.FormatUint(rng.End.Byte, 10)
+	if len(key) > model.MaxNativeKeyBytes {
+		return "", false
 	}
-	return scopeKey, nativeKey, true
+	return key, true
 }
 
 // fileScope is the file-local alias scope of Section 11.3.
