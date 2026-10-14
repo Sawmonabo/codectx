@@ -255,6 +255,7 @@ $ codectx version --json
 
 | Document | What it covers |
 |---|---|
+| [docs/product-requirements.md](docs/product-requirements.md) | What codectx is for, who uses it, the requirements every part meets, and its capabilities |
 | [docs/operations.md](docs/operations.md) | Diagnosis, recovery codes, retention and the grace window, disk pressure, rebuilding |
 | [docs/diagnostics.md](docs/diagnostics.md) | The run ledger: what each stage of a run cost and how to read it live; profiling a run with `CODECTX_PPROF_DIR` |
 | [docs/configuration.md](docs/configuration.md) | Every configuration key, its bounds and the cross-field rules |
