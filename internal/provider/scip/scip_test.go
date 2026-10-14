@@ -1423,3 +1423,45 @@ func TestSeveralSymbolsAtOneCallSiteAreASetOfTargets(t *testing.T) {
 		}
 	}
 }
+
+// TestAClassTemplateConstructorCallReachesItsDefinition holds the two
+// spellings scip-clang 0.4.0 gives one constructor of a class template to
+// one symbol. Its definition is named by the injected class name with the
+// template's parameters, Ptr#`Ptr<T>`(h)., while a construction, mapped back
+// to the pattern, names Ptr#Ptr(h). with the same disambiguator. Read as two
+// strings they are two symbols: the call targets an external node with no
+// location and never the constructor it runs.
+//
+// Mutation caught: drop the respelling in parseSymbol (the reference resolves
+// to a second, unlocated node).
+func TestAClassTemplateConstructorCallReachesItsDefinition(t *testing.T) {
+	const src = "template <class T> struct Ptr {\n  Ptr(T* p) {}\n};\nvoid use() { Ptr<int>(nullptr); }\n"
+	const (
+		symDef = "cxx . . $ Ptr#`Ptr<T>`(ebd0a1552f8ce24f)."
+		symRef = "cxx . . $ Ptr#Ptr(ebd0a1552f8ce24f)."
+	)
+	at := func(off, n int) []int32 {
+		line := int32(strings.Count(src[:off], "\n"))
+		col := int32(off - strings.LastIndexByte(src[:off], '\n') - 1)
+		return []int32{line, col, col + int32(n)}
+	}
+	def, _ := tokenAt(t, src, "Ptr", 1)
+	use, _ := tokenAt(t, src, "Ptr", 2)
+	files := fixture(t)
+	files["cc/p.cpp"] = src
+	files["ctor.scip"] = string(miniIndex("scip-clang", "0.4.0", documentRecord("cc/p.cpp", "cpp", 1,
+		occurrenceRecord(symDef, 1, at(def, 3)...), occurrenceRecord(symRef, 0, at(use, 3)...))))
+	inputs := append([]string{"ctor.scip", "cc/p.cpp"}, sourcePaths...)
+	p := joinProvider(t, "ctor.scip", callTables{files: files, tokens: map[string][][2]uint32{"cc/p.cpp": {{uint32(use), uint32(use + 3)}}}})
+	h := providertest.New(t, files)
+	got, _ := run(t, h, p, scip.ImportScope("ctor.scip"), inputs)
+
+	ctor := got.byNativeKey(t, symRef, h.File(t, "cc/p.cpp").ID)
+	wantRange(t, ctor, src, "Ptr", 1)
+	wantCall(t, got, "cc/p.cpp", src, "Ptr", 2, ctor.Node.ID)
+	for _, n := range got.nodes {
+		if n.Node.Range == nil && n.Node.Name == "Ptr" {
+			t.Fatalf("the construction resolved to an unlocated node %s besides the constructor's definition", n.Node.ID)
+		}
+	}
+}

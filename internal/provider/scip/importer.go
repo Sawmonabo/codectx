@@ -671,7 +671,7 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 		ON CONFLICT(key) DO UPDATE SET kind = CASE WHEN sym.kind = 0 THEN excluded.kind ELSE sym.kind END,
 		name = CASE WHEN sym.name = '' THEN excluded.name ELSE sym.name END,
 		sigcut = CASE WHEN sym.sig = '' THEN excluded.sigcut ELSE sym.sigcut END,
-		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, s.symbol, s.kind, name, s.signature, s.signatureCut); err != nil {
+		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, sym.raw, s.kind, name, s.signature, s.signatureCut); err != nil {
 		return err
 	}
 	for _, rel := range s.relationships {

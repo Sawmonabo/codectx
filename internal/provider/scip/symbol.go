@@ -76,7 +76,102 @@ func parseSymbol(s string) (symbol, error) {
 	if err := sym.parseDescriptors(); err != nil {
 		return symbol{}, err
 	}
+	if sym.scheme == schemeClang {
+		if d, ok := injectedConstructorName(sym.descriptors); ok {
+			sym.raw = s[:len(s)-len(rest)] + d
+			sym.descriptors, sym.lastSuffix, sym.prevSuffix = d, suffixNone, suffixNone
+			if err := sym.parseDescriptors(); err != nil {
+				return symbol{}, err
+			}
+		}
+	}
 	return sym, nil
+}
+
+// schemeClang is the symbol scheme scip-clang writes.
+const schemeClang = "cxx"
+
+// injectedConstructorName respells a constructor or destructor of a class
+// template the way its references spell it. scip-clang names the member by
+// the declaration's printed name, which inside a class template is the
+// injected class name with its parameters: the definition is
+// Ptr#`Ptr<T>`(ebd0a1552f8ce24f). while a call, mapped back to the pattern,
+// references Ptr#Ptr(ebd0a1552f8ce24f). (the same disambiguator, which
+// hashes the type, not the name). The two strings would be two symbols, so
+// the call would never reach its definition. A method descriptor whose
+// escaped name is its enclosing type's name, or that name after `~`,
+// followed by a template argument list, drops the list, and the name is
+// escaped again only when it is not an identifier. ok is false when nothing
+// changes.
+func injectedConstructorName(d string) (string, bool) {
+	var b strings.Builder
+	changed := false
+	typeName := ""
+	for i := 0; i < len(d); {
+		switch d[i] {
+		case '[', '(':
+			close := byte(']')
+			if d[i] == '(' {
+				close = ')'
+			}
+			end, err := nameEnd(d, i+1, close)
+			if err != nil {
+				return "", false
+			}
+			b.WriteString(d[i : end+1])
+			i, typeName = end+1, ""
+			continue
+		}
+		end, err := nameEnd(d, i, 0)
+		if err != nil || end >= len(d) {
+			return "", false
+		}
+		raw, name := d[i:end], unescapeName(d[i:end])
+		if d[end] == '(' && typeName != "" && len(raw) >= 2 && raw[0] == '`' {
+			tilde := strings.HasPrefix(name, "~")
+			base := strings.TrimPrefix(name, "~")
+			if rest, ok := strings.CutPrefix(base, typeName+"<"); ok && strings.HasSuffix(rest, ">") {
+				spelled := typeName
+				if tilde {
+					spelled = "~" + typeName
+				}
+				if tilde || !plainIdentifier(typeName) {
+					spelled = "`" + strings.ReplaceAll(spelled, "`", "``") + "`"
+				}
+				raw, changed = spelled, true
+			}
+		}
+		b.WriteString(raw)
+		typeName = ""
+		if d[end] == '#' {
+			typeName = name
+		}
+		if d[end] == '(' {
+			close := strings.IndexByte(d[end:], ')')
+			if close < 0 || end+close+1 >= len(d) {
+				return "", false
+			}
+			b.WriteString(d[end : end+close+2])
+			i = end + close + 2
+			continue
+		}
+		b.WriteByte(d[end])
+		i = end + 1
+	}
+	return b.String(), changed
+}
+
+// plainIdentifier reports whether a SCIP descriptor name needs no escape.
+func plainIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !isIdentifierByte(s[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // splitComponent cuts one space-terminated component, unescaping doubled
