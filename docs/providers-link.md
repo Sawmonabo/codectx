@@ -300,7 +300,10 @@ from every non-test file, whatever its build constraints, and cached on disk by 
 project's own conditional declarations are, and a type satisfying one implements it. Declarations are compared by
 their canonical spellings, not as written: `type Num = Count` (with `Count = int`) for unix and `type Num = int` for
 windows are one alias of `int`, `const Width = 4` and `2 + 2` one value, `Sum() [16]byte` and `Sum() [Size]byte` (with
-`Size = 16`) one method, and interface declarations that spell one method set are one interface.
+`Size = 16`) one method, and interface declarations that spell one method set are one interface. Declarations
+written alike are one only where they mean the same in each file: an import's name is declared in its own file's
+block, so `type Word = foo.T` in a 386 file whose `foo` imports one package and in an amd64 file whose `foo` imports
+another are two aliases, each under its own file's condition, in the project and outside it alike.
 
 Go method sets are decided per build (`go_build.go`). Every Go file, of the project (the worker sends its leading
 `//go:build` or `// +build` lines) and of the packages outside it, belongs to the builds its constraint and its
@@ -310,14 +313,29 @@ illumos=>solaris and ios=>darwin, the toolchain's ports from `go tool dist list`
 Each method-set record carries the condition of the builds holding it: a method's file and its type's declaration, an
 embedding's path, a promoted member a shallower one hides only where that one exists. A method declared per build is
 each of its signatures under its own condition, and a signature naming an alias or constant declared per build with
-different types or values (`const PtrSize = 4` for 386 and `8` for amd64) is one key per choice of declaration,
-under their conditions. A type implements an interface when some build holds, for every method name, a key of it in
+different types or values (`const PtrSize = 4` for 386 and `8` for amd64) is one key per distinct spelling the
+choices of declaration give, under the disjunction of the conditions of the choices that spell it: declarations
+written differently that spell one type or value are one choice, a choice no build makes is cut as soon as it is made,
+and no count of choices bounds the walk. A type implements an interface when some build holds, for every method name, a key of it in
 both: `Regs` with `PC() uint32` in `regs_386.go` and `PC() uint64` in `regs_amd64.go` implements `interface{ PC()
 uint64; SetPC(uint64) }` and never `interface{ PC() uint64; SetPC(uint32) }`, and its `PC` overrides only the
-interface method of its own key. Only the tags a condition names are enumerated; past 16 free tags (custom tags,
-`amd64.v2`-style tool tags, taken as independent) a condition counts as met. Two embedding paths at one depth stay
-ambiguous whatever their conditions (a miss, never a false edge), and a type declared with a different structure per
-build is each of its declarations, as before. A Go type implements an interface
+interface method of its own key. Each condition is a reduced ordered binary decision diagram (one id per function of
+the tags, however written), and some build meets it when it shares a satisfying assignment with the diagram of the
+valid builds: every port, compiler and architecture feature level, a feature tag such as `amd64.v3` holding only on
+its architecture with every lower level of its chain, `cgo` on any port, and each release above the module's go line
+only where the lower ones hold. The `-tags` flag is taken to add only tags of no fixed meaning (an operating system,
+architecture, compiler, release or feature tag is fixed by the build), and a feature tag the toolchain does not define
+holds in no build. No count of tags bounds a decision. The selector rule is applied per build: a name two embedding paths reach at one
+depth (two embedded types, or one embedded type reached twice) promotes nothing in the builds both paths exist in and
+hides the name deeper there, an embedded type declared once per build is one path in each, and a type a shallower depth
+reached in some builds is walked deeper in the others. "T implements I" means the method set of `*T` (one node per type,
+as an implementation finder that widens T to `*T` reads it), so embedding `C` or `*C` never filters a promoted method;
+the two count as one type reached twice when both are at one depth. A type declared with a different structure per
+build is each of its declarations in the unit; outside it, it is one type in the builds of any of its declarations, each
+declaration's embedded types under that declaration's condition (`unix.PtraceRegs`, declared once per architecture,
+keeps the `PC` of every architecture that declares one). A name that is a struct in some builds and an interface in
+others is, embedded, each kind's members in that kind's builds, and each interface declaration is implemented on its
+own. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
@@ -824,7 +842,7 @@ The members' language family picks the resolver:
   `go.mod` binds no import path (`hierarchy.goPackages`, `internal/provider/link/hierarchy_go.go`). A Go type's method
   set is its own methods and, depth by depth, those its embedded fields and embedded interfaces promote. A name a
   shallower depth declares, as a method or as a named or embedded field, is not promoted; a name a struct reaches at
-  one depth along two embedding paths, or as a field, promotes nothing. Embedding is promotion, never subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
+  one depth along two embedding paths in a build, or as a field, promotes nothing in that build ("Selectors"). Embedding is promotion, never subtyping: a call on an embedded type never dispatches into a type that embeds it. A promoted method is listed
   under the embedding type, and implicit interface satisfaction compares whole method sets (`hierarchy.satisfy`). A Go
   member site on a field (`x.cfg.Load()`) is typed by the declared type of the field that selector denotes on the
   owner's type, its own or promoted, read in the file that declares it, and a chain (`x.a.b.Load()`) step by

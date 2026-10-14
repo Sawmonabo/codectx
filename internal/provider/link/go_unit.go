@@ -87,12 +87,11 @@ func (t goUnitTypes) read(p, name string) (goTypeAnswer, bool, error) {
 		}
 		// An alias declared once per platform or build tag is each of its
 		// distinctly written declarations (goTypeAnswer.others).
-		var aliases []entry
+		var aliases []goWritten
 		err := h.decls.lookup(keyGoAlias+scope+"\x00"+name, func(e entry) error {
-			if !slices.ContainsFunc(aliases, func(a entry) bool { return a.Sig == e.Sig }) {
-				aliases = append(aliases, e)
-			}
-			return nil
+			var err error
+			aliases, err = t.addWritten(aliases, e)
+			return err
 		})
 		if err != nil {
 			return goTypeAnswer{}, false, err
@@ -148,16 +147,15 @@ func (t goUnitTypes) readConstant(p, name string) ([]goDecl, error) {
 		}
 		return h.goExt.constant(p, name), nil
 	}
-	var cs []entry
+	var cs []goWritten
 	for _, scope := range scopes {
 		if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
 			continue
 		}
 		err := h.decls.lookup(keyGoConst+scope+"\x00"+name, func(e entry) error {
-			if !slices.ContainsFunc(cs, func(c entry) bool { return c.Sig == e.Sig }) {
-				cs = append(cs, e)
-			}
-			return nil
+			var err error
+			cs, err = t.addWritten(cs, e)
+			return err
 		})
 		if err != nil {
 			return nil, err
@@ -166,27 +164,125 @@ func (t goUnitTypes) readConstant(p, name string) ([]goDecl, error) {
 	return t.decls(cs)
 }
 
-// decls are the forms (Sig) of the declarations es, each written in its
-// own file; a form whose file cannot be read is unknown.
-func (t goUnitTypes) decls(es []entry) ([]goDecl, error) {
-	var out []goDecl
-	for _, e := range es {
-		fc, found, err := t.h.fileContext(e.Ref.File)
-		if err != nil {
+// goWritten is one distinct declaration of a name: the entries of the
+// files that write it alike, read in the first one's file (names, found
+// false when that file cannot be read).
+type goWritten struct {
+	es    []entry
+	names goUnitNames
+	found bool
+}
+
+// addWritten adds the declaration e to written, the declarations of one
+// name grouped by what they mean: the same form (Sig) naming the same
+// declarations in each file that writes it (goSameMeaning), so a form
+// spelled alike in two files whose import of its qualifier is another
+// package is two declarations.
+func (t goUnitTypes) addWritten(written []goWritten, e entry) ([]goWritten, error) {
+	var names goUnitNames
+	loaded, found := false, false
+	load := func() error {
+		fc, ok, err := t.h.fileContext(e.Ref.File)
+		names, found, loaded = goUnitNames{h: t.h, fc: fc}, ok, true
+		return err
+	}
+	scoped := goFileScoped(e.Sig)
+	for i, w := range written {
+		if w.es[0].Sig != e.Sig {
+			continue
+		}
+		if scoped {
+			if !loaded {
+				if err := load(); err != nil {
+					return nil, err
+				}
+			}
+			if !found || !w.found {
+				continue
+			}
+			same, err := goSameMeaning(w.names, names, e.Sig, t.h.goDeclaresIn(t.h.goExt))
+			if err != nil {
+				return nil, err
+			}
+			if !same {
+				continue
+			}
+		}
+		written[i].es = append(w.es, e)
+		return written, nil
+	}
+	if !loaded {
+		if err := load(); err != nil {
 			return nil, err
 		}
-		d := goDecl{form: e.Sig, names: goUnitNames{h: t.h, fc: fc}}
-		if !found {
+	}
+	return append(written, goWritten{es: []entry{e}, names: names, found: found}), nil
+}
+
+// decls are the distinct declarations written, each read in the file of
+// the first declaration that writes it, under the disjunction of the
+// conditions of the files of all that do; a form whose file cannot be read
+// is unknown.
+func (t goUnitTypes) decls(written []goWritten) ([]goDecl, error) {
+	var out []goDecl
+	for _, w := range written {
+		d := goDecl{form: w.es[0].Sig, names: w.names}
+		if !w.found {
 			d.form = goIdentityUnknown
 		}
-		if t.h.goConds != nil {
-			if d.cond, err = t.h.goFileCond(e.Ref.File); err != nil {
-				return nil, err
+		if c := t.h.goConds; c != nil {
+			d.cond = goCondNone
+			for _, e := range w.es {
+				f, err := t.h.goFileCond(e.Ref.File)
+				if err != nil {
+					return nil, err
+				}
+				d.cond = c.or(d.cond, f)
 			}
 		}
 		out = append(out, d)
 	}
 	return out, nil
+}
+
+// goDeclaresIn is goDeclares over the unit's packages and the packages
+// outside it ext read (none when ext is nil). It reads only whether a
+// declaration of the name exists, never its form, so it never re-enters a
+// lookup of the name being read.
+func (h *hierarchy) goDeclaresIn(ext *goExternal) goDeclares {
+	return func(p, name string) (known, found bool, err error) {
+		inUnit := false
+		err = h.goPackages(p, func(scope string) error {
+			if strings.HasSuffix(scope, "_test") != strings.HasSuffix(p, "_test") {
+				return nil
+			}
+			inUnit = true
+			for _, key := range [...]string{keyGoAlias, keyType + "go\x00", keyGoConst} {
+				if found {
+					return nil
+				}
+				if err := h.decls.lookup(key+scope+"\x00"+name, func(entry) error {
+					found = true
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil || inUnit || h.goModule != "" && under(p, h.goModule) {
+			return true, found, err
+		}
+		if ext == nil {
+			return false, false, nil
+		}
+		pkg := ext.pkgs[p]
+		if pkg == nil {
+			return false, false, nil
+		}
+		t := pkg.types[name]
+		return true, t != nil && t.file >= 0 || len(pkg.consts[name]) > 0, nil
+	}
 }
 
 // goUnitNames is goNames of a member file of the unit.

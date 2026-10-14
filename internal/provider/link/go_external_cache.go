@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/paced"
 )
@@ -24,7 +25,7 @@ import (
 
 // goDeclarationsFormat names the encoding of a cache entry, so an entry
 // written in another encoding is never decoded as this one.
-const goDeclarationsFormat = "go-declarations\x00name files(constraint imports dot unnamed) types(name file alias form iface ineligible conflict methods embeds variants) consts(name form file) forms(struct interface array-constant generic-alias) declarations(each-distinct-method each-distinct-const)"
+const goDeclarationsFormat = "go-declarations\x00name files(constraint imports dot unnamed) types(name file also alias form iface ineligible conflict methods receiver-methods embeds variants) consts(name form file also) members(each-declaring-file) forms(struct interface array-constant generic-alias) declarations(each-distinct-method each-distinct-const)"
 
 type goDeclPackage struct {
 	Name   string
@@ -43,15 +44,17 @@ type goDeclFile struct {
 type goDeclType struct {
 	Name                               string
 	File                               int
+	Also                               []int
 	Alias, Iface, Ineligible, Conflict bool
 	Form                               string
-	Methods, Embeds                    []goDeclMethod
+	Methods, Recv, Embeds              []goDeclMethod
 	Variants                           []goDeclType
 }
 
 type goDeclMethod struct {
 	Name, Form string
 	File       int
+	Also       []int
 }
 
 // goDeclCacheFile is the cache entry of the package of identity id, empty
@@ -88,32 +91,35 @@ func readGoDecls(id, p string) (*goExtPackage, bool) {
 		}
 		pkg.files = append(pkg.files, goExtFile{constraint: df.Constraint, imports: imports, dot: df.Dot, unnamed: df.Unnamed})
 	}
+	files := func(fs []int) bool {
+		return !slices.ContainsFunc(fs, func(f int) bool { return f < 0 || f >= len(pkg.files) })
+	}
 	methods := func(ms []goDeclMethod) []goExtMethod {
 		var out []goExtMethod
 		for _, m := range ms {
-			if m.File < 0 || m.File >= len(pkg.files) {
+			if m.File < 0 || m.File >= len(pkg.files) || !files(m.Also) {
 				return nil
 			}
-			out = append(out, goExtMethod{name: m.Name, form: m.Form, file: m.File})
+			out = append(out, goExtMethod{name: m.Name, form: m.Form, file: m.File, also: m.Also})
 		}
 		return out
 	}
 	for _, c := range d.Consts {
-		if c.File < 0 || c.File >= len(pkg.files) {
+		if c.File < 0 || c.File >= len(pkg.files) || !files(c.Also) {
 			return nil, false
 		}
 		if pkg.consts == nil {
 			pkg.consts = map[string][]goExtMethod{}
 		}
-		pkg.consts[c.Name] = append(pkg.consts[c.Name], goExtMethod{name: c.Name, form: c.Form, file: c.File})
+		pkg.consts[c.Name] = append(pkg.consts[c.Name], goExtMethod{name: c.Name, form: c.Form, file: c.File, also: c.Also})
 	}
 	var decode func(t goDeclType) (*goExtType, bool)
 	decode = func(t goDeclType) (*goExtType, bool) {
-		if t.File >= len(pkg.files) {
+		if t.File >= len(pkg.files) || !files(t.Also) {
 			return nil, false
 		}
-		et := &goExtType{file: t.File, alias: t.Alias, form: t.Form, iface: t.Iface,
-			ineligible: t.Ineligible, conflict: t.Conflict, methods: methods(t.Methods), embeds: methods(t.Embeds)}
+		et := &goExtType{file: t.File, also: t.Also, alias: t.Alias, form: t.Form, iface: t.Iface,
+			ineligible: t.Ineligible, conflict: t.Conflict, methods: methods(t.Methods), recv: methods(t.Recv), embeds: methods(t.Embeds)}
 		for _, v := range t.Variants {
 			ev, ok := decode(v)
 			if !ok {
@@ -147,19 +153,19 @@ func writeGoDecls(id string, pkg *goExtPackage) {
 	methods := func(ms []goExtMethod) []goDeclMethod {
 		var out []goDeclMethod
 		for _, m := range ms {
-			out = append(out, goDeclMethod{Name: m.name, Form: m.form, File: m.file})
+			out = append(out, goDeclMethod{Name: m.name, Form: m.form, File: m.file, Also: m.also})
 		}
 		return out
 	}
 	for _, cs := range pkg.consts {
 		for _, c := range cs {
-			d.Consts = append(d.Consts, goDeclMethod{Name: c.name, Form: c.form, File: c.file})
+			d.Consts = append(d.Consts, goDeclMethod{Name: c.name, Form: c.form, File: c.file, Also: c.also})
 		}
 	}
 	var encode func(name string, t *goExtType) goDeclType
 	encode = func(name string, t *goExtType) goDeclType {
-		dt := goDeclType{Name: name, File: t.file, Alias: t.alias, Form: t.form, Iface: t.iface,
-			Ineligible: t.ineligible, Conflict: t.conflict, Methods: methods(t.methods), Embeds: methods(t.embeds)}
+		dt := goDeclType{Name: name, File: t.file, Also: t.also, Alias: t.alias, Form: t.form, Iface: t.iface,
+			Ineligible: t.ineligible, Conflict: t.conflict, Methods: methods(t.methods), Recv: methods(t.recv), Embeds: methods(t.embeds)}
 		for _, v := range t.variants {
 			dt.Variants = append(dt.Variants, encode(name, v))
 		}

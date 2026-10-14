@@ -131,6 +131,23 @@ func (h *hierarchy) goEmbeddings(methodSets *pagination.ExternalSort[entry], fc 
 				return err
 			}
 			if ok {
+				// An interface embedding a name outside the unit that is an
+				// interface in some builds and a defined type in others
+				// embeds its interface declarations, each in its own builds.
+				if sub.Ref.File == fc.file && t.Decls[sub.Ref.Index].Kind == model.NodeInterface {
+					if variants := h.goExt.interfaceDecls(external); variants != nil {
+						for _, v := range variants {
+							c := h.goConds.and(cond, v.cond)
+							if !h.goConds.holds(c) {
+								continue
+							}
+							if err := methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goEmbedRecord, Ref: v.ref, MaxArgs: c}); err != nil {
+								return err
+							}
+						}
+						return methodSets.Add(entry{Key: refKey(sub.Ref), Tag: goExternalRecord, Aux: external, MaxArgs: cond})
+					}
+				}
 				// A type outside the unit whose method set the build read
 				// promotes its methods as one of the unit's does.
 				if ext, found := h.goExt.materialized(external); found {
@@ -298,15 +315,23 @@ const goExternalKey = "\x01"
 
 // goSelectors yields the methods and fields a selector on the Go type typ
 // denotes ("Selectors", "Method sets"), each a record of its declaring type
-// (Tag says which): every method and field typ declares, then, depth by
-// depth through its embedded types, each of a name no shallower depth
-// declares. It also yields, with an empty name, every type outside the unit
-// typ embeds, directly or through its embedded types (goExternalRecord),
-// each once. At one depth a name a struct reaches along two or more embedding
-// paths denotes nothing, and hides the name at every deeper depth; an
-// interface's method set is the union of its embedded interfaces' and admits
-// a name from several of them. An interface embeds only interfaces. Only
-// typ's own walk is held.
+// (Tag says which) under the builds in which it does: every method and
+// field typ declares, then, depth by depth through its embedded types, each
+// of a name no shallower depth declares in that build. It also yields, with
+// an empty name, every type outside the unit typ embeds, directly or
+// through its embedded types (goExternalRecord), each once per condition.
+//
+// The language's rule is applied per build, as go/types applies it to one
+// (lookupFieldOrMethodImpl, NewMethodSet): at one depth, a name a struct
+// reaches along two or more embedding paths in a build, through two
+// embedded types or through one embedded type reached twice, denotes
+// nothing in that build and hides the name at every deeper depth there; a
+// type a shallower depth reached in a build is not walked again in it. The
+// counts are conditions: the builds in which at least one path, and at
+// least two, reach each embedded type, so two declarations of one embedded
+// name in disjoint builds are never two paths. An interface's method set is
+// the union of its embedded interfaces' and admits a name from several of
+// them. An interface embeds only interfaces. Only typ's own walk is held.
 func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name string, m entry, promoted bool) error) error {
 	// have is each name a shallower depth declares, with the condition of
 	// the builds in which it does: a deeper member of that name is part of
@@ -323,17 +348,27 @@ func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name str
 		cond goCond
 	}
 	external := map[outside]bool{}
-	// level counts the embedding paths reaching each type at the current
-	// depth, two meaning two or more, and paths the condition of the
-	// builds holding one of them.
-	level := map[Ref]int{}
-	paths := map[Ref]goCond{}
-	reach := func(level map[Ref]int, paths map[Ref]goCond, r Ref, n int, cond goCond) {
-		if old, ok := paths[r]; ok {
-			cond = c.or(old, cond)
-		}
-		level[r], paths[r] = min(level[r]+n, 2), cond
+	// reached holds, for each type an embedding path reaches at one depth,
+	// the builds in which at least one path does (one) and at least two do
+	// (two): a saturating count of paths, as a condition.
+	type reached struct {
+		one, two goCond
 	}
+	type level struct {
+		order []Ref
+		at    map[Ref]*reached
+	}
+	contribute := func(l *level, r Ref, one, two goCond) {
+		p := l.at[r]
+		if p == nil {
+			p = &reached{one: goCondNone, two: goCondNone}
+			l.at[r] = p
+			l.order = append(l.order, r)
+		}
+		p.two = c.or(p.two, c.or(two, c.and(p.one, one)))
+		p.one = c.or(p.one, one)
+	}
+	cur := &level{at: map[Ref]*reached{}}
 	err := ix.lookup(refKey(typ), func(e entry) error {
 		switch e.Tag {
 		case goMethodRecord, goFieldRecord:
@@ -343,38 +378,58 @@ func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name str
 			external[outside{e.Aux, e.MaxArgs}] = true
 			return yield("", e, false)
 		case goEmbedRecord:
-			reach(level, paths, e.Ref, 1, e.MaxArgs)
+			contribute(cur, e.Ref, e.MaxArgs, goCondNone)
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	visited := map[Ref]bool{typ: true}
-	for len(level) > 0 {
-		for r := range level {
-			visited[r] = true
+	// seen is, for each type, the builds in which a shallower depth reached
+	// it (go/types' seen, per build).
+	seen := map[Ref]goCond{typ: 0}
+	for len(cur.order) > 0 {
+		// One occurrence of a name at this depth: the records of it one
+		// embedded type holds (one member, one per build condition), the
+		// builds reaching it (in each record's condition already) and those
+		// reaching it along two or more paths.
+		type occurrence struct {
+			records []entry
+			present goCond
+			twice   goCond
 		}
-		// members are the records of one name at this depth, and paths
-		// the embedding paths reaching them, each embedded type counted
-		// once however many records of the name it holds (one per build
-		// condition).
-		type members struct {
-			members []entry
-			paths   int
-			last    Ref
+		// byName is each name's occurrences at this depth.
+		var names []string
+		byName := map[string][]*occurrence{}
+		next := &level{at: map[Ref]*reached{}}
+		// lives are the types reached at this depth in some build no
+		// shallower depth reached them in: the builds of one path or more
+		// (once) and of two or more (twice), past those.
+		type live struct {
+			r           Ref
+			once, twice goCond
 		}
-		byName := map[string]*members{}
-		next := map[Ref]int{}
-		nextPaths := map[Ref]goCond{}
-		for embedded, n := range level {
-			via := paths[embedded]
+		lives := make([]live, 0, len(cur.order))
+		for _, r := range cur.order {
+			p := cur.at[r]
+			s, ok := seen[r]
+			if !ok {
+				s = goCondNone
+			}
+			once := c.andNot(p.one, s)
+			if c.holds(once) {
+				lives = append(lives, live{r: r, once: once, twice: c.andNot(p.two, s)})
+			}
+			seen[r] = c.or(s, p.one)
+		}
+		for _, lv := range lives {
 			skip := false
-			err := ix.lookup(refKey(embedded), func(e entry) error {
+			occs := map[string]*occurrence{}
+			err := ix.lookup(refKey(lv.r), func(e entry) error {
 				if e.Tag != goTypeRecord && !skip {
 					// A promoted member is part of the builds holding it
-					// and the path that reaches it.
-					if e.MaxArgs = c.and(e.MaxArgs, via); !c.holds(e.MaxArgs) {
+					// and a path that reaches it.
+					if e.MaxArgs = c.and(e.MaxArgs, lv.once); !c.holds(e.MaxArgs) {
 						return nil
 					}
 				}
@@ -383,18 +438,19 @@ func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name str
 					skip = iface && e.Flags&flagAbstract == 0
 				case skip:
 				case e.Tag == goMethodRecord || e.Tag == goFieldRecord:
-					r := byName[e.Aux]
-					if r == nil {
-						r = &members{}
-						byName[e.Aux] = r
+					o := occs[e.Aux]
+					if o == nil {
+						if _, ok := byName[e.Aux]; !ok {
+							names = append(names, e.Aux)
+						}
+						o = &occurrence{present: goCondNone}
+						occs[e.Aux] = o
+						byName[e.Aux] = append(byName[e.Aux], o)
 					}
-					if len(r.members) == 0 || r.last != embedded {
-						r.paths = min(r.paths+n, 2)
-						r.last = embedded
-					}
-					r.members = append(r.members, e)
-				case e.Tag == goEmbedRecord && !visited[e.Ref]:
-					reach(next, nextPaths, e.Ref, n, e.MaxArgs)
+					o.records = append(o.records, e)
+					o.present = c.or(o.present, e.MaxArgs)
+				case e.Tag == goEmbedRecord:
+					contribute(next, e.Ref, e.MaxArgs, c.and(e.MaxArgs, lv.twice))
 				case e.Tag == goExternalRecord && !external[outside{e.Aux, e.MaxArgs}]:
 					external[outside{e.Aux, e.MaxArgs}] = true
 					return yield("", e, true)
@@ -404,36 +460,46 @@ func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name str
 			if err != nil {
 				return err
 			}
+			for _, o := range occs {
+				o.twice = c.and(o.present, lv.twice)
+			}
 		}
-		for name, r := range byName {
+		for _, name := range names {
+			occurrences := byName[name]
 			hidden, shallower := have[name]
 			if shallower && hidden == 0 {
 				continue
 			}
-			var cond goCond
-			for i, m := range r.members {
-				if i == 0 {
-					cond = m.MaxArgs
-				} else {
-					cond = c.or(cond, m.MaxArgs)
-				}
+			// The builds holding the name at this depth along one path or
+			// more (once), and along two or more (collide): two
+			// occurrences, or one occurrence reached twice.
+			once, collide := goCondNone, goCondNone
+			for _, o := range occurrences {
+				collide = c.or(collide, c.or(o.twice, c.and(once, o.present)))
+				once = c.or(once, o.present)
 			}
-			declare(name, cond)
-			if !iface && r.paths > 1 {
-				continue
+			declare(name, once)
+			blocked := goCondNone
+			if shallower {
+				blocked = hidden
 			}
-			for _, m := range r.members {
-				if shallower {
-					if m.MaxArgs = c.andNot(m.MaxArgs, hidden); !c.holds(m.MaxArgs) {
-						continue
+			if !iface {
+				blocked = c.or(blocked, collide)
+			}
+			for _, o := range occurrences {
+				for _, r := range o.records {
+					if blocked != goCondNone {
+						if r.MaxArgs = c.andNot(r.MaxArgs, blocked); !c.holds(r.MaxArgs) {
+							continue
+						}
 					}
-				}
-				if err := yield(name, m, true); err != nil {
-					return err
+					if err := yield(name, r, true); err != nil {
+						return err
+					}
 				}
 			}
 		}
-		level, paths = next, nextPaths
+		cur = next
 	}
 	return nil
 }
@@ -442,7 +508,7 @@ func goSelectors(ix *index, c *goConds, typ Ref, iface bool, yield func(name str
 // whole method set as that interface's subtype; sets is satisfy's. A pair
 // whose interface is outside the unit (goExternalFile) is handed to external
 // with the interface's method-set keys the type matches in a build that
-// satisfies it instead, since no index entry names that interface. A method of a name
+// satisfies the whole interface instead, since no index entry names that interface. A method of a name
 // has a key per build-dependent signature (goMethodKeys); the pair is
 // satisfied when every name is matched and some build holds, for every name,
 // one of its keys in both the interface and the type (go_build.go).
@@ -529,8 +595,10 @@ func pairSatisfied(dir string, c *goConds, links, sets *pagination.ExternalSort[
 				met = append(met, k.key)
 			}
 		} else {
-			// Some build holds, for every name, one of its keys in both.
+			// Some build holds, for every name, one of its keys in both;
+			// a key is met when such a build holds it.
 			var all goCond
+			var terms []keyed
 			j := 0
 			for i := 0; i < len(ifaceKeys); {
 				name := goKeyName(ifaceKeys[i].key)
@@ -547,7 +615,7 @@ func pairSatisfied(dir string, c *goConds, links, sets *pagination.ExternalSort[
 					if !c.holds(term) {
 						continue
 					}
-					met = append(met, ifaceKeys[i].key)
+					terms = append(terms, keyed{ifaceKeys[i].key, term})
 					if !found {
 						any, found = term, true
 					} else {
@@ -561,6 +629,11 @@ func pairSatisfied(dir string, c *goConds, links, sets *pagination.ExternalSort[
 			}
 			if !c.holds(all) {
 				return nil
+			}
+			for _, t := range terms {
+				if c.holds(c.and(t.cond, all)) {
+					met = append(met, t.key)
+				}
 			}
 		}
 		if refOf(pair[:8]).File == goExternalFile {
