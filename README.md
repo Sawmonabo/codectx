@@ -15,14 +15,19 @@ Build from source until then.
 
 ## Quick start
 
-codectx owns every analyzer it runs and every runtime those analyzers need — no
-Node, no npm, no JDK and no language server of your own.
+codectx must work on any checkout with zero setup
+([docs/product-requirements.md](docs/product-requirements.md)). Its own
+structural and linking providers need nothing on the host. Today it also runs
+pinned external indexers and language servers, and owns every runtime they need —
+no Node, no npm, no JDK and no language server of your own. Whether those
+external analyzers stay in the product is an open decision (section 8 of the
+requirements).
 
-Precise indexing of Go, Rust and Python additionally uses that language's own
-toolchain (`go`, `cargo`, `python3`/`pip3`) the way any build does, because the
-indexer loads the project model through it. Where one is absent that language
-falls back to the structural and linking providers, which need nothing on the
-host; no other language depends on anything you install.
+Precise indexing of Go, Rust and Python by those indexers additionally uses that
+language's own toolchain (`go`, `cargo`, `python3`/`pip3`) the way any build
+does, because the indexer loads the project model through it. Where one is absent
+that language falls back to the structural and linking providers; no other
+language depends on anything you install.
 
 ### Install the latest release
 
@@ -42,7 +47,8 @@ gigabytes. They land in one machine-wide store, `$XDG_DATA_HOME/codectx/tools`,
 shared by every repository on the host, so this happens once per machine and not
 once per checkout.
 
-The whole toolchain is several gigabytes. Two options narrow it:
+The whole toolchain is several gigabytes, all of it for the external analyzers;
+codectx's own providers need none of it. Two options narrow it:
 
 ```sh
 # only the tools this repository's languages select
@@ -146,7 +152,7 @@ codectx mcp serve --repo .
 | Indexing | `index`, `refresh`, `status`, `watch`, `reset`, `gc` |
 | Discovery | `search`, `symbol`, `repo-map`, `source` |
 | Graph queries | `refs`, `callers`, `callees`, `path`, `impact` |
-| Context sessions | `context plan`, `status`, `next`, `entries`, `include`, `read`, `acknowledge`, `waive`, `record`, `advance`, `capsule`, `close`, `export` |
+| Context sessions | `context plan`, `status`, `next`, `entries`, `include`, `read`, `record`, `advance`, `capsule`, `close`, `export`; being removed: `acknowledge`, `waive` (see [Context sessions](#context-sessions)) |
 | Agent integration | `mcp serve` |
 
 `codectx doctor` runs the diagnostic checks — build and toolchain pins,
@@ -219,7 +225,8 @@ from a different question.
 
 If only the bundled structural providers are available the commands still work
 and report their precision; SCIP indexing or LSP analysis enriches the
-same graph and query APIs without changing the agent integration. What that
+same graph and query APIs without changing the agent integration (whether those
+external analyzers stay is an open decision in the requirements). What that
 precision does and does not prove is set out in
 [docs/providers.md](docs/providers.md) and
 [docs/snapshots.md](docs/snapshots.md).
@@ -231,11 +238,16 @@ configuration keys they read.
 
 ## Context sessions
 
-`codectx context` compiles a snapshot-pinned manifest for one task, then tracks
-which actor actually read which bytes of it. A session seals only when every
-required file has a delivery receipt confirmed by the actor that received it, or
-an auditable waiver in its place — so "fully read" is evidence, not a claim.
-[docs/context-sessions.md](docs/context-sessions.md) walks the whole flow.
+`codectx context` compiles a snapshot-pinned plan for one task: the exact code
+to read, in order, sized to the model's window.
+
+Today a session also tracks which actor read which bytes: delivery receipts the
+actor confirms (`acknowledge`), waivers for files it skips (`waive`), and a seal
+that waits for both. Those steps are being removed. Under the product
+requirements (section 4.3) the owner process records every request and what it
+returned, so a lead agent or a reviewer can see which code each agent received,
+with no extra steps for the agent.
+[docs/context-sessions.md](docs/context-sessions.md) walks today's flow.
 
 ```sh
 codectx context plan --task "Add retry semantics to PaymentService.Authorize" \
