@@ -509,10 +509,7 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 		if err != nil {
 			return nil, err
 		}
-		score := min(base+scaled, maxScoreMicros)
-		if score < 0 {
-			score = 0
-		}
+		score := max(min(base+scaled, maxScoreMicros), 0)
 		cands[i].ScoreMicros = score
 		// The routes that were not enumerated are disclosed BEFORE the boost
 		// reasons, the order the streamed passes give them in (reasonRouted

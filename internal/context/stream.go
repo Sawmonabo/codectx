@@ -1134,10 +1134,7 @@ func (c *Compiler) passFBoosts(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		score := min(rec.Base+scaled, maxScoreMicros)
-		if score < 0 {
-			score = 0
-		}
+		score := max(min(rec.Base+scaled, maxScoreMicros), 0)
 		cand := rec.Cand
 		cand.ScoreMicros = score
 		for i, reason := range reasons {

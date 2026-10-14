@@ -117,18 +117,6 @@ func (f *facts) PutAliases(ctx context.Context, list []model.NativeAlias) error 
 	return f.UnitOutput.PutAliases(ctx, list)
 }
 
-// alias finds the node one scoped native key is aliased to.
-func (f *facts) alias(t *testing.T, scopeKey, nativeKey string) model.NodeID {
-	t.Helper()
-	for _, a := range f.aliases {
-		if a.ScopeKey == scopeKey && a.NativeKey == nativeKey {
-			return a.NodeID
-		}
-	}
-	t.Fatalf("no alias %q in scope %q among %d aliases", nativeKey, scopeKey, len(f.aliases))
-	return ""
-}
-
 // byNativeKey finds the one node whose evidence carries the SCIP symbol in
 // the given file (locals recur per document).
 func (f *facts) byNativeKey(t *testing.T, key string, file model.FileID) model.NodeFact {

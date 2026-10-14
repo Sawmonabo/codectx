@@ -572,13 +572,6 @@ func notAdmitted(code string) ledger.Measured {
 		Failure: ledger.ReasonNotAdmitted}
 }
 
-// int64Ptr is the address of a count a span reports at its end. Measured's
-// fields are pointers because an unavailable measurement is absent and never
-// zero; a count the caller has is always available.
-//
-//go:fix inline
-func int64Ptr(n int64) *int64 { return new(n) }
-
 // runsPage is the run list the result publishes and the number of runs that
 // did not fit it. Runs is a wire-sized page -- at most model.MaxRecordsPerResult
 // summaries -- and a generation with more runs than that must say so rather
