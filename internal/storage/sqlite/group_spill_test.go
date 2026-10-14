@@ -56,9 +56,7 @@ func TestAnotherDatabasesLogDoesNotCutTheIngestionGroup(t *testing.T) {
 			if _, err := other.Exec(`CREATE TABLE beat(n INTEGER)`); err != nil {
 				t.Fatalf("create the second database's table: %v", err)
 			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for {
 					select {
 					case <-stop:
@@ -71,7 +69,7 @@ func TestAnotherDatabasesLogDoesNotCutTheIngestionGroup(t *testing.T) {
 					}
 					writes++
 				}
-			}()
+			})
 		}
 
 		before := f.s.Commits()

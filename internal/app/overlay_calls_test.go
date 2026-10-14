@@ -61,8 +61,8 @@ func callFixture() (fake *fakeCallHierarchy, seedA, seedB overlayCallSeed, fileM
 	}
 	item := func(name string, file model.FileID, path string, b uint64) lsp.CallItem {
 		rng := at(b)
-		return lsp.CallItem{Symbol: lsp.Symbol{Name: name, Kind: model.NodeFunction,
-			Location: lsp.Location{File: file, Path: path, ContentHash: string(file), Range: rng, Selection: &rng}}}
+		return lsp.CallItem{Name: name, Kind: model.NodeFunction,
+			Location: lsp.Location{File: file, Path: path, ContentHash: string(file), Range: rng, Selection: &rng}}
 	}
 	site := func(file model.FileID, path string, b uint64) lsp.Location {
 		return lsp.Location{File: file, Path: path, ContentHash: string(file), Range: at(b)}
