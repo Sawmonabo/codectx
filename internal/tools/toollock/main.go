@@ -74,7 +74,7 @@ func selectedTools() (map[string]bool, bool) {
 		return nil, false
 	}
 	m := map[string]bool{}
-	for _, n := range strings.Split(*flagTools, ",") {
+	for n := range strings.SplitSeq(*flagTools, ",") {
 		if n = strings.TrimSpace(n); n != "" {
 			m[n] = true
 		}

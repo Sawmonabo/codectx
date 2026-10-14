@@ -359,10 +359,10 @@ func innermost(items, queries []wire.Span, strict bool) []int {
 			stack = append(stack, io[k])
 		}
 		out[q] = -1
-		for j := len(stack) - 1; j >= 0; j-- {
-			s := items[stack[j]]
+		for _, at := range slices.Backward(stack) {
+			s := items[at]
 			if s.Start <= qs.Start && s.End >= qs.End && !(strict && s == qs) {
-				out[q] = stack[j]
+				out[q] = at
 				break
 			}
 		}

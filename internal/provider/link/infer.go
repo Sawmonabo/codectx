@@ -820,12 +820,7 @@ func (in *inference) fieldDecides(x value, method string) (bool, error) {
 // open and registered, and closes each of prev that is not live.
 func (in *inference) release(mark int, prev []interface{ Close() error }, live ...interface{ Close() error }) {
 	isLive := func(c interface{ Close() error }) bool {
-		for _, l := range live {
-			if l == c {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(live, c)
 	}
 	kept := in.open[:mark]
 	for _, c := range in.open[mark:] {

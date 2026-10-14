@@ -340,7 +340,7 @@ func scenarioFiles() map[string]string {
 		"go.mod":    "module example.com/fixture\n\ngo 1.27\n",
 		"README.md": "# fixture\n",
 	}
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		files[fmt.Sprintf("pkg/f%02d.go", i)] = goFile("pkg", fmt.Sprintf("F%02d", i), "")
 	}
 	return files
@@ -408,7 +408,7 @@ func TestIncrementalScenario(t *testing.T) {
 
 	changed := make([]string, 0, 10)
 	t.Run("ten changed files rebuild only their own units", func(t *testing.T) {
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			p := fmt.Sprintf("pkg/f%02d.go", i)
 			changed = append(changed, p)
 			f.write(p, goFile("pkg", fmt.Sprintf("F%02d", i), "\n// edited\n"))
@@ -746,12 +746,7 @@ func assertRebuilt(t *testing.T, before, after map[string]model.UnitID, changed 
 
 func changedKey(key string, changed []string) bool {
 	_, path, _ := strings.Cut(key, "\x00")
-	for _, c := range changed {
-		if c == path {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(changed, path)
 }
 
 // A supplied index whose path resolves to nothing must still be recorded

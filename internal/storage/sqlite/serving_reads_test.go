@@ -84,9 +84,7 @@ func TestConcurrentReadsDoNotCommitTheRunsIngestionGroupEarly(t *testing.T) {
 		var wg sync.WaitGroup
 		var readErr error
 		if withReaders {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for {
 					select {
 					case <-stop:
@@ -104,7 +102,7 @@ func TestConcurrentReadsDoNotCommitTheRunsIngestionGroupEarly(t *testing.T) {
 					}
 					reads++
 				}
-			}()
+			})
 		}
 
 		before := f.s.Commits()

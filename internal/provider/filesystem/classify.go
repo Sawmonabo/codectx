@@ -189,7 +189,7 @@ func isOpenAPI(lower string) bool {
 
 // inADRDirectory reports whether some component of dir is "adr" or "adrs".
 func inADRDirectory(dir string) bool {
-	for _, part := range strings.Split(dir, "/") {
+	for part := range strings.SplitSeq(dir, "/") {
 		if strings.EqualFold(part, "adr") || strings.EqualFold(part, "adrs") {
 			return true
 		}

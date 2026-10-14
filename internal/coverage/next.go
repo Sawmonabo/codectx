@@ -58,10 +58,7 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (_ model.N
 	// waived and UNREAD file is unread here, is walked like any other, and
 	// raises Remaining -- and whether any waiver blocks readiness remains Task
 	// 17's question, not this one.
-	remaining := c.Required - c.FullyRead
-	if remaining < 0 {
-		remaining = 0
-	}
+	remaining := max(c.Required-c.FullyRead, 0)
 
 	item := model.NextContextItem{Binding: rec.Binding, Remaining: remaining}
 	cov, err := s.nextUnserved(ctx, rec)
@@ -140,10 +137,7 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (_ model.N
 // [0,ConfirmedBytes] -- at most 1 + log2(ConfirmedBytes) bounded boolean
 // questions, and never an interval list crossing into Go.
 func (s *Service) resumeOffset(ctx context.Context, rec sqlite.SessionRecord, cov model.FileCoverage) (uint64, error) {
-	hi := cov.ConfirmedBytes
-	if hi > cov.Size {
-		hi = cov.Size
-	}
+	hi := min(cov.ConfirmedBytes, cov.Size)
 	if hi <= 0 {
 		// Nothing is confirmed, so the whole file is still to read. Storage is
 		// not asked: the empty interval is not a range it can be asked about.

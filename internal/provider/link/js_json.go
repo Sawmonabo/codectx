@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 )
 
 // jkind is the kind of one JSON value (jval).
@@ -39,8 +40,8 @@ func (v jval) get(key string) (jval, bool) {
 	if v.kind != jObject {
 		return jval{}, false
 	}
-	for i := len(v.keys) - 1; i >= 0; i-- {
-		if v.keys[i] == key {
+	for i, v0 := range slices.Backward(v.keys) {
+		if v0 == key {
 			return v.items[i], true
 		}
 	}

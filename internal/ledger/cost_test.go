@@ -59,7 +59,7 @@ func BenchmarkCollectorRun(b *testing.B) {
 		}
 		ctx := run.Context(context.Background())
 		stageCtx, stage := ledger.Start(ctx, "structural_parse", "")
-		for unit := 0; unit < spansPerRun-1; unit++ {
+		for range spansPerRun - 1 {
 			_, span := ledger.StartProvider(stageCtx, "unit", "scope", "structural")
 			span.AddIn(1)
 			span.AddOut(2)

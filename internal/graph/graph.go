@@ -506,8 +506,7 @@ func typedContextError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return err
 	}
 	switch {

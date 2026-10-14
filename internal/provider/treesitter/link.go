@@ -254,8 +254,8 @@ func (b *builder) linkTable() error {
 			continue
 		}
 		t.Decls[i].Parameters = append(t.Decls[i].Parameters, link.Parameter{
-			Endpoint: link.Endpoint{Kind: model.NodeVariable, Name: bound(string(b.src[p.Name.Start:p.Name.End]), model.MaxNameBytes), Range: *rng},
-			Index:    p.Index, Variadic: p.Variadic, KeywordOnly: p.KeywordOnly})
+			Kind: model.NodeVariable, Name: bound(string(b.src[p.Name.Start:p.Name.End]), model.MaxNameBytes), Range: *rng,
+			Index: p.Index, Variadic: p.Variadic, KeywordOnly: p.KeywordOnly})
 	}
 	t.Reexports = wl.Reexports
 	t.Routing = b.linkRouting(siteAt, t.Sites)

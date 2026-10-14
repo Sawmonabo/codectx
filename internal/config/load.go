@@ -310,8 +310,7 @@ func decodeFile(path string, v *Config) (*toml.MetaData, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
-		var parseErr toml.ParseError
-		if errors.As(err, &parseErr) {
+		if parseErr, ok := errors.AsType[toml.ParseError](err); ok {
 			return nil, configInvalid("%s is not valid TOML: %s", path, parseErr.ErrorWithPosition())
 		}
 		return nil, configInvalid("%s cannot be read: %v", path, err)

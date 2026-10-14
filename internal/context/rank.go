@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
 	"sort"
 	"strings"
 
@@ -257,10 +258,7 @@ func boostsForCounts(cand candidate, associated bool, edges int64) (int64, []str
 	}
 	pkg := packageOf(cand.Path)
 	if edges > 0 {
-		boost := edges * centralityPerEdgeMicros
-		if boost > boostCentralityMax {
-			boost = boostCentralityMax
-		}
+		boost := min(edges*centralityPerEdgeMicros, boostCentralityMax)
 		total += boost
 		reasons = append(reasons, fmt.Sprintf("the walks from the named seeds crossed %d distinct edges in %s", edges, packageLabel(pkg)))
 	}
@@ -275,12 +273,7 @@ func boostsForCounts(cand candidate, associated bool, edges int64) (int64, []str
 // definition rather than re-spelled here: a second list would let the boost and
 // the seed step disagree about what a captured change is.
 func isCapturedChange(s model.FileStatus) bool {
-	for _, changed := range changedStatuses {
-		if s == changed {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(changedStatuses, s)
 }
 
 // associatedTestOrContract reports whether the candidate is an associated test
@@ -339,10 +332,8 @@ func appendReason(reasons []string, reason string) []string {
 	if reason == "" {
 		return reasons
 	}
-	for _, existing := range reasons {
-		if existing == reason {
-			return reasons
-		}
+	if slices.Contains(reasons, reason) {
+		return reasons
 	}
 	return append(reasons, reason)
 }

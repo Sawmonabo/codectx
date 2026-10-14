@@ -184,7 +184,7 @@ func (r Root) checkPath(rel string) (string, error) {
 	if strings.HasPrefix(slashed, "/") || filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" {
 		return "", pathError("%q is absolute; workspace paths are root-relative", rel)
 	}
-	for _, part := range strings.Split(slashed, "/") {
+	for part := range strings.SplitSeq(slashed, "/") {
 		switch part {
 		case "":
 			return "", pathError("%q has an empty path component", rel)

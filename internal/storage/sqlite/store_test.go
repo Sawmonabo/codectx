@@ -484,11 +484,9 @@ func TestStorePublicationScenario(t *testing.T) {
 	var wg sync.WaitGroup
 	var released atomic.Bool
 	raceErr := make(chan error, 64)
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 5; j++ {
+	for range 4 {
+		wg.Go(func() {
+			for range 5 {
 				r, err := f.s.PinGeneration(ctx, f.repo, 0, time.Minute)
 				if err != nil {
 					raceErr <- err
@@ -501,12 +499,10 @@ func TestStorePublicationScenario(t *testing.T) {
 					raceErr <- err
 				}
 			}
-		}()
+		})
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for attempt := 0; attempt < 10_000; attempt++ {
+	wg.Go(func() {
+		for attempt := range 10_000 {
 			err := f.s.DeleteGeneration(ctx, gen1)
 			if err == nil {
 				if !released.Load() {
@@ -530,7 +526,7 @@ func TestStorePublicationScenario(t *testing.T) {
 			}
 		}
 		raceErr <- errors.New("DeleteGeneration never succeeded after the lease was released")
-	}()
+	})
 	wg.Wait()
 	close(raceErr)
 	for err := range raceErr {
@@ -1815,9 +1811,7 @@ func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for i := range ingesters {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for j := range perCaller {
 				rec := blobRecord(fmt.Sprintf("ingested %d/%d\n", i, j))
 				if err := f.s.PutBlob(ctx, rec); err != nil {
@@ -1828,12 +1822,10 @@ func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 				hashes = append(hashes, rec.Hash)
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	for i := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for j := range perCaller {
 				// A batch of this caller's own first, so the exclusive write
 				// behind it finds an ingestion group open.
@@ -1857,7 +1849,7 @@ func TestExclusiveWritesInterleavedWithIngestionOnTheOneWriter(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

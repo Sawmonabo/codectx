@@ -399,12 +399,10 @@ func (r *Reader) spans(ctx context.Context, runID []byte, runWallMS int64, now t
 	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM spans WHERE run_id = ?`, runID).Scan(&total); err != nil {
 		return nil, 0, wrap("count run spans", err)
 	}
-	omitted := total - int64(len(out))
-	if omitted < 0 {
+	omitted := max(total-int64(len(out)),
 		// A span deleted between the page and the count: the page is still
 		// every span this read saw, and nothing was omitted from it.
-		omitted = 0
-	}
+		0)
 	return out, omitted, nil
 }
 

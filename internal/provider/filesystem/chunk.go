@@ -164,7 +164,7 @@ func overlap(body []byte) int {
 	}
 	end := len(body) - 1 // the trailing newline
 	start := len(body)
-	for lines := 0; lines < MaxOverlapLines; lines++ {
+	for range MaxOverlapLines {
 		prev := bytes.LastIndexByte(body[:end], '\n')
 		lineStart := prev + 1
 		if len(body)-lineStart > MaxOverlapBytes {

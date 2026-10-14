@@ -22,7 +22,7 @@ func procIO(t *testing.T, field string) int64 {
 	if err != nil {
 		t.Skipf("/proc/self/io: %v", err)
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
+	for line := range strings.SplitSeq(string(raw), "\n") {
 		if rest, ok := strings.CutPrefix(line, field+": "); ok {
 			n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
 			if err != nil {
@@ -104,7 +104,7 @@ func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, salt strin
 		facts := make([]model.NodeFact, 0, perUnit)
 		aliases := make([]model.NativeAlias, 0, perUnit)
 		docs := make([]model.SearchUnit, 0, perUnit)
-		for i := 0; i < perUnit; i++ {
+		for i := range perUnit {
 			node, key := nodeOf(ff, i)
 			ev := model.Evidence{UnitID: w.UnitID(), ProviderID: providerID, ProviderVersion: providerVersion,
 				OriginRunID: run, NodeID: node.ID, Precision: model.PrecisionSyntax, FileID: ff.id,
@@ -121,7 +121,7 @@ func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, salt strin
 			t.Fatalf("PutNodes(%d): %v", ui, err)
 		}
 		rels := make([]model.RelationFact, 0, perUnit)
-		for i := 0; i < perUnit; i++ {
+		for i := range perUnit {
 			from, _ := nodeOf(ff, i)
 			// Calls stay inside the unit (a relation endpoint must be a node
 			// the unit sees); the identities are content hashes, so every

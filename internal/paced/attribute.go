@@ -1,5 +1,7 @@
 package paced
 
+import "maps"
+
 import "sync"
 
 // A Purpose names what a removal was for. The set is small and closed on
@@ -80,9 +82,7 @@ func FreedByPurpose() map[Purpose]int64 {
 	freedMu.Lock()
 	defer freedMu.Unlock()
 	out := make(map[Purpose]int64, len(freed))
-	for p, n := range freed {
-		out[p] = n
-	}
+	maps.Copy(out, freed)
 	return out
 }
 

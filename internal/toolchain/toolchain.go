@@ -99,8 +99,7 @@ func resourceLimit(format string, args ...any) *model.Error {
 // cancellation stays cancellation, everything else is internal, and only the
 // operation and the operating-system reason survive -- never the path.
 func ioError(op string, err error) error {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

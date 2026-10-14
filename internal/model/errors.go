@@ -161,8 +161,7 @@ func ClassifyQueryDeadline(ctx context.Context, op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var typed *Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*Error](err); ok {
 		return err
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -176,16 +175,13 @@ func ClassifyQueryDeadline(ctx context.Context, op string, err error) error {
 // error message that reaches an ordinary surface names the failure without the
 // host path it happened on; an error that is none of these is returned as is.
 func BareCause(err error) error {
-	var pe *fs.PathError
-	if errors.As(err, &pe) {
+	if pe, ok := errors.AsType[*fs.PathError](err); ok {
 		return pe.Err
 	}
-	var le *os.LinkError
-	if errors.As(err, &le) {
+	if le, ok := errors.AsType[*os.LinkError](err); ok {
 		return le.Err
 	}
-	var se *os.SyscallError
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*os.SyscallError](err); ok {
 		return se.Err
 	}
 	return err

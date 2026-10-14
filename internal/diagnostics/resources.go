@@ -69,8 +69,7 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 // left absent for: a typed error's code, message and remediation, or the
 // error's own text.
 func warningText(err error) string {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		if typed.Remediation != "" {
 			return typed.Code + ": " + typed.Message + " -- " + typed.Remediation
 		}

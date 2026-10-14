@@ -96,8 +96,7 @@ func toolFailure(log *slog.Logger, err error) error {
 	if err == nil {
 		return nil
 	}
-	var domain *model.Error
-	if errors.As(err, &domain) {
+	if domain, ok := errors.AsType[*model.Error](err); ok {
 		return &toolError{err: domain}
 	}
 	if log != nil {

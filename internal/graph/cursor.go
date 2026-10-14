@@ -87,7 +87,7 @@ type traversalCursor struct {
 	//
 	// It is a position in ONE generation's packed adjacency. The generation
 	// fence on this cursor is what keeps it from being applied to another.
-	LevelPos EdgePos `json:"level_pos,omitempty"`
+	LevelPos EdgePos `json:"level_pos"`
 	// Level is the BFS level the walk stopped in and LevelState which of the
 	// level's two states it was in (traverse.go). Together with the position
 	// fields they are the whole of what a walk continuation resumes: the
@@ -794,8 +794,7 @@ func terminalOutcome(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return false
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		return !typed.Retryable
 	}
 	// An untyped error is not a refusal this engine classified; keeping the

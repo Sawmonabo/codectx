@@ -64,7 +64,7 @@ func TestSinkBoundsAreEnforcedAtTheBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sink.Discard()
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		if err := sink.PutAliases(ctx, []model.NativeAlias{alias}); err != nil {
 			t.Fatalf("PutAliases(%d): %v", i, err)
 		}

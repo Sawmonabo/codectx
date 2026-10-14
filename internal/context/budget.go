@@ -151,7 +151,7 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 		ReasonCount:   int64(len(c.Reasons)),
 		RouteCount:    int64(len(paths)),
 	}
-	for i := 0; i < sizeIterations; i++ {
+	for range sizeIterations {
 		served := e
 		served.Reasons, served.EvidencePaths = nil, nil
 		served.ReasonCount, served.RouteCount = explanationCountCharge, explanationCountCharge

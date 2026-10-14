@@ -200,7 +200,7 @@ func TestFullBusDropsAndNeverBlocks(t *testing.T) {
 	go func() {
 		defer close(produced)
 		time.Sleep(2 * flushIntervalForTest)
-		for i := 0; i < 8192; i++ {
+		for range 8192 {
 			_, span := ledger.Start(ctx, "precise_unit", "scope")
 			span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 		}
@@ -391,7 +391,7 @@ func TestSpansPastOnePageAreCountedAsOmitted(t *testing.T) {
 	const beyond = 3
 	l, dir := openLedger(t)
 	run, ctx := newRun(t, l)
-	for i := 0; i < model.MaxRecordsPerResult+beyond; i++ {
+	for i := range model.MaxRecordsPerResult + beyond {
 		_, span := ledger.Start(ctx, "unit", "pkg/"+strconv.Itoa(i))
 		span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
 	}

@@ -162,7 +162,7 @@ func (h *harness) consolidating(t *testing.T) (sqlite.SessionRecord, gate) {
 func (h *harness) seedUnresolved(t *testing.T, n int) {
 	t.Helper()
 	fs := h.store.sessions[fixtureSession]
-	for i := 0; i < n; i++ {
+	for i := range n {
 		req := model.ObservationRequest{
 			SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: fs.rec.ScopeVersion,
 			Kind: model.ObservationUnresolved, Note: "open question " + strconv.Itoa(i),

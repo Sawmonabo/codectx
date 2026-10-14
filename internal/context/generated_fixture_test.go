@@ -285,7 +285,7 @@ func TestACompileSortHoldsItsRunBudgetAndSpills(t *testing.T) {
 		t.Fatalf("newSort: %v", err)
 	}
 	const records = 20000
-	for i := 0; i < records; i++ {
+	for i := range records {
 		if err := sort.Add(candRec{Seq: int64(i), NodeID: model.NodeID(fmt.Sprintf("%040x", i)),
 			Requirement: model.RequirementFull}); err != nil {
 			t.Fatalf("Add: %v", err)

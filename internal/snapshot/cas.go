@@ -628,7 +628,7 @@ func isBucketName(name string) bool {
 	if len(name) != 2 {
 		return false
 	}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		c := name[i]
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false

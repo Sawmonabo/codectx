@@ -2,7 +2,7 @@ package workflow
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -272,7 +272,7 @@ func (s *Service) filesFullyRead(ctx context.Context, rec sqlite.SessionRecord, 
 	for id := range wanted {
 		distinct = append(distinct, id)
 	}
-	sort.Slice(distinct, func(i, j int) bool { return distinct[i] < distinct[j] })
+	slices.Sort(distinct)
 	last := distinct[len(distinct)-1]
 
 	found := make(map[model.FileID]model.FileCoverage, len(distinct))

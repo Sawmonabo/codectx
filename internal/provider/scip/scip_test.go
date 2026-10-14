@@ -457,7 +457,7 @@ func bigIndex(textBytes, n int) []byte {
 	def = appendVarint(def, 3, 1)
 	doc = appendBytes(doc, 2, def)
 	ref := appendBytes(appendBytes(nil, 1, packed(2, 11, 12)), 2, []byte("scip-go gomod example.com/big . big/G()."))
-	for i := 0; i < n; i++ {
+	for range n {
 		doc = appendBytes(doc, 2, ref)
 	}
 	doc = appendBytes(doc, 3, appendVarint(appendBytes(nil, 1, []byte("scip-go gomod example.com/big . big/F().")), 5, 17))

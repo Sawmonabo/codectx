@@ -14,6 +14,7 @@ package context
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
@@ -755,8 +756,8 @@ func (s *compileSorts) Close() error {
 		return nil
 	}
 	var err error
-	for i := len(s.release) - 1; i >= 0; i-- {
-		if cerr := s.release[i](); cerr != nil && err == nil {
+	for _, v := range slices.Backward(s.release) {
+		if cerr := v(); cerr != nil && err == nil {
 			err = cerr
 		}
 	}
@@ -1133,10 +1134,7 @@ func (c *Compiler) passFBoosts(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		score := rec.Base + scaled
-		if score > maxScoreMicros {
-			score = maxScoreMicros
-		}
+		score := min(rec.Base+scaled, maxScoreMicros)
 		if score < 0 {
 			score = 0
 		}

@@ -171,16 +171,16 @@ func arity(signature, name string, member bool) (lo, hi int64, ok bool) {
 		return 0, 0, false
 	}
 	rest := signature[at+len(name):]
-	open := strings.IndexByte(rest, '(')
-	if open < 0 {
+	before, after, ok := strings.Cut(rest, "(")
+	if !ok {
 		return 0, 0, false
 	}
 	// Generic parameters between the name and the list (`foo<T>(`) are
 	// skipped; anything else there means this is not the parameter list.
-	if between := strings.TrimSpace(rest[:open]); between != "" && !strings.HasPrefix(between, "<") {
+	if between := strings.TrimSpace(before); between != "" && !strings.HasPrefix(between, "<") {
 		return 0, 0, false
 	}
-	params, closed := splitParams(rest[open+1:])
+	params, closed := splitParams(after)
 	if !closed {
 		return 0, 0, false
 	}

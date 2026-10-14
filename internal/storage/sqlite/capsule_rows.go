@@ -49,7 +49,7 @@ func writeCapsuleRows(ctx context.Context, tx *sql.Tx, sessionRaw []byte,
 		rows := len(args) / capsuleRowColumns
 		var b strings.Builder
 		b.WriteString(`INSERT INTO context_capsule_rows(session_id, list, ordinal, row_key, row_json) VALUES `)
-		for i := 0; i < rows; i++ {
+		for i := range rows {
 			if i > 0 {
 				b.WriteByte(',')
 			}

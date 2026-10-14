@@ -30,7 +30,7 @@ func pyDecl(kind model.NodeKind, qualified string, parent int32) Decl {
 			break
 		}
 	}
-	return Decl{Endpoint: Endpoint{Kind: kind, Name: name, Qualified: qualified}, Parent: parent}
+	return Decl{Kind: kind, Name: name, Qualified: qualified, Parent: parent}
 }
 
 func pyClass(q string) Decl               { return pyDecl(model.NodeClass, q, -1) }
@@ -158,8 +158,8 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// the binding rules alone); the two agree on every binding.
 			anchor: "The Python Language Reference §6.3.4 (Calls: argument binding to parameters)",
 			tables: []*Table{{Path: "pets.py",
-				Decls: []Decl{pyClass("Cat"), pyMethod("Cat.meow", 0), {Endpoint: Endpoint{Kind: model.NodeFunction,
-					Name: "speak", Qualified: "speak"}, Parent: -1, Described: true, Params: 1}, pyFunc("main")},
+				Decls: []Decl{pyClass("Cat"), pyMethod("Cat.meow", 0), {Kind: model.NodeFunction,
+					Name: "speak", Qualified: "speak", Parent: -1, Described: true, Params: 1}, pyFunc("main")},
 				Sites: []Site{
 					{Caller: 2, Callee: "meow", Shape: wire.ShapeMember, Receiver: wire.Type{Kind: wire.TypeParam, Index: 0}},
 					{Caller: 3, Callee: "speak", Shape: wire.ShapeBare, Candidates: []int32{2},
@@ -181,8 +181,8 @@ func TestResolvePythonGoldens(t *testing.T) {
 			// the binding rules alone); the two agree on every binding.
 			anchor: "The Python Language Reference §7.6 (The return statement), §6.3.4 (Calls)",
 			tables: []*Table{{Path: "db.py",
-				Decls: []Decl{pyClass("Conn"), pyMethod("Conn.close", 0), {Endpoint: Endpoint{Kind: model.NodeFunction,
-					Name: "open_conn", Qualified: "open_conn"}, Parent: -1, Described: true,
+				Decls: []Decl{pyClass("Conn"), pyMethod("Conn.close", 0), {Kind: model.NodeFunction,
+					Name: "open_conn", Qualified: "open_conn", Parent: -1, Described: true,
 					Returns: wire.Type{Kind: wire.TypeResult, Index: 0}}, pyFunc("main")},
 				Sites: []Site{
 					{Caller: 2, Callee: "Conn", Shape: wire.ShapeBare, Candidates: []int32{0}},

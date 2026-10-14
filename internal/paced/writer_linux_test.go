@@ -68,7 +68,7 @@ func TestAWriterHandsTheDiskOneWindowAtATime(t *testing.T) {
 	writtenBefore := procIO(t, "write_bytes")
 	waitsBefore := Waits()
 	w := bufio.NewWriter(NewWriter(f))
-	for i := 0; i < chunks; i++ {
+	for range chunks {
 		if _, err := w.Write(chunk); err != nil {
 			t.Fatal(err)
 		}

@@ -41,7 +41,7 @@ func TestASlowSubscriberNeverPacesTheRun(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for i := 0; i < spanQueueDepth*4; i++ {
+		for i := range spanQueueDepth * 4 {
 			fanout.publish(ledger.SpanRow{Seq: int64(i), Stage: "walk", Outcome: ledger.OutcomeOK})
 		}
 	}()

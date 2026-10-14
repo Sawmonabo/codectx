@@ -705,7 +705,7 @@ func extremeDetail(key string, a, b model.CapabilityState) bool {
 func joinDetailValues(a, b string) (value string, truncated bool) {
 	parts := make([]string, 0, 8)
 	for _, v := range []string{a, b} {
-		for _, part := range strings.Split(v, detailSeparator) {
+		for part := range strings.SplitSeq(v, detailSeparator) {
 			if part != "" {
 				parts = append(parts, part)
 			}

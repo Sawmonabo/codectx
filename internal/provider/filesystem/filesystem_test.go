@@ -211,7 +211,7 @@ func TestBinaryDecisionIsAProportion(t *testing.T) {
 		"assets/img.png": pngBytes(8192),
 		"assets/utf16.txt": func() string {
 			var b strings.Builder
-			for i := 0; i < 2000; i++ {
+			for range 2000 {
 				b.WriteString("a\x00")
 			}
 			return b.String()

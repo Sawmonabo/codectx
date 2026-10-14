@@ -496,7 +496,7 @@ func (g *Git) filterOverrides(ctx context.Context, root string) ([]string, error
 	seen := map[string]bool{}
 	overFilters := false
 	var env []string
-	for _, record := range bytes.Split(out.Bytes(), []byte{0}) {
+	for record := range bytes.SplitSeq(out.Bytes(), []byte{0}) {
 		key, _, _ := bytes.Cut(record, []byte{'\n'})
 		if len(key) == 0 {
 			continue
@@ -531,7 +531,7 @@ func zeroObjectID(like string) string { return strings.Repeat("0", len(like)) }
 // follows them.
 func splitFields(record []byte, n int) (fields []string, path string, ok bool) {
 	rest := record
-	for i := 0; i < n; i++ {
+	for range n {
 		field, tail, found := bytes.Cut(rest, []byte{' '})
 		if !found {
 			return nil, "", false

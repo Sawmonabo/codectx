@@ -1484,8 +1484,7 @@ func argumentInvalid(format string, args ...any) *model.Error {
 // spelling: the typed answer contextErr already made of it, or the bare context
 // error a dependency below that mapping returns.
 func isQueryDeadline(ctx context.Context, err error) bool {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		return typed.Code == model.CodeQueryDeadline
 	}
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)

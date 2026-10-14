@@ -111,7 +111,7 @@ func pathProofGraph(width int) *pathGraph {
 		{"mid", "t", string(model.RelImports)},   // cost 4 at the target
 		{"mid", "dead", string(model.RelCalls)},  // a settled node that reaches nothing
 	}
-	for i := 0; i < width; i++ {
+	for i := range width {
 		edges = append(edges,
 			[3]string{"s", fmt.Sprintf("f%03d", i), string(model.RelCalls)},
 			[3]string{fmt.Sprintf("f%03d", i), fmt.Sprintf("g%03d", i), string(model.RelCalls)})
@@ -507,7 +507,7 @@ func TestPathDeadlineMintsAResumableCursor(t *testing.T) {
 	// The continuation runs under a deadline it can finish in.
 	e.limits.QueryTimeout = time.Minute
 	cursor := first.Meta.NextCursor
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		res, err := e.ShortestPath(context.Background(),
 			model.PathRequest{From: from, To: to, Relations: kinds,
 				Page: model.PageRequest{Cursor: cursor}})
@@ -753,7 +753,7 @@ func TestRetryableFailureLeavesAPathContinuationAdoptable(t *testing.T) {
 
 	// The SAME cursor, which is exactly what a retryable error tells the caller
 	// to present, and the search carries on to its answer.
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		res, err := e.ShortestPath(context.Background(), resume)
 		if err != nil {
 			t.Fatalf("retry %d after a retryable failure: %v", i, err)

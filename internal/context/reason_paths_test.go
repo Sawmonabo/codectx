@@ -20,7 +20,7 @@ import (
 func TestConfiguredReasonPathsSurviveToTheStoredEntry(t *testing.T) {
 	const routes = model.MaxReasonPathsPerEntry + 2
 	paths := make([]model.RelationPath, 0, routes)
-	for i := 0; i < routes; i++ {
+	for i := range routes {
 		paths = append(paths, model.RelationPath{
 			Relations: []model.RelationID{model.RelationID(hexID(byte(i)))},
 		})

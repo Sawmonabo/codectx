@@ -666,7 +666,7 @@ func readSection[T any](s stateReader, what string, decode func([]byte) (T, erro
 		return err
 	}
 	var last T
-	for i := uint64(0); i < n; i++ {
+	for i := range n {
 		raw, err := s.str("a record of its " + what)
 		if err != nil {
 			return err
@@ -748,7 +748,7 @@ func readState(r io.Reader, sink stateSink) error {
 		return err
 	}
 	var lastField manifestField
-	for i := uint64(0); i < n; i++ {
+	for i := range n {
 		var f manifestField
 		if f.Key, err = s.str("a manifest field"); err != nil {
 			return err

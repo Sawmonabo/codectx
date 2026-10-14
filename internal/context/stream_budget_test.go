@@ -232,7 +232,7 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 	// uniformly and prove nothing.
 	wide := make([]candidate, 0, 16)
 	wideFiles := append([]model.FileVersion(nil), files...)
-	for i := 0; i < 15; i++ {
+	for i := range 15 {
 		id := model.FileID("w" + string(rune('a'+i)))
 		path := "internal/wide/" + string(rune('a'+i)) + ".go"
 		wideFiles = append(wideFiles, fileVersion(string(id), path, 256))

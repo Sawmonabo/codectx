@@ -99,10 +99,10 @@ func relationFixture(t *testing.T, nodes, edgesPerNode int) (graph.GraphReader, 
 	byNode := map[model.NodeID][]model.Relation{}
 	all := make([]model.Relation, 0, nodes*edgesPerNode)
 	nodeFacts := make([]model.Node, 0, nodes)
-	for n := 0; n < nodes; n++ {
+	for n := range nodes {
 		node := model.NodeID(fmt.Sprintf("n%03d", n))
 		nodeFacts = append(nodeFacts, model.Node{ID: node, Kind: model.NodeFunction})
-		for e := 0; e < edgesPerNode; e++ {
+		for e := range edgesPerNode {
 			rel := model.Relation{ID: model.RelationID(fmt.Sprintf("r%04d", n*edgesPerNode+e)),
 				From: node, To: model.NodeID(fmt.Sprintf("n%03d", (n+1)%nodes)),
 				Kind: scopeRelations[e%len(scopeRelations)]}
@@ -365,7 +365,7 @@ func TestPassEMatchesCentralityMap(t *testing.T) {
 	edges = edges.WithFold(foldPkgEdgeDistinct)
 
 	reference := map[string]map[model.RelationID]struct{}{}
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		// Repeats across packages and within one, in an order no package's
 		// edges are contiguous in, so the sort is what makes them so.
 		pkg := fmt.Sprintf("pkg%d", i%7)
@@ -421,7 +421,7 @@ func TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound(t *testing.T) {
 	const nodes, edgesPerNode, hops = 60, 6, 4
 	g, evidence, edges := relationFixture(t, nodes, edgesPerNode)
 	ids := make([]model.NodeID, 0, nodes)
-	for n := 0; n < nodes; n++ {
+	for n := range nodes {
 		ids = append(ids, model.NodeID(fmt.Sprintf("n%03d", n)))
 	}
 	cands := candidatesOver(edges, ids, hops)

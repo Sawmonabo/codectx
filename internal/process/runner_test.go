@@ -398,7 +398,7 @@ func TestLiveSubprocessCountUnwindsOnFailure(t *testing.T) {
 	observed := make(chan int64, 1)
 	go func() {
 		var peak int64
-		for i := 0; i < 200; i++ {
+		for range 200 {
 			if n := runner.LiveSubprocesses(); n > peak {
 				peak = n
 			}

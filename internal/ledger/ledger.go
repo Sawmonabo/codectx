@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -585,8 +586,7 @@ func (l *Ledger) IndexRunID() (string, bool) {
 	c.runsMu.Lock()
 	runs := append([]*Run(nil), c.runs...)
 	c.runsMu.Unlock()
-	for i := len(runs) - 1; i >= 0; i-- {
-		run := runs[i]
+	for _, run := range slices.Backward(runs) {
 		if run.kind != KindIndex {
 			continue
 		}
@@ -921,8 +921,7 @@ func (c *collector) writeTx(ctx context.Context, fn func(tx *sql.Tx) error) erro
 // diagnosticCode reports a typed error's code, and the internal family for an
 // error that carries none, so a failed span always names a family.
 func diagnosticCode(err error) string {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		return typed.Code
 	}
 	return model.CodeInternal

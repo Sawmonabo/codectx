@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sort"
+	"slices"
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -367,7 +367,7 @@ func (src *capsuleSource) facts(ctx context.Context, e *capsuleEmitter, kind mod
 				rels = append(rels, ref.RelationID)
 			}
 		}
-		sort.Slice(rels, func(i, j int) bool { return rels[i] < rels[j] })
+		slices.Sort(rels)
 		var previous model.RelationID
 		for i, r := range rels {
 			if i > 0 && r == previous {

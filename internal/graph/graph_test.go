@@ -117,11 +117,11 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	addNode("n-d", model.NodeFunction, "n-d")
 	addNode("n-var", model.NodeVariable, "n-var")
 	addNode("n-sink", model.NodeFunction, "n-sink")
-	for i := 0; i < fixtureLeafCount; i++ {
+	for i := range fixtureLeafCount {
 		addNode(fmt.Sprintf("n-leaf-%02d", i), model.NodeFunction, fmt.Sprintf("leaf%02d", i))
 	}
 	addNode("n-wide", model.NodeFunction, "n-wide")
-	for i := 0; i < fixtureWideCount; i++ {
+	for i := range fixtureWideCount {
 		addNode(fmt.Sprintf("n-wide-leaf-%03d", i), model.NodeFunction, fmt.Sprintf("wide%03d", i))
 	}
 	// pkg-wide-a and pkg-wide-b make n-wide's fan-out a CROSS-package one, so a
@@ -137,7 +137,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// existing scenario's neighbourhood gains an edge it did not have.
 	addNode("n-ref", model.NodeFunction, "n-ref")
 	addNode("n-ref-caller", model.NodeFunction, "n-ref-caller")
-	for i := 0; i < fixtureWideCount; i++ {
+	for i := range fixtureWideCount {
 		addNode(fmt.Sprintf("n-ref-src-%03d", i), model.NodeFunction, fmt.Sprintf("refsrc%03d", i))
 	}
 
@@ -190,14 +190,14 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		bare[len(edges)] = true
 		edges = append(edges, e)
 	}
-	for i := 0; i < fixtureLeafCount; i++ {
+	for i := range fixtureLeafCount {
 		edges = append(edges, edge{"n-hub", model.RelCalls, fmt.Sprintf("n-leaf-%02d", i)})
 	}
 	// n-a calls the hub, so the fan-out is reachable from the same seed as the cycle.
 	edges = append(edges, edge{"n-a", model.RelCalls, "n-hub"})
 	// n-wide's fan-out is declared last so every relation id above keeps the
 	// position it had before this hub existed.
-	for i := 0; i < fixtureWideCount; i++ {
+	for i := range fixtureWideCount {
 		edges = append(edges, edge{"n-wide", model.RelCalls, fmt.Sprintf("n-wide-leaf-%03d", i)})
 	}
 	// Containment for that neighbourhood, again declared after everything that
@@ -205,12 +205,12 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// more than one clamped page, which is what makes rollup.go's containsEdges
 	// loop observable at all.
 	addBare(edge{"pkg-wide-a", model.RelContains, "n-wide"})
-	for i := 0; i < fixtureWideCount; i++ {
+	for i := range fixtureWideCount {
 		addBare(edge{"pkg-wide-b", model.RelContains, fmt.Sprintf("n-wide-leaf-%03d", i)})
 	}
 	// n-ref's incoming references carry no evidence, so a reference walk reads
 	// them, advances its keyset past them and emits nothing for them...
-	for i := 0; i < fixtureWideCount; i++ {
+	for i := range fixtureWideCount {
 		addBare(edge{fmt.Sprintf("n-ref-src-%03d", i), model.RelReferences, "n-ref"})
 	}
 	// ...and this is the one occurrence-bearing relation, declared last so it
@@ -631,7 +631,7 @@ func TestGraphScenarios(t *testing.T) {
 					{fixtureRelationID(13), fixtureRelationID(14)}, // n-a -> n-p -> n-z
 					{fixtureRelationID(15), fixtureRelationID(16)}, // n-a -> n-q -> n-z
 				}
-				for run := 0; run < 100; run++ {
+				for run := range 100 {
 					got, err := engine.ShortestPath(context.Background(), model.PathRequest{
 						From:      fixtureNodeID("n-a"),
 						To:        fixtureNodeID("n-z"),

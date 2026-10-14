@@ -299,8 +299,7 @@ func runLedgerArm(exe, repo, dataDir, arm string) (ledgerArmResult, error) {
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 	out, err := cmd.Output()
 	if err != nil {
-		var ex *exec.ExitError
-		if errors.As(err, &ex) {
+		if ex, ok := errors.AsType[*exec.ExitError](err); ok {
 			return ledgerArmResult{}, fmt.Errorf("arm %s: %v: %s", arm, err, ex.Stderr)
 		}
 		return ledgerArmResult{}, fmt.Errorf("arm %s: %w", arm, err)
@@ -311,13 +310,13 @@ func runLedgerArm(exe, repo, dataDir, arm string) (ledgerArmResult, error) {
 const ledgerArmResultPrefix = "LEDGER-COST-ARM "
 
 func parseLedgerArmResult(out string) (ledgerArmResult, error) {
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		rest, ok := strings.CutPrefix(strings.TrimSpace(line), ledgerArmResultPrefix)
 		if !ok {
 			continue
 		}
 		var res ledgerArmResult
-		for _, field := range strings.Fields(rest) {
+		for field := range strings.FieldsSeq(rest) {
 			key, value, ok := strings.Cut(field, "=")
 			if !ok {
 				return res, fmt.Errorf("arm result field %q is not key=value", field)

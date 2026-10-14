@@ -258,7 +258,7 @@ func addReferences(t *testing.T, f *graphFixture, node string, rows []int) {
 		rel := model.RelationID(fmt.Sprintf("%064x", 0xe000+i))
 		f.relations = append(f.relations, model.Relation{
 			ID: rel, From: src, Kind: model.RelCalls, To: target})
-		for j := 0; j < n; j++ {
+		for j := range n {
 			row := proto
 			row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-defer-%d-%d", i, j))[:model.EvidenceIDHexLen])
 			row.RelationID = rel
@@ -288,7 +288,7 @@ func widenReferences(t *testing.T, f *graphFixture, node string, n int) {
 	t.Helper()
 	proto := protoEvidence(t, f)
 	target := fixtureNodeID(node)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		name := fmt.Sprintf("n-page-src-%d", i)
 		src := fixtureNodeID(name)
 		f.nodes[src] = model.Node{ID: src, Kind: model.NodeFunction, Name: name,

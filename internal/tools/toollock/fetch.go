@@ -119,7 +119,7 @@ func (d digestSpec) resolve(ctx context.Context) (string, error) {
 }
 
 func parseChecksumFile(body, match string) (string, error) {
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue

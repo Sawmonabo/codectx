@@ -2,6 +2,7 @@ package gobuild
 
 import (
 	"go/build/constraint"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -99,9 +100,7 @@ func NewConds(minor int) *Conds {
 		fixed:  len(base.vars),
 		minor:  minor,
 	}
-	for k, v := range base.vars {
-		c.vars[k] = v
-	}
+	maps.Copy(c.vars, base.vars)
 	return c
 }
 
@@ -427,8 +426,8 @@ func buildBase() {
 					on[t] = true
 				}
 				cube := True
-				for i := len(order) - 1; i >= 0; i-- {
-					if on[order[i]] {
+				for i, o := range slices.Backward(order) {
+					if on[o] {
 						cube = scratch.mk(int32(i), False, cube)
 					} else {
 						cube = scratch.mk(int32(i), cube, False)

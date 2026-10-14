@@ -567,8 +567,7 @@ func (m *Manager) overlayContext(ctx context.Context, repositoryID string) conte
 		run, err := m.opts.Ledger.NewRun(ledger.KindOverlay, repositoryID)
 		if err != nil {
 			code := model.CodeInternal
-			var typed *model.Error
-			if errors.As(err, &typed) {
+			if typed, ok := errors.AsType[*model.Error](err); ok {
 				code = typed.Code
 			}
 			slog.Warn("language server starts are not being recorded in the run ledger",

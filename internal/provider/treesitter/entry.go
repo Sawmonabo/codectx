@@ -2,6 +2,7 @@ package treesitter
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -280,7 +281,7 @@ func javaMainParams(s string) (args, ok bool) {
 		}
 	}
 	var fields []string
-	for _, f := range strings.Fields(p) {
+	for f := range strings.FieldsSeq(p) {
 		if f != "final" {
 			fields = append(fields, f)
 		}
@@ -289,8 +290,8 @@ func javaMainParams(s string) (args, ok bool) {
 		return false, false
 	}
 	typ, name := fields[0], fields[1]
-	if strings.HasSuffix(name, "[]") {
-		typ, name = typ+"[]", strings.TrimSuffix(name, "[]")
+	if before, ok0 := strings.CutSuffix(name, "[]"); ok0 {
+		typ, name = typ+"[]", before
 	}
 	if strings.ContainsAny(name, "[].") {
 		return false, false
@@ -503,10 +504,5 @@ func stripAnnotations(s string) string {
 
 // hasWord reports whether words holds w.
 func hasWord(words []string, w string) bool {
-	for _, x := range words {
-		if x == w {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(words, w)
 }

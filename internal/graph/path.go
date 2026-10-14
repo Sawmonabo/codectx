@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -332,7 +331,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 			}
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	nodes, err := e.adjacency.NodesByID(ctx, ids)
 	if err != nil {
 		return model.PathResult{}, err
@@ -1197,7 +1196,7 @@ func (w *pathWalk) resolveBatch(ctx context.Context, batch []model.NodeID) ([]No
 			plain[ref] = batch[i]
 		}
 	}
-	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+	slices.Sort(refs)
 	return refs, plain, dispatch, nil
 }
 

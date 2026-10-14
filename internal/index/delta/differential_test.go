@@ -700,9 +700,7 @@ int inc(int x);
 int call(struct S *s) { return s->cb(1); }
 `,
 	}
-	for p, s := range extra {
-		base[p] = s
-	}
+	maps.Copy(base, extra)
 	edits := []edit{
 		{name: "body only", replace: []sub{{"util" + src, "return a + b; }", "return a + b + 0; }"}}},
 		{name: "body adding a call", replace: []sub{{"main" + src, "return add(x, 1); }", "return add(x, 1) + later(); }"}}},

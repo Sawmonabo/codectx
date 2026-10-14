@@ -203,7 +203,7 @@ func TestValidationRejectsBadRangesAndEnums(t *testing.T) {
 	// storage deleted the surplus rows, and every reader saw 64 however it
 	// asked -- a truncated answer under default settings.
 	manyEvidence := validFact
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		manyEvidence.Evidence = append(manyEvidence.Evidence, validEvidence)
 	}
 	if err := manyEvidence.Validate(); err != nil {

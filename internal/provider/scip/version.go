@@ -21,7 +21,7 @@ func satisfies(version, constraint string) (bool, error) {
 	if !ok {
 		return false, outputInvalidf("tool version %q is not a dotted version", version)
 	}
-	for _, term := range strings.Fields(constraint) {
+	for term := range strings.FieldsSeq(constraint) {
 		op := "="
 		for _, candidate := range []string{">=", "<=", ">", "<", "="} {
 			if strings.HasPrefix(term, candidate) {

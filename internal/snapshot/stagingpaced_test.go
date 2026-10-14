@@ -63,7 +63,7 @@ func TestTheCaptureStagingIsPacedWithoutTheApplicationsWiring(t *testing.T) {
 	// More than one window of paths, so the staging's own pages reach the file
 	// rather than sitting in its page cache.
 	dir := strings.Repeat("d/", 128)
-	for i := 0; i < 64<<10; i++ {
+	for i := range 64 << 10 {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO entries(path) VALUES(?)`, dir+strconv.Itoa(i)); err != nil {
 			t.Fatal(err)
 		}

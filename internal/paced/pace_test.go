@@ -27,11 +27,9 @@ func TestEveryChargerInTheProcessWaitsUnderOnePace(t *testing.T) {
 	var wg sync.WaitGroup
 	start := time.Now()
 	for range chargers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			r.charge(Window, nil)
-		}()
+		})
 	}
 	wg.Wait()
 	elapsed := time.Since(start)

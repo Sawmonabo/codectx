@@ -1309,8 +1309,7 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 func (s *stack) collect(ctx context.Context) {
 	report, err := s.collector.Collect(context.WithoutCancel(ctx))
 	if err != nil {
-		var typed *model.Error
-		if errors.As(err, &typed) {
+		if typed, ok := errors.AsType[*model.Error](err); ok {
 			s.logger.Warn("the startup collection pass did not finish", "component", "app",
 				"diagnostic_code", typed.Code, "diagnostic", typed.Message)
 		} else {

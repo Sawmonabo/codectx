@@ -1236,7 +1236,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	for id := range endpoints {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	nodes, err := e.adjacency.NodesByID(finish, ids)
 	if err != nil {
 		return model.GraphResult{}, err

@@ -561,8 +561,7 @@ func (p *Provider) parse(ctx context.Context, view model.SnapshotView, req wire.
 			p.pool.release(w, true)
 			return ex, nil
 		}
-		var perFile perFileError
-		if errors.As(err, &perFile) {
+		if perFile, ok := errors.AsType[perFileError](err); ok {
 			p.pool.release(w, true)
 			return nil, perFile.err
 		}

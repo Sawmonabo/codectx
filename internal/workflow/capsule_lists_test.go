@@ -140,7 +140,7 @@ func (h *harness) seedWaivers(t *testing.T, n int) {
 	fs := h.store.sessions[fixtureSession]
 	h.file(fixtureSession, fileWaived).waived = true
 	fs.waivers = nil
-	for i := 0; i < n; i++ {
+	for i := range n {
 		fs.waivers = append(fs.waivers, model.WaiverRecord{
 			SessionID: fixtureSession, ActorID: fixtureActor,
 			FileID:      model.FileID(fixtureID("waived", strconv.Itoa(i))),
@@ -165,7 +165,7 @@ func (h *harness) seedAcceptedFacts(t *testing.T, descending bool, arrival []int
 	fs := h.store.sessions[fixtureSession]
 	for _, n := range arrival {
 		refs := make([]model.ClaimReference, 0, 3)
-		for j := 0; j < 3; j++ {
+		for j := range 3 {
 			k := j
 			if descending {
 				k = 2 - j

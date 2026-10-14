@@ -702,7 +702,7 @@ func measureRepository(t *testing.T, dir, name string) corpusEntry {
 		Description: "measured at the tip this run observed, over the files Git tracks there whose " +
 			"extension lang.Of recognizes as source"}
 	h := sha256.New()
-	for _, rel := range strings.Split(run("ls-files", "-z"), "\x00") {
+	for rel := range strings.SplitSeq(run("ls-files", "-z"), "\x00") {
 		if rel == "" || lang.Of(rel) == "" {
 			continue
 		}

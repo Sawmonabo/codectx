@@ -247,8 +247,7 @@ func (w *payloadWriter) stream(name string, executable bool, r io.Reader) error 
 	}
 	defer f.Close()
 	if _, err := io.Copy(f, &budgetedReader{r: r, w: w}); err != nil {
-		var typed *model.Error
-		if errors.As(err, &typed) {
+		if _, ok := errors.AsType[*model.Error](err); ok {
 			return err
 		}
 		return ioError("tool payload write", err)

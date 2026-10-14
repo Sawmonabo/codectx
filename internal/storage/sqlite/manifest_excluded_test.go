@@ -49,7 +49,7 @@ func TestPutManifestStreamsExclusionsRowAtATime(t *testing.T) {
 		// The sequence GENERATES its rows; the test never holds them either, so
 		// what the window measures is the writer's retention and nothing else.
 		seq := func(yield func(model.ExcludedContextEntry) error) error {
-			for i := 0; i < n; i++ {
+			for i := range n {
 				if i == 0 {
 					first = liveHeap()
 				}

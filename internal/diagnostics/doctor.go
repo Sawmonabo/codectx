@@ -698,8 +698,7 @@ func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 // raw string.
 func failure(name string, err error) model.DoctorCheck {
 	code := model.CodeInternal
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		code = typed.Code
 	}
 	c := model.DoctorCheck{Name: name, State: model.CheckFail, Code: code}

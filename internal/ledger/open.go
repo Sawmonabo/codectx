@@ -328,15 +328,13 @@ func wrap(op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	var se *sqlite.Error
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*sqlite.Error](err); ok {
 		switch se.Code() & 0xff {
 		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
 			return &model.Error{Code: model.CodeWorkspaceBusy, Message: "run ledger is busy: " + op, Retryable: true}

@@ -314,8 +314,7 @@ func CodeOf(err error) string {
 	if err == nil {
 		return ""
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		return typed.Code
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

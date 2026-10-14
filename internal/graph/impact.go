@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -1328,7 +1328,7 @@ func newImpactAccumulator(start []model.NodeID, b *budget, maxVisited, maxEdges 
 	// The frozen frontier order is (depth asc, NodeID asc): seeds enter at
 	// depth 0 de-duplicated and sorted, so two requests naming the same seeds in
 	// different orders answer identically.
-	sort.Slice(a.seeds, func(i, j int) bool { return a.seeds[i] < a.seeds[j] })
+	slices.Sort(a.seeds)
 	return a
 }
 
@@ -1494,9 +1494,7 @@ func (e *Engine) attachRouteEvidence(ctx context.Context, routes []model.ImpactR
 		if err != nil {
 			return err
 		}
-		for id, ev := range got {
-			evidence[id] = ev
-		}
+		maps.Copy(evidence, got)
 	}
 	for i := range routes {
 		var ev []model.EvidenceID

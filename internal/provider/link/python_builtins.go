@@ -14,7 +14,7 @@ import (
 // outside the project.
 var pythonBuiltins = func() map[string]bool {
 	out := map[string]bool{}
-	for _, n := range strings.Fields(`
+	for n := range strings.FieldsSeq(`
 		abs aiter all anext any ascii bin bool breakpoint bytearray bytes callable chr classmethod compile
 		complex copyright credits delattr dict dir divmod enumerate eval exec exit filter float format
 		frozenset getattr globals hasattr hash help hex id input int isinstance issubclass iter len license

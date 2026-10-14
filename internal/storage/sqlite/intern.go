@@ -82,10 +82,7 @@ var _ interner = (*dbInterner)(nil)
 // interner memory is a function of the batch, exactly as the rest of the
 // writer's memory contract is.
 func newInterner(opts Options) *dbInterner {
-	capacity := opts.BatchRecords
-	if capacity < internCacheFloor {
-		capacity = internCacheFloor
-	}
+	capacity := max(opts.BatchRecords, internCacheFloor)
 	return &dbInterner{
 		nodes:     newRefCache(capacity),
 		relations: newRefCache(capacity),

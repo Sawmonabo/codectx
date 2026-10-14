@@ -217,9 +217,7 @@ func serveMCP(ctx context.Context, ws *app.Workspace, server *mcpserver.Server, 
 	var wg sync.WaitGroup
 	var watchErr error
 	if watch {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			// Each refresh is a log record on stderr, never a line on stdout:
 			// this is the same event `codectx watch` prints, on the only
 			// channel this process may use for it.
@@ -234,7 +232,7 @@ func serveMCP(ctx context.Context, ws *app.Workspace, server *mcpserver.Server, 
 			if watchErr != nil && !isCanceled(watchErr) {
 				stop()
 			}
-		}()
+		})
 	}
 
 	serveErr := server.Serve(ctx)
@@ -260,8 +258,7 @@ func serveMCP(ctx context.Context, ws *app.Workspace, server *mcpserver.Server, 
 // untyped, so an unwrapped one would be reported as an argument rejection --
 // the exit-2 class -- for a session that failed while running.
 func serveFailure(err error) error {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		return typed
 	}
 	return &model.Error{Code: model.CodeInternal, Message: "the MCP session ended: " + err.Error()}

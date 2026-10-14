@@ -46,7 +46,7 @@ func scaledLeavesFor(t *testing.T) []int {
 		return defaultScaledLeaves
 	}
 	out := make([]int, 0, 4)
-	for _, field := range strings.Split(raw, ",") {
+	for field := range strings.SplitSeq(raw, ",") {
 		field = strings.TrimSpace(field)
 		if field == "" {
 			continue

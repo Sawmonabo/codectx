@@ -15,6 +15,7 @@ package provider
 import (
 	"context"
 	"maps"
+	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -111,13 +112,7 @@ func (d Detection) Validate(desc model.ProviderDescriptor) error {
 		return outputInvalid(desc.ID, "detection lists more capabilities than the bound")
 	}
 	for _, c := range d.Capabilities {
-		declared := false
-		for _, want := range desc.Capabilities {
-			if c == want {
-				declared = true
-				break
-			}
-		}
+		declared := slices.Contains(desc.Capabilities, c)
 		if !declared {
 			return outputInvalid(desc.ID, "detection claims a capability the descriptor does not declare").WithDetail("capability", c)
 		}

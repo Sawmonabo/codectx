@@ -184,7 +184,7 @@ func TestCapabilityFoldMergesInOrderIndependently(t *testing.T) {
 	if got := len(forward.Details["reason"]); got > model.MaxDetailBytes {
 		t.Fatalf("the merged reason is %d bytes, want at most %d", got, model.MaxDetailBytes)
 	}
-	for _, value := range strings.Split(forward.Details["reason"], ",") {
+	for value := range strings.SplitSeq(forward.Details["reason"], ",") {
 		if !strings.HasSuffix(value, "_of_a_widely_degraded_unit") {
 			t.Fatalf("the merged reason carries the fragment %q; the cut split a value", value)
 		}

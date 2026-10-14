@@ -120,8 +120,7 @@ func resourceLimit(format string, args ...any) *model.Error {
 // text: a repository or data-directory path is not something an error may
 // carry into logs.
 func ioError(op string, err error) error {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -140,8 +139,7 @@ func typed(err error) error {
 	if err == nil {
 		return nil
 	}
-	var t *model.Error
-	if errors.As(err, &t) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

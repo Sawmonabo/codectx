@@ -204,8 +204,7 @@ func stateOf(err error) model.RunState {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return model.RunTimedOut
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		switch typed.Code {
 		case model.CodeCanceled:
 			if !onlyCancellation(err) {
@@ -234,8 +233,7 @@ func onlyCancellation(err error) bool {
 		}
 		return true
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		return typed.Code == model.CodeCanceled
 	}
 	return true

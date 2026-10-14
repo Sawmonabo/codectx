@@ -264,8 +264,7 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 	}
 	t, err := resolver.Resolve(ctx, name)
 	if err != nil {
-		var typed *model.Error
-		if errors.As(err, &typed) {
+		if typed, ok := errors.AsType[*model.Error](err); ok {
 			return Profile{}, typed.WithDetail("profile", name)
 		}
 		return Profile{}, err

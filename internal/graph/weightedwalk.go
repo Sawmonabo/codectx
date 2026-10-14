@@ -753,7 +753,7 @@ func (w *weightedWalk) expand(ctx context.Context, owners map[model.NodeID][]lab
 	if len(refs) == 0 {
 		return false, nil
 	}
-	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+	slices.Sort(refs)
 	pend := make([]weightedEdge, 0, adjacencyBatch)
 	stopped := false
 	var ferr error
@@ -1236,7 +1236,7 @@ func (w *weightedWalk) explain(ctx context.Context, page []servedLabel) (map[int
 	if len(scan) == 0 {
 		return out, nil
 	}
-	sort.Slice(scan, func(i, j int) bool { return scan[i] < scan[j] })
+	slices.Sort(scan)
 	var edges []Edge
 	if _, err := w.reader.Neighbours(ctx, scan, w.direction, w.codes, EdgePos{}, func(e Edge) error {
 		edges = append(edges, e)

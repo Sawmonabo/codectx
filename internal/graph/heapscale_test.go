@@ -201,7 +201,7 @@ func fanFixture(width int) ([]model.Node, []model.Relation) {
 	nodes := make([]model.Node, 0, total)
 	rels := make([]model.Relation, 0, width)
 	id := func(i int) model.NodeID { return model.NodeID(hexID(i)) }
-	for i := 0; i < total; i++ {
+	for i := range total {
 		name := fmt.Sprintf("s%07d", i)
 		nodes = append(nodes, model.Node{ID: id(i), Kind: model.NodeFunction, Name: name,
 			QualifiedName: name, Language: "go", SemanticSource: model.SemanticCanonical})

@@ -80,7 +80,7 @@ func TestWritesReachTheDiskOneWindowAtATime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < rows; i++ {
+	for range rows {
 		if _, err := tx.Exec(`INSERT INTO t VALUES(?)`, blob); err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +125,7 @@ func fill(t *testing.T, db *sql.DB, rows int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < rows; i++ {
+	for range rows {
 		if _, err := tx.Exec(`INSERT INTO t VALUES(?)`, blob); err != nil {
 			t.Fatal(err)
 		}

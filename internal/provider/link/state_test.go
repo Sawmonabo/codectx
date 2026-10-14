@@ -153,7 +153,7 @@ func TestFactDiffCoversEveryKind(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer targets.Close()
-	rf := &refresh{u: u, prev: &previous{resolution: resolution{bindings: before}}}
+	rf := &refresh{u: u, prev: &previous{bindings: before}}
 	if rf.changed, err = newFileIDSort(u.dir); err != nil {
 		t.Fatal(err)
 	}

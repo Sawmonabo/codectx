@@ -575,7 +575,9 @@ func notAdmitted(code string) ledger.Measured {
 // int64Ptr is the address of a count a span reports at its end. Measured's
 // fields are pointers because an unavailable measurement is absent and never
 // zero; a count the caller has is always available.
-func int64Ptr(n int64) *int64 { return &n }
+//
+//go:fix inline
+func int64Ptr(n int64) *int64 { return new(n) }
 
 // runsPage is the run list the result publishes and the number of runs that
 // did not fit it. Runs is a wire-sized page -- at most model.MaxRecordsPerResult
@@ -597,7 +599,7 @@ func (g *generation) attachReused(ctx context.Context) (err error) {
 	ctx, span := ledger.Start(ctx, stageAttachReused, "")
 	defer func() {
 		span.End(endOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
-			ItemsIn: int64Ptr(int64(len(g.plan.Reuse))), ItemsOut: &g.reused}, err)
+			ItemsIn: new(int64(len(g.plan.Reuse))), ItemsOut: &g.reused}, err)
 	}()
 	for _, unit := range g.plan.Reuse {
 		rows, err := g.c.opts.Store.AttachUnit(ctx, g.gen, unit)
@@ -821,14 +823,12 @@ func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 		return err
 	}
 	u.units++
-	u.wg.Add(1)
-	go func() {
-		defer u.wg.Done()
+	u.wg.Go(func() {
 		defer func() { <-u.sem }()
 		if err := u.g.unit(u.ctx, unit, span); err != nil {
 			u.once.Do(func() { u.fatal = err; u.cancel() })
 		}
-	}()
+	})
 	return nil
 }
 
@@ -990,7 +990,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, 
 		}
 		span.End(ledger.OutcomeOK,
 			ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
-				ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}, nil)
+				ItemsIn: new(u.InputCount), ItemsOut: new(res.parsed)}, nil)
 	}()
 	p, ok := c.opts.Registry.Lookup(u.ProviderID)
 	if !ok {
@@ -1147,7 +1147,7 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, out outcome, caus
 	// writes to the run row, and an end is once-only -- so this is the backstop
 	// for the two exits below, neither of which records a row to agree with.
 	m := ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
-		ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed)}
+		ItemsIn: new(u.InputCount), ItemsOut: new(out.parsed)}
 	defer func() { out.span.End(endingFor(provider.CodeOf(cause)), m, cause) }()
 	if ctx.Err() != nil && errors.Is(cause, ctx.Err()) {
 		return cause
@@ -1204,7 +1204,7 @@ func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome
 	// for an untyped error, and the two records would then diverge on exactly
 	// the failures nobody has a safe message for.
 	out.span.End(endingFor(stored.Code), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped,
-		ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed),
+		ItemsIn: new(u.InputCount), ItemsOut: new(out.parsed),
 		DiagnosticCode: stored.Code, Failure: stored.Message}, nil)
 	if res.RunID != "" {
 		// Under a context that survives the cancellation the failure may have
@@ -1233,8 +1233,7 @@ func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome
 // defect's text, not a diagnostic -- so only its family is kept.
 func typedFailure(cause error) unitFailure {
 	f := unitFailure{code: provider.CodeOf(cause)}
-	var typed *model.Error
-	if errors.As(cause, &typed) {
+	if typed, ok := errors.AsType[*model.Error](cause); ok {
 		f.message, f.details, f.remediation = typed.Message, typed.Details, typed.Remediation
 	}
 	return f

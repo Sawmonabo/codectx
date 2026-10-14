@@ -879,7 +879,7 @@ func (s *routeScan) nameRef(text string, at wire.Span) (wire.Ref, bool) {
 	if text == "" || uint32(len(text)) != at.End-at.Start {
 		return wire.Ref{}, false
 	}
-	for _, part := range strings.Split(text, ".") {
+	for part := range strings.SplitSeq(text, ".") {
 		if part == "" {
 			return wire.Ref{}, false
 		}

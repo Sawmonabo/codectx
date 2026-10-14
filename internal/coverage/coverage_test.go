@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -440,7 +439,7 @@ func (s *fakeStore) Coverage(ctx context.Context, session model.SessionID, actor
 	for fid := range fs.coverage {
 		ids = append(ids, fid)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := make([]model.FileCoverage, 0, limit)
 	for _, fid := range ids {
 		if fid <= after {
@@ -884,7 +883,7 @@ var scenarios = []scenario{
 			// The real receipt, echoed twice: the first grants exactly the
 			// chunk's bytes -- the fixture file entire -- and the replay
 			// neither fails nor adds more.
-			for i := 0; i < 2; i++ {
+			for i := range 2 {
 				if err := svc.confirmReceipts(ctx, rec, []string{token}); err != nil {
 					t.Fatalf("confirm %d: %v", i+1, err)
 				}

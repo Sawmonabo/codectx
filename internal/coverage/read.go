@@ -120,10 +120,7 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
-	end := req.Offset + uint64(raw)
-	if end > size {
-		end = size
-	}
+	end := min(req.Offset+uint64(raw), size)
 
 	// The view returns exactly [offset, end) with the whole-file position of
 	// each end: it walks back to the nearest line checkpoint itself, in spans

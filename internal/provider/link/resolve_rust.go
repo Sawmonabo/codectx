@@ -328,8 +328,8 @@ func rustFile(p string) (crate string, module []string) {
 	case root >= 0 && root+1 < len(dirs) && dirs[root+1] == "bin":
 		root, targets = root+1, true
 	case root < 0:
-		for i := len(dirs) - 1; i >= 0; i-- {
-			if slices.Contains(rustTargetDirs, dirs[i]) {
+		for i, dir := range slices.Backward(dirs) {
+			if slices.Contains(rustTargetDirs, dir) {
 				root, targets = i, true
 				break
 			}

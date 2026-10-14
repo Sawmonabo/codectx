@@ -556,7 +556,7 @@ func TestImpactPagesPastTheResultRecordCap(t *testing.T) {
 	addNode(seed, model.NodeFunction, "vf-seed")
 	addNode(seedPkg, model.NodePackage, "vf-pkg-seed")
 	addRel(model.RelContains, seedPkg, seed)
-	for i := 0; i < widePackageCount; i++ {
+	for i := range widePackageCount {
 		callee := fixtureNodeID(fmt.Sprintf("vf-callee-%d", i))
 		pkg := fixtureNodeID(fmt.Sprintf("vf-pkg-%04d", i))
 		addNode(callee, model.NodeFunction, fmt.Sprintf("vf-callee-%d", i))

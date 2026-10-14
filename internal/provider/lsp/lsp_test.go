@@ -217,7 +217,7 @@ func runScenario(t *testing.T, enc string) {
 	}
 	at := func(needle string, nth int) At {
 		off := 0
-		for i := 0; i < nth; i++ {
+		for range nth {
 			j := strings.Index(mainGo[off:], needle)
 			if j < 0 {
 				t.Fatalf("%q occurrence %d not in fixture", needle, nth)
@@ -237,11 +237,9 @@ func runScenario(t *testing.T, enc string) {
 	var held Result[Location]
 	var heldErr error
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		held, heldErr = ov.Definition(ctx, at("main", 1), 10)
-	}()
+	})
 	events.wait("holding-definition")
 	second, err := ov.Definition(ctx, at("y = 1", 1), 10)
 	wg.Wait()
@@ -318,11 +316,9 @@ func runScenario(t *testing.T, enc string) {
 	// the server and the connection must remain usable.
 	cctx, cancel := context.WithCancel(ctx)
 	var refErr error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		_, refErr = ov.References(cctx, at("other", 1), true, 10)
-	}()
+	})
 	events.wait("holding-references")
 	cancel()
 	wg.Wait()

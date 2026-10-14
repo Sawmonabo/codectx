@@ -660,7 +660,7 @@ func wrapCells(s string) []string {
 		lines []string
 		line  string
 	)
-	for _, word := range strings.Fields(s) {
+	for word := range strings.FieldsSeq(s) {
 		switch {
 		case line == "":
 			line = word
@@ -1619,8 +1619,7 @@ func writeCapsuleFile(path string, capsule model.Capsule, pager capsuleRowPager)
 		// A refusal this function raised itself (a list that streamed short)
 		// already carries its own code and remediation and is reported as it
 		// stands; only an I/O failure is wrapped.
-		var typed *model.Error
-		if errors.As(writeErr, &typed) {
+		if typed, ok := errors.AsType[*model.Error](writeErr); ok {
 			return 0, typed
 		}
 		closeErr = writeErr

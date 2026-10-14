@@ -22,9 +22,9 @@ import (
 // refused as malformed).
 func TestJoinRecordsRoundTrip(t *testing.T) {
 	params := []boundParam{
-		{paramInfo: paramInfo{Pos: 0, Name: "self"}, Node: "b.T.m.self"},
-		{paramInfo: paramInfo{Pos: 1, Name: "x", Index: 1}},
-		{paramInfo: paramInfo{Pos: 2, Name: "kw", Index: 2, Variadic: true, KeywordOnly: true}, Node: "b.T.m.kw"},
+		{Pos: 0, Name: "self", Node: "b.T.m.self"},
+		{Pos: 1, Name: "x", Index: 1},
+		{Pos: 2, Name: "kw", Index: 2, Variadic: true, KeywordOnly: true, Node: "b.T.m.kw"},
 	}
 	in := taken{Sig: "(int)(void)", From: "a", Target: target{File: "b", Node: "b.T.m"}, Params: encodeParams(params),
 		ReceiverFirst: true}

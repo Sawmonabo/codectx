@@ -221,8 +221,7 @@ func writeStamp(path string, now time.Time) error {
 // is never part of the message -- a data-directory path is not something an
 // error may carry into a log.
 func ioError(op string, err error) error {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

@@ -36,7 +36,7 @@ func TestTheSeedCutSurvivesIntoAValidManifestExclusion(t *testing.T) {
 	// the disclosure is per STEP and the two rows below are the assertion.
 	for _, step := range []string{"the captured working-tree changes", "a second step under the same origin"} {
 		in.BeginStep(originChangedFile, step)
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			if err := in.Admit(candidate{NodeID: model.NodeID(fmt.Sprintf("n-%s-%d", step, i)),
 				Origin: originChangedFile}); err != nil {
 				t.Fatalf("Admit: %v", err)
@@ -183,7 +183,7 @@ func TestChangedFileSeedsKeepReadingPastTheFirstPage(t *testing.T) {
 		}
 	}
 	var missing []string
-	for i := 0; i < generatedChanged; i++ {
+	for i := range generatedChanged {
 		if !seen[genLeaf(i)] {
 			missing = append(missing, genLeaf(i))
 		}
@@ -221,7 +221,7 @@ func TestTheWalkRootWidthIsTheConfiguredLimit(t *testing.T) {
 			t.Fatalf("newSeedIngest: %v", err)
 		}
 		in.BeginStep(originChangedFile, "the captured working-tree changes")
-		for i := 0; i < seeds; i++ {
+		for i := range seeds {
 			if err := in.Admit(candidate{NodeID: model.NodeID(fmt.Sprintf("n-%03d", i)),
 				Origin: originChangedFile}); err != nil {
 				t.Fatalf("Admit: %v", err)

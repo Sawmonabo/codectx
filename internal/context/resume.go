@@ -123,7 +123,7 @@ type checkpointScalars struct {
 
 	// Stop, Candidates and CandidatesUnavailable are scopeResult's fields of
 	// the same names.
-	Stop                  seedStop `json:"stop,omitempty"`
+	Stop                  seedStop `json:"stop"`
 	Candidates            int64    `json:"candidates,omitempty"`
 	CandidatesUnavailable string   `json:"candidates_unavailable,omitempty"`
 	// Round and Inputs are the compile's round and that round's inputs, both
@@ -132,7 +132,7 @@ type checkpointScalars struct {
 	// the round decision reads the verdict and group streams that boundary
 	// already carries (readPackOutcome).
 	Round   int           `json:"round,omitempty"`
-	Inputs  roundInputs   `json:"inputs,omitempty"`
+	Inputs  roundInputs   `json:"inputs"`
 	History []roundInputs `json:"history,omitempty"`
 }
 

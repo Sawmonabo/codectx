@@ -167,9 +167,9 @@ func (s *inputScan) lex() {
 			open := map[byte]byte{')': '(', ']': '[', '}': '{'}[c]
 			// An unbalanced closer pops to its own opener, so one stray
 			// bracket does not unbalance the rest of the file.
-			for k := len(stack) - 1; k >= 0; k-- {
-				if s.b.src[s.toks[stack[k]].start] == open {
-					s.match[stack[k]] = int32(i)
+			for k, s0 := range slices.Backward(stack) {
+				if s.b.src[s.toks[s0].start] == open {
+					s.match[s0] = int32(i)
 					stack = stack[:k]
 					break
 				}
@@ -389,8 +389,7 @@ func (b *builder) publishInputs(reads []inputRead) error {
 // declaration, else the file's module.
 func (b *builder) inputOwner(at wire.Span) model.NodeID {
 	d := b.innermostCallable(at)
-	for k := len(b.literals) - 1; k >= 0; k-- {
-		l := b.literals[k]
+	for _, l := range slices.Backward(b.literals) {
 		if l.at.Start > at.Start || at.End > l.at.End {
 			continue
 		}

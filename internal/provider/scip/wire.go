@@ -66,7 +66,7 @@ func (r *reader) readByte() (byte, error) {
 func (r *reader) varint() (uint64, error) {
 	var x uint64
 	var shift uint
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		b, err := r.readByte()
 		if err != nil {
 			return 0, err

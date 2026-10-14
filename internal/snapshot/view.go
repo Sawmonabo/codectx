@@ -320,8 +320,7 @@ func (v *View) Repair(ctx context.Context, id model.FileID, src RepairSource) er
 	catErr := src.Git.CatBlob(ctx, src.Root, fv.GitObjectID, pw, rec.Size+1)
 	pw.Close()
 	putErr := <-done
-	var typed *model.Error
-	if errors.As(catErr, &typed) {
+	if typed, ok := errors.AsType[*model.Error](catErr); ok {
 		switch typed.Code {
 		case model.CodeResourceLimit:
 			// The bound was the recorded size plus one: the object is not

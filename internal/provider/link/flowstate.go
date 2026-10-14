@@ -280,7 +280,7 @@ func idMapOf(dir string, ids *idTable) (*pagination.SortedRun[idRef], error) {
 			if err := add(idRef{File: file, Ref: Ref{File: ord, Index: fileNode}}); err != nil {
 				return err
 			}
-			for i := int32(0); i < decls; i++ {
+			for i := range decls {
 				t, err := ids.node(Ref{File: ord, Index: i})
 				if err != nil {
 					return err

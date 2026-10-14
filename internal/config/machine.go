@@ -267,10 +267,7 @@ func legacyCPUQuota() (int, bool) {
 // smallestQuota folds one group's quota and period into the smallest whole
 // core count seen so far.
 func smallestQuota(best int, found bool, quota, period int64) (int, bool) {
-	cores := int(quota / period)
-	if cores < 1 {
-		cores = 1
-	}
+	cores := max(int(quota/period), 1)
 	if !found || cores < best {
 		return cores, true
 	}
@@ -357,7 +354,7 @@ func smallestHeadroom(best int64, found bool, limitText, usageText string) (int6
 // the unified line ("0::/path") when controller is empty, otherwise the legacy
 // line whose comma-separated controller list holds it.
 func cgroupPathFor(controller string) (string, bool) {
-	for _, line := range strings.Split(readCgroupFile(procCgroupPath), "\n") {
+	for line := range strings.SplitSeq(readCgroupFile(procCgroupPath), "\n") {
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) != 3 || parts[2] == "" {
 			continue

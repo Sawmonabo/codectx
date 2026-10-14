@@ -70,7 +70,7 @@ func TestEvidenceClipIsAttributedNotFoldedIntoDropped(t *testing.T) {
 	const id model.NodeID = "n1"
 	b.nodes = append(b.nodes, model.NodeFact{Node: model.Node{ID: id}, Evidence: []model.Evidence{b.evidence(structure, id, "", nil, "", "")}})
 	b.nodeAt[id] = 0
-	for i := 0; i < 4; i++ { // 1 stored + 4 offered = 5 occurrences, clip 2
+	for range 4 { // 1 stored + 4 offered = 5 occurrences, clip 2
 		b.addEvidence(structure, id, nil, "")
 	}
 	if got := len(b.nodes[0].Evidence); got != 2 {

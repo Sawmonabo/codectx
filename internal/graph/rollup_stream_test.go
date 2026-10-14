@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -30,7 +31,7 @@ func newPairFixture(t *testing.T, edges, pkgs int) (*graphFixture, []model.Relat
 		},
 	}
 	pkgID := func(i int) model.NodeID { return fixtureNodeID(fmt.Sprintf("pkg-%03d", i)) }
-	for i := 0; i < pkgs; i++ {
+	for i := range pkgs {
 		name := fmt.Sprintf("pkg%03d", i)
 		f.nodes[pkgID(i)] = model.Node{ID: pkgID(i), Kind: model.NodePackage, Name: name,
 			QualifiedName: name, Language: "go", SemanticSource: model.SemanticCanonical}
@@ -44,7 +45,7 @@ func newPairFixture(t *testing.T, edges, pkgs int) (*graphFixture, []model.Relat
 		return id
 	}
 	calls := make([]model.Relation, 0, edges)
-	for i := 0; i < edges; i++ {
+	for i := range edges {
 		from := symbol(fmt.Sprintf("s-from-%06d", i), i%pkgs)
 		to := symbol(fmt.Sprintf("s-to-%06d", i), (i%pkgs+1)%pkgs)
 		rel := model.Relation{ID: fixtureRelationID(len(f.relations)), From: from,
@@ -126,8 +127,8 @@ func TestPackagePairCountsAreExactAndOrderIndependent(t *testing.T) {
 	forward := make([]model.Relation, len(calls))
 	copy(forward, calls)
 	reversed := make([]model.Relation, 0, len(calls))
-	for i := len(calls) - 1; i >= 0; i-- {
-		reversed = append(reversed, calls[i])
+	for _, call := range slices.Backward(calls) {
+		reversed = append(reversed, call)
 	}
 	var first []model.PackageEdge
 	for _, leg := range []struct {

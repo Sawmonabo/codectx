@@ -851,12 +851,10 @@ func TestAFileLargerThanTheAllocationRunsAlone(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
 	for range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, err := p.ParseProbe(context.Background(), "sample.go", src)
 			errs <- err
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

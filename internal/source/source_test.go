@@ -60,8 +60,7 @@ func TestColumnConversion(t *testing.T) {
 					if err == nil {
 						t.Fatalf("Offset(%d,%d,%s) = %d, want a rejection", tc.line, tc.column, tc.enc, got)
 					}
-					var typed *model.Error
-					if !errors.As(err, &typed) {
+					if _, ok := errors.AsType[*model.Error](err); !ok {
 						t.Fatalf("Offset returned %v, want a typed model error", err)
 					}
 					continue

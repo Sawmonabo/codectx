@@ -77,7 +77,7 @@ func TestWatchOverflowCollapsesToFullReconciliation(t *testing.T) {
 	deadline := time.After(20 * time.Second)
 	writes := 0
 	for !got.Overflow {
-		for n := 0; n < 4*maxPaths; n++ {
+		for n := range 4 * maxPaths {
 			name := filepath.Join(dir, "f"+string(rune('a'+writes%26))+string(rune('a'+n%26))+".go")
 			if err := os.WriteFile(name, []byte("package p\n"), 0o600); err != nil {
 				t.Fatalf("write %d: %v", n, err)

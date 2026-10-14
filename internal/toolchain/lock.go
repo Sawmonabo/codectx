@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/url"
 	"path"
 	"runtime"
@@ -192,9 +193,7 @@ func (l Lock) clone() Lock {
 	out := Lock{LockVersion: l.LockVersion, Tools: make(map[string]Entry, len(l.Tools))}
 	for name, e := range l.Tools {
 		platforms := make(map[string]Payload, len(e.Platforms))
-		for key, p := range e.Platforms {
-			platforms[key] = p
-		}
+		maps.Copy(platforms, e.Platforms)
 		e.Platforms = platforms
 		out.Tools[name] = e
 	}
@@ -377,7 +376,7 @@ func ConfinedRelPath(p string) error {
 	if path.Clean(p) != p {
 		return fmt.Errorf("is not normalized")
 	}
-	for _, part := range strings.Split(p, "/") {
+	for part := range strings.SplitSeq(p, "/") {
 		switch part {
 		case "":
 			return fmt.Errorf("has an empty component")

@@ -30,7 +30,7 @@ func (f fixedAliases) LookupAliases(_ context.Context, _ []model.UnitID, _, _ st
 func TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit(t *testing.T) {
 	const n = 18 // more alternatives than any fixed candidate count a resolver might impose
 	var store fixedAliases
-	for i := 0; i < n; i++ {
+	for i := range n {
 		id := model.NodeID(fmt.Sprintf("%064x", i+1))
 		store = append(store, sqlite.StoredAlias{NodeID: id, Kind: model.NodeFunction,
 			CanonicalKey: fmt.Sprintf("go|pkg|Sym|%03d", i)})

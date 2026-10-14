@@ -166,8 +166,7 @@ func unopenableReport(build model.BuildInfo, req model.DoctorRequest, err error,
 		Detail:      "the workspace could not be opened, so no further check could run",
 		Remediation: "re-run this command naming the repository path, and report it with that command if the failure persists",
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		// The typed message and remediation are the product's own bounded,
 		// code-derived text (Section 21: remediation is generated from typed
 		// codes), so they are reported as they are rather than re-worded here

@@ -60,7 +60,7 @@ func TestTheTraversalScratchIsPacedWithoutTheApplicationsWiring(t *testing.T) {
 	// More than one window of node keys, so the scratch's own pages reach the
 	// file rather than sitting in its page cache.
 	node := strings.Repeat("n", 512)
-	for i := 0; i < 64<<10; i++ {
+	for i := range 64 << 10 {
 		if err := s.exec(ctx, `INSERT INTO settled(node, dist, depth) VALUES(?, 1, 1)`,
 			node+strconv.Itoa(i)); err != nil {
 			t.Fatal(err)

@@ -875,8 +875,7 @@ func (h *harness) file(id model.SessionID, file model.FileID) *fakeFile {
 // code is the Section 20.3 code on err, or "" when err carries none. Every row
 // asserts on the code rather than on message text, which is presentation.
 func code(err error) string {
-	var e *model.Error
-	if errors.As(err, &e) {
+	if e, ok := errors.AsType[*model.Error](err); ok {
 		return e.Code
 	}
 	return ""
@@ -1045,13 +1044,7 @@ func (s *fakeStore) AdvanceSession(_ context.Context, req model.AdvanceRequest) 
 		return model.WorkflowStatus{}, &model.Error{Code: model.CodeVersionConflict,
 			Message: "the session advanced under this request"}
 	}
-	ok := false
-	for _, next := range allowed[fs.rec.State] {
-		if next == req.Target {
-			ok = true
-			break
-		}
-	}
+	ok := slices.Contains(allowed[fs.rec.State], req.Target)
 	if !ok {
 		return model.WorkflowStatus{}, &model.Error{Code: model.CodeVersionConflict,
 			Message: "that transition is not reachable from this state"}
@@ -1284,10 +1277,7 @@ func (s *fakeStore) CapsuleRows(_ context.Context, session model.SessionID, acto
 	if limit <= 0 || limit > model.MaxPageItems {
 		limit = model.MaxPageItems
 	}
-	end := start + limit
-	if end > len(all) {
-		end = len(all)
-	}
+	end := min(start+limit, len(all))
 	return append([]model.CapsuleRow(nil), all[start:end]...), err
 }
 
@@ -1320,7 +1310,7 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 		limit = model.MaxPageItems
 	}
 	ids := append([]model.FileID(nil), fs.order...)
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := make([]model.FileCoverage, 0, limit)
 	for _, id := range ids {
 		if after != "" && id <= after {
@@ -1463,7 +1453,7 @@ func (s *fakeStore) ManifestScopeNodes(_ context.Context, id model.ManifestID,
 		seen[e.NodeID] = true
 		ids = append(ids, e.NodeID)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	if limit <= 0 || limit > model.MaxPageItems {
 		limit = model.MaxPageItems
 	}

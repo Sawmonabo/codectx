@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1118,15 +1119,13 @@ func wrap(op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	var se *sqlite.Error
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*sqlite.Error](err); ok {
 		if refusedWrite(se.Code()) {
 			return writeRefused(op, se.Code(), se.Error())
 		}
@@ -1215,9 +1214,7 @@ func (s *Store) attribute(err error) error {
 	dir := filepath.Dir(s.path)
 	free, ok := s.freeBytes(dir)
 	settled := &model.Error{Code: typed.Code, Message: typed.Message, Details: map[string]string{}}
-	for k, v := range typed.Details {
-		settled.Details[k] = v
-	}
+	maps.Copy(settled.Details, typed.Details)
 	switch {
 	case !ok:
 		settled.Message += "; the free space under " + dir + " could not be measured"

@@ -336,11 +336,11 @@ func (f *fakeServer) find(uri, needle string, line int) (ident, error) {
 	}
 	lines := strings.SplitAfter(string(data), "\n")
 	text := strings.TrimRight(lines[line], "\r\n")
-	i := strings.Index(text, needle)
-	if i < 0 {
+	before, _, ok := strings.Cut(text, needle)
+	if !ok {
 		return ident{}, fmt.Errorf("%q not on line %d", needle, line)
 	}
-	return f.identifierAt(uri, position{Line: uint32(line), Character: f.units(text[:i])})
+	return f.identifierAt(uri, position{Line: uint32(line), Character: f.units(before)})
 }
 
 // functions lists "func NAME" declarations in the file.

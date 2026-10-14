@@ -802,8 +802,7 @@ func (c *Coordinator) activeGeneration(ctx context.Context) (model.GenerationID,
 // secrets, no environment and no raw analyzer output, which is what Section
 // 20.1 keeps out of ordinary logs.
 func logTyped(log *slog.Logger, msg string, err error, args ...any) {
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*model.Error](err); ok {
 		log.Warn(msg, append(args, "diagnostic_code", typed.Code, "diagnostic", typed.Message,
 			"remediation", typed.Remediation)...)
 		return

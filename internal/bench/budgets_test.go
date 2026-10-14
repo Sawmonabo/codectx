@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -407,11 +408,8 @@ func releaseBinary(tb testing.TB) string {
 // between two.
 func p95(samples []time.Duration) time.Duration {
 	sorted := append([]time.Duration(nil), samples...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	rank := (len(sorted)*95 + 99) / 100
-	if rank < 1 {
-		rank = 1
-	}
+	slices.Sort(sorted)
+	rank := max((len(sorted)*95+99)/100, 1)
 	return sorted[rank-1]
 }
 
@@ -533,7 +531,7 @@ func subjectTreeRSSBytes(root int) (uint64, bool) {
 		if pid == root {
 			continue
 		}
-		for hops := 0; hops < 16; hops++ {
+		for range 16 {
 			if r.parent == root {
 				total += all[pid].bytes
 				break
@@ -806,8 +804,7 @@ var budgetRows = []budgetRow{
 					ActorID: fmt.Sprintf("bench-plan-%02d", round),
 					Context: model.ContextRequest{Task: "measure the context plan budget",
 						Seeds: []string{f.seedName}, Phase: model.PhaseSweep, Budget: planBudget}}); err != nil {
-					var typed *model.Error
-					if errors.As(err, &typed) {
+					if typed, ok := errors.AsType[*model.Error](err); ok {
 						t.Fatalf("context plan: %v %v", err, typed.Details)
 					}
 					t.Fatalf("context plan: %v", err)

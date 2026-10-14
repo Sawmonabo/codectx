@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"testing"
 
@@ -150,8 +151,8 @@ func expandScopeAfter(ctx context.Context, eng *graph.Engine, gen model.Generati
 	}
 
 	res := refScope{
-		scopeResult: scopeResult{ScopeComplete: true, Stop: stop},
-		Candidates:  make([]candidate, 0, len(seeds)),
+		ScopeComplete: true, Stop: stop,
+		Candidates: make([]candidate, 0, len(seeds)),
 	}
 	// admitted is the seed fold's key set. The name-only candidates join it:
 	// the streamed side pushes them into the seed survivors' fold, so a
@@ -508,10 +509,7 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 		if err != nil {
 			return nil, err
 		}
-		score := base + scaled
-		if score > maxScoreMicros {
-			score = maxScoreMicros
-		}
+		score := min(base+scaled, maxScoreMicros)
 		if score < 0 {
 			score = 0
 		}
@@ -845,7 +843,7 @@ func (c *Compiler) resolvePrecisionWholeSet(ctx context.Context, reader evidence
 	if len(ids) == 0 {
 		return out, nil
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	batch := c.pageLimit()
 	for start := 0; start < len(ids); start += batch {
 		end := min(start+batch, len(ids))

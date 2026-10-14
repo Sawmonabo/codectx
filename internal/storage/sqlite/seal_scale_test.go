@@ -112,7 +112,7 @@ func TestSealingOneUnitCostsFlatTimePerFact(t *testing.T) {
 	sizes := []int{2000, 4000, 8000, 16000}
 	if raw := os.Getenv("CODECTX_SEAL_SIZES"); raw != "" {
 		sizes = nil
-		for _, part := range strings.Split(raw, ",") {
+		for part := range strings.SplitSeq(raw, ",") {
 			n, err := strconv.Atoi(strings.TrimSpace(part))
 			if err != nil {
 				t.Fatalf("CODECTX_SEAL_SIZES: %v", err)

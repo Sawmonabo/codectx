@@ -368,7 +368,7 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 		owners := []graph.NodeRef{refs[Hub], refs[Leaf]}
 		slices.Sort(owners)
 		full := scan(t, g, owners, model.DirectionBoth, nil)
-		for stopAfter := 0; stopAfter < len(full); stopAfter++ {
+		for stopAfter := range full {
 			seen := 0
 			var first []edge
 			pos, err := g.Neighbours(ctx, owners, model.DirectionBoth, nil, graph.EdgePos{},

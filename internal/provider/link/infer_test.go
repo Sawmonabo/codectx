@@ -38,7 +38,7 @@ func goldenUnit(t *testing.T, tables ...*Table) *unit {
 }
 
 func decl(kind model.NodeKind, name string, parent int32) Decl {
-	return Decl{Endpoint: Endpoint{Kind: kind, Name: name, Qualified: name}, Parent: parent, Described: true}
+	return Decl{Kind: kind, Name: name, Qualified: name, Parent: parent, Described: true}
 }
 
 func method(name string, class int32, receiver string) Decl {

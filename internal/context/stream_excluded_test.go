@@ -31,7 +31,7 @@ func TestExcludedRunReplaysIdenticallyWhenItSpills(t *testing.T) {
 	}
 	defer sorter.Close()
 	const n = 9
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := sorter.Add(model.ExcludedContextEntry{Ordinal: i,
 			Reference: model.ContextReference{NodeID: model.NodeID(fmt.Sprintf("node-%d", i)),
 				FileID: model.FileID(fmt.Sprintf("file-%d", i)), Path: fmt.Sprintf("src/f%d.go", i)},
