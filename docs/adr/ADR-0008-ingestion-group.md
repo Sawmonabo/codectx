@@ -269,8 +269,13 @@ bounded by the log bound, and every later group reuses it. The store therefore c
 log's size or header whether a group has begun to spill -- frames appended inside the existing length
 change neither -- and the engine's own frame count arrives only at commit, after the decision it
 serves. The signal is therefore the shim's: it sees every write the engine makes to a file the engine
-opened as a log, and the store marks that count when a group begins. The count is the process's, not
-one database's, which can only make a group commit earlier than it had to, never later than it must.
+opened as a log, and the store marks that count when a group begins. The count is kept per log, by
+the log's path, and the store reads its own: the run ledger, a second WAL database in the same
+process, commits every 250 ms, and one count for the whole process cut a first index's group at
+every ledger flush -- 966 commits and 62.8 GB written for a 2.36 GB store on a 3,594-file corpus,
+against 8 commits, 7.5 GB and a first index 24% shorter, with an identical store, counted per log.
+The store's tests run a spilling cache beside a second WAL database and hold the commit count to the
+count alone.
 Measured on the ingestion test: 1.3× engine, 1.2× disk against the 4× bound, peak log 2.3 MiB under
 a 2 MiB cache. The 600 × 40 rows below store 73.1 MiB on the fixture they were taken on; the current
 fixture stores 85.4 MiB with the same ratios.

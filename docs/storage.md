@@ -637,8 +637,9 @@ log's blocks several times in one run, in the middle of its work. Because a
 rewind writes inside the file the log already holds, its size no longer says
 whether the writer's page cache has begun spilling; the file system shim sees
 every write the engine makes, and the engine names a log in the open flags, so
-the shim counts the bytes written to a log and the store marks that count when a
-group begins. The group's commit and the checkpoint that follows
+the shim counts the bytes written to each log, by the log's path, and the store
+marks its own log's count when a group begins. Another database's log -- the run
+ledger's, flushed four times a second -- does not move it. The group's commit and the checkpoint that follows
 reach the disk as every write of the engine does, through the paced file
 system the process registers as its default: after each 8 MiB window
 written to a file the writer waits for the previous window to reach the
