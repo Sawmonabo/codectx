@@ -275,27 +275,18 @@ known to be incomplete. `data.resources.stages` is that run's stages, each with
 rather than zero where nothing measured it.
 
 `codectx_refresh_index` reports the run it is making as it goes, from the same
-finished-stage rows:
+finished-stage rows, as **`notifications/progress`**, only when the call carried
+a `progressToken`. `progress` is the number of the run's top-level stages that
+have finished, so it strictly increases and never counts a unit's inner steps;
+`message` names the stage that just finished with its outcome, its wall and its
+counts. At most one notification a second: a stage that finishes inside that
+second is counted by the next notification's value, never dropped from it.
+`total` is absent -- how many stages a run will open is not known to a stage
+that has finished, and a total that is a guess is worse than none. Nothing is
+sent after the call answers, and a call that passed no token is sent nothing at
+all. The stage rows themselves, in the shape above, are read with
+`codectx_index_status` and `resources=true`.
 
-- **`notifications/progress`**, only when the call carried a `progressToken`.
-  `progress` is the number of the run's top-level stages that have finished, so
-  it strictly increases and never counts a unit's inner steps; `message` names
-  the stage that just finished with its outcome, its wall and its counts. At
-  most one notification a second: a stage that finishes inside that second is
-  counted by the next notification's value, never dropped from it. `total` is
-  absent -- how many stages a run will open is not known to a stage that has
-  finished, and a total that is a guess is worse than none. Nothing is sent
-  after the call answers, and a call that passed no token is sent nothing at
-  all.
-- **`notifications/message`** at `info`, only when the client has asked for a
-  logging level at that severity or lower. A call carries its own level in the
-  metadata beside the progress token, and that level **replaces** any the
-  session set earlier, so a client that sets a level once for the session and
-  then makes calls that carry none is sent nothing. One message
-  per finished stage, carrying the stage row itself as structured `data` in the
-  shape above, so an agent watching the stream reads the figures rather than
-  parsing a line.
-
-Both are sent from the server's own goroutine for that call, never from the one
-recording the run: a client that is slow to read, or gone, costs its own
-notifications and never the run's speed.
+Notifications are sent from the server's own goroutine for that call, never
+from the one recording the run: a client that is slow to read, or gone, costs
+its own notifications and never the run's speed.

@@ -503,7 +503,7 @@ func TestToolSchemaSnapshot(t *testing.T) {
 // enumAt walks a dotted property path and returns the enum it finds, or nil.
 func enumAt(shape schemaShape, path string) []string {
 	cur := &shape
-	for _, field := range strings.Split(path, ".") {
+	for field := range strings.SplitSeq(path, ".") {
 		next := cur.Properties[field]
 		if next == nil {
 			return nil
@@ -1427,7 +1427,6 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 			var (
 				mu       sync.Mutex
 				progress []mcp.ProgressNotificationParams
-				logs     []mcp.LoggingMessageParams
 			)
 			// The rows the run publishes. Only the top-level ones move the
 			// bar; the nested one is a stage of the same run and must not.
@@ -1466,21 +1465,9 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 					progress = append(progress, *req.Params)
 					mu.Unlock()
 				},
-				LoggingMessageHandler: func(_ context.Context, req *mcp.LoggingMessageRequest) {
-					mu.Lock()
-					logs = append(logs, *req.Params)
-					mu.Unlock()
-				},
 			})
 			cs := connectClient(t, s, c)
 			params := &mcp.CallToolParams{Name: "codectx_refresh_index", Arguments: emptyInput{}}
-			// The level a client wants travels on the request itself, beside
-			// the progress token: under the protocol this session negotiates,
-			// a call's own _meta level is what decides whether the server's
-			// log messages are sent, and a session-wide logging/setLevel is
-			// replaced by it on every request. Asking here is therefore how a
-			// client asks at all.
-			params.SetMeta(map[string]any{mcp.MetaKeyLogLevel: "info"})
 			if tc.token != nil {
 				params.SetProgressToken(tc.token)
 			}
@@ -1500,9 +1487,6 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 			if !tc.wantProgress {
 				if len(progress) != 0 {
 					t.Fatalf("a call that passed no progress token was sent %d progress notifications", len(progress))
-				}
-				if len(logs) != 5 {
-					t.Errorf("log messages = %d, want the 5 stages published during the call", len(logs))
 				}
 				return
 			}
@@ -1533,23 +1517,6 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 			if progress[0].Progress != 1 || progress[1].Progress != 4 {
 				t.Errorf("progress values = %v then %v, want 1 then 4: every finished top-level stage counted, the nested one not",
 					progress[0].Progress, progress[1].Progress)
-			}
-			if len(logs) != 5 {
-				t.Fatalf("log messages = %d, want one per stage published during the call and none after", len(logs))
-			}
-			if logs[0].Level != "info" {
-				t.Errorf("log level = %q, want info", logs[0].Level)
-			}
-			var row model.StageRecord
-			raw, err := json.Marshal(logs[0].Data)
-			if err != nil {
-				t.Fatalf("re-marshal the log message data: %v", err)
-			}
-			if err := json.Unmarshal(raw, &row); err != nil {
-				t.Fatalf("a log message did not carry a stage row as structured data: %v", err)
-			}
-			if row.Stage != rows[0].Stage || row.WallMS != rows[0].WallMS || row.ItemsIn != rows[0].ItemsIn {
-				t.Errorf("logged row = %+v, want the published row %+v", row, rows[0])
 			}
 		})
 	}

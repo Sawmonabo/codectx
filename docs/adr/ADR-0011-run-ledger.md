@@ -188,9 +188,8 @@ scopes and profiles and never growing.
 3. **MCP**: `codectx_index_status` with `resources=true` returns the same rows, because
    `model.IndexStatus` is the one model and a second shape would be a second thing to keep true.
    `codectx_refresh_index` sends progress notifications when the client passed a progress token,
-   rate-limited and always increasing as the protocol requires and stopped at completion, and a
-   log notification per finished span when the client set a logging level. Both come from a
-   collector subscriber, never from the handler's goroutine.
+   rate-limited and always increasing as the protocol requires and stopped at completion. They come
+   from a collector subscriber, never from the handler's goroutine.
 4. **The structured log**: one line per finished span, which is what a log shipper or a proof
    recorder reads.
 

@@ -2,10 +2,9 @@ package mcpserver
 
 // The live view of an indexing run over the protocol: one progress
 // notification per finished top-level stage while a client is driving a
-// progress bar, and one log message per finished stage while a client is
-// watching the stream.
+// progress bar.
 //
-// Both come from the SAME finished-stage rows the tools return and the CLI
+// It comes from the SAME finished-stage rows the tools return and the CLI
 // prints -- there is no second measurement here and nothing is timed in this
 // file. The rows arrive through Options.Spans, are fanned out to the calls
 // that are listening, and are sent from a goroutine of the call's own, never
@@ -85,13 +84,6 @@ func (h *spanHub) listen(ch chan<- model.StageRecord) (remove func()) {
 // token is the progress token the client passed in the request's _meta, and is
 // nil when it passed none: a client that did not ask to follow progress gets
 // no progress notifications and no work done on its behalf.
-//
-// The log message is NOT gated here. The level a client wants travels on the
-// request the same way, and the session keeps it; which of the two channels a
-// level arrived on, and whether it outranks info, is the session's own
-// judgement and it is not readable from outside. Log applies it and sends
-// nothing when no level was asked for, so a client that asked for none is
-// charged one suppressed call per stage and no traffic.
 type reporter struct {
 	session *mcp.ServerSession
 	token   any
@@ -178,7 +170,6 @@ func (r *reporter) deliver(ctx context.Context, row model.StageRecord) {
 	if row.ParentSeq == nil && r.following(row.RunID) {
 		r.finished++
 	}
-	r.logRow(ctx, row)
 	if r.token == nil {
 		return
 	}
@@ -229,22 +220,6 @@ func (r *reporter) following(runID string) bool {
 		r.runID = id
 	}
 	return runID == r.runID
-}
-
-// logRow sends the finished stage as a log message, so an agent watching the
-// stream sees what a human running the command sees. The row travels as
-// structured data in the same shape the tools return it, never as a rendered
-// line: a reader that wants the wall or the counts should not have to parse
-// prose for them.
-func (r *reporter) logRow(ctx context.Context, row model.StageRecord) {
-	err := r.session.Log(ctx, &mcp.LoggingMessageParams{
-		Level:  "info",
-		Logger: "codectx.index",
-		Data:   row,
-	})
-	if err != nil {
-		r.log.Debug("stage log message was not delivered", "detail", err.Error())
-	}
 }
 
 // progressMessage is the one line a client shows beside the bar: which stage

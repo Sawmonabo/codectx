@@ -114,7 +114,8 @@ precise unit run on the reference repository, precise resolution would cover **4
 555,588 call sites. That number is a property of **that repository's configuration**, not of the
 precise tier: its majority language, 94.8% of its call sites, carries no project configuration
 anywhere in the tree, so no profile is planned for it. On a second corpus whose majority language does
-carry one, and where the pinned indexer ran over the whole repository, the same call-site join covers
+carry one, and where the pinned indexer ran over the whole repository, the same call-site join
+([SCIP provider, Call-site join](../providers-scip.md#call-site-join-section-113)) covers
 **112,554 of 135,714 call sites (82.9%)** and **91.5%** of that language's own; on a nine-language
 fixture, every project configured, it covers **41 of 45** and **23 of the 23** whose callee is defined
 in the fixture. The syntax tier resolves 13.6% — corrected to about 12.4% below — and leaves
@@ -770,8 +771,8 @@ range in a read-only clone at the snapshot's own commit, as **defined in the rep
 or bundled dependency's own source counts, because the producers resolve into those files), **a
 third-party library not in the tree**, **platform or runtime**, or **undeterminable without
 executing**. All 664 rows passed an offset check. Where a precise index covers the site, the compiler
-answers instead of a human: the call-site join's native alias says whether an occurrence exists at the
-callee identifier and whether that symbol has a definition occurrence inside a repository document.
+answers instead of a human: the call-site join says whether a compiler occurrence lies exactly on the
+callee token and whether that symbol has a definition occurrence inside a repository document.
 
 | | reference repository — **class (b)**, no configuration for its majority language | second corpus — **class (a)**, configured and precisely indexed |
 |---|---|---|

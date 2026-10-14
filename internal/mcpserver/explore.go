@@ -49,8 +49,7 @@ func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, in m
 func (h *handlers) refreshIndex(ctx context.Context, req *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
 	var zero result[model.IndexResult]
 	// The run reports itself while it goes: progress for a client that passed
-	// a progress token, a log message per finished stage for one that set a
-	// logging level (progress.go). Stopped before the answer is returned, so
+	// a progress token (progress.go). Stopped before the answer is returned, so
 	// nothing about this run reaches the client after the result that ends
 	// it.
 	defer h.watchSpans(ctx, req)()
