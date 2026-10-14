@@ -39,8 +39,8 @@ const (
 	// documentHashDomain frames the canonical document hash. The version is
 	// part of the domain: changing what the hash covers yields a disjoint
 	// hash space, so an old manifest can never be read as if it described the
-	// new composition. Provider.Version must be bumped with it, because the
-	// unit fingerprint is what makes an old manifest reachable at all.
+	// new composition; Version, the digest of this package's code, moves
+	// with any change to it, so a unit sealed under the old one is not reused.
 	documentHashDomain = "scip-document-v1"
 
 	// manifestSeparator is the two-space separator between the fields of a

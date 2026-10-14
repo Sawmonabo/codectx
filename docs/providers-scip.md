@@ -9,7 +9,9 @@ decoder.
 | A supplied `.scip` file inside the snapshot (`Options.Import`, the explicit import request field), optionally with an input-hash manifest (`Options.Manifest`) | `import:<root-relative path>` (`scip.ImportScope`) | `verified` only when every document that names a snapshot file proves its bytes; otherwise `unverified` |
 | One of the six managed indexer profiles (`scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer`, `scip-clang`), whose pinned payload codectx runs against a private materialization of the snapshot | `profile:<profile name>:<project directory>` (`scip.ProfileScope`), one unit per triggering directory | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
 
-The descriptor is `scip`, version `3`, capabilities `precise_definitions`,
+The descriptor is `scip`, version the digest of the code that maps SCIP records
+to facts (`codectx.Digest` of `internal/provider/scip`, the packages it imports,
+the outside modules they name and the toolchain; never set by hand), capabilities `precise_definitions`,
 `precise_references`, `precise_implementations`, invalidation scope
 `workspace`, optional. It depends on `filesystem` and `treesitter`, plus
 `manifest` when a profile is configured (profiles read package manifests).
@@ -902,11 +904,11 @@ pinned payloads must key their units identically, and whether some *other*
 language's indexer is absent because the store is empty or because `tools.offline`
 is set is not part of what produced these facts. That reason is carried by
 `Detection.DiagnosticCode` instead. `Detection.ObservedVersion` carries the same
-`3/<digest>` value for the coordinator to fold in — the digest rather than a list
+`<code digest>/<digest>` value for the coordinator to fold in — the digest rather than a list
 of fingerprints, because `ObservedVersion` is bounded at 256 bytes and six
 82-byte fingerprints would be truncated there, silently dropping whichever
 payloads sort last. A build that resolved no payload at all carries no digest:
-its version is plain `3`. The cost is named rather than hidden: an `import:`
+its version is the code digest alone. The cost is named rather than hidden: an `import:`
 unit's identity also moves when an indexer this repository does not use is
 replaced, because the frozen provider contract has one version per provider, not
 one per unit.

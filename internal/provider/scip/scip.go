@@ -34,8 +34,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx"
 	"github.com/Sawmonabo/codectx/internal/admission"
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -48,33 +50,23 @@ import (
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// ID and Version identify the provider. Version is part of every unit key:
-// bump it when the mapping of SCIP records to facts changes.
-//
-// Version 3 is the Section 11.3/11.4 mapping: every reference occurrence
-// publishes a call-site alias, an external entity's evidence carries no
-// location, a read or write occurrence is a `references` edge because
-// `reads`/`writes` are the structural provider's facts
-// (docs/providers-treesitter.md, Dependence facts), and a
-// document that does not declare its position encoding is converted in the
-// measured encoding of the tool **build** that wrote the index and only after
-// that encoding is proved against the pinned bytes.
-//
-// Each bump is what makes the units of the version before it unreachable. A
-// unit sealed by an older version over unchanged inputs has the same scope key
-// and the same input hash, so without it `UnitID` would be identical and the
-// stale unit eligible for reuse. Version 1 sealed *zero* facts for
-// scip-typescript, scip-java, scip-python, scip-go and scip-clang, because
-// those five leave `position_encoding` unspecified and version 1 skipped every
-// such document; version 2 sealed `reads`/`writes` edges this provider does
-// not own, and facts converted under an encoding assumed from a tool name
-// alone, which lands a fraction of them on source bytes that are not the
-// symbol. Neither may be reused. `documentHashDomain` changes only when what
-// the document hash covers changes, which forces a bump here in turn.
-const (
-	ID      = "scip"
-	Version = "4"
-)
+// ID identifies the provider.
+const ID = "scip"
+
+// Version is the descriptor version: the digest of the code that maps SCIP
+// records to facts (codectx.Digest of this package: every package of the
+// module it is built from, every outside module they import and the
+// toolchain), so a unit another build of different code sealed is never
+// reused and one of an unchanged build always is. Nothing versions it by
+// hand. A provider with profile payloads appends their identities. It is
+// digested once, when first asked.
+var Version = sync.OnceValue(func() string {
+	code, err := codectx.Digest("internal/provider/scip")
+	if err != nil {
+		panic("scip version: " + err.Error())
+	}
+	return code[:24]
+})
 
 // Capabilities this provider offers. Definitions covers symbol nodes and
 // aliases; references covers reference and import occurrences;
@@ -330,9 +322,9 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 	// A build with no payload identity at all carries no tools digest: an
 	// import-only provider runs no indexer, so a digest over six empty slots
 	// would key its units by tools it never had.
-	version := Version
+	version := Version()
 	if len(identities) > 0 {
-		version = Version + "/" + toolsFingerprint(identities)
+		version = Version() + "/" + toolsFingerprint(identities)
 	}
 	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
 		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout, stallTimeout: o.StallTimeout,
@@ -350,7 +342,7 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 	}
 	version := p.version
 	if version == "" {
-		version = Version
+		version = Version()
 	}
 	return model.ProviderDescriptor{ID: ID, Version: version, Capabilities: capabilities, DependsOn: deps,
 		InvalidationScope: model.InvalidationWorkspace, Required: false}
@@ -487,7 +479,7 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 	// at model.MaxIdentifierBytes, and a concatenation would be truncated there
 	// -- silently dropping whichever payloads sort last, so replacing one of them
 	// would change nothing the coordinator folds into UnitSpec.ProviderVersion.
-	if p.version != Version {
+	if p.version != Version() {
 		det.ObservedVersion = p.version
 	}
 	if !det.Available {
