@@ -548,6 +548,58 @@ def use(h):
 		fails: "a computed callee counted as open, or bound through its subscription's names, breaks the counts; every open site given one reason misnames three",
 	},
 	{
+		name:   "builtins-and-getattr",
+		anchor: "The Python Language Reference §4.2.2 (Resolution of names: a name no enclosing, global or local scope binds is looked up in the builtins module); the Python Library Reference, \"Built-in Functions: getattr\" (getattr(x, 'foobar') is equivalent to x.foobar)",
+		files: map[string]string{
+			"jobs.py": `class Job:
+    def run(self):  # @jr
+        pass
+
+
+def go(j: Job, name):
+    print("x")  # @pr
+    getattr(j, "run")()  # @ga
+    getattr(j, "run", None)()  # @gd
+    getattr(j, name)()  # @gc
+    missing()  # @bare
+`,
+			"shadow.py": `def open(p):  # @op
+    pass
+
+
+def use():
+    open("x")  # @oc
+`,
+			"star.py": `from tools import *
+
+
+def use():
+    len([])  # @sl
+`,
+		},
+		// Derived twice from the source and the anchors, the second time blind (the sources, the anchors and
+		// the binding rules alone); the two agree on every site. `print` and `getattr` are no name of go's
+		// scopes or of the module: the builtins module declares them, so each is a call outside the project.
+		// `getattr(j, "run")` is `j.run`, so calling it calls Job.run, virtual since j is annotated, with or
+		// without a default; a name that is not a constant names no attribute, and its call is computed.
+		// `missing` is no builtin and stays unbound; a module's own `open` shadows the builtin; a star import
+		// of a module outside the project may supply `len`.
+		want: []string{
+			"ga run -> jr run virtual",
+			"gd run -> jr run virtual",
+			"oc open -> op open exact",
+		},
+		sites: []string{
+			"bare missing open global_unbound bare 0",
+			"gc getattr(j, name) open computed value 0",
+			"sl len open global_unbound bare 1",
+		},
+		counts: map[string]string{
+			"sites": "10", "bound_sites": "3", "external_sites": "4", "open_sites": "2", "computed_sites": "1",
+		},
+		fails: "a builtin read as an unbound global names print and getattr global_unbound; getattr's constant name not followed leaves `getattr(j, \"run\")()` computed and Job.run without its caller; a builtin taken over a module's own def or a star import binds the builtin",
+	},
+	{
 		name:   "method-values-bound-and-unbound",
 		anchor: "The Python Language Reference §3.2 (The standard type hierarchy: Instance methods; a function retrieved from a class is a plain function, one retrieved through an instance a bound method; Static method objects; Class method objects)",
 		files: map[string]string{

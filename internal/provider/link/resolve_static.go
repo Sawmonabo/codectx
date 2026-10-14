@@ -11,9 +11,10 @@ import (
 )
 
 // sigSink receives what a site joins the cross-product with (the signature
-// sink of staticRun.member): an indirect site (tag 1) or a Java call of an
-// abstract method (tag 2, the method's Ref in Aux, the detail in Sig), each
-// under its declared signature in Key and the site's Ref in Ref.
+// sink of staticRun.member): an indirect site, or a Java call of an abstract
+// method, under the join key in Key (an indirect site's declared signature,
+// or a Java functional interface's javaTargetKey) and the site's Ref in Ref,
+// Tag 1.
 type sigSink func(entry) error
 
 // staticFile resolves the sites and values of one member table.
@@ -39,6 +40,31 @@ type returned struct {
 	// exact reports a result that is an object of exactly the type name
 	// (flagExactReturn).
 	exact bool
+	// external reports a result of an external method of a known result
+	// type (externalResults): name is that type's qualified name outside
+	// the project.
+	external bool
+}
+
+// externalResults are the external methods, by externalMethod key, whose
+// result is an object of a type outside the project that a call on it is
+// resolved against: the reflective lookups whose result a reflective call
+// runs (reflective), and the calls that give the object those are made on.
+//   - Java (the Java SE API): Object.getClass and Class.forName give a
+//     java.lang.Class; its getMethod and getDeclaredMethod a
+//     java.lang.reflect.Method, its getConstructor and
+//     getDeclaredConstructor a java.lang.reflect.Constructor;
+//   - Go (package reflect): Value.MethodByName and Value.Method give a
+//     reflect.Value.
+var externalResults = map[string]string{
+	externalMethod("java", "java.lang.Object", "getClass"):              "java.lang.Class",
+	externalMethod("java", "java.lang.Class", "forName"):                "java.lang.Class",
+	externalMethod("java", "java.lang.Class", "getMethod"):              "java.lang.reflect.Method",
+	externalMethod("java", "java.lang.Class", "getDeclaredMethod"):      "java.lang.reflect.Method",
+	externalMethod("java", "java.lang.Class", "getConstructor"):         "java.lang.reflect.Constructor",
+	externalMethod("java", "java.lang.Class", "getDeclaredConstructor"): "java.lang.reflect.Constructor",
+	externalMethod("go", "reflect.Value", "MethodByName"):               "reflect.Value",
+	externalMethod("go", "reflect.Value", "Method"):                     "reflect.Value",
 }
 
 // siteOut receives what the resolution of one site finds: each declaration
@@ -76,22 +102,20 @@ func valueOut(yield func(entry) error) siteOut {
 // into the parameter it binds and its FactSummary (argumentFlows,
 // flowFacts), and a FactCall to an external method or a
 // FactExternalSite for a proven external call. An indirect site with a
-// declared function type also joins bySignature.
-//
-// A Java call of an abstract method binds that declaration only when no
-// method reference of its signature does (crossProduct): a call runs a
-// body, and the abstract method is the target only when no body is known.
+// declared function type, and a Java call of an abstract method, also join
+// bySignature (shape).
 func (r *staticFile) site(i int32, bySignature sigSink) error {
 	ref := Ref{File: r.file, Index: i}
 	s := &r.t.Sites[i]
-	joins := r.fc.language == "java" && s.Shape == wire.ShapeMember && s.Receiver.Kind == wire.TypeNamed
 	out := siteOut{
 		call: func(e entry, detail string, d model.Dispatch) error {
-			if joins && e.Flags&flagAbstract != 0 && e.Sig != "" {
-				return bySignature(entry{Key: e.Sig, Tag: 2, Ref: ref, Aux: refKey(e.Ref), Sig: detail})
-			}
 			if err := r.emit(Binding{Site: ref, Target: e.Ref, Detail: detail, Dispatch: d}); err != nil {
 				return err
+			}
+			if r.fc.language == "java" && e.Flags&flagAbstract != 0 {
+				// A Java abstract method has no body: no argument flows into
+				// it and no value returns from it (joinFlows).
+				return nil
 			}
 			if err := returnFact(s, ref, e.Ref, r.emit); err != nil {
 				return err
@@ -102,7 +126,13 @@ func (r *staticFile) site(i int32, bySignature sigSink) error {
 			if key == "" {
 				return r.emit(Binding{Kind: FactExternalSite, Site: ref})
 			}
-			return r.emit(Binding{Site: ref, External: key, Detail: DetailDirect, Dispatch: d})
+			if err := r.emit(Binding{Site: ref, External: key, Detail: DetailDirect, Dispatch: d}); err != nil {
+				return err
+			}
+			if reflective[key] {
+				return r.emit(Binding{Kind: FactOpenSite, Site: ref, Reason: model.ReasonReflective})
+			}
+			return nil
 		},
 	}
 	return r.resolve(i, bySignature, out)
@@ -130,6 +160,17 @@ func (r *staticFile) flows(ref Ref, s *Site, e entry) error {
 	return argumentFlows(s, params, r.receiverFirst(s, e), func(arg, pos int32) error {
 		return flowFacts(s, ref, e.Ref, params, arg, pos, r.emit)
 	})
+}
+
+// javaTargetKey is the join-key prefix of the Java type at ref as a method
+// reference's target type: its node, which names it the same in every
+// member, and a NUL no signature holds.
+func (r *staticFile) javaTargetKey(ref Ref) (string, error) {
+	to, err := r.h.ids.node(ref)
+	if err != nil {
+		return "", err
+	}
+	return string(to.Node) + "\x00", nil
 }
 
 // javaUnbound reports a Java method reference written `T::m` that resolved
@@ -182,18 +223,27 @@ func (r *staticFile) resolve(i int32, bySignature sigSink, out siteOut) error {
 		r.returns[i] = nil
 	}
 	var rets []returned
-	err := r.shape(i, s, bySignature, out.with(func(e entry, detail string, d model.Dispatch) error {
+	add := func(ret returned) {
+		if !known && !slices.Contains(rets, ret) {
+			rets = append(rets, ret)
+		}
+	}
+	shaped := out.with(func(e entry, detail string, d model.Dispatch) error {
 		if !r.fits(s, e) {
 			return nil
 		}
-		if !known && e.Returns != "" {
-			ret := returned{file: e.Ref.File, name: e.Returns, exact: e.Flags&flagExactReturn != 0}
-			if !slices.Contains(rets, ret) {
-				rets = append(rets, ret)
-			}
+		if e.Returns != "" {
+			add(returned{file: e.Ref.File, name: e.Returns, exact: e.Flags&flagExactReturn != 0})
 		}
 		return out.call(e, detail, d)
-	}))
+	})
+	shaped.external = func(key string, d model.Dispatch) error {
+		if t, ok := externalResults[key]; ok {
+			add(returned{file: r.file, name: t, external: true})
+		}
+		return out.ext(key, d)
+	}
+	err := r.shape(i, s, bySignature, shaped)
 	if !known {
 		r.returns[i] = rets
 	}
@@ -229,17 +279,27 @@ func (r *staticFile) shape(i int32, s *Site, bySignature sigSink, out siteOut) e
 		if err != nil || bySignature == nil || r.fc.language != "java" || s.Receiver.Kind != wire.TypeNamed {
 			return err
 		}
-		// A Java call of an abstract method (a functional interface's, on a
-		// field or local holding a method reference) is an indirect call
-		// of that method's signature: it joins every method reference of
-		// that signature, as an indirect site joins the address-taken
-		// functions of its declared type.
+		// A Java call of an abstract method binds the method (member, above),
+		// virtual, and beside it every method reference that is an object of
+		// the receiver's type: one whose target type is that interface or a
+		// subinterface of it (javaTargetKey), and one whose target type the
+		// worker could not read, of the method's signature (JLS §15.13.3: a
+		// method reference evaluates to an instance of a class implementing
+		// its target type).
+		site := Ref{File: r.file, Index: i}
 		return r.h.typesIn(r.fc, s.Receiver.Name, func(typ entry) error {
+			key, err := r.javaTargetKey(typ.Ref)
+			if err != nil {
+				return err
+			}
 			return r.h.declared(typ.Ref, s.Callee, func(e entry) error {
 				if e.Flags&flagAbstract == 0 || e.Sig == "" {
 					return nil
 				}
-				return bySignature(entry{Key: e.Sig, Tag: 1, Ref: Ref{File: r.file, Index: i}})
+				if err := bySignature(entry{Key: key + e.Sig, Tag: 1, Ref: site}); err != nil {
+					return err
+				}
+				return bySignature(entry{Key: e.Sig, Tag: 1, Ref: site})
 			})
 		})
 	case wire.ShapeIndirect:
@@ -688,9 +748,22 @@ func (r *staticFile) member(caller int32, recv wire.Type, method string, out sit
 			}
 			return r.named(r.fc, typ, method, true, out)
 		}
-		return r.results(int32(recv.Index), method, func(fc fileCtx, written string, exact bool) error {
+		err := r.results(int32(recv.Index), method, func(fc fileCtx, written string, exact bool) error {
 			return r.named(fc, written, method, exact, out)
 		})
+		if err != nil {
+			return err
+		}
+		// A result of an external method of a known result type
+		// (externalResults), resolved by results.
+		for _, ret := range r.returns[int32(recv.Index)] {
+			if ret.external {
+				if err := out.ext(externalMethod(r.fc.family, ret.name, method), model.DispatchVirtual); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	case wire.TypeSuper:
 		return r.h.typesIn(r.fc, recv.Name, func(typ entry) error {
 			found := false
@@ -743,6 +816,9 @@ func (r *staticFile) results(j int32, method string, each func(fc fileCtx, writt
 		}
 	}
 	for _, ret := range r.returns[j] {
+		if ret.external {
+			continue
+		}
 		name := ret.name
 		if r.fc.family == "rust" {
 			var ok bool

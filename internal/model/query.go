@@ -944,7 +944,11 @@ const (
 	// MarkMayDispatch is an override of a callee that a virtual call into the
 	// callee may run instead.
 	MarkMayDispatch MarkKind = "may_dispatch"
-	// MarkValueSet is one target of a site bound to several, shown "1 of n".
+	// MarkValueSet is one target of a site bound to several, or to the
+	// values the project's own code gives it (the functions whose address it
+	// takes, the function values that reach it), shown "1 of n": a value
+	// from outside the project may hold another, so even 1 of 1 is not a
+	// direct call.
 	MarkValueSet MarkKind = "value_set"
 	// MarkNameOnly is a `may_call` candidate: same name and shape, no analysis
 	// bound it.
@@ -971,8 +975,15 @@ type GraphRowMark struct {
 	Base          NodeID `json:"base,omitempty"`
 	BaseOverrides int64  `json:"base_overrides,omitempty"`
 	// SetSize is n of a value_set mark's "1 of n".
-	SetSize  int64 `json:"set_size,omitempty"`
-	Possible bool  `json:"possible"`
+	SetSize int64 `json:"set_size,omitempty"`
+	// Open is set on a through_base or may_dispatch mark whose base method
+	// (the method called through, or the one the override overrides) code
+	// outside the indexed project can override: a method outside the
+	// project, or one its language leaves open (MetaExtensible). The
+	// overrides the answer lists or counts for it are the project's own,
+	// and may not be all of them.
+	Open     bool `json:"open,omitempty"`
+	Possible bool `json:"possible"`
 	// Occurrences are the relation's occurrences the mark applies to. A
 	// through_base relation lists only its virtual occurrences: a `super` or
 	// qualified call into the base method never runs the override.
@@ -1008,11 +1019,14 @@ func (m GraphRowMark) Validate() error {
 	if m.Kind != MarkThroughBase && m.BaseOverrides != 0 {
 		return invalid("graph_row_mark.base_overrides is set on a %s mark", m.Kind)
 	}
+	if m.Open && m.Kind != MarkThroughBase && m.Kind != MarkMayDispatch {
+		return invalid("graph_row_mark.open is set on a %s mark", m.Kind)
+	}
 	if (m.Kind == MarkValueSet) != (m.SetSize != 0) {
 		return invalid("graph_row_mark.set_size is set exactly on a %s mark", MarkValueSet)
 	}
-	if m.Kind == MarkValueSet && m.SetSize < 2 {
-		return invalid("graph_row_mark.set_size is %d; a several-target site has at least 2", m.SetSize)
+	if m.Kind == MarkValueSet && m.SetSize < 1 {
+		return invalid("graph_row_mark.set_size is %d; a value set has at least 1", m.SetSize)
 	}
 	if err := boundPage("graph_row_mark.occurrences", len(m.Occurrences)); err != nil {
 		return err
@@ -1028,13 +1042,16 @@ func (m GraphRowMark) Validate() error {
 // GraphCounts are a call answer's exact counts, kept apart so a caller can
 // tell precise callers from possible ones: Direct relations, ThroughBase
 // calls into an overridden method, MayDispatch overrides a callee may run,
-// MayCall name-only candidates, and the OpenSites no analysis bound.
+// MayCall name-only candidates, and the OpenSites no analysis bound;
+// OpenBase counts the ThroughBase and MayDispatch rows whose base method
+// code outside the indexed project can override (GraphRowMark.Open).
 type GraphCounts struct {
 	Direct      int64 `json:"direct"`
 	ThroughBase int64 `json:"through_base"`
 	MayDispatch int64 `json:"may_dispatch"`
 	MayCall     int64 `json:"may_call"`
 	OpenSites   int64 `json:"open_sites"`
+	OpenBase    int64 `json:"open_base"`
 }
 
 // Validate enforces nonnegative counts.
@@ -1048,6 +1065,7 @@ func (c GraphCounts) Validate() error {
 		{"graph_counts.may_dispatch", c.MayDispatch},
 		{"graph_counts.may_call", c.MayCall},
 		{"graph_counts.open_sites", c.OpenSites},
+		{"graph_counts.open_base", c.OpenBase},
 	} {
 		if err := requireNonNegative(f.field, f.value); err != nil {
 			return err

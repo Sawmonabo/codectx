@@ -150,7 +150,7 @@ class App {
 			"g1 handle -> real handle virtual",
 			"g2 handle -> habs handle virtual",
 		},
-		fails: "an anonymous class body registered as the instantiated type's own methods binds `r.handle()` to it; a call through Handler published to each override instead of the abstract method no method reference of its signature implements",
+		fails: "an anonymous class body registered as the instantiated type's own methods binds `r.handle()` to it; a call through Handler published to each override instead of the abstract method it declares",
 	},
 	{
 		name:   "enclosing-class",
@@ -204,10 +204,42 @@ class MathOps {
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every binding.
+		// The call binds the method Op declares, virtual, and beside it the one method reference whose target
+		// type is Op, exact: one of two (JLS §15.13.3: the reference is an object of a class implementing Op).
 		want: []string{
-			"call apply -> twice twice exact",
+			"call apply -> abs apply virtual set=2",
+			"call apply -> twice twice exact set=2",
 		},
-		fails: "a functional-interface call that binds the abstract method beside the referenced one, or that ignores method references, gives the wrong set",
+		// Mutation: let a method reference of the signature replace the abstract method -> the abs line is
+		// missing. Mutation: ignore method references -> the twice line is missing and the set is gone.
+		fails: "a functional-interface call whose method references replace the abstract method, or that ignores method references, gives the wrong set",
+	},
+	{
+		name:   "method-reference-target-type",
+		anchor: "Java Language Specification §15.13.2 (Type of a Method Reference: the target type is a functional interface type), §15.13.3 (Run-Time Evaluation of Method References), §9.8 (Functional Interfaces), §15.12.4.4",
+		files: map[string]string{
+			"Zoo.java": `interface Animal { String sound(); } // @asound
+class Dog implements Animal { public String sound() { return "woof"; } } // @dsound
+class Zoo {
+  String name() { return "zoo"; } // @name
+  String cry() { return "cry"; } // @cry
+  java.util.function.Supplier<String> s = this::name;
+  Animal pet = this::cry;
+  String speak(Animal a) { return a.sound(); } // @speak
+}
+`,
+		},
+		// Derived from the source and the anchors. this::name has the target type Supplier, outside the
+		// project, whose method `a.sound()` never calls; this::cry has the target type Animal, so it is an
+		// object of a class implementing Animal, which a.sound() may run. The call binds Animal.sound,
+		// virtual (Dog.sound is found through overrides), and this::cry beside it.
+		want: []string{
+			"speak sound -> asound sound virtual set=2",
+			"speak sound -> cry cry exact set=2",
+		},
+		// Mutation: join method references by signature alone -> speak also binds name. Mutation: let a
+		// method reference replace the abstract method -> the asound line is missing.
+		fails: "a call of an interface's method bound to a method reference of another functional interface, or bound to its references instead of the method the interface declares",
 	},
 	{
 		name:   "unbound-method-reference",
@@ -234,11 +266,13 @@ class Box {
 		// Derived from the source and the anchor; the worker's values, signatures and argument reads are
 		// probed. Box::size is unbound: of's first parameter is its receiver and its second size's scale.
 		// Box::twice is static and this::bound bound, so each takes of's parameters as its own, in order.
-		// All three are of of's function type, so `m.of(b, k)` may call each.
+		// All three are of of's function type and their target type is Measure, so `m.of(b, k)` calls the method
+		// Measure declares, virtual, and may run each of them.
 		want: []string{
-			"call of -> size size exact set=3",
-			"call of -> twice twice exact set=3",
-			"call of -> bound bound exact set=3",
+			"call of -> abs of virtual set=4",
+			"call of -> size size exact set=4",
+			"call of -> twice twice exact set=4",
+			"call of -> bound bound exact set=4",
 		},
 		facts: []string{
 			"run k flows size scale",

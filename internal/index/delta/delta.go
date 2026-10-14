@@ -20,7 +20,8 @@
 // and names those and the members that are gone replaced, and the applier
 // carries the rest over.
 //
-// A predecessor that is absent, stored no state, or stored state this build
+// A predecessor that is absent, stored no state, stored state another version
+// of its provider wrote, or stored state this build
 // cannot read is not an error: the unit is built in full and Result.Full and
 // Result.FullReason say so. That degradation covers provider-written state
 // only — the SCIP document manifest and the link resolution. A failure to
@@ -97,6 +98,10 @@ const (
 	// FullStateUnreadable: the predecessor's stored state exists and this
 	// build cannot read it.
 	FullStateUnreadable = "unreadable_previous_state"
+	// FullStateVersion: the predecessor's stored state was written by
+	// another version of its provider, whose facts this build does not
+	// carry.
+	FullStateVersion = "previous_state_of_another_version"
 )
 
 // Result is one built unit: what the provider reported, what was inherited
@@ -107,7 +112,7 @@ type Result struct {
 	Carried sqlite.CarryOverStats
 	Delta   Stats
 	// Full says the unit was built without inheriting anything, and
-	// FullReason says which of the three cases above it was.
+	// FullReason says which of the cases above it was.
 	Full       bool
 	FullReason string
 	// Filtered says the emit this build requested was a filtered one: the

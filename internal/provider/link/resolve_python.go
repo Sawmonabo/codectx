@@ -434,6 +434,9 @@ func (r *pySite) resolve(site Ref) error {
 		// f; f()`, spelled "a.b.f").
 		return lookupPython(site, tab.Path, s.Shape == wire.ShapeBare, s.Receiver.Name, s.Callee, true, r.look, r.hits)
 	}
+	if pythonBuiltinCall(tab, s) {
+		return r.emit(Binding{Kind: FactExternalSite, Site: site, Detail: DetailDirect})
+	}
 	switch s.Shape {
 	case wire.ShapeBare, wire.ShapeConstructor:
 		for _, c := range visibleCandidates(tab, s) {
@@ -501,11 +504,15 @@ func (r *pySite) receiver(site Ref, s *Site) error {
 		if v.Role != roleReceiver {
 			return nil
 		}
+		detail := DetailFlow
+		if v.Via {
+			detail = DetailReceiverValue
+		}
 		switch v.X.Kind {
 		case valInstance:
-			return r.instance(site, s, v.X.Ref, DetailFlow)
+			return r.instance(site, s, v.X.Ref, detail)
 		case valObject, valExact:
-			return r.object(site, s, v.X.Ref, DetailFlow)
+			return r.object(site, s, v.X.Ref, detail)
 		case valClass:
 			return r.class(site, s, v.X.Ref, DetailFlow)
 		}

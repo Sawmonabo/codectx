@@ -1255,11 +1255,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	if len(dropped) > 0 {
 		calls.drop(dropped)
 	}
-	marks, occurrences, err := e.marks(finish, calls, where.occurrences, &b.calls)
+	marks, occurrences, open, err := e.marks(finish, calls, where.occurrences, &b.calls)
 	if err != nil {
 		return model.GraphResult{}, err
 	}
 	where.occurrences = occurrences
+	notices = append(notices, open...)
 
 	// The possible rows come after every precise row: on the page the walk
 	// finished on, in the room it left, and on the pages after it.
@@ -1325,6 +1326,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			return model.GraphResult{}, err
 		}
 		notices = append(notices, external...)
+		notices = appendNotice(notices, reflectiveNotice(caps))
 	}
 
 	reason := walkReason

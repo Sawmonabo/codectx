@@ -610,6 +610,96 @@ func f(x int) { // @f
 		fails: "an argument into a variadic parameter, or a spread argument, left without its flow; a flow published at an unbound site; a site bound by its argument count alone",
 	},
 	{
+		name:   "java-reflective-call",
+		anchor: "Java SE API java.lang.reflect.Method.invoke (invokes the underlying method the Method object represents) and java.lang.Class.getMethod (the public member method of the given name), JLS §15.12.4.4; ADR-0015 decision 3 (open sites and their reasons)",
+		files: map[string]string{
+			"R.java": `import java.lang.reflect.Method;
+class Handler { void handle() {} } // @handle
+class R {
+  void go(Handler obj, String n) throws Exception {
+    Method m = Handler.class.getMethod("handle"); // @get
+    m.invoke(obj); // @inv
+    Handler.class.getDeclaredMethod("handle").invoke(obj); // @chain
+    Method k = Handler.class.getMethod("handle");
+    k = Handler.class.getMethod(n);
+    k.invoke(obj); // @moved
+  }
+}
+`,
+		},
+		// Derived from the source and the anchors. m.invoke runs whatever method m represents, chosen at run
+		// time: the call of Method.invoke is published, and beside it the site is open for that reason.
+		// `Handler.class` is a java.lang.Class (JLS §15.8.2), whose getMethod gives a Method. The
+		// string constant "handle" that m's every definition looks up names the method it runs, so the open
+		// site is named handle, whose methods are its candidates; so is the chained lookup. k is defined twice,
+		// once by a name that is no constant, so its site names nothing but the API.
+		want: []string{
+			"R.java:8 getMethod -> external java.lang.Class.getMethod virtual",
+			"R.java:9 getMethod -> external java.lang.Class.getMethod virtual",
+			"chain getDeclaredMethod -> external java.lang.Class.getDeclaredMethod virtual",
+			"chain invoke -> external java.lang.reflect.Method.invoke virtual",
+			"get getMethod -> external java.lang.Class.getMethod virtual",
+			"inv invoke -> external java.lang.reflect.Method.invoke virtual",
+			"moved invoke -> external java.lang.reflect.Method.invoke virtual",
+		},
+		sites: []string{
+			"chain handle open reflective member 1",
+			"inv handle open reflective member 1",
+			"moved invoke open reflective member 1",
+		},
+		// Mutation: drop the reflective open site -> the inv site is counted external and nothing says its
+		// target is unknown. Mutation: name a site by its variable's first definition -> the moved site is
+		// named handle.
+		fails: "a reflective call bound to the reflection API alone, with no open site saying its target is chosen at run time; a constant method name that reaches the call not followed, or one followed past a definition that names another",
+	},
+	{
+		name:   "go-reflective-call",
+		anchor: "Go standard library reflect.Value.Call (calls the function v with the input arguments) and reflect.Value.MethodByName (the method of the given name), The Go Programming Language Specification \"Calls\"; ADR-0015 decision 3",
+		files: map[string]string{
+			"go.mod": "module example.com/p\n\ngo 1.22\n",
+			"p.go": `package p
+
+import "reflect"
+
+type H struct{}
+
+func (H) Handle() {} // @handle
+
+func run(v reflect.Value, n string) {
+	v.Call(nil) // @call
+	v.MethodByName("Handle").Call(nil) // @chain
+	m := v.MethodByName("Handle")
+	m.Call(nil) // @named
+	k := v.MethodByName("Handle")
+	k = v.MethodByName(n)
+	k.Call(nil) // @moved
+}
+`,
+		},
+		// Derived from the source and the anchors: v.Call runs the function or method v holds, chosen at
+		// run time. A method value MethodByName looks up by the constant "Handle", directly or through m,
+		// names the method it runs; k is defined twice, once by a name that is no constant.
+		want: []string{
+			"call Call -> external reflect.Value.Call virtual",
+			"chain Call -> external reflect.Value.Call virtual",
+			"chain MethodByName -> external reflect.Value.MethodByName virtual",
+			"moved Call -> external reflect.Value.Call virtual",
+			"named Call -> external reflect.Value.Call virtual",
+			"p.go:12 MethodByName -> external reflect.Value.MethodByName virtual",
+			"p.go:14 MethodByName -> external reflect.Value.MethodByName virtual",
+			"p.go:15 MethodByName -> external reflect.Value.MethodByName virtual",
+		},
+		sites: []string{
+			"call Call open reflective member 1",
+			"chain Handle open reflective member 1",
+			"moved Call open reflective member 1",
+			"named Handle open reflective member 1",
+		},
+		// Mutation: drop the reflective open site -> the call site is counted external only. Mutation: name
+		// a site by its variable's first definition -> the moved site is named Handle.
+		fails: "a reflective call bound to the reflection API alone, with no open site saying its target is chosen at run time; a constant method name that reaches the call not followed, or one followed past a definition that names another",
+	},
+	{
 		name:   "go-open-and-external-sites",
 		anchor: "ADR-0015 decision 1 (open sites and their reasons); The Go Programming Language Specification, \"Calls\", \"Import declarations\"",
 		files: map[string]string{

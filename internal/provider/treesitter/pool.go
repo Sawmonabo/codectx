@@ -20,6 +20,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/residency"
 )
@@ -897,8 +898,8 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 	if err == nil {
 		if kind != wire.KindHello {
 			err = errors.New("first frame is not a hello")
-		} else if err = json.Unmarshal(payload, &hello); err == nil && hello.Fingerprint != fingerprint {
-			err = fmt.Errorf("worker fingerprint %s does not match the provider's %s", short(hello.Fingerprint), short(fingerprint))
+		} else if err = json.Unmarshal(payload, &hello); err == nil && hello.Fingerprint != lang.Fingerprint() {
+			err = fmt.Errorf("worker fingerprint %s does not match the provider's %s", short(hello.Fingerprint), short(lang.Fingerprint()))
 		} else if err == nil && hello.Build != p.build {
 			err = fmt.Errorf("worker build %q does not match the provider's %q", bound(hello.Build, 128), p.build)
 		}
@@ -1469,7 +1470,7 @@ func (p *pool) plan(ctx context.Context, view model.SnapshotView, language strin
 		return nil, err
 	}
 	key := needKey{repository: t.repository,
-		Kind: ledger.NeedParse, Subject: language, Fingerprint: fingerprint, Build: p.build, SizeClass: admission.SizeClassOf(size)}
+		Kind: ledger.NeedParse, Subject: language, Fingerprint: lang.Fingerprint(), Build: p.build, SizeClass: admission.SizeClassOf(size)}
 	p.mu.Lock()
 	m := p.models[key]
 	if m == nil {

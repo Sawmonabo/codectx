@@ -44,7 +44,16 @@ the same name is invisible to the index.
   placeholder node, no `may_refer_to`, no edge per override. Each `calls` occurrence's evidence carries a
   `dispatch` field of its own: `virtual` when the call can run an override, `exact` when it cannot (`super`, a
   qualified call, a constructed object, a final, static or non-virtual method). The field is computed per site, not
-  read back from the technique that bound it.
+  read back from the technique that bound it. A C++ member is virtual when the receiver's type or a supertype
+  declares it so, or may be when one of them has a supertype outside the project: that supertype may declare it
+  virtual, and an overrider is virtual without saying so ([class.virtual]/2), so the call is `virtual` and a
+  subclass's member of its signature overrides it.
+- **Extra targets are beside the declared method, never instead of it.** A Java call of an interface's abstract
+  method stores the call to that method, `virtual`, and beside it each method reference that is an object of the
+  receiver's type: a reference whose target type is that interface or a subinterface, or whose target type the
+  context does not state. A method reference evaluates to an instance of a class implementing its target type (JLS
+  §15.13.3), which is how mature call-graph builders model it (an extra implementation of that interface), so a
+  reference of another functional interface is never bound to the call.
 - **Hierarchy.** The linker publishes `extends` (type to declared supertype), `implements` (type to the interface or
   trait it declares or, for Go, satisfies by method set) and `overrides` (method to the method it directly overrides
   or implements). A supertype outside the indexed project gets a structural node keyed by its qualified name, so the
@@ -95,6 +104,17 @@ the same name is invisible to the index.
   see which subclasses other code will construct, so narrowing by the classes constructed in the project would drop
   real callers. Where value flow already gives the exact classes (decision 1, second row), the published targets are
   those classes only. Every through-base and may-dispatch row is marked as possible, never as certain.
+- **Overrides outside the project.** The set is the project's own overrides; code outside it may add more when the
+  base is open to it (the open-package assumption of Reif et al., FSE 2016). The structural provider marks each
+  method its language leaves open to outside overriding `extensible` (a public or protected Java method of a public,
+  non-final, non-sealed class or of a public interface; an exported method of an exported Go interface of an
+  importable package; a method of an exported TypeScript or JavaScript class or interface, not private or static; a
+  Python method unless it or its class is `final` or its name is mangled; a method of a `pub` Rust trait; a C++
+  member of a non-final class a header declares, not static or final). A through-base or may-dispatch row whose base
+  is open, or outside the project, is marked `open` and counted (`open_base`), each such base and each open target
+  of a virtual call is named in a notice, and `impact` of an open method says a change to it affects overrides
+  written outside. Closed cases (final, sealed, private, static, unexported, package-private, `internal` or `main`)
+  stay exact. It is a disclosure; no stored relation changes.
 - **Cost.** One index lookup per hierarchy level per visited node; exact totals, paged, no cap.
 
 **Alternatives.** A separate relation kind for dispatch calls: a request filtered to `calls` drops it, the same
@@ -108,10 +128,16 @@ for `Cat.sound` is then a false zero.
 
 - **Published once per site.** An open-site node in the file's scope, located at the site, named by the callee, with
   metadata `resolution: unresolved`, a `reason` (`receiver_untyped`, `value_untracked`, `global_unbound`,
-  `computed`), the call `shape` (`bare`, `member`, `value`, `construct`) and the argument count. The caller has a
-  `calls` edge to it. In answers this node replaces the structural `call:<name>` placeholder for the same site, as a
-  bound target or an external node does: the packed adjacency leaves out a placeholder edge every site of which
-  another `calls` edge of the caller covers at the same bytes (docs/storage.md, One edge per call).
+  `computed`, `reflective`), the call `shape` (`bare`, `member`, `value`, `construct`) and the argument count. The
+  caller has a `calls` edge to it. In answers this node replaces the structural `call:<name>` placeholder for the
+  same site, as a bound target or an external node does: the packed adjacency leaves out a placeholder edge every
+  site of which another `calls` edge of the caller covers at the same bytes (docs/storage.md, One edge per call).
+- **A reflective call is open too.** A call of a reflection API that runs a method chosen at run time (Java's
+  `Method.invoke`, `Constructor.newInstance`, `Class.newInstance`, the `MethodHandle` invocations; Go's
+  `reflect.Value.Call` and `CallSlice`) keeps its `calls` to the API's external method and is also an open site of
+  reason `reflective`, as mature call-graph builders record such a site as incomplete.
+  Its callee names the API, so it has no candidates; the `calls` row counts it in `reflective_sites`, and every
+  `callers` answer of a project with reflective sites says how many.
 - **Candidates per query, never stored.** The declarations of the same generation with the same name (as the
   language compares names), the site's shape (methods and function-valued fields for a member site, functions for a
   bare or value site, classes for a construction), the same language family, and, in the static families only, a
@@ -135,7 +161,10 @@ for `Cat.sound` is then a false zero.
 ### 4. Disclosure is structured and exact
 
 - The linker's `calls` capability row carries exact `sites`, `bound_sites`, `open_sites`, `computed_sites` and
-  `external_sites` counts.
+  `external_sites` counts, and `reflective_sites`, the external sites that call a reflection API.
+- A call bound through the values the project's own code gives its site (the functions whose address it takes, the
+  function values that reach it, the functions written to the field it calls through) is marked `value_set` "1 of
+  n" even with one target: a value from outside the project may hold another, so it never reads as a direct call.
 - Every call answer carries structured counts (`direct`, `through_base`, `may_dispatch`, `may_call`) and a notice in
   plain words, for example: "3 call sites in 2 callers name `handle` and no analysis bound them. They are listed by
   name only and may not call this symbol."
@@ -199,6 +228,14 @@ ranked, paged and counted.
 - *The Java Language Specification*, https://docs.oracle.com/javase/specs/jls/se21/html/ — §8.4.8.1 (overriding),
   §9.6.4.4 (`@Override`).
 - *PEP 698*, https://peps.python.org/pep-0698/ — `typing.override`.
+- *PEP 591*, https://peps.python.org/pep-0591/ — `typing.final`.
+- Reif, Eichberg, Hermann, Lerch, Mezini, *Call Graph Construction for Java Libraries*, FSE 2016 — the open-package
+  assumption: non-final classes can be extended and non-final methods overridden by a library's users.
+- Reif, Kübler, Eichberg, Helm, Mezini, ISSTA 2019, *identifying, understanding, and evaluating sources of
+  unsoundness in call graphs* — reflection among the most frequent sources, and the call to document where a call
+  graph is unsound.
+- *ISO/IEC 14882 [class.virtual]*, https://eel.is/c++draft/class.virtual — a member that overrides a virtual one is
+  virtual.
 - *callgraph/cha*, https://pkg.go.dev/golang.org/x/tools/go/callgraph/cha — class-hierarchy analysis and its spurious
   edges.
 - Salis et al., *PyCG: Practical Call Graph Generation in Python*, ICSE 2021 — precision and recall of a careful

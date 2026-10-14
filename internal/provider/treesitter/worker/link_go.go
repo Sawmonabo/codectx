@@ -42,13 +42,97 @@ func (k *goLinker) file(root Node, src []byte, out *wire.Link) {
 	x := &goLink{k: goLinkSyntaxOf(), src: src, out: out, reads: k.reads(),
 		sites: map[uint32]uint32{}, imports: map[string]bool{}, funcs: map[string]goVar{},
 		types: map[string]map[string]goVar{}, consts: map[string]bool{},
-		tops: map[string]*goTop{}, index: map[string]int32{}}
+		tops: map[string]*goTop{}, index: map[string]int32{}, reflected: map[uint32]*goReflectedDefs{}}
 	x.prepare(root)
 	for _, t := range x.tops {
 		x.topVar(t)
 	}
 	x.walk(root)
+	// A site's receiver local is named once every definition of it is seen.
+	for _, r := range x.reflectedAt {
+		if d := x.reflected[r.decl]; d != nil && !d.not {
+			out.Sites[r.site].Reflected = d.name
+		}
+	}
 	out.Constraint = gobuild.Header(src)
+}
+
+// goReflectedDefs are the definitions of one local: the one method name
+// every one of them gives it by a reflective lookup (goReflected), and not
+// that some definition gives it anything else.
+type goReflectedDefs struct {
+	name string
+	not  bool
+}
+
+// goReflectedAt is a site whose receiver is the local declared at decl.
+type goReflectedAt struct {
+	site int
+	decl uint32
+}
+
+// reflectedDef records one definition of the local declared at decl: a
+// reflective lookup of name, or, with name empty, anything else.
+func (x *goLink) reflectedDef(decl uint32, name string) {
+	if decl == 0 {
+		return
+	}
+	d := x.reflected[decl]
+	if d == nil {
+		d = &goReflectedDefs{}
+		x.reflected[decl] = d
+	}
+	switch {
+	case name == "" || d.name != "" && d.name != name:
+		d.not = true
+	default:
+		d.name = name
+	}
+}
+
+// goReflected is the method name a reflective lookup e (inside any
+// parentheses) finds by a constant: `v.MethodByName("N")` whose argument
+// is one string literal spelling an identifier (package reflect: the
+// method of that name of the value's type); "" for any other expression.
+func (x *goLink) goReflected(e Node) string {
+	k := x.k
+	e = x.unparen(e)
+	if e.IsNull() || e.KindId() != k.callExpression {
+		return ""
+	}
+	f := x.unparen(e.ChildByFieldId(k.fFunction))
+	if f.IsNull() || f.KindId() != k.selectorExpression {
+		return ""
+	}
+	if field := goChild(f, k.fField); field.IsNull() || x.text(field) != "MethodByName" {
+		return ""
+	}
+	var args []Node
+	if a := goChild(e, k.fArguments); !a.IsNull() {
+		goNamed(a, func(n Node) { args = append(args, n) })
+	}
+	if len(args) != 1 {
+		return ""
+	}
+	lit := x.text(args[0])
+	if len(lit) < 3 || (lit[0] != '"' || lit[len(lit)-1] != '"') && (lit[0] != '`' || lit[len(lit)-1] != '`') {
+		return ""
+	}
+	if name := lit[1 : len(lit)-1]; goIdentifier(name) {
+		return strings.Clone(name)
+	}
+	return ""
+}
+
+// goIdentifier reports an ASCII Go identifier; any other spelling is not
+// read.
+func goIdentifier(s string) bool {
+	for i, r := range s {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // goVar is what a name in scope says about its value: its type, its
@@ -59,6 +143,9 @@ type goVar struct {
 	typ   wire.Type
 	sig   string
 	bound bool
+	// decl is one more than the first byte of the identifier that declared
+	// a local, 0 for any other name.
+	decl uint32
 }
 
 // goTop is a package-level variable of the file: its spec, its position in
@@ -107,6 +194,11 @@ type goLink struct {
 	blankEnd uint
 	// tparams resolves the type names that denote type parameters.
 	tparams goTypeParams
+	// reflected are the definitions of each local by its declaration
+	// (reflectedDef), and reflectedAt the sites whose receiver is a local,
+	// named after the walk.
+	reflected   map[uint32]*goReflectedDefs
+	reflectedAt []goReflectedAt
 }
 
 func (x *goLink) text(n Node) string { return view(textOf(x.src, n)) }
@@ -608,6 +700,18 @@ func (x *goLink) enter(n Node) {
 		x.values(n.ChildByFieldId(k.fRight), func(int) string { return "" })
 	case k.assignmentStatement:
 		left := x.list(n.ChildByFieldId(k.fLeft))
+		right := x.list(n.ChildByFieldId(k.fRight))
+		for i, l := range left {
+			if l = x.unparen(l); l.KindId() != k.identifier || !x.local(x.text(l)) {
+				continue
+			}
+			name := ""
+			if len(right) == len(left) {
+				name = x.goReflected(right[i])
+			}
+			v, _ := x.lookup(x.text(l))
+			x.reflectedDef(v.decl, name)
+		}
 		x.values(n.ChildByFieldId(k.fRight), func(i int) string {
 			if i < len(left) {
 				if t := x.unparen(left[i]); x.is(t, k.selectorExpression) {
@@ -736,11 +840,20 @@ func (x *goLink) declare(names, values, spec Node) {
 		if id.KindId() != k.identifier {
 			continue
 		}
+		name := ""
+		if len(vals) == len(ids) {
+			name = x.goReflected(vals[i])
+		}
 		// A name `:=` redeclares in the same block is the same variable,
 		// with the type it was declared with ("Short variable declarations").
 		if spec.IsNull() && x.inInnermost(x.text(id)) {
+			if old, ok := x.lookup(x.text(id)); ok {
+				x.reflectedDef(old.decl, name)
+			}
 			continue
 		}
+		v.decl = uint32(id.StartByte()) + 1
+		x.reflectedDef(v.decl, name)
 		x.bind(id, v)
 	}
 }
@@ -1029,6 +1142,12 @@ func (x *goLink) site(call Node) {
 				}
 			}
 			s.Receiver = goCopiedType(t)
+			s.Reflected = x.goReflected(o)
+			if s.Reflected == "" && o.KindId() == k.identifier && x.local(x.text(o)) {
+				if v, _ := x.lookup(x.text(o)); v.decl != 0 {
+					x.reflectedAt = append(x.reflectedAt, goReflectedAt{site: len(x.out.Sites), decl: v.decl})
+				}
+			}
 		}
 	}
 	if args := goChild(call, k.fArguments); !args.IsNull() {

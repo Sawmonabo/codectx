@@ -8,6 +8,68 @@ func TestECMAScriptGoldens(t *testing.T) { runGoldens(t, ecmascriptGoldens) }
 
 var ecmascriptGoldens = []golden{
 	{
+		name:   "structural-implements",
+		anchor: "TypeScript Language Specification 1.8 §3.11.4 (Assignment Compatibility: S is assignable to T when, for each property in T, S has a property of that name, and each call signature of T is matched by one of S whose parameters T can supply; the checker's compareSignaturesRelated: the source's required parameters do not outnumber the target's parameters); §8.2.1 (a class need not name an interface it implements)",
+		files: map[string]string{
+			"zoo.ts": `interface Animal { // @animal
+  name: string;
+  sound(): string; // @asound
+}
+class Dog { // @dog
+  name = "d";
+  sound(): string { return "w"; } // @dsound
+}
+class Cat { // @cat
+  name = "c";
+  sound(loud: boolean, times: number): string { return "m"; } // @csound
+}
+class Fish { // @fish
+  sound(): string { return "b"; } // @fsound
+}
+class Puppy extends Dog {} // @puppy
+class Robot implements Animal { // @robot
+  name = "r";
+  sound(): string { return "beep"; } // @rsound
+}
+function speak(a: Animal) {
+  a.sound(); // @s
+}
+`,
+			"parrot.tsx": `class Parrot { // @parrot
+  name = "p";
+  sound(): string { return "squawk"; } // @psound
+}
+`,
+			"hen.js": `class Hen { // @hen
+  name = "h";
+  sound() { return "cluck"; } // @hsound
+}
+`,
+		},
+		// Derived from the source and the anchors. Dog has every member Animal names, and its sound takes no
+		// more required parameters than Animal's supplies: it is assignable to Animal without naming it, so
+		// it implements Animal and its sound overrides Animal's, and a call through Animal may run it; Puppy
+		// inherits both members. Cat's sound requires two arguments that a call of Animal.sound never passes,
+		// and Fish has no name: neither is assignable. Robot names Animal, as before. A TSX or JavaScript class
+		// of the same members, in another file and with no import of Animal, is assignable as Dog is.
+		want: []string{
+			"s sound -> asound sound virtual",
+		},
+		facts: []string{
+			"dog Dog implements animal Animal",
+			"dsound sound overrides asound sound",
+			"hen Hen implements animal Animal",
+			"hsound sound overrides asound sound",
+			"parrot Parrot implements animal Animal",
+			"psound sound overrides asound sound",
+			"puppy Puppy extends dog Dog",
+			"puppy Puppy implements animal Animal",
+			"robot Robot implements animal Animal",
+			"rsound sound overrides asound sound",
+		},
+		fails: "a class with an interface's members but no implements clause gets no implements and no overrides, so a call through the interface never reaches it; a member of more required parameters, or a missing property, read as assignable",
+	},
+	{
 		name:   "default-exports",
 		anchor: "ECMA-262 (15th edition, 2024) §16.2.2 (Imports), §16.2.3 (Exports: `export default`), §13.3.5 (The new Operator), §13.3.6 (Function Calls)",
 		files: map[string]string{

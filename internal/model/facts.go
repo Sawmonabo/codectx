@@ -731,12 +731,13 @@ const (
 	MetaCandidates = "candidates"
 	// MetaCallee holds the callee name of a call placeholder, as written.
 	MetaCallee = "callee"
-	// MetaReason, MetaShape and MetaArguments describe an open call site
+	// MetaReason, MetaShape, MetaArguments and MetaNamed describe an open call site
 	// (OpenSiteMetadata); MetaReason and MetaFragments an open import site
 	// (OpenImportSiteMetadata).
 	MetaReason    = "reason"
 	MetaShape     = "shape"
 	MetaArguments = "arguments"
+	MetaNamed     = "named"
 	MetaFragments = "fragments"
 	// MetaFramework, MetaMethod, MetaRoute, MetaPath and MetaPrefix describe an
 	// endpoint (EndpointMetadata).
@@ -754,6 +755,10 @@ const (
 	// parameter's own decorators are on its variable node, under
 	// MetaDecorators.
 	MetaTypeAnnotations = "type_annotations"
+	// MetaExtensible marks a method that code outside the indexed project
+	// can override or implement under its language's rules (true), so the
+	// overrides the index lists for it may not be all of them.
+	MetaExtensible = "extensible"
 	// MetaUnresolvedLines names the rows of a requirements file's
 	// configuration node that record the lines no requirement interprets, in
 	// source order; each row's value is {"line","reason","via"} and the row is
@@ -813,16 +818,28 @@ const (
 	// name: `obj[k]()`, `require(expr)`. An open call site with this reason
 	// has no candidates.
 	ReasonComputed OpenSiteReason = "computed"
+	// ReasonReflective is a call of a reflection API that runs a method or
+	// function chosen at run time (`m.invoke(obj)`, `v.Call(args)`): the
+	// site also calls that API's external method, and what it reaches is
+	// not known.
+	ReasonReflective OpenSiteReason = "reflective"
 )
 
 // Valid reports whether r is a known wire spelling.
 func (r OpenSiteReason) Valid() bool {
 	switch r {
-	case ReasonReceiverUntyped, ReasonValueUntracked, ReasonGlobalUnbound, ReasonComputed:
+	case ReasonReceiverUntyped, ReasonValueUntracked, ReasonGlobalUnbound, ReasonComputed, ReasonReflective:
 		return true
 	}
 	return false
 }
+
+// Named reports whether an open site of reason r is named by its callee:
+// whether a declaration of that name and shape may be what it calls. A
+// computed callee names nothing, and a reflective one names the reflection
+// API it calls, not what that API runs, unless a constant names the method
+// (OpenSiteMetadata.Named).
+func (r OpenSiteReason) Named() bool { return r != ReasonComputed && r != ReasonReflective }
 
 // CallShape is the form of a call site's callee expression, as candidates
 // for it are matched: methods and function-valued fields for a member site,
@@ -856,6 +873,12 @@ type OpenSiteMetadata struct {
 	Shape      CallShape      `json:"shape"`
 	// Arguments is the number of arguments the site passes.
 	Arguments int64 `json:"arguments"`
+	// Named reports a reflective site (ReasonReflective) named by the
+	// method a reflective lookup found by a constant name gives its
+	// receiver (`getMethod("handle")`, `MethodByName("Handle")`) rather than
+	// by the reflection API it calls: what it runs is a method of that
+	// name, and the methods of that name are its candidates.
+	Named bool `json:"named,omitempty"`
 }
 
 // Validate enforces the open-site metadata shape.
@@ -871,6 +894,9 @@ func (m OpenSiteMetadata) Validate() error {
 	}
 	if err := requireNonNegative("open_site.arguments", m.Arguments); err != nil {
 		return err
+	}
+	if m.Named && m.Reason != ReasonReflective {
+		return invalid("open_site.named is set on a site of reason %q; only a reflective site is named by a constant", m.Reason)
 	}
 	return nil
 }

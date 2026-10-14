@@ -43,7 +43,11 @@ type Link struct {
 	// nothing (`obj[k]()`, `f()()`, `(a || b)()`), which no call reference
 	// names: each a Site whose Name is the callee expression, Shape
 	// ShapeIndirect, with its Arguments. Only the ECMAScript family and
-	// Python send them.
+	// Python send them. A Python callee `getattr(obj, "name")` (with or
+	// without a default) is the attribute the constant names: its Site's
+	// Name is the string's content, its Shape, Qualifier and Receiver those
+	// of a call of that attribute of obj (ShapeMember, or ShapeStatic
+	// through an imported module).
 	Computed []Site
 	// Conversions are the file's values converted to a declared named type
 	// whose own type the value's syntax spells (Conversion). Only Go sends
@@ -232,6 +236,13 @@ type Site struct {
 	// is and how it is passed: Arguments[i] and Args[i] describe the same
 	// argument. It is empty when the worker sent no argument positions.
 	Arguments []Argument
+	// Reflected is, for a member call whose receiver is a method a
+	// reflective lookup found by a constant name (Java `getMethod("n", …)`
+	// or `getDeclaredMethod("n", …)` on a Class, Go `MethodByName("N")` on
+	// a reflect.Value), that name: the receiver is the lookup itself, or a
+	// local variable every definition of which in the file is such a lookup
+	// of that one name. Empty for every other site.
+	Reflected string
 }
 
 // Argument is one argument of a call site.
@@ -321,6 +332,13 @@ type Value struct {
 	// ECMAScript `a.b = () => …` or `{ k: () => … }`), that declaration's
 	// name token, which names the value exactly; empty for any other.
 	Declares Span
+	// Target is, for a Java method reference, its target type where the
+	// context writes it (JLS §15.13.2): the declared type of the variable
+	// or field it initializes or is assigned to, the cast it is the operand
+	// of, or the return type of the method that returns it. Unknown for
+	// every other value, and for a reference in any other context (an
+	// argument, a lambda's result).
+	Target Type
 }
 
 // Shape is a call site's callee expression form.
@@ -477,6 +495,7 @@ func AppendLink(dst []byte, l *Link) []byte {
 		e.str(v.Field)
 		e.typ(v.Type)
 		e.span(v.Declares)
+		e.typ(v.Target)
 	}
 	e.u32(uint32(len(l.Reexports)))
 	for _, r := range l.Reexports {
@@ -542,6 +561,7 @@ func (e *encoder) site(s *Site) {
 			e.span(r)
 		}
 	}
+	e.str(s.Reflected)
 }
 
 // encoder appends the link encoding's primitives.
@@ -604,7 +624,7 @@ func DecodeLink(payload []byte) (Link, error) {
 	}
 	l.Values = make([]Value, 0, d.count(29))
 	for range cap(l.Values) {
-		l.Values = append(l.Values, Value{At: d.span(), Field: d.str(), Type: d.typ(), Declares: d.span()})
+		l.Values = append(l.Values, Value{At: d.span(), Field: d.str(), Type: d.typ(), Declares: d.span(), Target: d.typ()})
 	}
 	l.Reexports = make([]Reexport, 0, d.count(12))
 	for range cap(l.Reexports) {
@@ -670,6 +690,7 @@ func (d *decoder) site() Site {
 		}
 		s.Arguments = append(s.Arguments, a)
 	}
+	s.Reflected = d.str()
 	return s
 }
 

@@ -459,7 +459,7 @@ func onlyLost(details map[string]string) map[string]string {
 	for k, v := range details {
 		switch k {
 		case "facts_without_node", "members", "sites", "bound_sites", "open_sites", "computed_sites", "external_sites",
-			"resolved_imports", "open_import_sites":
+			"reflective_sites", "resolved_imports", "open_import_sites":
 			out[k] = v
 		}
 	}

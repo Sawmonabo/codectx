@@ -42,9 +42,8 @@ func TestJoinRecordsRoundTrip(t *testing.T) {
 	}
 
 	args := []Argument{{Keyword: "kw"}, {Spread: wire.SpreadPositional}, {}}
-	use := sigUse{Sig: "(int)(void)", Abstract: true, Args: argumentShapes(args), Params: encodeParams(params),
-		Site: idBinding{Kind: FactCall, SiteFile: "a", Site: 4, TargetFile: "b", Target: "b.I.m", Detail: DetailAddressTaken,
-			Dispatch: model.DispatchVirtual}}
+	use := sigUse{Sig: "b.I\x00(int)(void)", Args: argumentShapes(args), Results: true,
+		Site: idBinding{Kind: FactCall, SiteFile: "a", Site: 4, Detail: DetailAddressTaken, Dispatch: model.DispatchExact}}
 	raw, err = encodeSigUse(use)
 	if err != nil {
 		t.Fatal(err)

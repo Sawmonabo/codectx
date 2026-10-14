@@ -53,6 +53,11 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	if err != nil {
 		return model.ImpactResult{}, err
 	}
+	open, err := e.openSeedNotices(deliverCtx(ctx), req.Start)
+	if err != nil {
+		return model.ImpactResult{}, err
+	}
+	answer.Notices = append(answer.Notices, open...)
 
 	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: slices.Concat(answer.Completeness, seamRows),
 		Notices:    appendNotice(appendNotice(append([]string(nil), answer.Notices...), depthNotice), seamNotice),

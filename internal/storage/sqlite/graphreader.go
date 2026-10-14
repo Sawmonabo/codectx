@@ -713,8 +713,9 @@ func (g *graphReader) RelationOccurrences(ctx context.Context, rel model.Relatio
 var _ graph.DispatchReader = (*graphReader)(nil)
 
 // RelationDispatch summarizes each relation's visible evidence in one grouped
-// read per batch: whether any occurrence is a virtual call, and the largest
-// set size any occurrence carries. Results align with rels; a relation with
+// read per batch: whether any occurrence is a virtual call, the largest set
+// size any occurrence carries, and whether any was bound by one of
+// graph.ValueDetails. Results align with rels; a relation with
 // no visible evidence reads as the zero summary.
 func (g *graphReader) RelationDispatch(ctx context.Context, rels []model.RelationID) ([]graph.RelationDispatch, error) {
 	out := make([]graph.RelationDispatch, len(rels))
@@ -737,7 +738,13 @@ func (g *graphReader) RelationDispatch(ctx context.Context, rels []model.Relatio
 		}
 		b := newBinder(g.r.gen)
 		list := b.markList(values)
-		query := `SELECT rl.canonical, max(CASE e.dispatch WHEN 'virtual' THEN 1 ELSE 0 END), max(e.set_size)
+		details := make([]any, len(graph.ValueDetails))
+		for i, d := range graph.ValueDetails {
+			details[i] = d
+		}
+		valued := b.markList(details)
+		query := `SELECT rl.canonical, max(CASE e.dispatch WHEN 'virtual' THEN 1 ELSE 0 END), max(e.set_size),
+			max(CASE WHEN e.detail IN ` + valued + ` THEN 1 ELSE 0 END)
 			FROM evidence e JOIN relation_ids rl ON rl.id = e.relation_id
 			WHERE rl.canonical IN ` + list + memberOf("e") + ` GROUP BY rl.canonical`
 		err = g.r.s.read(ctx, func(tx *sql.Tx) error {
@@ -748,12 +755,12 @@ func (g *graphReader) RelationDispatch(ctx context.Context, rels []model.Relatio
 			defer rows.Close()
 			for rows.Next() {
 				var id []byte
-				var virtual, setSize int64
-				if err := rows.Scan(&id, &virtual, &setSize); err != nil {
+				var virtual, setSize, valued int64
+				if err := rows.Scan(&id, &virtual, &setSize, &valued); err != nil {
 					return wrap("evidence", err)
 				}
 				for _, i := range at[model.RelationID(idHex(id))] {
-					out[i] = graph.RelationDispatch{Virtual: virtual == 1, SetSize: setSize}
+					out[i] = graph.RelationDispatch{Virtual: virtual == 1, SetSize: setSize, ValueBound: valued == 1}
 				}
 			}
 			return wrap("evidence", rows.Err())

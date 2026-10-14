@@ -240,6 +240,11 @@ type Decl struct {
 	// for a struct or variant with named fields, which only a struct
 	// expression builds, and for every other declaration.
 	Constructor string `json:"constructor,omitempty"`
+	// Extensible reports a method that code outside the indexed project can
+	// override or implement under its language's rules (the worker's
+	// declOpen): the overrides the project's index lists for it may not be
+	// all of them.
+	Extensible bool `json:"extensible,omitempty"`
 }
 
 // Decorator is one decorator or annotation on a declaration: its name as

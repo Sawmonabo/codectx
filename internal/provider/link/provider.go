@@ -36,7 +36,9 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 
+	"github.com/Sawmonabo/codectx"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	srclang "github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -51,8 +53,6 @@ const (
 	// ProviderID is the linking provider's descriptor identity. It is not
 	// the `dependence` id, which is never reused (ADR-0012 decision 9).
 	ProviderID = "link"
-	// Version is the descriptor version.
-	Version = "1"
 	// TableKind is the delta-state kind a structural unit stores its file's
 	// Table under.
 	TableKind = "link.tables"
@@ -60,6 +60,20 @@ const (
 	// resolution state under, which a later build of the unit starts from.
 	ResolutionKind = "link.resolution"
 )
+
+// Version is the descriptor version: the digest of the linker's code
+// (codectx.Digest of this package: every package of the module it is built
+// from, every outside module they import and the toolchain), so a unit, and
+// a predecessor's resolution state, that another build of different code
+// wrote is never reused or read (ErrStateVersion), and one of an unchanged
+// build always is. It is digested once, when first asked.
+var Version = sync.OnceValue(func() string {
+	code, err := codectx.Digest("internal/provider/link")
+	if err != nil {
+		panic("link version: " + err.Error())
+	}
+	return code[:24]
+})
 
 // Capabilities are the capabilities the provider declares, one row of each
 // per unit.
@@ -78,13 +92,24 @@ const (
 	DetailHierarchy = "hierarchy"
 	// DetailAddressTaken: an indirect site joined to an address-taken
 	// function of the same signature.
-	DetailAddressTaken = "address_taken"
+	DetailAddressTaken = graph.CallDetailAddressTaken
+	// DetailReceiverValue: the method the class of an instance declares or
+	// inherits, where the instance reached the receiver through a parameter
+	// or a field the project's code fills, rather than one the call's own
+	// function constructs, annotates or receives from a call: the receiver's
+	// values are the project's, and code outside the project may pass or
+	// store another (graph value_set).
+	DetailReceiverValue = graph.CallDetailReceiverValue
 	// DetailFlow: the receiver's type was recovered by flow-based type
 	// inference through assignments, parameters and returns.
 	DetailFlow = "flow"
+	// DetailFunctionValue: the function values that reach the value the
+	// site calls, through assignments, parameters, returns and fields
+	// (flow-based value inference).
+	DetailFunctionValue = graph.CallDetailFunctionValue
 	// DetailField: field-based resolution, a function written to the field
 	// the site calls through.
-	DetailField = "field"
+	DetailField = graph.CallDetailField
 	// DetailImport: an `imports` from a file's module to the module of a
 	// file its import resolves to.
 	DetailImport = "import"
@@ -185,7 +210,7 @@ func New(tables Tables) *Provider { return &Provider{tables: tables} }
 // structural provider whose tables it reads, and not required, since a
 // failed link degrades the linker's relations and nothing else.
 func (p *Provider) Descriptor() model.ProviderDescriptor {
-	return model.ProviderDescriptor{ID: ProviderID, Version: Version, Capabilities: Capabilities,
+	return model.ProviderDescriptor{ID: ProviderID, Version: Version(), Capabilities: Capabilities,
 		DependsOn: []string{lang.ProviderID}, InvalidationScope: model.InvalidationPackage}
 }
 
@@ -386,7 +411,7 @@ func (p *publisher) capabilities(members int64, unnamed map[model.RelationKind]i
 				key string
 				n   int64
 			}{{"sites", c.Sites}, {"bound_sites", c.Bound}, {"open_sites", c.Open}, {"computed_sites", c.Computed},
-				{"external_sites", c.External}} {
+				{"external_sites", c.External}, {"reflective_sites", c.Reflective}} {
 				st = st.WithDetail(d.key, strconv.FormatInt(d.n, 10))
 			}
 		case model.RelImports:

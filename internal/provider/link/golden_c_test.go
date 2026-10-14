@@ -171,6 +171,32 @@ void use(B* b, A& a) {
 		fails: "a non-virtual call marked virtual; a qualified call marked virtual; a virtual call published to each override (B::g, D::g) instead of the member the static type names",
 	},
 	{
+		name:   "virtual-by-an-external-base",
+		anchor: "ISO/IEC 14882 (C++) [class.virtual]/2 (a member function with the name and parameter list of a virtual member function of a base class overrides it and is virtual, whether or not it is so declared), [class.derived]",
+		files: map[string]string{
+			"w.cpp": `#include <widgets/widget.h>
+class MyWidget : public ui::Widget { protected: void paintEvent(int e); }; // @mypaint
+class Fancy : public MyWidget { protected: void paintEvent(int e) override; }; // @fancypaint
+void draw(MyWidget* w, int e) { w->paintEvent(e); } // @draw
+`,
+		},
+		// Derived from the source and the anchor. ui::Widget is outside the project, so whether it declares
+		// paintEvent virtual is unknown; Fancy's `override` proves that MyWidget::paintEvent is virtual
+		// ([class.virtual]/2 through ui::Widget). The call may dispatch, and Fancy::paintEvent overrides
+		// MyWidget::paintEvent.
+		want: []string{
+			"draw paintEvent -> mypaint paintEvent virtual",
+		},
+		facts: []string{
+			"fancypaint Fancy extends mypaint MyWidget",
+			"mypaint MyWidget extends external ui::Widget",
+			"fancypaint paintEvent overrides mypaint paintEvent",
+		},
+		// Mutation: read virtualness from the unit's own declarations only -> draw's call is exact and Fancy's
+		// paintEvent overrides nothing.
+		fails: "a member that may be virtual through a base outside the project called exact, and its override in the project dropped",
+	},
+	{
 		name:   "by-value-receivers",
 		anchor: "ISO/IEC 14882 (C++) [class.virtual] (a virtual call runs the final overrider in the dynamic type of the object), [intro.object] (an object declared of a class type, a member subobject and an array element have that type as their dynamic type), [expr.ref], [dcl.fct] (a parameter of array type is a pointer)",
 		files: map[string]string{

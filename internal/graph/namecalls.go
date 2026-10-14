@@ -19,6 +19,7 @@ type nodeMeta struct {
 	Reason     model.OpenSiteReason `json:"reason"`
 	Shape      model.CallShape      `json:"shape"`
 	Arguments  int64                `json:"arguments"`
+	Named      bool                 `json:"named"`
 	Callee     *string              `json:"callee"`
 	Fragments  *[]string            `json:"fragments"`
 	// FragmentsRows is set instead of Fragments when the site's fragment
@@ -116,6 +117,12 @@ func staticFamily(family string) bool {
 func (s callSite) fits(n model.Node) bool {
 	if n.Name != s.Name || !isDeclared(n) || n.ID == s.ID {
 		return false
+	}
+	if s.Reason == model.ReasonReflective {
+		// A reflective call passes the method's arguments through the
+		// API's own (`invoke(obj, args)`, `Call(args)`): its count says
+		// nothing of the method's arity.
+		return slices.Contains(shapeKinds(s.Shape), n.Kind) && languageFamily(n.Language) == languageFamily(s.Language)
 	}
 	if !slices.Contains(shapeKinds(s.Shape), n.Kind) {
 		return false

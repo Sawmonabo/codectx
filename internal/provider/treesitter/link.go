@@ -139,6 +139,7 @@ func (b *builder) linkTable() error {
 			w, siteAt[i] = i, int32(len(t.Sites))
 			s.Described = true
 			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, cmp.Or(wl.Sites[i].Qualifier, r.Qualifier), wl.Sites[i].Signature
+			s.Reflected = bound(wl.Sites[i].Reflected, model.MaxNameBytes)
 			s.QualifierIsImport = s.QualifierIsImport && s.Qualifier == r.Qualifier
 		}
 		joined = append(joined, w)
@@ -200,13 +201,20 @@ func (b *builder) linkTable() error {
 	for i := range wl.Computed {
 		ws := &wl.Computed[i]
 		rng, err := b.rangeOf(ws.Name.Start, ws.Name.End)
-		if err != nil || ws.Shape != wire.ShapeIndirect {
+		attribute := ws.Shape == wire.ShapeMember || ws.Shape == wire.ShapeStatic
+		if err != nil || ws.Shape != wire.ShapeIndirect && !attribute {
 			t.Dropped++
 			continue
 		}
 		s := link.Site{Caller: b.enclosing(byStart, ws.Name), Range: *rng, NameStart: ws.Name.Start, NameEnd: ws.Name.End,
 			Callee: bound(string(b.src[ws.Name.Start:ws.Name.End]), model.MaxNameBytes), Shape: wire.ShapeIndirect,
 			Described: true, Computed: true}
+		if attribute {
+			// A call of the attribute a constant names (`getattr(obj,
+			// "run")()`): a member or static site of that name, its
+			// receiver obj.
+			s.Shape, s.Qualifier, s.Receiver, s.Computed = ws.Shape, ws.Qualifier, typ(ws.Receiver), false
+		}
 		s.Handler = handlerOf(wire.Ref{Start: ws.Name.Start, End: ws.Name.End, Scope: int(s.Caller)})
 		s.Args, s.Arguments = b.linkArgs(ws, typ, &t.Dropped)
 		t.Sites = append(t.Sites, s)
@@ -282,7 +290,8 @@ func (b *builder) linkTable() error {
 				t.Dropped++
 				continue
 			}
-			lv := link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type)}
+			lv := link.Value{Caller: b.enclosing(byStart, v.At), Range: *rng, Field: v.Field, Type: typ(v.Type),
+				Target: typ(v.Target)}
 			if v.Declares != (wire.Span{}) {
 				// The value is the declaration its expression declares, or,
 				// when that joined nothing, no value to resolve by name.

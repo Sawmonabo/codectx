@@ -497,14 +497,15 @@ type filePublication struct {
 
 // site publishes the facts of site i, group: one `calls` per distinct
 // target (a declaration or an external method), each with the occurrence's
-// dispatch and, when there are several, the set size; or, when the site has
-// no call fact and no FactExternalSite, its open-site node and the caller's
-// `calls` to it; for each FactFlow, one `data_flows_to` from each variable
+// dispatch and, when there are several, the set size, and beside them, for
+// a reflective call (model.ReasonReflective), its open-site node; or, when
+// the site has no call fact and no FactExternalSite, its open-site node and
+// the caller's `calls` to it; for each FactFlow, one `data_flows_to` from each variable
 // the argument reads to the parameter; for each FactSummary, one from each
 // variable the argument reads to each variable the site's result is written
 // into (returnFlows); and for each FactReturn, one from the callee's return
 // node to each of those and to the return node the result reaches. It
-// counts the site bound, external, computed or open.
+// counts the site bound, external (and reflective), computed or open.
 func (f *filePublication) site(i int32, group []idBinding) error {
 	s := &f.t.Sites[i]
 	caller, err := f.caller(s)
@@ -541,6 +542,9 @@ func (f *filePublication) site(i int32, group []idBinding) error {
 		f.counts.Bound++
 	case len(calls) > 0 || external:
 		f.counts.External++
+		if reason == model.ReasonReflective {
+			f.counts.Reflective++
+		}
 	case s.Computed:
 		f.counts.Computed++
 	default:
@@ -560,6 +564,13 @@ func (f *filePublication) site(i int32, group []idBinding) error {
 				return err
 			}
 			f.relation(caller.Node, model.RelCalls, target, located(s.Range), key, b.Detail, b.Dispatch, set)
+		}
+		if reason == model.ReasonReflective {
+			// The reflection API runs what the site cannot name: the site is
+			// open beside its call of the API (FactOpenSite).
+			if err := f.openSite(s, caller, reason); err != nil {
+				return err
+			}
 		}
 	case !external:
 		if err := f.openSite(s, caller, cmp.Or(reason, openReason(s))); err != nil {
@@ -655,7 +666,8 @@ func openShape(s *Site) model.CallShape {
 }
 
 // openSite publishes site s's open-site node, located at the site and named
-// by its callee as written, and the caller's `calls` to it, with reason. The
+// by its callee as written (a reflective site by the method a constant
+// lookup names, Site.Reflected), and the caller's `calls` to it, with reason. The
 // node is keyed in the file's scope by "open:" and the site's call-site key,
 // or, for a computed callee, which has no callee token, "open:computed:", the
 // path and the site's bytes; the edge's evidence carries the call-site key,
@@ -672,13 +684,19 @@ func (f *filePublication) openSite(s *Site, caller Endpoint, reason model.OpenSi
 	if s.Shape == wire.ShapeMember || s.Shape == wire.ShapeStatic {
 		kind = model.NodeMethod
 	}
+	// A reflective call whose receiver a constant lookup names runs a
+	// method of that name: the node is named by it (OpenSiteMetadata.Named).
+	name, named := s.Callee, reason == model.ReasonReflective && s.Reflected != ""
+	if named {
+		name = s.Reflected
+	}
 	meta, err := json.Marshal(model.OpenSiteMetadata{Resolution: model.ResolutionUnresolved, Reason: reason,
-		Shape: openShape(s), Arguments: int64(max(len(s.Args), len(s.Arguments)))})
+		Shape: openShape(s), Arguments: int64(max(len(s.Args), len(s.Arguments))), Named: named})
 	if err != nil {
 		return internalErr("open site metadata: " + err.Error())
 	}
 	n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path, NativeKey: native,
-		Kind: kind, Language: f.t.Language, Name: nodeName(s.Callee, "call")}, s.Range, meta)
+		Kind: kind, Language: f.t.Language, Name: nodeName(name, "call")}, s.Range, meta)
 	if err != nil {
 		return err
 	}

@@ -1495,7 +1495,7 @@ func (s *hopStep) forward(ctx context.Context, c model.NodeID) (bool, error) {
 			return err == nil, err
 		}
 		site, ok := openCallSite(decls[0])
-		if !ok || site.Reason == model.ReasonComputed || site.Name == "" {
+		if !ok || !site.named() {
 			return true, nil
 		}
 		after := model.NodeID("")
@@ -1546,7 +1546,7 @@ func (s *hopStep) backward(ctx context.Context, k model.NodeID) (bool, error) {
 		}
 		for _, d := range page {
 			site, ok := openCallSite(d)
-			if ok && site.Reason != model.ReasonComputed && site.fits(n) {
+			if ok && site.named() && site.fits(n) {
 				if s.w.hopPos.Site != d.Node.ID {
 					s.w.hopPos.Site, s.w.hopPos.Edge = d.Node.ID, ""
 				}

@@ -219,7 +219,7 @@ func compareRanked(a, b rankedCandidate) int {
 // prefix. What a caller keeps of the stream is its own choice; nothing is
 // held here.
 func scanCandidates(ctx context.Context, dr DeclarationReader, site callSite, visit func(rankedCandidate)) error {
-	if site.Reason == model.ReasonComputed || site.Name == "" {
+	if !site.named() {
 		return nil
 	}
 	kinds := shapeKinds(site.Shape)
@@ -312,6 +312,9 @@ type callSite struct {
 	Arguments int64
 	Language  string
 	Reason    model.OpenSiteReason
+	// Named reports a reflective site a constant names (model.
+	// OpenSiteMetadata.Named): Name is the method it runs.
+	Named bool
 	// FileID, Dir and Unit place the site; Linked are the files its file
 	// imports or is imported by.
 	FileID model.FileID
@@ -319,6 +322,11 @@ type callSite struct {
 	Unit   model.UnitID
 	Linked map[model.FileID]bool
 }
+
+// named reports whether the site is named by a declaration's name, which its
+// candidates share: a site of a reason that is named, or a reflective site
+// a constant names.
+func (s callSite) named() bool { return s.Name != "" && (s.Reason.Named() || s.Named) }
 
 // openCallSite reads an open call site's description off its node, false for
 // any other node -- the structural provider's `call:<name>` placeholder
@@ -329,7 +337,7 @@ func openCallSite(d Declaration) (callSite, bool) {
 		return callSite{}, false
 	}
 	s := callSite{ID: d.Node.ID, Name: d.Node.Name, Shape: meta.Shape, Arguments: meta.Arguments, Language: d.Node.Language,
-		Reason: meta.Reason, FileID: d.Node.FileID, Unit: d.Unit}
+		Reason: meta.Reason, Named: meta.Named && meta.Reason == model.ReasonReflective, FileID: d.Node.FileID, Unit: d.Unit}
 	if d.Path != "" {
 		s.Dir = path.Dir(d.Path)
 	}

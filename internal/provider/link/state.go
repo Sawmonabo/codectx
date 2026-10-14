@@ -2,11 +2,13 @@ package link
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"errors"
 	"io"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -53,9 +55,19 @@ import (
 // A string is its length (an unsigned varint) and its bytes. A state that is
 // short, long, out of order or malformed is corrupt storage.
 
-// stateTag opens every stored resolution state, so a state of any other form
-// is refused before anything of it is read.
-const stateTag = "link.resolution.nodes\n"
+// stateTag opens every stored resolution state and names the Version that
+// wrote it, which covers the state's codecs with the rest of the linker's
+// code, so a state of another version is set aside (ErrStateVersion) and one
+// of any other form refused before anything of it is read.
+func stateTag() string { return stateFamily + " " + Version() + "\n" }
+
+// stateFamily opens the tag of a resolution state of every version.
+const stateFamily = "link.resolution"
+
+// ErrStateVersion is what reading a resolution state that another Version of
+// the linker (a build of different code) wrote answers: its form and its facts are that version's, so
+// nothing of it is read and the unit resolves in full. It is no corruption.
+var ErrStateVersion = errors.New("the previous link resolution state was written by another version of the linker")
 
 // details is every technique a fact can carry, in its stored order, which is
 // also the order of preference a fold of two equal facts keeps (better); the
@@ -63,7 +75,7 @@ const stateTag = "link.resolution.nodes\n"
 // site), is last. The visibility details and supertype_anonymous come just
 // before it: none of their facts folds with a fact of another technique, so
 // their place orders nothing.
-var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailField,
+var details = [...]string{DetailDirect, DetailHierarchy, DetailAddressTaken, DetailFlow, DetailReceiverValue, DetailFunctionValue, DetailField,
 	DetailImport, DetailArgument, DetailSupertype, DetailMethodSet, DetailSupertypeInterface, DetailSupertypeClass,
 	DetailSummary, DetailReturn, DetailSupertypeCandidate, DetailMacroInput, DetailMacroTranscribes,
 	DetailVisibilityDefault, DetailVisibilityHidden, DetailVisibilityProtected, DetailVisibilityInternal,
@@ -85,7 +97,7 @@ func detailCode(d string) (byte, bool) {
 var (
 	dispatches = [...]model.Dispatch{"", model.DispatchVirtual, model.DispatchExact}
 	reasons    = [...]model.OpenSiteReason{"", model.ReasonReceiverUntyped, model.ReasonValueUntracked,
-		model.ReasonGlobalUnbound, model.ReasonComputed}
+		model.ReasonGlobalUnbound, model.ReasonComputed, model.ReasonReflective}
 )
 
 func codeOf[T comparable](values []T, v T) (byte, bool) {
@@ -426,11 +438,12 @@ func externalsOf(dir string, run *pagination.SortedRun[idBinding]) (*pagination.
 // counts are one member's share of the counts its unit's capability rows
 // carry, so a row sums them over the records without reading a carried
 // member's table: its call sites, those bound to a declaration of the unit,
-// those open (Computed ones excluded), the computed ones, those external;
-// its imports resolved to a member and its open import sites.
+// those open (Computed ones excluded), the computed ones, those external,
+// and of those the reflective ones (model.ReasonReflective); its imports
+// resolved to a member and its open import sites.
 type counts struct {
-	Sites, Bound, Open, Computed, External int64
-	Imports, OpenImports                   int64
+	Sites, Bound, Open, Computed, External, Reflective int64
+	Imports, OpenImports                               int64
 }
 
 func (c *counts) add(o counts) {
@@ -439,6 +452,7 @@ func (c *counts) add(o counts) {
 	c.Open += o.Open
 	c.Computed += o.Computed
 	c.External += o.External
+	c.Reflective += o.Reflective
 	c.Imports += o.Imports
 	c.OpenImports += o.OpenImports
 }
@@ -470,7 +484,8 @@ func encodeRecord(r record) ([]byte, error) {
 	}
 	out = append(out, tabled)
 	c := r.Counts
-	for _, n := range [...]int64{r.Dropped, c.Sites, c.Bound, c.Open, c.Computed, c.External, c.Imports, c.OpenImports} {
+	for _, n := range [...]int64{r.Dropped, c.Sites, c.Bound, c.Open, c.Computed, c.External, c.Reflective, c.Imports,
+		c.OpenImports} {
 		if n < 0 {
 			return nil, internalErr("a member record holds a negative count")
 		}
@@ -484,7 +499,8 @@ func decodeRecord(raw []byte) (record, error) {
 	rec := record{File: model.FileID(r.str()), Content: r.str(), Digest: r.str(), Interface: r.str(), Sites: r.str()}
 	tabled := r.byte()
 	c := &rec.Counts
-	for _, p := range [...]*int64{&rec.Dropped, &c.Sites, &c.Bound, &c.Open, &c.Computed, &c.External, &c.Imports, &c.OpenImports} {
+	for _, p := range [...]*int64{&rec.Dropped, &c.Sites, &c.Bound, &c.Open, &c.Computed, &c.External, &c.Reflective,
+		&c.Imports, &c.OpenImports} {
 		*p = r.count()
 	}
 	if r.err != nil || len(r.b) != 0 || tabled > 1 {
@@ -574,7 +590,7 @@ func (r *byteReader) count() int64 {
 // writeState stores fields, records (by FileID) and res to w.
 func writeState(w io.Writer, fields []manifestField, records *pagination.SortedRun[record], res *resolution) error {
 	bw := bufio.NewWriter(w)
-	out := binary.AppendUvarint([]byte(stateTag), uint64(len(fields)))
+	out := binary.AppendUvarint([]byte(stateTag()), uint64(len(fields)))
 	for _, f := range fields {
 		out = appendString(appendString(out, f.Key), f.Value)
 	}
@@ -717,8 +733,14 @@ func (s stateReader) byte(what string) (byte, error) {
 func readState(r io.Reader, sink stateSink) error {
 	field, rec, bind := sink.field, sink.record, sink.binding
 	s := stateReader{br: bufio.NewReader(r)}
-	tag := make([]byte, len(stateTag))
-	if _, err := io.ReadFull(s.br, tag); err != nil || string(tag) != stateTag {
+	want := stateTag()
+	tag := make([]byte, len(want))
+	if n, _ := io.ReadFull(s.br, tag); string(tag[:n]) != want {
+		// A tag of the family that this one does not begin is another
+		// version's; a short piece of this one is a short state.
+		if bytes.HasPrefix(tag[:n], []byte(stateFamily)) && !strings.HasPrefix(want, string(tag[:n])) {
+			return ErrStateVersion
+		}
 		return stateCorrupt("it is not a resolution state of this form")
 	}
 	n, err := s.uvarint("its field count")

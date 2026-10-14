@@ -76,10 +76,13 @@ func (c *Compiler) admitCandidates(ctx context.Context, eng *graph.Engine, gen m
 }
 
 // namedOpenSite reports whether n is an open call site that names a callee:
-// its metadata says `resolution: unresolved` with a known `reason` other than
-// `computed`. A computed site, and an open import site (always computed), has
-// no name to look up and so no candidates. Only the two keys are read, so the
-// other metadata a node carries never decides it.
+// its metadata says `resolution: unresolved` with a known `reason` that is
+// named (model.OpenSiteReason.Named), or a reflective site a constant
+// names (model.OpenSiteMetadata.Named). A computed site, an open import
+// site (always computed) and a reflective site no constant names, whose
+// callee names the reflection API, have no name to look up and so no
+// candidates. Only those keys are read, so the other metadata a node
+// carries never decides it.
 func namedOpenSite(n model.Node) (bool, error) {
 	if len(n.Metadata) == 0 {
 		return false, nil
@@ -108,7 +111,19 @@ func namedOpenSite(n model.Node) (bool, error) {
 	if err := json.Unmarshal(rawReason, &reason); err != nil {
 		return false, metadataErr(n.ID, err)
 	}
-	return reason.Valid() && reason != model.ReasonComputed, nil
+	if !reason.Valid() {
+		return false, nil
+	}
+	if reason.Named() {
+		return true, nil
+	}
+	var named bool
+	if raw, ok := meta[model.MetaNamed]; ok {
+		if err := json.Unmarshal(raw, &named); err != nil {
+			return false, metadataErr(n.ID, err)
+		}
+	}
+	return reason == model.ReasonReflective && named, nil
 }
 
 // metadataErr is the typed failure for a sealed node whose metadata does not

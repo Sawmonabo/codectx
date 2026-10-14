@@ -18,7 +18,7 @@ linker cannot bind publishes an open-site node (Open sites, below).
 
 ```
 ID                link
-Version           1
+Version           the digest of the linker's code (below)
 Capabilities      calls, imports, data_flows_to, extends, implements, overrides, generates
 DependsOn         treesitter
 InvalidationScope package
@@ -26,7 +26,11 @@ Required          false
 ```
 
 `ProviderID`, `Version` and `Capabilities` are in `internal/provider/link/provider.go`, and the descriptor is
-`Provider.Descriptor`. The id is not `dependence`, which is never reused (decision 9). The provider is not required:
+`Provider.Descriptor`. `Version` is the first 24 hex digits of `codectx.Digest` (`sources.go` at the module root) of
+the linker's package: the non-test Go files of every package of the module it is built from, the version and sum of
+every outside module they import, and the Go toolchain's version. Any change to the code that links, the stored
+state's codecs included, changes it, so a unit and a stored state of other code are never reused (Refresh); an
+unchanged build reuses both. Nothing is versioned by hand. The id is not `dependence`, which is never reused (decision 9). The provider is not required:
 a failed link degrades its seven capabilities and nothing else. It runs when the structural provider is
 enabled and reports disabled with it; it has no configuration key of its own.
 
@@ -34,7 +38,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 
 | Capability | Relation | From → to | Evidence detail |
 |---|---|---|---|
-| `calls` | `calls` | caller → each bound declaration, or an external method node | `direct`, `hierarchy`, `address_taken`, `flow`, `field` |
+| `calls` | `calls` | caller → each bound declaration, or an external method node | `direct`, `hierarchy`, `address_taken`, `flow`, `receiver_value`, `function_value`, `field` |
 | `calls` | `calls` | caller → the site's open-site node | none |
 | `imports` | `imports` | file module → each file module the import resolves to | `import` |
 | `imports` | `imports` | file module → the import's open-import-site node | none |
@@ -42,7 +46,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 | `data_flows_to` | `data_flows_to` | each variable an argument reads → each variable the site's result is written into, when the parameter it binds reaches the callee's return | `summary:<position>` |
 | `data_flows_to` | `data_flows_to` | the callee's return node → each variable the site's result is written into, and the return node of the callable that returns the call | `return` |
 | `extends` | `extends` | type → a supertype of its own kind | `supertype`, `supertype_class`, `supertype_interface` |
-| `implements` | `implements` | type → an interface or trait it declares, or (Go) satisfies | `supertype`, `supertype_interface`, `method_set` |
+| `implements` | `implements` | type → an interface or trait it declares, or (Go, TypeScript) satisfies by its members | `supertype`, `supertype_interface`, `method_set` |
 | `overrides` | `overrides` | method → the method it directly overrides or implements | `supertype`, `method_set`, `supertype_candidate` |
 | `generates` | `generates` | Rust `macro_rules!` → each declaration written in an item-position invocation of it in another file of the unit | `macro_transcribes`, `macro_input` |
 | none of its own | `defines` | file module → a route endpoint at its full path, a declared entry point, or an inherited Java `main` | none |
@@ -54,7 +58,13 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 - `direct`: the callee names the declaration by its package, module, import or scope;
 - `hierarchy`: the method the receiver's static type declares or inherits, found by walking its supertypes;
 - `address_taken`: an indirect site joined to an address-taken function of the same signature;
-- `flow`: the receiver's type was recovered by flow-based type inference;
+- `flow`: the receiver's type was recovered by flow-based type inference from what the call's own function
+  constructs or annotates, or a call's result;
+- `receiver_value`: the method of an instance's class, where the instance reached the receiver through a
+  parameter its callers pass or a field the project writes: the targets are the project's own values, and code
+  outside it may pass or store another, so a query marks the call `value_set` even with one target;
+- `function_value`: a function value that reached the value the site calls, through assignments, parameters,
+  returns and fields (flow-based value inference);
 - `field`: a function written to the field the site calls through;
 - `import`: an import resolved to a file of the unit;
 - `argument`: an argument of a bound call site, matched to its parameter;
@@ -62,7 +72,8 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   parameter at that position (`Parameter.Index`, 0 the receiver), whose value reaches the callee's return;
 - `return`: the bound callee's return node flowing into the site's result;
 - `supertype`: a supertype or an override the source writes;
-- `method_set`: a Go interface a type satisfies by its method set, which the source never writes;
+- `method_set`: a Go interface a type satisfies by its method set, or a TypeScript interface a class has every
+  member of, which the source never writes;
 - `supertype_interface`, `supertype_class`: a supertype the source writes that is outside the project (a node of
   kind `type`), with the kind the clause that writes it proves: an interface or trait (an `implements` clause, an
   interface's `extends`, a Rust trait, a Go interface's embedded interface) or a class (a class's `extends` clause or
@@ -138,7 +149,22 @@ site, named by the callee as written (`call` when there is none), of kind `metho
 - `computed`: the callee is an expression that names nothing (`obj[k]()`);
 - `receiver_untyped`: a member or static call whose receiver has no recovered type;
 - `value_untracked`: a call through a value whose flow the analysis does not follow;
-- `global_unbound`: a bare name or a construction no visible scope declares.
+- `global_unbound`: a bare name or a construction no visible scope declares (a Python builtin, the scope read last,
+  is declared: its call is external);
+- `reflective`: a call of a reflection API that runs a method or function chosen at run time (`reflective`,
+  `internal/provider/link/reflective.go`: Java's `java.lang.reflect.Method.invoke`, `Constructor.newInstance`,
+  `java.lang.Class.newInstance` and `java.lang.invoke.MethodHandle`'s `invoke`, `invokeExact` and
+  `invokeWithArguments`; Go's `reflect.Value.Call` and `CallSlice`). Such a site also publishes its `calls` to the
+  API's external method; its open-site node is published beside it, and the site is counted external and
+  reflective. When a constant names the method it runs (`Site.Reflected`: the worker reads a receiver that is
+  `getMethod("n", …)` or `getDeclaredMethod("n", …)` in Java, `MethodByName("N")` in Go, with one string literal
+  spelling an identifier, directly or through a local every definition of which in the file is that lookup of
+  that name), the open-site node is named by that method and carries `"named":true`, so the methods of that name
+  are its candidates. The objects those lookups are made on are typed by the results of the external methods
+  that give them (`externalResults`, `resolve_static.go`: Java's `Object.getClass` and `Class.forName` give a
+  `java.lang.Class`, its `getMethod` and `getDeclaredMethod` a `java.lang.reflect.Method`, its `getConstructor`
+  and `getDeclaredConstructor` a `java.lang.reflect.Constructor`; Go's `reflect.Value.MethodByName` and `Method` a
+  `reflect.Value`), and a Java class literal `T.class` is a `java.lang.Class` (JLS §15.8.2).
 
 Its shape is `member`, `value`, `construct` or `bare`, and `arguments` is the number of arguments the site passes.
 The candidates of an open site are computed per query as `may_call`, never stored. A key longer than
@@ -247,7 +273,18 @@ sites.
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
 the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
 embedded interfaces), and `implements` to each other interface or trait it declares, or, in Go, satisfies by its
-method set. A Go struct's embedded types are promotion and no supertype. Each method publishes `overrides` to the
+method set. A TypeScript class implements, by its members alone (`method_set`, `internal/provider/link/hierarchy_ts.go`;
+TypeScript Language Specification 1.8 §3.11.4 and §8.2.1), each interface of the project that it neither declares
+nor inherits, that declares a method itself, and whose every member, its own and those of the types it extends, is a
+member of the class of that name, its own or along its superclasses (a static member, a constructor and a `#p` member
+are none): a method of the interface the class has as a method must not require more arguments than the interface's
+declares parameters. Each method of the class of such an interface member's name then `overrides` it (`method_set`),
+so a call through the interface reaches it: `class Dog { name = ""; sound() {} }` implements `interface Animal {
+name: string; sound(): string }`, and a class whose `sound` requires two arguments, or that has no `name`, does not.
+Members are matched by name and arity, never by type; a constructor's parameter properties, an index signature, an
+optional member (read as required) and an accessibility modifier are not read; a member a supertype outside the
+project gives the class is not seen, and one it gives the interface is not required. A Go struct's embedded types are
+promotion and no supertype. Each method publishes `overrides` to the
 method it directly overrides along each direct supertype, never a deeper one: in Java one of the same signature that
 is neither static, final nor private; in C++ a virtual one of the same signature; in Python the first along the
 method resolution order; in Rust the trait's, from the trait's impl; in ECMAScript one of the same name that is not private (a `#p` method's name is its class body's alone, so it
@@ -799,9 +836,12 @@ members are named replaced (`LinkOptions.Replaced`); every other fact is carried
 edit, with or without a new call, republishes the edited file; a rename republishes the edited file and the files
 whose sites named the old name; an inserted overload republishes its file and keeps every existing overload's node.
 
-A predecessor that stored no state, or a state this build cannot read (its format tag, `link.ValidateState`), resolves
-in full, with `Result.FullReason` `no_previous_state` or `unreadable_previous_state`, publishes every fact, carries
-nothing, and stores its state for the next.
+The state opens with a tag naming the linker's version (`link.Version`, the digest of its code), so a state written
+by other code is told apart before anything of it is read. A predecessor that stored no
+state, a state another version wrote (`link.ErrStateVersion`: its tag names another version, so neither its form nor
+its facts are this build's), or a state this build cannot read (`link.ValidateState`; the one case that is warned
+about) resolves in full, with `Result.FullReason` `no_previous_state`, `previous_state_of_another_version` or
+`unreadable_previous_state`, publishes every fact, carries nothing, and stores its state for the next.
 
 ## Resolution
 
@@ -828,8 +868,18 @@ The members' language family picks the resolver:
   `hierarchy.overridable`) and `exact` otherwise; a call on a newly created object (`new Dog().sound()`, no class
   body) binds exactly, the object being exactly its class (JLS §15.9.4). An anonymous class body is a subtype of
   the type it instantiates, read as its declaration (`anonymousType`: the class `new T`, or the enum constant whose
-  body it is), whose methods override that type's. A call of an abstract method (a functional
-  interface's) also joins every method reference of that method's signature. A method reference `T::m` to an
+  body it is), whose methods override that type's. A call of an abstract method binds that method, `virtual`, and
+  beside it every method reference that is an object of the receiver's type (JLS §15.13.3: a method reference
+  evaluates to an instance of a class implementing its target type): one whose target type is that type or a
+  subtype of it, and one whose target type the worker could not read, each of the method's signature, each
+  `exact` with the detail `address_taken`. The worker reads a reference's target type (`wire.Value.Target`) from
+  the declaration of the local, field or constant it initializes, the variable or `this` field it is assigned to,
+  the cast it is the operand of, or the return type of the method whose `return` gives it, through parentheses and
+  either arm of a conditional (JLS §15.13.2); a reference in an argument or a lambda's result has none. A reference
+  of a known target type is joined under the target type's node and each of its supertypes of the unit
+  (`javaTaken`), and a call under its receiver type's node (`javaTargetKey`), so a call never binds a reference of
+  another functional interface; a target type outside the unit joins nothing, since a call joins only through an
+  abstract method of the unit. No argument flows into the abstract method, which has no body. A method reference `T::m` to an
   instance method, `T` a type, is unbound (JLS §15.13.1): its signature is `m`'s with `T` as its first parameter, and
   a call through it passes its first argument to the receiver and the rest to `m`'s parameters in order. A static
   method's, a constructor's and a bound one's (`this::m`) take the arguments as their own parameters. A receiver that is a field of a class,
@@ -850,8 +900,12 @@ The members' language family picks the resolver:
   indirect site joins every function taken as a value whose declared signature equals the site's
   (`wire.Export.Signature`, `wire/link.go`); a Go method expression `T.M` taken as a value has the method's
   signature with `T` as its first parameter (`goMethodExpression`). This is the address-taken × indirect-site
-  cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is not
-  `Final` and that the receiver's type or a supertype declares `virtual` ([class.virtual]). In C++ a bare call inside
+  cross-product, with no reachability fixed point. A C++ member call is `virtual` only through a member that is
+  neither `Final` nor static and that the receiver's type or a supertype declares `virtual`, or may: a type along
+  the climb that has a supertype outside the unit makes the member possibly virtual, since that supertype may
+  declare it virtual and [class.virtual]/2 makes an overrider virtual without saying so (`hierarchy.virtual`). A
+  member of a subclass with the member's name and signature then overrides it (`supertype`), as it overrides a
+  member the unit declares `virtual`. In C++ a bare call inside
   a class walks out to the enclosing classes' static members. A Go method set compares methods by
   name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
   alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
@@ -1006,7 +1060,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   `keyReexport` beside ECMAScript's, `addPythonReexports`); a name the module declares itself, binds by several
   imports, or several star imports supply, is not followed. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor
-  a function nested in another function. A call of a class is its construction and binds its `__init__` when
+  a function nested in another function. A bare name no scope of the file binds, that no import binds and that no
+  star import may supply, is the builtins module's when it names a builtin (Language Reference §4.2.2;
+  `python_builtins.go`): `print(x)`, `len(xs)`, `ValueError(m)` are calls outside the project, counted external,
+  never open `global_unbound`; any other such name stays `global_unbound`. `getattr(obj, "name")()`, with or without
+  a default, calls obj's attribute `name` as `obj.name()` does (the Library Reference's `getattr`: "`getattr(x,
+  'foobar')` is equivalent to `x.foobar`"): the worker sends it as a member site of that name located at the string,
+  so it binds by obj's types like any member call and, unbound, is an open `receiver_untyped` site with that name's
+  candidates; a name that is not one constant string (`getattr(obj, name)()`) names nothing, and the call is
+  `computed`. A call of a class is its construction and binds its `__init__` when
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance
   receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type of a receiver two
   disagreeing definitions reach included) binds, for each of its types, the first declaration of the method along
@@ -1061,7 +1123,8 @@ The provider publishes one row of each of its seven capabilities (`calls`, `impo
   visibility macro) is counted on the `calls` row.
 
 The `calls` row always carries the unit's site counts, which add up: `sites` = `bound_sites` + `open_sites` +
-`computed_sites` + `external_sites`. A bound site has at least one target of the unit; an external site reached only
+`computed_sites` + `external_sites`; `reflective_sites` counts the external sites that call a reflection API
+(`reflective`), whose open-site node is published beside their call. A bound site has at least one target of the unit; an external site reached only
 external nodes or was proven to leave the project; a computed site has a callee that names nothing; every other site
 is open. The `imports` row carries `resolved_imports`, the imports resolved to at least one file, and
 `open_import_sites`.

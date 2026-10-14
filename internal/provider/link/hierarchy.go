@@ -203,6 +203,13 @@ const (
 	// keyJavaMain + refKey(type): a Java method the type declares that a
 	// class can be launched by (Decl.Main), its form in Flags.
 	keyJavaMain = "jm\x00"
+	// keyShape + refKey(type): an instance member of an ECMAScript class or
+	// interface (addShapes), its name in Aux, shapeMethod or shapeField in
+	// Sig and, for a method, the argument counts a call may pass.
+	keyShape = "sm\x00"
+	// keyShapeFirst + name: an ECMAScript interface that declares a method,
+	// the least name of those it declares.
+	keyShapeFirst = "sf\x00"
 )
 
 // The flags of an entry.
@@ -854,6 +861,11 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 	}
 	if err := addJSRouting(links, file, t); err != nil {
 		return err
+	}
+	if fc.family == "js" {
+		if err := addShapes(links, file, t); err != nil {
+			return err
+		}
 	}
 	for i := range t.Decls {
 		d := &t.Decls[i]
@@ -1805,10 +1817,11 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 //   - Java: one of them is an instance method that is not Final (JLS
 //     §8.4.8): a static method hides and a final or private one, or one of a
 //     final class, has no override;
-//   - C and C++: one of them is not Final, and typ or a supertype declares
-//     the method virtual ([class.virtual]): a member overriding a virtual
-//     one is virtual without saying so, and a non-virtual call runs the
-//     member the static type names;
+//   - C and C++: one of them is neither Final nor static, and typ or a
+//     supertype declares the method virtual, or may (virtual): a member
+//     overriding a virtual one is virtual without saying so
+//     ([class.virtual]/2), and a non-virtual call runs the member the
+//     static type names;
 //   - Go: one of them is an interface's method; a concrete type's method is
 //     promoted into the types embedding it, never overridden;
 //   - ECMAScript: unless the method is private (`#p`), whose name is its
@@ -1828,7 +1841,7 @@ func (h *hierarchy) overridable(family string, typ Ref, method string, found []e
 	case "go":
 		return slices.ContainsFunc(found, func(e entry) bool { return e.Flags&flagAbstract != 0 }), nil
 	case "c":
-		if !slices.ContainsFunc(found, func(e entry) bool { return e.Flags&flagFinal == 0 }) {
+		if !slices.ContainsFunc(found, func(e entry) bool { return e.Flags&(flagFinal|flagStatic) == 0 }) {
 			return false, nil
 		}
 		return h.virtual(typ, method)
@@ -1838,10 +1851,15 @@ func (h *hierarchy) overridable(family string, typ Ref, method string, found []e
 	return true, nil
 }
 
-// virtual reports that typ or one of its supertypes declares method
-// virtual. Every declaration is read, the prototypes a definition replaces
-// included (methods drops them): only the declaration inside the class can
-// say `virtual`, never a definition outside it.
+// virtual reports that the C++ member method of typ is virtual or may be:
+// typ or one of its supertypes declares it virtual, or one of them has a
+// supertype outside the unit (keyExternalSuper), whose declaration of the
+// method the unit cannot read and which makes it virtual when virtual there
+// ([class.virtual]/2: a member with the name and parameter list of a base's
+// virtual member is virtual, whether or not it is so declared). Every
+// declaration is read, the prototypes a definition replaces included
+// (methods drops them): only the declaration inside the class can say
+// `virtual`, never a definition outside it.
 func (h *hierarchy) virtual(typ Ref, method string) (bool, error) {
 	seen := map[Ref]bool{typ: true}
 	queue := []Ref{typ}
@@ -1851,6 +1869,13 @@ func (h *hierarchy) virtual(typ Ref, method string) (bool, error) {
 		found := false
 		err := h.links.lookup(keyMethod+refKey(t)+method, func(e entry) error {
 			found = found || e.Flags&flagVirtual != 0
+			return nil
+		})
+		if err != nil || found {
+			return found, err
+		}
+		err = h.links.lookup(keyExternalSuper+refKey(t), func(entry) error {
+			found = true
 			return nil
 		})
 		if err != nil || found {
@@ -2456,7 +2481,8 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // interface when it is one itself (a Java or TypeScript interface's
 // extended interfaces, a Rust supertrait, a Go interface's embedded
 // interfaces), and implements each other interface or trait it declares, or
-// that a Go type satisfies by its method set (DetailMethodSet). A Go struct's
+// that a Go type satisfies by its method set or a TypeScript class by its
+// members (DetailMethodSet, hierarchy_ts.go). A Go struct's
 // embedded types are promotion and no supertype. A supertype outside the
 // unit is its external type node (externalType).
 //
@@ -2465,8 +2491,9 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // neither static, final nor private, of the same signature; in C++ a virtual
 // one of the same signature; in Python the first along the method
 // resolution order; in Rust a trait's, by a method of the trait's impl
-// (Decl.Override); in ECMAScript one of the same name; in Go each method of
-// an interface its type satisfies. A method that overrides none of the
+// (Decl.Override); in ECMAScript one of the same name, and each method of
+// its name of an interface its class implements by its members; in Go each
+// method of an interface its type satisfies. A method that overrides none of the
 // unit's and that the language marks as overriding (Decl.Override) overrides
 // the method of its name of the one supertype outside the unit its type has
 // (externalSupers), none when it has several. Go publishes nothing toward a
@@ -2479,6 +2506,9 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // file's own reads of the indexes.
 func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
 	fc := contextOf(file, t)
+	// The interfaces each class of the file implements by its members,
+	// read once for its own facts and its methods'.
+	shapes := newStructuralMemo()
 	if err := h.springInputFacts(file, t, emit); err != nil {
 		return err
 	}
@@ -2502,9 +2532,9 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		case isType(d.Kind) && fc.family == "go":
 			err = h.goSupertypeFacts(fc, t, ref, d, emit)
 		case isType(d.Kind):
-			err = h.supertypeFacts(fc, ref, d, emit)
+			err = h.supertypeFacts(fc, ref, d, shapes, emit)
 		case isCallable(d.Kind):
-			err = h.overrideFacts(fc, t, ref, d, emit)
+			err = h.overrideFacts(fc, t, ref, d, shapes, emit)
 		}
 		if err == nil {
 			err = h.macroInputFacts(fc, ref, d, emit)
@@ -2523,7 +2553,7 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 // but Go: its declared supertypes of the unit (keySuper) and outside it
 // (keyExternalSuper), wherever the unit declares them (a Rust impl in another
 // file).
-func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, shapes *structuralMemo, emit func(Binding) error) error {
 	relation := func(super byte) Fact {
 		if super&flagInterface != 0 && d.Kind != model.NodeInterface {
 			return FactImplements
@@ -2535,6 +2565,11 @@ func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Bindi
 	})
 	if err != nil {
 		return err
+	}
+	if fc.family == "js" && d.Kind == model.NodeClass {
+		if err := h.structuralFacts(ref, shapes, emit); err != nil {
+			return err
+		}
 	}
 	return h.links.lookup(keyExternalSuper+refKey(ref), func(e entry) error {
 		detail := DetailSupertypeClass
@@ -2624,7 +2659,7 @@ func (h *hierarchy) owners(fc fileCtx, t *Table, d *Decl, yield func(Ref) error)
 
 // overrideFacts emits what the method d at ref directly overrides
 // (hierarchyFacts).
-func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, shapes *structuralMemo, emit func(Binding) error) error {
 	switch {
 	case d.Static && (fc.family == "java" || fc.family == "c"):
 		// A static method hides; it overrides nothing.
@@ -2734,6 +2769,25 @@ func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit f
 		for _, target := range targets {
 			if err := emit(Binding{Kind: FactOverrides, Site: ref, Target: target, Detail: detail}); err != nil {
 				return err
+			}
+		}
+		if fc.family == "js" && instanceMember(d) && owner.File == fc.file && t.Decls[owner.Index].Kind == model.NodeClass {
+			// The interfaces the class implements by its members alone
+			// (structural).
+			var structural []Ref
+			err := h.structuralOverrides(owner, d.Name, shapes, func(e entry) error {
+				if e.Ref != ref && !slices.Contains(targets, e.Ref) && !slices.Contains(structural, e.Ref) {
+					structural = append(structural, e.Ref)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			for _, target := range structural {
+				if err := emit(Binding{Kind: FactOverrides, Site: ref, Target: target, Detail: DetailMethodSet}); err != nil {
+					return err
+				}
 			}
 		}
 		if fc.family == "go" {

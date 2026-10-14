@@ -34,10 +34,18 @@ Required          true
 
 `lang.Fingerprint()` folds, with `model.Hasher` under the domain
 `treesitter-fingerprint-v1`: the binding module and version
-(`github.com/tree-sitter/go-tree-sitter@v0.25.0`), the extraction version, and
-for every language its name, grammar module and version, ABI, grammar metadata
-version and the full text of its composed query pack. A grammar upgrade, an ABI
-change or an edited `.scm` therefore changes `ProviderVersion`, which changes
+(`github.com/tree-sitter/go-tree-sitter@v0.25.0`), the digest of the extraction
+code, and for every language its name, grammar module and version, ABI, grammar
+metadata version and the full text of its composed query pack. The code digest
+is `codectx.Digest` (`sources.go` at the module root) of the provider and its
+parser worker: the module embeds its own Go sources, and the digest folds the
+non-test Go files of every package of the module the two import, transitively
+(read from the embedded files' import lists), the version and sum of every
+outside module those imports name, as the build resolved them, and the Go
+toolchain's version. It is computed once per process, when first asked (about
+10 ms for this digest and the linker's together). A grammar upgrade, an ABI
+change, an edited `.scm` or any change to the code that extracts therefore
+changes `ProviderVersion`, which changes
 every unit key (`NewUnitID` folds the version) and invalidates all sealed
 treesitter units, as Section 11.3 requires. The worker reports the same
 fingerprint in its hello frame and the parent refuses a worker whose value
@@ -293,6 +301,39 @@ declared `static`; a tentative definition (`int x;`) is one, a prototype and an
 `extern` declaration without an initializer are not, since they define
 nothing. This is linkage, not shared-library visibility. C++ publishes no
 `exports`.
+
+**Methods code outside the project may override.** A method that code
+outside the indexed project can override or implement under its language's
+rules carries `extensible: true` metadata (`declOpen`,
+`internal/provider/treesitter/worker/extensible.go`), which a call answer
+reads to say that the overrides it lists for a base may not be all of them
+(docs/queries.md). A type is open when code outside can subtype it, and a
+method only inside an open type: in Java a public or protected (or interface
+member) class that is neither `final` nor `sealed`, and not an enum, record or
+annotation interface, or a public interface that is not `sealed`, whose
+public or protected methods that are not `static`, `private` or `final` are
+open, and in an interface every method not `static` or `private` (JLS
+§8.1.1.2, §8.4.3); in Go the exported methods of an exported interface of a
+package that is not `main` or under an `internal` directory, since any type
+of another package with those methods implements it without naming it (an
+unexported method is closed: another package cannot declare it, and a type
+that embeds the interface to gain it runs a body the project declares); in
+TypeScript and JavaScript the methods of an exported class or interface that
+are not `private`, `#`-named or `static`; in Python a method of a class at
+module or class level, unless the method or its class is decorated `final`
+(PEP 591) or its name is mangled (`__name`); in Rust the methods of a trait
+declared `pub` (not `pub(crate)`, `pub(super)` or `pub(in …)`) that is not
+sealed: a trait one of whose supertraits code outside the crate cannot name
+is sealed (the Rust API Guidelines' C-SEALED), and that is a trait of its
+module that is not `pub` (`pub trait Inward: Hidden` with `pub(crate) trait
+Hidden`), or a path through a module of its module that is not `pub` and that
+no `pub use` of that module re-exports from (`mod private { pub trait Sealed
+{} }` with `pub trait Shape: private::Sealed`), followed through a `use` of
+the module that names it; the file is read alone, so a `pub use` of the
+supertrait in a submodule another file holds is not seen; in C++ the
+members, not `static` or `final`, of a class that a header declares outside
+an unnamed namespace and that is not `final`. A Go or Rust concrete type's
+method, which nothing overrides, and every C declaration carry none.
 
 **C and C++ visibility as declared.** A declaration's own attributes give its
 `visibility` metadata: the first `visibility("…")` attribute's value
@@ -802,8 +843,8 @@ failure stores no table and discloses `link_failure` on its structural capabilit
 ### Reuse
 
 The four families are facts of the structural file unit, so a file whose fingerprint matches its sealed unit reuses
-them with its structural facts, and an edited file recomputes all of them. The extraction version
-(`internal/provider/treesitter/lang/lang.go`) changes with the facts the worker emits.
+them with its structural facts, and an edited file recomputes all of them. The fingerprint's code digest
+(`lang.Fingerprint`) changes with any change to the code that emits them, and only then.
 
 ## Worker process
 

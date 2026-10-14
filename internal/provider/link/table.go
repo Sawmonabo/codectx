@@ -354,6 +354,10 @@ type Site struct {
 	// that consumes this call's value directly (the site whose Nested names
 	// this one).
 	Feeds int32 `json:"feeds,omitempty"`
+	// Reflected is the method name a reflective lookup by a constant gives
+	// the site's receiver (wire.Site.Reflected): what a reflective call of
+	// it runs is a method of that name.
+	Reflected string `json:"reflected,omitempty"`
 }
 
 // Argument is one argument of a call site (wire.Argument): where it is,
@@ -379,6 +383,9 @@ type Value struct {
 	// function the value's own expression declares (wire.Value.Declares):
 	// the value is that declaration, whatever its name.
 	Declares int32 `json:"declares,omitempty"`
+	// Target is, for a Java method reference, its target type where the
+	// context writes it (wire.Value.Target), unknown otherwise.
+	Target wire.Type `json:"target"`
 }
 
 // Encode is t's stored form.

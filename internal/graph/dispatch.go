@@ -110,7 +110,32 @@ type RelationDispatch struct {
 	// SetSize is the largest number of targets any occurrence's site was
 	// bound to, 0 for a site bound to one.
 	SetSize int64
+	// ValueBound is true when any occurrence was bound by a technique whose
+	// targets are the values the project's own code gives the site
+	// (valueBound): one of them is the target, and a value from outside
+	// the project may be another.
+	ValueBound bool
 }
+
+// The call techniques (evidence details) whose targets are the values the
+// project's own code gives a site: the functions of its type whose address
+// the project takes, the function values that reach it, the functions
+// written to the field it calls through, and the methods of the instances
+// the project's code passes, returns or stores into its receiver. The
+// linker publishes them under these names.
+const (
+	CallDetailAddressTaken  = "address_taken"
+	CallDetailFunctionValue = "function_value"
+	CallDetailField         = "field"
+	CallDetailReceiverValue = "receiver_value"
+)
+
+// ValueDetails are the techniques valueBound reads, for a reader that
+// summarizes them in its own query.
+var ValueDetails = []string{CallDetailAddressTaken, CallDetailFunctionValue, CallDetailField, CallDetailReceiverValue}
+
+// valueBound reports whether detail is one of ValueDetails.
+func valueBound(detail string) bool { return slices.Contains(ValueDetails, detail) }
 
 // dispatchReader is the seam the engine hands a call walk, nil when the
 // packed reader does not report dispatch.
