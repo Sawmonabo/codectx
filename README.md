@@ -1,8 +1,10 @@
 # codectx
 
 Codebase intelligence for software-development agents: a Go CLI and MCP server
-that index a Git repository, keep the exact indexed bytes, and answer bounded
-structural queries — locally, offline, with no AI service and no API key.
+that index a Git repository, keep the exact indexed bytes, and answer structural
+queries completely by default — locally, offline, with no AI service and no API
+key. [docs/product-requirements.md](docs/product-requirements.md) states what it
+is for and what every part of it must meet.
 
 **Status: pre-release.** Every command listed under [Commands](#commands) is
 implemented and wired into the command tree. What is still moving is the
@@ -155,17 +157,18 @@ remediation. A metric this host cannot measure is reported as unavailable, never
 as zero; [docs/operations.md](docs/operations.md) has the check list and what
 each recovery code means.
 
-`codectx repo-map` reports the bounded repository, module, package and directory
-map of the pinned generation, continued by token rather than truncated — see
-[docs/queries.md](docs/queries.md#the-repository-map--repo-map).
+`codectx repo-map` reports the repository, module, package and directory map of
+the pinned generation a page at a time, continued by token rather than truncated
+— see [docs/queries.md](docs/queries.md#the-repository-map--repo-map).
 
 ## The managed toolchain
 
 Every external analyzer is pinned by an exact version, a per-platform URL and a
 SHA-256 in a lock the binary embeds. Indexing installs what your repository
 needs, verified against that lock before anything executes, into a user-private
-store outside the repository. codectx itself looks nothing up on `PATH`; the
-three host toolchains above are the analyzers' own, and
+store outside the repository. codectx looks up none of its analyzers on `PATH`.
+It does look up `git`, and the host toolchains above that some indexers shell out
+to: on `PATH` first, then, for Go and Rust, their usual install locations.
 [docs/toolchain.md](docs/toolchain.md) lists them in one place.
 
 `codectx tools` is the optional lifecycle surface for CI and offline hosts:
@@ -221,8 +224,8 @@ precision does and does not prove is set out in
 [docs/providers.md](docs/providers.md) and
 [docs/snapshots.md](docs/snapshots.md).
 
-`codectx refs`, `callers`, `callees`, `path` and `impact` answer bounded
-structural questions about the indexed generation;
+`codectx refs`, `callers`, `callees`, `path` and `impact` answer structural
+questions about the indexed generation;
 [docs/queries.md](docs/queries.md) has their arguments, budgets and the
 configuration keys they read.
 
@@ -270,7 +273,9 @@ $ codectx version --json
 | [SECURITY.md](SECURITY.md) | The operator-facing trust boundary and how to report an issue |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The pinned toolchain, the verification set and the test policy |
 
-The full specification is [docs/implementation-plan.md](docs/implementation-plan.md).
+What codectx must do is [docs/product-requirements.md](docs/product-requirements.md);
+[docs/implementation-plan.md](docs/implementation-plan.md) is the earlier
+implementation specification.
 
 ## Licensing
 
