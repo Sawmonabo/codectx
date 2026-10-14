@@ -50,13 +50,16 @@ var joinCases = []joinCase{
 
 // TestASCIPOccurrenceAtACallSiteGivesTheCallItsCompilerTarget indexes one
 // file per language with an index that resolves the call, and asks the
-// product for the callees of the structural caller. The answer must hold a
-// `calls` relation to the node the index resolved the occurrence to, with a
-// compiler-precision evidence row keyed by the call site.
+// product for the callees of the structural caller. The index defines helper
+// at the structural declaration's name token, so both name one node: the
+// answer must be that one callee, its `calls` relation carrying the
+// compiler-precision evidence row keyed by the call site beside the linker's.
 //
-// Mutation caught: a join that publishes the call-site key and nothing that
+// Mutations caught: a join that publishes the call-site key and nothing that
 // reads it (the reference stays a `references` edge from the index's own
-// enclosing node, and `calls` holds the linker's target alone).
+// enclosing node, and `calls` holds the linker's target alone); a definition
+// that mints its own identity rather than adopting the declaration's (run
+// then lists helper twice, once per identity).
 func TestASCIPOccurrenceAtACallSiteGivesTheCallItsCompilerTarget(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
@@ -110,7 +113,10 @@ func TestASCIPOccurrenceAtACallSiteGivesTheCallItsCompilerTarget(t *testing.T) {
 	for _, c := range joinCases {
 		t.Run(c.language, func(t *testing.T) {
 			caller := providerNode(t, reader, c.path, "run", tslang.ProviderID)
-			target := providerNode(t, reader, c.path, "helper", scip.ID)
+			target := providerNode(t, reader, c.path, "helper", tslang.ProviderID)
+			if adopted := providerNode(t, reader, c.path, "helper", scip.ID); adopted != target {
+				t.Fatalf("the index defines helper as %s, the structural provider as %s: one function, two identities", adopted, target)
+			}
 			start, end := token(c.source, "helper", 1)
 			key := "callsite:" + c.path + ":" + strconv.Itoa(start+1) + "-" + strconv.Itoa(end)
 			answer, err := ws.Services().Graph(ctx, model.GraphRequest{GenerationID: gen, Start: []model.NodeID{caller},
@@ -120,22 +126,34 @@ func TestASCIPOccurrenceAtACallSiteGivesTheCallItsCompilerTarget(t *testing.T) {
 			}
 			var to []string
 			for _, rel := range answer.Relations {
-				to = append(to, string(rel.To))
-				if rel.To != target || rel.Kind != model.RelCalls {
+				if rel.Kind == model.RelCalls {
+					to = append(to, string(rel.To))
+				}
+			}
+			if len(to) != 1 || to[0] != string(target) {
+				t.Fatalf("the callees of run (%s) are %v, want helper %s alone", caller, to, target)
+			}
+			for _, rel := range answer.Relations {
+				if rel.Kind != model.RelCalls {
 					continue
 				}
 				rows, err := reader.Evidence(ctx, "", rel.ID, "", model.MaxPageItems)
 				if err != nil {
 					t.Fatal(err)
 				}
+				var compiler, static bool
 				for _, r := range rows {
-					if r.Evidence.Precision == model.PrecisionCompiler && r.Evidence.NativeKey == key {
-						return
+					switch {
+					case r.Evidence.Precision == model.PrecisionCompiler && r.Evidence.NativeKey == key:
+						compiler = true
+					case r.Evidence.Precision == model.PrecisionStaticAnalysis:
+						static = true
 					}
 				}
-				t.Fatalf("run calls the index's helper %s with no compiler evidence row keyed %s: %+v", target, key, rows)
+				if !compiler || !static {
+					t.Fatalf("run calls helper %s with compiler row keyed %s %v, static row %v: %+v", target, key, compiler, static, rows)
+				}
 			}
-			t.Fatalf("the callees of run (%s) are %v; none is the index's helper %s at %s", caller, to, target, key)
 		})
 	}
 }

@@ -206,9 +206,9 @@ the same call-site key as the linker's occurrence and with no `dispatch`; a
 token the index resolves to several symbols gives one relation per symbol, each
 with its `set_size`.
 The linker's relation for the call stays, so an open site the index resolved
-is listed beside the index's target. The index's symbol is its own node: a
-function the structural provider also declares is listed once per node
-([SCIP provider](providers-scip.md), Call-site join).
+is listed beside the index's target. A function the structural provider also
+declares is one node, listed once ([SCIP provider](providers-scip.md),
+Call-site join).
 
 **Calls no analysis bound are listed by name, after every precise row.** When
 the linker cannot bind a call — `obj.handle()` with nothing known about `obj` —

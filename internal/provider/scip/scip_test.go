@@ -529,24 +529,61 @@ func tokenAt(t *testing.T, src, needle string, nth int) (int, int) {
 }
 
 // callTables is a link.Tables holding, for each file it names, one call site
-// at each listed callee token, made from the file's module: the structural
-// provider's call sites the join matches occurrences against, without
-// running that provider.
+// at each listed callee token, and one function declaration at each listed
+// name token: the structural provider's call sites and declarations the join
+// matches occurrences against, without running that provider. A site is made
+// from the module, or from the innermost listed declaration whose name token
+// precedes it on its line when there is one. salt, per file, moves the
+// identity of every declaration of the file.
 type callTables struct {
 	files  map[string]string
 	tokens map[string][][2]uint32
+	decls  map[string][][2]uint32
+	salt   map[string]string
 }
 
 func (c callTables) Table(_ context.Context, _ model.GenerationID, fv model.FileVersion) (*link.Table, bool, error) {
 	tokens, ok := c.tokens[fv.Path]
-	if !ok {
+	decls, declared := c.decls[fv.Path]
+	if !ok && !declared {
 		return nil, false, nil
 	}
-	t := &link.Table{Path: fv.Path, Language: "test", Module: moduleEndpoint(fv.Path, c.files[fv.Path])}
+	src := c.files[fv.Path]
+	t := &link.Table{Path: fv.Path, Language: "test", Module: moduleEndpoint(fv.Path, src)}
+	for _, tok := range decls {
+		t.Decls = append(t.Decls, link.Decl{Parent: -1, Endpoint: declEndpoint(fv.Path, src, c.salt[fv.Path], tok)})
+	}
 	for _, tok := range tokens {
-		t.Sites = append(t.Sites, link.Site{Caller: -1, NameStart: tok[0], NameEnd: tok[1]})
+		caller := int32(-1)
+		for i, d := range decls {
+			if d[1] <= tok[0] && !strings.Contains(src[d[1]:tok[0]], "\n") {
+				caller = int32(i)
+			}
+		}
+		t.Sites = append(t.Sites, link.Site{Caller: caller, NameStart: tok[0], NameEnd: tok[1]})
 	}
 	return t, true, nil
+}
+
+// declEndpoint is the function callTables declares at the name token tok of
+// path, its range the token's line.
+func declEndpoint(path, src, salt string, tok [2]uint32) link.Endpoint {
+	key := model.H("test-decl", salt, path, strconv.Itoa(int(tok[0])))
+	lineStart := strings.LastIndexByte(src[:tok[0]], '\n') + 1
+	lineEnd := lineStart + strings.IndexByte(src[lineStart:], '\n')
+	name := byteRange(src, uint32(tok[0]), tok[1])
+	return link.Endpoint{Node: model.NewNodeID(model.RepositoryID(model.H("providertest-repo")), model.NodeFunction, key), CanonicalKey: key,
+		Kind: model.NodeFunction, Name: src[tok[0]:tok[1]], Qualified: src[tok[0]:tok[1]],
+		Range: byteRange(src, uint32(lineStart), uint32(lineEnd)), NameRange: &name}
+}
+
+// byteRange is [start,end) of src with its one-based lines and byte columns.
+func byteRange(src string, start, end uint32) model.SourceRange {
+	at := func(b uint32) model.Position {
+		return model.Position{Byte: uint64(b), Line: uint32(strings.Count(src[:b], "\n") + 1),
+			Column: b - uint32(strings.LastIndexByte(src[:b], '\n')+1)}
+	}
+	return model.SourceRange{Start: at(start), End: at(end)}
 }
 
 // moduleEndpoint is the module node of path as callTables names it.
@@ -1464,4 +1501,88 @@ func TestAClassTemplateConstructorCallReachesItsDefinition(t *testing.T) {
 			t.Fatalf("the construction resolved to an unlocated node %s besides the constructor's definition", n.Node.ID)
 		}
 	}
+}
+
+// TestADeltaFollowsTheStructuralIdentitiesTheJoinReads holds a refresh to
+// the identities the call-site join takes from the link tables, which are
+// in neither the index nor the bytes. use.go calls F, which def.go defines
+// at the structural declaration's name token, so the definition adopts the
+// declaration's identity and the call is made from run's.
+//
+//   - Nothing moved: both documents are unchanged.
+//   - F's declaration takes a new identity (its parameter list was edited,
+//     say) while both documents' index records and bytes stay: def.go is
+//     changed, and so is use.go, whose call must now reach F's new identity.
+//   - run's declaration takes a new identity: use.go is changed and its call
+//     leaves the new caller; def.go is not.
+//
+// Mutations caught: leave the join digest out of the document hash (the
+// caller's move keeps use.go and its call from a caller no unit publishes);
+// leave the named identities out (F's move keeps use.go's call at an
+// identity no unit publishes); hash anything that varies between two equal
+// runs (the first case reports changes).
+func TestADeltaFollowsTheStructuralIdentitiesTheJoinReads(t *testing.T) {
+	const symF = "scip-go gomod example.com/m v0 g/F()."
+	files := map[string]string{
+		"g/def.go": "package g\n\nfunc F() {}\n",
+		"g/use.go": "package g\n\nfunc run() { F() }\n",
+	}
+	fs, fe := tokenAt(t, files["g/def.go"], "F", 0)
+	rs, re := tokenAt(t, files["g/use.go"], "run", 0)
+	cs, ce := tokenAt(t, files["g/use.go"], "F", 0)
+	occ := func(src string, roles uint64, start, end int) []byte {
+		line := int32(strings.Count(src[:start], "\n"))
+		col := int32(start - strings.LastIndexByte(src[:start], '\n') - 1)
+		return occurrenceRecord(symF, roles, line, col, col+int32(end-start))
+	}
+	files["delta.scip"] = string(miniIndex("scip-go", "0.2.7",
+		documentWithText("g/def.go", "go", 1, files["g/def.go"], occ(files["g/def.go"], 1, fs, fe)),
+		documentWithText("g/use.go", "go", 1, files["g/use.go"], occ(files["g/use.go"], 0, cs, ce))))
+	inputs := []string{"delta.scip", "g/def.go", "g/use.go"}
+	scope := scip.ImportScope("delta.scip")
+	tables := func(salt map[string]string) callTables {
+		return callTables{files: files, salt: salt,
+			decls:  map[string][][2]uint32{"g/def.go": {{uint32(fs), uint32(fe)}}, "g/use.go": {{uint32(rs), uint32(re)}}},
+			tokens: map[string][][2]uint32{"g/use.go": {{uint32(cs), uint32(ce)}}}}
+	}
+	node := func(path, salt string, start, end int) model.NodeID {
+		return declEndpoint(path, files[path], salt, [2]uint32{uint32(start), uint32(end)}).Node
+	}
+	wantCalls := func(t *testing.T, got *facts, from, to model.NodeID) {
+		t.Helper()
+		rel, ok := got.relations[model.NewRelationID(model.RepositoryID(model.H("providertest-repo")), from, model.RelCalls, to)]
+		if !ok || len(rel.Evidence) == 0 || rel.Evidence[0].Precision != model.PrecisionCompiler {
+			t.Fatalf("no compiler calls %s -> %s among %d relations", from, to, len(got.relations))
+		}
+	}
+
+	// One store across the runs, as a refresh has. A changed document's rows
+	// may name a node only an unchanged document's stored rows publish, so a
+	// sealed unit of the same index registers the first run's identities.
+	files["seed.scip"] = files["delta.scip"]
+	h := providertest.New(t, files)
+	seed, _ := importDelta(t, h, joinProvider(t, "seed.scip", tables(nil)), scip.ImportScope("seed.scip"),
+		[]string{"seed.scip", "g/def.go", "g/use.go"}, nil)
+	if err := seed.Seal(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, rep := importDelta(t, h, joinProvider(t, "delta.scip", tables(nil)), scope, inputs, nil)
+	stored, _ := saveManifest(t, rep.Manifest, "documents.txt")
+
+	_, same := importDelta(t, h, joinProvider(t, "delta.scip", tables(nil)), scope, inputs, stored)
+	if got := classes(t, same.Manifest, stored); len(got[scip.ClassChanged]) != 0 {
+		t.Fatalf("nothing moved, yet %v changed", got[scip.ClassChanged])
+	}
+
+	moved, rep2 := importDelta(t, h, joinProvider(t, "delta.scip", tables(map[string]string{"g/def.go": "1"})), scope, inputs, stored)
+	if got := classes(t, rep2.Manifest, stored); !slices.Equal(got[scip.ClassChanged], []string{"g/def.go", "g/use.go"}) {
+		t.Fatalf("F's declaration moved; changed %v, want g/def.go and g/use.go", got[scip.ClassChanged])
+	}
+	wantCalls(t, moved, node("g/use.go", "", rs, re), node("g/def.go", "1", fs, fe))
+
+	caller, rep3 := importDelta(t, h, joinProvider(t, "delta.scip", tables(map[string]string{"g/use.go": "1"})), scope, inputs, stored)
+	if got := classes(t, rep3.Manifest, stored); !slices.Equal(got[scip.ClassChanged], []string{"g/use.go"}) {
+		t.Fatalf("run's declaration moved; changed %v, want g/use.go alone", got[scip.ClassChanged])
+	}
+	wantCalls(t, caller, node("g/use.go", "1", rs, re), node("g/def.go", "", fs, fe))
 }

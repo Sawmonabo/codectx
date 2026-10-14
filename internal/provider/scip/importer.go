@@ -325,6 +325,11 @@ type docSource struct {
 	// refusing the correct references an aliased import creates. It is bounded
 	// by this document's occurrences and discarded with it.
 	spellings map[string]map[string]struct{}
+	// names are the declarations of the document's file in its link table,
+	// by the bytes of each name token, and language the table's language
+	// (bindTable): what a definition occurrence adopts.
+	names    map[[2]uint64]link.Endpoint
+	language string
 }
 
 // docRow is the scratch record of one document bound to a snapshot file.
@@ -364,6 +369,9 @@ func (im *importer) run(ctx context.Context, open opener) error {
 		im.partialCode = model.CodeSourceBindingUnverified
 	}
 	if err := im.passDefinitions(ctx, open); err != nil {
+		return err
+	}
+	if err := im.settleDocuments(ctx); err != nil {
 		return err
 	}
 	if err := im.passReferences(ctx); err != nil {
@@ -764,7 +772,12 @@ func (im *importer) endDocument(d document) error {
 			return im.dropSpool(ctx, d.index)
 		}
 	}
-	hash, err := im.documentHash(ctx, row)
+	tab, err := im.linkTable(ctx, row.file)
+	if err != nil {
+		return err
+	}
+	ds.bindTable(tab)
+	hash, err := im.documentHash(ctx, row, joinDigest(tab))
 	if err != nil {
 		return err
 	}
@@ -781,8 +794,23 @@ func (im *importer) endDocument(d document) error {
 	if err := im.bindSpellings(ctx, ds); err != nil {
 		return err
 	}
-	if err := im.sc.each(ctx, `SELECT seq, symbol, roles, s0, s1, s2, s3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
-		[]any{row.idx, roleDefinition}, func(scan func(...any) error) error {
+	if err := im.defineDocument(ctx, ds, publish); err != nil {
+		return err
+	}
+	if !publish {
+		// Settled once every definition is known (settleDocuments); its
+		// refusals are counted then.
+		return nil
+	}
+	// Its references are refused, if at all, when pass 2 reads them.
+	return im.addRefused(ctx, row.idx, ds.refused)
+}
+
+// defineDocument records every definition occurrence of one document, and
+// publishes them when publish is set.
+func (im *importer) defineDocument(ctx context.Context, ds *docSource, publish bool) error {
+	return im.sc.each(ctx, `SELECT seq, symbol, roles, s0, s1, s2, s3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
+		[]any{ds.doc.idx, roleDefinition}, func(scan func(...any) error) error {
 			var seq int64
 			var symbolText string
 			var roles int32
@@ -799,19 +827,7 @@ func (im *importer) endDocument(d document) error {
 				enclosing = &[4]int32{*e[0], *e[1], *e[2], *e[3]}
 			}
 			return im.defineSymbol(ctx, ds, symbolText, r, enclosing, publish)
-		}); err != nil {
-		return err
-	}
-	if publish {
-		// Its references are refused, if at all, when pass 2 reads them.
-		return im.addRefused(ctx, row.idx, ds.refused)
-	}
-	// An unchanged document emits no reference, so its occurrences are not
-	// read again, and the refusals are the stored ones.
-	if err := im.carryRefusals(ctx, row); err != nil {
-		return err
-	}
-	return im.dropSpool(ctx, row.idx)
+		})
 }
 
 // dropSpool discards the spooled records of a document no later pass reads.
@@ -1442,22 +1458,47 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if len(qualified) <= model.MaxQualifiedNameBytes {
 		descriptor = qualified
 	}
-	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: sym.scopeKey(ds.doc.path), NativeKey: sym.raw, Kind: sym.nodeKind(kind),
-		Language: ds.doc.language, Name: name, QualifiedName: qualified, Signature: sig,
-		FileID: ds.doc.file.ID, ContentHash: ds.doc.file.ContentHash, Range: rng, Descriptor: descriptor}
-	res, err := im.req.Resolver.Resolve(ctx, cand)
-	if err != nil {
-		return err
-	}
-	// A definition occurrence's range is the symbol's name token, and the
-	// node is located at that occurrence, so its name range is its range.
-	res.Node.NameRange = rng
+	scope := sym.scopeKey(ds.doc.path)
 	loc := location{file: ds.doc.file, rng: rng}
-	if publish {
-		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false, sigCut); err != nil {
+	var res model.Resolution
+	if e, ok := ds.adopt(rng); ok {
+		// The structural declaration named at these bytes: one function,
+		// one identity (adopt). The fact is the caller occurrence's own
+		// (structuralNode), with its evidence at this definition.
+		n, err := im.structuralNode(ds.doc.file, ds.language, e)
+		if err != nil {
 			return err
 		}
-		if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: cand.ScopeKey, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
+		res = model.Resolution{Node: n, Basis: model.MatchNativeKey, CanonicalKey: e.CanonicalKey}
+		if err := res.Validate(); err != nil {
+			return err
+		}
+		if publish {
+			ev := im.evidence(n.ID, "", loc, sym.raw, "definition", 0)
+			if err := im.sink.PutNodes(ctx, []model.NodeFact{{Node: n, CanonicalKey: e.CanonicalKey, Evidence: []model.Evidence{ev}}}); err != nil {
+				return err
+			}
+			im.records++
+		}
+	} else {
+		cand := model.NodeCandidate{ProviderID: ID, ScopeKey: scope, NativeKey: sym.raw, Kind: sym.nodeKind(kind),
+			Language: ds.doc.language, Name: name, QualifiedName: qualified, Signature: sig,
+			FileID: ds.doc.file.ID, ContentHash: ds.doc.file.ContentHash, Range: rng, Descriptor: descriptor}
+		if res, err = im.req.Resolver.Resolve(ctx, cand); err != nil {
+			return err
+		}
+		// A definition occurrence's range is the symbol's name token, and
+		// the node is located at that occurrence, so its name range is its
+		// range.
+		res.Node.NameRange = rng
+		if publish {
+			if err := im.putNode(ctx, res, sym.raw, "definition", loc, false, sigCut); err != nil {
+				return err
+			}
+		}
+	}
+	if publish {
+		if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: scope, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
 			return err
 		}
 		im.records++
@@ -1728,11 +1769,8 @@ type docSites struct {
 // to join, and neither has an import built without tables.
 func (im *importer) callSites(ctx context.Context, d docRow) (*docSites, error) {
 	out := &docSites{}
-	if im.p.tables == nil {
-		return out, nil
-	}
-	t, ok, err := im.p.tables.Table(ctx, im.req.Binding.GenerationID, d.file)
-	if err != nil || !ok {
+	t, err := im.linkTable(ctx, d.file)
+	if err != nil || t == nil {
 		return out, err
 	}
 	out.language, out.byToken, out.published = t.Language, make(map[[2]uint64][]link.Endpoint, len(t.Sites)), map[model.NodeID]bool{}
@@ -1796,22 +1834,19 @@ func (im *importer) joinCall(ctx context.Context, d docRow, loc location, to mod
 	return nil
 }
 
-// putCaller publishes this unit's occurrence of a structural caller: the
-// node the structural provider resolved, under its canonical key, with its
-// own attributes and an evidence row at its declaration.
+// putCaller publishes this unit's occurrence of a structural caller
+// (structuralNode), under its canonical key, with an evidence row at its
+// declaration.
 func (im *importer) putCaller(ctx context.Context, d docRow, language string, e link.Endpoint) error {
-	rng := e.Range
-	n := model.Node{ID: e.Node, Kind: e.Kind, Language: language, Name: e.Name, QualifiedName: e.Qualified,
-		FileID: d.file.ID, ContentHash: d.file.ContentHash, Range: &rng}
-	if e.NameRange != nil {
-		nr := *e.NameRange
-		n.NameRange = &nr
+	n, err := im.structuralNode(d.file, language, e)
+	if err != nil {
+		return err
 	}
 	key := e.Qualified
 	if len(key) > model.MaxNativeKeyBytes {
 		key = ""
 	}
-	ev := im.evidence(e.Node, "", location{file: d.file, rng: &rng}, key, "caller", 0)
+	ev := im.evidence(e.Node, "", location{file: d.file, rng: n.Range}, key, "caller", 0)
 	if err := im.sink.PutNodes(ctx, []model.NodeFact{{Node: n, CanonicalKey: e.CanonicalKey, Evidence: []model.Evidence{ev}}}); err != nil {
 		return err
 	}

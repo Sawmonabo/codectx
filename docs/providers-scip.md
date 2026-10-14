@@ -224,9 +224,14 @@ slices for the same heap reason; `fn` may be nil when only the counts are
 wanted.
 
 **Canonical document hash.** Framed with `model.NewHasher("scip-document-v1")`
-over the document's path, language, resolved position encoding, **the pinned
-file's content hash**, and the canonical digest of every occurrence and symbol
-record of the document, folded in sorted order.
+over the document's path, the digest of what the call-site join reads of the
+file's link table, language, resolved position encoding, **the pinned file's
+content hash**, and the canonical digest of every occurrence and symbol record
+of the document, folded in sorted order. Once every document's definitions are
+known, that hash is framed again with each global symbol the document names and
+the node its definition resolved to, in symbol order, and the result is the
+document's canonical hash. A refresh decides a document the stored unit holds
+only then; a full import, and a refresh's new path, publish at once.
 
 - Occurrence and symbol digests cover exactly the fields this provider turns
   into facts, in the normalized four-value range form. A producer that switches
@@ -247,6 +252,19 @@ record of the document, folded in sorted order.
   unchanged and the retained evidence rows would name content hashes the
   snapshot no longer holds, which is the one way a delta import can serve wrong
   source as compiler evidence.
+- The join digest covers the table's module, every declaration and route
+  handler (identity, canonical key, kind, name, qualified name, range, name
+  range) and every call site's caller and callee token, the inputs of the
+  call-site join and of adoption below. They are in neither the index nor the
+  bytes: a structural identity moves with a declaration's parameter list, and
+  a document whose rows publish `calls` from a caller that moved is changed.
+- The named identities cover what a document's rows point at in another
+  document. A reference's target is its symbol's definition, wherever that
+  is, and an adopted definition's identity moves with the structural
+  declaration, which the referencing document does not spell: a call of a
+  function whose parameter list was edited changes the calling document too,
+  rather than keeping a relation to an identity no unit publishes. An
+  identity that did not move costs nothing: the document stays unchanged.
 
 **What a delta run publishes.** Facts for the changed documents only.
 Definitions are converted and resolved for *every* admitted document, because a
@@ -607,9 +625,8 @@ native key the call-site key:
 The identifier `Bar` occupying zero-based bytes `[34,37)` of `pkg/a.go` is
 therefore `callsite:pkg/a.go:35-37`, byte for byte the key the linker cites on
 its own evidence for the call. So one call carries both rows, under one key
-from one caller. The target is the index's own node (below), so today they are
-two `calls` relations: the linker's to its target or open site, the importer's
-to the index's symbol. The row carries no `dispatch`: SCIP records which symbol
+from one caller: one relation when the linker bound the same target, two when
+it bound another target or left an open site. The row carries no `dispatch`: SCIP records which symbol
 a token names, not whether the call can run an override. When the index names several
 symbols at one callee token -- scip-clang's overload candidates of a dependent
 call in a template body, or a constructor sharing the token of the function
@@ -627,10 +644,18 @@ that would exceed `model.MaxNativeKeyBytes` cannot be spelled; the occurrence
 is counted under `callsite_keys_skipped` and degrades the capability with
 `CTX_RESOURCE_LIMIT`, and the call keeps the linker's target alone.
 
-The target is the SCIP symbol's own node: a symbol the index defines is keyed
-by its descriptor path, not by the structural declaration's, so a function
-both providers declare is two nodes, and the compiler's `calls` names the
-SCIP one.
+**Adoption.** A definition occurrence whose bytes are exactly a structural
+declaration's name token in the same table is that declaration: the index's
+definition takes the declaration's identity, kind and attributes rather than
+minting a node keyed by its descriptor path, so a function both providers
+declare is one node, and its callers, callees and references are that node's,
+in all six languages (a C++ member defined out of line included: its name token
+is the member's name, as scip-clang's definition occurrence is). The unit
+publishes the same description of the node as its caller occurrence does, with
+its own evidence row at the definition, and aliases the symbol to it, so a
+reference from any document reaches it. A definition with no declaration at its
+bytes (a symbol the structural provider does not declare) keeps the identity
+its descriptor path keys.
 
 ## Symbol spellings
 
