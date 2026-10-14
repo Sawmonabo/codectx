@@ -3,6 +3,7 @@ package delta_test
 import (
 	"bytes"
 	"maps"
+	"path"
 	"slices"
 	"strings"
 	"testing"
@@ -66,7 +67,8 @@ var differentialScripts = []script{goScript, pythonScript, javascriptScript, typ
 
 // tsxScript is the JavaScript project with every source file a TSX file,
 // which links in the ECMAScript family.
-var tsxScript = script{name: "tsx", base: renamed(javascriptScript.base, ".js", ".tsx"), edits: ecmascriptEdits(".tsx")}
+var tsxScript = script{name: "tsx", base: renamed(javascriptScript.base, ".js", ".tsx"),
+	edits: append(ecmascriptEdits(".tsx"), packageEdits("main.tsx")...)}
 
 // renamed is files with each path ending in from ending in to instead.
 func renamed(files map[string]string, from, to string) map[string]string {
@@ -291,6 +293,17 @@ def hop_c(v):
 		{name: "file added", write: map[string]string{"extra.py": "from factory import make\n\n\ndef extra():\n    return make().speak()\n"}},
 		{name: "file deleted", remove: []string{"pets.py"}},
 		{name: "file renamed", move: [][2]string{{"factory.py", "maker.py"}}},
+		{name: "project manifest added", write: map[string]string{
+			"pyproject.toml":   "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"requests>=2.0\"]\n\n[project.scripts]\napp = \"main:main\"\n",
+			"requirements.txt": "requests==2.31.0\n",
+		}},
+		{name: "dependency version bump", replace: []sub{{"requirements.txt", "2.31.0", "2.32.0"}, {"pyproject.toml", "requests>=2.0", "requests>=2.1"}}},
+		{name: "entry point change", replace: []sub{{"pyproject.toml", `app = "main:main"`, `app = "ui:on_click"`}}},
+		{name: "module path change", replace: []sub{{"pyproject.toml", `name = "app"`, `name = "renamed"`}}},
+		{name: "new nested module", write: map[string]string{
+			"tools/pyproject.toml": "[project]\nname = \"tools\"\nversion = \"0.1.0\"\n",
+			"tools/helper.py":      "from main import main\n\n\ndef helper():\n    return main()\n",
+		}},
 	},
 }
 
@@ -375,6 +388,23 @@ export function feed(`},
 	}
 }
 
+// packageEdits are the package.json edits of a JavaScript project whose
+// main module is main: a dependency added and its version bumped, the
+// declared entry points changed, the package renamed, and a nested package
+// that imports the project's main module.
+func packageEdits(main string) []edit {
+	return []edit{
+		{name: "dependency added", replace: []sub{{"package.json", `"type": "module"`, `"type": "module",\n  "dependencies": {\n    "left-pad": "1.0.0"\n  }`}}},
+		{name: "dependency version bump", replace: []sub{{"package.json", `"left-pad": "1.0.0"`, `"left-pad": "1.1.0"`}}},
+		{name: "entry point change", replace: []sub{{"package.json", `"type": "module",`, `"type": "module",\n  "main": "` + main + `",\n  "bin": "` + main + `",`}}},
+		{name: "module path change", replace: []sub{{"package.json", `"name": "app"`, `"name": "renamed"`}}},
+		{name: "new nested module", write: map[string]string{
+			"tools/package.json":            "{\n  \"name\": \"tools\",\n  \"type\": \"module\"\n}\n",
+			"tools/helper" + path.Ext(main): "import { main } from \"../" + main + "\";\n\nexport function helper() {\n  return main();\n}\n",
+		}},
+	}
+}
+
 var javascriptScript = script{
 	name: "javascript",
 	base: withFiles(map[string]string{
@@ -430,7 +460,7 @@ export class Button {
 }
 `,
 	}, ecmascriptRing(".js")),
-	edits: ecmascriptEdits(".js"),
+	edits: append(ecmascriptEdits(".js"), packageEdits("main.js")...),
 }
 
 var typescriptScript = script{
@@ -511,6 +541,11 @@ export class Button {
 			"export function parse(s: string): number;\n",
 			"export function parse(b: boolean): number;\nexport function parse(s: string): number;\n"}}}),
 		edit{name: "tsconfig paths change", replace: []sub{{"tsconfig.json", `["lib/*"]`, `["src/lib/*"]`}}},
+		edit{name: "tsconfig paths restored", replace: []sub{{"tsconfig.json", `["src/lib/*"]`, `["lib/*"]`}}},
+		edit{name: "tsconfig baseUrl change", replace: []sub{{"tsconfig.json", `"baseUrl": "."`, `"baseUrl": "lib"`}}},
+		edit{name: "tsconfig moduleResolution change", replace: []sub{{"tsconfig.json", `"baseUrl": "lib",`,
+			`"baseUrl": "lib",\n    "moduleResolution": "node16",\n    "module": "node16",`}}},
+		edit{name: "tsconfig include change", replace: []sub{{"tsconfig.json", "  }\n}\n", "  },\n  \"include\": [\"*.ts\"]\n}\n"}}},
 	),
 }
 
@@ -614,7 +649,22 @@ public class Holder {
 		{name: "file added", write: map[string]string{"src/app/Extra.java": "package app;\n\npublic class Extra {\n  static String extra() {\n    return Factory.make().speak();\n  }\n}\n"}},
 		{name: "file deleted", remove: []string{"src/app/Dog.java"}},
 		{name: "file renamed", move: [][2]string{{"src/app/Factory.java", "src/app/core/Factory.java"}}},
+		{name: "build file added", write: map[string]string{"pom.xml": javaPOM("app", "1.0.0")}},
+		{name: "dependency version bump", replace: []sub{{"pom.xml", "<version>1.0.0</version>", "<version>1.1.0</version>"}}},
+		{name: "module path change", replace: []sub{{"pom.xml", "<artifactId>app</artifactId>", "<artifactId>renamed</artifactId>"}}},
+		{name: "gradle build file added", write: map[string]string{
+			"build.gradle": "plugins {\n  id 'java'\n}\n\ndependencies {\n  implementation 'com.example:lib:1.0.0'\n}\n"}},
+		{name: "gradle dependency version bump", replace: []sub{{"build.gradle", "lib:1.0.0", "lib:1.1.0"}}},
+		{name: "new nested module", write: map[string]string{"src/app/core/pom.xml": javaPOM("core", "1.0.0")}},
 	},
+}
+
+// javaPOM is a Maven build file declaring the artifact artifact, with one
+// dependency at version version.
+func javaPOM(artifact, version string) string {
+	return "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  <artifactId>" + artifact +
+		"</artifactId>\n  <version>0.1.0</version>\n  <dependencies>\n    <dependency>\n      <groupId>com.example</groupId>\n" +
+		"      <artifactId>lib</artifactId>\n      <version>" + version + "</version>\n    </dependency>\n  </dependencies>\n</project>\n"
 }
 
 // cFamilyScript is the C and C++ project, over a source extension and a
@@ -673,6 +723,9 @@ int call(struct S *s) { return s->cb(1); }
 			"extra" + src: "#include \"util" + hdr + "\"\n\nint extra(void) { return add(3, 4) + plus(1, 2); }\n"}},
 		edit{name: "file deleted", remove: []string{"util" + src}},
 		edit{name: "file renamed", move: [][2]string{{"main" + src, "app/main" + src}}},
+		edit{name: "compile database added", write: map[string]string{"compile_commands.json": "[\n  {\"directory\": \".\", \"file\": \"app/main" + src +
+			"\", \"command\": \"cc -DFAST -c app/main" + src + "\"}\n]\n"}},
+		edit{name: "compile database change", replace: []sub{{"compile_commands.json", "-DFAST", "-DSLOW -I include"}}},
 	)
 	return script{name: name, base: base, edits: edits}
 }
@@ -743,6 +796,14 @@ pub fn call(h: &Holder) -> i32 {
 			write: map[string]string{"src/extra.rs": "pub fn extra() -> i32 {\n    crate::util::plus(1, 2)\n}\n"}},
 		{name: "file deleted", remove: []string{"src/util.rs"}},
 		{name: "file renamed", move: [][2]string{{"src/shapes.rs", "src/shapes/mod.rs"}}},
+		{name: "dependency added", replace: []sub{{"Cargo.toml", "edition = \"2021\"\n", "edition = \"2021\"\n\n[dependencies]\nserde = \"1.0.0\"\n"}}},
+		{name: "dependency version bump", replace: []sub{{"Cargo.toml", `serde = "1.0.0"`, `serde = "1.0.1"`}}},
+		{name: "entry point change", replace: []sub{{"Cargo.toml", "[dependencies]", "[[bin]]\nname = \"app-bin\"\npath = \"src/call.rs\"\n\n[dependencies]"}}},
+		{name: "module path change", replace: []sub{{"Cargo.toml", `name = "app"`, `name = "renamed"`}}},
+		{name: "new nested module", write: map[string]string{
+			"tools/Cargo.toml": "[package]\nname = \"tools\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+			"tools/src/lib.rs": "pub fn helper() -> i32 {\n    1\n}\n",
+		}},
 	},
 }
 

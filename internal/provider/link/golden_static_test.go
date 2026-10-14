@@ -585,12 +585,14 @@ func f(x int) { // @f
 	ys := []int{x}    // @ys
 	h(ys...)          // @c3
 	_ = strconv.Itoa(x) // @c4
+	missing(x)          // @c5
 }
 `,
 		},
 		// Derived twice from the source and the anchor, the second time blind (the sources, the anchors and
 		// the binding rules alone); the two agree on every fact. strconv is outside the unit: its call binds
-		// nothing and carries no flow.
+		// nothing and carries no flow. missing is declared nowhere: its call binds nothing either, though g
+		// and f take one argument as it passes one, and carries no flow.
 		want: []string{
 			"c1 g -> g g exact",
 			"c2 h -> h h exact",
@@ -603,7 +605,9 @@ func f(x int) { // @f
 		},
 		// Mutation: bind arguments by position alone -> `h(x, x)`'s second argument and `h(ys...)` reach no
 		// parameter. Mutation: emit flows on a site bound to nothing -> strconv.Itoa's argument flows.
-		fails: "an argument into a variadic parameter, or a spread argument, left without its flow; a flow published at an unbound site",
+		// Mutation: bind by arity alone (a site no name binds taken to call each callable of its argument
+		// count) -> `missing(x)` calls g and f, and x flows into g's p and f's x.
+		fails: "an argument into a variadic parameter, or a spread argument, left without its flow; a flow published at an unbound site; a site bound by its argument count alone",
 	},
 	{
 		name:   "go-open-and-external-sites",
