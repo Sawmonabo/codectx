@@ -39,8 +39,11 @@ import (
 //   - a static site binds the method its qualifier's type declares or
 //     inherits, and through a module receiver the module's export;
 //   - a member site binds, for each instance its receiver holds, the method
-//     the instance's type declares or inherits (DetailFlow), never a
-//     subtype's override: its dispatch is virtual for an instance a
+//     the instance's type declares or inherits (DetailFlow for an instance
+//     the site's own function constructs or annotates, DetailReceiverValue
+//     for one that reached the receiver through a parameter or a field,
+//     which code outside the project may fill too), never a subtype's
+//     override: its dispatch is virtual for an instance a
 //     declaration or an annotation types, which an override can stand in
 //     for (hierarchy.overridable), and exact for a construction's result;
 //     through a `super` receiver or a class object the method the type
@@ -297,23 +300,28 @@ type watch struct {
 	Call call
 }
 
-// recv is one value playing Role at Call.
+// recv is one value playing Role at Call. Via reports a value that reached
+// it through a parameter or a field, which code outside the project may
+// fill too, rather than one the site's own function constructs or
+// annotates, or a call's result.
 type recv struct {
 	Call call
 	Role byte
 	X    value
+	Via  bool
 }
 
 // The techniques in the order a pair found by several keeps the first.
 const (
 	rankDirect byte = iota
 	rankFlow
+	rankReceiver
 	rankValue
 	rankField
 )
 
-var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankValue: DetailFunctionValue,
-	rankField: DetailField}
+var rankDetail = [...]string{rankDirect: DetailDirect, rankFlow: DetailFlow, rankReceiver: DetailReceiverValue,
+	rankValue: DetailFunctionValue, rankField: DetailField}
 
 // binding is one target found for a site. Flow reports that the site's
 // arguments and result connect to the target's parameters and returns (a
@@ -580,7 +588,7 @@ func (in *inference) run(ctx context.Context) (*types, error) {
 		err = join(delta, in.watches, func(f fact, w watch) int { return cmpVar(f.V, w.V) },
 			func(f fact, ws []watch) error {
 				for _, w := range ws {
-					if err := in.receive(r, recv{Call: w.Call, Role: w.Role, X: f.X}); err != nil {
+					if err := in.receive(r, recv{Call: w.Call, Role: w.Role, X: f.X, Via: w.V.Kind == varParam || w.V.Kind == varField}); err != nil {
 						return err
 					}
 				}
@@ -777,7 +785,7 @@ func (in *inference) addFieldWatches(r *round) error {
 	}
 	err = join(in.facts, added, func(f fact, w watch) int { return cmpVar(f.V, w.V) }, func(f fact, ws []watch) error {
 		for _, w := range ws {
-			if err := in.receive(r, recv{Call: w.Call, Role: w.Role, X: f.X}); err != nil {
+			if err := in.receive(r, recv{Call: w.Call, Role: w.Role, X: f.X, Via: w.V.Kind == varParam || w.V.Kind == varField}); err != nil {
 				return err
 			}
 		}
@@ -1506,11 +1514,15 @@ func (in *inference) receive(r *round, v recv) error {
 	}
 	switch v.Role {
 	case roleReceiver:
+		flow := rankFlow
+		if v.Via {
+			flow = rankReceiver
+		}
 		switch v.X.Kind {
 		case valInstance:
-			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow, Virtual: true})
+			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: flow, Virtual: true})
 		case valObject:
-			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankFlow})
+			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: flow})
 		case valExact:
 			return r.lookups.Add(lookup{Class: v.X.Ref, Name: c.Callee, Call: c, Rank: rankDirect})
 		case valClass:
@@ -2344,11 +2356,22 @@ var watchByCall = codec[watch]{put: watchCodec.put, get: watchCodec.get,
 }
 
 var recvCodec = codec[recv]{
-	put: func(w *wbuf, x recv) { w.call(x.Call); w.u8(x.Role); w.value(x.X) },
-	get: func(r *rbuf) recv { return recv{Call: r.call(), Role: r.u8(), X: r.value()} },
+	put: func(w *wbuf, x recv) { w.call(x.Call); w.u8(x.Role); w.value(x.X); w.flag(x.Via) },
+	get: func(r *rbuf) recv { return recv{Call: r.call(), Role: r.u8(), X: r.value(), Via: r.flag()} },
 	cmp: func(a, b recv) int {
-		return cmp.Or(cmpCall(a.Call, b.Call), cmp.Compare(a.Role, b.Role), cmpValue(a.X, b.X))
+		return cmp.Or(cmpCall(a.Call, b.Call), cmp.Compare(a.Role, b.Role), cmpValue(a.X, b.X), cmpFlag(a.Via, b.Via))
 	},
+}
+
+// cmpFlag orders false before true.
+func cmpFlag(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case !a:
+		return -1
+	}
+	return 1
 }
 
 var bindingCodec = codec[binding]{

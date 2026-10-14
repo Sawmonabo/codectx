@@ -164,7 +164,12 @@ to the targets the project's own code gives it (the functions of its type whose
 address the project takes, the function values that reach it, the functions
 written to the field), and a value from outside the project may hold another:
 it is marked `value_set` even with one target ("1 of 1"), never shown as a
-direct call. A Java call of an interface's abstract method binds that method,
+direct call. So is a method call whose receiver holds only the instances the
+project's code passes or stores into it through a parameter or a field
+(`speak(a) { a.sound() }` with `speak(new Dog())`): code outside the project
+may pass or store another, so `Dog.sound` reads "1 of 1"; a receiver the
+call's own function constructs, annotates or receives from a call carries no
+mark. A Java call of an interface's abstract method binds that method,
 `virtual`, and beside it each method reference that is an object of the
 interface: one whose target type, where the declaration, assignment, cast or
 return it is written in states one, is that interface or a subinterface, and

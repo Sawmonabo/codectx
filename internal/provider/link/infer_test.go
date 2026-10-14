@@ -105,7 +105,7 @@ class Car {
 		// Engine declares no constructor, so `new Engine()` binds the class;
 		// the constructed instance written to `engine` reaches the read in
 		// drive, exactly an Engine.
-		want:     []Binding{b(0, 0, 0, 0, DetailDirect, exact), b(0, 1, 0, 1, DetailFlow, exact)},
+		want:     []Binding{b(0, 0, 0, 0, DetailDirect, exact), b(0, 1, 0, 1, DetailReceiverValue, exact)},
 		mutation: "a field write that adds no edge into the field's variable leaves `this.engine.start()` unbound",
 	}, {
 		name: "parameter flow across an import",
@@ -130,7 +130,7 @@ export function run(task) { task.exec(); }`,
 				[]Decl{exported(decl(model.NodeFunction, "run", -1))},
 				[]Site{{Caller: 0, Callee: "exec", Shape: wire.ShapeMember, Receiver: param(0)}}, nil),
 		},
-		want:     []Binding{b(0, 0, 1, 0, DetailDirect, exact), b(0, 1, 0, 0, DetailDirect, exact), b(1, 0, 0, 1, DetailFlow, exact)},
+		want:     []Binding{b(0, 0, 1, 0, DetailDirect, exact), b(0, 1, 0, 0, DetailDirect, exact), b(1, 0, 0, 1, DetailReceiverValue, exact)},
 		mutation: "connecting an argument to a parameter of the caller instead of the callee leaves `task.exec()` unbound",
 	}, {
 		name: "return flow",

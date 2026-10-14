@@ -64,3 +64,53 @@ func TestOneFunctionValueKeepsItsTechnique(t *testing.T) {
 		})
 	}
 }
+
+// TestAReceiverValueKeepsItsTechnique pins, in every flow-family language,
+// that a member call whose receiver holds only the instances the project's
+// code passes into it (a parameter its callers give a construction) carries
+// the technique receiver_value, which marks it as one of the project's own
+// values (graph value_set) and not a call on a type the call's own function
+// fixes; a receiver the function constructs itself, or one its annotation
+// types, keeps flow.
+//
+// Mutations caught: binding a flowed receiver under flow (every speak case
+// reads flow, unmarked); taking a local construction or an annotation for
+// a flowed value (the local and annotated cases read receiver_value).
+func TestAReceiverValueKeepsItsTechnique(t *testing.T) {
+	structural := newStructural(t)
+	cases := []struct {
+		name       string
+		files      map[string]string
+		site, want string
+	}{
+		{"javascript", map[string]string{"c.js": "class Dog { sound() {} }\nfunction speak(a) { a.sound(); } // @s\nspeak(new Dog());\n"},
+			"s sound", link.DetailReceiverValue + " exact"},
+		{"typescript", map[string]string{"c.ts": "class Dog { sound() {} }\nfunction speak(a) { a.sound(); } // @s\nspeak(new Dog());\n"},
+			"s sound", link.DetailReceiverValue + " exact"},
+		{"python", map[string]string{"c.py": "class Dog:\n    def sound(self):\n        pass\n\n\ndef speak(a):\n    a.sound()  # @s\n\n\nspeak(Dog())\n"},
+			"s sound", link.DetailReceiverValue + " exact"},
+		{"javascript-local", map[string]string{"c.js": "class Dog { sound() {} }\nfunction own() { const d = new Dog(); d.sound(); } // @s\n"},
+			"s sound", link.DetailFlow + " exact"},
+		{"typescript-annotated", map[string]string{"c.ts": "class Dog { sound() {} }\nfunction speak(a: Dog) { a.sound(); } // @s\n"},
+			"s sound", link.DetailFlow + " virtual"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l := linkSources(t, structural, c.files)
+			var got []string
+			for _, r := range l.out.rels {
+				if r.Relation.Kind != model.RelCalls {
+					continue
+				}
+				for _, e := range r.Evidence {
+					if l.site(t, e.NativeKey) == c.site {
+						got = append(got, e.Detail+" "+string(e.Dispatch))
+					}
+				}
+			}
+			if len(got) != 1 || got[0] != c.want {
+				t.Fatalf("%s binds %q, want Dog.sound by %s", c.site, got, c.want)
+			}
+		})
+	}
+}

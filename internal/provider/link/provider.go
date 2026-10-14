@@ -93,6 +93,13 @@ const (
 	// DetailAddressTaken: an indirect site joined to an address-taken
 	// function of the same signature.
 	DetailAddressTaken = graph.CallDetailAddressTaken
+	// DetailReceiverValue: the method the class of an instance declares or
+	// inherits, where the instance reached the receiver through a parameter
+	// or a field the project's code fills, rather than one the call's own
+	// function constructs, annotates or receives from a call: the receiver's
+	// values are the project's, and code outside the project may pass or
+	// store another (graph value_set).
+	DetailReceiverValue = graph.CallDetailReceiverValue
 	// DetailFlow: the receiver's type was recovered by flow-based type
 	// inference through assignments, parameters and returns.
 	DetailFlow = "flow"

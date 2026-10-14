@@ -38,7 +38,7 @@ enabled and reports disabled with it; it has no configuration key of its own.
 
 | Capability | Relation | From → to | Evidence detail |
 |---|---|---|---|
-| `calls` | `calls` | caller → each bound declaration, or an external method node | `direct`, `hierarchy`, `address_taken`, `flow`, `function_value`, `field` |
+| `calls` | `calls` | caller → each bound declaration, or an external method node | `direct`, `hierarchy`, `address_taken`, `flow`, `receiver_value`, `function_value`, `field` |
 | `calls` | `calls` | caller → the site's open-site node | none |
 | `imports` | `imports` | file module → each file module the import resolves to | `import` |
 | `imports` | `imports` | file module → the import's open-import-site node | none |
@@ -58,7 +58,11 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
 - `direct`: the callee names the declaration by its package, module, import or scope;
 - `hierarchy`: the method the receiver's static type declares or inherits, found by walking its supertypes;
 - `address_taken`: an indirect site joined to an address-taken function of the same signature;
-- `flow`: the receiver's type was recovered by flow-based type inference;
+- `flow`: the receiver's type was recovered by flow-based type inference from what the call's own function
+  constructs or annotates, or a call's result;
+- `receiver_value`: the method of an instance's class, where the instance reached the receiver through a
+  parameter its callers pass or a field the project writes: the targets are the project's own values, and code
+  outside it may pass or store another, so a query marks the call `value_set` even with one target;
 - `function_value`: a function value that reached the value the site calls, through assignments, parameters,
   returns and fields (flow-based value inference);
 - `field`: a function written to the field the site calls through;

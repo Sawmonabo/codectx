@@ -167,7 +167,7 @@ func TestResolvePythonGoldens(t *testing.T) {
 					{Caller: 3, Callee: "Cat", Shape: wire.ShapeBare, Candidates: []int32{0}},
 				}}},
 			want: []want{
-				{Site: Ref{0, 0}, Target: Ref{0, 1}, Detail: DetailFlow, Dispatch: model.DispatchExact},
+				{Site: Ref{0, 0}, Target: Ref{0, 1}, Detail: DetailReceiverValue, Dispatch: model.DispatchExact},
 				{Site: Ref{0, 1}, Target: Ref{0, 2}, Detail: DetailDirect, Dispatch: model.DispatchExact},
 				{Site: Ref{0, 2}, Target: Ref{0, 0}, Detail: DetailDirect, Dispatch: model.DispatchExact},
 			},
