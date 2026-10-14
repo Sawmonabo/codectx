@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"path"
 	"slices"
 	"strconv"
@@ -154,13 +155,18 @@ func storedList(ctx context.Context, r GraphReader, nodes []model.NodeID, direct
 }
 
 // possibleRows computes a walk's possible rows from its start nodes. With
-// through set the rows' far ends are walked on, up to depth hops.
+// through set the rows' far ends are walked on, up to depth hops. A reader
+// that cannot list candidates is refused, never answered with no rows: the
+// caller decides whether its answer refuses or discloses (nameOnlyUnavailable).
 func (e *Engine) possibleRows(ctx context.Context, r GraphReader, mode tailMode, starts []model.NodeID,
 	through bool, depth int) (possibleList, error) {
 	var list possibleList
-	dr := declarationReader(r)
-	if dr == nil || mode == tailNone {
+	if mode == tailNone {
 		return list, nil
+	}
+	dr := declarationReader(r)
+	if dr == nil {
+		return list, candidatesUnavailable()
 	}
 	repo := r.Binding().RepositoryID
 	at := map[model.RelationID]int{}
@@ -617,15 +623,20 @@ func siteCounts(caps []model.CapabilityState) string {
 }
 
 // dropPlaceholders removes, from one page of a call answer, the structural
-// provider's `call:<name>` placeholder for every site an open call site also
-// stands for (same file, overlapping call range): one row per open site, never
-// two. Whether an open site covers a placeholder's site is read from the
-// pinned generation -- the caller's stored calls to open sites and their
-// occurrences -- and not from the page, so a placeholder whose open site is
-// served on another page is dropped all the same. A placeholder relation keeps
-// the occurrences no open site covers, and is dropped only when none is left;
-// a placeholder node no relation of the page still names is dropped with it.
-// It returns the relation ids it dropped.
+// provider's `call:<name>` placeholder for every site another `calls` edge of
+// the same caller also stands for -- the bound target, an open site or an
+// external node the linker published for that call: one row per call, never
+// two. A site is covered when the other edge has an occurrence at exactly the
+// same bytes of the same file; overlap is not enough, because an inner call's
+// range lies inside its outer call's. The packed adjacency already leaves out
+// a placeholder edge every site of which is covered (storage's
+// supersedeCoveredPlaceholders), so what reaches a page here is an edge with
+// at least one site nothing else stands for; its covered occurrences are
+// removed, and the edge is dropped only when no occurrence of it, on this page
+// or beyond it, is left. Coverage is read from the pinned generation -- the
+// caller's stored calls and their occurrences -- and not from the page. A
+// placeholder node no relation of the page still names is dropped with it. It
+// returns the relation ids it dropped.
 func (e *Engine) dropPlaceholders(ctx context.Context, r GraphReader, nodes []model.Node, relations []model.Relation,
 	where *located) ([]model.Node, []model.Relation, map[model.RelationID]bool, error) {
 	placeholder := map[model.NodeID]bool{}
@@ -657,63 +668,64 @@ func (e *Engine) dropPlaceholders(ctx context.Context, r GraphReader, nodes []mo
 			targets = append(targets, c.Other)
 		}
 	}
-	open := map[model.NodeID]bool{}
+	covering := map[model.NodeID]bool{}
 	if len(targets) > 0 {
 		decls, err := dr.Declared(ctx, sortedNodes(targets))
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		for _, d := range decls {
-			if isOpenCallSite(d.Node) {
-				open[d.Node.ID] = true
+			if !isCallPlaceholder(d.Node) {
+				covering[d.Node.ID] = true
 			}
 		}
 	}
-	covered := map[model.FileID][]model.ByteRange{}
+	type site struct {
+		file  model.FileID
+		bytes model.ByteRange
+	}
+	covered := map[site]bool{}
 	for _, caller := range sortedNodes(callers) {
 		for _, c := range calls[caller] {
-			if !open[c.Other] {
+			if !covering[c.Other] {
 				continue
 			}
-			sites, _, err := e.relationSites(ctx, loc, c.Rel, occurrenceBudget)
+			sites, _, err := e.relationSites(ctx, loc, c.Rel, math.MaxInt)
 			if err != nil {
 				return nil, nil, nil, err
 			}
 			for _, o := range sites {
-				covered[o.FileID] = append(covered[o.FileID], o.Bytes)
+				covered[site{o.FileID, o.Bytes}] = true
 			}
 		}
 	}
 	if len(covered) == 0 {
 		return nodes, relations, nil, nil
 	}
-	overlaps := func(o model.RelationOccurrence) bool {
-		for _, b := range covered[o.FileID] {
-			if o.Bytes.Start < b.End && b.Start < o.Bytes.End {
-				return true
-			}
-		}
-		return false
-	}
-	kept := map[model.RelationID]int{}
-	had := map[model.RelationID]bool{}
+	is := func(o model.RelationOccurrence) bool { return covered[site{o.FileID, o.Bytes}] }
 	occ := where.occurrences[:0:0]
 	for _, o := range where.occurrences {
-		if toPlaceholder[o.RelationID] {
-			had[o.RelationID] = true
-			if overlaps(o) {
-				continue
-			}
-			kept[o.RelationID]++
+		if toPlaceholder[o.RelationID] && is(o) {
+			continue
 		}
 		occ = append(occ, o)
 	}
 	where.occurrences = occ
+	// An edge goes only when every occurrence it has is covered, read whole:
+	// the page lists at most occurrenceBudget of them.
+	whole := map[model.RelationID]bool{}
+	for id := range toPlaceholder {
+		all, _, err := e.relationSites(ctx, loc, id, math.MaxInt)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		whole[id] = len(all) > 0 && !slices.ContainsFunc(all, func(o model.RelationOccurrence) bool { return !is(o) })
+	}
 	dropped := map[model.RelationID]bool{}
 	named := map[model.NodeID]bool{}
 	rels := relations[:0:0]
 	for _, rel := range relations {
-		if toPlaceholder[rel.ID] && had[rel.ID] && kept[rel.ID] == 0 {
+		if whole[rel.ID] {
 			dropped[rel.ID] = true
 			continue
 		}
@@ -1104,10 +1116,14 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 // scratch ends with that request. A deadline that lands inside it ends the
 // expansion and the answer is marked truncated (impactPhaseError), exactly as
 // before; there is no partial expansion for a continuation to resume.
+//
+// A reader without the declaration seam cannot list any open site's
+// candidates, so the expansion answers what Candidates answers on that reader:
+// unavailable, never an empty expansion that reads as "no possible callers".
 func (e *Engine) expandOpenSites(ctx context.Context, r GraphReader, req model.ImpactRequest, maxDepth config.Limit,
 	retain *retainedWalk) (err error) {
 	if declarationReader(r) == nil {
-		return nil
+		return candidatesUnavailable()
 	}
 	var modes []tailMode
 	switch req.Direction {

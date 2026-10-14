@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"maps"
 	"path"
 	"sort"
 	"strconv"
@@ -26,7 +27,7 @@ func ScopeKey(rel string) string { return scopePrefix + rel }
 // not a file scope is a coordinator error, not provider input.
 func PathFromScope(scopeKey string) (string, error) {
 	rel, ok := strings.CutPrefix(scopeKey, scopePrefix)
-	if !ok || rel == "" || rel != path.Clean(rel) || strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "../") || rel == ".." {
+	if !ok || !model.IsRepoPath(rel) {
 		return "", &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "unit scope is not a normalized file scope", Details: map[string]string{"scope_key": scopeKey}}
 	}
@@ -473,9 +474,7 @@ func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 // is not changed.
 func withField(fields map[string]any, key, value string) map[string]any {
 	out := make(map[string]any, len(fields)+1)
-	for k, v := range fields {
-		out[k] = v
-	}
+	maps.Copy(out, fields)
 	out[key] = value
 	return out
 }

@@ -162,6 +162,9 @@ func TestPassCMatchesWholeSet(t *testing.T) {
 		pageItems int
 		budget    config.Limit
 		unmatched bool
+		// repeats adds node-less candidates that cross the first candidate's
+		// relations again, so the hop run repeats those ids.
+		repeats int
 	}{
 		{name: "no routes at all", nodes: 4, edges: 3, hops: 0, pageItems: 8, budget: config.Unlimited},
 		{name: "every wanted edge typed early", nodes: 6, edges: 3, hops: 2, pageItems: 8, budget: config.Unlimited},
@@ -179,6 +182,13 @@ func TestPassCMatchesWholeSet(t *testing.T) {
 		// sides must page to exhaustion under an unlimited bound.
 		{name: "more wanted relations than one page", nodes: 60, edges: 6, hops: 4,
 			pageItems: model.MaxPageItems, budget: config.Unlimited},
+		// Routes that share relations. Sixty relations and the empty id fill
+		// one word of the matched set; the repeats put twenty more hop records
+		// ahead of the last ids, so a set indexed by hop-record ordinal rather
+		// than by distinct-id ordinal drops those relations untyped and reports
+		// the scope incomplete. Mutation caught: indexing by the record ordinal.
+		{name: "routes that share relations", nodes: 15, edges: 4, hops: 4, pageItems: 8,
+			budget: config.Unlimited, repeats: 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -198,6 +208,9 @@ func TestPassCMatchesWholeSet(t *testing.T) {
 			// node: both are what the dedupe and the "" skip must survive.
 			cands = append(cands, candidate{NodeID: nodes[0], FileID: "fdup", Paths: cands[0].Paths},
 				candidate{FileID: "fnode", Paths: []model.RelationPath{{Relations: []model.RelationID{""}}}})
+			for r := 0; r < tc.repeats; r++ {
+				cands = append(cands, candidate{FileID: model.FileID(fmt.Sprintf("frep%d", r)), Paths: cands[0].Paths})
+			}
 
 			c := testCompiler(tc.pageItems, tc.budget)
 
@@ -265,6 +278,76 @@ func assertHopAttributes(t *testing.T, got, source *pagination.SortedRun[hopRec]
 	}
 	if !reflect.DeepEqual(have, want) {
 		t.Fatalf("joined hops diverged\nstreamed:  %+v\nwhole-set: %+v", have, want)
+	}
+}
+
+// TestEdgeScanWalksTheWantedStreamOncePerEpoch guards the edge scan's cost.
+// Each join of delivered entries is one walk of the wanted stream, so a scan
+// that joins every page-sized buffer walks it once per page and costs wanted x
+// scanned / pageLimit decoded records: quadratic in the scope. The scan joins
+// in epochs of at least `wanted` entries instead, so it walks the stream at
+// most once per `wanted` delivered entries plus the final join.
+//
+// Mutation caught: joining each buffer as it fills (an epoch target of one
+// page), or opening a cursor over the wanted stream per buffer, either of which
+// walks it once per page -- here hundreds of times.
+func TestEdgeScanWalksTheWantedStreamOncePerEpoch(t *testing.T) {
+	ctx := context.Background()
+	const nodes, edgesPerNode, hops, pageItems = 60, 6, 4, 2
+	g, _, edges := relationFixture(t, nodes, edgesPerNode)
+	ids := make([]model.NodeID, 0, nodes)
+	for n := range nodes {
+		ids = append(ids, model.NodeID(fmt.Sprintf("n%03d", n)))
+	}
+	cands := candidatesOver(edges, ids, hops)
+	c := testCompiler(pageItems, config.Unlimited)
+	wantRelations, wantComplete, err := c.relationsOnPathsWholeSet(ctx, g, cands)
+	if err != nil {
+		t.Fatalf("whole-set edge scan: %v", err)
+	}
+
+	s := openSorts(t, config.Config{})
+	candRun, hopRun := spoolCandidates(t, s, cands)
+	byRelation, err := newSort(s, "test-hop-relid", lessRelID, sizeOfHop)
+	if err != nil {
+		t.Fatalf("hop sort: %v", err)
+	}
+	if err := hopRun.Each(func(h hopRec) error { return byRelation.Add(h) }); err != nil {
+		t.Fatalf("add hops: %v", err)
+	}
+	wantedRun, err := byRelation.Sorted()
+	if err != nil {
+		t.Fatalf("hop run: %v", err)
+	}
+	wantedRun = trackRun(s, wantedRun)
+	wanted, err := distinctRelationCount(wantedRun)
+	if err != nil {
+		t.Fatalf("count wanted: %v", err)
+	}
+	nodeRun, err := c.scanNodes(s, candRun)
+	if err != nil {
+		t.Fatalf("scan nodes: %v", err)
+	}
+	attrs, err := newSort(s, "test-rel-attr", lessRelAttr, sizeOfRelAttr)
+	if err != nil {
+		t.Fatalf("attribute sort: %v", err)
+	}
+
+	before := wantedRun.Walks()
+	matched, err := c.scanEdgeKinds(ctx, s, g, wantedRun, nodeRun, wanted, attrs)
+	if err != nil {
+		t.Fatalf("edge scan: %v", err)
+	}
+	walks := wantedRun.Walks() - before
+	if (matched == wanted) != wantComplete || matched != int64(len(wantRelations)) {
+		t.Fatalf("the scan typed %d of %d wanted relations, the whole-set scan %d (complete=%v)",
+			matched, wanted, len(wantRelations), wantComplete)
+	}
+	// Every node's list in both directions is the most the port can deliver.
+	delivered := int64(2 * nodes * edgesPerNode)
+	if bound := delivered/wanted + 2; walks > bound {
+		t.Fatalf("the scan walked the %d-relation wanted stream %d times over at most %d delivered entries "+
+			"in %d-entry pages; at most %d walks keep it linear", wanted, walks, delivered, pageItems, bound)
 	}
 }
 

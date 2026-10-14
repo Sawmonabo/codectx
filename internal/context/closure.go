@@ -265,8 +265,9 @@ func (c *Compiler) filePaths(ctx context.Context, reader *sqlite.PinnedReader, i
 //
 // It runs as one unit (closeKeptFilesUnit): what it admits goes into the
 // plan's spools under a mark, and a deadline that lands inside it on a paged
-// compile rolls them back to the mark and ends the pass before the closure, so the continuation runs it again whole and
-// the plan is the one an uninterrupted compile makes.
+// compile rolls them back to the mark and ends the pass before the closure,
+// so the continuation runs it again whole and the plan is the one an
+// uninterrupted compile makes.
 //
 // Memory: the kept files' nodes, U and S together, C's nodes, C's files and
 // the hits go through external sorts. U and R are held, as every walk's start
@@ -396,6 +397,9 @@ func (c *Compiler) closeKeptFiles(ctx context.Context, in *seedIngest, eng *grap
 // run: one `may_call` step into unreached, read through the impact walk (which
 // applies ADR-0015's name-only rules in this direction and answers each site's
 // callers) a page at a time, each start list at most the walk request's width.
+// A reader that cannot list name-only candidates has no naming sites to
+// offer: the start set is unreached alone and the plan says the candidates are
+// unavailable.
 func (c *Compiler) withNamingSites(ctx context.Context, in *seedIngest, eng *graph.Engine, gen model.GenerationID,
 	unreached []string, haltable bool) (*pagination.SortedRun[idRec], error) {
 	all, err := newIDSort(in.sorts, "closure-start")
@@ -425,6 +429,10 @@ func (c *Compiler) withNamingSites(ctx context.Context, in *seedIngest, eng *gra
 				Page:         model.PageRequest{Limit: c.pageLimit(), Cursor: cursor},
 			})
 			if err != nil {
+				if why, ok := candidatesUnavailableReason(err); ok {
+					in.scope.CandidatesUnavailable = why
+					return sortedRun(in.sorts, all)
+				}
 				return nil, contextErr(ctx, err)
 			}
 			if res.Meta.Truncated {
@@ -659,11 +667,9 @@ func (c *Compiler) closureWalk(ctx context.Context, in *seedIngest, eng *graph.E
 			}
 			if explain && len(entries) > 0 {
 				if why == nil {
-					if impact.Answer == "" {
-						return contextErr(ctx, &model.Error{Code: model.CodeInternal,
-							Message: "context: the impact answer was not retained, so its entries cannot be explained"})
+					if why, err = explanationOf(ctx, eng, req, impact); err != nil {
+						return err
 					}
-					why = newExplanation(eng, req, impact.Answer)
 				}
 				if err := why.explain(ctx, in, entries); err != nil {
 					return contextErr(ctx, err)

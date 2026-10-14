@@ -898,7 +898,7 @@ func (w *retainedWalk) admitLevel(ctx context.Context, s *sortedLevel, level int
 		return 0, internalErr("graph: a level transition was asked to commit a run from another level")
 	}
 	file := openRetainFile(w.home, levelFileName(admittedLevelPrefix, level))
-	count, err := w.writeAdmitted(ctx, s, file, level, costs)
+	count, err := w.writeAdmitted(ctx, s, file, costs)
 	if err != nil {
 		return 0, err
 	}
@@ -1000,8 +1000,7 @@ func (w *retainedWalk) again(node NodeRef, reached dispatchStep) (dispatchStep, 
 // already committed. A file that exists is the committed decision of this
 // level: rebuilding it would test visited bits that attempt has already set and
 // admit nothing at all.
-func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *retainFile,
-	level int, costs kindCosts) (int64, error) {
+func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *retainFile, costs kindCosts) (int64, error) {
 	var count int64
 	if _, err := os.Stat(file.path()); err == nil {
 		err := file.each(func([]byte) error {
@@ -1095,7 +1094,7 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 	if w.crashInAdmit {
 		return 0, errAdmitCrash
 	}
-	// The admitted states name their route rows, so the rows are durable
+	// The admitted states name their route rows, so the rows are written
 	// before the level that names them is written. A crash after this leaves
 	// rows no level names, which no route ever reads.
 	if w.routes != nil {

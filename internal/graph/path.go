@@ -211,13 +211,23 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	// A name-only call is admitted only when the search proved there is no
 	// precise route: an exhausted search, not one a budget, the clock or the
 	// depth bound stopped, which owes a continuation or a truncation instead.
+	//
+	// A reader that cannot list candidates cannot make that search, and the
+	// answer says so (nameOnlyUnavailable): "no route" there means no route
+	// analysis bound, not that no call could link the two.
 	if !w.routing && !w.possible && !w.targetSettled && !w.resumable() && !w.depthPruned &&
-		slices.Contains(kinds, model.RelCalls) && declarationReader(e.reader) != nil {
-		if err := w.startPossible(); err != nil {
-			return model.PathResult{}, err
-		}
-		if err := w.run(ctx, req.From, req.To); err != nil {
-			return model.PathResult{}, err
+		slices.Contains(kinds, model.RelCalls) {
+		if declarationReader(e.reader) == nil {
+			row, notice := nameOnlyUnavailable(model.RelMayCall)
+			res.Meta.Completeness = slices.Concat(res.Meta.Completeness, []model.CapabilityState{row})
+			res.Meta.Notices = appendNotice(res.Meta.Notices, notice)
+		} else {
+			if err := w.startPossible(); err != nil {
+				return model.PathResult{}, err
+			}
+			if err := w.run(ctx, req.From, req.To); err != nil {
+				return model.PathResult{}, err
+			}
 		}
 	}
 	res.VisitedCount = w.visited
@@ -1649,28 +1659,6 @@ func (w *pathWalk) markReach(to model.NodeID) error {
 			UNION
 			SELECT p.frm FROM parent p JOIN back ON p.node = back.n
 		) SELECT n FROM back`, string(to))
-}
-
-// admitted returns the edges out of n that lie on a shortest route to the
-// target, in RelationID order. The (frm, rel) index answers it directly, so
-// enumeration never scans the DAG. The slice is materialized before the caller
-// recurses: the scratch holds ONE connection, and a nested query under an open
-// row set would wait on it forever.
-func (w *pathWalk) admitted(n model.NodeID) ([]model.Relation, error) {
-	var out []model.Relation
-	err := w.sc.each(w.scCtx, `SELECT p.node, p.rel, p.kind FROM parent p
-		WHERE p.frm = ? AND EXISTS(SELECT 1 FROM reach r WHERE r.node = p.node)
-		ORDER BY p.rel`, []any{string(n)},
-		func(scan func(...any) error) error {
-			var node, rel, kind string
-			if err := scan(&node, &rel, &kind); err != nil {
-				return internalErr("path scratch read: " + err.Error())
-			}
-			out = append(out, model.Relation{ID: model.RelationID(rel), From: n,
-				To: model.NodeID(node), Kind: model.RelationKind(kind)})
-			return nil
-		})
-	return out, err
 }
 
 // routeStep is one edge of the shortest-path graph out of a state, keyed for

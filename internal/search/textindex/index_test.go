@@ -91,7 +91,7 @@ func genCorpus(seed uint64, n, unitSize int) corpus {
 	}
 	kinds := []model.NodeKind{model.NodeFunction, model.NodeMethod, model.NodeClass}
 	c := corpus{docs: map[string][]Document{}}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		u := fmt.Sprintf("unit%03d", i/unitSize)
 		if len(c.units) == 0 || c.units[len(c.units)-1] != u {
 			c.units = append(c.units, u)

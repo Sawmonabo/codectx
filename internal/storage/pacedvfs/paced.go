@@ -64,10 +64,11 @@ type header struct {
 	// mode selects the wait: bySync asks the wrapped file to sync, which
 	// every platform has; byRange waits on the file's own descriptor.
 	mode int32
-	// isLog is set for a write-ahead log, the file whose writes are the
-	// store's spill signal. The engine names the file's role in the open
-	// flags, so no path matching is involved.
-	isLog int32
+	// logSlot is set, counting from one, for a write-ahead log, the file
+	// whose writes are its store's spill signal: the slot of the counter its
+	// writes add to (LogBytes). The engine names the file's role in the open
+	// flags, and the log's own path names its database.
+	logSlot int32
 	// pooled is set for a temporary served from the scratch arena. See
 	// enginetemp.go.
 	pooled int32
@@ -210,8 +211,8 @@ func xOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOutFlags uin
 	}
 	h.FpMethods = uintptr(unsafe.Pointer(&methods))
 	h.mode, h.fd = waitMode(wrapped(pFile), zName)
-	if flags&sqlite3.SQLITE_OPEN_WAL != 0 {
-		h.isLog = 1
+	if flags&sqlite3.SQLITE_OPEN_WAL != 0 && zName != 0 {
+		h.logSlot = logSlot(libc.GoString(zName))
 	}
 	return sqlite3.SQLITE_OK
 }
@@ -398,8 +399,8 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 		}
 		done += n
 	}
-	if h.isLog != 0 {
-		logBytes.Add(int64(done))
+	if h.logSlot != 0 {
+		(*logCounts.Load())[h.logSlot-1].Add(int64(done))
 	}
 	if h.pooled != 0 {
 		h.logical = max(h.logical, iOfst+int64(done))

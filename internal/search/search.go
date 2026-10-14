@@ -11,7 +11,6 @@ import (
 	"errors"
 	"log/slog"
 	"math"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -212,7 +211,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	resumed := req.Page.Cursor != ""
 	generation := req.GenerationID
 	var token searchToken
-	var pos searchPosition
+	pos := searchPosition{phase: phaseStart}
 	if resumed {
 		if token, err = decodeSearchToken(s.signer, req.Page.Cursor, now); err != nil {
 			return empty, err
@@ -408,8 +407,7 @@ func (s *Service) collect(ctx context.Context, reader *sqlite.PinnedReader, req 
 			// A result is one occurrence even when the search counted none of
 			// its documents: a served hit reporting zero occurrences would read
 			// as a result that was not actually found.
-			OccurrenceCount: max(h.Occurrences, 1),
-			Reasons:         []string{reasonFor(model.TierLexical)}}, &bytes)
+			OccurrenceCount: max(h.Occurrences, 1)}, &bytes)
 	}
 	if page != nil && page.Canceled {
 		// The context ended the index search: what it returned is the best it
@@ -439,8 +437,7 @@ func ended(ctx context.Context, ans searchAnswer, err error) (searchAnswer, erro
 		ans.deadline, ans.next = true, nil
 		return ans, nil
 	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
+	if _, ok := errors.AsType[*model.Error](err); ok {
 		return searchAnswer{}, err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -473,12 +470,12 @@ type exactEntry struct{ exactHit }
 
 // served projects the entry into the hit that is served and its byte interval.
 // The exact tiers are not ranked: a hit scores 0 and is one occurrence, and its
-// reason names the tier so a caller can see why it sorts above scored hits.
+// tier says why it sorts above scored hits.
 func (e exactEntry) served() (model.SearchHit, *model.ByteRange) {
 	n := e.Node.Node
 	return model.SearchHit{NodeID: n.ID, FileID: n.FileID, Path: e.Path, Kind: n.Kind, Name: n.Name,
 		QualifiedName: n.QualifiedName, Signature: n.Signature, Tier: e.Tier, ScoreMicros: 0,
-		OccurrenceCount: 1, Reasons: []string{reasonFor(e.Tier)}}, e.Node.Bytes
+		OccurrenceCount: 1}, e.Node.Bytes
 }
 
 // servableExact reports whether an exact candidate can be served under the
@@ -580,14 +577,28 @@ type exactSource struct {
 }
 
 // exactPage answers a page's exact hits, at most limit of them, and whether
-// more exact hits follow them. A page continuing a spool reads its records
-// (ans.spooled says where it stopped); a page whose spool is gone, or a
-// positional continuation that may sort, sorts the hits after its position
-// once and serves the head of the run (ans.rest holds the remainder for a
-// spool); a first page, and a continuation that may not sort, walks with a
-// heap of limit+1 hits.
+// more exact hits follow them. It serves the tiers in order from the
+// position's, stopping once it holds limit+1 hits, and reads each tier the
+// cheapest way its order allows:
+//
+//   - exact_path: the one file the query names, through a heap of the hits
+//     still wanted;
+//   - exact_qualified_name and exact_name: by seek, in served order, from the
+//     position (seekTier), so a page costs its own hits;
+//   - qualified_name_prefix, whose order no index holds: a page that may sort
+//     (a continuation answered by this process's store) sorts the tier's hits
+//     after the position once, serves the head of the run and leaves the rest
+//     in ans.rest for a spool; any other page walks the tier with a heap.
+//
+// A page continuing a spool reads its records first (ans.spooled says where it
+// stopped) and, when the spool runs out inside the page, goes on to the tiers
+// after the prefix tier. A spool that is gone is answered from the position.
 func (s *Service) exactPage(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter,
 	pos searchPosition, limit int, src exactSource, ans *searchAnswer) ([]exactEntry, bool, error) {
+	var held []exactEntry
+	from := model.TierExactPath.Rank()
+	var after *exactEntry
+	spooled := false
 	if t := src.spool; t != nil {
 		entries, next, gone, err := s.spooledPage(ctx, t.Cursor, *t.Exact, limit, src.now)
 		if err != nil {
@@ -600,60 +611,91 @@ func (s *Service) exactPage(ctx context.Context, reader exactReader, rule *tierR
 				at.Rank, at.Node = last.Tier.Rank(), last.Node.Node.ID
 			}
 			ans.spooled = &at
-			return entries, at.Remaining > 0, nil
+			if at.Remaining > 0 {
+				return entries, true, nil
+			}
+			held, spooled = entries, true
+			from = model.TierQualifiedNamePrefix.Rank() + 1
 		}
 	}
-	if pos.phase == phaseExact && src.sort {
-		run, err := s.sortedAfter(ctx, reader, rule, filter, pos)
+	if !spooled && pos.phase == phaseExact {
+		from = pos.rank
+		key, err := positionKey(ctx, reader, rule, filter, pos)
 		if err != nil {
 			return nil, false, err
 		}
-		head, err := headOf(run, limit)
-		if err != nil || run.Len() <= int64(limit) {
-			run.Close()
-			return head, false, err
-		}
-		ans.rest = &exactRest{run: run, skip: limit}
-		return head, true, nil
-	}
-	held, err := s.exactPhase(ctx, reader, rule, filter, pos, limit)
-	if len(held) > limit {
-		return held[:limit], true, err
-	}
-	return held, false, err
-}
-
-// exactPhase walks the exact tiers from the cursor's position and answers the
-// least limit+1 hits after it, in served order. On an error it still answers
-// what it held, so a deadline can serve them.
-//
-// A position names its last hit by tier and node; the full content key that
-// hit sorted under is read back first (positionKey), and every later candidate
-// is compared against it.
-func (s *Service) exactPhase(ctx context.Context, reader exactReader, rule *tierRule,
-	filter hitFilter, pos searchPosition, limit int) ([]exactEntry, error) {
-	span := allExactTiers
-	var after *exactEntry
-	if pos.phase == phaseExact {
-		span.from = pos.rank
-		key, err := positionKey(ctx, reader, rule, filter, pos)
-		if err != nil {
-			return nil, err
-		}
 		after = &key
 	}
-	h := newExactHeap(limit + 1)
-	err := exactCandidates(ctx, reader, rule, model.MaxPageItems, span, func(e exactHit) error {
-		if !servableExact(e, filter) {
-			return nil
+	for _, tier := range servedTiers {
+		need := limit + 1 - len(held)
+		if tier.Rank() < from || need <= 0 {
+			continue
 		}
-		entry := exactEntry{e}
-		if after != nil && cmpExact(entry, *after) <= 0 {
-			return nil
+		var at *exactEntry
+		if tier.Rank() == from {
+			at = after
 		}
-		h.offer(entry)
-		return nil
-	})
+		var got []exactEntry
+		var err error
+		switch tier {
+		case model.TierQualifiedNamePrefix:
+			if src.sort && pos.phase == phaseExact {
+				// A deadline inside the walk still answers the run of what it
+				// read, sorted: the page serves its head, truncated.
+				room := limit - len(held)
+				run, err := s.sortedAfter(ctx, reader, rule, filter, at)
+				if run == nil {
+					return held, false, err
+				}
+				head, herr := headOf(run, room)
+				held = append(held, head...)
+				if err = errors.Join(err, herr); err != nil || run.Len() <= int64(room) {
+					run.Close()
+					if err != nil {
+						return held, false, err
+					}
+					continue
+				}
+				ans.rest = &exactRest{run: run, skip: room}
+				return held, true, nil
+			}
+			got, err = heapTier(ctx, reader, rule, filter, tier, at, need)
+		case model.TierExactQualifiedName, model.TierExactName:
+			got, err = seekTier(ctx, reader, rule, filter, tier, at, need)
+		default:
+			got, err = heapTier(ctx, reader, rule, filter, tier, at, need)
+		}
+		held = append(held, got...)
+		if err != nil {
+			return held[:min(len(held), limit)], false, err
+		}
+	}
+	if len(held) > limit {
+		return held[:limit], true, nil
+	}
+	return held, false, nil
+}
+
+// servedTiers is the exact tiers in served order.
+var servedTiers = [...]model.SearchTier{
+	model.TierExactPath, model.TierExactQualifiedName, model.TierQualifiedNamePrefix, model.TierExactName,
+}
+
+// heapTier walks one exact tier and answers its least `want` servable hits
+// after `after` (nil: from the tier's start), in served order. On an error it
+// still answers what it held, so a deadline can serve them.
+func heapTier(ctx context.Context, reader exactReader, rule *tierRule, filter hitFilter, tier model.SearchTier,
+	after *exactEntry, want int) ([]exactEntry, error) {
+	h := newExactHeap(want)
+	err := exactCandidates(ctx, reader, rule, model.MaxPageItems, tierSpan{from: tier.Rank(), to: tier.Rank()},
+		func(e exactHit) error {
+			entry := exactEntry{e}
+			if !servableExact(e, filter) || (after != nil && cmpExact(entry, *after) <= 0) {
+				return nil
+			}
+			h.offer(entry)
+			return nil
+		})
 	return h.sorted(), err
 }
 
@@ -800,8 +842,7 @@ func (s *Service) lexicalErr(err error) error {
 	if errors.Is(err, textindex.ErrUnknownPosition) {
 		return cursorInvalid("the search cursor names a position that is not in its answer")
 	}
-	var many *textindex.TooManyTerms
-	if errors.As(err, &many) {
+	if many, ok := errors.AsType[*textindex.TooManyTerms](err); ok {
 		return &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the query carries " + strconv.FormatInt(many.Terms, 10) +
 				" terms, more than the resources.max_query_terms limit of " + s.maxTerms.String(),
@@ -907,11 +948,6 @@ func (s *Service) hydrateNodes(ctx context.Context, reader *sqlite.PinnedReader,
 	return nil
 }
 
-// reasonFor is the bounded explanation a hit carries for the tier it was found
-// by. The exact and prefix tiers score 0 by construction, so without this a
-// caller would see a hit ranked above a scoring one with nothing saying why.
-func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + " tier" }
-
 // hitFilter is SearchRequest.Languages and .Paths, applied uniformly to every
 // tier. The lexical tier applies the path prefixes inside the search index and
 // this package applies the languages to its results, so every page of one
@@ -927,15 +963,22 @@ type hitFilter struct {
 	prefixes  []string
 	languages map[string]bool
 	tag       lang.Tagger
+	// headers is the filter's verdict on the shared-header extensions it
+	// decides without a tag (decidedHeaders), and headersDecided says it
+	// decides every one, so the tagger is never bound.
+	headers        map[string]bool
+	headersDecided bool
 }
 
 // pin binds the language filter to the pinned snapshot's tagger, and that to
 // the pinned generation's parses, so a header is tagged with the grammar its
 // kept parse used. The snapshot header is read only when a language filter is
-// set, since only it tags. A lookup the bound tagger fails tags its header ""
-// and is reported by tag.Err, which every caller checks before it answers.
+// set and some shared header's verdict depends on its tag, since only that
+// binding tags one; any other path is tagged by its name alone. A lookup the
+// bound tagger fails tags its header "" and is reported by tag.Err, which
+// every caller checks before it answers.
 func (f *hitFilter) pin(ctx context.Context, store *sqlite.Store, parses lang.Parses, id model.SnapshotID) error {
-	if f.languages == nil {
+	if f.languages == nil || f.headersDecided {
 		return nil
 	}
 	snap, err := store.Snapshot(ctx, id)
@@ -953,7 +996,7 @@ func newHitFilter(req model.SearchRequest) (hitFilter, error) {
 	var f hitFilter
 	for i, p := range req.Paths {
 		clean := strings.TrimSuffix(strings.ReplaceAll(strings.TrimSpace(p), `\`, "/"), "/")
-		if clean == "" || strings.HasPrefix(clean, "/") || clean != path.Clean(clean) || strings.HasPrefix(clean, "../") || clean == ".." {
+		if !model.IsRepoPath(clean) {
 			return hitFilter{}, &model.Error{Code: model.CodeArgumentInvalid,
 				Message:     "search.paths[" + strconv.Itoa(i) + "] is not a root-relative repository path",
 				Remediation: "list paths relative to the repository root, with \"/\" separators and no \"..\" segment"}
@@ -965,13 +1008,14 @@ func newHitFilter(req model.SearchRequest) (hitFilter, error) {
 		for _, l := range req.Languages {
 			f.languages[strings.ToLower(strings.TrimSpace(l))] = true
 		}
+		f.headers, f.headersDecided = decidedHeaders(f.languages)
 	}
 	return f, nil
 }
 
 // keep reports whether a hit at this repository path survives the filters.
 func (f hitFilter) keep(p string) bool {
-	if f.languages != nil && !f.languages[f.tag.Of(p)] {
+	if f.languages != nil && !f.keepsLanguage(p) {
 		return false
 	}
 	if len(f.prefixes) == 0 {

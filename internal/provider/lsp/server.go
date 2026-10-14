@@ -261,9 +261,6 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		if closing {
 			return
 		}
-		if err == nil {
-			err = unavailable("the language server closed its connection")
-		}
 		s.fail(err)
 	}()
 

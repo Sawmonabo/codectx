@@ -11,15 +11,14 @@ import (
 )
 
 // freeC is free for C and C++. A function of internal linkage that the
-// caller's own file declares, else that a header the file includes
+// caller's own file declares, else that a header in its include closure
 // declares, decides alone: in the translation unit it denotes every use of
 // its name, and no other file's function of internal linkage is ever named
 // (ISO C 6.2.2, [basic.link]). Otherwise the functions of the one external
 // linkage scope whose namespace encloses the caller or a namespace a
-// using-directive of the file names are read together with those of
-// internal linkage any other header declares, which the file may include
-// through a header it includes; else the function a using-declaration of
-// the name names. A prototype yields to its definition throughout.
+// using-directive of the file names are read, together with those of
+// internal linkage any other header declares when the closure is open
+// (internalC); else the function a using-declaration of the name names. A prototype yields to its definition throughout.
 func (r *staticFile) freeC(caller int32, callee string, yield func(entry) error) error {
 	from := []string{""}
 	if caller >= 0 {
@@ -68,8 +67,9 @@ func (r *staticFile) qualifiedC(q, name string, yield func(entry) error) error {
 
 // qualifiedName yields the functions the qualified name q denotes, read as
 // freeC reads a simple name: those of internal linkage the caller's file or
-// a header it includes declares, else those of external linkage with those
-// of internal linkage any other header declares.
+// a header in its include closure declares, else those of external linkage
+// with those of internal linkage any other header declares when the
+// closure is open.
 func (r *staticFile) qualifiedName(q string, yield func(entry) error) error {
 	headers, decided, err := r.internalC(q, func(string) bool { return true }, yield)
 	if err != nil || decided {
@@ -87,11 +87,13 @@ func (r *staticFile) qualifiedName(q string, yield func(entry) error) error {
 
 // internalC yields, and reports decided for, the functions of internal
 // linkage named name (a simple name in a namespace keep accepts, or a
-// qualified name) that the caller's file declares, else those a header it
-// includes declares. When neither declares one, headers are those every
-// other header declares, for the caller to read with the functions of
-// external linkage: the file may include their header through another, and
-// no table says which.
+// qualified name) that the caller's file declares, else those a header in
+// its include closure declares (cClosure): either is in the translation
+// unit, and no other file's function of internal linkage ever is. When
+// neither declares one and the closure is open (a directive it cannot
+// follow), headers are those every other header declares, for the caller to
+// read with the functions of external linkage, since the file may reach
+// their header through that directive; a closed closure leaves none.
 func (r *staticFile) internalC(name string, keep func(ns string) bool, yield func(entry) error) (headers []entry, decided bool, err error) {
 	inScope := func(e entry) bool {
 		ns, _, _ := strings.Cut(e.Aux, "\x00")
@@ -111,20 +113,35 @@ func (r *staticFile) internalC(name string, keep func(ns string) bool, yield fun
 	if err != nil || decided {
 		return nil, decided, err
 	}
-	var included []entry
+	var candidates, included []entry
 	err = r.h.decls.lookup(keyFuncInternal+"\x00"+name, func(e entry) error {
-		if e.Ref.File == r.file || !inScope(e) {
-			return nil
+		if e.Ref.File != r.file && inScope(e) {
+			candidates = append(candidates, e)
 		}
-		if _, p, _ := strings.Cut(e.Aux, "\x00"); r.includes(p) {
+		return nil
+	})
+	if err != nil || len(candidates) == 0 {
+		return nil, false, err
+	}
+	closure := r.includeClosure()
+	for _, e := range candidates {
+		_, p, _ := strings.Cut(e.Aux, "\x00")
+		ok, err := closure.seesFile(e.Ref.File, p)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
 			included = append(included, e)
 		} else {
 			headers = append(headers, e)
 		}
-		return nil
-	})
-	if err != nil || len(included) == 0 {
-		return headers, false, err
+	}
+	if len(included) == 0 {
+		// Every candidate was read for, so the whole closure is read.
+		if open, err := closure.complete(); err != nil || !open {
+			return nil, false, err
+		}
+		return headers, false, nil
 	}
 	err = preferDefinitions(func(f func(entry) error) error {
 		for _, e := range included {
@@ -189,7 +206,7 @@ func addInternal(s *pagination.ExternalSort[entry], t *Table, d *Decl, e entry) 
 // aliasC yields what a call of name in caller binds through the C or C++
 // object-like macros of that name whose replacement is one identifier
 // (Decl.Alias) and that the caller's file sees: its own, and those of a
-// header it includes (includes). The preprocessor replaces the name before
+// header in its include closure (cClosure). The preprocessor replaces the name before
 // the call is parsed, so a visible macro decides alone (aliased), and the
 // call binds what each definition's identifier names in the caller, as a
 // bare call of it would, one binding per definition (a macro defined in
@@ -197,18 +214,28 @@ func addInternal(s *pagination.ExternalSort[entry], t *Table, d *Decl, e entry) 
 // replaced along the expansion, which the preprocessor never replaces again
 // ([cpp.rescan]).
 func (r *staticFile) aliasC(caller int32, name string, yield func(entry) error, seen map[string]bool) (aliased bool, err error) {
+	var defs []entry
+	if err = r.h.decls.lookup(keyMacro+name, func(e entry) error {
+		defs = append(defs, e)
+		return nil
+	}); err != nil {
+		return false, err
+	}
 	var replacements []string
-	err = r.h.decls.lookup(keyMacro+name, func(e entry) error {
-		if e.Ref.File == r.file || r.includes(e.Aux) {
+	for _, e := range defs {
+		ok, err := r.includeClosure().sees(e)
+		if err != nil {
+			return false, err
+		}
+		if ok {
 			aliased = true
 			if !slices.Contains(replacements, e.Sig) {
 				replacements = append(replacements, e.Sig)
 			}
 		}
-		return nil
-	})
-	if err != nil || !aliased {
-		return aliased, err
+	}
+	if !aliased {
+		return false, nil
 	}
 	if seen == nil {
 		seen = map[string]bool{}
@@ -298,13 +325,14 @@ const (
 // visibilityFacts emits, for each C or C++ declaration of the file written
 // with macros among its specifiers (Decl.Macros), a FactVisibility to each
 // definition of each macro that states a visibility and that the file sees:
-// its own, and those of a header it includes (includes), as aliasC reads a
-// macro. A one-identifier replacement is followed to the definitions of the
-// macro it names, never to one already replaced along the expansion
-// ([cpp.rescan]). Every definition reached is a fact, so a macro defined in
-// several `#if` arms publishes each arm's visibility; a macro the file sees
-// no definition of publishes nothing. What a macro reaches is read once per
-// file.
+// its own, and those of every header in its include closure (cClosure), the
+// headers the preprocessor reads for it. A one-identifier replacement is
+// followed to the definitions of the macro it names, never to one already
+// replaced along the expansion ([cpp.rescan]). Every definition reached is a
+// fact, so a macro defined in several `#if` arms publishes each arm's
+// visibility; a macro the file sees no definition of publishes nothing.
+// What a macro reaches is read once per file, and the closure is read only
+// as far as the definitions it is asked about need.
 func (r *staticFile) visibilityFacts() error {
 	if r.fc.family != "c" {
 		return nil
@@ -315,12 +343,13 @@ func (r *staticFile) visibilityFacts() error {
 		if d.Macros == "" {
 			continue
 		}
+		closure := r.includeClosure()
 		site := Ref{File: r.file, Index: int32(i)}
-		for _, m := range strings.Fields(d.Macros) {
+		for m := range strings.FieldsSeq(d.Macros) {
 			facts, ok := reached[m]
 			if !ok {
 				var err error
-				if facts, err = r.macroVisibility(m, map[string]bool{}, nil); err != nil {
+				if facts, err = r.macroVisibility(m, closure, map[string]bool{}, nil); err != nil {
 					return err
 				}
 				reached[m] = facts
@@ -337,35 +366,51 @@ func (r *staticFile) visibilityFacts() error {
 }
 
 // macroVisibility appends to out the FactVisibility facts, with no site, of
-// the definitions the macro name reaches (visibilityFacts); seen holds the
-// names already read along the expansion.
-func (r *staticFile) macroVisibility(name string, seen map[string]bool, out []Binding) ([]Binding, error) {
+// the definitions the macro name reaches (visibilityFacts) in the files of
+// closure; seen holds the names already read along the expansion.
+func (r *staticFile) macroVisibility(name string, closure *cClosure, seen map[string]bool, out []Binding) ([]Binding, error) {
 	if seen[name] {
 		return out, nil
 	}
 	seen[name] = true
-	sees := func(e entry) bool { return e.Ref.File == r.file || r.includes(e.Aux) }
+	var defs, aliases []entry
 	err := r.h.decls.lookup(keyMacroVisibility+name, func(e entry) error {
-		if detail, ok := visibilityDetail(e.Sig); ok && sees(e) {
+		if _, ok := visibilityDetail(e.Sig); ok {
+			defs = append(defs, e)
+		}
+		return nil
+	})
+	if err != nil {
+		return out, err
+	}
+	if err := r.h.decls.lookup(keyMacro+name, func(e entry) error {
+		aliases = append(aliases, e)
+		return nil
+	}); err != nil {
+		return out, err
+	}
+	for _, e := range defs {
+		ok, err := closure.sees(e)
+		if err != nil {
+			return out, err
+		}
+		if ok {
+			detail, _ := visibilityDetail(e.Sig)
 			out = append(out, Binding{Kind: FactVisibility, Target: e.Ref, Detail: detail})
 		}
-		return nil
-	})
-	if err != nil {
-		return out, err
 	}
 	var names []string
-	err = r.h.decls.lookup(keyMacro+name, func(e entry) error {
-		if sees(e) && !slices.Contains(names, e.Sig) {
+	for _, e := range aliases {
+		ok, err := closure.sees(e)
+		if err != nil {
+			return out, err
+		}
+		if ok && !slices.Contains(names, e.Sig) {
 			names = append(names, e.Sig)
 		}
-		return nil
-	})
-	if err != nil {
-		return out, err
 	}
 	for _, n := range names {
-		if out, err = r.macroVisibility(n, seen, out); err != nil {
+		if out, err = r.macroVisibility(n, closure, seen, out); err != nil {
 			return out, err
 		}
 	}

@@ -203,7 +203,7 @@ All **user** trust.
 | `cache_bytes` | `33554432` | Total cache reservation. |
 | `max_temp_bytes` | `0` (unlimited) | Temporary bytes across materializations. Unlimited by default, so no default setting refuses a large repository's temporary work; a value you set must exceed `min_free_disk_bytes`, which stays the host-safety floor and is enforced against actual free space either way. One eighth of it is the budget for the paging spools that hold the ranked remainder of a graph answer (`impact`, its package rollup, `refs`) between pages; the rest is the budget for the materializations the heavy children stage. A ranked `codectx search` spools nothing: it collects its best results in memory, a page at a time. Temporary sort runs the context compiler writes share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the candidate count and charging it would let this budget refuse a wide task outright; size the directory for the widest compile you expect in addition to the live continuation spools the budget does cover. |
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve the host keeps whatever the product is doing. It also sizes child admission's disk allocation: the free space under the data directory less this floor is what heavy children may stage between them, and a child that does not fit waits rather than filling the device. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
-| `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
+| `max_metadata_response_bytes` | `262144` | Largest MCP tool-call request: the raw arguments of a `tools/call` are refused past it before they are decoded. No response is weighed against it; a generic tool's answer is bounded by `max_page_items` and the bounded fields of its records, and source by `max_source_response_bytes`. Must be smaller than the source budget. |
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
 | `query_timeout` | `0` (unlimited) | Deadline for one query. **Unlimited by default: a call you do not bound returns the complete answer**, with nothing to tune and no continuation to follow. Set a positive value and it becomes the default deadline for calls that carry none of their own — `codectx search` and `codectx symbol` apply it to the whole request, from pinning the generation to hydrating the page, and `codectx context plan` ends the pass it is in with a continuation cursor. `--timeout` on the command line, or a deadline an MCP client attaches to its request, sets the deadline for that one call instead, above this value as readily as below it. |
 | `max_query_text_bytes` | `8192` | Largest query text. |
@@ -406,8 +406,10 @@ them should know which. It walks **once for the whole answer** and then ranks
 what the walk admitted, so `max_visited_nodes` and `max_graph_edges` are
 answer-level bounds there: spending one truncates that answer and is reported,
 rather than ending a page. What the pages then serve is the finished ranking —
-one globally ordered list, `score_micros` descending, then `depth` ascending,
-then `node_id` ascending, with each entity listed **exactly once** no matter how
+one globally ordered list: every call-reached entity before every entity only a
+dependence hop reaches (`reach: "dependence"`), then `score_micros` descending,
+then `depth` ascending, then `node_id` ascending, with each entity listed
+**exactly once** no matter how
 many frontiers reached it (the cheapest route wins and the reasons of every edge
 that touched it are merged into that one entry). Paging does not re-rank: a page
 is a window on the one global order, never a chunk ranked against itself, so no

@@ -23,6 +23,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 )
 
 // TestMain makes this test binary its own parser worker, as the codectx
@@ -31,7 +32,7 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
 	}
-	done := goTestHost()
+	done := testenv.GoHost()
 	code := m.Run()
 	done()
 	os.Exit(code)
@@ -291,8 +292,9 @@ type linked struct {
 	out   *capture
 	// structural is what the structural units handed their outputs.
 	structural *capture
-	// calls is the unit's `calls` capability row.
+	// calls is the unit's `calls` capability row, and rows every row.
 	calls model.CapabilityState
+	rows  []model.CapabilityState
 	// lost is each row's facts_without_node count, by capability, for the
 	// rows that have one.
 	lost map[string]string
@@ -372,7 +374,7 @@ func linkSources(t *testing.T, structural *treesitter.Provider, files map[string
 	}
 	lost := checkCapability(t, result, scope)
 	checkEndpoints(t, out)
-	l := linked{h: h, files: files, out: out, structural: structOut, lost: lost}
+	l := linked{h: h, files: files, out: out, structural: structOut, lost: lost, rows: result.Capabilities}
 	for _, c := range result.Capabilities {
 		if c.Capability == string(model.RelCalls) {
 			l.calls = c
@@ -484,8 +486,14 @@ func checkEndpoints(t *testing.T, out *capture) {
 // capture records what the linking unit hands its output.
 type capture struct {
 	provider.UnitOutput
-	nodes map[model.NodeID]model.Node
-	rels  []model.RelationFact
+	nodes  map[model.NodeID]model.Node
+	rels   []model.RelationFact
+	search []model.SearchUnit
+}
+
+func (c *capture) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
+	c.search = append(c.search, docs...)
+	return c.UnitOutput.PutSearchUnits(ctx, docs)
 }
 
 func (c *capture) PutNodes(ctx context.Context, facts []model.NodeFact) error {

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Sawmonabo/codectx/internal/gobuild"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/flow"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
@@ -47,6 +48,7 @@ func (k *goLinker) file(root Node, src []byte, out *wire.Link) {
 		x.topVar(t)
 	}
 	x.walk(root)
+	out.Constraint = gobuild.Header(src)
 }
 
 // goVar is what a name in scope says about its value: its type, its
@@ -592,6 +594,9 @@ func (x *goLink) enter(n Node) {
 		x.fieldExports(n)
 	case k.varSpec, k.constSpec:
 		x.eachName(n, func(id Node) { x.blankDecl(n, id) })
+		if n.KindId() == k.constSpec && x.packageLevel(n) {
+			x.constExports(n)
+		}
 		if n.KindId() == k.varSpec {
 			x.values(n.ChildByFieldId(k.fValue), func(int) string { return "" })
 			x.conversions(n)

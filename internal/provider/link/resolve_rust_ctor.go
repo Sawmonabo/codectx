@@ -79,10 +79,10 @@ func (r *staticFile) rustValue(caller int32, written string, accept func(shape s
 	case q == "Self":
 		return r.innermostTypes(caller, func(typ Ref) error { return variants(entry{Ref: typ}, name) })
 	}
-	if err := r.h.typesIn(r.ctx, r.fc, written, structs); err != nil || !qualified {
+	if err := r.h.typesIn(r.fc, written, structs); err != nil || !qualified {
 		return err
 	}
-	return r.h.typesIn(r.ctx, r.fc, q, func(enum entry) error { return variants(enum, name) })
+	return r.h.typesIn(r.fc, q, func(enum entry) error { return variants(enum, name) })
 }
 
 // rustCalled accepts the constructor a call calls: a tuple struct's or

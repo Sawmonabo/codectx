@@ -115,7 +115,7 @@ func (m QueryMeta) Validate() error {
 	if err := m.Binding.Validate(); err != nil {
 		return err
 	}
-	if err := validateCapabilityStates("meta.completeness", m.Completeness); err != nil {
+	if err := validateCapabilityStates(m.Completeness); err != nil {
 		return err
 	}
 	if m.Truncated && m.TruncationReason == "" {
@@ -318,8 +318,8 @@ func (t SearchTier) Valid() bool { return t.Rank() < len(searchTiers) }
 
 // SearchHit is one deduplicated search result. Section 14.2 fixes its contents:
 // the canonical entity or file chunk that was matched, the integer ranking
-// component with its retrieval tier, bounded reasons and the occurrence count
-// that deduplication folded away. It carries no source body — Section 19.3
+// component with its retrieval tier, which says why it was found, and the
+// occurrence count that deduplication folded away. It carries no source body — Section 19.3
 // reserves those for codectx_read_source, which reads a hit's node or file by
 // id within a context session or outside one, from the generation the hit's
 // binding names.
@@ -335,7 +335,6 @@ type SearchHit struct {
 	ScoreMicros     int64        `json:"score_micros"`
 	Range           *SourceRange `json:"range,omitempty"`
 	OccurrenceCount int64        `json:"occurrence_count"`
-	Reasons         []string     `json:"reasons,omitempty"`
 	// UnresolvedFields names the fields of THIS hit that could not be
 	// resolved, against the typed reason each failed with. It is the search
 	// counterpart of the truncated-fields map a stored record carries: a hit
@@ -395,9 +394,6 @@ func (h SearchHit) Validate() error {
 		}
 	}
 	if err := requireNonNegative("search_hit.occurrence_count", h.OccurrenceCount); err != nil {
-		return err
-	}
-	if err := boundStrings("search_hit.reasons", h.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
 	}
 	// The same wire bound Error.Details and CapabilityState.Details carry: the
@@ -606,15 +602,33 @@ func (o ReferenceOccurrence) Validate() error {
 // GraphRequest is a bounded neighborhood traversal. Every bound is explicit:
 // Section 14.3 forbids an unbounded expansion and requires visited and edge
 // counts to be reported back.
+//
+// SemanticSource and Profile route a call-hierarchy request (Section 11.6):
+// canonical walks the sealed index, lsp asks the managed language server
+// Profile names for one level of incoming or outgoing calls, answered as a
+// labeled overlay (GraphResult.Calls). Unlike SymbolRequest, the empty source
+// is valid and means canonical, Section 11.6's default: the same request type
+// is the canonical engine's traversal input, which every internal caller
+// (context compilation among them) builds for canonical facts only.
 type GraphRequest struct {
-	GenerationID GenerationID   `json:"generation_id,omitempty"`
-	Start        []NodeID       `json:"start"`
-	Relations    []RelationKind `json:"relations,omitempty"`
-	Direction    Direction      `json:"direction"`
-	MaxDepth     int            `json:"max_depth,omitempty"`
-	MaxVisited   int            `json:"max_visited,omitempty"`
-	MaxEdges     int            `json:"max_edges,omitempty"`
-	Page         PageRequest    `json:"page,omitempty"`
+	GenerationID   GenerationID   `json:"generation_id,omitempty"`
+	Start          []NodeID       `json:"start"`
+	Relations      []RelationKind `json:"relations,omitempty"`
+	Direction      Direction      `json:"direction"`
+	MaxDepth       int            `json:"max_depth,omitempty"`
+	MaxVisited     int            `json:"max_visited,omitempty"`
+	MaxEdges       int            `json:"max_edges,omitempty"`
+	SemanticSource SemanticSource `json:"semantic_source,omitempty"`
+	Profile        string         `json:"profile,omitempty"`
+	Page           PageRequest    `json:"page,omitempty"`
+}
+
+// Source is the request's semantic source, canonical when it names none.
+func (r GraphRequest) Source() SemanticSource {
+	if r.SemanticSource == "" {
+		return SemanticCanonical
+	}
+	return r.SemanticSource
 }
 
 // Validate enforces bounded seeds, depth and work budgets. A zero bound means
@@ -641,6 +655,12 @@ func (r GraphRequest) Validate() error {
 	}
 	if !r.Direction.Valid() {
 		return invalid("graph.direction %q is not a known direction", truncateForMessage(string(r.Direction)))
+	}
+	if r.SemanticSource != "" && !r.SemanticSource.Valid() {
+		return invalid("graph.semantic_source %q is not a known semantic source", truncateForMessage(string(r.SemanticSource)))
+	}
+	if err := boundField("graph.profile", r.Profile, MaxIdentifierBytes); err != nil {
+		return err
 	}
 	// Zero defers to the configured traversal caps; see PageRequest.
 	for _, b := range []struct {
@@ -687,6 +707,11 @@ type GraphResult struct {
 	Marks []GraphRowMark `json:"marks,omitempty"`
 	// Counts are the structured call counts of a callers or callees answer.
 	Counts GraphCounts `json:"counts,omitzero"`
+	// Calls are the edges of a semantic_source=lsp answer: one level of the
+	// language server's call hierarchy. An overlay edge has no canonical
+	// relation, so it is not in Relations; its two ends are overlay nodes of
+	// Nodes, named by index. A canonical answer carries none.
+	Calls []OverlayCall `json:"calls,omitempty"`
 }
 
 // Validate enforces the traversal accounting contract.
@@ -735,6 +760,72 @@ func (r GraphResult) Validate() error {
 	}
 	if err := r.Counts.Validate(); err != nil {
 		return err
+	}
+	if err := boundPage("graph_result.calls", len(r.Calls)); err != nil {
+		return err
+	}
+	for _, c := range r.Calls {
+		if err := c.Validate(r.Nodes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// OverlayCall is one edge of a language server call hierarchy (LSP 3.17
+// callHierarchy/incomingCalls and callHierarchy/outgoingCalls): From calls To
+// at Sites. It is an ephemeral overlay answer, never a canonical fact: no
+// relation or evidence was sealed for it, so it carries no relation or
+// evidence id, and its ends are the overlay nodes Nodes[From] and Nodes[To]
+// of the answer it belongs to.
+type OverlayCall struct {
+	// Seed is the canonical start node whose position the call hierarchy was
+	// prepared at: the callee of an incoming call, the caller of an outgoing
+	// one.
+	Seed NodeID `json:"seed"`
+	From int    `json:"from"`
+	To   int    `json:"to"`
+	// SiteFile is the caller's file, where the protocol places every call
+	// site of the edge (its fromRanges), and Sites are those sites.
+	SiteFile FileID        `json:"site_file_id"`
+	SitePath string        `json:"site_path,omitempty"`
+	Sites    []SourceRange `json:"sites"`
+}
+
+// Validate enforces the edge shape against the nodes of its answer: both ends
+// name an overlay node of that answer and every site lies in the caller's
+// file.
+func (c OverlayCall) Validate(nodes []Node) error {
+	if err := requireID("overlay_call.seed", string(c.Seed)); err != nil {
+		return err
+	}
+	for _, end := range []struct {
+		field string
+		index int
+	}{{"overlay_call.from", c.From}, {"overlay_call.to", c.To}} {
+		if end.index < 0 || end.index >= len(nodes) {
+			return invalid("%s is %d; the answer has %d nodes", end.field, end.index, len(nodes))
+		}
+		if nodes[end.index].SemanticSource != SemanticLSP {
+			return invalid("%s names a node that is not an lsp overlay node", end.field)
+		}
+	}
+	if err := requireID("overlay_call.site_file_id", string(c.SiteFile)); err != nil {
+		return err
+	}
+	if c.SiteFile != nodes[c.From].FileID {
+		return invalid("overlay_call.site_file_id is not the caller's file; call sites lie in the caller")
+	}
+	if err := boundField("overlay_call.site_path", c.SitePath, MaxPathBytes); err != nil {
+		return err
+	}
+	if err := boundCount("overlay_call.sites", len(c.Sites), MaxRecordsPerResult); err != nil {
+		return err
+	}
+	for i, site := range c.Sites {
+		if err := site.Validate(indexed("overlay_call.sites", i)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1256,17 +1347,34 @@ func (r PathResult) Validate() error {
 // kept, for every entry the walk reached.
 type ImpactEntry struct {
 	// Ordinal is the entry's position in the ranked answer, from zero.
-	Ordinal     int64     `json:"ordinal"`
-	NodeID      NodeID    `json:"node_id"`
-	FileID      FileID    `json:"file_id,omitempty"`
-	Name        string    `json:"name,omitempty"`
-	Kind        NodeKind  `json:"kind"`
-	Direction   Direction `json:"direction"`
-	Depth       int       `json:"depth"`
-	ScoreMicros int64     `json:"score_micros"`
-	ReasonCount int64     `json:"reason_count"`
-	RouteCount  int64     `json:"route_count"`
+	Ordinal   int64     `json:"ordinal"`
+	NodeID    NodeID    `json:"node_id"`
+	FileID    FileID    `json:"file_id,omitempty"`
+	Name      string    `json:"name,omitempty"`
+	Kind      NodeKind  `json:"kind"`
+	Direction Direction `json:"direction"`
+	Depth     int       `json:"depth"`
+	// Reach is the tier the entry was reached in: empty for an entry a call,
+	// override or structural route reaches, ImpactReachDependence for one only
+	// a data or control dependence hop reaches. Every entry of the first tier
+	// ranks before every entry of the second.
+	Reach ImpactReach `json:"reach,omitempty"`
+	// ScoreMicros is the entry's score within its tier, never negative.
+	ScoreMicros int64 `json:"score_micros"`
+	ReasonCount int64 `json:"reason_count"`
+	RouteCount  int64 `json:"route_count"`
 }
+
+// ImpactReach names the tier an impact entry was reached in.
+type ImpactReach string
+
+// ImpactReachDependence is the tier of an entry only a program-dependence
+// hop (data_flows_to, control_depends_on) reaches. The call tier, which ranks
+// first, is the empty value and is omitted from the wire.
+const ImpactReachDependence ImpactReach = "dependence"
+
+// Valid reports whether r is the call tier (empty) or a known tier.
+func (r ImpactReach) Valid() bool { return r == "" || r == ImpactReachDependence }
 
 // ImpactReason is one reason of one impact entry, in the order the answer
 // gives them.
@@ -1358,6 +1466,12 @@ func (e ImpactEntry) Validate() error {
 		return err
 	}
 	if err := requireNonNegative("impact_entry.ordinal", e.Ordinal); err != nil {
+		return err
+	}
+	if !e.Reach.Valid() {
+		return invalid("impact_entry.reach %q is not a known tier", truncateForMessage(string(e.Reach)))
+	}
+	if err := requireNonNegative("impact_entry.score_micros", e.ScoreMicros); err != nil {
 		return err
 	}
 	if e.ReasonCount < 1 {

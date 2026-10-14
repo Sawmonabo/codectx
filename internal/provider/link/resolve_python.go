@@ -74,7 +74,7 @@ func emitPython(ctx context.Context, u *unit, e *flowEmit) error {
 		}
 		return calls.Add(pyCall{Site: b.Site, Target: b.Target, First: receiverFirst})
 	}
-	look := func(r pyRecord) error { return lookPython(e.mods, r, hits) }
+	look := func(r pyRecord) error { return lookPythonFollowing(e.h, e.mods, r, hits) }
 	e.start()
 	defer e.stop()
 	err = u.filesOf(ctx, e.only, func(file int32, _ model.FileVersion, tab *Table, sel selection) error {
@@ -92,7 +92,7 @@ func emitPython(ctx context.Context, u *unit, e *flowEmit) error {
 			if err := emitPythonRoutes(file, tab, e.mods, emit); err != nil {
 				return err
 			}
-			if err := emitPythonInputs(file, tab, e.mods, emit); err != nil {
+			if err := emitPythonInputs(file, tab, e.h, e.mods, emit); err != nil {
 				return err
 			}
 		}
@@ -195,31 +195,6 @@ type pyRecord struct {
 	// import names, 1 the submodule it names, 2 the module it imports from.
 	Import bool  `json:"m,omitempty"`
 	Rank   uint8 `json:"n,omitempty"`
-}
-
-func comparePyRecord(a, b pyRecord) int {
-	if c := strings.Compare(a.Key, b.Key); c != 0 {
-		return c
-	}
-	if c := cmpBool(a.Lookup, b.Lookup); c != 0 {
-		return c
-	}
-	if c := cmpBool(a.Import, b.Import); c != 0 {
-		return c
-	}
-	if c := compareRef(a.Ref, b.Ref); c != 0 {
-		return c
-	}
-	if c := strings.Compare(a.Root, b.Root); c != 0 {
-		return c
-	}
-	for _, c := range []int{cmpBool(a.Class, b.Class), cmpBool(a.Unbound, b.Unbound), cmpBool(a.Init, b.Init),
-		cmpBool(a.Exact, b.Exact), cmpBool(a.Probe, b.Probe), int(a.Rank) - int(b.Rank)} {
-		if c != 0 {
-			return c
-		}
-	}
-	return 0
 }
 
 // The groups of the module merge's hits.
@@ -472,7 +447,7 @@ func (r *pySite) resolve(site Ref) error {
 		if err := lookupPython(site, tab.Path, false, s.Qualifier, s.Callee, false, r.look, r.hits); err != nil {
 			return err
 		}
-		return r.h.types(r.ctx, site.File, s.Qualifier, func(typ Ref) error {
+		return r.h.types(site.File, s.Qualifier, func(typ Ref) error {
 			return r.class(site, s, typ, DetailDirect)
 		})
 	case wire.ShapeMember:
@@ -482,7 +457,7 @@ func (r *pySite) resolve(site Ref) error {
 	}
 	// A method value taken through its class (`f = C.m; f(obj)`) passes its
 	// receiver first; one taken through an instance is bound to it.
-	return r.t.functions(r.ctx, site, func(target Ref, detail string, receiverFirst bool) error {
+	return r.t.functions(site, func(target Ref, detail string, receiverFirst bool) error {
 		return r.call(Binding{Kind: FactCall, Site: site, Target: target, Detail: detail, Dispatch: model.DispatchExact}, receiverFirst)
 	})
 }
@@ -502,23 +477,23 @@ func (r *pySite) receiver(site Ref, s *Site) error {
 	switch s.Receiver.Kind {
 	case wire.TypeNamed:
 		found := false
-		err := r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+		err := r.h.types(site.File, s.Receiver.Name, func(typ Ref) error {
 			found = true
 			return r.instance(site, s, typ, DetailHierarchy)
 		})
 		if err != nil || found {
 			return err
 		}
-		_, err = externalReceiver(r.ctx, r.h, r.fc, site, s, []wire.Type{s.Receiver}, r.emit)
+		_, err = externalReceiver(r.h, r.fc, site, s, []wire.Type{s.Receiver}, r.emit)
 		return err
 	case wire.TypeClass:
-		return r.h.types(r.ctx, site.File, s.Receiver.Name, func(typ Ref) error {
+		return r.h.types(site.File, s.Receiver.Name, func(typ Ref) error {
 			return r.class(site, s, typ, DetailDirect)
 		})
 	case wire.TypeSuper:
 		return r.super(site, s)
 	case wire.TypeUnion:
-		if _, err := externalReceiver(r.ctx, r.h, r.fc, site, s, typeMembers(r.tab, s.Receiver), r.emit); err != nil {
+		if _, err := externalReceiver(r.h, r.fc, site, s, typeMembers(r.tab, s.Receiver), r.emit); err != nil {
 			return err
 		}
 	}
@@ -563,6 +538,26 @@ func (r *pySite) instance(site Ref, s *Site, typ Ref, detail string) error {
 			return err
 		}
 	}
+	return r.ahead(site, typ, typ, s.Callee, detail, d)
+}
+
+// ahead emits, beside the binding of site to the first class of the unit
+// along typ's order after from that defines method, a call to the method of
+// each base outside the unit the order places ahead of that class
+// (pythonAhead): the true callee is one of them or that class, a set the
+// site's targets count.
+func (r *pySite) ahead(site, typ, from Ref, method, detail string, d model.Dispatch) error {
+	bases, err := r.h.pythonAhead(typ, from, method, true)
+	if err != nil {
+		return err
+	}
+	for _, q := range bases {
+		err := r.emit(Binding{Kind: FactCall, Site: site, Detail: detail, Dispatch: d,
+			External: externalMethod(r.fc.family, q, method)})
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -574,8 +569,11 @@ func (r *pySite) object(site Ref, s *Site, typ Ref, detail string) error {
 		found = true
 		return r.exactCall(site, detail)(e.Ref)
 	})
-	if err != nil || found {
+	if err != nil {
 		return err
+	}
+	if found {
+		return r.ahead(site, typ, typ, s.Callee, detail, model.DispatchExact)
 	}
 	_, err = r.t.outsideCall(r.h, r.fc.family, site, typ, s.Callee, r.emit)
 	return err
@@ -591,8 +589,11 @@ func (r *pySite) class(site Ref, s *Site, typ Ref, detail string) error {
 		b := Binding{Kind: FactCall, Site: site, Target: e.Ref, Detail: detail, Dispatch: model.DispatchExact}
 		return r.call(b, e.Flags&flagStatic == 0)
 	})
-	if err != nil || found {
+	if err != nil {
 		return err
+	}
+	if found {
+		return r.ahead(site, typ, typ, s.Callee, detail, model.DispatchExact)
 	}
 	_, err = r.t.outsideCall(r.h, r.fc.family, site, typ, s.Callee, r.emit)
 	return err
@@ -607,6 +608,9 @@ func (r *pySite) super(site Ref, s *Site) error {
 	err := resolvePythonSuper(r.ctx, r.h, site, r.tab, s, func(target Ref) error {
 		found = true
 		return bind(target)
+	}, func(q string) error {
+		return r.emit(Binding{Kind: FactCall, Site: site, Detail: DetailHierarchy, Dispatch: model.DispatchExact,
+			External: externalMethod(r.fc.family, q, s.Callee)})
 	})
 	if err != nil || found {
 		return err
@@ -693,14 +697,29 @@ func pythonSubtypes(ctx context.Context, h *hierarchy, typ Ref, yield func(Ref) 
 // sibling base a subclass lists after B is (cooperative multiple
 // inheritance). A type whose bases admit no order reaches nothing; for B
 // itself the nearest declaration along each of its bases' paths answers.
-func resolvePythonSuper(ctx context.Context, h *hierarchy, site Ref, tab *Table, s *Site, bind func(Ref) error) error {
+func resolvePythonSuper(ctx context.Context, h *hierarchy, site Ref, tab *Table, s *Site, bind func(Ref) error, external func(string) error) error {
 	class := enclosingClass(tab, s.Caller)
 	if class < 0 {
 		return nil
 	}
 	b := Ref{File: site.File, Index: class}
+	// external is told, once each, the bases outside the unit some
+	// subtype's order places after B and ahead of the class it binds.
+	told := map[string]bool{}
 	return pythonSubtypes(ctx, h, b, func(sub Ref) error {
-		order, err := h.pythonMRO(sub)
+		ahead, err := h.pythonAhead(sub, b, s.Callee, false)
+		if err != nil {
+			return err
+		}
+		for _, q := range ahead {
+			if !told[q] {
+				told[q] = true
+				if err := external(q); err != nil {
+					return err
+				}
+			}
+		}
+		order, err := h.pythonUnitOrder(sub)
 		if err != nil {
 			return err
 		}
@@ -800,17 +819,17 @@ func (h *hierarchy) bases(typ Ref) ([]Ref, error) {
 // mergeC3 is C3's merge of seqs: repeatedly the first head of a sequence that
 // is in no sequence's tail, removed from every head; false when sequences
 // remain and every head is in some tail.
-func mergeC3(seqs [][]Ref) ([]Ref, bool) {
-	var out []Ref
+func mergeC3[T comparable](seqs [][]T) ([]T, bool) {
+	var out []T
 	for {
-		seqs = slices.DeleteFunc(seqs, func(s []Ref) bool { return len(s) == 0 })
+		seqs = slices.DeleteFunc(seqs, func(s []T) bool { return len(s) == 0 })
 		if len(seqs) == 0 {
 			return out, true
 		}
-		var next Ref
+		var next T
 		ok := false
 		for _, s := range seqs {
-			inTail := slices.ContainsFunc(seqs, func(o []Ref) bool { return slices.Contains(o[1:], s[0]) })
+			inTail := slices.ContainsFunc(seqs, func(o []T) bool { return slices.Contains(o[1:], s[0]) })
 			if !inTail {
 				next, ok = s[0], true
 				break
@@ -826,6 +845,164 @@ func mergeC3(seqs [][]Ref) ([]Ref, bool) {
 			}
 		}
 	}
+}
+
+// pyBase is one class of a Python method resolution order with the bases
+// outside the unit placed (pythonFullMRO): a class of the unit (ref), or a
+// base outside it, its qualified name in external.
+type pyBase struct {
+	ref      Ref
+	external string
+}
+
+// pythonFullMRO is typ's C3 linearisation with every base outside the unit
+// placed where the linearisation puts it ("The Python 2.3 Method Resolution
+// Order": the merge of the bases' linearisations and the bases as listed,
+// local precedence order and monotonicity kept). The unit has no
+// declaration of a base outside it, so its own bases are not known: it
+// enters the merge as the linearisation of itself alone. Its unknown
+// ancestors are all outside the unit and follow it in the true order, and
+// a member they define is reached through it (attribute lookup on the base
+// finds it), so the order decides, for each class of the unit, which bases
+// outside the unit precede it. That is exact unless a base outside the unit
+// is itself an ancestor of another one the hierarchy names, which no
+// declaration read can show: the true order then places that ancestor
+// after its descendant, which this order does not know, so it may list
+// that ancestor ahead of a class of the unit the true order puts first.
+// nil when typ is no Python class or its bases admit no linearisation
+// (Python refuses to create such a class).
+func (h *hierarchy) pythonFullMRO(typ Ref) ([]pyBase, error) {
+	language, err := h.fileLanguage(typ.File)
+	if err != nil || language != "python" {
+		return nil, err
+	}
+	memo := map[Ref][]pyBase{}
+	active := map[Ref]bool{}
+	var linearise func(t Ref) ([]pyBase, error)
+	linearise = func(t Ref) ([]pyBase, error) {
+		if l, ok := memo[t]; ok {
+			return l, nil
+		}
+		if active[t] {
+			return nil, nil
+		}
+		active[t] = true
+		defer delete(active, t)
+		bases, err := h.writtenBases(t)
+		if err != nil {
+			return nil, err
+		}
+		seqs := make([][]pyBase, 0, len(bases)+1)
+		for _, b := range bases {
+			if b.external != "" {
+				seqs = append(seqs, []pyBase{b})
+				continue
+			}
+			l, err := linearise(b.ref)
+			if err != nil || l == nil {
+				return nil, err
+			}
+			seqs = append(seqs, l)
+		}
+		merged, ok := mergeC3(append(seqs, bases))
+		if !ok {
+			return nil, nil
+		}
+		memo[t] = append([]pyBase{{ref: t}}, merged...)
+		return memo[t], nil
+	}
+	return linearise(typ)
+}
+
+// pythonUnitOrder is typ's method resolution order over the classes of the
+// unit: pythonFullMRO's without the bases outside the unit, else, when the
+// bases outside the unit admit no linearisation, pythonMRO's.
+func (h *hierarchy) pythonUnitOrder(typ Ref) ([]Ref, error) {
+	full, err := h.pythonFullMRO(typ)
+	if err != nil || full == nil {
+		if err != nil {
+			return nil, err
+		}
+		return h.pythonMRO(typ)
+	}
+	out := make([]Ref, 0, len(full))
+	for _, b := range full {
+		if b.external == "" {
+			out = append(out, b.ref)
+		}
+	}
+	return out, nil
+}
+
+// pythonAhead is the bases outside the unit that typ's full order
+// (pythonFullMRO) places after the class from and ahead of the first class
+// of the unit after it that defines method, when a lookup starting past
+// from reaches that class (`super()` in from); with self, the lookup starts
+// at from itself (a call on from's instance, from being typ), and from
+// defining method leaves none. Each may hold the method instead of that
+// class, so the call's targets are a set of them and that class. Empty when
+// no such class follows, or when the order does not exist.
+func (h *hierarchy) pythonAhead(typ, from Ref, method string, self bool) ([]string, error) {
+	full, err := h.pythonFullMRO(typ)
+	if err != nil || full == nil {
+		return nil, err
+	}
+	start := slices.IndexFunc(full, func(b pyBase) bool { return b.external == "" && b.ref == from })
+	if start < 0 {
+		return nil, nil
+	}
+	if self {
+		defines := false
+		if err := h.methods(from, method, func(entry) error { defines = true; return nil }); err != nil || defines {
+			return nil, err
+		}
+	}
+	var ahead []string
+	for _, b := range full[start+1:] {
+		if b.external != "" {
+			ahead = append(ahead, b.external)
+			continue
+		}
+		defines := false
+		if err := h.methods(b.ref, method, func(entry) error { defines = true; return nil }); err != nil {
+			return nil, err
+		}
+		if defines {
+			return ahead, nil
+		}
+	}
+	return nil, nil
+}
+
+// writtenBases are typ's direct bases, of the unit (keySuper, position in
+// Aux) and outside it (keyExternalSuper, position in Sig), in the order its
+// declaration lists them, each once.
+func (h *hierarchy) writtenBases(typ Ref) ([]pyBase, error) {
+	type placed struct {
+		pos string
+		b   pyBase
+	}
+	var all []placed
+	if err := h.links.lookup(keySuper+refKey(typ), func(e entry) error {
+		all = append(all, placed{e.Aux, pyBase{ref: e.Ref}})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := h.links.lookup(keyExternalSuper+refKey(typ), func(e entry) error {
+		all = append(all, placed{e.Sig, pyBase{external: e.Aux}})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	slices.SortStableFunc(all, func(a, b placed) int { return strings.Compare(a.pos, b.pos) })
+	out := make([]pyBase, 0, len(all))
+	for _, p := range all {
+		if !slices.Contains(out, p.b) {
+			out = append(out, p.b)
+		}
+	}
+	return out, nil
 }
 
 // fileLanguage is the language of a member file, as the hierarchy indexed it.
@@ -961,7 +1138,8 @@ func absolutePythonModule(importer, rel string) string {
 
 // settlePythonHits settles the hits the lookups met (lookPython), with each
 // module-bound site's sentinel, sorted by site or import: per site
-// (settlePython) and per import (settlePythonImport).
+// (settlePython) and per import (settlePythonImport). A canceled context
+// stops it between groups.
 func settlePythonHits(ctx context.Context, hits *pagination.ExternalSort[pyHit], emit func(Binding) error,
 	call func(Binding, bool) error) error {
 	settled, err := hits.Sorted()
@@ -973,6 +1151,9 @@ func settlePythonHits(ctx context.Context, hits *pagination.ExternalSort[pyHit],
 	flush := func() error {
 		if len(group) == 0 {
 			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if group[0].Group == hitImport {
 			return settlePythonImport(group, emit)
@@ -1107,7 +1288,7 @@ func pythonFlows(ctx context.Context, u *unit, e *flowEmit, calls *pagination.Ex
 		}
 		for i := range tab.Sites {
 			s := &tab.Sites[i]
-			if (len(s.Arguments) == 0 && !hasResult(s)) || !sel.has(int32(i)) {
+			if (len(s.Arguments) == 0 && len(s.Nested) == 0 && !hasResult(s)) || !sel.has(int32(i)) {
 				continue
 			}
 			site := Ref{File: file, Index: int32(i)}

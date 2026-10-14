@@ -137,6 +137,25 @@ type esInputs struct {
 	// dirConfigs are the paths of the configs the scan read, by directory,
 	// sorted.
 	dirConfigs map[string][]string
+	// outside are the paths an `extends` named that the scan did not
+	// select (a base under another name, or outside the unit), each looked
+	// up in the snapshot by its path, present or not: inputs of the unit
+	// beyond OwnsInput's names (Unit.Inputs).
+	outside map[string]bool
+}
+
+// esInputsOf is the unit's configuration, read once per link: the manifest
+// fields and then the hierarchy's resolver read the same parse.
+func esInputsOf(ctx context.Context, u *unit) (*esInputs, error) {
+	if u.es != nil {
+		return u.es, nil
+	}
+	in, err := readESInputs(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	u.es = in
+	return in, nil
 }
 
 // readESInputs reads the unit's configuration: one pass over the snapshot's
@@ -144,9 +163,7 @@ type esInputs struct {
 // nested project the plan gives a unit of its own) whose names
 // esConfigFile admits, and each is read and parsed once.
 func readESInputs(ctx context.Context, u *unit) (*esInputs, error) {
-	in := &esInputs{view: u.content, root: u.root, raws: map[string]*rawConfig{}, missing: map[string]bool{},
-		flat: map[string]*tsConfig{}, pkgs: map[string]*esPackage{}, names: map[string][]string{},
-		workspaceFiles: map[string][]string{}, dirConfigs: map[string][]string{}}
+	in := newESInputs(u.content, u.root)
 	if u.content == nil {
 		return in, nil
 	}
@@ -175,17 +192,64 @@ func readESInputs(ctx context.Context, u *unit) (*esInputs, error) {
 			own = pu
 		}
 	}
-	var workspaceGlobs globSet
+	found = slices.DeleteFunc(found, func(fv model.FileVersion) bool { return !own.Contains(fv.Path) })
+	if err := in.readConfigs(ctx, found); err != nil {
+		return nil, err
+	}
+	return in, in.readPackages(ctx, found)
+}
+
+func newESInputs(view model.SnapshotView, root string) *esInputs {
+	return &esInputs{view: view, root: root, raws: map[string]*rawConfig{}, missing: map[string]bool{},
+		flat: map[string]*tsConfig{}, pkgs: map[string]*esPackage{}, names: map[string][]string{},
+		workspaceFiles: map[string][]string{}, dirConfigs: map[string][]string{}, outside: map[string]bool{}}
+}
+
+// readConfigs reads and parses each tsconfig*.json and jsconfig*.json of
+// found, the unit's files esConfigFile admits.
+func (in *esInputs) readConfigs(ctx context.Context, found []model.FileVersion) error {
 	for _, fv := range found {
-		if !own.Contains(fv.Path) {
-			continue
-		}
-		data, err := readFile(ctx, u.content, fv)
-		if err != nil {
-			return nil, err
-		}
 		dir, base := path.Split(fv.Path)
 		dir = strings.TrimSuffix(dir, "/")
+		switch base {
+		case "package.json", "pnpm-workspace.yaml", "lerna.json":
+			continue
+		}
+		data, err := readFile(ctx, in.view, fv)
+		if err != nil {
+			return err
+		}
+		v, err := parseJSONC(data)
+		if err != nil || v.kind != jObject {
+			in.missing[fv.Path] = true
+			continue
+		}
+		in.raws[fv.Path] = &rawConfig{path: fv.Path, v: v}
+		in.dirConfigs[dir] = append(in.dirConfigs[dir], fv.Path)
+	}
+	for _, ps := range in.dirConfigs {
+		slices.Sort(ps)
+	}
+	return nil
+}
+
+// readPackages reads and parses each package.json, pnpm-workspace.yaml and
+// lerna.json of found, and maps each workspace package's name to its
+// directories.
+func (in *esInputs) readPackages(ctx context.Context, found []model.FileVersion) error {
+	var workspaceGlobs globSet
+	for _, fv := range found {
+		dir, base := path.Split(fv.Path)
+		dir = strings.TrimSuffix(dir, "/")
+		switch base {
+		case "package.json", "pnpm-workspace.yaml", "lerna.json":
+		default:
+			continue
+		}
+		data, err := readFile(ctx, in.view, fv)
+		if err != nil {
+			return err
+		}
 		switch base {
 		case "package.json":
 			v, err := parseJSONC(data)
@@ -222,14 +286,6 @@ func readESInputs(ctx context.Context, u *unit) (*esInputs, error) {
 					workspaceGlobs.add(dir, g)
 				}
 			}
-		default:
-			v, err := parseJSONC(data)
-			if err != nil || v.kind != jObject {
-				in.missing[fv.Path] = true
-				continue
-			}
-			in.raws[fv.Path] = &rawConfig{path: fv.Path, v: v}
-			in.dirConfigs[dir] = append(in.dirConfigs[dir], fv.Path)
 		}
 	}
 	for dir, p := range in.pkgs {
@@ -244,10 +300,7 @@ func readESInputs(ctx context.Context, u *unit) (*esInputs, error) {
 	for _, dirs := range in.names {
 		slices.Sort(dirs)
 	}
-	for _, ps := range in.dirConfigs {
-		slices.Sort(ps)
-	}
-	return in, nil
+	return nil
 }
 
 // newESPackage reads a package.json object.
@@ -322,8 +375,8 @@ func pnpmPackages(data []byte) []string {
 			if i := strings.Index(rest, "#"); i == 0 {
 				rest = ""
 			}
-			if strings.HasPrefix(rest, "[") {
-				body := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(rest, "[")), "]")
+			if body, ok := strings.CutPrefix(rest, "["); ok {
+				body = strings.TrimSuffix(strings.TrimSpace(body), "]")
 				for item := range strings.SplitSeq(body, ",") {
 					if s := scalar(item); s != "" {
 						out = append(out, s)
@@ -354,6 +407,7 @@ func (in *esInputs) raw(ctx context.Context, p string) (*rawConfig, error) {
 		return nil, nil
 	}
 	in.missing[p] = true
+	in.outside[p] = true
 	var r *rawConfig
 	err := in.view.EachFile(ctx, model.FileSelection{Paths: []string{p}}, func(fv model.FileVersion) error {
 		if fv.Status == model.FileDeleted || fv.Path != p {
@@ -424,6 +478,17 @@ func (in *esInputs) apply(ctx context.Context, c *tsConfig, r *rawConfig, seen m
 	bases, _ := r.v.strings("extends")
 	for _, spec := range bases {
 		bp, ok := in.extendsPath(dir, spec)
+		if ok && esRelative(spec) && !strings.HasSuffix(bp, ".json") {
+			// TypeScript's getExtendsConfigPath: the file as written,
+			// else with ".json" added.
+			r, err := in.raw(ctx, bp)
+			if err != nil {
+				return err
+			}
+			if r == nil {
+				bp += ".json"
+			}
+		}
 		if !ok || seen[bp] {
 			c.opaque = c.opaque || !ok
 			continue
@@ -520,8 +585,8 @@ func rebase(dir string, patterns []string) []string {
 }
 
 // extendsPath is the config file an `extends` entry written in a config of
-// directory dir names: a relative or absolute path (".json" added when the
-// file as written is absent), or a package name or package subpath resolved
+// directory dir names: a relative or absolute path (apply adds ".json" when
+// the file as written is absent), or a package name or package subpath resolved
 // through the workspace map (the package's `tsconfig` field, else its
 // tsconfig.json, for a bare name). It reports false for a package the
 // repository does not hold, which is a base the snapshot cannot read.
@@ -531,11 +596,6 @@ func (in *esInputs) extendsPath(dir, spec string) (string, bool) {
 		p := path.Join(dir, spec)
 		if strings.HasPrefix(spec, "/") {
 			p = strings.TrimPrefix(path.Clean(spec), "/")
-		}
-		if !strings.HasSuffix(p, ".json") {
-			if _, ok := in.raws[p]; !ok {
-				p += ".json"
-			}
 		}
 		return p, true
 	}

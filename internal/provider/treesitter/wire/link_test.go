@@ -63,6 +63,7 @@ func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 			{Name: Span{Start: 104, End: 107}, Macros: "API XMLCALL "},
 		},
 		Conversions: []Conversion{{Type: "T", Interface: "io.Reader"}, {Type: "U", Interface: "fmt.Stringer"}},
+		Constraint:  "linux && !cgo",
 		Values: []Value{{At: Span{Start: 81, End: 90}, Field: "run", Type: Type{Kind: TypeFunction, Name: "obj.run"},
 			Declares: Span{Start: 13, End: 16}}},
 		Supertypes: []Supertype{{Type: "A", Super: "Thread"}, {Type: "A", Super: "Runnable", Interface: true}},
@@ -95,6 +96,9 @@ func TestLinkFactsBeyondCallsRoundTrip(t *testing.T) {
 	}
 	if !slices.Equal(out.Supertypes, in.Supertypes) {
 		t.Fatalf("supertypes changed:\n got %+v\nwant %+v", out.Supertypes, in.Supertypes)
+	}
+	if out.Constraint != in.Constraint {
+		t.Fatalf("constraint changed: got %q, want %q", out.Constraint, in.Constraint)
 	}
 	if !slices.Equal(out.Conversions, in.Conversions) {
 		t.Fatalf("conversions changed:\n got %+v\nwant %+v", out.Conversions, in.Conversions)

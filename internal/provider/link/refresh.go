@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"slices"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -88,6 +89,46 @@ func manifestFields(ctx context.Context, u *unit) ([]manifestField, error) {
 	return slices.Compact(out), nil
 }
 
+// hierarchyFields is the fields a hierarchy built from the tables depends
+// on: layoutFields without the declared entry points, which no hierarchy
+// and no site reads (withEntries resolves them on every build that
+// resolves). A change to the entry points alone keeps the layout and
+// re-runs nothing.
+func hierarchyFields(fields []manifestField) []manifestField {
+	return slices.DeleteFunc(layoutFields(fields), func(f manifestField) bool { return strings.HasPrefix(f.Key, fieldEntry) })
+}
+
+// entryGroups is groups with every declared entry point's group replaced by
+// those of fields: what indexGroups gives the same hierarchy under fields
+// when only the entry points moved. Only the manifest's few keys are held.
+func entryGroups(dir string, groups *pagination.SortedRun[group], old, fields []manifestField) (*pagination.SortedRun[group], error) {
+	entries := func(fs []manifestField) []manifestField {
+		return slices.DeleteFunc(slices.Clone(fs), func(f manifestField) bool { return !strings.HasPrefix(f.Key, fieldEntry) })
+	}
+	drop := map[string]bool{}
+	for _, f := range entries(old) {
+		drop[groupKey(f.Key)] = true
+	}
+	out, err := newGroupSort(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer out.Close()
+	err = groups.Each(func(g group) error {
+		if drop[g.Key] {
+			return nil
+		}
+		return out.Add(g)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := fieldGroups(entries(fields), "", out.Add); err != nil {
+		return nil, err
+	}
+	return out.Sorted()
+}
+
 // refresh is one build's account of what moved since its predecessor.
 type refresh struct {
 	u    *unit
@@ -95,13 +136,14 @@ type refresh struct {
 	// resolve reports that the bindings are found again.
 	resolve bool
 	// layout reports that the unit's hierarchy is its predecessor's: the
-	// same members, the same manifest fields, and every member whose table
-	// moved keeps its interface (InterfaceDigest), which is all a hierarchy
-	// is built from. Only the members whose sites moved then re-run, and no
+	// same members, the same manifest fields but the declared entry points
+	// (hierarchyFields), and every member whose table moved keeps its
+	// interface (InterfaceDigest), which is all a hierarchy is built from. Only the members whose sites moved then re-run, and no
 	// other table is read.
 	layout bool
 	// external reports that the manifest fields moved and only those that
-	// say where a Go package outside the unit is read from (goExternalField):
+	// say where a Go package outside the unit is read from (goExternalField),
+	// the entry points held:
 	// the layout holds when what those packages declare is what the
 	// predecessor read (sameGoSurface).
 	external bool
@@ -157,8 +199,8 @@ func newFileIDSort(dir string) (*pagination.ExternalSort[model.FileID], error) {
 // each member's stored MemberDigest, empty for a member without a table.
 func (rf *refresh) classify(ctx context.Context, digests Digests, fields []manifestField) error {
 	rf.resolve = !slices.Equal(fields, rf.prev.fields)
-	rf.layout = slices.Equal(layoutFields(fields), layoutFields(rf.prev.fields))
-	rf.external = rf.resolve && rf.layout
+	rf.layout = slices.Equal(hierarchyFields(fields), hierarchyFields(rf.prev.fields))
+	rf.external = rf.resolve && slices.Equal(layoutFields(fields), layoutFields(rf.prev.fields))
 	next, stop := pull(rf.prev.records)
 	defer stop()
 	old, ok, err := next()
@@ -386,8 +428,8 @@ func diffGroups[T any, K cmp.Ordered](a, b *pagination.SortedRun[T], key func(T)
 // same costs its own member's sites only, and reads no other table.
 
 // Observer, when the Tables a link reads also implement it, is told the
-// member path of each site of the flow family the link resolves, as it
-// resolves it: the work a build does, site by site.
+// member path of each site the link resolves, as it resolves it: the work a
+// build does, site by site.
 type Observer interface {
 	Resolved(path string)
 }

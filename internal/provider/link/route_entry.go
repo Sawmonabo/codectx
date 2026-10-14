@@ -258,8 +258,8 @@ func resolveEntries(ctx context.Context, u *unit, entries []declaredEntry) ([]id
 			continue
 		}
 		target := model.NodeID("")
-		switch {
-		case c.qualified == "":
+		switch c.qualified {
+		case "":
 			target = t.Module.Node
 			if c.rustMain {
 				for i := range t.Decls {
@@ -333,10 +333,8 @@ func entryNames(u *unit, e declaredEntry, p string) (string, bool, bool) {
 		return attr, false, found
 	case FamilyJavaScript:
 		v := path.Clean(path.Join(dir, e.value))
-		for _, c := range []string{v, v + ".js", v + ".mjs", v + ".cjs", v + "/index.js"} {
-			if p == c {
-				return "", false, true
-			}
+		if slices.Contains([]string{v, v + ".js", v + ".mjs", v + ".cjs", v + "/index.js"}, p) {
+			return "", false, true
 		}
 	case FamilyRust:
 		given := strings.TrimPrefix(e.value, "path:")
@@ -355,9 +353,9 @@ func entryNames(u *unit, e declaredEntry, p string) (string, bool, bool) {
 
 // entries publishes the declared entry points the FactEntries of this file,
 // group, found: one `endpoint` per distinct entry point, in the file's
-// scope, keyed by its descriptor and manifest, located at its target,
-// defined by the file's module and routed to the target, with the set size
-// when several files supply it.
+// scope, keyed by its descriptor and manifest, located at its target, with
+// a search document of its name, defined by the file's module and routed to
+// the target, with the set size when several files supply it.
 func (f *filePublication) entries(group []idBinding) error {
 	byPayload := map[string][]idBinding{}
 	var order []string
@@ -389,6 +387,7 @@ func (f *filePublication) entries(group []idBinding) error {
 			if err != nil {
 				return err
 			}
+			f.endpointDocument(n, nodeName(p.Descriptor, "endpoint"), "", target.Range, model.EndpointMetadata{})
 			f.node(occurrenceOf(f.fv, f.t, f.t.Module))
 			f.relation(f.t.Module.Node, model.RelDefines, n, located(target.Range), "", "", "", 0)
 			f.relation(n, model.RelRoutesTo, b.Target, located(target.Range), "", b.Detail, "", p.Set)

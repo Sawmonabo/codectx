@@ -190,22 +190,28 @@ symbols without rescanning):
   the declaration's final byte lies on, not the half-open end position's. The
   path is the same root-relative slash path the unit's scope key carries.
   Nothing is normalized — no case folding, no qualification, no receiver
-  prefix: the identifier is the token the source spells. Publishing this alias
-  is what merges the two providers' identities for one function instead of
-  leaving two correct but unrelated nodes. A key over `MaxNativeKeyBytes` is
+  prefix: the identifier is the token the source spells. An alias is read only
+  by `reconcile.Resolver`, when a unit that declares this one a dependency
+  resolves a candidate under the same scope and native key and so adopts this
+  declaration's identity; no provider here resolves a candidate by a `decl:`
+  key, so the alias joins nothing by itself. A key over `MaxNativeKeyBytes` is
   omitted rather than truncated (a truncated key would be a different, possibly
   colliding claim); the declaration keeps its own identity and its
   qualified-name alias either way. The omission is counted, so the file's
   capability state becomes `partial` with `CTX_COVERAGE_INCOMPLETE`: a
-  declaration without this key will not merge with the semantic provider's
-  node for the same function, which is missing coverage, not a silent
-  simplification.
+  declaration without this key cannot be resolved by it from a dependent
+  unit, which is missing coverage, not a silent simplification.
 - `("file:"+path, "callsite:"+path+":"+first+"-"+last)` → the callee node of
-  every call site. This is the Section 11.3 call-site join key, computed
+  every call site. This is the Section 11.3 call-site key, computed
   byte-for-byte identically by the SCIP importer for the reference occurrence
-  at the same bytes, so the reconciler merges the syntactic callee with the
-  compiler-resolved symbol and the `calls` relation acquires a precise target
-  while both evidence rows remain:
+  at the same bytes and by the call linker for the site it publishes. No
+  provider resolves a candidate by a `callsite:` key, so the key merges no two
+  nodes: the SCIP symbol and the syntactic callee stay two identities. The
+  linker cites the key in the evidence of its `calls` edge for the site, and
+  the packed adjacency leaves out this provider's placeholder edge wherever
+  the linker's edge from the same caller covers every one of its sites at the
+  same bytes ([storage](storage.md), One edge per call), so a bound call is
+  served as one callee:
 
   ```
   scope key  file:<path>
@@ -223,7 +229,7 @@ symbols without rescanning):
   not a key. A key over `MaxNativeKeyBytes` is omitted rather than truncated
   and the omission is counted, so the file is `partial`. Only `@call.name`
   captures produce this alias; a type reference does not, because only a call
-  site is the join SCIP cannot make on its own (no indexer distinguishes a
+  site is what SCIP cannot identify on its own (no indexer distinguishes a
   call-site reference from a function-value reference).
 - `("pkg:go:"+dir+":"+package, qualified name)` → Go top-level declarations;
   `("pkg:java:"+package, qualified name)` → Java top-level declarations. These
@@ -405,7 +411,9 @@ published and is counted, so the file reports partial.
 **Framework routes.** The provider reads routes from decorators, annotations
 and registration calls, only in a file that imports the framework (Python
 `flask`, `fastapi`, `starlette`, `django.urls` or `django.conf.urls`; JavaScript and
-TypeScript `express` and `@nestjs/common`; Go `net/http`, `github.com/gorilla/mux`,
+TypeScript `express` and `@nestjs/common` or `@nestjs/core`, and a file importing neither that names
+`setGlobalPrefix` or `enableVersioning`, or writes a `module:` property, is scanned for those calls and for the
+RouterModule route trees its module-level bindings hold alone; Go `net/http`, `github.com/gorilla/mux`,
 `github.com/go-chi/chi`, `github.com/gin-gonic/gin`, `github.com/labstack/echo`;
 Java `org.springframework.web.bind.annotation`). Each method and route is one
 endpoint with `routes_to` its handler. A receiver is known by the call that built
@@ -418,7 +426,7 @@ it (the link table's site result type).
 | Django | `path`, `re_path`, `url` imported from `django.urls` or `django.conf.urls`, or called through that module (`from django import urls` then `urls.path(…)`, `import django.urls`); no method; `include()` entries are mounts, not routes | the second argument or `view=`; `X.as_view()` names `X` | never in the file: the including urlconf is chosen by settings, so every Django route is `unresolved` here; the linker joins the settings chain and the `include()` prefixes (docs/providers-link.md, Route prefixes across files) |
 | Starlette | `Route(path, endpoint, methods=[…])` (none: `GET` for a function endpoint, every method for a class, Starlette's own rule; an endpoint not declared here as a function names no method), `WebSocketRoute(path, endpoint)` (`WEBSOCKET`), each an entry of a route list | `endpoint` | `Starlette(routes=…)` (and a FastAPI application's `routes=`) is a root; `Router(routes=…)` and `Mount(path, routes=…)` hold lists; an entry is mounted on the object whose list, written in place or held by one module binding, is innermost around it; `Mount(path, app=x)` mounts `x` |
 | Express | `x.get`/`post`/`put`/`delete`/`patch`/`options`/`head`; `all` and `use(path, fn)` name no method; `x.route(p).get(h)` chains; a path array is one endpoint per element | the last argument (earlier ones are middleware) | `express()` is a root; `express.Router()`, or `Router()` imported or destructured from `require("express")`, through exactly one `use([path,] router)` |
-| NestJS | `@Get` … `@Head`, `@QueryMethod` (`QUERY`), `@All` (no method), imported from `@nestjs/common`, on a method of a `@Controller` class; a string, an array (one endpoint per element) or none (written `""`, the controller's own path) | the decorated method | never in the file: Nest joins the controller's path, the application's `setGlobalPrefix` and `RouterModule` paths, which another file sets, so every NestJS route is `unresolved` |
+| NestJS | `@Get` … `@Head`, `@QueryMethod` (`QUERY`), `@All` (no method), imported from `@nestjs/common`, on a method of a `@Controller` class; a string, an array (one endpoint per element) or none (written `""`, the controller's own path) | the decorated method | never in the file: Nest joins the controller's path, the application's `setGlobalPrefix`, its URI versioning and `RouterModule` paths, which another file sets, so every NestJS route is `unresolved` here; the route is recorded for the linker, with each `@Module` class's `controllers`, each `RouterModule.register` route tree (a literal in place, the file's one module-level binding, or the import that binds it) and each module-level binding a route tree initializes, and the linker publishes its full paths when every application the unit creates and the controller's RouterModule module path are decided (docs/providers-link.md, NestJS paths) |
 | Spring | `@GetMapping` … `@PatchMapping`, `@RequestMapping(method = RequestMethod.X)` (none: no method); `value`, `path` or positional, arrays | the annotated method | the class-level `@RequestMapping` is the only prefix, none means no prefix; each literal route it names is a prefix, every method route mapped below each (Spring combines the patterns pairwise); a non-literal one leaves the class's routes `unresolved`. Its `method =` adds to each method mapping's own methods, a union as Spring combines them, and a mapping naming none takes the class's |
 | Go `net/http` | `http.Handle`/`HandleFunc` on the default mux, a `ServeMux`'s `Handle`/`HandleFunc`; a Go 1.22 pattern `"GET /x"` gives the method and the route `/x` | the second argument | the default mux is a root; `NewServeMux()` when the file serves it once (`ListenAndServe[TLS]`, `Serve[TLS]`, or the `Handler` of an `http.Server{…}` literal, written as the router's construction or a name the file assigns exactly one router to) or another router handles it once; a router `Handle(p, http.StripPrefix(prefix, r))` passes sits below the stripped literal prefix |
 | gorilla/mux | `Handle`/`HandleFunc`, methods from `.Methods(…)` on the registration; a matcher chain closed by `Handler(h)`/`HandlerFunc(h)` (`PathPrefix(p).Handler(h)`, `Methods(m).Path(p).HandlerFunc(h)`, from the router or `NewRoute()`) whose one `Path` or `PathPrefix` is the route | the second argument; the closing call's argument | `NewRouter()` served or handled once; `PathPrefix(p).Subrouter()` a child |
@@ -695,8 +703,17 @@ ADR-0017 decision 7; `internal/provider/treesitter/returns.go`):
   (docs/providers-link.md, Return flows).
 - **A call's result.** Each site of the link table takes `Site.Results`, the variables the innermost node of the
   innermost analysed function containing the call defines (killing or may), and `Site.Into`, that function's
-  callable when the node is one of its returning nodes; neither when another call site lies between the two (its
-  value is consumed by that call first) or no node of that function contains the call.
+  callable when the node is one of its returning nodes; neither when no node of that function contains the call.
+  When another call site lies between the two, the call's value is consumed by that call directly: the call records
+  the consuming site (`Site.Feeds`) and the consuming site records the call with the argument it is part of, or
+  `NestedReceiver` when the call is the receiver of a member call (`Site.Nested`, `nestInto` in
+  `internal/provider/treesitter/returns_nested.go`); a call in the consuming call's callee expression otherwise
+  (`f()()`) is recorded nowhere.
+- **A failed analysis.** A callable whose function message carries `Failed` publishes no flows and no parameter
+  variables, so whether a parameter reaches its return is not known: each of its parameters with no node is marked
+  `Unknown` (`Parameter.Unknown`, `unknownSummaries` in `internal/provider/treesitter/dependence.go`). The linker
+  counts each summary a bound site then finds for it as a fact with no node and publishes none
+  (docs/providers-link.md, Return flows).
 
 ### Capabilities
 
@@ -1171,7 +1188,7 @@ All MIT:
   nested declaration is contained by its outer one, the pool never exceeds
   its bound and every worker has exited after `Close`. The test binary is its
   own worker through `TestMain`. `checkCallsites` extends the same loop with
-  the three call-site join invariants: every `callsite:` key's one-based
+  the three call-site key invariants: every `callsite:` key's one-based
   inclusive range selects exactly its callee node's name in the pinned bytes
   (the Go fixture's non-ASCII `日本語` callee is what separates a byte range
   from a rune range at both ends), a second independent unit over the same

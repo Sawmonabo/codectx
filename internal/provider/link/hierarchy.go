@@ -56,12 +56,24 @@ type hierarchy struct {
 	// goSurface is the digest of what the build read from the packages
 	// outside a Go unit (goExternal.surface), empty for any other unit.
 	goSurface string
+	// goSpellings counts the unit's Go methods by how exactly their
+	// method-set keys spell their signatures (goMethodKey).
+	goSpellings [3]uint32
+	// goMemo remembers Go lookups while the hierarchy is built (goMemo).
+	goMemo goMemos
+	// goConds, while a Go unit's hierarchy is built, interns the build
+	// conditions its method-set records carry (go_build.go).
+	goConds *goConds
 	// members is every member's projection with a table, by FileID
 	// (projection.go).
 	members *pagination.SortedRun[projection]
 	// note, while a member's reads are recorded (record), is told each
 	// read by its trace key.
 	note func(TraceKey) error
+	// wide, while a static-family member's reads are recorded by node, has
+	// the reads until the function it returns is called recorded for the
+	// whole member (memberWide).
+	wide func() func()
 }
 
 // record has the indexes report every key looked up, and goPackages every
@@ -92,7 +104,8 @@ func (h *hierarchy) record(note func(TraceKey) error) {
 const (
 	// keyFile + refKey(file, 0): the file's language and path (Aux, joined
 	// by a NUL) and its scopes (Sig, joined by "\n"), the context a name
-	// written in it is read in.
+	// written in it is read in; a Go file's build constraint in Returns
+	// (Table.Constraint).
 	keyFile = "f\x00"
 	// keyImport + refKey(file, 0) + name: the declaration the import is
 	// written in (Ref.Index, -1 the module), the path a name the file's
@@ -153,12 +166,13 @@ const (
 	// keyFuncInternal + scope + name, and + scope + each qualified suffix of
 	// two or more components: a C or C++ function with internal linkage,
 	// which no other translation unit names. The scope is its file's path,
-	// and, for a function a header declares, also "" (every file that
-	// includes the header, which no table says transitively); Aux is its
+	// and, for a function a header declares, also "" (every file whose
+	// include closure reaches the header, cClosure); Aux is its
 	// namespace and its file's path, joined by a NUL.
 	keyFuncInternal = "ui\x00"
 	// keyMethod + refKey(type) + name: a method or constructor the type
-	// declares, its signature in Sig.
+	// declares, its signature in Sig; for a Go method whose keys are
+	// recorded, its method-set keys in Aux (goMethodKeysAux).
 	keyMethod = "m\x00"
 	// keySub + refKey(type): a declared or satisfied direct subtype.
 	keySub = "d\x00"
@@ -225,6 +239,8 @@ const (
 	// return (Parameter.Returned): a body edit that changes it changes the
 	// entry, so every member whose argument flows read it re-runs.
 	paramReturned
+	// paramUnknown marks Parameter.Unknown, traced as paramReturned is.
+	paramUnknown
 )
 
 // typeKinds are the declaration kinds a type name denotes; a Rust trait is
@@ -494,13 +510,18 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 		return nil, err
 	}
 	if u.family == FamilyGo {
+		h.goConds = newGoConds(h.goInfo.goVersion)
 		if h.goExt, err = newGoExternal(ctx, h, u); err != nil {
 			return nil, err
 		}
 		h.goSurface = h.goExt.surface()
+		// The memos answer for this build's indexes and packages alone.
+		h.goMemo = goMemos{}
 		defer func() {
 			h.goExt.close()
 			h.goExt = nil
+			h.goMemo = goMemos{}
+			h.goConds = nil
 		}()
 	}
 
@@ -530,6 +551,13 @@ func buildHierarchy(ctx context.Context, u *unit, from *heldProjections) (*hiera
 	})
 	if err != nil {
 		return nil, err
+	}
+	if h.goExt != nil {
+		err := links.Add(entry{Key: keyGoCoverage, Tag: 1, MinArgs: h.goSpellings[goSpellingUnresolved],
+			MaxArgs: h.goSpellings[goSpellingUnknown]})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := h.satisfy(u.dir, links, methodSets); err != nil {
 		return nil, err
@@ -576,12 +604,23 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 	}
 	fc := contextOf(file, t)
 	fileKey := refKey(Ref{File: file})
-	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n")}); err != nil {
+	if err := s.Add(entry{Key: keyFile + fileKey, Aux: t.Language + "\x00" + t.Path, Sig: strings.Join(fc.scopes, "\n"),
+		Returns: t.Constraint}); err != nil {
+		return err
+	}
+	if err := addCIncludes(s, file, t, fc); err != nil {
 		return err
 	}
 	for _, imp := range t.Imports {
 		if imp.Name == "" {
 			continue
+		}
+		if fc.family == "go" && imp.Name != ImportAll {
+			// The file's named imports listed together, which a Go
+			// identity read in a context from the index needs (goUnitNames).
+			if err := s.Add(entry{Key: keyImport + fileKey + goImportList, Aux: imp.Path, Sig: imp.Name}); err != nil {
+				return err
+			}
 		}
 		e := entry{Key: keyImport + fileKey + imp.Name, Ref: Ref{File: file, Index: imp.Scope}, Aux: imp.Path, Sig: imp.Original}
 		if imp.Syntax == ImportRequire {
@@ -637,6 +676,11 @@ func addDecls(ctx context.Context, s *pagination.ExternalSort[entry], file int32
 		}
 		if fc.family == "go" && strings.HasPrefix(d.Identity, "=") && isType(d.Kind) {
 			if err := s.Add(entry{Key: keyGoAlias + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
+				return err
+			}
+		}
+		if fc.family == "go" && strings.HasPrefix(d.Identity, "#") && d.Kind == model.NodeConstant {
+			if err := s.Add(entry{Key: keyGoConst + declScope(t, fc) + "\x00" + d.Name, Ref: ref, Sig: d.Identity[1:]}); err != nil {
 				return err
 			}
 		}
@@ -722,6 +766,9 @@ func addParameters(s *pagination.ExternalSort[entry], ref Ref, d *Decl) error {
 		}
 		if p.Returned {
 			e.Flags |= paramReturned
+		}
+		if p.Unknown {
+			e.Flags |= paramUnknown
 		}
 		if err := s.Add(e); err != nil {
 			return err
@@ -831,19 +878,68 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		if p := d.Parent; !d.Described && p >= 0 && t.Decls[p].Kind == model.NodeInterface {
 			e.Flags |= flagAbstract
 		}
+		counted := false
 		add := func(typ Ref) error {
 			e.Key = keyMethod + refKey(typ) + d.Name
-			if err := links.Add(e); err != nil {
-				return err
-			}
 			if fc.family != "go" {
-				return nil
+				return links.Add(e)
 			}
-			key, err := goMethodKey(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref)
+			// The method is part of the builds that hold both its file and
+			// the receiver type's declaration (go_build.go).
+			cond, err := h.goFileCond(file)
 			if err != nil {
 				return err
 			}
-			return addGoMethod(methodSets, typ, d.Name, key, e)
+			declared, err := h.goFileCond(typ.File)
+			if err != nil {
+				return err
+			}
+			cond = h.goConds.and(cond, declared)
+			type keyed struct {
+				key  string
+				cond goCond
+			}
+			var keys []keyed
+			worst := goSpellingExact
+			if h.goConds.holds(cond) {
+				err = h.goMethodKeys(ctx, h.goTypes(), goUnitNames{h: h, fc: fc}, d.Name, d.Identity, ref,
+					func(key string, spelling goSpelling, keyCond goCond) error {
+						worst = max(worst, spelling)
+						if c := h.goConds.and(cond, keyCond); h.goConds.holds(c) {
+							keys = append(keys, keyed{key, c})
+						}
+						return nil
+					})
+				if err != nil {
+					return err
+				}
+			}
+			// A method of an interface, or one that only some builds hold or
+			// that has a key per build, records its keys (goMethodKeysAux),
+			// so its overrides pair it only with methods of one of them.
+			e.Aux = ""
+			if cond != 0 || len(keys) != 1 || keys[0].cond != 0 || d.Parent >= 0 && t.Decls[d.Parent].Kind == model.NodeInterface {
+				ks := make([]string, len(keys))
+				for i, k := range keys {
+					ks[i] = k.key
+				}
+				e.Aux = goMethodKeysAux(ks)
+			}
+			if err := links.Add(e); err != nil {
+				return err
+			}
+			for _, k := range keys {
+				if err := addGoMethod(methodSets, typ, d.Name, k.key, k.cond, e); err != nil {
+					return err
+				}
+			}
+			if !counted && len(keys) > 0 {
+				// A method is counted once, whatever types its receiver
+				// names.
+				h.goSpellings[worst]++
+				counted = true
+			}
+			return nil
 		}
 		// A Java anonymous class body's method is its synthetic type's,
 		// whatever declaration encloses it (an initializer block's is its
@@ -864,7 +960,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 			continue
 		}
 		typed := false
-		err := h.typesIn(ctx, fc, d.Receiver, func(te entry) error {
+		err := h.typesIn(fc, d.Receiver, func(te entry) error {
 			typed = true
 			return add(te.Ref)
 		})
@@ -881,14 +977,14 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 	}
 	if fc.family == "go" {
-		if err := h.goEmbeddings(ctx, methodSets, fc, t); err != nil {
+		if err := h.goEmbeddings(methodSets, fc, t); err != nil {
 			return err
 		}
 		return h.goConversions(ctx, links, fc, t)
 	}
 	for i, st := range t.Supertypes {
 		var supers []entry
-		err := h.typesIn(ctx, fc, st.Super, func(super entry) error {
+		err := h.typesIn(fc, st.Super, func(super entry) error {
 			supers = append(supers, super)
 			return nil
 		})
@@ -897,7 +993,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 		}
 		external, ok := "", false
 		if len(supers) == 0 {
-			if external, ok, err = h.externalName(ctx, fc, st.Super); err != nil {
+			if external, ok, err = h.externalName(fc, st.Super); err != nil {
 				return err
 			}
 			if !ok {
@@ -906,7 +1002,7 @@ func (h *hierarchy) addLinks(ctx context.Context, links, methodSets *pagination.
 				continue
 			}
 		}
-		err = h.typesIn(ctx, fc, st.Type, func(sub entry) error {
+		err = h.typesIn(fc, st.Type, func(sub entry) error {
 			if ok {
 				var flags byte
 				if st.Interface || externalInterface(fc.family, sub.Flags) {
@@ -967,18 +1063,18 @@ func refOf(k string) Ref {
 
 // types yields the type declarations a type name as written in a table of
 // the member file may denote, each once.
-func (h *hierarchy) types(ctx context.Context, file int32, name string, yield func(Ref) error) error {
-	return h.typeEntries(ctx, file, name, func(e entry) error { return yield(e.Ref) })
+func (h *hierarchy) types(file int32, name string, yield func(Ref) error) error {
+	return h.typeEntries(file, name, func(e entry) error { return yield(e.Ref) })
 }
 
 // typeEntries is types yielding each type's entry, whose Flags say whether
 // it is an interface.
-func (h *hierarchy) typeEntries(ctx context.Context, file int32, name string, yield func(entry) error) error {
+func (h *hierarchy) typeEntries(file int32, name string, yield func(entry) error) error {
 	fc, found, err := h.fileContext(file)
 	if err != nil || !found {
 		return err
 	}
-	return h.typesIn(ctx, fc, name, yield)
+	return h.typesIn(fc, name, yield)
 }
 
 // fileContext is the context of the member file at ordinal file as the
@@ -1018,7 +1114,7 @@ func (h *hierarchy) fileContext(file int32) (fc fileCtx, found bool, err error) 
 // path, a Rust path by its module, an ECMAScript or Python module by its
 // path, a Java or C++ name by the import's qualified name. Any other
 // qualified name is the declarations whose qualified name ends in it.
-func (h *hierarchy) typesIn(ctx context.Context, fc fileCtx, written string, yield func(entry) error) error {
+func (h *hierarchy) typesIn(fc fileCtx, written string, yield func(entry) error) error {
 	name := typeName(written)
 	if name == "" {
 		return nil
@@ -1168,6 +1264,7 @@ func (h *hierarchy) closedImports(fc fileCtx) (bool, error) {
 	if fc.closed.asked {
 		return fc.closed.closed, nil
 	}
+	defer h.memberWide()()
 	closed := true
 	for _, imp := range fc.imports {
 		found := false
@@ -1380,7 +1477,8 @@ func (h *hierarchy) moduleExport(base, name string, yield func(entry) error) err
 // statements name resolve it to, when they agree, and ambiguous when two
 // resolve it to different exports. seen holds the module and name pairs
 // already asked along the resolution, so a cycle resolves to nothing. A
-// Python module exports its own declarations only.
+// Python module exports its own declarations and also what its module-level
+// from-imports bind (addPythonReexports).
 func (h *hierarchy) resolveExport(base, name string, seen map[string]bool) (res []entry, ambiguous bool, err error) {
 	key := base + "\x00" + name
 	if seen[key] {
@@ -1441,7 +1539,8 @@ func sameExports(a, b []entry) bool {
 
 // addExports adds what a module exports itself and what it re-exports,
 // under each module path bases names its file by. A Python module exports
-// each module-level type and callable it declares. An ECMAScript module
+// each module-level type and callable it declares, and also what its
+// module-level from-imports bind (addPythonReexports). An ECMAScript module
 // exports a module-level declaration under its own name (exportedByName),
 // under the name a local `export` statement gives it (`export default C`,
 // `export { a as b }`), a module as a namespace (`export * as ns from`),
@@ -1476,7 +1575,7 @@ func addExports(s *pagination.ExternalSort[entry], file int32, t *Table, bases [
 		}
 	}
 	if python {
-		return nil
+		return addPythonReexports(s, t, bases)
 	}
 	from := func(name, spec, original string) error {
 		for _, target := range es.targets(t.Path, spec) {
@@ -1646,7 +1745,7 @@ func (h *hierarchy) declared(typ Ref, method string, yield func(entry) error) er
 	if err != nil || found {
 		return err
 	}
-	order, err := h.pythonMRO(typ)
+	order, err := h.pythonUnitOrder(typ)
 	if err != nil {
 		return err
 	}
@@ -2070,7 +2169,7 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 		}
 		return yield(paramInfo{Pos: int32(binary.BigEndian.Uint64([]byte(e.Aux))), Name: e.Sig, Index: e.MinArgs,
 			Variadic: e.Flags&paramVariadic != 0, KeywordOnly: e.Flags&paramKeywordOnly != 0,
-			Returned: e.Flags&paramReturned != 0})
+			Returned: e.Flags&paramReturned != 0, Unknown: e.Flags&paramUnknown != 0})
 	})
 }
 
@@ -2102,13 +2201,13 @@ func (h *hierarchy) parameters(callable Ref, yield func(paramInfo) error) error 
 //     using-declaration, since any other may be a template parameter.
 //
 // Every read goes through the indexes, so a member's trace records it.
-func (h *hierarchy) externalName(ctx context.Context, fc fileCtx, written string) (qualified string, ok bool, err error) {
+func (h *hierarchy) externalName(fc fileCtx, written string) (qualified string, ok bool, err error) {
 	name := typeName(written)
 	if name == "" {
 		return "", false, nil
 	}
 	inUnit := false
-	if err := h.typesIn(ctx, fc, name, func(entry) error {
+	if err := h.typesIn(fc, name, func(entry) error {
 		inUnit = true
 		return nil
 	}); err != nil || inUnit {
@@ -2380,7 +2479,7 @@ var javaObjectMethods = map[string]bool{"clone": true, "equals": true, "finalize
 // file's own reads of the indexes.
 func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, emit func(Binding) error) error {
 	fc := contextOf(file, t)
-	if err := h.springInputFacts(ctx, file, t, emit); err != nil {
+	if err := h.springInputFacts(file, t, emit); err != nil {
 		return err
 	}
 	if err := h.goRouteFacts(ctx, file, t, emit); err != nil {
@@ -2401,11 +2500,11 @@ func (h *hierarchy) hierarchyFacts(ctx context.Context, file int32, t *Table, em
 		var err error
 		switch {
 		case isType(d.Kind) && fc.family == "go":
-			err = h.goSupertypeFacts(ctx, fc, t, ref, d, emit)
+			err = h.goSupertypeFacts(fc, t, ref, d, emit)
 		case isType(d.Kind):
 			err = h.supertypeFacts(fc, ref, d, emit)
 		case isCallable(d.Kind):
-			err = h.overrideFacts(ctx, fc, t, ref, d, emit)
+			err = h.overrideFacts(fc, t, ref, d, emit)
 		}
 		if err == nil {
 			err = h.macroInputFacts(fc, ref, d, emit)
@@ -2453,7 +2552,7 @@ func (h *hierarchy) supertypeFacts(fc fileCtx, ref Ref, d *Decl, emit func(Bindi
 // interface extends each interface it embeds, of the unit or outside it, and
 // a type that is no interface implements each interface its method set
 // satisfies.
-func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) goSupertypeFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
 	if d.Kind != model.NodeInterface {
 		err := h.links.lookup(keySuper+refKey(ref), func(e entry) error {
 			if e.Aux != "" {
@@ -2468,7 +2567,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 	}
 	for _, st := range t.Supertypes {
 		sub := false
-		if err := h.typesIn(ctx, fc, st.Type, func(e entry) error {
+		if err := h.typesIn(fc, st.Type, func(e entry) error {
 			sub = sub || e.Ref == ref
 			return nil
 		}); err != nil {
@@ -2478,7 +2577,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 			continue
 		}
 		found := false
-		err := h.typesIn(ctx, fc, st.Super, func(e entry) error {
+		err := h.typesIn(fc, st.Super, func(e entry) error {
 			found = true
 			if e.Ref == ref || e.Flags&flagInterface == 0 {
 				return nil
@@ -2491,7 +2590,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 			}
 			continue
 		}
-		q, ok, err := h.externalName(ctx, fc, st.Super)
+		q, ok, err := h.externalName(fc, st.Super)
 		if err != nil {
 			return err
 		}
@@ -2509,7 +2608,7 @@ func (h *hierarchy) goSupertypeFacts(ctx context.Context, fc fileCtx, t *Table, 
 // owners yields the types the method d of t, in context fc, is declared on:
 // its enclosing type, a Java anonymous class body's synthetic type, or the
 // types its receiver names.
-func (h *hierarchy) owners(ctx context.Context, fc fileCtx, t *Table, d *Decl, yield func(Ref) error) error {
+func (h *hierarchy) owners(fc fileCtx, t *Table, d *Decl, yield func(Ref) error) error {
 	if p := d.Parent; p >= 0 && int(p) < len(t.Decls) && isType(t.Decls[p].Kind) && !anonymousReceiver(fc, d) {
 		return yield(Ref{File: fc.file, Index: p})
 	}
@@ -2520,19 +2619,19 @@ func (h *hierarchy) owners(ctx context.Context, fc fileCtx, t *Table, d *Decl, y
 	if d.Receiver == "" {
 		return nil
 	}
-	return h.typesIn(ctx, fc, d.Receiver, func(e entry) error { return yield(e.Ref) })
+	return h.typesIn(fc, d.Receiver, func(e entry) error { return yield(e.Ref) })
 }
 
 // overrideFacts emits what the method d at ref directly overrides
 // (hierarchyFacts).
-func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
+func (h *hierarchy) overrideFacts(fc fileCtx, t *Table, ref Ref, d *Decl, emit func(Binding) error) error {
 	switch {
 	case d.Static && (fc.family == "java" || fc.family == "c"):
 		// A static method hides; it overrides nothing.
 		return nil
 	case fc.family == "rust":
 		// Only an item of a trait's impl implements, and only its trait's.
-		return h.rustTraitOverrides(ctx, fc, ref, d, emit)
+		return h.rustTraitOverrides(fc, ref, d, emit)
 	case fc.family == "js" && strings.HasPrefix(d.Name, "#"):
 		// A private method's name is its class body's alone (ECMA-262
 		// §15.7.1, PrivateName): it overrides nothing.
@@ -2542,7 +2641,7 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 		return nil
 	}
 	sig := declEntry(ref, d).Sig
-	return h.owners(ctx, fc, t, d, func(owner Ref) error {
+	return h.owners(fc, t, d, func(owner Ref) error {
 		var targets []Ref
 		add := func(e entry) {
 			if e.Ref != ref && !slices.Contains(targets, e.Ref) {
@@ -2553,12 +2652,18 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 		switch fc.family {
 		case "go":
 			detail = DetailMethodSet
-			err := h.links.lookup(keySuper+refKey(owner), func(iface entry) error {
+			own, err := h.goOwnKeys(owner, ref, d.Name)
+			if err != nil {
+				return err
+			}
+			err = h.links.lookup(keySuper+refKey(owner), func(iface entry) error {
 				if iface.Aux != "" || iface.Ref == owner {
 					return nil
 				}
 				return h.methods(iface.Ref, d.Name, func(e entry) error {
-					add(e)
+					if goKeysMeet(own, e.Aux) {
+						add(e)
+					}
 					return nil
 				})
 			})
@@ -2566,6 +2671,30 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 				return err
 			}
 		default:
+			full, err := h.pythonFullMRO(owner)
+			if err != nil {
+				return err
+			}
+			if full != nil {
+				// The first class along the order, bases outside the unit
+				// placed, that defines the method (PEP 698); a base outside
+				// the unit ahead of it is externalOverrides'.
+				for _, base := range full[1:] {
+					if base.external != "" {
+						continue
+					}
+					if err := h.methods(base.ref, d.Name, func(e entry) error {
+						add(e)
+						return nil
+					}); err != nil {
+						return err
+					}
+					if len(targets) > 0 {
+						break
+					}
+				}
+				break
+			}
 			order, err := h.pythonMRO(owner)
 			if err != nil {
 				return err
@@ -2608,7 +2737,11 @@ func (h *hierarchy) overrideFacts(ctx context.Context, fc fileCtx, t *Table, ref
 			}
 		}
 		if fc.family == "go" {
-			return h.goExternalOverrides(fc, owner, ref, d, emit)
+			own, err := h.goOwnKeys(owner, ref, d.Name)
+			if err != nil {
+				return err
+			}
+			return h.goExternalOverrides(fc, owner, ref, d, own, emit)
 		}
 		return h.externalOverrides(fc, owner, ref, d, len(targets) > 0, emit)
 	})

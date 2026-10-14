@@ -3,6 +3,7 @@ package manifest
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -83,7 +84,9 @@ func (u *unit) gradleLock(ctx context.Context) error {
 // satisfies; its fields give the version, where it was resolved from, the
 // integrity (classic) or checksum (later), and its dependency tables. A
 // dependency resolves to the block whose descriptors include it, which is
-// exactly how the lock was written.
+// exactly how the lock was written. A descriptor whose range is an npm
+// alias (`alias@npm:name@range`) names the package name, installed under
+// the alias.
 func (u *unit) yarnLock(ctx context.Context) error {
 	var (
 		entries []lockEntry
@@ -92,7 +95,7 @@ func (u *unit) yarnLock(ctx context.Context) error {
 		version string
 		berry   bool
 	)
-	byDescriptor := map[string]string{}
+	byDescriptor := map[string]int{}
 	var descriptors [][]string
 	err := eachLine(u.data, func(l textLine) error {
 		switch {
@@ -104,7 +107,7 @@ func (u *unit) yarnLock(ctx context.Context) error {
 				return nil
 			}
 			var descs []string
-			for _, d := range strings.Split(head, ",") {
+			for d := range strings.SplitSeq(head, ",") {
 				if d = strings.Trim(d, ` "'`); d != "" {
 					descs = append(descs, d)
 				}
@@ -113,8 +116,12 @@ func (u *unit) yarnLock(ctx context.Context) error {
 				u.malformedEntry()
 				return nil
 			}
-			name, _ := yarnSplit(descs[0])
-			entries = append(entries, lockEntry{name: name, start: l.start, end: l.end})
+			name, rng := yarnSplit(descs[0])
+			alias := ""
+			if own, _, ok := npmAlias(rng); ok {
+				name, alias = own, name
+			}
+			entries = append(entries, lockEntry{name: name, alias: alias, start: l.start, end: l.end})
 			descriptors = append(descriptors, descs)
 			cur = len(entries) - 1
 		case cur < 0:
@@ -163,18 +170,33 @@ func (u *unit) yarnLock(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	for i := range entries {
+		// A descriptor that names the package by an alias alone
+		// (`alias@npm:name`, no range) is told by where the block was
+		// resolved from, which names the package itself.
+		if e := &entries[i]; e.alias == "" {
+			if own := yarnResolvedName(e.source); own != "" && own != e.name {
+				e.name, e.alias = own, e.name
+			}
+		}
+	}
 	for i, descs := range descriptors {
 		for _, d := range descs {
-			byDescriptor[d] = entries[i].version
+			byDescriptor[d] = i
 		}
 	}
 	for i := range entries {
 		for j := range entries[i].deps {
 			d := &entries[i].deps[j]
-			if v, ok := byDescriptor[d.name+"@"+d.requirement]; ok {
-				d.version = v
-			} else if v, ok := byDescriptor[d.name+"@npm:"+d.requirement]; ok && berry {
-				d.version = v
+			k, ok := byDescriptor[d.name+"@"+d.requirement]
+			if !ok && berry {
+				k, ok = byDescriptor[d.name+"@npm:"+d.requirement]
+			}
+			if ok {
+				d.version = entries[k].version
+				if entries[k].name != d.name {
+					d.target = entries[k].name
+				}
 			}
 		}
 	}
@@ -182,6 +204,27 @@ func (u *unit) yarnLock(ctx context.Context) error {
 		version = "1"
 	}
 	return u.lock(ctx, lockFile{ecosystem: ecosystemNPM, language: languageJS, version: version, entries: entries})
+}
+
+// yarnResolvedName is the package a yarn block was resolved as: the name
+// of a later yarn's `resolution` (`name@npm:version`), or the package path
+// of a classic `resolved` registry tarball URL (`<registry>/<name>/-/<file>`,
+// the name its last path component, or its last two under a scope, so a
+// registry served under a path prefix adds nothing to it); "" for any other
+// source.
+func yarnResolvedName(source string) string {
+	if name, rng := yarnSplit(source); strings.HasPrefix(rng, "npm:") {
+		return name
+	}
+	before, _, ok := strings.Cut(source, "/-/")
+	if !ok || !strings.Contains(before, "://") {
+		return ""
+	}
+	_, path, _ := strings.Cut(before, "://")
+	if _, path, ok = strings.Cut(path, "/"); !ok || path == "" {
+		return ""
+	}
+	return bunName(path)
 }
 
 // yarnSplit splits a descriptor `name@range` at the first `@` after the
@@ -294,13 +337,17 @@ func (u *unit) pnpmLock(ctx context.Context) error {
 				}
 			}
 			dep := lockDep{name: name, version: ver, kind: kind}
-			for _, have := range e.deps {
-				if have == dep {
-					return nil
-				}
+			if slices.Contains(e.deps, dep) {
+				return nil
 			}
 			if strings.HasPrefix(ver, "link:") {
 				dep.version, dep.requirement = "", ver
+			} else if pnpmDepPath(ver, version) {
+				// An alias: the value is the dependency path of the
+				// package installed under the name.
+				if target, v := pnpmSplit(ver, version); target != "" && target != name {
+					dep.target, dep.version = target, v
+				}
 			}
 			e.deps = append(e.deps, dep)
 		}
@@ -314,8 +361,16 @@ func (u *unit) pnpmLock(ctx context.Context) error {
 
 // pnpmSplit splits a package key into name and version: `/name/version`
 // before format 6, `/name@version` or `name@version` after, dropping the
-// peer suffix (`(peer@1)` from 6, `_peer@1` before).
+// peer suffix (`(peer@1)` from 6, `_peer@1` before). Before format 9 a
+// path not beginning with `/` is absolute: its first component is the
+// registry's host (a dotted name), which is no part of the name; a
+// `file:` or `link:` path is no registry path and is kept whole.
 func pnpmSplit(key, format string) (name, version string) {
+	if pnpmMajor(format) < 9 && !strings.HasPrefix(key, "/") {
+		if host, rest, ok := strings.Cut(key, "/"); ok && strings.Contains(host, ".") && !strings.Contains(host, ":") {
+			key = rest
+		}
+	}
 	key = strings.TrimPrefix(key, "/")
 	if i := strings.IndexByte(key, '('); i > 0 {
 		key = key[:i]
@@ -337,7 +392,7 @@ func pnpmSplit(key, format string) (name, version string) {
 func pnpmFlow(s string) map[string]string {
 	out := map[string]string{}
 	s = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(s), "{"), "}")
-	for _, part := range strings.Split(s, ",") {
+	for part := range strings.SplitSeq(s, ",") {
 		k, v, ok := strings.Cut(part, ":")
 		if ok {
 			out[strings.TrimSpace(k)] = unquote(strings.TrimSpace(v))
@@ -346,10 +401,39 @@ func pnpmFlow(s string) map[string]string {
 	return out
 }
 
+// pnpmDepPath reports whether a dependency's value is a dependency path
+// rather than a version (the peer suffix already removed): from format 9 a
+// value beginning with `@` or holding an `@` before any `:`; before it a
+// value holding a `/`. The value is then the path of the package installed
+// under the dependency's name, which is another package's when the name is
+// an alias.
+func pnpmDepPath(v, format string) bool {
+	if strings.HasPrefix(v, "link:") || strings.HasPrefix(v, "file:") {
+		return false
+	}
+	if pnpmMajor(format) < 9 {
+		return strings.Contains(v, "/")
+	}
+	if strings.HasPrefix(v, "@") {
+		return true
+	}
+	at, colon := strings.IndexByte(v, '@'), strings.IndexByte(v, ':')
+	return at > 0 && (colon < 0 || at < colon)
+}
+
 // pnpmBefore6 reports a lock format version before 6, which spells package
 // keys `/name/version` and peer suffixes after `_`.
 func pnpmBefore6(format string) bool {
+	return pnpmMajor(format) < 6
+}
+
+// pnpmMajor is the major number of a lock format version, 9 (the current
+// format's) when the file states none it can be read from.
+func pnpmMajor(format string) int {
 	major, _, _ := strings.Cut(format, ".")
-	n, err := strconv.Atoi(major)
-	return err == nil && n < 6
+	n, err := strconv.Atoi(strings.Trim(major, `'"`))
+	if err != nil {
+		return 9
+	}
+	return n
 }

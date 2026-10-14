@@ -13,7 +13,6 @@ package context
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -27,18 +26,16 @@ import (
 // Records
 // ---------------------------------------------------------------------------
 //
-// Every record is encoded with encodeRecord and decoded with decodeRecord: one
-// JSON codec for all of them, with short field tags. JSON and not a packed
-// encoding for the reason internal/index/plan/plan.go:925-932 already settled
-// for the planner's sort -- the record never leaves this process, and a codec
-// that cannot drift from the struct it encodes is worth more here than the
-// bytes a hand-packed one would save. encoding/json emits struct fields in
-// declaration order, so the encoding is deterministic: two compiles of one
-// generation produce identical run files.
+// Every record is written in one binary layout derived from its struct
+// (recordcodec.go): fields in declaration order, so the encoding is
+// deterministic and two compiles of one generation produce identical run
+// files, and derived by reflection, so it cannot drift from the struct it
+// encodes. Against a JSON codec of the same records it costs about a tenth of
+// the time per record and under half the allocation (candRec, keepRec and
+// hopRec measured). The json tags the records carry are not read by the sorts.
 //
-// Round-trip normalization: every variable-length field is `omitempty`, so a
-// nil slice round-trips to nil and an empty non-nil slice round-trips to nil.
-// No producer here distinguishes the two.
+// Round-trip normalization: an empty non-nil slice decodes as nil. No
+// producer here distinguishes the two.
 
 // candRec is one candidate as the streamed pipeline carries it: the frozen
 // `candidate` record minus its routes, plus the two positions the stream needs.
@@ -653,26 +650,6 @@ func sizeOfDecision(r decisionRec) int64 {
 	return int64(len(r.FileID)) + recordOverheadBytes
 }
 
-// encodeRecord and decodeRecord are the one codec every record above uses.
-func encodeRecord[T any](v T) ([]byte, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, &model.Error{Code: model.CodeInternal,
-			Message: "encoding a context compile record for its external sort: " + err.Error()}
-	}
-	return b, nil
-}
-
-func decodeRecord[T any](b []byte) (T, error) {
-	var v T
-	if err := json.Unmarshal(b, &v); err != nil {
-		var zero T
-		return zero, &model.Error{Code: model.CodeInternal,
-			Message: "decoding a context compile record from its external sort: " + err.Error()}
-	}
-	return v, nil
-}
-
 // compileSorts is one compile's sort area: where runs are written, how large a
 // run buffer each sort gets, and the release list that removes every run on
 // every exit path.
@@ -703,6 +680,10 @@ type compileSorts struct {
 	// number of sorts a compile opens, which is a constant of the pipeline and
 	// not a function of the repository.
 	observed []sortObservation
+	// runRecords is the run buffer's record count each sort is opened with;
+	// zero takes the primitive's default, and runBytes is then the bound that
+	// spills first. Only a test sets it (Compiler.runRecords).
+	runRecords int
 }
 
 // sortObservation is what one sort reports about its own memory behaviour.
@@ -729,11 +710,7 @@ func (s *compileSorts) observations() []sortObservation {
 	if s == nil {
 		return nil
 	}
-	out := make([]sortObservation, 0, len(s.observed))
-	for _, o := range s.observed {
-		out = append(out, o)
-	}
-	return out
+	return append(make([]sortObservation, 0, len(s.observed)), s.observed...)
 }
 
 // newCompileSorts opens the sort area for one compile.
@@ -799,16 +776,13 @@ func (s *compileSorts) releaseRound() error { return s.Close() }
 // sizeOf and registered for release. It is a free function and not a method
 // because Go methods carry no type parameters of their own.
 //
-// The record buffer count is left at the primitive's default: runBytes is the
-// bound that means something here, since these records vary in size, and the
-// count is the secondary guard the primitive already applies.
+// The record buffer count is the primitive's default unless a test set
+// runRecords: runBytes is the bound that means something here, since these
+// records vary in size, and the count is the secondary guard the primitive
+// already applies.
 func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 	sizeOf func(T) int64) (*pagination.ExternalSort[T], error) {
-	if s == nil {
-		return nil, argumentInvalid("a context compile sort requires an open sort area")
-	}
-	sorter, err := pagination.NewExternalSort(s.dir, 0,
-		encodeRecord[T], decodeRecord[T], compare)
+	sorter, err := openSorter(s, compare, sizeOf)
 	if err != nil {
 		return nil, err
 	}
@@ -828,7 +802,85 @@ func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 		return nil
 	})
 	s.track(sorter.Close)
+	return sorter, nil
+}
+
+// openSorter builds one sort in this compile's area, byte-budgeted with sizeOf,
+// and registers nothing: the caller owns its observation and its release.
+func openSorter[T any](s *compileSorts, compare func(a, b T) int,
+	sizeOf func(T) int64) (*pagination.ExternalSort[T], error) {
+	if s == nil {
+		return nil, argumentInvalid("a context compile sort requires an open sort area")
+	}
+	encode, decode, err := recordCodecFuncs[T]()
+	if err != nil {
+		return nil, err
+	}
+	sorter, err := pagination.NewExternalSort(s.dir, s.runRecords, encode, decode, compare)
+	if err != nil {
+		return nil, err
+	}
 	return sorter.WithRunBytes(s.runBytes, sizeOf), nil
+}
+
+// sortSeries is a succession of sorts under one name, at most one open at a
+// time, for a pass that sorts its input in epochs: each epoch is sorted, read
+// and closed before the next opens. The series registers ONE observation and
+// ONE release however many epochs it runs, so the compile's observation list
+// stays bounded by the pipeline's sorts rather than by the input, and the
+// observation reports the series' peak, its total records and its total runs.
+type sortSeries[T any] struct {
+	s       *compileSorts
+	name    string
+	compare func(a, b T) int
+	sizeOf  func(T) int64
+	idx     int
+	obs     sortObservation
+	cur     *pagination.ExternalSort[T]
+}
+
+func newSortSeries[T any](s *compileSorts, name string, compare func(a, b T) int,
+	sizeOf func(T) int64) (*sortSeries[T], error) {
+	if s == nil {
+		return nil, argumentInvalid("a context compile sort requires an open sort area")
+	}
+	q := &sortSeries[T]{s: s, name: name, compare: compare, sizeOf: sizeOf,
+		idx: len(s.observed), obs: sortObservation{Name: name}}
+	s.observed = append(s.observed, q.obs)
+	s.track(q.retire)
+	return q, nil
+}
+
+// open answers the series' open sort, opening the next epoch when none is.
+func (q *sortSeries[T]) open() (*pagination.ExternalSort[T], error) {
+	if q.cur != nil {
+		return q.cur, nil
+	}
+	sorter, err := openSorter(q.s, q.compare, q.sizeOf)
+	if err != nil {
+		return nil, err
+	}
+	q.cur = sorter
+	return sorter, nil
+}
+
+// current answers the open epoch, nil when none is open.
+func (q *sortSeries[T]) current() *pagination.ExternalSort[T] { return q.cur }
+
+// retire closes the open epoch, if any, and folds what it held into the
+// series' observation. It is safe after the epoch's Sorted and on every exit
+// path, which is why it is also the series' release.
+func (q *sortSeries[T]) retire() error {
+	cur := q.cur
+	if cur == nil {
+		return nil
+	}
+	q.cur = nil
+	q.obs.Peak = max(q.obs.Peak, cur.PeakLiveRecords())
+	q.obs.Added += cur.Len()
+	q.obs.Spilled += cur.SpilledRuns()
+	q.s.observed[q.idx] = q.obs
+	return cur.Close()
 }
 
 // trackRun registers a sorted run for release with the compile's sort area, so

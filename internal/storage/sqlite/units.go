@@ -628,8 +628,9 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 			}
 			defer kindOf.Close()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature, file_id, start_byte, end_byte,
-				name_start_byte, name_end_byte, metadata_json)
-				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(unit_id, node_id) DO NOTHING`)
+				name_start_byte, name_end_byte, metadata_json, path, sort_start, sort_end)
+				VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, coalesce((SELECT f.path FROM files f WHERE f.id = ?7), ''),
+					ifnull(?8, 0), ifnull(?9, -1)) ON CONFLICT(unit_id, node_id) DO NOTHING`)
 			if err != nil {
 				return err
 			}
@@ -1167,6 +1168,16 @@ const closureCTE = `WITH RECURSIVE closure(id) AS (
 
 // sealChecks are the invariants SealUnit validates over one unit, each a
 // count that must be zero, keyed by the unit's row as ?1.
+//
+// The visibility checks write `+nf.unit_id IN (SELECT id FROM closure)`. The
+// unary plus takes the unit column out of index selection (the SQLite query
+// optimizer overview, "Disqualifying WHERE clause terms using unary-operator
+// +", https://sqlite.org/optoverview.html), so each endpoint is a seek of
+// idx_node_facts_id on node_id alone with the closure as a membership test
+// against its materialized list. Without it the planner seeks (node_id,
+// unit_id) once per closure member: every endpoint costs the size of the
+// closure, and a unit that depends on every file unit of a repository seals in
+// time quadratic in the repository.
 var sealChecks = []struct {
 	what  string
 	query string
@@ -1183,10 +1194,10 @@ var sealChecks = []struct {
 		JOIN blobs b ON b.hash = ui.content_hash WHERE su.unit_id = ?1 AND su.end_byte > b.size_bytes`},
 	{"relation endpoints with no visible node fact", closureCTE + ` SELECT count(*) FROM relation_facts rf JOIN relation_ids ri ON ri.id = rf.relation_id
 		WHERE rf.unit_id = ?1 AND (
-			NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.from_node_id AND nf.unit_id IN (SELECT id FROM closure))
-		 OR NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.to_node_id AND nf.unit_id IN (SELECT id FROM closure)))`},
+			NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.from_node_id AND +nf.unit_id IN (SELECT id FROM closure))
+		 OR NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = ri.to_node_id AND +nf.unit_id IN (SELECT id FROM closure)))`},
 	{"alias targets with no visible node fact", closureCTE + ` SELECT count(*) FROM native_aliases na WHERE na.unit_id = ?1
-		AND NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = na.node_id AND nf.unit_id IN (SELECT id FROM closure))`},
+		AND NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = na.node_id AND +nf.unit_id IN (SELECT id FROM closure))`},
 	{"dependency cycles", `SELECT count(*) FROM unit_dependencies ud WHERE ud.dependency_id = ?1 AND ud.unit_id IN (` +
 		`WITH RECURSIVE closure(id) AS (SELECT ?1 UNION SELECT d.dependency_id FROM unit_dependencies d JOIN closure c ON d.unit_id = c.id) SELECT id FROM closure)`},
 }

@@ -97,7 +97,8 @@ type Reader struct{ db *sql.DB }
 // by another schema.
 //
 // It reports false, and no error, for a workspace that has never recorded a
-// run: there is nothing to read and nothing to report as broken. The
+// run, and for a ledger another schema wrote: neither holds a run this build
+// can read, and the next writer of the workspace replaces the foreign one. The
 // connection is read-only, so asking never creates the file.
 func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 	path := Path(dir)
@@ -111,19 +112,37 @@ func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	var fingerprint string
-	if err := db.QueryRowContext(ctx, `SELECT fingerprint FROM ledger_meta WHERE singleton = 1`).Scan(&fingerprint); err != nil {
+	found, ok, err := recordedFingerprint(ctx, db)
+	if err != nil || !ok || found != Fingerprint {
 		db.Close()
-		return nil, false, wrap("read the ledger schema", err)
-	}
-	if fingerprint != Fingerprint {
-		db.Close()
-		return nil, false, &model.Error{Code: model.CodeSchemaMismatch,
-			Message:     "run ledger schema fingerprint " + fingerprint + " does not match this binary's " + Fingerprint,
-			Details:     map[string]string{"path": path},
-			Remediation: "delete the run ledger beside the index cache, or run `codectx reset --reindex`"}
+		return nil, false, err
 	}
 	return &Reader{db: db}, true, nil
+}
+
+// WrittenByAnotherSchema reports whether the ledger beside the index store in
+// dir exists and was written by another schema: the one ledger OpenReader
+// reads as absent although a writer of another build may be recording into it
+// right now. A process waiting for the workspace asks it to tell a holder it
+// cannot read from one that has recorded nothing.
+func WrittenByAnotherSchema(ctx context.Context, dir string) (bool, error) {
+	path := Path(dir)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, internal("stat " + path + ": " + err.Error())
+	}
+	db, err := openPool(path, readerPragmas(), "deferred", 1, true)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	found, ok, err := recordedFingerprint(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	return !ok || found != Fingerprint, nil
 }
 
 // Close releases the reader's connections.

@@ -1,7 +1,6 @@
 package link
 
 import (
-	"context"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -60,13 +59,13 @@ func outsideSupertypes(h *hierarchy, typ Ref) ([]string, error) {
 // the file of fc, to the external method of each type its receiver names
 // that is outside the project (hierarchy.externalName). It reports whether
 // it emitted.
-func externalReceiver(ctx context.Context, h *hierarchy, fc fileCtx, site Ref, s *Site, members []wire.Type, emit func(Binding) error) (bool, error) {
+func externalReceiver(h *hierarchy, fc fileCtx, site Ref, s *Site, members []wire.Type, emit func(Binding) error) (bool, error) {
 	emitted := false
 	for _, m := range members {
 		if m.Kind != wire.TypeNamed {
 			continue
 		}
-		q, ok, err := h.externalName(ctx, fc, m.Name)
+		q, ok, err := h.externalName(fc, m.Name)
 		if err != nil {
 			return emitted, err
 		}

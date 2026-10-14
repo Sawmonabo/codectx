@@ -15,6 +15,7 @@ package context
 
 import (
 	"context"
+	"errors"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/graph"
@@ -124,9 +125,9 @@ type relationAttributes struct {
 //  2. Deduplicate the candidate node ids by identity keeping the earliest
 //     sequence, then restore ingest order: the node list the edge scan cuts its
 //     batches from.
-//  3. Scan the packed adjacency incident to those nodes, merge-matching each
-//     bounded batch of delivered entries against the wanted stream instead of
-//     probing a map.
+//  3. Scan the packed adjacency incident to those nodes, sorting the delivered
+//     entries in epochs and merge-matching each epoch against the wanted
+//     stream instead of probing a map.
 //  4. Resolve precision over the same ascending de-duplicated ids in pageLimit
 //     batches.
 //  5. Merge the two attribute streams by relation id (foldRelAttr is
@@ -180,7 +181,7 @@ func (c *Compiler) passCRelationAttributes(ctx context.Context, s *compileSorts,
 	}
 	attrs = attrs.WithFold(foldRelAttr)
 
-	matched, err := c.scanEdgeKinds(ctx, g, hopsByRelation, nodes, wanted, attrs)
+	matched, err := c.scanEdgeKinds(ctx, s, g, hopsByRelation, nodes, wanted, attrs)
 	if err != nil {
 		return relationAttributes{}, err
 	}
@@ -274,25 +275,47 @@ func scopeKindCodes(g graph.GraphReader) (codes []graph.KindCode, absent bool) {
 //
 // The node list is cut into pageLimit batches in ingest order and each batch is
 // resolved to surrogates, which the port requires ascending and duplicate-free.
-// Delivered entries are buffered pageLimit at a time; a buffer is translated
-// back to canonical relation ids in one batched read, SORTED, and merge-joined
-// against the wanted stream. The sort is what makes the join legal: the port
-// delivers in (owner, list index) order, which is a surrogate order and says
-// nothing about canonical ids, so a forward cursor over the canonically-ordered
-// wanted stream would walk past most of the batch without it. A fresh cursor
-// opens per buffer for the same reason -- two consecutive buffers are not
-// jointly ascending.
+// Delivered entries are buffered pageLimit at a time and each buffer is
+// translated back to canonical relation ids in one batched read. The typed
+// entries then go into an epoch sort, and an epoch is merge-joined against the
+// wanted stream once it holds at least as many entries as there are wanted
+// relations (and never fewer than a page), when the edge budget is spent, and
+// when the scan ends. The sort is what makes the join legal: the port delivers
+// in (owner, list index) order, a surrogate order that says nothing about
+// canonical ids, so consecutive buffers are not jointly ascending.
+//
+// The epoch is what keeps the scan linear. A join is one walk of the wanted
+// stream, and joining every page-sized buffer walks it once per page: wanted x
+// scanned / pageLimit records decoded, which on a scope of N relations is
+// N^2 / pageLimit. Holding an epoch of at least `wanted` entries makes each
+// walk pay for itself (Graefe, "Query Evaluation Techniques for Large
+// Databases", ACM Computing Surveys 25(2), 1993, section 5: a block join
+// rescans its inner input once per outer block, so the block must grow with
+// the inner input). The epoch is an external sort, so it holds the run budget
+// in heap and spills the rest.
+//
+// What the scan writes is unchanged by when it joins. A wanted relation is
+// typed once, by any delivered entry that names it -- entries naming one
+// relation carry one kind, since the kind is part of the relation's identity --
+// and the budget cut is a count of delivered entries, so it falls on the same
+// entry either way. Only the completeness exit moves: it is tested after a join
+// rather than after every page, so a scan that types every wanted relation
+// reads at most one epoch past the page that completed it, an epoch that costs
+// no more than the walk it saves.
 //
 // `scanned` counts entries the port DELIVERED, which is what context.max_graph_edges
 // bounds, and the scan ends early through ErrStopScan once every wanted
 // relation is typed or that budget is spent.
 //
 // The matched set is a bit per distinct wanted relation, indexed by the
-// relation's ordinal in the wanted stream. It is the one structure here that is
-// a function of the walk rather than of a batch, and it is what preserves the
+// relation's ordinal among the DISTINCT ids of the wanted stream. The stream
+// is the hop run, which repeats a relation once per route that crosses it, so
+// a record ordinal would run past the set's last word and drop every relation
+// that sorts after enough repeats. The set is the one structure here that is a
+// function of the walk rather than of a batch, and it is what preserves the
 // early exit: without an exact running count of distinct typed relations the
 // scan cannot know it is done, and it would read every node's whole list.
-func (c *Compiler) scanEdgeKinds(ctx context.Context, g graph.GraphReader,
+func (c *Compiler) scanEdgeKinds(ctx context.Context, s *compileSorts, g graph.GraphReader,
 	wantedRun *pagination.SortedRun[hopRec], nodes *pagination.SortedRun[nodeRec],
 	wanted int64, attrs *pagination.ExternalSort[relAttrRec]) (int64, error) {
 	seen := newBitset(wanted)
@@ -305,8 +328,31 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, g graph.GraphReader,
 	scanned := 0
 	stopped := false
 
+	epochs, err := newSortSeries(s, "edge-kind", lessRelAttr, sizeOfRelAttr)
+	if err != nil {
+		return 0, err
+	}
+	epochTarget := max(wanted, int64(limit))
+	join := func() error {
+		epoch := epochs.current()
+		if epoch == nil || epoch.Len() == 0 {
+			return epochs.retire()
+		}
+		run, err := epoch.Sorted()
+		if err == nil {
+			err = joinEdgeKinds(wantedRun, run, seen, attrs)
+		}
+		if cerr := run.Close(); err == nil {
+			err = cerr
+		}
+		if rerr := epochs.retire(); err == nil {
+			err = rerr
+		}
+		return err
+	}
+
 	buf := make([]graph.Edge, 0, limit)
-	joinBuffer := func() error {
+	drain := func() error {
 		if len(buf) == 0 {
 			return nil
 		}
@@ -318,7 +364,10 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, g graph.GraphReader,
 		if err != nil {
 			return err
 		}
-		typed := make([]relAttrRec, 0, len(buf))
+		epoch, err := epochs.open()
+		if err != nil {
+			return err
+		}
 		for i, e := range buf {
 			kind, ok := g.Kinds().Kind(e.Kind)
 			// The generation does not publish one of the two facts the entry
@@ -327,22 +376,15 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, g graph.GraphReader,
 			if !ok || ids[i] == "" {
 				continue
 			}
-			typed = append(typed, relAttrRec{RelationID: ids[i], Kind: kind})
-		}
-		buf = buf[:0]
-		slices.SortFunc(typed, lessRelAttr)
-		cursor := newRunCursor(wantedRun)
-		for _, t := range typed {
-			pos, ok := cursor.seek(hopRec{RelationID: t.RelationID}, lessRelID)
-			if !ok || !seen.set(pos) {
-				continue
-			}
-			if err := attrs.Add(t); err != nil {
-				cursor.Close()
+			if err := epoch.Add(relAttrRec{RelationID: ids[i], Kind: kind}); err != nil {
 				return err
 			}
 		}
-		return cursor.Close()
+		buf = buf[:0]
+		if epoch.Len() < epochTarget {
+			return nil
+		}
+		return join()
 	}
 
 	scan := func(refs []graph.NodeRef) error {
@@ -353,10 +395,16 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, g graph.GraphReader,
 			if len(buf) < limit && !spent {
 				return nil
 			}
-			if err := joinBuffer(); err != nil {
+			if err := drain(); err != nil {
 				return err
 			}
-			if spent || seen.count == wanted {
+			if spent {
+				if err := join(); err != nil {
+					return err
+				}
+				return graph.ErrStopScan
+			}
+			if seen.count == wanted {
 				return graph.ErrStopScan
 			}
 			return nil
@@ -364,7 +412,7 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, g graph.GraphReader,
 		if err != nil {
 			return err
 		}
-		return joinBuffer()
+		return drain()
 	}
 
 	batch := make([]model.NodeID, 0, limit)
@@ -406,7 +454,58 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, g graph.GraphReader,
 	if err := flush(); err != nil {
 		return 0, err
 	}
+	if err := join(); err != nil {
+		return 0, err
+	}
 	return seen.count, nil
+}
+
+// errJoinDone ends the wanted-stream walk of joinEdgeKinds once the epoch is
+// exhausted: no wanted id after that point can match. It never escapes.
+var errJoinDone = errors.New("context: edge-kind epoch exhausted")
+
+// joinEdgeKinds merge-joins one epoch of typed entries, ordered by relation id,
+// against the wanted stream, and adds the first entry of every wanted relation
+// the scan has not typed yet. The wanted stream drives the walk so the ordinal
+// it counts is the DISTINCT one the matched set is indexed by; the epoch is the
+// pulled side, and the walk stops as soon as it runs out.
+func joinEdgeKinds(wantedRun *pagination.SortedRun[hopRec], epoch *pagination.SortedRun[relAttrRec],
+	seen *bitset, attrs *pagination.ExternalSort[relAttrRec]) error {
+	cursor := newRunCursor(epoch)
+	ord := int64(-1)
+	var prev model.RelationID
+	first := true
+	err := wantedRun.Each(func(h hopRec) error {
+		if !first && h.RelationID == prev {
+			return nil
+		}
+		prev, first = h.RelationID, false
+		ord++
+		for cursor.ok && cmpString(string(cursor.cur.RelationID), string(h.RelationID)) < 0 {
+			cursor.advance()
+		}
+		if !cursor.ok {
+			if err := cursor.err(); err != nil {
+				return err
+			}
+			return errJoinDone
+		}
+		if cursor.cur.RelationID != h.RelationID {
+			return nil
+		}
+		typed := cursor.cur
+		if !seen.set(ord) {
+			return nil
+		}
+		return attrs.Add(typed)
+	})
+	if errors.Is(err, errJoinDone) {
+		err = nil
+	}
+	if cerr := cursor.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // ascendingDistinctRefs is the port's precondition on a batch of node

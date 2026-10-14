@@ -517,15 +517,14 @@ func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
 	}
 	// The remedy must not lose the leg that ran before the stall: the answer it
 	// reaches is the whole one, not the remainder.
-	if want := unboundedImpactCount(t, f, signer, store, spoolDir, limits, req.Start); served != want {
+	if want := unboundedImpactCount(t, f, signer, store, limits, req.Start); served != want {
 		t.Fatalf("the resumed walk served %d entities; the unbounded walk serves %d", served, want)
 	}
 }
 
 // unboundedImpactCount is how many entities the same query answers with no
 // deadline in its way, paged to exhaustion.
-func unboundedImpactCount(t *testing.T, f *graphFixture, signer *pagination.Signer,
-	store pagination.LeaseStore, spoolDir string, limits Limits, start []model.NodeID) int {
+func unboundedImpactCount(t *testing.T, f *graphFixture, signer *pagination.Signer, store pagination.LeaseStore, limits Limits, start []model.NodeID) int {
 	t.Helper()
 	spools, err := pagination.NewSpools(t.TempDir(), 0, store)
 	if err != nil {
@@ -662,7 +661,7 @@ func TestALevelBoundaryDeadlineKeepsTheWholeAnswer(t *testing.T) {
 		}
 		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
 	}
-	if want := unboundedImpactCount(t, f, signer, store, spoolDir, limits, start); served != want {
+	if want := unboundedImpactCount(t, f, signer, store, limits, start); served != want {
 		t.Fatalf("the walk a level-boundary deadline split served %d entities and reported no "+
 			"truncation; the unbounded walk serves %d", served, want)
 	}

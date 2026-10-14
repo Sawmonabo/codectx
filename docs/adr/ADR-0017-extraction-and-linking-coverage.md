@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted, 2026-10-09, by the owner's ruling: all eight, each in the form below. Not yet implemented. The survey behind
+Accepted, 2026-10-09, by the owner's ruling: all eight, each in the form below. Implemented, every decision and every proof of §10. The survey behind
 it is [research 26](../research/26-extraction-and-linking-coverage.md).
 
 ## Context
@@ -47,7 +47,9 @@ it is [research 26](../research/26-extraction-and-linking-coverage.md).
   such, not shared-library visibility.
 - **C and C++ visibility as declared in source:** a declaration's own attributes (`visibility("…")`, `__declspec`
   `dllexport`/`dllimport`) give its `visibility` metadata; a macro among its specifiers is read by the linker through
-  the definitions its file sees by decision 4's include lookup, following one-identifier replacements, and published as
+  the definitions its file sees: those of the file and of every header in its include closure, each `#include`
+  resolved by decision 4's include lookup and each header read once [S22], following one-identifier replacements, and
+  published as
   a `references` to each definition with the visibility it states, one per `#if` arm with the set size. It is never
   claimed as the binary's export table: `-fvisibility` and the toolchain's export lists decide that, and no attribute
   publishes no visibility [S4]. No macro name is known in advance; the project's own `#define` is read.
@@ -66,8 +68,13 @@ declarations as to any other.
 `#define NAME func`, where the replacement is a single identifier naming a known function, binds a call of `NAME` to
 `func`, as a preprocessor-based indexer sees it [S6]. A macro defined in several `#if` arms binds one `calls` per
 definition, each with `set_size` the number of definitions (ADR-0015's several-target rule). A macro defined in an
-included header binds through the include lookup the linker already performs
-(`internal/provider/link/resolve_c.go:139-157`). Any other replacement binds nothing.
+header in the including file's include closure binds: the file's directives and those of every header they reach,
+each resolved by the include lookup the linker already performs (`internal/provider/link/resolve_c.go` `includes`),
+each header read once, as an include guard makes a second inclusion add nothing [S22]. The same closure decides which
+functions of internal linkage a call may bind: those of the file and of a header the closure reaches, and, only when
+the closure holds a directive the unit cannot follow (an unfolded macro, a quoted path no member file answers), those
+of other headers read with the functions of external linkage (`internal/provider/link/include_c.go`). Any other
+replacement binds nothing.
 
 ### 5. `requirements.txt` and `composer.json` produce dependency nodes
 
@@ -77,14 +84,16 @@ included header binds through the include lookup the linker already performs
   format leaves dynamic. The supported subset is stated in the manifest documentation.
 - **`composer.json`:** `require` and `require-dev`, the platform entries `php` and `ext-*` included [S9]. It is read
   although PHP code is not indexed: the dependency facts need no PHP grammar.
-- **Lock files** (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `Cargo.lock`, `poetry.lock`,
-  `uv.lock`, `Pipfile.lock`, `pylock.toml`, `pdm.lock`, `gradle.lockfile`) are read, each by its published format,
+- **Lock files** (`package-lock.json` and `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`,
+  `Cargo.lock`, `poetry.lock`, `uv.lock`, `Pipfile.lock`, `pylock.toml` and `pylock.<name>.toml`, `pdm.lock`,
+  `gradle.lockfile` and `buildscript-gradle.lockfile`) are read, each by its published format,
   as a stream: JSON tokens with one package decoded at a time, TOML one package table at a time, the text formats
   line by line [S20][S21]. The lock defines a `configuration` node; each pinned package is a `depends_on`
   occurrence from it to the dependency node a manifest's requirement of the same name reaches, with
   `resolved_version`, the package's integrity where the format has one, and `set_size` the number of versions the
   lock pins for the name; each package's dependencies are `depends_on` occurrences between dependency nodes, with
-  the resolved version where the lock states it. These are evidence detail, because a dependency node is shared by
+  the resolved version where the lock states it. A package the lock installs under an alias is the package's own
+  node, the alias in the detail. These are evidence detail, because a dependency node is shared by
   every manifest and lock that names it. `composer.lock` is PHP's and is left out with PHP.
 
 ### 6. The linker publishes file-to-file `imports` for what it resolved
@@ -281,6 +290,10 @@ reach those answers without the verification the rest receives.
   "prefer a resolved lockfile"; the lock formats per ecosystem.
 - [S21] *pylock.toml specification* (PEP 751), https://packaging.python.org/en/latest/specifications/pylock-toml/ —
   `[[packages]]` with `name`, `version`, `dependencies` and hashed sources.
+- [S22] *The C Preprocessor*: *Search Path*, https://gcc.gnu.org/onlinedocs/cpp/Search-Path.html — a quoted include
+  is searched "first relative to the directory of the current file"; *Once-Only Headers*,
+  https://gcc.gnu.org/onlinedocs/cpp/Once-Only-Headers.html — a guarded header included again: "The preprocessor
+  will skip over the entire contents of the file".
 - [research 26](../research/26-extraction-and-linking-coverage.md) and
   [raw/coverage-gaps](../research/raw/coverage-gaps/findings.md) — the gap-by-gap survey, the options and the full
   source list.

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/scratch"
@@ -142,6 +143,9 @@ type ExternalSort[T any] struct {
 	// volume (which scales with the input even for a perfect external sort)
 	// cannot show.
 	peakRecords int
+	// collapsedBytes is the run bytes collapse has re-read before the final
+	// merge: the extra I/O a run count past MaxSortFanIn costs.
+	collapsedBytes int64
 	// mark is the point Mark set, nil when none is set.
 	mark *sortMark
 	err  error
@@ -598,36 +602,71 @@ func (s *ExternalSort[T]) foldBuffer(buf []T) ([]T, error) {
 	return out, nil
 }
 
-// collapse merges runs in groups until one merge pass can read them all at
-// once, so the final merge never holds more than MaxSortFanIn records live
-// however many runs the input produced.
+// collapse merges runs until one merge pass can read them all at once, so the
+// final merge never holds more than MaxSortFanIn records live however many
+// runs the input produced.
+//
+// It re-reads as little as it can. Each merge of g runs removes g-1, so the
+// final merge reads exactly MaxSortFanIn runs only when the run count is one
+// more than a multiple of MaxSortFanIn-1. While there are more runs than one
+// level of full merges can bring to MaxSortFanIn (more than MaxSortFanIn
+// squared), a level merges every run in groups of MaxSortFanIn. The last level
+// merges only what the final merge needs: a first group of just enough runs to
+// reach that residue, (runs-2) mod (MaxSortFanIn-1) + 2, then full groups of
+// MaxSortFanIn, and leaves every other run for the final merge to read once:
+// Knuth's sizing of the first pass of a k-way merge (TAOCP vol. 3, section
+// 5.4.9, the "dummy runs" that make the first pass merge fewer than k).
+// Eighteen runs cost one merge of three and the final merge, where merging
+// every run in groups of sixteen re-reads all eighteen.
+//
+// Every group is a contiguous window of runs and its merged run takes the
+// window's place, because the merge breaks ties between equal records by run
+// position: the output order, and the fold's left-to-right arrival order, are
+// exactly a single merge's.
 //
 // Each group's input runs are removed as soon as THAT group's merge completes,
-// not after the whole pass: removing them at the end of a pass would hold a
-// full second copy of the run set on disk for the length of the pass, so peak
-// temporary disk would be twice the input against a shared byte budget that
-// continuation spools also draw on. Removing per group keeps the peak at the
-// run set plus the one run currently being written.
+// so peak temporary disk is the run set plus the one run being written, never a
+// second copy of the run set, against a shared byte budget that continuation
+// spools also draw on.
 func (s *ExternalSort[T]) collapse() error {
 	for len(s.runs) > MaxSortFanIn {
-		next := make([]runFile, 0, (len(s.runs)+MaxSortFanIn-1)/MaxSortFanIn)
-		for i := 0; i < len(s.runs); i += MaxSortFanIn {
-			group := s.runs[i:min(i+MaxSortFanIn, len(s.runs))]
-			if len(group) == 1 {
+		full := len(s.runs) > MaxSortFanIn*MaxSortFanIn
+		var sizes []int
+		if full {
+			for i := 0; i < len(s.runs); i += MaxSortFanIn {
+				sizes = append(sizes, min(MaxSortFanIn, len(s.runs)-i))
+			}
+		} else {
+			first := (len(s.runs)-2)%(MaxSortFanIn-1) + 2
+			sizes = append(sizes, first)
+			for n := (len(s.runs) - first + 1 - MaxSortFanIn) / (MaxSortFanIn - 1); n > 0; n-- {
+				sizes = append(sizes, MaxSortFanIn)
+			}
+		}
+		next := make([]runFile, 0, len(s.runs))
+		at := 0
+		for _, g := range sizes {
+			group := s.runs[at : at+g]
+			if g == 1 {
 				next = append(next, group[0])
+				at += g
 				continue
+			}
+			for _, r := range group {
+				s.collapsedBytes += r.bytes
 			}
 			merged, err := s.mergeToRun(group)
 			if err != nil {
 				// Everything still on disk stays on s.runs so releaseRuns and
-				// Close clean it up: the merged outputs so far, and the groups
-				// this pass has not reached.
-				s.runs = append(next, s.runs[i:]...)
+				// Close clean it up: the merged outputs so far, and the runs
+				// this level has not reached.
+				s.runs = append(next, s.runs[at:]...)
 				return err
 			}
 			next = append(next, merged)
+			at += g
 		}
-		s.runs = next
+		s.runs = append(next, s.runs[at:]...)
 	}
 	return nil
 }
@@ -839,6 +878,20 @@ type SortedRun[T any] struct {
 	decode func([]byte) (T, error)
 	count  int64
 	closed bool
+	// walks counts the walks Each has begun over this run. It is observation
+	// only, read through Walks: a caller that re-reads a run once per batch
+	// turns a linear pass quadratic, and the count is what a test can hold to
+	// a bound where a clock cannot.
+	walks atomic.Int64
+}
+
+// Walks reports how many walks Each has begun over this run. Reading it never
+// changes the run.
+func (r *SortedRun[T]) Walks() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.walks.Load()
 }
 
 // Len is how many records the run holds.
@@ -863,6 +916,7 @@ func (r *SortedRun[T]) Each(yield func(T) error) error {
 	if r.closed {
 		return internalErr("this sorted run was closed; its records were read after the value that owns it was released")
 	}
+	r.walks.Add(1)
 	if r.path == "" {
 		for _, v := range r.mem {
 			if err := yield(v); err != nil {

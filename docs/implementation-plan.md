@@ -511,7 +511,7 @@ type Binding struct {
 Identity definitions:
 
 ```text
-RepositoryID = persisted random repository identity within this installation
+RepositoryID = H("repository-identity-v1", absolute_workspace_root_path)
 FileID       = H("file-v1", repository_id, normalized_root_relative_path)
 NodeID       = H("node-v1", repository_id, kind, canonical_entity_key)
 RelationID   = H("relation-v1", repository_id, from_id, relation_kind, to_id)
@@ -1146,7 +1146,7 @@ CREATE TABLE generation_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     -- remediation is what an operator can do about this row, in prose. It is a
     -- column rather than an entry in details_json because details_json is the
@@ -1167,7 +1167,7 @@ CREATE TABLE unit_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     remediation TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
@@ -1850,7 +1850,7 @@ Default debounce is 250 ms and reconciliation interval is 30 seconds. Coalesce p
 <a id="133-capability-freshness"></a>
 ### 13.3 Capability Freshness
 
-Use `fresh`, `partial`, `stale`, `unavailable`, and `failed` per capability/scope, and `fresh`, `degraded`, or `failed` for generation health. Store precise reason codes separately from user-readable remediation. An optional disabled tool can be unavailable while the base generation is fresh. While a unit is refreshing after an edit, the active generation keeps answering from the units it already selected until the new generation is validated and activated. An enabled requested provider that failed makes that capability failed and the active generation degraded if required base coverage still passes.
+Use `fresh`, `partial`, `unavailable`, and `failed` per capability/scope (every unit is keyed by the content of its inputs, so a capability's facts are never older than the snapshot that selected them and no state is needed for that), and `fresh`, `degraded`, or `failed` for generation health. Store precise reason codes separately from user-readable remediation. An optional disabled tool can be unavailable while the base generation is fresh. While a unit is refreshing after an edit, the active generation keeps answering from the units it already selected until the new generation is validated and activated. An enabled requested provider that failed makes that capability failed and the active generation degraded if required base coverage still passes.
 
 An active generation is coherent with its own snapshot even when the worktree is newer. Status distinguishes `snapshot_coherent`, `worktree_changed`, `refresh_pending`, `superseded`, and provider completeness. A valid historical query is not an assertion of current worktree freshness. No `fresh` status is inferred merely because an executable was found or a run emitted some rows.
 
@@ -1885,6 +1885,8 @@ type GraphRequest struct {
     MaxDepth int `json:"max_depth"`
     MaxVisited int `json:"max_visited"`
     MaxEdges int `json:"max_edges"`
+    SemanticSource SemanticSource `json:"semantic_source,omitempty"` // empty = canonical
+    Profile string `json:"profile,omitempty"`
     Page PageRequest `json:"page"`
 }
 type QueryMeta struct {
@@ -2327,8 +2329,8 @@ Existing SDK compatibility behavior is not a reason to implement or preserve par
 | `codectx_symbol_info` | Definition metadata, signature, scope and paginated evidence. |
 | `codectx_references` | Reference occurrences and implementations, distinguish relations from occurrences. |
 | `codectx_node_metadata` | Paginated elements, in order, of one node metadata field stored as rows: a node whose metadata names `<field>_rows: n` (a field too long for the node row) holds those n elements here. |
-| `codectx_callers` | Bounded incoming graph with reasons. |
-| `codectx_callees` | Bounded outgoing graph with reasons. |
+| `codectx_callers` | Bounded incoming graph with reasons; `semantic_source=lsp` with a `profile` answers one level of that language server's call hierarchy as labeled overlay nodes and `calls`. |
+| `codectx_callees` | Bounded outgoing graph with reasons; `semantic_source=lsp` with a `profile` answers one level of that language server's call hierarchy as labeled overlay nodes and `calls`. |
 | `codectx_dependency_path` | Bounded shortest path with evidence. |
 | `codectx_impact` | Affected scope and required boundaries, with completeness. |
 | `codectx_context_plan` | Compile/reuse manifest and open an actor-specific sweep/verify session. |
@@ -2533,7 +2535,7 @@ The source-position/path/hash/cursor/process utilities are shared concrete imple
 
 Use `log/slog` with component, repository/snapshot/generation/analysis IDs, provider/unit/run, operation, duration, status and error code. Source bodies, task text, secrets, inherited environment, and raw child stdout/stderr are excluded by default. Sanitize filenames/control characters before human display; JSON escaping is not terminal sanitization.
 
-Run states are consistently lowercase: `running`, `succeeded`, `partial`, `skipped`, `timed_out`, `failed`, `canceled`. Capability states are `fresh`, `partial`, `stale`, `unavailable`, `failed`. Generation health is `fresh`, `degraded`, `failed`. Unknown enum values fail validation; do not maintain competing uppercase wire vocabularies.
+Run states are consistently lowercase: `running`, `succeeded`, `partial`, `skipped`, `timed_out`, `failed`, `canceled`. Capability states are `fresh`, `partial`, `unavailable`, `failed`. Generation health is `fresh`, `degraded`, `failed`. Unknown enum values fail validation; do not maintain competing uppercase wire vocabularies.
 
 Stable error families include:
 

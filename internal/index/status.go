@@ -465,7 +465,7 @@ func stateKey(providerID, capability, scope string, state model.CapabilityStateV
 // per unit it sealed, so keeping them per scope would fill the whole report
 // with "this file worked" on any repository past a few hundred files and push
 // the degradations -- the only rows a reader acts on -- past the bound. A row
-// that is not fresh keeps its scope: which file or package is stale, partial
+// that is not fresh keeps its scope: which file or package is partial
 // or failed is exactly what the reader needs.
 func (r *capabilityReport) add(s model.CapabilityState) {
 	if s.State == model.CapabilityFresh {
@@ -639,7 +639,33 @@ func mergeDetailValue(key, a, b string, extreme bool) (value string, truncated b
 	if a == b {
 		return a, false
 	}
+	if key == failedScopesDetail {
+		return joinFailedScopes(a, b)
+	}
 	return joinDetailValues(a, b)
+}
+
+// joinFailedScopes unions two failed-scope samples into the sample the merged
+// row stands for: the lexicographically first maxFailedScopesNamed scope keys,
+// the rule providerFailures.add applies to one provider's failures. Each input
+// is the first maxFailedScopesNamed keys of its own set (or a shorter sorted
+// prefix of it when the byte bound cut it, which that row already names in
+// details_truncated), so the first
+// maxFailedScopesNamed of their union are exactly the first of the union of
+// the sets: any key ranked among those is ranked at least as high in its own
+// set and so is in its own sample. A union with more keys than the sample
+// holds reports truncated, which mergeDetails names in details_truncated
+// beside units_failed, the exact count.
+func joinFailedScopes(a, b string) (value string, truncated bool) {
+	parts := append(strings.Split(a, detailSeparator), strings.Split(b, detailSeparator)...)
+	parts = slices.DeleteFunc(parts, func(p string) bool { return p == "" })
+	slices.Sort(parts)
+	parts = slices.Compact(parts)
+	if len(parts) > maxFailedScopesNamed {
+		parts, truncated = parts[:maxFailedScopesNamed], true
+	}
+	joined, cut := joinDetailValues(strings.Join(parts, detailSeparator), "")
+	return joined, truncated || cut
 }
 
 // extremeDetail reports whether key is a figure the fold keeps the larger of
@@ -798,7 +824,7 @@ func (r *capabilityReport) reported(providerID, capability string) bool {
 //
 // A capability with facts in this generation is `partial`; one with none is
 // `failed` and never `unavailable`. That choice is load-bearing: healthOf
-// makes partial, stale and failed degrade the generation and deliberately
+// makes partial and failed degrade the generation and deliberately
 // leaves unavailable fresh, because `unavailable` is the state of a capability
 // nobody attempted -- no units planned. A provider
 // whose every planned unit failed WAS attempted and is broken, so reporting it
@@ -907,7 +933,7 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 //
 // The most severe row survives, ranked by outranks: Section 13.3 lets a report
 // under-claim and never over-claim. The fold keeps the first occurrence of a
-// key and never reorders its output, but which of two rows on one key supplies
+// key and never reorders its output (boundStates orders the result), but which of two rows on one key supplies
 // the surviving state and diagnostic code is decided by outranks alone, so the
 // published row is a function of the set and not of the order the concurrent
 // unit workers reported in -- the determinism the exemplar choices above exist
@@ -980,7 +1006,7 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 }
 
 // boundStates brings an assembled capability list inside
-// model.MaxCapabilityStates and reports how many rows it had to omit. It is
+// model.MaxCapabilityStates and reports whether it had to aggregate. It is
 // the one place the bound is applied: the indexing path calls it through
 // finish and Status over the stored list, so a reported list can never exceed
 // the bound its own contract validates against.
@@ -991,13 +1017,17 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 // which keys by state and rewrites each fold to the workspace scope and so
 // regenerates the very duplicates the first fold removed.
 //
-// When rows must go, the degradations stay. The list is first folded to one
-// row per provider capability and state, and only if that is still too long is
-// it ordered by severity -- failed, stale, partial, unavailable, then fresh --
-// and cut from the tail. Truncating the assembly order instead would drop the
-// failures, which are appended last, and keep the fresh rows:
-// Section 13.3 allows a report to under-claim and never to over-claim.
-// Truncation only removes rows, so the folded key stays closed.
+// Past the bound nothing is cut: the list is aggregated per provider
+// capability and state, and every aggregated row carries the number of scopes
+// it stands for, so the degradations stay and no row is lost.
+//
+// And it is the one place the list's order is fixed: ascending (provider_id,
+// capability, scope_key) by byte comparison, the order the store reads a
+// generation's rows back in and folds into the AnalysisKey. Assembly order is
+// the order concurrent unit workers sealed in, or, for a reused unit, the
+// order its stored rows were read; neither is a property of the generation, so
+// a run that builds its units and a run that reuses them publish the same set
+// in the same order, and `codectx status` serves that order too.
 func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.CapabilityState, bool) {
 	before := len(out)
 	out = foldToPrimaryKey(out)
@@ -1007,12 +1037,27 @@ func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.Capabil
 		// of the scopes it stands for -- and never cut. A row dropped off the
 		// tail was unrecoverable; an aggregated one still names its capability,
 		// its worst state and how many scopes it speaks for.
-		out = foldCollapsed(collapseScopes(out))
+		out = sortStates(foldCollapsed(collapseScopes(out)))
 		log.Info("the capability report was aggregated per provider capability", "component", component,
 			"rows_in", before, "rows_out", len(out), "threshold", model.MaxCapabilityStates)
 		return out, true
 	}
-	return out, false
+	return sortStates(out), false
+}
+
+// sortStates orders folded rows by (provider_id, capability, scope_key). The
+// fold leaves one row per that triple, so the order is total.
+func sortStates(rows []model.CapabilityState) []model.CapabilityState {
+	slices.SortFunc(rows, func(a, b model.CapabilityState) int {
+		if c := strings.Compare(a.ProviderID, b.ProviderID); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Capability, b.Capability); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Scope, b.Scope)
+	})
+	return rows
 }
 
 // outranks reports whether a must supply the surviving state and diagnostic
@@ -1055,8 +1100,6 @@ func severityRank(s model.CapabilityStateValue) int {
 	switch s {
 	case model.CapabilityFailed:
 		return 0
-	case model.CapabilityStale:
-		return 1
 	case model.CapabilityPartial:
 		return 2
 	case model.CapabilityUnavailable:

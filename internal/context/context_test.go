@@ -186,7 +186,7 @@ func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFix
 	t.Cleanup(func() { s.Close() })
 
 	fx := &contextFixture{t: t, ctx: ctx, Store: s, DBPath: dbPath, Cfg: config.Defaults(),
-		Repo:  model.RepositoryID(model.H("codectx.test.repo", "task-15")),
+		Repo:  model.RepositoryID(model.H("codectx.test.repo", "context-fixture")),
 		Files: map[string]model.FileVersion{}, Now: fixtureNow, Specs: specs}
 	if err := s.EnsureRepository(ctx, fx.Repo, "/repo"); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
@@ -209,7 +209,7 @@ func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFix
 		declared = append(declared, []fixtureFileSpec{f})
 		sourceBytes += uint64(len(f.content))
 	}
-	manifest := model.H("codectx.test.manifest", "task-15")
+	manifest := model.H("codectx.test.manifest", "context-fixture")
 	policy := model.H("codectx.test.source-policy")
 	snap := model.Snapshot{
 		ID:                 model.NewSnapshotID(fx.Repo, "", policy, manifest),
@@ -540,7 +540,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					versions = append(versions, fx.putBlob(path, body, false))
 					sourceBytes += uint64(len(body))
 				}
-				manifest := model.H("codectx.test.manifest", "task-15-ambiguous")
+				manifest := model.H("codectx.test.manifest", "context-fixture-ambiguous")
 				policy := model.H("codectx.test.source-policy")
 				snap := model.Snapshot{
 					ID:                 model.NewSnapshotID(fx.Repo, "", policy, manifest),
@@ -840,17 +840,17 @@ func TestContextCompilerScenario(t *testing.T) {
 					t.Fatal("an edge-budget truncation reported complete scope")
 				}
 
-				stale := []model.CapabilityState{{ProviderID: "treesitter", Capability: "structure",
-					Scope: "workspace", State: model.CapabilityStale}}
-				res, err = expandScope(fx.ctx, fx.scopeEngine(rels, stale), fx.Gen, fx.Cfg.Context,
-					[]candidate{fx.seedOf(impl)}, stale)
+				partial := []model.CapabilityState{{ProviderID: "treesitter", Capability: "structure",
+					Scope: "workspace", State: model.CapabilityPartial}}
+				res, err = expandScope(fx.ctx, fx.scopeEngine(rels, partial), fx.Gen, fx.Cfg.Context,
+					[]candidate{fx.seedOf(impl)}, partial)
 				if err != nil {
 					t.Fatalf("expandScope: %v", err)
 				}
 				if res.ScopeComplete {
-					t.Fatal("a stale capability reported complete scope")
+					t.Fatal("a partial capability reported complete scope")
 				}
-				if len(res.Completeness) != 1 || res.Completeness[0].State != model.CapabilityStale {
+				if len(res.Completeness) != 1 || res.Completeness[0].State != model.CapabilityPartial {
 					t.Fatalf("the manifest header lost the capability row behind the verdict: %+v", res.Completeness)
 				}
 			},
@@ -1802,9 +1802,21 @@ func scopeMemoryGraph(a *scopeAdjacency) *graph.MemoryGraph {
 func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.CapabilityState) *graph.Engine {
 	f.t.Helper()
 	adj := &scopeAdjacency{binding: f.Binding, nodes: map[model.NodeID]model.Node{}, relations: rels, caps: caps}
+	// The node of a (path, symbol) is NodeOf's: the FIRST spec that names it.
+	// Resolved through one map built here rather than NodeOf's scan per spec,
+	// which made building this engine quadratic in the fixture and charged
+	// that to every timed compile over a generated fixture.
+	type pathSymbol struct{ path, symbol string }
+	first := make(map[pathSymbol]fixtureFileSpec, len(f.Specs))
+	for _, spec := range f.Specs {
+		if _, ok := first[pathSymbol{spec.path, spec.symbol}]; !ok {
+			first[pathSymbol{spec.path, spec.symbol}] = spec
+		}
+	}
 	for _, spec := range f.Specs {
 		fv := f.File(spec.path)
-		id := f.NodeOf(spec.path, spec.symbol)
+		named := first[pathSymbol{spec.path, spec.symbol}]
+		id := model.NewNodeID(f.Repo, named.kind, model.CanonicalNodeKey(spec.path, named.symbol))
 		adj.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
 			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash}
 		adj.files = append(adj.files, fv)

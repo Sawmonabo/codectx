@@ -232,7 +232,7 @@ memory budget (`resources.query_memory_bytes`).
   next run reuses those units instead of rebuilding them. A store opened read-only never takes the writer.
 - **Commit cadence.** One commit per generation activation, never one per unit. A commit costs one fsync, so a commit
   per unit cost 954 s on kubernetes. Documents added between commits are invisible until their generation activates.
-- **Merging.** The library's background merges replace the lexical merge at activation. Activation no longer touches
+- **Merging.** The library's background merges replace the lexical merge at activation. Activation touches no
   postings.
 - **Crash order.** The library commits first, with the generation's id in decimal as its payload; queued document
   deletes are applied in that commit. The SQLite activation transaction follows: it stores the generation's visible
@@ -349,7 +349,8 @@ no search a person or an AI client runs needs the 253 589th-best match for `vend
   the next request resumes after the last result the previous one returned and asks for twice its depth. No request
   reads a result an earlier one returned, and nothing is held between pages.
 - **No spool.** The ranked lexical set is never sorted to disk. ADR-0001 §2.4 is amended to this rule. The exact
-  tiers are not ranked, and their continuation state is spooled (below).
+  tiers are not ranked; the two equality tiers page by seek, and the prefix tier's continuation state is spooled
+  (below).
 - **Block summaries.** Each segment has one summary file, `<segment id>.cxsum`, in the index directory. For every token
   of the five columns it holds the token's df over the segment's documents and, per block holding the token, the
   maximum weighted term frequency and the minimum document length under both length forms. It also holds the
@@ -389,20 +390,40 @@ exact tier served for the same query is dropped from the lexical sequence, by th
 of the node, asked for each index page's nodes together. The symbol endpoint applies the same rule to its tiers,
 where a row serves when it is a declaration site for definition, and always otherwise.
 
-**Paging the exact tiers.** No index holds the content key in tier order (the key starts with the path, which the
-fact rows do not carry, and a qualified-name range is ordered by name), so a page cannot seek to its position in
-the tiers. The first page walks them and keeps the least limit + 1 hits in a heap: one walk, nothing on disk, so an
-answer read one page deep pays nothing more. The first continuation inside the exact phase walks them once more,
-sorts every hit after its position with the external sort (its run share of the query memory admission, the rest on
-disk), serves its page from the head of the run, and spools the remainder; its cursor names the spool, the byte
-offset of the next record and the count left. Every later page reads its own records at that offset, so it costs
-its page, not the tiers: an exact phase of N hits read at P per page costs one walk, one N log N sort and N/P page
-reads, where walking from the position on every page cost about N²/P. The spool lives as long as the cursor's lease
-(a process that records no lease binds it to the cursor's stamped expiry, as every spool does), is released when the
-phase is read to its end, and is otherwise reclaimed by the spool store's sweep: nothing to tune. A page whose spool
-is gone, or a spool budget an operator set that cannot hold one, walks from the position the cursor also carries,
-which serves the same hits. A sorted search over a key no index is sorted by visits every match on every page in
-the mature engines too (the search-after form; see Sources); the spool is what lets a page skip that work.
+**Paging the exact tiers.** A page serves the tiers in order from its position and stops once it holds limit + 1
+hits, and reads each tier the cheapest way its order allows. A fact row carries its file's path, and the name and
+qualified-name indexes end with the content key's leading part (path, start byte, end byte, a missing interval read
+as 0 and -1), so the exact qualified-name and exact-name tiers are held in served order: a page seeks to its
+position (the span of the last hit served, read again and filtered past that hit) and reads a little more than its
+own hits, ordering hits that share a span by the rest of the key. Those two tiers cost each page its page, with
+nothing sorted and nothing on disk. The exact-path tier is the one file the query names, walked with a heap of the
+hits still wanted. The qualified-name prefix tier is ordered by qualified name in its index, not by path, so it
+cannot seek: the first page walks it and keeps the hits it needs in a heap (one walk, nothing on disk, so an answer
+read one page deep pays nothing more); the first continuation that reaches it walks it once more, sorts every hit
+after the position with the external sort (its run share of the query memory admission, the rest on disk), serves
+its page from the head of the run, and spools the remainder; its cursor names the spool, the byte offset of the next
+record and the count left. Every later page reads its own records at that offset, and a page that reaches the
+spool's end goes on into the exact-name tier by seek: a prefix tier of N hits read at P per page costs one walk, one
+N log N sort and N/P page reads, where walking from the position on every page cost about N²/P. The spool lives as
+long as the cursor's lease (a process that records no lease binds it to the cursor's stamped expiry, as every spool
+does), is released when the tier is read to its end, and is otherwise reclaimed by the spool store's sweep: nothing
+to tune. A page whose spool is gone, or a spool budget an operator set that cannot hold one, walks from the position
+the cursor also carries, which serves the same hits. A deadline that ends the prefix tier's walk on a continuation
+sorts what the walk had read and serves the head of it, truncated with the deadline as its reason and with no
+continuation. A sorted search over a key no index is sorted by visits every match on every page in the mature
+engines too (the search-after form; see Sources); the seek is what an index in the sort order buys, and the spool is
+what lets the one tier without one skip that work.
+
+Each tier walk reads its index in order, a page of 200 at a time, seeking each page to the last entry read, so a
+walk reads its tier once. A page is a few statements over its own rows: a window of index entries read from the index
+alone (unit and node; the sort columns are written columns, because SQLite counts a query that names a generated
+column as reading every column, so no index would cover it), one probe of idx_node_facts_id for the rows of the
+window's nodes, the precedence of units not seen before, and the full rows of the winners only. The winner per node is
+chosen from the unit precedence held per walk, which replaces a correlated subquery that probed the node's other rows,
+their units and their generation membership once per index entry. The statements are fixed texts prepared once per
+pooled connection. A page also carries each node's path, stored beside the fact, so no hit costs a file lookup. A tier that lists no node
+for the query (most often the exact qualified-name tier, and the prefix tier for a bare name) is found so by one
+probe of its index per request, and is then never asked about a page of candidates.
 
 **Alternatives.** *Score every match and keep a heap after a cursor, so every page down to the last match is
 reachable.* It costs a full scoring of every match for every page (4.04 s for the 30 queries, against milliseconds
@@ -559,7 +580,16 @@ The kubernetes measurement is repeated on the integrated binary and recorded in 
   https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-index-sorting.html; deep pages page
   by search-after over a point in time, re-running the query per page, and scroll's held search context is no longer
   recommended, https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html; the seek
-  method needs an index in the sort order, https://use-the-index-luke.com/sql/partial-results/fetch-next-page.
+  method needs an index in the sort order, https://use-the-index-luke.com/sql/partial-results/fetch-next-page; a
+  row-value comparison on an index's columns is answered as a seek into the index ("scrolling window queries"),
+  https://www.sqlite.org/rowvalue.html; a query that names a generated column marks every column of the table as
+  used, so no index covers it (`sqlite3ExprColUsed`,
+  https://github.com/sqlite/sqlite/blob/master/src/resolve.c), and an index over a VIRTUAL generated column is an
+  expression index, https://www.sqlite.org/gencol.html; a statement prepared on a pool is prepared once per
+  connection and reused by a transaction on it (`Tx.StmtContext`), https://pkg.go.dev/database/sql#Tx.StmtContext;
+  a search that runs past its time limit answers the hits it gathered and marks
+  the answer timed out (`timed_out`),
+  https://www.elastic.co/guide/en/elasticsearch/reference/current/search-your-data.html.
 - The key filter (the Merge and Block summaries bullets of decision 5):
   - binary fuse filters, within 13% of the space bound against 23% for xor and 44% for Bloom filters, with three
     memory reads per query, Graf and Lemire, "Binary Fuse Filters: Fast and Smaller Than Xor Filters", ACM Journal of

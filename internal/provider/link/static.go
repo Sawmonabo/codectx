@@ -94,7 +94,8 @@ type boundParam struct {
 }
 
 // encodeParams spells params, in order, as one string: each parameter's
-// position, index, marks (variadic, keyword-only, returned), name and node.
+// position, index, marks (variadic, keyword-only, returned, unknown), name
+// and node.
 func encodeParams(params []boundParam) string {
 	var out []byte
 	for _, p := range params {
@@ -107,6 +108,9 @@ func encodeParams(params []boundParam) string {
 		}
 		if p.Returned {
 			marks |= 4
+		}
+		if p.Unknown {
+			marks |= 8
 		}
 		out = binary.AppendUvarint(binary.AppendUvarint(out, uint64(p.Pos)), uint64(p.Index))
 		out = appendString(appendString(append(out, marks), p.Name), string(p.Node))
@@ -121,9 +125,9 @@ func decodeParams(s string) ([]boundParam, error) {
 	for len(b.b) > 0 && b.err == nil {
 		pos, index := b.index(), b.uvarint()
 		marks := b.byte()
-		p := boundParam{paramInfo: paramInfo{Pos: pos, Index: uint32(index), Variadic: marks&1 != 0, KeywordOnly: marks&2 != 0,
-			Returned: marks&4 != 0, Name: b.str()}, Node: model.NodeID(b.str())}
-		if index > 1<<32-1 || marks > 7 {
+		p := boundParam{Pos: pos, Index: uint32(index), Variadic: marks&1 != 0, KeywordOnly: marks&2 != 0,
+			Returned: marks&4 != 0, Unknown: marks&8 != 0, Name: b.str(), Node: model.NodeID(b.str())}
+		if index > 1<<32-1 || marks > 15 {
 			b.fail()
 		}
 		out = append(out, p)
@@ -272,6 +276,9 @@ type staticRun struct {
 	reads    *pagination.ExternalSort[read]
 	taken    *pagination.ExternalSort[taken]
 	uses     *pagination.ExternalSort[sigUse]
+	// ran, on a refresh, collects the nodes run since it was opened
+	// (selection.ran).
+	ran *pagination.ExternalSort[flowNode]
 }
 
 func (s *staticRun) open() error {
@@ -298,20 +305,18 @@ func (s *staticRun) close() {
 	}
 }
 
-// member resolves the sites and values of the member at ordinal file, whose
-// table is t, recording each read beyond t.
-func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
-	seen := map[string]bool{}
-	note := func(key TraceKey) error {
-		k := key.hash()
-		if seen[k] {
-			return nil
-		}
-		seen[k] = true
-		return s.reads.Add(read{Key: k, File: fv.ID})
-	}
+// member resolves the nodes sel selects of the member at ordinal file, whose
+// table is t: its sites, and its own facts and values (its file node),
+// recording each read beyond t by the node that made it (static_sites.go).
+func (s *staticRun) member(file int32, fv model.FileVersion, t *Table, sel selection) error {
+	reads := newNodeReads()
+	note := reads.note
 	s.h.record(note)
-	defer s.h.record(nil)
+	s.h.wide = reads.whole
+	defer func() {
+		s.h.record(nil)
+		s.h.wide = nil
+	}()
 	emit := func(b Binding) error {
 		if b.Site.File != file {
 			return internalErr("a resolver emitted a fact about member " + strconv.Itoa(int(b.Site.File)) +
@@ -358,7 +363,10 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 		}
 		ts := &t.Sites[e.Ref.Index]
 		args := argumentShapes(ts.Arguments)
-		results, into := len(ts.Results) > 0, ts.Into > 0
+		// A nested call's value reaches the consuming call (Site.Feeds), and a
+		// returned consuming call's summaries carry its nested calls' values
+		// (returns_nested.go).
+		results, into := len(ts.Results) > 0 || ts.Into > 0 && len(ts.Nested) > 0, ts.Into > 0 || ts.Feeds > 0
 		if e.Tag == 1 {
 			return s.uses.Add(sigUse{Sig: e.Key, Args: args, Results: results, Into: into, Site: idBinding{Kind: FactCall,
 				SiteFile: fv.ID, Site: e.Ref.Index, Detail: DetailAddressTaken, Dispatch: model.DispatchExact}})
@@ -380,10 +388,22 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 				SiteFile: fv.ID, Site: e.Ref.Index, TargetFile: to.File, Target: to.Node, Detail: e.Sig, Dispatch: model.DispatchVirtual}})
 	}
 	r := staticFile{h: s.h, ctx: s.ctx, file: file, t: t, fc: contextOf(file, t), emit: emit, returns: map[int32][]returned{}}
+	o, observed := s.u.tables.(Observer)
 	for i := range t.Sites {
+		if !sel.has(int32(i)) {
+			continue
+		}
+		reads.cur = int32(i)
+		if observed {
+			o.Resolved(fv.Path)
+		}
 		if err := r.site(int32(i), signature); err != nil {
 			return err
 		}
+	}
+	reads.cur = fileNode
+	if !sel.has(fileNode) {
+		return reads.flush(fv.ID, s.reads)
 	}
 	for i := range t.Values {
 		v := &t.Values[i]
@@ -415,7 +435,10 @@ func (s *staticRun) member(file int32, fv model.FileVersion, t *Table) error {
 	if err := r.visibilityFacts(); err != nil {
 		return err
 	}
-	return s.h.hierarchyFacts(s.ctx, file, t, emit)
+	if err := s.h.hierarchyFacts(s.ctx, file, t, emit); err != nil {
+		return err
+	}
+	return reads.flush(fv.ID, s.reads)
 }
 
 // boundParams is the declared parameters of the callable at ref, in
@@ -434,18 +457,20 @@ func (s *staticRun) boundParams(ref Ref) ([]boundParam, error) {
 	return out, err
 }
 
-// members runs every member with a table that run (FileIDs, ascending)
-// names, or every member with a table when run is nil, reading only those
-// members' tables.
-func (s *staticRun) members(run *pagination.SortedRun[model.FileID]) error {
-	has := func(model.FileID) (bool, error) { return true, nil }
+// members runs the nodes run selects (sorted, an Index of wholeFile every
+// node of its member) of every member with a table, or every node of every
+// member with a table when run is nil, reading only those members' tables.
+// A selected site re-runs the sites whose receiver is its result
+// (selection.closedUnder); s.ran, when open, collects what ran.
+func (s *staticRun) members(run *pagination.SortedRun[flowNode]) error {
+	of := func(model.FileID) (selection, error) { return selection{whole: true}, nil }
 	if run != nil {
-		c, err := newCursor(run)
+		sels, err := newSelections(run, splitNode)
 		if err != nil {
 			return err
 		}
-		defer c.stop()
-		has = c.has
+		defer sels.stop()
+		of = sels.of
 	}
 	var file int32 = -1
 	return s.u.members(func(fv model.FileVersion) error {
@@ -453,15 +478,21 @@ func (s *staticRun) members(run *pagination.SortedRun[model.FileID]) error {
 		if err := s.ctx.Err(); err != nil {
 			return err
 		}
-		ok, err := has(fv.ID)
-		if err != nil || !ok {
+		sel, err := of(fv.ID)
+		if err != nil || sel.empty() {
 			return err
 		}
 		t, ok, err := s.u.tables.Table(s.ctx, s.u.gen, fv)
 		if err != nil || !ok {
 			return err
 		}
-		return s.member(file, fv, t)
+		sel = sel.closedUnder(t)
+		if s.ran != nil {
+			if err := sel.ran(fv.ID, s.ran); err != nil {
+				return err
+			}
+		}
+		return s.member(file, fv, t, sel)
 	})
 }
 
@@ -578,7 +609,7 @@ func joinFlows(site *Site, call idBinding, file model.FileID, params []boundPara
 		}
 		err := out.Add(idBinding{Kind: FactFlow, SiteFile: call.SiteFile, Site: call.Site, Arg: arg, TargetFile: file,
 			Target: p.Node, Detail: DetailArgument})
-		if err != nil || !results || !p.Returned {
+		if err != nil || !results || !p.Returned && !p.Unknown {
 			return err
 		}
 		return out.Add(idBinding{Kind: FactSummary, SiteFile: call.SiteFile, Site: call.Site, Arg: arg,
@@ -620,6 +651,13 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 			return nil, err
 		}
 		res.h = rf.prev.h
+	} else if reuse && !slices.Equal(fields, rf.prev.fields) {
+		// Only the declared entry points moved (hierarchyFields).
+		var err error
+		if res.groups, err = entryGroups(u.dir, rf.prev.groups, rf.prev.fields, fields); err != nil {
+			return nil, err
+		}
+		res.h = rf.prev.h
 	} else if reuse {
 		res.h, res.groups = rf.prev.h, rf.prev.groups
 	} else {
@@ -641,19 +679,19 @@ func resolveStatic(ctx context.Context, u *unit, rf *refresh, fields []manifestF
 	if err := s.open(); err != nil {
 		return nil, err
 	}
-	var gone *pagination.SortedRun[model.FileID]
+	var superseded *pagination.SortedRun[flowNode]
 	var err error
 	if rf.prev == nil {
 		if err := s.members(nil); err != nil {
 			return nil, err
 		}
 	} else {
-		if gone, err = rf.rerunStatic(s, res.groups); err != nil {
+		if superseded, err = rf.rerunStatic(s, res.groups); err != nil {
 			return nil, err
 		}
-		defer gone.Close()
+		defer superseded.Close()
 	}
-	if err := s.finish(rf.prev, gone, res); err != nil {
+	if err := s.finish(rf.prev, superseded, res); err != nil {
 		return nil, err
 	}
 	ok = true
@@ -681,14 +719,18 @@ func indexGroups(dir string, h *hierarchy, fields []manifestField) (*pagination.
 }
 
 // finish completes res from what s ran and, on a refresh, from prev's
-// bindings, reads and address-taken functions of every member not in gone
-// (the members that re-ran and those that are no longer members).
-func (s *staticRun) finish(prev *previous, gone *pagination.SortedRun[model.FileID], res *resolution) error {
+// bindings, reads and address-taken functions of every node superseded does
+// not hold (the nodes that re-ran, and every node of the members that are no
+// longer members): a fact belongs to its site's node, or to its member's
+// file node for a fact about the member's declarations, imports or
+// endpoints (bindingNode), and a taken function to its member's file node.
+func (s *staticRun) finish(prev *previous, superseded *pagination.SortedRun[flowNode], res *resolution) error {
 	if prev != nil {
-		if err := keepExcept(prev.bindings, gone, func(b idBinding) model.FileID { return b.SiteFile }, s.bindings.Add); err != nil {
+		if err := filterNodes(prev.bindings, superseded, bindingNode, false, s.bindings.Add); err != nil {
 			return err
 		}
-		if err := keepExcept(prev.taken, gone, func(t taken) model.FileID { return t.From }, s.taken.Add); err != nil {
+		takenNode := func(t taken) flowNode { return flowNode{File: t.From, Index: fileNode} }
+		if err := filterNodes(prev.taken, superseded, takenNode, false, s.taken.Add); err != nil {
 			return err
 		}
 		byFile, err := newReadSort(s.u.dir, func(a, b read) int { return cmp.Or(cmp.Compare(a.File, b.File), cmp.Compare(a.Key, b.Key)) })
@@ -704,7 +746,7 @@ func (s *staticRun) finish(prev *previous, gone *pagination.SortedRun[model.File
 			return err
 		}
 		defer reads.Close()
-		if err := keepExcept(reads, gone, func(r read) model.FileID { return r.File }, s.reads.Add); err != nil {
+		if err := keepReads(reads, superseded, s.reads); err != nil {
 			return err
 		}
 	}
@@ -740,38 +782,23 @@ func (s *staticRun) finish(prev *previous, gone *pagination.SortedRun[model.File
 	return err
 }
 
-// keepExcept adds every entry of run (FileID of each ascending) whose file
-// gone does not hold.
-func keepExcept[T any](run *pagination.SortedRun[T], gone *pagination.SortedRun[model.FileID], file func(T) model.FileID, add func(T) error) error {
-	c, err := newCursor(gone)
-	if err != nil {
-		return err
-	}
-	defer c.stop()
-	return run.Each(func(v T) error {
-		out, err := c.has(file(v))
-		if err != nil || out {
-			return err
-		}
-		return add(v)
-	})
-}
-
-// rerunStatic runs, in s, the members a refresh of a static-family unit must
+// rerunStatic runs, in s, the nodes a refresh of a static-family unit must
 // resolve again, given groups, the rebuilt indexes' groups, and returns the
-// FileIDs whose predecessor's bindings, reads and address-taken functions
-// are superseded: those it ran and those that are no longer members.
+// nodes whose predecessor's bindings, reads and address-taken functions are
+// superseded: those it ran, and every node of the members that are no
+// longer members.
 //
-// The members run in two rounds. The first is every member whose table moved
-// or that is new, and every member that read a key whose group differs from
-// the predecessor's (a declaration added, removed or changed under it, a
-// manifest field moved). A member of the first round may take different
-// functions as values, so the second is every other member that read the
-// address-taken functions of a signature whose takers in the first round,
-// or among the members that are gone, changed. A member's values read the
-// hierarchy alone, so a second-round member takes the same functions it
-// took, and no third round can be needed.
-func (rf *refresh) rerunStatic(s *staticRun, groups *pagination.SortedRun[group]) (*pagination.SortedRun[model.FileID], error) {
+// The nodes run in two rounds. The first is every node of each member whose
+// table moved or that is new, and every node that read a key whose group
+// differs from the predecessor's (a declaration added, removed or changed
+// under it, a manifest field moved), with the sites whose receiver is the
+// result of one of them. A file node of the first round may take different
+// functions as values, so the second is every other site that read the
+// address-taken functions of a signature whose takers in the first round, or
+// among the members that are gone, changed. A member's values read the
+// hierarchy alone, so a second-round site takes nothing, and no third round
+// can be needed.
+func (rf *refresh) rerunStatic(s *staticRun, groups *pagination.SortedRun[group]) (*pagination.SortedRun[flowNode], error) {
 	dir := rf.u.dir
 	keys, err := newKeySort(dir)
 	if err != nil {
@@ -783,33 +810,30 @@ func (rf *refresh) rerunStatic(s *staticRun, groups *pagination.SortedRun[group]
 	if err != nil {
 		return nil, err
 	}
-	first, err := newFileIDSort(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer first.Close()
 	moved, err := rf.moved.Sorted()
 	if err != nil {
 		return nil, err
 	}
 	defer moved.Close()
-	if err := moved.Each(first.Add); err != nil {
-		return nil, err
-	}
-	if err := readersOf(keys, rf.prev.reads, first.Add); err != nil {
-		return nil, err
-	}
-	round1, err := first.Sorted()
+	round1, err := collect(dir, nodeCodec, keepFirst[flowNode], func(add func(flowNode) error) error {
+		err := moved.Each(func(id model.FileID) error { return add(flowNode{File: id, Index: wholeFile}) })
+		if err != nil {
+			return err
+		}
+		return readersOf(keys, rf.prev.reads, add)
+	})
 	if err != nil {
 		return nil, err
 	}
 	defer round1.Close()
-	if err := s.members(round1); err != nil {
+	ran1, err := s.run(round1)
+	if err != nil {
 		return nil, err
 	}
+	defer ran1.Close()
 
-	// The functions the first round took, against those its members and the
-	// members that are gone took before.
+	// The functions the first round took, against those its file nodes and
+	// the members that are gone took before.
 	fresh, err := s.taken.Sorted()
 	s.taken.Close()
 	s.taken = nil
@@ -828,18 +852,7 @@ func (rf *refresh) rerunStatic(s *staticRun, groups *pagination.SortedRun[group]
 		return nil, err
 	}
 	defer gone.Close()
-	before, err := newFileIDSort(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer before.Close()
-	if err := round1.Each(before.Add); err != nil {
-		return nil, err
-	}
-	if err := gone.Each(before.Add); err != nil {
-		return nil, err
-	}
-	replaced, err := before.Sorted()
+	replaced, err := fileNodesOf(dir, ran1, gone)
 	if err != nil {
 		return nil, err
 	}
@@ -880,48 +893,48 @@ func (rf *refresh) rerunStatic(s *staticRun, groups *pagination.SortedRun[group]
 	if err != nil {
 		return nil, err
 	}
-	second, err := newFileIDSort(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer second.Close()
-	// readersOf yields in key order, not FileID order, so the first round's
-	// members are dropped from the sorted readers below.
-	if err := readersOf(sigs, rf.prev.reads, second.Add); err != nil {
-		return nil, err
-	}
-	readers, err := second.Sorted()
+	readers, err := collect(dir, nodeCodec, keepFirst[flowNode], func(add func(flowNode) error) error {
+		return readersOf(sigs, rf.prev.reads, add)
+	})
 	if err != nil {
 		return nil, err
 	}
 	defer readers.Close()
-	round2, err := newFileIDSort(dir)
+	round2, err := minus(dir, readers, ran1)
 	if err != nil {
 		return nil, err
 	}
 	defer round2.Close()
-	if err := keepExcept(readers, round1, func(id model.FileID) model.FileID { return id }, round2.Add); err != nil {
-		return nil, err
-	}
-	run2, err := round2.Sorted()
+	ran2, err := s.run(round2)
 	if err != nil {
 		return nil, err
 	}
-	defer run2.Close()
-	if err := s.members(run2); err != nil {
-		return nil, err
-	}
-	all, err := newFileIDSort(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer all.Close()
-	for _, run := range []*pagination.SortedRun[model.FileID]{replaced, run2} {
-		if err := run.Each(all.Add); err != nil {
-			return nil, err
+	defer ran2.Close()
+	return collect(dir, nodeCodec, keepFirst[flowNode], func(add func(flowNode) error) error {
+		for _, run := range []*pagination.SortedRun[flowNode]{ran1, ran2} {
+			if err := run.Each(add); err != nil {
+				return err
+			}
 		}
+		return gone.Each(func(id model.FileID) error { return add(flowNode{File: id, Index: wholeFile}) })
+	})
+}
+
+// run runs the nodes nodes selects (members) and answers the nodes that ran.
+func (s *staticRun) run(nodes *pagination.SortedRun[flowNode]) (*pagination.SortedRun[flowNode], error) {
+	ran, err := newSort0(s.u.dir, nodeCodec, keepFirst[flowNode])
+	if err != nil {
+		return nil, err
 	}
-	return all.Sorted()
+	s.ran = ran
+	defer func() {
+		s.ran = nil
+		ran.Close()
+	}()
+	if err := s.members(nodes); err != nil {
+		return nil, err
+	}
+	return ran.Sorted()
 }
 
 // newKeySort is a sort of trace key hashes, each once.
@@ -932,33 +945,6 @@ func newKeySort(dir string) (*pagination.ExternalSort[string], error) {
 		return nil, err
 	}
 	return s.WithFold(func(a, _ string) (string, error) { return a, nil }), nil
-}
-
-// readersOf yields the member of every read in reads (by key) whose key keys
-// holds.
-func readersOf(keys *pagination.ExternalSort[string], reads *pagination.SortedRun[read], yield func(model.FileID) error) error {
-	run, err := keys.Sorted()
-	if err != nil {
-		return err
-	}
-	defer run.Close()
-	next, stop := pull(run)
-	defer stop()
-	key, ok, err := next()
-	if err != nil {
-		return err
-	}
-	return reads.Each(func(r read) error {
-		for ok && key < r.Key {
-			if key, ok, err = next(); err != nil {
-				return err
-			}
-		}
-		if ok && key == r.Key {
-			return yield(r.File)
-		}
-		return nil
-	})
 }
 
 // keepOnly adds every entry of run (FileID of each ascending) whose file

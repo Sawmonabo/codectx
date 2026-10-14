@@ -7,12 +7,15 @@ import (
 	"go/token"
 	"io"
 	"math"
+	"math/big"
 	"os"
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/gobuild"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
@@ -37,11 +40,18 @@ import (
 // (goConversions), and its capability rows say so (goExternalCoverage).
 //
 // A package's files are parsed with go/parser and only their declarations
-// read: every non-test file, whatever its build constraints, so a type
-// declared per platform is the union of its declarations; a name two files
-// declare differently is unusable as an interface (goExtType.conflict) and
-// such a method is dropped from a type's method set, so a platform
-// difference never yields a relation one platform lacks. An interface is
+// read: every non-test file, whatever its build constraints, each with the
+// build condition its constraint and name state (gobuild.File,
+// go_build.go). A name two files declare differently (per platform or build
+// tag, goExtType.variants) is each of its declarations: an interface
+// declared so is one entity per declaration, under its file's condition, as
+// the unit's conditional declarations are. Declarations written
+// differently are compared by their canonical spellings: an interface whose
+// declarations spell one method set is that one, under any of their
+// conditions; a method declared per build is each of its keys, under the
+// conditions of the declarations that spell it; and a signature naming an
+// alias or constant declared per build is one key per choice of
+// declaration (goMethodKeys). An interface is
 // materialized only when its whole method set is known: no type parameters,
 // no type elements, no unexported method (which only its own package can
 // implement), every embedded interface materialized too.
@@ -73,6 +83,8 @@ type goExternal struct {
 	// read and unavailable count the packages read and those with no
 	// readable source.
 	read, unavailable int
+	// conds are the build conditions of the files read (fileCond).
+	conds map[*goExtFile]goCond
 }
 
 // goExtPackage is one package's declarations.
@@ -81,29 +93,46 @@ type goExtPackage struct {
 	name  string
 	files []goExtFile
 	types map[string]*goExtType
+	// consts are the package-level constants by name: each distinctly
+	// written form of one's integer value (goASTConst, one per platform or
+	// build tag that writes it differently) and its file.
+	consts map[string][]goExtMethod
 }
 
-// goExtFile is one file's imports: by local name, and its dot imports.
+// goExtFile is one file's imports: by local name, and its dot imports;
+// unnamed are the paths it imports without a name, and unresolved those of
+// them whose package clause is not read (renameImports).
 type goExtFile struct {
-	imports map[string][]string
-	dot     []string
+	// constraint is the file's build constraint (gobuild.File), "" when it
+	// states none.
+	constraint string
+	imports    map[string][]string
+	dot        []string
+	unnamed    []string
+	unresolved []string
 }
 
 // goExtType is one type name a package declares.
 type goExtType struct {
 	file int
-	// alias is set for `type A = T`, its form T's (goIdentityUnknown for a
-	// generic alias).
+	// alias is set for `type A = T`, its form T's (for a generic alias
+	// `$$n` and T's form over its n parameters).
 	alias bool
 	form  string
 	iface bool
 	// ineligible marks an interface whose method set cannot be known
 	// exactly: type parameters, type elements, an unexported method.
 	ineligible bool
-	// conflict marks a name two files declare differently.
+	// conflict marks a name two files declare differently, and variants
+	// are its declarations after the first that differ from every one
+	// before them (a declaration per platform or build tag).
 	conflict bool
-	methods  []goExtMethod
-	embeds   []goExtMethod
+	variants []*goExtType
+	// methods are an interface's methods, or a defined type's methods with
+	// each distinctly written signature of a name declared once per
+	// platform or build tag (several entries of that name).
+	methods []goExtMethod
+	embeds  []goExtMethod
 }
 
 // goExtMethod is one method (name and form) or embedded type (form), with
@@ -111,6 +140,22 @@ type goExtType struct {
 type goExtMethod struct {
 	name, form string
 	file       int
+}
+
+// fileCond is the build condition of pkg's file i, 0 outside a hierarchy
+// build.
+func (x *goExternal) fileCond(pkg *goExtPackage, i int) goCond {
+	c := x.h.goConds
+	if c == nil || i < 0 || i >= len(pkg.files) {
+		return 0
+	}
+	f := &pkg.files[i]
+	if id, ok := x.conds[f]; ok {
+		return id
+	}
+	id := c.parse(f.constraint)
+	x.conds[f] = id
+	return id
 }
 
 // names is the goNames of the package's file i.
@@ -133,10 +178,13 @@ func (n goExtNames) imported(name string) (string, bool, error) {
 
 func (n goExtNames) dots() ([]string, error) { return n.f.dot, nil }
 
+func (n goExtNames) unresolved() ([]string, error) { return n.f.unresolved, nil }
+
 // newGoExternal locates the unit's sources and reads the closure of its
 // imports.
 func newGoExternal(ctx context.Context, h *hierarchy, u *unit) (*goExternal, error) {
-	x := &goExternal{h: h, info: h.goInfo, content: u.content, pkgs: map[string]*goExtPackage{}, refs: map[string]Ref{}}
+	x := &goExternal{h: h, info: h.goInfo, content: u.content, pkgs: map[string]*goExtPackage{}, refs: map[string]Ref{},
+		conds: map[*goExtFile]goCond{}}
 	x.cache = goModCache()
 	x.goroot, x.release = goRoot(x.cache, x.info.goVersion, x.info.toolchain)
 	if err := x.indexDirs(ctx, u.dir); err != nil {
@@ -324,13 +372,17 @@ func (x *goExternal) load(ctx context.Context, p string) (*goExtPackage, error) 
 				return nil, err
 			}
 			var key strings.Builder
-			key.WriteString("snap\x00" + p)
+			key.WriteString("snap\x00")
+			key.WriteString(p)
 			for _, e := range listed {
 				if e.Returns == "" {
 					key.Reset()
 					break
 				}
-				key.WriteString("\x00" + e.Aux + "\x00" + e.Returns)
+				key.WriteByte(0)
+				key.WriteString(e.Aux)
+				key.WriteByte(0)
+				key.WriteString(e.Returns)
 			}
 			if id = key.String(); id != "" {
 				if pkg, ok := readGoDecls(id, p); ok {
@@ -373,6 +425,7 @@ func (x *goExternal) load(ctx context.Context, p string) (*goExtPackage, error) 
 	slices.SortFunc(files, func(a, b file) int { return strings.Compare(a.name, b.name) })
 	fset := token.NewFileSet()
 	var parsed []*ast.File
+	dataOf := map[*ast.File][]byte{}
 	names := map[string]int{}
 	for _, f := range files {
 		af, err := parser.ParseFile(fset, f.name, f.data, parser.SkipObjectResolution)
@@ -380,6 +433,7 @@ func (x *goExternal) load(ctx context.Context, p string) (*goExtPackage, error) 
 			continue
 		}
 		parsed = append(parsed, af)
+		dataOf[af] = f.data
 		names[af.Name.Name]++
 	}
 	// The package's name is the one most of its files declare: a file of
@@ -399,7 +453,7 @@ func (x *goExternal) load(ctx context.Context, p string) (*goExtPackage, error) 
 		if af.Name.Name != name {
 			continue
 		}
-		pkg.addFile(af, std)
+		pkg.addFile(af, std, gobuild.File(path.Base(fset.File(af.Pos()).Name()), dataOf[af]))
 	}
 	if id != "" {
 		writeGoDecls(id, pkg)
@@ -410,9 +464,9 @@ func (x *goExternal) load(ctx context.Context, p string) (*goExtPackage, error) 
 // addFile reads one file's imports and declarations into p; std reports a
 // standard-library package, whose imports of packages it vendors name them
 // under vendor/ (GOROOT/src/vendor).
-func (p *goExtPackage) addFile(af *ast.File, std bool) {
+func (p *goExtPackage) addFile(af *ast.File, std bool, constraint string) {
 	fi := len(p.files)
-	f := goExtFile{imports: map[string][]string{}}
+	f := goExtFile{constraint: constraint, imports: map[string][]string{}}
 	for _, spec := range af.Imports {
 		ip := strings.Trim(spec.Path.Value, "\"`")
 		if std && strings.Contains(strings.SplitN(ip, "/", 2)[0], ".") {
@@ -421,6 +475,9 @@ func (p *goExtPackage) addFile(af *ast.File, std bool) {
 		switch {
 		case spec.Name == nil:
 			f.imports[goPackageName(ip)] = append(f.imports[goPackageName(ip)], ip)
+			if ip != "C" && !slices.Contains(f.unnamed, ip) {
+				f.unnamed = append(f.unnamed, ip)
+			}
 		case spec.Name.Name == ".":
 			f.dot = append(f.dot, ip)
 		case spec.Name.Name == "_":
@@ -432,6 +489,10 @@ func (p *goExtPackage) addFile(af *ast.File, std bool) {
 	for _, d := range af.Decls {
 		switch d := d.(type) {
 		case *ast.GenDecl:
+			if d.Tok == token.CONST {
+				p.addConsts(d, fi)
+				continue
+			}
 			if d.Tok != token.TYPE {
 				continue
 			}
@@ -451,22 +512,131 @@ func (p *goExtPackage) addFile(af *ast.File, std bool) {
 			if base == "" {
 				continue
 			}
-			t := p.typeNamed(base, fi)
+			t := p.typeNamed(base)
 			form := goASTSignature(d.Type, params)
-			if i := slices.IndexFunc(t.methods, func(m goExtMethod) bool { return m.name == d.Name.Name }); i >= 0 {
-				if t.methods[i].form != form {
-					t.methods[i].form = goIdentityUnknown
-				}
-				continue
+			if !slices.ContainsFunc(t.methods, func(m goExtMethod) bool { return m.name == d.Name.Name && m.form == form }) {
+				t.methods = append(t.methods, goExtMethod{name: d.Name.Name, form: form, file: fi})
 			}
-			t.methods = append(t.methods, goExtMethod{name: d.Name.Name, form: form, file: fi})
 		}
 	}
 }
 
+// addConsts reads one constant declaration: each name's value is its own
+// spec's, or the nearest earlier spec's with values, at iota the spec's
+// index ("Constant declarations", "Iota"). A name two files declare with
+// different forms keeps each (goExtPackage.consts).
+func (p *goExtPackage) addConsts(d *ast.GenDecl, fi int) {
+	var values []ast.Expr
+	for i, spec := range d.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		if len(vs.Values) > 0 {
+			values = vs.Values
+		}
+		for j, id := range vs.Names {
+			if id.Name == "_" {
+				continue
+			}
+			form := goIdentityUnknown
+			if j < len(values) {
+				var b []string
+				if goASTConst(&b, values[j], i) {
+					form = strings.Join(b, " ")
+				}
+			}
+			if p.consts == nil {
+				p.consts = map[string][]goExtMethod{}
+			}
+			if !slices.ContainsFunc(p.consts[id.Name], func(c goExtMethod) bool { return c.form == form }) {
+				p.consts[id.Name] = append(p.consts[id.Name], goExtMethod{name: id.Name, form: form, file: fi})
+			}
+		}
+	}
+}
+
+// goASTConst appends the form of the integer constant expression e at
+// iota (the worker's rule, goLink.constForm); false when the form cannot
+// spell it.
+func goASTConst(b *[]string, e ast.Expr, iota int) bool {
+	switch e := e.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.INT {
+			return false
+		}
+		v, ok := new(big.Int).SetString(e.Value, 0)
+		if !ok {
+			return false
+		}
+		*b = append(*b, v.String())
+		return true
+	case *ast.Ident:
+		if e.Name == "iota" && iota >= 0 {
+			*b = append(*b, itoaInt(iota))
+			return true
+		}
+		*b = append(*b, "."+e.Name)
+		return true
+	case *ast.SelectorExpr:
+		x, ok := e.X.(*ast.Ident)
+		if !ok {
+			return false
+		}
+		*b = append(*b, ":"+x.Name+"."+e.Sel.Name)
+		return true
+	case *ast.ParenExpr:
+		*b = append(*b, "(")
+		if !goASTConst(b, e.X, iota) {
+			return false
+		}
+		*b = append(*b, ")")
+		return true
+	case *ast.UnaryExpr:
+		switch e.Op {
+		case token.ADD, token.SUB, token.XOR:
+		default:
+			return false
+		}
+		*b = append(*b, "u"+e.Op.String())
+		return goASTConst(b, e.X, iota)
+	case *ast.BinaryExpr:
+		switch e.Op {
+		case token.ADD, token.SUB, token.MUL, token.QUO, token.REM, token.SHL, token.SHR, token.AND, token.OR,
+			token.XOR, token.AND_NOT:
+		default:
+			return false
+		}
+		*b = append(*b, "(")
+		if !goASTConst(b, e.X, iota) {
+			return false
+		}
+		*b = append(*b, e.Op.String())
+		if !goASTConst(b, e.Y, iota) {
+			return false
+		}
+		*b = append(*b, ")")
+		return true
+	}
+	return false
+}
+
+// constant is goPackageTypes.constant over the packages read.
+func (x *goExternal) constant(p, name string) []goDecl {
+	pkg := x.pkgs[p]
+	if pkg == nil {
+		return nil
+	}
+	var decls []goDecl
+	for _, c := range pkg.consts[name] {
+		decls = append(decls, goDecl{form: c.form, names: pkg.names(c.file), cond: x.fileCond(pkg, c.file)})
+	}
+	return decls
+}
+
 // typeNamed is the record of the type named name, made for a method whose
 // type's declaration is in a later file.
-func (p *goExtPackage) typeNamed(name string, fi int) *goExtType {
+func (p *goExtPackage) typeNamed(name string) *goExtType {
 	t := p.types[name]
 	if t == nil {
 		t = &goExtType{file: -1}
@@ -489,9 +659,10 @@ func (p *goExtPackage) addType(ts *ast.TypeSpec, fi int) {
 	}
 	switch {
 	case ts.Assign.IsValid():
-		n.alias, n.form = true, goIdentityUnknown
-		if params == nil {
-			n.form = goASTForm(ts.Type, nil)
+		n.alias, n.form = true, goASTForm(ts.Type, params)
+		if len(params) > 0 && n.form != goIdentityUnknown {
+			// A generic alias (the worker's rule, aliasExport).
+			n.form = "$$" + itoaInt(len(params)) + " " + n.form
 		}
 	default:
 		switch t := ts.Type.(type) {
@@ -534,10 +705,18 @@ func (p *goExtPackage) addType(ts *ast.TypeSpec, fi int) {
 		// Methods read before the declaration: keep them.
 		n.methods = append(n.methods, old.methods...)
 		*old = n
-	case old.alias != n.alias || old.iface != n.iface || old.form != n.form ||
-		!slices.Equal(old.embeds, n.embeds) && n.iface || !slices.EqualFunc(old.methods, n.methods, sameExtMethod) && n.iface:
+	case !sameExtDecl(old, &n) && !slices.ContainsFunc(old.variants, func(v *goExtType) bool { return sameExtDecl(v, &n) }):
 		old.conflict = true
+		old.variants = append(old.variants, &n)
 	}
+}
+
+// sameExtDecl reports two declarations of one type name that declare the
+// same type: alias or not, the same form, and for an interface the same
+// methods and embedded interfaces.
+func sameExtDecl(a, b *goExtType) bool {
+	return a.alias == b.alias && a.iface == b.iface && a.form == b.form &&
+		(!b.iface || slices.Equal(a.embeds, b.embeds) && slices.EqualFunc(a.methods, b.methods, sameExtMethod))
 }
 
 func sameExtMethod(a, b goExtMethod) bool { return a.name == b.name && a.form == b.form }
@@ -604,20 +783,35 @@ func goPackageName(p string) string {
 
 // renameImports rebinds, in every file read, each import written without a
 // name to the name its package's own clause declares, now that the closure
-// is read: the path's last element is only the convention.
-func (x *goExternal) renameImports() {
+// is read: the path's last element is only the convention. The imports
+// whose clause is still not known are the file's unresolved ones.
+func (x *goExternal) renameImports() error {
 	for _, pkg := range x.pkgs {
 		if pkg == nil {
 			continue
 		}
 		for i := range pkg.files {
 			f := &pkg.files[i]
+			clauses := map[string]string{}
+			f.unresolved = f.unresolved[:0]
+			for _, ip := range f.unnamed {
+				clause, ok, err := x.h.goClause(ip)
+				if err != nil {
+					return err
+				}
+				if ok {
+					clauses[ip] = clause
+				} else {
+					f.unresolved = append(f.unresolved, ip)
+				}
+			}
+			slices.Sort(f.unresolved)
 			renamed := map[string][]string{}
 			for name, paths := range f.imports {
 				for _, ip := range paths {
 					n := name
-					if imp := x.pkgs[ip]; imp != nil && name == goPackageName(ip) {
-						n = imp.name
+					if clause, ok := clauses[ip]; ok && name == goPackageName(ip) {
+						n = clause
 					}
 					renamed[n] = append(renamed[n], ip)
 				}
@@ -625,6 +819,7 @@ func (x *goExternal) renameImports() {
 			f.imports = renamed
 		}
 	}
+	return nil
 }
 
 // lookup is goPackageTypes over the packages read.
@@ -638,10 +833,19 @@ func (x *goExternal) lookup(p, name string) (goTypeAnswer, bool) {
 		return goTypeAnswer{}, true
 	}
 	if t.alias {
-		if t.conflict {
-			return goTypeAnswer{found: true, alias: true, form: goIdentityUnknown, names: pkg.names(t.file)}, true
+		a := goTypeAnswer{found: true, alias: true, form: t.form, names: pkg.names(t.file), cond: x.fileCond(pkg, t.file)}
+		for _, v := range t.variants {
+			if !v.alias {
+				// An alias in one build and a defined type in another.
+				return goTypeAnswer{found: true, alias: true, form: goIdentityUnknown, names: pkg.names(t.file)}, true
+			}
+			a.others = append(a.others, goDecl{form: v.form, names: pkg.names(v.file), cond: x.fileCond(pkg, v.file)})
 		}
-		return goTypeAnswer{found: true, alias: true, form: t.form, names: pkg.names(t.file)}, true
+		return a, true
+	}
+	if slices.ContainsFunc(t.variants, func(v *goExtType) bool { return v.alias }) {
+		// A defined type in one build and an alias in another.
+		return goTypeAnswer{found: true, alias: true, form: goIdentityUnknown, names: pkg.names(t.file)}, true
 	}
 	return goTypeAnswer{found: true}, true
 }
@@ -652,11 +856,27 @@ func (x *goExternal) lookup(p, name string) (goTypeAnswer, bool) {
 // each under its own Ref (goExternalFile), its methods' keys canonical
 // (goIdentity) and its embedded types those it embeds.
 func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.ExternalSort[entry]) error {
-	x.renameImports()
+	if err := x.renameImports(); err != nil {
+		return err
+	}
+	// An interface declared differently in several files (per platform or
+	// build tag) is each of its declarations, an entity of its own under
+	// its own key (q, NUL, the declaration's ordinal), as the unit's own
+	// conditional declarations are: a type that satisfies one implements
+	// q. Such an interface is never "the" read method set of q
+	// (materialized), so a type embedding q counts it as unread.
+	// Declarations written differently that spell the same method set
+	// canonically (a signature naming a type by an alias in one and by
+	// the aliased type in another) are one declaration: merged marks an
+	// interface all of whose declarations are, which is then q itself.
 	type named struct {
-		q   string
-		pkg *goExtPackage
-		t   *goExtType
+		q, key          string
+		pkg             *goExtPackage
+		t               *goExtType
+		variant, merged bool
+		// cond is the build condition of the declaration (of any of
+		// them, merged).
+		cond goCond
 	}
 	var all []named
 	for _, pkg := range x.pkgs {
@@ -664,57 +884,87 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 			continue
 		}
 		for name, t := range pkg.types {
-			if t.file < 0 || t.alias || !token.IsExported(name) || !t.iface && len(t.methods) == 0 && len(t.embeds) == 0 {
+			if t.file < 0 || !token.IsExported(name) {
 				continue
 			}
-			all = append(all, named{q: pkg.path + "." + name, pkg: pkg, t: t})
+			q := pkg.path + "." + name
+			if t.conflict && t.iface || t.conflict && t.alias {
+				var seen []string
+				var distinct []named
+				for i, d := range append([]*goExtType{t}, t.variants...) {
+					if !d.iface || d.alias {
+						continue
+					}
+					set, spelled, err := x.methodSetSpelling(ctx, pkg, d)
+					if err != nil {
+						return err
+					}
+					if !spelled || !slices.Contains(seen, set) {
+						seen = append(seen, set)
+						distinct = append(distinct, named{q: q, key: q + "\x00" + itoaInt(i), pkg: pkg, t: d, variant: true,
+							cond: x.fileCond(pkg, d.file)})
+					}
+				}
+				if len(distinct) == 1 && !slices.ContainsFunc(t.variants, func(v *goExtType) bool { return v.alias || !v.iface }) && !t.alias {
+					distinct[0].key, distinct[0].variant, distinct[0].merged = q, false, true
+					for _, v := range t.variants {
+						distinct[0].cond = x.h.goConds.or(distinct[0].cond, x.fileCond(pkg, v.file))
+					}
+				}
+				all = append(all, distinct...)
+				continue
+			}
+			if t.alias || !t.iface && len(t.methods) == 0 && len(t.embeds) == 0 {
+				continue
+			}
+			all = append(all, named{q: q, key: q, pkg: pkg, t: t, cond: x.fileCond(pkg, t.file)})
 		}
 	}
-	slices.SortFunc(all, func(a, b named) int { return strings.Compare(a.q, b.q) })
+	slices.SortFunc(all, func(a, b named) int { return strings.Compare(a.key, b.key) })
 	// Canonical embedded types first, so each interface's eligibility can
 	// follow its embedded interfaces.
 	embeds := map[string][]string{}
 	byName := map[string]named{}
 	for _, n := range all {
-		byName[n.q] = n
+		byName[n.key] = n
 		for _, e := range n.t.embeds {
 			c, err := goIdentity(ctx, x.h.goTypes(), n.pkg.names(e.file), e.form)
 			if err != nil {
 				return err
 			}
-			embeds[n.q] = append(embeds[n.q], c)
+			embeds[n.key] = append(embeds[n.key], c)
 		}
 	}
 	eligible := map[string]bool{"error": true}
-	var check func(q string, depth int) bool
-	check = func(q string, depth int) bool {
-		if ok, done := eligible[q]; done {
+	var check func(key string, depth int) bool
+	check = func(key string, depth int) bool {
+		if ok, done := eligible[key]; done {
 			return ok
 		}
-		n, found := byName[q]
-		if !found || !n.t.iface || n.t.ineligible || n.t.conflict || depth > goAliasDepth {
+		n, found := byName[key]
+		if !found || !n.t.iface || n.t.ineligible || n.t.conflict && !n.variant && !n.merged || depth > goAliasDepth {
 			return false
 		}
-		eligible[q] = false
-		for _, e := range embeds[q] {
+		eligible[key] = false
+		for _, e := range embeds[key] {
 			if !check(e, depth+1) {
 				return false
 			}
 		}
-		eligible[q] = true
+		eligible[key] = true
 		return true
 	}
-	ref := func(q string) Ref {
-		r, ok := x.refs[q]
+	ref := func(key, q string) Ref {
+		r, ok := x.refs[key]
 		if !ok {
 			r = Ref{File: goExternalFile, Index: int32(len(x.names))}
 			x.names = append(x.names, q)
-			x.refs[q] = r
+			x.refs[key] = r
 		}
 		return r
 	}
 	// The predeclared interface error, Error() string ("Errors").
-	errRef := ref("error")
+	errRef := ref("error", "error")
 	for _, e := range []entry{
 		{Key: refKey(errRef), Tag: goTypeRecord, Flags: flagAbstract, Aux: "error"},
 		{Key: refKey(errRef), Tag: goMethodRecord, Ref: errRef, Aux: "Error", Returns: "Error\x00( ) ( string )"},
@@ -724,13 +974,13 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 		}
 	}
 	for _, n := range all {
-		if n.t.iface && !check(n.q, 0) {
+		if n.t.iface && !check(n.key, 0) {
 			continue
 		}
-		ref(n.q)
+		ref(n.key, n.q)
 	}
 	for _, n := range all {
-		r, ok := x.refs[n.q]
+		r, ok := x.refs[n.key]
 		if !ok {
 			continue
 		}
@@ -741,27 +991,119 @@ func (x *goExternal) materialize(ctx context.Context, methodSets *pagination.Ext
 		if err := methodSets.Add(e); err != nil {
 			return err
 		}
-		for _, m := range n.t.methods {
-			if n.t.conflict && !n.t.iface {
-				continue
-			}
-			key, err := goMethodKey(ctx, x.h.goTypes(), n.pkg.names(m.file), m.name, m.form, r)
+		// A defined type declared differently in another file (an alias or
+		// an interface there) has no one method set; its embedded types stay.
+		if !n.t.conflict || n.t.iface {
+			keys, err := x.methodKeys(ctx, n.pkg, n.t, r, n.cond)
 			if err != nil {
 				return err
 			}
-			if err := methodSets.Add(entry{Key: refKey(r), Tag: goMethodRecord, Ref: r, Aux: m.name, Returns: key}); err != nil {
-				return err
+			for _, m := range keys {
+				err := methodSets.Add(entry{Key: refKey(r), Tag: goMethodRecord, Ref: r, Aux: m.name, Returns: m.key, MaxArgs: m.cond})
+				if err != nil {
+					return err
+				}
 			}
 		}
-		for _, c := range embeds[n.q] {
+		for _, c := range embeds[n.key] {
 			if er, ok := x.refs[c]; ok {
-				if err := methodSets.Add(entry{Key: refKey(r), Tag: goEmbedRecord, Ref: er}); err != nil {
+				if err := methodSets.Add(entry{Key: refKey(r), Tag: goEmbedRecord, Ref: er, MaxArgs: n.cond}); err != nil {
 					return err
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// methodKeys are the method-set keys (goMethodKeys) of t's methods at r,
+// in declaration order, each with the build condition of the builds it is
+// part of: the declaration's, cond, and for a defined type's method its own
+// file's. A method declared once per platform or build tag is each of its
+// keys under the conditions of the declarations that spell it, and a key no
+// build holds is dropped.
+func (x *goExternal) methodKeys(ctx context.Context, pkg *goExtPackage, t *goExtType, r Ref, cond goCond) ([]goKeyed, error) {
+	c := x.h.goConds
+	out := make([]goKeyed, 0, len(t.methods))
+	// at indexes out by name and key once a type has more methods than a
+	// scan of out costs less than a map's upkeep.
+	var at map[[2]string]int
+	if len(t.methods) > 32 {
+		at = make(map[[2]string]int, len(t.methods))
+	}
+	for _, m := range t.methods {
+		base := cond
+		if !t.iface {
+			base = c.and(cond, x.fileCond(pkg, m.file))
+			if !c.holds(base) {
+				continue
+			}
+		}
+		err := x.h.goMethodKeys(ctx, x.h.goTypes(), pkg.names(m.file), m.name, m.form, r,
+			func(key string, _ goSpelling, keyCond goCond) error {
+				kc := c.and(base, keyCond)
+				if !c.holds(kc) {
+					return nil
+				}
+				i, seen := -1, false
+				if at != nil {
+					i, seen = at[[2]string{m.name, key}]
+				} else if i = slices.IndexFunc(out, func(o goKeyed) bool { return o.name == m.name && o.key == key }); i >= 0 {
+					seen = true
+				}
+				if seen {
+					out[i].cond = c.or(out[i].cond, kc)
+					return nil
+				}
+				if at != nil {
+					at[[2]string{m.name, key}] = len(out)
+				}
+				out = append(out, goKeyed{name: m.name, key: key, cond: kc})
+				return nil
+			})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// goKeyed is a method's name and method-set key, and the build condition
+// under which the method has that key.
+type goKeyed struct {
+	name, key string
+	cond      goCond
+}
+
+// methodSetSpelling is the canonical spelling of the interface declaration
+// t's method set: its methods' canonical signatures and its embedded
+// types', each sorted; spelled is false when one cannot be spelled, which
+// makes the declaration equal to no other.
+func (x *goExternal) methodSetSpelling(ctx context.Context, pkg *goExtPackage, t *goExtType) (set string, spelled bool, err error) {
+	var ms, es []string
+	for _, m := range t.methods {
+		id, err := goIdentity(ctx, x.h.goTypes(), pkg.names(m.file), m.form)
+		if err != nil {
+			return "", false, err
+		}
+		if id == goIdentityUnknown {
+			return "", false, nil
+		}
+		ms = append(ms, m.name+"\x00"+id)
+	}
+	for _, e := range t.embeds {
+		c, err := goIdentity(ctx, x.h.goTypes(), pkg.names(e.file), e.form)
+		if err != nil {
+			return "", false, err
+		}
+		if c == goIdentityUnknown {
+			return "", false, nil
+		}
+		es = append(es, c)
+	}
+	slices.Sort(ms)
+	slices.Sort(es)
+	return strings.Join(ms, "\x01") + "\x02" + strings.Join(es, "\x01") + "\x02" + flagString(t.ineligible), true, nil
 }
 
 // materialized is the Ref of the external type of qualified name q whose
@@ -863,9 +1205,19 @@ func goASTType(b *[]string, e ast.Expr, params map[string]int) bool {
 			if l.Kind != token.INT {
 				return false
 			}
-			add("[", l.Value, "]")
-		default:
+			v, ok := new(big.Int).SetString(l.Value, 0)
+			if !ok {
+				return false
+			}
+			add("[", v.String(), "]")
+		case *ast.Ellipsis:
 			return false
+		default:
+			add("[#")
+			if !goASTConst(b, l, -1) {
+				return false
+			}
+			add("]")
 		}
 		return goASTType(b, t.Elt, params)
 	case *ast.MapType:
@@ -894,23 +1246,132 @@ func goASTType(b *[]string, e ast.Expr, params map[string]int) bool {
 		add(strings.Split(s, " ")...)
 		return true
 	case *ast.StructType:
-		if len(t.Fields.List) != 0 {
-			return false
-		}
-		add("struct{}")
-		return true
+		return goASTStruct(b, t, params)
 	case *ast.InterfaceType:
-		if len(t.Methods.List) != 0 {
-			return false
-		}
-		add("interface{}")
-		return true
+		return goASTInterface(b, t, params)
 	case *ast.IndexExpr:
 		return goASTGeneric(b, t.X, []ast.Expr{t.Index}, params)
 	case *ast.IndexListExpr:
 		return goASTGeneric(b, t.X, t.Indices, params)
 	}
 	return false
+}
+
+// goASTStruct appends the form of a struct type (the worker's rule,
+// goForm.structType).
+func goASTStruct(b *[]string, t *ast.StructType, params map[string]int) bool {
+	if t.Fields == nil || len(t.Fields.List) == 0 {
+		*b = append(*b, "struct{}")
+		return true
+	}
+	first := true
+	for _, f := range t.Fields.List {
+		tag := ""
+		if f.Tag != nil {
+			tok, ok := goTagToken(f.Tag.Value)
+			if !ok {
+				return false
+			}
+			tag = tok
+		}
+		field := func(prefix ...string) bool {
+			if first {
+				*b = append(*b, "struct{")
+			} else {
+				*b = append(*b, ";")
+			}
+			first = false
+			*b = append(*b, prefix...)
+			typ := f.Type
+			if len(f.Names) == 0 {
+				if s, ok := typ.(*ast.StarExpr); ok {
+					typ = s.X
+				}
+			}
+			if !goASTType(b, typ, params) {
+				return false
+			}
+			if tag != "" {
+				*b = append(*b, tag)
+			}
+			return true
+		}
+		if len(f.Names) == 0 {
+			prefix := []string{"^"}
+			if _, ok := f.Type.(*ast.StarExpr); ok {
+				prefix = append(prefix, "*")
+			}
+			if !field(prefix...) {
+				return false
+			}
+			continue
+		}
+		for _, n := range f.Names {
+			if !field("@" + n.Name) {
+				return false
+			}
+		}
+	}
+	*b = append(*b, "}")
+	return true
+}
+
+// goASTInterface appends the form of an interface type (the worker's rule,
+// goForm.interfaceType).
+func goASTInterface(b *[]string, t *ast.InterfaceType, params map[string]int) bool {
+	if t.Methods == nil || len(t.Methods.List) == 0 {
+		*b = append(*b, "interface{}")
+		return true
+	}
+	for i, m := range t.Methods.List {
+		if i == 0 {
+			*b = append(*b, "interface{")
+		} else {
+			*b = append(*b, ";")
+		}
+		ft, isMethod := m.Type.(*ast.FuncType)
+		switch {
+		case isMethod && len(m.Names) == 1:
+			*b = append(*b, "@"+m.Names[0].Name)
+			s := goASTSignature(ft, params)
+			if s == goIdentityUnknown {
+				return false
+			}
+			*b = append(*b, strings.Split(s, " ")...)
+		case len(m.Names) == 0 && !goTypeElement(m.Type):
+			*b = append(*b, "^")
+			if !goASTType(b, m.Type, params) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	*b = append(*b, "}")
+	return true
+}
+
+// goTypeElement reports an interface element that is a constraint's type
+// element (`~T`, `A | B`), not an embedded interface.
+func goTypeElement(e ast.Expr) bool {
+	switch e := e.(type) {
+	case *ast.UnaryExpr, *ast.BinaryExpr:
+		return true
+	case *ast.ParenExpr:
+		return goTypeElement(e.X)
+	}
+	return false
+}
+
+// goTagToken is the token of a struct field's tag written as the string
+// literal lit (the worker's rule): `#` and its value quoted, spaces escaped
+// so the token holds none.
+func goTagToken(lit string) (string, bool) {
+	v, err := strconv.Unquote(lit)
+	if err != nil {
+		return "", false
+	}
+	return "#" + strings.ReplaceAll(strconv.Quote(v), " ", `\x20`), true
 }
 
 func goASTGeneric(b *[]string, base ast.Expr, args []ast.Expr, params map[string]int) bool {

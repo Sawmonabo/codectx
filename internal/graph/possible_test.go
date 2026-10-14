@@ -430,6 +430,51 @@ func TestAPlaceholderIsDroppedWhenItsOpenSiteIsOnAnotherPage(t *testing.T) {
 	}
 }
 
+// TestAPlaceholderInsideACoveredCallStays pins that a site is covered only by
+// another edge's occurrence at the same bytes: `outer(inner())` with the
+// linker's edge for the outer call at [20,40) and the placeholder for the
+// inner call at [26,36), inside it. The inner call is a different call, so its
+// placeholder stays, edge and occurrence.
+//
+// Mutation caught: matching sites by overlap (the placeholder is dropped).
+func TestAPlaceholderInsideACoveredCallStays(t *testing.T) {
+	placeholder, _ := json.Marshal(map[string]any{"resolution": "unresolved", "candidates": 0, "callee": "inner"})
+	f := newCallFixture("nested_site", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "run", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{0, 60}},
+			{Name: "outer", Kind: model.NodeFunction, File: "app.py", Bytes: [2]uint64{40, 60}},
+			{Key: "placeholder", Name: "inner", Kind: model.NodeFunction, Metadata: placeholder},
+		},
+		Relations: []fixtureFact{
+			{From: "run", Kind: model.RelCalls, To: "outer",
+				Occurrences: []fixtureOccurrence{{Bytes: [2]uint64{20, 40}, Dispatch: model.DispatchExact}}},
+			{From: "run", Kind: model.RelCalls, To: "placeholder",
+				Occurrences: []fixtureOccurrence{{Bytes: [2]uint64{26, 36}}}},
+		},
+	})
+	e := f.engine(t)
+	r := f.reader()
+	ctx := context.Background()
+	toPlaceholder := f.rel(t, "run", model.RelCalls, "placeholder")
+	page := []model.Relation{{ID: toPlaceholder, From: f.id(t, "run"), Kind: model.RelCalls, To: f.id(t, "placeholder")}}
+	nodes, err := f.NodesByID(ctx, []model.NodeID{f.id(t, "run"), f.id(t, "placeholder")})
+	if err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	where, err := e.locate(ctx, []model.NodeID{f.id(t, "run"), f.id(t, "placeholder")}, page)
+	if err != nil {
+		t.Fatalf("locate: %v", err)
+	}
+	_, rels, dropped, err := e.dropPlaceholders(ctx, r, nodes, page, &where)
+	if err != nil {
+		t.Fatalf("drop placeholders: %v", err)
+	}
+	if len(rels) != 1 || len(dropped) != 0 || len(where.occurrences) != 1 {
+		t.Errorf("the inner call's placeholder left %d relations and %d occurrences (dropped %v), want both kept",
+			len(rels), len(where.occurrences), dropped)
+	}
+}
+
 // TestImpactWalksOpenSitesWhenAsked pins the other half of impact's rule: a
 // request naming `may_call` lists the callers of the open sites an affected
 // node is a candidate of, one depth deeper, on a route marked possible.

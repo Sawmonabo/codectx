@@ -69,7 +69,8 @@ the allocation. Its temporary disk is planned the same way (`server disk`): the
 snapshot copy it is rooted in, counted for every server because the copy is
 shared, plus what its class was measured to write into its work directory,
 read at `initialize` and again when it exits. A server of a class nothing was
-measured in yet is reserved at the whole allocations until it answers
+measured in yet is reserved at the whole allocations, less what standing
+holdings such as the search index's writer hold, until it answers
 `initialize`, then holds what its class now predicts; the next server of its
 class waits for that measurement and is planned from it. A start that fails is
 learned as a lower bound, and its class then starts one server at a time until
@@ -433,7 +434,12 @@ does not have to rediscover it.
 ## Consumers
 
 The query facade (`internal/app`) routes `semantic_source=lsp` requests here with
-the caller's `profile`, maps `Location`/`Symbol`/`Call` onto the overlay-aware
-`model.Node` and `model.ReferenceOccurrence` shapes and sets
-`QueryMeta.Overlay`. Context compilation always requests canonical mode and
+the caller's `profile`, maps `Location`/`Symbol` onto the overlay-aware
+`model.Node` and `model.ReferenceOccurrence` shapes and `CallItem`/`Call` onto
+overlay `model.Node`s and `model.OverlayCall` edges of a `model.GraphResult`,
+and sets `QueryMeta.Overlay`. A `callers` or `callees` request prepares each
+start node's item at its stored name token and asks one level of incoming or
+outgoing calls; a relation other than `calls`, both directions or a depth
+above one is refused as unavailable before any server is started, and every
+start node must root at the same project's server. Context compilation always requests canonical mode and
 never consults this package.

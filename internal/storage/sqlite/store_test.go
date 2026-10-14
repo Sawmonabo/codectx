@@ -1372,18 +1372,6 @@ var factColumns = []struct{ table, cols string }{
 	{"evidence", "coalesce(node_id, 0), coalesce(relation_id, 0), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key_id, detail, content_hash_bound"},
 }
 
-// nodeRowID resolves a canonical node identity to the node_ids surrogate the
-// fact tables reference, so a test can assert on the row a canonical id names.
-func nodeRowID(t *testing.T, db *sql.DB, id model.NodeID) int64 {
-	t.Helper()
-	raw, _ := model.DecodeID(string(id))
-	var row int64
-	if err := db.QueryRow(`SELECT id FROM node_ids WHERE canonical = ?`, raw).Scan(&row); err != nil {
-		t.Fatalf("node row for %s: %v", id, err)
-	}
-	return row
-}
-
 // unitRowID resolves a unit key to the integer row the fact tables reference.
 func unitRowID(t *testing.T, db *sql.DB, id model.UnitID) int64 {
 	t.Helper()

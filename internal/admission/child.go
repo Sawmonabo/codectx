@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +29,8 @@ import (
 // and persisted in the run ledger's observation store.
 //
 // No figure is a constant of a tool. A class with no observation is reserved
-// at the whole allocation in both dimensions: it runs alone among the heavy
+// at the whole allocation in both dimensions, less what standing holdings --
+// the search index's writer -- hold of it: it runs alone among the heavy
 // children, once per repository, tool payload, build and size class, because
 // nothing derivable says what it will use. Every published source on these
 // tools' memory names the project, its dependency closure or the machine
@@ -155,13 +157,15 @@ type ChildWork struct {
 // ChildNeed is one tool run's reservation and what is learned from it.
 type ChildNeed struct {
 	// Bytes is the memory the run reserves: the model's prediction for its
-	// work, or the allocation when nothing is learned yet, and never more
-	// than the allocation it was planned against nor less than one byte, so a
-	// runner always tracks the child's residency.
+	// work, or the room when nothing is learned yet, and never more than the
+	// room it was planned against -- the allocation less what standing
+	// holdings hold -- nor less than one byte, so a runner always tracks the
+	// child's residency.
 	Bytes int64
 	// DiskBytes is the temporary disk it reserves: the staged bytes plus the
-	// predicted written bytes, or at least the whole disk allocation when
-	// nothing is learned yet.
+	// predicted written bytes, or at least the disk room -- the disk
+	// allocation less what standing holdings hold -- when nothing is learned
+	// yet.
 	DiskBytes int64
 	// Learned reports a memory prediction from a class a run that succeeded
 	// was measured in; false is a first run, or a run of a class known only
@@ -209,8 +213,10 @@ func (m *childModel) predict(ctx context.Context, run *ledger.Run, key ledger.Ne
 	return need, ok, m.succeeded
 }
 
-// plan predicts one run's reservation within the allocations l holds for it.
-// The memory allocation is re-derived for the admission. The half-life is
+// plan predicts one run's reservation within the room l holds for it: each
+// allocation less what standing holdings hold, which give it back only after
+// this run's work has ended (Ledger.room). The memory allocation is
+// re-derived for the admission. The half-life is
 // counted in the repository's own projects of the tool, so the models forget
 // at the pace the repository in front of it produces evidence. A run with no
 // ledger run in its context is still planned from what this process learned,
@@ -220,22 +226,19 @@ func (m *childModel) predict(ctx context.Context, run *ledger.Run, key ledger.Ne
 func (c *ChildNeeds) plan(ctx context.Context, l *Ledger, key ChildKey, w ChildWork) (ChildNeed, error) {
 	memKind, diskKind, _ := key.Kind.kinds()
 	run := ledger.RunFromContext(ctx)
-	class := ledger.NeedKey{Subject: key.Tool, Fingerprint: key.Fingerprint, Build: childBuild(),
-		SizeClass: SizeClassOf(w.WorkBytes)}
-	n := ChildNeed{ChildWork: w, run: run}
-	n.memKey = childModelKey{repository: run.RepositoryID(), NeedKey: class}
-	n.memKey.Kind = memKind
+	n := ChildNeed{ChildWork: w, run: run, memKey: childModelKey{repository: run.RepositoryID(), Kind: memKind,
+		Subject: key.Tool, Fingerprint: key.Fingerprint, Build: childBuild(), SizeClass: SizeClassOf(w.WorkBytes)}}
 	n.diskKey = n.memKey
 	n.diskKey.Kind = diskKind
 	n.mem, n.disk = c.model(n.memKey), c.model(n.diskKey)
 	for {
 		memNeed, memOK, proven := n.mem.predict(ctx, run, n.memKey.NeedKey, w.WorkBytes)
 		written, diskOK, _ := n.disk.predict(ctx, run, n.diskKey.NeedKey, w.WorkBytes)
-		allocation := max(l.Allocation(), 1)
-		diskAllocation, _ := l.DiskSnapshot()
-		n.Bytes, n.DiskBytes = allocation, max(diskAllocation, w.StagedBytes)
+		room, diskRoom := l.room()
+		room = max(room, 1)
+		n.Bytes, n.DiskBytes = room, max(diskRoom, w.StagedBytes)
 		if memOK {
-			n.Bytes = min(max(memNeed, 1), allocation)
+			n.Bytes = min(max(memNeed, 1), room)
 		}
 		if diskOK {
 			n.DiskBytes = saturatingAdd(w.StagedBytes, written)
@@ -341,7 +344,7 @@ func (ch *childHold) end(got ChildMeasure) {
 
 // HoldChild admits one external tool run -- a precise indexer's profile unit
 // or a language server -- at the memory and temporary disk needs predicts for
-// its work, within the allocations the ledger holds for this admission.
+// its work, within the room the ledger holds for this admission (Ledger.room).
 // Everything Hold documents holds: strict first-in-first-out, the runs-alone
 // rule, makeRoom and the cancellation that leaks nothing. The holding's
 // Observe records what the run used; its Release ends the plan either way, so
@@ -380,7 +383,7 @@ func (h *Holding) Need() (ChildNeed, bool) {
 //
 // Written bytes above what the holding holds of disk raise it at once: they
 // are on the disk already. A run planned without a prediction in a dimension
-// -- a first run, held at the whole allocations, or a run of a class known
+// -- a first run, held at the whole room, or a run of a class known
 // only from failed runs -- is then lowered in that dimension to what its class
 // now predicts for its work, once it is measured there: a language server lives on after its
 // measurement, and holding the allocations for its lifetime would keep every
@@ -463,10 +466,14 @@ func WrittenBytes(dir string, staged int64) (int64, bool) {
 // process has learned so far, and returns the holding.
 type Admit func(ctx context.Context, l *Ledger) (*Holding, error)
 
-// Allocation re-derives the memory allocation from the kernel's figure, as
-// every admission does, and returns it: the ceiling a reservation planned now
-// is held within.
-func (l *Ledger) Allocation() int64 {
+// room re-derives the memory allocation from the kernel's figure, as every
+// admission does, and returns what an external tool planned now is held
+// within, read together under one lock: each allocation less what standing
+// holdings hold of it (Reservation.Standing), and never below zero. A
+// standing holding gives its room back only after the tool's own work has
+// ended, so a plan that counted that room in could never be granted beside it
+// within the sum.
+func (l *Ledger) room() (memory, disk int64) {
 	l.mu.Lock()
 	rederive := l.rederive
 	l.mu.Unlock()
@@ -475,7 +482,7 @@ func (l *Ledger) Allocation() int64 {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.allocation
+	return max(l.allocation-l.standingUsed, 0), max(l.diskAllocation-l.standingDisk, 0)
 }
 
 // Bytes is the memory the holding holds now, adjustments included.
@@ -596,11 +603,8 @@ func ProjectWork(ctx context.Context, view model.SnapshotView, root string, mark
 			w.WorkBytes = saturatingAdd(w.WorkBytes, fv.Size)
 		}
 		dir, base := path.Split(fv.Path)
-		for _, m := range markers {
-			if base == m {
-				dirs[dir] = struct{}{}
-				break
-			}
+		if slices.Contains(markers, base) {
+			dirs[dir] = struct{}{}
 		}
 		return nil
 	})

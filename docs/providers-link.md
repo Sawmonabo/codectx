@@ -80,8 +80,12 @@ The details are the `Detail*` constants (`provider.go`). Each one names the tech
   never the binary's export table (compiler flags such as `-fvisibility=hidden` decide that);
   `visibility_unspecified`: a definition that states none (an empty replacement, keywords only);
   `visibility_unresolved`: one that names another macro among other tokens, which is not expanded. A declaration's
-  macros are read through the definitions its file sees: its own and those of a header it includes directly (the
-  include lookup), following a one-identifier replacement to the macro it names. Each definition reached is one
+  macros are read through the definitions its file sees: its own and those of every header in its include closure,
+  each `#include` of the file and of every header it reaches resolved by the include lookup (a quoted path beside the
+  including file, and either form by its path suffix), each header read once, which ends a cycle as an include guard
+  does, and only as far as a definition asked about needs (`include_c.go` `cClosure`); a one-identifier replacement is
+  followed to the macro it names. The same closure, read once per file, decides which macros replace a call's name
+  and which functions of internal linkage it may call. Each definition reached is one
   occurrence (`resolve_c.go` `visibilityFacts`), so a macro defined in several `#if` arms publishes each arm's value,
   with the set size their number; no definition seen publishes nothing. These details are declared in `resolve_c.go`.
 
@@ -162,7 +166,9 @@ may supply) is counted external and publishes no edge.
 
 **Imports.** An import the linker resolves publishes `imports` from the file's module to the module of each file it
 names: a JavaScript, TypeScript or TSX specifier the module resolution reaches, a Python `import a.b` or
-`from a import b` (to the file that declares `b`, else the submodule `a.b`, else the module `a`), and a quoted C or C++ `#include` (the
+`from a import b` (to the file that declares `b`, else the submodule `a.b`, else the module `a`; a module that declares
+no `b` but binds it by an import of its own, as a package's `__init__.py` re-exports `from .user import User`, is
+followed to what that import names, `internal/provider/link/resolve_python_reexport.go`), and a quoted C or C++ `#include` (the
 file beside the including one, and every member file whose path ends in the header's at a component boundary). An
 angled include, a package outside the unit, and an import naming no member file publish nothing. An ECMAScript
 import of a module of the repository that resolves to no member file (a workspace package whose `exports` name an
@@ -195,14 +201,25 @@ edge from the callee's return node, never by an unlabelled edge from inside the 
 decision 7), for every family that publishes argument flows, the address-taken join
 included (`internal/provider/link/returns.go`). A site's result is where the structural provider found its value
 goes: `Site.Results`, the variables the innermost node evaluating the call defines, and `Site.Into`, the callable
-whose return that node is (`return f()`); a call whose value another call consumes first (`g(f())`, `f().m()`)
-has neither, and a site with neither publishes no return flow. A bound site publishes:
+whose return that node is (`return f()`); a call whose value another call consumes directly (`g(f())`, `f().m()`)
+has neither and is that call's nested call instead (`Site.Nested`, `Site.Feeds`, below). A site with none of
+these publishes no return flow. A bound site publishes:
 - for each argument bound to a parameter marked `Returned` (its value reaches the callee's return), one
   `data_flows_to` from each variable the argument reads to each variable of `Site.Results`, at the argument, detail
   `summary:<position>` (`FactSummary`);
 - from the callee's return node (`Decl.Return`) one `data_flows_to` to each variable of `Site.Results` and to the
   return node of the callable `Site.Into` names, at the call expression, detail `return` (`FactReturn`). A callee
   with no return node (a type, a constructor that returns no value) publishes none.
+
+- for a nested call, whose value is part of an argument of the consuming call or is its receiver
+  (`returns_nested.go`): from the nested callee's return node one `data_flows_to` to each parameter the argument
+  binds at the consuming call's bound callee (the receiver parameter for a receiver, where the callee declares one:
+  Python `self`, a Go or Rust receiver), carrying two evidence details, `argument` and `return`, since it leaves one
+  callee and enters another; and, when that parameter is `Returned`, one to each variable of the consuming call's
+  `Site.Results` and to the return node its `Site.Into` names, detail `return`, the consuming callee's summary at
+  this site. Both are evidenced at the nested call. The impact walk reads a relation with both roles as leaving and
+  then entering: a path that entered the nested callee through another call's argument never takes it, and a path
+  that takes it is inside the consuming callee and never leaves it through a return edge.
 
 Every value a returning node reads flows into the callable's return node (docs/providers-treesitter.md, Return
 flow), parameter-reached values included, so a value created inside the callee (`k = 1; if p: return k`) reaches
@@ -219,6 +236,13 @@ whatever that callee returns. The summary is part of the callee's interface (`Pa
 `paramReturned` mark of its hierarchy entry): a body edit that changes whether a parameter reaches the return
 changes the entry every bound site's argument flows read, so a refresh re-runs exactly those sites. The return node
 is keyed by the callable's identity and exists for every analysed callable, so its flows do not depend on the body.
+A callable whose analysis failed in the worker has no flows and no parameter nodes, so whether a parameter reaches
+its return is not known: each parameter is marked `Unknown` (`Parameter.Unknown`, the `paramUnknown` mark of its
+entry, traced like `Returned`), and a bound site whose value is written into a variable finds a summary for each
+argument bound to it that is kept with no node, never published and counted on the `data_flows_to` row
+(`facts_without_node`), beside the argument flow into the same parameter. No flow is claimed the callee was not
+shown to carry, and none is lost in silence; an analysis that later succeeds changes the entry and re-runs the
+sites.
 
 **Hierarchy.** Each type publishes `extends` to each declared supertype that is a class, or that is an interface when
 the type is one itself (a Java or TypeScript interface's extended interfaces, a Rust supertrait, a Go interface's
@@ -244,8 +268,16 @@ an external one only where the language marks it (Java `@Override`, C++ `overrid
   the one candidate is the extended class outside the project when no class of the project along the chain declares
   the member.
 - Python: `typing.override` proves the first ancestor along the method resolution order that defines the method.
-  When no class of the project along the order defines it, it is one of the external bases of the classes along the
-  order, each published (`supertype`) with the set size of their number when there are several.
+  The order is the C3 linearisation with each base outside the project placed as the linearisation of itself
+  (`hierarchy.pythonFullMRO`): the bases outside the project ahead of the first class of the project that defines
+  the method are its candidates, published (`supertype`) with that class's own override as one set whose size counts
+  them all; a base outside the project after it is no candidate. `class C(Base, U)` with `U.run` publishes `C.run`
+  overrides `Base.run` and `U.run`, set size 2; `class D(U, Base)` publishes `U.run` alone. A base outside the
+  project has no declaration read, so its own bases are unknown: they follow it in the true order and a member they
+  define is reached through it, so naming it covers them; only when one base outside the project is an ancestor of
+  another one the hierarchy names can the true order place it later than this order does, which no declaration
+  read can show. Bases that admit no linearisation fall back to the bases outside the project of the classes along
+  the project's own order, published when no class of the project defines the method.
 - Rust: an impl item implements its block's trait's item of its name (`Decl.Trait`), the external trait's method
   when the trait is outside the project (`hierarchy_rust.go`).
 
@@ -259,9 +291,33 @@ cache, `go_host.go`); a module of the governing `go.work` or a local `replace` i
 snapshot; a required module, after `replace`, from the module cache at its exact version (`GOMODCACHE`, else the
 first `GOPATH` entry's `pkg/mod`). A package none of these holds (a local `replace` outside the repository, a
 module the cache does not hold) is unavailable, and the `implements` and `overrides` capability rows count both
-(`go_external_packages`, `go_external_packages_unavailable`). Each package's types, aliases and method forms are read
-with `go/parser` from every non-test file (every build variant; a type or method two variants declare differently is
-left out) and cached on disk by its source's identity (`go_external_cache.go`). A Go type implements an interface
+(`go_external_packages`, `go_external_packages_unavailable`), and the methods of the unit whose signature names a
+type by its unresolved spelling or could not be spelled (`go_method_signatures_unresolved`,
+`go_method_signatures_unknown`). Each package's types, aliases, constants and method forms are read with `go/parser`
+from every non-test file, whatever its build constraints, and cached on disk by its source's identity
+(`go_external_cache.go`). An interface two files declare differently (per platform or build tag: `Handle` with
+`Fd() uintptr` for unix and `Fd() int` for windows) is each of its declarations, one entity per declaration as the
+project's own conditional declarations are, and a type satisfying one implements it. Declarations are compared by
+their canonical spellings, not as written: `type Num = Count` (with `Count = int`) for unix and `type Num = int` for
+windows are one alias of `int`, `const Width = 4` and `2 + 2` one value, `Sum() [16]byte` and `Sum() [Size]byte` (with
+`Size = 16`) one method, and interface declarations that spell one method set are one interface.
+
+Go method sets are decided per build (`go_build.go`). Every Go file, of the project (the worker sends its leading
+`//go:build` or `// +build` lines) and of the packages outside it, belongs to the builds its constraint and its
+`_GOOS`/`_GOARCH` name admit, by the go command's rules (`internal/gobuild`: the header rule of go/build's
+`parseFileHeader`, the file-name rule of `goodOSArchFile`, the tags of `matchTag` with `unix`, android=>linux,
+illumos=>solaris and ios=>darwin, the toolchain's ports from `go tool dist list`, releases from the module's go line).
+Each method-set record carries the condition of the builds holding it: a method's file and its type's declaration, an
+embedding's path, a promoted member a shallower one hides only where that one exists. A method declared per build is
+each of its signatures under its own condition, and a signature naming an alias or constant declared per build with
+different types or values (`const PtrSize = 4` for 386 and `8` for amd64) is one key per choice of declaration,
+under their conditions. A type implements an interface when some build holds, for every method name, a key of it in
+both: `Regs` with `PC() uint32` in `regs_386.go` and `PC() uint64` in `regs_amd64.go` implements `interface{ PC()
+uint64; SetPC(uint64) }` and never `interface{ PC() uint64; SetPC(uint32) }`, and its `PC` overrides only the
+interface method of its own key. Only the tags a condition names are enumerated; past 16 free tags (custom tags,
+`amd64.v2`-style tool tags, taken as independent) a condition counts as met. Two embedding paths at one depth stay
+ambiguous whatever their conditions (a miss, never a false edge), and a type declared with a different structure per
+build is each of its declarations, as before. A Go type implements an interface
 outside the unit by its method set, which publishes `implements` (`method_set`) and an `overrides` from each method to
 the interface's of its name; an interface with an unexported method implements only within its own package. A
 conversion `var _ io.Reader = (*T)(nil)` (or `&T{}`, `T{}`, `new(T)`) proves `T` implements that interface without its
@@ -294,8 +350,10 @@ and descends into the mounts recorded on that object; a binding already on the h
 routers including each other ends. The walk is bounded by the mounts the unit holds, never by a depth. Each route
 reached becomes one `endpoint` in the scope of the file the root mount is in, located at that mount, keyed
 `endpoint:<method route>@<full path>`, with the endpoint metadata `framework`, `method`, `route`, `prefix: resolved`
-and `path`, defined by the file's module and routing to each handler (`routes_to`, detail `import`). A handler the
-route's file imports is resolved through the module index to its declaration.
+and `path`, defined by the file's module and routing to each handler (`routes_to`, detail `import`). Like every endpoint of
+the linker (`internal/provider/link/route_search.go`), it carries the search document the structural provider gives an
+endpoint: its framework, method, route and path as its body, located at the endpoint, so a kind filter on endpoints
+finds it. A handler the route's file imports is resolved through the module index to its declaration.
 
 A route several mounts reach is several endpoints, one per path, and every `routes_to` of each carries `set_size`,
 the number of paths the walks of the file's root mounts gave that route. A hop whose prefix is not a literal (an
@@ -346,6 +404,67 @@ another framework, a call whose receiver is a call's result, a parameter written
 (`handlers.Show`) is resolved in that file's context; a handler written inline gives the endpoint no `routes_to`. Every lookup is traced on the mount's
 file.
 
+## NestJS paths
+
+A NestJS route's path is joined from facts of several files (`internal/provider/link/route_nest.go`,
+`route_nest_modules.go`): the controller's path and the route decorator's in the controller's file, the global prefix
+and versioning the file creating the application sets on it (`NestFactory.create`, then `app.setGlobalPrefix(…)`,
+`app.enableVersioning(…)`), and the RouterModule path of the module listing the controller.
+The structural provider publishes every NestJS route `unresolved` (docs/providers-treesitter.md, Framework routes) and
+records, in the controller's link table, each route (`Routing.Nest`: method, route, the controller's paths and the
+route's as written in literals, the method's `@Version` and the controller's `version`, the handler) on a mount of its
+own located at the decorator (`RouteMount.Nest`); and, in any ECMAScript file that creates an application or calls
+`setGlobalPrefix` or `enableVersioning`, what it sets (`Routing.NestApp`, indexed under `keyNestApp`), with each
+`@Module` class and the controllers its `controllers` array lists (indexed under `keyNestModule` by the name the
+controller's own module declares or exports it by) and each `RouterModule.register(…)` call's route tree (indexed
+under `keyNestRouter`). A call is
+attributed by its receiver: one on an application the file creates applies to it, one on a testing application (a
+`createNestApplication` result, or any application in a file importing `@nestjs/testing` that NestFactory did not
+create) is not read, and any other receiver (a helper's parameter) is an application no table ties to one.
+
+The linker builds each path as Nest's `RoutePathFactory.create` does (packages/core/router/route-path-factory.ts):
+the URI version segment (`/` + the versioning's `prefix`, `v` unless it says otherwise or `false`, + the version; the
+method's `@Version`, else the controller's `version`, else the `defaultVersion`; `VERSION_NEUTRAL` adds none; an
+array is one path per version), then the module path, the controller's path and the route's, each joined as
+`stripEndSlash(a) +
+addLeadingSlash(b)` with an array one path per element (`@Controller()` and a route with no path are `/`), then the
+global prefix with its trailing slash removed, and a final leading slash with no trailing one. Only URI versioning
+puts the version in the path; header, media-type and custom versioning leave it out. Each path is one `endpoint` in
+the controller's file, located at the decorator, keyed `endpoint:<method route>@<path>`, with `prefix: resolved`,
+routing to the method (detail `direct`). The paths are computed for every application the unit creates; distinct
+paths are published together, each `routes_to` carrying their number as `set_size`.
+
+The module path is RouterModule's (packages/core/router/router-module.ts). A register call's tree is read from an
+array literal in place, the one module-level binding of the same file its argument names, or, for a name the file
+imports, the tree the module it names exports under that name, through re-exports as ECMAScript resolves an export
+(`nestTreeOf`; each module-level binding initialized with a route tree is indexed under `keyNestTree` by the names its
+module exports it under, read from any ECMAScript file writing a `module:` property, NestJS imported or not), its
+modules resolved from the tree's own file. Each tree is flattened as Nest's
+`flattenRoutePaths` does: a route object with a `module` and a non-empty `path` gives the module that path, a child
+object's path becomes its parent's joined to its own (each normalized: a leading slash, no trailing one), a class
+written as a child takes its parent's path, and a child object with no path joins its own children to no parent path.
+Each module's path is the normalized path of its last entry in the call, as the metadata Nest sets replaces an earlier
+one. A controller is served under the path of every module listing it, matched by the names its file declares or
+exports it under and every name a renaming export gives one of them (`export { A as B } from`, indexed under
+`keyJSRenamed` by the name renamed, followed transitively), and confirmed by resolving the listing through the module
+file's imports (`esModules`, re-exports included), so a same-named class of another file is not taken; a module no
+tree names has no path. The register calls
+are taken to apply to every application of the unit; the module import tree from `NestFactory.create` is not walked.
+
+Nothing is published, and the structural `unresolved` endpoint stays the route's only one, when the unit creates no
+application (the bootstrap is another unit's); when a setting is made on an application no table ties to one; when a
+file creating several applications sets either; when one file's settings disagree; when a prefix or a versioning
+option is no literal, or `setGlobalPrefix` passes options (its `exclude` list is matched against each route at run
+time); and when the route's or the controller's path or the version it needs is no literal. With RouterModule in use
+(any file naming it from `@nestjs/core`), nothing is published for a controller no module lists, and nothing at all
+when a module's `controllers` are no literal list of names the file binds (a shorthand or spread `@Module` metadata
+hides them), when a route tree is no literal (a call's result, an import that reaches no tree or several, a path or
+module that is no literal or class name), when a tree's entry names no class the unit declares, or, for a module,
+when two register calls give it different paths (which holds is the order Nest initializes the modules in). Every
+application, module listing, rename and route tree is read through traced lookups, and all of them are part of their
+file's interface summary, so an edit to `main.ts`, a module, a tree, a renaming or re-exporting index re-resolves the
+NestJS routes that read it.
+
 ## Request inputs across files
 
 A request-input read whose source another file decides is published by the linker
@@ -361,7 +480,13 @@ imports from other modules, which decide the rest. A class with a base the file 
 
 The classes are indexed under each dotted name their file can be imported as (`keyPyClass`). For each pending input
 the linker looks the class up as an import's lookup does (the nearest source root), follows its imported bases
-through further files, a class already on the walk's way ending it, and decides the source by FastAPI's own rule
+through further files, a class already on the walk's way ending it. A module that declares no class of the name may
+bind it by an import of its own, as a package's `__init__.py` re-exports `from .user import User`
+(`internal/provider/link/route_input_reexport.go`): FastAPI reads the module's attribute, which that import binds
+(Python Language Reference, The import statement), so the walk follows the one module-level import that binds the
+name, or, when none does, the one `from m import *` whose module declares it; a module that declares the name itself,
+binds it by several imports or by a whole-module import, or whose star imports supply it from several modules or
+none, decides nothing. The walk then decides the source by FastAPI's own rule
 (`fastapi/dependencies/utils.py` `analyze_param`): a name the route writes is a path read unless the class is a
 special type; else a body for a model or a dataclass, a file for an `UploadFile`, a query for any other class. A
 request subclass, a special type, a class no member declares, several declarations that disagree and bases of
@@ -369,7 +494,12 @@ different kinds publish nothing. The read is one `variable` node in the file's s
 `input:<owner's qualified name>#<parameter>`, located at the parameter, with the `input` metadata the structural
 provider's reads carry (key the parameter's name), and its owner `reads` it (detail `request_input`). The pending
 inputs and the classes are part of the interface summary beside the routing, and every class lookup is traced on the
-handler's file, so an edit to a model or to a base of it in another file re-resolves the parameters it types.
+handler's file, so an edit to a model, to a base of it or to a re-export of it in another file re-resolves the
+parameters it types. A class a library declares that FastAPI's own table does not name (any base outside the unit
+other than Pydantic's, `typing`'s, `abc`'s, `enum`'s, FastAPI's and Starlette's) is undecidable from the project:
+`analyze_param` reads it as a body only when it subclasses `BaseModel`, a mapping or `UploadFile`, or is a sequence or
+a dataclass (`fastapi/_compat/shared.py` `field_annotation_is_complex`), which the library's own source decides, so it publishes
+nothing.
 
 A Spring handler parameter that no binding annotation marks and that no resolver Spring runs before the project's own
 decides is a pending input under the rule `spring` (`internal/provider/link/route_input_spring.go`). Spring resolves
@@ -414,9 +544,10 @@ decision 8, `internal/provider/link/route_entry.go`). The linker reads the manif
 | `Cargo.toml` | `[[bin]]` with its `path`, else `src/bin/<name>.rs` or `src/bin/<name>/main.rs` | the file's top-level `fn main`, else its module |
 
 Each is keyed `endpoint:declared:<group>:<name>@<manifest>` (the group alone when it is the name, as for `main`),
-located at its target, defined by the file's module and routing to the target (detail `import`). A name several member files can supply
-publishes one endpoint in each, each with the set size; a value that names no member publishes nothing. The entries
-are manifest fields of the unit, so a change to one re-resolves the unit.
+located at its target, with a search document of its descriptor, defined by the file's module and routing to the target
+(detail `import`). A name several member files can supply publishes one endpoint in each, each with the set size; a
+value that names no member publishes nothing. The entries are manifest fields of the unit, so a change to one
+re-resolves the unit.
 
 ## Inherited Java `main`
 
@@ -431,9 +562,9 @@ there, with what the project declares (`internal/provider/link/java_main.go`). T
 `endpoint` named `main` with the identity the structural provider gives the main of a class it resolves itself (the
 file, the descriptor `main` and the class's qualified name as disambiguator), so an edit that moves the decision
 between the two providers moves no endpoint. It is located at the class, defined by the file's module and routing to
-the method (detail `hierarchy`); like the linker's other endpoints it carries no search document. A superclass the
-file names ambiguously is a path of its own; when the paths choose several methods each `routes_to` carries their
-number as its set size. The reads are index lookups of the hierarchy, so an edit to a superclass's `main` or to its
+the method (detail `hierarchy`), and carries the search document the structural provider gives that endpoint (the same
+document identity, body `main`, located at the class). A superclass the file names ambiguously is a path of its own; when the paths choose several
+methods each `routes_to` carries their number as its set size. The reads are index lookups of the hierarchy, so an edit to a superclass's `main` or to its
 `extends` re-resolves the classes that read it.
 
 ## Endpoint identity per family
@@ -457,7 +588,7 @@ toward it stays valid. What a call can bind to differs by family, and so does wh
 | Java | methods and constructors; `Static` for static methods; `Abstract` for interface and abstract methods; `Final` for a `final` or `private` method, or one of a `final` class, a record, an enum without constant bodies or an anonymous body | the enclosing class, interface, record or enum; `#n` for an anonymous class body or an enum constant's body, n the byte offset of the name token of its declaration (the class `new T`, or the enum constant), sent as a subtype of the type it instantiates |
 | Go | functions and methods; interface methods, `Abstract` | a method's receiver base type (`*T` is `T`); the interface for an interface method |
 | Rust | functions, associated functions (`Static` when there is no `self`), methods, trait methods (`Abstract` without a default body); `self` is not one of `Params` | the impl's self type; the trait for a trait method |
-| C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file, a file including its header directly, or (with the functions of external linkage) a file that may include its header through another binds, and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
+| C, C++ | functions, methods (in-class and out-of-class) and function-like macros; `Abstract` for a pure virtual function or a declaration a subtype supplies; `Virtual` for a member declared `virtual`, `override` or `final`, `Final` for one declared `final` or of a `final` class, as the declaration says (an out-of-class definition repeats neither); `Internal` for a namespace-scope function declared `static` anywhere in its file or in an unnamed namespace, which only its own file or a file whose include closure reaches its header binds (or, with the functions of external linkage, a file whose closure holds a directive the unit cannot follow: an `#include` of an unfolded macro or a quoted path no member file answers), and for a class, struct, union or enum defined in an unnamed namespace, which its own file's type names reach alone; `Optional` counts default arguments and every macro parameter, `...` and a pack are `Variadic`, and so is a C prototype's `()` | the enclosing class or struct, or the qualifier of an out-of-class definition |
 | JavaScript, TypeScript, TSX | functions, class methods, object-literal methods | the class |
 | Python | functions and methods; `Static` for `@staticmethod` and `@classmethod` | the class |
 
@@ -475,7 +606,8 @@ candidates `Unit.Contains` admits. The delta build hands it the unit's inputs as
 
 The unit's inputs are its member files and the manifests it owns; an ECMAScript unit also owns every
 `tsconfig*.json` and `jsconfig*.json` (a `tsconfig.base.json`, a referenced `tsconfig.app.json`), `package.json`,
-`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads. A
+`pnpm-workspace.yaml` and `lerna.json` under its root (`esConfigFile`), each of which its resolution reads, and every
+config its `extends` chains read under another name or outside its root (`Unit.Inputs`). A
 `pnpm-workspace.yaml` or `lerna.json` marks a JavaScript project as `package.json` does, so a workspace with no root
 `package.json` is one unit, whose packages import each other by name. The unit's identity is their content, as for every unit: the facts it
 publishes bind their evidence to each file's bytes and ranges (`model.NewEvidenceID`), and a declaration's node id
@@ -521,7 +653,7 @@ Besides the joined declarations, sites and values, the table carries what the re
   the trait's method of that name when the trait is the unit's, else the external trait's method, the self type
   never consulted, so a blanket impl over a type parameter implements its trait's item too;
 - `Decl.Alias`: the one identifier an object-like macro is replaced by (`#define LOG log_impl`), which a call of the
-  macro calls;
+  macro calls in every file whose include closure reaches the macro's file;
 - `Decl.Visibility` and `Decl.Macros`: the visibility an object-like macro's replacement states, and the macros a C or
   C++ declaration is written with, which its `references` visibility occurrences read;
 - `Site.Arguments`: each argument's range, keyword name, spread mark and the variables it reads;
@@ -573,8 +705,10 @@ resolution and ownership read), each `package.json`'s `name`, `type`, `exports`,
 `module`, `main`, `tsconfig` and `workspaces`, and each workspace file's globs (`jsManifestFields`, `js_manifest.go`).
 A changed ECMAScript field rebuilds the hierarchy, whose specifier answers (`keyESSpec`) are diffed key by key like
 every other index group, so only the nodes whose imports now resolve differently re-run, in any file of the unit.
-Nothing else of a manifest is read: the Python and Java project files decide only which unit a file belongs to, so a
-change to them is a change of membership or nothing. A change to the Go fields other than the `module` path, which only
+Beyond these, the declared entry points of a `pyproject.toml`, `package.json` or `Cargo.toml` are read
+(`entryFields`, `route_entry.go`), and nothing else of a manifest: a Python or Java project root is no field the
+linker reads. It decides membership (the unit's scope key) only, so adding or moving a `pyproject.toml`, `setup.py`,
+`setup.cfg`, `pom.xml` or `build.gradle` is a membership change. A change to the Go fields other than the `module` path, which only
 say where a package outside the unit is read from, keeps the layout (`goExternalField`, `go_refresh.go`): the packages outside the unit are read
 again over the stored hierarchy, and the hierarchy is kept when the digest of everything they declare
 (`goExternal.surface`, stored as a group) is the predecessor's, an early cutoff, so a dependency bump that changes no
@@ -587,16 +721,26 @@ What re-resolves:
 - **Go, Java, Rust, C, C++** (`rerunStatic`, `static.go`): every resolution read is recorded at the hierarchy's one
   lookup point (`index.lookup`, lookups that found nothing included), at the Go module path (`goPackages`) and at the
   signature cross-product, as a trace key that names files and declaration nodes, never positions
-  (`internal/provider/link/trace.go`). A refresh re-runs the members whose table moved, the added members, the members
-  whose reverse-index keys name a changed index group or a changed manifest field, and then the members whose
-  indirect sites read a signature whose set of taken functions changed. A file re-runs whole, since its sites read
-  each other's results. When the layout holds (the same members, the same fields but those saying where a Go package outside the unit is read from, and every member whose table moved
+  (`internal/provider/link/trace.go`). A member is resolved as nodes: each site, and its file node (its supertype,
+  override, route, input, include and visibility facts and the functions it takes as values). Each read is recorded
+  with the node that made it, one record per key and member listing its nodes (`static_sites.go`); a read that fills
+  what the member's sites share once computed (whether every import names the unit, `closedImports`; a C or C++
+  member's include closure) is recorded for the whole member. A refresh re-runs every node of the members whose table
+  moved and of the added members, the nodes whose reverse-index keys name a changed index group or a changed manifest
+  field, with every site whose receiver is the result of a re-run site (read from the table), and then the sites that
+  read a signature whose set of taken functions changed. Every other node keeps its facts, reads and taken functions,
+  so a changed export re-runs the sites that read it, not their whole files. When the layout holds (the same members,
+  the same fields but those saying where a Go package outside the unit is read from and the declared entry points,
+  which only their own resolution reads, and every member whose table moved
   keeps its interface digest) the refresh reads the hierarchy from the state and decodes only the tables it re-runs
   and republishes; otherwise it rebuilds the hierarchy and diffs it group by group. The rebuild reads the tables of
   the members whose digest moved and of the added members only: for every other member it reads the projection the
   state keeps (`internal/provider/link/projection.go`), the table without its sites, values, handlers and dynamic
   imports but with each routing mount's argument and the Java anonymous bodies' offsets, which is everything the
-  hierarchy is built from. A full build reads each table once and builds its second pass from the projections.
+  hierarchy is built from, stored as the table's own JSON. The hierarchy reads each table once on a full build and
+  builds its second pass from the projections. Publication reads a republished member's table once more, for its
+  sites: the targeted nodes it publishes first come from the endpoints the resolution spilled when it read the table
+  (`target_spill.go`), so publication reads each republished table once.
 - **Python, JavaScript, TypeScript, TSX** (`resolveFlow`, `refresh.go`): their resolution is one least fixed point of
   value flow and binding, decomposed into nodes (each site, and each file's node), which a refresh maintains by
   deleting and re-deriving at the granularity of nodes (Gupta, Mumick and Subrahmanian, "Maintaining Views
@@ -694,9 +838,18 @@ The members' language family picks the resolver:
   name and type identity (`goIdentity`, `internal/provider/link/go_identity.go`): the worker sends each method's and
   alias's form (`wire.Export.Identity`), and the linker names each type by its package's import path and name,
   however the file writes it (a renamed or dot import, a vendored copy), follows aliases (`byte` is `uint8`, `rune`
-  `int32`, `any` `interface{}`, a user alias its type), and qualifies an unexported method name by its package. Type
-  parameters compare by position. A form it cannot decide (a struct or interface literal with members, an alias it
-  cannot follow, a name two dot imports declare) matches nothing, never a guess. A Go interface embedded from a
+  `int32`, `any` `interface{}`, a user alias its type, a generic alias `List[string]` its type with its arguments
+  substituted), and qualifies an unexported method name by its package. Type
+  parameters compare by position. A struct literal compares by its fields in order (name, an unexported one
+  qualified by its package, type, tag by value, embedding) and an interface literal by its sorted methods and
+  embedded interfaces ("Type identity"); an array length by its value, a constant expression folded over the
+  constants of the unit and of the packages read (`iota` and implicit repetition included, exact big-integer
+  arithmetic), else spelled with each constant named by its package. A qualifier no import binds by name is the
+  file's one unnamed import whose package clause is not read; with several such imports, and for a name only dot
+  imports not read can supply, the type is spelled unresolved with its candidates (`?p1|p2:yaml.Node`), which
+  denotes one type wherever it is written and matches only the same spelling. A form it cannot decide (an alias it
+  cannot follow, a name two dot imports declare, a length that is no integer constant expression) matches nothing,
+  never a guess. A Go interface embedded from a
   package outside the unit contributes its methods as read from that package (above, Hierarchy). `#define NAME func` makes a call of `NAME` a call of `func`,
   one per definition when `#if` arms define it differently, in the file and in the headers it includes.
 
@@ -785,13 +938,15 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   unit root, the first `tsconfig.json` or `jsconfig.json` whose `files`/`include` minus `exclude` covers it (`.js`
   files only with `allowJs` or in a `jsconfig.json`), else the configs that config's `references` reach that do, all
   of them; with none covering it, the nearest config by directory; with no config, none. The module mode is the
-  config's `moduleResolution`, else TypeScript's default for its `module` (CommonJS: Node10; node16/nodenext:
-  Node16; preserve: Bundler); a config that sets neither, or no config, resolves under both Bundler and Node16. The
-  order, under each governing config and mode: a relative or absolute path (TypeScript's extension substitution:
-  `./a.js` names `a.ts`; a directory's `index` file except for an ES module's import under Node16, which names its
-  file with its extension; then `rootDirs`); a `#` specifier through the `imports` of the file's package scope; the
-  config's `paths` (an exact key, else the longest prefix, each fallback in order, the first naming a member
-  winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`; the package's own name when it
+  config's `moduleResolution`, else TypeScript's default for its `module` (none, AMD, UMD, System: Classic;
+  CommonJS: Node10; node16/nodenext: Node16; preserve: Bundler); a config that sets neither, or no config, resolves
+  under both Bundler and Node16. The order, under each governing config and mode: a relative or absolute path
+  (TypeScript's extension substitution: `./a.js` names `a.ts`; a directory's `index` file except for an ES module's
+  import under Node16, which names its file with its extension; then `rootDirs`, the one that is the path's longest
+  prefix giving the suffix tried under each other one in order); a `#` specifier through the `imports` of the file's
+  package scope; the config's `paths` (an exact key, else the longest prefix, each fallback in order, the first
+  naming a member winning; relative to `baseUrl`, else to the config that wrote `paths`); `baseUrl`, only when no
+  `paths` key matched; the package's own name when it
   has `exports`; a workspace package by `name` (the `package.json` files the root `workspaces`, a
   `pnpm-workspace.yaml` or a `lerna.json` declare, every `package.json` of the unit when none does) through
   `exports` where the mode reads it (an exact subpath key, else Node's `PATTERN_KEY_COMPARE` order; conditions
@@ -807,25 +962,43 @@ unit (`hierarchy.closedImports`); never in Java, ECMAScript or Python, where suc
   is published, with its size. Each import's answer is computed once per build, while the hierarchy is built, and
   written to the decls index under `keyESSpec` (the importing file's path and the specifier); the import facts, the
   export resolution and the inference each look that one key up.
+  Classic resolution (`js_classic.go`, TypeScript's `classicNameResolver`) reads no `package.json`: no `exports`,
+  `imports`, own name or workspace package. It runs two passes, TypeScript and declaration files, then JavaScript
+  files, each in this order: `paths` for a bare specifier (a matching key decides), else `baseUrl`; `rootDirs` for a
+  relative one; then a relative or absolute specifier as a file beside the importing file, a bare one as a file in
+  the importing file's directory or any directory above it to the unit root, nearest first. It reads files only,
+  never a directory's `index`, and a bare specifier it finds nowhere is a package outside the repository (TypeScript
+  then reads `node_modules/@types`), so a workspace package's name under Classic is external.
 
   Limits. Aliases defined in program code (a bundler's alias table, a test runner's module mapper, a compiler plugin)
   are not data and are not read. A package outside the repository (an ignored `node_modules`, a package manager's
   own cache) stays external, and an `extends` base inside one leaves the options it may set unknown, so a config
   that does not set its own mode resolves under both. `typesVersions` and `types@` conditions depend on the TypeScript version and are not
-  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone. An `extends` base under a name
-  other than `tsconfig*.json`/`jsconfig*.json` is read but is not an input of the unit, so an edit to it alone is
-  seen at the unit's next rebuild.
+  read. A pnpm-workspace.yaml is read for its top-level `packages` sequence alone.
+  Every config a unit's `extends` chains name under another name than `tsconfig*.json`/`jsconfig*.json`, or outside
+  the unit, is an input of the unit (`Unit.Inputs`, `esPlanInputs` in `js_plan.go`), present or not, so an edit to it
+  alone, or its creation, rebuilds the unit: the planner reads the unit's configs to follow the chains, and its
+  `package.json` files only when a config extends a package by name. A relative `extends` names the file as written,
+  else with `.json` added, as TypeScript's getExtendsConfigPath reads it.
 - **Python** (`resolvePython`, `internal/provider/link/resolve_python.go`): direct binding through `import`,
-  `from … import` and modules. A bare name binds only the in-file declarations its scope can name: those of the
+  `from … import` and modules. A name a module does not declare but binds by a module-level import of its own (a
+  package's `__init__.py` re-exporting `from .user import User`, or a `from m import *` whose one supplying module
+  declares it) is followed to that import's target, for calls and imports (`lookPythonFollowing`,
+  `resolve_python_reexport.go`) and for the class a receiver's type names (the re-exports are indexed under
+  `keyReexport` beside ECMAScript's, `addPythonReexports`); a name the module declares itself, binds by several
+  imports, or several star imports supply, is not followed. A bare name binds only the in-file declarations its scope can name: those of the
   innermost function enclosing the call that declares one, else the module's (`Table.Visible`); never a method, nor
   a function nested in another function. A call of a class is its construction and binds its `__init__` when
   declared, and a call on its result (`C().m()`) binds the method `C` declares or inherits alone. An instance
   receiver (`self`, `cls`, an annotation, or a type flow-based inference recovered, every type of a receiver two
   disagreeing definitions reach included) binds, for each of its types, the first declaration of the method along
-  that type's C3 linearisation (`hierarchy.pythonMRO`, over the bases in the order each class lists them), never a
-  subclass's override. A class object (`A.make()`, `mod.A.make()`) binds the method `A`
+  that type's C3 linearisation (`hierarchy.pythonUnitOrder`, over the bases in the order each class lists them,
+  the bases outside the project placed as for overrides), never a subclass's override. A base outside the project
+  that the order places ahead of that declaration may hold the method instead, so the call also reaches that base's
+  method, a set counting both (`class C(Base, U)`: `c.run()` reaches `Base.run` and `U.run`, set size 2). A class object (`A.make()`, `mod.A.make()`) binds the method `A`
   declares or inherits alone, never a subclass's override. `super().m()` in class `B` binds, for `B` and each class
-  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached. Field-based
+  below it, the first `m` after `B` in that class's linearisation, so no override below `B` is reached, and each
+  base outside the project a linearisation places between `B` and that `m` as a candidate beside it. Field-based
   resolution (a function written to the attribute; a method is written to no attribute, so it is reached only through
   a receiver's type) answers an attribute call only when its receiver's type bound nothing and reaches the method
   through no supertype outside the project: `class L(list)` calling `self.append(1)` calls the external
@@ -852,7 +1025,7 @@ It then propagates them across functions and files, iterated to the least fixed 
 
 ## Capability states
 
-The provider publishes one row of each of its six capabilities per unit, at the unit's scope:
+The provider publishes one row of each of its seven capabilities (`calls`, `imports`, `data_flows_to`, `extends`, `implements`, `overrides`, `generates`) per unit, at the unit's scope:
 - `fresh` when every member had a table and no table dropped an entry;
 - `partial`, with `coverage_incomplete` (`publisher.capabilities`, `internal/provider/link/provider.go`), when a
   member has no table (`members_without_table`) or a table's `Dropped` is non-zero (`dropped_table_entries`; a
@@ -862,8 +1035,8 @@ The provider publishes one row of each of its six capabilities per unit, at the 
   of these is fatal.
 - `partial`, with `coverage_incomplete`, on the row of each relation a fact was found for whose target the structural
   provider minted no node (`facts_without_node`, counted by `externalsOf`, `state.go`): a call or hierarchy fact into
-  a declaration with no node, or an argument's flow into a parameter with none (one whose key did not fit, a C or C++
-  `...`) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
+  a declaration with no node, or an argument's flow or summary into a parameter with none (one whose key did not fit,
+  a C or C++ `...`, one of a callable whose analysis failed) of a callable with a body. Such a fact publishes no relation; it is kept in the state with its target's file
   and no node (`idBinding.unnamed`), so a refresh carries and counts it like any other. A flow into a callable with
   no body (an abstract method, a prototype) and a return flow from a callee with no return node are not facts. A fact
   whose relation is no capability of its own (a route's handler, a declared entry point, a launchable `main`, a

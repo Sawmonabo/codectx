@@ -183,7 +183,7 @@ only graph expansion a plain-language task gets; an agent localization study los
 ## Consequences
 
 - A broad task reads matches down to a floor set by the plan's own file budget, not to the end of the index, and
-  walks only from them; the walk no longer scales with how many documents hold a common word.
+  walks only from them; the walk does not scale with how many documents hold a common word.
 - Every root, whatever its weight, is walked in one walk. A node keeps each pair no other pair at it beats on every
   count the ranking can only improve with (depth, class, weight, route product, remaining derived depth, and the
   route's shape: whether it reached a sibling, whether its last hop went up a hierarchy kind and so may turn, and

@@ -286,7 +286,6 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"page/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
 		{"page/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
 		{"page/an_unbounded_query_answers_in_full", legUnboundedQueryAnswersInFull},
-		{"resolve/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
 		{"exact/a_two_offset_node_is_served_at_the_precedence_winner",
 			legTwoOffsetNodeServesThePrecedenceWinner},
 	}
@@ -836,10 +835,6 @@ func (s *stubExact) FileByPath(_ context.Context, p string) (model.FileID, error
 	return s.file, nil
 }
 
-func (s *stubExact) File(_ context.Context, id model.FileID) (model.FileVersion, error) {
-	return model.FileVersion{ID: id, Path: s.path}, nil
-}
-
 // NodesInFile pages the declarations on the (start_byte, node_id) keyset, which
 // is the contract exact.go walks; it applies no kind filter, exactly as storage
 // does not.
@@ -878,6 +873,12 @@ func (s *stubExact) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int)
 // empty.
 func (s *stubExact) NodesAmong(context.Context, sqlite.NodeFilter, []model.NodeID) ([]sqlite.StoredNode, error) {
 	return nil, nil
+}
+
+// WalkTier yields nothing, as Nodes does.
+func (s *stubExact) WalkTier(context.Context, sqlite.NodeFilter, *sqlite.TierSpan, int,
+	func([]sqlite.StoredNode) (int, error)) error {
+	return nil
 }
 
 // legPathTierLossless proves the exact_path tier drops nothing: it walks the
@@ -934,13 +935,17 @@ type stubWideExact struct {
 	n    int
 	file model.FileID
 	path string
+	// qualifier, when set, precedes every qualified name, so "Widget" no
+	// longer prefixes them and the exact_name tier serves the nodes.
+	qualifier string
 }
 
 func (s *stubWideExact) node(i int) sqlite.StoredNode {
 	return sqlite.StoredNode{
 		Node: model.Node{ID: model.NodeID(fmt.Sprintf("%0*x", model.IDHexLen, i)), Kind: model.NodeFunction,
-			Name: "Widget", QualifiedName: "Widget.m" + strconv.Itoa(i), FileID: s.file},
+			Name: "Widget", QualifiedName: s.qualifier + "Widget.m" + strconv.Itoa(i), FileID: s.file},
 		Bytes: &model.ByteRange{Start: uint64(i), End: uint64(i) + 1},
+		Path:  s.path,
 	}
 }
 
@@ -953,10 +958,6 @@ func (s *stubWideExact) FileByPath(_ context.Context, path string) (model.FileID
 		return "", &model.Error{Code: model.CodeArgumentInvalid, Message: "no such file"}
 	}
 	return s.file, nil
-}
-
-func (s *stubWideExact) File(_ context.Context, id model.FileID) (model.FileVersion, error) {
-	return model.FileVersion{ID: id, Path: s.path}, nil
 }
 
 // NodesInFile pages the same synthetic declarations on the (start_byte,
@@ -1046,6 +1047,41 @@ func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after mode
 		}
 	}
 	return out, nil
+}
+
+// WalkTier yields the tier a page at a time, in the stub's id order, with
+// storage's page bound. A short page ends the walk, as it does in storage.
+// Node i sits at bytes [i, i+1) of the one file, so id order is the content
+// order, and a walk from a span starts at the node whose start is the span's.
+func (s *stubWideExact) WalkTier(ctx context.Context, f sqlite.NodeFilter, from *sqlite.TierSpan, limit int,
+	yield func([]sqlite.StoredNode) (int, error)) error {
+	limit = min(limit, model.MaxPageItems)
+	bound := limit
+	after := model.NodeID("")
+	if from != nil && from.Start > 0 {
+		after = s.node(int(from.Start) - 1).Node.ID
+	}
+	for {
+		nodes, err := s.Nodes(ctx, f, after, bound)
+		if err != nil {
+			return err
+		}
+		if len(nodes) < bound {
+			if len(nodes) > 0 {
+				_, err = yield(nodes)
+			}
+			return err
+		}
+		next, err := yield(nodes)
+		if err != nil {
+			return err
+		}
+		after = nodes[len(nodes)-1].Node.ID
+		bound = limit
+		if next > 0 && next < limit {
+			bound = next
+		}
+	}
 }
 
 // legExactTiersHoldOnePage proves the exact tiers carry no candidate-sized heap
@@ -1354,99 +1390,6 @@ func legPageClampIsReported(t *testing.T, f *fixture) {
 	}
 	if len(plain.Meta.Notices) != 0 {
 		t.Fatalf("a request that named no page bound carries notices %v, want none", plain.Meta.Notices)
-	}
-}
-
-// stubFileReader answers File for any id by SYNTHESIZING the version, so a walk
-// over 200 000 distinct files costs the stub nothing: a pre-built map of them
-// would be the heap the leg below measures. Nothing else on the read surface is
-// exercised, and the methods that are not say so rather than returning
-// plausible empty answers.
-type stubFileReader struct{ reads int }
-
-func (s *stubFileReader) File(_ context.Context, id model.FileID) (model.FileVersion, error) {
-	s.reads++
-	return model.FileVersion{ID: id, Path: "pkg/" + string(id) + ".go"}, nil
-}
-
-func (s *stubFileReader) Node(context.Context, model.NodeID) (sqlite.StoredNode, error) {
-	return sqlite.StoredNode{}, errors.New("not used")
-}
-
-func (s *stubFileReader) FileByPath(context.Context, string) (model.FileID, error) {
-	return "", errors.New("not used")
-}
-
-func (s *stubFileReader) NodesInFile(context.Context, model.FileID, int64, model.NodeID, int) ([]sqlite.StoredNode, error) {
-	return nil, errors.New("not used")
-}
-
-func (s *stubFileReader) DistinctNodesInFile(context.Context, model.FileID, int64, model.NodeID, int) ([]sqlite.StoredNode, error) {
-	return nil, errors.New("not used")
-}
-
-func (s *stubFileReader) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int) ([]sqlite.StoredNode, error) {
-	return nil, errors.New("not used")
-}
-
-func (s *stubFileReader) NodesAmong(context.Context, sqlite.NodeFilter, []model.NodeID) ([]sqlite.StoredNode, error) {
-	return nil, errors.New("not used")
-}
-
-// legPathResolverHoldsOnePage proves the exact tiers' path cache is bounded by
-// the READ PAGE and not by the answer. Mutation: a resolver that memoizes one
-// entry per distinct file of the whole request, so a symbol query spanning a
-// repository's files costs that much heap for the life of the request.
-//
-// Every path is still served -- the count below is the answer, and an evicted
-// entry costs one more File read, which is the whole trade.
-//
-// Mutation: restore the unbounded map (keep every entry, never evict) and the
-// ten-fold input moves the live set by ~24 MiB, failing the bound.
-func legPathResolverHoldsOnePage(t *testing.T, _ *fixture) {
-	const page = 1000
-	resolve := func(n int) uint64 {
-		t.Helper()
-		p := newPathResolver(&stubFileReader{}, page)
-		var held uint64
-		for i := range n {
-			got, err := p.path(context.Background(), model.FileID(fmt.Sprintf("f%08d", i)))
-			if err != nil {
-				t.Fatalf("path(%d): %v", i, err)
-			}
-			if got == "" {
-				t.Fatalf("file %d resolved to no path", i)
-			}
-			if i == n-1 {
-				var m runtime.MemStats
-				runtime.GC()
-				runtime.ReadMemStats(&m)
-				held = m.HeapAlloc
-			}
-		}
-		return held
-	}
-	small := resolve(20_000)
-	large := resolve(200_000)
-	if large > small+(1<<20) {
-		t.Fatalf("the path resolver held %d heap bytes over 20000 distinct files and %d over 200000; "+
-			"its working set is one read page, not the answer's file count", small, large)
-	}
-	t.Logf("path-resolver live set: 20000 files %d bytes, 200000 files %d bytes", small, large)
-
-	// The cache is a read-amplification knob, never a bound on the answer: a
-	// repeat within the page is served from the cache, and one past it is
-	// re-read rather than dropped.
-	warm := &stubFileReader{}
-	p := newPathResolver(warm, 2)
-	for _, id := range []model.FileID{"a", "b", "a", "c", "b"} {
-		if _, err := p.path(context.Background(), id); err != nil {
-			t.Fatalf("path(%s): %v", id, err)
-		}
-	}
-	if warm.reads != 4 {
-		t.Fatalf("a 2-entry cache made %d File reads over a,b,a,c,b; want 4: the repeat inside the "+
-			"cache is served from it and the evicted one is re-read", warm.reads)
 	}
 }
 

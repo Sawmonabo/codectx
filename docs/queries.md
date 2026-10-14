@@ -19,14 +19,16 @@ name**.
 
 A name is resolved against the pinned generation: the exact `name` first, the
 exact `qualified_name` second. A name that no node carries, and a name that
-several nodes carry, are both `CTX_ARGUMENT_INVALID`; the ambiguous case
-carries the exact number of candidates (detail `candidates`) and names every
-one of them by qualified name and id prefix in its remediation, printed under
-the error on the text path and carried in the `--json` envelope, so the caller
-can pick one. A name carried by more nodes than one page holds (the page
-ceiling, `resources.max_page_items`' bound) names the first page by node id and
-points to `codectx symbol <name>`, which lists all of them a page at a time
-with `--cursor`. Nothing is ever resolved to the first
+several nodes carry, are both `CTX_ARGUMENT_INVALID`. The ambiguous case
+carries the exact number of candidates (detail `candidates`), counted in one
+statement. Its remediation, printed under the error on the text path and
+carried in the `--json` envelope, opens with that count and with
+`codectx symbol "<name>"`, which lists every match a page at a time with
+`--cursor`; then it names, by qualified name and id prefix, as many
+candidates of the first page in node-id order as fit whole in the
+remediation's 1,024-byte bound, every one when they fit, and says how many it
+names (detail `candidates_named`). The bound can shorten that list and never
+cuts a name, the count or the command. Nothing is ever resolved to the first
 candidate silently — the candidates are different symbols, and answering about
 the wrong one is a wrong answer the caller cannot detect.
 
@@ -58,9 +60,10 @@ entity only a dependence route reaches. Across calls the slice is realizable: a
 value passed at one call site enters the callee through its argument flow and
 leaves only through that site's summary flow, never through another site's
 result, while a value the callee creates itself leaves through every call site's
-return flow. A dependence-reached entry's `score_micros` is negative (its plain
-score minus 1 000 001), so the order stays `score_micros` descending; its path's
-`cost_units` is the plain sum of its hop costs. `path` and the traversals walk
+return flow. A dependence-reached entry says so with `reach: "dependence"`
+(the field is omitted on a call-reached entry), and its `score_micros` is the
+plain score of its route's cost, never negative; its path's `cost_units` is the
+plain sum of its hop costs. `path` and the traversals walk
 `data_flows_to` at its plain cost.
 
 `impact` also
@@ -132,6 +135,33 @@ MCP `codectx_callers` and `codectx_callees` tools walk `calls` when `relations`
 is empty, exactly as these commands do; a request that names relations walks
 those.
 
+**Asking the language server instead.** `callers` and `callees` take
+`--semantic-source lsp --profile <server>` (MCP: `semantic_source` and
+`profile`), as `symbol` and `refs` do. The answer is then one level of that
+managed server's call hierarchy, over the pinned snapshot: each start node's
+item is prepared at its name token (`textDocument/prepareCallHierarchy`), and
+the answer is that item's direct incoming or outgoing calls
+(`callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`). Its nodes are
+overlay nodes (`semantic_source: lsp`, no canonical id, located by file and
+range), and its edges are in `calls`, not `relations`: each names its two ends
+by their index in `nodes` (`from` calls `to`), the start node it was prepared
+for (`seed`), and its call sites with their file, which is always the
+caller's. `meta.overlay` names the server, its version and the input digest;
+nothing is stored and no coverage credit is granted. A server that prepared
+nothing for any start node is reported `unavailable` with its reason, since
+that empty answer cannot be told apart from one the server could not analyse,
+and any one start node it prepared nothing for is named in a notice.
+
+The protocol answers one level, one direction and `calls` only, per request,
+and an overlay answer is one bounded page with no continuation. So a request
+naming another relation, both directions, `--depth` above 1 or `--cursor` is
+refused (`CTX_PROVIDER_UNAVAILABLE`, or `CTX_ARGUMENT_INVALID` for the cursor),
+never answered from the index; so is a server that does not advertise
+`callHierarchyProvider`. `--limit` bounds the calls, `--edges` and `--visited`
+bound the calls and nodes as on the canonical walk, and a cut by either is
+reported as truncation. Every start node must belong to one project, which one
+server answers; start nodes in two projects are asked separately.
+
 **Calls through a base class are found at query time.** A call is stored once,
 against the method its receiver's declared type declares: in
 
@@ -175,7 +205,10 @@ it publishes one open-site node for the call, located at it, named by the
 callee and carrying its shape (`bare`, `member`, `value`, `construct`) and
 argument count; the caller's `calls` edge goes to that node, and it replaces the
 structural `call:<name>` placeholder for the same site, so an open call is one
-row, on whichever page the open site falls. Its candidates are computed per query, never stored: the declarations of
+row, on whichever page the open site falls. A call the linker binds, or proves
+external through an external node, replaces the placeholder the same way, in
+callers, callees and impact alike; a placeholder is served only for a call no
+other edge of its caller stands for at the same bytes. Its candidates are computed per query, never stored: the declarations of
 the same name, of a kind the shape can call (methods for a member call,
 functions for a bare or value call, classes for a construction), in the same
 language family (C with C++, JavaScript with TypeScript), and, in C, C++, Go,
@@ -226,10 +259,12 @@ so a changed handler marks the endpoints that route to it affected.
 | `--timeout` | all | Deadline for this invocation, and the only thing that bounds one: `resources.query_timeout` is a default and not a ceiling, and it is unlimited, so a command you do not bound answers in full. Every command honours that — `search`, `symbol`, the graph walks, `context plan`, the coverage and workflow commands, and the MCP tools alike. A value here **sets** the deadline for the call — above a configured `resources.query_timeout` as readily as below it. What a call does when it expires depends on whether there is anything to resume past. `search`, `symbol`, the graph walks and `context plan` accumulate work across pages or passes, so a bounded call ends with a continuation cursor and the next call carries on from it. The coverage commands (`coverage read`, `coverage next`, `coverage ack`, `coverage session`, `coverage status`) and the workflow commands (`workflow advance`, `workflow close`, `workflow include`, `workflow status`) answer one bounded read or apply one mutation, so there is no partial state for a cursor to name: an expiry there is reported as `CTX_QUERY_DEADLINE`, naming `resources.query_timeout` / `--timeout` as the setting to move. Zero asks for no deadline of its own and leaves the configured value in charge. |
 | `--limit` | all | Items in one page; on `path`, the equal-cost routes one page lists. |
 | `--cursor` | all | Continue a previous page — on `path`, continue the same search, or the list of its equal-cost routes. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
+| `--semantic-source` | `symbol`, `refs`, `callers`, `callees` | `canonical` (the default) answers from the sealed index; `lsp` answers from the managed language server `--profile` names, as a labeled overlay. |
+| `--profile` | `symbol`, `refs`, `callers`, `callees` | The managed language server to answer from; required with `--semantic-source lsp` and refused without it. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
-| `--view` | `impact` | Which view of the answer a page serves: `entries` (the default), `reasons` or `routes`. Combine it with the `answer` token as `--cursor` to read another view of an answer already walked. |
+| `--view` | `impact` | Which view of the answer a page serves: `entries` (the default), `reasons` or `routes`. Combine it with the `answer` token as `--cursor` to read another view of an answer already walked. An answer that one page of every view holds needs no second read: it is served whole, every view in the one response. |
 | `--direction` | `path` | Which way edges are followed: `outgoing` (the default), `incoming` or `both`. The other traversal commands pin their own direction — a `callers` query asked outgoing would not be a callers query — so only `path` takes it. |
 
 **`path --direction` is the difference between "no route" and "no route that way".**
@@ -249,19 +284,22 @@ reports stay cumulative across the pages of the one walk, so replaying a cursor
 neither resets nor doubles them. `impact` carries a different contract: **its first page pays for the whole
 walk.** The request that mints an impact answer expands until the walk is
 exhausted, streams every admitted edge into a disk-backed sort, ranks the whole
-affected set once, serves the first page and spools the globally ranked
-remainder behind the continuation. Later pages read that spool and walk nothing,
-which is why page 1 is the slow one and every page after it is a file read.
+affected set once and serves the first page. An answer that one page of every
+view holds is served whole in that response, as described below; any longer
+answer spools the globally ranked remainder behind the continuation. Later pages
+read that spool and walk nothing, which is why page 1 is the slow one and every
+page after it is a file read.
 
 What that buys is the contract a single unbounded walk gives, and it is what
 `impact` guarantees: the pages **concatenate** to the single-shot answer —
 the same entities, in the same global order, each listed exactly once. An entity
 reached again from a later frontier is one record, not two; the cheapest route
 to it wins, and the reasons of every edge that touched it are merged into that
-one entry. The order is `score_micros` descending, then `depth` ascending, then
-`node_id` ascending. A `score_micros` below zero marks an entity reached only
-through data or control dependence; every such entity ranks after every entity a
-call, override or structural route reaches. **`name` is not a tie-break** — it is known only after
+one entry. The order is the reach first — every entity a call, override or
+structural route reaches, then every entity only a data or control dependence
+hop reaches, marked `reach: "dependence"` — then `score_micros` descending, then
+`depth` ascending, then `node_id` ascending. `score_micros` is the score within
+its reach and never negative. **`name` is not a tie-break** — it is known only after
 hydration, so ranking on it would reorder one page of a globally ordered
 answer.
 
@@ -288,9 +326,19 @@ entries; a reasons page may end inside one entry's reasons, and the next page
 starts at the reason after it. Nothing is cut: no reason is truncated and no
 route is clipped.
 
-Every page prints an `answer` token beside `next`. Passed as `--cursor` with any
-`--view`, it reads that view of the same ranked answer from its start, so the
-entries read from one view are explained by the others without walking again.
+**An answer that fits one page is served whole, inline.** When one page of
+every view the request reads holds that whole view — at most `--limit` entries
+and package pairs, at most `--limit` reasons, and so at most `--limit` routes —
+the one response carries the entries, every reason and every route, and nothing
+is retained: no spool, no lease, no `answer` token and no `next`. The bound is
+the page bound each view already serves under, so an inline response is never
+larger than the pages a client would otherwise fetch one view at a time. The
+CLI prints the reasons and routes after the entries.
+
+Any longer answer is spooled, and every page prints an `answer` token beside
+`next`. Passed as `--cursor` with any `--view`, it reads that view of the same
+ranked answer from its start, so the entries read from one view are explained
+by the others without walking again.
 A `next` token continues only its own view; presented with another view it is
 `CTX_ARGUMENT_INVALID`. The answer is kept until every view the client reads
 has been served to its end — all three, unless the request's `views` names
@@ -442,6 +490,13 @@ A `search` continuation's exact-tier spool is the one exception: when the
 budget cannot hold it, the cursor carries the position instead and the next
 page walks the tiers from it, so the answer is complete and only slower.
 
+**Continuation state does not outlive a restart of the host.** It is written
+for the cursor's lifetime and never forced to stable storage, so on Linux and
+macOS every spool and retained walk records the boot that wrote it, and after
+a reboot a cursor issued before it answers `CTX_CURSOR_INVALID`: re-run from
+the first page. Whatever a power loss left of those files is never read as an
+answer; the next `gc` or `index` removes it.
+
 On every command but `path`, the query deadline ends a page and not an answer:
 a walk that runs out of time
 returns what it has, reports `query deadline reached` and hands back a cursor the
@@ -510,6 +565,18 @@ a callable's return node (kind `return`), which every callable has under the
 same name; a request whose kinds name `return` finds it. Symbol resolution
 and document symbols leave it out the same way.
 
+**Why a hit was found.** Each hit carries its `tier`, which is the whole
+explanation: an exact-tier hit scores 0 and sorts above every scored one
+because of its tier, and a lexical hit's `score_micros` is its BM25F score. A
+hit carries no list of reasons beside it, since such a list would repeat the
+tier; the table's REASON column is written from `tier` ("matched the
+exact_name tier"), after the fault of a hit whose range could not be read.
+The rule every answer follows: a list whose length grows with the repository
+(an impact entry's reasons, its route, a page of hits) is paged by reference
+and never cut; a list whose length its producer fixes (a hit's
+`unresolved_fields`, keyed by a fixed set of field names) may carry a
+validation bound.
+
 **Then the lexical tier.** The index returns the page's limit plus one of the
 results ranked after the last one served, so it knows whether another page
 exists; a page reads what follows the previous page, never the results before
@@ -542,11 +609,13 @@ tree indexed at another root, or re-indexed as a delta, answers in the same
 order. A cursor carries the last served position by content, not by document
 address — the tier and node of the last exact result, or the score and stored
 document id of the last lexical result — so it survives the index's background
-merges between pages. A continuation inside the exact tiers sorts the hits
-after its position once and spools them; the cursors after it name that spool
-and the offset of their next record, so a deep exact answer costs each page its
-own page. A page whose spool is gone walks from the position instead and
-serves the same hits.
+merges between pages. The exact qualified-name and exact-name tiers are kept in
+served order by their indexes, so a page of either seeks to its position and
+reads its own hits. The qualified-name prefix tier cannot seek: a continuation
+that reaches it sorts its hits after the position once and spools them; the
+cursors after it name that spool and the offset of their next record, so a deep
+prefix answer costs each page its own page too. A page whose spool is gone
+walks from the position instead and serves the same hits.
 
 A cursor pins the generation, the analysis key and the query with its filters.
 Resubmitting a continuation with a different query or filter set, or against a
@@ -559,7 +628,10 @@ writer; a search keeps no other state between pages.
 **What a query deadline does to a search.** A deadline that ends the index's
 search serves the best results found by then, truncated with the deadline as
 its reason and with no continuation: the order of a cut-short search is not
-the true ranking, so there is no position to resume from. Re-run with a longer
+the true ranking, so there is no position to resume from. A deadline inside an
+exact tier does the same: a seek serves the hits it had read in order, and a
+continuation's sort of the prefix tier serves the head of what it had read,
+sorted. Re-run with a longer
 `--timeout`. Cancelling the call is an error, not a page.
 
 ## Configuration these commands read

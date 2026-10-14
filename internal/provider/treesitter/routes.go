@@ -31,10 +31,16 @@ import (
 func (b *builder) routeTable() []endpointFact {
 	s := newRouteScan(b)
 	if s == nil {
-		if b.lang.Name == "python" && b.mayNameSettings() {
+		switch {
+		case b.lang.Name == "python" && b.mayNameSettings():
 			// A settings module imports no framework: its chain is read
 			// alone (djangoSettings).
 			b.links = newRouteScanOf(b).linkRoutes()
+		case mayConfigureNest(b):
+			// A helper that sets a NestJS application's prefix, or a file
+			// exporting a RouterModule route tree, need not import NestJS
+			// (nestAppScan).
+			b.links = newRouteScanOf(b).nestOnly()
 		}
 		return nil
 	}
@@ -54,6 +60,7 @@ func (b *builder) routeTable() []endpointFact {
 	case "python", "javascript", "typescript", "tsx":
 		b.links = s.linkRoutes()
 		b.routeHandlers = s.routeHandlerNames()
+		b.links = s.nestLinks(b.links)
 	case "go":
 		b.links = s.goLinks()
 	}
@@ -98,6 +105,8 @@ type routeScan struct {
 	pending       []pendingMount
 	djangoEntries []djangoEntry
 	out           []routeFact
+	// nestOut are the file's NestJS routes, for the linker (nestLinks).
+	nestOut []nestRoute
 	// params are the Go routers the file's callables receive as
 	// parameters, by callable and parameter (goParamObj); fns is the
 	// file's analysed functions' callables, built on first use (goFns).
@@ -278,7 +287,7 @@ func frameworkOf(language, path string) string {
 		switch path {
 		case "express":
 			return fwExpress
-		case "@nestjs/common":
+		case "@nestjs/common", "@nestjs/core":
 			return fwNest
 		}
 	case "go":

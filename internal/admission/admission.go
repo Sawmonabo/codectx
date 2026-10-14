@@ -31,6 +31,18 @@
 // never answers. A language server therefore queues behind an indexer unit that
 // arrived first instead of opportunistically taking room from under it.
 //
+// A standing holding (Reservation.Standing) is one whose holder gives it back
+// only after work the ledger admits beside it has ended: the search index's
+// writer, which a run holds from its first write until the generation it
+// writes is published. Waiting for it is waiting for the waiter's own work, so
+// the runs-alone rule does not count it: a reservation that does not fit is
+// granted once nothing but standing holdings is held, never left waiting for a
+// release that cannot come. An external tool's plan is held within the
+// allocation less what standing holdings hold (ChildNeeds.plan), so a run
+// planned to run alone keeps the sum within the allocation beside them. A
+// standing holding is itself taken at once, ahead of the queue, since it is
+// asked for by work already admitted (Hold).
+//
 // The one thing a reserver may do before it waits is free room of its own: a
 // reserver that brought a makeRoom step is asked to run it when it reaches the
 // head and does not fit. That is how the language-server manager keeps its
@@ -81,6 +93,12 @@ type Ledger struct {
 	// serializes every child that wants disk at all.
 	diskAllocation int64
 	admitted       int
+	// standing counts the admitted standing holdings, and standingUsed and
+	// standingDisk are what they hold now in each dimension
+	// (Reservation.Standing).
+	standing     int
+	standingUsed int64
+	standingDisk int64
 	// parses counts the admitted Parse reservations: the forward-progress
 	// rule grants a Parse head whenever it is zero. alone counts the admitted
 	// ones that run alone: while it is above zero no Parse head is granted.
@@ -107,6 +125,7 @@ type waiter struct {
 	diskBytes int64
 	parse     bool
 	alone     bool
+	standing  bool
 	granted   bool
 	released  bool
 	ready     chan struct{}
@@ -149,8 +168,8 @@ func NewLedger(allocationBytes, diskAllocationBytes int64) (*Ledger, error) {
 // ReserveWith; this is that call with no disk.
 //
 // A reservation larger than the whole allocation is admitted when the ledger
-// holds nothing. Refusing it would refuse work the user never asked to have
-// refused; serializing it is the whole point of the reservation. This is the
+// holds nothing but standing holdings (Reservation.Standing). Refusing it
+// would refuse work the user never asked to have refused; serializing it is the whole point of the reservation. This is the
 // runs-alone rule, stated once here for every reserver.
 //
 // makeRoom may be nil. When it is not, the ledger calls it when this
@@ -190,6 +209,15 @@ type Reservation struct {
 	// prediction that has already fallen short of what a file needed, so no
 	// other parse's room is staked on it. It requires Parse.
 	Alone bool
+	// Standing marks a holding its holder gives back only after work the
+	// ledger admits beside it has ended, so no waiter may wait for it: once
+	// nothing but standing holdings is held, the head of the queue is granted
+	// whatever the sum (the runs-alone rule counts no standing holding), and an
+	// external tool is planned within the allocation less what standing
+	// holdings hold. It is taken at once, whatever the sum, because work the
+	// ledger already admitted asks for it. A Parse reservation is never
+	// standing.
+	Standing bool
 }
 
 // ReserveWith is Reserve in both dimensions: it blocks until this child's
@@ -209,7 +237,8 @@ func (l *Ledger) ReserveWith(ctx context.Context, r Reservation, makeRoom func()
 // against it right now, adjustments included, read together under one lock so
 // the two figures an operator reads are a consistent pair rather than two
 // moments. reserved can exceed allocation: a holding adjusted upward, a
-// reservation admitted alone and a lowered allocation all leave it above.
+// reservation admitted alone, a standing holding taken beside a tool planned
+// before it and a lowered allocation all leave it above.
 func (l *Ledger) Snapshot() (allocation, reserved int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -300,10 +329,12 @@ func (l *Ledger) Waiting() bool {
 func (l *Ledger) pump() {
 	for len(l.queue) > 0 {
 		head := l.queue[0]
-		// The sums are checked only against something already admitted: an
-		// idle ledger admits any single reservation, whatever it is, so a
-		// child larger than the whole allocation -- of either dimension --
-		// runs alone rather than never. A dimension is checked only when the
+		// The sums are checked only against something already admitted that
+		// comes back without this head's work: a ledger holding nothing but
+		// standing holdings admits any single reservation, whatever it is, so
+		// a child larger than the whole allocation, or than what standing
+		// holdings leave of it -- of either dimension -- runs alone rather
+		// than never. A dimension is checked only when the
 		// head requests some of it: a child that stages nothing is never held
 		// behind a disk dimension another child filled, and a child that
 		// holds no memory never behind the memory one. Every dimension the
@@ -325,7 +356,7 @@ func (l *Ledger) pump() {
 			memoryFits = false
 		}
 		diskFits := head.diskBytes == 0 || l.diskUsed+head.diskBytes <= l.diskAllocation
-		if l.admitted > 0 && !(memoryFits && diskFits) {
+		if l.admitted > l.standing && !(memoryFits && diskFits) {
 			select {
 			case head.stuck <- struct{}{}:
 			default:
@@ -387,6 +418,11 @@ func (l *Ledger) release(w *waiter) {
 	if w.alone {
 		l.alone--
 	}
+	if w.standing {
+		l.standing--
+		l.standingUsed -= w.bytes
+		l.standingDisk -= w.diskBytes
+	}
 	l.used -= w.bytes
 	l.diskUsed -= w.diskBytes
 	l.pump()
@@ -421,11 +457,15 @@ func (l *Ledger) Hold(ctx context.Context, r Reservation, makeRoom func()) (*Hol
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "only a parser file's reservation can run alone among the parses"}
 	}
+	if r.Standing && r.Parse {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: "a parser file's reservation is never a standing holding"}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, model.Canceled(err)
 	}
-	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, parse: r.Parse, alone: r.Alone, ready: make(chan struct{}),
-		stuck: make(chan struct{}, 1)}
+	w := &waiter{bytes: r.MemoryBytes, diskBytes: r.DiskBytes, parse: r.Parse, alone: r.Alone, standing: r.Standing,
+		ready: make(chan struct{}), stuck: make(chan struct{}, 1)}
 	h := &Holding{l: l, w: w}
 	l.mu.Lock()
 	rederive := l.rederive
@@ -434,6 +474,26 @@ func (l *Ledger) Hold(ctx context.Context, r Reservation, makeRoom func()) (*Hol
 		rederive()
 	}
 	l.mu.Lock()
+	if w.standing {
+		// A standing holding is taken at once, whatever the sum and ahead of
+		// the queue, for the reason Adjust takes upward at once: it is asked
+		// for by work the ledger already admitted -- the search index's writer
+		// opens on the first write of a unit that holds its room -- so a wait
+		// could be a wait on that unit, which releases only after this
+		// returns. The room it takes is kept from every external tool planned
+		// after it (Ledger.room), so the sum can stand above the allocation by
+		// at most this holding, and only beside a tool planned before it.
+		l.admitted++
+		l.standing++
+		l.used += w.bytes
+		l.diskUsed += w.diskBytes
+		l.standingUsed += w.bytes
+		l.standingDisk += w.diskBytes
+		w.granted = true
+		close(w.ready)
+		l.mu.Unlock()
+		return h, nil
+	}
 	l.queue = append(l.queue, w)
 	l.pump()
 	l.mu.Unlock()
@@ -490,6 +550,9 @@ func (h *Holding) Adjust(memoryBytes int64) {
 	delta := memoryBytes - h.w.bytes
 	h.w.bytes = memoryBytes
 	l.used += delta
+	if h.w.standing {
+		l.standingUsed += delta
+	}
 	if delta < 0 {
 		l.pump()
 	}
@@ -512,6 +575,9 @@ func (h *Holding) AdjustDisk(diskBytes int64) {
 	delta := diskBytes - h.w.diskBytes
 	h.w.diskBytes = diskBytes
 	l.diskUsed += delta
+	if h.w.standing {
+		l.standingDisk += delta
+	}
 	if delta < 0 {
 		l.pump()
 	}

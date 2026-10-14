@@ -163,10 +163,13 @@ func (r *PinnedReader) Close() error {
 // consumer derives line/column positions from the source's line checkpoints,
 // so the model.Node here carries no Range or NameRange: Bytes holds the
 // node's interval and NameBytes its name token's, absent when none is stored.
+// Path is the root-relative path of the node's file, stored beside the fact
+// ("" for a node with no file), so a reader of nodes needs no file lookup.
 type StoredNode struct {
 	Node          model.Node
 	Bytes         *model.ByteRange
 	NameBytes     *model.ByteRange
+	Path          string
 	UnitID        model.UnitID
 	SourceBinding model.SourceBinding
 }
@@ -196,7 +199,7 @@ func (r *PinnedReader) visible(alias string) string {
 }
 
 const nodeColumns = `ni.canonical, ni.kind, nf.language, nf.name, nf.qualified_name, nf.signature, nf.file_id, ui.content_hash,
-	nf.start_byte, nf.end_byte, nf.name_start_byte, nf.name_end_byte, nf.metadata_json, u.unit_key, u.source_binding`
+	nf.start_byte, nf.end_byte, nf.name_start_byte, nf.name_end_byte, nf.metadata_json, u.unit_key, u.source_binding, nf.path`
 
 // nodeOrder is the Section 9.4 attribute precedence as far as storage can
 // apply it: exact-source binding first, then provider, then the stable unit
@@ -209,7 +212,7 @@ func scanNode(rows interface{ Scan(...any) error }) (StoredNode, error) {
 	var start, end, nameStart, nameEnd sql.NullInt64
 	var metadata string
 	if err := rows.Scan(&nodeID, &n.Node.Kind, &n.Node.Language, &n.Node.Name, &n.Node.QualifiedName, &n.Node.Signature,
-		&fileID, &contentHash, &start, &end, &nameStart, &nameEnd, &metadata, &unitKey, &n.SourceBinding); err != nil {
+		&fileID, &contentHash, &start, &end, &nameStart, &nameEnd, &metadata, &unitKey, &n.SourceBinding, &n.Path); err != nil {
 		if isNoRows(err) {
 			return n, err
 		}
@@ -271,63 +274,10 @@ type NodeFilter struct {
 // node: when several units publish the same node the precedence order picks
 // one. limit is capped at model.MaxPageItems.
 func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.NodeID, limit int) ([]StoredNode, error) {
-	limit = pageLimit(ctx, limit)
-	predicates := 0
-	for _, p := range []string{f.Name, f.QualifiedName, f.QualifiedPrefix} {
-		if p != "" {
-			predicates++
-		}
-	}
-	if predicates != 1 {
-		return nil, invalid("node filter must name exactly one of name, qualified name or qualified-name prefix")
-	}
-	if len(f.Kinds) > model.MaxFilterValues {
-		return nil, invalid("node filter has %d kinds, limit %d", len(f.Kinds), model.MaxFilterValues)
-	}
-	afterRaw, err := optionalBlob("after", string(after))
+	query, args, err := r.nodesStatement(f, after, pageLimit(ctx, limit))
 	if err != nil {
 		return nil, err
 	}
-	var where []string
-	args := []any{r.gen}
-	switch {
-	case f.Name != "":
-		where = append(where, "nf.name = ?")
-		args = append(args, f.Name)
-	case f.QualifiedName != "":
-		where = append(where, "nf.qualified_name = ?")
-		args = append(args, f.QualifiedName)
-	default:
-		where = append(where, "nf.qualified_name >= ? AND nf.qualified_name < ?")
-		args = append(args, f.QualifiedPrefix, prefixUpperBound(f.QualifiedPrefix))
-	}
-	if len(f.Kinds) > 0 {
-		marks := make([]string, len(f.Kinds))
-		for i, k := range f.Kinds {
-			if !k.Valid() {
-				return nil, invalid("node filter kind %q is not a known node kind", k)
-			}
-			marks[i] = "?"
-			args = append(args, string(k))
-		}
-		where = append(where, "ni.kind IN ("+strings.Join(marks, ",")+")")
-	} else {
-		skip := model.NonSymbolKinds()
-		marks := make([]string, len(skip))
-		for i, k := range skip {
-			marks[i] = "?"
-			args = append(args, string(k))
-		}
-		where = append(where, "ni.kind NOT IN ("+strings.Join(marks, ",")+")")
-	}
-	if afterRaw != nil {
-		where = append(where, "ni.canonical > ?")
-		args = append(args, afterRaw)
-	}
-	args = append(args, limit)
-	query := `SELECT ` + nodeColumns + ` FROM node_facts nf` + r.visible("nf") +
-		`JOIN node_ids ni ON ni.id = nf.node_id LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY ni.canonical, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key LIMIT ?`
 	var out []StoredNode
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, query, args...)
@@ -350,6 +300,75 @@ func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.Node
 		return wrap("node_facts", rows.Err())
 	})
 	return out, err
+}
+
+// nodesStatement is one page of Nodes after the node id `after` ("": from
+// the first).
+func (r *PinnedReader) nodesStatement(f NodeFilter, after model.NodeID, limit int) (string, []any, error) {
+	predicates := 0
+	for _, p := range []string{f.Name, f.QualifiedName, f.QualifiedPrefix} {
+		if p != "" {
+			predicates++
+		}
+	}
+	if predicates != 1 {
+		return "", nil, invalid("node filter must name exactly one of name, qualified name or qualified-name prefix")
+	}
+	if len(f.Kinds) > model.MaxFilterValues {
+		return "", nil, invalid("node filter has %d kinds, limit %d", len(f.Kinds), model.MaxFilterValues)
+	}
+	afterRaw, err := optionalBlob("after", string(after))
+	if err != nil {
+		return "", nil, err
+	}
+	var where []string
+	args := []any{r.gen}
+	switch {
+	case f.Name != "":
+		where = append(where, "nf.name = ?")
+		args = append(args, f.Name)
+	case f.QualifiedName != "":
+		where = append(where, "nf.qualified_name = ?")
+		args = append(args, f.QualifiedName)
+	default:
+		where = append(where, "nf.qualified_name >= ? AND nf.qualified_name < ?")
+		args = append(args, f.QualifiedPrefix, prefixUpperBound(f.QualifiedPrefix))
+	}
+	if len(f.Kinds) > 0 {
+		marks := make([]string, len(f.Kinds))
+		for i, k := range f.Kinds {
+			if !k.Valid() {
+				return "", nil, invalid("node filter kind %q is not a known node kind", k)
+			}
+			marks[i] = "?"
+			args = append(args, string(k))
+		}
+		where = append(where, "ni.kind IN ("+strings.Join(marks, ",")+")")
+	} else {
+		skip := model.NonSymbolKinds()
+		marks := make([]string, len(skip))
+		for i, k := range skip {
+			marks[i] = "?"
+			args = append(args, string(k))
+		}
+		where = append(where, "ni.kind NOT IN ("+strings.Join(marks, ",")+")")
+	}
+	if afterRaw != nil {
+		where = append(where, "ni.canonical > ?")
+		args = append(args, afterRaw)
+	}
+	args = append(args, limit)
+	// CROSS JOIN fixes the join order: the tier's facts first, through its
+	// name or qualified-name index, then whether the generation selects each
+	// fact's unit. Left to itself, with statistics, the planner starts from
+	// the generation's units and reads every fact they hold.
+	query := `SELECT ` + nodeColumns + ` FROM node_facts nf
+		CROSS JOIN generation_units gu ON gu.unit_id = nf.unit_id AND gu.generation_id = ?1
+		CROSS JOIN units u ON u.id = gu.unit_id
+		CROSS JOIN node_ids ni ON ni.id = nf.node_id
+		LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
+		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY ni.canonical, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key LIMIT ?`
+	return query, args, nil
 }
 
 // prefixUpperBound is the smallest string greater than every string with the

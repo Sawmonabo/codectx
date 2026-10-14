@@ -163,7 +163,7 @@ CREATE TABLE generation_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     -- remediation is what an operator can do about this row, in prose. It is a
     -- column rather than an entry in details_json because details_json is the
@@ -184,7 +184,7 @@ CREATE TABLE unit_capabilities (
     provider_id TEXT NOT NULL,
     capability TEXT NOT NULL,
     scope_key TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
+    state TEXT NOT NULL CHECK(state IN ('fresh','partial','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
     remediation TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
@@ -219,8 +219,20 @@ CREATE TABLE node_facts (
     name_start_byte INTEGER,
     name_end_byte INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    -- path is the root-relative path of file_id ('' for a node with no file),
+    -- and sort_start and sort_end the byte interval with a missing one read as
+    -- (0, -1): the content key the exact search tiers serve a tier in (path,
+    -- start byte, end byte), so the two name indexes below hold each equality
+    -- tier in that order and a page of it is one seek. They are written
+    -- columns, not generated ones: a query that names a generated column
+    -- counts every column of the table as used, so no index covers it, and a
+    -- tier window would read each fact row besides its index entry.
+    path TEXT NOT NULL DEFAULT '',
+    sort_start INTEGER NOT NULL,
+    sort_end INTEGER NOT NULL,
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
+    CHECK(sort_start = ifnull(start_byte, 0) AND sort_end = ifnull(end_byte, -1)),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte)),
@@ -559,8 +571,11 @@ CREATE INDEX idx_generation_ref ON generations(repository_id, ref, activated_at)
 CREATE INDEX idx_generation_units_unit ON generation_units(unit_id, generation_id);
 CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
 CREATE INDEX idx_unit_dependencies_reverse ON unit_dependencies(dependency_id, unit_id);
-CREATE INDEX idx_nodes_name ON node_facts(name, unit_id, node_id);
-CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, unit_id, node_id);
+-- The name indexes end with the content key, so an exact name or qualified-name
+-- tier reads in served order; every key also carries (unit_id, node_id), the
+-- PRIMARY KEY suffix, which makes each entry unique for a keyset.
+CREATE INDEX idx_nodes_name ON node_facts(name, path, sort_start, sort_end);
+CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, path, sort_start, sort_end);
 -- idx_nodes_file is narrowed to the one column it probes. start_byte was a
 -- dead middle column: search.go keysets on coalesce(nf.start_byte, 0), which no
 -- plain column index can serve, and unit_id is already the leading column of
@@ -622,6 +637,13 @@ CREATE INDEX idx_search_unit ON search_units(unit_id, doc_id);
 -- ids. Without this index both are a scan of search_units per probe.
 CREATE INDEX idx_search_doc ON search_units(doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
+-- Collection asks whether any session still names a snapshot (the snapshot
+-- delete's NOT EXISTS, once per candidate snapshot) and how many name a
+-- generation (DeleteGeneration's refusal count). Neither column is a child
+-- key no other index leads with -- idx_read_sessions_manifest leads with the
+-- manifest -- so without these both questions scan every session row.
+CREATE INDEX idx_read_sessions_snapshot ON read_sessions(snapshot_id);
+CREATE INDEX idx_read_sessions_generation ON read_sessions(generation_id);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
 CREATE INDEX idx_lease_expiry ON retention_leases(expires_at);

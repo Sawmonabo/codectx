@@ -59,9 +59,6 @@ type importRec struct {
 	seen map[string]bool
 }
 
-// add appends one local name the statement binds, once.
-func (r *importRec) add(name string) { r.addAs(name, "") }
-
 // addAs appends one local name the statement binds, once, with the name
 // original it denotes in the imported module, empty when that is the local
 // name.

@@ -89,6 +89,19 @@ The reasoning behind the redesign, the alternatives that were refused and the
 sources are in
 [ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md).
 
+A node fact also carries its file's root-relative `path` (`''` for a node with
+no file) and two sort columns, `sort_start` and `sort_end`, the byte interval
+with a missing one read as 0 and -1 (a CHECK holds them to the byte columns).
+They are written by the insert rather than generated: SQLite counts every
+column of a table as used by a query that names a generated column
+(`sqlite3ExprColUsed`, src/resolve.c), so no index would cover a tier window
+and each entry would cost a read of its fact row. `idx_nodes_name` and
+`idx_nodes_qname` are `(name or qualified_name, path, sort_start, sort_end)`,
+with the primary key `(unit_id, node_id)` after them, so an exact name or exact
+qualified name is held in the order search serves it (path, start byte, end
+byte first; [ADR-0013](adr/ADR-0013-search-index.md)) and a page of it is one
+seek. The path is written beside the fact from `files`, by the same insert.
+
 ## Why a refresh is a new unit
 
 A unit identity folds its input hash, so a refresh over edited source is
@@ -281,7 +294,11 @@ deletion `retention_leases` and, through its cascade, `session_files`, a
 generation deletion `retention_leases`, `provider_runs` and
 `context_manifests`, and the provider-run sweep `units` per run. The indexes
 that close these are listed with their reasons in `schema.sql`, and a test holds
-every foreign key of the schema to the rule.
+every foreign key of the schema to the rule. Collection's own questions of
+`read_sessions` are lookups as well: whether any session still names a
+candidate snapshot (`idx_read_sessions_snapshot`) and how many name a
+generation being deleted (`idx_read_sessions_generation`). Neither column is
+one a child-key index leads with, so a test checks those two plans by name.
 
 ## What a delta names
 
@@ -620,8 +637,9 @@ log's blocks several times in one run, in the middle of its work. Because a
 rewind writes inside the file the log already holds, its size no longer says
 whether the writer's page cache has begun spilling; the file system shim sees
 every write the engine makes, and the engine names a log in the open flags, so
-the shim counts the bytes written to a log and the store marks that count when a
-group begins. The group's commit and the checkpoint that follows
+the shim counts the bytes written to each log, by the log's path, and the store
+marks its own log's count when a group begins. Another database's log -- the run
+ledger's, flushed four times a second -- does not move it. The group's commit and the checkpoint that follows
 reach the disk as every write of the engine does, through the paced file
 system the process registers as its default: after each 8 MiB window
 written to a file the writer waits for the previous window to reach the
@@ -752,19 +770,18 @@ Freeing is the expensive act, so the working files a store writes for its own
 later reading are not freed at all. They are taken from a **scratch pool** under
 the directory they belong to and given back to it: an external sort's runs and
 its merged output, the surface a blob is
-streamed into while it is hashed and the one its compressed object is written
-into, a shortest-path search's state, an index
+streamed into while it is hashed (which, for new content, is the object it
+publishes), a shortest-path search's state, an index
 import's symbol spool, and the database engine's own temporaries. `Take` hands out an existing file of the asked-for
 purpose, opened for overwrite at offset zero, or creates one; `Release` returns
 it for the next taker. **Nothing truncates a surface to reuse it**: a file
 keeps whatever length its largest tenant gave it, and re-indexing an unchanged
 repository or answering a second query of the same shape therefore frees
 nothing at all. The one truncation in the pool is the content store's, which
-trims a staged object to the length its frames and frame index occupy *before*
-the object is published -- the published object is that file, and a reader
-proves an object by its frame index, which must end exactly at the file's end
-([snapshots.md](snapshots.md#the-content-addressed-store)) -- and that trim is
-windowed and charged to the same budget as every other free.
+trims a staged blob to the length its record states *before* the object is
+published -- the published object is that file, and a reader proves an object
+by its length ([snapshots.md](snapshots.md#the-content-addressed-store)) -- and
+that trim is windowed and charged to the same budget as every other free.
 
 A surface the pool cannot open is not handed out. `Take` opens the file it is
 about to lease, and one it cannot open leaves the pool *and* the disk: the pool
@@ -777,8 +794,8 @@ way.
 Because nothing truncates, **the file's length is not the data's length**. Every
 tenant carries its own logical length — a header, a record count, a byte count
 it recorded when it wrote — and never learns it from the file: a sort run is
-read through a limited reader over the byte count it recorded, a staged object is
-trimmed to the length its encoder wrote before it is published, and a database
+read through a limited reader over the byte count it recorded, a staged blob is
+trimmed to the length its record states before it is published, and a database
 surface is emptied by dropping its tables, which returns their pages to the
 database's own free list without giving the filesystem anything back.
 
@@ -818,7 +835,7 @@ at the same rate as the reclaimer's own and through the same turn.
 | An indexer's index file | Removal | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
 | A materialized source tree | Removal | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
 | A published blob a retention sweep collected, and an orphan the sweep found | Removal | The object is content the store no longer names | — |
-| The trim of a staged object before it is published | In place | The published object is that file and a reader proves it by a frame index that must end at the file's end, so it must be that length before the publication, not after | — |
+| The trim of a staged blob before it is published | In place | The published object is that file and a reader proves it by its length, so it must be that length before the publication, not after | — |
 | The staging name of a blob that has just been published | In place, freeing nothing | Two names of one object; the object stays and the unlink gives no blocks back | — |
 | A walk's retained level files and its retained directory | Removal | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
 | A retained level cut back to the byte count a resumed cursor carried | In place | The file goes on being appended to, so there is nothing to rename away | — |
@@ -881,7 +898,9 @@ about itself: how long each stage took, what it cost and what went through it
 [ADR-0011](adr/ADR-0011-run-ledger.md)). It holds `runs`, one row per run, and
 `spans`, one row per stage or unit, keyed to its run and to
 its parent span. A third table holds a single row: the ledger's own schema
-fingerprint, which is that file's alone and never mixed with the store's.
+fingerprint, which is that file's alone and never mixed with the store's. A file
+recording another fingerprint, or none, is replaced by an empty ledger of this schema the next
+time a writer holds the workspace (one log line), and is read as no run recorded until then.
 
 ### Why it is not a table in the store
 
@@ -960,6 +979,20 @@ descent per frontier node and a visibility sub-query per candidate edge, and
 both costs grow with the repository while the answer does not. Resolving
 visibility once, at publication, and scanning a packed array instead turns the
 per-page cost into a sequential read.
+
+**One edge per call.** The structural provider names a call it cannot resolve
+inside its file by a file-less placeholder (`call:<name>`), and the linker then
+publishes, for the same call, the bound target, an open site or an external
+node, from the same caller and with evidence at the same bytes. The build leaves
+out a placeholder's `calls` edge when every one of its visible sites is covered
+that way -- another visible `calls` edge of the same caller with an occurrence at
+exactly the same file and byte range; overlap is not enough, since an inner
+call lies inside its outer call. A placeholder edge with a site nothing else
+covers (a proven external call the linker publishes no edge for) is packed whole.
+The pass reads the file-less node facts once, the edges into the placeholders
+through `idx_relations_to`, and each such caller's `calls` evidence in caller
+order, holding one caller's sites at a time, so every walk serves one edge per
+call and no query pays for the rule.
 
 **The two tables.** `generation_graph` carries one row per generation: the
 largest node and relation surrogate, the node and edge counts, and the

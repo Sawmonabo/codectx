@@ -418,6 +418,9 @@ var toolEnums = map[string]map[string][]string{
 	"codectx_references": {
 		"operation": {"references", "implements", "type-definition"},
 	},
+	"codectx_callers": {
+		"semantic_source": {"canonical", "lsp"},
+	},
 	"codectx_context_capsule": {
 		"view": {"accepted_facts", "rejected_facts", "contradictions", "unresolved",
 			"coverage", "waivers", "export"},
@@ -776,11 +779,63 @@ var scenarios = []scenario{
 		},
 	},
 	{
+		// Failure mode: a language server call hierarchy answer never reaches
+		// the client, or reaches it looking canonical. The handler dropping
+		// semantic_source/profile sends the request to the canonical engine;
+		// the output schema refusing an overlay node (no id) or an overlay
+		// call turns the answer into a protocol error; rebuilding the result
+		// drops QueryMeta.Overlay. Mutation caught: graph() not forwarding
+		// SemanticSource or Profile, or GraphResult losing Calls on the wire.
+		name: "callers routes an lsp request and returns its labeled calls",
+		facade: func(f *fakeServices) {
+			f.graphFn = func(_ context.Context, r model.GraphRequest) (model.GraphResult, error) {
+				if r.SemanticSource != model.SemanticLSP || r.Profile != "gopls" {
+					return model.GraphResult{}, &model.Error{Code: model.CodeArgumentInvalid,
+						Message: "handler altered the semantic route: " + string(r.SemanticSource) + "/" + r.Profile}
+				}
+				rng := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1, Column: 1}, End: model.Position{Byte: 4, Line: 1, Column: 5}}
+				return model.GraphResult{
+					Meta:      model.QueryMeta{Overlay: &model.OverlayBinding{ProviderID: "lsp:gopls", ProviderVersion: "1.2.3", InputDigest: "d1"}},
+					Direction: r.Direction,
+					Nodes: []model.Node{
+						{Kind: model.NodeFunction, Name: "Serve", FileID: "f1", Range: rng, SemanticSource: model.SemanticLSP},
+						{Kind: model.NodeFunction, Name: "main", FileID: "f2", Range: rng, SemanticSource: model.SemanticLSP},
+					},
+					Relations: []model.Relation{},
+					MaxDepth:  1,
+					Calls: []model.OverlayCall{{Seed: r.Start[0], From: 1, To: 0, SiteFile: "f2", SitePath: "main.go",
+						Sites: []model.SourceRange{*rng}}},
+				}, nil
+			}
+		},
+		tool: "codectx_callers",
+		args: graphInput{Start: []model.NodeID{model.NodeID(strings.Repeat("a", 64))},
+			SemanticSource: model.SemanticLSP, Profile: "gopls"},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("callers reported a tool error: %s", firstText(res))
+			}
+			var got result[model.GraphResult]
+			decode(t, res, &got)
+			if got.Data.Meta.Overlay == nil || got.Data.Meta.Overlay.ProviderID != "lsp:gopls" {
+				t.Fatalf("meta.overlay = %+v; an lsp answer reached the client unlabelled", got.Data.Meta.Overlay)
+			}
+			if len(got.Data.Calls) != 1 || got.Data.Calls[0].From != 1 || got.Data.Calls[0].To != 0 ||
+				got.Data.Calls[0].SitePath != "main.go" || len(got.Data.Calls[0].Sites) != 1 {
+				t.Fatalf("calls = %+v, want the facade's one overlay call verbatim", got.Data.Calls)
+			}
+			if len(got.Data.Nodes) != 2 || got.Data.Nodes[1].SemanticSource != model.SemanticLSP {
+				t.Fatalf("nodes = %+v, want two lsp overlay nodes", got.Data.Nodes)
+			}
+		},
+	},
+	{
 		// Failure mode: a node metadata field stored as rows cannot be read
 		// over MCP. Mutation caught: the handler drops the field or the node
 		// on the way to the facade, or a row's raw JSON value fails the
 		// output schema (it is json.RawMessage, like Node.Metadata), so the
-		// rows a "<field>_rows" marker names are unreachable.
+		// rows a "<field>_rows" marker names are unreachable; or a row's
+		// value is altered or its rows reordered on the way.
 		name: "node_metadata forwards the node and field and returns the rows verbatim",
 		facade: func(f *fakeServices) {
 			f.nodeMetadataFn = func(_ context.Context, r model.NodeMetadataRequest) (model.Page[model.MetadataRow], error) {
@@ -801,9 +856,15 @@ var scenarios = []scenario{
 			}
 			var got result[model.Page[model.MetadataRow]]
 			decode(t, res, &got)
-			if len(got.Data.Items) != 2 || got.Data.Items[1].Ordinal != 1 ||
-				string(got.Data.Items[1].Value) != `{"name":"login_required","bytes":{"start":10,"end":25}}` {
-				t.Errorf("items = %+v, want the facade's two rows verbatim, in order", got.Data.Items)
+			// The SDK validates a tool's structured output by decoding it
+			// into a generic value and encoding it again, so an object's
+			// members come back in key order; an object's member order
+			// carries no meaning (RFC 8259 section 4). Each row's value is
+			// therefore compared as the JSON value it is, member for member.
+			if len(got.Data.Items) != 2 || got.Data.Items[0].Ordinal != 0 || got.Data.Items[1].Ordinal != 1 ||
+				!sameJSON(t, got.Data.Items[0].Value, `{"name":"app.route","bytes":{"start":0,"end":9}}`) ||
+				!sameJSON(t, got.Data.Items[1].Value, `{"name":"login_required","bytes":{"start":10,"end":25}}`) {
+				t.Errorf("items = %+v, want the facade's two rows, values unchanged, in order", got.Data.Items)
 			}
 		},
 	},
@@ -1673,4 +1734,17 @@ func TestCapsuleCursorWalkReachesEveryRecord(t *testing.T) {
 	}) {
 		t.Fatalf("the walk read %d records, the capsule sealed %d: %+v", len(walked), len(sealed), walked)
 	}
+}
+
+// sameJSON reports whether got and want encode the same JSON value.
+func sameJSON(t *testing.T, got json.RawMessage, want string) bool {
+	t.Helper()
+	var g, w any
+	if err := json.Unmarshal(got, &g); err != nil {
+		t.Fatalf("decode %s: %v", got, err)
+	}
+	if err := json.Unmarshal([]byte(want), &w); err != nil {
+		t.Fatalf("decode %s: %v", want, err)
+	}
+	return reflect.DeepEqual(g, w)
 }

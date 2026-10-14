@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // An impact route is stored as a parent pointer per admission, never as a list
@@ -119,7 +120,7 @@ func (t *routeTable) open() error {
 	}
 	whole := st.Size() / routeRowBytes * routeRowBytes
 	if whole != st.Size() {
-		if err := f.Truncate(whole); err != nil {
+		if err := paced.ShrinkFile(f, whole); err != nil {
 			_ = f.Close()
 			return internalErr("graph: the route table: " + err.Error())
 		}
@@ -153,14 +154,24 @@ func (t *routeTable) admit(parent uint64, via model.RelationID) (uint64, error) 
 	return t.rows, nil
 }
 
-// sync makes every row written so far durable. A level's admitted states name
-// their rows, so the rows are synced before the level that names them is.
+// sync hands every row written so far to the file. A level's admitted states
+// name their rows, so the rows are written before the level that names them
+// is, and any reader on this boot reads them whole.
+//
+// They are not synced to stable storage where continuation state is scoped to
+// the boot (pagination.BootKnown): like the level files and bitsets beside
+// them, the rows live one cursor lease, and after the restart a power loss
+// implies the whole walk is expired before any row of it is read. Where the
+// boot cannot be told, the rows keep their sync.
 func (t *routeTable) sync() error {
 	if t.w == nil {
 		return nil
 	}
 	if err := t.w.Flush(); err != nil {
 		return internalErr("graph: the route table: " + err.Error())
+	}
+	if pagination.BootKnown() {
+		return nil
 	}
 	if err := t.f.Sync(); err != nil {
 		return internalErr("graph: the route table: " + err.Error())

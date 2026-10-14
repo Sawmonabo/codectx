@@ -2,8 +2,9 @@
 
 - **Status:** Accepted (decisions 1–7 implemented; decisions 8 and 9 accepted and scheduled); §2.4 is the rule of [ADR-0013](ADR-0013-search-index.md) decision 5, 2026-10-08
 - **Date:** 2026-09-14
-- **Amended 2026-10-08:** the hosted dependence engine this record governs was deleted under
-  [ADR-0012](ADR-0012-native-dependence-engine.md) phase 6.
+- **Scope:** dependence facts are produced in process by the native engine
+  ([ADR-0012](ADR-0012-native-dependence-engine.md)); the analysis-unit subprocesses named below
+  are the managed indexers and language servers.
 - **Supersedes:** the dependence-tier direction of 2026-09-13 recorded in
   [`docs/research/00-synthesis.md` §8](../research/00-synthesis.md),
   which this record generalises from one provider to the whole product
@@ -99,11 +100,11 @@ facts on a 604-file cut of the same generator). Because the cost is per identity
 source byte, the ratio moves with the corpus while the per-symbol number does not — which is why
 the per-symbol number, not the ratio, became the primary regression metric.
 
-The same reference-scale run recorded a second miss at the time: an indexing process-tree peak of
-912.6 MiB against a 768 MiB envelope, with the cold index itself passing at 2 m 56 s against a
-3 min target. Re-measured after the planner's external merge sort and the batched provider sinks
-landed, the same corpus indexes in 1 m 32 s with a **145.3 MiB** process-tree peak (two cold runs,
-250 ms and 50 ms sampling, within 0.1 MiB of each other), so that miss is closed.
+The same reference-scale run measured an indexing process-tree peak of 912.6 MiB against a 768 MiB
+envelope while the planner sorted in heap and providers wrote per fact (§2.3); with the planner's
+external merge sort and batched provider sinks the same corpus indexes in 1 m 32 s with a
+**145.3 MiB** process-tree peak (two cold runs, 250 ms and 50 ms sampling, within 0.1 MiB of each
+other).
 
 ---
 
@@ -146,8 +147,8 @@ layered configuration (a project file may narrow a user setting, never widen it)
 expressible if unlimited is a lattice element rather than a magic small number. And `Exceeded`
 being strictly greater removes an off-by-one class of bug from fifty call sites at once.
 
-**What was measured.** Two proofs, both mutation-checked: reverting the fingerprint rendering to
-the old integer quoting makes the "`0` and `"unlimited"` are one identity" assertion fail;
+**What was measured.** Two proofs, both mutation-checked: rendering the bound in the fingerprint
+as a plain quoted integer makes the "`0` and `"unlimited"` are one identity" assertion fail;
 flipping the lattice so unlimited is the bottom makes the ordering assertion fail. A negative value
 is still refused, and a zero *reservation* (not a bound) is still refused.
 
@@ -171,13 +172,13 @@ however long it runs. Only one that has produced nothing for the stall window is
 the reason `stalled`, reported.
 
 **Consequences.** Every remaining bound is the operator's choice, and the diagnostic burden moves
-from "why did it refuse?" to "why is it slow?". Two safety nets now carry the load that the caps
-used to carry: the query deadline, which must end a *page* and mint a cursor rather than end an
+from "why did it refuse?" to "why is it slow?". Two safety nets carry the load a cap would carry:
+the query deadline, which must end a *page* and mint a cursor rather than end an
 answer; and memory admission, which serialises. Both are exercised by tests named for the failure
 mode they protect. The stall detector's signals are bytes read and, where a process tree can be
 sampled, CPU; on a platform where the tree cannot be sampled, a legitimately silent computation
-now dies at the stall window where it previously survived to the wall clock. That is the accepted
-cost of removing the wall clock, and it is recorded rather than worked around: a third signal —
+dies at the stall window, where a wall clock would have let it run to the clock. That is the
+accepted cost of having no wall clock, and it is recorded rather than worked around: a third signal —
 growth of an output file — would close it.
 
 ### 2.2 Resumable traversal: a cursor for every stop
@@ -243,29 +244,27 @@ both true.
   continuation on every budget stop. Mutation: minting a cursor only for "page full" fails the
   test with *"page 1 spent the visited budget with no continuation: the frontier is unreachable"*.
 - The visited set at **200 000 nodes over 40 levels** holds a front of 50 entries — below garbage
-  collection noise. Mutation (let the streamed cumulative set land in the front, which is the shape
-  of the old materialisation) reports **19 774 784 bytes** held for the same walk. 19.77 MB → noise
-  is the before-and-after.
+  collection noise. Mutation (let the streamed cumulative set land in the front, materialising
+  it) reports **19 774 784 bytes** held for the same walk.
 - Spool peak across both frontier proofs: **9 704 KiB** for the whole test binary.
-- Depth exhaustion, which previously exited the loop with `truncated = false` and no reason at all,
-  now reports. Mutation: deleting the depth-limited branch fails with *"truncated = false, reason =
+- Depth exhaustion reports `truncated = true` with its reason. Mutation: deleting the depth-limited branch fails with *"truncated = false, reason =
   ""; want a depth-limited walk to say so"*.
 
 **Why depth exhaustion reports but mints no cursor.** The maximum depth is a component of the
 traversal query hash that a cursor is bound to. A continuation minted at the depth bound could only
 resume a walk already past that bound — a non-terminating chain returning no rows. Nodes at the
 bound are admitted but their edges were never read, so under *this* query there is no work to
-resume. The defect was the silence, and the silence is fixed. Asking for more depth is a different
+resume. What the walk owes is the disclosure, and it gives it. Asking for more depth is a different
 query, and says so.
 
-**Consequences.** Peak resident memory on this path is now: the resumed frontier (bounded by the
+**Consequences.** Peak resident memory on this path is: the resumed frontier (bounded by the
 frontier byte budget) plus this page's admissions (bounded by the page item ceiling) plus one
 level's probe answers plus one page of relations plus one spool record in flight. Nothing scales
 with the graph. The cost side is real and stated for verification: one spool sweep per
 *level* replaces one per page, so a chain-shaped graph — and a call chain is exactly that — can pay
 up to one sweep per page item. Two spools are transiently live per walk, since the consumed one is
-released only after the fresh one is written. The two callers that used to expand a whole walk in
-one request keep the walk-to-completion their answers need, and pay for it on disk rather than in
+released only after the fresh one is written. The two callers whose answers need a whole walk in
+one request (impact and the package rollup) keep the walk-to-completion, and pay for it on disk rather than in
 heap: impact and the package rollup stream every admitted edge into external sorts, rank the whole
 answer once, serve one page and spool the globally ranked remainder behind a cursor, with the
 rollup's containment read keyset-paged per batch. Neither ranks or aggregates a whole walk in
@@ -276,7 +275,7 @@ fan-in — a function of the query memory admission, not of the reachable set.
 ### 2.3 External merge for the planner, with byte-identical order
 
 **Decision.** The index planner's whole-snapshot input list — one record per file in the snapshot,
-previously sorted in heap and aliased into every whole-snapshot unit — becomes an external sort:
+read by every whole-snapshot unit — is an external sort:
 records fill a fixed buffer, spill as stable-sorted runs, and merge through one k-way heap into a
 single file. Peak is the run buffer plus fan-in times block size, independent of file count. The
 sorted result is exposed as an iterator rather than a slice.
@@ -292,7 +291,7 @@ everything, or worse, reusing across an identity change. Byte-identical order is
 constraint, not a preference.
 
 *Keep the in-heap sort and rely on the host having enough memory.* Rejected by the second half of the
-rule. Measured, the old shape retained roughly **44 MiB** at 300 000 inputs — 88 bytes of headers
+rule. Measured, the in-heap sort retains roughly **44 MiB** at 300 000 inputs — 88 bytes of headers
 plus two 64-byte hex bodies per record — growing linearly, and aliased into every whole-snapshot
 unit.
 
@@ -331,7 +330,7 @@ empty input fold is a unit identity that would reuse forever whatever changed. W
 fixed, the planner's largest remaining structure is the plan's own output: roughly 120 bytes plus a
 scope key per planned file unit, or 50–80 MiB at 300 000 files with two file providers active. That
 is named for verification rather than claimed as solved. A new I/O characteristic is also
-named: each whole-snapshot unit re-reads the merged file, where it previously read memory.
+named: each whole-snapshot unit re-reads the merged file rather than memory.
 
 ### 2.4 Search: the best results, a page at a time
 
@@ -432,12 +431,12 @@ name exceeded its ceiling was rejected as invalid provider output, and that reje
 into a **dead unit — the whole file published nothing** — with no test coverage anywhere near it.
 One over-long generated symbol silently erased a file from the index.
 
-**What was measured.** A declaration with a 3 000-byte qualified name now succeeds: the stored
+**What was measured.** A declaration with a 3 000-byte qualified name succeeds: the stored
 value is within the ceiling, the truncation attribute records the original 3 000 bytes, and the
-native key is the file-local form rather than the cut prefix. Mutation (restore the two length arms
-of the old guard) fails the unit with *"declaration name is empty or not UTF-8"*. On the import
-path for precise-index payloads, an over-limit occurrence symbol now drops that record and counts
-it while an in-bound sibling still publishes; mutation (restore the abort) fails the whole import
+native key is the file-local form rather than the cut prefix. Mutation (a guard that refuses a name
+over its ceiling) fails the unit with *"declaration name is empty or not UTF-8"*. On the import
+path for precise-index payloads, an over-limit occurrence symbol drops that record and counts
+it while an in-bound sibling still publishes; mutation (abort the import instead) fails the whole import
 with a typed resource-limit error.
 
 **The degradation surface.** Truncation is only honest if it reaches an operator. A record-size
@@ -479,10 +478,9 @@ explicitly.
 
 *A bare semaphore for admission.* Rejected as insufficient. A bare semaphore is backpressure, not
 admission: the queue behind it must itself be bounded and block on enqueue, or the out-of-memory
-condition simply moves into the queue. The previous code also took a concurrency slot *before*
-checking the byte budget, so waiters could each hold a slot while waiting for memory that only a
-running child could free, and no child could start. Concurrency and bytes are now taken together
-under one lock, or not at all.
+condition simply moves into the queue. Taking a concurrency slot *before* checking the byte budget
+lets waiters each hold a slot while waiting for memory that only a running child could free, so no
+child can start. Concurrency and bytes are taken together under one lock, or not at all.
 
 *Inherit the memory limit from the container runtime rather than admitting explicitly.* Rejected on
 two documented facts. The runtime's soft memory limit counts system memory minus released heap and
@@ -505,10 +503,10 @@ a child echoing every 50 ms for 20 rounds finishes untouched. Two mutations: dis
 lets the stalled child run out the test at 30 s; making the progress probe return zero kills the
 *working* child — proving the detector is progress-driven and not a wall clock under another name.
 For output caps, a child emitting three times its capture bound completes and is flagged; mutations
-restore the refusal and break stream delivery. For admission, mutations restore the
-does-not-fit refusal and break cancellation, and the package is race-clean at three repetitions.
-Removing the kill path also cut one test package's runtime from 62.4 s to 5.6 s, because two tests
-no longer wait out a wall clock for a kill that no longer happens.
+that refuse it or break stream delivery fail. For admission, mutations that refuse a reservation
+that does not fit yet, or break cancellation, fail, and the package is race-clean at three repetitions.
+With no wall-clock kill, one test package runs in 5.6 s rather than 62.4 s: no test waits out a
+clock.
 
 **Consequences.** The accepted trade-off of head-of-line admission is that headroom can sit idle
 while a large reservation waits; that is the price of never starving one, and it is stated at the
@@ -532,24 +530,24 @@ report's silent clamp is deleted; the workspace sweep's silent slice is deleted 
 call-site evidence: the only consumer computes health and completeness over the **whole** set, so
 paging only moves the loop, and page-sizing it properly needs the status surface to fold health
 incrementally and the status wire type to gain a paged completeness contract. The honest statement
-is that the returned slice is now proportional to the total capability row count rather than capped
-at 256 — a real change in shape, recorded as an open concern, rather than a paging claim the code
+is that the returned slice is proportional to the total capability row count, not capped
+at 256 — a real shape, recorded as an open concern, rather than a paging claim the code
 does not support.
 
-*Keep the severity fold and accept that the loser's counts vanish.* Rejected. The fold kept only
-the most severe of two rows for one provider capability, so the discarded row's scope count was
-lost while the omitted counter stayed at zero — a drop that reported itself as no drop. The defect is
-Minor on two checks (health can only worsen under the fold, so nothing
-over-claims; and the omitted counter has exactly one consumer) and is fixed regardless.
+*Keep the severity fold and accept that the loser's counts vanish.* Rejected. The fold keeps only
+the most severe of two rows for one provider capability, so the discarded row's scope count is
+lost while the omitted counter stays at zero — a drop that reports itself as no drop. The defect is
+minor on two checks (health can only worsen under the fold, so nothing over-claims; and the omitted
+counter has exactly one consumer) and is refused regardless.
 
-**Why it was chosen.** The read path was the decisive site: a bare `LIMIT 256` silently dropped the
-tail of the capability report, and that report feeds the completeness field on **every** answer.
+**Why it was chosen.** The read path is the decisive site: a bare `LIMIT 256` would silently drop
+the tail of the capability report, and that report feeds the completeness field on **every** answer.
 A silent drop there makes every answer's completeness claim unfounded. On the write path, the same
-ceiling refused to *publish the generation at all* on a large repository, which makes the index
+ceiling refuses to *publish the generation at all* on a large repository, which makes the index
 unusable rather than merely incomplete.
 
 **What was measured.** 300 distinct provider/capability/scope triples publish and read back
-whole. Mutation A (restore the publish refusal) fails with a typed argument error; mutation B
+whole. Mutation A (refuse to publish past 256 rows) fails with a typed argument error; mutation B
 (restore the read `LIMIT`) fails with *"returned 256 rows, want all 300; the read path dropped the
 tail"*. The aggregating fold: mutation C (keep only the winner's count) reports `scopes="300"`
 where `301` is correct; mutation D (use the plain fold after the collapse) reports `scopes="1"`.
@@ -567,7 +565,7 @@ that cannot be expressed as unlimited without a configuration key that does not 
 its enforcement without adding the key would leave an inbound request unbounded with no operator
 control — strictly worse than today — so it was left, with the exact three-line change recorded.
 
-### 2.8 Storage: identity width is the amplifier *(accepted; landed)*
+### 2.8 Storage: identity width is the amplifier *(accepted; implemented)*
 
 **Decision.** The store's amplification is attributed, not guessed, and the redesign follows the
 attribution: **integer surrogate identities and interned keys**, with bytes-per-indexed-symbol as
@@ -672,65 +670,56 @@ once by each binary, with identical row counts in every identity table: 1 005 88
 gate itself is still owed its re-measurement on the corrected reference corpus and on real
 repositories, and is what re-records `docs/performance.md` row 13.
 
-### 2.9 Capsule pagination *(accepted; closed)*
+### 2.9 Capsule pagination *(accepted; implemented)*
 
 **Decision.** The sealed context capsule's lists become **durable, per-list rows** written inside
 the seal's own write transaction, with the capsule blob keeping identity and per-list counts only,
 a paged read surface, and the canonical hash computed over three bounded passes of the source.
 
-**This has landed.** The capsule's 250 000-file coverage ceiling and its record bounds are gone,
-replaced by `context.max_capsule_records_per_list` and `context.max_capsule_coverage_files`, both
-**unlimited by default**: only a value an operator sets refuses a seal, and the refusal names the
+The capsule's coverage and record bounds are `context.max_capsule_records_per_list` and
+`context.max_capsule_coverage_files`, both **unlimited by default**: only a value an operator sets refuses a seal, and the refusal names the
 key and the count the list reached rather than truncating. Every capsule read is a keyset page —
 the six `capsule --view` projections through the tool and command surfaces, and `context export`,
 which streams all eight lists onto the file a page at a time and refuses to write a file whose list
 is shorter than the count the seal pinned. The record set resident in any process is one page's
 worth whatever the session recorded.
 
-**Why it could not land in halves, stated plainly.** Three separate implementation attempts reached this item and
-each declined to half-land it, for three different and cumulative reasons. The first found that the
-mechanism named in the plan was wrong: a continuation spool is lease-bound and expiry-stamped,
-while a sealed capsule is a write-once durable artefact replayed by a later session — the
-discriminating question being whether a capsule read after its lease expired still serves pages,
-and through a spool it does not. The second found that stripping the count bounds *without* the
-durable rows produces exactly the unbounded heap-resident capsule the second half of the rule
-forbids — and, worse, that such a change would have **passed** a 300 000-file proof on a 47 GiB
-host while violating the rule. The third measured the blast radius and found the minimum
-footprint spans the workflow, server, command-line and storage layers plus five test files that
-carry the byte-identity and replay evidence, which must be rewritten in the same commit or the gate
-is red on a half-landed capsule.
+**Why it is one change, not halves.** A continuation spool is the wrong mechanism: it is
+lease-bound and expiry-stamped, while a sealed capsule is a write-once durable artefact replayed by
+a later session, and a capsule read after its lease expired must still serve pages. Stripping the
+count bounds *without* the durable rows produces exactly the unbounded heap-resident capsule the
+second half of the rule forbids — and such a change would **pass** a 300 000-file proof on a 47 GiB
+host while violating the rule. The minimum footprint spans the workflow, server, command-line and
+storage layers plus five test files that carry the byte-identity and replay evidence.
 
-Two design facts were established on the way and are load-bearing for the landed work. The
+Two design facts are load-bearing. The
 store opens a single-connection writer pool and a separate reader pool under write-ahead logging,
 so a read issued from inside the write callback takes a *reader* connection and cannot deadlock —
 which means the rows can be written inside the seal's own transaction, keeping the seal genuinely
 write-once and removing a clobber race entirely. And the hash cannot be computed in two passes as
-first proposed: the digest emits each list's length *before* its elements, and the digest itself is
+one might expect: the digest emits each list's length *before* its elements, and the digest itself is
 a validated field of the sealed record, so the rows cannot be written before the hash exists.
-Three bounded passes over the source — count, hash, then write — are byte-identical to today's
-digest. Because no stored golden digest existed anywhere in the tree, two reference digests were
-computed and pinned so the change can be proved rather than asserted.
+Three bounded passes over the source — count, hash, then write — produce the digest a whole-capsule
+hash produces; two reference digests are pinned so that is proved rather than asserted.
 
-**Consequences.** The shape that landed freezes one interface first
-(schema rows, the writer and reader inside the seal transaction, the counts on the record, page
-validation), then fills it in and integrates it. Each behavioural change
-carries a mutation proof: a single-pass hash breaks the pinned digests, a source that buffers a
+**Consequences.** One interface carries it (schema rows, the writer and reader inside the seal
+transaction, the counts on the record, page validation). Each behaviour carries a mutation proof: a single-pass hash breaks the pinned digests, a source that buffers a
 list is caught by a walk count rather than by the digest it would reproduce, a tool that drops the
 page cursor never terminates the capsule walk, and an export that stops streaming writes a file
 whose lists are shorter than the counts the seal pinned.
 
 ---
 
-### 2.10 The context compiler is a stream *(accepted; landed in part)*
+### 2.10 The context compiler is a stream *(accepted; implemented in part)*
 
-**Decision.** A compile no longer holds any structure sized by its candidate count. The whole-set
+**Decision.** A compile holds no structure sized by its candidate count. The whole-set
 passes — the admitted-candidate slice and its dedupe map, the hydrated file table, the relation and
 precision maps, the nested per-package centrality map, and the budget pass's five candidate-sized
-structures — become sorted streams joined by merge and reduced by streaming aggregation, over the
+structures — are sorted streams joined by merge and reduced by streaming aggregation, over the
 same external sort the index planner uses (§2.3, §2.4). Peak heap is a function of that sort's run
 budget (the quarter share of `resources.query_memory_bytes`) and of the resolved budget, which is the
 caller's own declared window, and never of how wide the task's scope is. The plan is required to be
-byte-for-byte what the whole-set pipeline produced: the same entries, ordinals, slices, exclusions
+byte-for-byte what the whole-set pipeline produces: the same entries, ordinals, slices, exclusions
 with their reasons, notices and canonical manifest hash.
 
 **Alternative rejected.** Bounding the candidate set instead. That is the shortcut this record exists
@@ -762,7 +751,7 @@ let that budget refuse a wide compile outright.
 
 ## 3. Consequences
 
-### 3.1 What bounds peak memory now
+### 3.1 What bounds peak memory
 
 | Path | Bound |
 |---|---|
@@ -776,7 +765,7 @@ let that budget refuse a wide compile outright.
 
 ### 3.2 The safety nets, and how they are tested
 
-Four mechanisms now carry the load the caps used to carry, and each is exercised by a test named
+Four mechanisms carry the load a cap would carry, and each is exercised by a test named
 for the failure mode it protects, not for the mechanism:
 
 - **The query deadline** is the only remaining stop on an unbounded walk, and it must end a *page*.
@@ -799,33 +788,31 @@ duplicates an existing assertion.
 
 ### 3.3 What is still open
 
-- **No default cap remains.** The capsule's coverage ceiling, the last one, is closed (§2.9):
-  its two successors, `context.max_capsule_records_per_list` and
+- **No default cap remains.** The capsule's bounds, `context.max_capsule_records_per_list` and
   `context.max_capsule_coverage_files`, are unlimited by default and only an operator-set value
-  refuses work.
+  refuses work (§2.9).
 - **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage records' to
-  close (§2.8). The indexing peak, 912.6 MiB when first measured, re-measured at 145.3 MiB against
-  the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
+  close (§2.8). The indexing peak is 145.3 MiB against the 768 MiB envelope (§1.4).
 - **Search heap**: a ranked search holds one top-k heap of 200·n entries for page n and writes
   nothing to disk (§2.4), so peak heap on this path is a function of the page, independent of the
   match count.
-- The smaller residuals this document recorded at their sites are **closed**, each with a reader.
-  The cut on a joined documentation body is disclosed: the composed search body is bounded through
+- The smaller residuals recorded at their sites each have a reader. The cut on a joined
+  documentation body is disclosed: the composed search body is bounded through
   the declaration's own truncation helper, which records the field and its original length. The
-  clamp notice now travels: the context manifest carries a notices field that the compile installs
+  clamp notice travels: the context manifest carries a notices field that the compile installs
   on the manifest it returns, and the graph engine installs the same disclosure at its own query
-  metadata sites. The provider-side derived-row refusal is closed. The observation-reference count
-  is one user-set bound on both paths -- the wire contract's fixed 64-reference refusal is gone and
-  the single-observation path reads the same configured limit the aggregate path does.
-- **A deadline that lands mid-RANK, after the walk completed, is CLOSED.** The external sort has an
+  metadata sites. Providers refuse no derived row. The observation-reference count is one user-set
+  bound on both paths: the single-observation path reads the same configured limit the aggregate
+  path does, and the wire contract fixes no count.
+- **A deadline that lands mid-RANK, after the walk completed, ends a page.** The external sort has an
   adopt-existing-runs constructor (`pagination.AdoptRuns`), and `walkrun.go`'s `detachRankPass` hands
   it the runs an interrupted ranking had already spilled -- moved into the retained state directory
   -- and mints the `f` cursor over them. The next request re-enters those runs instead of re-sorting,
   and the retained pass-1 input feeds whatever they do not yet hold. No stop on these two endpoints
   returns truncated with no cursor.
-- **`resources.max_temp_bytes` defaults to unlimited; a paged walk no longer re-copies its
-  cumulative visited set.** Both decisions are accepted and both have LANDED.
-  (a) LANDED. The temporary-byte budget is a bound nobody set, so it defaults to unlimited like
+- **`resources.max_temp_bytes` defaults to unlimited; a paged walk never re-copies its
+  cumulative visited set.** Both decisions are accepted and implemented.
+  (a) The temporary-byte budget is a bound nobody set, so it defaults to unlimited like
   every other count or size bound: the spool store reads a non-positive cap as unlimited (it
   refuses no write and keeps the accounting the resource envelope reports), the configuration
   default is `0`, the `max_temp_bytes > min_free_disk_bytes` validation is one-sided and applies
@@ -833,66 +820,62 @@ duplicates an existing assertion.
   unlimited rather than refusing construction -- a value that IS set still refuses a run up front,
   with a typed `CTX_RESOURCE_LIMIT` naming `resources.max_temp_bytes`. `min_free_disk_bytes` stays
   as it is: it protects the host's free space rather than capping work, and it is still enforced
-  against actual free space under an unlimited temporary budget. (b) LANDED. A walk page used to write a FRESH
-  continuation spool holding the WHOLE cumulative visited set -- the previous page's visited section
-  is streamed record by record into the new spool -- and the resume decodes that same section again
-  to rebuild the frontier and the membership summary. Both are O(visited) per page, which is the
-  measured linear growth in page latency (0.31 s/page over the first fifty pages of a real
-  repository walk, 2.20 s/page by page 400) and therefore a quadratic walk to completion.
-  The state a page keeps is append-only now: one ascending RUN per leg holding that leg's own
+  against actual free space under an unlimited temporary budget. (b) A walk page that writes a FRESH
+  continuation spool holding the WHOLE cumulative visited set, and a resume that decodes it again to
+  rebuild the frontier and the membership summary, are each O(visited) per page: measured as linear
+  growth in page latency (0.31 s/page over the first fifty pages of a real repository walk,
+  2.20 s/page by page 400), a quadratic walk to completion. That shape is refused.
+  The state a page keeps is append-only: one ascending RUN per leg holding that leg's own
   admissions, an O(1) manifest, and the membership summary persisted beside the runs rather than
   rebuilt -- the concatenated-ascending-runs shape the membership merge-join already read. The
   filter's bit count and probe count are FROZEN at creation and carried in the manifest, because
   bits set under one geometry and probed under another produce false negatives and therefore a
   cross-page re-admission of the same entity. The carrier is `retainedWalk`
-  (`internal/graph/walkretain.go`), which already travels through the impact and rollup endpoints,
+  (`internal/graph/walkretain.go`), which travels through the impact and rollup endpoints,
   is reopened for append on every resume and is carried forward by rename; `expandOptions.Visited`
   is the hop that lets the INTERNAL links append to it directly. EVERY paged endpoint keeps its set
-  there now -- the neighbours traversal included -- so a continuation spool holds frontier records
-  and nothing else, and the visited section, its record kind and the per-page filter rebuilt from it
-  are gone rather than merely bypassed (payload version 7). A neighbours page creates the store only
+  there -- the neighbours traversal included -- so a continuation spool holds frontier records
+  and nothing else: it has no visited section, record kind or per-page filter (payload version 7). A neighbours page creates the store only
   when it actually mints a continuation, and the filter is clamped to the same share of the shared
   continuation byte budget that it takes of the frontier ceiling: it is an accelerator, so a tight
   `resources.max_temp_bytes` makes it denser, never makes paging a walk impossible. The retained directory is re-adopted incrementally
   (`Spools.ReadoptDir` transfers the previous reservation inside one critical section and charges
-  only the delta), so the shared budget no longer holds two copies of the cumulative state at every
+  only the delta), so the shared budget never holds two copies of the cumulative state at a
   page boundary. The RANKED tail of those same two endpoints is O(page) per page
   as well: the page that settles the order writes one spool and every later page seeks to the byte
   offsets its cursor carries (`RankOffset`, `PairOffset`, payload version 6) and reads only its own
-  page out of it, where it used to re-open the spool at record zero and copy the whole unserved
-  remainder into a fresh one.
+  page out of it ([research 29](../research/29-ranked-impact-continuation-paging.md) measures it
+  beside a continuation that copies the unserved remainder).
 
   **What it measures.** On a twenty-thousand-node walk split into many legs by the frontier
   ceiling, the cumulative set grew by 2 398 281 bytes against a ceiling of 5 648 381 derived from
   what the walk admitted, and the walk's `visited_count` is exactly the fixture's node count
   (`graph.TestAWalkWritesItsVisitedSetOnce`); re-adoption charges the grown directory once rather
-  than twice (`pagination.TestReadoptingAGrownDirectoryChargesItOnce`). The "before" column is the
-  soak's own shape -- 0.31 s/page over the first fifty pages, 2.20 s/page by page 400 -- not a
-  re-measured build.
+  than twice (`pagination.TestReadoptingAGrownDirectoryChargesItOnce`). The 0.31 and 2.20 s/page
+  figures in (b) are a soak of the refused shape, not of this one.
 
   **Residual, by design.** The filter's geometry is frozen when the first page creates it, so past
   roughly m/16 admitted nodes it saturates: `mayHold` answers true for everything and every level
   falls back to the full merge-join. Correctness is intact -- a false positive costs a sweep, never
   an answer -- and the remedy is a larger `resources.query_memory_bytes`, not a re-sized filter,
   which would change the geometry the bits were set under.
-- **An impact or rollup continuation dropping the nodes its INTERNAL links admitted is CLOSED.**
-  `runWalkToCompletion` chains several `expand` calls inside one request, and the continuation it
-  minted used to carry only the OUTER cursor's stream, so a walk that crossed an internal boundary
-  forgot every node the earlier links admitted and the next page re-admitted them: the same entity
-  on two pages. The links now append their own admissions to the persisted runs through
-  `expandOptions.Visited`, and `walkState.Carried` and `ReleaseCarried` are gone.
+- **An impact or rollup continuation carries the nodes its INTERNAL links admitted.**
+  `runWalkToCompletion` chains several `expand` calls inside one request; a continuation carrying
+  only the OUTER cursor's stream would forget every node the earlier links admitted, and the next
+  page would re-admit them: the same entity on two pages. The links append their own admissions to
+  the persisted runs through `expandOptions.Visited`.
 - **The shortest-path walk is external-memory** and truncates for no memory reason: its settled
   set, distances and frontier live in a per-request SQLite scratch database under the retained
   state directory (`path.go`, `pathscratch.go`), and a page that runs out of time mints the `p`
   cursor over that scratch rather than ending the answer. The repository map's containment read is
-  closed too -- it is keyset-paged, so its peak is a page and not a container's fan-out.
+  keyset-paged, so its peak is a page and not a container's fan-out.
 
 ### 3.4 What verification on real repositories must show
 
 The verification pass runs fully offline with an isolated cache and configuration, cold, over four
 real repositories of 13 223, 6 270, 5 432 and 4 019 tracked files, plus one synthetic 300 000-file
-corpus whose only purpose is to prove that the removed workspace ceiling no longer refuses: it must
-index to completion. For each it reports wall clock, sampled process-**tree** peak resident memory,
+corpus whose only purpose is to prove that no workspace ceiling refuses: it must index to
+completion. For each it reports wall clock, sampled process-**tree** peak resident memory,
 the storage ratio and bytes per indexed symbol. The gate is: no out-of-memory failure on the 47 GiB
 host, and a peak bounded by page and batch size rather than by file count. The two storage numbers
 are **reported here and gated by the storage records**.

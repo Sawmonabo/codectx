@@ -28,6 +28,10 @@ import (
 // neither NodeID nor FileID and attaches no routes, so a diverted record
 // removes nothing from P-C's node or relation sets. What it removes is the
 // exclusion itself, which is what this asserts.
+//
+// Mutation caught: P-A writing a survivor's reasons onto its reason stream
+// empty (or not at all), so the streamed survivor loses the reasons the map
+// pipeline keeps.
 func TestStreamedIngestMatchesTheMapDedupe(t *testing.T) {
 	t.Parallel()
 	fx := newContextFixture(t)
@@ -259,9 +263,10 @@ func spoolOf(t *testing.T, sorts *compileSorts, cands []candidate) *pagination.S
 	return trackRun(sorts, run)
 }
 
-// drainCandidates rebuilds the candidates P-A produced, routes included: the
-// record stream carries them as pathRec/hopRec keyed by the same seq, so this
-// is also the check that no route was lost on the way onto those streams.
+// drainCandidates rebuilds the candidates P-A produced, routes and reasons
+// included: the record stream carries them as pathRec/hopRec/reasonRec keyed
+// by the same seq, so this is also the check that no route or reason was lost
+// on the way onto those streams.
 func drainCandidates(t *testing.T, in *ingested) []candidate {
 	t.Helper()
 	routes := map[int64][]model.RelationPath{}
@@ -284,10 +289,20 @@ func drainCandidates(t *testing.T, in *ingested) []candidate {
 	}); err != nil {
 		t.Fatalf("draining the hop stream: %v", err)
 	}
+	// Reasons ride their own stream keyed by the same seq; they are read back
+	// under appendReason's rules, as P-I attaches them.
+	reasons := map[int64][]string{}
+	if err := in.Reasons.Each(func(r reasonRec) error {
+		reasons[r.Seq] = appendReason(reasons[r.Seq], r.Text)
+		return nil
+	}); err != nil {
+		t.Fatalf("draining the reason stream: %v", err)
+	}
 	var out []candidate
 	if err := in.Cands.Each(func(r candRec) error {
 		c := r.rankCandidate()
 		c.Paths = routes[r.Seq]
+		c.Reasons = reasons[r.Seq]
 		out = append(out, c)
 		return nil
 	}); err != nil {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -109,9 +108,10 @@ type IndexService interface {
 }
 
 // ExploreService answers the read-only discovery and traversal endpoints.
-// Symbol and References carry SemanticSource and Profile, so the same two
-// methods serve the canonical index and the LSP overlay; GraphRequest,
-// PathRequest and ImpactRequest carry none, because traversal is canonical-only.
+// Symbol, References and Graph carry SemanticSource and Profile, so the same
+// methods serve the canonical index and the LSP overlay (Graph's overlay
+// route is one level of the server's call hierarchy); PathRequest and
+// ImpactRequest carry none, because path search and impact are canonical-only.
 type ExploreService interface {
 	Overview(ctx context.Context, req model.OverviewRequest) (model.Page[model.OverviewItem], error)
 	Search(ctx context.Context, req model.SearchRequest) (model.Page[model.SearchHit], error)
@@ -333,15 +333,28 @@ func (s *Services) References(ctx context.Context, req model.ReferenceRequest) (
 	return model.Page[model.ReferenceOccurrence]{}, unknownSource("references", req.SemanticSource)
 }
 
-// Graph answers bounded callers/callees traversal.
+// Graph answers bounded callers/callees traversal, from the canonical index or
+// the LSP overlay.
 //
-// It routes to Engine.Neighbors, the one traversal the engine exposes: it walks
-// the request's own direction and relation allowlist, and GraphRequest carries
-// no operation selector, so `callers` and `callees` are that request with
-// Direction and Relations set rather than two further engine entry points.
+// The canonical route is Engine.Neighbors, the one traversal the engine
+// exposes: it walks the request's own direction and relation allowlist, and
+// GraphRequest carries no operation selector, so `callers` and `callees` are
+// that request with Direction and Relations set rather than two further
+// engine entry points.
 func (s *Services) Graph(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
 	if err := req.Validate(); err != nil {
 		return model.GraphResult{}, err
+	}
+	switch req.Source() {
+	case model.SemanticCanonical:
+	case model.SemanticLSP:
+		res, err := s.w.s.overlayCalls(ctx, req)
+		if err != nil {
+			return model.GraphResult{}, s.fail("graph", err)
+		}
+		return res, nil
+	default:
+		return model.GraphResult{}, unknownSource("graph", req.SemanticSource)
 	}
 	var res model.GraphResult
 	err := s.withEngine(ctx, req.GenerationID, func(e *graph.Engine) error {
@@ -1130,9 +1143,8 @@ func requestSpanKey(repo model.RepositoryID, req model.ReadChunkRequest) (spanKe
 // the root itself or climbs above it names no file of the repository and is
 // CTX_ARGUMENT_INVALID.
 func repositoryPath(p string) (string, error) {
-	clean := path.Clean(filepath.ToSlash(p))
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "../") ||
-		filepath.IsAbs(p) {
+	clean, ok := model.CleanRepoPath(filepath.ToSlash(p))
+	if !ok || filepath.IsAbs(p) {
 		return "", &model.Error{Code: model.CodeArgumentInvalid,
 			Message:     "read_chunk.path " + strconv.Quote(p) + " is not a file path inside the repository",
 			Remediation: "name the file relative to the repository root, with no \"..\" segment that leaves it"}

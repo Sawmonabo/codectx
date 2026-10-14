@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,14 +25,18 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // schemaSQL is this database's complete DDL. A change to it is a new
-// fingerprint, and a file carrying another fingerprint is refused rather than
-// altered: there is no migration runner here and none is wanted, because the
-// rows are a record of runs that have already happened.
+// fingerprint. A file carrying another fingerprint is never migrated, never
+// half-read and never refused: it is derived accounting whose learned rows are
+// keyed by the build that wrote them (NeedKey.Build), so no other build could
+// use them. The writer, which holds the workspace lock, replaces it with an
+// empty ledger of this schema; a reader, which holds no lock, reads it as a
+// workspace that has recorded no run.
 //
 //go:embed schema.sql
 var schemaSQL string
@@ -165,37 +170,83 @@ func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOn
 }
 
 // initSchema creates the schema in an empty file or verifies an existing one.
-func initSchema(ctx context.Context, db *sql.DB, path string) error {
+// An existing file whose recorded fingerprint is not this binary's, or that
+// records none, answers foreign true and is left untouched: what to do with it
+// is the caller's, which knows whether it holds the workspace lock.
+func initSchema(ctx context.Context, db *sql.DB) (foreign string, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return wrap("begin", err)
+		return "", wrap("begin", err)
 	}
 	defer tx.Rollback()
 	var tables int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
-		return wrap("sqlite_master", err)
+		return "", wrap("sqlite_master", err)
 	}
 	if tables == 0 {
 		if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
-			return wrap("create the ledger schema", err)
+			return "", wrap("create the ledger schema", err)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO ledger_meta(singleton, fingerprint) VALUES(1, ?)`, Fingerprint); err != nil {
-			return wrap("ledger_meta", err)
+			return "", wrap("ledger_meta", err)
 		}
-		return wrap("commit", tx.Commit())
+		return "", wrap("commit", tx.Commit())
+	}
+	found, ok, err := recordedFingerprint(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	if !ok || found != Fingerprint {
+		return foreignName(found, ok), nil
+	}
+	return "", wrap("commit", tx.Commit())
+}
+
+// recordedFingerprint reads the fingerprint a ledger file records, and false
+// when it records none: no ledger_meta table, or no row in it, is a file this
+// schema did not write. A read that fails is an error, never "none recorded".
+func recordedFingerprint(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (string, bool, error) {
+	var tables int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ledger_meta'`).Scan(&tables); err != nil {
+		return "", false, wrap("read the ledger schema", err)
+	}
+	if tables == 0 {
+		return "", false, nil
 	}
 	var fingerprint string
-	if err := tx.QueryRowContext(ctx, `SELECT fingerprint FROM ledger_meta WHERE singleton = 1`).Scan(&fingerprint); err != nil || fingerprint != Fingerprint {
-		found := fingerprint
-		if err != nil {
-			found = "unreadable"
-		}
-		return &model.Error{Code: model.CodeSchemaMismatch,
-			Message:     "run ledger schema fingerprint " + found + " does not match this binary's " + Fingerprint,
-			Details:     map[string]string{"path": path},
-			Remediation: "delete the run ledger beside the index cache, or run `codectx reset --reindex`"}
+	err := q.QueryRowContext(ctx, `SELECT fingerprint FROM ledger_meta WHERE singleton = 1`).Scan(&fingerprint)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
 	}
-	return wrap("commit", tx.Commit())
+	if err != nil {
+		return "", false, wrap("read the ledger schema", err)
+	}
+	return fingerprint, true, nil
+}
+
+// foreignName is how a log line names the schema a foreign file was written
+// by.
+func foreignName(found string, recorded bool) string {
+	if !recorded {
+		return "none recorded"
+	}
+	return found
+}
+
+// removeLedgerFiles deletes the ledger file and the write-ahead log and shared
+// memory files beside it. All three go: a log left beside a new file of the
+// same name would be replayed into it. A ledger is as large as the runs it
+// recorded, so its blocks go back at the pace every free keeps; each name is
+// gone when paced.Remove returns, which is what the new file needs.
+func removeLedgerFiles(path string) error {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := paced.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return internal("remove the run ledger written by another schema: " + err.Error())
+		}
+	}
+	return nil
 }
 
 // verifiedConnector reads every pragma back on each physical connection: the

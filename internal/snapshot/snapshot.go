@@ -19,7 +19,6 @@
 //
 //	<data>/workspace.lock   cross-process indexing/GC coordination lock
 //	<data>/cas/hh/<hash>    immutable blobs named by validated SHA-256
-//	<data>/cas/tmp/         private files being written before publication
 //	<data>/staging/         per-capture staging databases
 //	<data>/materialize/     private analyzer materializations
 package snapshot
