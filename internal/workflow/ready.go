@@ -72,7 +72,6 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 		FullyRead:     c.FullyRead,
 		Waived:        c.Waived,
 		ScopeComplete: m.ScopeComplete,
-
 		// The two counts are carried apart because they answer different
 		// questions. Served is the reported fully_served_files and excludes a
 		// waived file whatever its bytes say -- a waiver is an admission that a
@@ -86,7 +85,8 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 		// Read completeness is the coverage answer with one addition: an incomplete
 		// manifest scope disqualifies the session outright even when the counts
 		// agree.
-		ReadComplete: m.ScopeComplete && c.FullyRead == c.Required}
+		ReadComplete: m.ScopeComplete && c.FullyRead == c.Required,
+	}
 
 	var shut []string
 

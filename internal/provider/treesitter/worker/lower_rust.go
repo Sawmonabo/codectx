@@ -521,7 +521,6 @@ func (r *rsLower) closeFrame() { r.frames = r.frames[:len(r.frames)-1] }
 // rsTryLabel, otherwise the innermost frame so labelled), or -1.
 func (r *rsLower) frameOf(label string) int {
 	for i, f := range slices.Backward(r.frames) {
-
 		var name string
 		if f.to > f.from {
 			name = view(rawIdent(r.src[f.from:f.to]))

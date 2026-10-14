@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
@@ -252,10 +253,46 @@ func TestSelectPublishesDetectionDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A comma separates the values the status fold merges from two rows, so
+	// the published sentence carries semicolons where the provider wrote
+	// commas, and a merge cannot split it.
+	// Mutation: publish det.Reason as written and the comma survives.
+	published := "scip-go: scip-go runs the go command; and none was found on PATH"
 	for i, got := range reasonedSel.States {
-		if got.State != model.CapabilityPartial || got.Details["reason"] != why || got.Details["scip-go"] != model.CodeProviderUnavailable {
-			t.Fatalf("published state %d = %+v, want a partial row carrying the refusal code and the reason", i, got)
+		if got.State != model.CapabilityPartial || got.Details["reason"] != published || got.Details["scip-go"] != model.CodeProviderUnavailable {
+			t.Fatalf("published state %d = %+v, want a partial row carrying the refusal code and the reason %q", i, got, published)
 		}
+	}
+	// An unavailable detection's reason is the only thing that says why the
+	// provider is not running at all: a repository whose one language is Go, on
+	// a machine with no go command, published a bare code before.
+	// Mutation: build the inactive rows without the details and the reason is
+	// gone.
+	refused := providertest.Func{Desc: desc, DetectFn: func(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+		return provider.Detection{DiagnosticCode: model.CodeProviderUnavailable, Reason: why}, nil
+	}}
+	refusedReg, err := provider.NewRegistry(refused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedSel, err := refusedReg.Select(context.Background(), h.Root, h.Policy, func(string) config.Enablement { return config.Auto })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refusedSel.States) != len(desc.Capabilities) {
+		t.Fatalf("an unavailable provider published %d rows, want one per capability (%d)", len(refusedSel.States), len(desc.Capabilities))
+	}
+	for i, got := range refusedSel.States {
+		if got.State != model.CapabilityUnavailable || got.DiagnosticCode != model.CodeProviderUnavailable || got.Details["reason"] != published {
+			t.Fatalf("published state %d = %+v, want an unavailable row carrying the reason %q", i, got, published)
+		}
+		if got.Validate() != nil {
+			t.Fatalf("published state %d does not validate: %v", i, got.Validate())
+		}
+	}
+	refusedSel.States[0].Details["reason"] = "edited"
+	if len(refusedSel.States) > 1 && refusedSel.States[1].Details["reason"] != published {
+		t.Fatal("unavailable rows share one details map")
 	}
 	// The other half of the same false-readiness question, in the other
 	// direction: a detail that is not a refusal must publish nothing. A pinned

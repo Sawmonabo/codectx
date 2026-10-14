@@ -25,6 +25,18 @@ var goInstallDirs = func(lookup Lookup) []string {
 	return dirs
 }
 
+// userHome is the user's home directory as the environment names it:
+// USERPROFILE, as os.UserHomeDir and rustup read it on Windows. A HOME a Unix
+// shell exports there is not what Cargo and rustup install under.
+func userHome(lookup Lookup) string {
+	h, _ := lookup("USERPROFILE")
+	return h
+}
+
+// userBinDir is empty: Windows has no per-user executable directory a profile
+// adds to PATH outside the environment block every process already inherits.
+func userBinDir(Lookup) string { return "" }
+
 func executableName(name string) string { return name + ".exe" }
 
 // isExecutable is a regular file; Windows has no execute bit to check.

@@ -204,20 +204,24 @@ var kindSpecs = map[Kind]kindSpec{
 		network: NetworkDenied,
 		timeout: 45 * time.Minute,
 	},
-	// rust-analyzer's scip subcommand loads cargo metadata, so cargo must be
-	// reachable and its home addressable. rust-analyzer also looks in Cargo's
-	// bin directory itself, so a missing cargo is not refused here: its index
-	// came out byte-identical with and without cargo on PATH (measured, a
-	// dependency-free crate).
+	// rust-analyzer's scip subcommand loads cargo metadata and asks rustc for
+	// the target's cfgs, so both must be reachable and Cargo's home
+	// addressable. With neither anywhere it exits 1 at once ("Failed to load
+	// the project", measured under a service manager's PATH with an empty
+	// home), so the kind is refused before any unit is planned. rust-analyzer
+	// looks in the same places hosttool.Find does (CARGO and RUSTC, PATH,
+	// Cargo's bin directory), so the refusal costs no run that would have
+	// worked.
 	KindRust: {
 		triggers: []string{"Cargo.toml"},
 		args: func(a argPaths) []string {
 			return []string{"scip", a.InputDir, "--output", a.OutputFile}
 		},
-		env:     []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
-		host:    []string{"cargo", "rustc"},
-		network: NetworkAllowed,
-		timeout: 45 * time.Minute,
+		env:          []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
+		host:         []string{"cargo", "rustc"},
+		requiresHost: true,
+		network:      NetworkAllowed,
+		timeout:      45 * time.Minute,
 	},
 	// scip-clang carries its own Clang and reads the project's compilation
 	// database. The database is normalized in the private materialization
@@ -453,12 +457,12 @@ func hostRefusal(k Kind, lookup hosttool.Lookup) (unresolved, bool) {
 		if _, ok := findHost(name, lookup); ok {
 			continue
 		}
-		where := "on PATH or in a standard install location"
-		if name == "go" {
-			where = "on PATH, under GOROOT or in a standard Go install location"
+		where := "on PATH or under GOROOT or in the user's bin directory or a standard Go install location"
+		if name != "go" {
+			where = "on PATH or at the path " + strings.ToUpper(name) + " names or in CARGO_HOME/bin or ~/.cargo/bin"
 		}
 		err := (&model.Error{Code: model.CodeProviderUnavailable,
-			Message: string(k) + " runs the " + name + " command, and none was found " + where}).
+			Message: string(k) + " runs the " + name + " command and none was found " + where}).
 			WithRemediation("install " + name + ", or start codectx with the directory that holds it on PATH")
 		return unresolved{kind: k, code: model.CodeProviderUnavailable, err: err}, true
 	}
@@ -602,9 +606,10 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		follow = admission.FollowResidency(held, cpu.AnonResidentBytes, process.TreeSampleInterval)
 	}
 	_, span := ledger.Start(ctx, stageRun, prof.Name())
+	stderr := newTailWriter(stderrTailBytes)
 	res, err := p.runner.Run(ctx, process.Spec{
 		Path: path, Args: args, Dir: input, Env: prof.env(p.lookupEnv),
-		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
+		Stderr: stderr, MaxStdoutBytes: maxToolOutputBytes,
 		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace, ProgressFiles: []string{output},
 		CPUProgress: cpu, MemoryReservationBytes: memory, DiskReservationBytes: disk,
 	})
@@ -622,7 +627,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		// The indexer's own words are the one record of why it failed: the
 		// runner's error says only that it exited. They travel as the stderr
 		// tail, which the run keeps and no capability row or log line carries.
-		if tail := stderrTail(res.Stderr); tail != "" {
+		if tail := stderrTail(stderr.bytes()); tail != "" {
 			if typed, ok := errors.AsType[*model.Error](err); ok {
 				err = typed.WithDetail(model.DetailStderrTail, tail)
 			}
@@ -651,6 +656,42 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	}
 	return output, manifestSHA, nil
 }
+
+// tailWriter keeps the last max bytes written to it and drops the rest, so an
+// indexer's standard error costs a fixed few kilobytes however long the run
+// talks. The runner hands a caller's writer every byte in order and bounds
+// only its own capture buffer, which keeps the FRONT of a stream: a long run's
+// error line, printed after megabytes of progress, would be cut away there.
+type tailWriter struct {
+	max int
+	buf []byte
+}
+
+// stderrTailBytes is what tailWriter keeps of a failed indexer's standard
+// error: twice the detail bound, so stderrTail can trim trailing blank lines
+// and still fill the bound.
+const stderrTailBytes = 2 * model.MaxDetailBytes
+
+func newTailWriter(max int) *tailWriter {
+	return &tailWriter{max: max, buf: make([]byte, 0, max)}
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if len(p) >= w.max {
+		w.buf = append(w.buf[:0], p[len(p)-w.max:]...)
+		return n, nil
+	}
+	if over := len(w.buf) + len(p) - w.max; over > 0 {
+		w.buf = append(w.buf[:0], w.buf[over:]...)
+	}
+	w.buf = append(w.buf, p...)
+	return n, nil
+}
+
+// bytes is what the writer kept. It is read only after the run that wrote
+// it has returned.
+func (w *tailWriter) bytes() []byte { return w.buf }
 
 // stderrTail is the end of what a failed indexer wrote to standard error,
 // bounded to model.MaxDetailBytes. The end, because an indexer prints its
@@ -709,8 +750,9 @@ func fileSHA256(path string) (string, error) {
 }
 
 const (
-	// maxToolOutputBytes bounds each captured stream of an indexer. The
-	// streams are diagnostics only and never logged raw (Section 22).
+	// maxToolOutputBytes bounds the captured standard output of an indexer.
+	// It is a diagnostic only and never logged raw (Section 22); standard
+	// error goes to a tailWriter instead.
 	maxToolOutputBytes = 1 << 20
 	toolGrace          = 10 * time.Second
 )

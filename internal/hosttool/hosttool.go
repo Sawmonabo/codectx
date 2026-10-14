@@ -4,13 +4,11 @@
 // editor or an agent client starts often has a shorter PATH than the user's
 // shell, and a toolchain missing from that PATH is not missing from the
 // machine. Each tool is therefore looked up where its installers put it, in
-// this order: PATH, then the tool's own home variable, then the installers'
-// default locations.
+// this order: PATH, then the tool's own home variable, then the user's own
+// executable directory and the installers' default locations.
 package hosttool
 
 import (
-	"bufio"
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,7 +69,10 @@ func ChildPATH(lookup Lookup, names ...string) (string, bool) {
 // GoEnv reads one Go environment variable the way the go command does ("go help
 // environment"): the environment, else the user's go env file (GOENV, default
 // os.UserConfigDir()/go/env, "off" for none), which is where `go env -w`
-// writes.
+// writes. The file is read by the go command's own rule (cmd/go
+// internal/cfg readEnvFile): a line is KEY=value with KEY starting with an
+// upper-case letter, nothing is trimmed, and a later line for a key replaces
+// an earlier one.
 func GoEnv(key string, lookup Lookup) string {
 	if v, ok := lookup(key); ok && v != "" {
 		return v
@@ -91,22 +92,26 @@ func GoEnv(key string, lookup Lookup) string {
 	if err != nil {
 		return ""
 	}
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	for sc.Scan() {
-		k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
-		if ok && strings.TrimSpace(k) == key {
-			return strings.TrimSpace(v)
+	var value string
+	for line := range strings.Lines(string(data)) {
+		line = strings.TrimSuffix(line, "\n")
+		k, v, ok := strings.Cut(line, "=")
+		if ok && k != "" && k[0] >= 'A' && k[0] <= 'Z' && k == key {
+			value = v
 		}
 	}
-	return ""
+	return value
 }
 
 // fallbackDirs are the directories after PATH where the named tool's
 // installers put it:
-//   - go: GOROOT/bin (GOROOT as GoEnv reads it), then the Go installers' and the
-//     common package managers' default locations (goInstallDirs);
-//   - cargo and rustc: CARGO_HOME/bin, then the home directory's .cargo/bin,
-//     where rustup installs rustc and cargo ("Cargo's bin directory").
+//   - go: GOROOT/bin (GOROOT as GoEnv reads it), then the user's executable
+//     directory (userBinDir), then the Go installers' and the common package
+//     managers' default locations (goInstallDirs);
+//   - cargo and rustc: the directory of the executable CARGO or RUSTC names
+//     (the variable rust-analyzer reads first), then CARGO_HOME/bin, then the
+//     home directory's .cargo/bin, where rustup installs rustc and cargo
+//     ("Cargo's bin directory").
 func fallbackDirs(name string, lookup Lookup) []string {
 	var dirs []string
 	switch name {
@@ -114,8 +119,14 @@ func fallbackDirs(name string, lookup Lookup) []string {
 		if root := GoEnv("GOROOT", lookup); root != "" {
 			dirs = append(dirs, filepath.Join(root, "bin"))
 		}
+		if dir := userBinDir(lookup); dir != "" {
+			dirs = append(dirs, dir)
+		}
 		dirs = append(dirs, goInstallDirs(lookup)...)
 	case "cargo", "rustc":
+		if exe, ok := lookup(strings.ToUpper(name)); ok && filepath.IsAbs(exe) {
+			dirs = append(dirs, filepath.Dir(exe))
+		}
 		if home, ok := lookup("CARGO_HOME"); ok && home != "" {
 			dirs = append(dirs, filepath.Join(home, "bin"))
 		}
@@ -124,18 +135,6 @@ func fallbackDirs(name string, lookup Lookup) []string {
 		}
 	}
 	return dirs
-}
-
-// userHome is the user's home directory as the environment names it: HOME, or
-// USERPROFILE where HOME is unset (Windows).
-func userHome(lookup Lookup) string {
-	if h, ok := lookup("HOME"); ok && h != "" {
-		return h
-	}
-	if h, ok := lookup("USERPROFILE"); ok && h != "" {
-		return h
-	}
-	return ""
 }
 
 // inDirs is the first absolute directory of dirs holding an executable regular

@@ -59,16 +59,16 @@ func testRunner(t *testing.T) *process.Runner {
 	return r
 }
 
-// noGoAnywhere stands in for a machine with no Go toolchain on PATH, under
-// GOROOT or in any install location.
-func noGoAnywhere(t *testing.T) {
+// hostHas stands in for a machine whose toolchain holds exactly the named
+// host commands, wherever they would be looked for.
+func hostHas(t *testing.T, names ...string) {
 	t.Helper()
 	saved := findHost
-	findHost = func(name string, lookup hosttool.Lookup) (string, bool) {
-		if name == "go" {
-			return "", false
+	findHost = func(name string, _ hosttool.Lookup) (string, bool) {
+		if slices.Contains(names, name) {
+			return "/stand-in/bin/" + name, true
 		}
-		return saved(name, lookup)
+		return "", false
 	}
 	t.Cleanup(func() { findHost = saved })
 }
@@ -81,8 +81,9 @@ func noGoAnywhere(t *testing.T) {
 // (measured: 41 units, six minutes, on a 31,407-file repository whose indexer
 // was started with a service manager's PATH).
 //
-// Mutation: drop the construction-time check and the Go project plans a unit
-// again, while Detect reports the provider healthy.
+// Mutation: drop the construction-time check, or requiresHost from either
+// kind, and that project plans a unit again, while Detect reports the provider
+// healthy.
 func TestAGoProjectWithNoGoAnywhereIsRefusedBeforeAnyUnit(t *testing.T) {
 	ctx := context.Background()
 	exe, err := os.Executable()
@@ -98,7 +99,7 @@ func TestAGoProjectWithNoGoAnywhereIsRefusedBeforeAnyUnit(t *testing.T) {
 		return p
 	}
 	found := newProvider(t).Descriptor().Version
-	noGoAnywhere(t)
+	hostHas(t, "cargo", "rustc")
 
 	t.Run("beside a language that can run, Go is named as refused with its reason", func(t *testing.T) {
 		h := providertest.New(t, map[string]string{"go.mod": "module m\n", "a.go": "package m\n",
@@ -138,6 +139,26 @@ func TestAGoProjectWithNoGoAnywhereIsRefusedBeforeAnyUnit(t *testing.T) {
 		}
 		if scopes := p.Scopes(det); len(scopes) != 0 {
 			t.Errorf("Scopes = %v, want none", scopes)
+		}
+	})
+
+	t.Run("a Rust project with no cargo anywhere is refused the same way", func(t *testing.T) {
+		hostHas(t, "go", "rustc")
+		h := providertest.New(t, map[string]string{"go.mod": "module m\n", "a.go": "package m\n",
+			"Cargo.toml": "[package]\nname = \"r\"\nversion = \"0.1.0\"\n", "src/lib.rs": "pub fn a() {}\n"})
+		p := newProvider(t)
+		det, err := p.Detect(ctx, h.Root, h.Policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := det.Details[string(KindRust)]; got != model.CodeProviderUnavailable {
+			t.Errorf("details[rust-analyzer] = %q, want %s", got, model.CodeProviderUnavailable)
+		}
+		if !strings.Contains(det.Reason, "rust-analyzer runs the cargo command") || !strings.Contains(det.Reason, "CARGO_HOME") {
+			t.Errorf("Reason = %q; it must say cargo was found nowhere and where it was looked for", det.Reason)
+		}
+		if scopes := p.Scopes(det); !slices.Equal(scopes, []string{ProfileScope(string(KindGo), "")}) {
+			t.Errorf("Scopes = %v; want the Go project alone, no Rust unit", scopes)
 		}
 	})
 
@@ -193,9 +214,12 @@ func TestAGoIndexerFindsGoOutsideAShortPATH(t *testing.T) {
 // tool printed is the cause ("go command required, not found" was the cause of
 // every Go unit failing for weeks), and it was dropped, so the run said only
 // "exited with status 1". The tail of standard error now travels as the
-// stderr_tail detail, which the run keeps and no capability row carries.
+// stderr_tail detail, which the run keeps and no capability row carries. The
+// stand-in prints more progress than the runner's 1 MiB capture holds before
+// its error, as a long run does.
 //
-// Mutation: drop the detail and the failure is again a bare exit status.
+// Mutation: drop the detail and the failure is again a bare exit status; take
+// the tail from the runner's capture buffer and it ends in progress lines.
 func TestAFailedIndexerKeepsItsOwnWords(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in indexer is a shell script")
@@ -203,6 +227,7 @@ func TestAFailedIndexerKeepsItsOwnWords(t *testing.T) {
 	ctx := context.Background()
 	script := filepath.Join(t.TempDir(), "scip-go")
 	body := "#!/bin/sh\nprintf 'Resolving module name\\nLoading Packages\\n' >&2\n" +
+		"i=0; while [ $i -lt 40000 ]; do echo 'Visiting Packages [progress line of an indexer]' >&2; i=$((i+1)); done\n" +
 		"printf 'error: err: go command required, not found\\n' >&2\nexit 1\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
@@ -253,5 +278,50 @@ func TestStderrTailKeepsTheEnd(t *testing.T) {
 	// byte of a rune, which must not lead the tail.
 	if got := stderrTail([]byte(strings.Repeat("é", model.MaxDetailBytes) + "z")); !strings.HasPrefix(got, "é") || !strings.HasSuffix(got, "z") {
 		t.Errorf("a cut through a multi-byte rune left a partial rune at the front: %q", got[:4])
+	}
+}
+
+// TestTailWriterKeepsTheLastBytes protects the writer the indexer's standard
+// error goes to: it holds the last stderrTailBytes of the stream whatever the
+// sizes of the writes that carried it.
+//
+// Mutation: keep the first bytes, or drop the shift when a small write
+// overflows, and the kept bytes are no longer the stream's end.
+func TestTailWriterKeepsTheLastBytes(t *testing.T) {
+	var all strings.Builder
+	w := newTailWriter(16)
+	for i, chunk := range []string{"abc", "defghij", "klmnopqrstuvwxyz0123", "4", "56789", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"} {
+		n, err := w.Write([]byte(chunk))
+		if n != len(chunk) || err != nil {
+			t.Fatalf("write %d = %d, %v; want every byte taken", i, n, err)
+		}
+		all.WriteString(chunk)
+		want := all.String()
+		want = want[max(0, len(want)-16):]
+		if got := string(w.bytes()); got != want {
+			t.Fatalf("after write %d kept %q, want the stream's last bytes %q", i, got, want)
+		}
+	}
+}
+
+// TestJoinReasonsKeepsWholeSentences protects the reason of a detection that
+// refuses several kinds: each kind's reason is kept whole or counted, never cut
+// mid-sentence, and the result fits a detail.
+//
+// Mutation: truncate the joined string instead and the last reason ends
+// mid-word with no count.
+func TestJoinReasonsKeepsWholeSentences(t *testing.T) {
+	short := []string{"scip-go: no go command", "rust-analyzer: no payload"}
+	if got := joinReasons(short); got != "scip-go: no go command; rust-analyzer: no payload" {
+		t.Errorf("joinReasons = %q", got)
+	}
+	long := strings.Repeat("x", 400)
+	reasons := []string{"a: " + long, "b: " + long, "c: " + long, "d: " + long}
+	got := joinReasons(reasons)
+	if len(got) > model.MaxDetailBytes {
+		t.Fatalf("joined reason is %d bytes, over the %d bound", len(got), model.MaxDetailBytes)
+	}
+	if want := "a: " + long + "; b: " + long + "; and 2 more"; got != want {
+		t.Errorf("joinReasons = %q...; want two whole reasons and the count of the rest", got[:min(len(got), 40)])
 	}
 }

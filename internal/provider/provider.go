@@ -70,8 +70,10 @@ type Detection struct {
 	// projects simply sit in subdirectories reads as "this provider is broken
 	// or absent" -- and Details deliberately do not survive an unavailable
 	// detection, so this is where the finding goes. On an available detection
-	// it is empty unless a refusal needs saying, and it then travels on the
-	// partly degraded rows as their "reason" detail.
+	// it is empty unless a refusal needs saying. Either way it travels on the
+	// provider's rows -- the unavailable ones, or the partly degraded ones --
+	// as their "reason" detail, with each comma made a semicolon (a comma
+	// separates the values the status fold merges).
 	Reason string `json:"reason,omitempty"`
 }
 

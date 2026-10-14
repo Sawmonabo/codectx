@@ -774,7 +774,7 @@ launcher prefix:
 | `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar --infer-tsconfig` | `HOME` | denied | none (managed Node) |
 | `scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `index --cwd <input> --output <output> --project-version 0.0.0 --quiet` | `PATH HOME` | denied | `python3`, `pip3` |
 | `scip-java` | `pom.xml`, `build.gradle`, `build.gradle.kts` | `index --scip-config <input>/scip-java.json --targetroot <work>/scip-java-targetroot --output <output>` | `PATH HOME` | denied | none (managed JDK) |
-| `rust-analyzer` | `Cargo.toml` | `scip <input> --output <output>` | `PATH HOME CARGO_HOME RUSTUP_HOME` | allowed | `cargo` |
+| `rust-analyzer` | `Cargo.toml` | `scip <input> --output <output>` | `PATH HOME CARGO_HOME RUSTUP_HOME` | allowed | `cargo`, `rustc` |
 | `scip-clang` | `compile_commands.json`, `compile_flags.txt` | `--compdb-path=<input>/compile_commands.json --index-output-path=<output>` | `PATH HOME` | denied | none (carries its own Clang); needs the compilation database the project's build produced |
 
 **The host-toolchain column is not optional.** Three of the six load the
@@ -791,50 +791,58 @@ the managed JDK's own `javac` and needs no host build tool (see below).
 parent's `PATH`.** A service manager or an editor starts codectx with a short
 `PATH` that often lacks the user's own toolchain: a systemd user manager's is
 `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:…`, while a
-version manager or a manual install keeps `go` under the home directory. Under
-that `PATH`, `scip-go` exited 1 on every module of a 31,407-file repository
-(measured: 41 units failed in six minutes, each after copying the whole
-snapshot), and run by hand under the same `PATH` it prints `error: err: go
-command required, not found: exec: "go": executable file not found in $PATH`. Each profile names the host commands it runs
-(`kindSpec.host`), and `internal/hosttool` looks for each one the way its own
-installer documents it, without running it:
+version manager or a manual install keeps `go` under the home directory and a
+login shell's profile is what puts it on `PATH`. Under that `PATH`, `scip-go`
+exited 1 on every module of a 31,407-file repository (measured: 41 units failed
+in six minutes, each after copying the whole snapshot), and run by hand under
+the same `PATH` it prints `error: err: go command required, not found: exec:
+"go": executable file not found in $PATH`. Each profile names the host commands
+it runs (`kindSpec.host`), and `internal/hosttool` looks for each one where its
+installers put it, without running it:
 
 | Command | Looked for, in order |
 |---|---|
-| `go` | every absolute `PATH` entry; `GOROOT/bin` (`GOROOT` from the environment, else from the go env file, `GOENV` or the user config directory's `go/env`); `/usr/local/go/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/home/linuxbrew/.linuxbrew/bin` (Windows: `Go\bin` under `ProgramFiles`, then under `ProgramFiles(x86)`) |
-| `cargo`, `rustc` | every absolute `PATH` entry; `CARGO_HOME/bin`; `.cargo/bin` under `HOME`, else under `USERPROFILE` |
+| `go` | every absolute `PATH` entry; `GOROOT/bin` (`GOROOT` from the environment, else from the go env file — `GOENV`, or the user config directory's `go/env` — read by the go command's own rule: the last line for a key wins); the user's executable directory `~/.local/bin` ("Executables that shall appear in the user's `$PATH` search path", the Linux file system hierarchy; not on Windows); `/usr/local/go/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/home/linuxbrew/.linuxbrew/bin` (Windows: `Go\bin` under `ProgramFiles`, then under `ProgramFiles(x86)`) |
+| `cargo`, `rustc` | every absolute `PATH` entry; the directory of the executable `CARGO` or `RUSTC` names (the variable `rust-analyzer` reads first); `CARGO_HOME/bin`; `.cargo/bin` under the home directory (`HOME`; `USERPROFILE` on Windows, as rustup reads it) |
 
-A relative `PATH` entry is never searched, and a match must be a regular file
-with an execute bit. The child's `PATH` is the parent's with the directory of
-each host command it lacks appended (`hosttool.ChildPATH`), so the parent's
-order still wins for every command the parent's `PATH` already holds, and a
-kind with no host command keeps the parent's `PATH` as it is.
+A relative `PATH` entry or variable is never used, and a match must be a
+regular file with an execute bit. The child's `PATH` is the parent's with the
+directory of each host command it lacks appended (`hosttool.ChildPATH`), so the
+parent's order still wins for every command the parent's `PATH` already holds,
+and a kind with no host command keeps the parent's `PATH` as it is. A link is
+appended as found (`~/.local/bin`), and the go command finds its own `GOROOT`
+through it.
 
-**`scip-go` with no `go` anywhere is refused before any unit.** `scip-go`
-cannot start without the go command, so `scip.New` moves it to the unusable
-kinds when `go` is found in none of those places (`withoutHost`). Detection
-then reports it under `Detection.Details` with `CTX_PROVIDER_UNAVAILABLE`, and
-`Detection.Reason` says why: `scip-go runs the go command, and none was found
-on PATH, under GOROOT or in a standard Go install location`, with the
-remediation to install it or start codectx with its directory on `PATH`. When
-another language of the repository can still be indexed, the detection stays
-available and the registry carries that reason on the `partial` rows as their
-`reason` detail; when Go is the only one, the detection is unavailable with the
-same words. The refusal does not change the provider version — the payload did
-not change — so a later process that finds `go` plans the Go units without
-rekeying anything else. `rust-analyzer` is not refused: it looks in Cargo's
-`bin` directory itself, and its index came out byte-identical with and without
-`cargo` on `PATH` (measured), so its host commands only extend the child's
-`PATH`.
+**An indexer whose host toolchain is found nowhere is refused before any
+unit.** `scip-go` cannot start without the go command, and `rust-analyzer`
+exits 1 at once without `cargo` and `rustc` ("Failed to load the project",
+measured under a service manager's `PATH` with an empty home). `scip.New`
+moves such a kind to the unusable kinds (`withoutHost`, `kindSpec.requiresHost`).
+Detection then reports it under `Detection.Details` with
+`CTX_PROVIDER_UNAVAILABLE`, and `Detection.Reason` says why — for Go, `scip-go
+runs the go command and none was found on PATH or under GOROOT or in the user's
+bin directory or a standard Go install location` — with the remediation to
+install it or start codectx with its directory on `PATH`. When another language
+of the repository can still be indexed, the detection stays available and the
+registry carries the reasons of the refused kinds on the `partial` rows as
+their `reason` detail, whole reasons joined by `; ` and the rest counted (`and
+N more`) rather than cut; when the refused kind is the only one, the detection
+is unavailable and the registry carries its reason on the `unavailable` rows.
+A comma in a reason is published as a semicolon: commas separate the values the
+status fold merges from two rows. The refusal does not change the provider
+version — the payload did not change — so a later process that finds the
+toolchain plans those units without rekeying anything else.
 
 **A failed indexer's own words are kept.** The runner's error says only that
 the tool exited (`exited with status 1`); what the tool printed is the cause.
-On a failed run the profile attaches the end of the indexer's standard error,
-bounded to `model.MaxDetailBytes` and cut on a rune boundary, as the
-`stderr_tail` detail (`model.DetailStderrTail`). The end, because an indexer
-prints its progress first and its error last. The tail is raw analyzer output:
-it is kept on the run's failure row and leaves through no capability row,
-status answer or log line (`index.withoutRawOutput`).
+An indexer's standard error goes to a writer that keeps its last 2 KiB
+(`tailWriter`) — the runner bounds only its own capture buffer, and that keeps
+the front of a stream, so after a megabyte of progress the error line would be
+gone. On a failed run the profile attaches the end of what was kept, bounded to
+`model.MaxDetailBytes` and cut on a rune boundary, as the `stderr_tail` detail
+(`model.DetailStderrTail`). The tail is raw analyzer output: it is kept on the
+run's failure row and leaves through no capability row, status answer or log
+line (`index.withoutRawOutput`).
 
 `<input>` is the unit's project directory inside the private materialization,
 which is also the child's working directory; `<output>` and `<work>` are under
@@ -875,8 +883,8 @@ runtime.
 Everything is executed through the shared `internal/process` runner with an
 argv array only: no shell anywhere. The run is bounded by the
 smaller of the profile's own timeout and `providers.scip.timeout`, by the
-memory and temporary disk the run's need predicts, and by 1 MiB of captured
-output per stream.
+memory and temporary disk the run's need predicts, by 1 MiB of captured
+standard output, and by the last 2 KiB of standard error.
 
 **Memory and disk are the run's measured need.** No profile carries a memory
 or disk figure. A profile unit is planned when it is admitted

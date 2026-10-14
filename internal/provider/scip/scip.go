@@ -468,7 +468,7 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 	if det.Available && len(reasons) > 0 {
 		// The provider runs, short of these languages: the reason is what the
 		// partly degraded rows say about why (provider.Registry.Select).
-		det.Reason = model.TruncateDetail(strings.Join(reasons, "; "))
+		det.Reason = joinReasons(reasons)
 	}
 	// The provenance line is the same bounded digest the descriptor commits to,
 	// not a concatenation of six 82-byte fingerprints: ObservedVersion is capped
@@ -728,6 +728,36 @@ func (p *Provider) walkTriggers(ctx context.Context, root workspace.Root, policy
 		return nil, false, err
 	}
 	return out, truncated, nil
+}
+
+// joinReasons joins one reason per refused kind with "; ", whole reasons only,
+// within model.MaxDetailBytes. A reason that does not fit is counted instead
+// of cut, so no sentence ends mid-word and the reader knows how many more
+// kinds Detection.Details names.
+func joinReasons(reasons []string) string {
+	var b strings.Builder
+	for i, r := range reasons {
+		rest := ""
+		if left := len(reasons) - i - 1; left > 0 {
+			rest = "; and " + strconv.Itoa(left) + " more"
+		}
+		sep := ""
+		if b.Len() > 0 {
+			sep = "; "
+		}
+		if b.Len()+len(sep)+len(r)+len(rest) > model.MaxDetailBytes {
+			more := "; and " + strconv.Itoa(len(reasons)-i) + " more"
+			if b.Len() == 0 {
+				// Not even the first fits beside the count: say what it can.
+				return model.TruncateDetail(r)
+			}
+			b.WriteString(more)
+			return b.String()
+		}
+		b.WriteString(sep)
+		b.WriteString(r)
+	}
+	return b.String()
 }
 
 // refusalMessage is the product's own words for why a kind cannot run: the

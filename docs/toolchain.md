@@ -1,10 +1,11 @@
 # The managed analyzer toolchain: what is pinned and why
 
 codectx owns every external analyzer it runs and every runtime those analyzers
-need. codectx looks nothing up on `PATH`, installs nothing on the user's behalf
-beyond the payloads its own lock pins, and executes nothing the shipped binary
-did not pin — with one documented exception, the three host toolchains three of
-the indexers shell out to (see [Host dependencies](#host-dependencies)). This document describes
+need. codectx looks up none of its analyzers on `PATH`, installs nothing on the
+user's behalf beyond the payloads its own lock pins, and executes nothing the
+shipped binary did not pin — with one documented exception, the host toolchains
+some of the indexers shell out to, and `git` (see
+[Host dependencies](#host-dependencies)). This document describes
 the pinned set and the provenance behind it, the `codectx tools` commands that
 manage it, and the per-platform matrix that proves it (Section 11.7). Store
 layout, resolution order and offline refusals are implemented in
@@ -353,14 +354,21 @@ them:
 
 | Program | Needed by | Language |
 |---|---|---|
-| `go` | `scip-go` | go |
-| `cargo` | `rust-analyzer` | rust |
+| `go` | `scip-go`, `gopls`, the linker's view of the standard library | go |
+| `cargo`, `rustc` | `rust-analyzer` | rust |
 | `python3`/`pip3` | `scip-python` | python |
+| `git` | the snapshot of a repository's tracked files | all |
+
+`go`, `cargo` and `rustc` are looked for on `PATH` and then where their
+installers put them, so a codectx started by a service manager or an editor
+with a short `PATH` still finds them (`internal/hosttool`; the lookup order is in
+[the SCIP provider](providers-scip.md)). An indexer that cannot run without its
+toolchain is refused before any unit when the toolchain is found nowhere.
 
 Nothing else needs anything on the host. Java in particular does not: `scip-java`
 is driven from a `--scip-config` project description compiled with the managed
 JDK's own `javac`, so neither Maven nor Gradle is required. Where one of the
-three is absent, that language falls back to the structural and linking
+language toolchains is absent, that language falls back to the structural and linking
 providers and is reported at the precision they give; it is never a failure of
 another language. On the matrix runner the same absence **fails the leg**: a
 language the runner cannot prove is the platform going uncovered, which is

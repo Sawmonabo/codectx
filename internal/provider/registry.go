@@ -201,7 +201,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 			// The codes say which part is refused; the reason, when the
 			// provider gave one, says why, in the words a reader acts on.
 			if det.Reason != "" {
-				refusals["reason"] = model.TruncateDetail(det.Reason)
+				refusals[reasonDetail] = reasonValue(det.Reason)
 			}
 			for _, c := range d.Capabilities {
 				sel.States = append(sel.States, model.CapabilityState{ProviderID: id, Capability: c,
@@ -225,8 +225,12 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 			// the operator turned off was never asked to do anything.
 			continue
 		}
+		// The reason an inactive detection gave travels on its rows: they
+		// are the one surface that says the provider is not running, and a
+		// bare code names a category, not the finding.
 		for _, c := range d.Capabilities {
-			sel.States = append(sel.States, model.CapabilityState{ProviderID: id, Capability: c, Scope: ScopeWorkspace, State: state, DiagnosticCode: code})
+			sel.States = append(sel.States, model.CapabilityState{ProviderID: id, Capability: c, Scope: ScopeWorkspace, State: state, DiagnosticCode: code,
+				Details: maps.Clone(details)})
 		}
 	}
 	return sel, nil
@@ -308,7 +312,19 @@ func unavailableReason(det Detection) map[string]string {
 	if det.Reason == "" {
 		return nil
 	}
-	return map[string]string{"reason": model.TruncateDetail(det.Reason)}
+	return map[string]string{reasonDetail: reasonValue(det.Reason)}
+}
+
+// reasonDetail is the detail key a detection's reason is published under.
+const reasonDetail = "reason"
+
+// reasonValue is a detection's reason as a row carries it: bounded, and with
+// every comma made a semicolon. A comma separates the values of a detail the
+// status fold merges from two rows (the reasons of two degradations are
+// unioned as a set), so a comma inside one sentence would split it into
+// pieces the fold then sorts apart.
+func reasonValue(reason string) string {
+	return model.TruncateDetail(strings.ReplaceAll(reason, ",", ";"))
 }
 
 // CodeOf extracts the Section 22 code an error carries for a diagnostic
