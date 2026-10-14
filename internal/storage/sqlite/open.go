@@ -223,10 +223,6 @@ type Store struct {
 	// activation or abort, at a flush and at close -- never per batch. Only
 	// the writer goroutine reads or writes it.
 	group *writeGroup
-	// logPath is this database's write-ahead log as the engine names it,
-	// whose bytes are the group's spill signal (pacedvfs.LogBytes). It is
-	// empty on a read-only store, which has no group.
-	logPath string
 	// commits counts the ingestion groups this store has committed. It is a
 	// disclosure of how a long cascade was broken up, read by the test that
 	// holds the activation's compaction to the group bound.
@@ -370,16 +366,6 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	if err := s.checkEngine(ctx); err != nil {
 		s.closeOpened()
 		return nil, err
-	}
-	if !opts.ReadOnly {
-		// The engine names the log after the database's full path, which
-		// it resolves itself; asking it is what makes the two names match.
-		var file string
-		if err := s.readers.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&file); err != nil {
-			s.closeOpened()
-			return nil, wrap("database path", err)
-		}
-		s.logPath = file + "-wal"
 	}
 	// A writer-bearing process creates the schema when the cache is empty; a
 	// read-only one verifies the fingerprint it finds. The verification is the
@@ -694,7 +680,8 @@ type writerResult struct {
 
 // writeGroup is the open ingestion group: its transaction, the statement
 // cache that lives exactly as long as it (stmtcache.go), and the count of
-// bytes written to this store's write-ahead log when it began. Nothing reaches the log while a group's dirty pages fit the
+// bytes written to a write-ahead log through the process's file system when
+// it began. Nothing reaches the log while a group's dirty pages fit the
 // writer's page cache, so a count that has moved since is one the cache has
 // started spilling into.
 type writeGroup struct {
@@ -875,7 +862,7 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 		if err != nil {
 			return wrap("begin", err)
 		}
-		s.group = &writeGroup{tx: tx, stmts: newStmtCache(tx), log: pacedvfs.LogBytes(s.logPath)}
+		s.group = &writeGroup{tx: tx, stmts: newStmtCache(tx), log: pacedvfs.LogBytes()}
 	}
 	tx := s.group.tx
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
@@ -929,7 +916,7 @@ func (s *Store) commitGroupIfDue(force bool) error {
 	if s.group == nil {
 		return nil
 	}
-	if !force && pacedvfs.LogBytes(s.logPath) == s.group.log {
+	if !force && pacedvfs.LogBytes() == s.group.log {
 		return nil
 	}
 	return s.commitGroup()
