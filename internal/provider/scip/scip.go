@@ -306,6 +306,7 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 	var missing []unresolved
 	if o.Resolver != nil {
 		profs, deferred, identities, missing = resolveProfiles(ctx, o.Resolver)
+		profs, deferred, missing = withoutHost(profs, deferred, missing, o.LookupEnv)
 	}
 	// A build with no payload identity at all carries no tools digest: an
 	// import-only provider runs no indexer, so a digest over six empty slots
@@ -457,10 +458,17 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 	// plans scip-go only, and says nothing anywhere about Rust: Scopes plans no
 	// unit for the missing kind, so no capability row ever carries the reason
 	// either.
+	var reasons []string
 	for _, u := range p.missing {
 		if len(triggers[u.kind]) > 0 {
 			det = det.WithDetail(string(u.kind), u.code)
+			reasons = append(reasons, string(u.kind)+": "+refusalMessage(u.err))
 		}
+	}
+	if det.Available && len(reasons) > 0 {
+		// The provider runs, short of these languages: the reason is what the
+		// partly degraded rows say about why (provider.Registry.Select).
+		det.Reason = model.TruncateDetail(strings.Join(reasons, "; "))
 	}
 	// The provenance line is the same bounded digest the descriptor commits to,
 	// not a concatenation of six 82-byte fingerprints: ObservedVersion is capped
@@ -481,7 +489,7 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 		for _, u := range p.missing {
 			if len(triggers[u.kind]) > 0 {
 				det.DiagnosticCode = u.code
-				det.Reason = "the precise indexer for " + string(u.kind) + " is not usable on this machine"
+				det.Reason = model.TruncateDetail("the precise indexer for " + string(u.kind) + " is not usable on this machine: " + refusalMessage(u.err))
 				break
 			}
 		}
@@ -720,6 +728,18 @@ func (p *Provider) walkTriggers(ctx context.Context, root workspace.Root, policy
 		return nil, false, err
 	}
 	return out, truncated, nil
+}
+
+// refusalMessage is the product's own words for why a kind cannot run: the
+// typed error's message, else the error's text.
+func refusalMessage(err error) string {
+	if typed, ok := errors.AsType[*model.Error](err); ok && typed.Message != "" {
+		return typed.Message
+	}
+	if err == nil {
+		return "no reason was recorded"
+	}
+	return err.Error()
 }
 
 // errDetectionFull ends a bounded detection walk without making an early stop

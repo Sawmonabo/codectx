@@ -11,9 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/admission"
+	"github.com/Sawmonabo/codectx/internal/hosttool"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -84,9 +87,20 @@ type kindSpec struct {
 	// env names the parent variables the child may inherit. The child's
 	// environment is exactly these (those the parent actually has) plus the
 	// variables the resolved tool carries, and nothing else.
-	env     []string
-	network NetworkPosture
-	timeout time.Duration
+	env []string
+	// host names the toolchain commands on this machine the indexer runs and
+	// codectx does not ship. Each one's directory joins the child's PATH when
+	// the parent's PATH lacks it (hosttool.ChildPATH), so an indexer started by
+	// a service or an editor with a short PATH still finds the toolchain the
+	// user installed.
+	host []string
+	// requiresHost marks an indexer that cannot run at all without its host
+	// commands. New refuses such a kind when one of them is found nowhere,
+	// before any unit is planned, so no unit copies the snapshot for a run that
+	// would exit at once.
+	requiresHost bool
+	network      NetworkPosture
+	timeout      time.Duration
 }
 
 // kindSpecs are the six profiles. Timeouts are the measured
@@ -102,16 +116,19 @@ type kindSpec struct {
 // see KindJava. docs/providers-scip.md tables this per profile.
 var kindSpecs = map[Kind]kindSpec{
 	// scip-go drives the host `go` toolchain through go/packages, so `go` must
-	// be reachable and its caches must be addressable; without PATH it exits 1
-	// with "go command required" and writes no index (measured).
+	// be reachable and its caches must be addressable; without it the indexer
+	// exits 1 with "go command required, not found" and writes no index
+	// (measured, under a service manager's PATH that lacks the user's Go).
 	KindGo: {
 		triggers: []string{"go.mod", "go.work"},
 		args: func(a argPaths) []string {
 			return []string{"index", "--output", a.OutputFile}
 		},
-		env:     []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
-		network: NetworkAllowed,
-		timeout: 20 * time.Minute,
+		env:          []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
+		host:         []string{"go"},
+		requiresHost: true,
+		network:      NetworkAllowed,
+		timeout:      20 * time.Minute,
 	},
 	// scip-typescript resolves nothing of its own: it carries its own compiler
 	// and reads only what the materialization holds, so its posture is denied
@@ -188,13 +205,17 @@ var kindSpecs = map[Kind]kindSpec{
 		timeout: 45 * time.Minute,
 	},
 	// rust-analyzer's scip subcommand loads cargo metadata, so cargo must be
-	// reachable and its home addressable.
+	// reachable and its home addressable. rust-analyzer also looks in Cargo's
+	// bin directory itself, so a missing cargo is not refused here: its index
+	// came out byte-identical with and without cargo on PATH (measured, a
+	// dependency-free crate).
 	KindRust: {
 		triggers: []string{"Cargo.toml"},
 		args: func(a argPaths) []string {
 			return []string{"scip", a.InputDir, "--output", a.OutputFile}
 		},
 		env:     []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
+		host:    []string{"cargo", "rustc"},
 		network: NetworkAllowed,
 		timeout: 45 * time.Minute,
 	},
@@ -296,10 +317,19 @@ func (p Profile) argv(a argPaths) (path string, args []string) {
 // env is the child's complete environment: the allowlisted parent variables
 // the parent actually has, then the variables the resolved tool carries.
 // The tool's own come last so a host JAVA_HOME can never shadow the managed
-// JDK the lock pinned.
+// JDK the lock pinned. PATH is the one the kind's host commands need
+// (hosttool.ChildPATH): the parent's, with the directory of each host command
+// it lacks appended.
 func (p Profile) env(lookup func(string) (string, bool)) []string {
+	spec := kindSpecs[p.Kind]
 	var out []string
-	for _, name := range kindSpecs[p.Kind].env {
+	for _, name := range spec.env {
+		if name == "PATH" && len(spec.host) > 0 {
+			if value, ok := hosttool.ChildPATH(lookup, spec.host...); ok {
+				out = append(out, name+"="+value)
+			}
+			continue
+		}
 		if value, ok := lookup(name); ok {
 			out = append(out, name+"="+value)
 		}
@@ -377,6 +407,62 @@ func resolveProfiles(ctx context.Context, r *toolchain.Resolver) (ready []Profil
 		}
 	}
 	return ready, deferred, identities, bad
+}
+
+// withoutHost moves every ready or deferred kind whose indexer cannot run
+// without a host command that is found nowhere (hosttool.Find) into bad, with
+// the reason in the product's words. The kind's payload identity stays in the
+// provider version: the payload did not change, and a later process that
+// finds the toolchain plans the kind's units without rekeying any other unit.
+// bad stays in Kinds order, which Detect reports in.
+func withoutHost(ready []Profile, deferred []Kind, bad []unresolved, lookup hosttool.Lookup) ([]Profile, []Kind, []unresolved) {
+	keptReady := make([]Profile, 0, len(ready))
+	for _, prof := range ready {
+		if u, refused := hostRefusal(prof.Kind, lookup); refused {
+			bad = append(bad, u)
+			continue
+		}
+		keptReady = append(keptReady, prof)
+	}
+	keptDeferred := make([]Kind, 0, len(deferred))
+	for _, k := range deferred {
+		if u, refused := hostRefusal(k, lookup); refused {
+			bad = append(bad, u)
+			continue
+		}
+		keptDeferred = append(keptDeferred, k)
+	}
+	slices.SortStableFunc(bad, func(a, b unresolved) int {
+		return slices.Index(Kinds, a.kind) - slices.Index(Kinds, b.kind)
+	})
+	return keptReady, keptDeferred, bad
+}
+
+// findHost locates a host command. A variable so a test can stand in for a
+// machine that has no such toolchain anywhere.
+var findHost = hosttool.Find
+
+// hostRefusal is the refusal of a kind that requires a host command found
+// nowhere, or false when the kind requires none or every one is found.
+func hostRefusal(k Kind, lookup hosttool.Lookup) (unresolved, bool) {
+	spec := kindSpecs[k]
+	if !spec.requiresHost {
+		return unresolved{}, false
+	}
+	for _, name := range spec.host {
+		if _, ok := findHost(name, lookup); ok {
+			continue
+		}
+		where := "on PATH or in a standard install location"
+		if name == "go" {
+			where = "on PATH, under GOROOT or in a standard Go install location"
+		}
+		err := (&model.Error{Code: model.CodeProviderUnavailable,
+			Message: string(k) + " runs the " + name + " command, and none was found " + where}).
+			WithRemediation("install " + name + ", or start codectx with the directory that holds it on PATH")
+		return unresolved{kind: k, code: model.CodeProviderUnavailable, err: err}, true
+	}
+	return unresolved{}, false
 }
 
 // codeOf is the typed code of a resolution failure, or CTX_PROVIDER_UNAVAILABLE
@@ -533,6 +619,14 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	// for, and the runner measured it either way.
 	if err != nil {
 		span.End(ledger.OutcomeFailed, measured(res), err)
+		// The indexer's own words are the one record of why it failed: the
+		// runner's error says only that it exited. They travel as the stderr
+		// tail, which the run keeps and no capability row or log line carries.
+		if tail := stderrTail(res.Stderr); tail != "" {
+			if typed, ok := errors.AsType[*model.Error](err); ok {
+				err = typed.WithDetail(model.DetailStderrTail, tail)
+			}
+		}
 		return "", "", p.profileError(prof, "", err)
 	}
 	span.End(ledger.OutcomeOK, measured(res), nil)
@@ -556,6 +650,21 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		return "", "", p.profileError(prof, "", err)
 	}
 	return output, manifestSHA, nil
+}
+
+// stderrTail is the end of what a failed indexer wrote to standard error,
+// bounded to model.MaxDetailBytes. The end, because an indexer prints its
+// progress first and its error last, and WithDetail would keep the front.
+func stderrTail(stderr []byte) string {
+	t := strings.TrimSpace(string(stderr))
+	if len(t) <= model.MaxDetailBytes {
+		return t
+	}
+	t = t[len(t)-model.MaxDetailBytes:]
+	for len(t) > 0 && !utf8.RuneStart(t[0]) {
+		t = t[1:]
+	}
+	return t
 }
 
 // profileError carries the run-level facts a profile diagnostic must name: the

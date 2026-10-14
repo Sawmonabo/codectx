@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/hosttool"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -51,6 +52,12 @@ type Definition struct {
 	// environment is exactly these (those the parent actually has) plus the
 	// variables the resolved payload carries, and nothing else.
 	EnvAllowlist []string
+	// Host names the toolchain commands on this machine the server runs and
+	// codectx does not ship. Each one's directory joins the server's PATH when
+	// the parent's PATH lacks it (hosttool.ChildPATH), so a server started by
+	// a service or an editor with a short PATH still finds the user's
+	// toolchain.
+	Host []string
 	// RootMarkers are root-relative files whose presence suggests the
 	// repository is this server's kind. Detection reads their metadata through
 	// the confined root and nothing else.
@@ -76,11 +83,13 @@ var definitions = map[string]Definition{
 		Name: "gopls", Languages: []string{"go"},
 		Args:         []string{"serve"},
 		EnvAllowlist: []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
+		Host:         []string{"go"},
 		RootMarkers:  []string{"go.mod", "go.work"},
 	},
 	"rust-analyzer": {
 		Name: "rust-analyzer", Languages: []string{"rust"},
 		EnvAllowlist: []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
+		Host:         []string{"cargo", "rustc"},
 		RootMarkers:  []string{"Cargo.toml"},
 	},
 	// The python server is a native static binary started with its server
@@ -354,10 +363,18 @@ func (p Profile) runtimeArgs() []string {
 // variables the parent actually has, then the variables the resolved payload
 // carries. The payload's come last so a host JAVA_HOME can never shadow the
 // managed JDK the lock pinned. A variable the parent does not have is absent,
-// not empty.
+// not empty. PATH is the one the server's host commands need
+// (hosttool.ChildPATH): the parent's, with the directory of each host command
+// it lacks appended.
 func (p Profile) env() []string {
 	var out []string
 	for _, name := range p.EnvAllowlist {
+		if name == "PATH" && len(p.Host) > 0 {
+			if v, ok := hosttool.ChildPATH(os.LookupEnv, p.Host...); ok {
+				out = append(out, name+"="+v)
+			}
+			continue
+		}
 		if v, ok := os.LookupEnv(name); ok {
 			out = append(out, name+"="+v)
 		}

@@ -64,13 +64,14 @@ type Detection struct {
 	// keeps that typed rather than silent.
 	Details map[string]string `json:"details,omitempty"`
 	// Reason is the one bounded phrase that says, in the product's own words,
-	// why a detection is unavailable. A diagnostic code alone names the
-	// category and not the finding -- CTX_PROVIDER_UNAVAILABLE on a
-	// repository whose projects simply sit in subdirectories reads as "this
-	// provider is broken or absent" -- and Details deliberately do not
-	// survive an unavailable detection, so this is where the finding goes.
-	// It is empty for an available detection, which has its rows to speak
-	// with.
+	// why a detection is unavailable, or why an available one is short of a
+	// part its Details refuse. A diagnostic code alone names the category and
+	// not the finding -- CTX_PROVIDER_UNAVAILABLE on a repository whose
+	// projects simply sit in subdirectories reads as "this provider is broken
+	// or absent" -- and Details deliberately do not survive an unavailable
+	// detection, so this is where the finding goes. On an available detection
+	// it is empty unless a refusal needs saying, and it then travels on the
+	// partly degraded rows as their "reason" detail.
 	Reason string `json:"reason,omitempty"`
 }
 

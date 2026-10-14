@@ -126,7 +126,14 @@ writes its workspace state and its whole Equinox configuration there; the
 materialization is the server's read-only input and is never its data
 directory. The child's environment is exactly the allowlisted variables the
 parent has plus the variables the payload needs, and the payload's come last so
-a host `JAVA_HOME` can never shadow the managed JDK.
+a host `JAVA_HOME` can never shadow the managed JDK. Two servers drive a host
+toolchain codectx does not ship (`Definition.Host`): `gopls` runs the go
+command, and `rust-analyzer` runs `cargo` and `rustc`. Their `PATH` is the
+parent's with the directory of each such command it lacks appended, found where
+its installer puts it (`hosttool.ChildPATH`, the lookup order in
+`docs/providers-scip.md`), so a server started by a service manager or an
+editor with a short `PATH` still finds the user's toolchain. The other servers
+keep the parent's `PATH` as it is.
 
 | Definition | Languages | Arguments after the launcher | Environment allowlist | Root markers |
 |---|---|---|---|---|

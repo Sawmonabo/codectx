@@ -326,8 +326,9 @@ An unmarked method with an external supertype publishes no `overrides`.
 A Go type outside the unit is read from its package's source (`goExternal`, `internal/provider/link/go_external.go`):
 the transitive closure of the unit's imports outside it, each package found as the go command finds it without
 running it (`goModuleInfo.source`, `go_module.go`): the standard library of the toolchain the project builds with
-(`GOROOT`, else the `go` on `PATH`, else the toolchain the `go.mod` `toolchain` or `go` line selects in the module
-cache, `go_host.go`); a module of the governing `go.work` or a local `replace` inside the repository from the
+(`GOROOT`, else that of the host `go` found as the indexers find it — `PATH`, then the installers' default locations
+(`hosttool.Find`, `docs/providers-scip.md`) — else the toolchain the `go.mod` `toolchain` or `go` line selects in the
+module cache, `go_host.go`); a module of the governing `go.work` or a local `replace` inside the repository from the
 snapshot; a required module, after `replace`, from the module cache at its exact version (`GOMODCACHE`, else the
 first `GOPATH` entry's `pkg/mod`). A package none of these holds (a local `replace` outside the repository, a
 module the cache does not hold) is unavailable, and the `implements` and `overrides` capability rows count both

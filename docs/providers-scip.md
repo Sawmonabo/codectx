@@ -757,7 +757,9 @@ configuration**: the tool it starts, its argument array, the parent environment
 variables it may see, its budgets, its timeout and its declared network posture
 are constants of this build, and the binary is the payload the embedded tool
 lock pinned and `internal/toolchain` verified. There is no `[analyzers.<name>]`
-table, no approved path and no PATH lookup (Section 20.2 — trust is the lock).
+table, no approved path and no PATH lookup of the indexer (Section 20.2 — trust
+is the lock); only the host toolchain an indexer drives is looked up on the
+machine (below).
 
 Every one of the six was resolved through the real lock and store and run end
 to end on `linux/amd64` — materialize, index, import, seal — against a fixture
@@ -784,6 +786,55 @@ language has no precise index — the profile exits non-zero and the unit fails
 with `CTX_PROVIDER_UNAVAILABLE` — and the structural and linking providers
 still cover it. `scip-java` is not in that list: it compiles the snapshot with
 the managed JDK's own `javac` and needs no host build tool (see below).
+
+**The host toolchain is found where its installer put it, not only on the
+parent's `PATH`.** A service manager or an editor starts codectx with a short
+`PATH` that often lacks the user's own toolchain: a systemd user manager's is
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:…`, while a
+version manager or a manual install keeps `go` under the home directory. Under
+that `PATH`, `scip-go` exited 1 on every module of a 31,407-file repository
+(measured: 41 units failed in six minutes, each after copying the whole
+snapshot), and run by hand under the same `PATH` it prints `error: err: go
+command required, not found: exec: "go": executable file not found in $PATH`. Each profile names the host commands it runs
+(`kindSpec.host`), and `internal/hosttool` looks for each one the way its own
+installer documents it, without running it:
+
+| Command | Looked for, in order |
+|---|---|
+| `go` | every absolute `PATH` entry; `GOROOT/bin` (`GOROOT` from the environment, else from the go env file, `GOENV` or the user config directory's `go/env`); `/usr/local/go/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/home/linuxbrew/.linuxbrew/bin` (Windows: `Go\bin` under `ProgramFiles`, then under `ProgramFiles(x86)`) |
+| `cargo`, `rustc` | every absolute `PATH` entry; `CARGO_HOME/bin`; `.cargo/bin` under `HOME`, else under `USERPROFILE` |
+
+A relative `PATH` entry is never searched, and a match must be a regular file
+with an execute bit. The child's `PATH` is the parent's with the directory of
+each host command it lacks appended (`hosttool.ChildPATH`), so the parent's
+order still wins for every command the parent's `PATH` already holds, and a
+kind with no host command keeps the parent's `PATH` as it is.
+
+**`scip-go` with no `go` anywhere is refused before any unit.** `scip-go`
+cannot start without the go command, so `scip.New` moves it to the unusable
+kinds when `go` is found in none of those places (`withoutHost`). Detection
+then reports it under `Detection.Details` with `CTX_PROVIDER_UNAVAILABLE`, and
+`Detection.Reason` says why: `scip-go runs the go command, and none was found
+on PATH, under GOROOT or in a standard Go install location`, with the
+remediation to install it or start codectx with its directory on `PATH`. When
+another language of the repository can still be indexed, the detection stays
+available and the registry carries that reason on the `partial` rows as their
+`reason` detail; when Go is the only one, the detection is unavailable with the
+same words. The refusal does not change the provider version — the payload did
+not change — so a later process that finds `go` plans the Go units without
+rekeying anything else. `rust-analyzer` is not refused: it looks in Cargo's
+`bin` directory itself, and its index came out byte-identical with and without
+`cargo` on `PATH` (measured), so its host commands only extend the child's
+`PATH`.
+
+**A failed indexer's own words are kept.** The runner's error says only that
+the tool exited (`exited with status 1`); what the tool printed is the cause.
+On a failed run the profile attaches the end of the indexer's standard error,
+bounded to `model.MaxDetailBytes` and cut on a rune boundary, as the
+`stderr_tail` detail (`model.DetailStderrTail`). The end, because an indexer
+prints its progress first and its error last. The tail is raw analyzer output:
+it is kept on the run's failure row and leaves through no capability row,
+status answer or log line (`index.withoutRawOutput`).
 
 `<input>` is the unit's project directory inside the private materialization,
 which is also the child's working directory; `<output>` and `<work>` are under

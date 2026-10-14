@@ -1,16 +1,15 @@
 package link
 
 import (
-	"bufio"
-	"bytes"
 	"go/version"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 
 	"golang.org/x/mod/module"
+
+	"github.com/Sawmonabo/codectx/internal/hosttool"
 )
 
 // The read-only host sources of Go code outside the repository: the
@@ -19,47 +18,14 @@ import (
 // it (running it may download a toolchain, "Go Toolchains"), and nothing
 // here writes to either.
 
-// goHostEnv reads one Go environment variable the way the go command does
-// ("go help environment"): the process environment, else the user's go env
-// file (GOENV, default os.UserConfigDir()/go/env, "off" for none), where
-// `go env -w` writes.
-func goHostEnv(key string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	file := os.Getenv("GOENV")
-	if file == "off" {
-		return ""
-	}
-	if file == "" {
-		dir, err := os.UserConfigDir()
-		if err != nil {
-			return ""
-		}
-		file = filepath.Join(dir, "go", "env")
-	}
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return ""
-	}
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	for sc.Scan() {
-		k, v, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
-		if ok && strings.TrimSpace(k) == key {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
-
 // goModCache is the module cache directory: GOMODCACHE, else the first
 // GOPATH entry's pkg/mod, GOPATH defaulting to $HOME/go (cmd/go
 // internal/cfg, go/build defaultGOPATH). Empty when none can be named.
 func goModCache() string {
-	if v := goHostEnv("GOMODCACHE"); v != "" {
+	if v := hosttool.GoEnv("GOMODCACHE", os.LookupEnv); v != "" {
 		return filepath.Clean(v)
 	}
-	gopath := goHostEnv("GOPATH")
+	gopath := hosttool.GoEnv("GOPATH", os.LookupEnv)
 	if gopath == "" {
 		home, err := os.UserHomeDir()
 		if err != nil || home == "" {
@@ -97,15 +63,15 @@ func goModuleDir(cache string, m module.Version) string {
 //
 // The go command's own GOROOT is GOROOT from the environment, else the
 // directory two levels above its executable, its symbolic links resolved
-// (cmd/go internal/cfg findGOROOT); here the executable is the `go` found on
-// PATH, never run. That toolchain builds the project unless the go.mod's
+// (cmd/go internal/cfg findGOROOT); here the executable is the host `go`
+// (pathGoRoot), never run. That toolchain builds the project unless the go.mod's
 // toolchain line, else its go line, asks for a newer one: the go command
 // then switches to that release ("Go Toolchains", GOTOOLCHAIN=auto), kept
 // in the module cache as golang.org/toolchain@v0.0.1-<release>.<GOOS>-<GOARCH>;
 // that one is read when it is there, and the older one otherwise is not the
 // project's, so none is.
 func goRoot(cache, goLine, toolchain string) (dir, release string) {
-	dir = goHostEnv("GOROOT")
+	dir = hosttool.GoEnv("GOROOT", os.LookupEnv)
 	if dir == "" {
 		dir = pathGoRoot()
 	}
@@ -135,16 +101,15 @@ func goRoot(cache, goLine, toolchain string) (dir, release string) {
 	return "", ""
 }
 
-// pathGoRoot is the GOROOT of the `go` executable on PATH: its directory's
+// pathGoRoot is the GOROOT of the host `go` executable (hosttool.Find: PATH,
+// then GOROOT, then the installers' default locations): its directory's
 // parent, or its symbolic links' target's, holding src/runtime.
 func pathGoRoot() string {
-	exe, err := exec.LookPath("go")
-	if err != nil {
+	exe, ok := hosttool.Find("go", os.LookupEnv)
+	if !ok {
 		return ""
 	}
-	if exe, err = filepath.Abs(exe); err != nil {
-		return ""
-	}
+	var err error
 	for _, e := range []string{exe, ""} {
 		if e == "" {
 			if e, err = filepath.EvalSymlinks(exe); err != nil {

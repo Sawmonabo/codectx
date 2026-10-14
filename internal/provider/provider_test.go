@@ -236,6 +236,27 @@ func TestSelectPublishesDetectionDetails(t *testing.T) {
 	if sel.States[1].Details["rust-analyzer"] != model.CodeToolOverrideInvalid {
 		t.Fatal("published states share one details map")
 	}
+	// The code names the refused part; the detection's reason says why, and the
+	// rows are the only surface an available detection's reason reaches. A row
+	// with the code alone is how a missing go command went unexplained.
+	why := "scip-go: scip-go runs the go command, and none was found on PATH"
+	reasoned := providertest.Func{Desc: desc, DetectFn: func(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+		d := provider.Detection{Available: true, Capabilities: desc.Capabilities, Reason: why}
+		return d.WithDetail("scip-go", model.CodeProviderUnavailable), nil
+	}}
+	reasonedReg, err := provider.NewRegistry(reasoned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasonedSel, err := reasonedReg.Select(context.Background(), h.Root, h.Policy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range reasonedSel.States {
+		if got.State != model.CapabilityPartial || got.Details["reason"] != why || got.Details["scip-go"] != model.CodeProviderUnavailable {
+			t.Fatalf("published state %d = %+v, want a partial row carrying the refusal code and the reason", i, got)
+		}
+	}
 	// The other half of the same false-readiness question, in the other
 	// direction: a detail that is not a refusal must publish nothing. A pinned
 	// payload the first unit fetches and then indexes at full precision is such

@@ -198,6 +198,11 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 			if len(refusals) == 0 {
 				continue
 			}
+			// The codes say which part is refused; the reason, when the
+			// provider gave one, says why, in the words a reader acts on.
+			if det.Reason != "" {
+				refusals["reason"] = model.TruncateDetail(det.Reason)
+			}
 			for _, c := range d.Capabilities {
 				sel.States = append(sel.States, model.CapabilityState{ProviderID: id, Capability: c,
 					Scope: ScopeWorkspace, State: model.CapabilityPartial, DiagnosticCode: code,
