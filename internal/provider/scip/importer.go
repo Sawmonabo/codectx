@@ -1135,6 +1135,14 @@ func (ds *docSource) onPinnedBytes(sym symbol, rng *model.SourceRange) string {
 	if _, spelled := ds.spellings[sym.raw][string(text)]; spelled {
 		return ""
 	}
+	if sym.cxxConstructor() {
+		// scip-clang puts the constructor a declaration runs on the declared
+		// variable's name, which spells the variable, not the type: measured
+		// on 0.4.0, `D d0;`, `D d1(1);` and `D d2{};` each reference their
+		// constructor at d0, d1 and d2. Any one identifier token is a
+		// construction's.
+		return ""
+	}
 	return "the occurrence does not select the identifier its symbol names"
 }
 
@@ -1699,7 +1707,7 @@ func (im *importer) eachReference(ctx context.Context, d docRow, ds *docSource, 
 			kind, detail := model.RelReferences, "reference"
 			if roles&roleImport != 0 {
 				kind, detail = model.RelImports, "import"
-			} else if err := im.joinCall(ctx, d, loc, to, sites, sets[r]); err != nil {
+			} else if err := im.joinCall(ctx, d, loc, to, sites, sets[r], sym.cxxConstructor()); err != nil {
 				return err
 			}
 			return im.addEdge(ctx, from, kind, to, loc, sym.raw, detail, 0)
@@ -1754,12 +1762,17 @@ func (im *importer) rangeSets(ctx context.Context, doc int64) (map[[4]int32]int6
 }
 
 // docSites are the call sites of one document's file, by the byte range of
-// each callee token, with the node the site's calls are made from, and the
-// callers this import has published an occurrence of.
+// each callee token, with the node the site's calls are made from, the
+// callers this import has published an occurrence of, and the file's module
+// and callable declarations, which a construction no site records is made
+// from (constructionCaller).
 type docSites struct {
 	language  string
 	byToken   map[[2]uint64][]link.Endpoint
 	published map[model.NodeID]bool
+	module    link.Endpoint
+	callables []link.Endpoint
+	held      bool
 }
 
 // callSites reads the link table the structural provider stored for the
@@ -1774,6 +1787,12 @@ func (im *importer) callSites(ctx context.Context, d docRow) (*docSites, error) 
 		return out, err
 	}
 	out.language, out.byToken, out.published = t.Language, make(map[[2]uint64][]link.Endpoint, len(t.Sites)), map[model.NodeID]bool{}
+	out.module, out.held = t.Module, true
+	for i := range t.Decls {
+		if k := t.Decls[i].Kind; k == model.NodeFunction || k == model.NodeMethod {
+			out.callables = append(out.callables, t.Decls[i].Endpoint)
+		}
+	}
 	for i := range t.Sites {
 		s := &t.Sites[i]
 		if s.Computed || s.NameEnd <= s.NameStart {
@@ -1809,10 +1828,21 @@ func (im *importer) callSites(ctx context.Context, d docRow) (*docSites, error) 
 // evidence without one too. The call keeps the linker's target alone, and the
 // occurrence is counted and degrades the capability like any other bound that
 // leaves a fact out.
-func (im *importer) joinCall(ctx context.Context, d docRow, loc location, to model.NodeID, sites *docSites, set int64) error {
+//
+// A reference to a C++ constructor is a construction wherever it is
+// (symbol.cxxConstructor), and most have no call site: the structural
+// provider records `D(3)` but not `D d0;` or `new D(2)`, and scip-clang puts
+// the declaration's on the variable's name. One no site matches is made from
+// the innermost function or method declared around it, else the module
+// (constructionCaller), keyed by its own token, its one target the
+// constructor.
+func (im *importer) joinCall(ctx context.Context, d docRow, loc location, to model.NodeID, sites *docSites, set int64, ctor bool) error {
 	callers := sites.byToken[[2]uint64{loc.rng.Start.Byte, loc.rng.End.Byte}]
 	if len(callers) == 0 {
-		return nil
+		if !ctor || !sites.held {
+			return nil
+		}
+		callers, set = []link.Endpoint{sites.constructionCaller(loc.rng)}, 0
 	}
 	key, ok := callsiteKey(d.path, loc.rng)
 	if !ok {
@@ -1832,6 +1862,23 @@ func (im *importer) joinCall(ctx context.Context, d docRow, loc location, to mod
 		}
 	}
 	return nil
+}
+
+// constructionCaller is the node a construction at rng no call site records
+// is made from: the innermost function or method whose range holds it, else
+// the module.
+func (s *docSites) constructionCaller(rng *model.SourceRange) link.Endpoint {
+	out := s.module
+	found := false
+	for _, e := range s.callables {
+		if e.Range.Start.Byte > rng.Start.Byte || e.Range.End.Byte < rng.End.Byte {
+			continue
+		}
+		if !found || e.Range.End.Byte-e.Range.Start.Byte < out.Range.End.Byte-out.Range.Start.Byte {
+			out, found = e, true
+		}
+	}
+	return out
 }
 
 // putCaller publishes this unit's occurrence of a structural caller

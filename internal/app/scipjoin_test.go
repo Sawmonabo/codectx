@@ -62,9 +62,6 @@ var joinCases = []joinCase{
 // then lists helper twice, once per identity).
 func TestASCIPOccurrenceAtACallSiteGivesTheCallItsCompilerTarget(t *testing.T) {
 	ctx := context.Background()
-	home := t.TempDir()
-	repo := filepath.Join(home, "repo")
-	userCfg := filepath.Join(home, "config", "codectx")
 	files := map[string]string{
 		"go.mod":           "module example.com/m\n\ngo 1.27\n",
 		"web/package.json": "{\"name\":\"web\",\"version\":\"1.0.0\"}\n",
@@ -76,39 +73,7 @@ func TestASCIPOccurrenceAtACallSiteGivesTheCallItsCompilerTarget(t *testing.T) {
 		docs = append(docs, c.document(t))
 	}
 	files["index.scip"] = string(joinIndex(docs...))
-	for path, body := range files {
-		if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, path)), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		writeFile(t, filepath.Join(repo, path), []byte(body))
-	}
-	if err := os.MkdirAll(userCfg, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cfg := "[storage]\ndata_dir = \"" + filepath.Join(home, "data") + "\"\n" +
-		"[tools]\noffline = true\n" +
-		"[providers.scip]\nenabled = true\n[providers.lsp]\nenabled = false\n"
-	writeFile(t, filepath.Join(userCfg, "config.toml"), []byte(cfg))
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "share"))
-
-	ws, err := OpenWorkspace(ctx, repo, OpenOptions{Operation: "index", SCIPImport: "index.scip"})
-	if err != nil {
-		t.Fatalf("open workspace: %v", err)
-	}
-	t.Cleanup(func() { _ = ws.Close() })
-	result, err := ws.Services().Index(ctx, model.IndexRequest{})
-	if err != nil {
-		t.Fatalf("index: %v", err)
-	}
-	gen := result.Binding.GenerationID
-	reader, err := ws.s.store.PinGeneration(ctx, ws.s.repo, gen, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
+	ws, reader, gen := importIndex(t, files, "index.scip")
 
 	for _, c := range joinCases {
 		t.Run(c.language, func(t *testing.T) {
@@ -156,6 +121,50 @@ func TestASCIPOccurrenceAtACallSiteGivesTheCallItsCompilerTarget(t *testing.T) {
 			}
 		})
 	}
+}
+
+// importIndex writes files to a repository, indexes it with the SCIP index
+// at importPath imported, and pins the generation it built.
+func importIndex(t *testing.T, files map[string]string, importPath string) (*Workspace, *sqlite.PinnedReader, model.GenerationID) {
+	t.Helper()
+	ctx := context.Background()
+	home := t.TempDir()
+	repo := filepath.Join(home, "repo")
+	userCfg := filepath.Join(home, "config", "codectx")
+	for path, body := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, path)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(repo, path), []byte(body))
+	}
+	if err := os.MkdirAll(userCfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "[storage]\ndata_dir = \"" + filepath.Join(home, "data") + "\"\n" +
+		"[tools]\noffline = true\n" +
+		"[providers.scip]\nenabled = true\n[providers.lsp]\nenabled = false\n"
+	writeFile(t, filepath.Join(userCfg, "config.toml"), []byte(cfg))
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "share"))
+
+	ws, err := OpenWorkspace(ctx, repo, OpenOptions{Operation: "index", SCIPImport: importPath})
+	if err != nil {
+		t.Fatalf("open workspace: %v", err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	result, err := ws.Services().Index(ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	gen := result.Binding.GenerationID
+	reader, err := ws.s.store.PinGeneration(ctx, ws.s.repo, gen, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reader.Close() })
+	return ws, reader, gen
 }
 
 // providerNode is the one node called name in path that provider publishes
@@ -285,46 +294,11 @@ func scipBytes(b []byte, field int, payload []byte) []byte {
 // its index file (drop the anchored check in emit).
 func TestASuppliedIndexTheSnapshotLeavesOutPlansNoUnit(t *testing.T) {
 	ctx := context.Background()
-	home := t.TempDir()
-	repo := filepath.Join(home, "repo")
-	userCfg := filepath.Join(home, "config", "codectx")
 	c := joinCases[0]
 	// A vendor directory is outside the snapshot by the default policy,
 	// while the file is on disk for detection to find.
-	files := map[string]string{"go.mod": "module example.com/m\n\ngo 1.27\n", c.path: c.source,
-		"vendor/index.scip": string(joinIndex(c.document(t)))}
-	for path, body := range files {
-		if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, path)), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		writeFile(t, filepath.Join(repo, path), []byte(body))
-	}
-	if err := os.MkdirAll(userCfg, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cfg := "[storage]\ndata_dir = \"" + filepath.Join(home, "data") + "\"\n" +
-		"[tools]\noffline = true\n" +
-		"[providers.scip]\nenabled = true\n[providers.lsp]\nenabled = false\n"
-	writeFile(t, filepath.Join(userCfg, "config.toml"), []byte(cfg))
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "share"))
-
-	ws, err := OpenWorkspace(ctx, repo, OpenOptions{Operation: "index", SCIPImport: "vendor/index.scip"})
-	if err != nil {
-		t.Fatalf("open workspace: %v", err)
-	}
-	t.Cleanup(func() { _ = ws.Close() })
-	result, err := ws.Services().Index(ctx, model.IndexRequest{})
-	if err != nil {
-		t.Fatalf("index: %v", err)
-	}
-	reader, err := ws.s.store.PinGeneration(ctx, ws.s.repo, result.Binding.GenerationID, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
+	_, reader, _ := importIndex(t, map[string]string{"go.mod": "module example.com/m\n\ngo 1.27\n", c.path: c.source,
+		"vendor/index.scip": string(joinIndex(c.document(t)))}, "vendor/index.scip")
 	states, err := reader.Capabilities(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -353,4 +327,104 @@ func TestASuppliedIndexTheSnapshotLeavesOutPlansNoUnit(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestAConstructionReachesItsConstructor holds the C++ constructions no call
+// site records to the constructor the index resolved. The occurrences are
+// scip-clang 0.4.0's for this source, measured: `D d0;` references D's
+// default constructor on d0, and `new D(2)` references the type and the
+// int constructor on D. The structural provider records neither as a call,
+// so each is a `calls` from run, the function around it, to the constructor
+// node, keyed by the token the index put the reference on.
+//
+// Mutations caught: hold the reference on d0 to the constructor's name (the
+// spelling check refuses it, and the construction is lost); join a
+// constructor reference only at a call site (neither construction is a
+// call).
+func TestAConstructionReachesItsConstructor(t *testing.T) {
+	ctx := context.Background()
+	const path = "cc/a.cpp"
+	const src = "struct D { D() {} D(int) {} };\n\nvoid run() { D d0; D* p = new D(2); }\n"
+	const (
+		typeD = "cxx . . $ D#"
+		ctor0 = "cxx . . $ D#D(49f6e7a06ebc5aa8)."
+		ctor1 = "cxx . . $ D#D(d4f767463ce0a6b3)."
+		run   = "cxx . . $ run(49f6e7a06ebc5aa8)."
+	)
+	at := func(word string, n int) []int32 { s, e := token(src, word, n); return scipRange(src, s, e) }
+	doc := scipBytes(nil, 1, []byte(path))
+	doc = scipBytes(doc, 4, []byte("cpp"))
+	for _, o := range [][]byte{
+		scipOccurrence(typeD, 1, at("D", 0), nil),
+		scipOccurrence(ctor0, 1, at("D", 1), nil),
+		scipOccurrence(ctor1, 1, at("D", 2), nil),
+		scipOccurrence(run, 1, at("run", 0), nil),
+		scipOccurrence(typeD, 0, at("D", 3), nil),
+		scipOccurrence(ctor0, 0, at("d0", 0), nil),
+		scipOccurrence(typeD, 0, at("D", 4), nil),
+		scipOccurrence(typeD, 0, at("D", 5), nil),
+		scipOccurrence(ctor1, 0, at("D", 5), nil),
+	} {
+		doc = scipBytes(doc, 2, o)
+	}
+	ws, reader, gen := importIndex(t, map[string]string{path: src, "index.scip": string(joinIndex(scipVarint(doc, 6, 1)))}, "index.scip")
+
+	caller := providerNode(t, reader, path, "run", tslang.ProviderID)
+	answer, err := ws.Services().Graph(ctx, model.GraphRequest{GenerationID: gen, Start: []model.NodeID{caller},
+		Relations: []model.RelationKind{model.RelCalls}, Direction: model.DirectionOutgoing, MaxDepth: 1})
+	if err != nil {
+		t.Fatalf("callees of run: %v", err)
+	}
+	for _, want := range []struct {
+		ctor       string
+		word       string
+		occurrence int
+	}{{ctor: ctor0, word: "d0"}, {ctor: ctor1, word: "D", occurrence: 5}} {
+		target := definedAs(t, reader, path, "D", want.ctor)
+		start, end := token(src, want.word, want.occurrence)
+		key := "callsite:" + path + ":" + strconv.Itoa(start+1) + "-" + strconv.Itoa(end)
+		found := false
+		for _, rel := range answer.Relations {
+			if rel.Kind != model.RelCalls || rel.To != target {
+				continue
+			}
+			rows, err := reader.Evidence(ctx, "", rel.ID, "", model.MaxPageItems)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range rows {
+				found = found || (r.Evidence.Precision == model.PrecisionCompiler && r.Evidence.NativeKey == key)
+			}
+		}
+		if !found {
+			t.Fatalf("run has no compiler calls to the constructor %s keyed %s: %+v", target, key, answer.Relations)
+		}
+	}
+}
+
+// definedAs is the node called name in path whose definition evidence the
+// index keys by symbol.
+func definedAs(t *testing.T, reader *sqlite.PinnedReader, path, name, symbol string) model.NodeID {
+	t.Helper()
+	ctx := context.Background()
+	nodes, err := reader.Nodes(ctx, sqlite.NodeFilter{Name: name}, "", model.MaxPageItems)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range nodes {
+		if n.Path != path {
+			continue
+		}
+		rows, err := reader.Evidence(ctx, n.Node.ID, "", "", model.MaxPageItems)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rows {
+			if r.Evidence.ProviderID == scip.ID && r.Evidence.NativeKey == symbol {
+				return n.Node.ID
+			}
+		}
+	}
+	t.Fatalf("no node called %s in %s is defined as %s", name, path, symbol)
+	return ""
 }

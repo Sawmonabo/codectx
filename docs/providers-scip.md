@@ -405,7 +405,8 @@ passes over it.
 
 **The name check.** A range that is exactly one identifier token, whose symbol's
 last descriptor is a name the grammar spells literally, must select that name or
-an identifier the document itself spells for that symbol. A document that
+an identifier the document itself spells for that symbol; a C++ constructor's
+reference may select any one identifier (Call-site join, Constructions). A document that
 aliases an import spells the symbol under a name of its own — `use HashSet as
 Set` makes every later `Set` of that file a correct reference to `HashSet` — and
 the occurrence carries nothing saying so: the indexer that produces this shape
@@ -656,6 +657,17 @@ its own evidence row at the definition, and aliases the symbol to it, so a
 reference from any document reaches it. A definition with no declaration at its
 bytes (a symbol the structural provider does not declare) keeps the identity
 its descriptor path keys.
+
+**Constructions.** A `cxx` method named as the type it is a member of is a
+constructor, and C++ has no value of a constructor, so every reference to one
+is a construction. Most have no call site: the structural provider records
+`D(3)` but not `D d0;` or `new D(2)`, and scip-clang 0.4.0 puts a
+declaration's constructor reference on the declared variable's name (measured:
+`D d0;`, `D d1(1);` and `D d2{};` reference their constructors at `d0`, `d1`
+and `d2`). The name check therefore accepts a constructor reference on any one
+identifier token, and a constructor reference no site matches publishes
+`calls` from the innermost function or method declared around it, else the
+module, to the constructor alone, keyed by the token it is on.
 
 ## Symbol spellings
 

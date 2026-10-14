@@ -39,7 +39,8 @@ type symbol struct {
 	// of a global symbol; "." stands for an empty manager, name or version.
 	scheme, manager, name, version string
 	// descriptors is the raw descriptor string; lastName and lastSuffix
-	// describe its final descriptor, prevSuffix the one before it.
+	// describe its final descriptor, prevSuffix and prevName the one before
+	// it.
 	// lastEscaped records that lastName arrived backtick-escaped, which is how
 	// the grammar spells a name that is not a plain identifier.
 	descriptors string
@@ -47,6 +48,7 @@ type symbol struct {
 	lastEscaped bool
 	lastSuffix  descriptorSuffix
 	prevSuffix  descriptorSuffix
+	prevName    string
 }
 
 // parseSymbol parses s; a string that is not a SCIP symbol is malformed
@@ -79,7 +81,7 @@ func parseSymbol(s string) (symbol, error) {
 	if sym.scheme == schemeClang {
 		if d, ok := injectedConstructorName(sym.descriptors); ok {
 			sym.raw = s[:len(s)-len(rest)] + d
-			sym.descriptors, sym.lastSuffix, sym.prevSuffix = d, suffixNone, suffixNone
+			sym.descriptors, sym.lastSuffix, sym.prevSuffix, sym.lastName = d, suffixNone, suffixNone, ""
 			if err := sym.parseDescriptors(); err != nil {
 				return symbol{}, err
 			}
@@ -249,7 +251,7 @@ func (sym *symbol) parseDescriptors() error {
 			return malformed("descriptor has an empty name")
 		}
 		sym.prevSuffix, sym.lastSuffix = sym.lastSuffix, suffix
-		sym.lastName, sym.lastEscaped = name, len(raw) >= 2 && raw[0] == '`'
+		sym.prevName, sym.lastName, sym.lastEscaped = sym.lastName, name, len(raw) >= 2 && raw[0] == '`'
 	}
 	if sym.lastSuffix == suffixNone {
 		return malformed("symbol has no descriptors")
@@ -303,6 +305,14 @@ func unescapeName(s string) string {
 		return strings.ReplaceAll(s[1:len(s)-1], "``", "`")
 	}
 	return s
+}
+
+// cxxConstructor reports a scip-clang constructor: a method descriptor named
+// as the type it is a member of (`D#D(49f6e7a06ebc5aa8).`). C++ has no value
+// of a constructor -- its address cannot be taken -- so every reference to
+// one is a construction.
+func (sym symbol) cxxConstructor() bool {
+	return sym.scheme == schemeClang && sym.lastSuffix == suffixMethod && sym.prevSuffix == suffixType && sym.lastName == sym.prevName
 }
 
 // probeName is the identifier a definition occurrence of this symbol must
