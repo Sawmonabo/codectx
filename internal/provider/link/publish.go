@@ -666,7 +666,8 @@ func openShape(s *Site) model.CallShape {
 }
 
 // openSite publishes site s's open-site node, located at the site and named
-// by its callee as written, and the caller's `calls` to it, with reason. The
+// by its callee as written (a reflective site by the method a constant
+// lookup names, Site.Reflected), and the caller's `calls` to it, with reason. The
 // node is keyed in the file's scope by "open:" and the site's call-site key,
 // or, for a computed callee, which has no callee token, "open:computed:", the
 // path and the site's bytes; the edge's evidence carries the call-site key,
@@ -683,13 +684,19 @@ func (f *filePublication) openSite(s *Site, caller Endpoint, reason model.OpenSi
 	if s.Shape == wire.ShapeMember || s.Shape == wire.ShapeStatic {
 		kind = model.NodeMethod
 	}
+	// A reflective call whose receiver a constant lookup names runs a
+	// method of that name: the node is named by it (OpenSiteMetadata.Named).
+	name, named := s.Callee, reason == model.ReasonReflective && s.Reflected != ""
+	if named {
+		name = s.Reflected
+	}
 	meta, err := json.Marshal(model.OpenSiteMetadata{Resolution: model.ResolutionUnresolved, Reason: reason,
-		Shape: openShape(s), Arguments: int64(max(len(s.Args), len(s.Arguments)))})
+		Shape: openShape(s), Arguments: int64(max(len(s.Args), len(s.Arguments))), Named: named})
 	if err != nil {
 		return internalErr("open site metadata: " + err.Error())
 	}
 	n, err := f.mint(model.NodeCandidate{ProviderID: ProviderID, ScopeKey: lang.ScopePrefix + path, NativeKey: native,
-		Kind: kind, Language: f.t.Language, Name: nodeName(s.Callee, "call")}, s.Range, meta)
+		Kind: kind, Language: f.t.Language, Name: nodeName(name, "call")}, s.Range, meta)
 	if err != nil {
 		return err
 	}

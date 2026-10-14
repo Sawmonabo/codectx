@@ -139,6 +139,7 @@ func (b *builder) linkTable() error {
 			w, siteAt[i] = i, int32(len(t.Sites))
 			s.Described = true
 			s.Shape, s.Qualifier, s.Signature = wl.Sites[i].Shape, cmp.Or(wl.Sites[i].Qualifier, r.Qualifier), wl.Sites[i].Signature
+			s.Reflected = bound(wl.Sites[i].Reflected, model.MaxNameBytes)
 			s.QualifierIsImport = s.QualifierIsImport && s.Qualifier == r.Qualifier
 		}
 		joined = append(joined, w)

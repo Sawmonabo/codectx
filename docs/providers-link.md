@@ -155,7 +155,15 @@ site, named by the callee as written (`call` when there is none), of kind `metho
   `java.lang.Class.newInstance` and `java.lang.invoke.MethodHandle`'s `invoke`, `invokeExact` and
   `invokeWithArguments`; Go's `reflect.Value.Call` and `CallSlice`). Such a site also publishes its `calls` to the
   API's external method; its open-site node is published beside it, and the site is counted external and
-  reflective.
+  reflective. When a constant names the method it runs (`Site.Reflected`: the worker reads a receiver that is
+  `getMethod("n", …)` or `getDeclaredMethod("n", …)` in Java, `MethodByName("N")` in Go, with one string literal
+  spelling an identifier, directly or through a local every definition of which in the file is that lookup of
+  that name), the open-site node is named by that method and carries `"named":true`, so the methods of that name
+  are its candidates. The objects those lookups are made on are typed by the results of the external methods
+  that give them (`externalResults`, `resolve_static.go`: Java's `Object.getClass` and `Class.forName` give a
+  `java.lang.Class`, its `getMethod` and `getDeclaredMethod` a `java.lang.reflect.Method`, its `getConstructor`
+  and `getDeclaredConstructor` a `java.lang.reflect.Constructor`; Go's `reflect.Value.MethodByName` and `Method` a
+  `reflect.Value`), and a Java class literal `T.class` is a `java.lang.Class` (JLS §15.8.2).
 
 Its shape is `member`, `value`, `construct` or `bare`, and `arguments` is the number of arguments the site passes.
 The candidates of an open site are computed per query as `may_call`, never stored. A key longer than

@@ -236,6 +236,13 @@ type Site struct {
 	// is and how it is passed: Arguments[i] and Args[i] describe the same
 	// argument. It is empty when the worker sent no argument positions.
 	Arguments []Argument
+	// Reflected is, for a member call whose receiver is a method a
+	// reflective lookup found by a constant name (Java `getMethod("n", …)`
+	// or `getDeclaredMethod("n", …)` on a Class, Go `MethodByName("N")` on
+	// a reflect.Value), that name: the receiver is the lookup itself, or a
+	// local variable every definition of which in the file is such a lookup
+	// of that one name. Empty for every other site.
+	Reflected string
 }
 
 // Argument is one argument of a call site.
@@ -554,6 +561,7 @@ func (e *encoder) site(s *Site) {
 			e.span(r)
 		}
 	}
+	e.str(s.Reflected)
 }
 
 // encoder appends the link encoding's primitives.
@@ -682,6 +690,7 @@ func (d *decoder) site() Site {
 		}
 		s.Arguments = append(s.Arguments, a)
 	}
+	s.Reflected = d.str()
 	return s
 }
 

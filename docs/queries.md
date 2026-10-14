@@ -233,7 +233,14 @@ Java and Rust, with parameters that take the call's arguments. Each is a
   calls that API's external method and is also an open site of reason
   `reflective`, and a method it reaches cannot list it. A reflective site's
   callee is the API's name, so it has no candidates, as a computed one has
-  none.
+  none, unless a constant names the method it runs: a receiver that is a
+  lookup by a string literal (`Handler.class.getMethod("handle")`,
+  `v.MethodByName("Handle")`), directly or through a local every definition
+  of which is that lookup, names the site's node after the method (metadata
+  `named: true`), and the methods of that name are its candidates, ranked
+  as any site's, whatever their arity (the API passes the arguments through
+  its own); so `callers Handler.handle` lists the site's caller as
+  `may_call`.
 - `callees` lists the open-site node and then its candidates, nearest first:
   the same file, the same directory, a file the call's file imports or is
   imported by, the same unit, then anywhere.

@@ -57,6 +57,9 @@ type javaLinker struct {
 	bound                 []javaBound
 	// frames are the enclosing type bodies, innermost last.
 	frames []javaFrame
+	// reflectedAt are the sites whose receiver is a local, named after the
+	// walk by the local's definitions (file).
+	reflectedAt []javaReflectedAt
 	// siteAt maps a call node to its index in out.Sites, which a later
 	// site's TypeResult names.
 	siteAt map[uintptr]uint32
@@ -66,6 +69,11 @@ type javaLinker struct {
 type javaBound struct {
 	typ   wire.Type
 	field bool
+	// reflected is the one method name every definition of a local gives
+	// it by a reflective lookup (javaReflected), and reflectedNot that
+	// some definition gives it anything else.
+	reflected    string
+	reflectedNot bool
 	// owner is the type that declares a field sent as an Export, whose read
 	// is TypeField "owner.name"; empty for every other binding.
 	owner string
@@ -109,9 +117,77 @@ func (k *javaLinker) function(fn Node, g *flow.Graph, du flow.Edges, src []byte)
 // field).
 func (k *javaLinker) file(root Node, src []byte, out *wire.Link) {
 	k.src, k.out = src, out
-	defer func() { k.src, k.out = nil, nil }()
+	defer func() { k.src, k.out, k.reflectedAt = nil, nil, k.reflectedAt[:0] }()
 	k.collectTypes(root)
 	k.visit(root)
+	// A site's receiver local is named once every definition of it is seen.
+	for _, r := range k.reflectedAt {
+		if b := &k.bound[r.bound]; !b.reflectedNot {
+			out.Sites[r.site].Reflected = b.reflected
+		}
+	}
+}
+
+// javaReflectedAt is a site whose receiver is the local bound[bound].
+type javaReflectedAt struct {
+	site  int
+	bound int32
+}
+
+// javaReflected is the method name a reflective lookup e (inside any
+// parentheses) finds by a constant: `getMethod("n", …)` or
+// `getDeclaredMethod("n", …)` whose first argument is one string literal
+// spelling an identifier (the Java SE API java.lang.Class: the method of
+// that name); "" for any other expression.
+func (k *javaLinker) javaReflected(e Node) string {
+	j := k.k
+	for !e.IsNull() && e.KindId() == j.parenthesized {
+		e = firstNamed(e)
+	}
+	if e.IsNull() || e.KindId() != j.methodInvocation {
+		return ""
+	}
+	switch string(k.text(e.ChildByFieldId(j.fName))) {
+	case "getMethod", "getDeclaredMethod":
+	default:
+		return ""
+	}
+	args := e.ChildByFieldId(j.fArguments)
+	if args.IsNull() {
+		return ""
+	}
+	first := firstNamed(args)
+	if first.IsNull() {
+		return ""
+	}
+	lit := string(k.text(first))
+	if len(lit) < 3 || lit[0] != '"' || lit[len(lit)-1] != '"' || !javaIdentifier(lit[1:len(lit)-1]) {
+		return ""
+	}
+	return lit[1 : len(lit)-1]
+}
+
+// javaIdentifier reports an ASCII Java identifier; any other spelling (an
+// escape, a non-ASCII letter) is not read.
+func javaIdentifier(s string) bool {
+	for i, r := range s {
+		if !(r == '_' || r == '$' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// reflectedDef records one definition of the local bound[i]: a reflective
+// lookup of name, or, with name empty, anything else.
+func (k *javaLinker) reflectedDef(i int32, name string) {
+	b := &k.bound[i]
+	switch {
+	case name == "" || b.reflected != "" && b.reflected != name:
+		b.reflectedNot = true
+	default:
+		b.reflected = name
+	}
 }
 
 // collectTypes fills k.types before the walk, since a type may be used
@@ -182,6 +258,13 @@ func (k *javaLinker) visit(n Node) {
 		k.children(n)
 	case id == j.localVarDecl:
 		k.locals(n)
+	case id == j.assignment:
+		k.children(n)
+		if left := n.ChildByFieldId(j.fLeft); !left.IsNull() && left.KindId() == j.identifier {
+			if i := k.vars.innermost(k.text(left)); i >= 0 && !k.bound[k.vars.at(i).v].field {
+				k.reflectedDef(k.vars.at(i).v, k.javaReflected(n.ChildByFieldId(j.fRight)))
+			}
+		}
 	case id == j.resource:
 		k.resource(n)
 	case id == j.enhancedFor:
@@ -557,6 +640,12 @@ func (k *javaLinker) invocation(n Node) {
 		} else {
 			s.Shape, s.Receiver = wire.ShapeMember, k.exprType(obj)
 		}
+		s.Reflected = k.javaReflected(obj)
+		if s.Reflected == "" && obj.KindId() == j.identifier {
+			if i := k.vars.innermost(k.text(obj)); i >= 0 && !k.bound[k.vars.at(i).v].field {
+				k.reflectedAt = append(k.reflectedAt, javaReflectedAt{site: len(k.out.Sites), bound: k.vars.at(i).v})
+			}
+		}
 	}
 	k.addSite(n, s)
 }
@@ -804,6 +893,9 @@ func (k *javaLinker) locals(n Node) {
 		}
 		if name := d.ChildByFieldId(j.fName); !name.IsNull() && name.KindId() == j.identifier {
 			k.bind(&k.vars, name, typ, false)
+			if !v.IsNull() {
+				k.reflectedDef(int32(len(k.bound)-1), k.javaReflected(v))
+			}
 		}
 	}
 }
@@ -1034,6 +1126,9 @@ func (k *javaLinker) exprType(n Node) wire.Type {
 		return k.thisType()
 	case j.objectCreation, j.cast:
 		return k.named(x.child(n, x.fType))
+	case j.classLiteral:
+		// `T.class` is a java.lang.Class (JLS §15.8.2).
+		return wire.Type{Kind: wire.TypeNamed, Name: "java.lang.Class"}
 	case j.methodInvocation:
 		if i, ok := k.siteAt[n.Id()]; ok {
 			return wire.Type{Kind: wire.TypeResult, Index: i}

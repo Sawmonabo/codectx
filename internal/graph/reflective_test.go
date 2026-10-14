@@ -62,3 +62,41 @@ func TestAReflectiveSiteIsDisclosedAndNamesNoCandidate(t *testing.T) {
 		t.Errorf("callers(invoke) lists go through the reflective site named after the reflection API")
 	}
 }
+
+// TestAReflectiveSiteAConstantNamesHasThatNamesCandidates pins a reflective
+// site a constant names (`Method m = cls.getMethod("handle"); m.invoke(obj)`,
+// model.OpenSiteMetadata.Named): its node is named handle, the methods of
+// that name are its possible callees whatever their arity (invoke passes
+// the method's receiver and arguments through its own), and a callers walk
+// from one reaches the site's caller.
+//
+// Mutations caught: reading Named as nothing (no `may_call` to handle, and
+// callers(handle) misses go); fitting a reflective site by its argument
+// count (handle, of no parameter, against invoke's one argument, is no
+// candidate).
+func TestAReflectiveSiteAConstantNamesHasThatNamesCandidates(t *testing.T) {
+	meta, _ := json.Marshal(model.OpenSiteMetadata{Resolution: model.ResolutionUnresolved,
+		Reason: model.ReasonReflective, Shape: model.CallShapeMember, Arguments: 1, Named: true})
+	f := newCallFixture("reflective_named", fixtureScenario{
+		Nodes: []fixtureDecl{
+			{Name: "go", Kind: model.NodeMethod, File: "R.java", Bytes: [2]uint64{0, 60}, Language: "java"},
+			{Key: "site", Name: "handle", Kind: model.NodeMethod, File: "R.java", Bytes: [2]uint64{30, 40},
+				Metadata: meta, Language: "java"},
+			{Name: "handle", Kind: model.NodeMethod, File: "Handler.java", Bytes: [2]uint64{0, 30}, Language: "java",
+				Signature: "void handle()"},
+		},
+		Relations: []fixtureFact{{From: "go", Kind: model.RelCalls, To: "site", Occurrences: site(30)}},
+	})
+	res := callAnswer(t, f, "go", model.DirectionOutgoing)
+	if !slices.ContainsFunc(res.Relations, func(r model.Relation) bool {
+		return r.Kind == model.RelMayCall && f.name(r.To) == "handle"
+	}) {
+		t.Errorf("callees(go) lists no `may_call` to handle; the constant names the method the reflective site runs")
+	}
+	res = callAnswer(t, f, "handle", model.DirectionIncoming)
+	if !slices.ContainsFunc(res.Relations, func(r model.Relation) bool {
+		return r.Kind == model.RelMayCall && f.name(r.From) == "go"
+	}) {
+		t.Errorf("callers(handle) lists no `may_call` from go, whose reflective site a constant names handle")
+	}
+}

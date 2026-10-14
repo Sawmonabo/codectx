@@ -274,7 +274,7 @@ func sitesNaming(ctx context.Context, dr DeclarationReader, n model.Node) ([]mod
 			return nil, err
 		}
 		for _, d := range page {
-			if site, ok := openCallSite(d); ok && site.Reason.Named() && site.fits(n) {
+			if site, ok := openCallSite(d); ok && site.named() && site.fits(n) {
 				out = append(out, d.Node.ID)
 			}
 		}
@@ -1076,7 +1076,7 @@ func (c *openSiteCounter) flush(ctx context.Context) error {
 			}
 			for _, d := range page {
 				site, ok := openCallSite(d)
-				if !ok || !site.Reason.Named() {
+				if !ok || !site.named() {
 					continue
 				}
 				done, err := c.counted(d.Node.ID)

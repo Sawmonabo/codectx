@@ -354,6 +354,10 @@ type Site struct {
 	// that consumes this call's value directly (the site whose Nested names
 	// this one).
 	Feeds int32 `json:"feeds,omitempty"`
+	// Reflected is the method name a reflective lookup by a constant gives
+	// the site's receiver (wire.Site.Reflected): what a reflective call of
+	// it runs is a method of that name.
+	Reflected string `json:"reflected,omitempty"`
 }
 
 // Argument is one argument of a call site (wire.Argument): where it is,
